@@ -16,6 +16,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -115,6 +116,8 @@ def systemctl_shim(calls: Path, manifest: Path, on_restart: str = "", booted_at:
         # After a restart, MainPID is $NEW_PID; with $NEW_PID_LATER set, every read
         # after the first one reports that pid instead (the unit restarted again).
         'if [[ " $* " == *" MainPID "* ]]; then\n'
+        # $MAIN_PID_RC: systemd could not be asked (a bus failure): no output.
+        '  [ -z "${MAIN_PID_RC:-}" ] || exit "$MAIN_PID_RC"\n'
         f'  if grep -q "restart genesis-server" "{calls}"; then\n'
         f'    if [ -n "${{NEW_PID_LATER:-}}" ] && [ -f "{calls}.pidread" ]; then echo "$NEW_PID_LATER";\n'
         f'    else touch "{calls}.pidread"; echo "${{NEW_PID:-2222}}"; fi\n'
@@ -228,9 +231,22 @@ def station(tmp_path):
     manifest.write_text('{"pid": 1111, "manifest": {"db": "ok", "perception": "ok"}}')
     # curl answers per $CURL_RC, and records whether the deploy marker was held
     # at the moment the health check ran.
+    #
+    # The in-flight query (GET /api/genesis/inflight) is answered apart from the
+    # health check: $INFLIGHT_CODE (default 200; 000 = no answer at all) and the
+    # body in $INFLIGHT_FILE (default: nothing in flight). The headers it was sent
+    # on stdin are kept in inflight_headers.
     exec_file(
         shims / "curl",
         "#!/bin/bash\n"
+        'if [[ " $* " == *"/api/genesis/inflight"* ]]; then\n'
+        f'  printf "%s\\n" "$*" >> "{tmp_path}/inflight_args"\n'
+        f'  cat > "{tmp_path}/inflight_headers"\n'
+        '  code="${INFLIGHT_CODE:-200}"\n'
+        '  [ "$code" = 000 ] && exit 7\n'
+        '  if [ -n "${INFLIGHT_FILE:-}" ]; then cat "$INFLIGHT_FILE"; else printf \'{"items": []}\'; fi\n'
+        '  printf "\\n%s" "$code"; exit 0\n'
+        "fi\n"
         f'[ -f "{marker}" ] && echo held >> "{tmp_path}/marker_seen"\n'
         f'printf "%s\\n" "$*" >> "{tmp_path}/curl_args"\n'
         "exit ${CURL_RC:-0}\n",
@@ -241,11 +257,15 @@ def station(tmp_path):
     # the restarted unit, $NEW_PID or 2222); $PROBE_NONE = nothing listening;
     # $PROBE_FOREIGN_TOO = a second listener held by another process. Exit 0
     # means "every listener on the port is <pid>'s". Never the real probe: the
-    # live server listens on that port.
+    # live server listens on that port. The RUNNING server ($MAIN_PID, 1111 by
+    # default, before any restart) owns the port unless $PROBE_SERVER_FOREIGN: the restart refusal
+    # checks that before it hands the server the token or believes its answer.
     probe = tmp_path / "port_probe.py"
     probe.write_text(
         "import os, sys\n"
         "pid = sys.argv[2]\n"
+        "if pid == os.environ.get('MAIN_PID', '1111'):\n"
+        "    sys.exit(1 if os.environ.get('PROBE_SERVER_FOREIGN') else 0)\n"
         "if os.environ.get('PROBE_NONE') or os.environ.get('PROBE_FOREIGN_TOO'):\n"
         "    sys.exit(1)\n"
         "owner = os.environ.get('PROBE_OWNER') or os.environ.get('NEW_PID') or '2222'\n"
@@ -286,6 +306,31 @@ def station(tmp_path):
     }
     site = tmp_path / "site"
     install_fixture(site, root)
+    # The process table the restart refusal scans (GENESIS_DEPLOY_PROC_ROOT): an
+    # empty fake /proc, so no test's verdict depends on what runs on the machine
+    # (the shim's MainPID, 1111, can be a real pid here). A test that wants
+    # sessions writes them into it (fake_proc_entry). The session table it names
+    # them from (GENESIS_DEPLOY_DB) is a path that does not exist unless a test
+    # builds it.
+    fake_proc = tmp_path / "proc"
+    fake_proc.mkdir()
+    (fake_proc / "stat").write_text(f"cpu 0\nbtime {int(time.time()) - 3600}\n")
+    env.update(GENESIS_DEPLOY_PROC_ROOT=str(fake_proc))
+    # The internal API token the server writes at boot: the in-flight query sends
+    # it (the curl shim keeps what it was sent).
+    (home / ".genesis" / "internal_api_token").write_text("station-token\n")
+    # A second layer under the systemctl shim: the user bus points at an empty
+    # directory, so a code path that bypasses the shim gets "Failed to connect to
+    # bus" (MEASURED, systemd 255) instead of stopping the live server. A
+    # backup/restore test once stopped it ten times in a day through that gap.
+    # Pointed elsewhere, not unset: deploy_code_only.sh fills both in with the
+    # real defaults when they are empty.
+    nobus = tmp_path / "nobus"
+    nobus.mkdir()
+    env.update(
+        XDG_RUNTIME_DIR=str(nobus),
+        DBUS_SESSION_BUS_ADDRESS=f"unix:path={nobus}/bus",
+    )
     env.update(
         HOME=str(home),
         PATH=f"{shims}:{env['PATH']}",
@@ -310,7 +355,29 @@ def station(tmp_path):
         "booted_at": booted_at,
         "lock": home / ".genesis" / "locks" / "update.lock",
         "queue": home / ".genesis" / "alerts" / "queue",
+        "proc": fake_proc,
     }
+
+
+def fake_proc_entry(
+    st, pid: int, ppid: int, comm: str, argv: list[str], *, state: str = "S", start: int = 6000
+) -> None:
+    """Add /proc/<pid> to the station's fake process table (by default sleeping,
+    started a minute after its fake boot: start tick 6000)."""
+    d = st["proc"] / str(pid)
+    d.mkdir()
+    rest = [state, str(ppid)] + ["0"] * 17 + [str(start), "0"]
+    (d / "stat").write_text(f"{pid} ({comm}) " + " ".join(rest) + "\n")
+    (d / "comm").write_text(comm + "\n")
+    (d / "cmdline").write_bytes(b"\x00".join(a.encode() for a in argv) + b"\x00")
+
+
+def inflight_report(st, items: list[dict]) -> dict:
+    """Make the curl shim report *items* as the server's in-flight work; returns
+    the env to run with."""
+    path = st["tmp"] / "inflight.json"
+    path.write_text(json.dumps({"items": items}))
+    return {**st["env"], "INFLIGHT_FILE": str(path)}
 
 
 _ADVANCES = [0]

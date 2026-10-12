@@ -26,3 +26,14 @@ enabled: true
 # `off` regardless of this file. The open-question tools are not gated by this
 # lever: they write only local rows.
 mode: "off"
+
+# Which Projects v2 board (user-owned). Install-specific, so never set here:
+# `scripts/board_setup.py --apply --write-config` records them in
+# ~/.genesis/config/board.local.yaml when it creates the project; setup then
+# works only on the project recorded here, never one found by its title.
+# OVERLAY-ONLY, like `live`: settings_update() rejects both keys, so a model
+# can never repoint Genesis's board writes at a project it controls.
+#   project_owner: <github login>
+#   project_number: <n>
+project_owner: null
+project_number: null

@@ -50,12 +50,17 @@ to the repository root.
 
 `src/genesis/autonomy/watchdog.py` — `_check_memory_pressure()`, `reclaim_page_cache()`, `get_container_memory()`
 
-- Runs every watchdog cycle (60s)
+- Runs every watchdog cycle (`genesis-watchdog.timer`: 60s after boot, then every 300s)
 - Reads cgroup v2 memory usage via `/sys/fs/cgroup/memory.current` and `memory.max`
 - 80% threshold: reclaim 128M page cache
 - 90% threshold: reclaim 256M page cache
 - Reclaim target capped at 256M (larger reclaims cause I/O death spirals — incident 2026-03-16)
 - I/O pressure guard: skips reclaim if `/sys/fs/cgroup/io.pressure` `full avg10 > 10%`
+- I/O stall attribution (`_check_io_pressure` → `_log_io_culprits`): above full avg10 25%
+  the watchdog logs the top in-container processes by current I/O rate, each with
+  its systemd unit, its Claude Code session pid when it has one, and the summed
+  in-container rate; a small total means the I/O came from somewhere the container
+  cannot see
 - Cooldown: max once per 300s via monotonic clock
 - Writes to `/sys/fs/cgroup/user.slice/memory.reclaim` via `sudo tee` with 5s timeout
 

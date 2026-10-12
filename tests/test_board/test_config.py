@@ -149,7 +149,44 @@ def test_owner_overlay_still_arms_live(config_dirs):
 
 @pytest.mark.parametrize(
     "changes",
-    [{"mode": "LIVE"}, {"mode": True}, {"enabled": "false"}, {"project_number": 3}],
+    [{"mode": "LIVE"}, {"mode": True}, {"enabled": "false"}, {"repo": "o/r"}],
 )
 def test_validator_rejects_bad_values_and_unknown_keys(changes):
     assert _validate_board(changes)
+
+
+# ── project reference (written by scripts/board_setup.py) ──────────────────
+
+
+def test_project_ref_is_none_until_setup_runs(config_dirs):
+    assert bc.project_ref() is None
+
+
+def test_project_ref_reads_the_overlay(config_dirs):
+    _, overlay = config_dirs
+    overlay.write_text("project_owner: someone\nproject_number: 4\n")
+    assert bc.project_ref() == ("someone", 4)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "project_owner: someone\n",
+        "project_owner: 'bad login!'\nproject_number: 4\n",
+        "project_owner: a\nproject_number: 0\n",
+    ],
+)
+def test_malformed_project_ref_is_treated_as_unset(config_dirs, body):
+    _, overlay = config_dirs
+    overlay.write_text(body)
+    assert bc.project_ref() is None
+
+
+@pytest.mark.parametrize(
+    "change", [{"project_owner": "someone"}, {"project_number": 4}, {"project_owner": "bad login!"}]
+)
+def test_validator_refuses_project_keys_they_are_overlay_only(change):
+    """Which board Genesis writes to is set only by board_setup in the overlay
+    file: a session must not repoint it at a project it controls."""
+    [error] = _validate_board(change)
+    assert "board_setup.py --write-config" in error

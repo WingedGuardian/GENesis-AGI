@@ -1,0 +1,585 @@
+"""Promotion (propose side): every refusal, the scan's line+scanner-only
+report, and the shape of a held board row. Nothing here touches GitHub."""
+
+from __future__ import annotations
+
+import json
+
+import aiosqlite
+import pytest
+
+from genesis.board import config as board_config
+from genesis.board import promotion
+from genesis.contribution.findings import Finding, FindingKind, SanitizerResult, Severity
+from genesis.db.crud import approval_requests as ar
+from genesis.db.crud import board as board_crud
+from genesis.db.schema import create_all_tables
+
+FOLLOW = "f0110000" + "a" * 24
+LEDGER = "1edcef00" + "b" * 24
+NOW = "2026-10-03T12:00:00+00:00"
+
+
+@pytest.fixture
+async def db(tmp_path, monkeypatch):
+    monkeypatch.setattr(board_config, "effective_mode", lambda: "live")
+    monkeypatch.setattr("genesis.env.github_user", lambda: "owner")
+    monkeypatch.setattr("genesis.env.github_public_repo", lambda: "Repo")
+    async with aiosqlite.connect(str(tmp_path / "g.db")) as conn:
+        conn.row_factory = aiosqlite.Row
+        await create_all_tables(conn)
+        await conn.execute(
+            "INSERT INTO follow_ups (id, source, content, strategy, status, created_at) "
+            "VALUES (?, 'test', 'do x', 'user_input_needed', 'pending', ?)",
+            (FOLLOW, NOW),
+        )
+        await conn.execute(
+            "INSERT INTO session_ledger (id, session_id, text, created_at) VALUES (?, 's', 'row', ?)",
+            (LEDGER, NOW),
+        )
+        await conn.commit()
+        yield conn
+
+
+async def _propose(db, **over):
+    kw = dict(
+        source=f"follow_up:{FOLLOW[:10]}",
+        title="Add X",
+        body="Body text.",
+        acceptance_criteria=["works"],
+    )
+    kw.update(over)
+    return await promotion.propose(db, now=NOW, **kw)
+
+
+async def _holds(db):
+    cur = await db.execute("SELECT * FROM pending_issue_posts WHERE source = 'board'")
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def test_held_row_shape_and_marker_is_opaque(db):
+    out = await _propose(db)
+    assert out["status"] == "held" and out["mode"] == "live" and out["repo"] == "owner/repo"
+    [row] = await _holds(db)
+    assert row["source_ref"] == f"follow_up:{FOLLOW}" and row["mode"] == "live"
+    assert promotion.source_marker("follow_up", FOLLOW) in row["body"]
+    assert FOLLOW not in row["body"] and FOLLOW[:8] not in row["body"], (
+        "the private id never reaches the public body"
+    )
+    assert "## Acceptance criteria\n\n- [ ] works" in row["body"]
+    approval = await ar.get_by_id(db, row["request_id"])
+    assert approval["action_type"] == promotion.BOARD_PROMOTION_ACTION_TYPE
+    assert approval["status"] == "pending", "never self-approved"
+    assert json.loads(approval["context"])["scan_receipt"]["ok"] is True
+
+
+async def test_off_mode_refuses_and_writes_nothing(db, monkeypatch):
+    monkeypatch.setattr(board_config, "effective_mode", lambda: "off")
+    assert (await _propose(db))["status"] == "disabled"
+    assert await _holds(db) == []
+
+
+async def test_propose_only_is_stamped(db, monkeypatch):
+    monkeypatch.setattr(board_config, "effective_mode", lambda: "propose_only")
+    await _propose(db)
+    assert (await _holds(db))[0]["mode"] == "propose_only"
+
+
+@pytest.mark.parametrize(
+    "source", ["follow_up:deadbeef", "ledger:12", "issue:x", "nope", f"follow_up:{LEDGER}"]
+)
+async def test_unresolvable_source_is_an_error(db, source):
+    out = await _propose(db, source=source)
+    assert out["status"] == "error"
+    assert await _holds(db) == []
+
+
+async def test_ledger_source_resolves(db):
+    assert (await _propose(db, source=f"ledger:{LEDGER[:8]}"))["status"] == "held"
+
+
+async def test_an_open_question_block_refuses_promotion_then_releases(db):
+    qid = await board_crud.raise_question(
+        db, question="which?", now=NOW, blocks=[("follow_up", FOLLOW)]
+    )
+    out = await _propose(db)
+    assert out["status"] == "refused" and out["blocking_question_ids"] == [qid]
+    assert await _holds(db) == []
+    refused = await board_crud.list_events(db, event="promotion_refused")
+    assert refused["total"] == 1
+    await board_crud.close_question(
+        db, question_id=qid, status="resolved", resolution="this", now=NOW
+    )
+    assert (await _propose(db))["status"] == "held"
+
+
+async def test_a_refusal_on_the_servers_shared_connection_is_still_logged(db):
+    """board_promote runs on the server's SerializedConnection, which the board
+    writers refuse; the refusal event goes through an owned connection."""
+    from genesis.db.connection import SerializedConnection
+
+    await board_crud.raise_question(db, question="which?", now=NOW, blocks=[("follow_up", FOLLOW)])
+    out = await _propose(SerializedConnection(db))
+    assert out["status"] == "refused"
+    assert (await board_crud.list_events(db, event="promotion_refused"))["total"] == 1
+
+
+async def test_duplicates_are_refused(db):
+    assert (await _propose(db))["status"] == "held"
+    again = await _propose(db, title="Different title")
+    assert again["status"] == "duplicate"
+    assert len(await _holds(db)) == 1
+
+
+async def test_a_follow_up_held_in_the_contributor_lane_is_not_promoted_too(db):
+    """One record, one public issue — across lanes."""
+    await db.execute(
+        "INSERT INTO pending_issue_posts (id, request_id, repo, title, body, source, source_ref, cell_domain, "
+        "cell_verb, cell_risk_class, held_at, mode, status) VALUES ('c1', 'r1', 'owner/repo', 't', 'b', "
+        "'follow_up', ?, 'github', 'issue_create', 'bulk', ?, 'live', 'held')",
+        (FOLLOW, NOW),
+    )
+    await db.commit()
+    out = await _propose(db)
+    assert out["status"] == "duplicate"
+
+
+async def test_the_contributor_lane_refuses_a_follow_up_already_on_the_board(db, monkeypatch):
+    from genesis.mcp.health import contributor_issue as ci
+
+    monkeypatch.setattr(ci, "effective_mode", lambda: "live")
+    monkeypatch.setattr(ci, "require_approval", lambda: True)
+    monkeypatch.setattr(ci, "_default_repo", lambda: "owner/repo")
+    assert (await _propose(db))["status"] == "held"  # pending board promotion
+    pending = await ci._impl_contributor_issue_propose(
+        db,
+        title="Other title",
+        body="b",
+        labels=["area:runtime", "good first issue"],  # the tracker requires both kinds
+        repo="owner/repo",
+        source="follow_up",
+        source_follow_up_id=FOLLOW,
+    )
+    # A board hold for the same follow-up (source_ref "follow_up:<id>") blocks a
+    # contributor-lane post of it: the board_ref clause in the contributor tool.
+    assert pending["status"] == "duplicate"
+    await board_crud.record_link(
+        db,
+        source_kind="follow_up",
+        source_id=FOLLOW,
+        repo="owner/repo",
+        issue_number=9,
+        promoted_by="dashboard",
+        scan_receipt={},
+        body_sha256="c" * 64,
+        now=NOW,
+    )
+    linked = await ci._impl_contributor_issue_propose(
+        db,
+        title="Third title",
+        body="b",
+        labels=None,
+        repo="other/repo",
+        source="follow_up",
+        source_follow_up_id=FOLLOW,
+    )
+    assert linked["status"] == "duplicate" and "work board" in linked["reason"]
+
+
+async def test_already_linked_source_is_refused(db):
+    await board_crud.record_link(
+        db,
+        source_kind="follow_up",
+        source_id=FOLLOW,
+        repo="owner/repo",
+        issue_number=5,
+        promoted_by="dashboard",
+        scan_receipt={},
+        body_sha256="c" * 64,
+        now=NOW,
+    )
+    out = await _propose(db)
+    assert out["status"] == "duplicate" and out["issue"] == "owner/repo#5"
+
+
+async def test_scan_refusal_reports_line_and_scanner_only(db, monkeypatch):
+    secret = "SECRET-MATCHED-TEXT"
+    finding = Finding(
+        kind=list(FindingKind)[0],
+        severity=Severity.BLOCK,
+        message=f"found {secret}",
+        file="<prose>",
+        line=3,
+        scanner="fingerprint",
+        detail=secret,
+    )
+    monkeypatch.setattr(
+        "genesis.contribution.scan_prose",
+        lambda _text, **_k: SanitizerResult(
+            ok=False, findings=[finding], scanners_run=["fingerprint"]
+        ),
+    )
+    out = await _propose(db)
+    assert out["status"] == "blocked" and out["findings"] == [{"line": 3, "scanner": "fingerprint"}]
+    assert secret not in json.dumps(out)
+    assert await _holds(db) == []
+    events = await board_crud.list_events(db, event="promotion_refused")
+    assert secret not in json.dumps(events)
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"title": ""},
+        {"body": "  "},
+        {"title": "x" * (promotion.MAX_TITLE_CHARS + 1)},
+        {"acceptance_criteria": ["c"] * (promotion.MAX_CRITERIA + 1)},
+        {"labels": ["l"] * (promotion.MAX_LABELS + 1)},
+        {"labels": ["x" * (promotion.MAX_LABEL_CHARS + 1)]},
+    ],
+)
+async def test_bounds_are_refused(db, over):
+    assert (await _propose(db, **over))["status"] == "error"
+
+
+# ─── round 1 (Codex at ea8329d76) ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize("mode", ["live", "propose_only"])
+async def test_no_project_is_needed_to_propose(db, monkeypatch, mode):
+    """Promotion never places a card (the reconciler does), so a configured
+    project is not a precondition of a promotion in either mode."""
+    monkeypatch.setattr(board_config, "effective_mode", lambda: mode)
+    monkeypatch.setattr(board_config, "project_ref", lambda: None)
+    assert (await _propose(db))["status"] == "held"
+
+
+@pytest.mark.parametrize("user", ["", "not a login!"])
+async def test_no_resolvable_tracker_is_refused(db, monkeypatch, user):
+    monkeypatch.setattr("genesis.env.github_user", lambda: user)
+    out = await _propose(db)
+    assert out["status"] == "error" and "tracker" in out["reason"]
+    assert await _holds(db) == []
+
+
+def _labels_on_repo(monkeypatch, present, *, fail=False, repo_ok=True):
+    asked = []
+
+    def lookup(repo, name):
+        asked.append((repo, name))
+        if fail:
+            return 1, "HTTP 502: Bad Gateway"
+        return (0, "") if name in present else (1, "gh: Not Found (HTTP 404)")
+
+    def repo_lookup(repo):
+        asked.append((repo, None))
+        return (0, "") if repo_ok else (1, "gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(promotion, "_label_lookup", lookup)
+    monkeypatch.setattr(promotion, "_repo_lookup", repo_lookup)
+    return asked
+
+
+async def test_a_label_the_tracker_lacks_is_refused_before_the_hold(db, monkeypatch):
+    asked = _labels_on_repo(monkeypatch, {"enhancement"})
+    out = await _propose(db, labels=["enhancement", "no-such-label"])
+    assert out["status"] == "error" and "no-such-label" in out["reason"]
+    assert ("owner/repo", "no-such-label") in asked
+    assert await _holds(db) == []
+
+
+async def test_an_unverifiable_label_is_refused_not_assumed(db, monkeypatch):
+    _labels_on_repo(monkeypatch, set(), fail=True)
+    out = await _propose(db, labels=["enhancement"])
+    assert out["status"] == "error" and "could not verify" in out["reason"]
+
+
+async def test_existing_labels_are_held(db, monkeypatch):
+    _labels_on_repo(monkeypatch, {"enhancement"})
+    assert (await _propose(db, labels=["enhancement"]))["status"] == "held"
+
+
+async def test_labels_are_never_sent_to_github_before_the_scan_passes(db, monkeypatch):
+    asked = _labels_on_repo(monkeypatch, {"enhancement"})
+    monkeypatch.setattr(
+        "genesis.contribution.scan_prose",
+        lambda _text, **_k: SanitizerResult(ok=False, findings=[], scanners_run=["x"]),
+    )
+    out = await _propose(db, labels=["enhancement"])
+    assert out["status"] == "blocked"
+    assert asked == []
+
+
+async def test_a_codebase_contributor_hold_of_the_follow_up_blocks_promotion(db):
+    from genesis.db.crud import pending_issue_posts as pip
+
+    await pip.create(
+        db,
+        id="c-row",
+        request_id="r-1",
+        repo="owner/repo",
+        title="t",
+        body="b",
+        source="codebase",
+        source_ref=FOLLOW,
+        cell_domain="github",
+        cell_verb="issue_create",
+        cell_risk_class="bulk",
+        held_at=NOW,
+        mode="live",
+    )
+    out = await _propose(db)
+    assert out["status"] == "duplicate" and out["existing_id"] == "c-row"
+
+
+# ─── round 2 (Codex at db70ffbd4 + class audit) ─────────────────────────────
+
+
+async def test_a_label_404_on_a_missing_repo_is_not_reported_as_a_missing_label(db, monkeypatch):
+    _labels_on_repo(monkeypatch, set(), repo_ok=False)
+    out = await _propose(db, labels=["enhancement"])
+    assert out["status"] == "error" and "could not verify" in out["reason"]
+    assert await _holds(db) == []
+
+
+@pytest.mark.parametrize("where", ["title", "body", "criterion", "label"])
+async def test_a_draft_carrying_a_board_marker_is_refused(db, monkeypatch, where):
+    """The drain posts a board body only with exactly one marker, its own."""
+    _labels_on_repo(monkeypatch, {"x"})
+    marker = promotion.source_marker("follow_up", "f" * 32)
+    kw = {
+        "title": {"title": f"T {marker}"},
+        "body": {"body": f"see {marker}"},
+        "criterion": {"acceptance_criteria": [f"keep {marker}"]},
+        "label": {"labels": [marker]},  # 47 chars: within the 50-char label limit
+    }[where]
+    assert len(marker) <= promotion.MAX_LABEL_CHARS
+    out = await _propose(db, **kw)
+    assert out["status"] == "error" and "board marker" in out["reason"]
+    assert await _holds(db) == []
+
+
+@pytest.mark.parametrize(
+    ("table", "col", "value"),
+    [
+        ("follow_ups", "status", "completed"),
+        ("follow_ups", "status", "failed"),
+        ("follow_ups", "kind", "tabled"),
+    ],
+)
+async def test_a_closed_or_tabled_follow_up_is_not_promoted(db, table, col, value):
+    await db.execute(f"UPDATE {table} SET {col} = ? WHERE id = ?", (value, FOLLOW))
+    await db.commit()
+    out = await _propose(db)
+    assert out["status"] == "error"
+    assert await _holds(db) == []
+
+
+@pytest.mark.parametrize("status", ["done", "absorbed", "dropped"])
+async def test_a_closed_ledger_row_is_not_promoted(db, status):
+    await db.execute("UPDATE session_ledger SET status = ? WHERE id = ?", (status, LEDGER))
+    await db.commit()
+    out = await _propose(db, source=f"ledger:{LEDGER[:8]}")
+    assert out["status"] == "error" and status in out["reason"]
+
+
+@pytest.mark.parametrize("status", ["blocked", "scheduled", "in_progress"])
+async def test_an_open_follow_up_in_any_live_state_is_still_promotable(db, status):
+    await db.execute("UPDATE follow_ups SET status = ? WHERE id = ?", (status, FOLLOW))
+    await db.commit()
+    assert (await _propose(db))["status"] == "held"
+
+
+async def test_a_mode_change_while_proposing_is_refused_not_stamped(db, monkeypatch):
+    """The hold is stamped with the mode; a flip during the lookups must not
+    leave a hold stamped with the stale one."""
+    # Read at entry (the stamp), by preconditions(), and once more before holding.
+    modes = iter(["live", "live", "propose_only"])
+    monkeypatch.setattr(board_config, "effective_mode", lambda: next(modes))
+    out = await _propose(db)
+    assert out["status"] == "error" and "mode changed" in out["reason"]
+    assert await _holds(db) == []
+
+
+async def test_a_refusal_survives_a_failed_audit_write(db, monkeypatch):
+    """The refusal is the answer the session needs; losing its audit row must
+    not turn it into a raw tool error."""
+    await board_crud.raise_question(db, question="which?", now=NOW, blocks=[("follow_up", FOLLOW)])
+
+    def broken(_db):
+        raise board_crud.WriteBusy("locked")
+
+    monkeypatch.setattr(board_crud, "owned_connection", broken)
+    out = await _propose(db)
+    assert out["status"] == "refused"
+
+
+# ─── round 3: one shared precondition function ─────────────────────────────
+
+
+async def _pre(db, *, source=None, labels=(), require_live=False):
+    return await promotion.preconditions(
+        db,
+        source_ref=source or f"follow_up:{FOLLOW}",
+        repo="owner/repo",
+        labels=list(labels),
+        require_live=require_live,
+    )
+
+
+async def test_preconditions_pass_for_an_open_unblocked_unlinked_record(db):
+    assert await _pre(db) is None
+
+
+async def _close(db):
+    await db.execute("UPDATE follow_ups SET status = 'completed' WHERE id = ?", (FOLLOW,))
+    await db.commit()
+
+
+async def _table(db):
+    await db.execute("UPDATE follow_ups SET kind = 'tabled' WHERE id = ?", (FOLLOW,))
+    await db.commit()
+
+
+async def _delete(db):
+    await db.execute("DELETE FROM follow_ups WHERE id = ?", (FOLLOW,))
+    await db.commit()
+
+
+async def _link(db):
+    await board_crud.record_link(
+        db,
+        source_kind="follow_up",
+        source_id=FOLLOW,
+        repo="owner/repo",
+        issue_number=5,
+        promoted_by="dashboard",
+        scan_receipt={},
+        body_sha256="c" * 64,
+        now=NOW,
+    )
+
+
+async def _question(db):
+    await board_crud.raise_question(db, question="which?", now=NOW, blocks=[("follow_up", FOLLOW)])
+
+
+async def _no_store(monkeypatch):
+    async def no(_db):
+        return False
+
+    monkeypatch.setattr(board_crud, "tables_available", no)
+
+
+async def _broken_store(monkeypatch):
+    async def boom(*_a, **_k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(board_crud, "blocking_questions", boom)
+
+
+@pytest.mark.parametrize(
+    ("db_change", "patch", "labels", "expect_status", "permanent"),
+    [
+        (_close, None, (), "error", True),
+        (_table, None, (), "error", True),
+        (_delete, None, (), "error", True),
+        (_link, None, (), "duplicate", True),
+        (None, "missing-label", ("gone",), "error", True),
+        (_question, None, (), "refused", False),
+        (None, "label-502", ("x",), "error", False),
+        (None, "repo-404", ("x",), "error", False),
+        (None, "no-store", (), "error", False),
+        (None, "broken-store", (), "error", False),
+    ],
+    ids=[
+        "source-closed",
+        "source-tabled",
+        "source-missing",
+        "already-linked",
+        "label-missing",
+        "open-question",
+        "label-lookup-fails",
+        "repo-unreadable",
+        "store-unmigrated",
+        "store-read-fails",
+    ],
+)
+async def test_each_precondition_is_classified_permanent_or_transient(
+    db, monkeypatch, db_change, patch, labels, expect_status, permanent
+):
+    """The drain ends a hold only on a PERMANENT refusal; a transient one
+    (nothing could be read, or a question that can be resolved) waits."""
+    if db_change is not None:
+        await db_change(db)
+    if patch == "missing-label":
+        _labels_on_repo(monkeypatch, set())
+    elif patch == "label-502":
+        _labels_on_repo(monkeypatch, set(), fail=True)
+    elif patch == "repo-404":
+        _labels_on_repo(monkeypatch, set(), repo_ok=False)
+    elif patch == "no-store":
+        await _no_store(monkeypatch)
+    elif patch == "broken-store":
+        await _broken_store(monkeypatch)
+    refusal = await _pre(db, labels=labels)
+    assert refusal is not None
+    assert (refusal.status, refusal.permanent) == (expect_status, permanent), refusal
+
+
+@pytest.mark.parametrize(("mode", "require_live"), [("off", False), ("propose_only", True)])
+async def test_the_lever_is_a_transient_precondition(db, monkeypatch, mode, require_live):
+    monkeypatch.setattr(board_config, "effective_mode", lambda: mode)
+    refusal = await _pre(db, require_live=require_live)
+    assert refusal is not None and refusal.permanent is False
+
+
+async def test_an_unparseable_source_ref_is_permanent(db):
+    refusal = await _pre(db, source="issue:nope")
+    assert refusal is not None and refusal.permanent is True
+
+
+async def test_propose_and_the_drain_share_the_one_function(db, monkeypatch):
+    """BOTH callers refuse through preconditions(): replacing it changes
+    propose's answer AND the drain's, so the two cannot drift apart. The drain
+    half also pins WHEN: it is consulted before any create is attempted."""
+    from genesis.autonomy import contributor_issue_watcher as ciw
+    from genesis.autonomy.approval import ApprovalManager
+
+    held = await _propose(db)  # the real preconditions, so a hold exists
+    assert held["status"] == "held", held
+    await ApprovalManager(db=db).resolve(
+        held["request_id"], status="approved", resolved_by="dashboard"
+    )
+
+    order: list[str] = []
+
+    async def refuse(*_a, **_k):
+        order.append("preconditions")
+        return promotion.Refusal("error", "sentinel refusal", permanent=True)
+
+    async def no_marked_issue(_repo, _digest):
+        return True, None
+
+    async def create(*_a, **_k):
+        order.append("create")
+        return 1, "u", None
+
+    monkeypatch.setattr(promotion, "preconditions", refuse)
+    out = await _propose(db, source=f"ledger:{LEDGER}")
+    assert out == {"status": "error", "reason": "sentinel refusal"}
+    assert order == ["preconditions"]
+
+    monkeypatch.setattr(ciw, "effective_mode", lambda: "off")  # contributor lane paused
+    monkeypatch.setattr(ciw, "_find_issue_by_marker", no_marked_issue)
+    monkeypatch.setattr(ciw, "_create_issue", create)
+
+    class _RT:
+        _db = db
+
+    await ciw.drain_pending_issue_posts(_RT())
+    assert order == ["preconditions", "preconditions"], "the drain must ask it, before any create"
+    (row,) = await _holds(db)
+    assert row["status"] == "expired"
+    refused = await board_crud.list_events(db, event="promotion_refused")
+    assert "sentinel refusal" in refused["items"][0]["reason"]

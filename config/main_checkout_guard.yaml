@@ -1,0 +1,41 @@
+# Main-checkout guard — keeps a Claude Code session's hand edits out of this
+# install's primary checkout (the deploy root that hooks, scripts and the server
+# run from). Read by scripts/hooks/main_checkout_guard.py on every
+# Write/Edit/MultiEdit/NotebookEdit call and before and after every Bash call.
+#
+# Why: a hand edit in the deploy root bypasses review and leaves the tree dirty,
+# which makes scripts/deploy_code_only.sh refuse the next deploy. Changes are made
+# in a worktree from origin/main and reach the deploy root through a merged PR and
+# scripts/deploy_code_only.sh or scripts/update.sh.
+#
+# File tools (Write/Edit/MultiEdit/NotebookEdit): a change to a TRACKED file in
+# the deploy root is REFUSED. Untracked files, linked worktrees, other
+# repositories and the known-ephemeral paths the deploy scripts also tolerate are
+# allowed; anything the guard cannot evaluate is allowed with a note.
+#
+# Bash: never refused. The guard snapshots the deploy root's tracked state before
+# the command and compares after it; if a tracked file newly differs, an
+# already-modified one changed again, or HEAD moved, the session is told which
+# files changed, and — only when the command was aimed at the deploy root — how to
+# restore them. This reports after the fact, so it prevents nothing (a file
+# written and executed by the same command has already run), and it cannot tell
+# the command's changes from anything else that changed the deploy root while it
+# ran. A command that rewrites this file to `enabled: false` is still reported.
+#
+# The dashboard update pipeline's sessions carry GENESIS_UPDATE_TIER=1 and are
+# exempt, because resolving the update's merge in the deploy root is their job.
+# Only the exact value 1 exempts.
+#
+# enabled: master switch for both halves. The guard is off only when the loaded
+# value IS the boolean false. PyYAML reads false / no / off (in the case forms
+# YAML 1.1 lists) as that boolean, so each of those turns it off; 0, null, a
+# quoted "false" and anything else keep it ON, as does a malformed file.
+#
+# Turn it off in ${GENESIS_HOME:-~/.genesis}/config/main_checkout_guard.local.yaml
+# (what settings_update("main_checkout_guard", {"enabled": false}) writes when
+# GENESIS_HOME is unset; that writer always uses ~/.genesis/config). A
+# config/main_checkout_guard.local.yaml inside the checkout is NOT read: it would
+# be untracked, so a session could write it. Read live per tool call — takes
+# effect immediately, no restart. The env kill switch GENESIS_MAIN_CHECKOUT_GUARD=0
+# also turns it off.
+enabled: true

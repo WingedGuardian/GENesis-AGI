@@ -154,6 +154,28 @@ async def test_record_link_retry_is_idempotent(db):
     assert await board.count_links(db) == 1
 
 
+async def test_the_promotion_event_is_written_with_the_pointer_and_only_once(db):
+    first = await _link(db, log_promotion=True)
+    await _link(db, now=LATER, log_promotion=True)  # a retry finds the pointer
+    events = await board.list_events(db, event="promotion")
+    assert events["total"] == 1
+    assert events["items"][0]["detail"] == {"link_id": first["id"], "adopted": False}
+
+
+async def test_a_failed_promotion_event_rolls_the_pointer_back(db, monkeypatch):
+    """Both commit or neither: a pointer without its event would never be
+    retried, because the re-link pass selects rows with NO pointer."""
+
+    async def broken(_db, _values):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(board, "_insert_event", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        await _link(db, log_promotion=True)
+    assert await board.count_links(db) == 0
+    assert db.in_transaction is False
+
+
 async def test_same_source_to_a_different_issue_raises(db):
     """One private record maps to ONE issue: silently keeping the first would
     hide a duplicate issue on GitHub."""
@@ -778,6 +800,19 @@ async def test_prune_counts_real_deletions_and_spares_open_work(db):
 async def test_prune_rejects_non_positive_windows(db):
     with pytest.raises(ValueError):
         await board.prune(db, now=NOW, question_days=0)
+
+
+async def test_owned_connection_opens_the_same_file_and_refuses_memory(db):
+    """The owned connection is resolved from the caller's own connection, so a
+    board write can never land in a different database than the one the caller
+    validated against; an in-memory database has no file to share."""
+    async with board.owned_connection(db) as own:
+        await board.append_event(own, event="drag", now=NOW)
+    assert (await board.list_events(db))["total"] == 1
+    async with aiosqlite.connect(":memory:") as mem:
+        with pytest.raises(ValueError, match="in-memory"):
+            async with board.owned_connection(mem):
+                pass
 
 
 async def test_a_cancel_while_begin_is_queued_never_leaves_the_lock_held(db):

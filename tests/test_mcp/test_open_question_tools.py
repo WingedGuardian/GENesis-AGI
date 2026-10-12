@@ -90,7 +90,8 @@ async def _shared_writes(db, call):
         out = await call()
     finally:
         db.execute, db.commit = real_execute, real_commit
-    return out, [s for s in seen if s == "COMMIT" or not s.lstrip().upper().startswith("SELECT")]
+    reads = ("SELECT", "PRAGMA DATABASE_LIST")  # the owned connection's file lookup
+    return out, [s for s in seen if s == "COMMIT" or not s.lstrip().upper().startswith(reads)]
 
 
 @pytest.mark.parametrize("op", ["raise", "resolve", "block_add", "block_remove"])

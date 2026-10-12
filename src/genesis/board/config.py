@@ -34,6 +34,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +53,14 @@ _CONFIG_NAME = "board.yaml"
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "mode": "off",
+    # Which Projects v2 board: written by scripts/board_setup.py into the user
+    # overlay. Install-specific, so the shipped config never carries a value.
+    "project_owner": None,
+    "project_number": None,
 }
+
+_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+_REPO_NAME = re.compile(r"^[A-Za-z0-9._-]{1,100}$")  # GitHub repo-name charset
 
 
 def _base_path() -> Path:
@@ -86,8 +94,6 @@ def load_config() -> dict[str, Any]:
     return merged
 
 
-# GROUNDWORK(board-promotion): read by board_promote and the promotion drain (branch
-# feat/board-promotion); nothing reads the lever until then.
 def effective_mode() -> str:
     """The mode every board consumer must run under — read live.
 
@@ -112,7 +118,46 @@ def effective_mode() -> str:
     return mode
 
 
-# GROUNDWORK(board-reconciler): the predicate every GitHub writer will check.
+# GROUNDWORK(board-reconciler-writes): the predicate every reconciler GitHub write
+# will check (the read-only reconciler writes nothing).
 def writes_allowed() -> bool:
     """True only in ``live`` — the single predicate a GitHub writer checks."""
     return effective_mode() == "live"
+
+
+def valid_login(value: object) -> bool:
+    return isinstance(value, str) and bool(_LOGIN.match(value))
+
+
+def valid_project_number(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def tracker_repo() -> tuple[str, str] | None:
+    """``(owner, name)`` of the public tracker promotions post to and the board
+    links — the configured ``github.user`` / ``github.public_repo``, never the
+    checkout's own remote (on a fork clone that is the operator's fork). None
+    when either half is missing or malformed: callers refuse rather than guess."""
+    from genesis.env import github_public_repo, github_user
+
+    owner, name = github_user(), github_public_repo()
+    if not (valid_login(owner) and isinstance(name, str) and _REPO_NAME.match(name)):
+        return None
+    return owner, name
+
+
+def project_ref() -> tuple[str, int] | None:
+    """``(owner_login, project_number)`` of the configured board, or None when
+    setup has not run (or the overlay holds a malformed value, logged)."""
+    cfg = load_config()
+    owner, number = cfg.get("project_owner"), cfg.get("project_number")
+    if owner is None and number is None:
+        return None
+    if not (valid_login(owner) and valid_project_number(number)):
+        logger.warning(
+            "board project_owner/project_number malformed (%r, %r) — treated as unset",
+            owner,
+            number,
+        )
+        return None
+    return owner, number

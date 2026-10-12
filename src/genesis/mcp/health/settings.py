@@ -185,8 +185,8 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "Invalid mode degrades to propose_only. Kill "
             "switch GENESIS_BOARD_DISABLED=1. A session may set enabled false or "
             "mode off/propose_only, never live or enabled true (owner edits). "
-            "Read live per call by its consumers; none ships yet (board promotion "
-            "is the first), so a change here has no effect until then."
+            "Read live per call by board promotion (board_promote and the drain), "
+            "so a change takes effect at the next promotion — no restart."
         ),
         config_filename="board.yaml",
         readonly=False,
@@ -390,6 +390,27 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="worktree_ownership.yaml",
         readonly=False,
         needs_restart=False,  # read live per call
+    ),
+    "main_checkout_guard": SettingsDomain(
+        name="main_checkout_guard",
+        description=(
+            "Main-checkout guard — master `enabled` (default true). Keeps a Claude "
+            "Code session's hand edits out of this install's primary checkout (the "
+            "deploy root hooks, scripts and the server run from). REFUSES a "
+            "Write/Edit/MultiEdit/NotebookEdit of a TRACKED file there. Never refuses "
+            "Bash: it snapshots the deploy root before each command and, after it, "
+            "tells the session which tracked files changed (or that HEAD moved) and "
+            "how to restore them. Untracked files, linked worktrees, other "
+            "repositories, the deploy scripts' known-ephemeral paths and the dashboard "
+            "update pipeline's sessions are left alone; anything it cannot evaluate is "
+            "allowed. Applies to foreground and dispatched sessions alike. Only "
+            "`enabled: false` turns it off; an invalid value keeps it ON. Read live "
+            "per tool call — takes effect immediately, no restart. Env kill switch "
+            "GENESIS_MAIN_CHECKOUT_GUARD=0 forces off."
+        ),
+        config_filename="main_checkout_guard.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per tool call by the hook
     ),
     "ego_reconcile": SettingsDomain(
         name="ego_reconcile",
@@ -1473,6 +1494,19 @@ def _validate_worktree_ownership(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_main_checkout_guard(changes: dict) -> list[str]:
+    """Validate main-checkout guard lever changes (read by
+    scripts/hooks/main_checkout_guard.py, which keeps the guard ON for any value
+    other than the boolean false)."""
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key != "enabled":
+            errors.append(f"Unknown key '{key}'. Valid: enabled")
+        elif not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
+    return errors
+
+
 def _validate_ws2_ledger(changes: dict) -> list[str]:
     """Validate ws2_ledger consumer-lever changes (see
     genesis.ledger.ws2_ledger_config)."""
@@ -1657,7 +1691,7 @@ def _validate_board(changes: dict) -> list[str]:
     from genesis.board.config import MODES
 
     errors: list[str] = []
-    valid_keys = ("enabled", "mode")
+    valid_keys = ("enabled", "mode", "project_owner", "project_number")
     for key, value in changes.items():
         if key not in valid_keys:
             errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
@@ -1672,6 +1706,16 @@ def _validate_board(changes: dict) -> list[str]:
                     "re-enabling the board is an owner edit of "
                     "~/.genesis/config/board.local.yaml"
                 )
+        elif key in ("project_owner", "project_number"):
+            # WHICH board the reconciler writes to is overlay-only, like `live`:
+            # a session that could repoint it could send Genesis's card writes
+            # to a project it controls. scripts/board_setup.py --write-config is
+            # the writer; it edits the overlay file directly.
+            errors.append(
+                f"'{key}' cannot be set through settings_update — run "
+                "scripts/board_setup.py --write-config, which records it in "
+                "~/.genesis/config/board.local.yaml"
+            )
         elif value == "live":
             errors.append(
                 "'mode: live' cannot be set through settings_update — arming the "
@@ -2202,6 +2246,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "youtube_fetch": _validate_youtube_fetch,
     "mcp_staleness_guard": _validate_mcp_staleness_guard,
     "worktree_ownership": _validate_worktree_ownership,
+    "main_checkout_guard": _validate_main_checkout_guard,
     "voice_act": _validate_voice_act,
     "voice_recency_resume": _validate_voice_recency_resume,
     "tts": _validate_tts,

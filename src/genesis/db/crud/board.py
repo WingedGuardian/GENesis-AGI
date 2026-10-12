@@ -148,8 +148,6 @@ async def tables_available(db: aiosqlite.Connection) -> bool:
 # ─── board_links ────────────────────────────────────────────────────────────
 
 
-# GROUNDWORK(board-promotion): the promotion drain writes this pointer after it
-# creates or adopts the public issue (branch feat/board-promotion).
 async def record_link(
     db: aiosqlite.Connection,
     *,
@@ -164,6 +162,7 @@ async def record_link(
     adopted: bool = False,
     approval_id: str | None = None,
     project_item_id: str | None = None,
+    log_promotion: bool = False,
 ) -> dict:
     """Write the pointer for a promotion that HAS happened (the issue exists).
 
@@ -174,6 +173,12 @@ async def record_link(
     and silently keeping the first would hide a duplicate issue on GitHub.
     ``repo`` is stored lowercased, because GitHub owner/name is case-insensitive
     and a case variant must not escape the one-issue-one-pointer rule.
+
+    With ``log_promotion`` the ``promotion`` event is written in the SAME
+    transaction as the pointer, and only when this call inserted it: both commit
+    or neither does, so a pointer can never exist without its audit line (the
+    drain re-links only rows with no pointer, so a separately-lost event would
+    never be retried), and a retry that finds the pointer adds no second event.
     """
     _one_of("source_kind", source_kind, SOURCE_KINDS)
     if not _HEX32.match(source_id or ""):
@@ -191,8 +196,20 @@ async def record_link(
         raise ValueError("now is required")
 
     link_id = uuid.uuid4().hex
+    event_row = (
+        _event_values(
+            event="promotion",
+            now=now,
+            repo=repo,
+            issue_number=issue_number,
+            worker="genesis",
+            detail={"link_id": link_id, "adopted": bool(adopted)},
+        )
+        if log_promotion
+        else None
+    )
     async with _write_unit(db, "record_link"):
-        await db.execute(
+        cur = await db.execute(
             "INSERT INTO board_links (id, source_kind, source_id, repo, issue_number, "
             "project_item_id, adopted, promoted_by, approval_id, scan_receipt, body_sha256, "
             "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
@@ -213,6 +230,8 @@ async def record_link(
                 now,
             ),
         )
+        if event_row is not None and cur.rowcount == 1:
+            await _insert_event(db, event_row)
         by_source = await get_link_by_source(db, source_kind=source_kind, source_id=source_id)
         by_issue = await get_link_by_issue(db, repo=repo, issue_number=issue_number)
     if by_source is None and by_issue is None:
@@ -238,7 +257,6 @@ def _link_row(out: dict | None) -> dict | None:
     return out
 
 
-# GROUNDWORK(board-promotion): promotion's duplicate check and drain re-link.
 async def get_link_by_source(
     db: aiosqlite.Connection, *, source_kind: str, source_id: str
 ) -> dict | None:
@@ -249,7 +267,6 @@ async def get_link_by_source(
     return _link_row(await _one(cur))
 
 
-# GROUNDWORK(board-promotion): the one-issue-one-pointer re-read in record_link.
 async def get_link_by_issue(
     db: aiosqlite.Connection, *, repo: str, issue_number: int
 ) -> dict | None:
@@ -274,7 +291,8 @@ async def set_project_item(
     return cur.rowcount == 1
 
 
-# GROUNDWORK(board-reconciler): coverage numerator for the board status read.
+# GROUNDWORK(board-tab): the dashboard Board tab's promotion count (the third
+# reconciler PR). board_status counts cards from the reconciler's own read.
 async def count_links(db: aiosqlite.Connection) -> int:
     cur = await db.execute("SELECT COUNT(*) FROM board_links")
     return (await cur.fetchone())[0]
@@ -342,6 +360,24 @@ async def _commit(db: aiosqlite.Connection) -> None:
         if _is_lock_error(exc) and not db.in_transaction:
             return
         raise
+
+
+@contextlib.asynccontextmanager
+async def owned_connection(db: aiosqlite.Connection):
+    """A fresh connection the caller owns, on the SAME database file as ``db``
+    (read from ``db``'s own ``PRAGMA database_list``, so it can never open a
+    different database than the one the caller validated against). The board
+    writers need it: they refuse the server's shared connection (see
+    :func:`_write_unit`). An in-memory database has no file to share, so it is
+    refused."""
+    from genesis.db.connection import get_raw_db
+
+    cur = await db.execute("PRAGMA database_list")
+    path = next((row[2] for row in await cur.fetchall() if row[1] == "main"), "")
+    if not path:
+        raise ValueError("an in-memory database has no file for a second connection")
+    async with get_raw_db(path) as own:
+        yield own
 
 
 @contextlib.asynccontextmanager
@@ -604,8 +640,6 @@ async def question_summary(db: aiosqlite.Connection) -> dict:
 # ─── board_events ───────────────────────────────────────────────────────────
 
 
-# GROUNDWORK(board-promotion): promotion logs promotion / promotion_refused here;
-# the reconciler adds the rest of EVENTS.
 async def append_event(
     db: aiosqlite.Connection,
     *,
@@ -625,6 +659,39 @@ async def append_event(
     index absorbs a re-read of the same GitHub change). Any OTHER failure raises
     — the conflict clause names that index only, so a missing value can never be
     mistaken for a dedup hit."""
+    values = _event_values(
+        event=event,
+        now=now,
+        repo=repo,
+        issue_number=issue_number,
+        project_item_id=project_item_id,
+        attempt=attempt,
+        worker=worker,
+        reason=reason,
+        observed_change_key=observed_change_key,
+        detail=detail,
+    )
+    async with _write_unit(db, "append_event"):
+        cur = await _insert_event(db, values)
+    return cur.lastrowid if cur.rowcount == 1 else None
+
+
+def _event_values(
+    *,
+    event: str,
+    now: str,
+    repo: str | None = None,
+    issue_number: int | None = None,
+    project_item_id: str | None = None,
+    attempt: int | None = None,
+    worker: str | None = None,
+    reason: str | None = None,
+    observed_change_key: str | None = None,
+    detail: dict | None = None,
+) -> tuple:
+    """Validate one event and return its column values, in
+    :func:`_insert_event`'s order. Raises ``ValueError`` before anything is
+    written."""
     _one_of("event", event, EVENTS)
     if not now:
         raise ValueError("now is required")
@@ -651,30 +718,34 @@ async def append_event(
             raise ValueError(
                 f"detail is {len(detail_json.encode())} bytes; the limit is {MAX_DETAIL_BYTES}"
             )
-    async with _write_unit(db, "append_event"):
-        cur = await db.execute(
-            "INSERT INTO board_events (event, repo, issue_number, project_item_id, attempt, "
-            "worker, reason, observed_change_key, detail, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT (event, observed_change_key) WHERE observed_change_key IS NOT NULL "
-            "DO NOTHING",
-            (
-                event,
-                repo,
-                issue_number,
-                project_item_id,
-                attempt,
-                worker,
-                reason,
-                observed_change_key,
-                detail_json,
-                now,
-            ),
-        )
-    return cur.lastrowid if cur.rowcount == 1 else None
+    return (
+        event,
+        repo,
+        issue_number,
+        project_item_id,
+        attempt,
+        worker,
+        reason,
+        observed_change_key,
+        detail_json,
+        now,
+    )
 
 
-# GROUNDWORK(board-promotion): read back by promotion's tests and the board status.
+async def _insert_event(db: aiosqlite.Connection, values: tuple) -> aiosqlite.Cursor:
+    """The event INSERT, inside a caller's :func:`_write_unit` (never alone)."""
+    return await db.execute(
+        "INSERT INTO board_events (event, repo, issue_number, project_item_id, attempt, "
+        "worker, reason, observed_change_key, detail, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT (event, observed_change_key) WHERE observed_change_key IS NOT NULL "
+        "DO NOTHING",
+        values,
+    )
+
+
+# GROUNDWORK(board-tab): the dashboard Board tab lists recent events (drags,
+# promotions); no runtime caller yet (tests only).
 async def list_events(
     db: aiosqlite.Connection,
     *,

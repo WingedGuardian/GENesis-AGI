@@ -416,6 +416,52 @@ class TestAmendment7Worktree:
 
         assert "t-001" not in engine._worktree_paths
 
+    async def test_stale_worktree_reason_reaches_the_task(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess, monkeypatch,
+    ):
+        """A worktree the reset refused to delete fails the task WITH the reason,
+        not as "Unexpected error" (#2926 PR 4)."""
+        from genesis.autonomy.executor import worktree_mgr
+
+        async def refuse(*a, **k):
+            raise worktree_mgr.StaleWorktreeError("left for the reaper: /x/task-t-001")
+
+        monkeypatch.setattr(worktree_mgr, "create_worktree", refuse)
+        await _seed_task(db, plan_path=plan_file)
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        reasons: list[str] = []
+        real_fail = engine._fail_task
+
+        async def spy(task_id, reason):
+            reasons.append(reason)
+            await real_fail(task_id, reason)
+
+        engine._fail_task = spy
+
+        assert await engine.execute("t-001") is False
+        assert reasons == ["left for the reaper: /x/task-t-001"]
+
+    async def test_stale_worktree_on_resume_is_raised_not_swallowed(
+        self, db, mock_invoker, mock_decomposer, mock_reviewer, monkeypatch,
+    ):
+        """Resume must not log it as a generic recovery failure and retry."""
+        from genesis.autonomy.executor import worktree_mgr
+
+        async def refuse(*a, **k):
+            raise worktree_mgr.StaleWorktreeError("locked")
+
+        async def gone(*a, **k):
+            return False
+
+        monkeypatch.setattr(worktree_mgr, "is_registered_worktree", gone)
+        monkeypatch.setattr(worktree_mgr, "create_worktree", refuse)
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        engine._resolve_and_record_base = AsyncMock(return_value=None)
+        task = {"outputs": json.dumps({"worktree_path": "/x/task-t-001"})}
+        with pytest.raises(worktree_mgr.StaleWorktreeError):
+            await engine._recover_worktree("t-001", task)
+
     async def test_code_step_gets_working_dir(
         self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
         mock_subprocess,

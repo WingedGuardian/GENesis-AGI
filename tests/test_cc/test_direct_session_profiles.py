@@ -1316,3 +1316,30 @@ def test_open_question_authority_is_universal_so_overlay_profiles_inherit_it():
 
     authority = {"mcp__genesis-health__open_question_resolve", "mcp__genesis-health__open_question_block"}
     assert authority <= set(_UNIVERSAL_DISALLOW)
+
+
+def test_interact_profile_loads_browser_safety_rules():
+    """Background browser sessions must see the payment, credential and hand-off
+    rules, which live in browser-automation; stealth-browser is behaviour-only."""
+    from genesis.cc.direct_session import _PROFILE_SKILLS
+
+    assert {"stealth-browser", "browser-automation"} <= set(_PROFILE_SKILLS["interact"])
+
+
+def test_explicit_skills_keep_the_interact_safety_rules():
+    """An explicit skill list adds to interact's mandatory skills, never replaces them."""
+    from genesis.cc.direct_session import DirectSessionRequest, _resolve_skills
+
+    skills = _resolve_skills(
+        DirectSessionRequest(prompt="x", profile="interact", skills=["genesis-voice"])
+    )
+    assert skills[0] == "genesis-voice"
+    assert {"stealth-browser", "browser-automation"} <= set(skills)
+
+
+def test_explicit_skills_keep_web_research():
+    from genesis.cc.direct_session import DirectSessionRequest, _resolve_skills
+
+    assert "web-research" in _resolve_skills(
+        DirectSessionRequest(prompt="x", profile="research", skills=[])
+    )

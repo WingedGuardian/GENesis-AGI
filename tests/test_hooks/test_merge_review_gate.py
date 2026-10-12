@@ -783,7 +783,7 @@ class TestEffectivePushRemote:
     def test_explicit_repo_flag(self, guard_module):
         with patch.object(guard_module.subprocess, "run", side_effect=AssertionError):
             assert (
-                guard_module._effective_push_remote(_push_seg("git push --repo fork feat"), "feat")
+                guard_module._effective_push_remote(_push_seg("git push --repo fork"), "feat")
                 == "fork"
             )
 
@@ -4555,7 +4555,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_scheduled_claude_reviewed_head",
-            lambda n, head=None, repo=None, relief_out=None: "",
+            lambda n, head=None, repo=None, relief_out=None, exempt_out=None: "",
         )
         monkeypatch.setattr(
             guard_module, "_check_pr_review_findings", lambda n, repo=None: (False, "")
@@ -4596,7 +4596,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_scheduled_claude_reviewed_head",
-            lambda n, head=None, repo=None, relief_out=None: (
+            lambda n, head=None, repo=None, relief_out=None, exempt_out=None: (
                 f"no scheduled review at head:\n  {self._DETAIL}"
             ),
         )
@@ -6247,7 +6247,7 @@ class TestUncountedFindingsReachTheRow:
         monkeypatch.setattr(
             guard_module,
             "_check_scheduled_claude_reviewed_head",
-            lambda n, head=None, repo=None, relief_out=None: "",
+            lambda n, head=None, repo=None, relief_out=None, exempt_out=None: "",
         )
         monkeypatch.setattr(
             guard_module, "_check_pr_review_findings", lambda n, repo=None: (False, "")

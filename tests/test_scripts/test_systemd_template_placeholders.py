@@ -149,6 +149,45 @@ def test_every_template_token_is_substituted_by_every_renderer(renderer):
     )
 
 
+def _render_command(renderer: str) -> list[str]:
+    """The renderer's `sed` invocation as BASH joins it: the line that opens
+    it, then every line reached through a trailing-backslash continuation.
+
+    A continuation joins exactly the NEXT physical line, so a blank line after
+    a `\\` ends the command there — whatever follows runs as a separate
+    command. That is not hypothetical: a blank line between the last `-e` and
+    `"$template")` made sed read stdin and ran the template path as a command,
+    aborting bootstrap under `set -e`, while every token-set assertion above
+    stayed green because they read the expressions, not the command they form.
+    """
+    lines = (REPO / "scripts" / renderer).read_text(encoding="utf-8").splitlines()
+    start = next(
+        (i for i, ln in enumerate(lines) if 'sed -e "s|__HOME__|' in ln), None
+    )
+    assert start is not None, f"scripts/{renderer}: render sed command not found"
+    command = [lines[start]]
+    while command[-1].rstrip().endswith("\\") and start + len(command) < len(lines):
+        command.append(lines[start + len(command)])
+    return command
+
+
+@pytest.mark.parametrize("renderer", RENDERERS)
+def test_the_render_command_reaches_its_template_argument(renderer):
+    """Every substitution and the template path belong to ONE command."""
+    command = _render_command(renderer)
+    joined = "\n".join(command)
+    assert '"$template"' in command[-1], (
+        f"scripts/{renderer}: the render command ends on {command[-1]!r} instead "
+        'of its "$template" argument -- a broken continuation leaves sed reading '
+        "stdin and runs the rest as a separate command"
+    )
+    stranded = _substituted_tokens(renderer) - set(_SED_EXPR.findall(joined))
+    assert not stranded, (
+        f"scripts/{renderer}: substitution(s) {sorted(stranded)} sit outside the "
+        "render command, so they are never applied"
+    )
+
+
 def test_the_two_renderers_agree_on_their_substitution_sets():
     """Divergence is the root cause, not the individual missing token.
 
