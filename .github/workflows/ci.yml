@@ -1060,4 +1060,7 @@ jobs:
         # collect 71 here and 57 on origin/main, measured with
         # --collect-only: test_backup_backends.py 7 -> 20, test_backup_dated_snapshots.py
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25712
+        # Card vault store and CLI (#3194): +128 collected, measured with
+        # --collect-only (test_vault_store 92, test_vault_cli 36, both new; pyrage
+        # and zxcvbn are in the test extra, so no skips). Floor: 25712 + 128 = 25840.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25840
