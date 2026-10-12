@@ -21,6 +21,7 @@
 #
 # Imported once and kept, so a new copy loads only with a restart:
 _RUNTIME_RELOAD_SCRIPTS=(
+    scripts/hooks/secret_scrub.py    # retained by transcript_analytics.scrub
     scripts/lib/index_marker.py      # imported by surplus/jobs/gitnexus.py (and disk_reclaim.py)
     scripts/hooks/worktree_claim.py  # loaded at import by observability/worktree_ownership_config.py
 )
