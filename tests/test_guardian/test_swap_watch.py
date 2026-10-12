@@ -553,6 +553,139 @@ async def test_native_path_asserts_the_key(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_new_native_ceiling_has_ceiling_alert_copy(tmp_path, monkeypatch):
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "true", ""),
+        "limits.memory": (0, "8GiB", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert "now 50% of host swap" in body
+    assert "swap_reconcile_enabled" not in body
+    assert "D-state" not in body
+
+
+@pytest.mark.asyncio
+async def test_changed_native_ceiling_has_ceiling_alert_copy(tmp_path, monkeypatch):
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "8589934592", ""),
+        "limits.memory": (0, "8GiB", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert "now 50% of host swap" in body
+    assert "swap_reconcile_enabled" not in body
+    assert "D-state" not in body
+
+
+@pytest.mark.asyncio
+async def test_native_ceiling_removal_has_only_ceiling_alert_copy(tmp_path):
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=swap_watch.SWAP_CEILING_OFF)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "2147483648", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert "swap_ceiling_pct: off" in body
+    assert "Without this" not in body
+    assert "D-state" not in body
+
+
+@pytest.mark.asyncio
+async def test_live_only_ceiling_removal_has_only_ceiling_alert_copy(tmp_path):
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=swap_watch.SWAP_CEILING_OFF)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "true", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="2147483648")),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert "swap_ceiling_pct: off" in body
+    assert "Without this" not in body
+    assert "D-state" not in body
+
+
+@pytest.mark.asyncio
+async def test_plain_swap_off_repair_has_only_repair_alert_copy(tmp_path):
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "false", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian set container swap"]
+    body = _sent_bodies(d)[0]
+    assert "Without this, a memory spike wedges the box into D-state" in body
+    assert "swap_reconcile_enabled: false" in body
+    assert "This follows swap_ceiling_pct" not in body
+
+
+@pytest.mark.asyncio
+async def test_live_zero_repair_has_only_repair_alert_copy(tmp_path):
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "true", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="0")),
+        patch.object(swap_watch, "activate_swap_max", AsyncMock(return_value=True)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian set container swap"]
+    body = _sent_bodies(d)[0]
+    assert "Without this, a memory spike wedges the box into D-state" in body
+    assert "swap_reconcile_enabled: false" in body
+    assert "This follows swap_ceiling_pct" not in body
+
+
+@pytest.mark.asyncio
+async def test_false_key_with_ceiling_has_mixed_repair_and_ceiling_copy(tmp_path, monkeypatch):
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "false", ""),
+        "limits.memory": (0, "8GiB", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian set container swap"]
+    body = _sent_bodies(d)[0]
+    assert "swap_reconcile_enabled: false" in body
+    assert "Without this, a memory spike wedges the box into D-state" in body
+    assert "This follows swap_ceiling_pct in the guardian config (now 50% of host swap)" in body
+
+
+@pytest.mark.asyncio
 async def test_native_path_idempotent_when_matching(tmp_path, monkeypatch):
     _patch_target(monkeypatch)
     cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
@@ -1283,7 +1416,7 @@ async def test_write_swap_max_accepts_bare_zero():
 
 
 # ---------------------------------------------------------------------------
-# _is_swap_on / _is_parseable_incus_size matrix — unchanged from #3069.
+# is_swap_on / _is_parseable_incus_size matrix — unchanged from #3069.
 # ---------------------------------------------------------------------------
 
 
@@ -1321,4 +1454,4 @@ async def test_write_swap_max_accepts_bare_zero():
     ],
 )
 def test_is_swap_on_matrix(raw, expected):
-    assert swap_watch._is_swap_on(raw) is expected
+    assert swap_watch.is_swap_on(raw) is expected
