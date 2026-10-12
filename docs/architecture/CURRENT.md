@@ -1476,12 +1476,27 @@ verified: 637f7f7bb679 2026-10-05
   `executable_path` (camoufox's own read-only selection; never its in-launch
   delete-and-download), also asked by the `browser_automation` capability in a
   subprocess; `packages.py` refuses a launch on browser modules pip replaced
-  under the process. The automation TOOLS live in `mcp/health/browser.py`: each layer
-  (Camoufox, Chromium, remote CDP, TinyFish) has its own idle clock and
-  cleanup, so a stale-page restart or the 1 h idle reclaim of one layer never
-  touches another (TinyFish included: leaving it does not end its paid
-  session, which bills until its own idle reclaim); a click that opens a new
-  tab switches the tools to it. `browser_fill` refuses a payment card number
+  under the process. Before the browser tools launch Camoufox or the Chromium
+  fallback, `profile_backup.py` copies the profile to
+  `<profile>.pre-v<version>-<time>` when a different browser build is about to
+  open it (the profile's own record against the engine's; caches and locks left
+  out, launch locks only at the profile root; a copy the profile changed under is
+  discarded, and so is one whose own record is not the version its label names;
+  a copy whose files still match the profile's makes a second copy unnecessary,
+  so a launch that never opened the profile makes no second one; a lock beside
+  the profile makes concurrent sessions copy once; a copy never moves the disk
+  into the disk guardian's ORANGE or RED free-space tier, judged by the guardian's
+  own `dg_floor_tier` through `util/disk_headroom.py` (time-to-full left out: the
+  copy's own burst would raise it), though a disk already ORANGE
+  still gets one; never stops the launch, though a launch waits up to 10 minutes
+  for another session's copy of the same profile).
+  `scripts/browser.py` launches without a copy. `scripts/disk_hygiene.sh` keeps
+  the newest copy per profile, and the newest per version for 90 days. The automation TOOLS live in
+  `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
+  TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
+  1 h idle reclaim of one layer never touches another (TinyFish included:
+  leaving it does not end its paid session, which bills until its own idle
+  reclaim); a click that opens a new tab switches the tools to it. `browser_fill` refuses a payment card number
   as the value and `browser_run_js` one in its script (the value check only:
   telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
