@@ -1173,7 +1173,7 @@ jobs:
         # skips). Floor: 25508 + 78 = 25586.
         # Vault service: +55 collected (test_vault_service 38, test_vault_cli
         # +14, test_payment_vault_events 3). Floor: 25586 + 55 = 25641.
-        # Vault in backup and restore: +32 collected (test_payment_vault_backup
-        # 32, new file; pyrage is in the test extra, so no skips). Floor: 25641
-        # + 32 = 25673.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25673
+        # Vault in backup and restore: +68 collected (test_payment_vault_backup
+        # 68, new file, measured with --collect-only; pyrage is in the test
+        # extra, so no skips). Floor: 25641 + 68 = 25709.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 25709

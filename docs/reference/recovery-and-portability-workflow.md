@@ -314,13 +314,19 @@ locale/byte checks; final regression and recovery tests remain required.
    so the container↔host gateway is restored in the same step.
 
 **The card vault** (`identity.age`, `recipient.txt`, `cards.db`) is backed up as
-a set: `cards.db` through SQLite's online backup, all three GPG-encrypted under
-`creds/payment_vault/`, written only when all three pass the same check restore
-runs. Restore stages a fresh set (never a mix with an earlier restore) and checks
-it: `cards.db` integrity, its format version, and the shape of both key files. A
-set that fails the check is a restore warning, so restore exits non-zero. It is
-never placed automatically: placing it over a live vault would bring back retired
-cards or replace a newer key. Placement, on a box with no vault:
+one archive: `cards.db` through SQLite's online backup, the three files in one tar,
+GPG-encrypted as `creds/payment_vault.tar.gpg` and renamed into place only when
+the set passes the same check restore runs. One file means git, the off-site
+upload, the host mirror and the restore pull can never hold two files from
+different backups. Restore uses the archive only when it comes from the off-site
+snapshot it selected (or from Tier-1 when it selected none), refuses an archive
+whose members are not exactly the three regular files, and checks the set:
+`cards.db` integrity, its format version and card table, and the shape of both key
+files. A refused or failing archive is a restore warning, so restore exits
+non-zero, and it leaves no decrypted copy behind. The checked set is staged fresh;
+an earlier staged copy is moved aside to `payment_vault.pre-restore-<time>.<pid>`.
+It is never placed automatically: placing it over a live vault would bring back
+retired cards or replace a newer key. Placement, on a box with no vault:
 
 1. confirm `~/.genesis/payment_vault` does not exist;
 2. `systemctl --user stop genesis-server`;
@@ -330,17 +336,18 @@ cards or replace a newer key. Placement, on a box with no vault:
 
 Backup states (`payment_vault` in `backup_status.json`): `ok`; `absent` (no
 vault); `skipped` (not attempted: no backup passphrase, or the run stopped first); `failed` (the vault exists but no fresh
-set was written; the earlier set is kept, since an older vault beats none); and
-`missing` (an earlier set exists but the vault is gone). `failed` and `missing`
+archive was written; the earlier one is kept, since an older vault beats none); and
+`missing` (an earlier archive exists but the vault is gone). `failed` and `missing`
 fail the run and send the backup-failed alert on every run until fixed. To retire
-a vault on purpose, remove its set from the backups repo:
-`git -C ~/backups/genesis-backups rm -r creds/payment_vault`, then commit. A box
+a vault on purpose, remove its archive from the backups repo:
+`git -C ~/backups/genesis-backups rm creds/payment_vault.tar.gpg`, then commit. A box
 just restored from a backup that holds a vault is in the `missing` state too, so
 its backups fail until the staged vault is placed or retired.
 
 Every version stays in the backups repo's git history. The host mirror holds the
-current set, and the host archive keeps the newest set of each file name and never
-deletes one, so a retired vault's last set stays on the host. Both sit next to the
+current archive, and the host archive keeps the newest copy of each file name and
+never deletes one, so a retired vault's last archive stays on the host; a restore
+that falls back to it says so, because it may be a vault since retired. Both sit next to the
 escrowed backup passphrase, so on the host only the vault passphrase protects the
 card details. The mirror fallback is all-or-nothing: when the Tier-1 clone has
 any credential payload, restore reads the clone alone, which is the newer copy.

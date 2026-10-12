@@ -220,6 +220,8 @@ def _cmd_retire(args: argparse.Namespace) -> int:
         f"retired {args.card_ref}; its encrypted details were removed from the vault "
         "(best effort on disk: also close the virtual card with its issuer)"
     )
+    # Until the next backup, a restore would bring the retired card's details back.
+    print(_BACKUP_HINT)
     return 0
 
 

@@ -2,42 +2,58 @@
 # (sourced fragment, not an executable script — no shebang)
 #
 # The card vault (src/genesis/payments/vault_store.py) in the encrypted
-# credentials section: backup.sh §8 writes it, restore.sh §8 checks what it
-# staged. The vault is three files, and only all three together are usable:
+# credentials section: backup.sh §8 writes it, restore.sh §8 stages it. The
+# vault is three files, and only all three together, from one moment, are
+# usable:
 #   identity.age   the age secret key, sealed under the vault passphrase
 #   recipient.txt  its public key (adding a card encrypts to this)
 #   cards.db       SQLite, one row per card, each card's details age-encrypted
 #
-#   payment_vault_check <dir>
-#       Return 0 when <dir> holds a complete, readable set; otherwise print the
-#       reason (fixed text, never a value) and return 1. Shared by both sides,
-#       so backup only ever ships a set restore will accept.
+# So the three travel as ONE archive, creds/payment_vault.tar.gpg: one file
+# for every reader (git, the off-site upload, the host mirror, the restore
+# pull), so no reader can ever hold two files from different backups.
 #
-#   backup_payment_vault <vault_dir> <out_dir> <temp_root>
-#       Write <out_dir>/{identity.age,recipient.txt,cards.db}.gpg with
-#       backup.sh's encrypt_file, and print ONE line: "<state> [reason]".
-#         ok       a fresh set was written
-#         absent   no vault, and no earlier set in <out_dir>
-#         missing  no vault, but an earlier set exists (the caller fails the run:
-#                  a vault that vanished is a loss, and retiring one on purpose
-#                  is `git rm -r creds/payment_vault` in the backups repo)
-#         failed   the vault exists but no fresh set could be written; the
-#                  earlier set, if any, is left in place, because an older
-#                  vault beats none
+#   payment_vault_check <dir>
+#       Return 0 when <dir> holds a complete set vault_store would accept;
+#       otherwise print the reason (fixed text, never a value) and return 1.
+#       Shared by both sides, so backup only ever ships a set restore accepts.
+#
+#   backup_payment_vault <vault_dir> <creds_dir> <temp_root>
+#       Write <creds_dir>/payment_vault.tar.gpg with backup.sh's encrypt_file
+#       and print ONE line: "<state> [reason]".
+#         ok       a fresh archive was written
+#         absent   no vault, and no earlier archive
+#         missing  no vault, but an earlier archive exists (the caller fails the
+#                  run: a vault that vanished is a loss; retiring one on purpose
+#                  is `git rm creds/payment_vault.tar.gpg` in the backups repo)
+#         failed   the vault exists but no fresh archive could be written; the
+#                  earlier archive, if any, is kept, because an older vault
+#                  beats none
 #       Always exits 0: the caller runs it as `out=$(…)` under `set -e`.
 #       Runs in a subshell, so its EXIT trap never replaces the caller's.
+#
+#   payment_vault_unpack <archive.tar> <dest_parent>
+#       Restore's side: check that <archive.tar> holds exactly the three files,
+#       each a regular file, and unpack them into a NEW directory under
+#       <dest_parent>, checked with payment_vault_check. Prints that directory on
+#       success; prints a reason and returns 1 otherwise (nothing left behind).
 #
 # cards.db is copied with SQLite's online backup (a plain copy can tear on a
 # concurrent `vault add`), from a read-only connection (`-readonly` never
 # creates a missing file), while holding the vault directory's flock, the same
-# lock `vault init` takes, so a backup never sees an init half-done. The set
-# is built under <temp_root>, outside the backups clone, and moved in only once
-# all three files are encrypted, under names no `*.gpg` reader matches.
+# lock `vault init`, `add` and `retire` take, so a backup never sees one of
+# them half-done. The archive is built under <temp_root>, outside the backups
+# clone, and moved in by one rename from a name no `*.gpg` reader matches.
 
 PAYMENT_VAULT_FILES=(identity.age recipient.txt cards.db)
+PAYMENT_VAULT_ARCHIVE=payment_vault.tar.gpg
+# vault_store.SCHEMA_VERSION and the cards table's columns, in order (a parity
+# test builds a real vault with vault_store and checks it here).
+PAYMENT_VAULT_SCHEMA_VERSION=1
+PAYMENT_VAULT_COLUMNS="card_ref label brand last4 merchant single_use status created_at retired_at blob"
 
 payment_vault_check() {
-    local dir="$1" f ic uv
+    local dir="$1" f ic uv cols
     for f in "${PAYMENT_VAULT_FILES[@]}"; do
         if [ -L "$dir/$f" ] || [ ! -f "$dir/$f" ]; then
             printf '%s is missing or not a regular file\n' "$f"
@@ -48,7 +64,10 @@ payment_vault_check() {
         printf 'identity.age is not an age file\n'
         return 1
     fi
-    if ! head -n 1 "$dir/recipient.txt" 2>/dev/null | grep -qE '^age1[0-9a-z]+$'; then
+    # "age1" plus 58 Bech32 characters: an X25519 public key. (vault_store also
+    # verifies its checksum; the shape is enough to refuse a truncated file.)
+    if ! head -n 1 "$dir/recipient.txt" 2>/dev/null \
+        | grep -qE '^age1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}$'; then
         printf 'recipient.txt does not hold an age public key\n'
         return 1
     fi
@@ -62,27 +81,34 @@ payment_vault_check() {
         return 1
     fi
     uv="$(sqlite3 -readonly "$dir/cards.db" 'PRAGMA user_version' 2>/dev/null)" || uv=""
-    case "$uv" in
-        '' | 0 | *[!0-9]*)
-            printf 'cards.db is not a vault database (format version unset)\n'
-            return 1
-            ;;
-    esac
+    if [ "$uv" != "$PAYMENT_VAULT_SCHEMA_VERSION" ]; then
+        printf 'cards.db is not a vault database of format version %s\n' "$PAYMENT_VAULT_SCHEMA_VERSION"
+        return 1
+    fi
+    cols="$(sqlite3 -readonly "$dir/cards.db" \
+        "SELECT group_concat(name, ' ') FROM (SELECT name FROM pragma_table_info('cards') ORDER BY cid)" \
+        2>/dev/null)" || cols=""
+    if [ "$cols" != "$PAYMENT_VAULT_COLUMNS" ]; then
+        printf 'cards.db does not have the vault card table\n'
+        return 1
+    fi
     return 0
 }
 
 backup_payment_vault() (
-    vault="$1" out="$2" tmproot="$3" stage="" fd="" why="" f=""
+    vault="$1" out="$2" tmproot="$3" stage="" fd="" why="" n=""
+    archive="$out/$PAYMENT_VAULT_ARCHIVE"
+    tmpname="$out/.$PAYMENT_VAULT_ARCHIVE.tmp"
     trap '[ -n "$stage" ] && rm -rf -- "$stage"' EXIT
     say() { printf '%s\n' "$*"; exit 0; }
-    prior() {
-        for f in "${PAYMENT_VAULT_FILES[@]}"; do
-            [ -e "$out/$f.gpg" ] && return 0
-        done
-        return 1
-    }
-    # Staging leftovers of a killed earlier run.
-    rm -f -- "$out"/.*.gpg.tmp 2>/dev/null
+    prior() { [ -e "$archive" ]; }
+    # A symlink here (or at its parent) would send the archive outside the
+    # backups repo while the run reported ok.
+    if [ -L "$out" ] || [ -L "$(dirname -- "$out")" ]; then
+        say failed "the backup directory is a symlink"
+    fi
+    # The staging leftover of a killed earlier run.
+    rm -f -- "$tmpname" 2>/dev/null
     if [ ! -e "$vault" ] && [ ! -L "$vault" ]; then
         prior && say missing "the vault directory is gone"
         say absent
@@ -92,10 +118,24 @@ backup_payment_vault() (
     fi
     declare -F encrypt_file >/dev/null || say failed "encrypt_file is not defined"
     exec {fd}<"$vault" || say failed "the vault directory cannot be opened"
-    flock -w 30 "$fd" || say failed "the vault stayed locked for 30s (a vault init running?)"
+    flock -w 30 "$fd" || say failed "the vault stayed locked for 30s (a vault command running?)"
     if [ ! -e "$vault/identity.age" ] && [ ! -L "$vault/identity.age" ]; then
         # Never initialised, or an init killed before its key landed (vault_store
-        # treats identity.age as the mark of an initialised vault): no key to keep.
+        # treats identity.age as the mark of an initialised vault). Cards without
+        # a key are a loss, not an empty vault (vault_store refuses that state too).
+        if [ -e "$vault/cards.db" ] || [ -L "$vault/cards.db" ]; then
+            if [ -L "$vault/cards.db" ] || [ ! -f "$vault/cards.db" ]; then
+                say failed "cards.db is not a regular file in a vault with no key"
+            fi
+            if [ -s "$vault/cards.db" ]; then
+                n="$(sqlite3 -readonly "$vault/cards.db" 'SELECT count(*) FROM cards' 2>/dev/null)" \
+                    || say failed "cards.db cannot be read in a vault with no key"
+                case "$n" in
+                    0 | '') ;;
+                    *) say failed "cards remain in a vault with no key" ;;
+                esac
+            fi
+        fi
         prior && say missing "the vault holds no key"
         say absent
     fi
@@ -108,31 +148,58 @@ backup_payment_vault() (
         stage=""
         say failed "cannot create a temp directory"
     }
-    cp -- "$vault/identity.age" "$vault/recipient.txt" "$stage/" 2>/dev/null \
+    mkdir -m 0700 "$stage/set" 2>/dev/null || say failed "cannot create a temp directory"
+    cp -- "$vault/identity.age" "$vault/recipient.txt" "$stage/set/" 2>/dev/null \
         || say failed "cannot copy the key files"
     # cd keeps the destination a fixed relative name: .backup takes it quoted,
     # and a path holding a quote would break that.
-    (cd "$stage" && sqlite3 -readonly "$vault/cards.db" ".timeout 10000" ".backup cards.db") \
+    (cd "$stage/set" && sqlite3 -readonly "$vault/cards.db" ".timeout 10000" ".backup cards.db") \
         >/dev/null 2>&1 || say failed "the cards.db snapshot failed (after an interrupted vault command, run python -m genesis vault status once to roll it back)"
-    why="$(payment_vault_check "$stage")" || say failed "$why"
-    for f in "${PAYMENT_VAULT_FILES[@]}"; do
-        encrypt_file "$stage/$f" "$stage/$f.gpg" || say failed "encrypting $f failed"
-    done
-    # A symlink here (or at its parent) would send the set outside the backups
-    # repo while the run reported ok.
-    if [ -L "$out" ] || [ -L "$(dirname -- "$out")" ]; then
-        say failed "the backup directory is a symlink"
-    fi
+    why="$(payment_vault_check "$stage/set")" || say failed "$why"
+    tar -C "$stage/set" --format=ustar -cf "$stage/payment_vault.tar" -- "${PAYMENT_VAULT_FILES[@]}" \
+        2>/dev/null || say failed "packing the vault failed"
+    encrypt_file "$stage/payment_vault.tar" "$stage/$PAYMENT_VAULT_ARCHIVE" || say failed "encrypting the vault failed"
     mkdir -p "$out" 2>/dev/null || say failed "cannot create the output directory"
-    for f in "${PAYMENT_VAULT_FILES[@]}"; do
-        cp -- "$stage/$f.gpg" "$out/.$f.gpg.tmp" 2>/dev/null || {
-            rm -f -- "$out"/.*.gpg.tmp 2>/dev/null
-            say failed "writing the backup copy failed"
-        }
-    done
-    for f in "${PAYMENT_VAULT_FILES[@]}"; do
-        mv -f -- "$out/.$f.gpg.tmp" "$out/$f.gpg" 2>/dev/null \
-            || say failed "renaming $f.gpg into place failed"
-    done
+    cp -- "$stage/$PAYMENT_VAULT_ARCHIVE" "$tmpname" 2>/dev/null || {
+        rm -f -- "$tmpname" 2>/dev/null
+        say failed "writing the backup copy failed"
+    }
+    mv -f -- "$tmpname" "$archive" 2>/dev/null || {
+        rm -f -- "$tmpname" 2>/dev/null
+        say failed "renaming the archive into place failed"
+    }
     say ok
 )
+
+payment_vault_unpack() {
+    local tarfile="$1" parent="$2" listing types names dest why
+    listing="$(tar -tvf "$tarfile" 2>/dev/null)" || {
+        printf 'the archive cannot be read\n'
+        return 1
+    }
+    # Exactly three entries, each a regular file, named exactly the three
+    # names (duplicates kept, so a repeated name cannot pass). A link or any
+    # other member type is refused before anything is written.
+    types="$(printf '%s\n' "$listing" | cut -c1 | sort | tr -d '\n')"
+    names="$(tar -tf "$tarfile" 2>/dev/null | sort | tr '\n' ' ')"
+    if [ "$types" != "---" ] || [ "$names" != "cards.db identity.age recipient.txt " ]; then
+        printf 'the archive does not hold exactly the three vault files\n'
+        return 1
+    fi
+    dest="$(umask 077 && mktemp -d -p "$parent" .payment_vault.XXXXXX 2>/dev/null)" || {
+        printf 'cannot create a staging directory\n'
+        return 1
+    }
+    if ! (umask 077 && tar -C "$dest" --no-same-owner --no-same-permissions \
+        -xf "$tarfile" -- "${PAYMENT_VAULT_FILES[@]}") 2>/dev/null; then
+        rm -rf -- "$dest"
+        printf 'the archive could not be unpacked\n'
+        return 1
+    fi
+    if ! why="$(payment_vault_check "$dest")"; then
+        rm -rf -- "$dest"
+        printf '%s\n' "$why"
+        return 1
+    fi
+    printf '%s\n' "$dest"
+}

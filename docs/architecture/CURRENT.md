@@ -3115,12 +3115,16 @@ verified: ba9dd8a37 2026-10-09
   refusal and relock lands in `payment_vault_events` with the requesting pid
   and process names; unlock fails closed without that audit row. Nothing
   decrypts a card yet. Backup: `scripts/lib/payment_vault_backup.sh` from
-  backup.sh §8 writes the three files GPG-encrypted to `creds/payment_vault/`
-  (cards.db via SQLite online backup, under the vault's directory lock, only
-  when the whole set passes the check restore reruns); `payment_vault` in
-  `backup_status.json` is ok/absent/skipped (not attempted)/failed/missing, and failed or
-  missing fails the run (non_db). restore.sh stages a fresh, checked set in
-  `~/.genesis/restore-creds/payment_vault/` and never places it.
+  backup.sh §8 writes the three files as ONE GPG-encrypted tar,
+  `creds/payment_vault.tar.gpg`, renamed into place once (cards.db via SQLite
+  online backup, under the vault's directory lock, only when the set passes the
+  check restore reruns), so no reader can mix files from two backups;
+  `payment_vault` in `backup_status.json` is ok/absent/skipped (not
+  attempted)/failed/missing, and failed or missing fails the run (non_db).
+  restore.sh decrypts it only when it comes from the selected off-site snapshot
+  (or Tier-1 when none was selected), checks member types and the vault, and
+  stages it fresh in `~/.genesis/restore-creds/payment_vault/` (an earlier copy
+  is moved aside); it never places it.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;

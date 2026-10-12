@@ -78,7 +78,11 @@ fi
 # pre-deploy backup while update.sh prints "Backup complete".
 # shellcheck source=scripts/lib/dr_lock.sh
 source "$_SCRIPT_DIR/lib/dr_lock.sh"
-_GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
+# Absolute from the start: §8 runs after `cd "$BACKUP_DIR"`, so a relative
+# GENESIS_HOME would otherwise resolve against the backups clone. -s keeps a
+# symlinked component as written, so the card vault step can still refuse a
+# symlinked vault directory (#3245 tracks where GENESIS_HOME is read from).
+_GENESIS_HOME="$(realpath -s -m -- "${GENESIS_HOME:-$HOME/.genesis}")"
 _STATUS_FILE="$_GENESIS_HOME/backup_status.json"
 _RUN_ID="${GENESIS_BACKUP_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 _TRIGGER="${GENESIS_BACKUP_TRIGGER:-timer}"
@@ -1203,10 +1207,10 @@ if $_ENCRYPT_READY; then
         fi
     done
     log "Creds: $_CREDS_COUNT files (encrypted)"
-    # The card vault → creds/payment_vault/ (scripts/lib/payment_vault_backup.sh).
+    # The card vault → creds/payment_vault.tar.gpg (scripts/lib/payment_vault_backup.sh).
     # A failure or a vanished vault fails the run like a Qdrant gap: the rest of
     # the backup still lands, and update.sh continues degraded on non_db.
-    _PV_OUT="$(backup_payment_vault "$_GENESIS_HOME/payment_vault" creds/payment_vault "$GENESIS_BIG_TMP")" \
+    _PV_OUT="$(backup_payment_vault "$_GENESIS_HOME/payment_vault" creds "$GENESIS_BIG_TMP")" \
         || _PV_OUT="failed the vault step aborted"
     read -r _PV_STATUS _PV_WHY <<< "$_PV_OUT"
     case "$_PV_STATUS" in
@@ -1214,7 +1218,7 @@ if $_ENCRYPT_READY; then
         *) _PV_STATUS="failed"; _PV_WHY="the vault step returned no known state" ;;
     esac
     if [ "$_PV_STATUS" = ok ]; then
-        log "Payment vault: 3 files (encrypted)"
+        log "Payment vault: 1 archive (encrypted)"
     elif [ "$_PV_STATUS" = absent ]; then
         log "Payment vault: none"
     else
@@ -1423,16 +1427,12 @@ else
 
     # Upload creds (encrypted credential + wiring files) so the COMPLETE snapshot
     # genuinely includes them — a no-git fresh box pulls them from here (restore
-    # §8). One level of nesting: creds/*.gpg plus creds/<subdir>/*.gpg (ssh,
-    # payment_vault); a failed upload of a present file flips _T2_OK, same
-    # contract as the payloads above. Every subdirectory is created first, because
-    # the smb backend's put does not create one; a failed mkdir surfaces as the
-    # failed put, so it must not abort the run here.
+    # §8). One level of nesting: creds/*.gpg + creds/ssh/*.gpg (the card vault is
+    # the flat creds/payment_vault.tar.gpg); a failed upload of a present file
+    # flips _T2_OK, same contract as the payloads above.
     if [ -d creds ]; then
         backend_mkdir "${_T2_DIR}/creds"
-        while IFS= read -r -d '' _d; do
-            backend_mkdir "${_T2_DIR}/${_d}" || true
-        done < <(find creds -mindepth 1 -type d -print0 2>/dev/null)
+        [ -d creds/ssh ] && backend_mkdir "${_T2_DIR}/creds/ssh"
         while IFS= read -r -d '' f; do
             rel="${f#creds/}"
             if backend_put "$f" "${_T2_DIR}/creds/${rel}"; then

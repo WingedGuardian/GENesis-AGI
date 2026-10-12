@@ -181,7 +181,10 @@ class TestRetire:
         _answers(monkeypatch, [PASSPHRASE])
         assert _run(["retire", card]) == 0
         assert vs.list_cards()[0]["status"] == "retired"
-        assert "close the virtual card with its issuer" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "close the virtual card with its issuer" in out
+        # Until the next backup, a restore would bring the retired card's details back.
+        assert "scripts/backup.sh" in out
 
     def test_bad_ref_is_refused_before_the_passphrase_prompt(self, card, monkeypatch, capsys):
         getpass = _answers(monkeypatch, [])

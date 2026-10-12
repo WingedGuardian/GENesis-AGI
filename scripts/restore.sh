@@ -84,6 +84,10 @@ _EXTRA_RESTORED=0
 # stale one left in a reused checkout by an earlier run.
 _EXTRA_FROM_SNAPSHOT=false
 _EXTRA_PULLED=""
+# The card vault archive in the selected snapshot (set in the creds pass of
+# _pull_from_offsite): pulled, failed or absent. §8 stages the vault only when
+# it is "pulled", or when no snapshot was selected (Tier-1 git is the source).
+_PV_PULL=""
 _CCMEM_RESTORED=false
 _OVERLAYS_RESTORED=0
 _SECRETS_RESTORED=false
@@ -283,6 +287,69 @@ decrypt_file() {
     backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
     printf '%s' "$_BACKUP_PASSPHRASE" | python3 \
         "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup "$src" "$dst" 2>/dev/null
+}
+
+# _pv_overlaps <a> <b>: true when the two paths are the same or one holds the
+# other. Staging the card vault must never land on (or over) the live vault,
+# which a GENESIS_CREDS_STAGE pointed at GENESIS_HOME would do with no symlink.
+_pv_overlaps() {
+    local a b
+    a="$(realpath -m -- "$1")"
+    b="$(realpath -m -- "$2")"
+    case "$a/" in "$b/"*) return 0 ;; esac
+    case "$b/" in "$a/"*) return 0 ;; esac
+    return 1
+}
+
+# _pv_stage_vault: decrypt $_PV_ARCHIVE into a private temp file, unpack it into
+# a NEW directory (payment_vault_unpack checks member types, names and the
+# vault itself), move any earlier staged vault aside (never deleted), then
+# rename the new one into place and print how to use it. Never places it.
+_pv_stage_vault() {
+    local tarf dir why aside
+    tarf="$(umask 077 && mktemp -p "$CREDS_STAGE" .payment_vault.tar.XXXXXX 2>/dev/null)" || {
+        warn "Payment vault: cannot create a temp file in $CREDS_STAGE; not staged"
+        return 1
+    }
+    if ! decrypt_file "$_PV_ARCHIVE" "$tarf"; then
+        rm -f -- "$tarf"
+        warn "Payment vault: decrypting $PAYMENT_VAULT_ARCHIVE failed; not staged"
+        return 1
+    fi
+    if ! dir="$(payment_vault_unpack "$tarf" "$CREDS_STAGE")"; then
+        why="$dir"
+        rm -f -- "$tarf"
+        warn "Payment vault: the archive failed its check ($why); not staged, do not use it"
+        return 1
+    fi
+    rm -f -- "$tarf"
+    if [ -e "$_PV_STAGE" ] || [ -L "$_PV_STAGE" ]; then
+        aside="$_PV_STAGE.pre-restore-$(date -u +%Y%m%dT%H%M%SZ).$$"
+        if ! mv -T -- "$_PV_STAGE" "$aside"; then
+            rm -rf -- "$dir"
+            warn "Payment vault: could not move the earlier staged vault aside; not staged"
+            return 1
+        fi
+        log "Payment vault: the earlier staged copy was moved aside to $aside"
+    fi
+    if ! mv -T -- "$dir" "$_PV_STAGE"; then
+        rm -rf -- "$dir"
+        warn "Payment vault: could not rename the staged vault into place; not staged"
+        return 1
+    fi
+    log "Payment vault: staged at $_PV_STAGE (NOT placed). To use it, on a box with no vault:"
+    log "      1. confirm $_PV_LIVE does not exist (placing it over a live vault would bring"
+    log "         back retired cards or replace a newer key)"
+    log "      2. systemctl --user stop genesis-server"
+    log "      3. mv -T \"$_PV_STAGE\" \"$_PV_LIVE\""
+    log "      4. systemctl --user start genesis-server, then: python -m genesis vault unlock"
+    log "         (a successful unlock proves the passphrase and the key match)"
+    log "      Until it is placed (or retired: git rm creds/$PAYMENT_VAULT_ARCHIVE in the backups"
+    log "      repo), every backup reports payment_vault: missing and fails."
+    if [ "$CREDS_SRC_DIR" != "$BACKUP_DIR/creds" ]; then
+        warn "Payment vault: it came from the fallback copy $CREDS_SRC_DIR (the host mirror or its never-pruned archive), which may hold a vault since retired"
+    fi
+    return 0
 }
 
 # read_payload <path-without-.gpg> → echo resolved path and whether decryption needed.
@@ -520,17 +587,21 @@ _pull_from_offsite() {
     # snapshot too (restore §8 reads $BACKUP_DIR/creds). backend_list is
     # single-level, so iterate creds/ and each subdirectory separately; the .gpg
     # filter drops the subdirectory entries so they are not mis-fetched as files.
-    for _sub in creds creds/ssh creds/payment_vault; do
-        if [ -L "$BACKUP_DIR/$_sub" ]; then
-            warn "off-site: $_sub in the backup checkout is a symlink; not pulling into it"
+    _PV_PULL=absent
+    for _sub in creds creds/ssh; do
+        if [ -L "$BACKUP_DIR/creds" ] || [ -L "$BACKUP_DIR/$_sub" ]; then
+            warn "off-site: $_sub in the backup checkout is (or sits under) a symlink; not pulling into it"
+            if [ "$_sub" = creds ]; then _PV_PULL=failed; fi
             continue
         fi
         while read -r fname; do
             mkdir -p "$BACKUP_DIR/$_sub"
             if backend_get "$snap/$_sub/$fname" "$BACKUP_DIR/$_sub/$fname"; then
                 log "  off-site: pulled $_sub/$fname"
+                if [ "$_sub/$fname" = "creds/$PAYMENT_VAULT_ARCHIVE" ]; then _PV_PULL=pulled; fi
             else
                 warn "off-site: failed to pull $_sub/$fname from snapshot $latest"
+                if [ "$_sub/$fname" = "creds/$PAYMENT_VAULT_ARCHIVE" ]; then _PV_PULL=failed; fi
             fi
         done < <(backend_list "$snap/$_sub" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
     done
@@ -1587,18 +1658,6 @@ if [ -d "$CREDS_SRC_DIR" ]; then
     if ! $DRY_RUN; then
         mkdir -p "$CREDS_STAGE" && chmod 0700 "$CREDS_STAGE"
     fi
-    # The card vault is usable only as a set from ONE backup, and a failed decrypt
-    # below leaves an earlier staged file in place; so clear the three staged
-    # names first whenever this source carries a vault set.
-    _PV_SRC=false
-    if [ -d "$CREDS_SRC_DIR/payment_vault" ] && _creds_has_payload "$CREDS_SRC_DIR/payment_vault"; then
-        _PV_SRC=true
-        if ! $DRY_RUN; then
-            for _f in "${PAYMENT_VAULT_FILES[@]}"; do
-                rm -f -- "$CREDS_STAGE/payment_vault/$_f"
-            done
-        fi
-    fi
     _prev_umask="$(umask)"; umask 077
     while IFS= read -r -d '' _gpg; do
         _rel="${_gpg#"$CREDS_SRC_DIR"/}"       # e.g. ssh/id_ed25519.gpg
@@ -1614,30 +1673,38 @@ if [ -d "$CREDS_SRC_DIR" ]; then
         else
             warn "Creds: decrypt failed for $_rel"
         fi
-    done < <(find "$CREDS_SRC_DIR" -type f -name '*.gpg' -print0)
+    done < <(find "$CREDS_SRC_DIR" -type f -name '*.gpg' ! -name "$PAYMENT_VAULT_ARCHIVE" -print0)
     umask "$_prev_umask"
     if ! $DRY_RUN; then
         log "Creds: $_CREDS_STAGED file(s) decrypted → $CREDS_STAGE (staged, NOT auto-placed)"
         log "      Move into place manually (ssh/ → ~/.ssh/, gh_hosts.yml → ~/.config/gh/hosts.yml, etc.)."
     fi
-    if $_PV_SRC && ! $DRY_RUN; then
-        _PV_STAGE="$CREDS_STAGE/payment_vault"
-        _PV_LIVE="${GENESIS_HOME:-$HOME/.genesis}/payment_vault"
-        if _pv_why="$(payment_vault_check "$_PV_STAGE")"; then
-            log "Payment vault: staged at $_PV_STAGE (NOT placed). To use it, on a box with no vault:"
-            log "      1. confirm $_PV_LIVE does not exist (placing it over a live vault would bring"
-            log "         back retired cards or replace a newer key)"
-            log "      2. systemctl --user stop genesis-server"
-            log "      3. mv -T \"$_PV_STAGE\" \"$_PV_LIVE\""
-            log "      4. systemctl --user start genesis-server, then: python -m genesis vault unlock"
-            log "         (a successful unlock proves the passphrase and the key match)"
-            log "      Until it is placed (or retired: git rm -r creds/payment_vault in the backups"
-            log "      repo), every backup reports payment_vault: missing and fails."
+    # The card vault: one archive, decrypted here (never by the loop above) and
+    # only once it is known to come from this restore's source, so a refused
+    # archive never leaves a plaintext copy behind.
+    _PV_ARCHIVE="$CREDS_SRC_DIR/$PAYMENT_VAULT_ARCHIVE"
+    _PV_STAGE="$CREDS_STAGE/payment_vault"
+    _PV_LIVE="${GENESIS_HOME:-$HOME/.genesis}/payment_vault"
+    _PV_STAGED=false
+    if [ -L "$_PV_ARCHIVE" ]; then
+        warn "Payment vault: not staged. $PAYMENT_VAULT_ARCHIVE in the backup source is a symlink"
+    elif [ -f "$_PV_ARCHIVE" ]; then
+        if $_EXTRA_FROM_SNAPSHOT && [ "$_PV_PULL" != pulled ]; then
+            warn "Payment vault: not staged. The snapshot listing failed, the pull failed, or the selected snapshot holds no vault archive, so the archive in the checkout may come from another backup"
+        elif ! command -v realpath >/dev/null 2>&1; then
+            warn "Payment vault: not staged. realpath is not installed, so the staging path cannot be checked against the live vault"
+        elif _pv_overlaps "$_PV_STAGE" "$_PV_LIVE"; then
+            warn "Payment vault: not staged. Its staging path $_PV_STAGE overlaps the live vault $_PV_LIVE (check GENESIS_CREDS_STAGE)"
+        elif $DRY_RUN; then
+            log "Creds: would stage the card vault from $PAYMENT_VAULT_ARCHIVE"
+            _PV_STAGED=true
         else
-            warn "Payment vault: the staged set failed its check ($_pv_why); do not place it"
+            _pv_stage_vault && _PV_STAGED=true
         fi
-    elif ! $DRY_RUN && [ -e "$CREDS_STAGE/payment_vault/identity.age" ]; then
-        log "NOTE: $CREDS_STAGE/payment_vault holds a vault set from an EARLIER restore; this backup has none"
+    fi
+    # Whatever is still at the staging path was not written by this restore.
+    if ! $_PV_STAGED && ! $DRY_RUN && [ -e "$_PV_STAGE/identity.age" ]; then
+        log "NOTE: $_PV_STAGE holds a vault from an EARLIER restore, not from this backup"
     fi
 else
     log "Creds: no backup payload at $CREDS_SRC_DIR"
