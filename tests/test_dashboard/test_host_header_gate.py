@@ -284,13 +284,13 @@ def _ts_json(dnsname):
 
 
 def test_magicdns_full_and_short_name_pass(gate, monkeypatch):
-    monkeypatch.setattr(hg, "_run_tailscale_status", lambda: _ts_json("genesis-3.tail0000.ts.net."))
+    monkeypatch.setattr(hg, "_run_tailscale_status", lambda: _ts_json("tsbox.tail0000.ts.net."))
     hg._reset_cache()
     assert (
-        _get(gate, "/genesis", "genesis-3.tail0000.ts.net").status_code == 200
+        _get(gate, "/genesis", "tsbox.tail0000.ts.net").status_code == 200
     )  # trailing dot stripped
-    assert _get(gate, "/genesis", "GENESIS-3.tail0000.ts.net:5000").status_code == 200
-    assert _get(gate, "/genesis", "genesis-3:5000").status_code == 200
+    assert _get(gate, "/genesis", "TSBOX.tail0000.ts.net:5000").status_code == 200
+    assert _get(gate, "/genesis", "tsbox:5000").status_code == 200
     assert _get(gate, "/genesis", "other.tail0000.ts.net").status_code == 403
 
 
