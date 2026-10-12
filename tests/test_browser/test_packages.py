@@ -133,17 +133,22 @@ def test_restart_message_names_versions(_baseline):
         "installed_versions",
         return_value={"camoufox": None, "playwright": "1.62.0", "patchright": None},
     ):
-        message = packages.packages_changed_message()
+        message = packages.packages_changed_message(["playwright"])
     assert "playwright 1.58.0 -> 1.62.0" in message
     assert "Restart this Claude Code session" in message
 
 
 def test_import_error_after_an_upgrade_says_restart(_baseline):
+    """playwright 1.58 stays loaded while 1.62 lands on disk; new camoufox code then
+    imports a name the loaded playwright lacks. Only a restart fixes that."""
     _baseline(playwright="1.58.0")
-    with patch.object(
-        packages,
-        "installed_versions",
-        return_value={"camoufox": None, "playwright": "1.62.0", "patchright": None},
+    with (
+        patch.object(
+            packages,
+            "installed_versions",
+            return_value={"camoufox": None, "playwright": "1.62.0", "patchright": None},
+        ),
+        patch.dict("sys.modules", _modules(["playwright"]), clear=True),
     ):
         message = packages.import_error_message(
             ImportError("cannot import name 'BrowserBindResult'")
@@ -151,6 +156,37 @@ def test_import_error_after_an_upgrade_says_restart(_baseline):
     assert "Restart this Claude Code session" in message
     assert "BrowserBindResult" in message
     assert "camoufox fetch" not in message
+
+
+def test_import_error_after_an_unloaded_change_needs_no_restart(_baseline):
+    """patchright installed during the session, nothing browser-side loaded: the
+    failed import read the files on disk, so a restart would read the same ones."""
+    startup = _baseline(camoufox="0.5.8", playwright="1.62.0")
+    with (
+        patch.object(
+            packages, "installed_versions", return_value=dict(startup, patchright="1.62.3")
+        ),
+        patch.dict("sys.modules", _modules(), clear=True),
+    ):
+        message = packages.import_error_message(ImportError("No module named 'camoufox'"))
+        stale = packages.stale_loaded_modules()
+    assert message.startswith("Browser not available")
+    assert "Restart" not in message
+    assert stale == []
+
+
+def test_stale_loaded_modules_names_only_loaded_changed_ones(_baseline):
+    startup = _baseline(camoufox="0.5.7", playwright="1.62.0")
+    with (
+        patch.object(
+            packages,
+            "installed_versions",
+            return_value=dict(startup, camoufox="0.5.8", playwright="1.62.1", patchright="1.62.3"),
+        ),
+        patch.dict("sys.modules", _modules(["playwright"]), clear=True),
+    ):
+        packages._loaded["playwright"] = "1.62.0"
+        assert packages.stale_loaded_modules() == ["playwright"]
 
 
 def test_import_error_without_an_upgrade_says_tell_the_user(_baseline):
@@ -207,7 +243,57 @@ def test_an_uninstalled_package_is_not_told_to_skip_reinstalling(_baseline):
         "installed_versions",
         return_value={"camoufox": None, "playwright": None, "patchright": None},
     ):
-        message = packages.packages_changed_message()
+        message = packages.packages_changed_message(["camoufox"])
     assert "camoufox 0.5.7 -> None" in message
     assert "do not reinstall" not in message
     assert "tell the user" in message
+
+
+@pytest.mark.parametrize(
+    "exc", [UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), OSError(5, "EIO")]
+)
+def test_unreadable_metadata_is_reported_not_raised(monkeypatch, exc):
+    """importlib.metadata raises these for a damaged .dist-info; the launch guard
+    must not let them escape before the import-failure handling runs."""
+
+    def version(name):
+        if name == "camoufox":
+            raise exc
+        raise packages.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(packages.metadata, "version", version)
+    assert packages.installed_versions() == {
+        "camoufox": packages.UNREADABLE,
+        "playwright": None,
+        "patchright": None,
+    }
+
+
+def test_metadata_damaged_after_startup_says_reinstall(_baseline):
+    _baseline(camoufox="0.5.7")
+    with patch.object(
+        packages,
+        "installed_versions",
+        return_value={"camoufox": packages.UNREADABLE, "playwright": None, "patchright": None},
+    ):
+        message = packages.packages_changed_message(["camoufox"])
+    assert "do not reinstall" not in message
+    assert packages.PACKAGE_HINT in message
+
+
+def test_import_error_advice_is_scoped_to_the_failing_layer(_baseline):
+    """A stale camoufox is no reason to restart for a failed Chromium import."""
+    startup = _baseline(camoufox="0.5.7", playwright="1.62.0")
+    with (
+        patch.object(packages, "installed_versions", return_value=dict(startup, camoufox="0.5.8")),
+        patch.dict("sys.modules", _modules(["camoufox", "playwright"]), clear=True),
+    ):
+        packages._loaded.update(camoufox="0.5.7", playwright="1.62.0")
+        chromium = packages.import_error_message(ImportError("x"), packages.PLAYWRIGHT_ONLY)
+        camoufox = packages.import_error_message(ImportError("x"), packages.CAMOUFOX_DISTS)
+    assert chromium.startswith("Browser not available")
+    assert "Restart this Claude Code session" in camoufox
+
+
+def test_camoufox_dists_leave_out_the_chromium_package():
+    assert set(packages.CAMOUFOX_DISTS) == {"camoufox", "playwright"}
