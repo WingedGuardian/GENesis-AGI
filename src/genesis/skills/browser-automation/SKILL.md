@@ -215,7 +215,9 @@ the error names. Never run that step, `camoufox fetch` or `pip install` from
 inside a session; every session's MCP server shares the engine and the venv,
 and the engine download is far larger than a session's temp space. If the
 error says the browser packages changed after this session started, the fix
-is restarting the session, not reinstalling.
+is restarting the session, not reinstalling. The operator's one-step repair for
+the whole stack is `scripts/install_browser_stack.sh` (engine, Chromium and
+system libraries; it prints one `browser-stack:` outcome line).
 
 ## Verify after every action
 

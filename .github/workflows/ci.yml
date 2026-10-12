@@ -1062,7 +1062,14 @@ jobs:
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
         # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
         # Floor: 25712 + 6 = 25718.
+        # Native codex harness (#3075), new file test_codex_native.py: 20 cases
+        # (client x action x decision), measured with --collect-only. All 20
+        # carry a module-wide skipif on GENESIS_CODEX_NATIVE_TESTS != "1",
+        # which CI never sets (native binaries are a separate opt-in
+        # integration requirement, per the test's own skip reason). No
+        # overlap with the files above (new paths). Floor: 25718 + 20 = 25738.
+        # Ceiling: 104 + 20 = 124.
         # Card vault store and CLI (#3194): +151 collected, measured with
         # --collect-only (test_vault_store 105, test_vault_cli 46, both new; pyrage
-        # and zxcvbn are in the test extra, so no skips). Floor: 25718 + 151 = 25869.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25869
+        # and zxcvbn are in the test extra, so no skips). Floor: 25738 + 151 = 25889.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124 --min-collected 25889
