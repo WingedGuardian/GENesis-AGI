@@ -498,13 +498,23 @@ def _hold_lock() -> bool:
     return True  # held until the process exits
 
 
-def _browser_requirements() -> list:
-    """The ``browser`` extra's requirements as the installed Genesis records them
-    (its Requires-Dist), so pyproject.toml stays their one source. A requirement
-    belongs to the extra when its marker holds with ``extra == "browser"`` and not
-    without it (a core one carrying, say, a python_version marker is not)."""
+def _browser_requirements(pyproject: Path | None = None) -> list:
+    """The ``browser`` extra's requirements that apply on this host (an environment
+    marker that is false here drops one, as pip drops it). From ``pyproject`` when
+    given: the checkout pip was just asked to install, since a pip run that fails
+    leaves the previous ranges in the installed metadata. Otherwise as the installed
+    Genesis records them (its Requires-Dist); a requirement belongs to the extra
+    when its marker holds with ``extra == "browser"`` and not without it (a core one
+    carrying, say, a python_version marker is not)."""
     from packaging.requirements import Requirement
 
+    if pyproject is not None:
+        import tomllib
+
+        with open(pyproject, "rb") as f:
+            extras = tomllib.load(f)["project"]["optional-dependencies"]
+        reqs = [Requirement(line) for line in extras["browser"]]
+        return [r for r in reqs if r.marker is None or r.marker.evaluate({"extra": "browser"})]
     dist = next(iter(metadata.packages_distributions().get("genesis", [])), None)
     found = []
     for line in (metadata.requires(dist) if dist else None) or []:
@@ -518,7 +528,7 @@ def _browser_requirements() -> list:
     return found
 
 
-def unmet_packages() -> list[str]:
+def unmet_packages(pyproject: Path | None = None) -> list[str]:
     """What the installed browser packages lack against the ``browser`` extra:
     each package installed, at a version its requirement admits, and camoufox
     carrying its browser pin. Read by bootstrap and install.sh after pip, whose
@@ -526,14 +536,17 @@ def unmet_packages() -> list[str]:
     versions = packages.installed_versions()
     unmet = [f"{dist} is not installed" for dist in packages.BROWSER_DISTS if not versions[dist]]
     try:
-        requirements = _browser_requirements()
+        requirements = _browser_requirements(pyproject)
     except ImportError as exc:
         # Unable to check the ranges is not a range violation; presence and the pin
         # are still checked. (`packaging` comes with the Genesis venv's own deps.)
         print(f"browser-stack: version ranges not checked ({exc})", file=sys.stderr)
         requirements = []
-    except Exception as exc:  # noqa: BLE001 - unreadable metadata: a broken install
-        unmet.append(f"the browser extra's version ranges could not be read ({exc!r})")
+    except Exception as exc:  # noqa: BLE001 - unreadable pyproject or metadata
+        source = pyproject or "the installed Genesis metadata"
+        unmet.append(
+            f"the browser extra's version ranges could not be read from {source} ({exc!r})"
+        )
         requirements = []
     for req in requirements:
         installed = versions.get(req.name.lower())
@@ -549,12 +562,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command", choices=("run", "mark-legacy", "check-packages"), nargs="?", default="run"
     )
+    parser.add_argument(
+        "--pyproject",
+        type=Path,
+        help="check-packages: the checkout's pyproject.toml (default: installed metadata)",
+    )
     args = parser.parse_args(argv)
     if args.command == "mark-legacy":
         mark_legacy(engine.camoufox_install_dir())
         return 0
     if args.command == "check-packages":
-        unmet = unmet_packages()
+        unmet = unmet_packages(args.pyproject)
         for problem in unmet:
             print(f"browser-stack: {problem}")
         return 1 if unmet else 0

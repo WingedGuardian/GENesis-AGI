@@ -146,6 +146,8 @@ def test_extras_name_the_install_target(tmp_path: Path, extras: str, target_suff
     res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
     assert res.returncode == RC_OK, res.stdout + res.stderr
     assert log.read_text().splitlines()[:3] == ["install", "-e", f"{repo}{target_suffix}"]
+
+
 def _recording_venv(tmp_path: Path, *, check_rc: int = 0) -> tuple[Path, Path]:
     """A venv whose pip and python append their arguments to one log; python
     exits ``check_rc`` for `check-packages` and 0 otherwise."""
@@ -181,7 +183,11 @@ def test_browser_extra_marks_the_cache_then_installs_then_checks(tmp_path: Path)
     calls = log.read_text().splitlines()
     assert calls[0] == "python -m genesis.browser.provision mark-legacy"
     assert calls[1].startswith(f"pip install -e {tmp_path / 'repo'}[browser]")
-    assert calls[-1] == "python -m genesis.browser.provision check-packages"
+    # The checkout's pyproject.toml, not the installed metadata pip may have left stale.
+    assert calls[-1] == (
+        f"python -m genesis.browser.provision check-packages "
+        f"--pyproject {tmp_path / 'repo'}/pyproject.toml"
+    )
 
 
 def test_browser_extra_reports_what_pip_left_out(tmp_path: Path) -> None:

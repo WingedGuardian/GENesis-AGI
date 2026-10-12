@@ -286,7 +286,9 @@ def test_a_killed_fetchs_missing_chmod_is_finished_not_redownloaded(env, monkeyp
     (bad / "sub").mkdir(parents=True)
     (bad / "camoufox-bin").write_bytes(b"x")
     (bad / "camoufox-bin").chmod(0o644)
-    status = engine.EngineStatus(engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin")
+    status = engine.EngineStatus(
+        engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin"
+    )
     _resolves(monkeypatch, status, READY)
     run = Runner()
     out = provision.provision(run)
@@ -503,7 +505,9 @@ def test_a_symlinked_version_dir_is_never_changed(env, monkeypatch, tmp_path):
     browsers.mkdir(parents=True)
     (browsers / "156.0.1-beta.36-abc").symlink_to(outside)
     bad = browsers / "156.0.1-beta.36-abc"
-    status = engine.EngineStatus(engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin")
+    status = engine.EngineStatus(
+        engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin"
+    )
     _resolves(monkeypatch, status)
     run = Runner()
     provision.provision(run)
@@ -513,7 +517,9 @@ def test_a_symlinked_version_dir_is_never_changed(env, monkeypatch, tmp_path):
 def test_chmod_that_cannot_help_stops(env, monkeypatch):
     bad = env / "xdg" / "camoufox" / "browsers" / "official" / "156.0.1-beta.36-abc"
     bad.mkdir(parents=True)
-    status = engine.EngineStatus(engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin")
+    status = engine.EngineStatus(
+        engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin"
+    )
     _resolves(monkeypatch, status, status, status)
     run = Runner()
     out = provision.provision(run)
@@ -536,7 +542,14 @@ def test_a_failing_extras_step_keeps_the_engine_result(env, monkeypatch):
 def test_a_too_old_glibc_is_not_sent_to_install_deps(env, monkeypatch):
     status = _engine_on_disk(env)
     _resolves(monkeypatch, status)
-    run = Runner({"ldd": (0, "libxul.so: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by libxul.so)\n")})
+    run = Runner(
+        {
+            "ldd": (
+                0,
+                "libxul.so: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by libxul.so)\n",
+            )
+        }
+    )
     out = provision.provision(run)
     assert "libs=glibc-too-old:" in out.line() and run.ran("install-deps") == []
 
@@ -795,10 +808,67 @@ def test_check_packages_without_packaging_checks_presence_and_notes_it(env, monk
         lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
     )
 
-    def no_packaging():
+    def no_packaging(pyproject=None):
         raise ModuleNotFoundError("No module named 'packaging'")
 
     monkeypatch.setattr(provision, "_browser_requirements", no_packaging)
     assert provision.main(["check-packages"]) == 0
     captured = capsys.readouterr()
     assert captured.out == "" and "version ranges" in captured.err
+
+
+def test_check_packages_reads_the_extra_from_the_checkout_not_stale_metadata(
+    env, monkeypatch, capsys, tmp_path
+):
+    """A pip run that fails before writing metadata leaves the OLD extra's ranges on
+    disk; the checkout's pyproject.toml holds the ones this install asked for."""
+    _metadata(monkeypatch, ['playwright>=1.40; extra == "browser"'])
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "genesis-v3"\n[project.optional-dependencies]\n'
+        'browser = ["camoufox>=0.5.7,<0.6", "playwright>=1.62,<1.63", "patchright>=1.62.1,<1.63"]\n'
+        'voice = ["openai>=2"]\n'
+    )
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.60.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(provision, "_pin_capable", lambda: True)
+    assert provision.main(["check-packages", "--pyproject", str(pyproject)]) == 1
+    assert "playwright 1.60.0 is outside" in capsys.readouterr().out
+
+
+def test_check_packages_with_an_unreadable_pyproject_says_so(env, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(provision, "_pin_capable", lambda: True)
+    missing = tmp_path / "missing.toml"
+    assert provision.main(["check-packages", "--pyproject", str(missing)]) == 1
+    out = capsys.readouterr().out
+    assert "could not be read" in out and str(missing) in out
+
+
+def test_a_checkout_requirement_whose_marker_fails_here_is_not_checked(
+    env, monkeypatch, capsys, tmp_path
+):
+    """pip skips a requirement whose environment marker is false on this host, so
+    the check must too, or it reports a package pip was right not to install."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "genesis-v3"\n[project.optional-dependencies]\n'
+        'browser = ["camoufox>=0.5.7,<0.6", "playwright>=1.62,<1.63", '
+        '"patchright>=1.62.1,<1.63", "playwright>=9; python_version < \'3\'"]\n'
+    )
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(provision, "_pin_capable", lambda: True)
+    assert provision.main(["check-packages", "--pyproject", str(pyproject)]) == 0, (
+        capsys.readouterr().out
+    )
