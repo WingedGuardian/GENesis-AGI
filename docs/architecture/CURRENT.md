@@ -381,8 +381,26 @@ any task bigger than an LLM call.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 6aae986bb 2026-10-04
+verified: 806b12cd0 2026-10-12
 ```
+
+- **Peer execution policy groundwork (dark, opt-in)** — `cc/peer_segment.py`
+  and `CCInvocation.peer_segment` constrain explicit internal invocations to one
+  private facade configuration, exact facade tools and isolated CLI settings.
+  Named systemd scopes enforce deadlines and descendant-aware cleanup on both
+  run paths, including cancellation; unknown drain state raises. Peer ownership
+  remains held through cleanup; checkout admission precedes launch reads and
+  is released before peer drain. Empty failed
+  scopes are collected for retry, and private error redaction preserves the
+  original exception through disabled or failed child tracing. The public peer
+  API, task coordinator and lease broker are separate dependent slices, so this
+  mechanism alone does not enable peer work. See [peer execution](../reference/peer-execution.md).
+  Launch executables are resolved outside the peer directory with a sanitized
+  PATH; final child environments force CLAUDE.md suppression while retaining
+  owner proxy/CA settings. Automatic prompt attachments are also suppressed:
+  `@` file mentions remain text rather than implicitly reading owner files.
+  Peer error prose bypasses account classification,
+  and confirmed cleanup retires ownership before propagating caller cancellation.
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
   `cc/gmodel_settings.py`): Kimi K3 and MiMo V2.6 Pro select subscription, native
@@ -2709,8 +2727,9 @@ verified: 4117f6ed 2026-10-05
   genesis-memory MCP env-redirected to a WAL-safe DB snapshot
   (`GENESIS_DB_PATH` + `GENESIS_MEMORY_WRITEBACKS_OFF` — recall is
   read-MOSTLY: without the seam it bumps retrieved_count in shared prod
-  Qdrant); bare arm = `--safe-mode` (the only OAuth-compatible CLAUDE.md
-  suppression; `--bare` refuses OAuth) + cleanroom CLAUDE_CONFIG_DIR.
+  Qdrant); bare arm = `--safe-mode` (disables customizations including MCP,
+  preserving OAuth) + cleanroom CLAUDE_CONFIG_DIR. Peer containment uses the
+  separately measured CLAUDE.md-off environment switch while retaining its facade.
   Task set is PRIVATE (`~/.genesis/eval/bench_tasks_v1.jsonl`; loader
   refuses in-repo paths). Judge = `bench_task_success` rubric, UNCALIBRATED
   v1 (every surface stamps `judge_calibrated: false`). Every new

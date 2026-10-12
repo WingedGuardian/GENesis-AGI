@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+from genesis.cc.peer_segment import PeerSegment
+
 # CC's spawn/escape-class tool names — the single source of truth for the restricted CC
 # sessions where spawning would escape the parent's tool restrictions: reflection (fully
 # read-only), the inbox/mail judges, the experimentation completion, sentinel-degraded.
@@ -354,10 +356,10 @@ class CCInvocation:
     # --safe-mode: start with all customizations (CLAUDE.md, skills, plugins,
     # hooks, MCP servers, custom commands/agents) disabled, with OAuth intact —
     # unlike --bare, which refuses OAuth and requires ANTHROPIC_API_KEY. Used by
-    # the eval bench's "bare Claude" arm: safe-mode is the only OAuth-compatible
-    # way to suppress the user-level CLAUDE.md, which CC discovers via the
-    # passwd-resolved home directory regardless of $HOME/$CLAUDE_CONFIG_DIR
-    # (probe-verified 2026-07-09). Built-in tools remain available.
+    # the eval bench's "bare Claude" arm. Peer execution instead pins
+    # CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 to suppress memory while retaining its
+    # facade (native CLI 2.1.280 controls, 2026-10-11). Safe-mode still disables
+    # all MCP servers. Built-in tools remain available.
     safe_mode: bool = False
     # --strict-mcp-config: CC honors ONLY the servers in --mcp-config, ignoring
     # user/project-scope MCP configs. Without it, mcp_config is additive — CC
@@ -456,8 +458,45 @@ class CCInvocation:
         compare=False,
         repr=False,
     )
+    peer_segment: PeerSegment | None = None
+
+    def validate_peer_policy(self) -> None:
+        if self.peer_segment is not None:
+            if not isinstance(self.peer_segment, PeerSegment):
+                raise ValueError("peer execution requires an immutable segment policy")
+            if (
+                self.skip_permissions
+                or self.resume_session_id
+                or not self.strict_mcp_config
+                or self.bare
+                or self.safe_mode
+                or self.supervised
+                or self.append_system_prompt
+                or self.allowed_tools is not None
+                or self.disallowed_tools is not None
+                or self.skill_tags
+                or self.bash_allowlist
+                or self.env_overrides is not None
+                or self.output_format != "json"
+                or self.origin != "external_untrusted"
+            ):
+                raise ValueError("peer execution cannot override its containment policy")
+            if (
+                not isinstance(self.system_prompt, str)
+                or not self.system_prompt
+                or not isinstance(self.mcp_config, str)
+                or not Path(self.mcp_config).is_absolute()
+                or not isinstance(self.working_dir, str)
+                or not Path(self.working_dir).is_absolute()
+                or type(self.timeout_s) is not int
+                or not 0 < self.timeout_s <= 7200
+            ):
+                raise ValueError(
+                    "peer execution requires explicit context, facade, cwd and bounded timeout"
+                )
 
     def __post_init__(self) -> None:
+        self.validate_peer_policy()
         # Producer-side loud validation of the WS-3 origin (the env READER is
         # fail-safe instead): a dispatch-site typo like "external-untrusted"
         # must fail at construction, not silently classify a session's memory

@@ -162,6 +162,29 @@ def _now_us() -> int:
     return int(time.time() * 1_000_000)
 
 
+def _exception_message(exc: Exception, override: str | None) -> tuple[str, bool]:
+    try:
+        # Bypass subclass attributes/descriptors and dict method overrides.
+        attrs = BaseException.__dict__["__dict__"].__get__(exc)
+        if override is not None:
+            dict.__setitem__(attrs, "_genesis_trace_error_message", override)
+        safe = dict.get(attrs, "_genesis_trace_error_message")
+        if safe is not None:
+            # A malformed marker still denotes private content. Base str's
+            # method makes a builtin string without invoking subclass hooks.
+            return (
+                str.__str__(safe) if isinstance(safe, str) else "private operation failed",
+                True,
+            )
+    except Exception:
+        # Tracing must preserve the caller's exception even if metadata fails.
+        return "private operation failed", True
+    try:
+        return f"{type(exc).__name__}: {exc}", False
+    except Exception:
+        return "exception text unavailable", False
+
+
 @contextmanager
 def start_span(
     name: str,
@@ -170,15 +193,24 @@ def start_span(
     attributes: dict[str, Any] | None = None,
     trace_id: str | None = None,
     parent_span_id: str | None = None,
+    error_message: str | None = None,
 ) -> Generator[Span | _NullSpan]:
     """Open a span for the duration of the block.
 
     Parent resolution: explicit ``parent_span_id``/``trace_id`` args (used for
     cross-process handoff) > the current ContextVar span (in-process nesting) >
     a brand-new root trace. Yields ``_NULL_SPAN`` when capture is disabled.
+    ``error_message`` replaces exception prose and marks it for ancestor spans,
+    preventing a sensitive child error from escaping through a parent trace.
     """
+    sensitive_error = error_message is not None
     if _writer is None or not _enabled:
-        yield _NULL_SPAN
+        try:
+            yield _NULL_SPAN
+        except Exception as exc:
+            if error_message is not None:
+                _exception_message(exc, error_message)
+            raise
         return
 
     token = None
@@ -205,17 +237,23 @@ def start_span(
         )
         token = _current_span.set(span)
     except Exception:
-        logger.debug("start_span setup failed", exc_info=True)
+        logger.debug("start_span setup failed", exc_info=not sensitive_error)
         if token is not None:
             with contextlib.suppress(Exception):
                 _current_span.reset(token)
-        yield _NULL_SPAN
+        try:
+            yield _NULL_SPAN
+        except Exception as exc:
+            if error_message is not None:
+                _exception_message(exc, error_message)
+            raise
         return
 
     try:
         yield span
     except Exception as exc:
-        span.set_status_error(f"{type(exc).__name__}: {exc}")
+        message, sensitive_error = _exception_message(exc, error_message)
+        span.set_status_error(message)
         raise
     finally:
         with contextlib.suppress(Exception):
@@ -226,4 +264,4 @@ def start_span(
         try:
             _writer.record(span)
         except Exception:
-            logger.debug("span record failed", exc_info=True)
+            logger.debug("span record failed", exc_info=not sensitive_error)

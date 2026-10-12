@@ -191,6 +191,14 @@ names, so an overlay of a read-only file is editable (#2446).
 
 ## 4. Other sources
 
+- **Peer CLI environment** — `cc/peer_segment.py` filters inherited process
+  values to its provider/connectivity allowlist, preserving native authentication,
+  HTTP(S) proxy/bypass variables and configured certificate paths. The final
+  invoker launch gate forces `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`,
+  `CLAUDE_CODE_DISABLE_ATTACHMENTS=1` and a PATH
+  containing only absolute directories outside the peer cwd. These containment
+  pins cannot be overridden by a peer request; no configuration file is changed.
+
 - **Process env only** (no file layer): paths — `GENESIS_REPO_ROOT`, `SECRETS_PATH`,
   `GENESIS_DB_PATH`, `GENESIS_HOME`, `VENV_PATH`, `CLAUDE_HOME`, `GENESIS_PLANS_DIR`,
   `GENESIS_OUTPUT_DIR`, `GENESIS_CC_PROJECT_ID`; tuning — `GENESIS_DB_BUSY_TIMEOUT_MS`

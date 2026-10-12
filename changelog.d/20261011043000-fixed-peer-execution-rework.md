@@ -1,0 +1,3 @@
+- Contain peer launches with resolved executables, explicit memory suppression, fixed account-error diagnostics and systemd-249-compatible scope properties.
+- Preserve provider proxy/CA settings, redact callback failures and release confirmed cleanup ownership before propagating cancellation.
+- Suppress automatic prompt attachments so file mentions cannot bypass facade authorization.

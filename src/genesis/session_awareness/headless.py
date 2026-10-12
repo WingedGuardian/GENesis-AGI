@@ -47,8 +47,8 @@ logger = logging.getLogger(__name__)
 #
 # The control is now `--safe-mode` in build_argv, which disables CLAUDE.md,
 # skills, plugins, hooks, MCP servers and custom commands outright while
-# keeping OAuth — the only OAuth-compatible way to suppress the user-level
-# memory file (cc/types.py:347-353). That closes the ancestor class the fresh
+# keeping OAuth. The peer path separately pins CLAUDE_CODE_DISABLE_CLAUDE_MDS
+# while retaining its facade; judges deliberately disable MCP too. Safe-mode closes the ancestor class the fresh
 # directory could not, and it closes it for the cwd too.
 #
 # With suppression doing the work, per-call freshness buys nothing and COSTS:

@@ -1062,4 +1062,16 @@ jobs:
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
         # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
         # Floor: 25712 + 6 = 25718.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25718
+        # Merge with main (#3241): this PR's own +176 (peer_segments 90,
+        # peer_rework 60, native controls 4, test_spans 22) lands on different
+        # files than main's smb/deploy-backup deltas above, so no overlap.
+        # Floor: 25718 + 176 = 25894.
+        # test_peer_native.py's 4 cases (2 mode x 2 auth) skipif-skip when the
+        # `claude` executable is absent, which it is in this job (#3241 Codex
+        # P1): raise the ceiling 104 -> 108 for these intentional skips. The
+        # build/review session runs them on its own pin; CI does not install
+        # the native CLI, by design (see the test file's own docstring).
+        # Peer status-isolation regression tests (#3241 Codex P2s): 4 new
+        # cases in test_peer_segments.py (90 -> 94), no skips.
+        # Floor: 25894 + 4 = 25898.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 108 --min-collected 25898
