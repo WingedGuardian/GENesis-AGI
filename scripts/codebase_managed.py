@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -304,6 +305,14 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
     except (OSError, ValueError) as error:
         result["settings_error"] = str(error)
     try:
+        systemd_spec = importlib.util.spec_from_file_location(
+            "_genesis_util_systemd",
+            Path(__file__).resolve().parent.parent / "src/genesis/util/systemd.py",
+        )
+        if systemd_spec is None or systemd_spec.loader is None:
+            raise ImportError("could not load systemd utilities")
+        systemd = importlib.util.module_from_spec(systemd_spec)
+        systemd_spec.loader.exec_module(systemd)
         output = subprocess.check_output(
             [
                 "/usr/bin/systemctl",
@@ -324,9 +333,10 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
             text=True,
             timeout=30,
             stderr=subprocess.PIPE,
+            env=systemd.systemctl_env(),
         )
         result["service"] = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
-    except (OSError, subprocess.SubprocessError) as error:
+    except (ImportError, OSError, SyntaxError, subprocess.SubprocessError) as error:
         result["manager_error"] = str(error)
     return result
 

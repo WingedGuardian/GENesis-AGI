@@ -38,8 +38,21 @@ from fastmcp import Context
 from genesis.browser import engine, packages
 from genesis.browser.types import BrowserLayer
 from genesis.mcp.health import mcp
+from genesis.security.card_shapes import contains_card_number
 
 logger = logging.getLogger(__name__)
+
+# Fixed texts: a refusal never echoes the value it refused.
+_REFUSE_CARD_VALUE = (
+    "Refused: the value looks like a payment card number. Card numbers are never "
+    "typed with the general browser tools; hand card entry to the user (see the "
+    "browser-automation skill, Safety gates)."
+)
+_REFUSE_CARD_RUN_JS = (
+    "Refused: the script contains what looks like a payment card number. Card "
+    "numbers never go through browser_run_js; hand card entry to the user (see the "
+    "browser-automation skill, Safety gates)."
+)
 
 # File-based logging for the entire MCP health server — routes ALL log
 # output to ~/tmp/mcp_health.log so it's readable after timeouts.
@@ -4029,7 +4042,21 @@ async def _with_stall_diagnostics(
 
 
 async def _impl_browser_fill(selector: str, value: str) -> dict:
-    """Fill a form field on the current page."""
+    """Fill a form field on the current page.
+
+    A value containing a payment card number is refused before anything is
+    typed or logged.
+
+    Known limit: the check reads the VALUE. Whether the target field is a card
+    field is not judged here; deciding that from page attributes misses labels
+    in other languages, placeholders and frames, so it is not judged anywhere
+    yet; the planned card-fill flow (#3172) owns it, where a field it fails to
+    find fails the fill (safe). A model already holding a card could type it in
+    pieces; the planned card vault and input and output redaction (#3172) are
+    what keep real numbers out of its context.
+    """
+    if contains_card_number(value):
+        return {"error": _REFUSE_CARD_VALUE}
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -4200,8 +4227,17 @@ async def _impl_browser_run_js(expression: str) -> dict:
     """Execute JavaScript on the current page and return the result.
 
     Runs JS in the browser's V8 engine via Playwright page.evaluate().
-    Equivalent to Chrome DevTools console. Expressions are logged for audit.
+    Equivalent to Chrome DevTools console. Expressions are logged for audit,
+    so one containing a card number is refused before that log line.
+
+    Known limit (a documented residual, by owner decision): the check reads the
+    expression's TEXT, so a script that computes a number at runtime
+    (``'4242'+'4242'+…``) is not caught. No text check can close that for an
+    arbitrary evaluator; the guard catches the accidental literal, and the
+    planned card vault (#3172) keeps real numbers out of the agent's context.
     """
+    if contains_card_number(expression):
+        return {"error": _REFUSE_CARD_RUN_JS}
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -4590,6 +4626,9 @@ async def browser_fill(selector: str, value: str, ctx: Context | None = None) ->
     keystroke) makes no progress for 30 s, and then the page is reset if it
     is still the active page. Progress is reported as the fill advances, so
     the MCP client's idle timeout does not cancel a long fill.
+
+    A value containing a payment card number is refused; card entry is handed
+    to the user.
     """
     steps = 0
     last_sent = time.monotonic()
@@ -4670,6 +4709,8 @@ async def browser_run_js(expression: str) -> dict:
     Chrome DevTools console. Returns the expression result.
 
     Example: browser_run_js('document.title')
+
+    An expression containing a payment card number is refused.
     """
     return await _with_tool_timeout(
         _impl_browser_run_js(expression), _TOOL_TIMEOUT_S, "browser_run_js"
