@@ -313,7 +313,8 @@ if [[ "$POST_MERGE" == "false" ]]; then
             fi
             if [ -n "$_UR_PICK" ]; then
                 # The helper's plain_name rule: only such a name can be the source.
-                if ! [[ "$_UR_PICK" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ "$_UR_PICK" == *.lock ]]; then
+                if ! [[ "$_UR_PICK" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ "$_UR_PICK" == *..* ]] \
+                    || [[ "$_UR_PICK" == *. ]] || [[ "$_UR_PICK" == *.lock ]]; then
                     echo "ERROR: the update-remote rule could not run (exit $_UR_RC), and the $_UR_HOW"
                     echo "       update remote '$_UR_PICK' is not a plain remote name."
                     echo "       Refusing to update until it is fixed."

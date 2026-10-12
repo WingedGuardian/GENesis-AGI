@@ -286,7 +286,9 @@ def update_check():
 
     # Fetch branch first (must succeed), then force-update tags separately
     # (tag conflicts from history rewrites should not block the check).
-    branch_out, branch_err = _git_result("fetch", remote, "main", timeout=30)
+    # Into the exact ref read below: a remote whose configured refspec does not
+    # track main (`git remote add -t other`) would otherwise leave it stale.
+    branch_out, branch_err = _git_result("fetch", remote, f"+refs/heads/main:{ref}", timeout=30)
     if branch_out is None:
         logger.error("git fetch failed: %s", branch_err)
         return jsonify({"error": "git fetch failed"}), 502

@@ -269,7 +269,9 @@ class GenesisVersionCollector:
 
         # Fetch (updates remote refs + tags, doesn't change working tree)
         proc = await asyncio.create_subprocess_exec(
-            "git", "fetch", remote, "main", "--tags",
+            # Into the exact ref read below: a remote whose configured refspec
+            # does not track main would otherwise leave it stale.
+            "git", "fetch", remote, f"+refs/heads/main:{ref}", "--tags",
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

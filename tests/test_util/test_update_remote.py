@@ -304,6 +304,17 @@ def test_the_degraded_path_refuses_a_pin_that_is_not_a_plain_name(tmp_path):
     assert "is not a plain remote name" in r.stdout
 
 
+@pytest.mark.parametrize("pick", ["a..b", "a."])
+def test_the_degraded_path_refuses_a_pin_that_cannot_form_a_ref(tmp_path, pick):
+    root = tmp_path / "badref"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "remote", "add", "origin", UPSTREAM)
+    _git(root, "config", "--local", ur.PIN_KEY, pick)
+    r = _run_block(tmp_path, root, helper_rc=1)
+    assert r.returncode == 3, r
+    assert "is not a plain remote name" in r.stdout
+
+
 @pytest.mark.parametrize(
     ("name", "plain"),
     [
@@ -317,6 +328,9 @@ def test_the_degraded_path_refuses_a_pin_that_is_not_a_plain_name(tmp_path):
         ("foo\u0085bar", False),
         ("a/b", False),
         ("x.lock", False),
+        ("a..b", False),
+        ("a.", False),
+        ("v1.2", True),
         ("", False),
     ],
 )
@@ -331,11 +345,34 @@ def test_an_override_or_pin_that_is_not_a_plain_name_refuses(label):
         ur.select(remotes, PUBLIC, **{label if label == "override" else "pinned": "--all"})
 
 
-def test_a_remote_that_is_not_a_plain_name_is_never_a_candidate():
-    """A `--all` remote naming the public repo beside a private origin: ignored,
-    so the rule takes the no-candidate fallback instead of refusing every update."""
-    remotes = {"origin": PRIVATE, "--all": UPSTREAM}
-    assert ur.select(remotes, PUBLIC) == ("origin", "fallback")
+def test_a_remote_that_is_not_a_plain_name_naming_the_public_repo_refuses():
+    """A `--all` remote naming the public repo beside a private origin may BE the
+    public remote: never chosen, and never a reason to fall back to the private
+    origin either (round 4: the fallback would deploy the private repository)."""
+    with pytest.raises(ur.UpdateRemoteError, match="not a plain remote name"):
+        ur.select({"origin": PRIVATE, "--all": UPSTREAM}, PUBLIC)
+
+
+def test_origin_naming_the_public_repo_still_wins_over_an_unusable_remote():
+    assert ur.select({"origin": UPSTREAM, "--all": CONTRIB}, PUBLIC) == ("origin", "origin")
+
+
+def test_an_unusable_remote_naming_another_repo_does_not_block_the_fallback():
+    assert ur.select({"origin": PRIVATE, "--all": "/srv/other.git"}, PUBLIC) == (
+        "origin",
+        "fallback",
+    )
+
+
+def test_a_url_ending_in_whitespace_keeps_it(tmp_path):
+    """Only git's record LF is removed; a private path ending in a space must not
+    be read as one naming the public repository."""
+    root = tmp_path / "trailing"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "remote", "add", "origin", "/private/GENesis-AGI.git ")
+    remotes = ur.fetch_remotes(root)
+    assert remotes["origin"] == "/private/GENesis-AGI.git "
+    assert ur.repo_name(remotes["origin"]) != "genesis-agi"
 
 
 @pytest.mark.parametrize(

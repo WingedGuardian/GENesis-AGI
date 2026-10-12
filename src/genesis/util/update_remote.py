@@ -29,11 +29,12 @@ whatever its name. A refusal pins nothing. A repository name is compared as a
 whole last path component, case-insensitively, never as a substring.
 
 Only a PLAIN remote name (``plain_name``: a letter or digit, then letters,
-digits, ``.``, ``_`` or ``-``) can be the update remote. Git accepts far more
+digits, ``.``, ``_`` or ``-``, forming a valid ref) can be the update remote. Git accepts far more
 (a leading dash, Unicode separators, a name that shadows ``heads``), and every
 caller passes the name to git as an argument and builds refs from it. A remote
-with any other name is never a candidate, and an override or pin naming one is
-refused. Callers read ``refs/remotes/<remote>/main`` in full, never the
+with any other name is never chosen: an override or pin naming one is refused,
+and so is the rule when such a remote names the public repository (it may be the
+public remote, so falling back to ``origin`` would be a guess). Callers read ``refs/remotes/<remote>/main`` in full, never the
 ``<remote>/main`` shorthand, which a local branch can shadow.
 
 Command line: ``python -m genesis.util.update_remote <checkout> [--pin]`` prints
@@ -61,8 +62,17 @@ _PLAIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def plain_name(name: str) -> bool:
-    """Whether *name* may be the update remote (see the module docstring)."""
-    return bool(_PLAIN_NAME.fullmatch(name)) and not name.endswith(".lock")
+    """Whether *name* may be the update remote (see the module docstring).
+
+    Also excludes what the character class lets through but git's ref-format
+    rules reject in ``refs/remotes/<name>/main``: ``..``, a trailing ``.``, and a
+    ``.lock`` suffix.
+    """
+    return (
+        bool(_PLAIN_NAME.fullmatch(name))
+        and ".." not in name
+        and not name.endswith((".", ".lock"))
+    )
 
 
 def tracking_ref(remote: str) -> str:
@@ -72,7 +82,9 @@ def tracking_ref(remote: str) -> str:
 
 def repo_name(url: str) -> str:
     """The repository name a remote URL ends in, without ``.git``, casefolded."""
-    path = url.strip().rstrip("/")
+    # No strip(): git accepts a local path ending in whitespace, and trimming it
+    # could turn a private path into one that names the public repository.
+    path = url.rstrip("/")
     head, sep, rest = path.partition(":")
     # scp-like `[user@]host:path`, by git's own rule: a colon with no slash
     # before it, in a URL with no scheme. A colon anywhere else is part of a
@@ -109,11 +121,19 @@ def select(
                 )
             return name, label
     want = public_repo.strip().casefold()
-    candidates = sorted(
-        n for n, url in remotes.items() if plain_name(n) and repo_name(url) == want
-    )
+    matches = sorted(n for n, url in remotes.items() if repo_name(url) == want)
+    candidates = [n for n in matches if plain_name(n)]
     if "origin" in candidates:
         return "origin", "origin"
+    unusable = [n for n in matches if not plain_name(n)]
+    if unusable:
+        # It may be the public remote: falling back to origin (perhaps a
+        # private repository) would be a guess, so refuse and say how to fix it.
+        raise UpdateRemoteError(
+            f"remote {', '.join(repr(n) for n in unusable)} names {public_repo} but is "
+            f"not a plain remote name, so it cannot be the update source. Rename it "
+            f"(git remote rename), then pin the public remote: git config {PIN_KEY} <remote>"
+        )
     if not candidates:
         return "origin", "fallback"
     raise UpdateRemoteError(
@@ -164,7 +184,9 @@ def fetch_remotes(root: Path) -> dict[str, str]:
             raise UpdateRemoteError(
                 f"cannot read the fetch URL of remote {name!r}: {url.stderr.strip()}"
             )
-        remotes[name] = url.stdout.rstrip("\n")
+        # Exactly the one LF git terminates the record with; any other trailing
+        # whitespace belongs to the URL.
+        remotes[name] = url.stdout[:-1] if url.stdout.endswith("\n") else url.stdout
     return remotes
 
 
