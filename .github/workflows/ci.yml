@@ -1060,7 +1060,6 @@ jobs:
         # collect 71 here and 57 on origin/main, measured with
         # --collect-only: test_backup_backends.py 7 -> 20, test_backup_dated_snapshots.py
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
-        # Peer request input (#3167): tests/test_hosting/test_request_input.py
-        # is new (absent on main) and collects 26 (--collect-only): +26.
-        # Floor: 25712 + 26 = 25738; ceiling stays 104.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25738
+        # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
+        # Floor: 25712 + 6 = 25718.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25718
