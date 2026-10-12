@@ -259,7 +259,10 @@ class TestPatchrightChromium:
         starter.start.assert_awaited_once()
         assert backup.call_args.args[1] == "playwright"
         assert "patchright is not installed" in caplog.text
-        assert "install the Genesis `browser` extra" in caplog.text
+        # The browser extra gains patchright only later in the series, so the
+        # step names the package itself (with the range the extra pins).
+        assert "patchright>=1.62.1,<1.63" in caplog.text
+        assert "browser` extra" not in caplog.text
         caplog.clear()
         browser._stealth_page = None
         await browser._cleanup_chromium()
@@ -275,10 +278,33 @@ class TestPatchrightChromium:
         with (
             patch.dict(sys.modules, {"patchright": None, "patchright.async_api": None}),
             self._stub("playwright", starter),
-            pytest.raises(ImportError),
+            pytest.raises(ImportError) as exc,
         ):
             await browser._ensure_chromium_fallback()
         starter.start.assert_not_awaited()
+        # Its own step: the browser extra does not carry patchright yet.
+        assert isinstance(exc.value, browser.PatchrightBroken)
+        assert "patchright>=1.62.1,<1.63" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_navigate_names_patchrights_step_for_a_broken_patchright(self):
+        err = browser.PatchrightBroken("patchright is installed but cannot be imported (x)")
+        with patch.object(browser, "_get_page", new=AsyncMock(side_effect=err)):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"] == str(err)
+        assert "browser` extra" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_navigate_says_restart_first_when_packages_changed(self, monkeypatch):
+        """An upgrade under the session can be why patchright no longer imports: a
+        reinstall would not help the running process, a restart would."""
+        changed = "Browser packages changed since startup (patchright 1.62.1 -> 1.62.3)"
+        monkeypatch.setattr(browser.packages, "packages_changed_message", lambda *a: changed)
+        err = browser.PatchrightBroken("patchright is installed but cannot be imported (x)")
+        with patch.object(browser, "_get_page", new=AsyncMock(side_effect=err)):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"].startswith(changed)
+        assert "cannot be imported (x)" in result["error"]
 
     @pytest.mark.asyncio
     async def test_run_js_runs_in_the_main_world_on_patchright(self):

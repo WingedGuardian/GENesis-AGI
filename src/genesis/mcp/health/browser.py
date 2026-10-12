@@ -498,6 +498,13 @@ def _patchright_installed() -> bool:
 
 
 _warned_no_patchright = False
+# The operator step for patchright, named directly: the browser extra gains
+# patchright only with #3208, which replaces this with engine.PACKAGE_HINT.
+_PATCHRIGHT_STEP = "install 'patchright>=1.62.1,<1.63' into the Genesis venv"
+
+
+class PatchrightBroken(ImportError):
+    """patchright is installed but cannot be imported; the message is the repair."""
 
 
 def _chromium_package() -> str:
@@ -511,7 +518,7 @@ def _chromium_package() -> str:
         logger.warning(
             "patchright is not installed; the Chromium fallback uses plain Playwright, "
             "which sites can detect. Operator step: %s",
-            engine.PACKAGE_HINT,
+            _PATCHRIGHT_STEP,
         )
     return "playwright"
 
@@ -521,7 +528,13 @@ def _chromium_async_playwright(package: str):
     fails is re-raised: switching silently to the detectable Chromium would hide
     the broken install."""
     if package == "patchright":
-        from patchright.async_api import async_playwright
+        try:
+            from patchright.async_api import async_playwright
+        except ImportError as exc:
+            raise PatchrightBroken(
+                f"patchright is installed but cannot be imported ({exc}); tell the user; "
+                f"operator step: reinstall it ({_PATCHRIGHT_STEP})"
+            ) from exc
     else:
         from playwright.async_api import async_playwright
     return async_playwright
@@ -3184,6 +3197,12 @@ async def _impl_browser_navigate(
         lead = f"{changed} " if changed else ""
         return {"error": f"{lead}Camoufox is not ready: {e}"}
     except packages.BrowserPackagesChanged as e:
+        return {"error": str(e)}
+    except PatchrightBroken as e:
+        # Restarting comes first when a package changed under this session, as for
+        # any import error; otherwise the message is patchright's own repair.
+        if packages.packages_changed_message():
+            return {"error": packages.import_error_message(e)}
         return {"error": str(e)}
     except ImportError as e:
         return {"error": packages.import_error_message(e)}
