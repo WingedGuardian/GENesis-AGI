@@ -24,6 +24,7 @@ import yaml
 
 from genesis.awareness.types import SignalReading
 from genesis.env import update_in_progress
+from genesis.util.update_remote import tracking_ref
 
 if TYPE_CHECKING:
     pass
@@ -264,7 +265,7 @@ class GenesisVersionCollector:
         Raises RuntimeError on git failure.
         """
         remote = await asyncio.to_thread(_update_remote)
-        ref = f"{remote}/main"
+        ref = tracking_ref(remote)
 
         # Fetch (updates remote refs + tags, doesn't change working tree)
         proc = await asyncio.create_subprocess_exec(
@@ -353,7 +354,7 @@ class GenesisVersionCollector:
 
     async def _check_upstream_by_commits(self) -> tuple[int, str]:
         """Fallback: count commits when no release tags exist."""
-        ref = f"{await asyncio.to_thread(_update_remote)}/main"
+        ref = tracking_ref(await asyncio.to_thread(_update_remote))
         proc = await asyncio.create_subprocess_exec(
             "git", "rev-list", "--count", f"HEAD..{ref}",
             cwd=str(_GENESIS_ROOT),
@@ -483,7 +484,7 @@ class GenesisVersionCollector:
         self, current: str, behind: int, summary: str,
     ) -> bool:
         """Store update-available observation. Returns True if new (not deduped)."""
-        ref = f"{await asyncio.to_thread(_update_remote)}/main"
+        ref = tracking_ref(await asyncio.to_thread(_update_remote))
         # Get target commit for dedup
         proc = await asyncio.create_subprocess_exec(
             "git", "rev-parse", "--short", ref,

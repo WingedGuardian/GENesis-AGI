@@ -312,6 +312,13 @@ if [[ "$POST_MERGE" == "false" ]]; then
                 _UR_HOW="pinned"
             fi
             if [ -n "$_UR_PICK" ]; then
+                # The helper's plain_name rule: only such a name can be the source.
+                if ! [[ "$_UR_PICK" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ "$_UR_PICK" == *.lock ]]; then
+                    echo "ERROR: the update-remote rule could not run (exit $_UR_RC), and the $_UR_HOW"
+                    echo "       update remote '$_UR_PICK' is not a plain remote name."
+                    echo "       Refusing to update until it is fixed."
+                    exit 3
+                fi
                 if ! git -C "$GENESIS_ROOT" remote get-url -- "$_UR_PICK" >/dev/null 2>&1; then
                     echo "ERROR: the update-remote rule could not run (exit $_UR_RC), and the $_UR_HOW"
                     echo "       update remote '$_UR_PICK' is not a remote of this checkout."

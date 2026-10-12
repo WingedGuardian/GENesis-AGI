@@ -275,14 +275,14 @@ def update_check():
     rule refuses, the check reports that through the same 502 as a failed
     fetch rather than comparing against a remote updates would not use.
     """
-    from genesis.util.update_remote import UpdateRemoteError, update_remote
+    from genesis.util.update_remote import UpdateRemoteError, tracking_ref, update_remote
 
     try:
         remote = update_remote(_GENESIS_ROOT)
     except (UpdateRemoteError, OSError, subprocess.SubprocessError) as exc:
         logger.error("cannot choose the update remote: %s", exc)
         return jsonify({"error": f"cannot choose the update remote: {exc}"}), 502
-    ref = f"{remote}/main"
+    ref = tracking_ref(remote)
 
     # Fetch branch first (must succeed), then force-update tags separately
     # (tag conflicts from history rewrites should not block the check).

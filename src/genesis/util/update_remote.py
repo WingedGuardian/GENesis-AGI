@@ -28,6 +28,14 @@ install was cloned from, so a remote added later cannot change the source,
 whatever its name. A refusal pins nothing. A repository name is compared as a
 whole last path component, case-insensitively, never as a substring.
 
+Only a PLAIN remote name (``plain_name``: a letter or digit, then letters,
+digits, ``.``, ``_`` or ``-``) can be the update remote. Git accepts far more
+(a leading dash, Unicode separators, a name that shadows ``heads``), and every
+caller passes the name to git as an argument and builds refs from it. A remote
+with any other name is never a candidate, and an override or pin naming one is
+refused. Callers read ``refs/remotes/<remote>/main`` in full, never the
+``<remote>/main`` shorthand, which a local branch can shadow.
+
 Command line: ``python -m genesis.util.update_remote <checkout> [--pin]`` prints
 the remote's name on the first line and how it was chosen on the second, and
 exits 0; or prints why it refuses and exits 2.
@@ -36,6 +44,7 @@ exits 0; or prints why it refuses and exits 2.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -48,12 +57,29 @@ class UpdateRemoteError(RuntimeError):
     """The update remote cannot be chosen safely."""
 
 
+_PLAIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def plain_name(name: str) -> bool:
+    """Whether *name* may be the update remote (see the module docstring)."""
+    return bool(_PLAIN_NAME.fullmatch(name)) and not name.endswith(".lock")
+
+
+def tracking_ref(remote: str) -> str:
+    """The fully qualified ref of *remote*'s main, which no local branch shadows."""
+    return f"refs/remotes/{remote}/main"
+
+
 def repo_name(url: str) -> str:
     """The repository name a remote URL ends in, without ``.git``, casefolded."""
-    tail = url.strip().rstrip("/").rsplit("/", 1)[-1]
-    if ":" in tail:  # scp-like host:repo with no owner path
-        tail = tail.rsplit(":", 1)[-1]
-    tail = tail.casefold()
+    path = url.strip().rstrip("/")
+    head, sep, rest = path.partition(":")
+    # scp-like `[user@]host:path`, by git's own rule: a colon with no slash
+    # before it, in a URL with no scheme. A colon anywhere else is part of a
+    # local path (`/srv/mirror:x.git`).
+    if sep and "://" not in path and "/" not in head:
+        path = rest
+    tail = path.rsplit("/", 1)[-1].casefold()
     if tail.endswith(".git"):  # after casefold: a mirror may be named X.GIT
         tail = tail[: -len(".git")]
     return tail
@@ -70,6 +96,12 @@ def select(
     fallback. Raises UpdateRemoteError when the choice would be a guess."""
     for label, name in (("override", override), ("pinned", pinned)):
         if name:
+            if not plain_name(name):
+                raise UpdateRemoteError(
+                    f"the {label} update remote {name!r} is not a plain remote name "
+                    f"(a letter or digit, then letters, digits, '.', '_' or '-'); "
+                    f"rename the remote (git remote rename) and pin the new name."
+                )
             if name not in remotes:
                 raise UpdateRemoteError(
                     f"the {label} update remote {name!r} is not a remote of this checkout "
@@ -77,7 +109,9 @@ def select(
                 )
             return name, label
     want = public_repo.strip().casefold()
-    candidates = sorted(n for n, url in remotes.items() if repo_name(url) == want)
+    candidates = sorted(
+        n for n, url in remotes.items() if plain_name(n) and repo_name(url) == want
+    )
     if "origin" in candidates:
         return "origin", "origin"
     if not candidates:
@@ -93,12 +127,17 @@ def select(
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
     # surrogateescape: a local remote path may hold bytes that are not UTF-8;
     # they round-trip into later git argv instead of raising UnicodeDecodeError.
+    # Without the caller's GIT_* variables: a GIT_DIR or GIT_CONFIG_* inherited
+    # from, say, a git hook would point every probe (and the pin) at another
+    # repository, even with -C.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     return subprocess.run(
         ["git", "-C", str(root), *args],
         capture_output=True,
         text=True,
         errors="surrogateescape",
         timeout=30,
+        env=env,
     )
 
 
@@ -114,8 +153,9 @@ def fetch_remotes(root: Path) -> dict[str, str]:
     if proc.returncode != 0:
         raise UpdateRemoteError(f"cannot list the remotes of {root}: {proc.stderr.strip()}")
     remotes: dict[str, str] = {}
-    for name in proc.stdout.splitlines():
-        name = name.strip()
+    # Split on git's LF only: str.splitlines() also breaks on Unicode separators
+    # a remote name may contain, and strip() would change such a name.
+    for name in proc.stdout.split("\n"):
         if not name:
             continue
         # `--`: a remote may be named like an option (`git remote add -- --all URL`).

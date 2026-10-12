@@ -291,15 +291,99 @@ def test_a_remote_named_like_an_option_does_not_break_resolution(tmp_path):
     assert ur.select(remotes, PUBLIC) == ("origin", "origin")
 
 
-def test_the_degraded_path_accepts_a_pin_named_like_an_option(tmp_path):
+def test_the_degraded_path_refuses_a_pin_that_is_not_a_plain_name(tmp_path):
+    """The same plain_name rule as the helper: such a name would reach
+    `git fetch` as an option."""
     root = tmp_path / "dashed_pin"
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     _git(root, "remote", "add", "origin", PRIVATE)
     _git(root, "remote", "add", "--", "--all", UPSTREAM)
     _git(root, "config", "--local", ur.PIN_KEY, "--all")
     r = _run_block(tmp_path, root, helper_rc=1)
-    assert r.returncode == 0, r
-    assert _result(r).startswith("RESULT remote=--all how=pinned"), r.stdout
+    assert r.returncode == 3, r
+    assert "is not a plain remote name" in r.stdout
+
+
+@pytest.mark.parametrize(
+    ("name", "plain"),
+    [
+        ("origin", True),
+        ("upstream-2", True),
+        ("my.fork_x", True),
+        ("--all", False),
+        ("-x", False),
+        (".hidden", False),
+        ("a b", False),
+        ("foo\u0085bar", False),
+        ("a/b", False),
+        ("x.lock", False),
+        ("", False),
+    ],
+)
+def test_plain_name(name, plain):
+    assert ur.plain_name(name) is plain
+
+
+@pytest.mark.parametrize("label", ["override", "pinned"])
+def test_an_override_or_pin_that_is_not_a_plain_name_refuses(label):
+    remotes = {"origin": UPSTREAM, "--all": CONTRIB}
+    with pytest.raises(ur.UpdateRemoteError, match="not a plain remote name"):
+        ur.select(remotes, PUBLIC, **{label if label == "override" else "pinned": "--all"})
+
+
+def test_a_remote_that_is_not_a_plain_name_is_never_a_candidate():
+    """A `--all` remote naming the public repo beside a private origin: ignored,
+    so the rule takes the no-candidate fallback instead of refusing every update."""
+    remotes = {"origin": PRIVATE, "--all": UPSTREAM}
+    assert ur.select(remotes, PUBLIC) == ("origin", "fallback")
+
+
+@pytest.mark.parametrize(
+    ("url", "name"),
+    [
+        ("/srv/mirror:GENesis-AGI.git", "mirror:genesis-agi"),
+        ("./mirror:GENesis-AGI.git", "mirror:genesis-agi"),
+        ("git@host:owner/GENesis-AGI.git", "genesis-agi"),
+        ("host:GENesis-AGI.git", "genesis-agi"),
+        ("ssh://git@host:22/owner/GENesis-AGI.git", "genesis-agi"),
+    ],
+)
+def test_a_colon_is_a_host_separator_only_in_scp_form(url, name):
+    assert ur.repo_name(url) == name
+
+
+def test_a_remote_name_with_a_unicode_separator_is_read_whole(tmp_path):
+    """git ends each name with LF only; str.splitlines() would split on NEL."""
+    root = tmp_path / "nel"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _git(root, "remote", "add", "origin", UPSTREAM)
+    _git(root, "remote", "add", "foo\u0085bar", CONTRIB)
+    remotes = ur.fetch_remotes(root)
+    assert remotes == {"origin": UPSTREAM, "foo\u0085bar": CONTRIB}
+    assert ur.select(remotes, PUBLIC) == ("origin", "origin")
+
+
+def test_the_callers_git_dir_does_not_redirect_the_probes(tmp_path, monkeypatch):
+    target = tmp_path / "target"
+    other = tmp_path / "other"
+    for root, url in ((target, UPSTREAM), (other, PRIVATE)):
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        _git(root, "remote", "add", "origin", url)
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    assert ur.fetch_remotes(target) == {"origin": UPSTREAM}
+
+
+def test_callers_read_the_fully_qualified_tracking_ref():
+    """`<remote>/main` resolves refs/heads/<remote>/main first, so a remote named
+    `heads` (or a local branch `<remote>/main`) would shadow it."""
+    assert ur.tracking_ref("heads") == "refs/remotes/heads/main"
+    for rel in (
+        "src/genesis/dashboard/routes/updates.py",
+        "src/genesis/learning/signals/genesis_version.py",
+    ):
+        text = (REPO / rel).read_text()
+        assert '{remote}/main"' not in text and '_update_remote)}/main"' not in text, rel
+        assert "tracking_ref(" in text, rel
 
 
 def test_a_remote_path_that_is_not_utf8_is_read_and_round_trips(tmp_path):

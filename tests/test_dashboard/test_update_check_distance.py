@@ -26,10 +26,10 @@ def _call(count, tags, remote="origin"):
             # The range itself is the fix. Asserted here rather than in a value
             # comparison, because a tag-span implementation would still return a
             # plausible number — it is the ARGUMENTS that distinguish them.
-            assert args == ("rev-list", "--count", f"HEAD..{remote}/main")
+            assert args == ("rev-list", "--count", f"HEAD..refs/remotes/{remote}/main")
             return count
         if args[0] == "log":
-            assert args[-1] == f"HEAD..{remote}/main"
+            assert args[-1] == f"HEAD..refs/remotes/{remote}/main"
             return "two\none"
         return ""
 
