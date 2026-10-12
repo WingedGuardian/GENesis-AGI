@@ -345,9 +345,15 @@ async def direct_session_run(
       follow-ups in SQLite, files under `~/.genesis/output/`, and outreach_send.
       Use for workflows that operate external platforms and communicate with the user.
 
-    All profiles block: `Bash`, `Edit`, `task_submit`, and `settings_update`.
-    Profiles that block `Write`: `observe` and `mail`.
-    No profile can call `memory_store`, `memory_synthesize`, `memory_extract`,
+    The specialised built-in profiles (`mail`, `campaign`,
+    `community-responder`) serve dedicated pipelines; do not choose them for
+    general work.
+
+    For the built-in profiles (profiles added by an install-local overlay may
+    have different rules):
+    All built-in profiles block: `Bash`, `Edit`, `task_submit`, and `settings_update`.
+    Built-in profiles that block `Write`: `observe` and `mail`.
+    No built-in profile can call `memory_store`, `memory_synthesize`, `memory_extract`,
     `memory_supersede`, `knowledge_ingest`, `knowledge_ingest_batch`, or
     `knowledge_ingest_source`.
 
