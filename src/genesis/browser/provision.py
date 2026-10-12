@@ -89,13 +89,16 @@ def _short_of_space(paths: list[Path], writes: dict[Path, int] | None = None) ->
     top of it, summed per filesystem, so a download cannot itself take the disk
     below the floor. The engine, its download and Chromium can each be elsewhere."""
     floor = min_free_bytes()
+    # Writes are summed per device (st_dev) and every destination on it must hold the
+    # sum by the guardian's quota-aware figure: on btrfs a subvolume is its own st_dev
+    # and quota, so writes sharing one share its room; an ext4/XFS project quota on a
+    # shared device can only make this refuse a run that would fit (the timer
+    # retries), never let one overrun the floor.
     need: dict[object, tuple[list[Path], int]] = {}
     for path, size in [(p, 0) for p in paths] + list((writes or {}).items()):
         key = disk_device(path) or path
         members, total = need.get(key, ([], floor))
         need[key] = ([*members, path] if path not in members else members, total + size)
-    # Every destination is measured: a project quota (ext4, XFS) limits one tree on a
-    # device the others share, so the first one's figure says nothing about the rest.
     for members, wanted in need.values():
         for path in members:
             free = free_bytes(path)
@@ -106,7 +109,22 @@ def _short_of_space(paths: list[Path], writes: dict[Path, int] | None = None) ->
                     f"low disk: {path} has {free / 1024**3:.1f} GB free, "
                     f"{wanted / 1024**3:.1f} GB needed"
                 )
+        # And the filesystem itself: quotas can each have room the pool lacks.
+        physical = _device_free(members[0])
+        if physical is not None and physical < wanted:
+            return (
+                f"low disk: the filesystem of {members[0]} has {physical / 1024**3:.1f} GB "
+                f"free, {wanted / 1024**3:.1f} GB needed"
+            )
     return None
+
+
+def _device_free(path: Path) -> int | None:
+    """The filesystem's own free bytes (statvfs), shared by every quota on it."""
+    try:
+        return shutil.disk_usage(existing_parent(path)).free
+    except OSError:
+        return None
 
 
 def _writable(path: Path) -> bool:
@@ -302,10 +320,12 @@ def _temp_dir() -> Path:
     return path
 
 
-def _clear_stale_temp() -> None:
+def _clear_stale_temp() -> list[str]:
     """Remove what killed runs left: camoufox's temp files, and the
-    ``playwright-download-*`` directories Playwright's installer makes."""
+    ``playwright-download-*`` directories Playwright's installer makes. Returns
+    what could not be removed, since that can be what keeps the disk low."""
     now = time.time()
+    failed: list[str] = []
     for entry in _temp_dir().iterdir():
         try:
             if entry.is_symlink() or now - entry.stat().st_mtime <= _STALE_TEMP_S:
@@ -314,8 +334,9 @@ def _clear_stale_temp() -> None:
                 entry.unlink()
             elif entry.is_dir() and entry.name.startswith("playwright-download-"):
                 shutil.rmtree(entry)
-        except OSError:
-            continue
+        except OSError as exc:
+            failed.append(f"could not remove stale download {entry}: {exc}")
+    return failed
 
 
 def _child_env(**extra: str) -> dict[str, str]:
@@ -338,11 +359,34 @@ def _under_browsers(path: Path | None) -> bool:
     if path is None:
         return False
     browsers = engine.camoufox_install_dir() / "browsers"
-    return path.parent.parent.parent == browsers
+    directory = path.parent
+    if directory.parent.parent != browsers:
+        return False
+    # Nothing here may be a link: a deletion or chmod through one would act outside
+    # the cache. The cache root itself may be one (a cache moved to another disk).
+    if browsers.is_symlink() or directory.parent.is_symlink() or directory.is_symlink():
+        return False
+    try:
+        return directory.resolve().is_relative_to(browsers.resolve())
+    except OSError:
+        return False
+
+
+def _resolve() -> engine.EngineStatus:
+    """The resolver's answer, plus the one file it does not check: libxul.so, which
+    ships inside the engine (install-deps cannot restore it)."""
+    status = engine.resolve_camoufox_engine()
+    if status.ready and status.path is not None and status.path.is_file():
+        libxul = status.path.parent / "libxul.so"
+        if not libxul.is_file():
+            return engine.EngineStatus(
+                engine.INVALID, f"{libxul} is missing from the engine", status.path
+            )
+    return status
 
 
 def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.EngineStatus]:
-    status = engine.resolve_camoufox_engine()
+    status = _resolve()
     if status.ready:
         return status.detail, True, status
     if status.kind in (engine.NO_PACKAGE, engine.PLAYWRIGHT_MISSING):
@@ -367,9 +411,6 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
             if _live_engine_in(directory):
                 notes.append(f"{directory} is invalid but a running Camoufox uses it; not replaced")
                 return "invalid", False, status
-            if directory.is_symlink():
-                notes.append(f"{directory} is a symlink; not changed here")
-                break
             if "not executable" in status.detail:
                 if chmodded:
                     notes.append(f"{directory} stays not executable after chmod (a noexec mount?)")
@@ -403,12 +444,22 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
             fetched = True
         else:
             break
-        status = engine.resolve_camoufox_engine()
+        status = _resolve()
         if status.ready:
             notes.append(
                 "the browser_automation capability reflects this at the next genesis-server restart"
             )
             return status.detail, True, status
+    if (
+        status.kind == engine.INVALID
+        and status.path is not None
+        and "browsers" in status.path.parts
+        and not _under_browsers(status.path)
+    ):
+        notes.append(
+            f"{status.path.parent} is reached through a link or lies outside the engine "
+            "cache; not changed here"
+        )
     notes.append(status.detail)
     if status.kind == engine.NOT_INSTALLED:
         return "missing", False, status
@@ -513,7 +564,8 @@ def _chromium_step(run: Runner, notes: list[str]) -> tuple[str, bool, list[Path]
     for build in chromium.BUILDS:
         if chromium.needs_force(build, where[build][1]):
             _force(run, package, build, where[build][1], notes, gc)
-    _install(run, package, ("chromium",), **gc)
+    if due:
+        _install(run, package, ("chromium",), **gc)
 
     def unfinished() -> list[str]:
         return [p for b in chromium.BUILDS if (p := chromium.problem(b, where[b][1]))]
@@ -555,13 +607,15 @@ def _missing_libs(run: Runner, binaries: list[Path]) -> tuple[list[str], list[Pa
     unreadable: list[Path] = []
     for binary in binaries:
         proc = _ldd(run, binary)
-        found = len(missing)
+        named = False
         for line in (proc.stdout or "").splitlines() + (proc.stderr or "").splitlines():
             if "=> not found" in line:
                 missing.add(line.split("=>", 1)[0].strip())
+                named = True
             elif "not found (required by" in line:  # e.g. version `GLIBC_2.38' not found
                 missing.add(line.split("not found", 1)[0].split(":")[-1].strip())
-        if proc.returncode != 0 and len(missing) == found:
+                named = True
+        if proc.returncode != 0 and not named:
             unreadable.append(binary)  # an exit code with nothing named: not "ok"
     return sorted(missing), unreadable
 
@@ -616,7 +670,7 @@ def provision(run: Runner | None = None) -> Outcome:
     # Before the space check: a killed run's archive can be what takes the disk
     # below the floor, and a skip would then never reclaim it.
     try:
-        _clear_stale_temp()
+        notes.extend(_clear_stale_temp())
     except OSError as exc:
         notes.append(f"could not clear stale downloads in {temp}: {exc}")
     short = _short_of_space([root, temp])

@@ -66,6 +66,28 @@ elif [ "$lock_rc" -ne 0 ]; then
 fi
 
 cd "$REPO_DIR" || { _log "repo directory $REPO_DIR is unreachable"; exit 75; }
+
+# The runtime reads these from secrets.env (overriding its environment), so the
+# oneshot must provision where it launches from. By name only: no other secret
+# reaches the downloaders. Last assignment wins, as in systemd's own reader.
+SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
+_load_browser_setting() {
+    local key="$1" line="" val
+    [ -f "$SECRETS_FILE" ] || return 0
+    line="$(grep -aE "^${key}=" "$SECRETS_FILE" | tail -1)" || line=""
+    [ -n "$line" ] || return 0
+    val="${line#*=}"
+    case "$val" in
+        \"*\") val="${val#\"}"; val="${val%\"}" ;;
+        \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    [ -n "$val" ] && export "$key=$val"
+    return 0
+}
+for _key in PLAYWRIGHT_BROWSERS_PATH XDG_CACHE_HOME CAMOUFOX_EXECUTABLE_PATH \
+        GENESIS_BIG_TMP GENESIS_BROWSER_MIN_FREE_GB; do
+    _load_browser_setting "$_key"
+done
 export GENESIS_BROWSER_STACK_LOCK_FD=8  # the module verifies this descriptor holds the lock
 "$VENV_PY" -m genesis.browser.provision run
 exit $?
