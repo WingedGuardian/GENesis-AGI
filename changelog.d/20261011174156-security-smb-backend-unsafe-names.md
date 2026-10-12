@@ -1,0 +1,1 @@
+- The smb off-site backend now refuses a file or directory name holding a quote, `;`, a backslash or a newline instead of passing it to smbclient; such a file is reported as a failed upload.
