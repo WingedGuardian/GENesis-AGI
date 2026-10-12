@@ -10,7 +10,7 @@ trees to pick the right one.
 | `memory_store` | Cross-session knowledge, syntheses, learnings | Sessions, extractions | "User prefers X approach" |
 | `observation_write` | Findings, task detections, reflections | Perception pipeline | "Found stale alert from Apr 17" |
 | `knowledge_ingest` | Authoritative external sources (docs, articles) | Knowledge base | "Ingest this API reference" |
-| `reference_store` | Credentials, URLs, IPs, identifiers | Reference ledger | "API key for service X" |
+| `reference_store` | Credentials, URLs, IPs, identifiers (never payment card numbers: refused) | Reference ledger | "API key for service X" |
 | `procedure_store` | Reusable multi-step workflows with confidence | Procedural memory | "Deploy pattern: steps 1-5" |
 | `follow_up_create` | Deferred USER-OWNED work needing tracking + completion | Follow-up ledger | "Finish the deck I asked for" |
 | `gh issue create` | Deferred GENESIS-REPO work (code, tests, docs, infra) | Public GitHub tracker | "Adapter for provider X is hardcoded" |

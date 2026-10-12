@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import logging
 import math
+import re
 import time
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
@@ -12,14 +13,22 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 from qdrant_client import QdrantClient
 
+from genesis.db._slow_log import timed
 from genesis.db.connection import ReadConnectionPool, ReadPoolClosed
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links, observations
-from genesis.db.crud._fts import drop_bm25_inert_terms, fts5_term
+from genesis.db.crud._fts import (
+    FTS_MAX_TERMS,
+    bounded_terms,
+    drop_bm25_inert_terms,
+    fts5_query_tokens,
+    fts5_term,
+)
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.intent import (
     QueryIntent,
+    _tokenize_query,
     classify_intent,
     expand_query,
     rank_by_intent,
@@ -701,8 +710,13 @@ class HybridRetriever:
         pool = self._read_pool
         if pool is not None:
             try:
-                async with pool.acquire() as ro:
-                    return await fn(ro, *args, **kwargs)
+                # Labelled by the helper's name, never its arguments (they carry
+                # the prompt). The fallback below is timed per statement by the
+                # shared connection itself, so it is not timed again here.
+                with timed(f"ro:{getattr(fn, '__qualname__', 'read')}") as t:
+                    async with pool.acquire() as ro:
+                        t.acquired()
+                        return await fn(ro, *args, **kwargs)
             except ReadPoolClosed:
                 pass  # pool closed / not opened — use the shared connection
             except Exception:
@@ -1456,6 +1470,18 @@ class HybridRetriever:
             # near-tie swap at ranks 44–48. See ``_fts.drop_bm25_inert_terms``.
             kept = await self._ro_read(drop_bm25_inert_terms, safe_terms) if safe_terms else []
             base = fts_query
+            # The raw prompt enters boolean mode here as an implicit-AND group, so a
+            # long paste would AND every one of its words. Bounded only when it
+            # exceeds the cap, so a short prompt keeps its exact form, and only when
+            # it IS the raw prompt: an expanded expression is already bounded and
+            # must not be re-tokenised. The cap is judged by EVERY word the raw
+            # prompt puts into the MATCH, not only the meaningful ones: a long paste
+            # of stopwords filters to few or no terms, yet would reach FTS5 whole.
+            if base == query and fts5_query_tokens(query) > FTS_MAX_TERMS:
+                # The same meaningful tokens as the expanded query (site A); when
+                # there are none, the words themselves, as the OR retry does.
+                raw = _tokenize_query(query) or re.findall(r"\w+", query.lower())
+                base = " ".join(bounded_terms(raw, site="lane-base"))
             if kept:
                 fts_query = f"({base}) OR ({' OR '.join(kept)})"
             elif safe_terms:

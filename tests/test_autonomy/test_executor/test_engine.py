@@ -454,7 +454,7 @@ class TestAmendment7Worktree:
         async def gone(*a, **k):
             return False
 
-        monkeypatch.setattr(worktree_mgr, "verify_worktree", gone)
+        monkeypatch.setattr(worktree_mgr, "is_registered_worktree", gone)
         monkeypatch.setattr(worktree_mgr, "create_worktree", refuse)
         engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
         engine._resolve_and_record_base = AsyncMock(return_value=None)

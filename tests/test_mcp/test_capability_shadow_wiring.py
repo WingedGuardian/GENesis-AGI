@@ -96,6 +96,25 @@ async def test_send_reply_records_shadow_and_still_sends(db):
         bot_mod._bot_token, bot_mod._db = old_token, old_db
 
 
+@pytest.mark.asyncio
+async def test_send_reply_refuses_a_card_number_before_any_request(db):
+    """A payment card number never leaves through send_reply, and the refusal
+    does not echo it. Stripe's public test number, grouped as a person types it."""
+    old_token, old_db = bot_mod._bot_token, bot_mod._db
+    bot_mod._bot_token, bot_mod._db = "test-token", db
+    try:
+        client = _mock_httpx("reply-x")
+        test_card = "4242 4242 4242 4242"
+        with patch("genesis.mcp.discord_bot_mcp.httpx.AsyncClient", return_value=client):
+            tools = await bot_mcp.get_tools()
+            result = await tools["send_reply"].fn(channel_id="789", content=f"use {test_card}")
+        assert "payment card number" in json.loads(result)["error"]
+        assert "4242" not in result
+        client.post.assert_not_called()
+    finally:
+        bot_mod._bot_token, bot_mod._db = old_token, old_db
+
+
 def test_init_discord_bot_wires_shadow_db():
     # The bootstrap injects the shadow DB via init_discord_bot(db=...); confirm it lands.
     from genesis.mcp.discord_bot_mcp import init_discord_bot

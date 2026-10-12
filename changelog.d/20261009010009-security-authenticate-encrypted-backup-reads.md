@@ -1,0 +1,1 @@
+- Reject unencrypted or integrity-invalid OpenPGP backups during recovery and transcript evidence reads; failed decryption preserves existing destination files.

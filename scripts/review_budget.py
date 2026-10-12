@@ -236,7 +236,10 @@ def confirmation_marker(head: str) -> str:
 
 
 class _BudgetExhausted(Exception):
-    """The aggregate lookup budget ran out before this call could be issued."""
+    """The aggregate lookup budget ran out before this call could be issued.
+
+    ``args[0]``, when present, carries the ``gh_failure:<class>`` codes recorded
+    so far, so a persistent class still reaches the result."""
 
 
 class _Truncated(Exception):
@@ -763,8 +766,10 @@ def _default_runner(argv: Sequence[str], *, timeout: float) -> tuple[int, str, s
             list(argv), capture_output=True, text=True, timeout=timeout, check=False
         )
         return result.returncode, result.stdout, result.stderr
-    except Exception:
-        return 1, "", "runner_failed"
+    except Exception as exc:  # noqa: BLE001 - classified by _gh_failure_class, never raised
+        # The exception TYPE, never its text: a subprocess timeout must read as
+        # `timeout` there, the same as an exception the harness wrapper catches.
+        return 1, "", f"runner_failed:{type(exc).__name__}"
 
 
 def _json_lines(raw: str, source: str) -> tuple[list[dict[str, Any]] | None, str | None]:
@@ -800,6 +805,98 @@ _GRAPHQL_MAX_PAGES = 50
 #: large to read in time is ``unknown``, exactly as the REST walk hitting its
 #: 8s cap was.
 _GRAPHQL_READ_SECONDS = 20.0
+
+#: Error codes that mean only "GitHub could not be read just now": a failed or
+#: timed-out read, or a lookup that ran out of its time budget. The ONLY codes
+#: an install-local ask switch (`hooks.asks.review_request`) may treat as
+#: transient. Everything else that reads as unknown -- deleted findings,
+#: truncated responses, a malformed record, a configuration error, a head
+#: that moved -- is persistent or a tamper signal and must keep asking.
+#: `gh_failure:<class>` entries ride along with these codes (see
+#: `_gh_failure_class`). Only the classes in TRANSIENT_GH_FAILURES count: an
+#: auth failure, a not-found, a 4xx or an unclassified failure (`other`,
+#: `runner_raised`) is not "GitHub could not answer just now" and keeps asking.
+TRANSIENT_ERRORS = frozenset(
+    {
+        "graphql_unreadable",
+        "graphql_read_timeout",
+        "final_head_unreadable",
+        "files_unreadable",
+        "lookup_budget_exhausted",
+    }
+)
+
+TRANSIENT_GH_FAILURES = frozenset({"timeout", "hook_deadline", "network", "rate_limited"})
+
+
+def _transient_gh_failure(code: str) -> bool:
+    cls = code[len("gh_failure:") :]
+    if cls in TRANSIENT_GH_FAILURES:
+        return True
+    return cls.startswith("http_5") and len(cls) == 8 and cls[5:].isdigit()
+
+
+def errors_are_transient(errors: Any) -> bool:
+    """True when ``errors`` is a non-empty list of transient read failures only."""
+    if not isinstance(errors, list) or not errors:
+        return False
+    return all(
+        isinstance(e, str)
+        and (e in TRANSIENT_ERRORS or (e.startswith("gh_failure:") and _transient_gh_failure(e)))
+        for e in errors
+    )
+
+
+def failure_errors(failures: Sequence[str]) -> list[str]:
+    """``gh_failure:<class>`` for EVERY distinct failed-call class, first-seen order.
+
+    The vocabulary is small and fixed, so this stays bounded. Cutting the list to
+    the first few dropped a late persistent class (auth, not_found) behind
+    recovered transient ones, and errors_are_transient() then read the whole
+    result as transient.
+
+    Classes of calls that RECOVERED on retry are kept on purpose: a recovered
+    `auth` or `other` makes an otherwise transient result ask. That is the safe
+    direction for an approval prompt; do not drop them to save a prompt.
+    """
+    return [f"gh_failure:{cls}" for cls in dict.fromkeys(failures)]
+
+
+def _gh_failure_class(stderr: str) -> str:
+    """A short, fixed-vocabulary class for a failed gh call (never raw stderr).
+
+    The raw text can carry account details, so only the class is kept. The
+    point is that one occurrence says WHY a read failed, not only that it did.
+    """
+    text = stderr or ""
+    if text.startswith("runner_failed:"):
+        kind = text.split(":", 1)[1]
+        if kind == "TimeoutExpired":
+            return "timeout"
+        # The caller's timeout_for refused to issue the call: production's
+        # review_deadline.bounded_timeout raises DeadlineExpired (a RuntimeError
+        # subclass), and the wrapper records the CONCRETE type name.
+        if kind in ("DeadlineExpired", "RuntimeError"):
+            return "hook_deadline"
+        return "runner_raised"
+    low = text.lower()
+    if "rate limit" in low or "secondary rate" in low:
+        return "rate_limited"
+    code = re.search(r"\bHTTP (\d{3})\b", text)
+    if code:
+        return f"http_{code.group(1)}"
+    # Persistent classes before `timeout`: an auth message that also mentions a
+    # timeout must keep asking, never read as transient.
+    if "auth" in low or "credential" in low or "token" in low:
+        return "auth"
+    if "timed out" in low or "timeout" in low or "deadline exceeded" in low:
+        return "timeout"
+    if "could not resolve" in low:
+        return "not_found"
+    if "connection" in low or "network" in low or "dial tcp" in low or "eof" in low:
+        return "network"
+    return "other"
+
 
 #: One connection per REST endpoint the lookup used to call, projected to the
 #: fields ``evaluate_evidence`` reads and nothing more.
@@ -1051,14 +1148,19 @@ def _evaluate_pr_inner(
         remaining = deadline.remaining()
         if remaining is not None:
             if deadline.exhausted(minimum_useful=floor):
-                raise _BudgetExhausted
+                raise _BudgetExhausted(failure_errors(failures))
             seconds = min(seconds, remaining)
         try:
             return runner(argv, timeout=timeout_for(seconds))
-        except Exception:
-            return 1, "", "runner_failed"
+        except Exception as exc:  # noqa: BLE001 - classified, never raised
+            return 1, "", f"runner_failed:{type(exc).__name__}"
 
     repo_owner, _, repo_name = repo.partition("/")
+    #: Classes of the failed gh calls, in order, reported beside the error code.
+    failures: list[str] = []
+
+    def unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
+        return _unknown(*errors, *failure_errors(failures), current_head=current_head)
 
     def snapshot(names: Sequence[str]) -> tuple[dict[str, Any] | None, str | None]:
         """The PR head plus every page of the named connections, in ONE query.
@@ -1085,6 +1187,10 @@ def _evaluate_pr_inner(
         body_moved = False
         path_changed = False
         read = Deadline.after(_GRAPHQL_READ_SECONDS, monotonic=monotonic)
+        # Failures recorded by an EARLIER snapshot say nothing about this one: a
+        # recovered failure there must not make this read's budget exhaustion look
+        # transient.
+        failures_before = len(failures)
         for _page in range(_GRAPHQL_MAX_PAGES):
             # ONE clock reading decides both whether to call and how long the
             # call may take. Two readings leave a gap a stall can fall into:
@@ -1092,6 +1198,11 @@ def _evaluate_pr_inner(
             # #2594); just short of it, it issued a call too small to finish.
             left = read.remaining()
             if left is None or left < floor:
+                if _page and len(failures) == failures_before:
+                    # Pages were read and no call failed: the PR's evidence is too
+                    # large to read in this budget. That holds on every attempt, so
+                    # it is NOT on the transient allowlist (it keeps asking).
+                    return None, "graphql_read_budget_pages"
                 return None, "graphql_read_timeout"
             argv = [
                 "gh",
@@ -1109,9 +1220,20 @@ def _evaluate_pr_inner(
             for item in pending:
                 if item in cursors:
                     argv += ["-f", f"after_{item}={cursors[item]}"]
-            rc, raw, _ = run(argv, min(8.0, left))
+            rc, raw, err = run(argv, min(8.0, left))
             if rc != 0:
-                return None, "graphql_unreadable"
+                failures.append(_gh_failure_class(err))
+                # One retry: a single failed read used to decide the whole
+                # result, which surfaced as an "unreadable history" prompt for
+                # PRs a later read handled fine. Only while the read budget
+                # still covers a useful call.
+                left = read.remaining()
+                if left is None or left < floor:
+                    return None, "graphql_unreadable"
+                rc, raw, err = run(argv, min(8.0, left))
+                if rc != 0:
+                    failures.append(_gh_failure_class(err))
+                    return None, "graphql_unreadable"
             try:
                 payload = json.loads(raw)
                 # gh exits non-zero on an `errors` response, including one that
@@ -1192,7 +1314,7 @@ def _evaluate_pr_inner(
     if needed or test_head is None:
         first, error = snapshot(needed)
         if error or first is None:
-            return _unknown(error or "graphql_unreadable", current_head=test_head or "")
+            return unknown(error or "graphql_unreadable", current_head=test_head or "")
         if test_head is None:
             test_head = str(first["head"]).strip()
 
@@ -1208,7 +1330,7 @@ def _evaluate_pr_inner(
         fetched[item] = rows or []
 
     if first is not None and "files" in needed and first.get("path_changed"):
-        rc, raw, _ = run(
+        rc, raw, err = run(
             [
                 "gh",
                 "api",
@@ -1220,7 +1342,8 @@ def _evaluate_pr_inner(
             8,
         )
         if rc != 0:
-            return _unknown("files_unreadable", current_head=test_head)
+            failures.append(_gh_failure_class(err))
+            return unknown("files_unreadable", current_head=test_head)
         rows, error = _json_lines(raw, "files")
         if error:
             return _unknown(error, current_head=test_head)
@@ -1250,7 +1373,7 @@ def _evaluate_pr_inner(
         if error or second is None:
             if error == "graphql_unreadable":
                 error = "final_head_unreadable"
-            return _unknown(error or "final_head_unreadable", current_head=test_head)
+            return unknown(error or "final_head_unreadable", current_head=test_head)
         if final_head is None:
             final_head = str(second["head"]).strip()
     if final_head != test_head:
@@ -1309,8 +1432,11 @@ def evaluate_pr(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """
     try:
         return _evaluate_pr_inner(*args, **kwargs)
-    except _BudgetExhausted:
-        return _unknown("lookup_budget_exhausted")
+    except _BudgetExhausted as exc:
+        # The classes of calls that failed before the stop travel with it: a
+        # persistent one (auth, not_found) must keep the result non-transient.
+        recorded = exc.args[0] if exc.args else []
+        return _unknown("lookup_budget_exhausted", *recorded)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
