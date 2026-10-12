@@ -93,5 +93,6 @@ install_browser_extra() {
     # browser-stack unit marks it itself). Best effort: a fresh install has no cache.
     "$venv_path/bin/python" -m genesis.browser.provision mark-legacy 2>/dev/null || true
     editable_install_guarded "$repo_dir" "$venv_path" browser || return 1
-    "$venv_path/bin/python" -m genesis.browser.provision check-packages
+    # The checkout's ranges, not the installed metadata a failed pip left behind.
+    "$venv_path/bin/python" -m genesis.browser.provision check-packages --pyproject "$repo_dir/pyproject.toml"
 }

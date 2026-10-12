@@ -1,5 +1,5 @@
 """genesis.browser.provision: the unattended oneshot that installs the Camoufox engine
-the installed package pairs with, patchright's Chromium, and their system libraries.
+the installed package pairs with, the Chromium the fallback launches, and their system libraries.
 
 Every external effect goes through a recording fake runner and module seams; nothing
 downloads, nothing runs sudo, and the engine cache is a tmp dir.
@@ -7,7 +7,6 @@ downloads, nothing runs sudo, and the engine cache is a tmp dir.
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -71,15 +70,13 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(provision, "_pin_capable", lambda: True)
     monkeypatch.setattr(provision, "_explicit_choice", lambda: False)
     monkeypatch.setattr(provision, "_live_engine_in", lambda path: False)
-    monkeypatch.setattr(provision, "_live_chromium", lambda: False)
+    monkeypatch.setattr(provision, "_live_under", lambda directory: False)
+    # The fallback's Chromium, complete, where the (faked) dry-run says it is.
+    _uses(monkeypatch, tmp_path, package="playwright")
+    _layout(tmp_path)
     monkeypatch.setattr(provision, "_removed", [], raising=False)
     monkeypatch.setattr(
         provision, "_remove_version", lambda path: provision._removed.append(path) or True
-    )
-    monkeypatch.setattr(
-        provision.packages,
-        "installed_versions",
-        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": None},
     )
     return tmp_path
 
@@ -119,14 +116,15 @@ def test_low_disk_while_the_engine_is_missing_fails_visibly(env, monkeypatch):
 
 def test_low_disk_while_chromium_is_missing_fails_visibly(env, monkeypatch):
     monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
-    monkeypatch.setattr(
-        provision.packages,
-        "installed_versions",
-        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
-    )
-    monkeypatch.setattr(provision.chromium, "not_ready", lambda package, **kw: "missing")
+    _layout(env, chrome=False)  # the fallback's Chromium has lost its executable
     _resolves(monkeypatch, READY)
     assert not provision.provision(Runner()).ok
+
+
+def test_low_disk_with_everything_in_place_is_a_success(env, monkeypatch):
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
+    _resolves(monkeypatch, READY)
+    assert provision.provision(Runner()).ok
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-1", "0", "abc", ""])
@@ -138,10 +136,6 @@ def test_bad_min_free_setting_falls_back_to_the_default(monkeypatch, value):
 def test_min_free_setting_is_honoured(monkeypatch):
     monkeypatch.setenv("GENESIS_BROWSER_MIN_FREE_GB", "2.5")
     assert provision.min_free_bytes() == int(2.5 * 1024**3)
-
-
-def test_free_bytes_walks_up_to_an_existing_dir(tmp_path):
-    assert provision.free_bytes(tmp_path / "not" / "yet") > 0
 
 
 def test_a_killed_playwright_download_dir_is_cleared(env, monkeypatch):
@@ -248,23 +242,73 @@ def test_corrupt_pinned_dir_is_removed_then_fetched(env, monkeypatch):
     assert len(run.ran("camoufox fetch")) == 1 and out.ok
 
 
-@pytest.mark.parametrize(("age_days", "replaced"), [(1, False), (8, True)])
-def test_an_engine_fetched_this_week_is_not_downloaded_again(env, monkeypatch, age_days, replaced):
-    """The daily timer would otherwise repeat one run's delete-and-fetch every day
-    for an engine that installs invalid by Genesis's checks: 1.3 GB a day."""
+def _bad_engine(env, *, age_days=1):
     bad = env / "xdg" / "camoufox" / "browsers" / "official" / "156.0.1-beta.36-abc"
     bad.mkdir(parents=True)
     (bad / "version.json").write_text("{}")
     then = time.time() - age_days * 86400
     os.utime(bad / "version.json", (then, then))
-    invalid = engine.EngineStatus(engine.INVALID, "corrupt", bad / "camoufox-bin")
+    return bad, engine.EngineStatus(engine.INVALID, "corrupt", bad / "camoufox-bin")
+
+
+def test_an_engine_damaged_after_a_good_install_is_repaired(env, monkeypatch):
+    """A recent version.json says the install completed, not that the engine is
+    still whole: one damaged since (files removed) is repaired, not left a week."""
+    bad, invalid = _bad_engine(env, age_days=1)
     _resolves(monkeypatch, invalid, READY)
     run = Runner()
     out = provision.provision(run)
-    assert (provision._removed == [bad]) is replaced
-    assert len(run.ran("camoufox fetch")) == (1 if replaced else 0)
-    if not replaced:
-        assert not out.ok and any("remove it by hand" in n for n in out.notes)
+    assert provision._removed == [bad] and len(run.ran("camoufox fetch")) == 1
+    assert out.ok
+
+
+def test_after_a_fetch_that_stays_invalid_the_next_runs_do_not_fetch(env, monkeypatch):
+    """The daily timer would otherwise repeat a delete and a 1.3 GB fetch every day
+    for an engine that installs invalid by Genesis's checks."""
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid)
+    first = provision.provision(Runner())
+    assert "engine=invalid (after fetch)" in first.line()
+    provision._removed.clear()
+    run = Runner()
+    out = provision.provision(run)
+    assert run.ran("camoufox fetch") == [] and provision._removed == []
+    assert not out.ok and any("remove it by hand" in n for n in out.notes)
+
+
+def test_a_failed_fetch_is_retried_after_a_week(env, monkeypatch):
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid)
+    provision.provision(Runner())
+    real = time.time
+    monkeypatch.setattr(provision.time, "time", lambda: real() + 8 * 86400)
+    run = Runner()
+    provision.provision(run)
+    assert len(run.ran("camoufox fetch")) == 1
+
+
+def test_a_ready_engine_clears_the_failed_fetch_record(env, monkeypatch):
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid)
+    provision.provision(Runner())
+    _resolves(monkeypatch, READY)
+    provision.provision(Runner())
+    _resolves(monkeypatch, invalid, READY)
+    run = Runner()
+    provision.provision(run)
+    assert len(run.ran("camoufox fetch")) == 1  # damaged again later: repaired
+
+
+@pytest.mark.parametrize("content", ["not json", "[]", '{"x": "y"}'])
+def test_an_unreadable_record_does_not_stop_a_repair(env, monkeypatch, content):
+    record = provision._failed_fetches_path()
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(content)
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid, READY)
+    run = Runner()
+    provision.provision(run)
+    assert len(run.ran("camoufox fetch")) == 1
 
 
 def test_a_fresh_fetch_that_stays_invalid_is_not_deleted_again(env, monkeypatch):
@@ -286,7 +330,9 @@ def test_a_killed_fetchs_missing_chmod_is_finished_not_redownloaded(env, monkeyp
     (bad / "sub").mkdir(parents=True)
     (bad / "camoufox-bin").write_bytes(b"x")
     (bad / "camoufox-bin").chmod(0o644)
-    status = engine.EngineStatus(engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin")
+    status = engine.EngineStatus(
+        engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin"
+    )
     _resolves(monkeypatch, status, READY)
     run = Runner()
     out = provision.provision(run)
@@ -359,7 +405,8 @@ def test_no_browser_package_is_reported(env, monkeypatch, kind):
     _resolves(monkeypatch, engine.EngineStatus(kind, "no package"))
     run = Runner()
     out = provision.provision(run)
-    assert run.calls == [] and not out.ok
+    # Nothing camoufox-side runs; the Chromium fallback does not need camoufox.
+    assert run.ran("camoufox") == [] and not out.ok
     assert "engine=no_package" in out.line()
 
 
@@ -383,86 +430,353 @@ def test_the_flag_is_set_before_any_fetch(env, monkeypatch):
 # ── Chromium ──────────────────────────────────────────────────────────────────
 
 
-def _patchright(env, monkeypatch, *, installed=True):
-    pkg = env / "site" / "patchright"
-    (pkg / "driver" / "package").mkdir(parents=True)
-    (pkg / "driver" / "package" / "browsers.json").write_text(
-        json.dumps(
-            {
-                "browsers": [
-                    {"name": "chromium", "revision": "1194"},
-                    {"name": "chromium-headless-shell", "revision": "1194"},
-                    {"name": "firefox", "revision": "1490"},
-                ]
-            }
-        )
-    )
+def _layout(env, *, chrome=True, shell=True, marked=("chromium", "chromium-headless-shell")):
+    """Chromium as `install chromium` leaves it, at the locations the package's
+    dry-run names; ``chrome``/``shell`` say whether each executable is there."""
+    root = env / "pw"
+    dirs = {
+        "chromium": root / "chromium-1234",
+        "chromium-headless-shell": root / "chromium_headless_shell-1234",
+    }
+    exes = {
+        "chromium": dirs["chromium"] / "chrome-linux64" / "chrome",
+        "chromium-headless-shell": dirs["chromium-headless-shell"]
+        / "chrome-headless-shell-linux64"
+        / "chrome-headless-shell",
+    }
+    for build, present in (("chromium", chrome), ("chromium-headless-shell", shell)):
+        exes[build].parent.mkdir(parents=True, exist_ok=True)
+        if present:
+            exes[build].write_bytes(b"\x7fELF")
+            exes[build].chmod(0o755)
+        else:
+            exes[build].unlink(missing_ok=True)
+        if build in marked:
+            (dirs[build] / "INSTALLATION_COMPLETE").write_text("")
+    return dirs, exes
+
+
+def _uses(monkeypatch, env, package="patchright"):
+    """The installed packages, and the locations that package's dry-run names."""
     monkeypatch.setattr(
-        provision.chromium, "package_dir", lambda name: pkg if name == "patchright" else None
-    )
-    monkeypatch.setattr(
-        provision.packages,
+        provision.chromium.packages,
         "installed_versions",
         lambda: {
             "camoufox": "0.5.8",
             "playwright": "1.62.0",
-            "patchright": "1.62.3" if installed else None,
+            "patchright": "1.62.3" if package == "patchright" else None,
         },
     )
-    return env / "xdg" / "ms-playwright"
+    asked = []
+
+    def locations(pkg, *, run=None):
+        asked.append(pkg)
+        return {
+            "chromium": ("1234", env / "pw" / "chromium-1234"),
+            "chromium-headless-shell": ("1234", env / "pw" / "chromium_headless_shell-1234"),
+        }
+
+    monkeypatch.setattr(provision.chromium, "locations", locations)
+    return asked
 
 
-def _complete(browsers: Path, *names):
-    for name in names:
-        (browsers / name).mkdir(parents=True, exist_ok=True)
-        (browsers / name / "INSTALLATION_COMPLETE").write_text("")
-
-
-def test_chromium_is_skipped_without_patchright(env, monkeypatch):
-    _resolves(monkeypatch, READY)
-    run = Runner()
-    out = provision.provision(run)
-    assert run.ran("patchright") == []
-    assert "chromium=skipped" in out.line() and out.ok
-
-
-def test_chromium_is_installed_and_confirmed(env, monkeypatch):
-    browsers = _patchright(env, monkeypatch)
+def test_chromium_is_installed_for_the_package_the_fallback_launches(env, monkeypatch):
+    """Without patchright the fallback launches playwright's Chromium, so that is the
+    one the stack installs (round-1 P1: it used to skip and report success)."""
+    asked = _uses(monkeypatch, env, package="playwright")
     _resolves(monkeypatch, READY)
     run = Runner()
 
     def install(argv, **kw):
-        if "patchright install chromium" in " ".join(argv):
-            _complete(browsers, "chromium-1194", "chromium_headless_shell-1194")
-        return Runner.__call__(run, argv, **kw)
+        if argv[1:4] == ["-m", "playwright", "install"]:
+            _layout(env)
+        return run(argv, **kw)
 
     out = provision.provision(install)
-    ((argv, kw),) = run.ran("patchright install chromium")
-    assert argv[:3] == [sys.executable, "-m", "patchright"]
+    assert asked == ["playwright"]
+    ((argv, kw),) = run.ran("-m playwright install chromium")
+    assert argv == [sys.executable, "-m", "playwright", "install", "chromium"]
     assert kw["env"]["TMPDIR"] == str(env / "bigtmp" / "browser-stack")
-    assert "PLAYWRIGHT_SKIP_BROWSER_GC" not in kw["env"]
-    assert "chromium=1194" in out.line() and out.ok
+    assert "chromium=1234" in out.line() and out.ok
+
+
+def test_patchright_is_used_whenever_it_is_installed(env, monkeypatch):
+    asked = _uses(monkeypatch, env, package="patchright")
+    _layout(env)
+    _resolves(monkeypatch, READY)
+    run = Runner()
+    out = provision.provision(run)
+    assert asked == ["patchright"] and run.ran("-m patchright install chromium")
+    assert out.ok
+
+
+def test_no_playwright_family_package_skips_chromium(env, monkeypatch):
+    monkeypatch.setattr(provision.chromium, "launch_package", lambda: None)
+    _resolves(monkeypatch, READY)
+    run = Runner()
+    out = provision.provision(run)
+    assert run.ran("install chromium") == []
+    assert "chromium=skipped (no package)" in out.line() and out.ok
+
+
+def test_both_builds_must_have_their_executable(env, monkeypatch):
+    _uses(monkeypatch, env)
+    _layout(env, shell=False)  # marked complete, the headless shell's binary gone
+    _resolves(monkeypatch, READY)
+    out = provision.provision(Runner())
+    assert "chromium=missing" in out.line() and not out.ok
+    assert any("no executable" in n for n in out.notes)
+
+
+def test_a_marked_build_without_its_executable_is_force_reinstalled(env, monkeypatch):
+    """A plain install skips a directory that has its marker; upstream's --force
+    re-downloads it under the installer's own lock."""
+    _uses(monkeypatch, env)
+    _layout(env, chrome=False)
+    _resolves(monkeypatch, READY)
+    run = Runner()
+
+    def install(argv, **kw):
+        if "--force" in argv:
+            _layout(env)
+        return run(argv, **kw)
+
+    out = provision.provision(install)
+    forced = run.ran("--force")
+    assert [a[3:] for a, _ in forced] == [["install", "--force", "--no-shell", "chromium"]]
+    assert out.ok
+
+
+def test_a_broken_headless_shell_is_forced_on_its_own(env, monkeypatch):
+    _uses(monkeypatch, env)
+    _layout(env, shell=False)
+    _resolves(monkeypatch, READY)
+    run = Runner()
+    provision.provision(run)
+    assert [a[3:] for a, _ in run.ran("--force")] == [
+        ["install", "--force", "chromium-headless-shell"]
+    ]
+
+
+def test_a_build_a_live_browser_runs_from_is_not_forced(env, monkeypatch):
+    dirs, _ = _layout(env, chrome=False)
+    _uses(monkeypatch, env)
+    monkeypatch.setattr(provision, "_live_under", lambda d: d == dirs["chromium"])
+    _resolves(monkeypatch, READY)
+    run = Runner()
+    out = provision.provision(run)
+    assert run.ran("--force") == [] and not out.ok
+    assert any("running" in n for n in out.notes)
 
 
 def test_a_live_chromium_turns_off_browser_gc(env, monkeypatch):
     """Playwright's install deletes revisions it considers unused; one a live browser
     runs from must stay."""
-    browsers = _patchright(env, monkeypatch)
-    _complete(browsers, "chromium-1194", "chromium_headless_shell-1194")
-    monkeypatch.setattr(provision, "_live_chromium", lambda: True)
+    _uses(monkeypatch, env)
+    _layout(env)
+    monkeypatch.setattr(provision, "_live_under", lambda d: d == env / "pw")
     _resolves(monkeypatch, READY)
     run = Runner()
     provision.provision(run)
-    ((_, kw),) = run.ran("patchright install chromium")
+    ((_, kw),) = run.ran("install chromium")
     assert kw["env"]["PLAYWRIGHT_SKIP_BROWSER_GC"] == "1"
 
 
-def test_an_unfinished_chromium_install_is_missing(env, monkeypatch):
-    browsers = _patchright(env, monkeypatch)
-    _complete(browsers, "chromium-1194")  # the headless shell never finished
+def test_no_live_chromium_leaves_browser_gc_on(env, monkeypatch):
+    _uses(monkeypatch, env)
+    _layout(env)
     _resolves(monkeypatch, READY)
-    out = provision.provision(Runner())
-    assert "chromium=missing" in out.line() and not out.ok
+    run = Runner()
+    provision.provision(run)
+    ((_, kw),) = run.ran("install chromium")
+    assert "PLAYWRIGHT_SKIP_BROWSER_GC" not in kw["env"]
+
+
+def test_an_unknown_chromium_layout_is_not_ok(env, monkeypatch):
+    def locations(pkg, *, run=None):
+        raise provision.chromium.ChromiumLayoutUnknown("dry-run named no build")
+
+    monkeypatch.setattr(provision.chromium, "locations", locations)
+    _resolves(monkeypatch, READY)
+    run = Runner()
+    out = provision.provision(run)
+    assert "chromium=unknown" in out.line() and not out.ok
+    assert run.ran("install chromium") == []
+    assert any("no build" in n for n in out.notes)
+
+
+def test_a_corrupt_chromium_executable_is_force_reinstalled_once(env, monkeypatch):
+    """ldd cannot read it (a truncated file): marker and file are there, so only
+    --force replaces it."""
+    _uses(monkeypatch, env)
+    _, exes = _layout(env)
+    _resolves(monkeypatch, READY)
+    run = Runner({f"ldd {exes['chromium']}": (1, "\tnot a dynamic executable\n")})
+    out = provision.provision(run)
+    assert [a[3:] for a, _ in run.ran("--force")] == [
+        ["install", "--force", "--no-shell", "chromium"]
+    ]
+    assert "libs=error" in out.line() and not out.ok
+
+
+# ── which processes run from a directory ──────────────────────────────────────
+
+
+def _proc(tmp_path, monkeypatch, entries):
+    """A fake /proc: {pid: (uid, exe or PermissionError, argv0 or OSError)}."""
+    root = tmp_path / "proc"
+    links = {}
+    for pid, (uid, exe, argv0) in entries.items():
+        d = root / str(pid)
+        d.mkdir(parents=True)
+        links[str(d / "exe")] = exe
+        if isinstance(argv0, str):
+            (d / "cmdline").write_bytes(argv0.encode() + b"\0--flag\0")
+        else:  # a cmdline this user may not read
+            (d / "cmdline").write_bytes(b"")
+            (d / "cmdline").chmod(0)
+        os.chmod(d, 0o755)
+        monkeypatch.setitem(_UIDS, str(d), uid)
+
+    real_readlink = os.readlink
+
+    def readlink(path, *a, **kw):
+        value = links.get(str(path))
+        if value is None:
+            return real_readlink(path, *a, **kw)
+        if isinstance(value, type) and issubclass(value, BaseException):
+            raise value(13, "denied")
+        return value
+
+    monkeypatch.setattr(provision, "_PROC", root)
+    monkeypatch.setattr(provision.os, "readlink", readlink)
+    monkeypatch.setattr(provision, "_owner", lambda d: _UIDS[str(d)])
+    return root
+
+
+_UIDS: dict[str, int] = {}
+
+
+def test_live_under_reads_each_processes_executable(tmp_path, monkeypatch):
+    me = os.getuid()
+    target = tmp_path / "pw" / "chromium-1234"
+    _proc(tmp_path, monkeypatch, {10: (me, str(target / "chrome-linux64" / "chrome"), "chrome")})
+    assert provision._live_under(target) is True
+    assert provision._live_under(tmp_path / "pw" / "chromium-1100") is False
+
+
+def test_a_deleted_executable_still_counts(tmp_path, monkeypatch):
+    target = tmp_path / "pw" / "chromium-1234"
+    exe = f"{target}/chrome-linux64/chrome (deleted)"
+    _proc(tmp_path, monkeypatch, {10: (os.getuid(), exe, "x")})
+    assert provision._live_under(target) is True
+
+
+def test_an_unreadable_executable_falls_back_to_its_command_line(tmp_path, monkeypatch):
+    """MEASURED: 12 of 108 of this user's processes (systemd, gpg-agent, tmux) deny
+    the exe link and allow cmdline; counting them as live would make every check
+    true for good."""
+    target = tmp_path / "pw" / "chromium-1234"
+    me = os.getuid()
+    _proc(
+        tmp_path,
+        monkeypatch,
+        {
+            10: (me, PermissionError, "/usr/lib/systemd/systemd"),
+            11: (me, PermissionError, "tmux"),
+        },
+    )
+    assert provision._live_under(target) is False
+
+
+def test_a_command_line_under_the_directory_counts(tmp_path, monkeypatch):
+    target = tmp_path / "pw" / "chromium-1234"
+    _proc(
+        tmp_path,
+        monkeypatch,
+        {10: (os.getuid(), PermissionError, f"{target}/chrome-linux64/chrome")},
+    )
+    assert provision._live_under(target) is True
+
+
+def test_a_process_that_reads_as_nothing_counts_as_live(tmp_path, monkeypatch):
+    target = tmp_path / "pw" / "chromium-1234"
+    _proc(tmp_path, monkeypatch, {10: (os.getuid(), PermissionError, PermissionError)})
+    assert provision._live_under(target) is True
+
+
+def test_other_users_processes_are_not_counted(tmp_path, monkeypatch):
+    target = tmp_path / "pw" / "chromium-1234"
+    _proc(tmp_path, monkeypatch, {10: (os.getuid() + 1, str(target / "x" / "chrome"), "chrome")})
+    assert provision._live_under(target) is False
+
+
+# ── free space on every destination ───────────────────────────────────────────
+
+
+def test_every_destination_must_have_room(env, monkeypatch):
+    """The engine lands in the camoufox cache and its download in the temp dir;
+    either filesystem may be the short one."""
+    temp = env / "bigtmp" / "browser-stack"
+    monkeypatch.setattr(provision, "disk_device", lambda path: str(path))  # separate filesystems
+    monkeypatch.setattr(
+        provision, "free_bytes", lambda path: 1 * 1024**3 if Path(path) == temp else 100 * 1024**3
+    )
+    _resolves(monkeypatch, MISSING)
+    run = Runner()
+    out = provision.provision(run)
+    # Nothing downloaded and the engine is missing: not a success (see
+    # test_low_disk_while_chromium_is_missing_fails_visibly).
+    assert not out.ok and run.ran("camoufox fetch") == []
+    assert "low disk" in out.line() and str(temp) in out.line()
+
+
+def test_chromiums_destination_must_have_room(env, monkeypatch):
+    _uses(monkeypatch, env)
+    _layout(env, chrome=False, marked=("chromium-headless-shell",))  # chromium is due
+    monkeypatch.setattr(provision, "disk_device", lambda path: str(path))
+    monkeypatch.setattr(
+        provision,
+        "free_bytes",
+        lambda path: 1 * 1024**3 if Path(path) == env / "pw" else 100 * 1024**3,
+    )
+    _resolves(monkeypatch, READY)
+    run = Runner()
+    out = provision.provision(run)
+    assert run.ran("install chromium") == []
+    assert "chromium=skipped (low disk" in out.line() and not out.ok
+
+
+def test_a_destination_that_cannot_be_measured_skips(env, monkeypatch):
+    monkeypatch.setattr(provision, "free_bytes", lambda path: None)
+    _resolves(monkeypatch, MISSING)
+    run = Runner()
+    out = provision.provision(run)
+    assert run.calls == [] and "cannot measure" in out.line()
+
+
+def test_free_bytes_is_the_effective_headroom(monkeypatch, tmp_path):
+    monkeypatch.setattr(provision, "effective_free_bytes", lambda path: 42)
+    assert provision.free_bytes(tmp_path) == 42
+
+
+# ── one time budget for the whole run ─────────────────────────────────────────
+
+
+def test_each_step_gets_what_is_left_of_the_units_budget(env, monkeypatch):
+    """TimeoutStartSec covers the whole run, so a slow fetch shortens what the later
+    steps may take instead of letting systemd kill the run mid-install."""
+    _uses(monkeypatch, env)
+    _layout(env)
+    clock = iter([0.0, 0.0] + [25000.0] * 6)
+    monkeypatch.setattr(provision.time, "monotonic", lambda: next(clock, 25000.0))
+    _resolves(monkeypatch, MISSING, READY)
+    run = Runner()
+    provision.provision(run)
+    ((_, fetch),) = run.ran("camoufox fetch")
+    ((_, install),) = run.ran("install chromium")
+    assert fetch["timeout"] == provision.STEP_TIMEOUT_S
+    assert install["timeout"] == provision.RUN_BUDGET_S - 25000
 
 
 # ── system libraries ──────────────────────────────────────────────────────────
@@ -503,7 +817,9 @@ def test_a_symlinked_version_dir_is_never_changed(env, monkeypatch, tmp_path):
     browsers.mkdir(parents=True)
     (browsers / "156.0.1-beta.36-abc").symlink_to(outside)
     bad = browsers / "156.0.1-beta.36-abc"
-    status = engine.EngineStatus(engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin")
+    status = engine.EngineStatus(
+        engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin"
+    )
     _resolves(monkeypatch, status)
     run = Runner()
     provision.provision(run)
@@ -513,7 +829,9 @@ def test_a_symlinked_version_dir_is_never_changed(env, monkeypatch, tmp_path):
 def test_chmod_that_cannot_help_stops(env, monkeypatch):
     bad = env / "xdg" / "camoufox" / "browsers" / "official" / "156.0.1-beta.36-abc"
     bad.mkdir(parents=True)
-    status = engine.EngineStatus(engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin")
+    status = engine.EngineStatus(
+        engine.INVALID, f"{bad}/camoufox-bin is not executable", bad / "camoufox-bin"
+    )
     _resolves(monkeypatch, status, status, status)
     run = Runner()
     out = provision.provision(run)
@@ -536,7 +854,14 @@ def test_a_failing_extras_step_keeps_the_engine_result(env, monkeypatch):
 def test_a_too_old_glibc_is_not_sent_to_install_deps(env, monkeypatch):
     status = _engine_on_disk(env)
     _resolves(monkeypatch, status)
-    run = Runner({"ldd": (0, "libxul.so: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by libxul.so)\n")})
+    run = Runner(
+        {
+            "ldd": (
+                0,
+                "libxul.so: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by libxul.so)\n",
+            )
+        }
+    )
     out = provision.provision(run)
     assert "libs=glibc-too-old:" in out.line() and run.ran("install-deps") == []
 
@@ -552,6 +877,7 @@ def test_a_ready_engine_gets_camoufoxs_own_addon_and_model_installers(env, monke
 
 def test_no_binary_to_check_is_unchecked_not_ok(env, monkeypatch):
     monkeypatch.setattr(provision, "_pin_capable", lambda: False)
+    monkeypatch.setattr(provision.chromium, "launch_package", lambda: None)
     _resolves(monkeypatch, MISSING)
     out = provision.provision(Runner())
     assert "libs=unchecked" in out.line()
@@ -784,3 +1110,172 @@ def test_main_exits_nonzero_when_not_ok(env, monkeypatch):
     _resolves(monkeypatch, MISSING, MISSING)
     monkeypatch.setattr(provision.subprocess, "run", Runner())
     assert provision.main(["run"]) == 1
+
+
+def test_check_packages_without_packaging_checks_presence_and_notes_it(env, monkeypatch, capsys):
+    """Not being able to read the version ranges is not a range violation: a venv
+    without `packaging` must not report a correctly installed extra as incomplete."""
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+
+    def no_packaging(pyproject=None):
+        raise ModuleNotFoundError("No module named 'packaging'")
+
+    monkeypatch.setattr(provision, "_browser_requirements", no_packaging)
+    assert provision.main(["check-packages"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "" and "version ranges" in captured.err
+
+
+def test_check_packages_reads_the_extra_from_the_checkout_not_stale_metadata(
+    env, monkeypatch, capsys, tmp_path
+):
+    """A pip run that fails before writing metadata leaves the OLD extra's ranges on
+    disk; the checkout's pyproject.toml holds the ones this install asked for."""
+    _metadata(monkeypatch, ['playwright>=1.40; extra == "browser"'])
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "genesis-v3"\n[project.optional-dependencies]\n'
+        'browser = ["camoufox>=0.5.7,<0.6", "playwright>=1.62,<1.63", "patchright>=1.62.1,<1.63"]\n'
+        'voice = ["openai>=2"]\n'
+    )
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.60.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(provision, "_pin_capable", lambda: True)
+    assert provision.main(["check-packages", "--pyproject", str(pyproject)]) == 1
+    assert "playwright 1.60.0 is outside" in capsys.readouterr().out
+
+
+def test_check_packages_with_an_unreadable_pyproject_says_so(env, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(provision, "_pin_capable", lambda: True)
+    missing = tmp_path / "missing.toml"
+    assert provision.main(["check-packages", "--pyproject", str(missing)]) == 1
+    out = capsys.readouterr().out
+    assert "could not be read" in out and str(missing) in out
+
+
+def test_a_checkout_requirement_whose_marker_fails_here_is_not_checked(
+    env, monkeypatch, capsys, tmp_path
+):
+    """pip skips a requirement whose environment marker is false on this host, so
+    the check must too, or it reports a package pip was right not to install."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "genesis-v3"\n[project.optional-dependencies]\n'
+        'browser = ["camoufox>=0.5.7,<0.6", "playwright>=1.62,<1.63", '
+        '"patchright>=1.62.1,<1.63", "playwright>=9; python_version < \'3\'"]\n'
+    )
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(provision, "_pin_capable", lambda: True)
+    assert provision.main(["check-packages", "--pyproject", str(pyproject)]) == 0, (
+        capsys.readouterr().out
+    )
+
+
+# ── review fixes ──────────────────────────────────────────────────────────────
+
+
+def test_a_forced_reinstall_that_fails_is_not_reported_ready(env, monkeypatch):
+    """Upstream's --force removes the build before it downloads; a failed download
+    leaves no build at all (coreBundle.js), and that is not ready."""
+    import shutil as _shutil
+
+    _uses(monkeypatch, env)
+    dirs, exes = _layout(env)
+    _resolves(monkeypatch, READY)
+    run = Runner({f"ldd {exes['chromium-headless-shell']}": (1, "\tnot a dynamic executable\n")})
+
+    def install(argv, **kw):
+        if "--force" in argv:
+            _shutil.rmtree(dirs["chromium-headless-shell"])
+            return subprocess.CompletedProcess(argv, 1, "", "download failed")
+        return run(argv, **kw)
+
+    out = provision.provision(install)
+    assert "chromium=missing" in out.line() and not out.ok
+
+
+def test_a_forced_reinstall_keeps_browser_gc_off_while_a_browser_runs(env, monkeypatch):
+    """Every install, --force included, deletes revisions Playwright thinks unused
+    unless told not to."""
+    _uses(monkeypatch, env)
+    _layout(env, chrome=False)
+    monkeypatch.setattr(provision, "_live_under", lambda d: d == env / "pw")
+    _resolves(monkeypatch, READY)
+    run = Runner()
+    provision.provision(run)
+    for _, kw in run.ran("install"):
+        assert kw["env"].get("PLAYWRIGHT_SKIP_BROWSER_GC") == "1"
+
+
+def test_a_fetch_needs_room_for_itself_above_the_floor(env, monkeypatch):
+    """The engine (about 1.3 GB unpacked) and its download (about as much) land on
+    top of the floor; the floor alone would let the fetch take the disk below it."""
+    free = 5 * 1024**3  # above the 4 GB floor, short of floor + engine + archive
+    monkeypatch.setattr(provision, "free_bytes", lambda path: free)
+    _resolves(monkeypatch, MISSING)
+    run = Runner()
+    out = provision.provision(run)
+    assert run.ran("camoufox fetch") == []
+    # The engine is missing and nothing was fetched: not a success, or the daily
+    # timer would repeat the skip as one.
+    assert "engine=skipped (low disk" in out.line() and not out.ok
+
+
+def test_a_ready_engine_needs_no_room_for_a_fetch(env, monkeypatch):
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 5 * 1024**3)
+    _resolves(monkeypatch, READY)
+    out = provision.provision(Runner())
+    assert "engine=Camoufox" in out.line()
+
+
+def test_ldd_missing_does_not_count_against_chromium(env, monkeypatch):
+    _uses(monkeypatch, env)
+    _layout(env)
+    _resolves(monkeypatch, READY)
+
+    def run(argv, **kw):
+        if argv[0] == "ldd":
+            raise FileNotFoundError("ldd")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    out = provision.provision(run)
+    assert "chromium=1234" in out.line()
+    assert "libs=error" in out.line() and not out.ok
+
+
+def test_writes_to_one_filesystem_are_summed(env, monkeypatch):
+    """The engine and its archive on the same disk need room for both at once."""
+    monkeypatch.setattr(provision, "disk_device", lambda path: "one-disk")
+    floor = provision.min_free_bytes()
+    just_one = floor + provision._ENGINE_BYTES + 1
+    monkeypatch.setattr(provision, "free_bytes", lambda path: just_one)
+    assert "low disk" in provision._room_to_fetch()
+    monkeypatch.setattr(provision, "disk_device", lambda path: str(path))
+    assert provision._room_to_fetch() is None
+
+
+def test_an_installed_chromium_needs_no_room_for_an_install(env, monkeypatch):
+    """A re-run with everything in place downloads nothing, so it must not be
+    skipped for lack of room a download would need."""
+    _uses(monkeypatch, env)
+    _layout(env)
+    monkeypatch.setattr(provision, "free_bytes", lambda path: provision.min_free_bytes() + 1)
+    _resolves(monkeypatch, READY)
+    out = provision.provision(Runner())
+    assert "chromium=1234" in out.line() and out.ok

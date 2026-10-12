@@ -498,6 +498,12 @@ def _patchright_installed() -> bool:
 
 
 _warned_no_patchright = False
+# The browser extra carries patchright, pinned beside the playwright it pairs with.
+_PATCHRIGHT_STEP = engine.PACKAGE_HINT
+
+
+class PatchrightBroken(ImportError):
+    """patchright is installed but cannot be imported; the message is the repair."""
 
 
 def _chromium_package() -> str:
@@ -511,7 +517,7 @@ def _chromium_package() -> str:
         logger.warning(
             "patchright is not installed; the Chromium fallback uses plain Playwright, "
             "which sites can detect. Operator step: %s",
-            engine.PACKAGE_HINT,
+            _PATCHRIGHT_STEP,
         )
     return "playwright"
 
@@ -521,7 +527,13 @@ def _chromium_async_playwright(package: str):
     fails is re-raised: switching silently to the detectable Chromium would hide
     the broken install."""
     if package == "patchright":
-        from patchright.async_api import async_playwright
+        try:
+            from patchright.async_api import async_playwright
+        except ImportError as exc:
+            raise PatchrightBroken(
+                f"patchright is installed but cannot be imported ({exc}); tell the user; "
+                f"operator step: reinstall it ({_PATCHRIGHT_STEP})"
+            ) from exc
     else:
         from playwright.async_api import async_playwright
     return async_playwright
@@ -547,22 +559,23 @@ async def _ensure_chromium_fallback():
         package = _chromium_package()
         packages.check_loaded_browser_modules((package,))
         async_playwright = _chromium_async_playwright(package)
-        # Before anything starts: Playwright's own error for a missing browser tells
-        # the reader to run `<package> install`, a download no session may start.
-        missing = chromium.not_ready(package)
-        if missing:
-            raise chromium.ChromiumNotReady(missing)
-
-        await asyncio.to_thread(
-            profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, package
-        )
-        _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-
-        # Always headed — Xvfb :99 is always running.
+        # Always headed — Xvfb :99 is always running. Set before the driver starts:
+        # it copies the environment then, and the browser inherits the driver's.
         os.environ["DISPLAY"] = _VNC_DISPLAY
-
         pw = await async_playwright().start()
         try:
+            # Before the profile copy and the launch: Playwright's own error for a
+            # missing browser tells the reader to run `<package> install`, a download
+            # no session may start. Judged where the driver itself will launch from.
+            missing = chromium.not_ready_at(package, "chromium", pw.chromium.executable_path)
+            if missing:
+                raise chromium.ChromiumNotReady(missing)
+
+            await asyncio.to_thread(
+                profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, package
+            )
+            _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
             ctx = await pw.chromium.launch_persistent_context(
                 user_data_dir=str(_CHROMIUM_PROFILE_DIR),
                 headless=False,
@@ -3191,6 +3204,12 @@ async def _impl_browser_navigate(
     except chromium.ChromiumNotReady as e:
         return {"error": f"Chromium is not ready: {e}"}
     except packages.BrowserPackagesChanged as e:
+        return {"error": str(e)}
+    except PatchrightBroken as e:
+        # Restarting comes first when a package changed under this session, as for
+        # any import error; otherwise the message is patchright's own repair.
+        if packages.packages_changed_message():
+            return {"error": packages.import_error_message(e)}
         return {"error": str(e)}
     except ImportError as e:
         return {"error": packages.import_error_message(e)}
