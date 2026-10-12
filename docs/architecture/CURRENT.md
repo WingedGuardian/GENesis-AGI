@@ -1469,11 +1469,26 @@ verified: 4ab8bf71c026 2026-10-10
   All `/v1` bearer reads go through `genesis.env.bearer_token`. Text-only, and an
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
-- **browser/**: profile/state layer only (persistent
-  `~/.genesis/browser-profile`, `BrowserLayer` enum (the navigate result's
-  `layer` values, numbered as in `mcp/health/browser.py`), pgrep patterns as
-  the single source of process detection). The automation TOOLS live in
-  `mcp/health/browser.py`.
+- **browser/**: profile/state layer (`profile.py` reads and clears
+  cookies in BOTH local profiles, `~/.genesis/camoufox-profile` and
+  `~/.genesis/browser-profile`, matching domains by whole label and refusing to
+  edit a profile another process has open; the cookie tools use the live
+  browser context instead when this process runs that browser),
+  `BrowserLayer` enum (the navigate result's `layer` values, numbered as in
+  `mcp/health/browser.py`), pgrep patterns as the single source of process
+  detection, plus two launch guards:
+  `engine.py` resolves the Camoufox binary every launch passes as
+  `executable_path` (camoufox's own read-only selection; never its in-launch
+  delete-and-download), also asked by the `browser_automation` capability in a
+  subprocess; `packages.py` refuses a launch on browser modules pip replaced
+  under the process. The automation TOOLS live in `mcp/health/browser.py`: each layer
+  (Camoufox, Chromium, remote CDP, TinyFish) has its own idle clock and
+  cleanup, so a stale-page restart or the 1 h idle reclaim of one layer never
+  touches another (TinyFish included: leaving it does not end its paid
+  session, which bills until its own idle reclaim); a click that opens a new
+  tab switches the tools to it. `browser_fill` refuses a payment card number
+  as the value and `browser_run_js` one in its script (the value check only:
+  telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
@@ -1676,6 +1691,16 @@ verified: 83a835e32 2026-10-08
   stabilization window, or a network outage; repeated restarts (flap) or max-restarts
   escalate to a durable owner/Telegram alert. This is why a wedged/dead surplus needs no
   `subsystem_stale` alert (§9): it is detected and self-healed here at 900s.
+  Each tick also reads the container's `io.pressure`; above full avg10 25% it
+  logs, besides the pressure line, the top in-container processes by current
+  I/O rate with their systemd units and, for a process under a Claude Code
+  session, that session's `claude` pid (`_log_io_culprits`, a 1 s sample
+  through the shared `genesis.util.proc_io` sampler the Guardian's recovery
+  also uses). The line carries the summed in-container rate as its
+  denominator: a small total during a stall points outside what the container
+  can see (the host, a process owned by another user, or I/O byte counters
+  miss, such as fsync storms and swap). Unreadable processes are counted, and
+  command lines are never logged.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
@@ -3087,8 +3112,9 @@ verified: ba9dd8a37 2026-10-09
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;
-  `python -m genesis.trash list|restore`. Callers: cognitive rollback and the
-  orphan task-worktree reset (`docs/reference/trash.md`). Stdlib only.
+  `python -m genesis.trash list|restore`. Callers: cognitive rollback, the
+  orphan task-worktree reset, and the dashboard's file-browser and memory-file
+  deletes (`docs/reference/trash.md`). Stdlib only.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the
@@ -3287,7 +3313,12 @@ verified: ba9dd8a37 2026-10-09
   only pulse and reads as never-having-run (false green).
 - **security/**: prompt-injection defense + outbound scanning — sanitizer is
   LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
-  `output_scanner` = deterministic outbound secrets/IP scan; `skill_scan`
+  `output_scanner` = deterministic outbound secrets/IP scan (a payment card
+  number is a critical finding); `card_shapes` = the one payment-card-number
+  detector (ASCII digits, alphanumeric boundary, standard groupings, brand
+  prefix + length, Luhn, UUID groups skipped; stdlib-only so scripts load it
+  by path), used by the browser tool guards, `reference_store`, reference
+  extraction and `output_scanner`; `skill_scan`
   shells to external NVIDIA SkillSpector. NOT auth or secrets storage (that's
   `runtime/init/secrets.py` + `env.py`). **`immunity.py` = the WS-3 kill
   switch + gate policy**: `gate_mode()` re-reads `config/ws3_immunity.yaml` +
@@ -3470,7 +3501,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 1109d1844 2026-10-08
+verified: 4ab8bf71c 2026-10-10
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3541,7 +3572,13 @@ verified: 1109d1844 2026-10-08
   (3) the same exact values in the `GENESIS_PRIVATE_PATTERNS` CI secret. CI is
   WARN-not-block on the broad classes (never hard-blocks a contributor's legit
   RFC1918 example); only exact-value matches hard-fail, on canonical non-fork
-  PRs. Procedure: `public-repo leak-detection design`.
+  PRs and pushes. The CI scan runs on PRs to main and pushes to main
+  (`ci.yml`, required check `leak-detector`) AND on every push to every other
+  branch (`branch-leak-scan.yml`, advisory check `branch-leak-scan`, which also
+  scans the branch's commit history with gitleaks), so a branch with no PR is
+  still scanned; both call `scripts/ci/leak_scan.sh`. Scan logs name
+  `path:line` only, never the matched text.
+  Procedure: `public-repo leak-detection design`.
 - **bookmark/**: two-tier session bookmarks stored as episodic memories +
   a lookup table; enrichment runs on surplus compute.
 - **workflows/**: YAML DAG executor — GROUNDWORK(workflow-engine), built with
