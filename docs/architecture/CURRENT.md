@@ -1476,7 +1476,15 @@ verified: 637f7f7bb679 2026-10-05
   fallback, `profile_backup.py` copies the profile to
   `<profile>.pre-v<version>-<time>` when a different browser build is about to
   open it (the profile's own record against the engine's; caches and locks left
-  out; a copy the profile changed under is discarded; never blocks the launch).
+  out, launch locks only at the profile root; a copy the profile changed under is
+  discarded, and so is one whose own record is not the version its label names;
+  a copy whose files still match the profile's makes a second copy unnecessary,
+  so a launch that never opened the profile makes no second one; a lock beside
+  the profile makes concurrent sessions copy once; a copy never moves the disk
+  into the disk guardian's ORANGE or RED tier, judged by the guardian's own
+  `dg_floor_tier` through `util/disk_headroom.py`, though a disk already ORANGE
+  still gets one; never stops the launch, though a launch waits up to 10 minutes
+  for another session's copy of the same profile).
   `scripts/browser.py` launches without a copy. `scripts/disk_hygiene.sh` keeps
   the newest copy per profile, and the newest per version for 90 days. The automation TOOLS live in
   `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,

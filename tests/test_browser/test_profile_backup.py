@@ -24,6 +24,12 @@ FF_LAST = "135.0.1-beta.24_20250315105650"
 FF_NEW = "156.0.1-beta.36_20260901000000"
 
 
+@pytest.fixture(autouse=True)
+def _roomy_disk(monkeypatch):
+    """A disk with room to spare, whatever the host's: the floor tests set their own."""
+    monkeypatch.setattr(pb, "tier_after_write", lambda _p, _n: ("green", "green"))
+
+
 def _age(p: Path, seconds: float) -> None:
     t = time.time() - seconds
     os.utime(p, (t, t), follow_symlinks=False)
@@ -232,7 +238,9 @@ def test_chromium_single_string_title(tmp_path, named):
     p = tmp_path / "browser-profile"
     p.mkdir()
     target = p if named == "self" else tmp_path / "browser-profile.pre-v1-20260101T000000"
-    proc = _spawn_titled(f"/opt/chrome/chrome --no-sandbox --user-data-dir={target} --remote-debugging-pipe")
+    proc = _spawn_titled(
+        f"/opt/chrome/chrome --no-sandbox --user-data-dir={target} --remote-debugging-pipe"
+    )
     try:
         _lock(p, "SingletonLock", f"myhost-{proc.pid}")
         assert pb.profile_in_use(p, "SingletonLock") is (named == "self")
@@ -242,7 +250,13 @@ def test_chromium_single_string_title(tmp_path, named):
 
 
 @pytest.mark.parametrize(
-    "flag", [("-profile", "{p}"), ("--profile", "{p}/"), ("--user-data-dir", "{p}"), ("--user-data-dir={p}",)]
+    "flag",
+    [
+        ("-profile", "{p}"),
+        ("--profile", "{p}/"),
+        ("--user-data-dir", "{p}"),
+        ("--user-data-dir={p}",),
+    ],
 )
 def test_flag_spellings_naming_the_profile_are_in_use(tmp_path, flag):
     p = _firefox_profile(tmp_path / "p")
@@ -315,6 +329,44 @@ def test_same_version_is_a_no_op(tmp_path):
     p = _firefox_profile(tmp_path / "p")
     assert _backup(p, FF_LAST, FF_LAST) is None
     assert _copies(p) == []
+
+
+def test_a_copy_whose_own_record_is_not_its_label_is_not_published(tmp_path, monkeypatch):
+    # Another launch opened the profile with the new build after this one read the
+    # recorded version: the copy would hold the upgraded profile under the old label.
+    p = _firefox_profile(tmp_path / "p")
+    real = pb._snapshot
+
+    def upgraded_first(profile):
+        if profile == p and FF_NEW not in (p / "compatibility.ini").read_text():
+            (p / "compatibility.ini").write_text(
+                f"[Compatibility]\nLastVersion={FF_NEW}/20260901000000\n"
+            )
+        return real(profile)
+
+    monkeypatch.setattr(pb, "_snapshot", upgraded_first)
+    dest = pb.backup_before_launch(
+        p, FF_LAST, FF_NEW, lock_name="lock", read_version=pb.firefox_profile_version
+    )
+    assert dest is None
+    assert _copies(p) == []
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_a_copy_whose_own_record_is_its_label_is_published(tmp_path):
+    p = _firefox_profile(tmp_path / "p")
+    dest = pb.backup_before_launch(
+        p, FF_LAST, FF_NEW, lock_name="lock", read_version=pb.firefox_profile_version
+    )
+    assert dest is not None and pb.firefox_profile_version(dest) == FF_LAST
+
+
+def test_both_profile_kinds_check_the_copy_against_its_label(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(pb, "backup_before_launch", lambda *a, **k: seen.append(k["read_version"]))
+    pb.backup_camoufox_profile(tmp_path / "p", tmp_path / "bin")
+    pb.backup_chromium_profile(tmp_path / "p", "playwright")
+    assert seen == [pb.firefox_profile_version, pb.chromium_profile_version]
 
 
 @pytest.mark.parametrize("make", ["missing", "empty"])
@@ -416,33 +468,39 @@ def test_in_use_profile_is_not_copied(tmp_path):
     assert _copies(p) == []
 
 
-def test_low_disk_skips_the_copy(tmp_path, monkeypatch):
-    p = _firefox_profile(tmp_path / "p")
-    usage = shutil.disk_usage(tmp_path)
-    monkeypatch.setattr(pb.shutil, "disk_usage", lambda _p: usage._replace(free=10))
-    assert _backup(p) is None
-    assert _copies(p) == []
-
-
 @pytest.mark.parametrize(
-    "total_gb,free_gb,copied",
+    "now,after,copied",
     [
-        (100, 8.5, True),  # stays above the 8% floor (8 GB)
-        (100, 8.0, False),  # would go below it
-        (20, 2.9, False),  # 8% is 1.6 GB, but the RED floor is 3 GiB
-        (20, 3.2, True),
+        ("green", "green", True),
+        ("green", "yellow", True),
+        ("yellow", "yellow", True),
+        ("yellow", "orange", False),  # the copy would page the watchdog
+        ("green", "orange", False),
+        ("orange", "orange", True),  # already there: the way back still matters
+        ("orange", "red", False),  # never into RED
+        ("red", "red", False),
     ],
 )
-def test_the_copy_never_takes_the_disk_below_the_watchdog_floor(
-    tmp_path, monkeypatch, total_gb, free_gb, copied
+def test_the_copy_never_moves_the_disk_into_orange_or_red(
+    tmp_path, monkeypatch, now, after, copied
 ):
-    """tmp_watchgod's ORANGE tier starts at 8% free (and RED at 3 GiB): a backup
-    must not be what pushes the disk there."""
+    """The disk guardian's tiers decide (owner ruling 2026-10-11): a copy may not be
+    what moves the disk into ORANGE or RED, and on a disk already ORANGE it is still
+    made unless it would reach RED, since without it a one-way upgrade is final."""
     p = _firefox_profile(tmp_path / "p")
-    gib = 1024**3
-    usage = shutil.disk_usage(tmp_path)._replace(total=int(total_gb * gib), free=int(free_gb * gib))
-    monkeypatch.setattr(pb.shutil, "disk_usage", lambda _p: usage)
+    monkeypatch.setattr(pb, "tier_after_write", lambda _p, _n: (now, after))
     assert (_backup(p) is not None) is copied
+    assert len(_copies(p)) == int(copied)
+
+
+def test_the_tier_is_judged_for_the_copy_beside_the_profile(tmp_path, monkeypatch):
+    p = _firefox_profile(tmp_path / "p")
+    seen = []
+    monkeypatch.setattr(
+        pb, "tier_after_write", lambda at, n: seen.append((at, n)) or ("green",) * 2
+    )
+    _backup(p)
+    assert seen == [(p.parent, pb._content_size(p) * pb._FREE_FACTOR)]
 
 
 def test_a_write_during_the_copy_discards_it_and_copies_again(tmp_path, monkeypatch):
@@ -648,3 +706,104 @@ def test_chromium_package_dir_never_raises(monkeypatch):
     assert pb.chromium_package_dir("no_such_package_xyz") is None
     monkeypatch.setitem(sys.modules, "stubbed_pkg_xyz", object())
     assert pb.chromium_package_dir("stubbed_pkg_xyz") is None
+
+
+# ── round 1 (#3199) ───────────────────────────────────────────────────────────
+
+
+def test_an_untiered_disk_skips_the_copy(tmp_path, monkeypatch):
+    p = _firefox_profile(tmp_path / "p")
+    monkeypatch.setattr(pb, "tier_after_write", lambda _p, _n: None)
+    assert _backup(p) is None and _copies(p) == []
+
+
+def test_a_file_dated_in_the_future_does_not_force_a_copy_per_launch(tmp_path):
+    """Freshness is the copied content, not the clock: a future-dated file must not
+    make every launch copy the unchanged profile again."""
+    p = _firefox_profile(tmp_path / "p")
+    later = time.time() + 86400
+    os.utime(p / "prefs.js", (later, later))
+    assert _backup(p) is not None
+    assert _backup(p) is None
+    assert len(_copies(p)) == 1
+
+
+def test_a_copy_is_judged_by_its_own_files(tmp_path):
+    """No record is stored: a copy whose files match the profile's (path, size,
+    mtime) is current, whenever and however it was made."""
+    p = _firefox_profile(tmp_path / "p")
+    old = tmp_path / f"p.pre-v{FF_LAST}-20260101T000000"
+    shutil.copytree(p, old, ignore=pb._ignore_for(p))
+    assert _backup(p) is None
+    (old / "prefs.js").write_text("edited after the copy")
+    assert _backup(p) is not None
+
+
+def test_a_backup_lock_held_too_long_skips_the_copy(tmp_path, monkeypatch, caplog):
+    """A stuck holder (a stopped session, a hung filesystem) must not hold every
+    other session's launch: past the wait, the launch goes ahead without a copy."""
+    import fcntl
+    import logging
+
+    p = _firefox_profile(tmp_path / "p")
+    monkeypatch.setattr(pb, "_LOCK_WAIT_S", 0.3)
+    with open(pb._lock_path(p), "w") as held, caplog.at_level(logging.WARNING):
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert _backup(p) is None
+    assert _copies(p) == [] and "another launch" in caplog.text
+
+
+def test_concurrent_launches_make_one_copy(tmp_path):
+    """Each session's MCP server runs its own launch path; the first copies and the
+    next, waiting on the same lock, finds that copy fresh."""
+    import threading
+
+    p = _firefox_profile(tmp_path / "p")
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(_backup(p))) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert len(_copies(p)) == 1
+    assert sum(r is not None for r in results) == 1
+
+
+def test_a_held_backup_lock_makes_the_launch_wait(tmp_path):
+    import fcntl
+    import threading
+
+    p = _firefox_profile(tmp_path / "p")
+    lock = pb._lock_path(p)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        t = threading.Thread(target=_backup, args=(p,))
+        t.start()
+        t.join(timeout=1.0)
+        assert t.is_alive()  # waiting for the copy in progress
+        assert _copies(p) == []
+    t.join(timeout=60)
+    assert not t.is_alive() and len(_copies(p)) == 1
+
+
+def test_lock_names_below_the_profile_root_are_copied(tmp_path):
+    """Only the browser's own launch locks sit at the profile root; a site or an
+    extension may keep a file called "lock" deeper down."""
+    p = _firefox_profile(tmp_path / "p")
+    (p / "storage" / "default").mkdir(parents=True)
+    (p / "storage" / "default" / "lock").write_text("site data")
+    (p / ".parentlock").write_text("")
+    dest = _backup(p)
+    assert (dest / "storage" / "default" / "lock").read_text() == "site data"
+    assert not (dest / ".parentlock").exists()
+
+
+def test_a_change_below_the_root_under_a_lock_name_counts(tmp_path):
+    p = _firefox_profile(tmp_path / "p")
+    (p / "sub").mkdir()
+    (p / "sub" / "lock").write_text("a")
+    first = _backup(p)
+    _age(first, 60)
+    (p / "sub" / "lock").write_text("b")
+    assert _backup(p) is not None
