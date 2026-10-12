@@ -1481,7 +1481,9 @@ verified: 637f7f7bb679 2026-10-05
   cleanup, so a stale-page restart or the 1 h idle reclaim of one layer never
   touches another (TinyFish included: leaving it does not end its paid
   session, which bills until its own idle reclaim); a click that opens a new
-  tab switches the tools to it.
+  tab switches the tools to it. `browser_fill` refuses a payment card number
+  as the value and `browser_run_js` one in its script (the value check only:
+  telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
@@ -3306,7 +3308,12 @@ verified: ba9dd8a37 2026-10-09
   only pulse and reads as never-having-run (false green).
 - **security/**: prompt-injection defense + outbound scanning — sanitizer is
   LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
-  `output_scanner` = deterministic outbound secrets/IP scan; `skill_scan`
+  `output_scanner` = deterministic outbound secrets/IP scan (a payment card
+  number is a critical finding); `card_shapes` = the one payment-card-number
+  detector (ASCII digits, alphanumeric boundary, standard groupings, brand
+  prefix + length, Luhn, UUID groups skipped; stdlib-only so scripts load it
+  by path), used by the browser tool guards, `reference_store`, reference
+  extraction and `output_scanner`; `skill_scan`
   shells to external NVIDIA SkillSpector. NOT auth or secrets storage (that's
   `runtime/init/secrets.py` + `env.py`). **`immunity.py` = the WS-3 kill
   switch + gate policy**: `gate_mode()` re-reads `config/ws3_immunity.yaml` +
