@@ -23,6 +23,11 @@ This snapshot makes that drift visible:
   deploy_checkout.sh``, run through bash): the state in which the next
   ``deploy_code_only.sh`` or ``update.sh`` run refuses. Not drift between
   merged and deployed, so the awareness check words it separately
+- ``live``         — whether the checkout runs `live`, the integration branch
+  ``scripts/deploy_candidates`` rebuilds from the deploy manifest. On `live`
+  the behind-count, tier-2 pending and host drift are measured from the
+  commit `live` was built on, never HEAD, so a candidate's own files never
+  read as undeployed merges
 
 The awareness tick's ``_check_deploy_staleness`` consumes the same collectors
 to raise a dashboard/morning-report observation. Everything is best-effort:
@@ -94,8 +99,11 @@ def _utcnow() -> datetime:
 # ── Collectors (sync, injectable paths, never raise) ────────────────
 
 
-def collect_git_facts(repo: Path, now: datetime | None = None) -> dict:
-    """Local-refs-only git staleness facts. No network, ever."""
+def collect_git_facts(repo: Path, now: datetime | None = None, *, on_live: bool = False) -> dict:
+    """Local-refs-only git staleness facts. No network, ever. ``on_live``: the
+    checkout runs `live`, which the engine creates from a commit and so gives
+    no upstream (MEASURED, git 2.43: ``switch -C live <sha>`` configures none);
+    its behind-count is origin/main's commits since the rebuild's base."""
     now = now or _utcnow()
     facts: dict = {
         "head": None,
@@ -109,8 +117,9 @@ def collect_git_facts(repo: Path, now: datetime | None = None) -> dict:
         # Behind-count against the current branch's upstream (origin/main on a
         # standard install). Counts against the LAST FETCHED state — pair with
         # fetch_age_hours to judge how trustworthy the number is.
+        upstream = _BASE_REF if on_live else "@{upstream}"
         rc, out, _ = _run_git(
-            repo, "rev-list", "--count", "HEAD..@{upstream}", timeout=_CHEAP_TIMEOUT_S
+            repo, "rev-list", "--count", f"HEAD..{upstream}", timeout=_CHEAP_TIMEOUT_S
         )
         if rc == 0:
             facts["commits_behind_upstream"] = int(out.strip())
@@ -215,13 +224,16 @@ def resolve_commit(repo: Path, name: str | None) -> tuple[str | None, str]:
     return resolved, f"{candidate} resolved to {resolved}"
 
 
-def collect_tier2_pending(repo: Path, since_commit: str | None) -> list[str] | None:
+def collect_tier2_pending(
+    repo: Path, since_commit: str | None, upto: str | None = "HEAD"
+) -> list[str] | None:
     """Tier-2 files changed since the last successful update.sh commit.
 
     Non-empty means "a bare merge brought update.sh-only changes" — the
     predictive signal. ``None`` = no baseline (no successful update recorded,
-    or its commit no longer resolves after a rebase/gc)."""
-    if not since_commit:
+    or its commit no longer resolves after a rebase/gc), or no ``upto`` (on
+    `live` whose base cannot be read)."""
+    if not since_commit or not upto:
         return None
     # Through the shared resolver: this was one of three copies of the same
     # short-SHA adapter (the third is scripts/update.sh, in shell). One home
@@ -235,7 +247,7 @@ def collect_tier2_pending(repo: Path, since_commit: str | None) -> list[str] | N
             repo,
             "diff",
             "--name-only",
-            f"{resolved}..HEAD",
+            f"{resolved}..{upto}",
             "--",
             *TIER2_PATHS,
             timeout=_CHEAP_TIMEOUT_S,
@@ -248,16 +260,22 @@ def collect_tier2_pending(repo: Path, since_commit: str | None) -> list[str] | N
         return None
 
 
-def collect_host_gateway(repo: Path, state_path: Path, now: datetime | None = None) -> dict:
+def collect_host_gateway(
+    repo: Path, state_path: Path, now: datetime | None = None, *, upto: str | None = "HEAD"
+) -> dict:
     """Guardian host deploy drift, from the state file cc_align_host_sync
     writes on every gateway ``version`` probe (update.sh + nightly timer).
 
     ``status`` values: ``no_data`` (guardian-less install or probe never ran),
     ``ok`` (host at HEAD or no guardian-path delta), ``drift`` (guardian paths
     changed since the host's deployed commit), ``unknown_commit`` (host commit
-    doesn't resolve locally — converge via update.sh)."""
+    doesn't resolve locally — converge via update.sh). ``upto`` is HEAD, or on
+    `live` the commit `live` was built on (candidate guardian code never reaches
+    the host); None when that cannot be read reports ``no_data``."""
     now = now or _utcnow()
     try:
+        if not upto:
+            return {"status": "no_data", "reason": "the base `live` was built on is unreadable"}
         if not state_path.exists():
             return {"status": "no_data"}
         data = json.loads(state_path.read_text())
@@ -293,7 +311,7 @@ def collect_host_gateway(repo: Path, state_path: Path, now: datetime | None = No
             repo,
             "diff",
             "--name-only",
-            f"{resolved_deployed}..HEAD",
+            f"{resolved_deployed}..{upto}",
             "--",
             *GUARDIAN_HOST_PATHS,
             timeout=_CHEAP_TIMEOUT_S,
@@ -611,6 +629,296 @@ async def last_success_update(db: aiosqlite.Connection | None) -> dict:
         return {"completed_at": None, "new_commit": None, "age_days": None}
 
 
+_LIVE_REF = "refs/heads/live"
+_BASE_REF = "refs/remotes/origin/main"
+_LIVE_WORDS = {0: "live", 1: "other", 2: "unreadable"}
+
+
+def _run_probe(argv: list[str], timeout: float) -> tuple[int, str] | None:
+    """Run a short read-only probe in its own process group with git's location
+    variables scrubbed; (rc, stdout), or None when it could not start or timed
+    out (the whole group is killed). The snapshot sits on the dashboard and the
+    Guardian health-probe path, so a probe is bounded like the checkout probe."""
+    from genesis.session_awareness.zero_drop_git import scrubbed_git_env
+
+    try:
+        proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell interpolation
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            env=scrubbed_git_env(),
+            start_new_session=True,
+        )
+    except Exception as exc:
+        logger.warning("deploy_health: probe %s could not start: %s", argv[1:2], exc)
+        return None
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_probe_group(proc)
+        logger.warning("deploy_health: probe %s timed out after %ss", argv[1:2], timeout)
+        return None
+    except BaseException:
+        _kill_probe_group(proc)
+        raise
+    return proc.returncode, out.decode("utf-8", "replace")
+
+
+def collect_live(repo: Path, *, timeout: float = _CHEAP_TIMEOUT_S) -> dict:
+    """Whether ``repo`` runs `live`, judged by the deploy scripts' own predicate
+    (``scripts/lib/live_checkout.py``, run afresh with ``python -I -S``; its word
+    and exit code must agree), and what that means for the other collectors.
+
+    ``state``: ``live`` / ``other`` / ``unreadable`` (the predicate's words; a
+    probe that cannot run reads ``unreadable`` with a ``reason``), or
+    ``deploying`` (not probed: a deploy moves the checkout). On ``live``,
+    ``base`` is merge-base(HEAD, origin/main), None when unreadable,
+    ``candidate_tier2`` the tier-2 paths `live` adds over it, and ``unbuilt`` /
+    ``unlisted`` how many candidates the manifest lists that `live` does not
+    hold, and the reverse. ``unbound``: HEAD is the branch `live` but no
+    manifest of this repository says what it should hold (``unlisted`` counts
+    what it does). Off `live`, ``candidates`` is how many listed candidates are
+    not running (None when the engine did not answer).
+
+    Every manifest and `live` fact comes from ONE engine read,
+    ``scripts/deploy_candidates list --json``; the manifest is never read here.
+    The predicate and the engine are two reads, so a rebuild landing between
+    them can mix two states for one snapshot; the next one is consistent.
+    Never raises."""
+    try:
+        return _collect_live(repo, timeout)
+    except Exception as exc:
+        logger.warning("deploy_health: live collector failed", exc_info=True)
+        return _unanswered(repo, f"collector failed: {type(exc).__name__}")
+
+
+def _on_live_branch(repo: Path) -> bool:
+    rc, ref, _ = _run_git(repo, "symbolic-ref", "-q", "HEAD", timeout=_CHEAP_TIMEOUT_S)
+    return rc == 0 and ref.strip() == _LIVE_REF
+
+
+def _live_base(repo: Path) -> str | None:
+    """What of origin/main `live` holds: the merge base of HEAD and origin/main,
+    used as the `upto` of the tier-2 and Guardian comparisons. Two candidates that
+    `live` merged and origin/main later merged separately give TWO merge bases,
+    and either alone omits the other's files (MEASURED, git 2.43: a guardian file
+    from one candidate was missing from the default single base). Then the base
+    is the tree of the two bases merged (`git diff` takes a tree), so neither is
+    dropped. More than two, or bases that do not merge cleanly: None (unknown)."""
+    rc, out, _ = _run_git(repo, "merge-base", "--all", "HEAD", _BASE_REF, timeout=_CHEAP_TIMEOUT_S)
+    bases = [ln.strip() for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+    if not bases or not all(_FULL_SHA.match(b) for b in bases):
+        return None
+    if len(bases) == 1:
+        return bases[0]
+    if len(bases) != 2:
+        return None
+    rc, tree, _ = _run_git(
+        repo, "merge-tree", "--write-tree", "--no-messages", *bases, timeout=_CHEAP_TIMEOUT_S
+    )
+    first = tree.splitlines()[0].strip() if tree.strip() else ""
+    return first if rc == 0 and _FULL_SHA.match(first) else None
+
+
+def _unanswered(repo: Path, reason: str) -> dict:
+    """The predicate gave no usable verdict. Only a checkout on the branch
+    `live` is "unreadable" (a finding); any other checkout is "other" with the
+    reason kept, so a slow or failed probe never raises a finding on an install
+    that does not run `live`."""
+    logger.warning("deploy_health: live predicate gave no verdict: %s", reason)
+    if _on_live_branch(repo):
+        # Still on `live`: the tier-2 and guardian comparisons must not fall back
+        # to HEAD (where every candidate reads as drift), so say so.
+        return {"state": "unreadable", "reason": reason, "on_live_branch": True}
+    # Off `live`, an unknown candidate count: carried by the awareness check,
+    # never read as 0 (which would resolve a standing live_off_branch alert).
+    return {"state": "other", "reason": reason, "candidates": None}
+
+
+def _collect_live(repo: Path, timeout: float) -> dict:
+    import sys
+
+    from genesis import env
+
+    if env.update_in_progress():
+        # Not probed while a deploy moves the checkout. Whether HEAD is on the
+        # branch `live` still decides what the other collectors compare with.
+        on_live = _on_live_branch(repo)
+        facts: dict = {"state": "deploying", "on_live_branch": on_live}
+        if on_live:
+            facts["base"] = _live_base(repo)
+        return facts
+    script = repo / "scripts" / "lib" / "live_checkout.py"
+    got = _run_probe([sys.executable, "-I", "-S", str(script), str(repo)], timeout)
+    if got is None:
+        return _unanswered(repo, "the live predicate did not answer")
+    rc, out = got
+    word = out.strip()
+    if _LIVE_WORDS.get(rc) != word:
+        return _unanswered(repo, f"the live predicate answered {word!r} (rc {rc})")
+    engine = None if word == "unreadable" else _observe_engine(repo, timeout)
+    if word == "other" and _on_live_branch(repo):
+        # HEAD is the branch `live`, but the manifest is missing or names another
+        # repository, so the predicate says `other`. Candidate code is checked
+        # out: compare against the base, never HEAD, and say what `live` holds.
+        facts: dict = {"state": "unbound", "on_live_branch": True, "base": _live_base(repo)}
+        holds = (engine or {}).get("live", {}).get("holds")
+        if engine is None or holds is None:
+            return {
+                "state": "unreadable",
+                "on_live_branch": True,
+                "base": facts["base"],
+                "reason": _engine_reason(engine, "what `live` holds could not be read"),
+            }
+        facts["unlisted"] = len(holds)
+        return facts
+    facts = {"state": word}
+    if word == "live":
+        # On `live`, an unreadable base or tier-2 diff is "unreadable", never a
+        # healthy `live`: without the base nothing can be compared, so a quiet
+        # snapshot would claim what it could not establish.
+        base = _live_base(repo)
+        if not base:
+            return {
+                "state": "unreadable",
+                "on_live_branch": True,
+                "reason": "the base `live` was built on (merge-base with origin/main) "
+                "could not be read",
+            }
+        facts["base"] = base
+        rc, diff, _ = _run_git(
+            repo,
+            "diff",
+            "--name-only",
+            f"{base}..HEAD",
+            "--",
+            *TIER2_PATHS,
+            timeout=_CHEAP_TIMEOUT_S,
+        )
+        if rc != 0:
+            return {
+                "state": "unreadable",
+                "on_live_branch": True,
+                "base": base,
+                "reason": "the update.sh-only files `live` adds over its base could not be listed",
+            }
+        facts["candidate_tier2"] = len([ln for ln in diff.splitlines() if ln.strip()])
+        state = (engine or {}).get("manifest", {}).get("state")
+        holds = (engine or {}).get("live", {}).get("holds")
+        if engine is None or state != "ok" or holds is None:
+            # The predicate bound the manifest, the engine could not read it (or
+            # what `live` holds): nothing here can say whether they agree.
+            return {
+                "state": "unreadable",
+                "on_live_branch": True,
+                "base": base,
+                "reason": _engine_reason(
+                    engine, "the engine could not compare `live` with the manifest"
+                ),
+            }
+        held = {(h["branch"], h["head"]) for h in holds}
+        held_names = {h["branch"] for h in holds}
+        listed = engine["listed"]
+        # Built: `live` holds exactly this (branch, head), or the checkout already
+        # has the head and no rebuild merged the branch (a contained candidate).
+        # A merged branch at another head is unbuilt even when HEAD contains the
+        # listed one (re-pinned backwards: `live` runs commits nobody pinned).
+        facts["unbuilt"] = sum(
+            1
+            for c in listed
+            if (c["branch"], c["head"]) not in held
+            and not (c["in_checkout"] and c["branch"] not in held_names)
+        )
+        names = {c["branch"] for c in listed}
+        facts["unlisted"] = sum(1 for h in holds if h["branch"] not in names)
+    elif word == "other":
+        if engine is None:
+            facts["candidates"] = None  # unknown: carried, never read as 0
+            facts["reason"] = "the engine (deploy_candidates list --json) did not answer"
+        elif engine["manifest"]["state"] == "error":
+            # A manifest exists and is broken: the engine says so on every read.
+            return {"state": "unreadable", "reason": engine["manifest"]["reason"]}
+        else:
+            # Off `live`: the listed candidates this checkout's HEAD does not
+            # contain (none when the manifest is absent or another repository's).
+            facts["candidates"] = sum(1 for c in engine["listed"] if not c["in_checkout"])
+    return facts
+
+
+def _observe_engine(repo: Path, timeout: float) -> dict | None:
+    """The engine's ``list --json`` reading, or None when it did not answer or
+    printed something this does not recognise (never a silent empty reading)."""
+    got = _run_probe([str(repo / "scripts" / "deploy_candidates"), "list", "--json"], timeout)
+    if got is None:
+        return None
+    rc, out = got
+    if rc != 0:
+        logger.warning("deploy_health: deploy_candidates list --json exited %s", rc)
+        return None
+    try:
+        data = json.loads(out)
+        ok = (
+            data["version"] == 1
+            and data["manifest"]["state"] in ("absent", "ok", "foreign", "error")
+            and all(
+                isinstance(c["branch"], str)
+                and isinstance(c["head"], str)
+                and isinstance(c["in_checkout"], bool)
+                for c in data["listed"]
+            )
+            and (
+                data["live"]["holds"] is None
+                or all(isinstance(h["branch"], str) for h in data["live"]["holds"])
+            )
+        )
+    except (ValueError, TypeError, KeyError):
+        ok = False
+    if not ok:
+        logger.warning("deploy_health: unrecognised deploy_candidates list --json output")
+        return None
+    return data
+
+
+def _engine_reason(engine: dict | None, default: str) -> str:
+    if engine is None:
+        return "the engine (deploy_candidates list --json) did not answer"
+    return engine["manifest"].get("reason") or engine["live"].get("reason") or default
+
+
+def live_unknown(live: dict | None) -> bool:
+    """True when the reading says nothing either way about the live classes: off
+    `live` with an unknown candidate count. The awareness check carries the last
+    actionable live findings over the first such tick; on a second it raises
+    live_unreadable only while a live alert stands."""
+    live = live or {}
+    return live.get("state") == "other" and "candidates" in live and live["candidates"] is None
+
+
+def live_findings(live: dict | None) -> list[str]:
+    """The finding keys a :func:`collect_live` dict contributes; the one
+    producer of ``live_*`` keys (the awareness check uses it to carry a
+    previous reading over a tick it cannot act on). None of them pages."""
+    live = live or {}
+    state = live.get("state")
+    if state == "unreadable":
+        return ["live_unreadable"]
+    if state == "other" and (live.get("candidates") or 0) > 0:
+        return [f"live_off_branch:{live['candidates']}"]
+    found = []
+    if state == "unbound":
+        # HEAD is the branch `live` with no manifest of this repository: the
+        # deploy scripts refuse it (restart included), whatever `live` holds.
+        found.append("live_unbound")
+    if state == "live" and live.get("unbuilt"):
+        found.append(f"live_unbuilt:{live['unbuilt']}")
+    if state in ("live", "unbound") and live.get("unlisted"):
+        found.append(f"live_unlisted:{live['unlisted']}")
+    if state == "live" and live.get("candidate_tier2"):
+        found.append(f"live_candidate_tier2:{live['candidate_tier2']}")
+    return found
+
+
 # Sustained-staleness thresholds (the awareness check's paging axis). A
 # finding-CLASS boundary, so they live here beside derive_findings — the
 # single producer of finding keys — not in the awareness layer: an alert
@@ -629,6 +937,7 @@ def derive_findings(
     update_age_days: float | None = None,
     behind_threshold: int = 50,
     main_checkout: dict | None = None,
+    live: dict | None = None,
 ) -> list[str]:
     """Stable, order-deterministic finding keys — the alert/dedup contract.
 
@@ -643,7 +952,8 @@ def derive_findings(
     ``main_checkout_dirty:<n>`` for tracked edits in the deploy checkout and
     ``main_checkout_unreadable`` when that could not be read: never nothing, so
     an unreadable tree cannot clear a standing dirty finding. ``clean``,
-    ``not_deploy_root`` and ``deploying`` add nothing."""
+    ``not_deploy_root`` and ``deploying`` add nothing. ``live``
+    (:func:`collect_live`) adds the ``live_*`` keys of :func:`live_findings`."""
     findings: list[str] = []
     if missing_units:
         findings.append("missing_units:" + ",".join(sorted(missing_units)))
@@ -663,6 +973,7 @@ def derive_findings(
     if commits_behind is not None and commits_behind > behind_threshold:
         findings.append(f"behind_upstream:{commits_behind}")
     findings.extend(main_checkout_findings(main_checkout))
+    findings.extend(live_findings(live))
     return findings
 
 
@@ -686,17 +997,29 @@ def main_checkout_findings(main_checkout: dict | None) -> list[str]:
 
 def _collect_sync(repo: Path, genesis_home_dir: Path) -> dict:
     """All filesystem/git collectors in one worker-thread hop."""
-    git_facts = collect_git_facts(repo)
+    main_checkout = collect_main_checkout_dirty(repo)
+    # A linked worktree (a dev tree, e.g. a session's MCP) is not the checkout
+    # `live` runs in: the engine would answer for the deploy checkout.
+    live = None if main_checkout.get("status") == "not_deploy_root" else collect_live(repo)
+    live_ = live or {}
+    on_live = live_.get("state") == "live" or bool(live_.get("on_live_branch"))
+    # On `live`, the base it was built on (None, i.e. unknown, mid-deploy or
+    # when unreadable); never HEAD, where every candidate reads as drift.
+    upto = live_.get("base") if on_live else "HEAD"
+    git_facts = collect_git_facts(repo, on_live=on_live)
+    git_facts["live"] = (live or {}).get("state")
     missing_units = collect_missing_units(
         repo / "scripts" / "systemd",
         Path.home() / ".config" / "systemd" / "user",
     )
-    host_gateway = collect_host_gateway(repo, genesis_home_dir / _HOST_STATE_FILE)
+    host_gateway = collect_host_gateway(repo, genesis_home_dir / _HOST_STATE_FILE, upto=upto)
     return {
         "git": git_facts,
         "missing_units": missing_units,
         "host_gateway": host_gateway,
-        "main_checkout": collect_main_checkout_dirty(repo),
+        "main_checkout": main_checkout,
+        "live": live,
+        "upto": upto,
     }
 
 
@@ -708,7 +1031,9 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
         repo = repo_root()
         collected = await asyncio.to_thread(_collect_sync, repo, genesis_home())
         update = await last_success_update(db)
-        tier2 = await asyncio.to_thread(collect_tier2_pending, repo, update.get("new_commit"))
+        tier2 = await asyncio.to_thread(
+            collect_tier2_pending, repo, update.get("new_commit"), collected["upto"]
+        )
         findings = derive_findings(
             missing_units=collected["missing_units"],
             tier2_pending=tier2,
@@ -716,6 +1041,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             commits_behind=collected["git"].get("commits_behind_upstream"),
             update_age_days=update.get("age_days"),
             main_checkout=collected["main_checkout"],
+            live=collected["live"],
         )
         return {
             "status": "attention" if findings else "healthy",
@@ -726,6 +1052,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             "tier2_pending": tier2,
             "host_gateway": collected["host_gateway"],
             "main_checkout": collected["main_checkout"],
+            "live": collected["live"],
         }
     except Exception:
         logger.error("deploy_health snapshot failed", exc_info=True)

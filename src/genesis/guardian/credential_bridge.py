@@ -21,6 +21,8 @@ import shutil
 import stat
 from pathlib import Path
 
+from .cred_integrity import _backup_passphrase_value
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -64,16 +66,10 @@ _KEY_MAP_PROVISIONING = {
 # The passphrase is as sensitive as everything it decrypts; the escrow file is
 # 0600 on the host mount (same trust level as the telegram/proxmox tokens here).
 # NOTE: backup.sh reads secrets.env via scripts/lib/load_secrets.sh (dotenv-safe
-# line parser, no shell evaluation) while this escrow reads it via _read_dotenv.
-# Both strip one quote layer; they can still diverge on exotic values (embedded
-# newlines are impossible in a single line; unbalanced quotes differ), in which
-# case the escrowed value would not match what encrypted the backup. The
-# generated passphrase is a plain token; keep any hand-set one shell-safe
-# (alphanumeric / base64) to stay sound.
+# line parser, no shell evaluation). Its credential-specific reader mirrors
+# that single-line grammar. Escrow writes/reads the resulting value literally,
+# so quotes and significant whitespace survive the host/container round trip.
 _PASSPHRASE_FILENAME = "backup_passphrase.env"  # noqa: S105 - filename constant, not a passphrase
-_KEY_MAP_PASSPHRASE = {
-    "GENESIS_BACKUP_PASSPHRASE": "GENESIS_BACKUP_PASSPHRASE",
-}
 
 # Credential-backup mirror (G.4). The encrypted creds+secrets bundle that
 # backup.sh produces lives ONLY in the Tier-1 backup clone inside the container
@@ -261,22 +257,20 @@ def propagate_backup_passphrase(
     src = secrets_path or _CONTAINER_SECRETS
     out_dir = (shared_dir or _CONTAINER_SHARED_DIR) / _CREDS_SUBDIR
 
-    source_secrets = _read_dotenv(src)
-    if not source_secrets:
+    if not src.exists():
         logger.debug("No secrets file for passphrase escrow — skipping")
         return None
 
-    creds: dict[str, str] = {}
-    for src_key, dst_key in _KEY_MAP_PASSPHRASE.items():
-        value = source_secrets.get(src_key, "")
-        if value:
-            creds[dst_key] = value
-
-    if not creds.get("GENESIS_BACKUP_PASSPHRASE"):
+    try:
+        value = _backup_passphrase_value(src.read_bytes())
+    except (OSError, ValueError):
+        logger.warning("Invalid backup passphrase file; retaining existing escrow")
+        return None
+    if not value:
         logger.debug("No GENESIS_BACKUP_PASSPHRASE present — skipping escrow")
         return None
 
-    out_path = _write_creds_atomic(out_dir, _PASSPHRASE_FILENAME, creds)
+    out_path = _write_creds_atomic(out_dir, _PASSPHRASE_FILENAME, {"GENESIS_BACKUP_PASSPHRASE": value})
     logger.debug("Backup passphrase escrowed to %s", out_path)
     return out_path
 
@@ -296,8 +290,9 @@ def load_backup_passphrase(
         logger.debug("Escrowed backup passphrase not found at %s", creds_path)
         return {}
     try:
-        return _read_dotenv(creds_path)
-    except OSError as exc:
+        value = _backup_passphrase_value(creds_path.read_bytes(), escrow=True)
+        return {"GENESIS_BACKUP_PASSPHRASE": value} if value else {}
+    except (OSError, ValueError) as exc:
         logger.warning("Failed to read escrowed backup passphrase: %s", exc)
         return {}
 
@@ -620,16 +615,16 @@ def _read_dotenv(path: Path) -> dict[str, str]:
         return {}
 
     result: dict[str, str] = {}
-    for line in path.read_text().splitlines():
-        line = line.strip()
+    for line in path.read_text().split("\n"):
+        line = line.strip(" \t\r\v\f")
         if not line or line.startswith("#"):
             continue
         if "=" in line:
             key, _, value = line.partition("=")
-            key = key.strip()
+            key = key.strip(" \t\r\v\f")
             # Handle 'export KEY=value' syntax
             if key.startswith("export "):
-                key = key[7:].strip()
-            value = value.strip().strip("'\"")
+                key = key[7:].strip(" \t\r\v\f")
+            value = value.strip(" \t\r\v\f").strip("'\"")
             result[key] = value
     return result

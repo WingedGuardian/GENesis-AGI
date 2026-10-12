@@ -109,8 +109,10 @@ jobs:
       # degrading to defaults (the gate imports yaml lazily; without it the
       # merge_gate.required_* config readers fail open to the shipped defaults —
       # which is also exactly what an install with no genesis.yaml gets).
-      - name: Install pyyaml
-        run: pip install pyyaml
+      # markdown-it-py: the `rework` row reads PR bodies as CommonMark; without it
+      # every body reads as unreadable (advisory, or a block for a found rebuild).
+      - name: Install pyyaml and markdown-it-py
+        run: pip install pyyaml "markdown-it-py>=3"
 
       - name: Run the merge gate
         id: gate

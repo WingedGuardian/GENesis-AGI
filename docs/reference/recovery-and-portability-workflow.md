@@ -159,7 +159,9 @@ The public repo (`GENesis-AGI`) is the primary repo, so there is no separate
 "strip and stage" step. Leak protection is enforced on every PR by the
 `leak-detector` job in `.github/workflows/ci.yml` (detect-secrets + gitleaks
 with the repo's `.gitleaks.toml` PII/infrastructure rules + portability
-+ email scans).
++ email scans), and on every push to any non-main branch by
+`.github/workflows/branch-leak-scan.yml`, so a branch is scanned the moment it
+is published, PR or not. Both run the same steps from `scripts/ci/leak_scan.sh`.
 
 Releases are cut on a **release branch**, never on `main` — the pre-commit hook
 rejects direct commits there and branch discipline requires a PR, so the fold
@@ -253,6 +255,37 @@ The mirror/archive carry only GPG-encrypted `*.gpg` files; the decryption
 passphrase is escrowed separately. The guardian **refuses to overwrite the
 archive from an empty or incomplete mirror**, so a container-side zeroing event
 can never propagate into the last-line copy.
+
+GPG's `--passphrase-fd` reads only the first line, so backup and decryption
+reject embedded LF; the guardian's byte-oriented decryption also rejects NUL.
+Existing single-line keys retain their spaces, quotes, carriage returns and
+Unicode bytes. Missing-key handling remains the caller's existing policy.
+
+Encrypted backup readers share the standalone `guardian/cred_integrity.py`
+decryption boundary, which also runs under system Python during credential
+recovery. A `.gpg` suffix or successful GPG exit alone is insufficient: readers
+require a single integrity-protected message successfully decrypted using the
+supplied passphrase. Unencrypted literal/signed packets, public-key fallback,
+unprotected encryption, damaged trailers, and incomplete decryption are rejected.
+Protected MDC and AEAD messages remain supported. File restores publish a private
+staged result only after authentication, preserving an existing destination on
+decryption failure. Historical unencrypted `.gpg` files are reported incomplete;
+the explicitly supported legacy plaintext forms remain separate.
+
+Standalone recovery needs the trusted checkout's
+`src/genesis/guardian/cred_integrity.py` alongside the scripts; it needs no
+installed Genesis package or working virtual environment. A minimal copied
+transcript-recovery bundle must preserve that file's checkout-relative path
+alongside `scripts/lib/transcript_archive.py`, plus the trusted catalog validator
+when restoring catalog-bearing analytics archives. Missing decoder code fails
+closed; copying only the archive script is insufficient for encrypted recovery.
+
+Secret-file syntax uses ASCII whitespace outside quotes. The Bash loader uses
+literal ASCII trim patterns and runs its `sed` parser under `LC_ALL=C`; guardian
+readers split on LF and trim ASCII whitespace. Unicode spaces and separators
+remain value bytes. Ordinary `LC_ALL` records still export to the caller, but
+cannot change later syntax parsing. This candidate has passed disposable
+locale/byte checks; final regression and recovery tests remain required.
 
 **Rebuild runbook (no network required):**
 

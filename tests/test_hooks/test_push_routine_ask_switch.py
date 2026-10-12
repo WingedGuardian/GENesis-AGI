@@ -257,19 +257,20 @@ def test_a_force_push_to_another_remote_still_asks(monkeypatch, tmp_path, capsys
     assert "FORCE" in _hso(out)["permissionDecisionReason"]
 
 
-def test_a_force_push_beside_a_routine_prompt_still_asks(
+def test_a_force_push_beside_a_routine_prompt_is_refused(
     monkeypatch, tmp_path, capsys, off, create_publishes
 ) -> None:
-    # Non-routine wins whatever order the arms set their reasons in.
-    _assert_asks(
-        *_run(
-            monkeypatch,
-            tmp_path,
-            capsys,
-            "git push -f fork HEAD && gh pr create --title t",
-            (("remote.origin.url", PUBLIC), ("remote.fork.url", OWNED)),
-        )
+    # The routine switch never silences a force push. Since #2868 a force push
+    # off the public repo must be the whole command, so a neighbour refuses it.
+    rc, _out, err = _run(
+        monkeypatch,
+        tmp_path,
+        capsys,
+        "git push -f fork HEAD && gh pr create --title t",
+        (("remote.origin.url", PUBLIC), ("remote.fork.url", OWNED)),
     )
+    assert rc == 2, err
+    assert "a force push off the public repo must be the whole command" in err
 
 
 def test_a_push_of_the_default_branch_still_asks(monkeypatch, tmp_path, capsys, off) -> None:
