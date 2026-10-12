@@ -88,6 +88,7 @@ def _clip_char_cost(text: str) -> int:
 
 
 _NONEMPTY_TEXT = st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), min_size=1, max_size=180)
+_ESCAPE_CLASS_FILLERS = ("é", "—", "漢", "🎯")
 
 _ORDINARY_BOUNDARY_PAYLOAD = {"permissionDecision": "deny", "reason": "x" * 80}
 _ORDINARY_BOUNDARY_KEYS = ("reason",)
@@ -114,8 +115,8 @@ _TWO_KEY_BOUNDARY_ENVELOPE_COST = _ho.emit_cost(
 
 
 @st.composite
-def _ordinary_boundary_case(draw) -> tuple[dict[str, object], tuple[str, ...], int]:
-    """Ordinary trimmable payloads budgeted at the emptied-envelope cost exactly."""
+def _ordinary_payload(draw) -> tuple[dict[str, object], tuple[str, ...], int, int]:
+    """Flat, nested, and two-key trimmable payloads with emptied/original costs."""
     shape = draw(st.sampled_from(("one_flat", "one_nested", "two_key")))
     if shape == "one_flat":
         payload: dict[str, object] = {
@@ -144,7 +145,25 @@ def _ordinary_boundary_case(draw) -> tuple[dict[str, object], tuple[str, ...], i
         }
         text_keys = _TWO_KEY_BOUNDARY_KEYS
     envelope_cost = _ho.emit_cost(json.dumps(_emptied_envelope(payload, text_keys)))
-    return payload, text_keys, envelope_cost
+    original_cost = _ho.emit_cost(json.dumps(payload))
+    return payload, text_keys, envelope_cost, original_cost
+
+
+@st.composite
+def _ordinary_boundary_case(draw) -> tuple[dict[str, object], tuple[str, ...], int]:
+    """Ordinary trimmable payloads budgeted from emptied-envelope cost through original."""
+    payload, text_keys, envelope_cost, original_cost = draw(_ordinary_payload())
+    budget = draw(
+        st.integers(min_value=envelope_cost, max_value=max(envelope_cost, original_cost))
+    )
+    return payload, text_keys, budget
+
+
+@st.composite
+def _below_envelope_case(draw) -> tuple[dict[str, object], tuple[str, ...], int]:
+    """Documented False path: budget is one unit below the emptied envelope."""
+    payload, text_keys, envelope_cost, _original_cost = draw(_ordinary_payload())
+    return payload, text_keys, envelope_cost - 1
 
 
 @_PROPERTY_SETTINGS
@@ -224,9 +243,23 @@ def test_print_json_bounded_true_means_the_emitted_stream_fits(
 )
 @example(
     case=(
+        copy.deepcopy(_ORDINARY_BOUNDARY_PAYLOAD),
+        _ORDINARY_BOUNDARY_KEYS,
+        _ORDINARY_BOUNDARY_ENVELOPE_COST + 1,
+    )
+)
+@example(
+    case=(
         copy.deepcopy(_TWO_KEY_BOUNDARY_PAYLOAD),
         _TWO_KEY_BOUNDARY_KEYS,
         _TWO_KEY_BOUNDARY_ENVELOPE_COST,
+    )
+)
+@example(
+    case=(
+        copy.deepcopy(_TWO_KEY_BOUNDARY_PAYLOAD),
+        _TWO_KEY_BOUNDARY_KEYS,
+        _TWO_KEY_BOUNDARY_ENVELOPE_COST + 1,
     )
 )
 def test_xfail_print_json_bounded_false_when_emptied_envelope_fits(
@@ -248,6 +281,37 @@ def test_xfail_print_json_bounded_false_when_emptied_envelope_fits(
         assert _stream_cost(sink) <= budget
     else:
         assert _ho.emit_cost(json.dumps(envelope)) > budget
+
+
+@_PROPERTY_SETTINGS
+@given(case=_below_envelope_case())
+@example(
+    case=(
+        copy.deepcopy(_ORDINARY_BOUNDARY_PAYLOAD),
+        _ORDINARY_BOUNDARY_KEYS,
+        _ORDINARY_BOUNDARY_ENVELOPE_COST - 1,
+    )
+)
+@example(
+    case=(
+        copy.deepcopy(_TWO_KEY_BOUNDARY_PAYLOAD),
+        _TWO_KEY_BOUNDARY_KEYS,
+        _TWO_KEY_BOUNDARY_ENVELOPE_COST - 1,
+    )
+)
+def test_print_json_bounded_false_when_emptied_envelope_exceeds_budget(
+    case: tuple[dict[str, object], tuple[str, ...], int],
+):
+    payload, text_keys, budget = case
+    original = copy.deepcopy(payload)
+    envelope = _emptied_envelope(original, text_keys)
+    sink = io.StringIO()
+    fits = _ho.print_json_bounded(payload, text_keys=text_keys, budget=budget, stream=sink)
+    emitted = json.loads(sink.getvalue())
+
+    assert _permission_decision(emitted) == "deny"
+    assert fits is False
+    assert _ho.emit_cost(json.dumps(envelope)) > budget
 
 
 @_PROPERTY_SETTINGS
@@ -329,22 +393,53 @@ def test_print_bounded_never_emits_over_budget(text: str, budget: int, mirror_hi
     reason="#3236: non-ASCII trimming leaves avoidable budget unused",
 )
 @_PROPERTY_SETTINGS
-@given(size=st.integers(min_value=80, max_value=130), over=st.integers(min_value=1, max_value=25))
-def test_xfail_3236_non_ascii_trimming_uses_the_available_budget(size: int, over: int):
-    base = "é" * size
-    payload = {"reason": base}
-    budget = _ho.emit_cost(json.dumps(payload)) - over
-    assume(budget > _ho.emit_cost(json.dumps({"reason": _TRUNCATION_NOTE})))
+@given(
+    filler=st.sampled_from(_ESCAPE_CLASS_FILLERS),
+    size=st.integers(min_value=80, max_value=130),
+    over=st.integers(min_value=1, max_value=25),
+    nested=st.booleans(),
+)
+@example(filler="é", size=80, over=1, nested=False)
+@example(filler="🎯", size=80, over=1, nested=True)
+@example(filler="—", size=80, over=1, nested=True)
+def test_xfail_3236_non_ascii_trimming_uses_the_available_budget(
+    filler: str,
+    size: int,
+    over: int,
+    nested: bool,
+):
+    base = filler * size
+    if nested:
+        payload: dict[str, object] = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "additionalContext": base,
+            }
+        }
+        text_keys = ("hookSpecificOutput.additionalContext",)
+        field_path = "hookSpecificOutput.additionalContext"
+    else:
+        payload = {"reason": base}
+        text_keys = ("reason",)
+        field_path = "reason"
+    original = copy.deepcopy(payload)
+    budget = _ho.emit_cost(json.dumps(original)) - over
+    note_only = copy.deepcopy(original)
+    _set_path(note_only, field_path, _TRUNCATION_NOTE)
+    assume(budget > _ho.emit_cost(json.dumps(note_only)))
 
     sink = io.StringIO()
-    assert _ho.print_json_bounded(payload, text_keys=("reason",), budget=budget, stream=sink)
+    assert _ho.print_json_bounded(payload, text_keys=text_keys, budget=budget, stream=sink)
 
-    trimmed = json.loads(sink.getvalue())["reason"]
+    trimmed = _get_path(json.loads(sink.getvalue()), field_path)
+    assert isinstance(trimmed, str)
     assert trimmed.endswith(_TRUNCATION_NOTE)
     kept = trimmed[: -len(_TRUNCATION_NOTE)]
     assume(len(kept) < len(base))
 
-    candidate = {"reason": kept + base[len(kept)] + _TRUNCATION_NOTE}
+    candidate = copy.deepcopy(original)
+    _set_path(candidate, field_path, kept + base[len(kept)] + _TRUNCATION_NOTE)
     assert _ho.emit_cost(json.dumps(candidate)) > budget
 
 
@@ -378,16 +473,26 @@ def test_xfail_3237_lone_surrogate_accounting_does_not_raise(text: str):
 )
 @_PROPERTY_SETTINGS
 @given(text=_LONE_SURROGATE_TEXT, budget=st.integers(min_value=1, max_value=80))
-def test_xfail_3237_lone_surrogate_writer_does_not_raise(
-    monkeypatch: pytest.MonkeyPatch,
-    text: str,
-    budget: int,
-):
-    def surrogatepass_emit_cost(value: str) -> int:
-        return len(value.encode("utf-16-le", "surrogatepass")) // 2 + 1
-
-    monkeypatch.setattr(_ho, "emit_cost", surrogatepass_emit_cost)
-    encoded_stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+@example(text="\ud800", budget=2)
+def test_xfail_3237_lone_surrogate_writer_does_not_raise(text: str, budget: int):
+    buf = io.BytesIO()
+    encoded_stream = io.TextIOWrapper(
+        buf, encoding="utf-8", errors="strict", newline="\n", write_through=True
+    )
     out = _ho.BoundedStdout(budget, label="hook", stream=encoded_stream)
     out.emit(text, block="surrogate")
     encoded_stream.flush()
+    raw = buf.getvalue()
+    decoded = raw.decode("utf-8", "surrogatepass")
+    billed = _ho.utf16_len(decoded)
+    assert billed == out.emitted_chars
+    assert billed <= budget
+    if billed > 0:
+        encodings = (
+            text.encode("utf-8", "surrogatepass"),
+            text.encode("utf-8", "replace"),
+            text.encode("unicode_escape"),
+        )
+        assert any(form in raw for form in encodings)
+    else:
+        assert _ho.emit_cost(text) > budget

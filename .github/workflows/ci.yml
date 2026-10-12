@@ -1063,7 +1063,7 @@ jobs:
         # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
         # Floor: 25712 + 6 = 25718.
         # Hook-output property tests (#3187): new test_hook_output_properties.py
-        # collects 10 tests. The four strict xfails pin #3236, #3237, and #3255,
+        # collects 11 tests. The four strict xfails pin #3236, #3237, and #3255,
         # and JUnit counts xfail as skipped, so ceiling 104 -> 108.
-        # Floor: 25718 + 10 = 25728.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 108 --min-collected 25728
+        # Floor: 25718 + 11 = 25729.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 108 --min-collected 25729
