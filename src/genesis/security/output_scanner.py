@@ -12,6 +12,8 @@ import logging
 import re
 from dataclasses import dataclass
 
+from genesis.security.card_shapes import contains_card_number
+
 logger = logging.getLogger(__name__)
 
 
@@ -98,6 +100,7 @@ _CRITICAL_PATTERNS = frozenset(
         "api_key_groq",
         "api_key_github",
         "env_variable_secret",
+        "payment_card",
     }
 )
 
@@ -113,6 +116,10 @@ def scan_outbound(content: str) -> ScanResult:
     for name, pattern in _OUTPUT_PATTERNS:
         if pattern.search(content):
             detected.append(name)
+    # A card number needs a checksum, not just a regex, so it is checked here
+    # rather than in the pattern table. Critical: it is never sent outward.
+    if contains_card_number(content):
+        detected.append("payment_card")
 
     if not detected:
         return ScanResult(safe=True, detected=[], risk_level="none")
