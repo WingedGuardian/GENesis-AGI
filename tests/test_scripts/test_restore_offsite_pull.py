@@ -93,6 +93,8 @@ def _run(sandbox, *, backend="local", host_override=None, extra_args=(), force=T
     env.update(
         HOME=str(sandbox["home"]), GENESIS_DIR=str(sandbox["gd"]),
         GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",
+        # Owned offline DB: no server or other process can hold this fixture.
+        GENESIS_RESTORE_HOLDER_SCAN="none",
         PATH=f'{sandbox["bind"]}:{os.environ["PATH"]}',
         # This fixture owns a fresh private database, with no server process.
         # Host /proc visibility is unrelated to the offline sandbox boundary.

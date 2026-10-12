@@ -1,0 +1,1 @@
+- The note shown when a session closes a pull request now says the builder of a rework may retire the PR it replaces, under the same conditions as the closing session: the owner's spec on record, the last replacement open, and a per-file coverage mapping in the closing comment. Devin never closes one; the closing session does.

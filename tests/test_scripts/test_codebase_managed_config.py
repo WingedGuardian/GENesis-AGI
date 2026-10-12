@@ -136,6 +136,26 @@ def test_status_checks_build_and_preserves_metadata(managed, tmp_path, monkeypat
     assert result["service"] == {"ActiveState": "inactive"}
 
 
+def test_status_seeds_systemd_session_environment(managed, monkeypatch):
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    calls = []
+
+    def check_output(args, **kwargs):
+        env = kwargs.get("env", {})
+        calls.append(env)
+        if not env.get("XDG_RUNTIME_DIR") or not env.get("DBUS_SESSION_BUS_ADDRESS"):
+            raise subprocess.CalledProcessError(1, args)
+        return "ActiveState=inactive\n"
+
+    monkeypatch.setattr(subprocess, "check_output", check_output)
+    result = managed.status(None)
+    uid = os.getuid()
+    assert result["manager_error"] is None
+    assert calls[0]["XDG_RUNTIME_DIR"] == f"/run/user/{uid}"
+    assert calls[0]["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path=/run/user/{uid}/bus"
+
+
 @pytest.mark.parametrize("command", ["status", "configure"])
 @pytest.mark.parametrize("explicit", [False, True])
 def test_config_path_precedence(managed, tmp_path, monkeypatch, command, explicit):
@@ -491,7 +511,8 @@ def test_native_configure_cli_e2e(native_root, long_runtime):
     shutil.copy2(
         ROOT / "scripts/lib/code_intel_cbm_worker.py", repo / "scripts/lib/code_intel_cbm_worker.py"
     )
-    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True, env=git_env)
     settings = home / ".genesis/config/codebase-managed.json"
     state = home / ("staged" + ("x" * 100 if long_runtime else ""))
     sentinel = home / "disabled"
@@ -510,7 +531,8 @@ def test_native_configure_cli_e2e(native_root, long_runtime):
         "--sentinel",
         str(sentinel),
     ]
-    env = dict(os.environ, HOME=str(home))
+    env = {key: value for key, value in git_env.items()}
+    env["HOME"] = str(home)
     result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
     if long_runtime:
         assert result.returncode == 1
