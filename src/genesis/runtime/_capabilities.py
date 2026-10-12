@@ -66,6 +66,7 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "voice_s2s": "Speech-to-speech session manager — GPT-Realtime/Gemini Live voice front-end with Genesis tool calling",
     "campaigns": "Campaign subsystem — persistent, scheduled, LLM-driven operations with strategy docs, pre-checks, and autonomous session dispatch",
     "office_deliverables": "OfficeCLI (iOfficeAI) — high-fidelity .xlsx/.pptx/.docx renderer for the deliverable-builder skill; degrades to pandoc/CSV when the binary is absent. Optional external tool, provisioned by bootstrap.sh into ~/.genesis/deps/officecli/.",
+    "browser_automation": "Camoufox browser engine for the browser_* tools. Active = the engine this install's camoufox package launches is present and launchable; degraded = the package or that engine is missing or broken (the logged reason says what to tell the user). Optional; provisioning is an operator step.",
 }
 
 

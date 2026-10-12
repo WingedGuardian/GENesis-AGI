@@ -94,7 +94,9 @@ def main(argv: list[str] | None = None) -> None:
     launcher = launcher_path()
     if not launcher.is_file():
         raise SystemExit(f"Genesis MCP launcher not found: {launcher}")
-    os.execve(str(launcher), [str(launcher), *args], sanitized_environment())  # noqa: S606
+    os.execve(  # noqa: S606
+        str(launcher), [str(launcher), "--external-client", *args], sanitized_environment(),
+    )
 
 
 if __name__ == "__main__":

@@ -203,13 +203,22 @@ async def probe_icmp_reachable(config: GuardianConfig) -> SignalResult:
     last_exc: Exception | None = None
     retry_used = False
 
+    target = config.container_ip
+    if not target:
+        target = await asyncio.to_thread(config._detect_container_ip)
+        if target == "127.0.0.1":
+            return SignalResult(
+                name=name, alive=False, latency_ms=0,
+                detail="container address auto-detection failed", collected_at=t0.isoformat(),
+            )
+
     for attempt in range(2):
         try:
             rc, stdout, stderr = await _run_subprocess(
                 "ping",
                 f"-c{config.probes.ping_count}",
                 f"-W{config.probes.ping_timeout_s}",
-                config.container_ip,
+                target,
                 timeout=config.probes.probe_timeout_s,
             )
             if rc == 0:

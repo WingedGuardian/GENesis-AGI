@@ -289,7 +289,10 @@ def main(argv: list[str] | None = None) -> int:
         metavar="MIN",
         help="on WAIT, re-check until it fits or MIN minutes pass (default: exit 3 at once)",
     )
-    rn.add_argument("--slice", help="systemd slice for the scope (e.g. genesis-workload.slice)")
+    rn.add_argument(
+        "--slice",
+        help="systemd slice for the scope (default app-capped.slice; e.g. genesis-workload.slice)",
+    )
     rn.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
     args = parser.parse_args(argv)
     handler = {"status": _status, "preflight": _preflight, "run": _run}[args.cmd]

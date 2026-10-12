@@ -59,6 +59,9 @@ _HOST_MODULES = (
     "genesis.guardian.credential_bridge",
     "genesis.env",
     "genesis.util.host_boot",
+    "genesis.guardian.cgroup_ops",         # lazily imported by recovery and swap_watch
+    "genesis.guardian.swap_watch",         # lazily imported by check each tick
+    "genesis.util.proc_io",                # cgroup_ops' I/O sampler
 )
 
 _PROBE = """
