@@ -278,8 +278,9 @@ _cred_fallback_sources() {
 # decrypt_file <src.gpg> <dst>
 decrypt_file() {
     local src="$1" dst="$2"
-    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
-        -d -o "$dst" "$src" 2>/dev/null
+    backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
+    printf '%s' "$_BACKUP_PASSPHRASE" | python3 \
+        "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup "$src" "$dst" 2>/dev/null
 }
 
 # read_payload <path-without-.gpg> → echo resolved path and whether decryption needed.
@@ -670,6 +671,9 @@ PY
                 [ "${_schema_count:-0}" -gt 0 ] \
                     || die "SQLite staged database has no application schema — live database left untouched"
                 log "SQLite: staged candidate passed integrity, foreign-key, and schema checks"
+
+                PYTHONPATH="$_SCRIPT_DIR/../src" python3 -m genesis.db.crud.peer_restore "$_DB_STAGE" \
+                    || die "SQLite peer authority reset failed — live database left untouched"
 
                 _quiesce_genesis_server
                 # Durable crash fence. If power is lost anywhere in the swap,
