@@ -75,8 +75,10 @@ DG_RUNAWAY_FORGET_S=3600
 # dispatched session has no one watching for the first page.
 DG_RUNAWAY_REPAGE_H=6
 _RW_REPAGED_PERIOD=-1
-# Set by _rw_respond: 1 when it emptied the file it was called for.
+# Set by _rw_respond: 1 when it emptied the file it was called for, and 1
+# when it paused a writer of it on this poll.
 _RW_EMPTIED=0
+_RW_PAUSED_NOW=0
 
 # Per generation (device:inode:birth): space used at the previous poll, when it
 # was last seen, and the modes it has been paged in.
@@ -219,6 +221,10 @@ DG_RUNAWAY_TAIL_DIR="$HOME/tmp/watchgod-truncated"
 _rw_task_output() {
     # 0 when $1 is exactly a Claude Code task output under cc-tmp.
     local path="${1% (deleted)}" root rel
+    # The path goes raw into the tab-separated pause record: a tab or newline
+    # in it would split or forge a record line (review finding). No task
+    # output Claude Code writes has either.
+    [[ "$path" != *$'\t'* && "$path" != *$'\n'* ]] || return 1
     root="$(cd -P -- "$CC_TMP_DIR" 2>/dev/null && pwd -P)" || return 1
     [[ "$path" == "$root"/* ]] || return 1
     rel="${path#"$root"/}"
@@ -245,23 +251,118 @@ _rw_claude_depth() {
 }
 
 _rw_starttime() {
-    local rest
-    read -r rest 2>/dev/null < "${DG_PROC:-/proc}/$1/stat" || return 1
-    rest="${rest##*) }"
-    local -a f
-    read -r -a f <<< "$rest"
-    printf '%s' "${f[19]:-}"
+    # Start time of pid $1 (stat field 22); scripts/lib/watchgod_signal.sh.
+    wg_starttime "$1"
+}
+
+_rw_state() {
+    # The one-letter state of pid $1, or nothing when it is gone.
+    awk '/^State:/ { print $2; exit }' "${DG_PROC:-/proc}/$1/status" 2>/dev/null || true
 }
 
 _rw_stopped() {
-    # 0 once pid $1 reports a stopped state, polling for up to a second.
+    # 0 once pid $1 reports a stopped state while it is still the process that
+    # started at $2, polling for up to a second.
     local i st
     for (( i = 0; i < 10; i++ )); do
-        st="$(awk '/^State:/ { print $2; exit }' "${DG_PROC:-/proc}/$1/status" 2>/dev/null)" || st=""
-        [[ "$st" == T || "$st" == t ]] && return 0
+        st="$(_rw_state "$1")"
+        if [[ "$st" == T || "$st" == t ]]; then
+            [[ "$(_rw_starttime "$1" 2>/dev/null || true)" == "$2" ]] && return 0
+            return 1
+        fi
         sleep 0.1
     done
     return 1
+}
+
+_rw_recorded() {
+    # 0 when the pause record holds pid $1 with start time $2: the guardian
+    # paused that very process, so `scripts/watchgod thaw` can resume it.
+    [[ -s "$FROZEN_FILE" ]] || return 1
+    awk -F'\t' -v p="$1" -v s="$2" '$1 == p && $2 == s { f = 1; exit } END { exit !f }' \
+        "$FROZEN_FILE" 2>/dev/null
+}
+
+_rw_unrecord() {
+    # Remove the pause record of pid $1, start time $2, written at $3, under
+    # thaw's lock. A removal that fails is logged; the line then names a
+    # process this response never stopped.
+    if ! { (
+            flock -w 5 9 || exit 1
+            awk -F'\t' -v p="$1" -v s="$2" -v t="$3" '!($1 == p && $2 == s && $4 == t)' \
+                "$FROZEN_FILE" > "$FROZEN_FILE.tmp" && mv -f -- "$FROZEN_FILE.tmp" "$FROZEN_FILE"
+        ) 9>"$FROZEN_FILE.lock"; } 2>/dev/null; then
+        log WARN "could not remove the pause record of pid $1, which was not paused"
+    fi
+    return 0
+}
+
+_rw_unpaused_holders() {
+    # After the pause: every process that NOW holds $1 (dev:inode) open for
+    # writing and is not stopped, one pid per line. $2: the pids this response
+    # confirmed paused itself (space-separated). Stopped means state T; a
+    # tracing stop (t) is a debugger's hold that a PTRACE_CONT ends at any
+    # moment, so it counts as stopped only for a pid in $2, whose own SIGSTOP
+    # stays pending as a group-stop that a traced process reports as t. The walk the response
+    # started from is a poll old; since then a holder may have forked a child
+    # that inherited the descriptor, or something else may have opened the
+    # file. Emptying it under any running writer lets that writer refill it at
+    # once (review finding). Prints "#incomplete" when this walk, or the
+    # revalidation of what it found, did not complete: then nothing can be
+    # confirmed, and the caller must not empty the file.
+    local key="$1" ours=" ${2:-} " k s pid fd _d rc="" id st src
+    local -A seen=()
+    while read -r k s pid fd _d; do
+        if [[ "$k" == "#rc" ]]; then rc="$s"; continue; fi
+        [[ "$k" == "$key" && -n "$pid" && -z "${seen[$pid]:-}" ]] || continue
+        # Still on this file through that descriptor? A gone pid or a closed
+        # or reused descriptor is not a holder. stat -L touches the file's
+        # filesystem, so it is bounded.
+        src=0
+        id="$(timeout -k 1 2 stat -L -c %d:%i -- "${DG_PROC:-/proc}/$pid/fd/$fd" 2>/dev/null)" || src=$?
+        case $src in
+            0) ;;
+            124|137) echo "#incomplete"; return 0 ;;
+            *) continue ;;
+        esac
+        [[ "$id" == "$key" ]] || continue
+        seen[$pid]=1
+        st="$(_rw_state "$pid")"
+        [[ -z "$st" || "$st" == T ]] && continue
+        [[ "$st" == t && "$ours" == *" ${pid} "* ]] && continue
+        printf '%s\n' "$pid"
+    done < <(_rw_scan)
+    [[ "$rc" =~ ^[01]$ ]] || echo "#incomplete"
+    return 0
+}
+
+# Action pages not yet in the alert queue, retried every poll (dedupe key ->
+# "title<US>body"). After the file is emptied it falls below the detector's
+# minimum, so nothing else would ever page that the command was paused (review
+# finding). Held in memory: on a full disk there is nowhere durable to hold
+# them, and the queue is the durable record once it takes one. A restart drops
+# them; the pause records on disk are re-paged by _rw_repage.
+declare -gA _RW_PENDING=()
+
+_rw_page_act() {
+    # Queue the action page $2/$3 under dedupe key $1, or hold it for retry.
+    if queue_alert_try emergency "watchgod:disk" "$2" "$3" "$1"; then
+        unset "_RW_PENDING[$1]"
+        return 0
+    fi
+    _RW_PENDING[$1]="$2"$'\x1f'"$3"
+    log WARN "could not queue the runaway-response page (alert queue unwritable?); retrying every poll"
+    return 0
+}
+
+_rw_flush_pending() {
+    local k v
+    for k in "${!_RW_PENDING[@]}"; do
+        v="${_RW_PENDING[$k]}"
+        queue_alert_try emergency "watchgod:disk" "${v%%$'\x1f'*}" "${v#*$'\x1f'}" "$k" \
+            && { unset "_RW_PENDING[$k]"; log INFO "queued the held runaway-response page ${k}"; }
+    done
+    return 0
 }
 
 _rw_respond() {
@@ -272,8 +373,10 @@ _rw_respond() {
     local key="$1" path="$2" dkey="$3" size_mb="$4" domains="$5"
     shift 5
     _RW_EMPTIED=0
-    local pid depth st comm ts sorted="" stopped="" newly="" unstopped="" unrecorded="" tail_note emptied=0
-    local -A seen=()
+    _RW_PAUSED_NOW=0
+    local pid depth st state comm ts sorted="" stopped="" paused="" newly="" unstopped="" unrecorded=""
+    local prestopped="" running="" tail_note emptied=0 why_not=""
+    local -A seen=() st_of=()
     # Parents before children: a child stopped first can be reaped and
     # replaced by its still-running parent before the parent's turn.
     # A holder that has already exited (a loop's short-lived child, gone
@@ -296,11 +399,28 @@ _rw_respond() {
     local deadline=$(( SECONDS + 5 ))
     while read -r depth pid; do
         [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || continue
+        # This holder's generation: every signal below is bound to it.
         st="$(_rw_starttime "$pid")" || continue
+        st_of[$pid]="$st"
         comm="$(cat "${DG_PROC:-/proc}/$pid/comm" 2>/dev/null)" || comm="?"
-        # Paused on an earlier poll (another holder had kept writing): already
-        # recorded, nothing to add.
-        if [[ "$(awk '/^State:/ { print $2; exit }' "${DG_PROC:-/proc}/$pid/status" 2>/dev/null)" == T ]]; then
+        state="$(_rw_state "$pid")"
+        # Only T is a stop someone made. A tracing stop (t) ends whenever the
+        # tracer continues it, so that holder gets our own SIGSTOP, a record,
+        # and confirmation like a running one (review finding).
+        if [[ "$state" == T ]]; then
+            if _rw_recorded "$pid" "$st"; then
+                # Paused on an earlier poll (another holder had kept writing):
+                # already recorded, nothing to add.
+                paused+=" ${pid}"
+            else
+                # Stopped by something else (job control, a debugger, an
+                # operator), or a pause of ours whose record could not be
+                # written. Stopped, so it cannot write; but thaw has no record
+                # of it, and adopting one would let `thaw all` resume a stop
+                # someone made on purpose. The page names it apart, with its
+                # own resume (review finding).
+                prestopped+=" ${pid}"
+            fi
             stopped+=" ${pid}"
             continue
         fi
@@ -312,14 +432,27 @@ _rw_respond() {
         # the record can fail, and the pause still happens: an unrecorded
         # pause is named in the page with its manual resume.
         # Under thaw's lock, so a thaw rewriting the file cannot drop this line.
+        local rec_ok=1 sigrc=0
         if ! { mkdir -p "$DG_STATE_DIR" && (
                 flock -w 5 9 || exit 1
                 printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pid" "$st" "$comm" "$ts" "$key" "$path" >> "$FROZEN_FILE"
             ) 9>"$FROZEN_FILE.lock"; } 2>/dev/null; then
-            unrecorded+=" ${pid}"
+            rec_ok=0
         fi
-        if kill -STOP "$pid" 2>/dev/null && _rw_stopped "$pid"; then
+        # Bound to the generation recorded above: a pid that exited and was
+        # recycled since the start time was read is not signalled (review
+        # finding). Its record then names a process that is gone, which thaw
+        # and the re-page both skip.
+        wg_signal_gen STOP "$pid" "$st" || sigrc=$?
+        # Nothing was sent: take the record back, or a stop someone else makes
+        # later would read as ours and `thaw all` would resume it (review
+        # finding).
+        (( sigrc != 0 && rec_ok )) && _rw_unrecord "$pid" "$st" "$ts"
+        (( sigrc == 1 )) && continue   # exited since the walk: not a holder any more
+        (( sigrc == 0 && ! rec_ok )) && unrecorded+=" ${pid}"
+        if (( sigrc == 0 )) && _rw_stopped "$pid" "$st"; then
             stopped+=" ${pid}"
+            paused+=" ${pid}"
             newly+=" ${pid}"
         else
             unstopped+=" ${pid}"
@@ -327,23 +460,45 @@ _rw_respond() {
     done < <(sort -n <<< "$sorted")
     [[ -n "$stopped" ]] || { log WARN "runaway ${path}: no writer could be paused (${unstopped# })"; return 0; }
 
+    # Empty the file only when NO live writer is left running (review finding:
+    # one paused holder out of several used to be enough). Both lists count:
+    # the holders this response could not pause, and whatever holds the file
+    # for writing NOW (a child forked since the walk inherits the descriptor).
+    # Those it did pause stay paused, and the next poll tries the rest again.
+    local p
+    for p in $unstopped; do
+        [[ "$(_rw_starttime "$p" 2>/dev/null || true)" == "${st_of[$p]}" ]] || continue   # exited since
+        running+=" ${p}"
+    done
+    while read -r p; do
+        [[ -n "$p" ]] || continue
+        if [[ "$p" == "#incomplete" ]]; then
+            why_not="the check for running writers did not complete"
+            continue
+        fi
+        [[ " ${running} " == *" ${p} "* ]] || running+=" ${p}"
+    done < <(_rw_unpaused_holders "$key" "$stopped")
+    [[ -n "$running" ]] && why_not="${why_not}${why_not:+; }still running: pid${running}"
+
     # Reach the file through a PAUSED holder (a stopped process cannot close
     # or reuse a descriptor), open it on a descriptor of our own, and act only
     # if that descriptor is still the file the walk saw. A /proc fd link of a
     # pid that exited and was recycled would name some other file.
     local flink="" ofd="" ffd own=""
-    for pid in $stopped; do
-        for ffd in "${DG_PROC:-/proc}/$pid"/fd/*; do
-            # readlink never touches the target's filesystem; only a link that
-            # names this file is stat'ed, and under a timeout (a holder's other
-            # descriptors may sit on a stalled mount).
-            [[ "$(readlink -- "$ffd" 2>/dev/null)" == "$path" ]] || continue
-            [[ "$(timeout -k 1 2 stat -L -c %d:%i -- "$ffd" 2>/dev/null)" == "$key" ]] && { flink="$ffd"; break 2; }
+    if [[ -z "$why_not" ]]; then
+        for pid in $stopped; do
+            for ffd in "${DG_PROC:-/proc}/$pid"/fd/*; do
+                # readlink never touches the target's filesystem; only a link that
+                # names this file is stat'ed, and under a timeout (a holder's other
+                # descriptors may sit on a stalled mount).
+                [[ "$(readlink -- "$ffd" 2>/dev/null)" == "$path" ]] || continue
+                [[ "$(timeout -k 1 2 stat -L -c %d:%i -- "$ffd" 2>/dev/null)" == "$key" ]] && { flink="$ffd"; break 2; }
+            done
         done
-    done
-    if [[ -n "$flink" ]] && { exec {ofd}>>"$flink"; } 2>/dev/null; then
-        own="/proc/$BASHPID/fd/$ofd"
-        [[ "$(stat -L -c %d:%i -- "$own" 2>/dev/null)" == "$key" ]] || own=""
+        if [[ -n "$flink" ]] && { exec {ofd}>>"$flink"; } 2>/dev/null; then
+            own="/proc/$BASHPID/fd/$ofd"
+            [[ "$(stat -L -c %d:%i -- "$own" 2>/dev/null)" == "$key" ]] || own=""
+        fi
     fi
 
     # Keep the last MB for whoever investigates, but only where there is room:
@@ -372,24 +527,39 @@ _rw_respond() {
     # Page only when this poll changed something: a writer newly paused, or
     # the file emptied. A truncate that keeps failing under writers paused on
     # an earlier poll is logged, not re-paged every poll.
-    local sid body pids="${stopped# }"
+    local sid body title pids="${paused# }" all="${stopped# }"
     if [[ -z "$newly" ]] && (( ! emptied )); then
-        log WARN "runaway ${path}: writers ${pids} stay paused; the file could not be emptied"
+        log WARN "runaway ${path}: writers ${all} stay paused; the file could not be emptied${why_not:+ (${why_not})}"
         return 0
     fi
     sid="$(_rw_session_of "$path")"
     body="${path} (${size_mb} MB) was filling ${CC_TMP_DIR}."$'\n'
-    body+="Paused (SIGSTOP, not killed): pid ${pids}. The Claude Code session itself was NOT paused; a tool call waiting on this command waits until it is resumed or until its own timeout. A paused command keeps any lock it holds."$'\n'
-    (( emptied )) && body+="The output file was emptied (${tail_note})."$'\n' \
-                  || body+="The output file could NOT be emptied."$'\n'
+    [[ -n "$pids" ]] && body+="Paused (SIGSTOP, not killed): pid ${pids}. "
+    body+="The Claude Code session itself was NOT paused; a tool call waiting on this command waits until it is resumed or until its own timeout. A paused command keeps any lock it holds."$'\n'
+    [[ -n "$prestopped" ]] && body+="Already stopped before the guardian acted (not paused by it; thaw does not resume these): pid${prestopped}; resume with kill -CONT${prestopped}."$'\n'
+    if (( emptied )); then
+        body+="The output file was emptied (${tail_note})."$'\n'
+    else
+        body+="The output file could NOT be emptied${why_not:+ (${why_not})}."$'\n'
+    fi
     [[ -n "$unstopped" ]] && body+="Could not pause: pid${unstopped}."$'\n'
     [[ -n "$sid" ]] && body+="Claude Code session: ${sid}"$'\n'
-    body+="Resume: scripts/watchgod thaw all (or thaw <pid>). End it instead: kill -CONT ${pids} && kill ${pids}."
+    [[ -n "$pids" ]] && body+="Resume: scripts/watchgod thaw all (or thaw <pid>). "
+    body+="End it instead: kill -CONT ${all} && kill ${all}."
     [[ -n "$unrecorded" ]] && body+=$'\n'"Not recorded (the state disk is full), so thaw cannot see:${unrecorded}; resume with kill -CONT${unrecorded}."
-    log WARN "runaway ${path}: paused ${pids}; emptied=${emptied}; ${tail_note}"
-    queue_alert_try emergency "watchgod:disk" "Paused a runaway Claude Code task and emptied its output" \
-        "$body" "watchgod:runaway-act:${key}:$(date +%s)" \
-        || log WARN "could not queue the runaway-response page (alert queue unwritable?)"
+    [[ -n "$newly" ]] && _RW_PAUSED_NOW=1
+    if (( emptied )) && [[ -z "$newly" ]]; then
+        # No signal was sent this poll: every writer was already stopped.
+        title="Emptied a runaway Claude Code task output (its writers were already stopped)"
+    elif (( emptied )); then
+        title="Paused a runaway Claude Code task and emptied its output"
+    else
+        # The title is what an alert listing shows: it must not claim the
+        # recovery in the case that still needs someone (review finding).
+        title="Paused a runaway Claude Code task; its output could NOT be emptied"
+    fi
+    log WARN "runaway ${path}: paused ${pids:-none}; already stopped${prestopped:- none}; emptied=${emptied}; ${tail_note}${why_not:+; ${why_not}}"
+    _rw_page_act "watchgod:runaway-act:${key}:$(date +%s)" "$title" "$body"
     return 0
 }
 
@@ -401,6 +571,8 @@ wg_runaway_check() {
     local domains="$1" now key size pid fd dev
     now="$(date +%s)"
     RUNAWAY_FAST=0
+    # An action page an earlier poll could not queue goes first.
+    _rw_flush_pending
     local -A size_of=() dev_of=() fds_of=()
     local scan scan_rc=""
     scan="$(_rw_scan)" || scan="#rc unknown"
@@ -507,8 +679,10 @@ wg_runaway_check() {
         body="${path}: ${size_mb} MB in use, held open for writing. Why flagged: ${why}."$'\n'"Writers:"$'\n'"$(_rw_holders "${holders[@]:0:DG_RUNAWAY_MAX_HOLDERS}")"
         (( ${#holders[@]} > DG_RUNAWAY_MAX_HOLDERS )) && body+=$'\n'"  +$(( ${#holders[@]} - DG_RUNAWAY_MAX_HOLDERS )) more"
         [[ -n "$sid" ]] && body+=$'\n'"Claude Code session: ${sid}"
-        if (( acted )); then
+        if (( acted && _RW_PAUSED_NOW )); then
             body+=$'\n'"The guardian paused its writers and emptied it; the next page says how to resume."
+        elif (( acted )); then
+            body+=$'\n'"The guardian emptied it; its writers were already stopped (the next page says by whom and how to resume)."
         else
             body+=$'\n'"The guardian has not acted on it. Stop the writer, or empty the file, before the filesystem fills."
         fi

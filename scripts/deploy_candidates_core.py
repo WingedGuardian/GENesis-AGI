@@ -381,7 +381,7 @@ class Repo:
         text = self.git("rev-parse", "--path-format=absolute", "--git-path", "hooks").stdout.strip()
         return Path(text)
 
-    def place(self, cmd: str) -> None:
+    def place(self, cmd: str, note: Callable[[str], None] = out) -> None:
         """From a linked worktree, the read-only commands report the main
         checkout (whose `live` and manifest they are about); every command that
         changes anything refuses, so only the main checkout's own copy of this
@@ -392,7 +392,8 @@ class Repo:
             return
         main_root = Path(common).parent if os.path.basename(common) == ".git" else None
         if cmd in ("list", "status") and main_root is not None:
-            out(f"(from a linked worktree: reporting the main checkout, {main_root})")
+            # `note`: stderr under `list --json`, whose stdout is one JSON object.
+            note(f"(from a linked worktree: reporting the main checkout, {main_root})")
             self.root = main_root
             return
         where = (

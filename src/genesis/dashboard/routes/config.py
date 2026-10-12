@@ -78,6 +78,15 @@ def _categorize_memory(filename: str) -> str:
     return "memory-reference"
 
 
+def _memory_index() -> Path | None:
+    """The resolved memory index, or None when it cannot be resolved (a symlink
+    loop raises RuntimeError on Python 3.12)."""
+    try:
+        return (_MEMORY_DIR / "MEMORY.md").resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
 @blueprint.route("/api/genesis/config-files")
 def config_files():
     """Return list of all editable config, identity, and memory files."""
@@ -153,6 +162,7 @@ def config_files():
 
     # Auto-memory files
     if _MEMORY_DIR.is_dir():
+        index = _memory_index()
         for p in sorted(_MEMORY_DIR.glob("*.md")):
             if p.is_file() and not p.name.startswith("."):
                 results.append({
@@ -160,7 +170,9 @@ def config_files():
                     "name": f"memory/{p.name}",
                     "category": _categorize_memory(p.name),
                     "editable": True,
-                    "deletable": p.name != "MEMORY.md",
+                    # By path, as the delete route refuses it: a link to
+                    # the index is not deletable either.
+                    "deletable": index is not None and p.resolve() != index,
                     "syntax": "markdown",
                 })
 
@@ -229,7 +241,7 @@ def config_file_update(name: str):
 
 @blueprint.route("/api/genesis/config-files/<path:name>", methods=["DELETE"])
 def config_file_delete(name: str):
-    """Delete an auto-memory file."""
+    """Move an auto-memory file to the Genesis trash (#2926); never MEMORY.md."""
     if not name.startswith("memory/"):
         return jsonify({"error": "only memory files can be deleted"}), 403
 
@@ -239,10 +251,32 @@ def config_file_delete(name: str):
         return jsonify({"error": "file not found"}), 404
     if not target.resolve().is_relative_to(_MEMORY_DIR.resolve()):
         return jsonify({"error": "path traversal blocked"}), 403
+    # Validate and trash ONE spelling: the parent resolved, the leaf kept (a
+    # symlink is trashed as the link). Memory files live directly in the
+    # memory directory; anything else (a subdirectory, "<link>/..") is refused,
+    # because the trash collapses ".." as text while the filesystem follows the
+    # link first, so the checked file and the trashed one could differ.
+    try:
+        target = target.parent.resolve() / target.name
+    except (OSError, RuntimeError):
+        return jsonify({"error": "path traversal blocked"}), 403
+    if target.name in ("", ".", "..") or target.parent != _MEMORY_DIR.resolve():
+        return jsonify({"error": "path traversal blocked"}), 403
+    # The index is not deletable (the listing marks it so); compare paths, not
+    # strings, so "memory/./MEMORY.md" is refused too. An index that cannot be
+    # resolved refuses every delete rather than guess.
+    index = _memory_index()
+    if index is None or target.resolve() == index:
+        return jsonify({"error": "MEMORY.md cannot be deleted"}), 403
+
+    from genesis.trash import TrashRefused, trash
 
     try:
-        target.unlink()
-        return jsonify({"status": "ok", "name": name})
+        # The unresolved path: a symlink goes to the trash as the link.
+        stone = trash(target, reason="dashboard memory file delete", caller="dashboard.config.memory_delete")
+        return jsonify({"status": "ok", "name": name, "trash_entry": stone.entry_id})
+    except TrashRefused as exc:
+        return jsonify({"error": str(exc)}), 409
     except Exception as exc:
         logger.error("Failed to delete memory file %s: %s", name, exc, exc_info=True)
         return jsonify({"error": "delete failed"}), 500

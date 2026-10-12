@@ -167,6 +167,10 @@ class CallResult:
     cost_usd: float = 0.0
     cost_known: bool = True
     retry_after_s: float | None = None
+    # A 429 whose provider said a DAILY quota is spent (not per-minute
+    # backpressure); retry_after_s then names the provider's own reset, and the
+    # daily-budget ledger deselects the provider until it.
+    daily_quota_exhausted: bool = False
     # Did the request actually REACH the provider? False only where the
     # delegate caught an exception carrying no HTTP status — DNS, socket and
     # TLS failures — which it reports as a synthesized 500 indistinguishable

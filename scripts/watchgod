@@ -34,14 +34,10 @@ usage() {
     exit "${1:-0}"
 }
 
-_starttime() {
-    local rest
-    read -r rest 2>/dev/null < "$DG_PROC/$1/stat" || return 1
-    rest="${rest##*) }"
-    local -a f
-    read -r -a f <<< "$rest"
-    printf '%s' "${f[19]:-}"
-}
+# wg_starttime and wg_signal_gen: a resume reaches only the process that was
+# paused, never a later holder of its pid.
+# shellcheck source=scripts/lib/watchgod_signal.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/watchgod_signal.sh"
 
 cmd_status() {
     if [[ -f "$STATE_FILE" ]]; then
@@ -63,7 +59,7 @@ PY
             [[ "$pid" =~ ^[0-9]+$ ]] || continue
             (( n++ == 0 )) && echo "paused:"
             state="gone"
-            [[ "$(_starttime "$pid" 2>/dev/null || true)" == "$st" ]] && state="still paused"
+            [[ "$(wg_starttime "$pid" 2>/dev/null || true)" == "$st" ]] && state="still paused"
             echo "  pid ${pid} (${comm}) since ${ts}, writing ${path} — ${state}"
         done < "$FROZEN_FILE"
     fi
@@ -78,7 +74,7 @@ cmd_thaw() {
     # The guardian appends under this lock; hold it across read-and-rewrite.
     exec 9>"$FROZEN_FILE.lock"
     flock 9
-    local keep="" pid st comm ts path hit=0 line
+    local keep="" pid st comm ts path hit=0 line rc
     while IFS= read -r line; do
         IFS=$'\t' read -r pid st comm ts _ path <<< "$line"
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
@@ -87,13 +83,25 @@ cmd_thaw() {
             continue
         fi
         hit=1
-        if [[ "$(_starttime "$pid" 2>/dev/null || true)" != "$st" ]]; then
-            echo "pid ${pid} (${comm}) is no longer running — record dropped"
+        # Resume only a process that is still paused (state T). One already
+        # running was resumed by someone else; one stopped by a debugger (t)
+        # is not ours to continue. Either way the record is stale (review
+        # finding). A process gone or recycled is reported by the signal below.
+        if [[ "$(wg_starttime "$pid" 2>/dev/null || true)" == "$st" ]] \
+                && [[ "$(awk '/^State:/ { print $2; exit }' "$DG_PROC/$pid/status" 2>/dev/null || true)" != T ]]; then
+            echo "pid ${pid} (${comm}) is not paused (resumed elsewhere?) — record dropped, not signalled"
             continue
         fi
-        if kill -CONT "$pid" 2>/dev/null; then
+        # Bound to the recorded start time: checked and signalled as one
+        # generation (a pidfd where the box has one), so a pid recycled after
+        # the check is never resumed.
+        rc=0
+        wg_signal_gen CONT "$pid" "$st" || rc=$?
+        if (( rc == 0 )); then
             echo "resumed pid ${pid} (${comm})"
             echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [INFO] THAWED pid ${pid} (${comm}) by operator" >> "$LOG_FILE" 2>/dev/null || true
+        elif (( rc == 1 )); then
+            echo "pid ${pid} (${comm}) is no longer running — record dropped"
         else
             echo "could not signal pid ${pid} (${comm}) — record kept" >&2
             keep+="${line}"$'\n'
