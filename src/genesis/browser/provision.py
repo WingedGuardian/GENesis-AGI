@@ -20,11 +20,12 @@ import argparse
 import fcntl
 import math
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -74,7 +75,8 @@ def min_free_bytes() -> int:
         gb = _DEFAULT_MIN_FREE_GB
     if not math.isfinite(gb) or gb <= 0:
         gb = _DEFAULT_MIN_FREE_GB
-    return int(gb * 1024**3)
+    # A floor no disk can meet skips every run; capped so the byte count stays finite.
+    return int(min(gb, 2.0**40) * 1024**3)
 
 
 def free_bytes(path: Path) -> int | None:
@@ -83,9 +85,10 @@ def free_bytes(path: Path) -> int | None:
     return effective_free_bytes(path)
 
 
-def _short_of_space(paths: list[Path], writes: dict[Path, int] | None = None) -> str | None:
+def _short_of_space(paths: list[Path], writes: Iterable[tuple[Path, int]] = ()) -> str | None:
     """Why a destination lacks room, or None. Each of ``paths`` must keep the minimum
-    free; ``writes`` (destination -> bytes a step is about to put there) must fit on
+    free; ``writes`` ((destination, bytes) a step is about to put there; one path may
+    appear twice, as when the browsers dir is the download dir) must fit on
     top of it, summed per filesystem, so a download cannot itself take the disk
     below the floor. The engine, its download and Chromium can each be elsewhere."""
     floor = min_free_bytes()
@@ -95,7 +98,7 @@ def _short_of_space(paths: list[Path], writes: dict[Path, int] | None = None) ->
     # shared device can only make this refuse a run that would fit (the timer
     # retries), never let one overrun the floor.
     need: dict[object, tuple[list[Path], int]] = {}
-    for path, size in [(p, 0) for p in paths] + list((writes or {}).items()):
+    for path, size in [(p, 0) for p in paths] + list(writes):
         key = disk_device(path) or path
         members, total = need.get(key, ([], floor))
         need[key] = ([*members, path] if path not in members else members, total + size)
@@ -160,13 +163,17 @@ def _temp_root() -> Path:
     return Path(os.environ.get("GENESIS_BIG_TMP") or Path.home() / "tmp") / "browser-stack"
 
 
+def _chromium_writes(root: Path) -> list[tuple[Path, int]]:
+    return [(root, _CHROMIUM_BYTES), (_temp_dir(), _CHROMIUM_ARCHIVE_BYTES)]
+
+
 def _room_to_fetch() -> str | None:
     return _short_of_space(
         [],
-        {
-            engine.camoufox_install_dir(): _ENGINE_BYTES,
-            _temp_root(): _ENGINE_ARCHIVE_BYTES,
-        },
+        [
+            (engine.camoufox_install_dir(), _ENGINE_BYTES),
+            (_temp_root(), _ENGINE_ARCHIVE_BYTES),
+        ],
     )
 
 
@@ -399,7 +406,8 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
         notes.append(
             "a `camoufox set` choice (or an unreadable camoufox config) would make fetch install "
             "that choice instead of the paired build; operator step: "
-            f"`{sys.executable} -m camoufox set --release`, then run this again"
+            f"`{shlex.join([sys.executable, '-m', 'camoufox', 'set', '--release'])}`, "
+            "then run this again"
         )
         return "user-selected", False, status
     # A directory the operator named is theirs to fix; it is never removed here.
@@ -482,9 +490,10 @@ _EXTRAS = (
 )
 
 
-def _extras_step(run: Runner, notes: list[str]) -> None:
+def _extras_step(run: Runner, notes: list[str]) -> bool:
     """camoufox's own idempotent installers for its default add-ons and fingerprint
-    model, which ``fetch`` runs and a launch otherwise downloads mid-call."""
+    model, which ``fetch`` runs and a launch otherwise downloads mid-call. False when
+    they failed: a launch runs the same installers first and fails the same way."""
     proc = run(
         [sys.executable, "-c", _EXTRAS],
         env=_child_env(),
@@ -494,8 +503,11 @@ def _extras_step(run: Runner, notes: list[str]) -> None:
     )
     if proc.returncode != 0:
         notes.append(
-            "camoufox's add-ons or fingerprint model did not install; a launch fetches them"
+            "camoufox's add-ons or fingerprint model did not install; a launch runs the "
+            "same install first, so the engine is not ready until it succeeds"
         )
+        return False
+    return True
 
 
 # Upstream's own repair of one build, under its installer lock: re-download and
@@ -554,9 +566,7 @@ def _chromium_step(run: Runner, notes: list[str]) -> tuple[str, bool, list[Path]
     if due and (blocked := _unwritable([root, _temp_root()])):
         notes.append(blocked)
         return "not writable", False, []
-    if due and (
-        short := _short_of_space([], {root: _CHROMIUM_BYTES, _temp_dir(): _CHROMIUM_ARCHIVE_BYTES})
-    ):
+    if due and (short := _short_of_space([], _chromium_writes(root))):
         return f"skipped ({short})", True, []
     # Every install, --force included, first deletes the revisions Playwright thinks
     # unused; one a live browser runs from must stay.
@@ -577,9 +587,7 @@ def _chromium_step(run: Runner, notes: list[str]) -> tuple[str, bool, list[Path]
         binary = chromium.executable(build, where[build][1])
         if not _unreadable_by_ldd(run, binary):
             continue
-        if short := _short_of_space(
-            [], {root: _CHROMIUM_BYTES, _temp_dir(): _CHROMIUM_ARCHIVE_BYTES}
-        ):
+        if short := _short_of_space([], _chromium_writes(root)):
             notes.append(f"{binary} is damaged; not reinstalled ({short})")
             continue  # the library step reports the damaged binary
         _force(run, package, build, where[build][1], notes, gc)
@@ -654,7 +662,7 @@ def _libs_step(run: Runner, binaries: list[Path], notes: list[str]) -> tuple[str
             "install-deps did not supply every library; if it was interrupted, "
             "`sudo dpkg --configure -a` finishes the package install"
         )
-    notes.append(f"operator step: `sudo {' '.join(deps)}`")
+    notes.append(f"operator step: `{shlex.join(['sudo', *deps])}`")
     return "missing:" + ",".join(missing), False
 
 
@@ -695,9 +703,11 @@ def provision(run: Runner | None = None) -> Outcome:
         eng, eng_ok, status = f"error:{type(exc).__name__}", False, None
     if status is not None and status.ready and _pin_capable():
         try:
-            _extras_step(run, notes)
-        except Exception as exc:  # noqa: BLE001 - a launch fetches them itself
+            extras_ok = _extras_step(run, notes)
+        except Exception as exc:  # noqa: BLE001 - reported on the outcome
             notes.append(f"add-on / fingerprint model step failed: {exc!r}")
+            extras_ok = False
+        eng_ok = eng_ok and extras_ok
     try:
         chromium, chromium_ok, chrome_bins = _chromium_step(run, notes)
     except Exception as exc:  # noqa: BLE001

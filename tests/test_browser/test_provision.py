@@ -1223,7 +1223,7 @@ def test_writes_sharing_a_quota_are_summed_against_it(env, monkeypatch):
     floor, w = provision.min_free_bytes(), 1024**3
     monkeypatch.setattr(provision, "free_bytes", lambda path: floor + w + 1)
     monkeypatch.setattr(provision, "_device_free", lambda path: 100 * 1024**3)
-    assert "low disk" in provision._short_of_space([], {env / "a": w, env / "b": w})
+    assert "low disk" in provision._short_of_space([], [(env / "a", w), (env / "b", w)])
 
 
 def test_the_device_itself_must_hold_every_write_on_it(env, monkeypatch):
@@ -1232,7 +1232,7 @@ def test_the_device_itself_must_hold_every_write_on_it(env, monkeypatch):
     floor, w = provision.min_free_bytes(), 1024**3
     monkeypatch.setattr(provision, "free_bytes", lambda path: 100 * 1024**3)
     monkeypatch.setattr(provision, "_device_free", lambda path: floor + w + 1)
-    assert "low disk" in provision._short_of_space([], {env / "a": w, env / "b": w})
+    assert "low disk" in provision._short_of_space([], [(env / "a", w), (env / "b", w)])
 
 
 def test_one_glibc_shortfall_on_two_binaries_is_not_unreadable(env, monkeypatch):
@@ -1269,3 +1269,44 @@ def test_stale_entries_that_cannot_be_removed_are_named(env, monkeypatch):
     _resolves(monkeypatch, READY)
     out = provision.provision(Runner())
     assert any(str(stale) in n for n in out.notes)
+
+
+def test_two_writes_to_one_path_are_both_counted(env, monkeypatch):
+    """PLAYWRIGHT_BROWSERS_PATH can be the download dir itself: the install and its
+    archive then land on one path, and both must fit."""
+    floor, w = provision.min_free_bytes(), 1024**3
+    monkeypatch.setattr(provision, "free_bytes", lambda path: floor + w + 1)
+    assert "low disk" in provision._short_of_space([], [(env / "a", w), (env / "a", w)])
+    assert provision._short_of_space([], [(env / "a", w)]) is None
+
+
+def test_an_absurd_free_space_floor_skips_without_a_traceback(env, monkeypatch):
+    monkeypatch.setenv("GENESIS_BROWSER_MIN_FREE_GB", "1e300")
+    out = provision.provision(Runner())
+    assert "low disk" in out.line()
+
+
+def test_a_failed_addon_or_model_install_is_not_ready(env, monkeypatch):
+    """camoufox's launch ensures the fingerprint model before it imports it, so a
+    failed install here fails the same way at every launch."""
+    _resolves(monkeypatch, READY, READY)
+    assert provision.provision(Runner()).ok
+    out = provision.provision(Runner({"maybe_download_addons": (1, "")}))
+    assert not out.ok and "engine=Camoufox official 156.0.1-beta.36" in out.line()
+
+
+def test_printed_commands_quote_a_path_with_spaces(env, monkeypatch):
+    monkeypatch.setattr(sys, "executable", "/opt/my venv/bin/python")
+    monkeypatch.setattr(provision, "_explicit_choice", lambda: True)
+    _resolves(monkeypatch, MISSING)
+    out = provision.provision(Runner())
+    assert "'/opt/my venv/bin/python' -m camoufox set --release" in "\n".join(out.notes)
+    monkeypatch.setattr(provision, "_explicit_choice", lambda: False)
+    status = _engine_on_disk(env)
+    _resolves(monkeypatch, status)
+    run = Runner({"ldd": (0, "\tlibgtk-3.so.0 => not found\n"), "sudo -n true": (1, "")})
+    out = provision.provision(run)
+    assert any(
+        "sudo '/opt/my venv/bin/python' -m playwright install-deps chromium firefox" in n
+        for n in out.notes
+    )
