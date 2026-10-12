@@ -592,6 +592,7 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
                         f"incus config set limits.memory.swap={target_str} failed: {err}",
                     )
         elif mode == "off" and _is_byte_ceiling(raw_value):
+            pre_live, pre_read = await read_swap_max(container), True
             ok, err = await _incus_config_set(container, {"limits.memory.swap": "true"})
             if ok:
                 healed.append(
@@ -655,22 +656,21 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     # `live_now` follows the value the cgroup holds after this tick's writes.
     current = await read_swap_max(container)
     live_now = current
+    # Was swap off before this tick? A 0 read after this tick's boolean key
+    # write may be the one Incus just wrote. When the pre-write read itself
+    # failed, such a 0 cannot be told apart and is not called a repair. With no
+    # pre-write read at all (no key write in a mode that reads), a live 0 is.
+    self_zeroed = key_now != raw_value and not _is_byte_ceiling(key_now)
+    if pre_read and pre_live is not None:
+        live_was_off = pre_live == "0"
+    else:
+        live_was_off = current == "0" and not (pre_read and self_zeroed)
 
     if mode == "ceiling":
         if current is not None and current != target_str:
             if await write_swap_max(container, target_str):
-                # Was swap off before this tick? A 0 read after this tick's
-                # boolean key write may be the one Incus just wrote. If the
-                # pre-write read itself failed, such a 0 is labelled a ceiling
-                # change: with no earlier signal it cannot be told apart.
-                self_zeroed = key_now != raw_value and not _is_byte_ceiling(key_now)
-                was_off = (
-                    pre_live == "0"
-                    if pre_read and pre_live is not None
-                    else current == "0" and not (pre_read and self_zeroed)
-                )
                 healed.append(
-                    (f"memory.swap.max: {current} → {target_str} bytes (live)", was_off, True)
+                    (f"memory.swap.max: {current} → {target_str} bytes (live)", live_was_off, True)
                 )
                 live_now = target_str
             else:
@@ -702,7 +702,13 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
         elif await activate_swap_max(container):
             live_now = "max"
             if config_verified:
-                healed.append(("memory.swap.max: 0 → max (live, no restart needed)", True, False))
+                healed.append(
+                    (
+                        "memory.swap.max: 0 → max (live, no restart needed)",
+                        live_was_off,
+                        not live_was_off,
+                    )
+                )
             else:
                 # Live-healed, but the config read failed so the PERSISTENT
                 # knob was never verified/set: a restart can revert

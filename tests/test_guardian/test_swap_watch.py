@@ -417,6 +417,57 @@ async def test_off_removes_a_native_ceiling_and_heals_the_live_zero(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_off_ceiling_removal_is_ceiling_only_when_swap_was_on(tmp_path):
+    """Lifting a ceiling with swap on: the key write to true makes Incus zero the
+    cgroup, and reopening that self-caused 0 is part of the ceiling change, not a
+    swap-off repair."""
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=swap_watch.SWAP_CEILING_OFF)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "2147483648", "")})
+    live = _IncusLive("2147483648")
+
+    async def activate(_container):
+        live.value = "max"
+        return True
+
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "_incus_config_set", AsyncMock(side_effect=live.config_set)),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(side_effect=live.read)),
+        patch.object(swap_watch, "activate_swap_max", AsyncMock(side_effect=activate)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert "memory.swap.max: 0 → max" in body
+    assert "D-state" not in body
+
+
+@pytest.mark.asyncio
+async def test_off_ceiling_removal_with_swap_already_off_is_a_repair(tmp_path):
+    """The cgroup read 0 before the key write: swap really was off, so reopening
+    it is a repair as well as the ceiling removal."""
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=swap_watch.SWAP_CEILING_OFF)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "2147483648", "")})
+    live = _IncusLive("0")
+
+    async def activate(_container):
+        live.value = "max"
+        return True
+
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "_incus_config_set", AsyncMock(side_effect=live.config_set)),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(side_effect=live.read)),
+        patch.object(swap_watch, "activate_swap_max", AsyncMock(side_effect=activate)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian set container swap"]
+    assert "D-state" in _sent_bodies(d)[0]
+
+
+@pytest.mark.asyncio
 async def test_off_lifts_a_fallback_cgroup_cap(tmp_path):
     """`off` with the key already true and a finite live cap (the fallback
     path's): the cap is lifted to max, the key is not touched."""
