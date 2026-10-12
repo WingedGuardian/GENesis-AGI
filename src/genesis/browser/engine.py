@@ -161,10 +161,7 @@ def _operator_step(*, legacy: bool = False, remove_first: bool = False) -> str:
     # The engine download is a temp file in TMPDIR; a session's TMPDIR is a small
     # quota, and a TMPDIR that does not exist falls back to /tmp, often a small
     # tmpfs. The interpreter is this one, the venv camoufox is installed in.
-    return (
-        f"{_TELL}{flag}`mkdir -p ~/tmp && TMPDIR=~/tmp {_q(sys.executable)} -m camoufox fetch`"
-    )
-
+    return f"{_TELL}{flag}`mkdir -p ~/tmp && TMPDIR=~/tmp {_q(sys.executable)} -m camoufox fetch`"
 
 
 def _repair_step(binary: Path, problem: str, kind: str) -> str:
@@ -371,18 +368,19 @@ def _legacy_engine(version: str) -> EngineStatus:
 
 def _engine_dirs() -> list[Path]:
     """Every ``browsers/<repo>/<version>`` directory holding a version.json: the
-    ones camoufox's ``list_installed`` reads (multiversion.py:281-291)."""
+    ones camoufox's ``list_installed`` reads (multiversion.py:281-291). A directory
+    that cannot be read raises, as it does from the listing: the repair is its
+    permissions, not an engine directory."""
     browsers = camoufox_install_dir() / "browsers"
+    if not browsers.is_dir():
+        return []
     found = []
-    try:
-        for repo in sorted(browsers.iterdir()):
-            if not repo.is_dir() or repo.name.startswith("."):
-                continue
-            found.extend(
-                d for d in sorted(repo.iterdir()) if d.is_dir() and (d / "version.json").exists()
-            )
-    except OSError:
-        pass
+    for repo in sorted(browsers.iterdir()):
+        if not repo.is_dir() or repo.name.startswith("."):
+            continue
+        found.extend(
+            d for d in sorted(repo.iterdir()) if d.is_dir() and (d / "version.json").exists()
+        )
     return found
 
 
@@ -444,6 +442,10 @@ def _pinned_engine(version: str) -> EngineStatus:
             for iv in installed
             if browser_pin.matches(pin, iv.repo_name, iv.version.version or "", iv.version.build)
         ]
+    except OSError:
+        # list_installed walks browsers/ unguarded: a directory it cannot read is a
+        # permissions repair, which resolve_camoufox_engine names.
+        raise
     except Exception as exc:  # noqa: BLE001 - upstream code reading the cache; never raise
         # One unreadable entry under browsers/ fails the whole listing (upstream
         # Version() raises IndexError on an empty build, for one), and `camoufox

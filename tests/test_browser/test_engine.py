@@ -162,6 +162,7 @@ def _fake_camoufox(monkeypatch, *, pin=PIN, installed=(), list_raises=None, pin_
 
     pkg = types.ModuleType("camoufox")
     bp = types.ModuleType("camoufox.browser_pin")
+
     def load_pin(path=None):
         if pin_raises is not None:
             raise pin_raises
@@ -388,7 +389,6 @@ def test_0_5_without_browser_pin_module_is_invalid(cache, monkeypatch):
     "exc",
     [
         KeyError("build"),
-        OSError("permission denied"),
         ValueError("x"),
         # upstream Version() indexes the first character of each build part, so
         # any browsers/ entry whose build is "" raises this (MEASURED, 0.5.7)
@@ -403,6 +403,39 @@ def test_upstream_lookup_failure_is_invalid_never_raises(cache, monkeypatch, exc
     assert status.kind == engine.INVALID
     assert "lookup failed" in status.detail
     assert "tell the user" in status.detail
+
+
+@pytest.mark.parametrize(
+    "exc", [PermissionError(13, "Permission denied"), OSError(5, "Input/output error")]
+)
+def test_an_unreadable_cache_gets_the_permissions_step(cache, monkeypatch, exc):
+    """list_installed walks browsers/ unguarded, so a directory it cannot read
+    raises from it; naming engine directories or config.json would not help."""
+    _versions(monkeypatch, camoufox="0.5.7")
+    _fake_camoufox(monkeypatch, list_raises=exc)
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.INVALID
+    assert "check the permissions under" in status.detail
+    assert "config.json" not in status.detail
+
+
+def test_engine_dirs_does_not_hide_an_unreadable_directory(cache, monkeypatch):
+    repo = engine.camoufox_install_dir() / "browsers" / "official"
+    repo.mkdir(parents=True)
+    real = Path.iterdir
+
+    def iterdir(self):
+        if self == repo:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    with pytest.raises(PermissionError):
+        engine._engine_dirs()
+
+
+def test_engine_dirs_without_a_browsers_directory_is_empty(cache):
+    assert engine._engine_dirs() == []
 
 
 def test_import_failure_is_invalid_never_raises(cache, monkeypatch):
@@ -605,7 +638,9 @@ def test_override_is_not_honoured_before_0_5_7(cache, monkeypatch, tmp_path, ver
 
 
 @pytest.mark.parametrize("ver,refused", [("0.5.6", True), ("0.5.7", False), ("0.5.8b1", False)])
-def test_without_a_file_list_the_version_decides_the_pin_cut(cache, monkeypatch, tmp_path, ver, refused):
+def test_without_a_file_list_the_version_decides_the_pin_cut(
+    cache, monkeypatch, tmp_path, ver, refused
+):
     """Some installers write no RECORD, so the file check cannot run."""
     _versions(monkeypatch, camoufox=ver, files=None)
     monkeypatch.setenv("CAMOUFOX_EXECUTABLE_PATH", str(_engine_dir(tmp_path / "custom")))
@@ -962,7 +997,9 @@ def test_a_dashed_build_is_not_the_pins_folder(cache, monkeypatch):
 
 
 @pytest.mark.parametrize("value", ["15\ufffd6.0.1-beta.36", "beta.36", "  "])
-def test_a_version_whose_major_is_not_a_number_is_invalid(value, cache, monkeypatch, tmp_path, linux):
+def test_a_version_whose_major_is_not_a_number_is_invalid(
+    value, cache, monkeypatch, tmp_path, linux
+):
     """camoufox puts ``Version.split('.', 1)[0]`` into the browser's fingerprint
     (0.5.8 utils.py:1082): a garbled major launches with a garbage User-Agent."""
     binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
@@ -1129,7 +1166,9 @@ def test_properties_json_is_loaded_the_way_camoufox_loads_it(
     assert status.kind == engine.INVALID and "properties.json" in status.detail
 
 
-def test_upstreams_own_properties_loader_is_used_when_it_imports(cache, monkeypatch, tmp_path, linux):
+def test_upstreams_own_properties_loader_is_used_when_it_imports(
+    cache, monkeypatch, tmp_path, linux
+):
     """camoufox's loader is the authority; the resolver's copy is only the fallback."""
     binary = _kind_engine("versioned", cache, monkeypatch, tmp_path)
     utils = types.ModuleType("camoufox.utils")
@@ -1160,4 +1199,3 @@ def test_a_removed_property_needs_no_type(cache, monkeypatch, tmp_path, linux):
         '[{"property": "a", "type": "str"}, {"property": "b", "removed": "140"}]'
     )
     assert engine.resolve_camoufox_engine().kind == engine.READY
-
