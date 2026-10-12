@@ -5843,6 +5843,53 @@ class TestRecheckAfterLateImport:
 
 
 # ---------------------------------------------------------------------------
+# Card-number guards (fill, run_js)
+# ---------------------------------------------------------------------------
+
+# Stripe's public test number, built from parts so no card literal is in the file.
+_TEST_CARD = "4242" * 4
+
+
+class TestCardNumberGuards:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "value",
+        [_TEST_CARD, f"{_TEST_CARD[:4]} {_TEST_CARD[4:8]} {_TEST_CARD[8:12]} {_TEST_CARD[12:]}"],
+    )
+    async def test_fill_refuses_a_card_value_before_touching_the_page(self, value):
+        page, calls = _typing_page()
+        with patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_fill("#note", value)
+        assert result == {"error": browser._REFUSE_CARD_VALUE}
+        assert calls["down"] == 0
+        page.fill.assert_not_awaited()
+        page.click.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_js_refuses_a_card_number_before_logging_it(self, caplog):
+        page = MagicMock()
+        page.url = "https://shop.example"
+        page.evaluate = AsyncMock(return_value=None)
+        browser._active_page = page
+        with caplog.at_level("DEBUG", logger="genesis"):
+            result = await browser._impl_browser_run_js(
+                f"document.querySelector('#cc').value = '{_TEST_CARD}'"
+            )
+        assert result == {"error": browser._REFUSE_CARD_RUN_JS}
+        page.evaluate.assert_not_awaited()
+        assert _TEST_CARD not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_run_js_runs_ordinary_scripts(self):
+        page = MagicMock()
+        page.url = "https://shop.example"
+        page.evaluate = AsyncMock(return_value="Checkout")
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("document.title")
+        assert result["result"] == "Checkout"
+
+
+# ---------------------------------------------------------------------------
 # Input-stall diagnostics: a click or fill focus click whose call log reached
 # "performing click action" carries a snapshot taken at that moment, so the
 # candidate causes (a JS dialog, lost focus or visibility, a navigation, the
@@ -6019,7 +6066,9 @@ class TestInputStallDiagnostics:
 
     @pytest.mark.asyncio
     async def test_a_stalled_fill_focus_click_carries_no_input_value(self, caplog):
-        secret = "4111111111111111"
+        # Not a card number: browser_fill refuses one before any click (#3188),
+        # so a card value could never reach the stalled-click path tested here.
+        secret = "pass-phrase-7731"
         page, _ = _typing_page()
         page.click = AsyncMock(side_effect=Exception(_STALL_LOG))  # raw: _human_type marks it
         page.context.pages = [page]
