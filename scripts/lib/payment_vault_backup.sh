@@ -53,7 +53,7 @@ PAYMENT_VAULT_SCHEMA_VERSION=1
 PAYMENT_VAULT_COLUMNS="card_ref label brand last4 merchant single_use status created_at retired_at blob"
 
 payment_vault_check() {
-    local dir="$1" f ic uv cols
+    local dir="$1" f ic uv cols meta digest sum rec
     for f in "${PAYMENT_VAULT_FILES[@]}"; do
         if [ -L "$dir/$f" ] || [ ! -f "$dir/$f" ]; then
             printf '%s is missing or not a regular file\n' "$f"
@@ -67,7 +67,7 @@ payment_vault_check() {
     # "age1" plus 58 Bech32 characters: an X25519 public key. (vault_store also
     # verifies its checksum; the shape is enough to refuse a truncated file.)
     if ! head -n 1 "$dir/recipient.txt" 2>/dev/null \
-        | grep -qE '^age1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}$'; then
+        | grep -qE '^age1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}$'; then  # pragma: allowlist secret (public BIP-173 alphabet, not a secret)
         printf 'recipient.txt does not hold an age public key\n'
         return 1
     fi
@@ -90,6 +90,29 @@ payment_vault_check() {
         2>/dev/null)" || cols=""
     if [ "$cols" != "$PAYMENT_VAULT_COLUMNS" ]; then
         printf 'cards.db does not have the vault card table\n'
+        return 1
+    fi
+    # The key pair init recorded (vault_store's vault_meta): a damaged or
+    # swapped key file is refused here too, so backup never ships one over the
+    # last good archive.
+    meta="$(sqlite3 -readonly "$dir/cards.db" \
+        "SELECT group_concat(name, ' ') FROM (SELECT name FROM pragma_table_info('vault_meta') ORDER BY cid)" \
+        2>/dev/null)" || meta=""
+    if [ "$meta" != "key value" ]; then
+        printf 'cards.db does not record the vault keys\n'
+        return 1
+    fi
+    digest="$(sqlite3 -readonly "$dir/cards.db" \
+        "SELECT value FROM vault_meta WHERE key = 'identity_sha256'" 2>/dev/null)" || digest=""
+    sum="$(sha256sum < "$dir/identity.age" 2>/dev/null)" || sum=""
+    if [ -z "$digest" ] || [ "$digest" != "${sum%% *}" ]; then
+        printf 'identity.age is not the key this vault was created with\n'
+        return 1
+    fi
+    rec="$(sqlite3 -readonly "$dir/cards.db" \
+        "SELECT value FROM vault_meta WHERE key = 'recipient'" 2>/dev/null)" || rec=""
+    if [ -z "$rec" ] || [ "$rec" != "$(head -n 1 "$dir/recipient.txt")" ]; then
+        printf 'recipient.txt is not the public key this vault was created with\n'
         return 1
     fi
     return 0

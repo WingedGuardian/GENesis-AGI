@@ -524,8 +524,12 @@ def _is_allowed(path: Path) -> bool:
     descriptor, which is the property this guard actually needs; the absoluteness
     did not, and a reader who believed it would conclude the ordering was moot
     and reorder it.)
+
+    A path that cannot be resolved (a symlink loop) is refused, never a 500.
     """
-    resolved = path.resolve()
+    resolved = _resolve_or_none(path)
+    if resolved is None:
+        return False
     root = next(
         (
             r
@@ -544,6 +548,16 @@ def _is_allowed(path: Path) -> bool:
     # lock the operator out of every root at once on an install whose home
     # happened to carry a matching name.
     below = resolved.relative_to(root).parts
+    # Neither trash is browsable; restore goes through its own CLI. The Genesis
+    # trash renames every item to the fixed leaf ``item``, so the name rules
+    # below could not see what a trashed file was; the worktree trash holds
+    # archives whose contents those rules never see either. Judged on the
+    # RESOLVED path, like everything here: a trashed symlink named as
+    # ``<trash>/<entry>/item`` is its target, which every route then reads or
+    # changes exactly as if the target had been named (and refuses if it is in
+    # a trash). One spelling, so what is checked is what is acted on.
+    if _in_a_trash(resolved):
+        return False
     # Block paths containing "secret" in any component (except dir names "secrets"/".secrets")
     for part in below:
         if "secret" in part.lower() and part.lower() not in ("secrets", ".secrets"):
@@ -594,6 +608,36 @@ def _is_allowed(path: Path) -> bool:
     return not _is_sqlite_artifact(resolved.name)
 
 
+def _worktree_trash_dir() -> Path:
+    # Resolved as its writer resolves it (zero_drop_worker._default_trash_dir):
+    # Path.home(), not GENESIS_HOME.
+    return Path.home() / ".genesis" / "worktree-trash"
+
+
+def _trash_stores() -> tuple[Path, ...]:
+    """Both trash roots, resolved. A root that cannot be resolved (a symlink
+    loop) is kept as spelled, so paths under it still count as in a trash
+    instead of every request failing."""
+    from genesis.trash import home_trash_root
+
+    return tuple(
+        _resolve_or_none(root) or root for root in (home_trash_root(), _worktree_trash_dir())
+    )
+
+
+def _in_a_trash(resolved: Path) -> bool:
+    return any(resolved.is_relative_to(store) for store in _trash_stores())
+
+
+def _resolve_or_none(path: Path) -> Path | None:
+    """``path.resolve()``, or None when it cannot be resolved: Python 3.12
+    raises RuntimeError on a symlink loop (MEASURED), later versions OSError."""
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
 def _sanitize_path(raw: str | None) -> tuple[Path | None, tuple | None]:
     """Resolve and validate a user-supplied path.
 
@@ -604,7 +648,9 @@ def _sanitize_path(raw: str | None) -> tuple[Path | None, tuple | None]:
     """
     if not raw:
         return None, ({"error": "path required"}, 400)
-    resolved = Path(raw).resolve()
+    resolved = _resolve_or_none(Path(raw))
+    if resolved is None:
+        return None, ({"error": "Path cannot be resolved"}, 400)
     if not _is_allowed(resolved):
         return None, ({"error": "Path not allowed"}, 403)
     return resolved, None
@@ -640,7 +686,9 @@ def file_list():
     if (resp := _auth_or_403()) is not None:
         return resp
     raw_path = request.args.get("path", str(_HOME / "genesis"))
-    target = Path(raw_path).resolve()
+    target = _resolve_or_none(Path(raw_path))
+    if target is None:
+        return jsonify({"error": "Path cannot be resolved"}), 400
 
     # Allow listing the home directory for navigation between roots,
     # but do NOT add _HOME to _ALLOWED_ROOTS (that would expose ~/.ssh etc.
@@ -657,11 +705,19 @@ def file_list():
         return jsonify({"error": "Permission denied"}), 403
 
     items = []
+    stores = _trash_stores()
     for entry in entries:
         # Skip hidden files except known safe directories
         if entry.name.startswith(".") and entry.name not in (".claude", ".genesis"):
             continue
         if entry.name.lower() in _BLOCKED_NAMES:
+            continue
+        # Not browsable, so not listed either: a trash, or a link into one. A
+        # link that cannot be resolved (a loop) is no trash; it is listed and
+        # _file_info reports it.
+        if (r := _resolve_or_none(entry)) is not None and any(
+            r.is_relative_to(store) for store in stores
+        ):
             continue
         items.append(_file_info(entry))
 
@@ -839,7 +895,7 @@ def file_rename():
 
 @blueprint.route("/api/genesis/files/delete", methods=["DELETE"])
 def file_delete():
-    """Delete a file (not directories, for safety).
+    """Move a file to the Genesis trash (not directories, for safety).
 
     Query params: path – absolute file path
     """
@@ -853,13 +909,19 @@ def file_delete():
     if target.is_dir():
         return jsonify({"error": "Cannot delete directories via browser — use terminal"}), 400
 
+    from genesis.trash import TrashRefused, trash
+
+    # Deletes go to the Genesis trash (#2926); it refuses, with the file left in
+    # place, anything it cannot take (another volume, the Claude Code temp volume).
     try:
-        target.unlink()
+        stone = trash(target, reason="dashboard file browser delete", caller="dashboard.files.delete")
+    except TrashRefused as exc:
+        return jsonify({"error": str(exc)}), 409
     except Exception:
         logger.exception("Failed to delete %s", target)
         return jsonify({"error": "Delete failed"}), 500
 
-    return jsonify({"status": "ok", "path": str(target)})
+    return jsonify({"status": "ok", "path": str(target), "trash_entry": stone.entry_id})
 
 
 @blueprint.route("/api/genesis/files/download")
@@ -931,7 +993,12 @@ def file_upload():
     # only appends a numeric suffix, so checking the pre-dedup name is correct
     # and avoids creating directories for a request we're about to reject.
     candidate = dest_dir / base_name
-    if not dest_dir.resolve().is_relative_to(_UPLOAD_DIR.resolve()) or not _is_allowed(candidate):
+    resolved_dir = _resolve_or_none(dest_dir)
+    if (
+        resolved_dir is None
+        or not resolved_dir.is_relative_to(_UPLOAD_DIR.resolve())
+        or not _is_allowed(candidate)
+    ):
         return jsonify({"error": "Path not allowed"}), 403
 
     # Create the validated destination and write. Guard the filesystem ops: a

@@ -197,6 +197,13 @@ names, so an overlay of a read-only file is editable (#2446).
   (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`,
   `GENESIS_SQLITE_SLOW_MS` (slow-statement log threshold, default 1000, `0` = off).
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
+- **The update remote** — which git remote `scripts/update.sh` fetches `main` from, and
+  which the version collector compares against. Chosen by `src/genesis/util/update_remote.py`:
+  env `GENESIS_UPDATE_REMOTE` (one run), then the checkout's own git config
+  `genesis.updateRemote` (read with `--local`; a global or system entry is ignored), then
+  `origin`. `update.sh` pins `origin` there on first use, so a remote added later (a
+  contributor's fork fetched for review) cannot move it. When `origin` does not name
+  `github.public_repo` but another remote does, it refuses until that key is set by hand.
 - **`~/.genesis/resource-budget.env`** — optional `KEY=VALUE` file for the resource-budget
   levers (`GENESIS_RB_*`), read by `genesis.hostmetrics`; the process environment wins over
   it. Details: `docs/reference/resource-budget.md`.

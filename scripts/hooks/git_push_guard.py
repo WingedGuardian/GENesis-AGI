@@ -114,6 +114,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -340,6 +341,8 @@ try:
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
         _REPARSE_CARRIERS,
+        PushArg,
+        PushArgKind,
         analyze,
         analyze_checked,
         commit_skips_hooks,
@@ -351,6 +354,7 @@ try:
         git_subcommand_index,
         has_trailing_override,
         mentions,
+        push_arg_stream,
         split_segments,
         unresolved_verb_programs,
     )
@@ -10414,6 +10418,17 @@ def _rework_ack_bot_logins() -> frozenset[str]:
 #: The heading an acknowledgement comment opens with (after leading whitespace).
 _REWORK_ACK_HEADING = "## rework acknowledgement"
 
+#: What may follow a spec or acknowledgement heading: a qualifier set off by
+#: punctuation and carrying at least one word, such as `(amended,
+#: decision-complete)`, `: v2` or a dash and a note. A bare following WORD is
+#: not allowed: "Rework acknowledgement needed" is an instruction, not an
+#: acknowledgement. The qualifier's MEANING is not judged. This row checks
+#: form; whether a spec is decision-complete is the closing session's call, as
+#: the closing-session skill's gate table says. A word list cannot tell a draft
+#: from a decision: it blocks "(final; no open questions)" and passes
+#: "(proposed)".
+_REWORK_HEADING_QUALIFIER = r"(?:\s*[(\[:,;\u2010-\u2015\u2212\uff1a-]\s*\w.*)?"
+
 #: The fields the `## Rework` section must carry, each with text after the colon.
 _REWORK_FIELDS = (
     "Replaces",
@@ -10987,8 +11002,11 @@ def _rework_ts(value: object) -> _dt.datetime | None:
 
 def _rework_heading_comment(body: str, heading: str) -> bool:
     """True when the comment's first rendered block is the level-2 heading
-    ``heading`` (ATX or setext, whitespace-normalized, exact, never a prefix),
-    optionally preceded by a paragraph that is only ``(aside)``. AGENTS.md puts
+    ``heading`` (ATX or setext, whitespace-normalized, case-insensitive),
+    optionally followed by a punctuation-led qualifier whose meaning is not
+    judged (``_REWORK_HEADING_QUALIFIER``) but never by a bare word, and optionally
+    preceded by a paragraph that is only ``(aside)``. "acknowledgement" also
+    matches the US spelling "acknowledgment". AGENTS.md puts
     ``(aside)`` on the first line of a comment on a Devin-built PR so the comment
     does not start a paid Devin session. Raises ``_ReworkUnreadable`` when the
     comment cannot be parsed.
@@ -10999,13 +11017,18 @@ def _rework_heading_comment(body: str, heading: str) -> bool:
     if not blocks:
         return False
     kind, where, text = blocks[0]
-    return kind == "heading" and where == 2 and " ".join(text.split()).lower() == heading
+    if kind != "heading" or where != 2:
+        return False
+    pattern = re.escape(heading).replace("acknowledgement", "acknowledge?ment")
+    normalized = " ".join(text.split()).lower()
+    return re.fullmatch(pattern + _REWORK_HEADING_QUALIFIER, normalized) is not None
 
 
 def _rework_is_ack(body: str) -> bool:
     """True when the comment opens with the "Rework acknowledgement" heading (see
-    ``_rework_heading_comment``). Never a prefix: "## Rework acknowledgement
-    needed" is an instruction, not an acknowledgement.
+    ``_rework_heading_comment``). A qualifier set off by punctuation may follow;
+    a bare word may not: "## Rework acknowledgement needed" is an instruction,
+    not an acknowledgement.
     """
     return _rework_heading_comment(body, _REWORK_ACK_HEADING.removeprefix("## "))
 
@@ -12096,10 +12119,6 @@ _SUBAGENT_UNREADABLE_DENY = (
 )
 
 
-# git push flags that consume the NEXT token as their value — so a value that
-# happens to start with '+' or contain 'f' is not misread as a force.
-_PUSH_VALUE_FLAGS = frozenset({"-o", "--push-option", "--repo", "--receive-pack", "--exec"})
-
 # The first-push-only skip uses an ALLOWLIST posture (git's push surface is too
 # flexible to blocklist safely): a push qualifies as a "plain current-branch
 # update" ONLY if every flag it carries is ref-set-neutral — verbosity, dry-run,
@@ -12124,15 +12143,12 @@ _PUSH_SAFE_LONG_FLAGS = frozenset(
         "--no-thin",
     }
 )
-# Ref-neutral value flags (skip the flag AND its value token). ``--repo`` (redirects
-# the push) and ``--receive-pack``/``--exec`` (select a receive-pack PROGRAM that git
-# EXECUTES on local/SSH transports — an arbitrary-code vector) are deliberately
-# EXCLUDED, so a push carrying any of them falls through to the approval prompt.
-_PUSH_SAFE_VALUE_FLAGS = frozenset({"-o", "--push-option"})
-# Ref-neutral short-flag letters (for bundles like ``-uq``). ``o`` is handled
-# separately (glued push-option value). ``f`` (force) and ``d`` (delete) are absent
-# by design — a bundle containing either is not a plain current-branch update.
-_PUSH_SAFE_SHORT_LETTERS = frozenset("uvqn46")
+# Ref-neutral long value flag. ``--repo`` redirects the push, and
+# ``--receive-pack``/``--exec`` select a program git executes, so they refuse.
+_PUSH_SAFE_VALUE_FLAGS = frozenset({"--push-option"})
+# Ref-neutral short-flag letters (for bundles like ``-uq``). ``o`` carries its
+# push-option value. ``f`` (force) and ``d`` (delete) are absent by design.
+_PUSH_SAFE_SHORT_LETTERS = frozenset("uvqn46o")
 # Git GLOBAL options (before ``push``) that a plain re-push may carry. ``-C`` is
 # resolved into the push's cwd by the caller; the pager switches change nothing
 # about the push. Every other global option — above all ``-c`` / ``--config-env``,
@@ -12141,134 +12157,120 @@ _PUSH_SAFE_GLOBAL_VALUE_FLAGS = frozenset({"-C"})
 _PUSH_SAFE_GLOBAL_FLAGS = frozenset({"-P", "--no-pager"})
 
 
+#: Short letters that set the same git variable as a long boolean.
+_PUSH_SHORT_BOOLEANS = {"f": "force", "n": "dry-run"}
+
+
+def _push_boolean_options(stream: list[PushArg] | None) -> dict[str, bool]:
+    """The effective value of each boolean option on a push, in argument order.
+
+    Git stores every occurrence of a boolean into one variable, so the LAST
+    spelling wins and ``--no-<name>`` clears it (MEASURED, git 2.43:
+    ``--force --no-force``, ``-f --no-force``, ``--mirr --no-mirror`` and
+    ``--force-w --no-force-with-lease`` are rejected as non-fast-forward;
+    ``--dry --no-dry-run`` and ``-n --no-dry-run`` really push). Names are the
+    stream's canonical long names without dashes; ``-f``/``-n`` map onto
+    ``force``/``dry-run``. ``--mirror`` shares force's bit, so it sets both
+    ``mirror`` and ``force`` and ``--no-mirror`` clears both (MEASURED, git
+    2.43 and 2.55: ``--force --no-mirror`` is not a force push).
+    """
+    state: dict[str, bool] = {}
+    for arg in stream or ():
+        if arg.kind is PushArgKind.LONG:
+            name = arg.text.split("=", 1)[0][2:]
+            if name.startswith("no-"):
+                name = name[3:]
+                state[name] = False
+                if name == "mirror":
+                    state["force"] = False
+            else:
+                state[name] = True
+                if name == "mirror":
+                    state["force"] = True
+        elif arg.kind is PushArgKind.SHORT and arg.text in _PUSH_SHORT_BOOLEANS:
+            state[_PUSH_SHORT_BOOLEANS[arg.text]] = True
+    return state
+
+
 def _push_is_force(argv: list[str]) -> bool:
     """Whether a parsed ``git push`` argv performs a force push.
 
     Argv comes from ``shell_parse`` (quote-stripped), so a quoted ``'-f'``
     counts and a branch/refspec name that merely contains ``-f`` (a bare
     positional) does not. Catches both the flag forms — ``--force`` /
-    ``--force-with-lease`` / ``--force-if-includes`` / ``--mirror`` / ``-f`` /
+    ``--force-with-lease`` / ``--mirror`` / ``-f`` /
     bundled ``-uf`` — and the ``+<refspec>`` shorthand (``git push origin +main``),
-    which git treats as ``--force`` for that ref. A short cluster stops at
-    ``o`` and the value token of ``-o`` / ``--push-option`` / ``--repo`` /
-    ``--exec`` / ``--receive-pack`` is skipped, so a push-option value that
-    starts with ``+`` or contains ``f`` (e.g. ``-oci.skip``) is not mistaken
-    for a force.
+    which git treats as ``--force`` for that ref. The shared stream consumes
+    option values, including ``-o`` ending a bundle and ``-c`` before ``push``.
+    ``--mirror`` sets the force bit as well as the mirror bit; a later
+    ``--no-mirror`` clears both. ``--force-if-includes`` alone is not a force
+    push; it only affects a push with ``--force-with-lease`` (MEASURED, git 2.43
+    and 2.55).
     """
-    i = 1  # skip argv[0] == "git"
-    while i < len(argv):
-        tok = argv[i]
-        if tok in _PUSH_VALUE_FLAGS:
-            i += 2  # skip the flag and its value token
-            continue
-        if tok == "--force" or tok.startswith("--force-"):
-            return True
-        if tok == "--mirror":
-            # --mirror force-updates EVERY ref and deletes remote refs that are
-            # absent locally — an unconditional destructive push, never a plain
-            # one, so it must hard-block rather than reach an approvable prompt.
-            return True
-        if tok.startswith("+"):
-            return True  # +<refspec> is git shorthand for --force on that ref
-        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
-            for ch in tok[1:]:
-                if ch == "o":  # -oVALUE glued push-option — rest is its value
-                    break
-                if ch == "f":
-                    return True
-        i += 1
-    return False
+    stream: list[PushArg] | None = push_arg_stream(argv)
+    if any(arg.kind is PushArgKind.PLUS for arg in stream or ()):
+        return True  # +<refspec> is git shorthand for --force on that ref; no flag undoes it
+    state = _push_boolean_options(stream)
+    # --mirror shares TRANSPORT_PUSH_FORCE's bit with TRANSPORT_PUSH_MIRROR.
+    # The state walk records that shared bit on `force`, so `--no-mirror`
+    # clears it and a later `--force` re-enables it, just as git does.
+    return any(
+        state.get(name, False)
+        for name in ("force", "force-with-lease", "mirror")
+    )
 
 
 def _push_named_remote(argv: list[str]) -> str | None:
     """The remote named on a ``git push <remote> …``, else None.
 
-    argv is quote-stripped from ``shell_parse``. Skips git global options (and
-    their values), the ``push`` token, and push flags/values; the first bare
-    positional after that is the remote. A ``+<refspec>`` positional is NOT a
-    remote (it is a force refspec) and is skipped.
+    The first positional in the shared stream; option values and ``+<refspec>``
+    force shorthands are not positional arguments.
     """
-    i = 1  # skip argv[0] == "git"
-    # advance past git global options to the `push` token
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return None
-    i += 1
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-") or t.startswith("+"):
-            i += 1
-            continue
-        return t  # first bare positional after `push` is the remote
+    for arg in push_arg_stream(argv) or ():
+        if arg.kind is PushArgKind.POSITIONAL:
+            return arg.text
     return None
 
 
 def _push_repo_flag(argv: list[str]) -> str | None:
     """The value of a ``--repo <value>`` / ``--repo=value`` on a git push, else None.
 
-    ``git push --repo <dest>`` overrides both the positional remote and the
-    branch upstream as the push DESTINATION (P1-C), so it must win when deciding
-    what a force push actually targets. The value may be a remote name OR a URL.
+    The value may be a remote name OR a URL. A positional repository takes
+    precedence over ``--repo``; this value is used only when no remote is named.
+    Git stores every occurrence into one option variable, so the LAST ``--repo``
+    wins and a later ``--no-repo`` clears it.
     """
-    i = 0
-    while i < len(argv):
-        t = argv[i]
-        if t == "--repo" and i + 1 < len(argv):
-            return argv[i + 1]
-        if t.startswith("--repo="):
-            return t.split("=", 1)[1]
-        i += 1
-    return None
+    stream: list[PushArg] | None = push_arg_stream(argv)
+    if stream is None:
+        return None
+    repo: str | None = None
+    for index, arg in enumerate(stream):
+        if arg.kind is not PushArgKind.LONG:
+            continue
+        option, equals, value = arg.text.partition("=")
+        if option == "--no-repo":
+            repo = None
+            continue
+        if option != "--repo":
+            continue
+        if equals:
+            repo = value
+        elif index + 1 < len(stream) and stream[index + 1].kind is PushArgKind.LONG_VALUE:
+            repo = stream[index + 1].text
+        else:
+            repo = None
+    return repo
 
 
-def _push_positionals(argv) -> list[str]:
+def _push_positionals(argv: list[str]) -> list[str]:
     """The bare positional args of a ``git push`` (``[remote, refspec, ...]``).
 
-    Parsed from a quote-stripped argv, mirroring ``_push_named_remote``: git global
-    options/values, the ``push`` token, and push flags/values are all skipped —
-    including no-value flags (``-u`` / ``--set-upstream`` / ``--force-with-lease``)
-    which take NO separate token, and value flags (``_PUSH_VALUE_FLAGS``:
-    ``-o`` / ``--push-option`` / ``--repo`` / ``--receive-pack`` / ``--exec``) which
-    take one. A ``+<refspec>`` (force) positional is excluded. Empty if not a push.
+    Only ``POSITIONAL`` entries are returned; options, values, and ``+`` force
+    refspecs have their own kinds in the shared stream.
     """
-    argv = argv or []
-    i = 1  # skip argv[0] == "git"
-    # advance past git global options (and their values) to the `push` token
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return []
-    i += 1
-    out: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-") or t.startswith("+"):
-            i += 1
-            continue
-        out.append(t)
-        i += 1
-    return out
+    return [
+        arg.text for arg in push_arg_stream(argv or []) or () if arg.kind is PushArgKind.POSITIONAL
+    ]
 
 
 # push.default modes that push the CURRENT branch to a SAME-NAMED remote ref (or
@@ -12532,44 +12534,13 @@ def _push_is_dry_run(seg) -> bool:
     Reads only the PUSH's own options, and skips each value-taking flag's
     value: ``git push -o --dry-run origin HEAD`` sends ``--dry-run`` to the
     server as a push-option and performs a REAL push (git-push(1): ``-o``
-    takes the next argument). The same walk as ``_push_positionals`` — global
-    options and their values, then ``_PUSH_VALUE_FLAGS`` values — so a value
-    is never read as the flag. ``--`` ends option parsing.
+    takes the next argument). Read through ``push_arg_stream`` — the same
+    value rules as every other consumer — so a value is never read as the
+    flag, and a ``-n`` after ``--`` is a positional, not the flag.
     """
     argv = getattr(seg, "argv", None) or []
-    i = 1  # skip argv[0] == "git"
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return False
-    i += 1
-    while i < len(argv):
-        t = argv[i]
-        if t == "--":
-            return False
-        if t in _PUSH_VALUE_FLAGS:
-            i += 2  # the value token is data, never the dry-run flag
-            continue
-        if t == "--dry-run":
-            return True
-        if t.startswith("-") and not t.startswith("--") and len(t) > 1:
-            letters = t[1:]
-            for pos, ch in enumerate(letters):
-                if ch == "o":
-                    if pos == len(letters) - 1:
-                        i += 1  # `-uo VALUE`: the NEXT token is the value
-                    break  # `-oVALUE`: the rest of this token is the value
-                if ch == "n":
-                    return True
-        i += 1
-    return False
+    # Effective value: `--dry --no-dry-run` really pushes (MEASURED, git 2.43).
+    return _push_boolean_options(push_arg_stream(argv)).get("dry-run", False)
 
 
 def _push_ref_positionals(argv: list[str]) -> list[str] | None:
@@ -12598,67 +12569,39 @@ def _push_ref_positionals(argv: list[str]) -> list[str] | None:
     before this), ``--exec-path`` (where git finds the programs it runs),
     ``--namespace``, ``--git-dir`` / ``--work-tree``, and anything unknown.
     """
-    # Advance past git global options to the `push` token — allowlisted.
-    i = 1
+    positionals: list[str] = []
     dash_c = 0
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+    stream: list[PushArg] | None = push_arg_stream(argv)
+    if stream is None:
+        return None  # not a `git push` — the bare-push `[]` does not apply
+    for arg in stream:
+        if arg.kind is PushArgKind.GLOBAL_VALUE:
             # git applies repeated -C cumulatively; the caller resolves only
             # the first, so a second one would make it probe the wrong repo.
+            if arg.text not in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+                return None  # -c / --config-env / --git-dir / unknown
             dash_c += 1
             if dash_c > 1:
                 return None
-            i += 2
-            continue
-        if t in _PUSH_SAFE_GLOBAL_FLAGS:
-            i += 1
-            continue
-        if t.startswith("-"):
-            return None  # -c / --config-env / --exec-path / --git-dir / unknown
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return None
-    i += 1
-    positionals: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_VALUE_FLAGS:
-            i += 2  # ref-neutral value flag: skip the flag and its value token
-            continue
-        if t.startswith("--"):
-            base = t.split("=", 1)[0]
-            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
-                i += 1  # --push-option=value etc.
-                continue
-            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
-                i += 1
+        elif arg.kind is PushArgKind.GLOBAL:
+            if arg.text not in _PUSH_SAFE_GLOBAL_FLAGS:
+                return None
+        elif arg.kind is PushArgKind.LONG:
+            base = arg.text.split("=", 1)[0]
+            if base in _PUSH_SAFE_VALUE_FLAGS:
+                continue  # --push-option; a separate value arrives as LONG_VALUE
+            if "=" not in arg.text and base in _PUSH_SAFE_LONG_FLAGS:
                 continue
             return None  # unknown/broadening long flag (or a =form of a no-value flag)
-        if t.startswith("+"):
+        elif arg.kind in {PushArgKind.SHORT_VALUE, PushArgKind.LONG_VALUE}:
+            continue  # the value of a value-flag the flag check already passed
+        elif arg.kind is PushArgKind.SHORT:
+            if arg.text not in _PUSH_SAFE_SHORT_LETTERS:
+                return None  # f/d/unknown letters change the ref set
+        elif arg.kind is PushArgKind.PLUS:
             return None  # +<refspec> force shorthand
-        if t.startswith("-") and len(t) > 1:
-            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
-            # glued push-option value, so the rest of the token is that value; an
-            # `o` that ENDS the bundle (`-uo VALUE`) takes the NEXT token instead,
-            # exactly as `_push_is_dry_run` reads it.
-            safe = True
-            letters = t[1:]
-            skip = 1
-            for pos, ch in enumerate(letters):
-                if ch == "o":
-                    if pos == len(letters) - 1:
-                        skip = 2
-                    break
-                if ch not in _PUSH_SAFE_SHORT_LETTERS:
-                    safe = False
-                    break
-            if not safe:
-                return None
-            i += skip
-            continue
-        positionals.append(t)
-        i += 1
+        else:  # POSITIONAL
+            positionals.append(arg.text)
     return positionals
 
 
@@ -12674,7 +12617,7 @@ def _push_targets_current_branch(
     itself, never a parsed destination. True ONLY when BOTH hold:
       1. Every flag after ``push`` is ref-set-neutral — a member of
          ``_PUSH_SAFE_LONG_FLAGS`` / ``_PUSH_SAFE_VALUE_FLAGS``, or a short bundle
-         whose every letter is in ``_PUSH_SAFE_SHORT_LETTERS`` (``o`` = glued
+         whose every letter is in ``_PUSH_SAFE_SHORT_LETTERS`` (``o`` carries a
          push-option value). ANY other flag (``--all`` / ``--tags`` / ``--delete``
          / a bundled ``-d`` / ``--stdin`` / ``--repo`` / unknown) → False.
       2. The positionals name a plain current-branch update:
@@ -12697,7 +12640,9 @@ def _push_targets_current_branch(
          configured receive-pack program, a divergent push URL. One predicate
          for all shapes costs an ask on the rare remap config and removes the
          per-shape subset that let those side channels through.
-    Conservative by construction: any unrecognized form re-prompts. argv-based
+    The explicit ``--`` terminator is accepted, so ``git push -- origin HEAD``
+    follows the same re-push path as its plain spelling. Tokens after it are
+    positional, not options. Any unrecognized option re-prompts. argv-based
     (quote-stripped).
     """
     if not cur:
@@ -12710,10 +12655,7 @@ def _push_targets_current_branch(
     if len(positionals) >= 3:
         return False  # multiple refspecs → not a single plain current-branch update
     if positionals and positionals[0] != remote:
-        # The remote git will read from argv must be the one the caller resolved
-        # and every check below keys on. They diverge when the two parsers read
-        # an option value differently (`git push -uo origin HEAD`: git takes
-        # `origin` as the -o value and `HEAD` as the remote).
+        # The positionals and resolved destination must agree.
         return False
     if len(positionals) == 2:
         refspec = positionals[1]
@@ -12809,6 +12751,50 @@ def _push_seg_has_no_prefix(seg) -> bool:
         return False
     # Exactly `git`: a path-qualified `./git` could be any program.
     return bool(words) and words[0] == "git"
+
+
+def _push_carries_command_config(seg) -> bool:
+    """Whether a push segment has a prefix, wrapper, or untrusted git global.
+
+    Only ``-C <dir>``, ``-P`` and ``--no-pager`` are safe before ``push``.
+    Git config supplied through any other global option, or an unrecognized
+    argv shape, is not visible to the guard's repository-config reads. This
+    structural decision is independent of destination: supplied config can
+    retarget a remote or introduce a force refspec before Git runs.
+    Repeated ``-C`` is refused because Git applies each directory change
+    cumulatively, while the cwd resolvers only read the first one.
+
+    A push reparsed from a shell-wrapper body (``bash -c '…'``, depth > 0) is
+    wrapped by definition: the outer shell can export config before running it
+    (``BASH_ENV=<file> bash -c 'git push …'`` sources the file first), and the
+    nested segment's own text no longer shows that prefix.
+    """
+    if getattr(seg, "depth", 0):
+        return True
+    if not _push_seg_has_no_prefix(seg):
+        return True
+    argv = list(getattr(seg, "argv", None) or [])
+    push_index = git_subcommand_index(argv)
+    if push_index is None or argv[push_index] != "push":
+        return True
+
+    i = 1
+    dash_c_count = 0
+    while i < push_index:
+        option = argv[i]
+        if option in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+            if option == "-C":
+                dash_c_count += 1
+                if dash_c_count > 1:
+                    return True
+            if i + 1 >= push_index:
+                return True
+            i += 2
+        elif option in _PUSH_SAFE_GLOBAL_FLAGS:
+            i += 1
+        else:
+            return True
+    return False
 
 
 def _ref_names_current_branch(ref: str, cur: str | None) -> bool:
@@ -12933,18 +12919,20 @@ def _refspec_onto_other_branch(
 def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
     """The push DESTINATION (remote name or URL) for a segment, or None if UNKNOWN.
 
-    Resolution order: an explicit ``--repo <dest>`` (P1-C) → an explicitly named
-    positional remote → else the current branch's upstream remote (the part
-    before ``/`` of ``@{upstream}``); else None. Callers FAIL CLOSED on None — an
+    Resolution order: an explicitly named positional remote → ``--repo <dest>``
+    when no positional remote is present → the current branch's upstream remote
+    (the part before ``/`` of ``@{upstream}``); else None. Measured with git
+    2.34.1: when both ``--repo`` and a positional repository are present, git
+    uses the positional repository. Callers FAIL CLOSED on None — an
     undeterminable destination is treated as origin/public and blocked.
     """
     argv = getattr(seg, "argv", None) or []
-    repo = _push_repo_flag(argv)
-    if repo:
-        return repo
     remote = _push_named_remote(argv)
     if remote:
         return remote
+    repo = _push_repo_flag(argv)
+    if repo:
+        return repo
     try:
         args = ["git"]
         if cwd:
@@ -12963,8 +12951,9 @@ def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
 def _effective_push_remote(seg, cur: str | None, cwd: str | None = None) -> str | None:
     """The remote a ``git push`` will ACTUALLY push to, honoring git's precedence.
 
-    An explicit ``--repo`` or positional remote wins. For a bare ``git push`` git
-    picks, in order: ``branch.<cur>.pushRemote`` → ``remote.pushDefault`` →
+    A positional repository takes precedence over ``--repo``; when neither is
+    present, a bare ``git push`` picks, in order:
+    ``branch.<cur>.pushRemote`` → ``remote.pushDefault`` →
     ``branch.<cur>.remote`` (the ``@{upstream}`` remote) → ``origin``. The
     republish + config checks MUST target this remote, not the fetch/upstream
     remote — otherwise a triangular fork workflow (pull from origin, push to fork)
@@ -12980,7 +12969,7 @@ def _effective_push_remote(seg, cur: str | None, cwd: str | None = None) -> str 
     """
     argv = getattr(seg, "argv", None) or []
     if _push_repo_flag(argv) or _push_named_remote(argv):
-        return _resolve_push_remote(seg, cwd=cwd)  # explicit --repo / positional wins
+        return _resolve_push_remote(seg, cwd=cwd)  # positional wins over --repo
     base = ["git"] + (["-C", cwd] if cwd else [])
     keys = ([f"branch.{cur}.pushRemote"] if cur else []) + ["remote.pushDefault"]
     keys += [f"branch.{cur}.remote"] if cur else []
@@ -13038,6 +13027,23 @@ def _push_dest_urls(dest: str, cwd: str | None = None) -> set[str]:
     if _looks_like_url(dest):
         return {dest}
     return set()
+
+
+def _push_dest_meets_origin(remote: str | None, pcwd: str | None, pcwd_unknown: bool) -> bool:
+    """Whether a push destination is public or cannot be proven disjoint from origin."""
+    if pcwd_unknown or remote is None or remote == "origin":
+        return True
+    dest_urls = _push_dest_urls(remote, cwd=pcwd)
+    origin_urls = _remote_push_urls("origin", cwd=pcwd)
+    if not dest_urls or not origin_urls or dest_urls & origin_urls:
+        return True
+    # Spellings of ONE repository differ as strings (https vs git@host:owner/repo,
+    # a trailing .git), so compare the (host, owner/repo) identity as well. A URL
+    # whose identity cannot be parsed (a relative path) cannot be the public repo,
+    # whose URL always parses, so the exact-string comparison above stands for it.
+    origin_ids = {_repo_identity_from_url(u) for u in origin_urls} - {None}
+    dest_ids = {_repo_identity_from_url(u) for u in dest_urls} - {None}
+    return bool(origin_ids & dest_ids)
 
 
 def _remote_branch_sha(remote: str, branch: str, cwd: str | None = None) -> str | None:
@@ -13418,6 +13424,12 @@ def _push_publish_scope_holds(
         worktree of this same repository>`` and an output-only ``2>&1 | tail -N``
         suffix — are judged there; ``cwd`` is the directory every check below
         reads, so a ``-C`` push is judged in the worktree it names;
+        OR that same plain push (no ``-C``, no output suffix) followed by ``&&``
+        and one ready ``gh pr create`` (``_push_then_pr_create``). The create
+        runs only after the push has finished, so it cannot change where the
+        push went. On the public repo a first push that is not that chained form
+        (other than a dry run) is denied before this is consulted, so there the
+        chained form is what reaches here;
       * no repository-selecting variable (``_REPO_SELECTION_ENV``) is set in the
         hook's environment;
       * a live probe confirms the branch is absent on the destination.
@@ -13429,7 +13441,10 @@ def _push_publish_scope_holds(
     # about the overriding repository instead of the one named.
     if _repo_selection_env_set():
         return False
-    if not _is_single_plain_push(segs, push_seg, cmd, hook_cwd=hook_cwd, push_cwd=cwd):
+    if not (
+        _is_single_plain_push(segs, push_seg, cmd, hook_cwd=hook_cwd, push_cwd=cwd)
+        or _push_then_pr_create(segs, push_seg, cmd, cwd) is not None
+    ):
         return False
     named = _raw_remote_push_urls(push_remote, cwd)
     if named is None:
@@ -13563,7 +13578,9 @@ def _dash_c_names_sibling_worktree(path: str, hook_cwd) -> bool:
     return mine is not None and mine == _git_common_dir(hook_cwd)
 
 
-def _is_single_plain_push(segs, push_seg, cmd: str, hook_cwd=None, push_cwd=None) -> bool:
+def _is_single_plain_push(
+    segs, push_seg, cmd: str, hook_cwd=None, push_cwd=None, *, allow_output_filters: bool = True
+) -> bool:
     """Whether the WHOLE command is exactly one top-level ``git push …``, in one
     of the few spellings that cannot change what the push does.
 
@@ -13590,11 +13607,18 @@ def _is_single_plain_push(segs, push_seg, cmd: str, hook_cwd=None, push_cwd=None
     beside the push, but they read stdin and write stdout and cannot touch the
     repository, its config or the network; each must also be a parsed top-level
     segment whose argv is the filter exactly. Applies to the suppression only;
-    the re-push allow keeps ``_push_compound_is_inert``."""
+    the re-push allow keeps ``_push_compound_is_inert``.
+
+    ``allow_output_filters=False`` (the force path) refuses that suffix too: a
+    force push off the public repo must be the push and nothing else, since a
+    ``tail`` resolved through a shell function or PATH shim is a step the
+    approval prompt never describes."""
     split = _split_push_output_suffix(cmd)
     if split is None:
         return False
     text, filters = split
+    if not allow_output_filters and (filters or text != cmd):
+        return False
     if len(segs) != 1 + len(filters) or segs[0] is not push_seg:
         return False
     for seg, words in zip(segs[1:], filters, strict=True):
@@ -13602,6 +13626,22 @@ def _is_single_plain_push(segs, push_seg, cmd: str, hook_cwd=None, push_cwd=None
             return False
         if list(getattr(seg, "argv", None) or []) != words:
             return False
+    return _text_is_plain_push(text, push_seg, hook_cwd=hook_cwd, push_cwd=push_cwd)
+
+
+def _text_is_plain_push(
+    text: str, push_seg, hook_cwd=None, push_cwd=None, *, allow_dash_c: bool = True
+) -> bool:
+    """Whether ``text`` is exactly ``push_seg`` spelled as one plain ``git push …``:
+    top level, no character of ``_SINGLE_PUSH_FORBIDDEN``, no prefix or wrapper,
+    re-tokenizing to exactly the segment's argv with ``push`` straight after
+    ``git`` — or, when ``allow_dash_c``, after one ``-C`` that
+    ``_dash_c_names_sibling_worktree`` accepts. The text-level half of
+    ``_is_single_plain_push``, shared with ``_push_then_pr_create`` so the push
+    half of the chained shape is held to the identical rule. That caller passes
+    ``allow_dash_c=False``: its ``gh pr create`` runs in the session's own
+    directory, not the ``-C`` one, so it would open the PR for whatever branch
+    is checked out THERE."""
     if getattr(push_seg, "depth", 0):
         return False
     if any(c in _SINGLE_PUSH_FORBIDDEN for c in text):
@@ -13617,9 +13657,252 @@ def _is_single_plain_push(segs, push_seg, cmd: str, hook_cwd=None, push_cwd=None
         return False
     if words[1] == "push":
         return True
-    if len(words) >= 4 and words[1] == "-C" and words[3] == "push":
+    if allow_dash_c and len(words) >= 4 and words[1] == "-C" and words[3] == "push":
         return push_cwd == words[2] and _dash_c_names_sibling_worktree(words[2], hook_cwd)
     return False
+
+
+#: ``gh pr create`` options the chained first-push shape accepts — a CLOSED set,
+#: so an option nobody listed (``--draft``/``-d``, ``--web``/``-w``,
+#: ``--dry-run``, ``--head``/``-H``, ``--repo``/``-R``, ``--base``/``-B``,
+#: ``--editor``/``-e``, a bundle such as ``-fd``, a positional) disqualifies the
+#: shape rather than being guessed about. Each of those can leave the branch with
+#: no PR, a draft PR, or a PR that is not this branch's PR onto the default
+#: branch. Value-taking options consume the next token, as gh's flag parser does
+#: for a separate value (``--title -d`` is a title, not ``--draft``).
+#:
+#: The metadata options — ``--label``/``-l``, ``--assignee``/``-a``,
+#: ``--reviewer``/``-r``, ``--milestone``/``-m``, ``--project``/``-p`` — are
+#: deliberately OUT of the set: gh resolves each name before it creates the PR
+#: and fails the whole create on one it cannot resolve (reported by the review
+#: that found this gap; not re-measured here), which in the chained shape
+#: happens AFTER the push has published the branch. They go on afterwards with
+#: ``gh pr edit``, where a failure leaves the PR in place.
+_CREATE_VALUE_LONG = frozenset({"title", "body", "body-file"})
+_CREATE_VALUE_SHORT = frozenset("tbF")
+_CREATE_BOOL_LONG = frozenset({"fill", "fill-first", "fill-verbose", "no-maintainer-edit"})
+_CREATE_BOOL_SHORT = frozenset({"-f"})
+
+#: Characters that make the create's text more than literal words, refused
+#: wherever they appear (quoted or not — telling the two apart is shell
+#: modelling): a newline or CR would start another command; ``$`` and backtick
+#: expand at run time (a substitution can yield ``--draft``); a backslash
+#: escapes; ``*``, ``?`` and ``[`` glob (``--title *`` becomes several words in
+#: a directory with several files, and gh then fails AFTER the push); ``{``
+#: brace-expands; ``~`` tilde-expands. A body carrying one belongs in
+#: ``--body-file``; a title carrying one needs rewording.
+_CREATE_TEXT_FORBIDDEN = frozenset("$`\\\n\r*?[{~")
+
+
+#: Short value flags spelled out, so a value can be filed under its long name.
+_CREATE_SHORT_TO_LONG = {"t": "title", "b": "body", "F": "body-file"}
+_CREATE_FILL_FLAGS = frozenset({"fill", "fill-first", "fill-verbose"})
+
+#: The most of a ``--body-file`` the hook reads, in bytes. A larger file does
+#: not qualify: the hook will not read an unbounded file. The byte bound only
+#: limits the read; the real limit is ``_CREATE_BODY_MAX_CHARS``.
+_CREATE_BODY_FILE_MAX = 1024 * 1024
+#: The longest PR body GitHub accepts, in characters (its API rejects a longer
+#: one, per the review of this rule; not re-measured here). A longer body fails
+#: the create AFTER the push, so it does not qualify, from a file or literal.
+_CREATE_BODY_MAX_CHARS = 65536
+#: The longest PR title that qualifies, in characters. GitHub rejects longer
+#: titles, so the create would fail AFTER the push. The figure is the one this
+#: repository already enforces for issue titles (scripts/file_tracker_issue.py,
+#: "GitHub rejects titles beyond ~256"); not re-measured for PRs here.
+_CREATE_TITLE_MAX_CHARS = 256
+
+
+def _body_file_is_readable(path: str) -> bool:
+    """Whether ``path`` is a regular file this process can open and read in full
+    (at most ``_CREATE_BODY_FILE_MAX`` bytes) as UTF-8 — i.e. gh, running as the
+    same user right after the push, will be able to read the body from it.
+
+    An existence check is not enough: an unreadable regular file passes
+    ``os.path.isfile`` while gh's open of it fails AFTER the push, leaving the
+    branch public with no PR. Only a regular file is opened, so a FIFO, a device
+    or ``/dev/stdin`` can never block the hook or consume its input: the path is
+    opened ONCE, non-blocking, and the type is checked on that descriptor
+    (``fstat``), so nothing can swap the file between the check and the read.
+    The decoded text must also fit ``_CREATE_BODY_MAX_CHARS``. Any failure →
+    False."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        chunks: list[bytes] = []
+        remaining = _CREATE_BODY_FILE_MAX + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > _CREATE_BODY_FILE_MAX:
+            return False
+        return len(data.decode("utf-8")) <= _CREATE_BODY_MAX_CHARS
+    except (OSError, ValueError):
+        return False
+    finally:
+        os.close(fd)
+
+
+def _create_opts_open_a_ready_pr(argv: list[str], cwd: str | None = None) -> bool:
+    """Whether a ``gh pr create`` argv uses only ``_CREATE_*`` options AND is a
+    form gh accepts with no terminal, so as far as the TEXT can say it opens a
+    ready (non-draft) PR for the current branch onto gh's resolved base (what gh
+    resolves at run time is not modelled; see ``_push_then_pr_create``). Anything
+    outside the closed set, or any form gh refuses non-interactively → False.
+
+    The second half matters because the create runs AFTER the push: a create that
+    fails leaves the branch public with no PR, the very state this shape exists to
+    rule out. MEASURED with gh 2.101 and stdin from /dev/null:
+
+      * gh refuses unless it has a title AND a body, or one fill flag — "must
+        provide `--title` and `--body` (or `--fill` or `fill-first` or
+        `--fillverbose`) when not running interactively". So a bare create, a
+        lone ``--title``, a lone ``--body``/``--body-file`` all fail;
+      * two different fill flags fail ("`--fill` is not supported with
+        `--fill-first`");
+      * a ``--body-file`` that does not exist ("open nope.md: no such file or
+        directory") or is a directory ("read adir: is a directory") fails.
+
+    So a qualifying create carries a title (``--title``/``-t``) and a body
+    (``--body``/``-b`` or ``--body-file``/``-F``), or exactly one of ``--fill``/
+    ``-f``, ``--fill-first``, ``--fill-verbose``. Every ``--body-file`` must name
+    a regular file the hook can actually read as UTF-8 (``_body_file_is_readable``),
+    resolved against ``cwd`` (the push's directory; the chained shape has no
+    ``cd``), and never ``-`` (stdin, whose content the hook cannot see). A short
+    value flag's value is read as gh reads it: ``-F=body.md`` names ``body.md``. A ``--title`` that is present must not be blank: gh's
+    flag check accepts ``--title ""``, but a PR cannot be created without a title
+    (INFERRED from the API, not measured — refusing it costs nothing). An
+    unknown ``cwd`` fails any ``--body-file`` check. ``--body`` and
+    ``--body-file`` together fail (gh: "specify only one of `--body` or
+    `--body-file`"), and so does a body longer than ``_CREATE_BODY_MAX_CHARS``
+    characters, literal or read from the file."""
+    if argv[:3] != ["gh", "pr", "create"]:
+        return False
+    values: dict[str, list[str]] = {}
+    fills: set[str] = set()
+    i = 3
+    while i < len(argv):
+        tok = argv[i]
+        if tok.startswith("--"):
+            name, eq, value = tok[2:].partition("=")
+            if name in _CREATE_VALUE_LONG:
+                if not eq:
+                    if i + 1 >= len(argv):
+                        return False
+                    value = argv[i + 1]
+                values.setdefault(name, []).append(value)
+                i += 1 if eq else 2
+            elif name in _CREATE_BOOL_LONG and not eq:
+                if name in _CREATE_FILL_FLAGS:
+                    fills.add(name)
+                i += 1
+            else:
+                return False
+        elif tok in _CREATE_BOOL_SHORT:
+            fills.add("fill")
+            i += 1
+        elif len(tok) >= 2 and tok[0] == "-" and tok[1] in _CREATE_VALUE_SHORT:
+            if len(tok) == 2:
+                if i + 1 >= len(argv):
+                    return False
+                value = argv[i + 1]
+            else:
+                # gh's flag parser (pflag) reads `-F=body.md` as the value
+                # `body.md`: one `=` straight after a short flag is a separator,
+                # not part of the value. Strip it so the checks below judge the
+                # value gh will use. A bare `-t=` therefore reads as an empty
+                # title and is refused (pflag may instead take it as the title
+                # "=" — not measured; refusing costs nothing).
+                value = tok[2:]
+                if value.startswith("="):
+                    value = value[1:]
+            values.setdefault(_CREATE_SHORT_TO_LONG[tok[1]], []).append(value)
+            i += 1 if len(tok) > 2 else 2
+        else:
+            return False
+    if len(fills) > 1:
+        return False
+    titles = values.get("title", [])
+    if titles and not titles[-1].strip():
+        return False  # gh keeps the LAST value of a repeated flag
+    if any(len(t) > _CREATE_TITLE_MAX_CHARS for t in titles):
+        return False
+    if values.get("body") and values.get("body-file"):
+        # gh: "specify only one of `--body` or `--body-file`", after the push.
+        return False
+    if any(len(b) > _CREATE_BODY_MAX_CHARS for b in values.get("body", [])):
+        return False
+    for path in values.get("body-file", []):
+        if path == "-" or cwd is None:
+            return False
+        if not _body_file_is_readable(os.path.join(cwd, path)):
+            return False
+    has_body = bool(values.get("body") or values.get("body-file"))
+    return bool(fills) or (bool(titles) and has_body)
+
+
+def _push_then_pr_create(segs, push_seg, cmd: str, cwd: str | None):
+    """The ``gh pr create`` segment when the WHOLE command is exactly
+    ``<one plain git push> && <one gh pr create>``, else None. ``cwd`` is the
+    push's directory (the create runs there too); the create opens the PR for
+    the current branch.
+
+    This is the only shape in which a first publication is followed by its PR
+    deterministically: ``&&`` runs the create exactly when the push succeeded,
+    and at that moment the branch is on the remote, so gh opens the PR rather
+    than pushing. Structural, like ``_is_single_plain_push``, and for the same
+    reason — a closed shape is checkable, a neighbour allowlist is not:
+
+      * exactly two parsed segments, both top level: the push, then the create;
+      * the text up to the FIRST ``&&`` is the push alone, held to
+        ``_text_is_plain_push`` and containing no ``#`` (bash would comment out
+        everything after it, ``&& gh pr create`` included). That text can hold no
+        ``;``, ``|``, ``&`` or newline, so the operator right after the push IS
+        that ``&&`` — a ``||`` or ``;`` join never qualifies;
+      * the text after it re-tokenizes to exactly the create's argv (no prefix,
+        wrapper, redirect, group or trailing ``&``), carries no
+        ``_CREATE_TEXT_FORBIDDEN`` character, and passes
+        ``_create_opts_open_a_ready_pr`` (no ``--draft``/``-d``, ``--web``,
+        ``--dry-run``, ``--head``, ``--repo``, ``--base``; a title and a body, or
+        one fill flag; any ``--body-file`` a readable UTF-8 file in ``cwd``).
+
+    This judges TEXT only. What gh resolves at run time — the base repository
+    (``gh repo set-default``, ``GH_REPO``/``GH_HOST`` in the environment), the
+    base branch (``branch.<b>.gh-merge-base``), whether the branch has commits
+    ahead of that base — is not knowable from the command, so it is not modelled
+    here. The guarantee that no branch stays public unchecked is the server-side
+    leak scan that runs on every branch push; this rule only makes the ordinary
+    case open its PR.
+
+    Anything else is None, and the caller treats the push as a bare first push."""
+    if len(segs) != 2 or segs[0] is not push_seg:
+        return None
+    create = segs[1]
+    if getattr(create, "depth", 0) or gh_pr_subcommand(create.argv) != "create":
+        return None
+    left, sep, right = cmd.partition("&&")
+    if sep != "&&" or "#" in left:
+        return None
+    if not _text_is_plain_push(left.strip(" \t"), push_seg, allow_dash_c=False):
+        return None
+    if any(c in _CREATE_TEXT_FORBIDDEN for c in right):
+        return None
+    try:
+        words = shlex.split(right, comments=True)
+    except ValueError:
+        return None
+    argv = list(getattr(create, "argv", None) or [])
+    if words != argv or not _create_opts_open_a_ready_pr(argv, cwd):
+        return None
+    return create
 
 
 def _remote_branch_definitely_absent(url: str, branch: str | None, cwd: str | None) -> bool:
@@ -13731,6 +14014,46 @@ def _publish_ask_text(reason: str, publish_off: bool) -> str:
         reason += f"\n\n{_PUBLISH_OFF_MISS}"
     notes = _drain_ask_notes()
     return f"{reason}\n\n{notes}" if notes else reason
+
+
+def _first_push_needs_pr_text(branch: str) -> str:
+    """The refusal for a first push to the public repo with no PR chained after
+    it. Written for the agent: what goes wrong, the exact command that passes,
+    and what to do instead when the work is not ready for review."""
+    return (
+        f"BLOCKED: this is the first push of '{branch}' to the public repo, and "
+        f"nothing in the command opens its PR. Pushed alone, the branch would be "
+        f"PUBLIC with NO PR, so CI never runs on it (ci.yml triggers on "
+        f"pull_request). This hook checks only this current-branch shape; the "
+        f"guarantee that no branch stays public unchecked is the server-side "
+        f"leak scan on branch pushes, not this check.\n"
+        f"Publish it and open its PR in ONE command, from the branch's own "
+        f"checkout:\n"
+        f'  git push -u origin HEAD && gh pr create --title "..." --body-file <file>\n'
+        f"Exactly that shape: one plain `git push` (no `cd`, `git -C` or other "
+        f"step), joined by `&&`, then one ready `gh pr create`. Without a "
+        f"terminal gh needs BOTH a non-empty title (--title/-t) AND a body "
+        f"(--body/-b, or --body-file/-F naming a readable UTF-8 file — not `-`; "
+        f"only one of the two, and at most 65,536 characters), OR "
+        f"exactly one of --fill/-f, --fill-first, --fill-verbose; a title is at "
+        f"most 256 characters; otherwise it "
+        f"fails after the push and leaves the branch with no PR. It may also "
+        f"carry --no-maintainer-edit. Values must be literal: no `$`, backtick, "
+        f"backslash, `*`, `?`, `[`, `{{` or `~` anywhere in the create (put the "
+        f"body in --body-file). No --label/-l, --assignee/-a, --reviewer/-r, "
+        f"--milestone/-m or --project/-p: gh fails the whole create on a name it "
+        f"cannot resolve, after the push — add them once the PR exists, with "
+        f"`gh pr edit --add-label …` etc. Never --draft/-d, --web, --dry-run, "
+        f"--head, --repo or --base.\n"
+        f"Do not reach for another push spelling instead: one this check does not "
+        f"read (another refspec, an extra flag) only raises an approval prompt, and "
+        f"once approved it still leaves the branch public with NO PR. Use the "
+        f"chained form above.\n"
+        f"Work that is not ready for a PR stays committed locally, unpushed.\n"
+        f"(If '{branch}' is in fact already on the remote, the presence check "
+        f"could not confirm it — a network failure reads as absent here — so "
+        f"retry the push.)"
+    )
 
 
 def _emit_context_only(note: str) -> int:
@@ -13962,10 +14285,11 @@ def _run_merge_and_push_gates() -> int:
     blind_spot_deny: str | None = None
     round_compound_deny: str | None = None
     round_autonomous_deny: str | None = None
-    #: A re-push to a branch on the CONFIGURED PUBLIC repo that has no open PR.
-    #: A BLOCK there, because PR-less public branches kept accumulating under
-    #: the ask. Everywhere else the ask is unchanged. Scoped by
-    #: `_no_pr_block_applies`. See the site below.
+    #: A push that would leave a branch on the CONFIGURED PUBLIC repo with no
+    #: open PR: a RE-push of a PR-less branch, or a FIRST push not chained
+    #: `&& gh pr create` (`_push_then_pr_create`). A BLOCK there, because
+    #: PR-less public branches kept accumulating under the ask. Everywhere else
+    #: the ask is unchanged. Scoped by `_no_pr_block_applies`. See the sites below.
     no_open_pr_deny: str | None = None
     try:
         payload = read_payload()
@@ -14323,6 +14647,12 @@ def _run_merge_and_push_gates() -> int:
         # off`, public-repo destinations only). Emitted at the tail as NO decision
         # plus a context note, and only if nothing else set an ask or a block.
         publish_note: str | None = None
+        # The `gh pr create` chained `&&` after a FIRST push (see
+        # `_push_then_pr_create`). It runs only once that push has succeeded, so
+        # it cannot itself publish; the create arm below skips its would-publish
+        # probe, which reads the remote BEFORE the push and would otherwise turn
+        # every chained first push into an ask.
+        first_push_create_seg = None
         # A push onto an OPEN PR's branch from another checkout that this install
         # silenced (`hooks.asks.push_pr_branch: off`). Same tail treatment as
         # publish_note: no decision, a context note, and only if nothing else in
@@ -14365,20 +14695,44 @@ def _run_merge_and_push_gates() -> int:
             # all count as public ⇒ blocked (fail closed). Only a destination
             # whose push urls resolve AND are DISJOINT from origin's gets the
             # softer cautious-ask path — interactive asks, dispatched denies.
+            # A force push known to target origin is blocked before checking the
+            # command shape, preserving the specific public-destination message.
+            # Off-origin force pushes must be exactly one plain `git push`: a
+            # prefix, wrapper, global option, redirect or other step can make
+            # the pre-command destination read differ from what Git will push.
+            # For non-force pushes, command-borne config or a prefix is blocked
+            # regardless of destination; config-writing neighbour steps remain
+            # outside this command-config rule.
             force_segs = [s for s in push_segs if _push_is_force(s.argv)]
             if force_segs:
-                remote = _resolve_push_remote(force_segs[0], cwd=pcwd)
+                # The remote git will ACTUALLY push to: a bare push honours
+                # branch.<cur>.pushRemote and remote.pushDefault before the
+                # upstream, so the upstream alone could name a disjoint remote
+                # while the force lands on origin. Unresolvable is None: blocked.
+                remote = _effective_push_remote(
+                    force_segs[0], _current_branch(cwd=pcwd), cwd=pcwd
+                )
                 if pcwd_unknown or remote is None or remote == "origin":
                     print(
                         "BLOCKED: Force push to origin/<public> is not allowed — open a PR.",
                         file=sys.stderr,
                     )
                     return 2
+                if not _is_single_plain_push(
+                    segs, force_segs[0], cmd, allow_output_filters=False
+                ):
+                    print(
+                        "BLOCKED: a force push off the public repo must be the whole "
+                        "command — one plain `git push`, with no prefix, wrapper, git "
+                        "global option, redirect, pipe or other step — because the "
+                        "guard reads its destination before anything runs.",
+                        file=sys.stderr,
+                    )
+                    print("Run the force push on its own.", file=sys.stderr)
+                    return 2
                 # Classify by PUSH-url set — a non-"origin" name/url that shares any
                 # push url with origin is still a public force. Unresolvable ⇒ block.
-                dest_urls = _push_dest_urls(remote, cwd=pcwd)
-                origin_urls = _remote_push_urls("origin", cwd=pcwd)
-                if not dest_urls or not origin_urls or (dest_urls & origin_urls):
+                if _push_dest_meets_origin(remote, pcwd, pcwd_unknown):
                     print(
                         "BLOCKED: Force push to origin/<public> is not allowed — open a PR.",
                         file=sys.stderr,
@@ -14401,6 +14755,22 @@ def _run_merge_and_push_gates() -> int:
                 )
                 # Fall through: any hard-block below still takes precedence.
             else:
+                for push_seg in push_segs:
+                    if _push_carries_command_config(push_seg):
+                        print(
+                            "BLOCKED: this push carries a prefix, wrapper or git config "
+                            "option (-c / --config-env / VAR=…). Config supplied that "
+                            "way can retarget the push or make it a force push (e.g. "
+                            "remote.<name>.push=+…, remote.<name>.pushurl=…) that no "
+                            "flag shows, and the guard cannot read it before the "
+                            "command runs.",
+                            file=sys.stderr,
+                        )
+                        print(
+                            "Retype it as a plain `git push` (`-C <dir>` is fine).",
+                            file=sys.stderr,
+                        )
+                        return 2
                 # Non-force push: interactive asks, dispatched hard-denies.
                 _remote, branch = _get_push_remote_and_branch(push_segs[0], cwd=pcwd)
                 if _is_dispatched():
@@ -14485,7 +14855,43 @@ def _run_merge_and_push_gates() -> int:
                         # so a misconfigured key announces itself on every such
                         # ask, scope checked only when the key is off.
                         publish_off = _ask_suppressed("push_publish")
-                        if publish_off and _push_publish_scope_holds(
+                        dry_run = _push_is_dry_run(push_segs[0])
+                        chained_create = _push_then_pr_create(segs, push_segs[0], cmd, pcwd)
+                        # The create is exempt from its would-publish probe only
+                        # where THIS rule judged it: a push that really
+                        # publishes (after a dry run the branch is still not on
+                        # the remote) to the configured public repo, whose
+                        # first push is denied unless the create qualifies.
+                        # Everywhere else the create keeps its probe and its
+                        # non-routine prompt, exactly as without this rule:
+                        # off the public repo `push_routine: off` could
+                        # otherwise silence a create that gh aims at another
+                        # repository (an inherited GH_REPO, say).
+                        if not dry_run and _no_pr_block_applies(urls):
+                            first_push_create_seg = chained_create
+                        # ON THE PUBLIC REPO a first push of the CURRENT branch
+                        # must bring its PR with it. Nothing else makes the PR
+                        # follow — the re-push block below only catches the
+                        # branch on its NEXT push, and a session that stops
+                        # after one push leaves it public with no PR. So the push
+                        # is refused unless the same command opens a ready PR
+                        # right after it (`&&`), whatever push_publish says: the
+                        # ask was never what created the PR. This is the client
+                        # half only, for the case a hook can read from text; the
+                        # guarantee that no branch stays public unchecked is the
+                        # server-side leak scan on every branch push. Other push
+                        # spellings keep the ask below. Same scope predicate, and the same
+                        # deferred slot, as the re-push block — so a hard block
+                        # elsewhere in the command still speaks first. A dry run
+                        # publishes nothing and keeps its old path. Dispatched
+                        # sessions never get here (denied above).
+                        if (
+                            chained_create is None
+                            and not dry_run
+                            and _no_pr_block_applies(urls)
+                        ):
+                            no_open_pr_deny = _first_push_needs_pr_text(cur)
+                        elif publish_off and _push_publish_scope_holds(
                             push_remote, segs, push_segs[0], cmd, pcwd, branch=cur,
                             hook_cwd=payload.get("cwd") if isinstance(payload, dict) else None,
                         ):
@@ -14575,10 +14981,11 @@ def _run_merge_and_push_gates() -> int:
                             # BLOCKED on the public repo: PR-less branches kept
                             # accumulating there under the ask (2 of 60 public
                             # branches on 2026-09-25, both after the previous
-                            # cleanup). Only a RE-push reaches here; the first
-                            # push must stay open, since `gh pr create` needs the
-                            # branch on the remote. Dispatched sessions never get
-                            # here (`_is_dispatched()` denies every push above).
+                            # cleanup). Only a RE-push reaches here; a first push
+                            # is judged above, where it may pass only chained
+                            # `&& gh pr create`, since the create needs the branch
+                            # on the remote. Dispatched sessions never get here
+                            # (`_is_dispatched()` denies every push above).
                             no_open_pr_deny = (
                                 f"BLOCKED: re-push to '{cur}' — this branch is "
                                 f"PUBLIC but has NO OPEN PR, so CI and the leak "
@@ -14750,8 +15157,17 @@ def _run_merge_and_push_gates() -> int:
         # create` prompts once (for the push) and the create rides along. BUT a
         # bare create from an UNPUSHED branch makes gh push (and possibly fork) the
         # branch itself — a code-publish that would bypass the push gate — so gate
-        # that form like a push: dispatched → deny, interactive → ask.
-        if create_segs and any(_pr_create_would_publish(s.argv) for s in create_segs):
+        # that form like a push: dispatched → deny, interactive → ask. The create
+        # chained `&&` after a first push is exempt from the probe: it runs only
+        # once the push succeeded, when the branch IS on the remote, and the push
+        # itself has already been judged (deny, ask, or a silenced note). The
+        # marker is set only for a push that is not a dry run — after `git push
+        # -n` the branch is still absent, so that create keeps its probe — and
+        # only when the push targets the configured public repo, where the
+        # first-push rule judged the create; off it the create keeps its probe.
+        if create_segs and any(
+            _pr_create_would_publish(s.argv) for s in create_segs if s is not first_push_create_seg
+        ):
             if _is_dispatched():
                 print(
                     "BLOCKED: this gh pr create would push a not-yet-pushed branch; "

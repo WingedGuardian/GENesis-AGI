@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import stat
 import time
 from pathlib import Path
@@ -66,6 +67,24 @@ async def _ask(svc, payload, raw: bytes | None = None) -> dict | None:
     line = await reader.readline()
     writer.close()
     return json.loads(line) if line else None
+
+
+def _rebind(vault: Path) -> None:
+    """Re-record the key pair in vault_meta after a test altered a key file.
+
+    vault_store's check_ready refuses a key file that is not the pair init
+    recorded, before the service ever unwraps. These tests exercise the
+    service's own checks behind it, so they make check_ready pass first.
+    """
+    import hashlib
+
+    digest = hashlib.sha256((vault / vs.IDENTITY).read_bytes()).hexdigest()
+    recipient = (vault / vs.RECIPIENT).read_text().strip()
+    with sqlite3.connect(vault / vs.CARDS) as conn:
+        conn.executemany(
+            "UPDATE vault_meta SET value = ? WHERE key = ?",
+            [(digest, "identity_sha256"), (recipient, "recipient")],
+        )
 
 
 async def _events(db) -> list[dict]:
@@ -167,7 +186,8 @@ class TestUnlockAndLock:
         assert (await _ask(service, {"op": "lock"}))["state"] == "locked"
         assert (await _ask(service, {"op": "lock"}))["state"] == "already locked"
         events = [e["event"] for e in await _events(db)]
-        assert events == ["service_start", "unlock_refused", "unlock", "lock"]
+        # The second lock had nothing to drop and is on the trail anyway.
+        assert events == ["service_start", "unlock_refused", "unlock", "lock", "lock"]
 
     async def test_no_reply_or_event_holds_the_passphrase(self, service, db):
         replies = [
@@ -258,19 +278,32 @@ class TestUnlockAndLock:
         self, service, db, monkeypatch, interrupt
     ):
         real = audit.record_event
+        racers: list[asyncio.Task] = []
 
         async def racing(conn, event, detail=None):
             if event == "unlock":
-                await (service.lock(None) if interrupt == "lock" else service.stop())
+                # A separate request, as in production: it takes effect (epoch
+                # bump, key dropped) at once and its own audit row queues
+                # behind this write. Awaiting it here would wait on the audit
+                # lock this write holds.
+                racers.append(
+                    asyncio.create_task(
+                        service.lock(None) if interrupt == "lock" else service.stop()
+                    )
+                )
+                await asyncio.sleep(0)
             await real(conn, event, detail)
 
         monkeypatch.setattr(audit, "record_event", racing)
-        result = await service.unlock(PASSPHRASE, None)
+        result = await asyncio.wait_for(service.unlock(PASSPHRASE, None), 30)
+        await asyncio.wait_for(asyncio.gather(*racers), 30)
         assert not result["ok"] and interrupt.rstrip("p") in result["error"]
         assert not service.unlocked and service._relock_handle is None
         assert service._unlocked_at is None
-        events = [e["event"] for e in await _events(db)]
-        assert events[-1] == "unlock_refused", events  # the trail ends in the true state
+        unlock_trail = [
+            e["event"] for e in await _events(db) if e["event"] in ("unlock", "unlock_refused")
+        ]
+        assert unlock_trail[-2:] == ["unlock", "unlock_refused"], unlock_trail  # ends true
 
     async def test_stale_identity_relocks(self, service, vault, db):
         assert (await service.unlock(PASSPHRASE, None))["ok"]
@@ -313,10 +346,13 @@ class TestFailClosed:
 
     async def test_a_key_that_does_not_match_recipient_is_not_held(self, service, vault, db):
         (vault / vs.RECIPIENT).write_text(str(x25519.Identity.generate().to_public()) + "\n")
+        _rebind(vault)
         result = await service.unlock(PASSPHRASE, None)
         assert result == {"ok": False, "error": "identity.age does not match recipient.txt"}
         assert not service.unlocked
-        assert (await _events(db))[-1]["detail"]["reason"] == "key does not match recipient.txt"
+        assert (await _events(db))[-1]["detail"][
+            "reason"
+        ] == "identity.age does not match recipient.txt"
 
     @pytest.mark.parametrize("damage", ["garbage", "unreadable"])
     async def test_a_damaged_identity_is_not_called_a_wrong_passphrase(
@@ -328,7 +364,9 @@ class TestFailClosed:
             os.chmod(vault / vs.IDENTITY, 0)
         result = await service.unlock(PASSPHRASE, None)
         os.chmod(vault / vs.IDENTITY, 0o600)
-        assert result == {"ok": False, "error": "identity.age could not be read"}
+        # Refused before the passphrase is unwrapped, by the store's own checks.
+        assert result["ok"] is False and "identity.age" in result["error"]
+        assert "wrong passphrase" not in result["error"]
 
     async def test_an_unreadable_audit_log_is_reported(self, service, monkeypatch):
         async def broken(db, limit=20):
@@ -340,7 +378,7 @@ class TestFailClosed:
     async def test_uninitialised_vault(self, db, tmp_path):
         svc = _make(db, tmp_path / "none", tmp_path)
         result = await svc.unlock(PASSPHRASE, None)
-        assert result == {"ok": False, "error": "the vault is not initialised"}
+        assert result["ok"] is False and "not initialised" in result["error"]
 
     async def test_server_without_pyrage(self, db, vault, tmp_path):
         python = shutil.which("python3", path="/usr/bin")
@@ -377,3 +415,224 @@ async def test_start_vault_service_returns_none_when_it_cannot_start(monkeypatch
 def test_the_unit_pins_core_dumps_off():
     unit = (REPO / "scripts/systemd/genesis-server.service.template").read_text()
     assert "\nLimitCORE=0\n" in unit
+
+
+class TestRoundOneFindings:
+    async def test_a_lock_while_an_unlock_is_queued_wins(self, service, monkeypatch):
+        """A lock that lands while an unlock waits behind another one keeps the vault locked."""
+        gate = asyncio.Event()
+        real = service._unwrap
+
+        async def slow(passphrase):
+            await gate.wait()
+            return await real(passphrase)
+
+        monkeypatch.setattr(service, "_unwrap", slow)
+        first = asyncio.create_task(service.unlock(PASSPHRASE, None))
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(service.unlock(PASSPHRASE, None))  # queued behind first
+        await asyncio.sleep(0.05)
+        await service.lock(None)
+        gate.set()
+        results = await asyncio.gather(first, second)
+        assert not service.unlocked
+        assert all(r["ok"] is False for r in results), results
+
+    async def test_a_recipient_changed_during_the_audit_write_is_not_held(
+        self, service, vault, monkeypatch
+    ):
+        real = audit.record_event
+
+        async def swap_recipient(conn, event, detail=None):
+            if event == "unlock":
+                other = x25519.Identity.generate().to_public()
+                (vault / vs.RECIPIENT).write_text(f"{other}\n")
+            return await real(conn, event, detail)
+
+        monkeypatch.setattr(audit, "record_event", swap_recipient)
+        result = await service.unlock(PASSPHRASE, None)
+        assert result == {"ok": False, "error": "recipient.txt changed during the unlock"}
+        assert not service.unlocked
+
+    async def test_a_failed_audit_commit_leaves_no_row_behind(self, service, db, monkeypatch):
+        async def insert_then_fail(conn, event, detail=None):
+            await conn.execute(
+                "INSERT INTO payment_vault_events (event, detail, created_at) VALUES (?, ?, ?)",
+                (event, None, "2026-01-01T00:00:00+00:00"),
+            )
+            raise aiosqlite.OperationalError("disk I/O error")  # the COMMIT failed
+
+        monkeypatch.setattr(audit, "record_event", insert_then_fail)
+        result = await service.unlock(PASSPHRASE, None)
+        assert result["ok"] is False and not service.unlocked
+        await db.commit()  # a later, unrelated commit must not persist the stray row
+        assert "unlock" not in [e["event"] for e in await _events(db)]
+
+    @pytest.mark.parametrize("name", [vs.IDENTITY, vs.RECIPIENT, ""])
+    async def test_a_vault_that_is_not_private_is_not_unlocked(self, service, vault, db, name):
+        os.chmod(vault / name, 0o755 if name == "" else 0o644)
+        try:
+            result = await service.unlock(PASSPHRASE, None)
+        finally:
+            os.chmod(vault / name, 0o700 if name == "" else 0o600)
+        assert result["ok"] is False and "not private" in result["error"]
+        assert (await _events(db))[-1]["event"] == "unlock_refused"
+
+    async def test_a_sealed_value_that_is_not_a_key_is_an_audited_refusal(self, service, vault, db):
+        from pyrage import passphrase as age_passphrase
+
+        not_a_key = "AGE-SECRET-KEY-1" + "Q" * 58  # the right length, not a key
+        (vault / vs.IDENTITY).write_bytes(age_passphrase.encrypt(not_a_key.encode(), PASSPHRASE))
+        _rebind(vault)
+        result = await service.unlock(PASSPHRASE, None)
+        assert result == {"ok": False, "error": "identity.age does not hold an age X25519 key"}
+        assert (await _events(db))[-1]["event"] == "unlock_refused"
+
+
+async def _pending_failed_write(monkeypatch):
+    """Patch record_event so an unlock_refused write INSERTs, waits, then fails its COMMIT."""
+    real = audit.record_event
+    inserted, release = asyncio.Event(), asyncio.Event()
+
+    async def fail_after_insert(conn, event, detail=None):
+        if event != "unlock_refused":
+            return await real(conn, event, detail)
+        await conn.execute(
+            "INSERT INTO payment_vault_events (event, detail, created_at) VALUES (?, ?, ?)",
+            (event, None, "2026-01-01T00:00:00+00:00"),
+        )
+        inserted.set()
+        await release.wait()
+        raise aiosqlite.OperationalError("disk I/O error")  # the COMMIT failed
+
+    monkeypatch.setattr(audit, "record_event", fail_after_insert)
+    return inserted, release
+
+
+class TestRoundOneReview:
+    async def test_a_concurrent_audit_write_does_not_commit_a_failed_one(
+        self, service, db, monkeypatch
+    ):
+        inserted, release = await _pending_failed_write(monkeypatch)
+        failing = asyncio.create_task(service._audit("unlock_refused", {"reason": "x"}))
+        await inserted.wait()
+        other = asyncio.create_task(service._audit("lock", None))
+        await asyncio.sleep(0.05)
+        release.set()
+        assert await asyncio.gather(failing, other) == [False, True]
+        events = [e["event"] for e in await _events(db)]
+        assert "unlock_refused" not in events and events[-1] == "lock"
+
+    async def test_status_never_reports_a_write_that_is_rolled_back(self, service, db, monkeypatch):
+        inserted, release = await _pending_failed_write(monkeypatch)
+        failing = asyncio.create_task(service._audit("unlock_refused", {"reason": "x"}))
+        await inserted.wait()
+        status = asyncio.create_task(service.status())
+        await asyncio.sleep(0.05)
+        release.set()
+        await failing
+        assert (await status)["last_event"]["event"] == "service_start"
+
+    async def test_a_server_without_pyrage_refuses_the_unlock(self, service, db, monkeypatch):
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pyrage", None)  # import pyrage now raises
+        result = await service.unlock(PASSPHRASE, None)
+        assert result == {"ok": False, "error": svc_mod._UNWRAP_REFUSALS[3]}
+        assert (await _events(db))[-1]["event"] == "unlock_refused"
+
+    async def test_an_unwrapped_value_that_is_not_text_is_unreadable_not_a_wrong_passphrase(
+        self, service, vault
+    ):
+        from pyrage import passphrase as age_passphrase
+
+        not_text = b"\xff" * 74  # the length of a key, so the sealed file keeps its shape
+        (vault / vs.IDENTITY).write_bytes(age_passphrase.encrypt(not_text, PASSPHRASE))
+        _rebind(vault)
+        result = await service.unlock(PASSPHRASE, None)
+        assert result == {"ok": False, "error": svc_mod._UNWRAP_REFUSALS[4]}
+
+
+class TestRoundOneReviewFollowUp:
+    async def test_start_owns_its_audit_connection_and_closes_it_at_stop(
+        self, vault, tmp_path, monkeypatch
+    ):
+        from genesis.env import genesis_db_path
+
+        dbp = genesis_db_path()  # conftest pins it to a per-test temp file
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "h"))
+        monkeypatch.setattr(vs, "vault_dir", lambda: vault)
+        async with aiosqlite.connect(str(dbp)) as conn:
+            await MIG.up(conn)
+        shared = object()
+        svc = await svc_mod.start_vault_service(type("Rt", (), {"db": shared})())
+        assert svc is not None and svc.owned_db is not None
+        assert svc._db is svc.owned_db and svc._db is not shared
+        assert (await svc.unlock(PASSPHRASE, None))["ok"]
+        await svc_mod.stop_vault_service(svc)
+        with pytest.raises(ValueError):
+            await svc.owned_db.execute("SELECT 1")
+
+    async def test_a_connection_that_will_not_open_leaves_unlock_refused(
+        self, vault, tmp_path, monkeypatch
+    ):
+        import genesis.db.connection as connection
+
+        async def no_db(path):
+            raise OSError("no database")
+
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "h"))
+        monkeypatch.setattr(connection, "get_db", no_db)
+        monkeypatch.setattr(vs, "vault_dir", lambda: vault)
+        svc = await svc_mod.start_vault_service(type("Rt", (), {"db": None})())
+        try:
+            assert svc is not None
+            result = await svc.unlock(PASSPHRASE, None)
+            assert not result["ok"] and "audit log is unavailable" in result["error"]
+        finally:
+            await svc_mod.stop_vault_service(svc)
+
+    async def test_an_unlocked_vault_answers_already_unlocked_not_a_refusal(
+        self, service, vault, db
+    ):
+        assert (await service.unlock(PASSPHRASE, None))["ok"]
+        os.chmod(vault / vs.IDENTITY, 0o644)  # would fail check_ready now
+        try:
+            result = await service.unlock(PASSPHRASE, None)
+        finally:
+            os.chmod(vault / vs.IDENTITY, 0o600)
+        assert result == {"ok": True, "state": "already unlocked"}
+        assert (await _events(db))[-1]["event"] == "unlock"
+
+    async def test_an_unwrap_helper_that_cannot_start_is_an_audited_refusal(
+        self, db, vault, tmp_path
+    ):
+        svc = _make(db, vault, tmp_path, python=str(tmp_path / "no-such-python"))
+        result = await svc.unlock(PASSPHRASE, None)
+        assert result == {"ok": False, "error": svc_mod._UNWRAP_REFUSALS[127]}
+        assert (await _events(db))[-1]["event"] == "unlock_refused"
+
+    async def test_stop_is_bounded_behind_a_stuck_audit_write(self, service, monkeypatch):
+        async def stuck(conn, event, detail=None):
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(svc_mod, "_STOP_WAIT_S", 0.2)
+        monkeypatch.setattr(audit, "record_event", stuck)
+        started = time.monotonic()
+        await asyncio.wait_for(service.stop(), 10)
+        assert time.monotonic() - started < 5
+
+
+async def test_a_key_file_altered_since_init_is_refused_before_any_unwrap(
+    service, vault, db, monkeypatch
+):
+    """Without a rebind, vault_store's recorded key pair refuses first, and no scrypt runs."""
+
+    async def no_unwrap(passphrase):
+        raise AssertionError("refused before the unwrap")
+
+    monkeypatch.setattr(service, "_unwrap", no_unwrap)
+    (vault / vs.RECIPIENT).write_text(str(x25519.Identity.generate().to_public()) + "\n")
+    result = await service.unlock(PASSPHRASE, None)
+    assert result["ok"] is False and "recipient.txt is not the public key" in result["error"]
+    assert (await _events(db))[-1]["event"] == "unlock_refused"

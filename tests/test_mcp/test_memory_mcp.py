@@ -340,7 +340,8 @@ _TEST_CARD = "4242" * 4  # Stripe's public test number, built from parts
 
 @pytest.mark.parametrize(
     "field",
-    ["value", "identifier", "description", "tags", "source"],
+    # kind is checked first: its unknown-kind error would quote the value.
+    ["value", "identifier", "description", "tags", "source", "kind"],
 )
 async def test_reference_store_refuses_card_numbers(field):
     """A payment card number is never persisted in the plaintext reference

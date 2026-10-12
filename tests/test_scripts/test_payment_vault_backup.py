@@ -9,6 +9,7 @@ unpack side are driven directly. Sandboxed like test_backup_dated_snapshots
 (HOME, GENESIS_DIR, GNUPGHOME in tmp; systemctl and curl stubbed).
 """
 
+import hashlib
 import io
 import json
 import os
@@ -523,6 +524,9 @@ def _rebuild_cards(db: Path, schema: str) -> None:
         ("recipient short", "recipient.txt does not hold an age public key"),
         ("recipient long", "recipient.txt does not hold an age public key"),
         ("recipient bad charset", "recipient.txt does not hold an age public key"),
+        ("no vault_meta", "does not record the vault keys"),
+        ("identity flipped", "identity.age is not the key this vault was created with"),
+        ("recipient swapped", "recipient.txt is not the public key this vault was created with"),
     ],
 )
 def test_the_shell_check_refuses_what_vault_store_would(_sealed, tmp_path, damage, reason):
@@ -543,6 +547,17 @@ def test_the_shell_check_refuses_what_vault_store_would(_sealed, tmp_path, damag
         (vault / "recipient.txt").write_text(key[:-1] + "\n")
     elif damage == "recipient long":
         (vault / "recipient.txt").write_text(key + "q\n")
+    elif damage == "no vault_meta":
+        with sqlite3.connect(db) as conn:
+            conn.execute("DROP TABLE vault_meta")
+    elif damage == "identity flipped":
+        data = bytearray((vault / "identity.age").read_bytes())
+        data[-5] ^= 0x01  # same length, same shape
+        (vault / "identity.age").write_bytes(bytes(data))
+    elif damage == "recipient swapped":
+        from pyrage import x25519
+
+        (vault / "recipient.txt").write_text(str(x25519.Identity.generate().to_public()) + "\n")
     else:
         (vault / "recipient.txt").write_text(key[:-1] + "b\n")  # 'b' is not Bech32
     proc = _check(vault)
@@ -556,11 +571,21 @@ def _synthetic_set(dest: Path, *, cards_ok: bool = True, mark: str = "q") -> Non
     """A set that passes payment_vault_check without a scrypt init. `mark` fills
     the recipient key, so two sets can be told apart."""
     dest.mkdir(parents=True)
-    (dest / "identity.age").write_bytes(b"age-encryption.org/v1\n-> scrypt x\n")
-    (dest / "recipient.txt").write_text("age1" + mark * 58 + "\n")
+    identity = b"age-encryption.org/v1\n-> scrypt x\n"
+    recipient = "age1" + mark * 58
+    (dest / "identity.age").write_bytes(identity)
+    (dest / "recipient.txt").write_text(recipient + "\n")
     if cards_ok:
         with sqlite3.connect(dest / "cards.db") as conn:
             conn.execute(vs._SCHEMA)
+            conn.execute(vs._META_SCHEMA)
+            conn.executemany(
+                "INSERT INTO vault_meta (key, value) VALUES (?, ?)",
+                [
+                    ("identity_sha256", hashlib.sha256(identity).hexdigest()),
+                    ("recipient", recipient),
+                ],
+            )
             conn.execute(f"PRAGMA user_version = {vs.SCHEMA_VERSION}")
     else:
         (dest / "cards.db").write_bytes(b"not sqlite" * 100)

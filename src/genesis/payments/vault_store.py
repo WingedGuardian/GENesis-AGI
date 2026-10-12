@@ -14,7 +14,10 @@ Layout of ``~/.genesis/payment_vault/`` (directory 0700, every file 0600):
   with ``secure_delete`` on, so the ciphertext does not stay in a free page
   of the file. That is best effort: SQLite's rollback journal and the
   filesystem may keep old ciphertext, so a retired virtual card is also
-  closed with its issuer.
+  closed with its issuer. Its ``vault_meta`` table records the sha256 of
+  ``identity.age`` and the text of ``recipient.txt`` as init wrote them, so a
+  damaged or replaced key file is refused without the passphrase, before any
+  card is sealed to a key that cannot open it.
 
 Only virtual cards go in: every card is scoped to one merchant, or marked
 single-use, or both. Decryption of cards is not here; the vault service that
@@ -24,6 +27,8 @@ unlocks the identity and fills a card comes later.
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -31,9 +36,10 @@ import secrets
 import sqlite3
 import stat
 import unicodedata
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from genesis.env import genesis_home
 from genesis.security.card_shapes import card_brand, contains_card_number
@@ -69,6 +75,19 @@ CREATE TABLE IF NOT EXISTS cards (
     CHECK ((status = 'active') = (blob IS NOT NULL))
 )
 """
+# The key pair as init wrote it: the sealed identity's sha256 and the
+# recipient text, in the same transaction as the schema. The identity's MAC
+# and payload can only be authenticated with the passphrase, so without this a
+# same-length corruption (or a replaced recipient.txt) would pass every check
+# that runs without it, and add would keep sealing cards no key here opens.
+_META_SCHEMA = """
+CREATE TABLE IF NOT EXISTS vault_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+)
+"""
+_IDENTITY_DIGEST = "identity_sha256"
+_RECIPIENT_ROW = "recipient"
 
 _EXPIRY = re.compile(r"(0[1-9]|1[0-2])\s*/\s*([0-9]{2}|[0-9]{4})")
 _HOST = re.compile(
@@ -97,92 +116,291 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def ensure_private_dir(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    info = os.lstat(path)
+def _check_root(path: Path) -> bool:
+    """True when the vault directory exists; refuse anything else at its path."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise VaultError(f"{path} cannot be checked ({exc.strerror})") from None
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-        raise VaultError(f"{path} is not a directory you own")
-    if stat.S_IMODE(info.st_mode) != 0o700:
-        os.chmod(path, 0o700)
+        raise VaultError(f"{path} is not a directory you own; move it aside")
+    if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+        raise VaultError(f"{path} is not readable and writable by you; `chmod 700` it")
+    return True
 
 
-def _write_new(path: Path, data: bytes) -> None:
+def _ensure_dir(path: Path) -> None:
+    if not _check_root(path):
+        try:
+            path.mkdir(mode=0o700, parents=True)
+        except FileExistsError:
+            pass  # created meanwhile; checked below
+        except OSError as exc:
+            raise VaultError(f"{path} cannot be created ({exc.strerror})") from None
+        _check_root(path)
+    try:
+        if stat.S_IMODE(os.lstat(path).st_mode) != 0o700:
+            os.chmod(path, 0o700)
+    except OSError as exc:
+        raise VaultError(f"{path} cannot be made private ({exc.strerror})") from None
+
+
+def ensure_private_dir(path: Path) -> None:
+    """Create (or check) a 0700 directory you own: the vault, or the service's socket dir."""
+    _ensure_dir(path)
+
+
+def _write_new(name: str, data: bytes, dir_fd: int) -> None:
     """Write ``data`` to a file that must not exist yet, created 0600."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
 
 
-def _fsync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+def _read_regular(name: str, dir_fd: int, limit: int | None = None) -> bytes:
+    """Read a regular file without following a symlink or blocking on a FIFO."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise VaultError(f"{name} is not a regular file")
+        return f.read() if limit is None else f.read(limit)
 
 
 @contextmanager
 def _dir_lock(path: Path):
-    """Hold an exclusive lock on the vault directory (one init at a time)."""
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    """Hold an exclusive lock on the vault directory (one writer at a time).
+
+    Yields the directory's file descriptor. Init, add and retire write through
+    it, so everything they touch lands in the directory they locked even if
+    another directory is moved onto the path meanwhile.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise VaultError(
+            "the vault is not initialised; run `python -m genesis vault init`"
+        ) from None
+    except OSError as exc:
+        raise VaultError(f"the vault directory cannot be opened ({exc.strerror})") from None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        yield fd
     finally:
         os.close(fd)
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+# An age X25519 recipient: "age1" plus 58 Bech32 characters (32 key bytes and
+# a 6-character checksum). The checksum is verified below in the stdlib, so a
+# corrupted key is caught even where pyrage is not installed.
+_BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"  # pragma: allowlist secret (public BIP-173 alphabet, not a secret)
+_RECIPIENT_TEXT = re.compile(rf"age1[{_BECH32}]{{58}}")
+
+
+def _bech32_ok(text: str) -> bool:
+    """BIP-173 Bech32 checksum (age uses Bech32, not Bech32m)."""
+    hrp, data = text[:3], [_BECH32.index(c) for c in text[4:]]
+    chk = 1
+    for value in [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp] + data:
+        top = chk >> 25
+        chk = (chk & 0x1FFFFFF) << 5 ^ value
+        for i, gen in enumerate((0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)):
+            chk ^= gen if (top >> i) & 1 else 0
+    return chk == 1
+
+
+# What `age_passphrase.encrypt` writes first: the header and a scrypt stanza.
+_SEALED_HEADER = b"age-encryption.org/v1\n-> scrypt "
+
+
+def _recipient_text(path: Path) -> str:
+    """recipient.txt's key text, checked by shape only (no crypto import)."""
+    try:
+        text = (path / RECIPIENT).read_bytes().decode("utf-8").strip()
+    except OSError as exc:
+        raise VaultError(f"recipient.txt cannot be read ({exc.strerror})") from None
+    except UnicodeDecodeError:
+        text = ""
+    if not (_RECIPIENT_TEXT.fullmatch(text) and _bech32_ok(text)):
+        raise VaultError(
+            "recipient.txt does not hold a valid age public key; restore the vault from backup"
+        )
+    return text
+
+
+def _read_recipient(path: Path):
+    """The vault's age recipient; a missing or damaged recipient.txt is a VaultError."""
+    from pyrage import RecipientError, x25519
+
+    try:
+        return x25519.Recipient.from_str(_recipient_text(path))
+    except RecipientError:
+        raise VaultError(
+            "recipient.txt does not hold a valid age public key; restore the vault from backup"
+        ) from None
+
+
+def _check_identity(path: Path) -> bytes:
+    """identity.age must be a whole passphrase-sealed age key, checked without the passphrase.
+
+    A sealed X25519 identity is the age header, an scrypt stanza, a MAC line,
+    then exactly 106 payload bytes (16 nonce + 74 key + 16 tag; MEASURED on
+    pyrage 1.4.0). A file cut anywhere fails this, before a card is sealed to
+    a key whose secret half is gone.
+    """
+    dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        data = _read_regular(IDENTITY, dfd, 4096)
+    except OSError as exc:
+        raise VaultError(f"identity.age cannot be read ({exc.strerror})") from None
+    finally:
+        os.close(dfd)
+    _head, sep, rest = data.partition(b"\n--- ")
+    mac, newline, payload = rest.partition(b"\n")
+    if (
+        not (data.startswith(_SEALED_HEADER) and sep and len(mac) == 43 and newline)
+        or len(payload) != 106
+    ):
+        raise VaultError(
+            "identity.age is not a whole passphrase-sealed age key (damaged?); "
+            "restore the vault from backup"
+        )
+    return data
+
+
+def _check_bound_keys(path: Path, sealed: bytes) -> None:
+    """identity.age and recipient.txt must be the pair init wrote, as recorded in cards.db."""
+    with _db(path) as conn:
+        rows = dict(conn.execute("SELECT key, value FROM vault_meta").fetchall())
+    digest, recipient = rows.get(_IDENTITY_DIGEST), rows.get(_RECIPIENT_ROW)
+    if not isinstance(digest, str) or not isinstance(recipient, str):
+        raise VaultError(
+            "cards.db records no digest of the vault's keys; restore the vault from backup"
+        )
+    # A digest of a public ciphertext and a public key: plain compares are enough.
+    if digest != hashlib.sha256(sealed).hexdigest():
+        raise VaultError(
+            "identity.age is not the key this vault was created with (damaged or replaced); "
+            "restore the vault from backup"
+        )
+    if recipient != _recipient_text(path):
+        raise VaultError(
+            "recipient.txt is not the public key this vault was created with (replaced?); "
+            "restore the vault from backup"
+        )
+
+
+def _translate(exc: sqlite3.Error) -> VaultError:
+    if isinstance(exc, sqlite3.OperationalError):  # locked, disk I/O, shape: maybe transient
+        return VaultError(f"cards.db could not be read or written ({exc})")
+    if type(exc) is sqlite3.DatabaseError:  # "not a database", "malformed": the file itself
+        return VaultError("cards.db is unreadable (not a database, or damaged)")
+    return VaultError(f"cards.db refused the operation ({type(exc).__name__})")
+
+
+def _normalised(sql: str | None) -> str:
+    text = re.sub(r"\s+", " ", sql or "").strip().replace("IF NOT EXISTS ", "")
+    return re.sub(r"\s*([(),])\s*", r"\1", text)
+
+
+def _shape(conn: sqlite3.Connection) -> str:
+    """'vault' (the vault's tables at SCHEMA_VERSION), 'empty' (no tables yet), or 'foreign'."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    rows = conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'").fetchall()
+    tables = dict(rows)
+    if set(tables) == {"cards", "vault_meta"} and version == SCHEMA_VERSION:
+        # The tables must be the ones init writes, constraints and all: a
+        # cards table of another shape is foreign, not a vault the code can trust.
+        same = _normalised(tables["cards"]) == _normalised(_SCHEMA) and _normalised(
+            tables["vault_meta"]
+        ) == _normalised(_META_SCHEMA)
+        return "vault" if same else "foreign"
+    if not tables and version == 0:
+        return "empty"
+    return "foreign"
+
+
+@contextmanager
+def _db(path: Path):
+    """An open, existing cards.db whose statements raise VaultError, never sqlite3 errors.
+
+    Opened read-write but never created, and never given a schema: only init
+    writes the schema, so a reader cannot turn a truncated or foreign file
+    into an empty vault database.
+    """
     db = path / CARDS
     try:
         info = os.lstat(db)
     except FileNotFoundError:
-        info = None
+        raise VaultError("cards.db is missing") from None
     except OSError as exc:
         raise VaultError(f"cards.db cannot be checked ({exc.strerror})") from None
-    if info is not None and not stat.S_ISREG(info.st_mode):
+    if not stat.S_ISREG(info.st_mode):
         raise VaultError("cards.db is not a regular file (a symlink or other); refusing to open it")
-    if info is None:
-        try:
-            os.close(os.open(db, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
-        except OSError as exc:
-            raise VaultError(f"cards.db cannot be created ({exc.strerror})") from None
-    conn = sqlite3.connect(db)
+    conn = None
     try:
+        conn = sqlite3.connect(f"file:{quote(str(db))}?mode=rw", uri=True)
+        # SQLite follows symlinks (its nofollow=1 URI flag does not refuse one
+        # here: MEASURED on 3.45.1), so check the file opened is still the
+        # regular file checked above, not something swapped in since.
+        opened = os.stat(db)
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise VaultError("cards.db changed while it was being opened; try again")
         conn.execute("PRAGMA secure_delete = ON")
-        conn.execute(_SCHEMA)
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version == 0:
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            conn.commit()
-        elif version != SCHEMA_VERSION:
+        shape = _shape(conn)
+        if shape != "vault":
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
             raise VaultError(
-                f"cards.db has format version {version}; this Genesis reads {SCHEMA_VERSION}"
+                "cards.db is not a vault card database "
+                f"({'empty' if shape == 'empty' else f'format version {version}'}); "
+                "restore the vault from backup"
             )
-    except sqlite3.OperationalError as exc:  # locked, disk I/O: likely transient
-        conn.close()
-        raise VaultError(f"cards.db could not be opened ({exc})") from None
-    except sqlite3.DatabaseError:
-        conn.close()
-        raise VaultError("cards.db is unreadable (not a database, or damaged)") from None
-    except VaultError:
-        conn.close()
-        raise
-    return conn
+        yield conn
+    except sqlite3.Error as exc:
+        raise _translate(exc) from None
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _card_count(path: Path) -> int:
-    if not os.path.lexists(path / CARDS):
+    """Cards in cards.db: 0 for an absent, 0-byte or never-written file."""
+    try:
+        if not os.path.lexists(path / CARDS) or os.lstat(path / CARDS).st_size == 0:
+            return 0
+    except OSError as exc:
+        raise VaultError(f"cards.db cannot be checked ({exc.strerror})") from None
+    try:
+        # mode=rw (never creates): a read-only connection cannot roll back the
+        # journal a killed write left, which would lock init out for good.
+        with closing(sqlite3.connect(f"file:{quote(str(path / CARDS))}?mode=rw", uri=True)) as c:
+            shape = _shape(c)
+    except sqlite3.Error as exc:
+        raise _translate(exc) from None
+    if shape == "empty":
         return 0
-    with closing(_connect(path)) as conn:
+    if shape == "foreign":
+        raise VaultError("cards.db is not an empty vault card database; move it aside first")
+    with _db(path) as conn:
         return conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
 
 
 def is_initialised(path: Path | None = None) -> bool:
     path = path or vault_dir()
-    return (path / IDENTITY).is_file() and (path / RECIPIENT).is_file()
+    try:
+        return (path / IDENTITY).is_file() and (path / RECIPIENT).is_file()
+    except OSError as exc:
+        raise VaultError(f"the vault cannot be checked ({exc.strerror})") from None
+
+
+def _incomplete() -> VaultError:
+    return VaultError(
+        "the vault is incomplete (identity.age is there but recipient.txt is missing or not "
+        "a file); restore it from backup or move the vault directory aside"
+    )
 
 
 def check_can_init(path: Path | None = None) -> None:
@@ -193,14 +411,13 @@ def check_can_init(path: Path | None = None) -> None:
     leave them sealed to the old one and unreadable.
     """
     path = path or vault_dir()
+    if not _check_root(path):
+        return
     if os.path.lexists(path / IDENTITY):
         if is_initialised(path):
             raise VaultError("the vault is already initialised")
-        raise VaultError(
-            "the vault is incomplete (identity.age is there but recipient.txt is missing or not "
-            "a file); restore it from backup or move the vault directory aside"
-        )
-    count = _card_count(path) if path.is_dir() else 0
+        raise _incomplete()
+    count = _card_count(path)
     if count:
         raise VaultError(
             f"cards.db holds {count} card(s) sealed to an earlier key; move the vault directory aside first"
@@ -211,10 +428,13 @@ def init_vault(passphrase: str, path: Path | None = None) -> str:
     """Create the vault; return the recipient (public key).
 
     Refuses as ``check_can_init`` does, and a passphrase below
-    MIN_PASSPHRASE_SCORE. A run killed midway leaves no ``identity.age`` and
-    no cards, so the vault still reads as uninitialised and a rerun starts
-    over. Concurrent inits are serialised by a directory lock, and the
-    identity is linked into place, so one can never replace another's.
+    MIN_PASSPHRASE_SCORE. The key is sealed (scrypt, slow) before the lock is
+    taken, so nothing slow runs between the check under the lock and the
+    writes. A run killed midway leaves no ``identity.age`` and no cards, so
+    the vault still reads as uninitialised and a rerun starts over.
+    Concurrent inits are serialised by a directory lock, every file is written
+    through the locked directory's descriptor, and the identity is linked into
+    place, so one can never replace another's.
     """
     from pyrage import passphrase as age_passphrase
     from pyrage import x25519
@@ -223,26 +443,110 @@ def init_vault(passphrase: str, path: Path | None = None) -> str:
     check_can_init(path)
     if passphrase_score(passphrase) < MIN_PASSPHRASE_SCORE:
         raise VaultError("the passphrase is too guessable (needs zxcvbn score 4)")
-    ensure_private_dir(path)
-    with _dir_lock(path):
-        check_can_init(path)  # another init may have finished while we waited
-        identity = x25519.Identity.generate()
-        recipient = str(identity.to_public())
-        sealed = age_passphrase.encrypt(str(identity).encode(), passphrase)
-        staged = {RECIPIENT: recipient.encode() + b"\n", IDENTITY: sealed}
-        for name in staged:  # leftovers of a killed run hold nothing secret
-            (path / f".{name}.tmp").unlink(missing_ok=True)
-        for name, data in staged.items():
-            _write_new(path / f".{name}.tmp", data)
-        with closing(_connect(path)):
-            pass
-        os.replace(path / f".{RECIPIENT}.tmp", path / RECIPIENT)
+    identity = x25519.Identity.generate()
+    recipient = str(identity.to_public())
+    sealed = age_passphrase.encrypt(str(identity).encode(), passphrase)
+    del identity
+    _ensure_dir(path)
+    try:
+        with _dir_lock(path) as dfd:
+            here, held = os.lstat(path), os.fstat(dfd)
+            if (here.st_dev, here.st_ino) != (held.st_dev, held.st_ino):
+                raise VaultError(f"another directory was moved onto {path}; it was left as it is")
+            check_can_init(path)  # another init may have finished while we waited
+            _publish(dfd, recipient.encode() + b"\n", sealed)
+            here = os.lstat(path)
+            if (here.st_dev, here.st_ino) != (held.st_dev, held.st_ino):
+                raise VaultError(
+                    f"another directory was moved onto {path} while init ran; it was left "
+                    "as it is, and this run's vault is in the directory that was moved away"
+                )
+    except OSError as exc:
+        raise VaultError(f"the vault could not be written ({exc.strerror or exc})") from None
+    return recipient
+
+
+def _create_cards_db(dfd: int, identity_digest: str, recipient_text: str) -> None:
+    """Create cards.db (0600, schema at SCHEMA_VERSION) in ``dfd``, or accept an empty one.
+
+    Either way it records the key pair this init is about to publish: the
+    sealed identity's sha256 and the recipient text.
+    """
+    cfd = os.open(CARDS, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dfd)
+    try:
+        info = os.fstat(cfd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise VaultError("cards.db is not a regular file you own; move it aside")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            os.fchmod(cfd, 0o600)
+    finally:
+        os.close(cfd)
+    # Through the locked directory's descriptor (Linux /proc), so the schema
+    # lands in the file just checked even if the vault path is swapped.
+    conn = sqlite3.connect(f"/proc/self/fd/{dfd}/{CARDS}", isolation_level=None)
+    try:
+        shape = _shape(conn)
+        if shape == "foreign":
+            raise VaultError("cards.db is not an empty vault card database; move it aside")
+        # Tables, digest and version land together or not at all.
+        conn.execute("BEGIN IMMEDIATE")
+        if shape == "vault":
+            if conn.execute("SELECT COUNT(*) FROM cards").fetchone()[0]:
+                conn.execute("ROLLBACK")
+                raise VaultError("cards.db holds cards sealed to an earlier key; move it aside")
+        else:
+            conn.execute(_SCHEMA)
+            conn.execute(_META_SCHEMA)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.executemany(
+            "INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)",
+            [(_IDENTITY_DIGEST, identity_digest), (_RECIPIENT_ROW, recipient_text)],
+        )
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        raise _translate(exc) from None
+    finally:
+        conn.close()
+
+
+def _publish(dfd: int, recipient: bytes, sealed: bytes) -> None:
+    """Write cards.db, recipient.txt, then identity.age, all in ``dfd``."""
+    staged = {RECIPIENT: recipient, IDENTITY: sealed}
+    for name in staged:  # leftovers of a killed run (the sealed key, or the public one)
+        with suppress(FileNotFoundError):
+            os.unlink(f".{name}.tmp", dir_fd=dfd)
+    for name, data in staged.items():
+        _write_new(f".{name}.tmp", data, dfd)
+    # Before the identity: an initialised vault always has one, recording its digest.
+    _create_cards_db(dfd, hashlib.sha256(sealed).hexdigest(), recipient.decode().strip())
+    with suppress(FileNotFoundError):  # checked here, through dfd, so nothing is overwritten
+        os.stat(IDENTITY, dir_fd=dfd, follow_symlinks=False)
+        raise VaultError(
+            "an identity.age appeared while this init ran; this init stopped without "
+            "publishing its key, and the copy that appeared is refused as not this vault's "
+            "key (move it aside and run init again, or restore the vault from backup)"
+        )
+    os.replace(f".{RECIPIENT}.tmp", RECIPIENT, src_dir_fd=dfd, dst_dir_fd=dfd)
+    try:
         # identity.age last, and linked rather than renamed: link fails if
         # the target exists, so an identity is never overwritten.
-        os.link(path / f".{IDENTITY}.tmp", path / IDENTITY)
-        (path / f".{IDENTITY}.tmp").unlink()
-        _fsync_dir(path)
-    return recipient
+        os.link(f".{IDENTITY}.tmp", IDENTITY, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except FileExistsError:
+        # Someone else's identity landed (a hand copy). This run's recipient
+        # must not stay beside it; theirs cannot be told apart from a
+        # leftover, so the vault is left incomplete (refused until restored),
+        # never paired with the wrong key.
+        with suppress(OSError, VaultError):
+            if _read_regular(RECIPIENT, dfd) == recipient:
+                os.unlink(RECIPIENT, dir_fd=dfd)
+        with suppress(FileNotFoundError):
+            os.unlink(f".{IDENTITY}.tmp", dir_fd=dfd)
+        raise VaultError(
+            "another identity.age appeared while this init ran; it was not replaced. "
+            "If `vault status` says incomplete, restore the vault from backup"
+        ) from None
+    os.unlink(f".{IDENTITY}.tmp", dir_fd=dfd)
+    os.fsync(dfd)
 
 
 def parse_card(number: str, expiry: str, cvc: str) -> dict:
@@ -290,15 +594,30 @@ def check_entry(label: str, merchant: str | None, single_use: bool) -> str | Non
 
 
 def check_ready(path: Path | None = None) -> None:
-    """Refuse to add to a vault that is not initialised or not private."""
+    """Refuse to use a vault that is not initialised, not intact, or not private.
+
+    Everything ``vault status`` reports as an error refuses here, before any
+    card detail or passphrase is asked for.
+    """
     path = path or vault_dir()
-    if not is_initialised(path):
-        if os.path.lexists(path / IDENTITY):
-            check_can_init(path)  # raises the "incomplete" message
+    status = vault_status(path)
+    if status["error"]:
+        raise VaultError(status["error"])
+    if not status["initialised"]:
         raise VaultError("the vault is not initialised; run `python -m genesis vault init`")
-    loose = [name for name, info in vault_status(path)["files"].items() if not info["private"]]
+    _read_recipient(path)  # the full key parse, beyond status's shape check
+    loose = [name for name, info in status["files"].items() if not info["private"]]
     if loose:
         raise VaultError(f"not private: {', '.join(loose)}; fix the modes (see `vault status`)")
+
+
+def _require_cards_db(path: Path) -> None:
+    """Init writes cards.db before identity.age, so an initialised vault without one lost it."""
+    if not os.path.lexists(path / CARDS):
+        raise VaultError(
+            "cards.db is missing from an initialised vault (lost, or left out of a restore); "
+            "restore the vault from backup rather than adding to an empty one"
+        )
 
 
 def add_card(
@@ -312,21 +631,46 @@ def add_card(
     path: Path | None = None,
 ) -> str:
     """Encrypt ``card`` (from ``parse_card``) to the vault's public key; return its ref."""
-    from pyrage import RecipientError, encrypt, x25519
+    from pyrage import encrypt
 
     path = path or vault_dir()
-    check_ready(path)
     merchant = check_entry(label, merchant, single_use)
+    with _dir_lock(path) as dfd:
+        _pin(path, dfd)  # the checks below read the locked directory, not a later one
+        check_ready(path)
+        pinned = _pin(path, dfd)
+        recipient = _read_recipient(pinned)
+        secret = {"v": BLOB_VERSION}
+        secret.update({k: card[k] for k in ("number", "exp_month", "exp_year", "cvc")})
+        secret.update(name=name, postal_code=postal_code)
+        try:
+            blob = encrypt(json.dumps(secret).encode(), [recipient])
+        except Exception as exc:  # noqa: BLE001 - never a raw library error, never a value
+            raise VaultError(f"the card could not be encrypted ({type(exc).__name__})") from None
+        ref = "card_" + secrets.token_hex(6)
+        _insert_card(pinned, ref, card, label, merchant, single_use, blob)
+    return ref
+
+
+def _pin(path: Path, dfd: int) -> Path:
+    """The locked directory, if it is still the one at ``path``, as a path through its fd.
+
+    Everything read or written after the checks goes through this path, so a
+    vault directory moved onto ``path`` meanwhile is never mixed with the one
+    that was checked: the key and the database always come from one directory.
+    """
     try:
-        recipient = x25519.Recipient.from_str((path / RECIPIENT).read_text().strip())
-    except RecipientError:
-        raise VaultError("recipient.txt does not hold a valid age public key") from None
-    secret = {"v": BLOB_VERSION}
-    secret.update({k: card[k] for k in ("number", "exp_month", "exp_year", "cvc")})
-    secret.update(name=name, postal_code=postal_code)
-    blob = encrypt(json.dumps(secret).encode(), [recipient])
-    ref = "card_" + secrets.token_hex(6)
-    with closing(_connect(path)) as conn, conn:
+        live = os.lstat(path)
+    except OSError as exc:
+        raise VaultError(f"the vault directory cannot be checked ({exc.strerror})") from None
+    held = os.fstat(dfd)
+    if (live.st_dev, live.st_ino) != (held.st_dev, held.st_ino):
+        raise VaultError("the vault directory was replaced during the operation; try again")
+    return Path(f"/proc/self/fd/{dfd}")
+
+
+def _insert_card(path, ref, card, label, merchant, single_use, blob) -> None:
+    with _db(path) as conn, conn:
         conn.execute(
             "INSERT INTO cards (card_ref, label, brand, last4, merchant, single_use, status,"
             " created_at, blob) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
@@ -341,15 +685,18 @@ def add_card(
                 blob,
             ),
         )
-    return ref
 
 
 def list_cards(path: Path | None = None) -> list[dict]:
     """Every card's clear columns (never the blob, never the expiry)."""
     path = path or vault_dir()
-    if not os.path.lexists(path / CARDS):
+    if not _check_root(path):
         return []
-    with closing(_connect(path)) as conn:
+    if is_initialised(path):
+        _require_cards_db(path)
+    elif _card_count(path) == 0:  # a run killed before its identity landed
+        return []
+    with _db(path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT card_ref, label, brand, last4, merchant, single_use, status, created_at,"
@@ -376,19 +723,40 @@ def verify_passphrase(passphrase: str, path: Path | None = None) -> None:
     path = path or vault_dir()
     if not is_initialised(path):
         raise VaultError("the vault is not initialised")
+    from pyrage import IdentityError, x25519
+
     try:
-        age_passphrase.decrypt((path / IDENTITY).read_bytes(), passphrase)
+        key = age_passphrase.decrypt((path / IDENTITY).read_bytes(), passphrase).decode()
     except DecryptError:
         raise VaultError("wrong passphrase (or identity.age is damaged)") from None
+    except OSError as exc:
+        raise VaultError(f"identity.age cannot be read ({exc.strerror})") from None
+    try:
+        public = str(x25519.Identity.from_str(key).to_public())
+    except (IdentityError, ValueError):
+        raise VaultError("identity.age does not hold an age X25519 key") from None
+    finally:
+        del key
+    # Cards are sealed to recipient.txt: a key that is not its pair opens none of them.
+    if public != _recipient_text(path):
+        raise VaultError(
+            "identity.age and recipient.txt do not match; restore the vault from backup"
+        )
 
 
 def retire_card(card_ref: str, passphrase: str, path: Path | None = None) -> None:
     """Mark a card retired and clear its encrypted blob. Needs the passphrase."""
     path = path or vault_dir()
-    check_ready(path)
-    check_active_card(card_ref, path)
-    verify_passphrase(passphrase, path)
-    with closing(_connect(path)) as conn, conn:
+    with _dir_lock(path) as dfd:
+        _pin(path, dfd)  # the checks below read the locked directory, not a later one
+        check_ready(path)
+        check_active_card(card_ref, path)
+        verify_passphrase(passphrase, path)
+        _retire_row(_pin(path, dfd), card_ref)
+
+
+def _retire_row(path: Path, card_ref: str) -> None:
+    with _db(path) as conn, conn:
         cur = conn.execute(
             "UPDATE cards SET status = 'retired', retired_at = ?, blob = NULL"
             " WHERE card_ref = ? AND status = 'active'",
@@ -399,29 +767,56 @@ def retire_card(card_ref: str, passphrase: str, path: Path | None = None) -> Non
 
 
 def vault_status(path: Path | None = None) -> dict:
-    """Whether the vault exists, its card counts, and whether its modes are private.
+    """Whether the vault exists and is intact, its card counts, and its file modes.
 
-    ``error`` is set (and ``cards`` is None) when cards.db cannot be read.
+    ``error`` is set when the vault cannot be used as it is: the root or a
+    file is unreadable or the wrong kind, the vault is incomplete, identity.age
+    or recipient.txt is damaged or is not the pair cards.db recorded at init,
+    cards.db is missing, damaged or foreign, or cards remain without an identity. ``cards`` is None when they cannot be
+    counted. Nothing here writes to the vault.
     """
     path = path or vault_dir()
     files = {}
-    for name in ("", IDENTITY, RECIPIENT, CARDS):
-        target = path / name
-        try:
-            mode = stat.S_IMODE(os.lstat(target).st_mode)
-        except FileNotFoundError:
-            continue
-        files[name or "."] = {"mode": oct(mode), "private": not mode & 0o077}
     counts: dict | None = {"active": 0, "retired": 0}
     error = None
+    initialised = False
     try:
-        for card in list_cards(path):
-            counts[card["status"]] += 1
+        if _check_root(path):
+            for name in ("", IDENTITY, RECIPIENT, CARDS):
+                try:
+                    mode = stat.S_IMODE(os.lstat(path / name).st_mode)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise VaultError(f"{name} cannot be checked ({exc.strerror})") from None
+                files[name or "."] = {"mode": oct(mode), "private": not mode & 0o077}
+            initialised = is_initialised(path)
+            if os.path.lexists(path / IDENTITY) and not initialised:
+                raise _incomplete()
+            sealed = None
+            if initialised:
+                sealed = _check_identity(path)
+                if importlib.util.find_spec("pyrage") is not None:
+                    _read_recipient(path)  # the checksum too, as add will
+                else:
+                    _recipient_text(path)  # status runs without the payments extra
+            for card in list_cards(path):
+                if card["status"] not in counts:
+                    raise VaultError("cards.db holds a card with an unknown status; restore it")
+                counts[card["status"]] += 1
+            if sealed is not None:  # after list_cards, so cards.db's own errors come first
+                _check_bound_keys(path, sealed)
+            held = counts["active"] + counts["retired"]
+            if held and not initialised:
+                raise VaultError(
+                    f"cards.db holds {held} card(s) but identity.age is missing; "
+                    "restore the vault from backup"
+                )
     except VaultError as exc:
-        counts, error = None, str(exc)
+        error, counts = str(exc), None
     return {
         "path": str(path),
-        "initialised": is_initialised(path),
+        "initialised": initialised,
         "cards": counts,
         "files": files,
         "error": error,

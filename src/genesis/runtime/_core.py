@@ -214,6 +214,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         # Optional external OfficeCLI binary (deliverable-builder render backend);
         # resolved by _init_office_deliverables, None when not provisioned.
         self._officecli_path: str | None = None
+        # The Camoufox engine the browser tools would launch; resolved by
+        # _init_browser_automation, None when no engine is launchable.
+        self._browser_engine_path: str | None = None
         # Set by the ``board`` bootstrap step once the reconciler job is wired.
         self._board_reconciler: str | None = None
         self._activity_tracker: ProviderActivityTracker | None = None
@@ -500,6 +503,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         # Unconditional (also in readonly probes): optional OfficeCLI render
         # backend. Present → active; absent → degraded (never fatal).
         self._run_init_step("office_deliverables", self._init_office_deliverables)
+        # Unconditional too: the browser stack is optional infrastructure.
+        # Launchable engine → active; anything else → degraded (never fatal).
+        await self._run_init_step_async("browser_automation", self._init_browser_automation)
 
         if _full:
             await self._run_init_step_async(
@@ -763,6 +769,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         "pipeline": "_pipeline_orchestrator",
         "campaigns": "_campaign_runner",
         "office_deliverables": "_officecli_path",
+        "browser_automation": "_browser_engine_path",
         "board": "_board_reconciler",
     }
 

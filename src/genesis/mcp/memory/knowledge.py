@@ -516,8 +516,8 @@ async def reference_store(
 
     ``value`` is the raw value (password, URL string, IP address, file path,
     etc.). Stored plaintext in the knowledge_units table, so an entry holding
-    a payment card number in any field is refused (cards belong in the
-    encrypted card vault).
+    a payment card number in any field is refused (the planned card vault
+    is tracked in #3172).
 
     ``description`` is REQUIRED. An IP without "what is this" or a credential
     without "what service" is useless 10 sessions later. Describes the
@@ -532,6 +532,15 @@ async def reference_store(
 
     Returns the unit_id of the stored row.
     """
+    # The reference store keeps values in plaintext, so a payment card number
+    # never goes in, whichever field carries it. The refusal does not echo it, and
+    # it runs first: the later validation errors quote ``kind``.
+    if _carries_card_number(kind, identifier, value, description, tags, source):
+        raise ValueError(
+            "reference_store: refused, the entry contains a payment card number. "
+            "Cards are never stored as references; hand card details to the user "
+            "(the planned card vault is tracked in #3172)."
+        )
     if kind not in _REFERENCE_KINDS:
         raise ValueError(
             f"reference_store: unknown kind '{kind}', must be one of {sorted(_REFERENCE_KINDS)}"
@@ -545,14 +554,6 @@ async def reference_store(
         raise ValueError("reference_store: identifier is required")
     if not value or not value.strip():
         raise ValueError("reference_store: value is required")
-    # The reference store keeps values in plaintext, so a payment card number
-    # never goes in, whichever field carries it. The refusal does not echo it.
-    if _carries_card_number(identifier, value, description, tags, source):
-        raise ValueError(
-            "reference_store: refused, the entry contains a payment card number. "
-            "Cards are never stored as references; they belong in the encrypted "
-            "card vault."
-        )
 
     body = _format_reference_body(
         kind=kind,
@@ -567,8 +568,8 @@ async def reference_store(
     if contains_card_number(body):
         raise ValueError(
             "reference_store: refused, the entry contains a payment card number. "
-            "Cards are never stored as references; they belong in the encrypted "
-            "card vault."
+            "Cards are never stored as references; hand card details to the user "
+            "(the planned card vault is tracked in #3172)."
         )
 
     # Tags JSON array for the SQLite row. Include reference markers up front
