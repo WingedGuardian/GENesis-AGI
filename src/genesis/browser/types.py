@@ -9,10 +9,16 @@ from enum import StrEnum
 # used by the awareness signal collector, health probe, process reaper, and
 # remediation registry. Verified against actual /proc/PID/cmdline entries —
 # they match only browser binaries, not the MCP server's Python process.
+#
+# These are POSIX EXTENDED regexes (pgrep -f), not Python regexes: a `(?:...)`
+# group is a pgrep regex error (exit 2), which every consumer reads as "no
+# browser processes". tests/test_browser/test_pgrep_patterns.py runs each one
+# through real pgrep. The driver pattern covers patchright, which ships the same
+# Node driver under its own package directory.
 BROWSER_PGREP_PATTERNS: tuple[str, ...] = (
     "camoufox-bin",
     r"ms-playwright.*chrome",
-    "playwright/driver/node",
+    "(playwright|patchright)/driver/node",
 )
 
 
