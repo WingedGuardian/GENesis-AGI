@@ -97,6 +97,10 @@ EXEMPT: dict[tuple[str, str], str] = {
     ("util/pytest_lock.py", "scripts/pytest_lock_wait.py"): (
         "named in the advice a blocked pytest prints; never executed"
     ),
+    ("browser/engine.py", "scripts/install_browser_stack.sh"): (
+        "named in the operator step an unready engine reports; an operator or the "
+        "browser-stack unit runs it, never the server"
+    ),
     ("surplus/jobs/gitnexus.py", "scripts/lib"): (
         "put on sys.path to import index_marker; every bare import of a scripts/ "
         "module is checked on its own below"

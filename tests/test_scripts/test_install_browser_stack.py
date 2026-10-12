@@ -103,7 +103,56 @@ def test_the_unit_allows_the_runs_whole_budget():
     from genesis.browser import provision
 
     unit = (_SCRIPT.parent / "systemd" / "genesis-browser-stack.service.template").read_text()
-    limit = int(next(ln.split("=", 1)[1] for ln in unit.splitlines() if ln.startswith("TimeoutStartSec=")))
+    limit = int(
+        next(ln.split("=", 1)[1] for ln in unit.splitlines() if ln.startswith("TimeoutStartSec="))
+    )
     assert limit == 28800
     assert limit > provision.RUN_BUDGET_S
 
+
+def test_no_sudoers_rule_is_recommended():
+    """Any rule naming the venv's python grants root to whoever can write the venv
+    (its package code, or a shadow module in the working directory)."""
+    assert "NOPASSWD" not in _SCRIPT.read_text()
+
+
+def test_the_unit_quotes_its_path_and_loads_no_environment_file():
+    """An unquoted assignment splits at whitespace in the checkout path. An
+    EnvironmentFile= would hand every secret to the downloaders and override the
+    unit's own PATH (measured on systemd 255, genesis-disk-hygiene's template)."""
+    unit = (_SCRIPT.parent / "systemd" / "genesis-browser-stack.service.template").read_text()
+    assert 'Environment="PATH=__VENV__/bin:' in unit
+    assert "EnvironmentFile" not in unit
+
+
+def _env_stub(repo, tmp_path):
+    py = repo / ".venv" / "bin" / "python"
+    out = tmp_path / "env.txt"
+    py.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s|%s|%s\\n" "$PLAYWRIGHT_BROWSERS_PATH" "$OPENAI_API_KEY" "$GENESIS_BIG_TMP" > "{out}"\n'
+    )
+    py.chmod(0o755)
+    return out
+
+
+def test_the_runtimes_browser_settings_come_from_secrets_env_by_name(repo, tmp_path):
+    """The oneshot must provision where the runtime launches from, and the runtime
+    reads these from secrets.env; nothing else from that file reaches it."""
+    out = _env_stub(repo, tmp_path)
+    (repo / "secrets.env").write_text(
+        'PLAYWRIGHT_BROWSERS_PATH="/data/pw"\nOPENAI_API_KEY=sk-not-for-you\n'
+        "GENESIS_BIG_TMP=/data/tmp\nPATH=/nowhere\n"
+    )
+    r = _run(repo, tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert out.read_text().strip() == "/data/pw||/data/tmp"
+
+
+def test_a_secrets_path_override_is_honoured(repo, tmp_path):
+    out = _env_stub(repo, tmp_path)
+    elsewhere = tmp_path / "elsewhere.env"
+    elsewhere.write_text("PLAYWRIGHT_BROWSERS_PATH=/other/pw\n")
+    r = _run(repo, tmp_path, env_extra={"SECRETS_PATH": str(elsewhere)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert out.read_text().split("|")[0] == "/other/pw"

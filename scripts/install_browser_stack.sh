@@ -10,10 +10,10 @@
 # server shares the engine cache and the venv.
 #
 # Run by an operator, a missing system library is installed through `sudo -n`
-# when that is allowed without a password. A sudoers rule for it should name
-# the exact command, never a wildcard over the venv's python (whoever owns the
-# venv could otherwise run anything as root through it):
-#   <user> ALL=(root) NOPASSWD: <venv>/bin/python -m playwright install-deps chromium firefox
+# only where this user may already run commands as root without a password;
+# otherwise the exact command is printed for the operator. Do not add a sudoers
+# rule just for it: the command runs the venv's python, which this user can
+# rewrite, so any such rule would hand that user root.
 #
 # Exit codes: the module's own (0 ready or deliberately skipped, 1 not ready),
 # 0 when another run holds the lock (that run does the work), 75 when this run
@@ -67,6 +67,28 @@ elif [ "$lock_rc" -ne 0 ]; then
 fi
 
 cd "$REPO_DIR" || { _log "repo directory $REPO_DIR is unreachable"; exit 75; }
+
+# The runtime reads these from secrets.env (overriding its environment), so the
+# oneshot must provision where it launches from. By name only: no other secret
+# reaches the downloaders. Last assignment wins, as in systemd's own reader.
+SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
+_load_browser_setting() {
+    local key="$1" line="" val
+    [ -f "$SECRETS_FILE" ] || return 0
+    line="$(grep -aE "^${key}=" "$SECRETS_FILE" | tail -1)" || line=""
+    [ -n "$line" ] || return 0
+    val="${line#*=}"
+    case "$val" in
+        \"*\") val="${val#\"}"; val="${val%\"}" ;;
+        \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    [ -n "$val" ] && export "$key=$val"
+    return 0
+}
+for _key in PLAYWRIGHT_BROWSERS_PATH XDG_CACHE_HOME CAMOUFOX_EXECUTABLE_PATH \
+        GENESIS_BIG_TMP GENESIS_BROWSER_MIN_FREE_GB; do
+    _load_browser_setting "$_key"
+done
 export GENESIS_BROWSER_STACK_LOCK_FD=8  # the module verifies this descriptor holds the lock
 "$VENV_PY" -m genesis.browser.provision run
 exit $?
