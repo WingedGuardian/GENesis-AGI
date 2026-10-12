@@ -1,0 +1,1 @@
+- The dashboard's web terminal now refuses a WebSocket connection opened from another origin, including another port on the same host. The dashboard's own terminal page is unaffected.

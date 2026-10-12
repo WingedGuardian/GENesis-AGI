@@ -1413,7 +1413,9 @@ verified: 637f7f7bb679 2026-10-05
   `per_device` scope; default `global`.
 - **dashboard/**: Flask blueprint at `/genesis` (~53 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
-  thread detects degraded-but-alive Flask; web terminal.
+  thread detects degraded-but-alive Flask; web terminal (its WebSocket refuses
+  a cross-origin handshake before the upgrade:
+  `routes/terminal._refuse_cross_origin_terminal`).
   **Auth posture — API READS ARE OPEN BY DEFAULT, and this is the fact auditors
   keep rediscovering.** Exactly two `before_request` hooks exist, and between
   them they leave a gap: `auth._check_auth` is blueprint-level and gates HTML

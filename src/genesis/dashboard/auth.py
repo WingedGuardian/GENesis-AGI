@@ -414,8 +414,8 @@ def _origin_matches_host(url: str) -> bool:
 
 
 def _is_same_origin_request() -> bool:
-    """Whether a state-changing request is same-origin — the CSRF check for the
-    cookie auth path.
+    """Whether a request is same-origin — the CSRF check for the cookie auth path,
+    also used by the terminal WebSocket gate.
 
     ``SameSite=Lax`` attaches the session cookie on same-*site* requests too (a
     sibling origin on another port/subdomain of the dashboard host), so a valid
@@ -439,6 +439,15 @@ def _is_same_origin_request() -> bool:
     if referer:
         return _origin_matches_host(referer)
     return False
+
+
+def is_same_origin_request() -> bool:
+    """Public entry to the same-origin check, for gates outside this module.
+
+    One implementation for every caller: the mutation gate and the terminal
+    WebSocket gate must agree about what counts as same-origin.
+    """
+    return _is_same_origin_request()
 
 
 def check_api_mutation_auth():
