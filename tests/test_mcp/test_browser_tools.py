@@ -71,7 +71,7 @@ def _reset_browser_state(monkeypatch, tmp_path):
     # tests are about; the launch check has its own tests.
     from genesis.browser import chromium
 
-    monkeypatch.setattr(chromium, "not_ready", lambda package, **kw: None)
+    monkeypatch.setattr(chromium, "not_ready_at", lambda package, build, path: None)
     # The stale-module guard records which browser modules were loaded; a test
     # that stubs one in sys.modules must not leave its record behind.
     monkeypatch.setattr(packages, "_loaded", dict(packages._loaded))
@@ -206,11 +206,13 @@ class TestProfileBackupBeforeLaunch:
             order.append(("backup", profile, package, threading.get_ident() != loop_thread))
 
         pw = MagicMock()
+        # The driver starts first (the install check asks it where Chromium is);
+        # the copy must come before the browser opens the profile.
         pw.chromium.launch_persistent_context = AsyncMock(
-            return_value=MagicMock(pages=[_alive_page()])
+            side_effect=lambda **kw: order.append(("launch",)) or MagicMock(pages=[_alive_page()])
         )
         starter = MagicMock()
-        starter.start = AsyncMock(side_effect=lambda: order.append(("launch",)) or pw)
+        starter.start = AsyncMock(return_value=pw)
         monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
         with _stub_playwright(starter):
             await browser._ensure_chromium_fallback()
@@ -264,10 +266,8 @@ class TestPatchrightChromium:
         starter.start.assert_awaited_once()
         assert backup.call_args.args[1] == "playwright"
         assert "patchright is not installed" in caplog.text
-        # The browser extra gains patchright only later in the series, so the
-        # step names the package itself (with the range the extra pins).
-        assert "patchright>=1.62.1,<1.63" in caplog.text
-        assert "browser` extra" not in caplog.text
+        # The browser extra carries patchright, so installing it is the step.
+        assert browser.engine.PACKAGE_HINT in caplog.text
         caplog.clear()
         browser._stealth_page = None
         await browser._cleanup_chromium()
@@ -276,23 +276,51 @@ class TestPatchrightChromium:
         assert "patchright is not installed" not in caplog.text  # once per process
 
     @pytest.mark.asyncio
-    async def test_a_missing_chromium_is_refused_before_anything_starts(self, monkeypatch):
+    async def test_the_driver_starts_with_the_display_set(self, monkeypatch):
+        """The driver copies the environment when it starts and the headed browser
+        inherits the driver's: a DISPLAY set after start() never reaches the first
+        launch (MEASURED: it fails, and only the second launch works)."""
+        monkeypatch.delenv("DISPLAY", raising=False)
+        seen = []
+        starter, pw = self._starter()
+
+        async def start():
+            seen.append(os.environ.get("DISPLAY"))
+            return pw
+
+        starter.start = AsyncMock(side_effect=start)
+        with self._stub("playwright", starter):
+            await browser._ensure_chromium_fallback()
+        assert seen == [browser._VNC_DISPLAY]
+
+    @pytest.mark.asyncio
+    async def test_a_missing_chromium_is_refused_before_the_launch(self, monkeypatch):
         """Playwright's own error would tell the reader to run `patchright install`,
-        a download a session must never start; the check names the operator step."""
+        a download a session must never start; the check names the operator step. It
+        is judged where the started driver launches from, then the driver is stopped:
+        no profile copy, no launch, no driver left running."""
         from genesis.browser import chromium, profile_backup
 
         monkeypatch.setattr(browser, "_patchright_installed", lambda: True)
-        monkeypatch.setattr(
-            chromium, "not_ready", lambda package, **kw: f"{package} Chromium missing; STEP"
-        )
+        seen = []
+
+        def not_ready_at(package, build, path):
+            seen.append((package, build, path))
+            return f"{package} Chromium missing; STEP"
+
+        monkeypatch.setattr(chromium, "not_ready_at", not_ready_at)
         backup = MagicMock()
         monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
-        starter, _ = self._starter()
+        starter, pw = self._starter()
+        pw.chromium.executable_path = "/pw/chromium-1234/chrome-linux64/chrome"
+        pw.stop = AsyncMock()
         with self._stub("patchright", starter), pytest.raises(chromium.ChromiumNotReady) as err:
             await browser._ensure_chromium_fallback()
         assert str(err.value) == "patchright Chromium missing; STEP"
-        starter.start.assert_not_awaited()
+        assert seen == [("patchright", "chromium", "/pw/chromium-1234/chrome-linux64/chrome")]
+        pw.chromium.launch_persistent_context.assert_not_awaited()
         backup.assert_not_called()
+        pw.stop.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_navigate_returns_the_chromium_refusal(self, monkeypatch):
@@ -319,9 +347,9 @@ class TestPatchrightChromium:
         ):
             await browser._ensure_chromium_fallback()
         starter.start.assert_not_awaited()
-        # Its own step: the browser extra does not carry patchright yet.
+        # Its repair is the browser extra, which carries patchright.
         assert isinstance(exc.value, browser.PatchrightBroken)
-        assert "patchright>=1.62.1,<1.63" in str(exc.value)
+        assert browser.engine.PACKAGE_HINT in str(exc.value)
 
     @pytest.mark.asyncio
     async def test_navigate_names_patchrights_step_for_a_broken_patchright(self):

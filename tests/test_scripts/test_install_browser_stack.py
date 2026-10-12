@@ -72,7 +72,8 @@ def test_an_unset_home_is_resolved_from_passwd(repo, tmp_path):
 
 def test_the_unit_template_runs_this_script_without_escalation():
     unit = (_SCRIPT.parent / "systemd" / "genesis-browser-stack.service.template").read_text()
-    assert "ExecStart=/bin/bash __REPO_DIR__/scripts/install_browser_stack.sh" in unit
+    # Quoted: systemd splits an unquoted rendered path at its first space.
+    assert 'ExecStart=/bin/bash "__REPO_DIR__/scripts/install_browser_stack.sh"' in unit
     assert "NoNewPrivileges=true" in unit and "Type=oneshot" in unit
     lines = [ln.strip() for ln in unit.splitlines() if not ln.strip().startswith("#")]
     assert "[Install]" not in lines  # started by its timer or an operator, never at login
@@ -94,3 +95,15 @@ def test_the_timer_retries_daily_and_catches_up():
     timer = (_SCRIPT.parent / "systemd" / "genesis-browser-stack.timer.template").read_text()
     assert "OnCalendar=*-*-* " in timer and "Persistent=true" in timer
     assert "WantedBy=timers.target" in timer  # the installers' timer loop enables it
+
+
+def test_the_unit_allows_the_runs_whole_budget():
+    """Each step's timeout is cut to what is left of provision.RUN_BUDGET_S, which
+    stays inside the unit's own limit."""
+    from genesis.browser import provision
+
+    unit = (_SCRIPT.parent / "systemd" / "genesis-browser-stack.service.template").read_text()
+    limit = int(next(ln.split("=", 1)[1] for ln in unit.splitlines() if ln.startswith("TimeoutStartSec=")))
+    assert limit == 28800
+    assert limit > provision.RUN_BUDGET_S
+
