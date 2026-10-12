@@ -1049,4 +1049,11 @@ jobs:
         # +116 (new), test_memory_mcp +7, test_browser_tools +4, test_reference_extraction
         # +4, test_browser_cli_card_guard +4 (new), test_output_scanner +3,
         # test_capability_shadow_wiring +1; no added skips. Floor: 25548 + 139 = 25687.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25687
+        # PR C (#3224, #3126, #3047, #2938, #2551), measured against origin/main
+        # b32ef3610 (deltas vs that base) with --collect-only:
+        # tests/test_scripts/test_backup_backends.py +1,
+        # tests/test_scripts/test_git_repair.py +3,
+        # tests/test_scripts/test_codebase_managed_config.py +1,
+        # tests/test_scripts/test_session_doors.py +6. No added skips.
+        # Floor: 25687 + 1 + 3 + 1 + 6 = 25698.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25698
