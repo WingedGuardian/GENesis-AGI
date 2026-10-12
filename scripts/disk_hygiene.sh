@@ -47,6 +47,10 @@
 #  15. Retention prune of the work board's local stores → scripts/prune_board.py
 #      (closed open-questions + their edges >90d, board events >180d; unverified
 #      questions and promotion pointers are never pruned)
+#  15b. Browser-profile copies (genesis.browser.profile_backup) → prune_browser_backups
+#      (scripts/prune_browser_backups.py decides: the newest copy per profile
+#      always stays, the newest per version for 90 days, older ones go after 14
+#      days, an unfinished *.tmp after a day)
 #  16. Copytruncate rotation of the shared MCP logs in ~/tmp (>10MB, 2 kept)
 #      → rotate_log (mcp_health.log, turnstile_debug.log; the first is held open
 #      by every session's MCP server, so both are copied and truncated, never
@@ -290,6 +294,32 @@ prune_guard_corpus() {
         \( -name 'guard-corpus.jsonl' -o -name 'guard-corpus.jsonl.*.tmp' \) \
         -mtime +45 -delete 2>/dev/null \
         || echo "guard-corpus prune exited $?"
+}
+
+prune_browser_backups() {
+    # genesis.browser.profile_backup copies a browser profile aside before a
+    # different engine first opens it (<profile>.pre-v<version>-<UTC time>, a
+    # few hundred MB with caches left out). scripts/prune_browser_backups.py
+    # decides what goes (per profile: the newest copy always stays; the newest
+    # copy of each version for 90 days, since going back to that version needs
+    # it; older copies after 14 days; an unfinished *.tmp after a day). This
+    # function only deletes what it names, each one a direct child of the
+    # canonical root, through remove_tree_one_fs like every other recursive
+    # deleter here.
+    local base="${1:-$HOME/.genesis}" canon mounts dir
+    if [ ! -x "${VENV_PY:-}" ] || [ ! -f "$SCRIPT_DIR/prune_browser_backups.py" ]; then
+        echo "browser backup prune SKIPPED: no python interpreter or no prune_browser_backups.py"
+        return 0
+    fi
+    canon="$(cd -P -- "$base" 2>/dev/null && pwd -P)" || return 0
+    if ! mounts="$(mount_targets "$canon")"; then
+        echo "browser backup prune SKIPPED in $canon: the mount table is unreadable"
+        return 0
+    fi
+    while IFS= read -r -d '' dir; do
+        [ "${dir%/*}" = "$canon" ] || { echo "browser backup prune refused $dir: not in $canon"; continue; }
+        remove_tree_one_fs "$dir" "$mounts" 1 || echo "browser backup prune failed or spared $dir"
+    done < <("$VENV_PY" "$SCRIPT_DIR/prune_browser_backups.py" "$canon")
 }
 
 # rotate_log FILE [MAX_BYTES] [KEEP] — copytruncate rotation for a log that
@@ -607,6 +637,9 @@ main() {
 
     echo "--- guard replay corpus retention prune (>45d) ---"
     prune_guard_corpus "$HOME/.genesis/output"
+
+    echo "--- browser profile copies (newest kept; per version 90d; older 14d; unfinished 1d) ---"
+    prune_browser_backups "$HOME/.genesis"
 
     echo "--- MCP log rotation (>10MB, copytruncate, 2 kept) ---"
     # 10 MB: about nine days of mcp_health.log at the measured rate, small
