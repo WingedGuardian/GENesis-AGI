@@ -1045,4 +1045,8 @@ jobs:
         # Push-argv shared scanner (#2864): the five changed test files collect
         # 996 here and 911 on origin/main b32ef3610 (one file absent there),
         # measured with --collect-only: net +85. Floor: 25463 + 85 = 25548.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25548
+        # Card-number guards (#3188), --collect-only against main: test_card_shapes
+        # +116 (new), test_memory_mcp +7, test_browser_tools +4, test_reference_extraction
+        # +4, test_browser_cli_card_guard +4 (new), test_output_scanner +3,
+        # test_capability_shadow_wiring +1; no added skips. Floor: 25548 + 139 = 25687.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25687
