@@ -17,6 +17,9 @@
 # only if it is still the SAME process that was paused (its start time matches
 # the record); a recycled pid is never signalled.
 set -euo pipefail
+# Records and their temp files are owner-only: they name the paths of
+# private task outputs.
+umask 077
 
 if [ -z "${HOME:-}" ]; then
     HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
@@ -39,6 +42,11 @@ usage() {
 # shellcheck source=scripts/lib/watchgod_signal.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/watchgod_signal.sh"
 
+_live_state() {
+    # The one-letter state of pid $1, or nothing when it is gone.
+    awk '/^State:/ { print $2; exit }' "$DG_PROC/$1/status" 2>/dev/null || true
+}
+
 cmd_status() {
     if [[ -f "$STATE_FILE" ]]; then
         python3 - "$STATE_FILE" <<'PY'
@@ -53,13 +61,26 @@ PY
     else
         echo "no state file at $STATE_FILE (is genesis-tmp-watchgod running?)"
     fi
-    local pid st comm ts _key path state n=0
+    # Labels follow the record lifecycle (scripts/lib/watchgod_runaway.sh):
+    # "still paused" only when the SAME process (start time) is in state T or
+    # t now. A record says what the guardian did, not what is true now.
+    local pid st comm ts _key path rstate state live n=0
     if [[ -s "$FROZEN_FILE" ]]; then
-        while IFS=$'\t' read -r pid st comm ts _key path; do
+        while IFS=$'\t' read -r pid st comm ts _key path rstate; do
             [[ "$pid" =~ ^[0-9]+$ ]] || continue
             (( n++ == 0 )) && echo "paused:"
-            state="gone"
-            [[ "$(wg_starttime "$pid" 2>/dev/null || true)" == "$st" ]] && state="still paused"
+            if [[ "$(wg_starttime "$pid" 2>/dev/null || true)" != "$st" ]]; then
+                state="gone"
+            else
+                live="$(_live_state "$pid")"
+                if [[ "${rstate:-paused}" == pending* ]]; then
+                    state="SIGSTOP sent, not confirmed (state ${live:-?}); thaw resumes it"
+                elif [[ "$live" == T || "$live" == t ]]; then
+                    state="still paused"
+                else
+                    state="RUNNING, not paused (state ${live:-?}; resumed elsewhere?)"
+                fi
+            fi
             echo "  pid ${pid} (${comm}) since ${ts}, writing ${path} — ${state}"
         done < "$FROZEN_FILE"
     fi
@@ -70,31 +91,43 @@ cmd_thaw() {
     local want="${1:-}"
     [[ -n "$want" ]] || usage 2
     [[ "$want" == all || "$want" =~ ^[0-9]+$ ]] || { echo "watchgod: thaw takes a pid or 'all'" >&2; exit 2; }
-    [[ -s "$FROZEN_FILE" ]] || { echo "nothing is paused"; return 0; }
-    # The guardian appends under this lock; hold it across read-and-rewrite.
-    exec 9>"$FROZEN_FILE.lock"
+    [[ -e "$FROZEN_FILE" || -e "$FROZEN_FILE.lock" ]] || { echo "nothing is paused"; return 0; }
+    # The guardian sends a stop and writes its record under this lock; hold it
+    # across read-and-rewrite, so a record is never seen before its stop. The
+    # emptiness check comes after the lock, or a record written while this
+    # waited would be missed (review finding).
+    exec 9>>"$FROZEN_FILE.lock"
     flock 9
-    local keep="" pid st comm ts path hit=0 line rc
+    [[ -s "$FROZEN_FILE" ]] || { echo "nothing is paused"; return 0; }
+    local keep="" pid st comm ts path rstate live hit=0 left=0 line rc
     while IFS= read -r line; do
-        IFS=$'\t' read -r pid st comm ts _ path <<< "$line"
+        IFS=$'\t' read -r pid st comm ts _ path rstate <<< "$line"
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
         if [[ "$want" != all && "$want" != "$pid" ]]; then
             keep+="${line}"$'\n'
             continue
         fi
         hit=1
-        # Resume only a process that is still paused (state T). One already
-        # running was resumed by someone else; one stopped by a debugger (t)
-        # is not ours to continue. Either way the record is stale (review
-        # finding). A process gone or recycled is reported by the signal below.
-        if [[ "$(wg_starttime "$pid" 2>/dev/null || true)" == "$st" ]] \
-                && [[ "$(awk '/^State:/ { print $2; exit }' "$DG_PROC/$pid/status" 2>/dev/null || true)" != T ]]; then
-            echo "pid ${pid} (${comm}) is not paused (resumed elsewhere?) — record dropped, not signalled"
+        if [[ "$(wg_starttime "$pid" 2>/dev/null || true)" != "$st" ]]; then
+            echo "pid ${pid} (${comm}) is no longer running — record dropped"
             continue
         fi
-        # Bound to the recorded start time: checked and signalled as one
-        # generation (a pidfd where the box has one), so a pid recycled after
-        # the check is never resumed.
+        live="$(_live_state "$pid")"
+        # A pending record is resumed whatever its live state: SIGCONT is the
+        # exact inverse of the SIGSTOP that was sent, and it also cancels one
+        # that has not landed yet (review finding: refusing it stranded a
+        # process whose stop landed later).
+        if [[ "${rstate:-paused}" != pending* && "$live" != T && "$live" != t ]]; then
+            # Running: someone resumed it. The record is stale, and a SIGCONT
+            # would only be noise.
+            echo "pid ${pid} (${comm}) is not paused (state ${live:-?}; resumed elsewhere?) — record dropped, not signalled"
+            continue
+        fi
+        # T, or t: a traced process reports the guardian's pending group-stop
+        # as t, and it is still ours to resume (review finding). Bound to the
+        # recorded start time (a pidfd where the box has one), so a pid
+        # recycled after the check is never resumed. The record goes only
+        # once the SIGCONT went.
         rc=0
         wg_signal_gen CONT "$pid" "$st" || rc=$?
         if (( rc == 0 )); then
@@ -105,10 +138,20 @@ cmd_thaw() {
         else
             echo "could not signal pid ${pid} (${comm}) — record kept" >&2
             keep+="${line}"$'\n'
+            left=1
         fi
     done < "$FROZEN_FILE"
-    printf '%s' "$keep" > "$FROZEN_FILE.tmp" && mv -f "$FROZEN_FILE.tmp" "$FROZEN_FILE"
-    (( hit )) || echo "pid ${want} is not in the paused list"
+    if ! printf '%s' "$keep" > "$FROZEN_FILE.tmp" || ! mv -f -- "$FROZEN_FILE.tmp" "$FROZEN_FILE"; then
+        echo "watchgod: could not rewrite ${FROZEN_FILE}; the records shown as resumed may still be listed" >&2
+        left=1
+    fi
+    if (( ! hit )); then
+        echo "pid ${want} is not in the paused list"
+        return 1
+    fi
+    # Nonzero when a record this call was asked to clear is still there, so a
+    # script that runs thaw knows a command is still stopped (review finding).
+    (( left )) && return 1
     return 0
 }
 

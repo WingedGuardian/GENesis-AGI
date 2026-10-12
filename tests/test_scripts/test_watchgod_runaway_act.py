@@ -586,20 +586,21 @@ def test_a_pause_nobody_resumed_is_paged_again_once_per_period(box):
 
 def test_a_pid_recycled_after_its_start_time_was_read_is_not_paused(box):
     """Between reading a holder's start time and sending SIGSTOP the guardian
-    writes the pause record, under a lock it may wait on. A pid that exits and
-    is handed to another process in that gap must not be stopped: the signal
-    is bound to the generation (pid + start time) that was recorded."""
+    reads its state and its pause record. A pid that exits and is handed to
+    another process in that gap must not be stopped: the signal is bound to
+    the generation (pid + start time) that was read."""
     f = _task_output(box)
     _session(box, f)
     marker = box["tmp"] / "recycled"
     recycle = rf"""
-flock() {{
-    if [[ ! -e '{marker}' ]]; then
+eval "$(declare -f _rw_record_state | sed '1s/^_rw_record_state/_rw_record_state_real/')"
+_rw_record_state() {{
+    if [[ "$1" == 200 && ! -e '{marker}' ]]; then
         : > '{marker}'
         # pid 200 exits and its number now names another process.
         sed -i 's/ 2000$/ 9999/' "$DG_PROC/200/stat"
     fi
-    command flock "$@"
+    _rw_record_state_real "$@"
 }}
 """
     _run(box, _KILL_STUB + recycle + f"wg_runaway_check '{_domains(box)}'")
@@ -688,7 +689,7 @@ def test_a_holder_stopped_by_something_else_is_named_apart_not_promised_to_thaw(
     assert [r[0] for r in _frozen(box)] == ["201"]
     body = [p for p in _pages(box) if p["title"].startswith("Paused")][0]["body"]
     assert "Paused (SIGSTOP, not killed): pid 201." in body
-    assert "Already stopped before the guardian acted" in body
+    assert "Stopped, with no pause record" in body
     assert "kill -CONT 200." in body
     assert f.stat().st_size == 0, "a stopped holder cannot write: the file is still emptied"
 
@@ -821,16 +822,19 @@ kill() {
 def test_a_holder_in_tracing_stop_is_paused_by_the_guardian_and_recorded(box):
     """`t` is a debugger's hold, which ends whenever the tracer continues the
     process: it is not someone's stop to leave alone. The guardian sends its
-    own SIGSTOP, records it, and then empties the file."""
+    own SIGSTOP and records it. Since the holder read t before the stop, t
+    afterwards confirms nothing: the record is pending and the file stays
+    full until the stop is seen to land."""
     f = _task_output(box)
     _session(box, f)
     _set_state(box, 200, "t (tracing stop)")
     _run(box, _KILL_STUB_TRACED + f"wg_runaway_check '{_domains(box)}'")
     assert _kills(box) == ["kill -STOP 200", "kill -STOP 201"]
-    assert [r[0] for r in _frozen(box)] == ["200", "201"]
-    assert f.stat().st_size == 0
+    assert {r[0]: r[6] for r in _frozen(box)} == {"200": "pending-t", "201": "paused"}
+    assert f.stat().st_size == 60 * _MB
     body = [p for p in _pages(box) if p["title"].startswith("Paused")][0]["body"]
-    assert "Already stopped before the guardian acted" not in body
+    assert "Stopped, with no pause record" not in body
+    assert "NOT yet confirmed (the process has not stopped yet): pid 200." in body
 
 
 def test_a_traced_writer_the_guardian_did_not_pause_blocks_the_empty(box):
@@ -974,3 +978,482 @@ def test_a_pidfd_the_box_does_not_allow_falls_back_instead_of_refusing(box, patc
     finally:
         victim.kill()
         victim.wait(timeout=10)
+
+
+# ── review round 5 (Codex round 3: classes) ────────────────────────
+
+
+def _frozen_file(box) -> Path:
+    return box["home"] / ".genesis" / "watchgod" / "frozen"
+
+
+def _write_record(
+    box, pid: int, st, ts: str = "2026-01-01T00:00:00Z", state: str | None = None
+) -> None:
+    f = _frozen_file(box)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    fields = [str(pid), str(st), "sleep", ts, "1:2", "/x/tasks/b1.output"]
+    if state is not None:
+        fields.append(state)
+    with open(f, "a") as fh:
+        fh.write("\t".join(fields) + "\n")
+
+
+def _thaw(box, *args: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ, HOME=str(box["home"]))
+    env.pop("DG_PROC", None)
+    return subprocess.run([str(_CLI), *args], env=env, capture_output=True, text=True, timeout=30)
+
+
+# Class 1: retained tails are owner-only and never share a name.
+
+
+def test_a_retained_tail_is_owner_only_in_an_owner_only_directory(box):
+    f = _task_output(box)
+    _session(box, f)
+    tails = box["home"] / "tmp" / "watchgod-truncated"
+    tails.mkdir(mode=0o755)
+    tails.chmod(0o755)
+    _run(box, "umask 022\n" + _KILL_STUB + f"wg_runaway_check '{_domains(box)}'")
+    kept = list(tails.glob("b1.output.*.tail"))
+    assert len(kept) == 1
+    assert (kept[0].stat().st_mode & 0o777) == 0o600
+    assert (tails.stat().st_mode & 0o777) == 0o700
+
+
+def test_two_tails_with_one_name_in_one_second_are_both_kept(box):
+    """Same task id in two sessions, handled in the same second."""
+    f1 = _task_output(box, rel="claude-1000/-proj/sess-1/tasks/b1.output")
+    f2 = _task_output(box, rel="claude-1000/-proj/sess-2/tasks/b1.output")
+    _proc(box, 100, "claude", 1)
+    _proc(box, 200, "bash", 100, f1, starttime=2000)
+    _proc(box, 110, "claude", 1)
+    _proc(box, 210, "bash", 110, f2, starttime=2100)
+    frozen_clock = (
+        'date() { if [[ "$*" == +%s ]]; then echo 1800000000; else command date "$@"; fi; }\n'
+    )
+    _run(box, frozen_clock + _KILL_STUB + f"wg_runaway_check '{_domains(box, total=200)}'")
+    assert f1.stat().st_size == 0 and f2.stat().st_size == 0
+    kept = sorted((box["home"] / "tmp" / "watchgod-truncated").glob("b1.output.*.tail"))
+    assert len(kept) == 2, "the second tail overwrote the first"
+    bodies = [p["body"] for p in _pages(box) if p["title"].startswith("Paused")]
+    named = {k.name for k in kept if any(str(k) in b for b in bodies)}
+    assert len(named) == 2, "each page names its own tail"
+
+
+# Class 2: the pause-record lifecycle.
+
+
+def test_a_record_appears_only_after_its_stop_and_under_the_lock(box):
+    """At the moment SIGSTOP is sent the record must not exist yet, and the
+    record lock must be held, so a thaw can never see the record first."""
+    f = _task_output(box)
+    _session(box, f)
+    probe = r"""
+kill() {
+    echo "kill $*" >> "$WG_KILLS"
+    if [[ "$1" == -STOP ]]; then
+        if [[ -s "$FROZEN_FILE" ]] && grep -q "^$2	" "$FROZEN_FILE"; then echo "early $2" >> "$WG_KILLS.probe"; fi
+        if ( flock -n 8 ) 8>>"$FROZEN_FILE.lock"; then echo "unlocked $2" >> "$WG_KILLS.probe"; fi
+        sed -i 's/^State:.*/State:\tT (stopped)/' "$DG_PROC/$2/status"
+    fi
+    return 0
+}
+"""
+    _run(box, probe + f"wg_runaway_check '{_domains(box)}'")
+    probe_file = box["tmp"] / "kills.probe"
+    assert not probe_file.exists(), probe_file.read_text()
+    assert [r[0] for r in _frozen(box)] == ["200", "201"]
+    assert all(r[6] == "paused" for r in _frozen(box))
+
+
+def test_a_stop_that_never_lands_is_recorded_pending(box):
+    f = _task_output(box)
+    _session(box, f)
+    stuck = r"""
+kill() {
+    echo "kill $*" >> "$WG_KILLS"
+    if [[ "$1" == -STOP && "$2" != 201 ]]; then
+        sed -i 's/^State:.*/State:\tT (stopped)/' "$DG_PROC/$2/status"
+    fi
+    return 0
+}
+"""
+    _run(box, stuck + f"wg_runaway_check '{_domains(box)}'")
+    assert {r[0]: r[6] for r in _frozen(box)} == {"200": "paused", "201": "pending"}
+    body = [p for p in _pages(box) if p["title"].startswith("Paused")][0]["body"]
+    assert "Recorded as pending" in body
+
+
+def test_a_pending_stop_that_landed_is_promoted_on_the_next_poll(box):
+    f = _task_output(box)
+    _session(box, f)
+    _set_state(box, 200, "T (stopped)")
+    _set_state(box, 201, "T (stopped)")
+    _write_record(box, 200, 2000, state="paused")
+    _write_record(box, 201, 2010, state="pending")
+    _respond(box)
+    assert not _kills(box)
+    assert {r[0]: r[6] for r in _frozen(box)} == {"200": "paused", "201": "paused"}
+
+
+def test_a_recorded_holder_in_tracing_stop_is_not_stopped_or_recorded_again(box):
+    """Ours already: a traced process reports the guardian's group-stop as t."""
+    f = _task_output(box)
+    _session(box, f)
+    _set_state(box, 200, "t (tracing stop)")
+    _set_state(box, 201, "T (stopped)")
+    _write_record(box, 200, 2000, state="paused")
+    _write_record(box, 201, 2010, state="paused")
+    _respond(box)
+    assert not _kills(box)
+    assert [r[0] for r in _frozen(box)] == ["200", "201"]
+    assert f.stat().st_size == 0
+
+
+def test_comm_with_a_tab_cannot_split_the_record(box):
+    f = _task_output(box)
+    _proc(box, 100, "claude", 1)
+    _proc(box, 200, "ba\tsh", 100, f, starttime=2000)
+    _respond(box)
+    rows = _frozen(box)
+    assert len(rows) == 1 and len(rows[0]) == 7
+
+
+def test_pause_records_are_owner_only(box):
+    f = _task_output(box)
+    _session(box, f)
+    _run(box, "umask 022\n" + _KILL_STUB + f"wg_runaway_check '{_domains(box)}'")
+    assert (_frozen_file(box).stat().st_mode & 0o777) == 0o600
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs a Linux /proc")
+def test_status_calls_a_running_recorded_process_running_not_paused(box):
+    victim = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL)
+    try:
+        _write_record(box, victim.pid, _starttime(victim.pid), state="paused")
+        out = _thaw(box, "status")
+        assert "still paused" not in out.stdout, out.stdout
+        assert "RUNNING, not paused" in out.stdout
+    finally:
+        victim.kill()
+        victim.wait(timeout=10)
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs a Linux /proc")
+def test_thaw_resumes_a_pending_record_that_has_not_stopped(box):
+    """SIGCONT is the exact inverse of the SIGSTOP that was sent, and it also
+    cancels one that has not landed: a pending record is resumed whatever the
+    process's state, then dropped."""
+    victim = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL)
+    try:
+        _write_record(box, victim.pid, _starttime(victim.pid), state="pending")
+        out = _thaw(box, "thaw", "all")
+        assert f"resumed pid {victim.pid}" in out.stdout, out
+        assert out.returncode == 0
+        assert _frozen(box) == []
+    finally:
+        victim.kill()
+        victim.wait(timeout=10)
+
+
+def _ptrace_stop(pid: int) -> bool:
+    """Put our child `pid` into a ptrace stop (state t). False if not allowed."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+    if libc.ptrace(0x4206, pid, None, None) != 0:  # PTRACE_SEIZE
+        return False
+    if libc.ptrace(0x4207, pid, None, None) != 0:  # PTRACE_INTERRUPT
+        return False
+    deadline = time.time() + 5
+    while _state(pid) != "t" and time.time() < deadline:
+        time.sleep(0.05)
+    return _state(pid) == "t"
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs a Linux /proc")
+def test_thaw_resumes_a_recorded_process_in_tracing_stop(box):
+    """A recorded t is the guardian's stop seen through a tracer: thaw sends
+    SIGCONT and only then removes the record."""
+    victim = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL)
+    try:
+        if not _ptrace_stop(victim.pid):
+            pytest.skip("ptrace is not allowed here")
+        _write_record(box, victim.pid, _starttime(victim.pid), state="paused")
+        out = _thaw(box, "thaw", "all")
+        assert f"resumed pid {victim.pid}" in out.stdout, out
+        assert out.returncode == 0
+        assert _frozen(box) == []
+    finally:
+        victim.kill()
+        victim.wait(timeout=10)
+
+
+def test_thaw_exits_nonzero_when_a_resume_is_refused(box):
+    """A SIGCONT that cannot be sent keeps the record and fails the command.
+    Fake process table; the pid is one that does not exist, so the kill fails
+    without touching any real process."""
+    pid_max = int(Path("/proc/sys/kernel/pid_max").read_text())
+    pid = next(p for p in range(pid_max - 1, pid_max - 200, -1) if not Path(f"/proc/{p}").exists())
+    _proc(box, pid, "sleep", 1, starttime=4242)
+    _set_state(box, pid, "T (stopped)")
+    _write_record(box, pid, 4242, state="paused")
+    env = dict(os.environ, HOME=str(box["home"]), DG_PROC=str(box["proc"]))
+    out = subprocess.run(
+        [str(_CLI), "thaw", "all"], env=env, capture_output=True, text=True, timeout=30
+    )
+    assert "record kept" in out.stderr, out
+    assert out.returncode != 0
+    assert len(_frozen(box)) == 1
+
+
+# Class 3: nothing is emptied while a possible writer could not be inspected.
+
+
+def _blind_child(box, pid: int, ppid: int, state: str = "S (sleeping)", threads: int = 1) -> None:
+    _proc(box, pid, "sudo", ppid, starttime=3000)
+    _set_state(box, pid, state)
+    st = box["proc"] / str(pid) / "status"
+    st.write_text(st.read_text() + f"Threads:\t{threads}\n")
+    (box["proc"] / str(pid) / "fd").chmod(0)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+def test_an_uninspectable_process_in_the_session_tree_vetoes_the_response(box):
+    """A setuid descendant of the command may hold the output where this uid
+    cannot see it: nothing is paused or emptied."""
+    f = _task_output(box)
+    _session(box, f)
+    _blind_child(box, 202, 200)
+    try:
+        _respond(box)
+    finally:
+        (box["proc"] / "202" / "fd").chmod(0o755)
+    assert not _kills(box)
+    assert f.stat().st_size == 60 * _MB
+    log = (box["home"] / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "pid 202, in the same command's process tree, could not be inspected" in log
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+def test_an_uninspectable_process_outside_the_session_or_a_zombie_does_not_veto(box):
+    f = _task_output(box)
+    _session(box, f)
+    _blind_child(box, 300, 1)  # some other user's daemon
+    _blind_child(box, 202, 200, state="Z (zombie)")  # exited, unreaped
+    try:
+        _respond(box)
+    finally:
+        for p in ("300", "202"):
+            (box["proc"] / p / "fd").chmod(0o755)
+    assert _kills(box) == ["kill -STOP 200", "kill -STOP 201"]
+    assert f.stat().st_size == 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+def test_a_holder_whose_fdinfo_cannot_be_read_is_blind_not_a_non_writer(box):
+    f = _task_output(box)
+    _session(box, f)
+    info = box["proc"] / "201" / "fdinfo" / "1"
+    info.chmod(0)
+    try:
+        _respond(box)
+    finally:
+        info.chmod(0o644)
+    assert not _kills(box)
+    assert f.stat().st_size == 60 * _MB
+
+
+def test_an_uninspectable_writer_appearing_after_the_pause_blocks_the_empty(box):
+    """The recheck walk counts blind processes too: a child forked after the
+    walk whose descriptor cannot be resolved (a link loop here) may write."""
+    f = _task_output(box)
+    _session(box, f)
+    fork = r"""
+kill() {
+    echo "kill $*" >> "$WG_KILLS"
+    if [[ "$1" == -STOP ]]; then
+        sed -i 's/^State:.*/State:\tT (stopped)/' "$DG_PROC/$2/status"
+        if [[ "$2" == 201 && ! -e "$DG_PROC/202" ]]; then
+            mkdir -p "$DG_PROC/202/fd" "$DG_PROC/202/fdinfo"
+            echo grep > "$DG_PROC/202/comm"
+            printf 'Name:\tgrep\nState:\tR (running)\nPPid:\t201\n' > "$DG_PROC/202/status"
+            echo "202 (grep) R 201 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 2020" > "$DG_PROC/202/stat"
+            ln -s "$DG_PROC/202/fd/1" "$DG_PROC/202/fd/1"
+        fi
+    fi
+    return 0
+}
+"""
+    _run(box, fork + f"wg_runaway_check '{_domains(box)}'")
+    assert f.stat().st_size == 60 * _MB
+    act = [p for p in _pages(box) if p["title"].startswith("Paused")]
+    assert "check for running writers did not complete" in act[0]["body"]
+
+
+# Class 4: reminders follow each pause's own clock.
+
+
+def test_each_pause_is_reminded_on_its_own_schedule(box):
+    """A command that turns six hours old just after another command's
+    reminder is reminded then, not at the next shared epoch boundary."""
+    import datetime as _dt
+
+    period = 6 * 3600
+    base = (int(time.time()) // period - 2) * period  # a period boundary
+    iso = lambda t: _dt.datetime.fromtimestamp(t, _dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+    _paused(box, 200, 2000)
+    _write_record(box, 200, 2000, ts=iso(base + 30 - period), state="paused")  # 6 h at base+30
+    _paused(box, 201, 2010)
+    _write_record(
+        box, 201, 2010, ts=iso(base + 600 - period - 1), state="paused"
+    )  # 6 h at base+599
+    out = _run(
+        box,
+        f"_rw_repage {base + 60}\n"
+        f"echo FIRST=$(find '{box['queue']}' -name '*.json' | wc -l)\n"
+        f"_rw_repage {base + 600}\n",
+    )
+    assert "FIRST=1" in out.stdout
+    still = [p for p in _pages(box) if p["title"].startswith("Still paused")]
+    assert len(still) == 2
+    assert any("pid 201 (" in p["body"] for p in still), "201 waited for the next epoch bucket"
+    assert sum("pid 200 (" in p["body"] for p in still) == 1, (
+        "200 is not reminded twice in one period"
+    )
+
+
+# Class 5: the detector page refers to its companion, not to an order.
+
+
+def test_the_detector_page_points_at_the_companion_action_page(box):
+    f = _task_output(box)
+    _session(box, f)
+    _respond(box)
+    detect = [p for p in _pages(box) if p["title"].startswith("Runaway file on")][0]["body"]
+    assert "companion action page" in detect
+    assert "next page" not in detect
+
+
+# ── review round 6 (independent review of round 5) ─────────────────
+
+
+def test_a_stop_that_lands_late_is_paged_reminded_and_promoted(box):
+    """The stop never confirms within the response; it lands later, after the
+    file stopped qualifying. It must still be paged, reminded and promoted, so
+    thaw finds it (thaw of a pending record: the real-process test below)."""
+    f = _task_output(box)
+    _proc(box, 100, "claude", 1)
+    _proc(box, 200, "bash", 100, f, starttime=2000)
+    never = r"""
+kill() { echo "kill $*" >> "$WG_KILLS"; return 0; }   # the stop does not land
+"""
+    out = _run(
+        box,
+        never
+        + f"""wg_runaway_check '{_domains(box)}'
+t0=$(date +%s)
+_rw_repage $(( t0 + 6 * 3600 + 60 ))
+echo AFTER_REMIND
+""",
+    )
+    assert "AFTER_REMIND" in out.stdout
+    assert {r[0]: r[6] for r in _frozen(box)} == {"200": "pending"}
+    assert f.stat().st_size == 60 * _MB
+    act = [p for p in _pages(box) if p["title"].startswith("Sent SIGSTOP")]
+    assert len(act) == 1, [p["title"] for p in _pages(box)]
+    assert "NOT yet confirmed" in act[0]["title"]
+    detect = [p for p in _pages(box) if p["title"].startswith("Runaway file on")][0]["body"]
+    assert "has not acted" not in detect
+    assert "sent its writers SIGSTOP but has NOT emptied it" in detect
+    still = [p for p in _pages(box) if p["title"].startswith("Still paused")]
+    assert len(still) == 1 and "SIGSTOP sent, not confirmed" in still[0]["body"]
+    # The stop lands; the file no longer qualifies (it stopped growing, and
+    # an operator trimmed it, say).
+    _set_state(box, 200, "T (stopped)")
+    with open(f, "r+b") as fh:
+        fh.truncate(1024)
+    _run(box, f"wg_runaway_check '{_domains(box)}'")
+    assert {r[0]: r[6] for r in _frozen(box)} == {"200": "paused"}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+@pytest.mark.parametrize(("threads", "vetoes"), [(2, True), (1, False)])
+def test_a_zombie_leader_with_live_threads_still_vetoes(box, threads, vetoes):
+    """A leader that called pthread_exit shows Z while another thread keeps
+    writing (its descriptors only under task/<tid>/fd): only a one-thread
+    zombie holds nothing."""
+    f = _task_output(box)
+    _session(box, f)
+    _blind_child(box, 202, 200, state="Z (zombie)", threads=threads)
+    try:
+        _respond(box)
+    finally:
+        (box["proc"] / "202" / "fd").chmod(0o755)
+    if vetoes:
+        assert not _kills(box)
+        assert f.stat().st_size == 60 * _MB
+    else:
+        assert _kills(box) == ["kill -STOP 200", "kill -STOP 201"]
+        assert f.stat().st_size == 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+def test_an_uninspectable_sibling_of_the_command_does_not_veto(box):
+    """Rooted at the command (claude's child), not the whole session: a
+    sandboxed process the session started beside the command holds none of
+    its descriptors."""
+    f = _task_output(box)
+    _session(box, f)
+    _blind_child(box, 150, 100)  # claude -> 150, beside the command 200
+    try:
+        _respond(box)
+    finally:
+        (box["proc"] / "150" / "fd").chmod(0o755)
+    assert _kills(box) == ["kill -STOP 200", "kill -STOP 201"]
+    assert f.stat().st_size == 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+def test_the_blind_veto_is_logged_once_not_every_poll(box):
+    f = _task_output(box)
+    _session(box, f)
+    _blind_child(box, 202, 200)
+    try:
+        _run(box, _KILL_STUB + f"wg_runaway_check '{_domains(box)}'\nwg_runaway_check '{_domains(box)}'")
+    finally:
+        (box["proc"] / "202" / "fd").chmod(0o755)
+    log = (box["home"] / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert log.count("could not be inspected") == 1
+
+
+def test_the_record_lock_is_held_through_the_truncate(box):
+    """Thaw cannot resume a writer between the re-check and the truncate."""
+    f = _task_output(box)
+    _session(box, f)
+    probe = r"""
+truncate() {
+    if ( flock -n 8 ) 8>>"$FROZEN_FILE.lock"; then echo unlocked >> "$WG_KILLS.probe"; fi
+    command truncate "$@"
+}
+"""
+    _run(box, _KILL_STUB + probe + f"wg_runaway_check '{_domains(box)}'")
+    assert f.stat().st_size == 0
+    assert not (box["tmp"] / "kills.probe").exists(), "the lock was free at the truncate"
+
+
+def test_a_pending_t_record_is_promoted_only_by_a_real_stop(box):
+    """Sent to a holder already in a tracing stop: t afterwards proves
+    nothing, so the reminder pass promotes it only once it reads T."""
+    _paused(box, 200, 2000)
+    _set_state(box, 200, "T (stopped)")
+    s = box["proc"] / "200" / "status"
+    s.write_text(s.read_text().replace("T (stopped)", "t (tracing stop)"))
+    _write_record(box, 200, 2000, state="pending-t")
+    _run(box, "_rw_repage $(date +%s)")
+    assert [r[6] for r in _frozen(box)] == ["pending-t"]
+    s.write_text(s.read_text().replace("t (tracing stop)", "T (stopped)"))
+    _run(box, "_rw_repage $(date +%s)")
+    assert [r[6] for r in _frozen(box)] == ["paused"]
