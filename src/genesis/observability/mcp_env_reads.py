@@ -10,8 +10,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 _original_environ_class: type | None = None
-_seen_keys: set[tuple[str, str]] = set()
+_seen_keys: set[tuple[str, str, str]] = set()
 _seen_lock = threading.Lock()
+_MAX_LOG_BYTES = 1024 * 1024
 
 
 def _caller() -> str:
@@ -24,6 +25,29 @@ def _caller() -> str:
     return "<unknown>:<unknown>"
 
 
+def _load_seen_keys(log_path: Path) -> set[tuple[str, str, str]]:
+    seen: set[tuple[str, str, str]] = set()
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    entry = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                server_name, key_name, caller = (
+                    entry.get("server"),
+                    entry.get("key"),
+                    entry.get("caller"),
+                )
+                if all(isinstance(value, str) for value in (server_name, key_name, caller)):
+                    seen.add((server_name, key_name, caller))
+    except OSError:
+        return set()
+    return seen
+
+
 def install(
     server: str,
     *,
@@ -32,12 +56,18 @@ def install(
     secret_keys: frozenset[str],
     log_path: Path,
 ) -> None:
-    """Record first reads of secret keys outside a server's declarations."""
+    """Record secret-read triples; concurrent children may append the same triple once."""
     global _original_environ_class
 
     uninstall()
     if os.environ.get("GENESIS_MCP_ENV_RECORDER") == "0":
+        with _seen_lock:
+            _seen_keys.clear()
         return
+
+    with _seen_lock:
+        _seen_keys.clear()
+        _seen_keys.update(_load_seen_keys(log_path))
 
     environ_class = type(os.environ)
     recording = threading.local()
@@ -50,11 +80,10 @@ def install(
         ):
             return
         caller = _caller()
-        seen_key = (key, caller)
+        seen_key = (server, key, caller)
         with _seen_lock:
             if seen_key in _seen_keys:
                 return
-            _seen_keys.add(seen_key)
             entry = {
                 "ts": datetime.now(UTC).isoformat(),
                 "server": server,
@@ -62,9 +91,25 @@ def install(
                 "pid": os.getpid(),
                 "caller": caller,
             }
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with log_path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(entry) + "\n")
+            fd: int | None = None
+            try:
+                log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                fd = os.open(
+                    log_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                    0o600,
+                )
+                if (os.fstat(fd).st_mode & 0o777) != 0o600:
+                    os.chmod(log_path, 0o600)
+                if os.fstat(fd).st_size >= _MAX_LOG_BYTES:
+                    return
+                with os.fdopen(fd, "a", encoding="utf-8") as stream:
+                    fd = None
+                    stream.write(json.dumps(entry) + "\n")
+            finally:
+                if fd is not None:
+                    os.close(fd)
+            _seen_keys.add(seen_key)
 
     class RecordingEnviron(environ_class):
         def __getitem__(self, key):

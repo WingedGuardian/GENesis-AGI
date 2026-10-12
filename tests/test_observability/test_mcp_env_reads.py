@@ -188,6 +188,197 @@ def test_unwritable_log_path_does_not_break_lookup(
     assert os.environ.get(key) == value
 
 
+def test_failed_write_is_retried_by_same_caller(
+    recorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "MCP_ENV_READ_TEST_WRITE_RETRY"
+    value = "retry-secret"
+    monkeypatch.setenv(key, value)
+    log_path = _install(recorder, tmp_path, secret_keys=frozenset({key}))
+    original_open = os.open
+    attempts = 0
+
+    def fail_first_open(path, *args, **kwargs):
+        nonlocal attempts
+        if Path(path) == log_path:
+            attempts += 1
+            if attempts == 1:
+                raise OSError("temporary log failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fail_first_open)
+    assert _read_with_get(key) == value
+    assert _read_with_get(key) == value
+
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert attempts == 2
+    assert [record["key"] for record in records] == [key]
+    assert records[0]["caller"] == f"{__name__}:_read_with_get"
+
+
+def test_log_file_permissions_are_restricted(
+    recorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_key = "MCP_ENV_READ_TEST_PERMISSIONS"
+    second_key = "MCP_ENV_READ_TEST_EXISTING_PERMISSIONS"
+    monkeypatch.setenv(first_key, "first-secret")
+    monkeypatch.setenv(second_key, "second-secret")
+    log_dir = tmp_path / "private-logs"
+    log_path = log_dir / "mcp_env_reads.jsonl"
+    previous_umask = os.umask(0o022)
+    try:
+        recorder.install(
+            "memory",
+            declared=frozenset(),
+            declared_prefixes=(),
+            secret_keys=frozenset({first_key, second_key}),
+            log_path=log_path,
+        )
+        assert _read_with_get(first_key) == "first-secret"
+        assert log_path.stat().st_mode & 0o777 == 0o600
+        assert log_dir.stat().st_mode & 0o777 == 0o700
+
+        log_path.chmod(0o644)
+        assert _read_with_get(second_key) == "second-secret"
+        assert log_path.stat().st_mode & 0o777 == 0o600
+    finally:
+        os.umask(previous_umask)
+
+
+def test_preexisting_triples_are_deduplicated_per_server(
+    recorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "MCP_ENV_READ_TEST_PREEXISTING"
+    value = "preexisting-secret"
+    monkeypatch.setenv(key, value)
+    log_path = tmp_path / "mcp_env_reads.jsonl"
+    caller = f"{__name__}:_read_with_get"
+    prior_entry = {
+        "ts": datetime.now().isoformat(),
+        "server": "memory",
+        "key": key,
+        "pid": os.getpid(),
+        "caller": caller,
+    }
+    log_path.write_text(json.dumps(prior_entry) + "\n", encoding="utf-8")
+
+    recorder.install(
+        "memory",
+        declared=frozenset(),
+        declared_prefixes=(),
+        secret_keys=frozenset({key}),
+        log_path=log_path,
+    )
+    assert _read_with_get(key) == value
+    assert len(log_path.read_text().splitlines()) == 1
+
+    recorder.install(
+        "health",
+        declared=frozenset(),
+        declared_prefixes=(),
+        secret_keys=frozenset({key}),
+        log_path=log_path,
+    )
+    assert _read_with_get(key) == value
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert [(record["server"], record["key"], record["caller"]) for record in records] == [
+        ("memory", key, caller),
+        ("health", key, caller),
+    ]
+
+
+def test_malformed_preexisting_lines_are_ignored(
+    recorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "MCP_ENV_READ_TEST_MALFORMED"
+    value = "malformed-secret"
+    monkeypatch.setenv(key, value)
+    log_path = tmp_path / "mcp_env_reads.jsonl"
+    log_path.write_text("{malformed json}\n", encoding="utf-8")
+    recorder.install(
+        "memory",
+        declared=frozenset(),
+        declared_prefixes=(),
+        secret_keys=frozenset({key}),
+        log_path=log_path,
+    )
+
+    assert _read_with_get(key) == value
+    lines = log_path.read_text().splitlines()
+    assert lines[0] == "{malformed json}"
+    assert json.loads(lines[1])["key"] == key
+
+
+def test_log_size_cap_keeps_lookups_working(
+    recorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "MCP_ENV_READ_TEST_LOG_CAP"
+    value = "cap-secret"
+    monkeypatch.setenv(key, value)
+    log_path = tmp_path / "mcp_env_reads.jsonl"
+    log_path.write_bytes(b"x" * recorder._MAX_LOG_BYTES)
+    recorder.install(
+        "memory",
+        declared=frozenset(),
+        declared_prefixes=(),
+        secret_keys=frozenset({key}),
+        log_path=log_path,
+    )
+
+    assert _read_with_get(key) == value
+    assert log_path.stat().st_size == recorder._MAX_LOG_BYTES
+
+
+def test_reinstall_resets_seen_state_for_new_server_and_log_path(
+    recorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "MCP_ENV_READ_TEST_REINSTALL"
+    value = "reinstall-secret"
+    monkeypatch.setenv(key, value)
+    first_path = tmp_path / "first" / "mcp_env_reads.jsonl"
+    second_path = tmp_path / "second" / "mcp_env_reads.jsonl"
+    third_path = tmp_path / "third" / "mcp_env_reads.jsonl"
+
+    recorder.install(
+        "memory",
+        declared=frozenset(),
+        declared_prefixes=(),
+        secret_keys=frozenset({key}),
+        log_path=first_path,
+    )
+    assert _read_with_get(key) == value
+
+    recorder.install(
+        "memory",
+        declared=frozenset(),
+        declared_prefixes=(),
+        secret_keys=frozenset({key}),
+        log_path=second_path,
+    )
+    assert _read_with_get(key) == value
+
+    recorder.install(
+        "health",
+        declared=frozenset(),
+        declared_prefixes=(),
+        secret_keys=frozenset({key}),
+        log_path=third_path,
+    )
+    assert _read_with_get(key) == value
+
+    expected_caller = f"{__name__}:_read_with_get"
+    first = json.loads(first_path.read_text().splitlines()[0])
+    second = json.loads(second_path.read_text().splitlines()[0])
+    third = json.loads(third_path.read_text().splitlines()[0])
+    assert [
+        (record["server"], record["key"], record["caller"]) for record in (first, second, third)
+    ] == [
+        ("memory", key, expected_caller),
+        ("memory", key, expected_caller),
+        ("health", key, expected_caller),
+    ]
+
+
 def test_environment_switch_disables_recording(
     recorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -220,14 +411,12 @@ def test_recording_guard_prevents_reentrant_duplicate_reads(
     value = "reentrant-value"
     monkeypatch.setenv(key, value)
     log_path = _install(recorder, tmp_path, secret_keys=frozenset({key}))
-    original_open = Path.open
+    original_fdopen = os.fdopen
 
-    def reentrant_open(path: Path, *args, **kwargs):
-        mode = args[0] if args else kwargs.get("mode", "r")
-        if path == log_path and mode == "a":
-            assert os.getenv(key) == value
-        return original_open(path, *args, **kwargs)
+    def reentrant_fdopen(fd, *args, **kwargs):
+        assert os.getenv(key) == value
+        return original_fdopen(fd, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", reentrant_open)
+    monkeypatch.setattr(os, "fdopen", reentrant_fdopen)
     assert os.getenv(key) == value
     assert len(log_path.read_text().splitlines()) == 1

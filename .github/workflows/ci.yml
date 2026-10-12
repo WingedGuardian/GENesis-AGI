@@ -1054,4 +1054,7 @@ jobs:
         #   test_mcp_env_declarations.py new -> 1
         #   test_api_key_env_names.py new -> 1
         # Floor: 25687 + 15 = 25702. No added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25702
+        # MCP recorder durability/security tests, measured with --collect-only:
+        #   test_mcp_env_reads.py 13 -> 19 (+6)
+        # Floor: 25702 + 6 = 25708. No added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25708
