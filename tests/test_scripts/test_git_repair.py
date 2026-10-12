@@ -162,6 +162,22 @@ def test_diagnose_ignores_invalid_reflog_entry(repos):
     assert d.healthy, d.render()
 
 
+def test_diagnose_ignores_warning_only_fsck_output(repos, monkeypatch):
+    _origin, work = repos
+    real_git = gr._git
+    warning = f"warning in tree {'a' * 40}: zeroPaddedFilemode: contains zero-padded file modes\n"
+
+    def fake_git(repo, *args, **kwargs):
+        if args and args[0] == "fsck":
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr=warning)
+        return real_git(repo, *args, **kwargs)
+
+    monkeypatch.setattr(gr, "_git", fake_git)
+    d = gr.diagnose(work)
+    checks = {check.name: check.ok for check in d.checks}
+    assert checks["fsck --full clean"] is True
+
+
 def test_scan_zeroed_only_flags_all_nul(repos):
     _origin, work = repos
     # a valid loose object must NOT be flagged

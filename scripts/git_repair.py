@@ -259,7 +259,12 @@ def diagnose(repo: Path) -> Diagnosis:
     )
     fsck_output = r.stderr + "\n" + r.stdout
     fsck_errs = _fsck_problem_lines(r.stderr, r.stdout)
-    fsck_ok = r.returncode == 0 and not fsck_errs
+    fsck_lines = r.stderr.splitlines() + r.stdout.splitlines()
+    fsck_has_errors = any(
+        ln.startswith(("error:", "fatal:")) or "corrupt" in ln or "missing" in ln
+        for ln in fsck_lines
+    )
+    fsck_ok = r.returncode == 0 and not fsck_has_errors
     d.add(
         "fsck --full clean",
         fsck_ok,
