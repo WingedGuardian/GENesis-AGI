@@ -1050,4 +1050,7 @@ jobs:
         #   test_mcp_env_declarations.py new -> 1
         #   test_api_key_env_names.py new -> 1
         # Floor: 25548 + 13 = 25561. No added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25561
+        # Caller-aware MCP environment reads, measured with --collect-only:
+        #   test_mcp_env_reads.py 11 -> 13 (+2)
+        # Floor: 25561 + 2 = 25563. No added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25563

@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 _original_environ_class: type | None = None
-_seen_keys: set[str] = set()
+_seen_keys: set[tuple[str, str]] = set()
 _seen_lock = threading.Lock()
 
 
@@ -49,16 +49,18 @@ def install(
             or any(key.startswith(prefix) for prefix in declared_prefixes)
         ):
             return
+        caller = _caller()
+        seen_key = (key, caller)
         with _seen_lock:
-            if key in _seen_keys:
+            if seen_key in _seen_keys:
                 return
-            _seen_keys.add(key)
+            _seen_keys.add(seen_key)
             entry = {
                 "ts": datetime.now(UTC).isoformat(),
                 "server": server,
                 "key": key,
                 "pid": os.getpid(),
-                "caller": _caller(),
+                "caller": caller,
             }
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8") as stream:

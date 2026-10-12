@@ -39,6 +39,18 @@ def _install(
     return log_path
 
 
+def _read_with_get(key: str) -> str | None:
+    return os.environ.get(key)
+
+
+def _read_with_index(key: str) -> str:
+    return os.environ[key]
+
+
+def _copy_environment() -> dict[str, str]:
+    return dict(os.environ)
+
+
 @pytest.mark.parametrize("access", ["getenv", "get", "contains", "index"])
 def test_undeclared_secret_reads_are_logged_once_per_supported_accessor(
     recorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, access: str
@@ -60,6 +72,45 @@ def test_undeclared_secret_reads_are_logged_once_per_supported_accessor(
 
     records = [json.loads(line) for line in log_path.read_text().splitlines()]
     assert [record["key"] for record in records] == [key]
+
+
+def test_secret_reads_are_deduplicated_per_caller(
+    recorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "MCP_ENV_READ_TEST_CALLER_DEDUPE"
+    value = "caller-dedupe-secret"
+    monkeypatch.setenv(key, value)
+    log_path = _install(recorder, tmp_path, secret_keys=frozenset({key}))
+
+    assert _read_with_get(key) == value
+    assert _read_with_get(key) == value
+    assert _read_with_index(key) == value
+
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert [record["caller"] for record in records] == [
+        f"{__name__}:_read_with_get",
+        f"{__name__}:_read_with_index",
+    ]
+    assert [record["key"] for record in records] == [key, key]
+
+
+def test_bulk_copy_does_not_suppress_later_direct_read(
+    recorder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "MCP_ENV_READ_TEST_BULK_COPY"
+    value = "bulk-copy-secret"
+    monkeypatch.setenv(key, value)
+    log_path = _install(recorder, tmp_path, secret_keys=frozenset({key}))
+
+    assert _copy_environment()[key] == value
+    assert _read_with_get(key) == value
+
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert [record["caller"] for record in records] == [
+        f"{__name__}:_copy_environment",
+        f"{__name__}:_read_with_get",
+    ]
+    assert [record["key"] for record in records] == [key, key]
 
 
 def test_declared_prefix_and_non_secret_reads_are_not_logged(
@@ -172,7 +223,8 @@ def test_recording_guard_prevents_reentrant_duplicate_reads(
     original_open = Path.open
 
     def reentrant_open(path: Path, *args, **kwargs):
-        if path == log_path:
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path == log_path and mode == "a":
             assert os.getenv(key) == value
         return original_open(path, *args, **kwargs)
 
