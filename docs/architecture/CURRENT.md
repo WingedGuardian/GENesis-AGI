@@ -1491,7 +1491,19 @@ verified: 637f7f7bb679 2026-10-05
   still gets one; never stops the launch, though a launch waits up to 10 minutes
   for another session's copy of the same profile).
   `scripts/browser.py` launches without a copy. `scripts/disk_hygiene.sh` keeps
-  the newest copy per profile, and the newest per version for 90 days. The automation TOOLS live in
+  the newest copy per profile, and the newest per version for 90 days.
+  `provision.py` (run by `scripts/install_browser_stack.sh`,
+  unit `genesis-browser-stack.service`) installs what the tools launch: the
+  engine the camoufox package pairs with (only from camoufox 0.5.7: 0.4's fetch
+  empties the cache and 0.5.3-0.5.6 have no pin), the Chromium the fallback
+  launches (`chromium.py`: patchright's when installed, else playwright's; where
+  it lives is asked of the package's own `install --dry-run`, and a build counts
+  only with its marker AND executable, a broken one repaired by upstream's
+  `install --force`), and their system libraries (`install-deps` through
+  `sudo -n`, else the command is printed). Free space is checked on every
+  destination with the disk guardian's effective figure (`util/disk_headroom.py`);
+  every step's timeout comes off one run budget inside the unit's limit. One
+  outcome line; a re-run is a no-op. The automation TOOLS live in
   `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
   TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
   1 h idle reclaim of one layer never touches another (TinyFish included:

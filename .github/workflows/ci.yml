@@ -1062,9 +1062,16 @@ jobs:
         # 50 -> 51 (+14). No added skips. Floor: 25698 + 14 = 25712.
         # Code-only deploy backups (#2629): test_deploy_code_only.py 66 -> 72 (+6).
         # Floor: 25712 + 6 = 25718.
+        # Native codex harness (#3075), new file test_codex_native.py: 20 cases
+        # (client x action x decision), measured with --collect-only. All 20
+        # carry a module-wide skipif on GENESIS_CODEX_NATIVE_TESTS != "1",
+        # which CI never sets (native binaries are a separate opt-in
+        # integration requirement, per the test's own skip reason). No
+        # overlap with the files above (new paths). Floor: 25718 + 20 = 25738.
+        # Ceiling: 104 + 20 = 124.
         # MCP env read recorder (W2-1), measured with --collect-only:
         #   test_mcp_env_reads.py new -> 19
         #   test_mcp_env_declarations.py new -> 1
         #   test_api_key_env_names.py new -> 1
-        # Floor: 25718 + 21 = 25739. No added skips.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104 --min-collected 25739
+        # Floor: 25738 + 21 = 25759. No added skips; ceiling stays 124.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124 --min-collected 25759
