@@ -487,7 +487,7 @@ class TestAuditFindings:
         not merely noise: a prompt that fires on mentions is a prompt the owner
         learns to click through, which defeats the one that matters.
         """
-        assert self._touches(command=command)
+        assert not self._touches(command=command)
 
     def test_heredoc_body_is_data_not_operands(self) -> None:
         """This module's own commit message must not trip its own gate."""
@@ -721,39 +721,27 @@ class TestAuditFindings:
         )
 
     def test_executor_after_data_heredoc_is_scanned(self, fake_home: Path) -> None:
-        command = (
-            "git commit -F - <<'EOF'\nmsg\nEOF\n"
-            'bash <<\'EOF\'\ncat "secrets.env"\nEOF\n'
-        )
+        command = "git commit -F - <<'EOF'\nmsg\nEOF\nbash <<'EOF'\ncat \"secrets.env\"\nEOF\n"
         assert self._touches(command=command)
 
     def test_sh_executor_after_data_heredoc_is_scanned(self, fake_home: Path) -> None:
-        command = (
-            "git commit -F - <<'EOF'\nmsg\nEOF\n"
-            'sh <<\'EOF\'\ncat "secrets.env"\nEOF\n'
-        )
+        command = "git commit -F - <<'EOF'\nmsg\nEOF\nsh <<'EOF'\ncat \"secrets.env\"\nEOF\n"
         assert self._touches(command=command)
 
     def test_python_executor_after_data_heredoc_is_scanned(self, fake_home: Path) -> None:
         command = (
             "git commit -F - <<'EOF'\nmsg\nEOF\n"
-            'python3 <<\'EOF\'\nopen("secrets.env").read()\nEOF\n'
+            "python3 <<'EOF'\nopen(\"secrets.env\").read()\nEOF\n"
         )
         assert self._touches(command=command)
 
     def test_different_heredoc_delimiters_keep_executor_visible(self, fake_home: Path) -> None:
-        command = (
-            "git commit -F - <<'MSG'\nmsg\nMSG\n"
-            'bash <<\'EOF\'\ncat "secrets.env"\nEOF\n'
-        )
+        command = "git commit -F - <<'MSG'\nmsg\nMSG\nbash <<'EOF'\ncat \"secrets.env\"\nEOF\n"
         assert self._touches(command=command)
 
     def test_executor_heredoc_before_data_heredoc_is_scanned(self, fake_home: Path) -> None:
-        command = (
-            'bash <<\'EOF\'\ncat "secrets.env"\nEOF\n'
-            "git commit -F - <<'MSG'\nmsg\nMSG\n"
-        )
-        assert not self._touches(command=command)
+        command = "bash <<'EOF'\ncat \"secrets.env\"\nEOF\ngit commit -F - <<'MSG'\nmsg\nMSG\n"
+        assert self._touches(command=command)
 
     def test_an_executor_fed_heredoc_body_is_scanned(self, fake_home: Path) -> None:
         commands = [
@@ -777,7 +765,5 @@ class TestAuditFindings:
     def test_a_writer_heredoc_does_not_promote_unrelated_quoted_mentions(
         self, fake_home: Path
     ) -> None:
-        command = (
-            'git commit -m "document secrets.env" && cat > f <<\'EOF\'\nbody\nEOF'
-        )
+        command = "git commit -m \"document secrets.env\" && cat > f <<'EOF'\nbody\nEOF"
         assert not self._touches(command=command), command
