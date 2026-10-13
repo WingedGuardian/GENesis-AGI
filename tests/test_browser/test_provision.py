@@ -7,6 +7,7 @@ downloads, nothing runs sudo, and the engine cache is a tmp dir.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -1608,3 +1609,34 @@ def test_printed_commands_quote_a_path_with_spaces(env, monkeypatch):
         "sudo '/opt/my venv/bin/python' -m playwright install-deps chromium firefox" in n
         for n in out.notes
     )
+
+
+def test_a_failed_fetch_record_from_the_future_does_not_block_a_retry(env, monkeypatch):
+    """After a clock rollback the record's age is negative; it must not suppress
+    retries until the clock catches up."""
+    directory = env / "xdg" / "camoufox" / "browsers" / "official" / "156.0.1-beta.36"
+    provision._failed_fetches_path().parent.mkdir(parents=True, exist_ok=True)
+    provision._failed_fetches_path().write_text(
+        json.dumps({str(directory): provision.time.time() + 86400})
+    )
+    assert not provision._fetched_invalid_recently(directory)
+
+
+def test_check_packages_reports_unreadable_camoufox_metadata(env, monkeypatch, capsys):
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {
+            "camoufox": provision.packages.UNREADABLE,
+            "playwright": "1.62.0",
+            "patchright": "1.62.3",
+        },
+    )
+
+    def pin_capable():
+        raise AssertionError("the pin is not probed through unreadable metadata")
+
+    monkeypatch.setattr(provision, "_pin_capable", pin_capable)
+    assert provision.main(["check-packages"]) == 1
+    out = capsys.readouterr().out
+    assert "camoufox" in out and "unreadable" in out and "reinstall" in out

@@ -119,8 +119,16 @@ def not_ready_at(package: str, build: str, executable_path: str | Path) -> str |
     """Why ``build`` cannot launch, judged where the launching package itself puts
     its executable (Playwright's ``browser_type.executable_path``, which applies its
     host overrides and PLAYWRIGHT_BROWSERS_PATH), or None. The install directory is
-    two levels up: ``<install dir>/<platform dir>/<executable>``."""
-    found = problem(build, Path(executable_path).parent.parent)
+    two levels up: ``<install dir>/<platform dir>/<executable>``. The selected
+    executable itself must be there and executable: a cache shared across platforms
+    can hold another platform's build beside it."""
+    exe = Path(executable_path)
+    directory = exe.parent.parent
+    found = None
+    if not (directory / _MARKER).is_file():
+        found = f"{build} at {directory} is not installed (its install has not finished)"
+    elif not (exe.is_file() and os.access(exe, os.X_OK)):
+        found = f"{build} at {directory} has no launchable {exe.name} where {package} looks"
     return f"{package}'s {found}; {stack_step()}" if found else None
 
 

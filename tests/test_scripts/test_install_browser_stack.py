@@ -4,7 +4,6 @@ provisioner's own exit code. The provisioner is a stub interpreter in a fake rep
 from __future__ import annotations
 
 import fcntl
-import os
 import subprocess
 import time
 from pathlib import Path
@@ -27,7 +26,8 @@ def repo(tmp_path):
 
 def _run(repo, tmp_path, *, rc=0, env_extra=None, drop_home=False):
     env = {
-        "PATH": os.environ["PATH"],
+        # Hermetic: a Genesis venv on the caller's PATH would be preferred.
+        "PATH": "/usr/bin:/bin",
         "HOME": str(tmp_path / "home"),
         "GENESIS_HOME": str(tmp_path / "gh"),
         "GENESIS_REPO_DIR": str(repo),
@@ -197,9 +197,10 @@ def _path_python(tmp_path, *, genesis_venv):
         "#!/bin/sh\n"
         f'if [ "$1" = "-c" ]; then exit {check_rc}; fi\n'
         'echo "$@" > "$STUB_LOG"\n'
+        f'touch "{bindir.parent}/ran"\n'
     )
     py.chmod(0o755)
-    return f"{bindir}:{os.environ['PATH']}"
+    return f"{bindir}:/usr/bin:/bin"
 
 
 def test_without_venv_path_the_venv_on_path_is_used(repo, tmp_path):
@@ -214,3 +215,14 @@ def test_a_python_on_path_that_is_not_a_genesis_venv_is_refused(repo, tmp_path):
     r = _run(repo, tmp_path, env_extra={"PATH": _path_python(tmp_path, genesis_venv=False)})
     assert r.returncode == 75
     assert not (tmp_path / "stub.log").exists()
+
+
+def test_the_venv_on_path_wins_over_a_checkout_venv(repo, tmp_path):
+    """An older unit names its configured venv only through PATH; a checkout
+    .venv left beside it may be stale."""
+    r = _run(repo, tmp_path, env_extra={"PATH": _path_python(tmp_path, genesis_venv=True)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    # The PATH stub writes the run's arguments; the checkout stub would too, so
+    # tell them apart by which one ran the import check.
+    assert (tmp_path / "stub.log").read_text().split() == ["-m", "genesis.browser.provision", "run"]
+    assert (tmp_path / "pathvenv" / "ran").exists()

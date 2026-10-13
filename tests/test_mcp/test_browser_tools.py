@@ -6824,7 +6824,7 @@ async def test_every_chromium_guard_checks_the_package_this_launch_selected(monk
     monkeypatch.setattr(browser, "_chromium_async_playwright", lambda package: lambda: starter)
     with pytest.raises(RuntimeError, match="stop at the launch"):
         await browser._ensure_chromium_fallback()
-    assert checked == [("patchright",)] * 3
+    assert checked == [("patchright",)] * 4  # import, past it, driver start, copy
 
 
 @pytest.mark.asyncio
@@ -6857,3 +6857,32 @@ async def test_chromium_rechecks_packages_after_the_backup(monkeypatch):
     pw.chromium.launch_persistent_context.assert_not_awaited()
     pw.stop.assert_awaited_once()
 
+
+@pytest.mark.asyncio
+async def test_an_upgrade_during_the_driver_start_says_restart_not_provision(monkeypatch):
+    """pip replacing the package while the driver starts can delete the old
+    Chromium revision; the old loaded driver then needs a restart, which no
+    provisioning can stand in for."""
+    from genesis.browser import packages
+
+    state = {"started": False}
+
+    def check(dists):
+        if state["started"]:
+            raise packages.BrowserPackagesChanged("changed during the driver start")
+
+    monkeypatch.setattr(packages, "check_loaded_browser_modules", check)
+    monkeypatch.setattr(browser.chromium, "not_ready_at", lambda *a: "chromium is not installed")
+    pw = MagicMock()
+    pw.stop = AsyncMock()
+    starter = MagicMock()
+
+    async def start():
+        state["started"] = True
+        return pw
+
+    starter.start = start
+    monkeypatch.setattr(browser, "_chromium_async_playwright", lambda package: lambda: starter)
+    with pytest.raises(packages.BrowserPackagesChanged):
+        await browser._ensure_chromium_fallback()
+    pw.stop.assert_awaited_once()

@@ -230,3 +230,28 @@ def test_browser_version_reads_the_version_a_package_launches(tmp_path):
     )
     assert chromium.browser_version(pkg) == "151.0.7922.34"
     assert chromium.browser_version(tmp_path / "missing") is None
+
+
+def test_not_ready_at_checks_the_selected_executable_not_a_sibling(tmp_path):
+    """A cache shared across platforms can hold another platform's build beside
+    the one Playwright selected."""
+    install = tmp_path / "chromium-1234"
+    (install / "chrome-linux").mkdir(parents=True)
+    other = install / "chrome-linux" / "chrome"
+    other.write_text("#!/bin/sh\n")
+    other.chmod(0o755)
+    (install / "INSTALLATION_COMPLETE").write_text("")
+    selected = install / "chrome-linux64" / "chrome"
+    assert chromium.not_ready_at("patchright", "chromium", selected)
+
+
+def test_not_ready_at_rejects_a_selected_executable_without_its_exec_bit(tmp_path):
+    install = tmp_path / "chromium-1234"
+    (install / "chrome-linux64").mkdir(parents=True)
+    exe = install / "chrome-linux64" / "chrome"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o644)
+    (install / "INSTALLATION_COMPLETE").write_text("")
+    assert chromium.not_ready_at("patchright", "chromium", exe)
+    exe.chmod(0o755)
+    assert chromium.not_ready_at("patchright", "chromium", exe) is None

@@ -596,6 +596,9 @@ async def _ensure_chromium_fallback():
         os.environ["DISPLAY"] = _VNC_DISPLAY
         pw = await async_playwright().start()
         try:
+            # An upgrade while the driver started can remove the revision this
+            # loaded driver launches: that needs a restart, not provisioning.
+            packages.check_loaded_browser_modules(dists)
             # Before the profile copy and the launch: Playwright's own error for a
             # missing browser tells the reader to run `<package> install`, a download
             # no session may start. Judged where the driver itself will launch from.

@@ -520,7 +520,8 @@ def _fetched_invalid_recently(directory: Path) -> bool:
     the age of its version.json: that says the install completed, and an engine
     damaged since (files removed) needs the repair."""
     when = _failed_fetches().get(str(directory))
-    return when is not None and time.time() - when < _RECENT_DAYS * 86400
+    # A record from the future (a clock rolled back) is stale, not eternal.
+    return when is not None and 0 <= time.time() - when < _RECENT_DAYS * 86400
 
 
 def _record_failed_fetch(directory: Path) -> None:
@@ -919,6 +920,14 @@ def unmet_packages(pyproject: Path | None = None) -> list[str]:
     exit status they cannot see."""
     versions = packages.installed_versions()
     unmet = [f"{dist} is not installed" for dist in packages.BROWSER_DISTS if not versions[dist]]
+    unreadable = [d for d in packages.BROWSER_DISTS if versions[d] == packages.UNREADABLE]
+    unmet += [
+        f"{dist}'s package metadata is unreadable (a damaged install); reinstall it "
+        f"({engine.PACKAGE_HINT})"
+        for dist in unreadable
+    ]
+    # Ranges, the pin and the import are judged only on a readable version.
+    versions = {d: (None if d in unreadable else v) for d, v in versions.items()}
     try:
         requirements = _browser_requirements(pyproject)
     except ImportError as exc:
