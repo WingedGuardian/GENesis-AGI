@@ -45,16 +45,24 @@
 # and with it a paged file's state for up to DG_RUNAWAY_PAGED_FORGET_S.
 #
 # A file pages once per mode per EPISODE. An episode ends when a paged file is
-# seen at half its retained size or less, or comes back from out of sight at
-# least halfway down from that size to the scan's floor (emptied below the
-# floor, truncated, rotated by copy-truncate):
+# seen at half its size at the previous sighting or less, or comes back from
+# out of sight at least halfway down from its last size to the scan's floor
+# (emptied below the floor, truncated, rotated by copy-truncate):
 # the paged modes are cleared, and a refill pages again under its own key,
 # "<generation>:e<start time>" (#3023). Never on the poll that ended it: a
-# shrink is the cure, not a new runaway. The first episode keeps the bare
-# generation key, so a restart still collapses with the page it re-sends. Half,
-# not "any decrease", for a file in sight: allocated size moves a little on its
-# own. Episodes live in memory: a restart mid-episode re-sends the bare key, which
-# the drainer collapses (accepted).
+# shrink is the cure, not a new runaway. Half, not "any decrease", for a file
+# in sight: allocated size moves a little on its own.
+# What counts as a refill: growth fast enough for the growth threshold, or a
+# CROSSING of the size threshold from below. A file still over the size
+# threshold after its shrink is not paged again for its size until it has been
+# seen under it (review finding: the size alone would re-page a file that was
+# shrunk and left). Known limit, accepted: a file cut to a size still over the
+# threshold that then regrows slowly is not paged again; one size page covers
+# one stretch over the threshold.
+# The first episode keeps the bare generation key, so a restart still collapses
+# with the page it re-sends. Episodes live in memory: after a restart, a refill
+# pages under the bare key, which the drainer suppresses while it still holds
+# the first page (24 h) (accepted).
 #
 # A file out of sight keeps its last size and when it was measured, so a writer
 # that closes its file for a poll and reopens it is judged against that
@@ -308,7 +316,16 @@ wg_runaway_check() {
             (( raw_b >= 0 )) && norm_b=$(( raw_b * POLL_INTERVAL / dt ))
         fi
         why=""
-        if (( size_mb * 100 >= DG_RUNAWAY_PCT * dtotal )); then
+        # Between episodes (opened, not yet paged), the size counts only on a
+        # crossing: it was under the threshold at the previous sighting, in
+        # the same whole MB as the test below (review finding: exact bytes here
+        # could call a file "over" that the size test calls "under").
+        local size_armed=1
+        if [[ -n "${_RW_EP[$gen]:-}" && -z "${_RW_PAGED[$gen]:-}" && -n "${_RW_PREV[$gen]:-}" ]] \
+                && (( ${_RW_PREV[$gen]} / 1048576 * 100 >= DG_RUNAWAY_PCT * dtotal )); then
+            size_armed=0
+        fi
+        if (( size_armed && size_mb * 100 >= DG_RUNAWAY_PCT * dtotal )); then
             why="it alone uses $(( size_mb * 100 / dtotal ))% of ${dpath} (threshold ${DG_RUNAWAY_PCT}%)"
         fi
         if (( norm_b >= 0 && norm_b * 100 >= DG_RUNAWAY_RATE_PCT * dtotal * 1048576 )); then

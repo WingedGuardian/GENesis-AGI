@@ -658,11 +658,11 @@ def _legacy_key(f: Path) -> str:
     return f"watchgod:runaway:{st.st_dev}:{st.st_ino}:{birth}"
 
 
-def _alloc(f: Path, mb: int) -> str:
+def _alloc(f: Path, mb: float) -> str:
     """Shell step: allocate `mb` MiB through a writer's descriptor."""
     return (
-        "python3 -c 'import os; fd = os.open(\"" + str(f) + "\", os.O_WRONLY); "
-        f"os.posix_fallocate(fd, 0, {mb} * 1048576)'"
+        "python3 -c 'import os; fd = os.open(\"" + str(f) + '", os.O_WRONLY); '
+        f"os.posix_fallocate(fd, 0, int({mb} * 1048576))'"
     )
 
 
@@ -842,18 +842,24 @@ def test_an_open_episode_outlives_the_short_forget_window(box):
 
 def test_a_partial_shrink_still_over_threshold_does_not_page_at_once(box):
     """Cutting a paged file to half still leaves it over the size threshold:
-    that poll opens the episode but pages nothing (nothing refilled)."""
+    that poll opens the episode but pages nothing (nothing refilled), and
+    neither do the polls after it while it stays there (review finding, PR
+    #3290: the size alone re-paged on the next poll)."""
     f = _file(box, "out.log", 300)
     _holder(box, 5, f)
     dom = _domain(box, 400)
-    _run(
+    out = _run(
         box,
         f"""
         wg_runaway_check '{dom}'
         {_empty(f)}; {_alloc(f, 120)}
         _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EP=${{#_RW_EP[@]}}
         """,
     )
+    assert "EP=1" in out.stdout, "guard: the episode did open"
     assert len(_pages(box)) == 1
 
 
@@ -919,3 +925,156 @@ def test_a_reopened_file_a_little_smaller_is_not_a_new_episode(box):
     )
     assert "EP=0" in out.stdout
     assert len(_pages(box)) == 1
+
+
+# ── Codex round 2 (PR #3290): a refill is growth or a crossing ────
+
+
+def test_a_file_back_over_the_threshold_from_out_of_sight_is_not_paged_again(box):
+    """Paged at 60 MB on a 200 MB domain (threshold 50), emptied below the
+    floor, back at 52 and left there: the episode opens, and nothing pages
+    while it sits there (it never crossed back over from below)."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    dom = _domain(box, 200)
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 52)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EP=${{#_RW_EP[@]}}
+        """,
+    )
+    assert "EP=1" in out.stdout, "guard: the episode did open"
+    assert len(_pages(box)) == 1
+
+
+def test_a_file_reopened_a_little_smaller_near_the_floor_is_not_paged_again(box):
+    """60 MB, closed for a poll, back at 55: out of sight, that is far enough
+    down toward the floor to open an episode, but it is still over the
+    threshold and never crossed it, so it does not page again."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    dom = _domain(box, 200)
+    hide = f"mv '{box['proc']}/5' '{box['tmp']}/hidden5'"
+    show = f"mv '{box['tmp']}/hidden5' '{box['proc']}/5'"
+    _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {hide}; _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'; {show}
+        {_empty(f)}; {_alloc(f, 55)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    assert len(_pages(box)) == 1
+
+
+def test_a_slow_refill_pages_again_when_it_crosses_the_threshold(box):
+    """Shrunk under the size threshold (100 MB of 400), then refilled more
+    slowly than the growth threshold (20 MB a poll): it pages again on the
+    poll it crosses the size threshold, not before."""
+    f = _file(box, "out.log", 300)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}; {_alloc(f, 60)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 75)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 90)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 105)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    pages = _pages(box)
+    assert len(pages) == 2, [p["title"] for p in pages]
+    assert pages[1]["dedupe_key"].startswith(_legacy_key(f) + ":e")
+    assert "alone uses" in pages[1]["body"], "paged for its size, at the crossing"
+    assert "grew" not in pages[1]["body"], "guard: the refill was slower than the growth threshold"
+
+
+def test_a_file_shrunk_but_still_over_the_threshold_regrowing_slowly_is_the_stated_limit(box):
+    """The accepted limit: cut to a size still over the threshold, then
+    regrowing slowly, it never crossed from below and grows too slowly for the
+    growth threshold, so it is not paged again. Pinned so a change to it is a
+    decision, not an accident."""
+    f = _file(box, "out.log", 300)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}; {_alloc(f, 120)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 135)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 150)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    assert len(_pages(box)) == 1
+
+
+def test_a_page_that_could_not_be_queued_is_retried_on_the_next_poll(box):
+    """The crossing rule applies only between episodes: a file whose first page
+    could not be queued is still unpaged and still over the threshold, and it
+    pages on the next poll (it never had an episode to re-arm)."""
+    f = _file(box, "out.log", 300)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    q = box["queue"]
+    out = _run(
+        box,
+        f"""
+        : > '{q}'
+        wg_runaway_check '{dom}'
+        echo PAGED_FIRST=${{#_RW_PAGED[@]}}
+        rm -f '{q}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    assert "PAGED_FIRST=0" in out.stdout, "guard: the first enqueue really failed"
+    assert len(_pages(box)) == 1
+
+
+def test_a_crossing_is_judged_in_the_same_units_as_the_size(box):
+    """401 MB domain: the size threshold is 100.25 MB, and the size test reads
+    whole MB, so 100.5 MB is under it. The next poll's crossing must see the
+    same: 100.5 then 115 MB is a crossing, and it pages (review finding).
+    Every step is under the growth threshold (20 MB a poll)."""
+    f = _file(box, "out.log", 300)
+    _holder(box, 5, f)
+    dom = _domain(box, 401)
+    _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}; {_alloc(f, 60)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 75)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 90)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 100.5)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 115)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    pages = _pages(box)
+    assert len(pages) == 2, [p["title"] for p in pages]
+    assert "alone uses" in pages[1]["body"]
