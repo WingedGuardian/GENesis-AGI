@@ -31,12 +31,13 @@
 wg_records_file() { printf '%s/frozen' "${DG_STATE_DIR:?DG_STATE_DIR is unset}"; }
 
 wg_boot_id() {
-    # This boot's identity: the kernel boot id, else the boot time. Fails when
-    # neither can be read; nothing is recorded or trusted without it.
+    # This boot's identity: the kernel boot id. Fails when it cannot be read;
+    # nothing is recorded or trusted without it. No fallback: a second source
+    # would let one failed read stamp a record as "another boot" and drop the
+    # rest (review finding). boot_id exists on every kernel with pidfd.
     local b=""
     read -r b 2>/dev/null < /proc/sys/kernel/random/boot_id || true
-    [[ "$b" =~ ^[0-9a-f-]+$ ]] || b="$(awk '$1 == "btime" { print "btime-" $2; exit }' /proc/stat 2>/dev/null)"
-    [[ -n "$b" ]] || return 1
+    [[ "$b" =~ ^[0-9a-f-]+$ ]] || return 1
     printf '%s' "$b"
 }
 
@@ -107,7 +108,8 @@ wg_record_put() {
     # where awk keeps it, so the two readers would disagree about the columns.
     local pid="$1" st="$2" comm="$3" ts="$4" key="$5" path="$6" state="$7" recs old line f
     # pid in /proc's own form (no leading zero), or the record never matches.
-    [[ "$pid" =~ ^[1-9][0-9]*$ && "$st" =~ ^[0-9]+$ ]] || return 1
+    # Both in /proc's own form (no leading zero): identities compare as text.
+    [[ "$pid" =~ ^[1-9][0-9]*$ && "$st" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
     [[ "$state" == paused || "$state" == pending || "$state" == pending-t ]] || return 1
     for f in "$ts" "$key" "$path"; do
         [[ -n "$f" && "$f" != *$'\t'* && "$f" != *$'\n'* ]] || return 1

@@ -901,3 +901,125 @@ def test_the_cli_keeps_a_record_when_the_signal_cannot_verify(home, tmp_path, st
     assert "cannot verify" in out.stderr and "record kept" in out.stderr
     assert len(_records(home)) == 1
     assert _live(stopped_sleep.pid) == "T"
+
+
+# ── Codex round 3 (PR B) ──────────────────────────────────────────
+
+
+def _cli_on_fake_proc(home: Path, tmp_path: Path, proc: Path, *args: str):
+    """The CLI pointed at a fake process table. Only for paths that never
+    signal (status, and thaw where it keeps the record): the signal fallback
+    would aim at whatever real process holds the fake pid number."""
+    root = tmp_path / "cli"
+    (root / "lib").mkdir(parents=True)
+    cli = root / "watchgod"
+    text = _CLI.read_text()
+    assert text.count("\nDG_PROC=/proc\n") == 1
+    cli.write_text(text.replace("\nDG_PROC=/proc\n", f"\nDG_PROC='{proc}'\n"))
+    cli.chmod(0o755)
+    (root / "lib" / "watchgod_records.sh").write_text(_RECORDS.read_text())
+    (root / "lib" / "watchgod_signal.sh").write_text(_SIGNAL.read_text())
+    env = dict(os.environ, HOME=str(home))
+    env.pop("DG_STATE_DIR", None)
+    return subprocess.run(
+        [str(cli), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def _fake_stat(pid: int, state: str, st: int) -> str:
+    rest = ["0"] * 49
+    rest[0] = state
+    rest[19] = str(st)
+    return f"{pid} (worker) " + " ".join(rest) + "\n"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a 0o000 file")
+def test_a_worker_whose_state_cannot_be_read_keeps_the_record(home, tmp_path):
+    """The main thread is a zombie and the one other thread's stat cannot be
+    read: that process may be alive and stopped, so status says unverified and
+    thaw keeps the record (review finding)."""
+    pid = 4242000
+    proc = tmp_path / "fakeproc"
+    (proc / str(pid) / "task" / str(pid)).mkdir(parents=True)
+    (proc / str(pid) / "task" / "4242001").mkdir(parents=True)
+    (proc / str(pid) / "stat").write_text(_fake_stat(pid, "Z", 777))
+    (proc / str(pid) / "task" / str(pid) / "stat").write_text(_fake_stat(pid, "Z", 777))
+    worker = proc / str(pid) / "task" / "4242001" / "stat"
+    worker.write_text(_fake_stat(4242001, "T", 777))
+    worker.chmod(0)
+    _record(home, pid, "777")
+    try:
+        out = _cli_on_fake_proc(home, tmp_path, proc, "status")
+        assert "cannot read its state" in out.stdout, out.stdout
+        out = _cli_on_fake_proc(home, tmp_path / "t2", proc, "thaw", str(pid))
+        assert out.returncode == 1 and "record kept" in out.stderr, out.stdout + out.stderr
+        assert len(_records(home)) == 1
+    finally:
+        worker.chmod(0o600)
+
+
+def test_raw_c1_bytes_are_not_sent_to_the_terminal(home, stopped_sleep):
+    """A raw 0x9b (CSI to some terminals) is shown as "?", like its UTF-8
+    form; an accented letter is kept (review finding)."""
+    f = _state_dir(home) / "frozen"
+    line = (
+        f"{stopped_sleep.pid}\t{_starttime(stopped_sleep.pid)}\t".encode()
+        + b"a\x9b2Jb\xc3\xa9\t2026-01-01T00:00:00Z\t1:2\t/x/o\tpaused\t"
+        + _BOOT.encode()
+        + b"\n"
+    )
+    f.write_bytes(line)
+    out = subprocess.run(
+        [str(_CLI), "status"],
+        env=dict(os.environ, HOME=str(home)),
+        capture_output=True,
+        timeout=60,
+    )
+    assert b"\x9b" not in out.stdout, out.stdout
+    assert "a?2Jb\u00e9".encode() in out.stdout, out.stdout
+
+
+# ── premise-check follow-ups (PR B) ───────────────────────────────
+
+
+def test_a_start_time_with_a_leading_zero_is_not_recorded(home):
+    out = _lib(
+        home, "wg_record_put 4242 0777 sleep T0 1:2 /x/out paused && echo WROTE || echo REFUSED"
+    )
+    assert "REFUSED" in out.stdout
+
+
+def test_status_still_lists_records_when_the_state_file_is_bad(home, stopped_sleep):
+    (home / ".genesis" / "watchgod_state.json").write_text("{not json")
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    out = _cli(home, "status")
+    assert "could not be read" in out.stdout
+    assert f"pid {stopped_sleep.pid}" in out.stdout and "still paused" in out.stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root lists a 0o000 dir")
+def test_a_zombie_leader_whose_threads_cannot_be_listed_keeps_the_record(home, tmp_path):
+    pid = 4242100
+    proc = tmp_path / "fakeproc"
+    task = proc / str(pid) / "task"
+    (task / str(pid)).mkdir(parents=True)
+    (proc / str(pid) / "stat").write_text(_fake_stat(pid, "Z", 777))
+    task.chmod(0)
+    _record(home, pid, "777")
+    try:
+        out = _cli_on_fake_proc(home, tmp_path, proc, "thaw", str(pid))
+        assert out.returncode == 1 and "record kept" in out.stderr, out.stdout + out.stderr
+        assert len(_records(home)) == 1
+    finally:
+        task.chmod(0o700)
+
+
+def test_boot_id_has_no_fallback(home):
+    """A second identity source would let one failed read stamp records as
+    another boot; the library names only the kernel boot id."""
+    assert "btime" not in _RECORDS.read_text()

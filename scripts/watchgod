@@ -65,11 +65,21 @@ _shown() {
     # $1 for the operator's terminal and log: a record's comm and path are
     # chosen by the paused process, so control bytes (escape sequences,
     # carriage returns) are shown as "?" (review finding).
-    # C0 and DEL, then C1 as UTF-8 encodes it (U+0080-U+009F, which some
-    # terminals act on); other UTF-8 text is left alone.
+    # Every control code (C0, DEL and C1, raw or UTF-8 encoded: some
+    # terminals act on a raw 0x9b) and every byte that is not valid UTF-8 is
+    # shown as "?"; other UTF-8 text is left alone (review findings).
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -I -S -c '
+import sys
+s = sys.argv[1]
+bad = lambda c: ord(c) < 32 or 0x7f <= ord(c) <= 0x9f or 0xdc80 <= ord(c) <= 0xdcff
+sys.stdout.buffer.write("".join("?" if bad(c) else c for c in s).encode("utf-8", "surrogateescape"))
+' "$1" 2>/dev/null && return 0
+    fi
+    # No python3: by bytes, which also turns some UTF-8 text into "?" (safe).
     local LC_ALL=C s="$1"
     s="${s//[[:cntrl:]]/?}"
-    printf '%s' "${s//$'\xc2'[$'\x80'-$'\x9f']/?}"
+    printf '%s' "${s//[$'\x80'-$'\x9f']/?}"
 }
 
 _live_state() {
@@ -79,11 +89,23 @@ _live_state() {
     local s t
     s="$(_stat_state "$DG_PROC/$1/stat")"
     if [[ "$s" == Z ]]; then
+        # Threads cannot be listed while the entry is there: cannot tell
+        # (review finding: the literal glob was skipped and Z read as gone).
+        if [[ -e "$DG_PROC/$1" && ! -r "$DG_PROC/$1/task" ]]; then
+            printf ''
+            return 0
+        fi
         for t in "$DG_PROC/$1/task"/*/stat; do
             [[ "$t" == "$DG_PROC/$1/task/$1/stat" ]] && continue
             [[ -e "$t" ]] || continue
             s="$(_stat_state "$t")"
-            [[ -n "$s" && "$s" != Z && "$s" != X ]] && break
+            if [[ -z "$s" ]]; then
+                # Unreadable while the thread is still there: cannot tell, and
+                # an empty state is never "gone" to a caller (review finding).
+                [[ -e "${t%/stat}" ]] && break
+                s=Z; continue
+            fi
+            [[ "$s" != Z && "$s" != X ]] && break
             s=Z
         done
     fi
@@ -97,7 +119,8 @@ _log() {
 
 cmd_status() {
     if [[ -f "$STATE_FILE" ]]; then
-        python3 - "$STATE_FILE" <<'PY'
+        # The paused list below matters more than the summary: never lose it.
+        python3 - "$STATE_FILE" <<'PY' || echo "the state file at $STATE_FILE could not be read"
 import json, sys
 d = json.load(open(sys.argv[1]))
 print(f"polled {d.get('poll_at', '?')}  mode: {'ACT' if d.get('act', 1) else 'OBSERVE'}")
@@ -302,6 +325,17 @@ cmd_kill() {
     # record.
     rc=0; wg_signal_gen TERM "$pid" "$st" || rc=$?
     (( rc >= 2 )) && { wg_records_unlock "$lk"; _kept "$rc" "$pid" "$comm"; return 1; }
+    if (( rc == 1 )); then
+        # Gone before the signal: nothing was ended here (review finding).
+        if wg_record_drop "$pid" "$st"; then
+            wg_records_unlock "$lk"
+            echo "pid ${pid} (${comm}) is no longer running — record dropped"
+            return 0
+        fi
+        wg_records_unlock "$lk"
+        echo "pid ${pid} (${comm}) is no longer running — its record could not be removed" >&2
+        return 1
+    fi
     if (( rc == 0 )); then
         rc=0; wg_signal_gen CONT "$pid" "$st" || rc=$?
         (( rc >= 2 )) && { wg_records_unlock "$lk"; _kept "$rc" "$pid" "$comm"; return 1; }
