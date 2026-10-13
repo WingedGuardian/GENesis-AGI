@@ -12,8 +12,9 @@ floor read 25,718, so a loss of about 40% of the suite would have passed.
 WHAT IT DOES. The ``collected-floor`` job collects node ids twice, at the same
 checkout path, with ``collect_ids_plugin``: once on the PR tree and once on the
 commit it lands on. This script compares the two sets. A vanished id is
-EXPLAINED only when the change touched its test file (the part of the id
-before the first ``::``). Deleting or editing a test is visible in review; a
+EXPLAINED only when the change touched its test file, which the plugin
+records per id (a file name may itself contain ``::``, so an id is never cut
+apart to find it). Deleting or editing a test is visible in review; a
 test that drops out because of a change somewhere else is the dormancy this job
 exists to catch. That includes a ``conftest.py`` change: ``tests/conftest.py``
 sits above the whole suite, so letting it explain drops below it would switch
@@ -88,17 +89,27 @@ def _load_tree(path: str) -> dict | str:
         value = data.get(key)
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             return f"collection output at {path} has no string list {key!r}"
+    paths = data.get("paths")
+    if not isinstance(paths, dict) or not all(isinstance(paths.get(i), str) for i in data["ids"]):
+        return f"collection output at {path} does not map every id to its file"
     if not data["ids"]:
         return f"collection output at {path} collected 0 tests, so it measures nothing"
     return data
 
 
-def file_of(nodeid: str) -> str:
-    """The test file an id belongs to: everything before the FIRST ``::``.
+def read_changed(path: str) -> set[str] | str:
+    """Paths from ``git diff -z --name-only``, or the reason they cannot be read.
 
-    File paths never contain ``::``; parametrize ids can (``2001:db8::1``).
+    Read as BYTES and split on NUL only: a git path may contain a newline,
+    surrounding spaces or bytes that are not UTF-8, and none of that may be
+    stripped or refused. ``os.fsdecode`` keeps undecodable bytes as surrogates,
+    the convention the plugin's ``os.fspath`` paths follow too.
     """
-    return nodeid.split("::", 1)[0]
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        return f"changed-file list unreadable: {type(exc).__name__}: {exc}"
+    return {os.fsdecode(p) for p in raw.split(b"\0") if p}
 
 
 def _conftest_dirs(changed: set[str]) -> set[str]:
@@ -158,7 +169,9 @@ class _Summary:
         self.used = 0
 
     def add(self, text: str) -> bool:
-        size = len(text.encode("utf-8"))
+        # Sized as it will be written (the summary file escapes surrogates too),
+        # so an undecodable path byte cannot raise here.
+        size = len(text.encode("utf-8", "backslashreplace"))
         if self.used + size > _SUMMARY_BUDGET:
             return False
         self.parts.append(text)
@@ -189,7 +202,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("base", help="collect_ids_plugin JSON for the base tree")
     parser.add_argument("pr", help="collect_ids_plugin JSON for the PR tree")
-    parser.add_argument("--changed", required=True, help="file: one changed path per line")
+    parser.add_argument(
+        "--changed",
+        required=True,
+        help="file: `git diff -z --name-only` output (NUL-separated paths)",
+    )
     body = parser.add_mutually_exclusive_group(required=True)
     body.add_argument("--body-file", help="the PR body, read for a Collected-drop line")
     body.add_argument(
@@ -198,6 +215,11 @@ def main(argv: list[str] | None = None) -> int:
     body.add_argument("--no-body", action="store_true", help="no PR exists for this change")
     parser.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
     args = parser.parse_args(argv)
+    # A path with bytes that are not UTF-8 arrives as surrogates; print it
+    # escaped rather than crash on the one id this job most needs to name.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
 
     base = _load_tree(args.base)
     if isinstance(base, str):
@@ -205,14 +227,9 @@ def main(argv: list[str] | None = None) -> int:
     pr = _load_tree(args.pr)
     if isinstance(pr, str):
         return _refuse(pr)
-    try:
-        # NUL-separated (`git diff -z`, so a non-ASCII path is not C-quoted and
-        # still matches its node id); a newline list is accepted too.
-        raw = Path(args.changed).read_text(encoding="utf-8")
-        changed = {p.strip() for p in re.split(r"[\0\n]", raw)}
-    except OSError as exc:
-        return _refuse(f"changed-file list unreadable: {type(exc).__name__}: {exc}")
-    changed.discard("")
+    changed = read_changed(args.changed)
+    if isinstance(changed, str):
+        return _refuse(changed)
     body_text = None
     if args.body_file:
         try:
@@ -224,7 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     vanished = base_ids - pr_ids
     added = pr_ids - base_ids
     conftest_dirs = _conftest_dirs(changed)
-    unexplained = sorted(i for i in vanished if file_of(i) not in changed)
+    file_of = base["paths"]
+    unexplained = sorted(i for i in vanished if file_of[i] not in changed)
     explained = sorted(vanished - set(unexplained))
     new_errors = sorted(set(pr["errors"]) - set(base["errors"]))
     newly_skipped = sorted(set(pr["skipped"]) - set(base["skipped"]))
@@ -247,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         for nodeid in new_errors:
             print(f"::error::{TAG}: new collection error on the PR tree: {nodeid}")
     if unexplained:
-        files = sorted({file_of(i) for i in unexplained})
+        files = sorted({file_of[i] for i in unexplained})
         for nodeid in unexplained:
             _say(f"unexplained: {nodeid}")
         near = [f for f in files if under_changed_conftest(f, conftest_dirs)]
@@ -299,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
         summary.id_block("Modules now skipped at import", newly_skipped)
         summary.id_block("Explained: removed from files this change touched", explained)
         try:
-            with open(args.summary, "a", encoding="utf-8") as fh:
+            with open(args.summary, "a", encoding="utf-8", errors="backslashreplace") as fh:
                 fh.write("".join(summary.parts))
         except OSError as exc:
             print(f"::warning::{TAG}: could not write the step summary: {exc}")

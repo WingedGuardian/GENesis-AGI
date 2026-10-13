@@ -26,10 +26,13 @@ OK, FAIL, REFUSED = 0, 1, 2
 TAG = "COLLECTED-FLOOR"
 
 
-def tree(path: Path, ids, errors=(), skipped=()) -> Path:
-    path.write_text(
-        json.dumps({"ids": list(ids), "errors": list(errors), "skipped": list(skipped)})
-    )
+def tree(path: Path, ids, errors=(), skipped=(), paths=None) -> Path:
+    # Synthetic ids here never put `::` inside a file name, so their file is
+    # the text before the first `::`; tests that need otherwise pass `paths`.
+    files = {i: i.split("::", 1)[0] for i in ids}
+    files.update(paths or {})
+    body = {"ids": list(ids), "paths": files, "errors": list(errors), "skipped": list(skipped)}
+    path.write_text(json.dumps(body))
     return path
 
 
@@ -37,7 +40,8 @@ def run(tmp_path: Path, base, pr, changed=(), body=None, mode=None, summary=True
     b = base if isinstance(base, Path) else tree(tmp_path / "base.json", base)
     p = pr if isinstance(pr, Path) else tree(tmp_path / "pr.json", pr)
     ch = tmp_path / "changed.txt"
-    ch.write_text("\n".join(changed) + "\n")
+    # `git diff -z` shape: NUL after every path.
+    ch.write_bytes(b"".join(os.fsencode(c) + b"\0" for c in changed))
     args = [sys.executable, str(SCRIPT), str(b), str(p), "--changed", str(ch)]
     if body is not None:
         bf = tmp_path / "body.txt"
@@ -141,20 +145,82 @@ class TestConftest:
         assert r.returncode == OK, r.stdout
 
 
-class TestChangedList:
-    def test_nul_separated_list_with_non_ascii_paths(self, tmp_path):
-        """`git diff -z` output: a non-ASCII path arrives unquoted and matches."""
-        base = [*BASE, "tests/ünï/test_ä.py::test_x"]
-        b = tree(tmp_path / "base.json", base)
+class TestPathIdentity:
+    """A vanished id is matched to its file by the path the plugin recorded,
+    and the changed list is raw `git diff -z` bytes: no name may be cut,
+    stripped or refused on the way."""
+
+    def _check(self, tmp_path, name: str, raw_changed: bytes):
+        nodeid = f"{name}::test_x"
+        b = tree(tmp_path / "base.json", [*BASE, nodeid], paths={nodeid: name})
         p = tree(tmp_path / "pr.json", BASE)
         ch = tmp_path / "changed.txt"
-        ch.write_bytes("src/x.py\0tests/ünï/test_ä.py\0".encode())
+        ch.write_bytes(b"src/x.py\0" + raw_changed + b"\0")
+        summary = tmp_path / "summary.md"
+        # Scrubbed: CI's test job sets GITHUB_STEP_SUMMARY, and the script must
+        # neither write into that job's summary nor pass here only because the
+        # summary path never ran. The summary is exercised explicitly instead.
+        env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
         r = subprocess.run(
-            [sys.executable, str(SCRIPT), str(b), str(p), "--changed", str(ch), "--no-body"],
+            [
+                sys.executable,
+                str(SCRIPT),
+                str(b),
+                str(p),
+                "--changed",
+                str(ch),
+                "--no-body",
+                "--summary",
+                str(summary),
+            ],
             capture_output=True,
             text=True,
+            # Lenient here so a raw undecodable byte reaches the assertion
+            # below instead of failing the harness.
+            errors="replace",
+            env=env,
         )
+        assert "Traceback" not in r.stderr, r.stderr
+        assert summary.exists(), "the summary path did not run"
+        return r
+
+    def test_non_ascii_name(self, tmp_path):
+        name = "tests/ünï/test_ä.py"
+        r = self._check(tmp_path, name, name.encode())
         assert r.returncode == OK, r.stdout + r.stderr
+
+    def test_double_colon_inside_a_file_name(self, tmp_path):
+        name = "tests/test_a::b.py"
+        r = self._check(tmp_path, name, name.encode())
+        assert r.returncode == OK, r.stdout + r.stderr
+
+    def test_newline_inside_a_file_name(self, tmp_path):
+        name = "tests/test_a\nb.py"
+        r = self._check(tmp_path, name, name.encode())
+        assert r.returncode == OK, r.stdout + r.stderr
+
+    def test_surrounding_spaces_are_part_of_the_name(self, tmp_path):
+        name = " tests/test_sp.py "
+        r = self._check(tmp_path, name, name.encode())
+        assert r.returncode == OK, r.stdout + r.stderr
+
+    def test_non_utf8_bytes_round_trip_instead_of_crashing(self, tmp_path):
+        raw = b"tests/test_\xff.py"
+        r = self._check(tmp_path, os.fsdecode(raw), raw)
+        assert r.returncode == OK, r.stdout + r.stderr
+
+    def test_unexplained_non_utf8_name_is_reported_not_crashed(self, tmp_path):
+        name = os.fsdecode(b"tests/test_\xfe.py")
+        r = self._check(tmp_path, name, b"src/other.py")
+        assert r.returncode == FAIL, r.stdout + r.stderr
+        assert "Traceback" not in r.stderr
+        assert "test_\\udcfe.py" in r.stdout
+
+    def test_a_missing_path_map_refuses(self, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text(json.dumps({"ids": BASE, "errors": [], "skipped": []}))
+        r = run(tmp_path, bad, BASE)
+        assert r.returncode == REFUSED and "map every id" in r.stdout
 
 
 class TestEscapeLine:
@@ -326,6 +392,8 @@ class TestPlugin:
             "tests/test_ok.py::test_p[a b]",
             "tests/test_ok.py::test_p[2001:db8::1]",
         ]
+        assert set(data["paths"].values()) == {"tests/test_ok.py"}
+        assert set(data["paths"]) == set(data["ids"])
         assert data["errors"] == ["tests/test_err.py"]
         assert data["skipped"] == ["tests/sub/test_skip.py"]
 
@@ -352,6 +420,23 @@ class TestWorkflowContract:
         assert "scripts/ci/collect_ids_plugin.py" in text and "-p collect_ids_plugin" in text
         assert "scripts/ci/collected_floor.py" in text
         assert (REPO / "scripts/ci/collect_ids_plugin.py").is_file()
+
+    def test_base_collects_under_its_own_dependencies(self):
+        (step,) = [
+            s
+            for s in self._jobs()["collected-floor"]["steps"]
+            if s.get("name") == "Collect test ids on both trees"
+        ]
+        run = step["run"]
+        # The dependency diff is taken BEFORE the switch, the fresh venv is
+        # built and installed AFTER it (so it installs the base's metadata),
+        # and the base is collected with that venv's interpreter.
+        diff = run.index('git diff --quiet "$BASE" "$HEAD_SHA" -- pyproject.toml')
+        checkout = run.index('git checkout --quiet --force --detach "$BASE"')
+        venv = run.index('python -m venv "$RUNNER_TEMP/venv-base"', checkout)
+        install = run.index('"$base_py" -m pip install --quiet -e ".[test]"', venv)
+        assert diff < checkout < venv < install < run.index('collect base "$base_py"')
+        assert "collect pr python" in run and '"$2" -m pytest' in run
 
     def test_job_runs_on_pull_requests_and_pushes_only(self):
         cond = self._jobs()["collected-floor"]["if"]

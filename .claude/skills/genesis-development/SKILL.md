@@ -4949,10 +4949,20 @@ Standard open-source workflow: PRs go directly to the public repo.
   is how coverage disappears.
 - **Adding tests no longer touches `ci.yml`.** The collected-test count is
   checked by the `collected-floor` CI job (#2743), which compares the test ids
-  your change collects against the commit it lands on. It fails only when ids
-  vanish from test files your change did not touch (a `conftest.py` edit does
-  not count as touching the files below it); if such a drop is deliberate, put
-  a line `Collected-drop: <reason>` in the PR body and re-run the job. A branch cut before #2743 that still edits the old
+  your change collects against the commit it lands on. It is a required check
+  once `.github/rulesets/checks.json` is applied (`scripts/apply_rulesets.py`).
+  It goes red (exit 1) when ids vanish from test files your change did not
+  touch (a `conftest.py` edit does not count as touching the files below it),
+  or when your tree has a collection error the base does not. It refuses
+  (exit 2) when it cannot measure: a base it cannot resolve (not a 2-parent
+  merge, or an unreadable pre-push commit), base dependencies that would not
+  install, pytest exiting other than 0, 1 or 5, a collection that did not
+  finish or collected nothing, malformed collection output, an unreadable
+  changed-file list, a PR-body scanner that would not load, or an unexplained
+  drop whose PR body could not be read. Read the
+  step summary first; it names every vanished id. If a drop is deliberate, put
+  a line `Collected-drop: <reason>` in the PR body and re-run the job (or push,
+  if a re-run no longer clears it: #2624). A branch cut before #2743 that still edits the old
   `--min-collected` line resolves that conflict by taking main's side and
   deleting its own floor paragraph. The `--ceiling` (skip count) still lives on
   the dormancy-guard line: raise it only in the commit that adds the skip,

@@ -802,7 +802,7 @@ jobs:
             # The test job's three selection flags; tests/test_scripts/
             # test_collected_floor.py fails if the two lists drift apart.
             COLLECTED_FLOOR_OUT="$out/$1.json" PYTHONPATH="$RUNNER_TEMP" \
-              pytest --collect-only -q -p collect_ids_plugin --continue-on-collection-errors \
+              "$2" -m pytest --collect-only -q -p collect_ids_plugin --continue-on-collection-errors \
               --ignore-glob='**/test_*az*.py' \
               --ignore-glob='**/test_*shim*.py' \
               --ignore=tests/test_ui/ > "$out/$1.log" 2>&1 || rc=$?
@@ -816,11 +816,28 @@ jobs:
             fi
             tail -n 1 "$out/$1.log"
           }
-          collect pr
+          collect pr python
+          # The base must collect under ITS OWN dependencies: under the PR's,
+          # a test the PR drops by removing or capping a dependency would skip
+          # on both trees and never show as vanished. pyproject.toml is the
+          # only dependency declaration, so when it differs between the trees
+          # the base gets a fresh venv (nothing the PR installed can leak in);
+          # when it does not, the installed environment is already the base's.
+          # A failed diff counts as "differs", the safe direction.
+          base_py=python
+          deps_differ=0
+          git diff --quiet "$BASE" "$HEAD_SHA" -- pyproject.toml || deps_differ=1
           # --force: an untracked file in the way of a base file would
           # otherwise stop the switch (measured, git 2.43).
           git checkout --quiet --force --detach "$BASE"
-          collect base
+          if [[ "$deps_differ" == 1 ]]; then
+            echo "collected-floor: pyproject.toml differs; collecting the base in a fresh venv"
+            python -m venv "$RUNNER_TEMP/venv-base"
+            base_py="$RUNNER_TEMP/venv-base/bin/python"
+            "$base_py" -m pip install --quiet -e ".[test]" > "$out/base-install.log" 2>&1 \
+              || { tail -n 30 "$out/base-install.log"; echo "::error::collected-floor: installing the base tree's dependencies failed"; exit 2; }
+          fi
+          collect base "$base_py"
           git checkout --quiet --force --detach "$HEAD_SHA"
       - name: Read the PR body for a Collected-drop line
         id: body
