@@ -1,0 +1,1 @@
+- Awareness posture now recognizes every Incus false spelling and zero-byte swap ceiling while treating unset values as healthy. Guardian INFO alerts distinguish swap repairs from configured swap-ceiling changes and name `swap_ceiling_pct`.

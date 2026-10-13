@@ -3,21 +3,26 @@ package pairs with, the Chromium the fallback launches (patchright's when it is
 installed, else playwright's: ``chromium.launch_package``), and the system
 libraries both need.
 
-Run unattended by ``genesis-browser-stack.service`` through
-``scripts/install_browser_stack.sh``, never from a session: every session's MCP
-server shares the engine cache and the venv. Upstream's installers do the work
+Run through ``scripts/install_browser_stack.sh``: by ``genesis-browser-stack.service``
+(which bootstrap.sh starts and a daily timer retries), inline by install.sh, or by
+an operator; never from a session: every session's MCP server shares the engine
+cache and the venv. Upstream's installers do the work
 (``camoufox fetch``, ``<package> install chromium``, ``playwright install-deps``);
 this module decides when each runs and checks the result, so a re-run is a no-op
 and an interrupted run is finished by the next one.
 
 The outcome is one line, ``browser-stack: engine=… chromium=… libs=…``, and the
-exit code is 0 only when the stack is ready or deliberately skipped.
+exit code is 0 only when the stack is ready, or deliberately skipped (low disk with
+nothing left to install, another run, camoufox older than its pin).
 """
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import importlib
+import json
+import logging
 import math
 import os
 import shlex
@@ -27,12 +32,17 @@ import sys
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from importlib import metadata
 from pathlib import Path
 
-from genesis.browser import chromium, engine
+from genesis.browser import chromium, engine, packages
 from genesis.browser.types import BROWSER_PGREP_PATTERNS
+from genesis.env import genesis_home
 from genesis.hostmetrics.readings import disk_device, existing_parent
+from genesis.util.atomic import atomic_write_text
 from genesis.util.disk_headroom import effective_free_bytes
+
+logger = logging.getLogger(__name__)
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -395,6 +405,7 @@ def _resolve() -> engine.EngineStatus:
 def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.EngineStatus]:
     status = _resolve()
     if status.ready:
+        _forget_failed_fetches()
         return status.detail, True, status
     if status.kind in (engine.NO_PACKAGE, engine.PLAYWRIGHT_MISSING):
         notes.append(status.detail)
@@ -433,12 +444,20 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
                 chmodded = True
             elif fetched:
                 break  # a fresh fetch is still invalid: deleting it again would not help
+            elif _fetched_invalid_recently(directory):
+                # A run of ours fetched it and it stayed invalid: fetching it again
+                # daily (the timer) would repeat a 1.3 GB download forever.
+                notes.append(
+                    f"{directory} was fetched in the last {_RECENT_DAYS} days and stayed "
+                    "invalid, so it is not downloaded again; remove it by hand to retry"
+                )
+                break
             else:
                 if blocked := _unwritable([engine.camoufox_install_dir(), _temp_root()]):
                     notes.append(blocked)
                     return "not writable", False, status
                 if short := _room_to_fetch():  # checked before anything is removed
-                    return f"skipped ({short})", True, status
+                    return f"skipped ({short})", False, status
                 _remove_version(directory)
                 _fetch(run)
                 fetched = True
@@ -447,13 +466,14 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
                 notes.append(blocked)
                 return "not writable", False, status
             if short := _room_to_fetch():
-                return f"skipped ({short})", True, status
+                return f"skipped ({short})", False, status
             _fetch(run)
             fetched = True
         else:
             break
         status = _resolve()
         if status.ready:
+            _forget_failed_fetches()
             notes.append(
                 "the browser_automation capability reflects this at the next genesis-server restart"
             )
@@ -471,7 +491,53 @@ def _engine_step(run: Runner, notes: list[str]) -> tuple[str, bool, engine.Engin
     notes.append(status.detail)
     if status.kind == engine.NOT_INSTALLED:
         return "missing", False, status
+    if fetched and status.kind == engine.INVALID and _under_browsers(status.path):
+        _record_failed_fetch(status.path.parent)
     return ("invalid (after fetch)" if fetched else "invalid"), False, status
+
+
+_RECENT_DAYS = 7
+
+
+def _failed_fetches_path() -> Path:
+    return genesis_home() / "state" / "browser-stack-failed-fetches.json"
+
+
+def _failed_fetches() -> dict[str, float]:
+    """{engine directory: when a fetch of ours left it invalid}. Unreadable reads as
+    none: the worst that costs is one more fetch."""
+    try:
+        data = json.loads(_failed_fetches_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, int | float)}
+
+
+def _fetched_invalid_recently(directory: Path) -> bool:
+    """Whether a fetch of ours left ``directory`` invalid within the last week. Not
+    the age of its version.json: that says the install completed, and an engine
+    damaged since (files removed) needs the repair."""
+    when = _failed_fetches().get(str(directory))
+    # A record from the future (a clock rolled back) is stale, not eternal.
+    return when is not None and 0 <= time.time() - when < _RECENT_DAYS * 86400
+
+
+def _record_failed_fetch(directory: Path) -> None:
+    record = {**_failed_fetches(), str(directory): time.time()}
+    try:
+        _failed_fetches_path().parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(_failed_fetches_path(), json.dumps(record))
+    except OSError as exc:
+        logger.warning("could not record the failed fetch of %s: %s", directory, exc)
+
+
+def _forget_failed_fetches() -> None:
+    try:
+        _failed_fetches_path().unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("could not clear %s: %s", _failed_fetches_path(), exc)
 
 
 def _chmod_tree(directory: Path) -> None:
@@ -567,7 +633,9 @@ def _chromium_step(run: Runner, notes: list[str]) -> tuple[str, bool, list[Path]
         notes.append(blocked)
         return "not writable", False, []
     if due and (short := _short_of_space([], _chromium_writes(root))):
-        return f"skipped ({short})", True, []
+        # A download is due, so the fallback stays unusable: not a success, or the
+        # timer's daily skip would read as one.
+        return f"skipped ({short})", False, []
     # Every install, --force included, first deletes the revisions Playwright thinks
     # unused; one a live browser runs from must stay.
     gc = {"PLAYWRIGHT_SKIP_BROWSER_GC": "1"} if _live_under(root) else {}
@@ -666,6 +734,67 @@ def _libs_step(run: Runner, binaries: list[Path], notes: list[str]) -> tuple[str
     return "missing:" + ",".join(missing), False
 
 
+# Read-only: whether camoufox's add-ons and its pinned fingerprint model are in
+# place (camoufox 0.5.8 fpgen_model.is_pinned, addons manifest.json), which a launch
+# would otherwise install first. Any failure, an older camoufox included, reads as
+# not in place.
+_EXTRAS_PRESENT = (
+    "import os, sys; "
+    "from camoufox.addons import DefaultAddons, get_addon_path; "
+    "from camoufox.fpgen_model import is_pinned; "
+    "sys.exit(0 if is_pinned() and all(os.path.exists(os.path.join("
+    "get_addon_path(a.name), 'manifest.json')) for a in DefaultAddons) else 1)"
+)
+
+
+def _extras_present(run: Runner) -> bool:
+    try:
+        proc = run(
+            [sys.executable, "-c", _EXTRAS_PRESENT],
+            env=_child_env(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=_timeout(),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _already_ready(run: Runner) -> bool:
+    """Whether a run would install nothing: the engine resolves, the Chromium the
+    fallback launches is complete (both builds, marker and executable, where its
+    package says they live), camoufox's add-ons and fingerprint model are in place,
+    and the binaries' system libraries resolve. Read-only: it fetches, installs and
+    writes nothing, so a low-disk run can still tell ready from merely present."""
+    status = _resolve()
+    if not status.ready:
+        return False
+    binaries: list[Path] = []
+    if status.path is not None:
+        binaries += [status.path, status.path.parent / "libxul.so"]
+    package = chromium.launch_package()
+    if package is not None:
+        try:
+            where = chromium.locations(package, run=run)
+        except chromium.ChromiumLayoutUnknown:
+            return False
+        if any(chromium.problem(b, where[b][1]) for b in chromium.BUILDS):
+            return False
+        for build in chromium.BUILDS:
+            if (exe := chromium.executable(build, where[build][1])) is not None:
+                binaries.append(exe)
+    if _pin_capable() and not _extras_present(run):
+        return False
+    binaries = [b for b in binaries if b.is_file()]
+    if binaries:
+        missing, unreadable = _missing_libs(run, binaries)
+        if missing or unreadable:
+            return False
+    return True
+
+
 def provision(run: Runner | None = None) -> Outcome:
     """Bring the browser stack to ready; idempotent. ``run`` defaults to
     ``subprocess.run``, looked up at call time."""
@@ -683,8 +812,10 @@ def provision(run: Runner | None = None) -> Outcome:
         notes.append(f"could not clear stale downloads in {temp}: {exc}")
     short = _short_of_space([root, temp])
     if short:
-        # The timer retries tomorrow; a full disk is not a failed unit.
-        return Outcome(f"skipped ({short})", "skipped", "unchecked", True, notes)
+        # Success only when nothing needed downloading: after the browser packages
+        # moved to a new pin, a skip leaves the browser unusable, and a unit that
+        # reads as succeeded would hide that every day the timer repeats it.
+        return Outcome(f"skipped ({short})", "skipped", "unchecked", _already_ready(run), notes)
     try:
         root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -752,13 +883,150 @@ def _hold_lock() -> bool:
     return True  # held until the process exits
 
 
+def _browser_requirements(pyproject: Path | None = None) -> list:
+    """The ``browser`` extra's requirements that apply on this host (an environment
+    marker that is false here drops one, as pip drops it). From ``pyproject`` when
+    given: the checkout pip was just asked to install, since a pip run that fails
+    leaves the previous ranges in the installed metadata. Otherwise as the installed
+    Genesis records them (its Requires-Dist); a requirement belongs to the extra
+    when its marker holds with ``extra == "browser"`` and not without it (a core one
+    carrying, say, a python_version marker is not)."""
+    from packaging.requirements import Requirement
+
+    if pyproject is not None:
+        import tomllib
+
+        with open(pyproject, "rb") as f:
+            extras = tomllib.load(f)["project"]["optional-dependencies"]
+        reqs = [Requirement(line) for line in extras["browser"]]
+        return [r for r in reqs if r.marker is None or r.marker.evaluate({"extra": "browser"})]
+    dist = next(iter(metadata.packages_distributions().get("genesis", [])), None)
+    found = []
+    for line in (metadata.requires(dist) if dist else None) or []:
+        req = Requirement(line)
+        if (
+            req.marker
+            and req.marker.evaluate({"extra": "browser"})
+            and not req.marker.evaluate({"extra": ""})
+        ):
+            found.append(req)
+    return found
+
+
+def unmet_packages(pyproject: Path | None = None) -> list[str]:
+    """What the installed browser packages lack against the ``browser`` extra:
+    each package installed, at a version its requirement admits, and camoufox
+    carrying its browser pin. Read by bootstrap and install.sh after pip, whose
+    exit status they cannot see."""
+    versions = packages.installed_versions()
+    unmet = [f"{dist} is not installed" for dist in packages.BROWSER_DISTS if not versions[dist]]
+    unreadable = [d for d in packages.BROWSER_DISTS if versions[d] == packages.UNREADABLE]
+    unmet += [
+        f"{dist}'s package metadata is unreadable (a damaged install); reinstall it "
+        f"({engine.PACKAGE_HINT})"
+        for dist in unreadable
+    ]
+    # Ranges, the pin and the import are judged only on a readable version.
+    versions = {d: (None if d in unreadable else v) for d, v in versions.items()}
+    try:
+        requirements = _browser_requirements(pyproject)
+    except ImportError as exc:
+        # Unable to check the ranges is not a range violation; presence and the pin
+        # are still checked. (`packaging` comes with the Genesis venv's own deps.)
+        print(f"browser-stack: version ranges not checked ({exc})", file=sys.stderr)
+        requirements = []
+    except Exception as exc:  # noqa: BLE001 - unreadable pyproject or metadata
+        source = pyproject or "the installed Genesis metadata"
+        unmet.append(
+            f"the browser extra's version ranges could not be read from {source} ({exc!r})"
+        )
+        requirements = []
+    for req in requirements:
+        installed = versions.get(req.name.lower())
+        if installed and not req.specifier.contains(installed, prereleases=True):
+            unmet.append(f"{req.name} {installed} is outside {req.specifier}")
+    if versions["camoufox"]:
+        try:
+            if not _pin_capable():
+                unmet.append(f"camoufox {versions['camoufox']} predates the browser pin (0.5.7)")
+        except engine._UnreadableMetadata as exc:  # e.g. a corrupt RECORD
+            unmet.append(
+                f"camoufox's package metadata is unreadable ({exc.args[-1]!r}); reinstall it "
+                f"({engine.PACKAGE_HINT})"
+            )
+    # pip counts a package as installed while its .dist-info survives, even with
+    # its module files gone; a launch then fails on the import.
+    for dist, module in _LAUNCH_MODULES.items():
+        if versions.get(dist) and (problem := _import_problem(module)):
+            unmet.append(
+                f"{dist} is installed but {module} does not import ({problem}); "
+                f"reinstall it ({engine.PACKAGE_HINT})"
+            )
+    return unmet
+
+
+# What each browser layer imports at launch.
+_LAUNCH_MODULES = {
+    "camoufox": "camoufox.async_api",
+    "playwright": "playwright.async_api",
+    "patchright": "patchright.async_api",
+}
+
+
+def _import_problem(module: str) -> str | None:
+    """Why ``module`` does not import, or None. Run in check-packages' own process,
+    never the server's: importing camoufox imports playwright."""
+    try:
+        importlib.import_module(module)
+    except Exception as exc:  # noqa: BLE001 - any failure means the launch fails too
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def _serves_checkout(
+    repo: Path,
+    *,
+    prefix: str | None = None,
+    base_prefix: str | None = None,
+    module_file: Path | None = None,
+) -> bool:
+    """Whether this interpreter is a venv whose ``genesis`` is ``repo``'s own (an
+    editable install of that checkout), so the wrapper may use it for ``repo``."""
+    import genesis
+
+    prefix = sys.prefix if prefix is None else prefix
+    base_prefix = sys.base_prefix if base_prefix is None else base_prefix
+    module = Path(module_file or genesis.__file__).resolve()
+    return prefix != base_prefix and module.is_relative_to(Path(repo).resolve())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m genesis.browser.provision")
-    parser.add_argument("command", choices=("run", "mark-legacy"), nargs="?", default="run")
+    parser.add_argument(
+        "command",
+        choices=("run", "mark-legacy", "check-packages", "venv-check"),
+        nargs="?",
+        default="run",
+    )
+    parser.add_argument(
+        "--repo", type=Path, help="venv-check: the checkout this interpreter must serve"
+    )
+    parser.add_argument(
+        "--pyproject",
+        type=Path,
+        help="check-packages: the checkout's pyproject.toml (default: installed metadata)",
+    )
     args = parser.parse_args(argv)
     if args.command == "mark-legacy":
         mark_legacy(engine.camoufox_install_dir())
         return 0
+    if args.command == "venv-check":
+        return 0 if args.repo is not None and _serves_checkout(args.repo) else 1
+    if args.command == "check-packages":
+        unmet = unmet_packages(args.pyproject)
+        for problem in unmet:
+            print(f"browser-stack: {problem}")
+        return 1 if unmet else 0
     if os.environ.get("CLAUDECODE"):
         print(
             "browser-stack: refusing to run inside a Claude Code session; every session's "

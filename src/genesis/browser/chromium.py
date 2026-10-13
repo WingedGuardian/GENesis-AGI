@@ -8,12 +8,17 @@ otherwise playwright. Where a package installs Chromium is asked of the package 
 ``PLAYWRIGHT_BROWSERS_PATH``; nothing here recomputes Playwright's registry. A
 build counts as installed only when Playwright's completion marker AND its
 executable are there: the installer skips any directory that has the marker, so a
-lost executable is never repaired by a plain install.
+lost executable is never repaired by a plain install. The launches refuse with
+the provisioning step while their build is not complete (``not_ready_at``,
+``not_ready``); the profile copy reads the version a package launches.
 """
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -21,6 +26,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from genesis.browser import packages
+from genesis.browser.engine import stack_step
 
 # The two builds `install chromium` writes. A headed launch runs chromium, a
 # headless one (Playwright >= 1.49) chromium-headless-shell.
@@ -85,8 +91,28 @@ def locations(
     return found
 
 
+# Where Playwright launches each build from, per machine (its registry's
+# executablePaths for linux-x64 / linux-arm64; patchright 1.62.3 coreBundle.js,
+# READ 2026-10-11). Only that path counts: a cache shared across machines can hold
+# the other platform's build beside it. An unlisted machine accepts any layout.
+_SELECTED = {
+    "x86_64": {
+        "chromium": "chrome-linux64/chrome",
+        "chromium-headless-shell": "chrome-headless-shell-linux64/chrome-headless-shell",
+    },
+    "aarch64": {
+        "chromium": "chrome-linux/chrome",
+        "chromium-headless-shell": "chrome-linux/headless_shell",
+    },
+}
+
+
 def executable(build: str, directory: Path) -> Path | None:
     """The build's executable inside its install directory, or None."""
+    selected = _SELECTED.get(platform.machine(), {}).get(build)
+    if selected is not None:
+        candidate = Path(directory) / selected
+        return candidate if candidate.is_file() and os.access(candidate, os.X_OK) else None
     for name in _EXECUTABLES[build]:
         for candidate in sorted(Path(directory).glob(f"*/{name}")):
             if candidate.is_file() and os.access(candidate, os.X_OK):
@@ -107,4 +133,68 @@ def problem(build: str, directory: Path) -> str | None:
         return f"{build} at {directory} is not installed (its install has not finished)"
     if executable(build, directory) is None:
         return f"{build} at {directory} has no executable (marked complete, files missing)"
+    return None
+
+
+def not_ready_at(package: str, build: str, executable_path: str | Path) -> str | None:
+    """Why ``build`` cannot launch, judged where the launching package itself puts
+    its executable (Playwright's ``browser_type.executable_path``, which applies its
+    host overrides and PLAYWRIGHT_BROWSERS_PATH), or None. The install directory is
+    two levels up: ``<install dir>/<platform dir>/<executable>``. The selected
+    executable itself must be there and executable: a cache shared across platforms
+    can hold another platform's build beside it."""
+    exe = Path(executable_path)
+    directory = exe.parent.parent
+    found = None
+    if not (directory / _MARKER).is_file():
+        found = f"{build} at {directory} is not installed (its install has not finished)"
+    elif not (exe.is_file() and os.access(exe, os.X_OK)):
+        found = f"{build} at {directory} has no launchable {exe.name} where {package} looks"
+    return f"{package}'s {found}; {stack_step()}" if found else None
+
+
+def not_ready(
+    package: str,
+    *,
+    headless: bool = False,
+    run: Callable[..., subprocess.CompletedProcess] | None = None,
+) -> str | None:
+    """``not_ready_at`` for a launch with no driver started yet (the CLI): the
+    package's own dry-run says where the build lives. A package that cannot say is
+    left to the launch, whose own error is the accurate one."""
+    try:
+        where = locations(package, run=run)
+    except ChromiumLayoutUnknown:
+        return None
+    build = "chromium-headless-shell" if headless else "chromium"
+    found = problem(build, where[build][1])
+    return f"{package}'s {found}; {stack_step()}" if found else None
+
+
+class ChromiumNotReady(RuntimeError):
+    """The Chromium fallback's browser is not installed; the message is the repair."""
+
+
+def package_dir(name: str) -> Path | None:
+    """Where the installed package ``name`` lives, or None. Never raises: a stub or
+    broken module reads as absent."""
+    try:
+        spec = importlib.util.find_spec(name)
+        origin = spec.origin if spec is not None else None
+    except Exception:  # noqa: BLE001 - a broken package reads as absent
+        return None
+    return Path(origin).parent if origin else None
+
+
+def browser_version(package: Path) -> str | None:
+    """The Chromium version ``package`` launches (its ``driver/package/browsers.json``
+    ``chromium`` entry's ``browserVersion``), the string a Chromium profile records;
+    None when unreadable. A version, not a location: no host override changes it."""
+    try:
+        data = json.loads((Path(package) / "driver" / "package" / "browsers.json").read_text())
+        for entry in data.get("browsers", []):
+            if entry.get("name") == "chromium":
+                return str(entry.get("browserVersion") or "").strip() or None
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
     return None

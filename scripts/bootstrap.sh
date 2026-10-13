@@ -361,14 +361,14 @@ elif [[ "$PKG_MGR" == "dnf" || "$PKG_MGR" == "yum" ]]; then
     sudo "$PKG_MGR" check-update -q 2>/dev/null; true
 fi
 
-# Python 3.12+ required
+# Python 3.12-3.14 required (upper bound mirrors pyproject's requires-python)
 if command -v python3.12 &>/dev/null; then
     echo "  Python: $(python3.12 --version)"
-elif command -v python3 &>/dev/null && python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
+elif command -v python3 &>/dev/null && python3 -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
     echo "  Python: $(python3 --version)"
 else
     _found_ver=$(python3 --version 2>/dev/null || echo "not found")
-    echo "  Python 3.12+ required (found: $_found_ver) — run install.sh to install it"
+    echo "  Python 3.12-3.14 required (found: $_found_ver) — run install.sh to install it"
     echo "  Or install manually and re-run bootstrap."
     exit 1
 fi
@@ -789,6 +789,13 @@ elif [ "$_ei_rc" -ne 0 ]; then
     echo "  Re-run: $VENV_DIR/bin/pip install -e $GENESIS_ROOT --verbose"
     exit 1
 fi
+# The browser packages, after the core and never fatal: a browser package that
+# cannot install leaves the browser tools refusing with the repair step, not a
+# half-configured machine. The engine and Chromium download later, in
+# genesis-browser-stack.service, started below once the units are rendered.
+echo "  Syncing browser packages..."
+install_browser_extra "$GENESIS_ROOT" "$VENV_DIR" \
+    || echo "  WARNING: browser packages incomplete (non-fatal; the browser tools say what to repair)"
 echo
 
 # --- Skill-security trusted baseline ---
@@ -1481,6 +1488,19 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     if [ -f "$SYSTEMD_USER_DIR/genesis-cc-tmp-align.service" ]; then
         systemctl --user enable genesis-cc-tmp-align.service 2>/dev/null && \
             echo "  + genesis-cc-tmp-align.service enabled (cold-start cc-tmp apply)" || true
+    fi
+
+    # The browser stack's downloads (the Camoufox engine and Chromium the packages
+    # above pin, about 1.5 GB the first time) run in their own oneshot, started
+    # without waiting: never inside bootstrap, nor update.sh's stop window when it
+    # runs bootstrap. A run with nothing to do exits in seconds; the daily timer
+    # enabled above retries a failure.
+    if [ -f "$SYSTEMD_USER_DIR/genesis-browser-stack.service" ]; then
+        if systemctl --user start --no-block genesis-browser-stack.service 2>/dev/null; then
+            echo "  + genesis-browser-stack.service started (journalctl --user -u genesis-browser-stack)"
+        else
+            echo "  WARNING: could not start genesis-browser-stack.service (run scripts/install_browser_stack.sh)"
+        fi
     fi
 else
     echo "  Template directory $SYSTEMD_TEMPLATE_DIR not found — skipping"

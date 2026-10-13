@@ -27,7 +27,6 @@ import contextlib
 import datetime as _dt
 import fcntl
 import hashlib
-import importlib.util
 import json
 import logging
 import os
@@ -38,6 +37,7 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
+from genesis.browser import chromium
 from genesis.util.disk_headroom import tier_after_write
 
 logger = logging.getLogger(__name__)
@@ -123,19 +123,6 @@ def chromium_profile_version(profile: Path) -> str | None:
         return (profile / "Last Version").read_text(encoding="utf-8").strip() or None
     except (OSError, UnicodeDecodeError):
         return None
-
-
-def chromium_engine_version(package_dir: Path) -> str | None:
-    """The Chromium version a Playwright-family package launches: ``browserVersion``
-    of its ``chromium`` entry in ``driver/package/browsers.json``."""
-    try:
-        data = json.loads((Path(package_dir) / "driver" / "package" / "browsers.json").read_text())
-        for entry in data.get("browsers", []):
-            if entry.get("name") == "chromium":
-                return str(entry.get("browserVersion") or "").strip() or None
-    except (OSError, ValueError, AttributeError, TypeError):
-        return None
-    return None
 
 
 # ── is another browser using the profile? ───────────────────────────────────
@@ -435,25 +422,14 @@ def backup_camoufox_profile(profile: Path, binary: Path) -> Path | None:
     )
 
 
-def chromium_package_dir(package: str) -> Path | None:
-    """Where the installed ``package`` (playwright or patchright) lives, or None.
-    Never raises: an unreadable version only means "back it up"."""
-    try:
-        spec = importlib.util.find_spec(package)
-        origin = spec.origin if spec is not None else None
-    except Exception:  # noqa: BLE001 - a stub or broken module reads as unknown
-        return None
-    return Path(origin).parent if origin else None
-
-
 def backup_chromium_profile(profile: Path, package: str) -> Path | None:
     """Copy the Chromium profile before the Chromium that ``package`` (playwright or
     patchright) launches first opens it."""
-    package_dir = chromium_package_dir(package)
+    package_dir = chromium.package_dir(package)
     return backup_before_launch(
         profile,
         chromium_profile_version(profile),
-        chromium_engine_version(package_dir) if package_dir is not None else None,
+        chromium.browser_version(package_dir) if package_dir is not None else None,
         lock_name="SingletonLock",
         read_version=chromium_profile_version,
     )

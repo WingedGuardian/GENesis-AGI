@@ -243,7 +243,7 @@ else
     echo "    WARN  'ss' not found — cannot check for port conflicts"
 fi
 
-# Python 3.12+ — prefer explicit python3.12 binary
+# Python 3.12-3.14 — prefer explicit python3.12 binary
 _install_python312() {
     # Attempt to install Python 3.12 using the available package manager and OS-specific sources.
     if command -v apt-get &>/dev/null; then
@@ -297,17 +297,18 @@ if command -v python3.12 &>/dev/null; then
     echo "    OK    Python $py_version"
 elif command -v python3 &>/dev/null; then
     py_version=$(python3 --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
-    if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
+    # Upper bound mirrors pyproject's requires-python (litellm caps Python <3.15).
+    if python3 -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
         echo "    OK    Python $py_version"
     else
         # Try to install Python 3.12 explicitly
-        echo "    Python $py_version found but 3.12+ required — installing python3.12..."
+        echo "    Python $py_version found but 3.12-3.14 required — installing python3.12..."
         _install_python312 || true
         if command -v python3.12 &>/dev/null; then
             py_version=$(python3.12 --version 2>&1 | grep -oP '\d+\.\d+' || echo "3.12")
             echo "    OK    Python $py_version (installed)"
         else
-            echo "    FAIL  Python 3.12+ required, found $py_version"
+            echo "    FAIL  Python 3.12-3.14 required, found $py_version"
             if command -v apt-get &>/dev/null; then
                 echo "    Install manually:"
                 echo "      Ubuntu: sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt-get install python3.12 python3.12-venv"
@@ -747,12 +748,12 @@ if [ ! -d "$VENV_PATH" ] || [ ! -x "$VENV_PATH/bin/python" ] || [ ! -x "$VENV_PA
     echo "    Creating venv at $VENV_PATH (using $PYTHON_BIN)..."
     "$PYTHON_BIN" -m venv "$VENV_PATH"
     echo "    + venv created"
-    # Verify venv Python is 3.12+ (defense-in-depth — pre-flight should catch this)
+    # Verify venv Python is 3.12-3.14 (defense-in-depth — pre-flight should catch this)
     _venv_pyver=$("$VENV_PATH/bin/python" --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
-    if ! "$VENV_PATH/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
-        echo "    WARNING: venv Python is $_venv_pyver but Genesis requires 3.12+"
+    if ! "$VENV_PATH/bin/python" -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
+        echo "    WARNING: venv Python is $_venv_pyver but Genesis requires 3.12-3.14"
         echo "    Install Python 3.12 and re-run this script."
-        setup_warn "venv Python is $_venv_pyver but Genesis requires 3.12+"
+        setup_warn "venv Python is $_venv_pyver but Genesis requires 3.12-3.14"
     fi
 fi
 
@@ -897,6 +898,7 @@ fi
 # ══════════════════════════════════════════════════════════════
 echo "  [6/$TOTAL_STEPS] Installing Genesis package..."
 
+_genesis_installed=0  # the browser stack step (step 11) needs Genesis importable
 if [ -d "$VENV_PATH" ]; then
     # Worktree guard + editable install + import verification — shared with
     # bootstrap.sh so the guard can't drift between the two entry points.
@@ -907,6 +909,14 @@ if [ -d "$VENV_PATH" ]; then
     case $_ei_rc in
         0)
             echo "    + Genesis installed in editable mode"
+            _genesis_installed=1
+            # The browser packages, after the core and never fatal (see
+            # install_browser_extra); their engine and Chromium download in step 11.
+            if install_browser_extra "$REPO_DIR" "$VENV_PATH" | sed 's/^/    /'; then
+                echo "    + browser packages installed"
+            else
+                setup_warn "browser packages incomplete (see above; re-run scripts/bootstrap.sh)"
+            fi
             ;;
         1)
             # Blocked (worktree) — guard already printed the reason; the
@@ -1419,6 +1429,31 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
                 echo "    + $timer_name enabled + started" || true
         fi
     done
+fi
+
+# The browser stack: the Camoufox engine and the Chromium the browser packages pin,
+# and their system libraries. Inline here, unlike bootstrap.sh, which starts it as a
+# unit: a fresh install has no browser running and the user is present, and a sudo
+# credential this run already cached lets the script's `sudo -n` install missing
+# libraries. Inside a Claude Code session the provisioner refuses to run, so the
+# unit runs it instead, as bootstrap.sh does.
+if [ "$_genesis_installed" != "1" ]; then
+    echo "    Browser stack: skipped (the Genesis package step above did not complete)"
+elif [ -n "${CLAUDECODE:-}" ]; then
+    if systemctl --user start --no-block genesis-browser-stack.service 2>/dev/null; then
+        echo "    + genesis-browser-stack.service started (journalctl --user -u genesis-browser-stack);"
+        echo "      unattended, it reports missing system libraries with the command to run"
+    else
+        setup_warn "browser stack not started (run scripts/install_browser_stack.sh from a terminal)"
+    fi
+elif echo "    Browser stack: Camoufox engine and Chromium, about 1.5 GB the first time;" \
+    && echo "    no progress is shown while it downloads..." \
+    && VENV_PATH="$VENV_PATH" GENESIS_BROWSER_STACK_WAIT_S=7200 \
+        bash "$SCRIPT_DIR/install_browser_stack.sh" 2>&1 | sed 's/^/    /'; then
+    # Exit 0 is ready, or deliberately skipped (low disk, another run): its line says which.
+    echo "    + browser stack step done (its browser-stack: line above says what it did)"
+else
+    setup_warn "browser stack not ready (see its browser-stack: line above; re-run scripts/install_browser_stack.sh)"
 fi
 
 # Enable the cc-tmp cold-start apply SERVICE (WantedBy=default.target, not a
