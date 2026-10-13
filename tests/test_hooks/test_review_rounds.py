@@ -1284,3 +1284,59 @@ def test_commits_say_when_ancestry_is_unknown():
     assert [c["parents"] for c in bare["commits"]] == [None, None]
     dag = _ev(head=H2, commits=_dag(H1, H2))
     assert [c["parents"] for c in dag["commits"]] == [[], [H1]]
+
+
+@pytest.mark.parametrize("listed", ["a1-first", "a2-first"])
+def test_a_merge_of_two_round_lines_has_no_round_head_whatever_the_list_order(listed):
+    """A late review on a merge whose two parent lines both opened a round has
+    no newest round ancestor; the date-ordered list must not pick one."""
+    base, a1, a2, merge, tip = H1, H2, H3, H4, H5
+    rows = {
+        base: {"sha": base, "parents": []},
+        a1: {"sha": a1, "parents": [base]},
+        a2: {"sha": a2, "parents": [base]},
+        merge: {"sha": merge, "parents": [a1, a2]},
+        tip: {"sha": tip, "parents": [merge]},
+    }
+    order = [base, a1, a2] if listed == "a1-first" else [base, a2, a1]
+    got = _ev(
+        head=tip,
+        commits=[rows[s] for s in (*order, merge, tip)],
+        reviews=(
+            _rv(CODEX, a1, P2, when=T1),
+            _rv(CODEX, a2, P2, when=T1),
+            _rv(CODEX, tip, when=T2, body="Looks good."),
+            _rv(DEVIN, merge, _devin("🟡"), when=T3),
+        ),
+    )
+    assert got["count"] == 2
+    assert [f["round_head"] for f in got["findings"] if f["head"] == merge] == [None]
+
+
+@pytest.mark.parametrize("state", ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"])
+def test_a_bodyless_approval_still_marks_its_head(state):
+    """Only a COMMENTED review can be a reply wrapper: an approval with no text
+    is a review of the head, so a later finding on its ancestor is late."""
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(
+            _rv(RABBIT, H2, when=T1, state=state),  # no body, no comment
+            _rv(DEVIN, H1, _devin("🟡"), when=T2),
+        ),
+    )
+    assert got["count"] == 0
+    assert (H2, _z(T1)) in [(m["head"], m["at"]) for m in got["marks"]]
+
+
+@pytest.mark.parametrize("state", [None, "SOMETHING_NEW"])
+def test_a_bodyless_review_of_unknown_state_marks_nothing(state):
+    """A state that is not certainly a review reads as a wrapper: marking less
+    can only raise the count, never lower it."""
+    row = {**_rv(RABBIT, H2, when=T1), "state": state}
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(row, _rv(DEVIN, H1, _devin("🟡"), when=T2)),
+    )
+    assert got["count"] == 1

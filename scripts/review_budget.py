@@ -424,8 +424,8 @@ def evaluate_evidence(
     2026-10-12). Every review MARKS the head it reviewed, clean or not; a finding
     review that lands on a head after one of that head's descendants was marked
     is a LATE review of an earlier round. It opens no round, and is listed in
-    ``findings`` with the round it belongs to (``round_head``) so its findings
-    stay owed. Ancestry comes from each commit's ``parents`` when the caller
+    ``findings`` with the round it belongs to (``round_head``), for the round
+    reflection to owe (issue #3301; nothing owes them yet). Ancestry comes from each commit's ``parents`` when the caller
     passes ``commit_heads`` entries as ``{"sha", "parents"}``; a bare SHA knows
     no ancestry, so it never makes a review late.
 
@@ -595,9 +595,14 @@ def evaluate_evidence(
             # wrapper GitHub makes for a reply inside a thread: nobody reviewed
             # the head it names, so it marks nothing.
             # A row with no comment list at all reads the same way: marking less
-            # can only make the count larger.
-            reply_only = (raw_tops is None or (isinstance(raw_tops, list) and not raw_tops)) and (
-                raw_body is None or (isinstance(raw_body, str) and not raw_body.strip())
+            # can only make the count larger. Only a COMMENTED review (or one
+            # whose state is missing or unknown) can be a wrapper: an approval,
+            # a change request or a dismissed review with no text is still a
+            # review of the head.
+            reply_only = (
+                item.get("state") not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+                and (raw_tops is None or (isinstance(raw_tops, list) and not raw_tops))
+                and (raw_body is None or (isinstance(raw_body, str) and not raw_body.strip()))
             )
             if not reply_only:
                 mark(sha, when, item.get("submitted_at"))
@@ -833,8 +838,8 @@ def evaluate_evidence(
     # (and by the commit gate once it enforces reflections; until then they are
     # reported, never enforced). The newest round only, and only while it is
     # open. A LATE review (one that opened no round, above) never lands here: it
-    # is listed in ``findings`` with the round it belongs to, for the reader
-    # that owes late findings.
+    # is listed in ``findings`` with the round it belongs to. Nothing owes
+    # those keys yet; the round reflection reader will (issue #3301).
     seen: dict[str, None] = {}  # ordered and linear, however many keys arrive
     keys_known = True
     if round_state == "open":
@@ -861,7 +866,10 @@ def evaluate_evidence(
 
     # Every post-cutover finding review and the round it belongs to: its own
     # head's round, else (a late review of a head that never opened one) the
-    # newest round head it descends from, else None. ``late_state`` says whether
+    # newest round head it descends from, else None. None means either no
+    # earlier round, or no single newest one (the two sides of a merge both
+    # opened rounds); a reader must never take it as owed by nobody.
+    # ``late_state`` says whether
     # every finding OUTSIDE the open round could be keyed; it is kept apart from
     # ``reflection_keys`` so an unkeyable finding there cannot make a known open
     # round unknown. Times here are normalised ISO-8601 (``+00:00``), so a
@@ -869,14 +877,12 @@ def evaluate_evidence(
     def round_of(sha: str) -> str | None:
         if sha in round_heads:
             return sha
-        older = [r for r in ancestors(sha) if r in round_heads]
-        # The newest by ANCESTRY: the one with the most of the others behind it.
-        # List order is by date, not by parent, so it cannot decide this.
-        return (
-            max(older, key=lambda r: (len(ancestors(r).intersection(older)), order[r]))
-            if older
-            else None
-        )
+        older = {r for r in ancestors(sha) if r in round_heads}
+        # The newest by ANCESTRY: the one round head every other candidate is an
+        # ancestor of. Two incomparable candidates (the two sides of a merge) have
+        # no newest, and list order (by date) cannot pick one: None, never a guess.
+        newest = [r for r in older if older - {r} <= ancestors(r)]
+        return newest[0] if len(newest) == 1 else None
 
     open_head = rounds[-1]["head"] if round_state == "open" else None
     findings_out: list[dict[str, Any]] = []
@@ -1553,7 +1559,9 @@ def _evaluate_pr_inner(
     final_head = os.environ.get("_TEST_REVIEW_BUDGET_HEAD_AFTER")
     if final_head is None and os.environ.get("_TEST_REVIEW_BUDGET_HEAD") is not None:
         final_head = test_head
-    mutable = [item for item in ("reviews", "comments") if item in needed]
+    # The commit graph is re-read too: it decides which reviews are late, and the
+    # PR's commit list can change (a base branch moving) while its head does not.
+    mutable = [item for item in ("reviews", "comments", "commits") if item in needed]
     second: dict[str, Any] | None = None
     if final_head is None or mutable:
         second, error = snapshot(mutable)

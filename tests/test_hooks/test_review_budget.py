@@ -1276,3 +1276,22 @@ def test_a_commit_node_without_its_parents_is_malformed(monkeypatch):
     serve = _graphql_server(files=_FILES, commits=[{"commit": {"oid": H5}}])
     got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
     assert got["status"] == "unknown" and "commits_malformed" in got["errors"], got
+
+
+def test_a_commit_graph_that_changes_between_the_reads_is_unknown(monkeypatch):
+    """The graph decides which reviews are late, so it is re-read with the other
+    mutable evidence; a PR commit list that moved while the head did not (a
+    base branch moving under a stacked PR) must not be evaluated from either read."""
+    _no_seams(monkeypatch)
+    first = _graphql_server(files=_FILES, commits=_linear_commits(H3, H4, H5))
+    second = _graphql_server(files=_FILES, commits=_linear_commits(H4, H5))
+    seen = []
+
+    def serve(argv, *, timeout):
+        seen.append(next(a for a in argv if a.startswith("query=")))
+        return (first if len(seen) == 1 else second)(argv, timeout=timeout)
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "unknown", got
+    assert "evidence_changed_during_evaluation" in got["errors"], got
+    assert " commits(first: 100" in seen[1]  # the re-read selects the graph
