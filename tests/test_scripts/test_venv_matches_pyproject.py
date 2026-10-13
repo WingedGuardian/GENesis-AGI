@@ -3,7 +3,7 @@
 It runs under the test interpreter (the venv it would answer for) with a fake
 installed project on PYTHONPATH, so every case is about metadata this test
 wrote. Exit codes: 0 match, 1 differs (a reinstall clears it), 2 cannot tell,
-3 the interpreter is older than the incoming requires-python.
+3 the interpreter is outside the incoming requires-python (too old or too new).
 """
 
 from __future__ import annotations

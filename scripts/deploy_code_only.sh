@@ -449,7 +449,8 @@ fi
 # Does the venv match the pyproject.toml read from stdin (<what> names that
 # tree)? A code-only deploy never reinstalls, so any difference goes to the
 # command in <remedy>, which does. Exit 3 is the one difference a reinstall
-# cannot fix: this interpreter is older than the incoming requires-python.
+# cannot fix: this interpreter is outside the incoming requires-python (too old,
+# or too new for its upper bound).
 _deps_ok() {
     local what="$1" remedy="$2" out rc=0
     out="$("$VENV_DIR/bin/python" -P "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
