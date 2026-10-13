@@ -1640,3 +1640,34 @@ def test_check_packages_reports_unreadable_camoufox_metadata(env, monkeypatch, c
     assert provision.main(["check-packages"]) == 1
     out = capsys.readouterr().out
     assert "camoufox" in out and "unreadable" in out and "reinstall" in out
+
+
+def test_check_packages_reports_an_unreadable_record(env, monkeypatch, capsys):
+    """METADATA readable, RECORD corrupt: the version reads, the pin probe (which
+    reads the file list) raises."""
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+
+    def pin_capable():
+        raise engine._UnreadableMetadata("camoufox", UnicodeDecodeError("utf-8", b"\xff", 0, 1, "x"))
+
+    monkeypatch.setattr(provision, "_pin_capable", pin_capable)
+    assert provision.main(["check-packages"]) == 1
+    out = capsys.readouterr().out
+    assert "camoufox" in out and "unreadable" in out and "reinstall" in out
+
+
+def test_venv_check_accepts_only_a_venv_serving_this_checkout(tmp_path):
+    repo = tmp_path / "repo"
+    module = repo / "src" / "genesis" / "__init__.py"
+    other = tmp_path / "other" / "src" / "genesis" / "__init__.py"
+    assert provision._serves_checkout(repo, prefix="/v", base_prefix="/usr", module_file=module)
+    assert not provision._serves_checkout(
+        repo, prefix="/v", base_prefix="/usr", module_file=other
+    )
+    assert not provision._serves_checkout(
+        repo, prefix="/usr", base_prefix="/usr", module_file=module
+    )

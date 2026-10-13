@@ -92,7 +92,24 @@ install_browser_extra() {
     # cache holding a pre-0.5 engine unless the cache carries .0.5_FLAG (the
     # browser-stack unit marks it itself). Best effort: a fresh install has no cache.
     "$venv_path/bin/python" -m genesis.browser.provision mark-legacy 2>/dev/null || true
-    editable_install_guarded "$repo_dir" "$venv_path" browser || return 1
+    # Under the browser-stack unit's own lock: pip replacing camoufox, playwright or
+    # patchright while a provisioning run uses them can mix pins mid-install. Waits
+    # up to GENESIS_BROWSER_STACK_WAIT_S (default 7200, the project's step floor).
+    local lock_dir="${GENESIS_HOME:-$HOME/.genesis}/locks"
+    local wait_s="${GENESIS_BROWSER_STACK_WAIT_S:-7200}"
+    if mkdir -p "$lock_dir" 2>/dev/null && command -v flock >/dev/null 2>&1; then
+        if ! (
+            flock -w "$wait_s" 9 || {
+                echo "browser-stack: a provisioning run still holds its lock after ${wait_s}s; browser packages not changed" >&2
+                exit 75
+            }
+            editable_install_guarded "$repo_dir" "$venv_path" browser
+        ) 9>"$lock_dir/browser-stack.lock"; then
+            return 1
+        fi
+    else
+        editable_install_guarded "$repo_dir" "$venv_path" browser || return 1
+    fi
     # The checkout's ranges, not the installed metadata a failed pip left behind.
     "$venv_path/bin/python" -m genesis.browser.provision check-packages --pyproject "$repo_dir/pyproject.toml"
 }

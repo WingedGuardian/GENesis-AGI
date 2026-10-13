@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -90,8 +91,28 @@ def locations(
     return found
 
 
+# Where Playwright launches each build from, per machine (its registry's
+# executablePaths for linux-x64 / linux-arm64; patchright 1.62.3 coreBundle.js,
+# READ 2026-10-11). Only that path counts: a cache shared across machines can hold
+# the other platform's build beside it. An unlisted machine accepts any layout.
+_SELECTED = {
+    "x86_64": {
+        "chromium": "chrome-linux64/chrome",
+        "chromium-headless-shell": "chrome-headless-shell-linux64/chrome-headless-shell",
+    },
+    "aarch64": {
+        "chromium": "chrome-linux/chrome",
+        "chromium-headless-shell": "chrome-linux/headless_shell",
+    },
+}
+
+
 def executable(build: str, directory: Path) -> Path | None:
     """The build's executable inside its install directory, or None."""
+    selected = _SELECTED.get(platform.machine(), {}).get(build)
+    if selected is not None:
+        candidate = Path(directory) / selected
+        return candidate if candidate.is_file() and os.access(candidate, os.X_OK) else None
     for name in _EXECUTABLES[build]:
         for candidate in sorted(Path(directory).glob(f"*/{name}")):
             if candidate.is_file() and os.access(candidate, os.X_OK):

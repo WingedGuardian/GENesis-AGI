@@ -195,7 +195,7 @@ def _path_python(tmp_path, *, genesis_venv):
     check_rc = 0 if genesis_venv else 1
     py.write_text(
         "#!/bin/sh\n"
-        f'if [ "$1" = "-c" ]; then exit {check_rc}; fi\n'
+        f'if [ "$3" = "venv-check" ]; then exit {check_rc}; fi\n'
         'echo "$@" > "$STUB_LOG"\n'
         f'touch "{bindir.parent}/ran"\n'
     )

@@ -43,12 +43,11 @@ _log() { printf 'browser-stack: %s\n' "$1"; }
 # A unit rendered before it carried VENV_PATH (install.sh never re-renders an
 # existing unit) names a custom venv only in its PATH, whose first entry is that
 # venv's bin. Without VENV_PATH, the python found there wins over the checkout
-# .venv (which may be stale), but only a venv that imports Genesis.
+# .venv (which may be stale), but only a venv whose Genesis is this checkout's.
 if [ -z "${VENV_PATH:-}" ]; then
     _path_py="$(command -v python 2>/dev/null)" || _path_py=""
-    if [ -n "$_path_py" ] && "$_path_py" -c \
-        'import sys, genesis.browser.provision; sys.exit(sys.prefix == sys.base_prefix)' \
-        </dev/null >/dev/null 2>&1; then
+    if [ -n "$_path_py" ] && "$_path_py" -m genesis.browser.provision venv-check \
+        --repo "$REPO_DIR" </dev/null >/dev/null 2>&1; then
         VENV_PY="$_path_py"
     fi
 fi

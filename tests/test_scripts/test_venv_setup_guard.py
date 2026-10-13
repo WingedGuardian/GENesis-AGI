@@ -19,6 +19,7 @@ not one.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -166,12 +167,17 @@ def _recording_venv(tmp_path: Path, *, check_rc: int = 0) -> tuple[Path, Path]:
     return venv, log
 
 
-def _install_browser_extra(tmp_path: Path, venv: Path) -> subprocess.CompletedProcess:
+def _install_browser_extra(
+    tmp_path: Path, venv: Path, env_extra: dict | None = None
+) -> subprocess.CompletedProcess:
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
     _git("init", "-q", cwd=repo)
     script = f'set -euo pipefail; source "{_LIB}"; install_browser_extra "{repo}" "{venv}"'
-    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    env = {**os.environ, "GENESIS_HOME": str(tmp_path / "gh"), **(env_extra or {})}
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=120, env=env
+    )
 
 
 def test_browser_extra_marks_the_cache_then_installs_then_checks(tmp_path: Path) -> None:
@@ -197,3 +203,21 @@ def test_browser_extra_reports_what_pip_left_out(tmp_path: Path) -> None:
     res = _install_browser_extra(tmp_path, venv)
     assert res.returncode == 1
     assert "patchright is not installed" in res.stdout
+
+
+def test_browser_extra_waits_for_a_running_provisioner(tmp_path: Path) -> None:
+    """pip replacing camoufox/playwright/patchright under a running browser-stack
+    unit can mix pins mid-install: the upgrade takes the provisioner's lock."""
+    import fcntl
+
+    venv, log = _recording_venv(tmp_path)
+    lock = tmp_path / "gh" / "locks" / "browser-stack.lock"
+    lock.parent.mkdir(parents=True)
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        res = _install_browser_extra(
+            tmp_path, venv, env_extra={"GENESIS_BROWSER_STACK_WAIT_S": "1"}
+        )
+    assert res.returncode != 0
+    assert not any(c.startswith("pip install") for c in log.read_text().splitlines())
+    assert "browser-stack" in res.stdout + res.stderr

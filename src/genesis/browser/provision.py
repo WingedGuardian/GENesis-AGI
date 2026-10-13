@@ -945,8 +945,15 @@ def unmet_packages(pyproject: Path | None = None) -> list[str]:
         installed = versions.get(req.name.lower())
         if installed and not req.specifier.contains(installed, prereleases=True):
             unmet.append(f"{req.name} {installed} is outside {req.specifier}")
-    if versions["camoufox"] and not _pin_capable():
-        unmet.append(f"camoufox {versions['camoufox']} predates the browser pin (0.5.7)")
+    if versions["camoufox"]:
+        try:
+            if not _pin_capable():
+                unmet.append(f"camoufox {versions['camoufox']} predates the browser pin (0.5.7)")
+        except engine._UnreadableMetadata as exc:  # e.g. a corrupt RECORD
+            unmet.append(
+                f"camoufox's package metadata is unreadable ({exc.args[-1]!r}); reinstall it "
+                f"({engine.PACKAGE_HINT})"
+            )
     # pip counts a package as installed while its .dist-info survives, even with
     # its module files gone; a launch then fails on the import.
     for dist, module in _LAUNCH_MODULES.items():
@@ -976,10 +983,33 @@ def _import_problem(module: str) -> str | None:
     return None
 
 
+def _serves_checkout(
+    repo: Path,
+    *,
+    prefix: str | None = None,
+    base_prefix: str | None = None,
+    module_file: Path | None = None,
+) -> bool:
+    """Whether this interpreter is a venv whose ``genesis`` is ``repo``'s own (an
+    editable install of that checkout), so the wrapper may use it for ``repo``."""
+    import genesis
+
+    prefix = sys.prefix if prefix is None else prefix
+    base_prefix = sys.base_prefix if base_prefix is None else base_prefix
+    module = Path(module_file or genesis.__file__).resolve()
+    return prefix != base_prefix and module.is_relative_to(Path(repo).resolve())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m genesis.browser.provision")
     parser.add_argument(
-        "command", choices=("run", "mark-legacy", "check-packages"), nargs="?", default="run"
+        "command",
+        choices=("run", "mark-legacy", "check-packages", "venv-check"),
+        nargs="?",
+        default="run",
+    )
+    parser.add_argument(
+        "--repo", type=Path, help="venv-check: the checkout this interpreter must serve"
     )
     parser.add_argument(
         "--pyproject",
@@ -990,6 +1020,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "mark-legacy":
         mark_legacy(engine.camoufox_install_dir())
         return 0
+    if args.command == "venv-check":
+        return 0 if args.repo is not None and _serves_checkout(args.repo) else 1
     if args.command == "check-packages":
         unmet = unmet_packages(args.pyproject)
         for problem in unmet:
