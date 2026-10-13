@@ -920,7 +920,12 @@ def evaluate_evidence(
         "reflection_keys": "ok" if keys_known else "unknown",
         "reviewers_reported": sorted(reported.get(head, set())),
         "expected_reviewers": expected,
-        "commits": [{"sha": sha, "parents": list(parents_of.get(sha, ()))} for sha in commits],
+        # ``parents`` is None where the caller gave no ancestry, so a reader can
+        # tell "unknown" from a root commit (``[]``).
+        "commits": [
+            {"sha": sha, "parents": list(parents_of[sha]) if sha in parents_of else None}
+            for sha in commits
+        ],
         "marks": [{"head": sha, "at": _iso(when, raw)} for sha, when, raw in marks],
         "findings": findings_out,
         "late_state": "ok" if late_known else "unknown",

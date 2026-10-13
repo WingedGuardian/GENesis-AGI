@@ -1261,3 +1261,26 @@ def test_round_head_is_chosen_by_ancestry_not_by_list_order():
     )
     assert got["count"] == 2
     assert [f["round_head"] for f in got["findings"]] == [H1, H2, H2]
+
+
+def test_a_clean_review_before_the_cutover_still_marks_its_head():
+    """Owner ruling: ANY review marks the head it reviewed, whenever it landed.
+    A finding on an ancestor of a head reviewed before the cutover is late."""
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(
+            _rv(DEVIN, H2, when=BEFORE, body="No issues found."),
+            _rv(DEVIN, H1, _devin("🟡"), when=T1),
+        ),
+    )
+    assert got["count"] == 0
+    assert [f["round_head"] for f in got["findings"]] == [None]
+
+
+def test_commits_say_when_ancestry_is_unknown():
+    """A bare SHA carries no ancestry: emitted as None, never as a root's []."""
+    bare = _ev(head=H2, commits=(H1, H2))
+    assert [c["parents"] for c in bare["commits"]] == [None, None]
+    dag = _ev(head=H2, commits=_dag(H1, H2))
+    assert [c["parents"] for c in dag["commits"]] == [[], [H1]]
