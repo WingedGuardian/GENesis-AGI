@@ -1061,3 +1061,22 @@ def test_the_local_manifest_is_rewritten_when_extras_are_unset(backup_env, tmp_p
     assert manifest.read_text() == "genesis-snapshot 1\n"
     assert not list((manifest.parent / "extra").glob("*.tar.gpg"))
     assert not (manifest.parent / ".extra-manifest.tmp").exists()
+
+
+def test_smb_offsite_refuses_a_name_that_could_leave_its_quotes(backup_env):
+    """A payload name holding ';' (or a quote) never reaches `smbclient -c`: its put
+    is refused, the snapshot is not COMPLETE (tier2 partial), and the run goes on."""
+    cc_id = str(backup_env["gd"]).replace("/", "-")
+    mem_dir = backup_env["home"] / ".claude" / "projects" / cc_id / "memory"
+    (mem_dir / "semi;colon.md").write_text("x\n")
+    (_repo(backup_env) / "creds").mkdir(exist_ok=True)
+    (_repo(backup_env) / "creds" / 'q"uote.gpg').write_bytes(b"x")
+    proc, cmds = _run(backup_env)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "semi;colon" not in cmds and 'q"uote' not in cmds, cmds
+    assert "refusing smb path" in proc.stderr
+    assert "off-site upload failed for memory/semi;colon.md.gpg" in proc.stdout, proc.stdout
+    assert 'off-site upload failed for creds/q"uote.gpg' in proc.stdout, proc.stdout
+    status = json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
+    assert status["tier2_status"] == "partial", status
+    assert not any("COMPLETE" in ln and "put" in ln for ln in cmds.splitlines()), cmds

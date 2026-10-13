@@ -14,9 +14,11 @@ ExecStart=/bin/bash "__REPO_DIR__/scripts/install_browser_stack.sh"
 # module cuts every step's timeout to what is left of this, so steps that each
 # stay inside their own limit cannot together be killed mid-install.
 TimeoutStartSec=28800
-Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin"
 # install_browser_stack.sh runs ${VENV_PATH:-<repo>/.venv}/bin/python.
-Environment=VENV_PATH=__VENV__
+Environment="VENV_PATH=__VENV__"
+# No environment file: install_browser_stack.sh reads the browser settings it needs
+# from secrets.env by name, so no other secret reaches the downloaders.
 StandardOutput=journal
 StandardError=journal
 # Writes only under $HOME: the engine cache, Playwright's browser cache, the

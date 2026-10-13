@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -90,8 +91,28 @@ def locations(
     return found
 
 
+# Where Playwright launches each build from, per machine (its registry's
+# executablePaths for linux-x64 / linux-arm64; patchright 1.62.3 coreBundle.js,
+# READ 2026-10-11). Only that path counts: a cache shared across machines can hold
+# the other platform's build beside it. An unlisted machine accepts any layout.
+_SELECTED = {
+    "x86_64": {
+        "chromium": "chrome-linux64/chrome",
+        "chromium-headless-shell": "chrome-headless-shell-linux64/chrome-headless-shell",
+    },
+    "aarch64": {
+        "chromium": "chrome-linux/chrome",
+        "chromium-headless-shell": "chrome-linux/headless_shell",
+    },
+}
+
+
 def executable(build: str, directory: Path) -> Path | None:
     """The build's executable inside its install directory, or None."""
+    selected = _SELECTED.get(platform.machine(), {}).get(build)
+    if selected is not None:
+        candidate = Path(directory) / selected
+        return candidate if candidate.is_file() and os.access(candidate, os.X_OK) else None
     for name in _EXECUTABLES[build]:
         for candidate in sorted(Path(directory).glob(f"*/{name}")):
             if candidate.is_file() and os.access(candidate, os.X_OK):
@@ -119,8 +140,16 @@ def not_ready_at(package: str, build: str, executable_path: str | Path) -> str |
     """Why ``build`` cannot launch, judged where the launching package itself puts
     its executable (Playwright's ``browser_type.executable_path``, which applies its
     host overrides and PLAYWRIGHT_BROWSERS_PATH), or None. The install directory is
-    two levels up: ``<install dir>/<platform dir>/<executable>``."""
-    found = problem(build, Path(executable_path).parent.parent)
+    two levels up: ``<install dir>/<platform dir>/<executable>``. The selected
+    executable itself must be there and executable: a cache shared across platforms
+    can hold another platform's build beside it."""
+    exe = Path(executable_path)
+    directory = exe.parent.parent
+    found = None
+    if not (directory / _MARKER).is_file():
+        found = f"{build} at {directory} is not installed (its install has not finished)"
+    elif not (exe.is_file() and os.access(exe, os.X_OK)):
+        found = f"{build} at {directory} has no launchable {exe.name} where {package} looks"
     return f"{package}'s {found}; {stack_step()}" if found else None
 
 

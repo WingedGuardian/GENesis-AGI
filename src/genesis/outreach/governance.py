@@ -102,6 +102,29 @@ _DEDUP_WINDOWS: dict[str, int] = {
 }
 _DEFAULT_DEDUP_HOURS = 24
 
+# Signal types whose topic IS the message identity: two requests with different
+# topics are different messages by construction. For these the topic-blind
+# content-hash secondary in _is_duplicate can only drop a distinct message (a
+# shared 200-char prefix is not a repeat), so it is skipped; the primary
+# (signal_type, topic, category) check still collapses genuine repeats.
+_TOPIC_IS_IDENTITY: frozenset[str] = frozenset(
+    {
+        # topic = "alert:<dedupe_key, else source>" (runtime/init/alert_drain.py).
+        # A repeated failure keeps one key, so it collapses on the primary check.
+        # A producer that queues with no key shares its source as the topic, so
+        # its distinct alerts collide on the primary check instead; that is the
+        # producer's key to fix, not this check's.
+        "queued_alert",
+        # topic = "Morning Report — <date>" (outreach/morning_report.py). Without
+        # this, a report drafted a few seconds faster than yesterday's lands inside
+        # the 24 h window and is dropped when both open with the same header.
+        "morning_report",
+        # topic carries a hash of the full staged company set
+        # (recon/career_outreach.py), so a distinct batch has a distinct topic.
+        "career_outreach_nudged",
+    }
+)
+
 
 def content_hash(text: str) -> str:
     """SHA-256 of the first 200 characters — fuzzy content dedup key."""
@@ -312,6 +335,14 @@ class GovernanceGate:
                 window_hours,
             )
             return True
+
+        if request.signal_type in _TOPIC_IS_IDENTITY:
+            return False
+        # An empty context hashes identically for every request, so a match
+        # says nothing about the message (outreach recovery submits retries
+        # with context="").
+        if not request.context.strip():
+            return False
 
         # Secondary: content-hash match (catches near-duplicate topics with same
         # body). Same datetime(delivered_at) normalization as the primary query.

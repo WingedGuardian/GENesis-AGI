@@ -263,34 +263,15 @@ def _state(tmp_path, eta_min, *, path=None, age_s=0):
     )
 
 
-def test_a_disk_filling_fast_is_tiered_as_the_watchdog_acts_on_it(tmp_path, monkeypatch):
-    """The watchdog acts on dg_tier: time-to-full raises the free-space tier by one
-    level. 6000 MB of 65000 is YELLOW by space; full in 5 minutes makes it ORANGE now,
-    and a write that takes the space tier to ORANGE makes it RED."""
+def test_the_watchdogs_time_to_full_does_not_change_the_answer(tmp_path, monkeypatch):
+    """Free space decides (owner ruling 2026-10-12): the copy's own write burst would
+    raise the watchdog's time-to-full tier on almost any yellow disk, so reading it
+    would refuse nearly every copy; and its state file names a path, not the quota
+    domain this write lands in."""
     _measured(tmp_path, monkeypatch, "6000 65000 0 - - ext4 1")
-    _state(tmp_path, 5)
-    assert disk_headroom.tier_after_write(tmp_path, 0) == ("orange", "orange")
-    assert disk_headroom.tier_after_write(tmp_path, 1000 * MB) == ("orange", "red")
-
-
-def test_a_stale_time_to_full_is_not_used(tmp_path, monkeypatch):
-    _measured(tmp_path, monkeypatch, "6000 65000 0 - - ext4 1")
-    _state(tmp_path, 5, age_s=3600)
+    _state(tmp_path, 5)  # full in 5 minutes by the watchdog's reading
     assert disk_headroom.tier_after_write(tmp_path, 0) == ("yellow", "yellow")
-
-
-def test_another_filesystems_time_to_full_is_not_used(tmp_path, monkeypatch):
-    _measured(tmp_path, monkeypatch, "6000 65000 0 - - ext4 1")
-    _state(tmp_path, 5, path="/proc")  # procfs: never the filesystem under tmp_path
-    assert disk_headroom.tier_after_write(tmp_path, 0) == ("yellow", "yellow")
-
-
-@pytest.mark.parametrize("content", ["not json", '{"disk": [], "poll_at": 3}', ""])
-def test_an_unreadable_state_file_means_no_time_to_full(tmp_path, monkeypatch, content):
-    _measured(tmp_path, monkeypatch, "6000 65000 0 - - ext4 1")
-    (tmp_path / ".genesis").mkdir()
-    (tmp_path / ".genesis" / "watchgod_state.json").write_text(content)
-    assert disk_headroom.tier_after_write(tmp_path, 0) == ("yellow", "yellow")
+    assert disk_headroom.tier_after_write(tmp_path, 1000 * MB) == ("yellow", "orange")
 
 
 def test_the_callers_environment_cannot_move_the_lines(tmp_path, monkeypatch):

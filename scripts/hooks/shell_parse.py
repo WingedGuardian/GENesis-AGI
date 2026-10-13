@@ -48,6 +48,7 @@ it, are written out beside :data:`_BLIND_UNRESOLVED_VERB`.
 
 from __future__ import annotations
 
+import enum
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -669,6 +670,178 @@ def _redirect_target_end(command: str, j0: int, n: int) -> int:
     return j
 
 
+_PLAIN_DATA_HEREDOC_LINE = re.compile(
+    r"^(?P<receiver>[^$`\\(){}#|;&<>]*?)"
+    r"<<'(?P<word>[A-Za-z_][A-Za-z0-9_]*)'(?P<tail>.*)$"
+)
+_IDIOM_DATA_HEREDOC_LINE = re.compile(
+    r"""^(?P<receiver>[^$`\\(){}#|;&<>]*?)"""
+    r"""(?P<flag>--message|-m|--body|-b)(?P<separator>[ \t]+|=)"""
+    r""""\$\((?:cat) <<'(?P<word>[A-Za-z_][A-Za-z0-9_]*)'$"""
+)
+
+
+def _data_heredoc_tail_is_allowed(tail: str) -> bool:
+    i = 0
+    while i < len(tail):
+        while i < len(tail) and tail[i] in " \t":
+            i += 1
+        if i == len(tail):
+            return True
+        if tail.startswith(">", i):
+            i += 1
+        elif i + 1 < len(tail) and tail[i] in "12" and tail[i + 1] == ">":
+            i += 2
+        else:
+            return False
+        while i < len(tail) and tail[i] in " \t":
+            i += 1
+        if not tail.startswith("/dev/null", i):
+            return False
+        i += len("/dev/null")
+        # The word ends only at whitespace or another `>`: bash reads a glued
+        # digit (`>/dev/null2>/dev/null`) as part of the file name.
+        if i < len(tail) and tail[i] not in " \t>":
+            return False
+    return True
+
+
+def _has_data_file_flag(argv: list[str], flags: frozenset[str]) -> bool:
+    for i in range(2, len(argv)):
+        if argv[i] in flags and i + 1 < len(argv) and argv[i + 1] == "-":
+            return True
+        if any(argv[i] == f"{flag}=-" for flag in flags if flag.startswith("--")):
+            return True
+    return False
+
+
+def _data_heredoc_receiver_is_allowed(
+    argv: list[str], *, idiom_flag: str | None = None
+) -> bool:
+    if not argv or "/" in argv[0] or "=" in argv[0]:
+        return False
+
+    if argv[0] == "cat":
+        return idiom_flag is None and argv in (["cat"], ["cat", "-"])
+
+    if argv[0] == "git" and len(argv) > 1:
+        if argv[1] in {"commit", "tag"}:
+            subcommand_args_start = 2
+        elif (
+            argv[1] == "notes"
+            and len(argv) > 2
+            and argv[2] in {"add", "append"}
+        ):
+            subcommand_args_start = 3
+        else:
+            return False
+        if idiom_flag is not None:
+            return idiom_flag in {"-m", "--message"}
+        return _has_data_file_flag(
+            ["git", argv[1], *argv[subcommand_args_start:]], frozenset({"-F", "--file"})
+        )
+
+    if (
+        argv[0] == "gh"
+        and len(argv) > 2
+        and argv[1] in {"pr", "issue"}
+        and argv[2] in {"create", "comment", "edit"}
+    ):
+        if idiom_flag is not None:
+            return idiom_flag in {"-b", "--body"}
+        return _has_data_file_flag(
+            ["gh", argv[1], *argv[2:]], frozenset({"-F", "--body-file"})
+        )
+
+    return False
+
+
+def excise_data_heredoc(command: str) -> tuple[str, str] | None:
+    """Return the command with one proven data-heredoc body removed, and that body.
+
+    This narrow grammar cannot see whether ``cat``, ``git`` or ``gh`` was redefined
+    outside the command (through ``PATH`` or earlier session state).
+    """
+    if len(command) > MAX_COMMAND_CHARS:
+        return None
+    newline = command.find("\n")
+    if newline < 0:
+        return None
+
+    first_line = command[:newline]
+    plain = _PLAIN_DATA_HEREDOC_LINE.match(first_line)
+    idiom = None
+    if plain is not None:
+        receiver_text = plain.group("receiver")
+        if not receiver_text or receiver_text[-1] not in " \t":
+            plain = None
+        else:
+            receiver_text = receiver_text.rstrip(" \t")
+            tail = plain.group("tail")
+            try:
+                argv = shlex.split(receiver_text)
+            except ValueError:
+                plain = None
+            else:
+                if not _data_heredoc_receiver_is_allowed(argv) or not (
+                    _data_heredoc_tail_is_allowed(tail)
+                ):
+                    plain = None
+
+    if plain is not None:
+        word = plain.group("word")
+    else:
+        idiom = _IDIOM_DATA_HEREDOC_LINE.match(first_line)
+        if idiom is None:
+            return None
+        separator = idiom.group("separator")
+        body_argument = (
+            f"{idiom.group('flag')}={_DATA_HEREDOC_BODY_PLACEHOLDER}"
+            if separator == "="
+            else f"{idiom.group('flag')}{separator}{_DATA_HEREDOC_BODY_PLACEHOLDER}"
+        )
+        try:
+            argv = shlex.split(idiom.group("receiver") + body_argument)
+        except ValueError:
+            return None
+        if not _data_heredoc_receiver_is_allowed(
+            argv, idiom_flag=idiom.group("flag")
+        ):
+            return None
+        word = idiom.group("word")
+
+    body_start = newline + 1
+    line_start = body_start
+    while line_start <= len(command):
+        line_end = command.find("\n", line_start)
+        if line_end < 0:
+            line_end = len(command)
+        line = command[line_start:line_end]
+        if line == word:
+            after_start = line_end + 1 if line_end < len(command) else len(command)
+            after = command[after_start:]
+            if idiom is not None and not after.startswith(')"'):
+                return None
+            # Only one body is excised, so a later heredoc's body would be read
+            # as commands where main strips or parses it its own way: leave the
+            # whole command to main's path.
+            if "<<" in after:
+                return None
+            return command[: newline + 1] + after, command[body_start:line_start]
+        if line.lstrip().startswith(word) or line_end == len(command):
+            return None
+        line_start = line_end + 1
+    return None
+
+
+_DATA_HEREDOC_BODY_PLACEHOLDER = "__DATA_HEREDOC_BODY__"
+
+
+def _excised_text(command: str) -> str:
+    excised = excise_data_heredoc(command)
+    return excised[0] if excised is not None else command
+
+
 def parse_segments(command: str) -> list[_ParsedSegment]:
     """Split a command line into executed segments, returning per segment BOTH the raw
     text and a redirect-STRIPPED argv source (see ``_ParsedSegment``).
@@ -789,10 +962,12 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
 
 
 def split_segments(command: str) -> list[str]:
-    """Executed-segment raw strings — a thin, byte-identical view over
-    ``parse_segments`` (all redirect/quote/comment semantics live there). Kept as the
-    stable ``list[str]`` API the cwd/occurrence consumers iterate."""
-    return [p.raw for p in parse_segments(command)]
+    """Executed-segment raw strings after only proven data-heredoc bodies are excised.
+
+    All redirect/quote/comment semantics live in ``parse_segments``. Kept as the
+    stable ``list[str]`` API the cwd/occurrence consumers iterate.
+    """
+    return [p.raw for p in parse_segments(_excised_text(command))]
 
 
 def has_top_level_pipe(command: str, *, count_substitutions: bool = False) -> bool:
@@ -1158,14 +1333,16 @@ def untokenizable(command: str) -> bool:
     segmentation off and drop a real, executing command from the parse, and the
     return value looks identical to "there was nothing to find".
 
-    Deliberately reads the WHOLE raw command, with no normalization of any kind.
-    An earlier version pre-processed it to suppress prompts on a class of
-    multi-line command, and that MEASURABLY disarmed the signal: on a shape a
-    developer writes without thinking, the command really ran (verified against
-    a shimmed binary, so the proof was execution rather than parse) while the
-    pre-processed text tokenized cleanly and the guard fell silent. The
-    triggering shape is deliberately not written down — this file is public and
-    the guard it protects is load-bearing.
+    Reads the WHOLE raw command except for one strict, proven data-heredoc form:
+    that body is removed to avoid the owner's ``204``/``212`` "cannot be parsed"
+    refusals when a data receiver carries ordinary prose. Every other command
+    remains unnormalized. An earlier broader pre-processing step suppressed
+    prompts on a class of multi-line command, and MEASURABLY disarmed the signal:
+    on a shape a developer writes without thinking, the command really ran
+    (verified against a shimmed binary, so the proof was execution rather than
+    parse) while the pre-processed text tokenized cleanly and the guard fell
+    silent. The triggering shape is deliberately not written down — this file is
+    public and the guard it protects is load-bearing.
 
     KNOWN COST, stated rather than hidden: ``_argv`` DOES normalize before its
     own tokenize (it strips trailing comments), so this probe over-reports
@@ -1199,7 +1376,7 @@ def untokenizable(command: str) -> bool:
     here with a message-hostile broadening.
     """
     try:
-        shlex.split(command)
+        shlex.split(_excised_text(command))
         return False
     except ValueError:
         return True
@@ -2022,9 +2199,10 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
         return [], _BLIND_OVER_LONG
     if reason == "depth":
         return [], _BLIND_OVER_NESTED
-    if has_continuation(command):
+    excised = _excised_text(command)
+    if has_continuation(excised):
         return [], _BLIND_CONTINUATION
-    if has_built_escape(command):
+    if has_built_escape(excised):
         return [], _BLIND_BUILT_ESCAPE
     if untokenizable(command):
         return segments, _BLIND_UNTOKENIZABLE
@@ -3326,6 +3504,8 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
     # every consumer that must not be blind is already asking for the reason.
     if _depth == 0 and len(command) > MAX_COMMAND_CHARS:
         return [], "length"
+    if _depth == 0:
+        command = _excised_text(command)
     out: list[Segment] = []
     truncated = False
     # Subshells opened and not yet closed by earlier segments of this command. A
@@ -3761,6 +3941,154 @@ def git_subcommand(argv: list[str]) -> str | None:
     global options (including ``-c KEY=VAL`` / ``-C DIR`` which take a value)."""
     i = git_subcommand_index(argv)
     return None if i is None else argv[i]
+
+
+class PushArgKind(enum.Enum):
+    GLOBAL = "global"
+    GLOBAL_VALUE = "global_value"
+    LONG = "long"
+    LONG_VALUE = "long_value"
+    SHORT = "short"
+    SHORT_VALUE = "short_value"
+    PLUS = "plus"
+    POSITIONAL = "positional"
+
+
+class PushArg(NamedTuple):
+    kind: PushArgKind
+    text: str
+
+
+# Measured from `git push -h` on git 2.34.1, 2.43.0, and 2.55.0.
+# `branches` and `verify` are listed only from 2.43.0; 2.34.1 accepts
+# `--verify` as the negation of `--no-verify` without listing it, and has no
+# `--branches`.
+GIT_PUSH_LONG_OPTIONS: dict[str, str] = {
+    "all": "none",
+    "atomic": "none",
+    "branches": "none",
+    "delete": "none",
+    "dry-run": "none",
+    "exec": "value",
+    "follow-tags": "none",
+    "force": "none",
+    "force-if-includes": "none",
+    "force-with-lease": "optional",
+    "ipv4": "none",
+    "ipv6": "none",
+    "mirror": "none",
+    "no-verify": "none",
+    "porcelain": "none",
+    "prune": "none",
+    "progress": "none",
+    "push-option": "value",
+    "receive-pack": "value",
+    "recurse-submodules": "value",
+    "repo": "value",
+    "set-upstream": "none",
+    "signed": "optional",
+    "tags": "none",
+    "thin": "none",
+    "quiet": "none",
+    "verbose": "none",
+    "verify": "none",
+}
+GIT_PUSH_SHORT_VALUE_LETTERS = frozenset("o")
+_GIT_PUSH_LONG_OPTION_CANDIDATES = frozenset(GIT_PUSH_LONG_OPTIONS) | frozenset(
+    f"no-{option}" for option in GIT_PUSH_LONG_OPTIONS
+)
+
+
+def _canonical_push_long_option(name: str) -> str:
+    if name in _GIT_PUSH_LONG_OPTION_CANDIDATES:
+        return name
+    matches = {
+        candidate
+        for candidate in _GIT_PUSH_LONG_OPTION_CANDIDATES
+        if candidate.startswith(name)
+    }
+    return next(iter(matches)) if len(matches) == 1 else name
+
+
+def push_arg_stream(argv: list[str]) -> list[PushArg] | None:
+    """Classify a ``git push`` argv with git's measured option grammar.
+
+    Returns ``None`` when ``argv`` is not a git push and ``[]`` for bare
+    ``git push``. Unique long-option prefixes are canonicalised as git does;
+    ambiguous and unknown options stay raw because git rejects those commands.
+    The option arities were measured from ``git push -h`` on git 2.34.1,
+    2.43.0, and 2.55.0 and are checked against the installed CLI by
+    ``test_git_push_option_table.py``. Git 2.34.1 accepts ``--verify`` as the
+    negation of ``--no-verify`` without listing it, and has no ``--branches``;
+    both are listed from 2.43.0.
+    """
+    push_index = git_subcommand_index(argv)
+    if push_index is None or argv[push_index] != "push":
+        return None
+
+    out: list[PushArg] = []
+    i = 1
+    while i < push_index:
+        arg_text = argv[i]
+        if arg_text in _GIT_OPTS_WITH_ARG:
+            out.append(PushArg(PushArgKind.GLOBAL_VALUE, arg_text))
+            i += 2
+        elif arg_text.startswith("-"):
+            out.append(PushArg(PushArgKind.GLOBAL, arg_text))
+            i += 1
+        else:
+            return None
+
+    i = push_index + 1
+    end_options = False
+    while i < len(argv):
+        arg_text = argv[i]
+        if arg_text == "--" and not end_options:
+            end_options = True
+            i += 1
+            continue
+        if end_options:
+            kind = PushArgKind.PLUS if arg_text.startswith("+") else PushArgKind.POSITIONAL
+            out.append(PushArg(kind, arg_text))
+            i += 1
+            continue
+        if arg_text.startswith("--"):
+            raw_name, equals, value = arg_text[2:].partition("=")
+            name = _canonical_push_long_option(raw_name)
+            suffix = f"={value}" if equals else ""
+            out.append(PushArg(PushArgKind.LONG, f"--{name}{suffix}"))
+            i += 1
+            arity_name = name[3:] if name.startswith("no-") else name
+            if (
+                not equals
+                and not name.startswith("no-")
+                and GIT_PUSH_LONG_OPTIONS.get(arity_name) == "value"
+                and i < len(argv)
+            ):
+                out.append(PushArg(PushArgKind.LONG_VALUE, argv[i]))
+                i += 1
+            continue
+        if arg_text.startswith("+"):
+            out.append(PushArg(PushArgKind.PLUS, arg_text))
+            i += 1
+            continue
+        if arg_text.startswith("-") and len(arg_text) > 1:
+            i += 1
+            letters = arg_text[1:]
+            for position, letter in enumerate(letters):
+                out.append(PushArg(PushArgKind.SHORT, letter))
+                if letter in GIT_PUSH_SHORT_VALUE_LETTERS:
+                    glued = letters[position + 1 :]
+                    if glued:
+                        out.append(PushArg(PushArgKind.SHORT_VALUE, glued))
+                    elif i < len(argv):
+                        out.append(PushArg(PushArgKind.SHORT_VALUE, argv[i]))
+                        i += 1
+                    break
+            continue
+        out.append(PushArg(PushArgKind.POSITIONAL, arg_text))
+        i += 1
+    return out
 
 
 #: Per-(group, subcommand) flag model for gh, MEASURED by parsing

@@ -21,6 +21,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 _HYGIENE = _SCRIPTS / "disk_hygiene.sh"
 DAY = 86400
@@ -149,3 +151,30 @@ def test_missing_base_is_a_no_op(tmp_path):
 def test_main_prunes_the_genesis_dir():
     src = _HYGIENE.read_text()
     assert 'prune_browser_backups "$HOME/.genesis"' in src
+
+
+def _decider():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "prune_browser_backups", _SCRIPTS / "prune_browser_backups.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "camoufox-profile.pre-v1-20260101T000000\n",
+        "camoufox-profile.pre-v1-20260101T000000.abc123.tmp\n",
+        "camoufox-profile.pre-v1-20260101T000000.ab\ncd.tmp",
+    ],
+)
+def test_a_name_with_a_newline_is_never_a_backup(tmp_path, name):
+    """`$` matches before a final newline: such a directory is no name this code
+    makes, so it must never reach the deleter (found by review)."""
+    old = _copy(tmp_path, name, 400)
+    _copy(tmp_path, "camoufox-profile.pre-v1-20260301T000000", 1)
+    assert old not in _decider().doomed(tmp_path, time.time())

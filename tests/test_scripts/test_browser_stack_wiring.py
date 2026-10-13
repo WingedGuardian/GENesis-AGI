@@ -46,6 +46,9 @@ def test_install_runs_the_step_inline_and_warns_on_failure():
     timers = code.index('for template in "$SYSTEMD_TEMPLATE_DIR"/*.timer.template')
     assert inline > timers  # its unit and timer exist by then
     assert re.search(r"else\n\s+setup_warn \"browser stack not ready", code[inline:])
+    # The timer loop above can start a catch-up run first; the inline step waits
+    # for it and reports its own outcome instead of exiting 0 on the lock.
+    assert "GENESIS_BROWSER_STACK_WAIT_S=7200" in code[timers:inline]
 
 
 def test_install_inside_a_claude_code_session_starts_the_unit_instead():
