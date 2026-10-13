@@ -28,11 +28,6 @@ _TRUNCATION_NOTE = f"\n[truncated — over the {_ho.HOOK_STDOUT_CAP}-char hook o
 _ASCII = st.characters(min_codepoint=0x20, max_codepoint=0x7E)
 _UNICODE_EDGE = st.sampled_from(["é", "Ω", "漢", "🎯", "🧪", "\t", "\n"])
 _TEXT = st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), max_size=120)
-_NON_ASCII_BMP = st.characters(
-    min_codepoint=0x80,
-    max_codepoint=0xD7FF,
-    blacklist_categories=("Cs",),
-)
 _LONE_SURROGATE_TEXT = st.lists(
     st.sampled_from(["\ud800", "\ud801", "\udc00", "\udfff"]),
     min_size=1,
@@ -230,6 +225,7 @@ def test_print_json_bounded_true_means_the_emitted_stream_fits(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="#3255: print_json_bounded can return False when the emptied envelope fits",
 )
 @_PROPERTY_SETTINGS
@@ -390,6 +386,7 @@ def test_print_bounded_never_emits_over_budget(text: str, budget: int, mirror_hi
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="#3236: non-ASCII trimming leaves avoidable budget unused",
 )
 @_PROPERTY_SETTINGS
@@ -459,6 +456,7 @@ def test_clip_to_cost_handles_lone_surrogates(text: str, budget: int):
 
 @pytest.mark.xfail(
     strict=True,
+    raises=UnicodeEncodeError,
     reason="#3237: lone surrogate accounting can raise UnicodeEncodeError",
 )
 @_PROPERTY_SETTINGS
@@ -469,6 +467,7 @@ def test_xfail_3237_lone_surrogate_accounting_does_not_raise(text: str):
 
 @pytest.mark.xfail(
     strict=True,
+    raises=UnicodeEncodeError,
     reason="#3237: lone surrogate writes can raise UnicodeEncodeError",
 )
 @_PROPERTY_SETTINGS
@@ -487,7 +486,7 @@ def test_xfail_3237_lone_surrogate_writer_does_not_raise(text: str, budget: int)
     billed = _ho.utf16_len(decoded)
     assert billed == out.emitted_chars
     assert billed <= budget
-    if billed > 0:
+    if out.cut is None and billed > 0:
         encodings = (
             text.encode("utf-8", "surrogatepass"),
             text.encode("utf-8", "replace"),

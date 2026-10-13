@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Lightweight CLI wrapper for Playwright browser automation.
+"""Lightweight CLI wrapper for Chromium browser automation (patchright when
+installed, else Playwright).
 
 NOTE: For interactive CC sessions, prefer the genesis-health MCP browser_*
 tools (lazy-init, persistent session within MCP lifetime). This CLI script
@@ -19,9 +20,8 @@ import importlib.util
 import sys
 import uuid
 from datetime import UTC, datetime
+from importlib import metadata
 from pathlib import Path
-
-from playwright.sync_api import sync_playwright
 
 USER_DATA_DIR = Path.home() / ".genesis" / "browser-profile"
 # The shared payment-card detector, loaded by file path so this CLI still
@@ -31,6 +31,46 @@ _CARD_SHAPES_PATH = (
 )
 
 
+def _installed(dist: str) -> bool:
+    try:
+        metadata.version(dist)
+    except metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+def _sync_playwright():
+    """``sync_playwright()`` from patchright when it is installed (it hides the
+    automation signals plain Playwright leaves), else from Playwright, and the
+    package's name. An installed patchright that fails to import raises rather
+    than falling back to the detectable Chromium, as the MCP fallback does."""
+    if _installed("patchright"):
+        from patchright.sync_api import sync_playwright
+
+        return sync_playwright(), "patchright"
+    from playwright.sync_api import sync_playwright
+
+    return sync_playwright(), "playwright"
+
+
+def _backup_profile(package: str) -> None:
+    """Copy the profile aside first when a different Chromium is about to open it
+    (genesis.browser.profile_backup, as the MCP tools do). Optional: this CLI also
+    runs where genesis is not importable, and then it makes no copy."""
+    try:
+        from genesis.browser.profile_backup import backup_chromium_profile
+    except ImportError:
+        print("Note: genesis is not importable here, so the profile is not copied first", file=sys.stderr)
+        return
+    backup_chromium_profile(USER_DATA_DIR, package)  # never raises
+
+
+def _open():
+    manager, package = _sync_playwright()
+    _backup_profile(package)
+    return manager
+
+
 def _default_screenshot_path() -> str:
     """A unique path per capture, so consecutive screenshots don't overwrite.
 
@@ -38,7 +78,8 @@ def _default_screenshot_path() -> str:
     life of the process, which is the bug this replaces. Same scheme as the
     MCP tool's `_impl_browser_screenshot` (genesis/mcp/health/browser.py):
     sortable timestamp + full uuid4 hex. Deliberately duplicated rather than
-    imported — this CLI stays free of genesis imports so it can run standalone.
+    imported — this CLI runs standalone; its one genesis import (the profile
+    copy) is optional.
     """
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     return str(Path.home() / "tmp" / f"browser_screenshot_{stamp}_{uuid.uuid4().hex}.png")
@@ -57,7 +98,7 @@ def _launch(pw):
 
 
 def cmd_navigate(args):
-    with sync_playwright() as pw:
+    with _open() as pw:
         context, page = _launch(pw)
         try:
             page.goto(args.url, wait_until="domcontentloaded", timeout=30000)
@@ -70,7 +111,7 @@ def cmd_navigate(args):
 
 
 def cmd_click(args):
-    with sync_playwright() as pw:
+    with _open() as pw:
         context, page = _launch(pw)
         try:
             page.click(args.selector, timeout=10000)
@@ -103,7 +144,7 @@ def cmd_fill(args):
         print("Refused: the value looks like a payment card number. Card numbers "
               "are never typed with this tool.", file=sys.stderr)
         sys.exit(2)
-    with sync_playwright() as pw:
+    with _open() as pw:
         context, page = _launch(pw)
         try:
             page.fill(args.selector, args.value, timeout=10000)
@@ -113,7 +154,7 @@ def cmd_fill(args):
 
 
 def cmd_snapshot(args):
-    with sync_playwright() as pw:
+    with _open() as pw:
         context, page = _launch(pw)
         try:
             snapshot = page.locator("body").aria_snapshot()
@@ -123,7 +164,7 @@ def cmd_snapshot(args):
 
 
 def cmd_screenshot(args):
-    with sync_playwright() as pw:
+    with _open() as pw:
         context, page = _launch(pw)
         try:
             path = args.path or _default_screenshot_path()
