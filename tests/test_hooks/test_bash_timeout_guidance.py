@@ -530,6 +530,17 @@ class TestDeployGuardFires:
         "git config alias.d '!./scripts/update.sh' && git d",
         "bash -n +n scripts/update.sh",
         "ssh host bash -s 0< scripts/update.sh",
+        # The secondary review found these: the path rides in a variable, so
+        # no segment names the script.
+        "V=scripts/update.sh; python3 -c \"import os; os.system('$V')\"",
+        "U=scripts/update.sh\npython3 -c \"import subprocess; subprocess.run(['bash', '$U'])\"",
+        "V=scripts/update.sh; perl -e 'system(\"$V\")'",
+        "V=scripts/update.sh; node -e \"require('child_process').spawnSync('$V')\"",
+        'V=scripts/update.sh; su -c "$V" svc',
+        "V=scripts/update.sh; systemd-run --user /bin/bash -c '\"$V\"'",
+        "for f in scripts/update.sh; do python3 -c \"import os; os.system('$f')\"; done",
+        # The heredoc's receiver spawns from its own -c text.
+        "python3 -c \"import sys, os; os.system(sys.stdin.read())\" <<'EOF'\n./scripts/update.sh\nEOF",
     )
 
     @pytest.mark.parametrize("command", LAUNCHES)

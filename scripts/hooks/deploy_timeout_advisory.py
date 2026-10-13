@@ -38,11 +38,14 @@ it does not cover fires.
 - A heredoc first goes through ``shell_parse.excise_data_heredoc``, which
   proves the commit and PR-body forms are data. Otherwise its body is judged
   by its receiver: a shell or ``ssh`` reads it as commands; ``python``/``node``
-  stay silent only with no process-spawn call in it; ``cat``/``tee`` and the
-  other readers treat it as data; ANY other receiver (``systemd-run``,
-  ``incus exec``, ``su``, ``perl``…) fires. A body that never closes fires.
+  stay silent only with no process-spawn call in the body or in their own
+  ``-c``; ``cat``/``tee`` and the other readers treat it as data; ANY other
+  receiver (``systemd-run``, ``incus exec``, ``su``, ``perl``…) fires. A body
+  that never closes fires.
 - A command with a pipe, an input redirect or a here-string feeds one program
-  to another, so EVERY program in it must be a known reader.
+  to another, and a variable can carry the script's path into a program that
+  never names it (``V=scripts/update.sh; perl -e 'system("$V")'``). In
+  either case EVERY program in it must be a known reader.
 - Otherwise a segment that names the script stays silent only when it is a
   known reader: a closed list of programs that read, list, copy or describe
   (``grep``, ``sed``, ``cat``, ``cp``…), ``git`` with a read subcommand and no
@@ -55,14 +58,14 @@ it does not cover fires.
   ``X=$(id -u) systemd-run …`` as a program named ``-u)`` without reporting a
   blind spot, so a real launch went quiet.
 
-MEASURED in session db1a0ce5, 2026-10-13, over 30 days of one install's
-transcripts (153 files): 862 Bash commands mention the script and about 25 of
-them launch it. The old hook fired on all 862; this one fires on 184 and is
-silent on 678, and no silent one is a launch (each launch-shaped silent
-command was read by hand; the four found are quoted prose). It also fires on
-every one of 63 constructed launch forms in the tests, 31 of which earlier
-drafts of this hook missed (found by three adversarial review passes). That is a corpus and a matrix, not a proof:
-a form nobody wrote down can still be silent.
+MEASURED 2026-10-13 over 30 days of one install's transcripts (153 files):
+876 Bash commands mention the script and about 25 of them launch it. The old
+hook fired on all 876; this one fires on 192 and is silent on 684, and no
+silent one is a launch (each launch-shaped silent command was read by hand; the
+five found are quoted prose). It also fires on every one of 71 constructed
+launch forms in the tests, 39 of which earlier drafts of this hook missed (found
+by three internal review passes and a cross-model one). That is a corpus and a
+matrix, not a proof: a form nobody wrote down can still be silent.
 
 A DETACHED launch still fires, on purpose: that is the moment the advice
 applies, and recognising detachment would need systemd-run's option grammar, an
@@ -138,6 +141,10 @@ _STDIN_PATH = re.compile(r"/dev/(?:stdin|fd/)|/proc/[^/]+/fd/")
 # here-string. With any of these, the program on the receiving end can run what
 # it is given without naming it, so only known readers stay silent.
 _FEEDS_INPUT = re.compile(r"(?<!\|)\|(?!\|)|(?<!<)<(?![<(])|<<<")
+# A variable can carry the script's path into a program that never names it
+# (`V=scripts/update.sh; perl -e 'system("$V")'`, a `for` loop over it), so a
+# command that reads one is judged the same way: only known readers stay silent.
+_VARIABLE = re.compile(r"\$\{?[A-Za-z_]")
 ADVISORY = r"""ADVISORY: this mentions scripts/update.sh. If you are LAUNCHING a deploy, it must be DETACHED from this session. Neither way of holding it in a Bash call works.
 
 FOREGROUND is impossible: the Bash tool's HARD CEILING is 600000ms (10 min), a larger 'timeout' value is not honoured, and an inner 'timeout N' does not extend it. MEASURED 2026-09-16: a bare update.sh ran 1022s. The SIGTERM at the ceiling is also not a silent truncation -- update.sh traps INT/TERM, and once the rollback trap is armed (just before the merge) an interrupt ROLLS BACK, unwinding a deploy that was going fine. Which phase a ten-minute kill lands in depends on the run, so treat it as "something will be undone", not as a clean stop.
@@ -315,7 +322,9 @@ def _runs_target(command: str) -> bool:
                 if _runs_target(body):
                     return True
             elif receiver.exe in _INTERPRETERS:
-                if _SPAWN.search(body):
+                # The code that spawns may be the body or the receiver's own
+                # `-c` text running what the body hands it on stdin.
+                if _SPAWN.search(body) or _SPAWN.search(" ".join(receiver.argv[1:])):
                     return True
             elif receiver.exe not in _READ_VERBS:
                 return True  # systemd-run, incus, docker, su, perl, …: may run it
@@ -323,7 +332,7 @@ def _runs_target(command: str) -> bool:
     segments, blind = _PARSER.analyze_checked(command)
     if blind is not None:
         return True
-    strict = bool(_FEEDS_INPUT.search(command))
+    strict = bool(_FEEDS_INPUT.search(command) or _VARIABLE.search(command))
     position = -1
     for segment in segments:
         if segment.depth == 0:
