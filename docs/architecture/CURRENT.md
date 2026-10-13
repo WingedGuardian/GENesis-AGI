@@ -945,6 +945,24 @@ treats `start == end` as off, matching `ego/cadence.py`), so nothing delays an
 owner-facing send by default. The salience thresholds and the shared daily cap
 are the other timing/volume controls on that path.
 
+Governance can also DROP an owner-facing send as a duplicate, writing no history
+row (`GovernanceGate._is_duplicate`). Inside the signal type's window
+(`_DEDUP_WINDOWS`, default 24 h; 0 turns dedup off), a delivered row with the same
+`(signal_type, topic, category)` suppresses it, and so does one with the same
+signal type, category and `content_hash` (SHA-256 of the first 200 characters of
+`context`, topic ignored). The content-hash match is skipped for the signal types
+whose topic is the message identity (`_TOPIC_IS_IDENTITY`: `queued_alert`,
+`morning_report`, `career_outreach_nudged`) and for any empty or whitespace-only
+context. Before that exemption, at least 3 of a live install's 84 recorded
+morning-report job runs (mid-July to October) delivered nothing this way: the
+next day's report finished drafting a few seconds sooner, fell inside the 24 h
+window, and opened with the same 200 characters. For a queued alert the topic is
+`alert:<dedupe_key>`, or `alert:<source>` when the producer passed no key, so a
+keyless producer's distinct alerts still collide on the topic check. `backup.sh`
+gives a repeated failure one dedupe key with `alert_stable_key`
+(`scripts/lib/alert_queue.sh`), which leaves the per-run
+`Time:`/`Duration:`/`SQLite lines:` lines out of the hash.
+
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]

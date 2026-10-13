@@ -326,14 +326,14 @@ elif [[ "$PKG_MGR" == "dnf" || "$PKG_MGR" == "yum" ]]; then
     sudo "$PKG_MGR" check-update -q 2>/dev/null; true
 fi
 
-# Python 3.12+ required
+# Python 3.12-3.14 required (upper bound mirrors pyproject's requires-python)
 if command -v python3.12 &>/dev/null; then
     echo "  Python: $(python3.12 --version)"
-elif command -v python3 &>/dev/null && python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
+elif command -v python3 &>/dev/null && python3 -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
     echo "  Python: $(python3 --version)"
 else
     _found_ver=$(python3 --version 2>/dev/null || echo "not found")
-    echo "  Python 3.12+ required (found: $_found_ver) — run install.sh to install it"
+    echo "  Python 3.12-3.14 required (found: $_found_ver) — run install.sh to install it"
     echo "  Or install manually and re-run bootstrap."
     exit 1
 fi

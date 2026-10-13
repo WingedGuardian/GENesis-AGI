@@ -243,7 +243,7 @@ else
     echo "    WARN  'ss' not found — cannot check for port conflicts"
 fi
 
-# Python 3.12+ — prefer explicit python3.12 binary
+# Python 3.12-3.14 — prefer explicit python3.12 binary
 _install_python312() {
     # Attempt to install Python 3.12 using the available package manager and OS-specific sources.
     if command -v apt-get &>/dev/null; then
@@ -297,17 +297,18 @@ if command -v python3.12 &>/dev/null; then
     echo "    OK    Python $py_version"
 elif command -v python3 &>/dev/null; then
     py_version=$(python3 --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
-    if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
+    # Upper bound mirrors pyproject's requires-python (litellm caps Python <3.15).
+    if python3 -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
         echo "    OK    Python $py_version"
     else
         # Try to install Python 3.12 explicitly
-        echo "    Python $py_version found but 3.12+ required — installing python3.12..."
+        echo "    Python $py_version found but 3.12-3.14 required — installing python3.12..."
         _install_python312 || true
         if command -v python3.12 &>/dev/null; then
             py_version=$(python3.12 --version 2>&1 | grep -oP '\d+\.\d+' || echo "3.12")
             echo "    OK    Python $py_version (installed)"
         else
-            echo "    FAIL  Python 3.12+ required, found $py_version"
+            echo "    FAIL  Python 3.12-3.14 required, found $py_version"
             if command -v apt-get &>/dev/null; then
                 echo "    Install manually:"
                 echo "      Ubuntu: sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt-get install python3.12 python3.12-venv"
@@ -747,12 +748,12 @@ if [ ! -d "$VENV_PATH" ] || [ ! -x "$VENV_PATH/bin/python" ] || [ ! -x "$VENV_PA
     echo "    Creating venv at $VENV_PATH (using $PYTHON_BIN)..."
     "$PYTHON_BIN" -m venv "$VENV_PATH"
     echo "    + venv created"
-    # Verify venv Python is 3.12+ (defense-in-depth — pre-flight should catch this)
+    # Verify venv Python is 3.12-3.14 (defense-in-depth — pre-flight should catch this)
     _venv_pyver=$("$VENV_PATH/bin/python" --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
-    if ! "$VENV_PATH/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
-        echo "    WARNING: venv Python is $_venv_pyver but Genesis requires 3.12+"
+    if ! "$VENV_PATH/bin/python" -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
+        echo "    WARNING: venv Python is $_venv_pyver but Genesis requires 3.12-3.14"
         echo "    Install Python 3.12 and re-run this script."
-        setup_warn "venv Python is $_venv_pyver but Genesis requires 3.12+"
+        setup_warn "venv Python is $_venv_pyver but Genesis requires 3.12-3.14"
     fi
 fi
 

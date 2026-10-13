@@ -19,6 +19,7 @@
 #
 #   queue_alert <severity> <source> <title> <body> [dedupe_key]
 #   queue_alert_try <same arguments>   → 0 queued, non-zero not queued
+#   alert_stable_key <prefix> <message>   → prints <prefix>:<12 hex>
 #
 # severity: info|warning|critical|emergency   source: short id (e.g. backup)
 # Title/body are passed via the environment (never interpolated into code), so
@@ -29,6 +30,20 @@ _ALERT_QUEUE_ROOT="${GENESIS_ALERT_QUEUE_ROOT:-$HOME/.genesis/alerts/queue}"
 queue_alert() {
     queue_alert_try "$@" || true
     return 0
+}
+
+# A dedupe key for a message that carries per-run lines. Lines starting with
+# "Time:", "Duration:" or "SQLite lines:" change on every run, so they are left
+# out of the hash: a repeated identical failure keeps one key (the outreach
+# dedup then collapses it within its window), and a different failure gets a
+# different key. Never fails the caller, including under errexit and pipefail
+# when every line is filtered out.
+alert_stable_key() {
+    local prefix="${1:-alert}" message="${2:-}" digest
+    digest=$(printf '%s' "$message" \
+        | { grep -vE '^(Time|Duration|SQLite lines):' || true; } \
+        | md5sum 2>/dev/null | cut -c1-12) || digest=""
+    printf '%s:%s\n' "$prefix" "$digest"
 }
 
 queue_alert_try() {
