@@ -13,7 +13,10 @@ Usage:
 """
 import argparse
 import json
+import os
 import sys
+import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -50,8 +53,105 @@ def render_mcp_text(template: str, genesis_root: Path) -> str:
     return json.dumps(config, indent=2) + "\n"
 
 
+# Servers an earlier template defined and the current one does not. Genesis owns
+# them, so the merge below removes them from an existing .mcp.json; without this
+# list they would read as the user's own and stay forever. When you remove a
+# server from config/mcp.json.template, add its name here.
+RETIRED_SERVERS: frozenset[str] = frozenset()
+
+
+def _deploy_backup_dir() -> Path:
+    """One directory per run under ~/.genesis/deploy-backups (GENESIS_HOME-aware,
+    like genesis.env.genesis_home; this script is stdlib-only), the directory a
+    deploy's other backups go to (GENESIS_MU_BACKUP_DIR when a deploy set one).
+    A ~1 KB file, written only when .mcp.json changes; disk_hygiene.sh prunes the
+    directory once its deploy-backups retention lands (#3138). Not next to
+    .mcp.json: that would leave a stray file in the checkout."""
+    if os.environ.get("GENESIS_MU_BACKUP_DIR"):
+        return Path(os.environ["GENESIS_MU_BACKUP_DIR"])
+    home = os.environ.get("GENESIS_HOME")
+    base = Path(home).expanduser() if home else Path.home() / ".genesis"
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return base / "deploy-backups" / stamp
+
+
+def _save_backup(data: bytes) -> Path:
+    """Write <data> into the backup directory without replacing an earlier backup
+    (two checkouts, or two runs in one second, share a directory name). 0600:
+    a user's own server entry may carry an env block with a key."""
+    backup_dir = _deploy_backup_dir()
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for n in range(100):
+        path = backup_dir / (".mcp.json" if n == 0 else f".mcp.json.{n}")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        return path
+    raise OSError(f"no free backup name in {backup_dir}")
+
+
+def _summary(line: str) -> None:
+    # update.sh hides bootstrap's output behind `tail -10`; a deploy that wants
+    # the change named passes a summary file. Never "kept ...": bootstrap counts
+    # those lines as kept systemd units.
+    path = os.environ.get("GENESIS_DEPLOY_SUMMARY")
+    if path:
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+
+
+def _write_keeping_mode(path: Path, text: str) -> None:
+    """Write through a symlink to its target, atomically (same-dir temp file,
+    then rename), keeping the old file's mode."""
+    target = Path(os.path.realpath(path))
+    mode = target.stat().st_mode & 0o777 if target.exists() else None
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".mcp.json.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode if mode is not None else 0o666 & ~_umask())
+        os.replace(tmp, target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def merge_mcp(existing: object, rendered: dict, template_servers: set[str]) -> dict | None:
+    """The merged .mcp.json, or None when ``existing`` is not usable as one.
+
+    Genesis owns every server its template defines (including the ones the
+    interactive render leaves out) and every retired one. Those are replaced by
+    the render; every other server, and every other top-level key, is kept."""
+    if not isinstance(existing, dict):
+        return None
+    existing_servers = existing.get("mcpServers") or {}  # absent or null: none yet
+    if not isinstance(existing_servers, dict):
+        return None
+    owned = template_servers | INTERACTIVE_EXCLUDED_SERVERS | RETIRED_SERVERS
+    servers = dict(rendered["mcpServers"])
+    for name, spec in existing_servers.items():
+        if name not in owned:
+            servers[name] = spec
+    merged = {k: v for k, v in existing.items() if k != "mcpServers"}
+    merged["mcpServers"] = servers
+    return merged
+
+
 def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool:
-    """Render .mcp.json from template. Returns True if changes were made."""
+    """Render .mcp.json from the template, keeping servers the template does not
+    own (#2413). Returns True if the file changed (or would, on a dry run)."""
     template_path = genesis_root / "config" / "mcp.json.template"
     output_path = genesis_root / ".mcp.json"
 
@@ -59,18 +159,65 @@ def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool:
         print(f"ERROR: MCP template not found at {template_path}", file=sys.stderr)
         return False
 
-    rendered = render_mcp_text(template_path.read_text(), genesis_root)
+    template_text = template_path.read_text()
+    rendered = json.loads(render_mcp_text(template_text, genesis_root))
+    template_servers = set(json.loads(template_text).get("mcpServers", {}))
 
-    if output_path.exists():
-        current = output_path.read_text()
-        if current == rendered:
+    old_bytes = output_path.read_bytes() if output_path.exists() else None
+    if old_bytes is None:
+        new, why = rendered, "created"
+    else:
+        try:
+            existing = json.loads(old_bytes.decode("utf-8"))
+        except ValueError:  # JSONDecodeError and UnicodeDecodeError
+            existing = None
+        merged = merge_mcp(existing, rendered, template_servers)
+        # Compared as objects: key order and formatting are not changes (serena's
+        # registration writes the same JSON without a trailing newline).
+        if merged is not None and merged == existing:
             print(f".mcp.json: already correct ({genesis_root})")
             return False
+        if merged is None:
+            new, why = rendered, "replaced an unreadable file with the template's servers"
+        else:
+            new = merged
+            old_servers = existing.get("mcpServers") or {}
+            updated = sorted(
+                n
+                for n in set(old_servers) & set(rendered["mcpServers"])
+                if old_servers[n] != rendered["mcpServers"][n]
+            )
+            added = sorted(set(rendered["mcpServers"]) - set(old_servers))
+            removed = sorted(set(old_servers) - set(merged["mcpServers"]))
+            kept = sorted(set(merged["mcpServers"]) - set(rendered["mcpServers"]))
+            parts = [
+                f"{label} {', '.join(names)}"
+                for label, names in (
+                    ("updated", updated),
+                    ("added", added),
+                    ("removed", removed),
+                    ("kept", kept),
+                )
+                if names
+            ]
+            why = "; ".join(parts) or "rewrote the file's other keys"
 
-    print(f".mcp.json: rendering with GENESIS_ROOT={genesis_root}")
-    if not dry_run:
-        output_path.write_text(rendered)
-        print("  Written.")
+    print(f".mcp.json: rendering with GENESIS_ROOT={genesis_root} ({why})")
+    if dry_run:
+        return True
+    note = ""
+    if old_bytes is not None:
+        try:
+            saved = _save_backup(old_bytes)
+        except OSError as exc:
+            # No rewrite without a backup, but never abort bootstrap over it.
+            print(f"  WARNING: could not back up .mcp.json ({exc}); left unchanged.")
+            return False
+        note = f"; previous file saved as {saved}"
+    _write_keeping_mode(output_path, json.dumps(new, indent=2) + "\n")
+    print(f"  Written{note}.")
+    if old_bytes is not None:
+        _summary(f"mcp.json {why}{note}")
     return True
 
 

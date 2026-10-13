@@ -227,9 +227,17 @@ names, so an overlay of a read-only file is editable (#2446).
   `config/mcp.json.template` by `scripts/setup_claude_config.py`, minus the servers only a
   dispatch profile uses (`INTERACTIVE_EXCLUDED_SERVERS` there, today `discord-bot`): the
   template stays the single source, and dispatched sessions get their servers from it
-  through `cc/session_config._MCP_PROFILES`. `install.sh` leaves an existing file alone, but
-  `scripts/bootstrap.sh` runs the same script, which REWRITES it whenever
-  it differs from that render, so custom entries do not survive a bootstrap. Its Genesis servers carry
+  through `cc/session_config._MCP_PROFILES`. `install.sh` leaves an existing file alone;
+  `scripts/bootstrap.sh` runs the same script, which MERGES by server name: the servers the
+  template defines (plus `INTERACTIVE_EXCLUDED_SERVERS` and `RETIRED_SERVERS`) belong to
+  Genesis and are replaced by the render, while every other server (your own, and the
+  `serena` entry bootstrap registers) and every other top-level key is kept. When the file
+  changes, the old one is saved under `~/.genesis/deploy-backups/<UTC time>/` and the run
+  names the servers it updated, added, removed or kept. A file that is not valid JSON is
+  backed up and replaced by the render. Edit a Genesis server in place and the next
+  bootstrap puts the template's version back (from the backup you can recover the edit);
+  give a changed copy its own name instead. A Genesis server you delete comes back at the
+  next bootstrap; to drop one for good, remove it from the template. Its Genesis servers carry
   no `env` block, so they get env from the CC process plus `secrets.env` (section 1).
 
 ---
