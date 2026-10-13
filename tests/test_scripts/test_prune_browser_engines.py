@@ -325,9 +325,7 @@ def test_a_recent_package_install_restarts_the_grace(prune, tmp_path):
     root = tmp_path / "camoufox"
     pinned = _version(root, "156.0.1-beta.36-bb", age_days=60)
     old = _version(root, "157.0.1-beta.40-aa", age_days=20)
-    doomed, _ = prune.plan(
-        root, _ready(pinned), [pinned, old], [], NOW, paired_at=NOW - 3 * DAY
-    )
+    doomed, _ = prune.plan(root, _ready(pinned), [pinned, old], [], NOW, paired_at=NOW - 3 * DAY)
     assert doomed == []
 
 
