@@ -5,7 +5,7 @@ Loaded by the CI ``collected-floor`` job with ``-p collect_ids_plugin`` during
 ``scripts/ci/collected_floor.py``.
 
 WHY A PLUGIN AND NOT ``-q`` OUTPUT. Measured on pytest 9.0.3: parametrize ids
-contain ``::`` (IPv6 literals such as ``fd00::1``), so splitting printed lines is
+contain ``::`` (IPv6 literals such as ``2001:db8::1``), so splitting printed lines is
 unsound, and a module skipped at import (``pytest.importorskip``) prints nothing
 at all under ``-q``. The plugin records ``session.items`` exactly, plus the
 collect reports that failed (collection errors) and were skipped (whole modules

@@ -96,7 +96,7 @@ def _load_tree(path: str) -> dict | str:
 def file_of(nodeid: str) -> str:
     """The test file an id belongs to: everything before the FIRST ``::``.
 
-    File paths never contain ``::``; parametrize ids can (``fd00::1``).
+    File paths never contain ``::``; parametrize ids can (``2001:db8::1``).
     """
     return nodeid.split("::", 1)[0]
 

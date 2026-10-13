@@ -92,7 +92,7 @@ class TestTheRule:
         assert r.returncode == OK, r.stdout
 
     def test_param_ids_containing_double_colon_map_to_their_file(self, tmp_path):
-        base = ["tests/a/test_x.py::test_ip[fd00::1]", *BASE]
+        base = ["tests/a/test_x.py::test_ip[2001:db8::1]", *BASE]
         r = run(tmp_path, base, BASE, changed=["tests/a/test_x.py"])
         assert r.returncode == OK, r.stdout
 
@@ -291,7 +291,7 @@ class TestPlugin:
         (proj / "tests" / "sub").mkdir(parents=True)
         (proj / "tests" / "test_ok.py").write_text(
             "import pytest\n"
-            "@pytest.mark.parametrize('x', [1, 'a b', 'fd00::1'])\n"
+            "@pytest.mark.parametrize('x', [1, 'a b', '2001:db8::1'])\n"
             "def test_p(x): pass\n"
         )
         (proj / "tests" / "test_err.py").write_text("import nosuchmodule_collected_floor\n")
@@ -324,7 +324,7 @@ class TestPlugin:
         assert data["ids"] == [
             "tests/test_ok.py::test_p[1]",
             "tests/test_ok.py::test_p[a b]",
-            "tests/test_ok.py::test_p[fd00::1]",
+            "tests/test_ok.py::test_p[2001:db8::1]",
         ]
         assert data["errors"] == ["tests/test_err.py"]
         assert data["skipped"] == ["tests/sub/test_skip.py"]
