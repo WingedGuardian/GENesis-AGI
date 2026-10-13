@@ -63,10 +63,17 @@ def _live(pid: int) -> str:
     return "?"
 
 
-def _record(home: Path, pid: int, st: str, state: str = "paused", comm: str = "sleep") -> None:
+_BOOT = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def _record(
+    home: Path, pid: int, st: str, state: str = "paused", comm: str = "sleep", boot: str = _BOOT
+) -> None:
     f = _state_dir(home) / "frozen"
     with open(f, "a") as fh:
-        fh.write(f"{pid}\t{st}\t{comm}\t2026-01-01T00:00:00Z\t1:2\t/x/tasks/b.output\t{state}\n")
+        fh.write(
+            f"{pid}\t{st}\t{comm}\t2026-01-01T00:00:00Z\t1:2\t/x/tasks/b.output\t{state}\t{boot}\n"
+        )
 
 
 def _records(home: Path) -> list[list[str]]:
@@ -501,7 +508,7 @@ def test_an_empty_field_is_refused(home, field):
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a 0o000 file")
 def test_an_unreadable_record_file_is_never_rewritten(home):
     f = _state_dir(home) / "frozen"
-    f.write_text("1\t1\ta\tT\tk\t/p\tpaused\n2\t2\tb\tT\tk\t/p\tpaused\n")
+    f.write_text(f"1\t1\ta\tT\tk\t/p\tpaused\t{_BOOT}\n2\t2\tb\tT\tk\t/p\tpaused\t{_BOOT}\n")
     f.chmod(0)
     try:
         out = _lib(
@@ -522,13 +529,19 @@ def test_thaw_waits_for_a_first_record_still_being_written(home, stopped_sleep):
     records file does not exist yet, and thaw must still wait, then resume."""
     lock = _state_dir(home) / "frozen.lock"
     rec = _state_dir(home) / "frozen"
-    line = f"{stopped_sleep.pid}\t{_starttime(stopped_sleep.pid)}\tsleep\tT\tk\t/x/o\tpaused\n"
+    line = f"{stopped_sleep.pid}\t{_starttime(stopped_sleep.pid)}\tsleep\tT\tk\t/x/o\tpaused\t{_BOOT}\n"
     holder = subprocess.Popen(
-        [sys.executable, "-c",
-         "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f, fcntl.LOCK_EX); "
-         "print('held', flush=True); time.sleep(1); open(sys.argv[2],'w').write(sys.argv[3])",
-         str(lock), str(rec), line],
-        stdout=subprocess.PIPE, text=True,
+        [
+            sys.executable,
+            "-c",
+            "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f, fcntl.LOCK_EX); "
+            "print('held', flush=True); time.sleep(1); open(sys.argv[2],'w').write(sys.argv[3])",
+            str(lock),
+            str(rec),
+            line,
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
     )
     assert holder.stdout.readline().strip() == "held"
     out = _cli(home, "thaw", "all")
@@ -570,8 +583,11 @@ def test_a_grace_with_a_leading_zero_is_decimal(home, stopped_sleep):
     _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
     env = dict(os.environ, HOME=str(home), WATCHGOD_KILL_GRACE_S="08")
     out = subprocess.run(
-        [str(_CLI), "kill", str(stopped_sleep.pid)], env=env, capture_output=True,
-        text=True, timeout=60,
+        [str(_CLI), "kill", str(stopped_sleep.pid)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     assert out.returncode == 0, out.stderr
     assert "value too great" not in out.stderr
@@ -583,3 +599,125 @@ def test_kill_and_thaw_read_a_pid_as_decimal(home, stopped_sleep):
     _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
     out = _cli(home, "thaw", "0" + str(stopped_sleep.pid))
     assert f"resumed pid {stopped_sleep.pid}" in out.stdout
+
+
+# ── Codex round 1 (PR B) ──────────────────────────────────────────
+
+
+def test_a_record_from_another_boot_is_not_a_record(home, stopped_sleep):
+    """(pid, start time) can recur after a reboot: a record written in another
+    boot is never acted on, and the next write drops it."""
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid), boot="0000-old-boot")
+    out = _cli(home, "kill", str(stopped_sleep.pid), grace=1)
+    assert out.returncode != 0 and "ended" not in out.stdout, out.stdout
+    assert _live(stopped_sleep.pid) == "T", "the process was not touched"
+    out = _cli(home, "thaw", "all")
+    assert "resumed" not in out.stdout
+    assert _live(stopped_sleep.pid) == "T"
+    _lib(home, "wg_record_put 4242 777 sleep T0 1:2 /x/out paused")
+    rows = _records(home)
+    assert len(rows) == 1 and rows[0][0] == "4242" and rows[0][7] == _BOOT
+
+
+def test_a_written_record_carries_this_boot(home):
+    _lib(home, "wg_record_put 4242 777 sleep T0 1:2 /x/out paused")
+    assert _records(home) == [["4242", "777", "sleep", "T0", "1:2", "/x/out", "paused", _BOOT]]
+
+
+def test_a_process_name_with_a_newline_is_still_that_process(home):
+    """comm may hold a newline: the stat record is read whole, so thaw finds
+    the process and resumes it instead of dropping its record."""
+    code = (
+        "import ctypes, os, signal, time\n"
+        "ctypes.CDLL(None).prctl(15, b'a\\nb) x', 0, 0, 0)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert p.stdout.readline().strip() == "ready"
+        assert "\n" in Path(f"/proc/{p.pid}/comm").read_text()[:-1], "guard: comm holds a newline"
+        os.kill(p.pid, signal.SIGSTOP)
+        for _ in range(50):
+            if _live(p.pid) == "T":
+                break
+            time.sleep(0.05)
+        _record(home, p.pid, _starttime(p.pid), comm="x")
+        out = _lib(home, f"wg_starttime {p.pid}")
+        assert out.stdout == _starttime(p.pid)
+        out = _cli(home, "status")
+        assert "still paused" in out.stdout, out.stdout
+        out = _cli(home, "thaw", str(p.pid))
+        assert f"resumed pid {p.pid}" in out.stdout, out.stdout
+        assert _live(p.pid) != "T"
+    finally:
+        p.kill()
+        p.wait(timeout=10)
+
+
+@pytest.mark.parametrize(
+    "args", [("kill", "{pid}", "1"), ("thaw", "{pid}", "x"), ("status", "x"), ("kill",), ("thaw",)]
+)
+def test_a_command_takes_exactly_its_arguments(home, stopped_sleep, args):
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    out = _cli(home, *(a.format(pid=stopped_sleep.pid) for a in args), grace=1)
+    assert out.returncode == 2, out.stdout + out.stderr
+    assert _live(stopped_sleep.pid) == "T", "nothing was signalled"
+    assert len(_records(home)) == 1
+
+
+@pytest.mark.parametrize("cmd", ["kill", "thaw"])
+def test_a_pid_operand_that_would_wrap_is_refused(home, stopped_sleep, cmd):
+    """bash arithmetic wraps at 2^64: 2^64 + pid must not name pid (review
+    finding: kill ended a process the operator never named)."""
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    out = _cli(home, cmd, str(2**64 + stopped_sleep.pid), grace=1)
+    assert out.returncode == 2, out.stdout + out.stderr
+    assert _live(stopped_sleep.pid) == "T"
+    assert len(_records(home)) == 1
+
+
+def test_a_pid_with_a_leading_zero_is_not_recorded(home):
+    out = _lib(
+        home, "wg_record_put 04242 777 sleep T0 1:2 /x/out paused && echo WROTE || echo REFUSED"
+    )
+    assert "REFUSED" in out.stdout
+
+
+def test_the_pidfd_path_binds_a_process_whose_name_is_not_utf8(home):
+    """A comm that is not valid UTF-8 must not knock the signal off the pidfd
+    path: the signal still reaches exactly that process."""
+    code = (
+        "import ctypes, time\n"
+        "ctypes.CDLL(None).prctl(15, b'\\xff\\xfe) q', 0, 0, 0)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert p.stdout.readline().strip() == "ready"
+        st = Path(f"/proc/{p.pid}/stat").read_bytes().rsplit(b") ", 1)[1].split()[19].decode()
+        out = subprocess.run(
+            ["python3", "-I", "-S", "-c", _pidfd_script(), str(p.pid), st, "TERM"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert out.returncode == 0, (out.returncode, out.stderr)
+        p.wait(timeout=10)
+        assert p.returncode == -signal.SIGTERM
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait(timeout=10)
+
+
+def _pidfd_script() -> str:
+    """The signal library's pidfd helper, exactly as it ships."""
+    return subprocess.run(
+        ["bash", "-c", f"source '{_SIGNAL}'; printf %s \"$_WG_PIDFD_PY\""],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout

@@ -29,8 +29,11 @@
 
 wg_starttime() {
     # Start time of pid $1 (stat field 22), or failure when it is gone.
-    local rest
-    read -r rest 2>/dev/null < "${DG_PROC:-/proc}/$1/stat" || return 1
+    # The WHOLE record: comm (field 2) may hold a newline, so the first line
+    # can end before its closing ")" (review finding).
+    local rest=""
+    IFS= read -r -d '' rest 2>/dev/null < "${DG_PROC:-/proc}/$1/stat" || true  # no NUL: always 1 at EOF
+    [[ "$rest" == *") "* ]] || return 1
     rest="${rest##*) }"
     local -a f
     read -r -a f <<< "$rest"
@@ -58,11 +61,13 @@ try:
     except OSError:
         sys.exit(12)
     try:
-        with open("/proc/%d/stat" % pid) as fh:
-            f = fh.read().rsplit(") ", 1)[1].split()
+        # Bytes: comm need not be valid UTF-8, and a decode error would
+        # silently drop to the fallback path (review finding).
+        with open("/proc/%d/stat" % pid, "rb") as fh:
+            f = fh.read().rsplit(b") ", 1)[1].split()
     except OSError:
         sys.exit(10)
-    if len(f) < 20 or f[19] != want:
+    if len(f) < 20 or f[19] != want.encode():
         sys.exit(10)
 except SystemExit:
     raise

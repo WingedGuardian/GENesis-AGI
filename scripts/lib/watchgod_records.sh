@@ -2,9 +2,13 @@
 # Pause records: every process the disk guardian paused, for `scripts/watchgod`.
 #
 # One file, $DG_STATE_DIR/frozen, one tab-separated line per paused process:
-#   pid  start-time  comm  paused-at  dev:inode  path  state
+#   pid  start-time  comm  paused-at  dev:inode  path  state  boot
 # A process is its pid AND its start time (stat field 22): every reader matches
 # both, so a record never applies to a later holder of the same pid number.
+# The start time counts clock ticks since boot, so the pair can recur after a
+# reboot: each line also carries the boot it was written in, and a line from
+# another boot is not a record (wg_records_list skips it, and the next write
+# drops it). Readers see the first seven fields only.
 # state is "paused" (the stop is confirmed: State T, or t for a traced process,
 # which reports its pending group-stop as t), "pending" (SIGSTOP was sent and
 # not yet seen to land), or "pending-t" (sent to a holder already in a tracing
@@ -25,6 +29,16 @@
 # Pure functions; nothing runs at source time. Needs DG_STATE_DIR.
 
 wg_records_file() { printf '%s/frozen' "${DG_STATE_DIR:?DG_STATE_DIR is unset}"; }
+
+wg_boot_id() {
+    # This boot's identity: the kernel boot id, else the boot time. Fails when
+    # neither can be read; nothing is recorded or trusted without it.
+    local b=""
+    read -r b 2>/dev/null < /proc/sys/kernel/random/boot_id || true
+    [[ "$b" =~ ^[0-9a-f-]+$ ]] || b="$(awk '$1 == "btime" { print "btime-" $2; exit }' /proc/stat 2>/dev/null)"
+    [[ -n "$b" ]] || return 1
+    printf '%s' "$b"
+}
 
 wg_records_lock() {
     # Take the records lock on a new descriptor, stored in the variable named
@@ -53,14 +67,17 @@ wg_records_unlock() {
 }
 
 wg_records_list() {
-    # Every well-formed record line (numeric pid and start time), in order.
-    # Fails when the file exists but cannot be read: an unreadable file is not
-    # an empty one, and a writer that took it for one would delete every record.
-    local f
+    # Every well-formed record of this boot (numeric pid and start time), in
+    # order, as its first seven fields. Fails when the file exists but cannot
+    # be read, or the boot cannot be identified: an unreadable file is not an
+    # empty one, and a writer that took it for one would delete every record.
+    local f boot
     f="$(wg_records_file)"
     [[ -e "$f" ]] || return 0
     [[ -r "$f" ]] || return 1
-    awk -F'\t' '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/' "$f" 2>/dev/null
+    boot="$(wg_boot_id)" || return 1
+    awk -F'\t' -v OFS='\t' -v b="$boot" \
+        'NF == 8 && $8 == b && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { NF = 7; print }' "$f" 2>/dev/null
 }
 
 wg_record_state() {
@@ -73,10 +90,12 @@ wg_record_state() {
 }
 
 _wg_records_replace() {
-    # Replace the file with stdin, atomically. The caller holds the lock.
-    local f
+    # Replace the file with stdin (seven-field lines), atomically, each line
+    # stamped with this boot. The caller holds the lock.
+    local f boot
     f="$(wg_records_file)"
-    ( umask 077; cat > "$f.tmp" && mv -f -- "$f.tmp" "$f" ) 2>/dev/null
+    boot="$(wg_boot_id)" || return 1
+    ( umask 077; awk -v b="$boot" 'NF { print $0 "\t" b }' > "$f.tmp" && mv -f -- "$f.tmp" "$f" ) 2>/dev/null
 }
 
 wg_record_put() {
@@ -87,7 +106,8 @@ wg_record_put() {
     # No field may be empty: bash's `IFS=$'\t' read` collapses an empty field
     # where awk keeps it, so the two readers would disagree about the columns.
     local pid="$1" st="$2" comm="$3" ts="$4" key="$5" path="$6" state="$7" recs old line f
-    [[ "$pid" =~ ^[0-9]+$ && "$st" =~ ^[0-9]+$ ]] || return 1
+    # pid in /proc's own form (no leading zero), or the record never matches.
+    [[ "$pid" =~ ^[1-9][0-9]*$ && "$st" =~ ^[0-9]+$ ]] || return 1
     [[ "$state" == paused || "$state" == pending || "$state" == pending-t ]] || return 1
     for f in "$ts" "$key" "$path"; do
         [[ -n "$f" && "$f" != *$'\t'* && "$f" != *$'\n'* ]] || return 1
