@@ -114,12 +114,14 @@ genesis_install_managed_unit() {
     python3 -I -S "$GENESIS_MU_PY" stamp < "$render" > "$stamped" || rc=$?
     if [ "$rc" -ne 0 ]; then
         rm -f "$stamped"
-        if [ "$rc" -eq 3 ]; then
-            echo "  WARNING: $rel carries the genesis-managed marker itself; $name not installed"
-        else
-            echo "  WARNING: could not stamp the render of $rel (exit $rc); $name left as it is"
-        fi
-        return 0
+        # A unit that cannot be rendered is a failed deploy, not a warning:
+        # the code would run against the old unit. Named in the summary too,
+        # since bootstrap's own output is cut to `tail -10` under update.sh.
+        local why="could not stamp the render of $rel (exit $rc)"
+        [ "$rc" -eq 3 ] && why="$rel carries the genesis-managed marker itself"
+        echo "  ERROR: $why; $name not installed"
+        genesis_mu_summary "not installed $name: $why"
+        return 1
     fi
     if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
         # A link (a masked unit is one, to /dev/null) or a directory is never
