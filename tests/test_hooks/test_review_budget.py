@@ -22,7 +22,15 @@ H5 = "5" * 40
 def _linear_commits(*heads):
     """GraphQL commit nodes for a linear history, each with its parent."""
     return [
-        {"commit": {"oid": h, "parents": {"nodes": [{"oid": heads[i - 1]}] if i else []}}}
+        {
+            "commit": {
+                "oid": h,
+                "parents": {
+                    "totalCount": 1 if i else 0,
+                    "nodes": [{"oid": heads[i - 1]}] if i else [],
+                },
+            }
+        }
         for i, h in enumerate(heads)
     ]
 
@@ -1266,7 +1274,7 @@ def test_the_live_read_carries_commit_parents_and_finds_a_late_review(monkeypatc
     assert [(f["head"], f["keys"], f["round_head"]) for f in got["findings"]] == [
         (H4, ["c900"], None)
     ]
-    assert " parents(first: 2) { nodes { oid } }" in " ".join(serve.seen[0])
+    assert " parents(first: 100) { totalCount nodes { oid } }" in " ".join(serve.seen[0])
 
 
 def test_a_commit_node_without_its_parents_is_malformed(monkeypatch):
@@ -1295,3 +1303,37 @@ def test_a_commit_graph_that_changes_between_the_reads_is_unknown(monkeypatch):
     assert got["status"] == "unknown", got
     assert "evidence_changed_during_evaluation" in got["errors"], got
     assert " commits(first: 100" in seen[1]  # the re-read selects the graph
+
+
+def test_a_parent_list_that_did_not_come_back_complete_is_unknown(monkeypatch):
+    """Every parent is read; a commit whose parent count exceeds the parents
+    returned (an octopus merge past the page) would make round_of guess."""
+    _no_seams(monkeypatch)
+    octopus = {
+        "commit": {
+            "oid": H5,
+            "parents": {"totalCount": 3, "nodes": [{"oid": H3}, {"oid": H4}]},
+        }
+    }
+    serve = _graphql_server(files=_FILES, commits=[*_linear_commits(H3, H4), octopus])
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "unknown" and "commits_malformed" in got["errors"], got
+    assert " parents(first: 100) { totalCount nodes { oid } }" in " ".join(serve.seen[0])
+
+
+def test_the_live_read_carries_comment_edit_times(monkeypatch):
+    """Issue comments are read with their edit time, and that time reaches the
+    marks: a clean comment edited after it was posted marks at the edit."""
+    _no_seams(monkeypatch)
+    clean = {
+        "fullDatabaseId": "9",
+        "body": "Codex Review: Didn't find any major issues.\nReviewed commit: `" + H5[:10] + "`",
+        "createdAt": "2026-10-05T01:00:00Z",
+        "updatedAt": "2026-10-05T02:00:00Z",
+        "author": {"login": "chatgpt-codex-connector", "__typename": "Bot"},
+    }
+    serve = _graphql_server(files=_FILES, commits=_linear_commits(H5), comments=[clean])
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert "createdAt updatedAt" in " ".join(serve.seen[0])
+    assert [m["at"] for m in got["marks"]] == ["2026-10-05T02:00:00+00:00"]

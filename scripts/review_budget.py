@@ -649,6 +649,15 @@ def evaluate_evidence(
         ok, when = _parse_time(item.get("created_at"))
         if not ok:
             return _unknown("malformed_comment_time", current_head=head)
+        # A comment can be edited. Its MARK takes the edit time and everything
+        # else its creation time: a later mark makes fewer reviews late, an
+        # earlier event time makes fewer late too, so each side raises the count.
+        marked_raw = item.get("updated_at") or item.get("created_at")
+        ok, marked = _parse_time(marked_raw)
+        if not ok:
+            return _unknown("malformed_comment_time", current_head=head)
+        if marked is None or (when is not None and marked < when):
+            marked = when  # never earlier than the comment itself
         before = when is None or when < cut
         # The confirmation marker and the identity template are matched on TEXT,
         # not on who wrote it, so a deleted author's comment still counts for both.
@@ -688,12 +697,12 @@ def evaluate_evidence(
                 return _unknown(error, current_head=head)
             confirm(resolved or "", before)
             report(resolved or "", login)
-            mark(resolved or "", when, item.get("created_at"))
+            mark(resolved or "", marked, marked_raw)
             continue
         is_findings, sha = review_findings.codex_comment_finding_head(body)
         if is_findings and sha is not None:
             report(sha, login)  # a report on either side of the cutover, like a review
-            mark(sha, when, item.get("created_at"))
+            mark(sha, marked, marked_raw)
         if is_findings and not before:
             if sha is None:
                 return _unknown("codex_findings_comment_unbound", current_head=head)
@@ -1088,7 +1097,7 @@ _GRAPHQL_CONNECTIONS = {
     ),
     "comments": (
         "comments(first: 100, after: $after_comments) { pageInfo { hasNextPage endCursor } "
-        "nodes { fullDatabaseId body createdAt author { login __typename } } }"
+        "nodes { fullDatabaseId body createdAt updatedAt author { login __typename } } }"
     ),
     "files": (
         "files(first: 100, after: $after_files) { pageInfo { hasNextPage endCursor } "
@@ -1096,7 +1105,7 @@ _GRAPHQL_CONNECTIONS = {
     ),
     "commits": (
         "commits(first: 100, after: $after_commits) { pageInfo { hasNextPage endCursor } "
-        "nodes { commit { oid parents(first: 2) { nodes { oid } } } } }"
+        "nodes { commit { oid parents(first: 100) { totalCount nodes { oid } } } } }"
     ),
 }
 
@@ -1214,6 +1223,7 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
                     "type": kind,
                     "body": node.get("body"),
                     "created_at": node.get("createdAt"),
+                    "updated_at": node.get("updatedAt"),
                 }
             )
         elif name == "files":
@@ -1227,11 +1237,15 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
             commit = node.get("commit")
             if not isinstance(commit, dict):
                 raise ValueError(name)
-            # The first two parents only. A third (an octopus merge) is left
-            # out, and a missing edge can only hide an ancestor, which leaves a
-            # late review counted as a round: the over-count direction.
+            # Every parent is read. A missing edge would not only leave a late
+            # review counted (the safe side) but could make round_of's "one newest
+            # round ancestor" falsely unique, so a parent list that did not come
+            # back complete makes the whole read unknown.
             parents = commit.get("parents")
             if not isinstance(parents, dict) or not isinstance(parents.get("nodes"), list):
+                raise ValueError(name)
+            total = parents.get("totalCount")
+            if not isinstance(total, int) or total != len(parents["nodes"]):
                 raise ValueError(name)
             oids = []
             for parent in parents["nodes"]:

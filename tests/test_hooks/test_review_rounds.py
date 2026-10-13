@@ -1340,3 +1340,29 @@ def test_a_bodyless_review_of_unknown_state_marks_nothing(state):
         reviews=(row, _rv(DEVIN, H1, _devin("🟡"), when=T2)),
     )
     assert got["count"] == 1
+
+
+@pytest.mark.parametrize("edited, late", [(None, True), (T4, False)])
+def test_an_edited_comment_marks_at_its_edit_time(edited, late):
+    """A comment mark takes the edit time: a clean comment on a descendant that
+    was edited after an ancestor finding arrived cannot make that finding late."""
+    clean = {**_clean(H2[:10], when=T1), "updated_at": edited}
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        comments=(clean,),
+        reviews=(_rv(DEVIN, H1, _devin("🟡"), when=T2),),
+    )
+    assert got["count"] == (0 if late else 1)
+    assert [m["at"] for m in got["marks"] if m["head"] == H2] == [_z(edited or T1)]
+
+
+def test_a_malformed_comment_edit_time_is_unknown():
+    clean = {**_clean(H2[:10], when=T1), "updated_at": "not a time"}
+    assert _ev(head=H2, commits=_dag(H1, H2), comments=(clean,))["status"] == "unknown"
+
+
+def test_an_edit_time_before_the_comment_never_back_dates_its_mark():
+    clean = {**_clean(H2[:10], when=T3), "updated_at": T1}
+    got = _ev(head=H2, commits=_dag(H1, H2), comments=(clean,))
+    assert [m["at"] for m in got["marks"]] == [_z(T3)]
