@@ -370,7 +370,7 @@ async def _impl_web_fetch(
             "url": result.url,
             "title": result.title,
             "content": result.text,
-            "backend_used": "scrapling" if not result.error else "httpx",
+            "backend_used": result.client,
             "status_code": result.status_code,
             "truncated": result.truncated,
             "error": result.error,
@@ -396,14 +396,14 @@ async def _impl_web_fetch(
         return {"url": url, "error": "Crawl4AI failed or unavailable", "backend_used": "crawl4ai"}
 
     elif backend in ("scrapling", "httpx"):
-        # Force WebFetcher (which uses scrapling if available, else httpx)
-        result = await fetcher.fetch(url, max_chars=max_chars)
+        # Force WebFetcher with the requested client.
+        result = await fetcher.fetch(url, max_chars=max_chars, client=backend)
         latency = (time.monotonic() - start) * 1000
         return {
             "url": result.url,
             "title": result.title,
             "content": result.text,
-            "backend_used": backend,
+            "backend_used": result.client,
             "status_code": result.status_code,
             "truncated": result.truncated,
             "error": result.error,
