@@ -7,7 +7,7 @@ source), so the module must run with no package context and survive a broken
 ``.venv``. A subprocess parity test (``test_cred_integrity.py``) re-runs the
 module in pipe mode and fails the build if any ``genesis.*`` import creeps in.
 
-Two entry points, one implementation both sides share:
+Credential entry points and a shared authenticated backup-decryption facility:
 
 - **check** (read-only): validate each target credential file; return only a
   JSON verdict. No secret bytes ever cross the container boundary.
@@ -17,6 +17,9 @@ Two entry points, one implementation both sides share:
   atomically place the restored file. The passphrase is resolved locally
   (env → validated secrets.env → host escrow) so the guardian process — which
   only pipes the command — never handles it.
+- **decrypt-backup**: authenticate one encrypted message and atomically publish
+  its plaintext. ``decrypt_backup_file`` and ``decrypt_backup_stream`` share
+  this boundary with backup, restore and transcript-evidence callers.
 
 Trigger policy (locked): restore fires STRICTLY on observed corruption
 (missing-with-backup / empty / NUL-zeroed / unparseable / missing structural
@@ -24,9 +27,9 @@ key). A valid-but-different file is never touched — this is what protects a
 mid-refresh ``.credentials.json`` or an install that legitimately omits an
 optional key from a destructive restore.
 
-Sibling: ``credential_bridge.py`` owns the passphrase *escrow* write; this
-module is its *reader* on the restore path. Keep the two dotenv parsers in
-sync (both strip one quote layer; see the quoting caveat in credential_bridge).
+Sibling: ``credential_bridge.py`` owns the passphrase *escrow* write and uses
+this module's credential-specific reader. Secrets follow load_secrets.sh's
+single-line syntax; escrow values are literal bytes between '=' and record LF.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -138,16 +142,16 @@ class RestoreResult:
 def _parse_dotenv(text: str) -> dict[str, str]:
     """Minimal key=value parser (mirrors credential_bridge._read_dotenv)."""
     result: dict[str, str] = {}
-    for raw in text.splitlines():
-        line = raw.strip()
+    for raw in text.split("\n"):
+        line = raw.strip(" \t\r\v\f")
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        key = key.strip()
+        key = key.strip(" \t\r\v\f")
         if key.startswith("export "):
-            key = key[7:].strip()
+            key = key[7:].strip(" \t\r\v\f")
         if key:
-            result[key] = value.strip().strip("'\"")
+            result[key] = value.strip(" \t\r\v\f").strip("'\"")
     return result
 
 
@@ -248,8 +252,11 @@ def check_all(
 # ── Restore (container-only side effects) ───────────────────────────────────
 
 
-class _DecryptError(Exception):
-    pass
+class _DecryptError(ValueError):
+    def __init__(self, message: str, *, returncode: int | None = None):
+        super().__init__(message)
+        self.returncode = returncode
+        self.command = None
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -259,26 +266,142 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-def _gpg_decrypt(src: Path, passphrase: str) -> bytes:
-    """Symmetric-decrypt a backup .gpg to bytes. Matches scripts/restore.sh:
-    ``gpg --batch --yes --passphrase-fd 0 -d <src>`` (passphrase on stdin)."""
+def _gpg_password(passphrase: str | bytes) -> bytes:
+    password = passphrase.encode("utf-8") if isinstance(passphrase, str) else passphrase
+    if not password or b"\n" in password or b"\0" in password:
+        raise _DecryptError("backup passphrase must be a single line without a terminator")
+    return password
+
+
+def _gpg_command(src: Path, status_fd: int) -> list[str]:
+    # Ignore gpg.conf: --ignore-mdc-error or an alternate output/status channel
+    # would invalidate this boundary. Never put a passphrase in argv.
+    return [
+        "gpg", "--no-options", "--batch", "--yes", "--no-symkey-cache",
+        "--pinentry-mode", "loopback", "--passphrase-fd", "0",
+        "--status-fd", str(status_fd), "--decrypt", "--", str(src),
+    ]
+
+
+def _gpg_authenticated(status, returncode: int) -> None:
+    """Require one protected, passphrase-decrypted message, after GPG exits.
+
+    GnuPG doc/DETAILS defines these machine records. DECRYPTION_INFO alone
+    also occurs on failure; DECRYPTION_OKAY alone can accept an unprotected
+    packet with unsafe options. AEAD is protected even when its MDC field is
+    zero. GOODMDC is obsolete and is not required for AEAD.
+    """
+    status.seek(0)
+    data = status.read(262145)
+    if returncode != 0:
+        raise _DecryptError("encrypted backup decryption or integrity check failed",
+                            returncode=returncode)
+    if len(data) > 262144:
+        raise _DecryptError("encrypted backup integrity status exceeds its limit")
+    records = [line[9:].split() for line in data.split(b"\n")
+               if line.startswith(b"[GNUPG:] ")]
+    names = [fields[0] for fields in records if fields]
+    forbidden = {b"DECRYPTION_KEY", b"DECRYPTION_FAILED", b"BADMDC", b"ERROR",
+                 b"FAILURE", b"NODATA", b"BAD_PASSPHRASE", b"MISSING_PASSPHRASE"}
+    required = (b"NEED_PASSPHRASE_SYM", b"BEGIN_DECRYPTION", b"DECRYPTION_INFO",
+                b"DECRYPTION_OKAY", b"END_DECRYPTION", b"PLAINTEXT")
+    if forbidden.intersection(names) or any(names.count(name) != 1 for name in required):
+        raise _DecryptError("backup is not one passphrase-authenticated encrypted message")
+    info = next(fields[1:] for fields in records if fields[0] == b"DECRYPTION_INFO")
     try:
-        proc = subprocess.run(
-            ["gpg", "--batch", "--yes", "--quiet", "--passphrase-fd", "0", "-d", str(src)],
-            input=passphrase.encode("utf-8"),
-            capture_output=True,
-            timeout=60,
-        )
-    except FileNotFoundError as exc:
-        raise _DecryptError("gpg not found") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise _DecryptError("gpg decrypt timed out") from exc
-    if proc.returncode != 0:
-        # stderr carries no passphrase; trim to keep logs bounded.
-        raise _DecryptError(
-            proc.stderr.decode("utf-8", "replace").strip()[:200] or "gpg failed"
-        )
-    return proc.stdout
+        mdc, cipher = int(info[0]), int(info[1])
+        aead = int(info[2]) if len(info) > 2 else 0
+    except (ValueError, IndexError) as exc:
+        raise _DecryptError("invalid encrypted backup integrity status") from exc
+    if cipher <= 0 or (mdc <= 0 and aead <= 0):
+        raise _DecryptError("encrypted backup has no integrity protection")
+
+
+def _gpg_scratch(scratch: Path | None) -> Path:
+    directory = Path(scratch) if scratch is not None else Path.home() / "tmp"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return directory
+
+
+def _gpg_run(src, password, output, scratch, timeout=None):
+    """Bytes and staged files share argv, status checks, and process lifetime."""
+    with tempfile.TemporaryFile(dir=_gpg_scratch(scratch)) as status:
+        try:
+            proc = subprocess.run(
+                _gpg_command(Path(src), status.fileno()), input=_gpg_password(password),
+                stdout=output, stderr=subprocess.DEVNULL, pass_fds=(status.fileno(),),
+                timeout=timeout,
+            )
+        except FileNotFoundError as exc:
+            raise _DecryptError("gpg not found") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise _DecryptError("gpg decrypt timed out") from exc
+        try:
+            _gpg_authenticated(status, proc.returncode)
+        except _DecryptError as exc:
+            exc.command = proc.args
+            raise
+        return proc.stdout
+
+
+def _gpg_decrypt(src: Path, passphrase: str) -> bytes:
+    """Authenticate before returning credential bytes; retain the 60s timeout."""
+    return _gpg_run(src, passphrase, subprocess.PIPE, None, timeout=60)
+
+
+def decrypt_backup_file(src: Path, target: Path, passphrase: str | bytes) -> None:
+    """Publish authenticated plaintext atomically; failure preserves target.
+
+    GPG can emit all plaintext before discovering a bad trailer. It therefore
+    writes only to a private sibling staging file, never the live destination.
+    """
+    target = Path(target)
+    fd, name = tempfile.mkstemp(prefix=".gpg-restore-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as stage:
+            _gpg_run(src, passphrase, stage, target.parent)
+            stage.flush()
+            os.fsync(stage.fileno())
+        os.replace(name, target)
+        dir_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name)
+
+
+@contextlib.contextmanager
+def decrypt_backup_stream(src: Path, passphrase: str | bytes, scratch: Path | None = None):
+    """Bounded-memory stream: accept results only AFTER this context exits.
+
+    Consumers may examine tentative bytes locally but must not publish them
+    inside the context. Drain the complete message before checking integrity.
+    """
+    password = _gpg_password(passphrase)
+    with tempfile.TemporaryFile(dir=_gpg_scratch(scratch)) as status:
+        try:
+            proc = subprocess.Popen(
+                _gpg_command(Path(src), status.fileno()), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, pass_fds=(status.fileno(),),
+            )
+        except FileNotFoundError as exc:
+            raise _DecryptError("gpg not found") from exc
+        try:
+            proc.stdin.write(password)
+            proc.stdin.close()
+            yield proc.stdout
+            while proc.stdout.read(65536):
+                pass
+            _gpg_authenticated(status, proc.wait(timeout=30))
+        finally:
+            proc.stdin.close()
+            proc.stdout.close()
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
 
 
 def restore_file(
@@ -354,10 +477,44 @@ def restore_file(
 # ── Passphrase resolution (container-side) ──────────────────────────────────
 
 
+def _backup_passphrase_value(raw: bytes, *, escrow: bool = False) -> str | None:
+    """Read this credential's file grammar without changing generic validation.
+
+    Secrets mirror load_secrets.sh's literal, single-LF-record syntax (no
+    expansion/multiline syntax). Escrow mirrors its raw writer and shell reader:
+    first matching record, no quote/whitespace/newline translation of its value.
+    """
+    if b"\0" in raw:
+        raise ValueError("backup passphrase file contains NUL")
+    whitespace = " \t\r\v\f"
+    selected = None
+    for record in raw.decode("utf-8").split("\n"):
+        if escrow:
+            for prefix in ("GENESIS_BACKUP_PASSPHRASE=", "export GENESIS_BACKUP_PASSPHRASE="):
+                if record.startswith(prefix):
+                    return record[len(prefix):]
+            continue
+        line = record.strip(whitespace)
+        if line.startswith("export "):
+            line = line[7:]
+        key, separator, value = line.partition("=")
+        if not separator or key != "GENESIS_BACKUP_PASSPHRASE":
+            continue
+        if value.startswith(("'", '"')):
+            selected = value[1:].split(value[0], 1)[0]
+        else:
+            for position, character in enumerate(value):
+                if character == "#" and position and value[position-1] in whitespace:
+                    value = value[:position]
+                    break
+            selected = value.rstrip(whitespace)
+    return selected
+
+
 def resolve_passphrase(home: Path) -> str | None:
     """env → validated secrets.env → host escrow. The escrow is the exit for the
     circular case (secrets.env itself corrupt → its passphrase is unusable)."""
-    env_pass = os.environ.get("GENESIS_BACKUP_PASSPHRASE", "").strip()
+    env_pass = os.environ.get("GENESIS_BACKUP_PASSPHRASE", "")
     if env_pass:
         return env_pass
 
@@ -369,21 +526,17 @@ def resolve_passphrase(home: Path) -> str | None:
             raw = b""
         # Only trust secrets.env for the passphrase if it is NOT itself corrupt.
         if validate_bytes("dotenv", raw, min_keys=1).ok:
-            val = _parse_dotenv(raw.decode("utf-8", "replace")).get(
-                "GENESIS_BACKUP_PASSPHRASE", ""
-            ).strip()
+            val = _backup_passphrase_value(raw)
             if val:
                 return val
 
     escrow = home / ".genesis/shared/guardian/backup_passphrase.env"
     if escrow.exists():
         try:
-            val = _parse_dotenv(escrow.read_text()).get(
-                "GENESIS_BACKUP_PASSPHRASE", ""
-            ).strip()
+            val = _backup_passphrase_value(escrow.read_bytes(), escrow=True)
             if val:
                 return val
-        except OSError:
+        except (OSError, ValueError):
             pass
     return None
 
@@ -438,7 +591,18 @@ def main(argv: list[str] | None = None) -> int:
     p_restore.add_argument("--home", default=None)
     p_restore.add_argument("--backup-dir", default=None)
 
+    p_decrypt = sub.add_parser("decrypt-backup")
+    p_decrypt.add_argument("source", type=Path)
+    p_decrypt.add_argument("target", type=Path)
+
     args = parser.parse_args(argv)
+    if args.cmd == "decrypt-backup":
+        try:
+            decrypt_backup_file(args.source, args.target, sys.stdin.buffer.read())
+        except (OSError, ValueError, subprocess.SubprocessError):
+            print("encrypted backup authentication failed", file=sys.stderr)
+            return 1
+        return 0
     home = Path(args.home).expanduser() if args.home else _default_home()
     backup_dir = (
         Path(args.backup_dir).expanduser() if args.backup_dir

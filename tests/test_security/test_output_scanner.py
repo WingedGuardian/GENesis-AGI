@@ -198,3 +198,28 @@ def test_benign_lookalikes_not_flagged(text):
     result = scan_outbound(text)
     assert result.safe is True
     assert result.detected == []
+
+
+_TEST_CARD = "4242" * 4  # Stripe's public test number, built from parts
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"Paid with {_TEST_CARD} today",
+        f"card {_TEST_CARD[:4]} {_TEST_CARD[4:8]} {_TEST_CARD[8:12]} {_TEST_CARD[12:]}",
+    ],
+    ids=["unbroken", "grouped"],
+)
+def test_payment_card_is_critical(text):
+    result = scan_outbound(text)
+    assert not result.safe
+    assert "payment_card" in result.detected
+    assert result.risk_level == "high"
+
+
+def test_card_shaped_but_not_a_card_is_safe():
+    # Luhn-failing, decimal fraction, and an epoch timestamp.
+    bad_luhn = _TEST_CARD[:-1] + "3"
+    for text in (f"order {bad_luhn}", f"score 0.{_TEST_CARD}", "ts 1728600000000"):
+        assert scan_outbound(text).safe, text
