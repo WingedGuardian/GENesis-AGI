@@ -110,7 +110,12 @@ def _non_mutating(seg) -> bool:
 
 
 def _commit_cwd(seg) -> str | None:
-    """Require one absolute literal -C: native hook cwd omits workdir overrides."""
+    """Require one absolute, canonical literal -C: native hook cwd omits workdir overrides.
+
+    Canonical means the spelling already equals its realpath: no symlink, no `..`,
+    and no process-relative procfs link such as /proc/self/cwd, which the hook and
+    the command would resolve in different processes.
+    """
     index = git_subcommand_index(seg.argv)
     options = seg.argv[1:index]
     if len(options) == 2 and options[0] == "-C":
@@ -119,7 +124,10 @@ def _commit_cwd(seg) -> str | None:
         return None
     if not os.path.isabs(target) or any(ch in target for ch in "$`\\*?[]{}()<>\n"):
         return None
-    return os.path.abspath(target) if Path(target).is_dir() else None
+    # "/" is refused too: its realpath "/" never equals the stripped "".
+    if not Path(target).is_dir() or os.path.realpath(target) != target.rstrip("/"):
+        return None
+    return target.rstrip("/")
 
 
 def _request_identity_reason(argv: list[str]) -> Fixable | None:
@@ -127,18 +135,20 @@ def _request_identity_reason(argv: list[str]) -> Fixable | None:
 
     gh 2.100.0 selects a PR URL before --repo; the shared helper does the reverse
     and drops hostnames. Mixed selectors and foreign hosts require a rewrite.
+    The host must be WRITTEN: a bare OWNER/REPO resolves against gh's configured
+    default host, which may be an enterprise host the budget lookup never sees.
     """
     token, _ = requests._comment_positional(argv)
     repo = requests._comment_repo_value(argv)
     if requests._unresolvable_identity(argv) is None and token is not None:
         if re.fullmatch(r"[0-9]+", token) and repo is not None:
-            if re.fullmatch(r"(?:github\.com/)?[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
+            if re.fullmatch(r"github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
                 return None
         elif (repo is None and token.startswith(("https://github.com/", "http://github.com/"))
               and requests._LITERAL_URL_RE.fullmatch(token)):
             return None
     return Fixable(
-        "Use one literal PR number with --repo OWNER/REPO (github.com), or one "
+        "Use one literal PR number with --repo github.com/OWNER/REPO, or one "
         "literal github.com PR URL without --repo. Branches, implicit targets, "
         "expansions, mixed URL/repository selectors and other hosts are unsupported."
     )
@@ -182,8 +192,9 @@ def decide(payload: object) -> str | None:
         effective_cwd = _commit_cwd(seg)
         if effective_cwd is None:
             return Fixable(
-                "Use git -C followed by one literal absolute directory; "
-                "other global options are unsupported."
+                "Use git -C followed by one literal absolute directory that is already "
+                "its own real path (no symlink, no .., no /proc/self link; check it with "
+                "realpath); other global options are unsupported."
             )
         deadline = Deadline.after(commits._COMMIT_HOOK_REGISTERED_TIMEOUT - 0.5)
         branch = state.get_current_branch(cwd=effective_cwd, deadline=deadline.expires_at)

@@ -28,12 +28,12 @@ def payload(command):
 @pytest.mark.parametrize("decision", ["ask", "deny", "unexpected"])
 def test_request_decisions_never_ask_or_allow_unknown(adapter, monkeypatch, decision):
     monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: (decision, "limit"))
-    assert adapter.decide(payload('gh pr comment 1 --repo owner/repo --body "@codex review"'))
+    assert adapter.decide(payload('gh pr comment 1 --repo github.com/owner/repo --body "@codex review"'))
 
 
 def test_request_allow_is_preserved(adapter, monkeypatch):
     monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: ("allow", ""))
-    assert adapter.decide(payload('gh pr comment 1 --repo owner/repo --body "@codex review"')) is None
+    assert adapter.decide(payload('gh pr comment 1 --repo github.com/owner/repo --body "@codex review"')) is None
 
 
 @pytest.mark.parametrize("command", ["printf hello", "printf 'git commit'", "git status"])
@@ -91,6 +91,25 @@ def test_glued_absolute_c_remains_parser_refused_before_lookup(adapter, monkeypa
     assert isinstance(adapter.decide(payload(f"git -C{tmp_path} commit -m x")), adapter.Fixable)
 
 
+@pytest.mark.parametrize("shape", ["symlink", "dotdot", "proc_self_cwd"])
+def test_non_canonical_c_targets_are_fixable_before_lookup(adapter, monkeypatch, tmp_path, shape):
+    """A -C spelling that resolves differently in another process never reaches the budget."""
+    real = tmp_path / "real"
+    real.mkdir()
+    if shape == "symlink":
+        (tmp_path / "link").symlink_to(real)
+        target = str(tmp_path / "link")
+    elif shape == "dotdot":
+        (tmp_path / "other").mkdir()
+        target = f"{tmp_path}/other/../real"
+    else:
+        target = "/proc/self/cwd"
+    assert Path(target).is_dir(), "fixture must name an existing directory"
+    monkeypatch.setattr(adapter.state, "get_current_branch", lambda **kw: pytest.fail("branch lookup"))
+    monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("budget lookup"))
+    assert isinstance(adapter.decide(payload(f"git -C {target} commit -m x")), adapter.Fixable)
+
+
 @pytest.mark.parametrize("selector", [
     "1", "branch --repo owner/repo", "--repo owner/repo", "'#1' --repo owner/repo",
     '1 --repo "$REPO"', '"$PR" --repo owner/repo',
@@ -98,6 +117,8 @@ def test_glued_absolute_c_remains_parser_refused_before_lookup(adapter, monkeypa
     "1 --repo elsewhere.invalid/owner/repo",
     "https://github.com/owner/repo/pull/1 --repo other/repo",
     "https://github.com/owner/repo/pull/1 --repo owner/repo",
+    # No written host: gh resolves OWNER/REPO against its configured default host.
+    "1 --repo owner/repo", "1 -Rowner/repo", "1 --repo=owner/repo",
 ])
 def test_context_dependent_review_identity_is_fixable_before_lookup(adapter, monkeypatch, selector):
     monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: pytest.fail("lookup"))
@@ -106,7 +127,7 @@ def test_context_dependent_review_identity_is_fixable_before_lookup(adapter, mon
 
 
 @pytest.mark.parametrize("selector", [
-    "1 --repo owner/repo", "1 --repo=github.com/owner/repo", "1 -Rowner/repo",
+    "1 --repo github.com/owner/repo", "1 --repo=github.com/owner/repo", "1 -Rgithub.com/owner/repo",
     "https://github.com/owner/repo/pull/1", "http://github.com/owner/repo/pull/1/files",
     "https://github.com/owner/repo/pull/1#issuecomment-2",
 ])
@@ -121,7 +142,7 @@ def test_explicit_review_identity_reaches_unchanged_policy(adapter, monkeypatch,
 
 
 @pytest.mark.parametrize("command", [
-    f"git -C {ROOT} commit -m x", 'gh pr comment 1 --repo owner/repo --body "@codex review"',
+    f"git -C {ROOT} commit -m x", 'gh pr comment 1 --repo github.com/owner/repo --body "@codex review"',
 ])
 def test_foreign_inherited_host_blocks_before_lookup(adapter, monkeypatch, command):
     monkeypatch.setenv("GH_HOST", "elsewhere.invalid")
@@ -197,13 +218,13 @@ def evidence(monkeypatch, adapter, count, gate=False):
 @pytest.mark.parametrize("count,blocked", [(0, False), (3, False), (4, True), (5, True)])
 def test_real_request_policy_ordinary_boundary(adapter, monkeypatch, count, blocked):
     evidence(monkeypatch, adapter, count)
-    reason = adapter.decide(payload('gh pr comment 1 --repo owner/repo --body "@codex review"'))
+    reason = adapter.decide(payload('gh pr comment 1 --repo github.com/owner/repo --body "@codex review"'))
     assert bool(reason) == blocked
 
 
 def test_real_gate_confirmation_policy_is_preserved(adapter, monkeypatch):
     budget, head = evidence(monkeypatch, adapter, 2, gate=True)
-    prefix = 'gh pr comment 1 --repo owner/repo --body "@codex review'
+    prefix = 'gh pr comment 1 --repo github.com/owner/repo --body "@codex review'
     assert adapter.decide(payload(prefix + '"'))
     assert adapter.decide(payload(prefix + '\n' + budget.confirmation_marker(head) + '"')) is None
 
@@ -221,7 +242,7 @@ def test_real_commit_policy_boundaries(adapter, monkeypatch, count, gate, blocke
 def test_broken_evidence_is_deny(adapter, monkeypatch):
     evidence(monkeypatch, adapter, 0)
     monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", "not JSON")
-    assert adapter.decide(payload('gh pr comment 1 --repo owner/repo --body "@codex review"'))
+    assert adapter.decide(payload('gh pr comment 1 --repo github.com/owner/repo --body "@codex review"'))
 
 
 def test_ordinary_exception_is_deny_not_exit_one(adapter, monkeypatch, capsys):
@@ -266,7 +287,7 @@ def test_launcher_denies_each_module_scope_import_failure(tmp_path, poisoned):
 
 
 @pytest.mark.parametrize("command", [
-    "git commit -m x", 'gh pr comment 1 --repo owner/repo --body "@codex review"',
+    "git commit -m x", 'gh pr comment 1 --repo github.com/owner/repo --body "@codex review"',
 ])
 @pytest.mark.parametrize("variable", ["GH_REPO", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"])
 def test_inherited_overrides_block_both_budget_paths(adapter, monkeypatch, command, variable):
@@ -459,7 +480,7 @@ def test_approval_and_evidence_denials_still_stop(adapter, monkeypatch, capsys, 
         monkeypatch.setattr(
             adapter.requests, "_check_codex_round_escalation", lambda *a: ("ask", "limit")
         )
-        data = payload('gh pr comment 1 --repo owner/repo --body "@codex review"')
+        data = payload('gh pr comment 1 --repo github.com/owner/repo --body "@codex review"')
     else:
         data = {"tool_name": "other"}
     reason = adapter.decide(data)
