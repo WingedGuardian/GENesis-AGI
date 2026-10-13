@@ -271,8 +271,16 @@ def test_retired_servers_share_no_name_with_the_template():
 
 @pytest.mark.parametrize(
     "bad",
-    ["{not json", "[1, 2]", '{"mcpServers": []}', '{"mcpServers": "x"}', "\udcff"],
-    ids=["invalid", "array", "servers-array", "servers-string", "undecodable"],
+    [
+        "{not json",
+        "[1, 2]",
+        '{"mcpServers": []}',
+        '{"mcpServers": "x"}',
+        "\udcff",
+        '{"mcpServers": {"mine": {"command": "/m"}}, "x": NaN}',
+        '{"mcpServers": {}, "x": -Infinity}',
+    ],
+    ids=["invalid", "array", "servers-array", "servers-string", "undecodable", "nan", "infinity"],
 )
 def test_an_unusable_file_is_backed_up_and_replaced(tmp_path, _scratch_home, bad):
     mod = _module()

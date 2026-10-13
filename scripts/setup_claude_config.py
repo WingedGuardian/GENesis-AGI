@@ -128,6 +128,13 @@ def _umask() -> int:
     return mask
 
 
+def _reject_constant(name: str) -> object:
+    # Python's json accepts NaN/Infinity; Claude Code's parser (JSON.parse) does
+    # not. A file holding one is unreadable to its real reader, so treat it as
+    # unusable (backed up and replaced) rather than writing the constant back.
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
 def merge_mcp(existing: object, rendered: dict, template_servers: set[str]) -> dict | None:
     """The merged .mcp.json, or None when ``existing`` is not usable as one.
 
@@ -168,8 +175,8 @@ def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool:
         new, why = rendered, "created"
     else:
         try:
-            existing = json.loads(old_bytes.decode("utf-8"))
-        except ValueError:  # JSONDecodeError and UnicodeDecodeError
+            existing = json.loads(old_bytes.decode("utf-8"), parse_constant=_reject_constant)
+        except ValueError:  # JSONDecodeError, UnicodeDecodeError, NaN/Infinity
             existing = None
         merged = merge_mcp(existing, rendered, template_servers)
         # Compared as objects: key order and formatting are not changes (serena's
@@ -214,7 +221,7 @@ def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool:
             print(f"  WARNING: could not back up .mcp.json ({exc}); left unchanged.")
             return False
         note = f"; previous file saved as {saved}"
-    _write_keeping_mode(output_path, json.dumps(new, indent=2) + "\n")
+    _write_keeping_mode(output_path, json.dumps(new, indent=2, allow_nan=False) + "\n")
     print(f"  Written{note}.")
     if old_bytes is not None:
         _summary(f"mcp.json {why}{note}")
