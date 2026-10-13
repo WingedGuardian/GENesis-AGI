@@ -650,6 +650,35 @@ def _update_lock_unopenable(exc: UpdateLockError):
     return jsonify({"error": f"Cannot open update.lock ({exc}); nothing was started."}), 500
 
 
+def _state_guards_merged_code(state: dict | None) -> bool:
+    """Whether update_state.json still stands between a restart and merged code
+    that bootstrap never ran on (#3139). Only "done", or a "fetching" state whose
+    rollback tag is still HEAD (git says nothing merged), is safe to retire; any
+    doubt keeps the guard, since only update.sh, bootstrap's crash recovery and
+    the user's Dismiss retire it on purpose."""
+    if not state:
+        return False
+    phase = state.get("phase")
+    if phase in (None, "done"):
+        return False
+    if phase != "fetching":
+        return True
+    tag = str(state.get("rollback_tag") or "")
+    if not tag or tag.startswith("-"):
+        return True
+    try:
+        heads = [
+            subprocess.run(
+                ["git", "-C", str(_GENESIS_ROOT), "rev-parse", "--verify", "-q", rev],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            for rev in (f"{tag}^{{commit}}", "HEAD")
+        ]
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return not heads[0] or heads[0] != heads[1]
+
+
 def _apply_supervised(pid_file: Path) -> tuple:
     """Spawn a three-tier CC update pipeline as a detached subprocess.
 
@@ -663,6 +692,16 @@ def _apply_supervised(pid_file: Path) -> tuple:
     the genesis package may be mid-update.
     """
     _GENESIS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # An earlier update that merged code it has not activated (a refused or
+    # conflicted --post-merge) keeps update_state.json as the restart guard;
+    # starting over would delete it. Finish that one first.
+    with contextlib.suppress(OSError, json.JSONDecodeError):
+        if _STATE_FILE.is_file() and _state_guards_merged_code(json.loads(_STATE_FILE.read_text())):
+            return jsonify({
+                "error": "An earlier update merged code it has not activated yet. "
+                "Finish it with scripts/update.sh --post-merge, or Dismiss it first.",
+            }), 409
 
     # Clean up ALL state files from prior runs
     for f in (_SUMMARY_FILE, _ESCALATION_FILE, _CONFLICT_FILE, _STATE_FILE):
@@ -894,21 +933,44 @@ MANAGED_UNITS = GENESIS_ROOT / "scripts" / "lib" / "managed_units.py"
 UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 
 def refused():
+    # True unless the check PASSES for both the checked-out tree and the commit
+    # update.sh fetched to deploy: a unit that only the fetched commit adds is
+    # refused before the merge, so HEAD alone cannot see it. Any doubt (the
+    # remote or the check cannot be resolved) also stops escalation, since
+    # escalating is the risky direction here.
     try:
         if SUMMARY.read_text().lstrip().startswith("refused:"):
             return True
     except OSError:
         pass
+    revisions = ["HEAD"]
     try:
-        rc = subprocess.run(
-            [sys.executable, "-I", "-S", str(MANAGED_UNITS), "check",
-             "--repo", str(GENESIS_ROOT), "--unit-dir", str(UNIT_DIR),
-             "--upto", "HEAD", "--accept-legacy"],
-            capture_output=True,
-        ).returncode
+        remote = subprocess.run(
+            [sys.executable, "-m", "genesis.util.update_remote", str(GENESIS_ROOT)],
+            capture_output=True, text=True, cwd=str(GENESIS_ROOT),
+        )
+        if remote.returncode != 0 or not remote.stdout.strip():
+            log.warning("cannot resolve the update remote; not escalating")
+            return True
+        revisions.append(
+            "refs/remotes/" + remote.stdout.splitlines()[0].strip() + "/main"
+        )
     except OSError:
-        return False
-    return rc == 4
+        return True
+    for rev in revisions:
+        try:
+            rc = subprocess.run(
+                [sys.executable, "-I", "-S", str(MANAGED_UNITS), "check",
+                 "--repo", str(GENESIS_ROOT), "--unit-dir", str(UNIT_DIR),
+                 "--upto", rev, "--accept-legacy"],
+                capture_output=True,
+            ).returncode
+        except OSError:
+            return True
+        if rc != 0:
+            log.info("managed-unit check at %s exited %d", rev, rc)
+            return True
+    return False
 
 if refused():
     log.info("update.sh refused over hand-edited units; not escalating")
@@ -1081,13 +1143,15 @@ def update_progress():
         except OSError:
             stale = True
 
-        # Clean up stale state file — no process is running and the file
-        # is just noise at this point (its purpose is crash recovery). Except
-        # after a refusal over hand-edited systemd units: a refused
-        # `update.sh --post-merge` keeps it on purpose, because the merge is in
-        # and only the file stops deploy_code_only.sh from restarting onto code
-        # that bootstrap never ran on.
-        if stale and not (summary or "").lstrip().startswith("refused:"):
+        # Clean up a stale state file ONLY while it says nothing has merged yet
+        # (phase "fetching"). From "merging" on, the file is what stops
+        # deploy_code_only.sh and the live engine restarting onto merged code
+        # whose bootstrap never ran: a merge-conflict exit, a refused
+        # `update.sh --post-merge` over hand-edited units, a crash. Those are
+        # retired by update.sh itself, by bootstrap's crash recovery, or by the
+        # user's Dismiss, never by a poll (#3139). Deciding from the summary
+        # text missed a direct CLI run, which writes no summary.
+        if stale and not _state_guards_merged_code(state_data):
             with contextlib.suppress(OSError):
                 _STATE_FILE.unlink()
 

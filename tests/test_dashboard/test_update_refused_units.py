@@ -7,6 +7,7 @@ when a session writes an escalation anyway.
 
 from __future__ import annotations
 
+import json
 import os
 import string
 import subprocess
@@ -72,13 +73,64 @@ def _orchestrate(tmp_path: Path, tier1_summary: str, genesis_root: Path | None =
     return calls.read_text().split()
 
 
-def test_a_refusal_is_never_escalated_even_when_a_session_asks(tmp_path):
-    assert _orchestrate(tmp_path, "refused: genesis-server.service") == ["haiku"]
+def _checkout(tmp_path: Path, monkeypatch, *, incoming: str | None = None) -> Path:
+    """A checkout with an ``origin`` remote whose tracking ref is what update.sh
+    fetched: HEAD, plus one commit adding ``incoming`` as a new template."""
+    repo = tmp_path / "genesis"
+    (repo / "scripts" / "lib").mkdir(parents=True)
+    (repo / "scripts" / "systemd").mkdir(parents=True)
+    (repo / "scripts" / "lib" / "managed_units.py").write_text(CHECKER.read_text())
+    (repo / "scripts" / "systemd" / "base.service.template").write_text("[Service]\nExecStart=/b\n")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "remote", "add", "origin", str(tmp_path / "upstream.git"))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    fetched = "HEAD"
+    if incoming is not None:
+        _git(repo, "checkout", "-qb", "incoming")
+        (repo / "scripts" / "systemd" / f"{incoming}.template").write_text(
+            "[Service]\nExecStart=/new\n"
+        )
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "adds a unit")
+        _git(repo, "checkout", "-q", "main")
+        fetched = "incoming"
+    _git(repo, "update-ref", "refs/remotes/origin/main", fetched)
+    home = tmp_path / "home"
+    (home / ".config" / "systemd" / "user").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    return home / ".config" / "systemd" / "user"
 
 
-def test_an_ordinary_failure_still_escalates(tmp_path):
+def test_a_refusal_is_never_escalated_even_when_a_session_asks(tmp_path, monkeypatch):
+    _checkout(tmp_path, monkeypatch)
+    calls = _orchestrate(
+        tmp_path, "refused: genesis-server.service", genesis_root=tmp_path / "genesis"
+    )
+    assert calls == ["haiku"]
+
+
+def test_an_ordinary_failure_still_escalates(tmp_path, monkeypatch):
     """Control: the stop above keys on the refusal, not on escalation in general."""
-    assert _orchestrate(tmp_path, "error: pip failed") == ["haiku", "sonnet"]
+    _checkout(tmp_path, monkeypatch)
+    calls = _orchestrate(tmp_path, "error: pip failed", genesis_root=tmp_path / "genesis")
+    assert calls == ["haiku", "sonnet"]
+
+
+@pytest.mark.parametrize("edited", [True, False])
+def test_a_unit_only_the_fetched_commit_adds_still_stops_escalation(tmp_path, monkeypatch, edited):
+    """update.sh refuses before the merge, so HEAD lacks the new template; the
+    gate must also check the commit update.sh fetched (#3138 review)."""
+    units = _checkout(tmp_path, monkeypatch, incoming="fresh.service")
+    if edited:
+        (units / "fresh.service").write_text("[Service]\nExecStart=/mine\n")
+    calls = _orchestrate(tmp_path, "Resolved everything.", genesis_root=tmp_path / "genesis")
+    assert calls == (["haiku"] if edited else ["haiku", "sonnet"])
+
+
+def test_an_unresolvable_update_remote_stops_escalation(tmp_path):
+    """No remote can be read (not even a checkout): doubt never escalates."""
+    assert _orchestrate(tmp_path, "error: pip failed") == ["haiku"]
 
 
 def _status_report(tmp_path: Path, monkeypatch, unit_text: str | None) -> dict:
@@ -179,11 +231,63 @@ def progress(tmp_path, monkeypatch):
     return app.test_client(), state, summary
 
 
-@pytest.mark.parametrize(("text", "kept"), [("refused: genesis-server.service", True), ("error: pip", False)])
-def test_the_progress_poll_keeps_a_refused_updates_state_file(progress, text, kept):
-    """A refused --post-merge keeps update_state.json so deploy_code_only.sh will
-    not restart onto merged code bootstrap never ran on; the poll must not GC it."""
+def _tagged_repo(tmp_path: Path, monkeypatch, *, merged: bool) -> str:
+    """A checkout whose rollback tag is HEAD, or one commit behind it (merged)."""
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "a")
+    _git(repo, "tag", "pre-update-x")
+    if merged:
+        _git(repo, "commit", "-q", "--allow-empty", "-m", "merged")
+    monkeypatch.setattr(updates, "_GENESIS_ROOT", repo)
+    return "pre-update-x"
+
+
+@pytest.mark.parametrize(
+    ("phase", "text", "tag", "kept"),
+    [
+        # From "merging" on the file is the restart guard, whatever the summary
+        # says and whether or not one exists (a direct CLI run writes none).
+        ("merging", "refused: genesis-server.service", "head", True),
+        ("merging", None, "head", True),
+        ("merging", "error: merge conflict", "head", True),
+        ("bootstrap", "error: pip", "head", True),
+        ("health_check", None, "head", True),
+        # "fetching" is retired only when git says nothing merged.
+        ("fetching", None, "head", False),
+        ("fetching", "error: fetch", "head", False),
+        # A killed --post-merge run also writes "fetching", over merged code.
+        ("fetching", None, "merged", True),
+        ("fetching", None, None, True),
+    ],
+)
+def test_the_progress_poll_never_deletes_a_post_merge_state_file(
+    progress, tmp_path, monkeypatch, phase, text, tag, kept
+):
+    """update_state.json past the merge stops deploy_code_only.sh and the live
+    engine restarting onto merged code bootstrap never ran on (#3139); a
+    dashboard poll must not delete it."""
     client, state, summary = progress
-    summary.write_text(text)
+    data = {"phase": phase, "pid": 999999999}
+    if tag is not None:
+        data["rollback_tag"] = _tagged_repo(tmp_path, monkeypatch, merged=(tag == "merged"))
+    state.write_text(json.dumps(data))
+    os.utime(state, (1, 1))
+    if text is not None:
+        summary.write_text(text)
     assert client.get("/api/genesis/updates/progress").status_code == 200
     assert state.exists() is kept
+
+
+def test_a_supervised_update_will_not_start_over_a_post_merge_guard(progress):
+    """Starting the dashboard pipeline used to delete update_state.json first."""
+    _client, state, _summary = progress
+    state.write_text(json.dumps({"phase": "merging", "pid": 999999999}))
+    from flask import Flask
+
+    with Flask(__name__).app_context():
+        body, code = updates._apply_supervised(state.parent / "pid")
+    assert code == 409
+    assert state.exists()
+    assert "--post-merge" in body.get_json()["error"]

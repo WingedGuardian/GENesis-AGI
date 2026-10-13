@@ -1043,7 +1043,20 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
                 -e "s|__AZ_ROOT__|$_az_root_esc|g" \
                 -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
                 -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
-                "$template" > "$target"
+                "$template" > "$target.render"
+            # Stamped like every bootstrap render (scripts/lib/managed_units.py),
+            # so a hand edit is recognised from the first update on. Unstamped,
+            # the unit would be matched against its template with each
+            # __TOKEN__ as a wildcard, and an edit confined to a token's value
+            # would be overwritten silently.
+            if ! python3 -I -S "$SCRIPT_DIR/lib/managed_units.py" stamp \
+                    < "$target.render" > "$target.tmp"; then
+                rm -f "$target.render" "$target.tmp"
+                echo "    ! $svc_name: could not stamp the rendered unit"
+                exit 1
+            fi
+            rm -f "$target.render"
+            mv -f "$target.tmp" "$target"
             echo "    + $svc_name generated"
             SERVICES_GENERATED=1
         fi

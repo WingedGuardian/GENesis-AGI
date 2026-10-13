@@ -195,3 +195,115 @@ def test_bootstrap_by_hand_refuses_a_hand_edit_before_anything(world, allow_live
     assert ("CONTINUED" in r.stdout) is (code == 0)
     if code == 4:
         assert "REFUSED: demo.service" in r.stdout
+
+
+def test_a_bootstrap_refusal_keeps_a_summary_file_it_did_not_create(world):
+    """GENESIS_DEPLOY_SUMMARY may name a caller's file; a refusal must not delete it."""
+    repo, home, units = world
+    (units / "demo.service").write_text("[Service]\nExecStart=/mine\n")
+    theirs = home / "callers-log.txt"
+    theirs.write_text("keep me\n")
+    script = (
+        f"set -euo pipefail\nGENESIS_ROOT={str(repo)!r}; HOME={str(home)!r}\n"
+        f"SCRIPT_DIR={str(repo / 'scripts')!r}\n"
+        f"export GENESIS_BOOTSTRAP_ALLOW_LIVE='' GENESIS_TAKE_TEMPLATES=''\n"
+        f"export GENESIS_DEPLOY_SUMMARY={str(theirs)!r}\n" + _bootstrap_refusal_block()
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert r.returncode == 4, r.stdout + r.stderr
+    assert theirs.read_text() == "keep me\n"
+
+
+def _install_step7_block() -> str:
+    text = (REPO / "scripts" / "install.sh").read_text()
+    start = text.index('    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template')
+    return text[start : text.index("\n    done\n", start) + len("\n    done\n")]
+
+
+def test_install_writes_stamped_units_and_never_overwrites(tmp_path):
+    """A unit install.sh creates carries its stamp from the start, so the first
+    update can tell an edit to a token's value from the template (#3138 review)."""
+    tdir, udir = tmp_path / "templates", tmp_path / "units"
+    tdir.mkdir()
+    udir.mkdir()
+    (tdir / "demo.service.template").write_text(TEMPLATE)
+    (tdir / "kept.service.template").write_text(TEMPLATE)
+    (udir / "kept.service").write_text("[Service]\nExecStart=/theirs\n")
+    script = (
+        "set -euo pipefail\n"
+        f"SYSTEMD_TEMPLATE_DIR={str(tdir)!r} SYSTEMD_USER_DIR={str(udir)!r}\n"
+        f"HOME={str(tmp_path)!r} VENV_PATH=/opt/v REPO_DIR=/opt/r CC_BIN_DIR=/opt/c\n"
+        f"SCRIPT_DIR={str(REPO / 'scripts')!r}\n"
+        "_falkordb_redis_server_bin() { echo /usr/bin/redis-server; }\n" + _install_step7_block()
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rendered = (udir / "demo.service").read_text()
+    stamp = subprocess.run(
+        ["python3", "-I", "-S", str(CHECKER), "stamp"], input=RENDER, capture_output=True, text=True
+    ).stdout
+    assert rendered == stamp
+    assert (udir / "kept.service").read_text() == "[Service]\nExecStart=/theirs\n"
+    assert sorted(p.name for p in udir.iterdir()) == ["demo.service", "kept.service"]
+
+
+def _no_change_branch() -> str:
+    # Anchored on the neighbours, not on the condition under test, so a mutated
+    # condition still extracts (and fails the assertion, not the extraction).
+    text = (REPO / "scripts" / "update.sh").read_text()
+    start = text.index("# END tier2-baseline-check\n") + len("# END tier2-baseline-check\n")
+    end = text.index('    echo "  Already up to date ($NEW_COMMIT)."', start)
+    end = text.rindex("elif ", start, end)
+    return (
+        text[start:end] + 'elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then\n    echo NOCHANGE\nfi\n'
+    )
+
+
+@pytest.mark.parametrize(("take", "activates"), [("demo.service", True), ("", False)])
+def test_a_take_with_nothing_new_still_runs_bootstrap(take, activates):
+    """Only bootstrap installs a taken template, so --take-template must not stop
+    at "Already up to date" (#3138 review)."""
+    script = (
+        "OLD_COMMIT=abc NEW_COMMIT=abc\n"
+        f"GENESIS_TAKE_TEMPLATES={take!r}\n"
+        "_tier2_pending_since_baseline() { return 1; }\n" + _no_change_branch()
+    )
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True).stdout
+    assert ("NOCHANGE" not in out) is activates, out
+    assert ("--take-template was given" in out) is activates
+
+
+def _state_helpers() -> str:
+    text = (REPO / "scripts" / "update.sh").read_text()
+    start = text.index("_clear_deploy_state() {")
+    end = text.index("\n}\n", text.index("_on_signal_prestop() {")) + 3
+    return text[start:end]
+
+
+@pytest.mark.parametrize(
+    ("owner", "post_merge", "call", "kept"),
+    [
+        ("other", "false", "_clear_deploy_state", True),
+        ("self", "false", "_clear_deploy_state", False),
+        ("self", "true", "_on_signal_prestop INT", True),
+        ("self", "false", "_on_signal_prestop INT", False),
+    ],
+)
+def test_update_only_ever_retires_its_own_state_file(tmp_path, owner, post_merge, call, kept):
+    """An early exit (failed fetch, refusal, nothing to do) must not delete an
+    EARLIER run's update_state.json: after a refused or conflicted merge it is the
+    restart guard. Nor may Ctrl-C in a --post-merge run, which continues a merge
+    that already happened (#3138 round 2)."""
+    state = tmp_path / "update_state.json"
+    pid = "$$" if owner == "self" else "1"
+    script = (
+        f"STATE_FILE={str(state)!r} GENESIS_HOME={str(tmp_path)!r} POST_MERGE={post_merge}\n"
+        "WERE_RUNNING=()\n"
+        "_deploy_marker_holder_live() { return 1; }\n"
+        "_start_genesis_server() { :; }\n"
+        f"printf '{{\"phase\": \"merging\", \"pid\": %s}}' {pid} > {str(state)!r}\n"
+        + _state_helpers()
+        + f"\n{call}\n"
+    )
+    subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert state.exists() is kept

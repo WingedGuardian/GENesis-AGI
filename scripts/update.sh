@@ -193,7 +193,25 @@ PY
 # that run finished); env.update_in_progress() reads such a dead marker as "no
 # deploy", so the window before it is cleaned is harmless.
 _clear_deploy_state() {
-    rm -f "$STATE_FILE" 2>/dev/null || true
+    # Only a state file THIS run wrote (its pid is $$). Before this run writes
+    # one, the file is an earlier run's: after a refused or conflicted merge it
+    # is what stops deploy_code_only.sh and the live engine restarting onto
+    # merged code bootstrap never ran on, so an early exit here (a failed fetch,
+    # a refusal, nothing to do) must leave it. Retiring it is the job of that
+    # run's --post-merge, bootstrap's crash recovery, or the dashboard's Dismiss.
+    if [ -f "$STATE_FILE" ] && python3 -I -S -c '
+import json, sys
+try:
+    sys.exit(0 if int(json.load(open(sys.argv[1])).get("pid", -1)) == int(sys.argv[2]) else 1)
+except Exception:
+    sys.exit(1)
+' "$STATE_FILE" "$$" 2>/dev/null; then
+        rm -f "$STATE_FILE" 2>/dev/null || true
+    fi
+    _clear_deploy_marker
+}
+
+_clear_deploy_marker() {
     local _m="${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid" _pid
     _pid="$(cat "$_m" 2>/dev/null || true)"
     # "Dead" includes a zombie (_deploy_marker_holder_live, in deploy_marker.sh),
@@ -230,7 +248,13 @@ _on_signal_prestop() {
             systemctl --user start "$_svc.service" 2>/dev/null || true
         fi
     done
-    _clear_deploy_state
+    if [[ "${POST_MERGE:-false}" == "true" ]]; then
+        # A --post-merge run continues a merge that already happened: its state
+        # file is what stops a restart onto merged code bootstrap never ran on.
+        _clear_deploy_marker
+    else
+        _clear_deploy_state
+    fi
     exit 1
 }
 
@@ -2343,7 +2367,12 @@ PYEOF
 }
 # END tier2-baseline-check
 
-if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]] && _tier2_pending_since_baseline; then
+if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]] && [ -n "$GENESIS_TAKE_TEMPLATES" ]; then
+    # Only bootstrap installs a taken template, so a take must not stop at
+    # "Already up to date" with the edited unit still installed.
+    echo "  No new commits, but --take-template was given — running full activation"
+    echo "  (bootstrap + migrations + restart) so the template is installed."
+elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]] && _tier2_pending_since_baseline; then
     echo "  No new commits, but update.sh-only paths changed since the last recorded"
     echo "  update — running full activation (bootstrap + migrations + restart)."
 elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then

@@ -278,7 +278,10 @@ if [ -z "${GENESIS_BOOTSTRAP_ALLOW_LIVE:-}" ]; then
         echo "Nothing was changed. Move each change into ~/.config/systemd/user/<unit>.d/*.conf"
         echo "(a drop-in, which updates never touch), or replace it with the template, keeping"
         echo "a backup:  GENESIS_TAKE_TEMPLATES='<unit> ...' scripts/bootstrap.sh"
-        rm -f "$GENESIS_DEPLOY_SUMMARY"
+        # Only a summary file bootstrap created itself; a caller's is not ours.
+        if [ "${_bootstrap_owns_summary:-0}" = "1" ]; then
+            rm -f "$GENESIS_DEPLOY_SUMMARY"
+        fi
         exit 4
     elif [ "$_mu_rc" -ne 0 ]; then
         echo "  WARNING: could not check the installed units for hand edits; any unit that"
