@@ -643,8 +643,12 @@ def test_a_process_name_with_a_newline_is_still_that_process(home):
                 break
             time.sleep(0.05)
         _record(home, p.pid, _starttime(p.pid), comm="x")
-        out = _lib(home, f"wg_starttime {p.pid}")
-        assert out.stdout == _starttime(p.pid)
+        out = _lib(
+            home,
+            f"wg_starttime {p.pid}; echo; rc=0; wg_same_gen {p.pid} {_starttime(p.pid)} || rc=$?; echo RC=$rc",
+        )
+        assert out.stdout.splitlines()[0] == _starttime(p.pid)
+        assert "RC=0" in out.stdout
         out = _cli(home, "status")
         assert "still paused" in out.stdout, out.stdout
         out = _cli(home, "thaw", str(p.pid))
@@ -721,3 +725,179 @@ def _pidfd_script() -> str:
         check=True,
         timeout=30,
     ).stdout
+
+
+# ── Codex/CodeRabbit round 2 (PR B) ───────────────────────────────
+
+
+def _fake_proc_with_unreadable_stat(home: Path, pid: int) -> Path:
+    """A process table where pid's entry exists but its stat cannot be read."""
+    proc = home / "fakeproc"
+    (proc / str(pid)).mkdir(parents=True)
+    s = proc / str(pid) / "stat"
+    s.write_text("x")
+    s.chmod(0)
+    return proc
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a 0o000 file")
+def test_an_unreadable_stat_is_cannot_tell_not_gone(home):
+    proc = _fake_proc_with_unreadable_stat(home, 4242)
+    out = _lib(
+        home,
+        f"DG_PROC='{proc}'; rc=0; wg_same_gen 4242 777 || rc=$?; echo SAME=$rc;"
+        " rc=0; wg_same_gen 4243 777 || rc=$?; echo ABSENT=$rc;"
+        " rc=0; wg_signal_gen CONT 4242 777 || rc=$?; echo SIG=$rc",
+    )
+    assert "SAME=2" in out.stdout and "ABSENT=1" in out.stdout and "SIG=3" in out.stdout, out.stdout
+
+
+def test_same_gen_says_yes_and_no_on_a_real_process(home, stopped_sleep):
+    st = _starttime(stopped_sleep.pid)
+    out = _lib(
+        home,
+        f"rc=0; wg_same_gen {stopped_sleep.pid} {st} || rc=$?; echo SAME=$rc;"
+        f" rc=0; wg_same_gen {stopped_sleep.pid} 1 || rc=$?; echo OTHER=$rc",
+    )
+    assert "SAME=0" in out.stdout and "OTHER=1" in out.stdout, out.stdout
+
+
+@pytest.mark.parametrize(("exc", "rc"), [("PermissionError", 13), ("FileNotFoundError", 10)])
+def test_the_pidfd_helper_cannot_tell_when_stat_is_unreadable(stopped_sleep, exc, rc):
+    """The shipped helper on a real process whose stat read fails: an error
+    other than "no such file" is 13 (cannot tell, nothing sent), never 10."""
+    prefix = (
+        "import builtins\n"
+        "_o = builtins.open\n"
+        "def _open(f, *a, **k):\n"
+        f"    if str(f).endswith('/stat'): raise {exc}('injected')\n"
+        "    return _o(f, *a, **k)\n"
+        "builtins.open = _open\n"
+    )
+    st = _starttime(stopped_sleep.pid)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            prefix + _pidfd_script(),
+            str(stopped_sleep.pid),
+            st,
+            "CONT",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert out.returncode == rc, (out.returncode, out.stderr)
+    assert _live(stopped_sleep.pid) == "T", "nothing was sent"
+
+
+def test_control_bytes_in_a_record_are_not_sent_to_the_terminal(home, stopped_sleep):
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid), comm="ev\x1b[2Jil\r")
+    out = _cli(home, "status")
+    assert "\x1b" not in out.stdout and "\r" not in out.stdout, repr(out.stdout)
+    assert "ev?[2Jil?" in out.stdout
+    out = _cli(home, "thaw", str(stopped_sleep.pid))
+    assert "\x1b" not in out.stdout and "resumed" in out.stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes a read-only dir")
+def test_kill_reports_a_record_it_could_not_remove(home, stopped_sleep):
+    """The process ends, but the records file cannot be replaced: kill says so
+    and exits nonzero instead of reporting a clean end."""
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    d = _state_dir(home)
+    (d / "frozen.lock").touch()
+    d.chmod(0o500)
+    try:
+        out = _cli(home, "kill", str(stopped_sleep.pid), grace=5)
+    finally:
+        d.chmod(0o700)
+    assert out.returncode == 1, out.stdout + out.stderr
+    assert "ended pid" in out.stdout and "could not be removed" in out.stderr
+    assert len(_records(home)) == 1
+
+
+def test_the_help_text_names_the_kill_signal_order(home):
+    out = _cli(home, "help")
+    assert "SIGTERM, then" in out.stdout and "SIGCONT, then SIGKILL" in out.stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a 0o000 file")
+def test_starttime_says_gone_or_cannot_tell(home):
+    proc = _fake_proc_with_unreadable_stat(home, 4242)
+    out = _lib(
+        home,
+        f"DG_PROC='{proc}'; rc=0; wg_starttime 4242 || rc=$?; echo UNREADABLE=$rc;"
+        " rc=0; wg_starttime 4243 || rc=$?; echo ABSENT=$rc",
+    )
+    assert "UNREADABLE=2" in out.stdout and "ABSENT=1" in out.stdout, out.stdout
+
+
+def _cli_cannot_tell(
+    home: Path, tmp_path: Path, *args: str, same: int = 2
+) -> subprocess.CompletedProcess:
+    """The CLI with an identity check that can never tell (a copy whose signal
+    library answers 2/3), against the real records and the real process."""
+    root = tmp_path / "cli"
+    (root / "lib").mkdir(parents=True)
+    cli = root / "watchgod"
+    cli.write_text(_CLI.read_text())
+    cli.chmod(0o755)
+    (root / "lib" / "watchgod_records.sh").write_text(_RECORDS.read_text())
+    (root / "lib" / "watchgod_signal.sh").write_text(
+        _SIGNAL.read_text()
+        + f"\nwg_same_gen() {{ return {same}; }}\nwg_signal_gen() {{ return 3; }}\n"
+    )
+    env = dict(os.environ, HOME=str(home), WATCHGOD_KILL_GRACE_S="1")
+    env.pop("DG_STATE_DIR", None)
+    return subprocess.run(
+        [str(cli), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+@pytest.mark.parametrize("cmd", ["thaw", "kill"])
+def test_the_cli_keeps_a_record_it_cannot_verify(home, tmp_path, stopped_sleep, cmd):
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    out = _cli_cannot_tell(home, tmp_path, cmd, str(stopped_sleep.pid))
+    assert out.returncode == 1, out.stdout + out.stderr
+    assert "cannot verify" in out.stderr and "record kept" in out.stderr
+    assert len(_records(home)) == 1
+    assert _live(stopped_sleep.pid) == "T", "nothing was signalled"
+
+
+def test_status_says_a_record_it_cannot_verify_is_unverified(home, tmp_path, stopped_sleep):
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    out = _cli_cannot_tell(home, tmp_path, "status")
+    assert "unverified (record kept)" in out.stdout, out.stdout
+
+
+def test_c1_controls_are_not_sent_to_the_terminal(home, stopped_sleep):
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid), comm="a\u009b2Jb\u00e9")
+    out = subprocess.run(
+        [str(_CLI), "status"],
+        env=dict(os.environ, HOME=str(home)),
+        capture_output=True,
+        timeout=60,
+    )
+    assert b"\xc2\x9b" not in out.stdout
+    assert "a?2Jb\u00e9".encode() in out.stdout, out.stdout
+
+
+@pytest.mark.parametrize("cmd", ["thaw", "kill"])
+def test_the_cli_keeps_a_record_when_the_signal_cannot_verify(home, tmp_path, stopped_sleep, cmd):
+    """The identity check passed, then the signal's own check could not tell
+    (wg_signal_gen 3): nothing is sent, the record is kept, and it says why."""
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    out = _cli_cannot_tell(home, tmp_path, cmd, str(stopped_sleep.pid), same=0)
+    assert out.returncode == 1, out.stdout + out.stderr
+    assert "cannot verify" in out.stderr and "record kept" in out.stderr
+    assert len(_records(home)) == 1
+    assert _live(stopped_sleep.pid) == "T"
