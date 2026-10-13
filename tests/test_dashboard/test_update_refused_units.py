@@ -1,17 +1,23 @@
 """A refusal over hand-edited systemd units (update.sh exit 4) on the dashboard path.
 
 The status card reports edited units from the real checker, and the supervised
-update never escalates a refusal to a tier that could "fix" the edit away, even
-when a session writes an escalation anyway.
+update never escalates a refusal to a tier that could "fix" the edit away: it
+reads the record update.sh writes when it refuses (``update_refused.json``),
+even when a session wrote prose over the summary or asked for escalation anyway.
+
+Nothing here may reach the install: HOME is a temp dir, the routes module's
+Popen raises, and the orchestrator runs with a PATH that holds only a fake
+``claude``. (An earlier version of this file let a failing case start real
+update orchestrators.)
 """
 
 from __future__ import annotations
 
-import json
 import os
 import string
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -20,6 +26,24 @@ from genesis.dashboard.routes import updates
 
 REPO = Path(__file__).resolve().parents[2]
 CHECKER = REPO / "scripts" / "lib" / "managed_units.py"
+
+
+@pytest.fixture(autouse=True)
+def _never_the_install(tmp_path, monkeypatch):
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError(f"a test reached a real process launch: {args!r}")
+
+    # The routes module's own view of subprocess, with Popen refused. Patching
+    # subprocess.Popen itself would also break subprocess.run everywhere.
+    routes_subprocess = types.SimpleNamespace(
+        **{name: getattr(subprocess, name) for name in dir(subprocess) if not name.startswith("__")}
+    )
+    routes_subprocess.Popen = _refuse
+    monkeypatch.setattr(updates, "subprocess", routes_subprocess)
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -33,25 +57,53 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=env)
 
 
-@pytest.mark.parametrize("prompt", ["_TIER1_PROMPT", "_TIER2_PROMPT", "_TIER3_PROMPT"])
-def test_every_tier_is_told_a_refusal_is_not_its_to_fix(prompt):
+@pytest.mark.parametrize("prompt", ["_TIER1_PROMPT", "_TIER2_PROMPT"])
+def test_every_tier_that_runs_a_plain_update_is_told_a_refusal_is_not_its_to_fix(prompt):
     text = getattr(updates, prompt)
     assert "exit 4" in text.lower() or "EXITS 4" in text
     assert "never pass --take-template" in text
     assert '"refused: <the units it names>"' in text
 
 
-def _orchestrate(tmp_path: Path, tier1_summary: str, genesis_root: Path | None = None) -> list[str]:
-    """Run the real orchestrator with a fake `claude` that writes the summary
-    and ALSO asks for tier 2, as a session that ignored its prompt would."""
-    summary, escalation, calls = tmp_path / "summary", tmp_path / "escalation", tmp_path / "calls"
+@pytest.mark.parametrize("prompt", ["_TIER2_PROMPT", "_TIER3_PROMPT"])
+def test_every_tier_that_runs_post_merge_is_told_a_kept_unit_is_not_its_to_fix(prompt):
+    """--post-merge never refuses; it keeps an edited unit and names it."""
+    text = " ".join(getattr(updates, prompt).split())
+    assert "never pass --take-template" in text
+    assert "kept <unit>: edited by hand" in text
+
+
+def _orchestrate(
+    tmp_path: Path,
+    tier1_summary: str,
+    *,
+    refuses_in: str | None = None,
+    stale_record: bool = False,
+    tier2_asks_tier3: bool = False,
+) -> tuple[list[str], str]:
+    """Run the real orchestrator with a fake `claude`. Tier 1 writes the summary
+    and ALSO asks for tier 2, as a session that ignored its prompt would.
+    ``refuses_in`` names the tier whose update.sh run refused: the fake writes
+    the record update.sh writes. Returns the tiers run and the final summary."""
+    summary, escalation = tmp_path / "summary", tmp_path / "escalation"
+    calls, refused = tmp_path / "calls", tmp_path / "update_refused.json"
+    if stale_record:
+        refused.write_text('{"units": ["old.service"]}')
     bindir = tmp_path / "bin"
     bindir.mkdir()
     fake = bindir / "claude"
+    record = f'echo \'{{"units": ["demo.service"]}}\' > {refused}'
     fake.write_text(
         "#!/bin/sh\n"
         f'echo "$4" >> {calls}\n'
-        f'if [ "$4" = haiku ]; then printf %s {tier1_summary!r} > {summary}; echo tier2_needed > {escalation}; fi\n'
+        f'if [ "$4" = haiku ]; then printf %s {tier1_summary!r} > {summary}; '
+        f"echo tier2_needed > {escalation}; fi\n"
+        + (f'if [ "$4" = {refuses_in} ]; then {record}; fi\n' if refuses_in else "")
+        + (
+            f'if [ "$4" = sonnet ]; then echo tier3_needed > {escalation}; fi\n'
+            if tier2_asks_tier3
+            else ""
+        )
     )
     fake.chmod(0o755)
     fields = {f for _, f, _, _ in string.Formatter().parse(updates._ORCHESTRATOR_TEMPLATE) if f}
@@ -59,78 +111,60 @@ def _orchestrate(tmp_path: Path, tier1_summary: str, genesis_root: Path | None =
     values.update(
         summary_file=str(summary),
         escalation_file=str(escalation),
+        refused_file=str(refused),
         pid_file=str(tmp_path / "pid"),
-        genesis_root=str(genesis_root or tmp_path),
+        genesis_root=str(tmp_path),
         tier1_prompt="t1",
         tier2_prompt="t2",
     )
     script = tmp_path / "orch.py"
     script.write_text(updates._ORCHESTRATOR_TEMPLATE.format(**values))
-    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    # Only the fake is reachable as `claude`: no real session can start.
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path / "isolated-home"),
+        "PATH": f"{bindir}:/usr/bin:/bin",
+    }
     subprocess.run(
         [sys.executable, str(script)], check=True, capture_output=True, env=env, timeout=60
     )
-    return calls.read_text().split()
+    return calls.read_text().split(), (summary.read_text() if summary.exists() else "")
 
 
-def _checkout(tmp_path: Path, monkeypatch, *, incoming: str | None = None) -> Path:
-    """A checkout with an ``origin`` remote whose tracking ref is what update.sh
-    fetched: HEAD, plus one commit adding ``incoming`` as a new template."""
-    repo = tmp_path / "genesis"
-    (repo / "scripts" / "lib").mkdir(parents=True)
-    (repo / "scripts" / "systemd").mkdir(parents=True)
-    (repo / "scripts" / "lib" / "managed_units.py").write_text(CHECKER.read_text())
-    (repo / "scripts" / "systemd" / "base.service.template").write_text("[Service]\nExecStart=/b\n")
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "remote", "add", "origin", str(tmp_path / "upstream.git"))
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    fetched = "HEAD"
-    if incoming is not None:
-        _git(repo, "checkout", "-qb", "incoming")
-        (repo / "scripts" / "systemd" / f"{incoming}.template").write_text(
-            "[Service]\nExecStart=/new\n"
-        )
-        _git(repo, "add", "-A")
-        _git(repo, "commit", "-qm", "adds a unit")
-        _git(repo, "checkout", "-q", "main")
-        fetched = "incoming"
-    _git(repo, "update-ref", "refs/remotes/origin/main", fetched)
-    home = tmp_path / "home"
-    (home / ".config" / "systemd" / "user").mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(home))
-    return home / ".config" / "systemd" / "user"
-
-
-def test_a_refusal_is_never_escalated_even_when_a_session_asks(tmp_path, monkeypatch):
-    _checkout(tmp_path, monkeypatch)
-    calls = _orchestrate(
-        tmp_path, "refused: genesis-server.service", genesis_root=tmp_path / "genesis"
-    )
+@pytest.mark.parametrize("summary", ["Resolved everything; see notes.", "error: pip failed"])
+def test_update_shs_record_stops_escalation_whatever_the_summary_says(tmp_path, summary):
+    """The session wrote prose and asked for tier 2; update.sh's record wins."""
+    calls, _ = _orchestrate(tmp_path, summary, refuses_in="haiku")
     assert calls == ["haiku"]
 
 
-def test_an_ordinary_failure_still_escalates(tmp_path, monkeypatch):
+def test_a_session_that_reports_a_refusal_is_not_escalated(tmp_path):
+    calls, _ = _orchestrate(tmp_path, "refused: genesis-server.service")
+    assert calls == ["haiku"]
+
+
+def test_an_ordinary_failure_still_escalates(tmp_path):
     """Control: the stop above keys on the refusal, not on escalation in general."""
-    _checkout(tmp_path, monkeypatch)
-    calls = _orchestrate(tmp_path, "error: pip failed", genesis_root=tmp_path / "genesis")
+    calls, _ = _orchestrate(tmp_path, "error: pip failed")
     assert calls == ["haiku", "sonnet"]
 
 
-@pytest.mark.parametrize("edited", [True, False])
-def test_a_unit_only_the_fetched_commit_adds_still_stops_escalation(tmp_path, monkeypatch, edited):
-    """update.sh refuses before the merge, so HEAD lacks the new template; the
-    gate must also check the commit update.sh fetched (#3138 review)."""
-    units = _checkout(tmp_path, monkeypatch, incoming="fresh.service")
-    if edited:
-        (units / "fresh.service").write_text("[Service]\nExecStart=/mine\n")
-    calls = _orchestrate(tmp_path, "Resolved everything.", genesis_root=tmp_path / "genesis")
-    assert calls == (["haiku"] if edited else ["haiku", "sonnet"])
+def test_a_record_left_by_an_earlier_run_does_not_stop_this_one(tmp_path):
+    calls, _ = _orchestrate(tmp_path, "error: pip failed", stale_record=True)
+    assert calls == ["haiku", "sonnet"]
 
 
-def test_an_unresolvable_update_remote_stops_escalation(tmp_path):
-    """No remote can be read (not even a checkout): doubt never escalates."""
-    assert _orchestrate(tmp_path, "error: pip failed") == ["haiku"]
+def test_a_refusal_in_tier_2_stops_tier_3(tmp_path):
+    _calls, summary = _orchestrate(
+        tmp_path, "error: pip failed", refuses_in="sonnet", tier2_asks_tier3=True
+    )
+    assert "conflicts_unresolved" not in summary
+
+
+def test_tier_3_is_reached_without_a_refusal(tmp_path):
+    """Control for the test above."""
+    _calls, summary = _orchestrate(tmp_path, "error: pip failed", tier2_asks_tier3=True)
+    assert "conflicts_unresolved" in summary
 
 
 def _status_report(tmp_path: Path, monkeypatch, unit_text: str | None) -> dict:
@@ -190,139 +224,9 @@ def test_the_backup_tab_renders_the_report():
     assert "--take-template" in html
 
 
-def test_a_session_that_overwrote_the_summary_still_cannot_escalate(tmp_path, monkeypatch):
-    """The gate re-runs the checker: a refusal holds even when the summary is prose."""
-    repo = tmp_path / "genesis"
-    (repo / "scripts" / "lib").mkdir(parents=True)
-    (repo / "scripts" / "systemd").mkdir(parents=True)
-    (repo / "scripts" / "lib" / "managed_units.py").write_text(CHECKER.read_text())
-    (repo / "scripts" / "systemd" / "demo.service.template").write_text("[Service]\nExecStart=/x\n")
-    _git(repo, "init", "-q", "-b", "trunk")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "t")
-    home = tmp_path / "home"
-    units = home / ".config" / "systemd" / "user"
-    units.mkdir(parents=True)
-    (units / "demo.service").write_text("[Service]\nExecStart=/mine\n")
-    monkeypatch.setenv("HOME", str(home))
-    calls = _orchestrate(tmp_path, "Resolved everything; see notes.", genesis_root=repo)
-    assert calls == ["haiku"]
-
-
-@pytest.fixture()
-def progress(tmp_path, monkeypatch):
-    from flask import Flask
-
-    from genesis.dashboard._blueprint import blueprint
-
-    app = Flask(__name__)
-    app.register_blueprint(blueprint)
-    gh = tmp_path / "gh"
-    gh.mkdir()
-    monkeypatch.setenv("GENESIS_HOME", str(gh))
-    state = tmp_path / "update_state.json"
-    summary = tmp_path / "summary.txt"
-    monkeypatch.setattr(updates, "_STATE_FILE", state)
-    monkeypatch.setattr(updates, "_SUMMARY_FILE", summary)
-    monkeypatch.setattr(updates, "_ESCALATION_FILE", tmp_path / "escalation.txt")
-    monkeypatch.setattr(updates, "_CONFLICT_FILE", tmp_path / "conflicts.json")
-    state.write_text('{"phase": "merging", "pid": 999999999}')
-    os.utime(state, (1, 1))
-    return app.test_client(), state, summary
-
-
-def _tagged_repo(tmp_path: Path, monkeypatch, *, merged: bool) -> str:
-    """A checkout whose rollback tag is HEAD, or one commit behind it (merged)."""
-    repo = tmp_path / "checkout"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "commit", "-q", "--allow-empty", "-m", "a")
-    _git(repo, "tag", "pre-update-x")
-    if merged:
-        _git(repo, "commit", "-q", "--allow-empty", "-m", "merged")
-    monkeypatch.setattr(updates, "_GENESIS_ROOT", repo)
-    return "pre-update-x"
-
-
-@pytest.mark.parametrize(
-    ("phase", "text", "tag", "kept"),
-    [
-        # From "merging" on the file is the restart guard, whatever the summary
-        # says and whether or not one exists (a direct CLI run writes none).
-        ("merging", "refused: genesis-server.service", "head", True),
-        ("merging", None, "head", True),
-        ("merging", "error: merge conflict", "head", True),
-        ("bootstrap", "error: pip", "head", True),
-        ("health_check", None, "head", True),
-        # "fetching" is retired only when git says nothing merged.
-        ("fetching", None, "head", False),
-        ("fetching", "error: fetch", "head", False),
-        # A killed --post-merge run also writes "fetching", over merged code.
-        ("fetching", None, "merged", True),
-        ("fetching", None, None, True),
-    ],
-)
-def test_the_progress_poll_never_deletes_a_post_merge_state_file(
-    progress, tmp_path, monkeypatch, phase, text, tag, kept
-):
-    """update_state.json past the merge stops deploy_code_only.sh and the live
-    engine restarting onto merged code bootstrap never ran on (#3139); a
-    dashboard poll must not delete it."""
-    client, state, summary = progress
-    data = {"phase": phase, "pid": 999999999}
-    if tag is not None:
-        data["rollback_tag"] = _tagged_repo(tmp_path, monkeypatch, merged=(tag == "merged"))
-    state.write_text(json.dumps(data))
-    os.utime(state, (1, 1))
-    if text is not None:
-        summary.write_text(text)
-    assert client.get("/api/genesis/updates/progress").status_code == 200
-    assert state.exists() is kept
-
-
-def test_a_supervised_update_will_not_start_over_a_post_merge_guard(progress):
-    """Starting the dashboard pipeline used to delete update_state.json first."""
-    _client, state, _summary = progress
-    state.write_text(json.dumps({"phase": "merging", "pid": 999999999}))
-    from flask import Flask
-
-    with Flask(__name__).app_context():
-        body, code = updates._apply_supervised(state.parent / "pid")
-    assert code == 409
-    assert state.exists()
-    assert "--post-merge" in body.get_json()["error"]
-
-
-@pytest.mark.parametrize(
-    "content",
-    ["{not json", "[1, 2]", '"text"', "{}", '{"pid": 1}'],
-    ids=["malformed", "array", "string", "empty-object", "no-phase"],
-)
-def test_a_state_file_the_guard_cannot_read_still_guards(progress, content):
-    """A file that exists but is not a readable state with a phase is doubt, and
-    doubt keeps the guard: the supervised pipeline refuses instead of deleting it."""
-    _client, state, _summary = progress
-    state.write_text(content)
-    from flask import Flask
-
-    with Flask(__name__).app_context():
-        _body, code = updates._apply_supervised(state.parent / "pid")
-    assert code == 409
-    assert state.read_text() == content
-
-
-@pytest.mark.parametrize("content", ["[1, 2]", "{not json"], ids=["array", "malformed"])
-def test_the_progress_poll_survives_a_state_file_it_cannot_read(progress, content):
-    client, state, _summary = progress
-    state.write_text(content)
-    os.utime(state, (1, 1))
-    assert client.get("/api/genesis/updates/progress").status_code == 200
-    assert state.read_text() == content
-
-
-@pytest.mark.parametrize("name", ["_TIER1_PROMPT", "_TIER2_PROMPT", "_TIER3_PROMPT"])
-def test_every_tier_is_told_never_to_delete_the_restart_guard(name):
-    """update.sh refuses a plain run over an earlier update's guard; a tier told
-    only to 'fix and retry' could delete the file to get past it."""
-    text = " ".join(getattr(updates, name).split())
-    assert "never delete or edit ~/.genesis/update_state.json" in text.lower()
+def test_the_orchestrator_and_update_sh_name_the_same_record():
+    """update.sh writes $HOME/.genesis/update_refused.json; the route passes the
+    orchestrator the path it reads."""
+    script = (REPO / "scripts" / "update.sh").read_text()
+    assert 'REFUSED_FILE="$HOME/.genesis/update_refused.json"' in script
+    assert updates._REFUSED_FILE == updates._HOME / ".genesis" / "update_refused.json"

@@ -115,7 +115,7 @@ def test_a_taken_unit_is_backed_up_then_replaced(world):
     repo, home, units = world
     (units / "demo.service").write_text("[Service]\nExecStart=/mine\n")
     r = _install(repo, home, units, take="demo.service")
-    assert "Updated: demo.service" in r.stdout
+    assert "Taken: demo.service" in r.stdout
     backups = list((home / ".genesis" / "deploy-backups").glob("*/demo.service"))
     assert len(backups) == 1 and backups[0].read_text() == "[Service]\nExecStart=/mine\n"
     assert (units / "demo.service").read_text() == _stamp(RENDER)
@@ -257,7 +257,9 @@ def test_install_writes_stamped_units_and_never_overwrites(tmp_path):
     assert sorted(p.name for p in udir.iterdir()) == ["demo.service", "kept.service"]
 
 
-@pytest.mark.parametrize("link_to", ["/dev/null", "/nonexistent/dangling"], ids=["masked", "dangling"])
+@pytest.mark.parametrize(
+    "link_to", ["/dev/null", "/nonexistent/dangling"], ids=["masked", "dangling"]
+)
 def test_an_install_rerun_never_replaces_a_masked_unit(tmp_path, link_to):
     """A masked unit is a symlink to /dev/null; replacing it would unmask it, and
     the timer loop that follows would then enable it (#3138 review)."""
@@ -306,37 +308,125 @@ def test_a_take_with_nothing_new_still_runs_bootstrap(take, activates):
     assert ("--take-template was given" in out) is activates
 
 
-def _state_helpers() -> str:
-    text = (REPO / "scripts" / "update.sh").read_text()
-    start = text.index("_clear_deploy_state() {")
-    end = text.index("\n}\n", text.index("_on_signal_prestop() {")) + 3
-    return text[start:end]
+def test_an_edit_after_the_precheck_is_kept_not_overwritten(world):
+    """The precheck's verdict was reached on the old bytes; a unit edited after it
+    (before its turn in the render loop) is judged again, never overwritten
+    (#3138 review)."""
+    repo, home, units = world
+    unit = units / "demo.service"
+    unit.write_text(_stamp(RENDER.replace("on-failure", "always")))
+    render = home / "render-dir" / "render"
+    render.parent.mkdir(exist_ok=True)
+    render.write_text(RENDER)
+    script = f"""
+set -euo pipefail
+GENESIS_ROOT={str(repo)!r}; HOME={str(home)!r}
+source {str(LIB)!r}
+genesis_mu_precheck {str(units)!r} {str(render.parent)!r}
+printf 'Environment=X=1\\n' >> {str(unit)!r}
+genesis_install_managed_unit scripts/systemd/demo.service.template {str(render)!r} {str(unit)!r}
+echo "kept=$GENESIS_MU_KEPT"
+"""
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert unit.read_text().endswith("Environment=X=1\n")
+    assert "Kept: demo.service (edited by hand)" in r.stdout and "kept=1" in r.stdout
 
 
-@pytest.mark.parametrize(
-    ("owner", "post_merge", "call", "kept"),
-    [
-        ("other", "false", "_clear_deploy_state", True),
-        ("self", "false", "_clear_deploy_state", False),
-        ("self", "true", "_on_signal_prestop INT", True),
-        ("self", "false", "_on_signal_prestop INT", False),
-    ],
-)
-def test_update_only_ever_retires_its_own_state_file(tmp_path, owner, post_merge, call, kept):
-    """An early exit (failed fetch, refusal, nothing to do) must not delete an
-    EARLIER run's update_state.json: after a refused or conflicted merge it is the
-    restart guard. Nor may Ctrl-C in a --post-merge run, which continues a merge
-    that already happened (#3138 round 2)."""
-    state = tmp_path / "update_state.json"
-    pid = "$$" if owner == "self" else "1"
-    script = (
-        f"STATE_FILE={str(state)!r} GENESIS_HOME={str(tmp_path)!r} POST_MERGE={post_merge}\n"
-        "WERE_RUNNING=()\n"
-        "_deploy_marker_holder_live() { return 1; }\n"
-        "_start_genesis_server() { :; }\n"
-        f"printf '{{\"phase\": \"merging\", \"pid\": %s}}' {pid} > {str(state)!r}\n"
-        + _state_helpers()
-        + f"\n{call}\n"
+def _replace(new: Path, target: Path, expected: str) -> subprocess.CompletedProcess:
+    script = f"""
+source {str(LIB)!r}
+genesis_mu_replace {str(new)!r} {str(target)!r} {expected!r}
+echo "rc=$?"
+"""
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GENESIS_ROOT": "/nonexistent"},
     )
-    subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-    assert state.exists() is kept
+
+
+def test_replace_refuses_a_target_that_changed_since_it_was_judged(tmp_path):
+    new, snap, target = tmp_path / "new", tmp_path / "snap", tmp_path / "unit"
+    new.write_text("new\n")
+    snap.write_text("judged\n")
+    target.write_text("edited since\n")
+    assert "rc=2" in _replace(new, target, str(snap)).stdout
+    assert target.read_text() == "edited since\n"
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".unit.")] == []
+
+
+def test_replace_never_writes_through_a_link_that_appeared(tmp_path):
+    new, snap, target, elsewhere = (tmp_path / n for n in ("new", "snap", "unit", "elsewhere"))
+    new.write_text("new\n")
+    snap.write_text("judged\n")
+    elsewhere.write_text("judged\n")
+    target.symlink_to(elsewhere)
+    assert "rc=2" in _replace(new, target, str(snap)).stdout
+    assert target.is_symlink() and elsewhere.read_text() == "judged\n"
+
+
+def test_replace_does_not_create_over_a_file_that_appeared(tmp_path):
+    new, target = tmp_path / "new", tmp_path / "unit"
+    new.write_text("new\n")
+    target.write_text("someone else's\n")
+    assert "rc=2" in _replace(new, target, "").stdout
+    assert target.read_text() == "someone else's\n"
+
+
+def test_replace_keeps_the_old_files_mode(tmp_path):
+    new, snap, target = tmp_path / "new", tmp_path / "snap", tmp_path / "unit"
+    new.write_text("new\n")
+    snap.write_text("judged\n")
+    target.write_text("judged\n")
+    target.chmod(0o640)
+    assert "rc=0" in _replace(new, target, str(snap)).stdout
+    assert target.read_text() == "new\n" and (target.stat().st_mode & 0o777) == 0o640
+
+
+def test_a_directory_is_kept_with_a_message_that_does_not_promise_a_take(world):
+    repo, home, units = world
+    (units / "demo.service").mkdir()
+    r = _install(repo, home, units, take="demo.service")
+    assert r.returncode == 0, r.stderr
+    assert (units / "demo.service").is_dir()
+    assert "not a regular file; remove it by hand" in r.stdout
+    assert "only --take-template" not in r.stdout
+
+
+def test_a_supervised_session_never_takes_through_bootstrap(world, monkeypatch):
+    """update.sh refuses the take flags in a tier session; the lib refuses an
+    inherited take list there too, so bootstrap is not a second door."""
+    repo, home, units = world
+    (units / "demo.service").write_text("[Service]\nExecStart=/mine\n")
+    monkeypatch.setenv("GENESIS_UPDATE_TIER", "1")
+    r = _install(repo, home, units, take="*")
+    assert (units / "demo.service").read_text() == "[Service]\nExecStart=/mine\n"
+    assert "Kept: demo.service (edited by hand)" in r.stdout
+
+
+def test_a_take_that_loses_the_race_is_reported_only_as_kept(world):
+    """The backup is made, then the unit changes before the rename: the summary
+    must not also claim the template was installed."""
+    repo, home, units = world
+    unit = units / "demo.service"
+    unit.write_text("[Service]\nExecStart=/mine\n")
+    render = home / "render-dir" / "render"
+    render.parent.mkdir(exist_ok=True)
+    render.write_text(RENDER)
+    summary = home / "summary"
+    script = f"""
+set -euo pipefail
+GENESIS_ROOT={str(repo)!r}; HOME={str(home)!r}
+export GENESIS_DEPLOY_SUMMARY={str(summary)!r} GENESIS_TAKE_TEMPLATES=demo.service
+source {str(LIB)!r}
+eval "_real_backup() $(declare -f genesis_mu_backup | tail -n +2)"
+genesis_mu_backup() {{ _real_backup "$@" && printf 'X=2\\n' >> {str(unit)!r}; }}
+genesis_install_managed_unit scripts/systemd/demo.service.template {str(render)!r} {str(unit)!r}
+"""
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert unit.read_text().endswith("X=2\n")
+    text = summary.read_text()
+    assert "kept demo.service: it changed while" in text and "taken demo.service" not in text

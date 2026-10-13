@@ -151,23 +151,32 @@ def _history_index(repo: str) -> dict[str, list[bytes]]:
     return {name: [blobs[sha] for sha in group if sha in blobs] for name, group in names.items()}
 
 
-def classify(repo: str, rel: str, target: str, revs: list[str], accept_legacy: bool) -> str:
+def _judge(repo: str, rel: str, target: str, revs: list[str], accept_legacy: bool) -> tuple[str, str]:
+    """The verdict on ``target`` and the sha256 of the bytes it was reached on
+    ("" when nothing was read), so a caller acting later can tell whether the
+    verdict still describes the file."""
     if os.path.islink(target) or (os.path.lexists(target) and not os.path.isfile(target)):
-        return "nonregular"
+        return "nonregular", ""
     if not os.path.exists(target):
-        return "missing"
+        return "missing", ""
     with open(target, "rb") as fh:
         data = fh.read()
+    digest = hashlib.sha256(data).hexdigest()
     state = verify(data)
     if state != "unstamped":
-        return state
+        return state, digest
     installed = data.decode("utf-8", "replace")
     if any(_matches(_git(repo, "show", f"{rev}:{rel}"), installed) for rev in revs):
-        return "legacy"
+        return "legacy", digest
     if not accept_legacy:
-        return "unstamped"
+        return "unstamped", digest
     name = _TEMPLATE_RE.fullmatch(rel).group(1)
-    return "legacy" if any(_matches(b, installed) for b in _history_index(repo).get(name, [])) else "edited"
+    history = _history_index(repo).get(name, [])
+    return ("legacy" if any(_matches(b, installed) for b in history) else "edited"), digest
+
+
+def classify(repo: str, rel: str, target: str, revs: list[str], accept_legacy: bool) -> str:
+    return _judge(repo, rel, target, revs, accept_legacy)[0]
 
 
 def _templates(repo: str, rev: str) -> list[str]:
@@ -182,9 +191,11 @@ def check(repo: str, unit_dir: str, revs: list[str], accept_legacy: bool, take: 
     rows = []
     for rel in _templates(repo, revs[0]):
         name = _TEMPLATE_RE.fullmatch(rel).group(1)
-        state = classify(repo, rel, os.path.join(unit_dir, name), revs, accept_legacy)
+        state, digest = _judge(repo, rel, os.path.join(unit_dir, name), revs, accept_legacy)
         refused = state == "edited" and "*" not in taken and name not in taken
-        rows.append({"unit": name, "template": rel, "state": state, "refused": refused})
+        rows.append(
+            {"unit": name, "template": rel, "state": state, "refused": refused, "sha256": digest}
+        )
     return rows
 
 
@@ -225,9 +236,9 @@ def _main(argv: list[str]) -> int:
         return 2
     if "--json" in flags:
         print(json.dumps(rows))
-    elif "--tsv" in flags:  # one "<unit>\t<state>" line each, for the shell lib
+    elif "--tsv" in flags:  # "<unit>\t<state>\t<sha256 of the bytes judged>", for the shell lib
         for row in rows:
-            print(f"{row['unit']}\t{row['state']}")
+            print(f"{row['unit']}\t{row['state']}\t{row['sha256']}")
     else:
         for row in rows:
             if row["state"] == "edited":

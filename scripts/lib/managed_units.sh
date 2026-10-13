@@ -30,6 +30,9 @@ genesis_mu_taken() {
     # `read -a`, not an unquoted `for name in $VAR`: that would glob-expand `*`
     # (--take-templates) into the current directory's file names.
     local name names=()
+    # A supervised update session never takes a template, through any door
+    # (update.sh refuses its flags; this covers bootstrap and setup-vnc).
+    [ "${GENESIS_UPDATE_TIER:-}" = "1" ] && return 1
     read -r -a names <<< "${GENESIS_TAKE_TEMPLATES:-}" || true
     for name in "${names[@]}"; do
         if [ "$name" = "*" ] || [ "$name" = "$1" ]; then
@@ -44,6 +47,7 @@ genesis_mu_taken() {
 # --take-templates must never unmask one. Only --take-template <name> replaces it.
 genesis_mu_taken_explicitly() {
     local name names=()
+    [ "${GENESIS_UPDATE_TIER:-}" = "1" ] && return 1
     read -r -a names <<< "${GENESIS_TAKE_TEMPLATES:-}" || true
     for name in "${names[@]}"; do
         if [ "$name" = "$1" ]; then
@@ -57,7 +61,7 @@ genesis_mu_taken_explicitly() {
 genesis_mu_backup() {
     : "${GENESIS_MU_BACKUP_DIR:=$HOME/.genesis/deploy-backups/$(date -u +%Y%m%dT%H%M%SZ)}"
     mkdir -p "$GENESIS_MU_BACKUP_DIR" && cp -P -- "$1" "$GENESIS_MU_BACKUP_DIR/" || return 1
-    genesis_mu_summary "taken $(basename "$1"): template installed, old file saved in $GENESIS_MU_BACKUP_DIR"
+    GENESIS_MU_TAKING=1
 }
 
 genesis_mu_keep() {
@@ -67,9 +71,43 @@ genesis_mu_keep() {
     genesis_mu_summary "kept $name: $why; put local changes in ~/.config/systemd/user/$name.d/*.conf, or take the template with --take-template $name"
 }
 
+# Replace <target> with the bytes of <new> in one rename, but only while <target>
+# still holds the bytes of <expected> (a regular file, not a link), or, with an
+# empty <expected>, while nothing is there. The verdict that allowed the write was
+# reached on <expected>; a file edited or swapped for a link since then is not
+# replaced. Returns 2 then, 1 when the write fails. The re-check and the rename
+# are not one atomic step, so an edit landing between them still loses; the
+# window is the rename, not the whole render loop.
+genesis_mu_replace() {
+    local new="$1" target="$2" expected="$3" tmp
+    tmp="$(mktemp -p "$(dirname "$target")" ".$(basename "$target").XXXXXX")" || return 1
+    if ! cat -- "$new" > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if [ -n "$expected" ]; then
+        chmod --reference="$target" "$tmp" 2>/dev/null || chmod "$(printf '%o' $((0666 & ~$(umask))))" "$tmp"
+        if [ -L "$target" ] || [ ! -f "$target" ] || ! cmp -s -- "$expected" "$target"; then
+            rm -f -- "$tmp"
+            return 2
+        fi
+    else
+        chmod "$(printf '%o' $((0666 & ~$(umask))))" "$tmp"
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            rm -f -- "$tmp"
+            return 2
+        fi
+    fi
+    if ! mv -fT -- "$tmp" "$target"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
 # genesis_install_managed_unit <template path relative to the repo> <unstamped render file> <target>
 genesis_install_managed_unit() {
-    local rel="$1" render="$2" target="$3" name stamped state
+    local rel="$1" render="$2" target="$3" name stamped state snap="" wrc=0
+    GENESIS_MU_TAKING=0
     name="$(basename "$target")"
     stamped="$(mktemp -p "$(dirname "$render")" mu.XXXXXX)" || return 1
     local rc=0
@@ -89,22 +127,34 @@ genesis_install_managed_unit() {
         # `*`, which would unmask); a directory is kept.
         if [ -L "$target" ] && genesis_mu_taken_explicitly "$name" && genesis_mu_backup "$target"; then
             rm -f -- "$target"
+        elif [ -L "$target" ]; then
+            genesis_mu_keep "$name" "a symlink (masked?); only --take-template $name replaces it"
+            rm -f "$stamped"
+            return 0
         else
-            genesis_mu_keep "$name" "a symlink or not a regular file; only --take-template $name replaces it"
+            genesis_mu_keep "$name" "not a regular file; remove it by hand to install the template"
             rm -f "$stamped"
             return 0
         fi
     fi
     if [ -f "$target" ]; then
-        if cmp -s "$stamped" "$target"; then
-            echo "  OK: $name (unchanged)"
-            rm -f "$stamped"
+        # Judge a snapshot, and replace only while the unit still holds it: an
+        # edit made after the precheck (or after this read) is never overwritten.
+        snap="$(mktemp -p "$(dirname "$stamped")" mu-snap.XXXXXX)" || { rm -f "$stamped"; return 1; }
+        if ! cat -- "$target" > "$snap"; then
+            genesis_mu_keep "$name" "could not be read"
+            rm -f "$stamped" "$snap"
             return 0
         fi
-        state="$(genesis_mu_verdict "$name")"
+        if cmp -s "$stamped" "$snap"; then
+            echo "  OK: $name (unchanged)"
+            rm -f "$stamped" "$snap"
+            return 0
+        fi
+        state="$(genesis_mu_verdict "$name" "$snap")"
         if [ -z "$state" ]; then
             state="$(python3 -I -S "$GENESIS_MU_PY" classify --repo "$GENESIS_ROOT" --template "$rel" \
-                --target "$target" --upto HEAD ${GENESIS_MU_PREV:+--also "$GENESIS_MU_PREV"} \
+                --target "$snap" --upto HEAD ${GENESIS_MU_PREV:+--also "$GENESIS_MU_PREV"} \
                 --accept-legacy 2>/dev/null)" || state="error"
         fi
         case "$state" in
@@ -112,25 +162,38 @@ genesis_install_managed_unit() {
             edited)
                 if ! genesis_mu_taken "$name" || ! genesis_mu_backup "$target"; then
                     genesis_mu_keep "$name" "edited by hand"
-                    rm -f "$stamped"
+                    rm -f "$stamped" "$snap"
                     return 0
                 fi
                 ;;
             *)
                 genesis_mu_keep "$name" "could not be checked"
-                rm -f "$stamped"
+                rm -f "$stamped" "$snap"
                 return 0
                 ;;
         esac
-        cat "$stamped" > "$target"
+    fi
+    genesis_mu_replace "$stamped" "$target" "$snap" || wrc=$?
+    rm -f "$stamped" ${snap:+"$snap"}
+    if [ "$wrc" -eq 2 ]; then
+        genesis_mu_keep "$name" "it changed while this run was installing it; run the update again"
+        return 0
+    elif [ "$wrc" -ne 0 ]; then
+        echo "  ERROR: could not write $target"
+        return 1
+    fi
+    if [ "$GENESIS_MU_TAKING" = "1" ]; then
+        # Named only once the template is in: a take that lost the race above
+        # was reported as kept instead.
+        echo "  Taken: $name (old file saved in $GENESIS_MU_BACKUP_DIR)"
+        genesis_mu_summary "taken $name: template installed, old file saved in $GENESIS_MU_BACKUP_DIR"
+    elif [ -n "$snap" ]; then
         echo "  Updated: $name"
         genesis_mu_summary "updated $name"
     else
-        cat "$stamped" > "$target"
         echo "  Created: $name"
         genesis_mu_summary "created $name"
     fi
-    rm -f "$stamped"
     # shellcheck disable=SC2034  # read by the sourcing script (bootstrap.sh)
     GENESIS_MU_CHANGED=1
 }
@@ -151,14 +214,19 @@ genesis_mu_precheck() {
     fi
 }
 
+# genesis_mu_verdict <unit> <snapshot>: the precheck's verdict, printed only when
+# it was reached on the same bytes as <snapshot>; nothing otherwise, and the
+# caller classifies the snapshot itself.
 genesis_mu_verdict() {
-    local unit state
+    local unit state digest now
     if [ -z "${GENESIS_MU_VERDICTS:-}" ] || [ ! -f "$GENESIS_MU_VERDICTS" ]; then
         return 0
     fi
-    while IFS=$'\t' read -r unit state; do
+    now="$(sha256sum -- "$2" 2>/dev/null)" || return 0
+    now="${now%% *}"
+    while IFS=$'\t' read -r unit state digest; do
         if [ "$unit" = "$1" ]; then
-            printf '%s\n' "$state"
+            [ -n "$digest" ] && [ "$digest" = "$now" ] && printf '%s\n' "$state"
             return 0
         fi
     done < "$GENESIS_MU_VERDICTS"

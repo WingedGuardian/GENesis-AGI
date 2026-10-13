@@ -7,6 +7,7 @@ is extracted from scripts/update.sh and armed the way update.sh arms it.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -78,3 +79,40 @@ def test_every_exit_trap_after_its_definition_flushes():
     assert len(traps) >= 2, traps
     for ln in traps:
         assert "_flush_deploy_summary" in ln, ln
+
+
+def test_a_summary_path_inherited_from_the_caller_is_never_printed_or_removed(tmp_path):
+    """update.sh forgets an inherited GENESIS_DEPLOY_SUMMARY before its EXIT trap
+    is armed, so an early exit leaves the caller's file alone (#3138 review)."""
+    text = UPDATE.read_text()
+    start = text.index("unset GENESIS_DEPLOY_SUMMARY")
+    end = text.index(
+        "\n", text.index("trap 'rm -f \"$_SELF_COPY\" 2>/dev/null; _flush_deploy_summary' EXIT")
+    )
+    theirs = tmp_path / "theirs"
+    theirs.write_text("the caller's line\n")
+    script = "_SELF_COPY=/nonexistent\n" + text[start:end] + "\nexit 1\n"
+    r = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GENESIS_DEPLOY_SUMMARY": str(theirs)},
+    )
+    assert r.returncode == 1
+    assert theirs.read_text() == "the caller's line\n"
+    assert "the caller's line" not in r.stdout
+
+
+def test_the_summary_exists_before_the_no_change_path_realigns_pins():
+    """The no-change path runs _sync_deploy_targets (Claude Code pin realignment
+    and shadow removal write summary lines) without bootstrap, so the summary
+    file is created right after the preflight and flushed on that path too."""
+    text = UPDATE.read_text()
+    created = text.index('GENESIS_DEPLOY_SUMMARY="$(mktemp -p "$HOME/tmp" update-summary.XXXXXX)"')
+    assert text.index("# END managed-units-preflight") < created
+    assert created < text.index('echo "  Already up to date ($NEW_COMMIT)."')
+    branch = text[text.index('echo "  Already up to date ($NEW_COMMIT)."') :]
+    sync = branch.index("    _sync_deploy_targets\n")
+    assert branch.index(
+        '_flush_deploy_summary "Changed outside the checkout:"', sync
+    ) < branch.index("exit 0", sync)

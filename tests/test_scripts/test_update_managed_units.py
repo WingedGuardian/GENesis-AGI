@@ -8,6 +8,7 @@ it from git.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -64,7 +65,6 @@ def _run(
     deploy_head: str,
     post_merge: bool = False,
     take: str = "",
-    reused: bool = False,
 ) -> subprocess.CompletedProcess:
     tag = "pre-update-test"
     _git(repo, "tag", "-f", tag)
@@ -73,14 +73,17 @@ def _run(
 set -Eeuo pipefail
 GENESIS_ROOT={str(repo)!r}; HOME={str(home)!r}
 DEPLOY_HEAD={deploy_head!r}; POST_MERGE={"true" if post_merge else "false"}
-GENESIS_TAKE_TEMPLATES={take!r}; ROLLBACK_TAG={tag!r}
-_ROLLBACK_TAG_REUSED={"true" if reused else "false"}; STATE_FILE={str(state)!r}
+GENESIS_TAKE_TEMPLATES={take!r}; ROLLBACK_TAG={tag!r}; STATE_FILE={str(state)!r}
 _clear_deploy_state() {{ rm -f "$STATE_FILE"; echo CLEARED; }}
 {_block()}
 echo PASSED_PREFLIGHT
 """
     state.write_text('{"phase": "merging"}')
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+
+def _record(home: Path) -> Path:
+    return home / ".genesis" / "update_refused.json"
 
 
 def _tag_exists(repo: Path) -> bool:
@@ -113,7 +116,32 @@ def test_a_hand_edited_unit_refuses_before_anything_stops(world):
     assert r.returncode == 4, r.stdout + r.stderr
     assert "REFUSED: demo.service" in r.stdout and "--take-template" in r.stdout
     assert "PASSED_PREFLIGHT" not in r.stdout
-    assert not _tag_exists(repo) and "CLEARED" in r.stdout
+    assert not _tag_exists(repo)
+    # This run wrote no state yet: the file on disk is an earlier run's and stays.
+    assert "CLEARED" not in r.stdout
+    assert (home / ".genesis" / "update_state.json").exists()
+
+
+def test_a_refusal_is_recorded_for_the_supervised_update(world):
+    """The dashboard's orchestrator reads this record instead of re-deriving the
+    verdict (#3138 review): the units refused and the commit judged."""
+    repo, home, units = world
+    (units / "demo.service").write_text("[Service]\nExecStart=/mine\n")
+    head = _new_commit(repo)
+    r = _run(repo, home, deploy_head=head)
+    assert r.returncode == 4, r.stdout + r.stderr
+    record = json.loads(_record(home).read_text())
+    assert record["units"] == ["demo.service"] and record["deploy_head"] == head
+
+
+@pytest.mark.parametrize("bad_head", [False, True], ids=["passes", "checker-error"])
+def test_any_verdict_but_a_refusal_removes_an_older_record(world, bad_head):
+    repo, home, _ = world
+    _record(home).write_text('{"units": ["old.service"]}')
+    head = "0" * 40 if bad_head else _git(repo, "rev-parse", "HEAD")
+    r = _run(repo, home, deploy_head=head)
+    assert r.returncode == (1 if bad_head else 0), r.stdout + r.stderr
+    assert not _record(home).exists()
 
 
 def test_take_template_lets_the_update_through(world):
@@ -132,18 +160,16 @@ def test_nothing_to_merge_still_refuses(world):
     assert r.returncode == 4 and "PASSED_PREFLIGHT" not in r.stdout
 
 
-@pytest.mark.parametrize("reused", [True, False])
-def test_a_post_merge_refusal_keeps_the_state_file_and_a_reused_tag(world, reused):
+def test_post_merge_never_refuses_it_finishes_a_merge_that_already_happened(world):
+    """Refusing here would strand merged code; bootstrap keeps the edited unit
+    and names it in the summary instead."""
     repo, home, units = world
     (units / "demo.service").write_text("[Service]\nExecStart=/mine\n")
-    r = _run(repo, home, deploy_head="", post_merge=True, reused=reused)
-    assert r.returncode == 4, r.stdout + r.stderr
-    assert (home / ".genesis" / "update_state.json").exists(), (
-        "the unfinished-update state must survive"
-    )
-    assert "CLEARED" not in r.stdout
-    assert _tag_exists(repo) is reused
-    assert "NOT activated" in r.stdout
+    r = _run(repo, home, deploy_head="", post_merge=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASSED_PREFLIGHT" in r.stdout and "REFUSED" not in r.stdout
+    assert _tag_exists(repo) and (home / ".genesis" / "update_state.json").exists()
+    assert not _record(home).exists()
 
 
 def test_a_checker_error_refuses_with_exit_1_and_changes_nothing(world):
@@ -176,7 +202,9 @@ def test_a_supervised_session_may_never_take_a_template(flag):
     script = "set -euo pipefail\n" + text[start:end] + "\necho PARSED\n"
     r = subprocess.run(
         ["bash", "-c", script, "update.sh", *flag],
-        capture_output=True, text=True, env={**os.environ, "GENESIS_UPDATE_TIER": "1"},
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GENESIS_UPDATE_TIER": "1"},
     )
     assert r.returncode == 1 and "PARSED" not in r.stdout
     assert "supervised update session" in r.stderr
@@ -192,7 +220,12 @@ def test_the_preflight_runs_before_the_stop_and_the_state_write():
 
 @pytest.mark.parametrize(
     "args",
-    [["--bogus"], ["--take-template"], ["--take-template", ""], ["--take-template", "--post-merge"]],
+    [
+        ["--bogus"],
+        ["--take-template"],
+        ["--take-template", ""],
+        ["--take-template", "--post-merge"],
+    ],
 )
 def test_bad_arguments_refuse_before_anything(args, tmp_path):
     text = UPDATE.read_text()

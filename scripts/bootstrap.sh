@@ -257,10 +257,11 @@ fi
 
 # --- Managed units: a run summary, and (run by hand) a refusal before any change ---
 # update.sh hands us its summary file; run by hand we keep our own and print it at
-# the end. update.sh has already refused a hand-edited unit before stopping the
-# server, so the check below is for a run by hand: it refuses here, after crash
+# the end. A plain update.sh run has already refused a hand-edited unit before
+# stopping the server (update.sh --post-merge does not: its merge already
+# happened), so the check below is for a run by hand: it refuses here, after crash
 # recovery (which never touches units) and before anything else changes. Under
-# update.sh the render loop still never overwrites an edited unit: it keeps it.
+# update.sh the render loop never overwrites an edited unit: it keeps and names it.
 if [ -z "${GENESIS_DEPLOY_SUMMARY:-}" ]; then
     mkdir -p "$HOME/tmp"
     GENESIS_DEPLOY_SUMMARY="$(mktemp -p "$HOME/tmp" bootstrap-summary.XXXXXX)"

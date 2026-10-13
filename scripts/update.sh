@@ -22,9 +22,13 @@
 #                 A symlinked unit (a mask) is replaced only when named.
 #                 Local changes that should survive updates belong in a drop-in,
 #                 ~/.config/systemd/user/<unit>.d/*.conf, which updates never touch.
+#                 --post-merge never refuses: the merge already happened, so it
+#                 keeps an edited unit (bootstrap does) and names it at the end.
 #
 # Exit codes: 0 updated (or nothing to do); 1 failed (rolled back where it got that
-# far); 2 merge conflicts; 4 refused, nothing stopped: hand-edited units are named.
+# far); 2 merge conflicts; 4 refused, nothing stopped: hand-edited units are named,
+# and ~/.genesis/update_refused.json records the refusal for the dashboard's
+# supervised update, which never escalates past it.
 
 set -Eeuo pipefail  # -E: the ERR trap is inherited by functions AND subshells
                     # (see _on_err's BASH_SUBSHELL guard for the subshell case)
@@ -84,6 +88,9 @@ readonly _SELF_COPY="${BASH_SOURCE[0]}"
 # bootstrap wrote them, so a failed run is exactly when the list matters. The
 # success path flushes it first with its own heading; this finds nothing then.
 # The traps remove the self-copy first, so a dead stdout cannot leak it.
+# A GENESIS_DEPLOY_SUMMARY inherited from the caller names the caller's file, not
+# one this run created: forget it, so no exit path prints or deletes it.
+unset GENESIS_DEPLOY_SUMMARY
 _flush_deploy_summary() {
     local heading="${1:-Changed outside the checkout before this run stopped (not undone):}"
     if [ -n "${GENESIS_DEPLOY_SUMMARY:-}" ] && [ -s "$GENESIS_DEPLOY_SUMMARY" ]; then
@@ -209,25 +216,7 @@ PY
 # that run finished); env.update_in_progress() reads such a dead marker as "no
 # deploy", so the window before it is cleaned is harmless.
 _clear_deploy_state() {
-    # Only a state file THIS run wrote (its pid is $$). Before this run writes
-    # one, the file is an earlier run's: after a refused or conflicted merge it
-    # is what stops deploy_code_only.sh and the live engine restarting onto
-    # merged code bootstrap never ran on, so an early exit here (a failed fetch,
-    # a refusal, nothing to do) must leave it. Retiring it is the job of that
-    # run's --post-merge, bootstrap's crash recovery, or the dashboard's Dismiss.
-    if [ -f "$STATE_FILE" ] && python3 -I -S -c '
-import json, sys
-try:
-    sys.exit(0 if int(json.load(open(sys.argv[1])).get("pid", -1)) == int(sys.argv[2]) else 1)
-except Exception:
-    sys.exit(1)
-' "$STATE_FILE" "$$" 2>/dev/null; then
-        rm -f "$STATE_FILE" 2>/dev/null || true
-    fi
-    _clear_deploy_marker
-}
-
-_clear_deploy_marker() {
+    rm -f "$STATE_FILE" 2>/dev/null || true
     local _m="${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid" _pid
     _pid="$(cat "$_m" 2>/dev/null || true)"
     # "Dead" includes a zombie (_deploy_marker_holder_live, in deploy_marker.sh),
@@ -264,13 +253,7 @@ _on_signal_prestop() {
             systemctl --user start "$_svc.service" 2>/dev/null || true
         fi
     done
-    if [[ "${POST_MERGE:-false}" == "true" ]]; then
-        # A --post-merge run continues a merge that already happened: its state
-        # file is what stops a restart onto merged code bootstrap never ran on.
-        _clear_deploy_marker
-    else
-        _clear_deploy_state
-    fi
+    _clear_deploy_state
     exit 1
 }
 
@@ -342,35 +325,6 @@ if ! flock -n "$_UPDATE_LOCK_FD"; then
     echo "       Refusing to run a second update concurrently."
     exit 1
 fi
-
-# BEGIN prior-state-guard
-# An earlier run that merged code but never activated it (a refused or
-# conflicted --post-merge, a crash) left update_state.json behind, and that file
-# is what stops deploy_code_only.sh and the live engine restarting onto the
-# unactivated code. This run's own _write_state would overwrite it, and its
-# exit paths would then delete it. So a plain run refuses while such a file
-# stands; --post-merge is the run that finishes it. The rule is
-# scripts/lib/update_state_guard.py, shared with the dashboard (#3139): exit 1
-# means safe to replace, anything else keeps the file (doubt keeps the guard).
-if [[ "$POST_MERGE" != "true" ]]; then
-    _prior_state_rc=0
-    python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$STATE_FILE" "$GENESIS_ROOT" || _prior_state_rc=$?
-    if [ "$_prior_state_rc" -eq 3 ]; then
-        echo "ERROR: an earlier update stopped on merge conflicts and nothing was merged"
-        echo "       ($STATE_FILE keeps its rollback point for the conflict resolver)."
-        echo "       Resolve it (~/.genesis/update_conflicts.json lists the files), or"
-        echo "       Dismiss it on the dashboard's update card, then run update.sh again."
-        echo "       Nothing was changed."
-        exit 1
-    elif [ "$_prior_state_rc" -ne 1 ]; then
-        echo "ERROR: an earlier update merged code it has not activated, or its state"
-        echo "       file cannot be read ($STATE_FILE)."
-        echo "       Finish it with: scripts/update.sh --post-merge"
-        echo "       (or Dismiss it on the dashboard's update card). Nothing was changed."
-        exit 1
-    fi
-fi
-# END prior-state-guard
 
 echo ""
 echo "  Genesis Update"
@@ -942,7 +896,6 @@ fi
 
 # ── Rollback tag ─────────────────────────────────────────
 ROLLBACK_TAG="pre-update-$(date +%Y%m%d-%H%M%S)"
-_ROLLBACK_TAG_REUSED=false  # true: the tag belongs to the run --post-merge finishes
 if [[ "$POST_MERGE" == "true" ]] && [ -f "$STATE_FILE" ]; then
     # In post-merge mode, reuse the rollback tag from the initial update.sh run
     # so rollback goes to pre-merge code, not the merged code.
@@ -954,7 +907,6 @@ if [[ "$POST_MERGE" == "true" ]] && [ -f "$STATE_FILE" ]; then
     ) || _saved_rt=""
     if [ -n "$_saved_rt" ] && git -C "$GENESIS_ROOT" rev-parse "$_saved_rt" >/dev/null 2>&1; then
         ROLLBACK_TAG="$_saved_rt"
-        _ROLLBACK_TAG_REUSED=true
         echo "  Post-merge mode: reusing rollback tag $ROLLBACK_TAG"
     else
         git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
@@ -1153,7 +1105,14 @@ fi
 # The checker that RUNS is this checkout's own copy: nothing from the fetched
 # tree executes before the merge and the gates that follow it. The incoming
 # commit is data only (`--upto`: its templates are the ones judged).
+# --post-merge skips it: the merge it finishes already happened, so refusing
+# would only strand merged code. bootstrap keeps an edited unit and names it in
+# the summary printed at the end.
+# The verdict is also written to REFUSED_FILE, the one thing the dashboard's
+# supervised update reads to decide that a refusal is not a tier's to fix.
 # BEGIN managed-units-preflight (extracted by tests/test_scripts/test_update_managed_units.py)
+REFUSED_FILE="$HOME/.genesis/update_refused.json"
+if [[ "$POST_MERGE" != "true" ]]; then
 _mu_rev="${DEPLOY_HEAD:-HEAD}"
 _mu_src="$(cat "$GENESIS_ROOT/scripts/lib/managed_units.py" 2>/dev/null)" || _mu_src=""
 _mu_rc=0
@@ -1168,6 +1127,8 @@ fi
 # No exception for "nothing to merge": a run with nothing new can still activate
 # template changes a code-only deploy pulled in (the tier-2 check further down),
 # so an edited unit refuses on every run.
+# The record always says what THIS preflight found: an older one goes first.
+rm -f "$REFUSED_FILE" 2>/dev/null || true
 if [ "$_mu_rc" -ne 0 ]; then
     if [ "$_mu_rc" -eq 4 ]; then
         echo "REFUSED: these systemd units were edited by hand, and this update would leave them"
@@ -1183,21 +1144,33 @@ if [ "$_mu_rc" -ne 0 ]; then
         printf '%s\n' "$_mu_out" | sed 's/^/  /'
         echo "Nothing was stopped or changed."
     fi
-    if [[ "$POST_MERGE" == "true" ]]; then
-        # The merge already happened in the run this one finishes: keep its state
-        # file and rollback tag, so deploy_code_only.sh and the engine still see an
-        # unfinished update. Only a fallback tag this run created goes.
-        [[ "$_ROLLBACK_TAG_REUSED" == "true" ]] || git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
-        echo "The merged code is NOT activated yet: resolve the units above, then run"
-        echo "scripts/update.sh --post-merge again."
-    else
-        git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
-        _clear_deploy_state
+    # This run has written no state yet (that is below), so the state file on
+    # disk, if any, is an earlier run's: it is left as it is.
+    git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+    if [ "$_mu_rc" -eq 4 ]; then
+        mkdir -p "$(dirname "$REFUSED_FILE")"
+        printf '%s\n' "$_mu_out" | python3 -I -S -c '
+import json, os, sys
+units = [line.split("REFUSED:", 1)[1].split()[0] for line in sys.stdin if "REFUSED:" in line]
+tmp = sys.argv[1] + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump({"deploy_head": sys.argv[2], "units": units, "pid": int(sys.argv[3])}, fh)
+os.replace(tmp, sys.argv[1])
+' "$REFUSED_FILE" "$_mu_rev" "$$" 2>/dev/null || echo "WARNING: could not record the refusal in $REFUSED_FILE"
+        exit 4
     fi
-    [ "$_mu_rc" -eq 4 ] && exit 4
     exit 1
 fi
+fi
 # END managed-units-preflight
+
+# What this run changes outside the checkout (units written or kept, timers,
+# templates taken, Claude Code pins realigned, shadow copies removed) is recorded
+# here from now on and printed at the end, on every path: bootstrap's own output
+# is cut to `tail -10`, and the no-change path realigns pins without bootstrap.
+mkdir -p "$HOME/tmp"
+GENESIS_DEPLOY_SUMMARY="$(mktemp -p "$HOME/tmp" update-summary.XXXXXX)" || GENESIS_DEPLOY_SUMMARY=""
+export GENESIS_DEPLOY_SUMMARY
 
 # ── Back up locally edited ephemeral files BEFORE anything stops ──────
 # The clean-tree gate above EXCUSES these tracked paths when they are dirty, and
@@ -2011,17 +1984,7 @@ with open(sys.argv[11], 'w') as f:
     # leftover entry can't suppress the watchdog's deploy-restart guard after a
     # rollback. The server is back up (above); once this invocation exits its PID
     # dies anyway, but removing the files closes the PID-reuse window proactively.
-    # BEGIN rollback-state-clear
-    # A rollback that did not put the code back keeps update_state.json: the
-    # tree may hold merged code bootstrap never ran on, and that file is what
-    # stops deploy_code_only.sh and the live engine restarting onto it.
-    if [ "$checkout_ok" = "true" ]; then
-        _clear_deploy_state
-    else
-        _clear_deploy_marker
-        echo "  update_state.json is kept as the restart guard: finish with update.sh --post-merge, or Dismiss on the dashboard."
-    fi
-    # END rollback-state-clear
+    _clear_deploy_state
 
     echo ""
     echo "  ──────────────────────────────────────"
@@ -2475,6 +2438,7 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
     # sync, must not leave drift in place just because the merge was a no-op.
     _sync_deploy_targets
+    _flush_deploy_summary "Changed outside the checkout:"
     # Clear stale recovery signals. If genesis-server was up when THIS run
     # started (present in WERE_RUNNING), any prior update failure was already
     # resolved — the server recovered. Leaving last_update_failure.json (and the
@@ -2610,12 +2574,6 @@ _write_state "bootstrap"
 # was stopped above, and the ERR trap is armed here, so a guard refusal would
 # escalate into a full update rollback. The guard must never gate this call.
 echo "--- Running bootstrap ---"
-# What bootstrap changes outside the checkout (units written or kept, timers,
-# templates taken) is recorded here and printed at the end of this run, since
-# the `tail -10` below shows only bootstrap's last lines.
-mkdir -p "$HOME/tmp"
-GENESIS_DEPLOY_SUMMARY="$(mktemp -p "$HOME/tmp" update-summary.XXXXXX)" || GENESIS_DEPLOY_SUMMARY=""
-export GENESIS_DEPLOY_SUMMARY
 GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
 echo "  Bootstrap complete"
 echo ""

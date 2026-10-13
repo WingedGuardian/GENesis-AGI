@@ -3518,30 +3518,23 @@ verified: ba9dd8a37 2026-10-09
   `# genesis-managed v1 sha256=` stamp of its own body
   (`scripts/lib/managed_units.py` holds the grammar), so a later run tells
   Genesis's output from a hand edit: an edited unit is KEPT and named, never
-  overwritten. `update.sh` checks every unit BEFORE it stops anything and exits
-  4 naming the edited ones (`--take-template <unit>` installs the template and
+  overwritten. A plain `update.sh` run checks every unit BEFORE it stops
+  anything and exits 4 naming the edited ones; `--post-merge` does not refuse
+  (its merge already happened), and bootstrap keeps and names the unit
+  instead (`--take-template <unit>` installs the template and
   backs the old file up under `~/.genesis/deploy-backups/`, pruned at 90 days by
   `disk_hygiene.sh`); a unit from before stamps is accepted when it matches a
   version of its template in git history. Local unit changes belong in a
   drop-in (`<unit>.d/*.conf`), which nothing here touches. Timers listed in
   `~/.genesis/config/disabled_timers` are not re-enabled (`systemctl mask`
   cannot work on a unit in `~/.config/systemd/user`). The dashboard's update
-  card shows edited units (stamp check only); the supervised update tiers stop
-  on exit 4 rather than escalate. `update.sh` prints what bootstrap changed
+  card shows edited units (stamp check only). A refusal is recorded in
+  `~/.genesis/update_refused.json` (units, commit judged), which every other
+  preflight verdict removes; the supervised update's orchestrator removes it
+  before tier 1 and never escalates while it stands. `update.sh` prints what bootstrap changed
   outside the checkout at the end of every run, a failed one included. A
   symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
   `--take-templates`.
-- **The restart guard, `~/.genesis/update_state.json`** (deploy scripts):
-  an update that merged code it has not activated leaves this file, and
-  `deploy_code_only.sh` and the live engine refuse to restart while it stands.
-  One rule decides whether it may be replaced or removed,
-  `scripts/lib/update_state_guard.py` (only phase `done`, or `fetching` whose
-  rollback tag is still HEAD, is safe; anything unreadable guards). The
-  dashboard's progress poll and Apply, and `update.sh` right after it takes
-  `update.lock`, all ask it: a plain `update.sh` run refuses over a guarding
-  state (finish it with `--post-merge`, or Dismiss), and names the conflict
-  remedy instead when an earlier run stopped on merge conflicts. A rollback that
-  did not restore the code keeps the file.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.

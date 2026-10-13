@@ -97,21 +97,15 @@ def _harness(text: str, scenario: str) -> str:
     on_signal = _extract_func(text, "_on_signal")
     on_prestop = _extract_func(text, "_on_signal_prestop")
     on_clear = _extract_func(text, "_clear_deploy_state")
-    on_clear_marker = _extract_func(text, "_clear_deploy_marker")
     return f"""#!/bin/bash
 set -Eeuo pipefail
 STATE_FILE="$STATE_FILE"
-POST_MERGE=false
-# A state file THIS run wrote: _clear_deploy_state removes only its own.
-printf '{{"pid": %s}}' "$$" > "$STATE_FILE"
-_deploy_marker_holder_live() {{ return 1; }}
 _do_rollback() {{ echo "depth=$BASH_SUBSHELL reason=$1" >> "$RB_LOG"; }}
 # Stub the service-restart calls the real _on_signal_prestop makes, so the test
 # records intent without touching real systemd.
 _start_genesis_server() {{ echo "start:genesis-server" >> "$RESTART_LOG"; return 0; }}
 systemctl() {{ echo "systemctl $*" >> "$RESTART_LOG"; return 0; }}
 {on_clear}
-{on_clear_marker}
 {on_err}
 {on_signal}
 {on_prestop}
@@ -247,38 +241,3 @@ def test_services_detected_before_stop(text: str) -> None:
 
 if sys.platform.startswith("win"):  # pragma: no cover
     pytest.skip("bash trap semantics are POSIX-only", allow_module_level=True)
-
-
-@pytest.mark.parametrize(("checkout_ok", "kept"), [("true", False), ("false", True)])
-def test_a_rollback_that_did_not_restore_the_code_keeps_the_restart_guard(
-    tmp_path: Path, text: str, checkout_ok: str, kept: bool
-) -> None:
-    """update_state.json is what stops deploy_code_only.sh restarting onto merged
-    code bootstrap never ran on; a rollback that left that code in place must not
-    retire it (#3138 round-3 review)."""
-    block = text[text.index("# BEGIN rollback-state-clear") : text.index("# END rollback-state-clear")]
-    state = tmp_path / "state.json"
-    script = f"""#!/bin/bash
-set -Eeuo pipefail
-STATE_FILE="{state}"
-POST_MERGE=false
-printf '{{"pid": %s}}' "$$" > "$STATE_FILE"
-_deploy_marker_holder_live() {{ return 1; }}
-{_extract_func(text, "_clear_deploy_state")}
-{_extract_func(text, "_clear_deploy_marker")}
-f() {{
-    local checkout_ok={checkout_ok}
-{block}
-}}
-f
-"""
-    r = subprocess.run(
-        ["bash", "-c", script],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env={**os.environ, "HOME": str(tmp_path)},
-    )
-    assert r.returncode == 0, r.stderr
-    assert state.exists() is kept
-    assert ("kept as the restart guard" in r.stdout) is kept

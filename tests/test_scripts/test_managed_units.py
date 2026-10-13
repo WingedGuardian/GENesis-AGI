@@ -249,3 +249,18 @@ def test_a_revision_that_looks_like_an_option_is_refused(world):
     repo, units = world
     r = _run("check", "--repo", str(repo), "--unit-dir", str(units), "--upto", "--output=/tmp/x")
     assert r.returncode == 2 and "may not start with" in r.stderr
+
+
+def test_the_shell_verdict_carries_the_hash_of_the_bytes_it_judged(world):
+    """The render loop acts on a precheck verdict only while the unit still holds
+    the bytes it was reached on, so the TSV names them (#3138 review)."""
+    repo, units = world
+    body = _render(V2) + "Environment=X=1\n"
+    (units / "demo.service").write_text(body)
+    out = _check(repo, units, "--tsv", "--accept-legacy", "--take", "*").stdout.splitlines()
+    assert out == [f"demo.service\tedited\t{hashlib.sha256(body.encode()).hexdigest()}"]
+
+
+def test_a_missing_unit_has_no_hash(world):
+    repo, units = world
+    assert _check(repo, units, "--tsv").stdout.splitlines() == ["demo.service\tmissing\t"]
