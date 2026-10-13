@@ -41,8 +41,13 @@ committed; a relative path is read from the repository the check runs in.
 Cite a copy that nothing else rewrites (``<pr>-round<N>-<kind>.txt``), never
 the review gate's per-worktree evidence file, which the next review replaces.
 A premise-evidence file must carry the canonical ``Design-premise:`` block of
-``.claude/docs/premise-check.md``: the verdict line at column 0 and at least
-two ``P<n> <verdict>`` claim lines directly under it, verdict first. Each of
+``.claude/docs/premise-check.md``: the verdict line at column 0, the
+``Expected before checking:`` line directly under it, at least two distinct
+``P<n> <verdict>`` claim lines in an unbroken run, verdict first, and then
+only ``Effect:``, ``Better shape:``, ``PR-shape:``, ``Persisted-state:`` or
+code-fence lines until a blank line or the next ``Design-premise:`` line (the
+block's paragraph is closed). At least one block that has claims must carry
+the Expected line. Each of
 the PR's acceptance points must appear within one Scope line that starts
 ``covered:``; that is a substring floor for an honest session, not proof
 that the line covers the point.
@@ -545,15 +550,14 @@ _COMMIT_CLOCK_SLACK = timedelta(seconds=1)
 EVIDENCE_MAX_BYTES = 1024 * 1024
 
 #: The premise-check block of .claude/docs/premise-check.md ("The output"):
-#: a ``Design-premise:`` line at column 0, then optionally one ``Expected before
+#: a ``Design-premise:`` line at column 0, then the required ``Expected before
 #: checking:`` line, then the claim lines ``P<n> TRUE|FALSE|UNPROVEN — <claim>``,
 #: verdict FIRST (a short parenthesised qualifier may follow it). A claim's
 #: verdict sits in a fixed slot, so no word in the claim's own text can be read
 #: as it (#3120: the free-text reader misbound them). Each line is matched whole
-#: after trailing whitespace is dropped, and a line that OPENS like one of the
-#: block's lines but does not match it exactly is refused by its line number,
-#: never read as prose (#3127 round 1: a malformed later verdict line and a
-#: bodiless claim were silently skipped and accepted).
+#: after trailing whitespace is dropped. A line that opens like a verdict line
+#: but does not match it is refused by its line number, and so is any line in
+#: the block's paragraph that is not one of the block's lines (#3127, #3238).
 _PREMISE_VERDICT_LINE_RE = re.compile(
     r"Design-premise:[ \t]+(SOUND-BUT-INFERIOR|SOUND|BROKEN)"
     r"(?:[ \t]+[—–-][ \t]+\S.*)?"
@@ -564,45 +568,53 @@ _PREMISE_VERDICT_LINE_RE = re.compile(
 _PREMISE_VERDICT_PREFIX_RE = re.compile(
     r"[*_]*design[-\u2010\u2011 ]premise[*_]*[ \t]*:", re.IGNORECASE
 )
-#: A heading or list item that gives a verdict (``## Design-premise: BROKEN``,
+#: A heading or list item labelled as the verdict (``## Design-premise: BROKEN``,
 #: ``- Design-premise: SOUND (80%)``) is not a sanctioned quote, so it would
-#: otherwise contradict the block unseen. A bare section heading such as
-#: ``## Design-premise:`` carries no verdict word and stays prose.
+#: otherwise contradict the block unseen. It is refused when the text after
+#: its colon carries an UPPERCASE verdict token, the grammar's own spelling; a
+#: lowercase question or description ("what would make this sound?") and a bare
+#: section heading stay prose. ``>`` is not a marker here: it is the doc's quote.
 _PREMISE_MARKED_VERDICT_RE = re.compile(
-    r"(?:#{1,6}|[-*+]|[0-9]+[.)])[ \t]+[*_]*design[-\u2010\u2011 ]premise[*_]*[ \t]*:"
-    r".*\b(?:sound|broken)\b",
-    re.IGNORECASE,
+    r"(?:#{1,6}|[-*+|]|[0-9]+[.)])[ \t]+[*_]*(?i:design[-\u2010\u2011 ]premise)[*_]*[ \t]*:(.*)"
 )
+_PREMISE_VERDICT_TOKEN_RE = re.compile(r"\b(?:SOUND|BROKEN)\b")
 _PREMISE_EXPECTED_LINE_RE = re.compile(r"Expected before checking:[ \t]+\S.*")
 _PREMISE_CLAIM_LINE_RE = re.compile(
     r"[ \t]*P([1-9][0-9]?) (TRUE|FALSE|UNPROVEN)(?: \([^)\n]*\))?[ \t]+[\u2014\u2013-][ \t]+\S.*"
 )
-#: A line that starts like a claim. Within the paragraph that holds a block's
-#: claims (up to the next blank line) every such line must be a claim line, or
-#: the file is refused by that line: a near-miss or wrapped claim is never
-#: silently dropped. Past the blank line it is prose, because a review's own
-#: prose starts lines with "P2" too.
-_PREMISE_CLAIM_LIKE_RE = re.compile(r"[ \t]*(?:[-*>|][ \t]*)?(?:\*\*)?P[0-9]")
-_PREMISE_CLAIM_SHAPE = "'P<n> TRUE|FALSE|UNPROVEN — <claim>' (verdict first, plain text)"
+#: After the claims, the block paragraph (up to the next blank line or verdict
+#: line) may hold only the doc's trailer lines (and ``Persisted-state:``, which
+#: the architect agent emits right after them) and a code fence. Every other
+#: line in it is refused by its line number: the paragraph is closed, so no
+#: near-miss spelling of a claim or Expected line can be dropped as prose (#3238).
+_PREMISE_TRAILER_RE = re.compile(
+    r"(?:Effect|Better shape|PR-shape|Persisted-state):[ \t]+\S.*|(?:```|~~~)\S*"
+)
 
 
 def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
     """``(verdict, {claim number: verdict}, problem)`` from a premise-check
     output in the canonical block. Every column-0 line that opens like
-    ``Design-premise:`` must be a verdict line, and they must all agree. The
-    claims are the unbroken run of claim lines right under the first verdict
-    line that has any (one non-empty ``Expected before checking:`` line may
-    sit between); a later block may repeat any of those claims with the same
-    verdict (claim text is not compared), never add one or change a verdict,
-    and a claim line past the block's paragraph is prose. Any line in the
-    paragraph after a verdict line that looks like a claim but is not one is
-    refused by its line number. Lines are split on newlines only, as the
-    reflection itself is. At least two distinct claims are required."""
+    ``Design-premise:`` must be a verdict line, and they must all agree; a
+    heading or list item labelled as the verdict that carries an uppercase
+    verdict token is refused. The block paragraph runs from a verdict line to
+    the next blank line or verdict line and is CLOSED: it holds the verdict
+    line, the ``Expected before checking:`` line directly under it,
+    the unbroken run of claim lines, then only ``Effect:``, ``Better shape:``,
+    ``PR-shape:``, ``Persisted-state:`` and code-fence lines. Any other line in it is refused by its
+    line number. The claims are those of the first block that has any; a later
+    block may repeat any of them with the same verdict (claim text is not
+    compared), never add one or change a verdict. At least one block with
+    claims must carry the Expected line (a restating summary need not), and at least two distinct claims are required. Lines are
+    split on newlines only, as the reflection itself is. Outside a block
+    paragraph, text is prose and is not checked."""
     lines = [line.rstrip() for line in text.split("\n")]
     verdicts: set[str] = set()
     first: dict[str, str] | None = None
+    has_expected = False
     for i, line in enumerate(lines):
-        if _PREMISE_MARKED_VERDICT_RE.match(line):
+        marked = _PREMISE_MARKED_VERDICT_RE.fullmatch(line)
+        if marked and _PREMISE_VERDICT_TOKEN_RE.search(marked.group(1)):
             return None, {}, (
                 f"line {i + 1} gives a 'Design-premise:' verdict in a heading or list item; "
                 "write it as a plain column-0 line, or indent or >-quote it if it is not yours"
@@ -622,7 +634,8 @@ def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
             )
         run: dict[str, str] = {}
         j = i + 1
-        if j < len(lines) and _PREMISE_EXPECTED_LINE_RE.fullmatch(lines[j]):
+        expected_here = j < len(lines) and bool(_PREMISE_EXPECTED_LINE_RE.fullmatch(lines[j]))
+        if expected_here:
             j += 1
         while j < len(lines):
             claim = _PREMISE_CLAIM_LINE_RE.fullmatch(lines[j])
@@ -632,19 +645,19 @@ def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
             if run.setdefault(number, said) != said:
                 return None, {}, f"line {j + 1}: claim P{number} carries two different verdicts"
             j += 1
-        stop = j
         while (
             j < len(lines) and lines[j].strip() and not _PREMISE_VERDICT_PREFIX_RE.match(lines[j])
         ):
-            if _PREMISE_CLAIM_LIKE_RE.match(lines[j]):
-                if _PREMISE_CLAIM_LINE_RE.fullmatch(lines[j]):
-                    return None, {}, (
-                        f"line {stop + 1} breaks the claim lines under line {i + 1} (a "
-                        "wrapped claim or Expected line, or an empty Expected line), so the "
-                        f"claim at line {j + 1} is cut off"
-                    )
-                return None, {}, f"line {j + 1} looks like a claim but is not {_PREMISE_CLAIM_SHAPE}"
+            if not _PREMISE_TRAILER_RE.fullmatch(lines[j]):
+                return None, {}, (
+                    f"line {j + 1} is inside the premise block that starts at line {i + 1} but "
+                    "is not one of its lines: a claim "
+                    "'P<n> TRUE|FALSE|UNPROVEN — <claim>' (one line, not wrapped), the "
+                    "Expected line directly under the verdict, Effect:, Better shape:, "
+                    "PR-shape:, Persisted-state: or a code fence. Leave a blank line before any other text"
+                )
             j += 1
+        has_expected = has_expected or (expected_here and bool(run))
         if first is None:
             first = run or None
         elif any(first.get(number) != said for number, said in run.items()):
@@ -660,6 +673,11 @@ def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
             "it needs the canonical block of .claude/docs/premise-check.md: a "
             "'Design-premise: <verdict>' line at column 0 with at least two "
             "'P<n> TRUE|FALSE|UNPROVEN' claim lines directly under it",
+        )
+    if not has_expected:
+        return None, {}, (
+            "the block needs its 'Expected before checking: <one line>' line directly "
+            "under the 'Design-premise:' line (.claude/docs/premise-check.md)"
         )
     return next(iter(verdicts)), claims, None
 

@@ -198,6 +198,16 @@ single-label host such as `localhost`, or an IPv4 address, matches only itself.
 An IPv6 address is refused (anything containing `:` is), so its cookies
 cannot be cleared this way.
 
+**Profile copies.** A different browser build upgrades a profile the first
+time it opens it, and the older build may then refuse it. So before the first
+launch on a new build, the profile is copied to
+`<profile>.pre-v<old version>-<time>` beside it (Camoufox:
+`~/.genesis/camoufox-profile`, Chromium: `~/.genesis/browser-profile`). Going
+back to the old build means restoring that copy with no browser open: an
+operator step, never one a session takes. The newest copy is kept, and the
+newest of each version for 90 days; older ones are deleted after 14 days.
+`scripts/browser.py` makes no copy.
+
 **Not installed?** If `browser_navigate` returns `Browser not available` or
 `Camoufox is not ready: …`, the browser packages or the Camoufox engine are
 missing or broken on this install: tell the user, passing on the operator step
@@ -205,7 +215,9 @@ the error names. Never run that step, `camoufox fetch` or `pip install` from
 inside a session; every session's MCP server shares the engine and the venv,
 and the engine download is far larger than a session's temp space. If the
 error says the browser packages changed after this session started, the fix
-is restarting the session, not reinstalling.
+is restarting the session, not reinstalling. The operator's one-step repair for
+the whole stack is `scripts/install_browser_stack.sh` (engine, Chromium and
+system libraries; it prints one `browser-stack:` outcome line).
 
 ## Verify after every action
 
