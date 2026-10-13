@@ -1,0 +1,585 @@
+"""Pause records and the operator CLI: scripts/lib/watchgod_records.sh,
+scripts/lib/watchgod_signal.sh and `scripts/watchgod status|thaw|kill`.
+
+What these pin:
+  * a record is keyed by pid AND start time, written whole (temp + rename),
+    owner-only, and refuses a path or key with a tab or newline;
+  * the records lock times out instead of hanging when asked to, and leaves
+    nothing open when it does;
+  * thaw resumes only the recorded process; a recycled pid, or a process that
+    is running again, is dropped without a signal;
+  * kill ends only the recorded process: SIGCONT, SIGTERM, then SIGKILL after
+    the grace period; it refuses "all"; a recycled pid is never touched.
+
+The CLI tests run real processes this test owns (no fake /proc): the signal
+library's fallback really calls kill(2), so a fake process table would point it
+at whatever real process holds that pid number.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[2]
+_CLI = _ROOT / "scripts" / "watchgod"
+_RECORDS = _ROOT / "scripts" / "lib" / "watchgod_records.sh"
+_SIGNAL = _ROOT / "scripts" / "lib" / "watchgod_signal.sh"
+
+pytestmark = pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs a Linux /proc")
+
+
+@pytest.fixture
+def home(tmp_path):
+    h = tmp_path / "home"
+    (h / ".genesis" / "watchgod").mkdir(parents=True)
+    (h / ".genesis" / "logs").mkdir(parents=True)
+    return h
+
+
+def _state_dir(home: Path) -> Path:
+    return home / ".genesis" / "watchgod"
+
+
+def _starttime(pid: int) -> str:
+    raw = Path(f"/proc/{pid}/stat").read_text()
+    return raw.rsplit(") ", 1)[1].split()[19]
+
+
+def _live(pid: int) -> str:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("State:"):
+                return line.split()[1]
+    except OSError:
+        return "gone"
+    return "?"
+
+
+def _record(home: Path, pid: int, st: str, state: str = "paused", comm: str = "sleep") -> None:
+    f = _state_dir(home) / "frozen"
+    with open(f, "a") as fh:
+        fh.write(f"{pid}\t{st}\t{comm}\t2026-01-01T00:00:00Z\t1:2\t/x/tasks/b.output\t{state}\n")
+
+
+def _records(home: Path) -> list[list[str]]:
+    f = _state_dir(home) / "frozen"
+    return [ln.split("\t") for ln in f.read_text().splitlines()] if f.exists() else []
+
+
+def _cli(home: Path, *args: str, grace: int | None = None) -> subprocess.CompletedProcess:
+    env = dict(os.environ, HOME=str(home))
+    env.pop("DG_STATE_DIR", None)
+    env.pop("DG_PROC", None)
+    if grace is not None:
+        env["WATCHGOD_KILL_GRACE_S"] = str(grace)
+    return subprocess.run(
+        [str(_CLI), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def _lib(home: Path, snippet: str) -> subprocess.CompletedProcess:
+    script = (
+        f"set -euo pipefail\nDG_STATE_DIR='{_state_dir(home)}'\n"
+        f"source '{_SIGNAL}'\nsource '{_RECORDS}'\n{snippet}\n"
+    )
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+@pytest.fixture
+def stopped_sleep():
+    p = subprocess.Popen(["sleep", "300"])
+    try:
+        os.kill(p.pid, signal.SIGSTOP)
+        for _ in range(50):
+            if _live(p.pid) == "T":
+                break
+            time.sleep(0.05)
+        yield p
+    finally:
+        try:
+            os.kill(p.pid, signal.SIGCONT)
+            p.kill()
+        except ProcessLookupError:
+            pass
+        p.wait(timeout=10)
+
+
+# ── the records library ───────────────────────────────────────────
+
+
+def test_put_state_promote_drop_round_trip(home):
+    out = _lib(
+        home,
+        """
+        lk=""; wg_records_lock lk
+        wg_record_put 4242 777 sleep T0 1:2 /x/out pending
+        echo S1=$(wg_record_state 4242 777)
+        wg_record_promote 4242 777
+        echo S2=$(wg_record_state 4242 777)
+        wg_record_state 4242 778 || echo OTHER_START=none
+        wg_record_drop 4242 777
+        wg_record_state 4242 777 || echo S3=none
+        wg_records_unlock "$lk"
+        """,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "S1=pending" in out.stdout and "S2=paused" in out.stdout
+    assert "OTHER_START=none" in out.stdout, "a record applies to one start time only"
+    assert "S3=none" in out.stdout
+
+
+def test_a_pending_record_keeps_its_first_time(home):
+    out = _lib(
+        home,
+        """
+        wg_record_put 4242 777 sleep T0 1:2 /x/out pending
+        wg_record_put 4242 777 sleep T1 1:2 /x/out pending
+        wg_record_put 4242 777 sleep T2 1:2 /x/out paused
+        wg_records_list
+        """,
+    )
+    assert out.returncode == 0, out.stderr
+    rows = [ln.split("\t") for ln in out.stdout.splitlines()]
+    assert len(rows) == 1, "one line per process"
+    assert rows[0][3] == "T2" and rows[0][6] == "paused"
+
+
+def test_a_pending_resend_does_not_reset_the_reminder_clock(home):
+    out = _lib(
+        home,
+        """
+        wg_record_put 4242 777 sleep T0 1:2 /x/out pending
+        wg_record_put 4242 777 sleep T1 1:2 /x/out pending
+        wg_records_list
+        """,
+    )
+    assert out.stdout.split("\t")[3] == "T0"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        "x 777 sleep T0 1:2 /x/out paused",  # pid not numeric
+        "4242 y sleep T0 1:2 /x/out paused",  # start time not numeric
+        "4242 777 sleep T0 1:2 /x/out frozen",  # unknown state
+        "4242 777 sleep T0 1:2 $'/x/a\\tb' paused",  # tab in the path
+        "4242 777 sleep T0 1:2 $'/x/a\\nb' paused",  # newline in the path
+        "4242 777 sleep T0 $'1\\t2' /x/out paused",  # tab in the key
+    ],
+)
+def test_a_malformed_record_is_refused(home, args):
+    out = _lib(home, f"wg_record_put {args} && echo WROTE || echo REFUSED; wg_records_list | wc -l")
+    assert "REFUSED" in out.stdout
+    assert out.stdout.strip().endswith("0")
+
+
+def test_comm_cannot_forge_a_field(home):
+    out = _lib(
+        home, "wg_record_put 4242 777 $'evil\\tname\\nx' T0 1:2 /x/out paused; wg_records_list"
+    )
+    rows = [ln.split("\t") for ln in out.stdout.splitlines()]
+    assert len(rows) == 1 and len(rows[0]) == 7
+    assert rows[0][2] == "evil name x"
+
+
+def test_records_are_owner_only_and_no_temp_is_left(home):
+    _lib(home, "wg_record_put 4242 777 sleep T0 1:2 /x/out paused; wg_record_drop 1 1")
+    f = _state_dir(home) / "frozen"
+    assert stat.S_IMODE(f.stat().st_mode) == 0o600
+    assert not (_state_dir(home) / "frozen.tmp").exists()
+
+
+def test_a_lock_that_is_held_times_out_and_leaves_nothing_open(home):
+    lock = _state_dir(home) / "frozen.lock"
+    lock.touch()
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f, fcntl.LOCK_EX); "
+            "print('held', flush=True); time.sleep(30)",
+            str(lock),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        t0 = time.time()
+        out = _lib(
+            home,
+            'lk=""; if wg_records_lock lk 1; then echo GOT; else echo BUSY; fi; '
+            "ls -l /proc/$$/fd | grep -c frozen.lock || true",
+        )
+        assert "BUSY" in out.stdout
+        assert out.stdout.strip().endswith("0"), "the descriptor was closed again"
+        assert time.time() - t0 < 10
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+
+def test_thaw_waits_for_the_lock(home, stopped_sleep):
+    """`thaw` never reads records while the guardian holds the lock."""
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    lock = _state_dir(home) / "frozen.lock"
+    lock.touch()
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f, fcntl.LOCK_EX); "
+            "print('held', flush=True); time.sleep(1.5)",
+            str(lock),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout.readline().strip() == "held"
+    t0 = time.time()
+    out = _cli(home, "thaw", "all")
+    waited = time.time() - t0  # measured BEFORE waiting on the holder
+    holder.wait(timeout=10)
+    assert waited >= 1.0, "thaw did not wait for the lock"
+    assert f"resumed pid {stopped_sleep.pid}" in out.stdout
+
+
+# ── thaw ──────────────────────────────────────────────────────────
+
+
+def test_thaw_resumes_the_recorded_process_and_drops_its_record(home, stopped_sleep):
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    out = _cli(home, "thaw", str(stopped_sleep.pid))
+    assert out.returncode == 0, out.stderr
+    assert f"resumed pid {stopped_sleep.pid}" in out.stdout
+    assert _live(stopped_sleep.pid) != "T"
+    assert _records(home) == []
+    log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert f"THAWED pid {stopped_sleep.pid}" in log
+
+
+def test_thaw_never_signals_a_recycled_pid(home, stopped_sleep):
+    """The record names a different start time: another process now has the
+    pid. It is dropped and never signalled (the process stays stopped)."""
+    _record(home, stopped_sleep.pid, "1")
+    out = _cli(home, "thaw", "all")
+    assert "no longer running — record dropped" in out.stdout
+    assert _live(stopped_sleep.pid) == "T"
+    assert _records(home) == []
+
+
+def test_thaw_drops_a_record_whose_process_is_running_again(home):
+    p = subprocess.Popen(["sleep", "300"])
+    try:
+        _record(home, p.pid, _starttime(p.pid))
+        out = _cli(home, "thaw", "all")
+        assert "record dropped, not signalled" in out.stdout
+        assert _records(home) == []
+    finally:
+        p.kill()
+        p.wait(timeout=10)
+
+
+def test_thaw_resumes_a_pending_record_whatever_its_state(home):
+    p = subprocess.Popen(["sleep", "300"])
+    try:
+        _record(home, p.pid, _starttime(p.pid), state="pending")
+        out = _cli(home, "thaw", "all")
+        assert f"resumed pid {p.pid}" in out.stdout
+    finally:
+        p.kill()
+        p.wait(timeout=10)
+
+
+def test_thaw_of_an_unknown_pid_fails(home, stopped_sleep):
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    out = _cli(home, "thaw", "999999")
+    assert out.returncode == 1
+    assert "is not in the paused list" in out.stdout
+    assert len(_records(home)) == 1
+
+
+# ── kill ──────────────────────────────────────────────────────────
+
+
+def test_kill_ends_the_recorded_process(home, stopped_sleep):
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    out = _cli(home, "kill", str(stopped_sleep.pid), grace=5)
+    assert out.returncode == 0, out.stderr
+    assert f"ended pid {stopped_sleep.pid}" in out.stdout
+    stopped_sleep.wait(timeout=10)
+    assert stopped_sleep.returncode == -signal.SIGTERM, "ended by SIGTERM within the grace"
+    assert _records(home) == []
+    log = (home / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert f"KILLED pid {stopped_sleep.pid}" in log
+
+
+def test_kill_escalates_to_sigkill_after_the_grace(home):
+    p = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); time.sleep(300)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert p.stdout.readline().strip() == "ready"
+        os.kill(p.pid, signal.SIGSTOP)
+        _record(home, p.pid, _starttime(p.pid), comm="python3")
+        out = _cli(home, "kill", str(p.pid), grace=1)
+        assert out.returncode == 0, out.stderr
+        p.wait(timeout=10)
+        assert p.returncode == -signal.SIGKILL
+        assert _records(home) == []
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait(timeout=10)
+
+
+def test_kill_never_touches_a_recycled_pid(home, stopped_sleep):
+    _record(home, stopped_sleep.pid, "1")
+    out = _cli(home, "kill", str(stopped_sleep.pid), grace=1)
+    assert "an earlier process) dropped" in out.stdout
+    assert "is no longer running" in out.stdout
+    assert _live(stopped_sleep.pid) == "T", "the process holding the pid now was not touched"
+    assert _records(home) == []
+
+
+@pytest.mark.parametrize("arg", ["all", "", "12x"])
+def test_kill_takes_exactly_one_pid(home, arg):
+    out = _cli(home, "kill", arg)
+    assert out.returncode == 2
+    assert "kill takes one pid" in out.stderr
+
+
+def test_kill_of_a_pid_not_in_the_list_does_nothing(home, stopped_sleep):
+    out = _cli(home, "kill", str(stopped_sleep.pid))
+    assert out.returncode == 1
+    assert "is not in the paused list" in out.stdout
+    assert _live(stopped_sleep.pid) == "T"
+
+
+# ── status ────────────────────────────────────────────────────────
+
+
+def test_status_labels_each_record_by_what_is_true_now(home, stopped_sleep):
+    running = subprocess.Popen(["sleep", "300"])
+    try:
+        _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+        _record(home, running.pid, _starttime(running.pid))
+        _record(home, running.pid, "1")
+        out = _cli(home, "status")
+        lines = [ln for ln in out.stdout.splitlines() if ln.startswith("  pid ")]
+        assert len(lines) == 3
+        assert "still paused" in lines[0]
+        assert "RUNNING, not paused" in lines[1]
+        assert lines[2].endswith("gone")
+    finally:
+        running.kill()
+        running.wait(timeout=10)
+
+
+def test_status_with_no_records_says_none(home):
+    out = _cli(home, "status")
+    assert "paused: none" in out.stdout
+
+
+def test_help_lists_every_command(home):
+    out = _cli(home, "help")
+    for cmd in ("status", "thaw <pid>", "thaw all", "kill <pid>"):
+        assert cmd in out.stdout
+
+
+# ── the generation-bound signal ───────────────────────────────────
+
+
+@pytest.mark.parametrize("path", ["pidfd", "fallback"])
+def test_signal_gen_never_signals_another_generation(home, tmp_path, stopped_sleep, path):
+    """wg_signal_gen sends only to the process that started at the given time:
+    with a pidfd (the real /proc), and through the start-time-checked kill
+    when no pidfd is used (DG_PROC spelled differently skips the pidfd path)."""
+    proc = "/proc"
+    if path == "fallback":
+        alias = tmp_path / "proc-alias"
+        alias.symlink_to("/proc")
+        proc = str(alias)
+    pid = stopped_sleep.pid
+    st = _starttime(pid)
+    out = _lib(home, f"DG_PROC='{proc}'; rc=0; wg_signal_gen CONT {pid} 1 || rc=$?; echo RC=$rc")
+    assert "RC=1" in out.stdout, out.stdout + out.stderr
+    assert _live(pid) == "T", "a different start time must not be signalled"
+    out = _lib(home, f"DG_PROC='{proc}'; rc=0; wg_signal_gen CONT {pid} {st} || rc=$?; echo RC=$rc")
+    assert "RC=0" in out.stdout, out.stdout + out.stderr
+    for _ in range(50):
+        if _live(pid) != "T":
+            break
+        time.sleep(0.05)
+    assert _live(pid) != "T", "the recorded generation is signalled"
+
+
+def test_signal_gen_reports_a_gone_process(home):
+    p = subprocess.Popen(["sleep", "300"])
+    st = _starttime(p.pid)
+    p.kill()
+    p.wait(timeout=10)
+    out = _lib(home, f"rc=0; wg_signal_gen CONT {p.pid} {st} || rc=$?; echo RC=$rc")
+    assert "RC=1" in out.stdout
+
+
+@pytest.mark.parametrize("args", ["CONT 1 5", "CONT 0 5", "CONT x 5", "CONT 99 y"])
+def test_signal_gen_refuses_malformed_or_init(home, args):
+    """pid 1 (and 0) is never signalled; a non-numeric pid or start time is refused."""
+    out = _lib(home, f"rc=0; wg_signal_gen {args} || rc=$?; echo RC=$rc")
+    assert "RC=2" in out.stdout
+
+
+# ── review findings (PR B) ────────────────────────────────────────
+
+
+def test_kill_skips_a_stale_record_for_the_same_pid(home, stopped_sleep):
+    """An older record whose process is gone, listed first, must not shadow the
+    live one: kill drops the stale record and ends the recorded process."""
+    _record(home, stopped_sleep.pid, "1")
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    out = _cli(home, "kill", str(stopped_sleep.pid), grace=5)
+    assert out.returncode == 0, out.stderr
+    assert f"ended pid {stopped_sleep.pid}" in out.stdout
+    stopped_sleep.wait(timeout=10)
+    assert _records(home) == []
+
+
+def test_an_empty_comm_cannot_shift_the_columns(home):
+    """bash's IFS read collapses an empty tab field where awk keeps it: put
+    never writes an empty field, so a pending record stays pending to thaw."""
+    p = subprocess.Popen(["sleep", "300"])
+    try:
+        st = _starttime(p.pid)
+        out = _lib(home, f"wg_record_put {p.pid} {st} '' T0 1:2 /x/out pending; wg_records_list")
+        assert out.stdout.split("\t")[2] == "?"
+        out = _cli(home, "thaw", "all")
+        assert f"resumed pid {p.pid}" in out.stdout, out.stdout
+    finally:
+        p.kill()
+        p.wait(timeout=10)
+
+
+@pytest.mark.parametrize("field", ["ts", "key", "path"])
+def test_an_empty_field_is_refused(home, field):
+    args = {"ts": "T0", "key": "1:2", "path": "/x/out"}
+    args[field] = ""
+    out = _lib(
+        home,
+        f"wg_record_put 4242 777 sleep '{args['ts']}' '{args['key']}' '{args['path']}' paused"
+        " && echo WROTE || echo REFUSED",
+    )
+    assert "REFUSED" in out.stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a 0o000 file")
+def test_an_unreadable_record_file_is_never_rewritten(home):
+    f = _state_dir(home) / "frozen"
+    f.write_text("1\t1\ta\tT\tk\t/p\tpaused\n2\t2\tb\tT\tk\t/p\tpaused\n")
+    f.chmod(0)
+    try:
+        out = _lib(
+            home,
+            "rc=0; wg_record_put 555 5 c T0 1:2 /x/out paused || rc=$?; echo PUT=$rc;"
+            " rc=0; wg_record_drop 1 1 || rc=$?; echo DROP=$rc",
+        )
+        assert "PUT=1" in out.stdout and "DROP=1" in out.stdout
+        status = _cli(home, "status")
+        assert status.returncode == 1 and "cannot be read" in status.stderr
+    finally:
+        f.chmod(0o600)
+    assert f.read_text().count("\n") == 2, "both records survived"
+
+
+def test_thaw_waits_for_a_first_record_still_being_written(home, stopped_sleep):
+    """The guardian holds the lock while it writes the FIRST record: the
+    records file does not exist yet, and thaw must still wait, then resume."""
+    lock = _state_dir(home) / "frozen.lock"
+    rec = _state_dir(home) / "frozen"
+    line = f"{stopped_sleep.pid}\t{_starttime(stopped_sleep.pid)}\tsleep\tT\tk\t/x/o\tpaused\n"
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f, fcntl.LOCK_EX); "
+         "print('held', flush=True); time.sleep(1); open(sys.argv[2],'w').write(sys.argv[3])",
+         str(lock), str(rec), line],
+        stdout=subprocess.PIPE, text=True,
+    )
+    assert holder.stdout.readline().strip() == "held"
+    out = _cli(home, "thaw", "all")
+    holder.wait(timeout=10)
+    assert f"resumed pid {stopped_sleep.pid}" in out.stdout, out.stdout
+    assert _live(stopped_sleep.pid) != "T"
+
+
+def test_kill_ends_a_process_whose_main_thread_exited(home):
+    """Its leader is a zombie while another thread still runs: that process is
+    alive, so kill must not call it gone and leave it stopped."""
+    code = (
+        "import ctypes, threading, time\n"
+        "threading.Thread(target=time.sleep, args=(300,)).start()\n"
+        "print('ready', flush=True)\n"
+        "ctypes.CDLL(None).pthread_exit(None)\n"
+    )
+    p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert p.stdout.readline().strip() == "ready"
+        for _ in range(50):
+            if _live(p.pid) == "Z":
+                break
+            time.sleep(0.05)
+        assert _live(p.pid) == "Z", "guard: the leader really exited"
+        os.kill(p.pid, signal.SIGSTOP)
+        _record(home, p.pid, _starttime(p.pid), comm="python3")
+        out = _cli(home, "kill", str(p.pid), grace=2)
+        assert out.returncode == 0, out.stdout + out.stderr
+        assert f"ended pid {p.pid}" in out.stdout
+        p.wait(timeout=10)
+    finally:
+        if p.poll() is None:
+            os.kill(p.pid, signal.SIGKILL)
+            p.wait(timeout=10)
+
+
+def test_a_grace_with_a_leading_zero_is_decimal(home, stopped_sleep):
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    env = dict(os.environ, HOME=str(home), WATCHGOD_KILL_GRACE_S="08")
+    out = subprocess.run(
+        [str(_CLI), "kill", str(stopped_sleep.pid)], env=env, capture_output=True,
+        text=True, timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "value too great" not in out.stderr
+    stopped_sleep.wait(timeout=10)
+    assert stopped_sleep.returncode == -signal.SIGTERM, "the grace ran, so TERM ended it"
+
+
+def test_kill_and_thaw_read_a_pid_as_decimal(home, stopped_sleep):
+    _record(home, stopped_sleep.pid, _starttime(stopped_sleep.pid))
+    out = _cli(home, "thaw", "0" + str(stopped_sleep.pid))
+    assert f"resumed pid {stopped_sleep.pid}" in out.stdout
