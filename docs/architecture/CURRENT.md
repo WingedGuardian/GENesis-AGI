@@ -945,6 +945,24 @@ treats `start == end` as off, matching `ego/cadence.py`), so nothing delays an
 owner-facing send by default. The salience thresholds and the shared daily cap
 are the other timing/volume controls on that path.
 
+Governance can also DROP an owner-facing send as a duplicate, writing no history
+row (`GovernanceGate._is_duplicate`). Inside the signal type's window
+(`_DEDUP_WINDOWS`, default 24 h; 0 turns dedup off), a delivered row with the same
+`(signal_type, topic, category)` suppresses it, and so does one with the same
+signal type, category and `content_hash` (SHA-256 of the first 200 characters of
+`context`, topic ignored). The content-hash match is skipped for the signal types
+whose topic is the message identity (`_TOPIC_IS_IDENTITY`: `queued_alert`,
+`morning_report`, `career_outreach_nudged`) and for any empty or whitespace-only
+context. Before that exemption, at least 3 of a live install's 84 recorded
+morning-report job runs (mid-July to October) delivered nothing this way: the
+next day's report finished drafting a few seconds sooner, fell inside the 24 h
+window, and opened with the same 200 characters. For a queued alert the topic is
+`alert:<dedupe_key>`, or `alert:<source>` when the producer passed no key, so a
+keyless producer's distinct alerts still collide on the topic check. `backup.sh`
+gives a repeated failure one dedupe key with `alert_stable_key`
+(`scripts/lib/alert_queue.sh`), which leaves the per-run
+`Time:`/`Duration:`/`SQLite lines:` lines out of the hash.
+
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
@@ -1490,7 +1508,9 @@ verified: 637f7f7bb679 2026-10-05
   copy's own burst would raise it), though a disk already ORANGE
   still gets one; never stops the launch, though a launch waits up to 10 minutes
   for another session's copy of the same profile).
-  `scripts/browser.py` launches without a copy. `scripts/disk_hygiene.sh` keeps
+  `scripts/browser.py` copies too when it can import Genesis (else it says so and
+  launches without a copy). The Chromium fallback and that CLI run
+  through patchright when installed. `scripts/disk_hygiene.sh` keeps
   the newest copy per profile, and the newest per version for 90 days.
   `provision.py` (run by `scripts/install_browser_stack.sh`,
   unit `genesis-browser-stack.service`) installs what the tools launch: the
