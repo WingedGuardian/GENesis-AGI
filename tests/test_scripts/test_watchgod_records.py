@@ -122,11 +122,14 @@ def stopped_sleep():
             time.sleep(0.05)
         yield p
     finally:
-        try:
-            os.kill(p.pid, signal.SIGCONT)
-            p.kill()
-        except ProcessLookupError:
-            pass
+        # Only while it is still ours: once a test has reaped it, the pid may
+        # name an unrelated process (review finding).
+        if p.poll() is None:
+            try:
+                os.kill(p.pid, signal.SIGCONT)
+                p.kill()
+            except ProcessLookupError:
+                pass
         p.wait(timeout=10)
 
 
@@ -1023,3 +1026,31 @@ def test_boot_id_has_no_fallback(home):
     """A second identity source would let one failed read stamp records as
     another boot; the library names only the kernel boot id."""
     assert "btime" not in _RECORDS.read_text()
+
+
+
+def test_status_waits_for_a_record_still_being_written(home, stopped_sleep):
+    """The guardian holds the lock while it writes a record: status waits for
+    it, then shows the finished record, as thaw does (review finding)."""
+    lock = _state_dir(home) / "frozen.lock"
+    rec = _state_dir(home) / "frozen"
+    line = (
+        f"{stopped_sleep.pid}\t{_starttime(stopped_sleep.pid)}\tsleep\tT\tk\t/x/o\tpaused\t{_BOOT}\n"
+    )
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f, fcntl.LOCK_EX); "
+            "print('held', flush=True); time.sleep(1); open(sys.argv[2],'w').write(sys.argv[3])",
+            str(lock),
+            str(rec),
+            line,
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout.readline().strip() == "held"
+    out = _cli(home, "status")
+    holder.wait(timeout=10)
+    assert "still paused" in out.stdout, out.stdout + out.stderr

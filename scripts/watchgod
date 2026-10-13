@@ -39,6 +39,9 @@ DG_PROC=/proc
 KILL_GRACE_S="${WATCHGOD_KILL_GRACE_S:-10}"
 [[ "$KILL_GRACE_S" =~ ^[0-9]{1,6}$ ]] || KILL_GRACE_S=10
 KILL_GRACE_S=$(( 10#$KILL_GRACE_S ))
+# How long `status` waits for the pause-record lock before showing the last
+# complete list.
+STATUS_LOCK_WAIT_S=5
 
 usage() {
     sed -n '4,10p' "$0" | sed 's/^# \{0,1\}//'
@@ -134,8 +137,18 @@ PY
     fi
     # "still paused" only while the SAME process (start time) is in state T or
     # t now: a record says what the guardian did, not what is true now.
-    local pid st comm ts _key path rstate state live n=0 listing rc
-    if ! listing="$(wg_records_list)"; then
+    local pid st comm ts _key path rstate state live n=0 listing rc lk="" lrc=0
+    # Under the records lock, like thaw and kill, so a record is never shown
+    # before its stop is final (review finding). Bounded: status is read-only
+    # and must not hang; past the wait it reads the last complete file (writes
+    # are whole-file renames) and says so.
+    if [[ -e "$(wg_records_file)" || -e "$(wg_records_file).lock" ]]; then
+        wg_records_lock lk "$STATUS_LOCK_WAIT_S" \
+            || echo "paused: the guardian is updating the pause records; showing the last complete list" >&2
+    fi
+    listing="$(wg_records_list)" || lrc=$?
+    wg_records_unlock "$lk"
+    if (( lrc )); then
         echo "paused: the pause records at $(wg_records_file) cannot be read" >&2
         return 1
     fi
