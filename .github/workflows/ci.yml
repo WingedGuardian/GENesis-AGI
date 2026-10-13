@@ -1069,4 +1069,7 @@ jobs:
         # integration requirement, per the test's own skip reason). No
         # overlap with the files above (new paths). Floor: 25718 + 20 = 25738.
         # Ceiling: 104 + 20 = 124.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124 --min-collected 25738
+        # Bash oracle harness (#1656), new test_shell_parse_bash_oracle.py:
+        # 7 tests, measured with --collect-only. No added skips.
+        # Floor: 25738 + 7 = 25745.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124 --min-collected 25745
