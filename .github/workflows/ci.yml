@@ -1069,4 +1069,13 @@ jobs:
         # integration requirement, per the test's own skip reason). No
         # overlap with the files above (new paths). Floor: 25718 + 20 = 25738.
         # Ceiling: 104 + 20 = 124.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124 --min-collected 25738
+        # Data-heredoc post-pass (#2972), changed test files measured against
+        # origin/main b714b1ec:
+        #   test_guard_ansic_fail_closed.py  285 -> 285  (+0)
+        #   test_push_pr_adjacency.py         61 -> 66   (+5)
+        #   test_secrets_env_access_guard.py  59 -> 67   (+8)
+        #   test_shell_parse.py              269 -> 343 (+74)
+        #   test_worktree_guard.py           129 -> 129  (+0)
+        #   test_worktree_remote_guard.py    192 -> 194  (+2)
+        # Delta +89. Floor: 25738 + 89 = 25827. No added skips.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124 --min-collected 25827
