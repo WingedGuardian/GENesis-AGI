@@ -1,0 +1,540 @@
+r"""Does this tool call TOUCH the secrets file? Answered by resolved path, not by string.
+
+The first version of this gate matched the literal ``secrets.env`` in a Bash
+command. An adversarial review broke it in seconds with shapes nobody would call
+exotic — ``cat ~/genesis/secrets.*``, ``cat secrets.e*``, ``cat s*.env`` — and it
+never saw ``Read``/``Grep`` at all, since it was wired only to ``Bash``. That is
+the hand-rolled-matcher tar pit the genesis-development skill names: every round
+finds one more spelling, and it does not converge.
+
+So this module asks a different question. Not "does the text look like the
+secrets file" but **"does anything in this call resolve to the secrets file"** —
+expand the globs, follow the symlinks, compare by ``st_ino``. A spelling the
+author never imagined still resolves to the same inode.
+
+WHAT THIS DOES NOT CATCH — read this before trusting it.
+
+An earlier version of this docstring said "two honest residuals, declared
+rather than hidden". That was the wrong claim: the residuals are not two, and
+they were not declared because nobody had enumerated them. MEASURED at this
+head against a real credentials file, with a literal path and a glob as
+positive controls and two benign commands as negative controls:
+
+    gated       cat <literal path>
+    gated       cat ~/genesis/s*.e*
+    NOT gated   grep -R API_KEY ~/genesis        <- prints the values
+    NOT gated   cp -R ~/genesis /tmp/x
+    NOT gated   tar -cf /tmp/x.tar ~/genesis
+    NOT gated   cat ~/alias/s*.e*                <- symlinked directory
+    NOT gated   cat ~/genesis/secrets\.env
+    NOT gated   cat ~/genesis/sec"rets".env
+    NOT gated   cat ~/genesis/'secrets'.env
+    NOT gated   awk -f - <<'AWK' … system("cat …")
+    silent      ls ~/genesis · cat README.md     <- correct
+
+**Three of eleven.** Every row is a different way a path or a receiver reaches
+the file, drawn from a different vocabulary — word splitting, quote
+concatenation, backslash escapes, symlink resolution, recursive tool semantics,
+the open set of programs that execute stdin. Predicting all of them from
+command text is the thing this module was written to avoid doing with strings,
+and it is still doing it one layer up.
+
+So the honest statement of what this is: a gate that closes the DIRECT
+spellings — a named path, a glob that expands to the file, a heredoc fed to a
+recognised interpreter — and does not close indirect access. It is strictly
+better than the string matcher it replaced, and it is not the boundary. The
+replacement enforces at the filesystem and credential boundaries instead, where
+one check answers every row above at once; that is **issue #2230**, and it
+carries this table as its acceptance bar.
+
+Two residuals that a boundary rebuild does NOT remove, kept from the earlier
+version because they remain true:
+
+* **Shell variables are not expanded.** ``f=secrets; cat $f.env`` cannot be
+  resolved without executing the shell, and this module never executes anything.
+  It is handled by the SUSPICION fallback below — a token carrying a variable
+  alongside secrets-ish wording is reported as unresolved-and-suspicious, and the
+  caller gates on it. That trades a rare extra prompt for not having a hole.
+* **A copy is gated once, at the copy.** ``cp secrets.env /tmp/x`` prompts; later
+  reads of ``/tmp/x`` do not, because by then it is a different file with no
+  marking. Inherent to gating at the filesystem boundary.
+
+MEASURED, because a gate nobody measured is a gate nobody knows the cost of.
+Replayed against 5,713 real Bash commands from the 60 most recent transcripts on
+one install:
+
+    fired            148/5,713 (2.591%)  ->  63/5,713 (1.103%)
+    of which TRUE     (names secrets.env as an operand)  59  (1.033%)
+    FALSE POSITIVES   89  (1.558%)       ->   4  (0.070%)
+
+The surviving 1.033% is a FIRE rate, not an error rate: those commands really do
+source, grep or sed the credentials file, which is the whole point. The number
+that mattered was the other one, and the reason it was so high is that the first
+version was a string matcher wearing an inode matcher's clothes — it gated on the
+word ``secrets.env`` appearing anywhere, including in this module's own commit
+message. Re-derive by replaying the corpus through ``touches_secrets``.
+
+Stdlib only, no ``genesis`` import, and every path operation is wrapped: a
+resolution failure must never crash the hook it guards — including
+``ValueError``, which ``Path.stat()`` (not ``OSError``) raises on an embedded NUL,
+and which reached CC as exit 1, i.e. a NON-blocking error that lets the tool run.
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import shell_parse  # noqa: E402
+from hook_input import brace_expand, strip_quoted  # noqa: E402
+
+#: Real secrets files. `secrets.env.example` is the shipped TEMPLATE and holds
+#: nothing — prompting on it would train the owner to click through the prompt
+#: that matters, which is worse than not prompting at all.
+_SECRET_BASENAMES = ("secrets.env",)
+
+
+#: The override the rest of the system actually uses. `SECRETS_PATH` is what
+#: `scripts/install.sh` documents and consumes (`:18`, `:128`), what
+#: `genesis.env.secrets_path()` reads at `:181`, and what six test modules call
+#: "the sanctioned SECRETS_PATH env override".
+#:
+#: This guard read `GENESIS_SECRETS_PATH`, a name NOTHING in the tree sets —
+#: MEASURED, one occurrence repo-wide, and it was this line. So on any install
+#: that relocates its credentials, the file was outside the gate entirely and
+#: the failure was silent, because a guard that finds no candidate root simply
+#: allows (Codex P1, #1826).
+#:
+#: Both names are read, the canonical one first: the invented spelling stays
+#: accepted because an install that already exported it would otherwise lose
+#: the gate at the moment this fix landed, which is the wrong direction for a
+#: credentials guard to move even briefly.
+#:
+#: Stdlib-only by contract — a hook cannot import `genesis.env` — so this
+#: MIRRORS `secrets_path()` rather than calling it. That is a replica, and the
+#: honest mitigation is that it is now a replica of something real instead of
+#: a name of its own; `test_the_guard_reads_the_same_override_the_runtime_does`
+#: fails if the two ever disagree.
+_SECRETS_PATH_ENV = ("SECRETS_PATH", "GENESIS_SECRETS_PATH")
+
+
+def _candidate_roots() -> list[Path]:
+    """Where a real secrets.env plausibly lives on this install."""
+    roots = []
+    for name in _SECRETS_PATH_ENV:
+        explicit = os.environ.get(name)
+        if explicit:
+            roots.append(Path(explicit).expanduser())
+    roots.append(Path.home() / "genesis" / "secrets.env")
+    repo = os.environ.get("CLAUDE_PROJECT_DIR")
+    if repo:
+        roots.append(Path(repo) / "secrets.env")
+    return roots
+
+
+def _secret_inodes() -> set[tuple[int, int]]:
+    """(st_dev, st_ino) of every real secrets file we can find.
+
+    Identity by inode rather than by path string: a symlink, a relative path, a
+    ``..`` walk and an absolute path all collapse to the same pair, so none of
+    them needs its own pattern.
+    """
+    out: set[tuple[int, int]] = set()
+    for p in _candidate_roots():
+        try:
+            st = p.resolve().stat()
+            out.add((st.st_dev, st.st_ino))
+        except OSError:
+            continue
+    return out
+
+
+def _is_secret_path(raw: str, inodes: set[tuple[int, int]], *, allow_bare: bool = True) -> bool:
+    """True when `raw` resolves to — or names — a real secrets file.
+
+    ``allow_bare`` governs the ONE ambiguous case: a token that does not resolve
+    AND carries no path separator, i.e. the word ``secrets.env`` on its own. That
+    spelling is a real operand after a ``cd``, and it is also what every sentence
+    ABOUT the file looks like. The caller decides, because only the caller knows
+    whether the token was quoted. See ``touches_secrets``.
+
+    ``ValueError`` is caught alongside ``OSError`` because ``Path.stat()`` raises
+    it — not OSError — on an embedded NUL byte. The narrower catch let that
+    escape as an uncaught exception, and an uncaught exception in a PreToolUse
+    hook is exit 1, which Claude Code treats as a NON-blocking error: the tool
+    runs. A credentials gate must not fail open on a malformed argument.
+    """
+    if not raw:
+        return False
+    try:
+        p = Path(os.path.expanduser(raw))
+        # NOTE: there is deliberately no `.example` test here. An earlier
+        # version short-circuited on the UNRESOLVED name before the inode
+        # compare below, which made a filename outrank file identity: a symlink
+        # named `x.example` pointing AT the real secrets.env was allowed, while
+        # a hardlink to the same inode under any other name correctly gated
+        # (MEASURED both ways). It also contradicted the comment below claiming
+        # the inode arm is unconditional. The branch had no legitimate effect to
+        # trade for that: `_SECRET_BASENAMES` is ('secrets.env',), so the
+        # template is already rejected by the name checks further down — proven
+        # by mutation, the suite stays green with the branch deleted. If a
+        # template exemption is ever wanted again it must come AFTER the
+        # identity test and read `p.resolve().name`.
+        st = p.resolve().stat()
+        if (st.st_dev, st.st_ino) in inodes:
+            # A real secrets file — but a bare NAME is still ambiguous when the
+            # token was quoted: `git commit -m "rotate secrets.env"` in a cwd
+            # that holds a real secrets.env is a mention that happens to
+            # resolve, not an operand (Devin BUG finding, #1826). The quoted
+            # OPERAND `cat "secrets.env"` keeps allow_bare via the caller's
+            # single-token-quoted-span rule, so consent is still required for
+            # the real file; only embedded-in-prose mentions are exempt.
+            stripped = raw.rstrip("/")
+            if os.sep not in stripped and not stripped.startswith("~"):
+                return allow_bare
+            return True
+        # Not one of the known installs, but named like the real thing — a
+        # backup, a second checkout, a copy under another root. Still secrets —
+        # but only if the token is not a bare name: a separator-less token that
+        # RESOLVES against cwd hits the same ambiguity as the unresolvable case
+        # (a quoted "secrets.env" mention gates when an unrelated secrets.env
+        # sits in the working directory — CodeRabbit Major, #1826). The inode
+        # arm above stays unconditional: it identifies the real file.
+        if p.name not in _SECRET_BASENAMES:
+            return False
+        stripped = raw.rstrip("/")
+        return allow_bare or (os.sep in stripped or stripped.startswith("~"))
+    except (OSError, ValueError):
+        # Cannot stat: fall back to the NAME, so a path that does not exist yet
+        # (a `cp … secrets.env` destination) is still recognised.
+        stripped = raw.rstrip("/")
+        if os.path.basename(stripped) not in _SECRET_BASENAMES:
+            return False
+        return allow_bare or (os.sep in stripped or stripped.startswith("~"))
+
+
+#: A token worth expanding: contains a path separator, a glob metacharacter, or
+#: reads like a secrets filename. Deliberately generous — expansion is cheap and
+#: a missed token is a hole.
+#: ``$`` and a backtick are included so a variable-built path reaches the
+#: SUSPICIOUS check below — without them ``$f.env`` was filtered out here and the
+#: fallback never ran, which is exactly how that shape slipped the first draft.
+_PATHY = re.compile(r"[/~*?\[\]$`]|secret", re.IGNORECASE)
+
+#: Unresolvable-but-suspicious: shell variable or command substitution sitting
+#: next to secrets-ish wording. Cannot be resolved without running the shell, so
+#: it is reported and the caller decides (we gate).
+_SUSPICIOUS = re.compile(r"(\$\{?\w+|`|\$\()", re.IGNORECASE)
+
+#: Does this command mention a secrets FILE, as opposed to the word "secret"?
+#:
+#: The distinction is load-bearing because the suspicion arm below is
+#: command-LEVEL: it gates whenever secrets-wording and an unresolvable shell
+#: construct appear anywhere in the same command. Testing for the bare substring
+#: ``secret`` therefore fired on every non-trivial command run inside a worktree
+#: named ``secrets-guard``, and on any ``gh api --body`` quoting the word — the
+#: single largest false-positive class in the corpus measurement.
+#:
+#: So it takes one of two shapes: ``secrets`` carrying the real EXTENSION or a
+#: glob (``secrets.env``, ``secrets.*``), or ``secret``/``secrets`` standing alone
+#: as a word glued to nothing. Excluded by the lookarounds, each a measured false
+#: positive: ``secrets-guard`` (a worktree name), ``secret_scrub`` (a module), and
+#: ``dashboard/routes/secrets.py`` (a source file that is not the credentials
+#: file). Still included: ``f=secrets; cat $f.env``, the declared shell-variable
+#: residual this arm exists for.
+#: ``.example`` is excluded here, and the reason is NOT the one an earlier
+#: version of this comment gave — it said "for the same reason
+#: ``_is_secret_path`` excludes it", and that function no longer excludes it at
+#: all, because doing so let a filename outrank an inode. The two are different
+#: mechanisms and only one was safe:
+#:
+#: * ``_is_secret_path`` answers IDENTITY. A name test there is unsound, since
+#:   any name can point at the real file.
+#: * this lookahead narrows a SUSPICION heuristic over tokens that could not be
+#:   resolved at all. There is no identity to defer to, so a name is the only
+#:   evidence available, and excluding the template only declines to gate on a
+#:   file that holds nothing. Without it, ANY command mentioning
+#:   ``secrets.env.example`` alongside a ``$`` gated at the command level even
+#:   though the per-token check would have cleared it.
+#:
+#: MEASURED when the identity-side branch was removed: every shape that reaches
+#: the REAL file still matches here — ``f=secrets; cat $f.env``,
+#: ``cat $HOME/secrets.env``, and ``cat secrets.env.example/../secrets.env``.
+#: One shape does NOT: ``g=secrets.env.example; cat ${g%.example}`` strips the
+#: suffix by parameter expansion and misses. That is an exotic instance of the
+#: shell-variable residual this arm already declares, not a new class — recorded
+#: on #2230 rather than chased with a wider pattern.
+_SECRETISH = re.compile(
+    r"(?<![\w-])secrets?\.(?:env\b(?!\.example)|[*?\[])|(?<![\w-])secrets?(?![\w.-])",
+    re.IGNORECASE,
+)
+
+
+#: Heredoc bodies are DATA, not operands — UNLESS the heredoc feeds an
+#: interpreter. `git commit -F - <<'EOF' … secrets.env … EOF` is a commit
+#: message discussing the file; nothing in it is opened. But `python3 <<'EOF'
+#: … cat secrets.env … EOF` EXECUTES the body — stripping it before the operand
+#: scan lets a nested credential read run without consent (Devin SEC finding,
+#: #1826). Which receiver a heredoc feeds is therefore a question about the
+#: command's resolved EXECUTABLE, and that is `shell_parse`'s job rather than a
+#: pattern's: the first version anchored the interpreter at the command start or
+#: after an operator, and MEASURED against the real file, three ordinary
+#: spellings hid it and ran the credential read without consent —
+#: `FOO=1 python3 <<'PY'`, `/usr/bin/python3 <<'PY'` and `env FOO=1 python3
+#: <<'PY'`. An assignment prefix, an absolute path and `env` are not exotic;
+#: they are what the next spelling always looks like, which is why this is
+#: bound to the canonical parser instead of being widened again.
+_HEREDOC = re.compile(r"<<-?\s*'?\"?(\w+)'?\"?\n.*?^\s*\1\s*$", re.DOTALL | re.MULTILINE)
+
+#: Basenames that EXECUTE what they are fed. Matched against
+#: `Segment.exe`, which `shell_parse` has already stripped of env
+#: assignments, `env`, `sudo`/`command` wrappers and any directory part — so
+#: this set names receivers, never spellings of them. `python` is a prefix
+#: match for the versioned forms (`python3`, `python3.12`).
+_EXEC_RECEIVERS = frozenset(
+    {
+        "bash",
+        "zsh",
+        "dash",
+        "sh",
+        "ksh",
+        "fish",
+        "node",
+        "nodejs",
+        "ruby",
+        "perl",
+        "php",
+        "lua",
+        "pwsh",
+        "powershell",
+        "ssh",
+        "docker",
+        "kubectl",
+        "podman",
+    }
+)
+
+
+def _heredoc_feeds_an_executor(command: str) -> bool:
+    """Does any segment of this command EXECUTE what a heredoc gives it?
+
+    Fails CLOSED in every direction a credentials gate should: an unparseable
+    command, a blind spot `shell_parse` reports, or an unresolved verb all
+    return True, which keeps the heredoc body in the operand scan. The cost of
+    a wrong True is that a data heredoc's prose is scanned — which at worst
+    asks for consent the user can grant; the cost of a wrong False is a
+    credential read that never asked.
+
+    Deliberately broader than "the segment carrying the `<<`": `Segment.raw`
+    has the redirect excised, so the introducer cannot be attributed back to
+    its own segment. An interpreter anywhere in a command that also carries a
+    heredoc is enough to keep the body. That over-scans a pipeline pairing an
+    interpreter with an unrelated data heredoc, and over-scanning is the
+    direction this module chooses everywhere else.
+    """
+    try:
+        segments, blind = shell_parse.analyze_checked(command)
+    except Exception:  # noqa: BLE001 - any parse failure is an unknown receiver
+        return True
+    if blind is not None:
+        return True
+    for seg in segments:
+        if seg.verb_unresolved:
+            return True
+        exe = seg.exe
+        if exe in _EXEC_RECEIVERS or exe.startswith("python"):
+            return True
+    return False
+
+
+#: Ceilings on the glob walk below. A glob is expanded against the REAL
+#: filesystem, so a token like ``/*/*/*/*/*/*`` walks an unbounded subtree —
+#: MEASURED on this box at 1.1s for ``/usr/*/*/*`` and 6.0s for ``/sys/*/*/*/*``,
+#: against a hook budget of 10s. Two separate harms: every ordinary `ls`/`rg`
+#: carrying a wide glob stalls, and a walk that outruns the budget is killed
+#: without emitting a decision — which is an ALLOW. So the walk is bounded, and
+#: exhausting the bound GATES rather than falls through. Unresolvable is treated
+#: the same way everywhere else in this module.
+_GLOB_BUDGET_S = 0.15
+_GLOB_MAX_HITS = 500
+#: A pattern with many wildcard components walks an unbounded subtree BETWEEN
+#: iglob yields — where neither the hit cap nor the deadline can see it — and a
+#: walk past the hook's own timeout is a fail-open ALLOW (CodeRabbit Major,
+#: #1826). The supported relevant globs carry at most one wildcard segment;
+#: two preserves them, anything deeper is refused by gating.
+_GLOB_MAX_WILD_SEGMENTS = 2
+
+
+def _glob_may_reach_secrets(tok: str) -> bool:
+    """Could this pattern name a secrets file at all? Cheap, and not a spelling test.
+
+    The walk has to be narrowed — expanding every glob costs more than the hook
+    budget (see the constants above). What it must NOT be narrowed by is the
+    pattern's SPELLING, which is what the first version did: it walked only
+    tokens whose literal text contained ``secret`` or ``.env``, deciding from
+    characters the shell never sees.
+
+    MEASURED against the real secrets file on this install, with `cat <literal
+    path>` gating as the control: ``~/genesis/s*.e*``, ``~/genesis/secr??s.e??``,
+    ``~/genesis/[s]ecrets.e[n]v`` and ``~/genesis/*.*`` all expand to it and all
+    returned False — no consent asked. (``?ecrets.env`` gated, but only because
+    ``.env`` survives literally in it, which is the coincidence rather than the
+    rule.) Every one of those is an ordinary way to type a path.
+
+    What narrows soundly is where the pattern is ROOTED. Everything before the
+    first wildcard is literal and must survive into any match, so a pattern
+    whose fixed prefix lies outside every directory that holds a secrets file
+    cannot name one, whatever it is spelled like. That keeps ``ls /usr/*/*/*``
+    off the walk for a reason nobody can spell around.
+
+    Three ways to answer yes, and the last two are deliberate slack:
+
+    * the fixed prefix can reach a directory holding a candidate secrets file;
+    * the prefix is RELATIVE, so it is rooted at a shell cwd this hook does not
+      know — the same cwd it cannot know for any other token;
+    * the old name test still passes, which keeps a COPY named like the real
+      thing recognised wherever it lives (``_is_secret_path`` matches those by
+      basename, and no path test can predict where someone put one).
+
+    Cost, stated: a pattern anchored at the filesystem root (``/*/*/*``) reaches
+    everything, so it walks, and the wildcard-segment ceiling then GATES it.
+    That is a prompt on a command almost nobody runs, chosen over a fail-open on
+    one that is typed daily, and it matches what this module already does with
+    any pattern it cannot walk inside its budget.
+    """
+    expanded = os.path.expanduser(tok)
+    cut = next((i for i, ch in enumerate(expanded) if ch in "*?["), len(expanded))
+    fixed = expanded[:cut]
+    if not os.path.isabs(fixed):
+        return True
+    base = (os.path.dirname(fixed) if cut < len(expanded) else fixed).rstrip(os.sep)
+    for root in _candidate_roots():
+        try:
+            holder = os.path.dirname(str(root.expanduser()))
+        except (OSError, ValueError):
+            continue
+        if holder == base or holder.startswith(base + os.sep):
+            return True
+    return bool(re.search(r"secret|\.env", tok, re.IGNORECASE))
+
+
+def _glob_hits_secret(tok: str, inodes: set[tuple[int, int]]) -> bool:
+    """Expand one glob token, bounded. True = it is (or may be) a secrets file."""
+    # A pattern that cannot name a secrets file is not worth walking for at all.
+    # This is what keeps `ls /usr/*/*/*` off the expensive path entirely.
+    if not _glob_may_reach_secrets(tok):
+        return False
+    wild = sum(1 for seg in tok.split(os.sep) if any(ch in seg for ch in "*?["))
+    if wild > _GLOB_MAX_WILD_SEGMENTS:
+        return True  # unwalkable within budget -> GATE
+    deadline = time.monotonic() + _GLOB_BUDGET_S
+    try:
+        for n, hit in enumerate(glob.iglob(os.path.expanduser(tok))):
+            if n > _GLOB_MAX_HITS or time.monotonic() > deadline:
+                return True  # over budget -> GATE; never let a slow walk allow
+            if _is_secret_path(hit, inodes):
+                return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> bool:
+    """True if any explicit path, or anything the command resolves to, is the secrets file.
+
+    ``paths``   — from structured tools (Read/Edit/Write ``file_path``, Grep
+                  ``path``/``pattern``/``glob``, Glob ``pattern``). Real paths or
+                  patterns; checked directly and glob-expanded.
+    ``command`` — Bash text. Tokens are brace- and glob-expanded and resolved;
+                  nothing is executed.
+
+    **Talking about the file is not touching it.** The first version gated on the
+    bare word ``secrets.env`` anywhere in a command, which fired on
+    ``grep -n "secrets.env" scripts/bootstrap.sh``, on a ``gh pr --body`` describing
+    the gate, and on this module's own commit message — MEASURED at 2.56% of real
+    commands, mostly mentions. In a foreground session that is a prompt the owner
+    learns to click through; in a dispatched session it is a hard DENY plus a
+    critical alert. So a separator-less token only counts when it survives
+    ``strip_quoted`` — i.e. it appears as a bare operand (``cd ~/genesis && cat
+    secrets.env``) rather than inside a quoted string. Tokens WITH a separator are
+    unaffected: quoting a path is normal and stays gated.
+    """
+    inodes = _secret_inodes()
+
+    for p in paths or []:
+        if not isinstance(p, str):
+            continue
+        if _is_secret_path(p, inodes):
+            return True
+        if any(ch in p for ch in "*?[") and _glob_hits_secret(p, inodes):
+            return True
+
+    if not command:
+        return False
+
+    # Heredoc bodies are data — unless the heredoc feeds an interpreter, in
+    # which case the body IS the executed payload and must be scanned.
+    exec_heredoc = _heredoc_feeds_an_executor(command)
+    scan = command if exec_heredoc else _HEREDOC.sub(" ", command)
+    # Quoted regions are DATA for the command-level arm too: a commit message
+    # naming the file is not an operand. The declared shell-variable residual
+    # (`f=secrets; cat $f.env`) is unquoted, so it survives stripping.
+    bare = strip_quoted(scan)
+    secretish = _SECRETISH.search(bare) is not None
+
+    # Command-LEVEL suspicion. Tokenising splits on parentheses, so a command
+    # substitution like `cat $(echo secrets).env` leaves no single token holding
+    # the `$(` — the per-token check below can never see it. Rather than add
+    # another token pattern (the tar pit), ask the whole command: does it mention
+    # secrets AND contain something only a shell can resolve? If so, gate. This
+    # fails toward asking, which in a foreground session costs one prompt.
+    if secretish and _SUSPICIOUS.search(bare):
+        return True
+
+    # Tokens that are NOT inside quotes. A quoted bare name stays a MENTION
+    # even when the quoted span is exactly `secrets.env`: `cat "secrets.env"`
+    # is textually identical to `grep "secrets.env" file`, where the quoted
+    # string is a content pattern, and treating quoted spans as operands put
+    # the corpus's dominant false-positive class back (measured 1.558%).
+    # Operand-role parsing is the tar pit this module exists to avoid, so a
+    # quoted bare operand is accepted residue — paths with separators still
+    # gate regardless of quoting.
+    unquoted = set(_tokens(bare))
+    if exec_heredoc:
+        # Inside an executed heredoc a quoted string is a code operand —
+        # `open("secrets.env")` reads the file — not prose. Every token counts.
+        unquoted.update(_tokens(scan))
+
+    for raw_tok in _tokens(scan):
+        if not _PATHY.search(raw_tok):
+            continue
+        # Bash brace-expands before the command ever runs, so
+        # `cp ~/genesis/{secrets.env,secrets.env.bak}` opens the real file while
+        # the single opaque token matches nothing. The repo already ships the
+        # expander for exactly this class (the rm guards hit it first).
+        try:
+            expansions = brace_expand(raw_tok)
+        except ValueError:
+            return True  # a brace bomb is unresolvable -> gate
+        for tok in expansions:
+            if _is_secret_path(tok, inodes, allow_bare=raw_tok in unquoted):
+                return True
+            # Expand globs against the real filesystem — this is what catches
+            # `secrets.*`, `secrets.e*`, `s*.env` without enumerating spellings.
+            if any(ch in tok for ch in "*?[") and _glob_hits_secret(tok, inodes):
+                return True
+            # Unresolvable shape next to secrets wording -> gate rather than guess.
+            if secretish and _SUSPICIOUS.search(tok):
+                return True
+
+    return False
+
+
+def _tokens(text: str) -> list[str]:
+    """Split shell text into candidate operands. Never executes anything."""
+    return [t for t in (t.strip() for t in re.split(r"[\s;|&<>()\"']+", text)) if t]

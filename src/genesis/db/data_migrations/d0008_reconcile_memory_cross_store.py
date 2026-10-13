@@ -49,6 +49,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from genesis.db.connection import connect_sqlite_rw
 from genesis.db.data_migrations._util import commit_in_batches
 from genesis.env import genesis_db_path
 from genesis.qdrant.collections import delete_point, get_client
@@ -196,7 +197,7 @@ def migrate() -> dict:
             ghost_delete_failed += 1
 
     # ── Phase 2 (batched writes, lock released between batches) ──
-    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
+    db = connect_sqlite_rw(genesis_db_path(), timeout=30.0)
     try:
 
         def _sweep_ghost(conn: sqlite3.Connection, pid: str) -> None:

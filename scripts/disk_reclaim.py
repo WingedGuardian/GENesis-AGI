@@ -13,10 +13,13 @@ Tiers, cleared in order until the disk is comfortable:
   LAST_RESORT — the code-intel index DBs. Deleting these turns every later
                 "incremental" index into a full 0->100 rebuild, which read-
                 saturates the container and storms it (2026-07 incident). So
-                they are cleared ONLY at >= ``--last-resort-above`` PCT (default
-                95, well past the medium gate), and clearing one drops an
-                index-request marker so the rebuild runs idle-gated via the
-                code-intel runner, never as an unthrottled reactive spawn.
+                they are cleared ONLY at >= ``--last-resort-above`` PCT, and
+                clearing one drops an index-request marker so the rebuild runs
+                idle-gated via the code-intel runner, never as an unthrottled
+                reactive spawn. The default is 101 (never): only a caller that
+                names a threshold clears them, and the one that does is the
+                disk guardian's RED pass (``disk_hygiene.sh --pressure
+                last-resort``, which passes 0).
   SYSTEM      — best-effort, needs sudo + write access to /var. Silently
                 skipped when unavailable (e.g. inside the hardened systemd
                 service, which runs with NoNewPrivileges + ProtectSystem=strict).
@@ -30,7 +33,9 @@ Usage:
     disk_reclaim.py                         # dry-run (report only) — default
     disk_reclaim.py --apply                 # clear CHEAP tier
     disk_reclaim.py --apply --if-above 90   # also clear MEDIUM tier if >= 90%
-    disk_reclaim.py --apply --last-resort-above 95  # also clear index DBs if >= 95%
+    disk_reclaim.py --apply --last-resort-above 0   # also clear index DBs (the
+                                                    #   guardian's RED pass; never
+                                                    #   cleared without the flag)
 
 Note: ~/.genesis/output is intentionally NOT touched — those are generated
 deliverables (not regenerable cache), managed by the user, not this tool.
@@ -187,7 +192,70 @@ def _is_safe_target(path: Path) -> bool:
         if prot_r != resolved and prot_r.is_relative_to(resolved):
             _log(f"REFUSE {path}: contains protected path {prot}")
             return False
+    mounts = _mount_points()
+    if mounts is None:
+        # Fail closed: nothing else guards these rmtree targets.
+        _log(f"REFUSE {path}: the mount table is unreadable")
+        return False
+    mount = _mount_at_or_below(resolved, mounts)
+    if mount is not None:
+        # rmtree follows into mounts: a bind mount (same device) or a
+        # separately mounted volume under a cache dir would be emptied along
+        # with the cache (review finding on #2570).
+        _log(f"REFUSE {path}: is or contains the mount point {mount}")
+        return False
     return True
+
+
+def _mount_points(mountinfo: Path = Path("/proc/self/mountinfo")) -> list[Path] | None:
+    """Mount points from the kernel's mount table, octal escapes decoded.
+
+    Field 5 of mountinfo escapes space, tab, newline and backslash as \\NNN;
+    other bytes pass raw, so records are split on "\\n" only (splitlines()
+    would also split on \\x0b, \\x1c, U+2028 ... inside a path). None when
+    the table cannot be read, or has no "/" entry — every real table has one,
+    so an empty or truncated read is not mistaken for "no mounts" (the same
+    rule as the shell guard's mount_targets; review finding on #2570). The
+    caller refuses rather than guessing.
+    """
+    # BYTES end to end: the kernel writes raw filename bytes, and only
+    # os.fsdecode maps them to the Path the rest of the code compares. Decoding
+    # as locale text and re-encoding as UTF-8 changed non-ASCII names under a
+    # non-UTF-8 filesystem encoding, so a real mount stopped matching (review
+    # finding on #2570, round 4).
+    try:
+        data = mountinfo.read_bytes()
+    except OSError:
+        return None
+    out = []
+    for line in data.split(b"\n"):
+        fields = line.split(b" ")
+        if len(fields) > 4:
+            out.append(Path(os.fsdecode(_unescape_octal(fields[4]))))
+    if Path("/") not in out:
+        return None
+    return out
+
+
+def _unescape_octal(raw: bytes) -> bytes:
+    out = bytearray()
+    i = 0
+    while i < len(raw):
+        if raw[i] == 0x5C and i + 4 <= len(raw) and all(0x30 <= c <= 0x37 for c in raw[i + 1:i + 4]):
+            out.append(int(raw[i + 1:i + 4], 8))
+            i += 4
+        else:
+            out.append(raw[i])
+            i += 1
+    return bytes(out)
+
+
+def _mount_at_or_below(resolved: Path, mounts: list[Path]) -> Path | None:
+    """The first mount point equal to or below *resolved*, else None."""
+    for mp in mounts:
+        if mp == resolved or mp.is_relative_to(resolved):
+            return mp
+    return None
 
 
 # ─── Reclaim operations ──────────────────────────────────────────────────
@@ -330,10 +398,11 @@ def main() -> int:
     parser.add_argument("--if-above", type=float, default=101.0, metavar="PCT",
                         help="Also clear MEDIUM tier when disk usage >= PCT "
                              "(default 101 = never)")
-    parser.add_argument("--last-resort-above", type=float, default=95.0, metavar="PCT",
+    parser.add_argument("--last-resort-above", type=float, default=101.0, metavar="PCT",
                         help="Also clear LAST_RESORT tier (code-intel index DBs) "
-                             "when disk usage >= PCT (default 95). Clearing one "
-                             "drops an index-request marker for an idle rebuild.")
+                             "when disk usage >= PCT (default 101 = never). "
+                             "Clearing one drops an index-request marker for an "
+                             "idle rebuild.")
     parser.add_argument("--fail-above", type=float, default=101.0, metavar="PCT",
                         help="Exit non-zero if usage is still >= PCT after "
                              "applying (signals 'cleaned but still critical' to "

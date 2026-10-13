@@ -58,6 +58,17 @@ def emit(sha: str, subject: str) -> int:
     now = datetime.now(UTC).isoformat()
     obs_id = str(uuid.uuid4())
 
+    # Admission fence (fail-closed): a quarantined
+    # database is never written; a skipped bugfix observation is recoverable.
+    try:
+        from db_admission_check import database_is_fenced
+    except Exception:
+        print("emit_bugfix_audit: fence state unknowable, skipping", file=sys.stderr)
+        return 0
+    if database_is_fenced(db):
+        print("emit_bugfix_audit: database fenced, skipping", file=sys.stderr)
+        return 0
+
     try:
         conn = sqlite3.connect(str(db), timeout=2.0)
         try:

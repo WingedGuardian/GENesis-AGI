@@ -20,7 +20,7 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PATCHES_DIR="$PROJECT_DIR/config/gstack-patches"
 GSTACK_DIR="$HOME/.claude/skills/gstack"
@@ -116,8 +116,6 @@ apply_overlay() {
     inc_applied
 }
 
-apply_overlay "$PATCHES_DIR/codex-SKILL.md.tmpl" "$GSTACK_DIR/codex/SKILL.md.tmpl" "Codex 2.0 template"
-apply_overlay "$PATCHES_DIR/codex-SKILL.md"      "$GSTACK_DIR/codex/SKILL.md"      "Codex 2.0 skill"
 apply_overlay "$PATCHES_DIR/review-checklist.md"  "$GSTACK_DIR/review/checklist.md" "Review checklist"
 
 # 2. Safety frontmatter patch (ship + land-and-deploy)

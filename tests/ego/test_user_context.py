@@ -862,6 +862,16 @@ class TestUserEgoContextBuilder:
             "VALUES (?, ?, ?, ?, ?)",
             ("i2", "/inbox/test2.md", "def", "processing", datetime.now(UTC).isoformat()),
         )
+        # Terminal rows are not backlog — a superseded row (replaced by a
+        # newer snapshot) must not inflate the count or its oldest age.
+        very_old = (datetime.now(UTC) - timedelta(days=40)).isoformat()
+        for rid, status in (("i3", "superseded"), ("i4", "failed"), ("i5", "completed")):
+            await db.execute(
+                "INSERT INTO inbox_items "
+                "(id, file_path, content_hash, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (rid, f"/inbox/{rid}.md", "ghi", status, very_old),
+            )
         await db.execute(
             "INSERT INTO observations "
             "(id, source, type, category, content, priority, resolved, created_at) "

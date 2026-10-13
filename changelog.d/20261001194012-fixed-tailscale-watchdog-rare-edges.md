@@ -1,0 +1,1 @@
+- **Tailscale watchdog state is handled more reliably.** It preserves daemon continuity when identities are incomplete, keeps polling through unreadable systemd reads, counts malformed-only scans as blind, recognizes runtime-enabled timers and masked services, and verifies every watchdog unit before reporting uninstall success.

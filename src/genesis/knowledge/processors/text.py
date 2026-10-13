@@ -1,4 +1,4 @@
-"""Text file processor (.txt, .md, .rst)."""
+"""Text file processor (.txt, .md, .rst, .text, .markdown)."""
 
 from __future__ import annotations
 

@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -71,7 +73,12 @@ def home(tmp_path: Path) -> Path:
 
 
 def _run_hook(
-    command: str, repo: Path, home: Path, payload_cwd: str | None = None
+    command: str,
+    repo: Path,
+    home: Path,
+    payload_cwd: str | None = None,
+    extra_env: dict[str, str] | None = None,
+    hook: Path = _HOOK,
 ) -> subprocess.CompletedProcess:
     body = {
         "hook_event_name": "PreToolUse",
@@ -83,8 +90,11 @@ def _run_hook(
         body["cwd"] = payload_cwd
     payload = json.dumps(body)
     env = {**os.environ, "HOME": str(home)}
+    env.setdefault("_TEST_REVIEW_BUDGET_PR", "none")
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
-        [sys.executable, str(_HOOK)],
+        [sys.executable, str(hook)],
         input=payload,
         cwd=str(repo),
         env=env,
@@ -92,6 +102,29 @@ def _run_hook(
         text=True,
         timeout=30,
     )
+
+
+def test_in_flight_branch_probe_timeout_blocks_before_hook_kill(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nexec sleep 30\n")
+    fake_git.chmod(0o755)
+
+    started = time.monotonic()
+    res = _run_hook(
+        'git commit -m "timed probe"',
+        repo,
+        home,
+        extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+    elapsed = time.monotonic() - started
+
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "deadline expired during subprocess" in res.stderr
+    assert elapsed < 9.5
 
 
 def _mark(repo: Path, home: Path) -> subprocess.CompletedProcess:
@@ -213,6 +246,167 @@ def test_literal_absolute_cd_still_allows(repo: Path, home: Path) -> None:
 def test_literal_dash_C_still_allows(repo: Path, home: Path) -> None:
     _mark(repo, home)
     res = _run_hook(f"git -C {repo} commit -m wip", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def _hook_inside(repo: Path) -> Path:
+    """A copy of the gate that lives inside ``repo``'s own ``.git``.
+
+    The live-branch refusal applies only when the commit is in the repository
+    the gate ships in. The shipped gate belongs to THIS repository, so against a
+    scratch repo it correctly stands aside. A copy under the scratch repo's
+    ``.git`` (untracked, so it never enters the staged diff) resolves to the
+    scratch repo's git dir, the same one a commit there uses."""
+    dest = repo / ".git" / "genesis-scripts"
+    shutil.copytree(
+        _REPO_ROOT / "scripts", dest, ignore=shutil.ignore_patterns("__pycache__")
+    )
+    return dest / "review_enforcement_commit.py"
+
+
+def _live_with_manifest(repo: Path, home: Path) -> None:
+    _git(repo, "checkout", "-q", "-b", "live")
+    (repo / "f.py").write_text("base = 4\n")
+    _git(repo, "add", "-A")
+    _mark(repo, home)
+    (home / ".genesis").mkdir(exist_ok=True)
+    (home / ".genesis" / "deploy_manifest.json").write_text("{}\n")
+
+
+def test_commit_on_live_integration_branch_is_blocked(repo: Path, home: Path) -> None:
+    # `live` is rebuilt by `git commit-tree` from origin/main plus the manifest's
+    # candidates, so a hand commit there is refused like one on main — even with
+    # a valid review marker, which would otherwise allow it.
+    hook = _hook_inside(repo)
+    _live_with_manifest(repo, home)
+    res = _run_hook(f"cd {repo} && git commit -m wip", repo, home, hook=hook)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "Commit on 'live'" in res.stderr
+
+
+def test_commit_on_another_repositorys_live_branch_is_ordinary(repo: Path, home: Path) -> None:
+    # The manifest describes THIS install's repository. A session also commits in
+    # unrelated checkouts, and their own `live` branches are not its business:
+    # the shipped gate (this repository's) stands aside for the scratch repo.
+    _live_with_manifest(repo, home)
+    res = _run_hook(f"cd {repo} && git commit -m wip", repo, home)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_live_repo_identity_unreadable_fails_closed(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With the manifest present, a commit whose repository cannot be identified
+    # is treated as one in this repository, as the gate treats an unreadable
+    # branch: refuse rather than guess.
+    import importlib.util
+
+    (home / ".genesis" / "deploy_manifest.json").write_text("{}\n")
+    monkeypatch.setenv("HOME", str(home))
+    spec = importlib.util.spec_from_file_location("rec_live_probe", str(_HOOK))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod._live_integration_repo(str(tmp_path / "missing")) is True
+    # An existing directory that is no repository at all is unreadable too.
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    assert mod._live_integration_repo(str(not_a_repo)) is True
+
+
+def _stall_common_dir_probe(tmp_path: Path) -> dict[str, str]:
+    """PATH with a `git` that hangs ONLY on `rev-parse --git-common-dir`.
+
+    That flag is read by nothing else on the commit path, so the stall lands on
+    the live-branch repository-identity probes and nowhere else; every other git
+    call reaches the real binary."""
+    real_git = shutil.which("git")
+    assert real_git
+    fake_bin = tmp_path / "stallbin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do\n'
+        '  [ "$a" = "--git-common-dir" ] && exec sleep 30\n'
+        "done\n"
+        f'exec {real_git} "$@"\n'
+    )
+    fake_git.chmod(0o755)
+    return {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+
+def test_live_identity_probes_are_bounded_by_the_hook_deadline(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    # The hook is registered with a 10-second timeout and a harness kill lets the
+    # commit through. Two identity probes with their own 5-second caps could spend
+    # the whole window; drawn from the hook's one deadline, a stalled probe ends
+    # as a refusal inside it.
+    hook = _hook_inside(repo)
+    _live_with_manifest(repo, home)
+    started = time.monotonic()
+    res = _run_hook(
+        f"cd {repo} && git commit -m wip",
+        repo,
+        home,
+        hook=hook,
+        extra_env=_stall_common_dir_probe(tmp_path),
+    )
+    elapsed = time.monotonic() - started
+    # Time first: that is the defect. Unbounded, the gate still refuses, but only
+    # after both probes time out, past the harness's 10-second kill.
+    assert elapsed < 9.5, f"hook took {elapsed:.1f}s"
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "deadline expired during subprocess" in res.stderr
+
+
+@pytest.mark.parametrize("left", [1.0, -1.0])
+def test_an_identity_probe_gets_only_the_budget_that_is_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, left: float
+) -> None:
+    # The end-to-end test above cannot tell this apart from a fixed 5-second cap:
+    # its FIRST probe starts with ~9 seconds left, so a timeout at 5 seconds still
+    # ends inside the window. What the deadline adds is the probe that starts
+    # LATE, with less than 5 seconds left (or none), which must get only that.
+    from tests.conftest import private_module
+
+    mod = private_module("rec_probe_budget", _HOOK)
+    monkeypatch.setenv("PATH", _stall_common_dir_probe(tmp_path)["PATH"])
+    started = time.monotonic()
+    with pytest.raises(mod.DeadlineExpired):
+        mod._git_common_dir(str(tmp_path), deadline=started + left)
+    assert time.monotonic() - started < 3.0
+
+
+def test_the_stalling_git_leaves_an_ordinary_commit_alone(
+    repo: Path, home: Path, tmp_path: Path
+) -> None:
+    # Control for the test above: with no manifest the identity probes never run,
+    # so the same stalling git costs nothing and the reviewed commit is allowed.
+    # The stall is therefore in the probes, not anywhere else on the path.
+    hook = _hook_inside(repo)
+    _mark(repo, home)
+    started = time.monotonic()
+    res = _run_hook(
+        f"cd {repo} && git commit -m wip",
+        repo,
+        home,
+        hook=hook,
+        extra_env=_stall_common_dir_probe(tmp_path),
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert time.monotonic() - started < 9.5
+
+
+def test_commit_on_a_live_branch_without_a_manifest_is_ordinary(repo: Path, home: Path) -> None:
+    # No deploy manifest = no integration branch: a branch that merely happens
+    # to be named `live` is an ordinary branch.
+    _git(repo, "checkout", "-q", "-b", "live")
+    (repo / "f.py").write_text("base = 4\n")
+    _git(repo, "add", "-A")
+    _mark(repo, home)
+    assert not (home / ".genesis" / "deploy_manifest.json").exists()
+    res = _run_hook(f"cd {repo} && git commit -m wip", repo, home)
     assert res.returncode == 0, res.stdout + res.stderr
 
 
@@ -693,6 +887,28 @@ def test_invalidate_clears_for_every_commit_form_the_checker_gates(
         f"a buried {form!r} left the review marker in place — the checker gates this "
         "form, so the invalidator must clear for it too or the two disagree"
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git com\\\nmit -m done",  # a line continuation inside the verb
+        "git \\\n  commit -m done",  # a continuation before the verb
+        "git co''mmit -m done",  # a quote inside the verb, which the shell removes
+    ],
+    ids=["continuation-inside-verb", "continuation-before-verb", "quote-inside-verb"],
+)
+def test_invalidate_clears_for_a_commit_the_raw_text_does_not_spell(
+    repo: Path, home: Path, command: str
+) -> None:
+    """The invalidator's early exit tests for the word `commit` before parsing, and
+    must test the text the shell assembles: otherwise a review marker could stay
+    valid past the commit it was for. It reads the same `mentions` the checker's
+    early exit reads, so the two cannot disagree about which commands are commits."""
+    assert _mark(repo, home).returncode == 0
+    assert len(_markers(home)) == 1
+    _run_invalidate(command, repo, home)
+    assert _markers(home) == [], f"{command!r} ran a commit and left the marker in place"
 
 
 # ── Invalidator/checker cwd symmetry (the #1254 follow-up, ab42b04f) ──────
@@ -1725,25 +1941,43 @@ def test_long_force_create_to_main_blocks(repo: Path, home: Path) -> None:
     assert "switches branches" in res.stderr
 
 
-def test_attached_short_branch_create_to_feature_allowed(repo: Path, home: Path) -> None:
-    # The attached form to a NON-main branch (`git switch -cfeature`) must stay allowed.
+@pytest.mark.parametrize(
+    "switch",
+    [
+        "git switch -- feature/other",
+        "git switch --detach HEAD",
+        "git switch",
+    ],
+)
+def test_every_switch_form_before_commit_requires_separate_command(
+    repo: Path, home: Path, switch: str
+) -> None:
+    _mark(repo, home)
+    res = _run_hook(f"cd {repo} && {switch} && git commit --amend --no-edit", repo, home)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "separate commands" in res.stderr.lower()
+
+
+def test_attached_short_branch_create_before_commit_blocks(repo: Path, home: Path) -> None:
+    # The review budget belongs to the branch the commit lands on. The hook sees
+    # only pre-command state, so even a literal feature target must be separate.
     _mark(repo, home)
     res = _run_hook(
         f"cd {repo} && git switch -cfeature/x && git commit --amend --no-edit", repo, home
     )
-    assert res.returncode == 0, res.stdout + res.stderr
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "separate commands" in res.stderr.lower()
 
 
-def test_create_branch_then_commit_still_allowed(repo: Path, home: Path) -> None:
-    # The flow the gate ITSELF recommends — create a NON-main branch and commit —
-    # must NOT be blocked by the branch-mutation guard.
+def test_create_branch_then_commit_requires_separate_commands(repo: Path, home: Path) -> None:
     _mark(repo, home)
     res = _run_hook(
         f"cd {repo} && git checkout -b feature/new && git commit --amend --no-edit",
         repo,
         home,
     )
-    assert res.returncode == 0, res.stdout + res.stderr
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert "separate commands" in res.stderr.lower()
 
 
 def test_checkout_file_restore_then_commit_allowed(repo: Path, home: Path) -> None:

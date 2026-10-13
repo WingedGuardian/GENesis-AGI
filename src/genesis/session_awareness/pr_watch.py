@@ -1,11 +1,16 @@
-"""PR-watch core — surface the upstream-PR-steward's own owner notifications
-inside foreground CC sessions.
+"""PR-watch core — surface the GitHub-steward owner notifications inside
+foreground CC sessions.
 
-The ``upstream-pr-steward`` campaign already notifies the owner (Telegram) when
-a tracked external PR changes (merged/closed/new maintainer comment/nudge), and
-logs each ping to ``outreach_history`` (category ``notification``). But those
-pings are easy to miss on Telegram. This module lets a SessionStart hook mirror
-the *unseen* ones inline as a one-line nudge.
+Genesis already notifies the owner (Telegram) when a tracked external PR changes
+(merged/closed/new maintainer comment/nudge), and logs each ping to
+``outreach_history`` (category ``notification``). But those pings are easy to
+miss on Telegram. This module lets a SessionStart hook mirror the *unseen* ones
+inline as a one-line nudge.
+
+The PRODUCERS of those rows are ``recon/account_activity.py`` -- a Python poller
+inside genesis-server, which writes ``topic=f"GitHub steward: ..."`` and is
+therefore what :data:`_TOPIC_LIKE` matches -- and the ``github-activity-digest``
+campaign's digests.
 
 Design notes:
 - **Read-only** against ``genesis.db`` (``file:...?mode=ro`` — WAL-aware; never

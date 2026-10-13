@@ -60,6 +60,12 @@ _CONSTRUCTS = (
     "ANSI-C",
     "apostrophe",
     "line continuation",
+    # Spelling variants of the same construct. "line continuation" was listed and a
+    # real pairing still went unflagged because the prose said "continuation" or
+    # "backslash-newline" instead — the term was covered, the spelling was not.
+    "continuation",
+    "backslash-newline",
+    "backslash newline",
 )
 # The other half of the pairing: the claim that a gate stopped working.
 _OUTCOMES = (
@@ -160,6 +166,30 @@ _ALLOWED: dict[tuple[str, str, str], str] = {
         "this file forbids. Kept as a waiver rather than reworded, because "
         "editing correct prose to satisfy a detector teaches the wrong habit and "
         "the next author will not know why the sentence reads oddly."
+    ),
+    # The four below surfaced when the continuation spellings were added. Every one
+    # describes the same CLOSED defect — the destructive guard's own continuation
+    # fold, fixed to fold only odd backslash runs — so none of them hands a reader a
+    # working shape.
+    (".claude/skills/genesis-development/SKILL.md", "backslash-newline", "bypass"): (
+        "The skill's own worked example of a false structural claim: it quotes the "
+        "wrong premise and explains why it was wrong. The defect it describes, in "
+        "the destructive guard's fold, was fixed before the example was written."
+    ),
+    (".claude/skills/genesis-development/SKILL.md", "continuation", "bypass"): (
+        "The same worked example as the triple above, spelled 'continuation' in "
+        "its later paragraphs: the fixed destructive-guard fold. (The permission-"
+        "mode heading nearby is already exempted by _MODE_NAME_RE — checked, not "
+        "the source of this pairing.)"
+    ),
+    ("scripts/hooks/destructive_command_guard.py", "continuation", "bypass"): (
+        "The guard's own comments on why its continuation fold tracks real state: "
+        "they record, as design rationale, the two directions a wrong fold fails "
+        "in. Both are fixed and pinned by fixture rows in its tests."
+    ),
+    ("tests/test_hooks/test_destructive_command_guard.py", "continuation", "bypass"): (
+        "Docstrings of the regression tests that pin the fixed fold, stating what "
+        "each fixture row guards against. A test explaining its own fixture."
     ),
 }
 

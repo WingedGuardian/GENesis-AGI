@@ -1,0 +1,1 @@
+- Corrected the grep.app guidance in the web-tools guide and the researcher agent: it is literal/regex code search, not semantic search, and it is reached through the keyless Grep MCP server rather than by scraping the HTML search page.

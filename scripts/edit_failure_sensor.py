@@ -66,7 +66,7 @@ _MAX_SCAN_BYTES = 25_000_000
 # the same path.
 #
 # Say what it is NOT: a fallback, never a backstop. SessionEnd does not fire when
-# a session is KILLED (OOM, SIGKILL, the tmp-watchgod sweep), so that gap is
+# a session is KILLED (OOM, SIGKILL), so that gap is
 # narrowed, not closed.
 #
 # Cost, MEASURED 2026-09-08 on this install (1,093 transcripts: p50 93 KB, p99
@@ -411,6 +411,18 @@ def _scan_transcript_outcomes(data: dict) -> None:
 def _insert_rows(rows: list[tuple]) -> None:
     """INSERT OR IGNORE outcome rows; OR IGNORE dedups on the unique tool_use_id."""
     if not rows or not _DB_PATH.exists():
+        return
+    # Admission fence (lazy, fail-closed — module import stays stdlib-only):
+    # never write to a quarantined database; skipping
+    # these best-effort outcome rows is the designed degrade.
+    _hooks = str(Path(__file__).resolve().parent / "hooks")
+    if _hooks not in sys.path:
+        sys.path.insert(0, _hooks)
+    try:
+        from db_admission_check import database_is_fenced
+    except Exception:
+        return
+    if database_is_fenced(_DB_PATH):
         return
     try:
         conn = sqlite3.connect(str(_DB_PATH), timeout=2)

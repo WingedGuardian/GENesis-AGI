@@ -252,6 +252,8 @@ def _success_output(
         "**Source:** https://example.com/first\n"
         "**Source:** https://example.com/second\n"
         "**Source:** https://example.com/article\n"
+        "**Source:** https://example.com\n"
+        "**Source:** https://example.com/tool\n"
     ),
 ) -> CCOutput:
     return CCOutput(
@@ -293,7 +295,6 @@ def monitor(db, mock_invoker, mock_session_manager, config, writer, tmp_path):
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
         config=config, writer=writer,
         clock=lambda: datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC),
-        prompt_dir=tmp_path,
     )
 
 
@@ -779,7 +780,8 @@ async def test_modified_file_only_sends_delta(
 
     # Reset and add new content
     mock_invoker.run.reset_mock()
-    mock_invoker.run.return_value = _success_output("eval of second")
+    mock_invoker.run.return_value = _success_output("eval of second\n**Source:** https://example.com/first\n"
+        "**Source:** https://example.com/second\n")
     f.write_text("https://example.com/first\n\nhttps://example.com/second\n")
     result2 = await monitor.check_once()
     assert result2.batches_dispatched == 1
@@ -862,7 +864,8 @@ async def test_bracket_directive_renders_on_second_delta_eval(
     assert result1.batches_dispatched == 1
 
     mock_invoker.run.reset_mock()
-    mock_invoker.run.return_value = _success_output("eval of second")
+    mock_invoker.run.return_value = _success_output("eval of second\n**Source:** https://example.com/first\n"
+        "**Source:** https://example.com/second\n")
     f.write_text(
         "[If it's in here, default to building it]\n"
         "https://example.com/first\n\n"
@@ -911,7 +914,6 @@ async def test_triage_pipeline_fired_after_evaluation(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
         config=config, writer=writer,
         clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
-        prompt_dir=tmp_path,
         triage_pipeline=mock_triage,
     )
     (inbox_dir / "test.md").write_text("https://example.com")
@@ -937,7 +939,6 @@ async def test_triage_failure_does_not_crash_monitor(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
         config=config, writer=writer,
         clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
-        prompt_dir=tmp_path,
         triage_pipeline=mock_triage,
     )
     (inbox_dir / "test.md").write_text("some content")
@@ -981,7 +982,7 @@ async def test_eval_memory_persistence_fired_after_evaluation(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
         config=config, writer=writer,
         clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
-        prompt_dir=tmp_path, router=object(), memory_store=object(),
+        router=object(), memory_store=object(),
     )
     (inbox_dir / "test.md").write_text("https://example.com")
     result = await mon.check_once()
@@ -1012,7 +1013,7 @@ async def test_eval_memory_failure_does_not_crash_monitor(
         db=db, invoker=mock_invoker, session_manager=mock_session_manager,
         config=config, writer=writer,
         clock=lambda: datetime(2026, 3, 14, 12, 0, 0, tzinfo=UTC),
-        prompt_dir=tmp_path, router=object(), memory_store=object(),
+        router=object(), memory_store=object(),
     )
     (inbox_dir / "test.md").write_text("some content")
     result = await mon.check_once()

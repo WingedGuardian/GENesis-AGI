@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import signal
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -114,20 +115,22 @@ def test_build_args_includes_span_settings(invoker, monkeypatch):
     monkeypatch.setattr(
         inv_mod,
         "cc_span_settings_path",
-        lambda: "/tmp/cc-span-settings.json",
+        lambda *_a, **_k: "/tmp/cc-span-settings.json",
     )
     args = invoker._build_args(CCInvocation(prompt="hi"))
     assert "--settings" in args
     assert args[args.index("--settings") + 1] == "/tmp/cc-span-settings.json"
 
 
-def test_build_args_omits_span_settings_when_unavailable(invoker, monkeypatch):
-    """No --settings when the span-hook file can't be generated (None)."""
+def test_build_args_pins_inline_when_the_settings_file_is_unavailable(invoker, monkeypatch):
+    """No settings FILE (launcher absent, unwritable ~/.genesis): the env pins
+    still reach the session, inline, so no dispatch launches unpinned."""
     import genesis.cc.invoker as inv_mod
 
-    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda: None)
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: None)
     args = invoker._build_args(CCInvocation(prompt="hi"))
-    assert "--settings" not in args
+    inline = json.loads(args[args.index("--settings") + 1])
+    assert inline == {"env": {var: "" for var in sorted(inv_mod._GH_CREDENTIAL_ENV)}}
 
 
 def _fake_genesis_hook_repo(tmp_path):
@@ -199,6 +202,402 @@ def test_cc_span_settings_path_rewrites_when_stale(monkeypatch, tmp_path):
     inv_mod.cc_span_settings_path()  # should rewrite
     data = json.loads(out.read_text())
     assert data["hooks"]["PostToolUse"][0]["matcher"] == ".*"
+
+
+# --- Bash-allowlist enforcement for dispatched sessions ---------------------
+
+
+def test_cc_span_settings_registers_the_bash_allowlist_guard(monkeypatch, tmp_path):
+    """The injected file carries the PreToolUse hook that enforces the allowlist.
+
+    ``_build_env`` exports GENESIS_BASH_ALLOWLIST for a scoped profile, but that
+    is only a declaration — this hook is the reader. It is registered
+    unconditionally because it no-ops without the env var, which is what keeps
+    the file a single fixed path with no per-invocation content.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, hook = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    out = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
+
+    inv_mod.cc_span_settings_path()
+    data = json.loads(out.read_text())
+
+    entry = data["hooks"]["PreToolUse"][0]
+    # Anchored on purpose. MEASURED on CC 2.1.246: a matcher is a REGEX (a hook
+    # registered as "^Bash$" fires on a Bash call), so a bare "Bash" also
+    # matches "BashOutput", which carries no .tool_input.command and would be
+    # refused by the guard's fail-closed leg with a misleading reason.
+    assert entry["matcher"] == "^Bash$"
+    cmd = entry["hooks"][0]["command"]
+    assert cmd == f"{hook} hooks/bash_allowlist_guard.sh"
+    # Absolute launcher path — CC leaves ${CLAUDE_PROJECT_DIR} unset in a dispatch.
+    assert cmd.startswith("/")
+    assert "${CLAUDE_PROJECT_DIR}" not in cmd
+    # The span hook must survive alongside it, not be displaced by it.
+    assert data["hooks"]["PostToolUse"][0]["matcher"] == ".*"
+
+
+def test_registered_guard_command_survives_a_space_in_the_install_root(monkeypatch, tmp_path):
+    """An install root containing a space must still produce a runnable command.
+
+    Unquoted, the shell CC runs the hook with would split the path and fail to
+    resolve it — exit 127, which is a NON-BLOCKING error, so the tool call
+    proceeds. That is the same fail-open shape this whole change exists to
+    remove, reached by a filesystem layout rather than a missing file.
+
+    Asserted by round-tripping through shlex, which is how the pre-launch
+    binding check parses it back.
+    """
+    import shlex
+
+    import genesis.cc.invoker as inv_mod
+
+    spaced = tmp_path / "install root with spaces"
+    hook = spaced / "repo" / ".claude" / "hooks" / "genesis-hook"
+    hook.parent.mkdir(parents=True)
+    hook.write_text("#!/bin/bash\n")
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(spaced / "repo"))
+    out = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
+
+    inv_mod.cc_span_settings_path()
+    command = json.loads(out.read_text())["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    argv = shlex.split(command)
+    assert argv == [str(hook), inv_mod._ALLOWLIST_GUARD_SCRIPT], (
+        f"the launcher path did not survive quoting: {argv}"
+    )
+
+
+def test_cc_span_settings_registers_the_main_checkout_guard(monkeypatch, tmp_path):
+    """Dispatched sessions get the main-checkout guard on Bash AND the file tools,
+    after the allowlist entry (which the binding check and tests keep at index 0)."""
+    import shlex
+
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, hook = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    out = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
+
+    inv_mod.cc_span_settings_path()
+    hooks = json.loads(out.read_text())["hooks"]
+    entries = hooks["PreToolUse"]
+    assert shlex.split(entries[0]["hooks"][0]["command"])[1] == inv_mod._ALLOWLIST_GUARD_SCRIPT
+
+    def guard_entries(event):
+        return {
+            e["matcher"]: e["hooks"][0]
+            for e in hooks.get(event, [])
+            if shlex.split(e["hooks"][0]["command"])[1:] == ["hooks/main_checkout_guard.py"]
+        }
+
+    guard = guard_entries("PreToolUse")
+    assert set(guard) == {"^Bash$", "^(Write|Edit|MultiEdit|NotebookEdit)$"}
+    # The Bash half compares AFTER the call: a command that exits 0 ends in
+    # PostToolUse, one that fails in PostToolUseFailure, so both are wired.
+    post = guard_entries("PostToolUse")
+    failure = guard_entries("PostToolUseFailure")
+    assert set(post) == {"^Bash$"} and set(failure) == {"^Bash$"}
+    # cc_span_hook keeps index 0 of PostToolUse, which other tests pin.
+    assert "cc_span_hook.py" in hooks["PostToolUse"][0]["hooks"][0]["command"]
+    for h in [*guard.values(), *post.values(), *failure.values()]:
+        assert shlex.split(h["command"])[0] == str(hook)
+        assert h["timeout"] >= 10
+    # Anchored: each fires on its own tools and not on a longer name (BashOutput).
+    import re
+
+    file_tools = "^(Write|Edit|MultiEdit|NotebookEdit)$"
+    assert all(re.search(file_tools, t) for t in ("Write", "Edit", "MultiEdit", "NotebookEdit"))
+    assert not re.search(file_tools, "EditX")
+    assert not re.search("^Bash$", "BashOutput")
+
+
+def test_bash_allowlist_guard_timeout_is_generous(monkeypatch, tmp_path):
+    """A tight timeout on a containment hook converts it into a silent permit.
+
+    A PreToolUse hook that exceeds its declared timeout is killed and the call
+    PROCEEDS, so the bound has to sit far above the guard's real cost rather
+    than close to it. Bounded rather than omitted so a hang cannot stall the
+    session forever.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, _ = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    out = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", out)
+
+    inv_mod.cc_span_settings_path()
+    data = json.loads(out.read_text())
+    timeout = data["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"]
+    assert timeout >= 10, "too tight — a slow guard would be killed, i.e. permit"
+
+
+def test_build_args_refuses_an_allowlist_it_cannot_enforce(invoker, monkeypatch):
+    """No settings file → the enforcing hook is not registered → do not launch.
+
+    Launching anyway gives the profile unrestricted Bash while every
+    declaration in the codebase says it is confined to its allowlist, which is
+    worse than having declared no allowlist at all.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: None)
+    with pytest.raises(RuntimeError, match="Refusing to launch"):
+        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+_REPO = Path(__file__).resolve().parents[2]
+_REAL_GUARD = _REPO / "scripts" / "hooks" / "bash_allowlist_guard.sh"
+
+
+def _settings_registering(tmp_path, command: str) -> str:
+    """Write a settings file whose PreToolUse Bash hook runs ``command``.
+
+    The pre-launch checks read and EXECUTE whatever the settings file
+    registers, so a test supplies the command directly rather than going
+    through the launcher — the launcher's own resolution is covered by
+    ``tests/test_scripts/test_bash_allowlist_guard.py``.
+    """
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": command, "timeout": 30}],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [("bare", "--bare skips hooks"), ("safe_mode", "--safe-mode disables all hooks")],
+)
+def test_build_args_refuses_an_allowlist_under_a_hook_disabling_flag(
+    invoker, monkeypatch, tmp_path, flag, expected
+):
+    """--bare skips hooks; --safe-mode disables all customizations.
+
+    Either one silently un-enforces the allowlist even though the settings file
+    was written correctly, so the settings check alone would not catch it.
+    Nothing sets these alongside an allowlist today — this keeps it that way.
+
+    The settings file here is REAL and enforcing, and the assertion names the
+    specific reason: otherwise these would pass on any later check's refusal
+    too, which is how a test starts passing for the wrong reason.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    settings = _settings_registering(tmp_path, f"bash {_REAL_GUARD}")
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: settings)
+    with pytest.raises(RuntimeError, match=expected):
+        invoker._build_args(CCInvocation(prompt="hi", bash_allowlist=("gh",), **{flag: True}))
+
+
+def test_build_args_refuses_when_env_overrides_would_blank_the_allowlist(
+    invoker, monkeypatch, tmp_path
+):
+    """env_overrides is applied last in _build_env and wins over everything."""
+    import genesis.cc.invoker as inv_mod
+
+    settings = _settings_registering(tmp_path, f"bash {_REAL_GUARD}")
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: settings)
+    with pytest.raises(RuntimeError, match="env_overrides sets"):
+        invoker._build_args(
+            CCInvocation(
+                prompt="hi",
+                bash_allowlist=("gh",),
+                env_overrides={"GENESIS_BASH_ALLOWLIST": ""},
+            )
+        )
+
+
+async def test_build_args_refuses_when_the_guard_was_rewritten_out_of_the_settings(
+    invoker, monkeypatch, tmp_path
+):
+    """The shared settings path is one file, and older code rewrites it.
+
+    A concurrently-running Genesis process on pre-merge code recomputes the
+    span-only payload, sees this content as stale, and replaces it — after we
+    wrote it. Re-reading at launch is what catches that.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    settings = _settings_registering(tmp_path, "some-other-hook.py")
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: settings)
+    with pytest.raises(RuntimeError, match="does not register"):
+        await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+def _arm(monkeypatch, tmp_path, argv):
+    """Register ``argv`` as the guard AND make the invoker expect exactly it.
+
+    The binding check refuses to execute anything other than the argv it
+    computes locally, so a test that wants the PROBE arms exercised has to move
+    both ends together. Patching only the settings file exercises the
+    tamper check instead — which is a different test, below.
+    """
+    import shlex
+
+    import genesis.cc.invoker as inv_mod
+
+    settings = _settings_registering(tmp_path, shlex.join(argv))
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: settings)
+    monkeypatch.setattr(inv_mod, "_allowlist_guard_argv", lambda: list(argv))
+    return settings
+
+
+async def _verify(invoker, inv):
+    """Drive the checks a real spawn path drives, in the same order.
+
+    `_build_args` keeps only the cheap checks; the settings read, the seal and
+    the two subprocess probes moved behind `verify_allowlist_enforceable` so
+    they do not run on the event loop. Both spawn paths call them back to back,
+    so the tests do too — asserting on `_build_args` alone would now assert on
+    half the gate.
+    """
+    invoker._build_args(inv)
+    await invoker.verify_allowlist_enforceable(inv)
+
+
+async def test_build_args_refuses_a_hook_registered_by_someone_else(invoker, monkeypatch, tmp_path):
+    """The settings file is outside the repo and any same-uid process can write
+    it — including a confined session that can drop a file somewhere.
+
+    The probe runs in the PARENT, which carries the server's whole environment,
+    so executing a command read out of that file would hand whoever won one
+    write a credential-bearing shell. The registered command is therefore
+    COMPARED against the locally-computed argv and a mismatch is a refusal.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    planted = tmp_path / "planted.sh"
+    planted.write_text("#!/usr/bin/env bash\nexit 2\n", encoding="utf-8")
+    settings = _settings_registering(tmp_path, f"bash {planted} {inv_mod._ALLOWLIST_GUARD_SCRIPT}")
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: settings)
+    with pytest.raises(RuntimeError, match="does not register"):
+        await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+async def test_build_args_refuses_a_registered_hook_that_does_not_refuse(
+    invoker, monkeypatch, tmp_path
+):
+    """Registered is not the same as BINDING, and that gap is a real defect.
+
+    The launcher resolves hooks against the MAIN worktree while the registrar
+    checks the invoking tree, so a guard the registrar can see may be absent to
+    the launcher — which then exits non-blocking and every command runs. The
+    only thing that distinguishes those cases is running the hook.
+
+    Here the guard is present and permits everything.
+    """
+    permit_all = tmp_path / "permit_all.sh"
+    permit_all.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    _arm(monkeypatch, tmp_path, ["bash", str(permit_all)])
+    with pytest.raises(RuntimeError, match="instead of refusing it"):
+        await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+async def test_build_args_refuses_a_registered_hook_that_refuses_everything(
+    invoker, monkeypatch, tmp_path
+):
+    """The other direction, and it is not redundant.
+
+    A hook that refuses EVERYTHING also refuses the probe, so a one-directional
+    check would call it enforcing. That state is exactly what the launcher
+    produces when the guard is missing: contained, but unable to run even its
+    own allowlisted binary.
+    """
+    refuse_all = tmp_path / "refuse_all.sh"
+    refuse_all.write_text("#!/usr/bin/env bash\nexit 2\n", encoding="utf-8")
+    _arm(monkeypatch, tmp_path, ["bash", str(refuse_all)])
+    with pytest.raises(RuntimeError, match="could do nothing at all"):
+        await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+async def test_build_args_probes_in_the_childs_environment_not_the_parents(
+    invoker, monkeypatch, tmp_path
+):
+    """env_overrides wins in _build_env, so a probe under os.environ would test
+    a different PATH than the session gets — and PATH is where the guard
+    resolves jq and awk from. Defending one variable by name was the narrow
+    version of this; building the same env is the structural one.
+
+    The stand-in guard reports what it sees, so the assertion is about the
+    environment reaching it rather than about a verdict.
+    """
+    reporter = tmp_path / "reporter.sh"
+    reporter.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s" "$GENESIS_PROBE_MARKER" > {tmp_path}/seen.txt\n'
+        '[ "$1" = "__genesis_allowlist_verification_probe__" ] && exit 2\n'
+        "cat >/dev/null; exit 2\n",
+        encoding="utf-8",
+    )
+    _arm(monkeypatch, tmp_path, ["bash", str(reporter)])
+    with pytest.raises(RuntimeError):
+        await _verify(
+            invoker,
+            CCInvocation(
+                prompt="hi",
+                bash_allowlist=("gh",),
+                env_overrides={"GENESIS_PROBE_MARKER": "from-child-env"},
+            ),
+        )
+    assert (tmp_path / "seen.txt").read_text() == "from-child-env", (
+        "the probe ran in the parent environment, so it cannot see what the "
+        "session's own PATH or dev-local override would do to the guard"
+    )
+
+
+async def test_build_args_launches_an_allowlisted_profile_when_the_guard_binds(
+    invoker, monkeypatch, tmp_path
+):
+    """The permitting path, against the REAL guard. A check that only refuses
+    proves nothing — and the earliest version of this test pointed at a settings
+    path that did not exist, so it asserted a launch that was never enforceable.
+    """
+    settings = _arm(monkeypatch, tmp_path, ["bash", str(_REAL_GUARD)])
+    inv = CCInvocation(prompt="hi", bash_allowlist=("gh",))
+    args = invoker._build_args(inv)
+    await invoker.verify_allowlist_enforceable(inv)
+    assert args[args.index("--settings") + 1] == settings
+
+
+@pytest.mark.parametrize("flag", ["bare", "safe_mode"])
+def test_build_args_allows_hook_disabling_flags_without_an_allowlist(invoker, monkeypatch, flag):
+    """No collateral refusal.
+
+    --bare and --safe-mode are legitimate for the eval-bench arms, which
+    declare no allowlist. The refusal is about the COMBINATION, so a profile
+    using either alone must still launch — and must not pay the probes.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: "/tmp/s.json")
+    invoker._build_args(CCInvocation(prompt="hi", **{flag: True}))
+
+
+def test_build_args_allows_a_missing_settings_file_without_an_allowlist(invoker, monkeypatch):
+    """An unwritable settings file is not itself fatal — only unenforceability is."""
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda *_a, **_k: None)
+    args = invoker._build_args(CCInvocation(prompt="hi"))
+    assert "env" in json.loads(args[args.index("--settings") + 1])
 
 
 def test_build_env_strips_claudecode(invoker):
@@ -334,9 +733,7 @@ def test_probe_sets_the_same_properties_as_the_real_invocation(monkeypatch):
     # here instead of at dispatch time.
     assert probe_argv[:-1] == out
     for prop in inv_mod._SCOPE_PROPERTIES:
-        assert ["-p", prop] == probe_argv[
-            probe_argv.index(prop) - 1 : probe_argv.index(prop) + 1
-        ]
+        assert ["-p", prop] == probe_argv[probe_argv.index(prop) - 1 : probe_argv.index(prop) + 1]
         assert prop in out
 
 
@@ -383,9 +780,7 @@ def _stub_probe(monkeypatch, results):
                 f"probe called {len(calls)}x but only {len(seq)} result(s) were "
                 "stubbed — the caller is probing more often than expected"
             )
-        return real_subprocess.CompletedProcess(
-            args[0], seq[len(calls) - 1], b"", b"bus error"
-        )
+        return real_subprocess.CompletedProcess(args[0], seq[len(calls) - 1], b"", b"bus error")
 
     monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
     monkeypatch.setattr(inv_mod.subprocess, "run", _probe)
@@ -898,12 +1293,10 @@ def _make_async_stdout(data: bytes, *, raise_on: tuple[int, ...] = ()):
             if self._i >= len(self._lines):
                 return b""
             idx = self._i
-            self._i += 1                      # consumed BEFORE raising
+            self._i += 1  # consumed BEFORE raising
             self.reads.append(idx)
             if idx in raise_on:
-                raise ValueError(
-                    "Separator is not found, and chunk exceed the limit"
-                )
+                raise ValueError("Separator is not found, and chunk exceed the limit")
             return self._lines[idx]
 
         def __aiter__(self):
@@ -990,6 +1383,7 @@ async def test_run_streaming_timeout_returns_partial(invoker, monkeypatch):
     data = _make_stream_lines(*events)
 
     mock_proc = AsyncMock()
+
     # Simulate: stdout yields lines then hangs → timeout fires. Must expose
     # readline() (the reader no longer uses the async-iterator protocol), and
     # must hang at the AWAIT rather than end the stream — an EOF would exit
@@ -1128,9 +1522,15 @@ async def test_run_streaming_records_tools_in_first_seen_order_without_repeats(i
 
     def _result(text):
         return {
-            "type": "result", "subtype": "success", "is_error": False, "result": text,
-            "session_id": "s9", "total_cost_usd": 0.0, "duration_ms": 1,
-            "usage": {"input_tokens": 1, "output_tokens": 1}, "modelUsage": {},
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": text,
+            "session_id": "s9",
+            "total_cost_usd": 0.0,
+            "duration_ms": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "modelUsage": {},
         }
 
     async def _run(events):
@@ -1410,6 +1810,7 @@ def test_register_prunes_dead_entries():
 async def test_run_registers_under_session_key_and_clears(invoker, monkeypatch):
     """End-to-end: run() registers the proc under invocation.session_key while
     executing, and unregisters it in finally (cc-loop-01)."""
+
     def _killpg_gone(*a):
         raise ProcessLookupError  # vacant group — never live-fire a real probe
 
@@ -1451,6 +1852,7 @@ async def test_run_registers_under_session_key_and_clears(invoker, monkeypatch):
 @pytest.mark.asyncio
 async def test_run_streaming_registers_under_session_key_and_clears(invoker, monkeypatch):
     """run_streaming registers under session_key during streaming and clears in finally."""
+
     def _killpg_gone(*a):
         raise ProcessLookupError  # vacant group — never live-fire a real probe
 
@@ -2269,6 +2671,7 @@ def _bg_result_events():
 async def test_run_streaming_sets_bg_truncated_on_ceiling_marker(monkeypatch):
     """The 'Background tasks still running...' stderr marker sets bg_truncated,
     and the partial result is still delivered (not dropped)."""
+
     def _killpg_gone(*a):
         raise ProcessLookupError  # vacant group — never live-fire a real probe
 
@@ -2323,6 +2726,7 @@ async def test_run_streaming_no_bg_truncated_without_marker(monkeypatch):
 async def test_run_streaming_bg_truncated_on_no_result_branch(monkeypatch):
     """Whole-tree kill before a result line flushes: the no-result branch must
     still mark bg_truncated (review Finding 2)."""
+
     def _killpg_gone(*a):
         raise ProcessLookupError  # vacant group — never live-fire a real probe
 
@@ -2610,7 +3014,8 @@ async def test_streaming_terminate_ignored_escalates_to_group_kill(invoker, monk
 
 @pytest.mark.asyncio
 async def test_streaming_escalates_when_leader_exits_but_group_survives(
-    invoker, monkeypatch,
+    invoker,
+    monkeypatch,
 ):
     """Codex P2 (PR #1417): after terminate(), the LEADER can exit (returncode
     set, e.g. -15) while an MCP/helper child survives in the group. Escalation
@@ -2702,6 +3107,7 @@ def _no_host_syscalls(monkeypatch):
     told to prefer killing an unrelated process. Stub it rather than gamble on
     the pid being vacant.
     """
+
     def _gone(*a):
         raise ProcessLookupError  # vacant group — never live-fire a real probe
 
@@ -2727,7 +3133,7 @@ async def test_over_limit_line_is_dropped_and_the_session_survives(invoker):
     assert output.text == "survived"
     assert output.session_id == "s1"
     assert not output.is_error
-    assert 1 in proc.stdout.reads, proc.stdout.reads   # the fault was reached
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the fault was reached
 
 
 @pytest.mark.asyncio
@@ -2775,15 +3181,13 @@ async def test_dropping_the_result_line_raises_instead_of_faking_success(invoker
         {"type": "system", "subtype": "init", "session_id": "s1"},
         _result_event("never seen"),
     )
-    proc = _streaming_proc(data, raise_on=(1,))   # the RESULT line is dropped
+    proc = _streaming_proc(data, raise_on=(1,))  # the RESULT line is dropped
 
     with (
         patch("asyncio.create_subprocess_exec", return_value=proc),
         pytest.raises(CCStreamTruncatedError, match="NO result event"),
     ):
-        await asyncio.wait_for(
-            invoker.run_streaming(CCInvocation(prompt="x")), timeout=10
-        )
+        await asyncio.wait_for(invoker.run_streaming(CCInvocation(prompt="x")), timeout=10)
 
     assert issubclass(CCStreamTruncatedError, CCProcessError), (
         "handlers catching CCProcessError must keep catching this"
@@ -2818,7 +3222,7 @@ async def test_dropped_line_with_empty_result_does_not_feed_the_cap_detector(inv
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}},
         _result_event(""),
     )
-    proc = _streaming_proc(data, raise_on=(1,))   # drop the assistant line
+    proc = _streaming_proc(data, raise_on=(1,))  # drop the assistant line
     fired = []
 
     async def _spy(*a, **k):
@@ -2832,7 +3236,7 @@ async def test_dropped_line_with_empty_result_does_not_feed_the_cap_detector(inv
     ):
         await invoker.run_streaming(CCInvocation(prompt="x", expect_output=True))
 
-    assert 1 in proc.stdout.reads, proc.stdout.reads   # the fault was reached
+    assert 1 in proc.stdout.reads, proc.stdout.reads  # the fault was reached
     assert not fired, "a dropped-line run forged the silent-cap signature"
 
 
@@ -2861,9 +3265,7 @@ async def test_bg_truncation_explains_a_missing_result_better_than_a_drop_does(
     )
     # index 1 = the oversized tool-result trace; no result event ever arrives.
     proc = _streaming_proc(data, raise_on=(1,))
-    proc.stderr = _make_mock_stderr(
-        b"Background tasks still running after 600s; terminating.\n"
-    )
+    proc.stderr = _make_mock_stderr(b"Background tasks still running after 600s; terminating.\n")
     proc.pid = 424201  # explicit + distinct; never a mock default
 
     with patch("asyncio.create_subprocess_exec", return_value=proc):
@@ -2881,9 +3283,7 @@ async def test_bg_truncation_explains_a_missing_result_better_than_a_drop_does(
 
 
 @pytest.mark.asyncio
-async def test_an_empty_result_without_a_drop_is_still_the_cap_signature(
-    invoker, monkeypatch
-):
+async def test_an_empty_result_without_a_drop_is_still_the_cap_signature(invoker, monkeypatch):
     """CLAUSE COVER for `oversized_dropped` in the result guard.
 
     Empty output with NO drop is the unexplained-empty shape the silent-cap
@@ -2935,9 +3335,7 @@ async def test_no_result_and_no_drop_returns_the_collected_text(invoker, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_a_drop_with_surviving_text_still_raises_without_bg_truncation(
-    invoker, monkeypatch
-):
+async def test_a_drop_with_surviving_text_still_raises_without_bg_truncation(invoker, monkeypatch):
     """CLAUSE COVER for the `bg_truncated` conjunct of the exemption.
 
     Surviving partial text is NOT on its own a reason to forgive a missing
@@ -2977,9 +3375,7 @@ async def test_bg_truncation_with_nothing_collected_still_raises(invoker, monkey
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "the answer"}]}},
     )
     proc = _streaming_proc(data, raise_on=(1,))  # the only text line is dropped
-    proc.stderr = _make_mock_stderr(
-        b"Background tasks still running after 600s; terminating.\n"
-    )
+    proc.stderr = _make_mock_stderr(b"Background tasks still running after 600s; terminating.\n")
     proc.pid = 424205  # explicit + distinct; never a mock default
 
     with (
@@ -3072,9 +3468,7 @@ def _error_result_event(text: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_a_drop_before_an_error_result_is_not_a_retryable_error(
-    invoker, monkeypatch
-):
+async def test_a_drop_before_an_error_result_is_not_a_retryable_error(invoker, monkeypatch):
     """The RETRYABLE branches run before the drop guard, so they had to learn it.
 
     The first round's fix only covered the shapes that fall THROUGH to the guard.
@@ -3095,9 +3489,14 @@ async def test_a_drop_before_an_error_result_is_not_a_retryable_error(
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "oversized tool result"},
-        ]}},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "oversized tool result"},
+                ]
+            },
+        },
         _error_result_event("You've hit your usage limit"),
     )
     proc = _streaming_proc(data, raise_on=(1,))
@@ -3152,9 +3551,7 @@ async def test_an_error_result_without_a_drop_still_raises_the_classified_error(
 
 
 @pytest.mark.asyncio
-async def test_a_drop_before_an_empty_rate_limited_result_is_not_retryable(
-    invoker, monkeypatch
-):
+async def test_a_drop_before_an_empty_rate_limited_result_is_not_retryable(invoker, monkeypatch):
     """The second retryable branch, and the more expensive one.
 
     A rate-limit error is what sends the turn to roster failover, so replaying
@@ -3166,9 +3563,14 @@ async def test_a_drop_before_an_empty_rate_limited_result_is_not_retryable(
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "oversized tool result"},
-        ]}},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "oversized tool result"},
+                ]
+            },
+        },
         {"type": "rate_limit_event", "info": {}},
         _result_event(""),
     )
@@ -3186,9 +3588,7 @@ async def test_a_drop_before_an_empty_rate_limited_result_is_not_retryable(
 
 
 @pytest.mark.asyncio
-async def test_an_empty_rate_limited_result_without_a_drop_still_rate_limits(
-    invoker, monkeypatch
-):
+async def test_an_empty_rate_limited_result_without_a_drop_still_rate_limits(invoker, monkeypatch):
     """CLAUSE COVER for `oversized_dropped` at the rate-limit branch.
 
     Without a drop, an empty rate-limited result is exactly what failover is
@@ -3213,9 +3613,7 @@ async def test_an_empty_rate_limited_result_without_a_drop_still_rate_limits(
 
 
 @pytest.mark.asyncio
-async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(
-    invoker, monkeypatch
-):
+async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(invoker, monkeypatch):
     """The BOUND on the two fixes above, and the reason they are placed where
     they are rather than hoisted above the whole result block.
 
@@ -3227,9 +3625,14 @@ async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "oversized tool result"},
-        ]}},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "oversized tool result"},
+                ]
+            },
+        },
         {"type": "rate_limit_event", "info": {}},
         _result_event("the answer survived"),
     )
@@ -3244,9 +3647,7 @@ async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(
 
 
 @pytest.mark.asyncio
-async def test_a_surviving_answer_still_reports_the_lines_it_lost(
-    invoker, monkeypatch
-):
+async def test_a_surviving_answer_still_reports_the_lines_it_lost(invoker, monkeypatch):
     """The drop has to be visible OUTSIDE `run_streaming`.
 
     This is the return path that matters most, because it is the one that looks
@@ -3264,9 +3665,14 @@ async def test_a_surviving_answer_still_reports_the_lines_it_lost(
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "oversized tool result"},
-        ]}},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "oversized tool result"},
+                ]
+            },
+        },
         _result_event("the answer survived"),
     )
     proc = _streaming_proc(data, raise_on=(1,))
@@ -3277,9 +3683,7 @@ async def test_a_surviving_answer_still_reports_the_lines_it_lost(
 
     assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
     assert output.text == "the answer survived"
-    assert output.stream_lines_dropped == 1, (
-        "a run that lost a line reported itself as a clean one"
-    )
+    assert output.stream_lines_dropped == 1, "a run that lost a line reported itself as a clean one"
 
 
 @pytest.mark.asyncio
@@ -3321,7 +3725,11 @@ class _TailAfterOverrunStdout:
     """
 
     def __init__(self, tail: bytes, rest: bytes):
-        self._steps: list = [ValueError("Separator is not found"), tail, *rest.splitlines(keepends=True)]
+        self._steps: list = [
+            ValueError("Separator is not found"),
+            tail,
+            *rest.splitlines(keepends=True),
+        ]
         self._i = 0
         self.reads: list[int] = []
 
@@ -3375,9 +3783,7 @@ async def test_the_tail_of_a_dropped_line_never_reaches_the_log_verbatim(
 
 
 @pytest.mark.asyncio
-async def test_a_clean_stream_still_logs_a_non_json_line_verbatim(
-    invoker, monkeypatch, caplog
-):
+async def test_a_clean_stream_still_logs_a_non_json_line_verbatim(invoker, monkeypatch, caplog):
     """CLAUSE COVER for `oversized_dropped` at the non-JSON log.
 
     With nothing dropped, a non-JSON line is a CLI protocol fault and its text
@@ -3395,9 +3801,9 @@ async def test_a_clean_stream_still_logs_a_non_json_line_verbatim(
         output = await invoker.run_streaming(CCInvocation(prompt="x"))
 
     assert output.text == "ok"
-    assert any(
-        "this-is-not-json-at-all" in r.getMessage() for r in caplog.records
-    ), "a protocol fault on a clean stream lost its only diagnostic"
+    assert any("this-is-not-json-at-all" in r.getMessage() for r in caplog.records), (
+        "a protocol fault on a clean stream lost its only diagnostic"
+    )
 
 
 @pytest.mark.asyncio
@@ -3439,18 +3845,33 @@ async def test_a_multi_block_assistant_line_warns_exactly_once(invoker, caplog):
     fixed on the peer-availability read path.
     """
     events = [
-        {"type": "assistant", "message": {"content": [
-            {"type": "thinking", "thinking": "hmm"},
-            {"type": "tool_use", "name": "Read", "input": {}},
-        ]}},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "hi"},
-            {"type": "tool_use", "name": "Bash", "input": {}},
-        ]}},
         {
-            "type": "result", "subtype": "success", "is_error": False,
-            "result": "done", "session_id": "s9", "total_cost_usd": 0.01,
-            "duration_ms": 100, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "thinking", "thinking": "hmm"},
+                    {"type": "tool_use", "name": "Read", "input": {}},
+                ]
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "tool_use", "name": "Bash", "input": {}},
+                ]
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "done",
+            "session_id": "s9",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
             "modelUsage": {},
         },
     ]
@@ -3482,14 +3903,24 @@ async def test_the_canary_does_not_fire_on_an_unrecognized_block(invoker, caplog
     devalue every real firing.
     """
     events = [
-        {"type": "assistant", "message": {"content": [
-            {"type": "redacted_thinking", "data": "x"},
-            {"type": "text", "text": "hi"},
-        ]}},
         {
-            "type": "result", "subtype": "success", "is_error": False,
-            "result": "done", "session_id": "s10", "total_cost_usd": 0.01,
-            "duration_ms": 100, "usage": {"input_tokens": 1, "output_tokens": 1},
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "redacted_thinking", "data": "x"},
+                    {"type": "text", "text": "hi"},
+                ]
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "done",
+            "session_id": "s10",
+            "total_cost_usd": 0.01,
+            "duration_ms": 100,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
             "modelUsage": {},
         },
     ]
@@ -3532,9 +3963,14 @@ async def test_a_drop_then_a_timeout_is_still_unreplayable(invoker, monkeypatch)
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "oversized tool result"},
-        ]}},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "oversized tool result"},
+                ]
+            },
+        },
     )
 
     class _DropThenHang:
@@ -3623,9 +4059,7 @@ def _proc_with_one_huge_line(data: bytes, *, overruns: int, at: int):
                 # advanced: nothing has been consumed to a newline yet.
                 self._left -= 1
                 self.raises += 1
-                raise ValueError(
-                    "Separator is not found, and chunk exceed the limit"
-                )
+                raise ValueError("Separator is not found, and chunk exceed the limit")
             idx = self._i
             self._i += 1
             self.reads.append(idx)
@@ -3774,3 +4208,2909 @@ async def test_a_clean_stream_still_reports_an_empty_inventory(invoker):
     assert output.tools_used == (), (
         f"a clean tool-free stream lost its runtime report ({output.tools_used!r})"
     )
+
+
+# --- Per-binary hardening: gh cannot be told to spawn a shell ---------------
+
+
+def _seal(monkeypatch, tmp_path, *, hosts: str | None = "github.com:\n  oauth_token: x\n"):
+    """Point the sealer at a synthetic source and target, and run it.
+
+    ``hosts`` writes a credential into the SOURCE directory, and since 2026-09-25
+    the sealer does not read it — which is exactly why the parameter stays: the
+    invariant worth testing is that a readable source credential does NOT reach
+    the seal, and a fixture with no credential to leak could not test it.
+    ``hosts=None`` is the never-authenticated arm. The source ``config.yml``
+    carries a shell alias for the same reason: config.yml IS synthesised, so the
+    alias must not appear either.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    source = tmp_path / "src-gh"
+    source.mkdir()
+    if hosts is not None:
+        (source / "hosts.yml").write_text(hosts, encoding="utf-8")
+    (source / "config.yml").write_text("aliases:\n  x: !whoami\n", encoding="utf-8")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(source))
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", tmp_path / "sealed")
+    return inv_mod._sealed_gh_config_dir()
+
+
+def test_sealed_gh_config_is_unwritable_by_the_session(monkeypatch, tmp_path):
+    """gh writes its aliases, pager and editor into config.yml.
+
+    Each of those runs a command of the caller's choosing, reached with `gh` as
+    every token — so a first-token allowlist permits both the command that
+    installs the escape and the command that triggers it. Making the file
+    unwritable is what closes it; the modes ARE the mechanism, so assert them.
+    """
+    sealed = Path(_seal(monkeypatch, tmp_path))
+    assert sealed.stat().st_mode & 0o777 == 0o500, "session could create new files here"
+    # config.yml is the whole seal now — the credential copy was removed, so the
+    # loop this used to run over ("config.yml", "hosts.yml") would raise
+    # FileNotFoundError rather than fail an assertion.
+    # Assert the expected SET first: iterating whatever happens to be present
+    # would pass VACUOUSLY on an empty seal, which is the state this seal exists
+    # to prevent.
+    assert sorted(f.name for f in sealed.iterdir()) == ["config.yml"]
+    for name in ("config.yml",):
+        mode = (sealed / name).stat().st_mode & 0o777
+        assert mode == 0o400, f"{name} is writable ({oct(mode)}) — gh could rewrite it"
+
+
+def test_sealed_gh_config_carries_no_aliases_and_a_shell_free_pager(monkeypatch, tmp_path):
+    """config.yml is SYNTHESISED, not copied.
+
+    Copying would carry the operator's own aliases into the confined session,
+    which is the escape arriving by inheritance rather than by being installed.
+    The fixture's source config deliberately contains a shell alias.
+    """
+    sealed = Path(_seal(monkeypatch, tmp_path))
+    body = (sealed / "config.yml").read_text()
+    assert "aliases: {}" in body
+    assert "pager: cat" in body
+    assert "whoami" not in body, "the operator's own aliases leaked into the seal"
+
+
+def test_the_seal_never_carries_the_credential_even_with_a_readable_source(
+    monkeypatch, tmp_path
+):
+    """THE INVARIANT THIS PR EXISTS FOR — asserted with a READABLE source.
+
+    Until 2026-09-25 the seal copied `hosts.yml`, handing every gh-allowlisted
+    dispatch the operator OAuth token (MEASURED scopes: delete_repo, gist,
+    read:org, repo, workflow). An absent-source test cannot catch a regression
+    here, because the copy is conditional on the source existing — so the
+    fixture deliberately WRITES a source credential and this asserts it does not
+    arrive.
+
+    The seal is a closed set, not a denylist of one name: assert the exact
+    contents, so a future key added to `desired` has to be justified here.
+    """
+    sealed = Path(_seal(monkeypatch, tmp_path))
+    assert not (sealed / "hosts.yml").exists(), (
+        "the operator credential was copied into the seal — a dispatched "
+        "session can authenticate as the operator"
+    )
+    assert sorted(f.name for f in sealed.iterdir()) == ["config.yml"]
+    body = (sealed / "config.yml").read_text(encoding="utf-8")
+    assert "oauth_token" not in body, "the credential arrived inside config.yml"
+
+
+def test_an_existing_seal_holding_a_credential_is_healed_on_the_next_launch(
+    monkeypatch, tmp_path
+):
+    """The arm operators actually depend on: installs that ALREADY copied it.
+
+    This arm covers the SWEEP: `hosts.yml` is no longer in `desired`, so
+    `_seal_matches` reports a mismatch and the stale sweep unlinks it. VERIFIED
+    on the live install: the real seal went from ['config.yml', 'hosts.yml'] to
+    ['config.yml'] on the first call.
+
+    It is NOT the migration, and calling it one was the error this docstring
+    used to carry. The sweep runs only when an allowlisted dispatch reaches
+    `_sealed_gh_config_dir`, which has never happened here — so the path that
+    actually heals an existing install is `reconcile_gh_seal()` at startup,
+    covered by `test_reconcile_gh_seal_strips_a_credential_from_an_existing_seal`.
+
+    `_seal_matches` has a fast path, which is exactly what could skip the
+    repair — so the pre-existing seal here is built at the CORRECT modes, the
+    shape that fast path accepts.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    target = tmp_path / "sealed"
+    target.mkdir()
+    for name, body in (
+        ("config.yml", inv_mod._SEALED_GH_CONFIG_YML),
+        ("hosts.yml", "github.com:\n  oauth_token: LEAKED\n"),
+    ):
+        (target / name).write_text(body, encoding="utf-8")
+        (target / name).chmod(0o400)
+    target.chmod(0o500)
+
+    source = tmp_path / "src-gh"
+    source.mkdir()
+    (source / "hosts.yml").write_text("github.com:\n  oauth_token: x\n", encoding="utf-8")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(source))
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", target)
+
+    assert inv_mod._sealed_gh_config_dir() == str(target)
+    assert not (target / "hosts.yml").exists(), (
+        "an existing seal kept its copied credential — the stale sweep did not "
+        "reach it, so every install that ran the old code stays exposed"
+    )
+    assert target.stat().st_mode & 0o777 == 0o500, "the repair left the seal writable"
+
+
+def test_the_seal_is_byte_identical_whatever_the_operators_own_config_holds(
+    monkeypatch, tmp_path
+):
+    """Source-INDEPENDENCE, which is the property left once the copy is gone.
+
+    This used to read "no credential is not a reason to leave the alias route
+    open" and drive `hosts=None`. That assertion went inert with the copy: the
+    sealer no longer reads the source at all, so `hosts=None` and a readable
+    credential take the same code path, and the test duplicated
+    `test_the_seal_never_carries_the_credential_even_with_a_readable_source`
+    while appearing to cover a second case. Two precedence tests were deleted
+    this round for exactly that — a test kept alive against a rewritten subject
+    asserts whatever the rewrite happens to do — so this one is repointed rather
+    than left standing.
+
+    What is worth asserting now is the pair, in both directions: the seal is
+    SYNTHESISED, so the bytes must not vary with what the operator's own gh
+    config contains — including whether it exists. That is the claim
+    "synthesised end to end" actually makes.
+    """
+    # Separate roots, created first: `_seal` mkdirs its source non-recursively.
+    with_creds = tmp_path / "with-creds"
+    without_creds = tmp_path / "without-creds"
+    with_creds.mkdir()
+    without_creds.mkdir()
+
+    authenticated = Path(_seal(monkeypatch, with_creds))
+    never = Path(_seal(monkeypatch, without_creds, hosts=None))
+
+    assert (authenticated / "config.yml").read_bytes() == (
+        never / "config.yml"
+    ).read_bytes(), "the seal's contents vary with the operator's own config"
+    for sealed in (authenticated, never):
+        assert sorted(p.name for p in sealed.iterdir()) == ["config.yml"]
+        assert (sealed / "config.yml").stat().st_mode & 0o777 == 0o400
+        assert sealed.stat().st_mode & 0o777 == 0o500
+
+
+def test_sealed_gh_config_is_idempotent_and_self_healing(monkeypatch, tmp_path):
+    """Re-runs must not churn, and a tampered seal must be repaired."""
+    import genesis.cc.invoker as inv_mod
+
+    sealed = Path(_seal(monkeypatch, tmp_path))
+    assert inv_mod._sealed_gh_config_dir() == str(sealed)
+
+    sealed.chmod(0o700)
+    (sealed / "config.yml").chmod(0o600)
+    (sealed / "config.yml").write_text("aliases:\n  evil: !whoami\n", encoding="utf-8")
+    repaired = Path(inv_mod._sealed_gh_config_dir())
+    assert "evil" not in (repaired / "config.yml").read_text()
+    assert (repaired / "config.yml").stat().st_mode & 0o777 == 0o400
+
+
+def test_build_env_hardens_gh_only_for_an_allowlisted_session(invoker, monkeypatch, tmp_path):
+    """The hardening rides the allowlist, not the binary being present.
+
+    An ordinary dispatch must keep the operator's own gh config — repointing
+    GH_CONFIG_DIR for every session would change unrelated behaviour.
+    """
+    _seal(monkeypatch, tmp_path)
+
+    scoped = invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+    assert scoped["GH_CONFIG_DIR"].endswith("sealed")
+    assert scoped["GH_PAGER"] == "cat"
+
+    unscoped = invoker._build_env(CCInvocation(prompt="hi"))
+    assert unscoped.get("GH_CONFIG_DIR") != scoped["GH_CONFIG_DIR"]
+    assert "GH_PAGER" not in unscoped or unscoped["GH_PAGER"] != "cat"
+
+
+def test_build_env_does_not_harden_gh_for_an_unrelated_allowlist(invoker, monkeypatch, tmp_path):
+    """A profile allowlisting something else gets no gh hardening.
+
+    Uses `jq`, not `git`. This test named `git` until 2026-09-26, when the
+    hardening lookup went three-state: `git` is now REFUSED as unreviewed, because
+    `git -c core.pager=…`, `-c alias.x='!sh'` and `core.sshCommand` each make it
+    run a program of its own accord, exactly like gh. The property under test here
+    is "an unrelated binary gets no GH pins", which needs a binary that is
+    classified as needing none — `jq`. That `git` refuses is asserted separately,
+    in the three-state test, because it is a different claim.
+    """
+    _seal(monkeypatch, tmp_path)
+    env = invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("jq",)))
+    assert env["GENESIS_BASH_ALLOWLIST"] == "jq"
+    assert not env["GH_CONFIG_DIR"].endswith("sealed")
+
+
+# --- The verification must stay wired to every spawn path -------------------
+
+
+def test_every_spawn_path_awaits_the_allowlist_verification():
+    """Structural lock on the async split.
+
+    `_build_args` keeps only the cheap checks now; the settings read, the seal
+    and the two subprocess probes moved behind `verify_allowlist_enforceable`
+    so they do not stall the event loop. That split is only safe while EVERY
+    path that calls `_build_args` also awaits the verification — a path that
+    skipped it would launch a profile whose confinement was never demonstrated,
+    which is the defect this whole change exists to remove.
+
+    Asserted by AST over the module rather than by reading, so a spawn path
+    added later fails here instead of launching unverified. Allowlist polarity:
+    the test enumerates the callers and requires the await in each, so a NEW
+    caller is a failure by construction rather than an omission nobody sees.
+    """
+    import ast
+    import inspect
+
+    from genesis.cc import invoker as inv_mod
+
+    tree = ast.parse(inspect.getsource(inv_mod))
+
+    def _awaits_verification(fn: ast.AST) -> bool:
+        """An ast.Await node, not merely a MENTION of the name.
+
+        The first version of this checked for the attribute in the dump, which
+        a bare `self.verify_allowlist_enforceable(inv)` satisfies — the
+        coroutine is then created and never run, so the verification silently
+        does not happen and the launch proceeds unverified. MEASURED: deleting
+        only the `await` keyword left that version GREEN. The sweep missed it
+        too, because it deleted the whole statement rather than the keyword.
+        """
+        return any(
+            isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "verify_allowlist_enforceable"
+            for node in ast.walk(fn)
+        )
+
+    callers: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        if "attr='_build_args'" not in ast.dump(node):
+            continue
+        callers[node.name] = _awaits_verification(node)
+
+    assert callers, "no caller of _build_args found — the AST probe is inert"
+    missing = sorted(name for name, ok in callers.items() if not ok)
+    assert not missing, (
+        f"these call _build_args without awaiting verify_allowlist_enforceable: "
+        f"{missing}. An allowlisted profile launched from there would never "
+        f"have its confinement demonstrated."
+    )
+
+
+# --- Fail closed when a binary's own hardening is not in force --------------
+
+
+async def test_refuses_to_launch_when_the_gh_seal_cannot_be_prepared(
+    invoker, monkeypatch, tmp_path
+):
+    """A seal that could not be built is a REFUSAL, not a degraded mode.
+
+    Without it the session falls back to the operator's own writable config —
+    exactly where `gh alias set --shell` installs an escape, and where any
+    alias the operator already has is already waiting. Pinning the pager alone
+    would close one route of five and read as hardening.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    _arm(monkeypatch, tmp_path, ["bash", str(_REAL_GUARD)])
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: None)
+    with pytest.raises(RuntimeError, match="could not be prepared"):
+        await _verify(invoker, CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+# DELETED 2026-09-25 with the credential copy: two tests pinned gh's SOURCE
+# precedence (GH_CONFIG_DIR > $XDG_CONFIG_HOME/gh > ~/.config/gh). That chain
+# existed only to locate `hosts.yml` and went with it — the seal is now
+# synthesised from a constant and reads nothing from the operator's config, so
+# there is no source to resolve and nothing left for those tests to assert. They
+# are deleted rather than retargeted: a test kept alive against a rewritten
+# subject asserts whatever the rewrite happens to do.
+#
+# The invariant that replaced them is
+# `test_the_seal_never_carries_the_credential_even_with_a_readable_source`, which
+# runs WITH a readable source credential present.
+
+
+# --- The seal is a FLAT SET OF FILES, and a directory is never legitimate ---
+
+
+def test_a_directory_planted_in_the_seal_is_neither_reported_clean_nor_kept(tmp_path, monkeypatch):
+    """The extension closure rests on `<seal>/gh/extensions` not existing.
+
+    `XDG_DATA_HOME` points at the seal, so a planted `gh/extensions/gh-x` is a
+    live extension tree — the exact route the pin exists to close. Enumerating
+    only `is_file()` was blind to it twice over: `_seal_matches` reported the
+    contaminated seal CLEAN, and the stale sweep (also file-only) left it in
+    place and then locked it in at 0500, permanently, across every reseal.
+
+    MEASURED before the fix: planted extension survived a reseal and
+    `_seal_matches` returned True. Both halves are asserted here because
+    fixing either one alone still leaves the route open — a clean verdict with
+    the tree present, or a correct verdict that never removes it.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    seal = tmp_path / "gh-sealed"
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+    assert inv_mod._sealed_gh_config_dir() == str(seal)
+
+    seal.chmod(0o700)
+    planted = seal / "gh" / "extensions" / "gh-evil"
+    planted.mkdir(parents=True)
+    (planted / "gh-evil").write_text("#!/bin/bash\necho pwned\n", encoding="utf-8")
+    seal.chmod(0o500)
+
+    # `desired` MUST match the seal's own file set exactly, or this test passes
+    # for the wrong reason. It used to add `hosts.yml` whenever the DEVELOPER had
+    # one at ~/.config/gh — and since the seal no longer carries that file, the
+    # resulting key mismatch made `_seal_matches` return False all by itself. The
+    # planted directory was then never the thing under test, and directory
+    # detection could have broken silently. Caught in review of the change that
+    # removed the copy; the file-set is now read FROM the seal.
+    desired = {
+        f.name: f.read_text(encoding="utf-8") for f in seal.iterdir() if f.is_file()
+    }
+    assert desired == {"config.yml": inv_mod._SEALED_GH_CONFIG_YML}, (
+        f"the seal's file set is not what this test assumes ({sorted(desired)}); "
+        f"the control below would not isolate the planted directory"
+    )
+
+    # POSITIVE CONTROL: with that exact file set and no directory, the seal
+    # MATCHES. Without this arm, a `_seal_matches` that returned False
+    # unconditionally would satisfy the assertion that follows.
+    seal.chmod(0o700)
+    import shutil
+
+    shutil.rmtree(seal / "gh")
+    seal.chmod(0o500)
+    assert inv_mod._seal_matches(seal, desired) is True, (
+        "the seal does not match its own contents — the arm below cannot then "
+        "attribute a False verdict to the planted directory"
+    )
+
+    # Re-plant, and now a False verdict can only be about the directory.
+    seal.chmod(0o700)
+    planted = seal / "gh" / "extensions" / "gh-evil"
+    planted.mkdir(parents=True)
+    (planted / "gh-evil").write_text("#!/bin/bash\necho pwned\n", encoding="utf-8")
+    seal.chmod(0o500)
+
+    assert inv_mod._seal_matches(seal, desired) is False, (
+        "a seal containing a directory was reported CLEAN — XDG_DATA_HOME "
+        "points here, so that directory is a live gh extension tree."
+    )
+    assert inv_mod._sealed_gh_config_dir() == str(seal)
+    assert not planted.exists(), "the stale sweep left the planted extension tree"
+    assert not (seal / "gh").exists()
+    assert seal.stat().st_mode & 0o777 == 0o500
+
+
+# --- The env that was CHECKED must be the env that LAUNCHES ----------------
+
+
+def test_the_launch_gate_refuses_an_env_that_lost_its_hardening(invoker, monkeypatch):
+    """`_build_env` is not the last word, which is what this catches.
+
+    Both spawn paths merge `_apply_login_fallback` on top of the built env and
+    launch the merged result, so a check that ended at the builder inspected a
+    dict that was then added to. This is the same class as the `env_overrides`
+    hole, one call later, and it made the PR's own structural claim false.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: "/seal")
+    inv = CCInvocation(prompt="hi", bash_allowlist=("gh",))
+    env = invoker._build_env(inv)
+
+    # survives untouched
+    assert invoker._launch_env(dict(env), inv)["GH_CONFIG_DIR"] == "/seal"
+
+    # a later merge strips the confinement — exactly what the fallback could do
+    tampered = {**env, "GH_CONFIG_DIR": "/tmp/attacker-writable"}
+    with pytest.raises(RuntimeError, match="not in the environment"):
+        invoker._launch_env(tampered, inv)
+
+
+def test_every_spawn_path_gates_the_env_it_actually_launches():
+    """Structural lock: nothing may build an env, spawn, and skip the gate.
+
+    KEYED ON THE SPAWN, not on a helper. An earlier version enumerated callers
+    of `_apply_login_fallback` and required each to gate — which binds today only
+    because both launch paths happen to use that helper. A method that called
+    `_build_env` and `create_subprocess_exec` without it was invisible to the
+    probe and passed, and that is not hypothetical in spirit: two launchers
+    elsewhere in this codebase spawn a session on a hand-copied `os.environ`
+    while carrying comments saying they mirror `_build_env`.
+
+    This matters more than an ordinary structural test, because
+    `_assert_no_gh_credentials`'s "runs on every dispatch" claim rests entirely
+    on `_launch_env` being on every path that launches — and this is the only
+    check that defends it structurally rather than by someone reading the file.
+
+    Both arms are asserted non-empty, because an AST probe whose predicate
+    matches nothing is the failure mode it is most likely to have: it reports
+    green forever and nobody notices the rename that silenced it.
+    """
+    import ast
+    import inspect
+
+    from genesis.cc import invoker as inv_mod
+
+    # Spelled broadly on purpose — a future path reaching for `Popen` or a
+    # blocking `run` to launch a session must be caught too, not just asyncio.
+    SPAWN = ("attr='create_subprocess_exec'", "attr='Popen'", "attr='run'")
+
+    tree = ast.parse(inspect.getsource(inv_mod))
+    launchers: dict[str, bool] = {}
+    fallback_callers: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        dumped = ast.dump(node)
+
+        # ARM 1 — builds the dispatch env AND spawns ⇒ must gate. A function
+        # that builds the env WITHOUT spawning is a verifier, not a launcher
+        # (`_verify_allowlist_enforceable_blocking` is one), and a probe that
+        # spawns without building the dispatch env is not launching a session.
+        if "attr='_build_env'" in dumped and any(s in dumped for s in SPAWN):
+            launchers[node.name] = "attr='_launch_env'" in dumped
+
+        # ARM 2 — the original regression, kept: `_apply_login_fallback` was
+        # called AFTER the builder's assertion in both paths and returned a
+        # merged dict, so the env that was checked was not the env launched.
+        if "attr='_apply_login_fallback'" in dumped and node.name != "_apply_login_fallback":
+            fallback_callers[node.name] = "attr='_launch_env'" in dumped
+
+    assert launchers, (
+        "no function both builds the dispatch env and spawns — the predicate "
+        "matches nothing, so this test proves nothing. A rename in invoker.py "
+        "is the likely cause."
+    )
+    assert fallback_callers, "no caller of _apply_login_fallback found — arm 2 is inert"
+
+    ungated = sorted(name for name, ok in launchers.items() if not ok)
+    assert not ungated, (
+        f"these build an env and spawn without calling _launch_env: {ungated}. "
+        f"The credential check would not run for sessions they launch, which is "
+        f"exactly the 'unconditional' claim this PR makes."
+    )
+    unregated = sorted(name for name, ok in fallback_callers.items() if not ok)
+    assert not unregated, (
+        f"these mutate the env after _build_env without re-gating it: "
+        f"{unregated}. The environment that was checked would not be the one "
+        f"launched."
+    )
+
+
+# --- The seal answers, rather than raising, when it moves under us ----------
+
+
+def test_a_seal_that_moves_under_the_check_reports_no_rather_than_raising(tmp_path):
+    """A concurrent rewrite must not turn into a refused launch.
+
+    The first `_seal_matches` call runs OUTSIDE the rewrite lock, so a writer
+    unlinking a stale file between the listing and the read is expected rather
+    than exceptional. If that escaped, it would reach the caller's fallback and
+    refuse a launch that should have succeeded — the whole point of queueing
+    behind the lock is to handle it, and that path is only reached by answering
+    False.
+
+    Fail-closed is preserved and asserted: the answer is never True. This is
+    "cannot confirm", which is not the same as "does not match", and both are
+    correctly handled by going on to take the lock.
+
+    RETARGETED at `os.listdir(dir_fd)`. This used to stub `Path.iterdir`, which
+    `_seal_matches` no longer calls — it enumerates through the pinned
+    directory descriptor now, so the stub became inert and the test failed by
+    reporting a clean seal rather than by finding a defect. The PROPERTY is
+    unchanged and still worth pinning: a name that vanishes between the listing
+    and the open raises `FileNotFoundError`, which is an `OSError`, so the
+    function answers False instead of letting it escape.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    target = tmp_path / "seal"
+    target.mkdir()
+    (target / "config.yml").write_text("x", encoding="utf-8")
+    (target / "config.yml").chmod(0o400)
+    target.chmod(0o500)
+
+    import os
+
+    real_listdir = os.listdir
+
+    def vanishing(fd):
+        names = real_listdir(fd)
+        # The concurrent writer, between the listing and the open.
+        for name in names:
+            os.chmod(name, 0o600, dir_fd=fd)
+            os.unlink(name, dir_fd=fd)
+        return names
+
+    with patch.object(os, "listdir", vanishing):
+        assert inv_mod._seal_matches(target, {"config.yml": "x"}) is False
+
+
+# --- The confinement is checked where the env is BUILT ----------------------
+
+
+def test_build_env_itself_refuses_when_a_binary_cannot_be_confined(invoker, monkeypatch):
+    """The refusal lives in the builder, not only in the pre-launch verifier.
+
+    This is the binding that matters, and the reason it is not merely a second
+    copy of the verifier's test: BOTH spawn paths call `_build_env` AGAIN after
+    `verify_allowlist_enforceable` has passed, and launch what that second call
+    returns. A check that lives only in the verifier therefore inspects an
+    environment that is then thrown away. Refusing inside the builder makes the
+    environment that was checked the environment that runs, by construction
+    rather than by the two staying in step.
+
+    Drives `_build_env` DIRECTLY for that reason — going through the verifier
+    would pass even with the builder failing open, which is the state this
+    replaces.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: None)
+    with pytest.raises(RuntimeError, match="could not be prepared"):
+        invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+
+
+def test_build_env_refuses_when_an_override_strips_the_confinement(invoker):
+    """`env_overrides` is applied last and wins — including over hardening.
+
+    Asserted at the builder for the same reason as above: the override is
+    applied on every build, so the check has to be on every build too.
+    """
+    with pytest.raises(RuntimeError, match="not in the environment"):
+        invoker._build_env(
+            CCInvocation(
+                prompt="hi",
+                bash_allowlist=("gh",),
+                env_overrides={"XDG_DATA_HOME": "/tmp/attacker-writable"},
+            )
+        )
+
+
+def test_an_unallowlisted_invocation_is_untouched_by_any_of_this(invoker):
+    """No allowlist, no hardening, no refusal — the collateral-damage arm.
+
+    Without it a refusal that fired on every dispatch would look exactly like
+    a working confinement.
+    """
+    env = invoker._build_env(CCInvocation(prompt="hi"))
+    assert "GENESIS_BASH_ALLOWLIST" not in env
+    assert "XDG_DATA_HOME" not in env
+
+
+# --- Every route gh documents for running a program of its own accord -------
+
+
+def test_the_gh_confinement_pins_the_extension_data_dir(monkeypatch):
+    """Extensions are NOT under the config dir, which is the whole trap.
+
+    MEASURED: `gh` resolves extensions from `$XDG_DATA_HOME/gh/extensions`, so
+    a sealed `GH_CONFIG_DIR` leaves `gh extension install` followed by
+    `gh extension exec` as arbitrary execution with `gh` as both first tokens.
+    An extension planted under the config dir was not found; one under the data
+    dir ran. Pinning the data dir at the same read-only seal closes both halves
+    — the install cannot create the directory, and the exec finds nothing.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: "/seal")
+    hardened = inv_mod._gh_hardening()
+    assert hardened is not None
+    assert hardened["XDG_DATA_HOME"] == "/seal", (
+        "the extension route is open: extensions resolve from the DATA dir, "
+        "not from GH_CONFIG_DIR, so sealing the config dir alone does nothing "
+        "about `gh extension`."
+    )
+
+
+def test_the_gh_confinement_pins_every_documented_program_route(monkeypatch):
+    """Enumerated from `gh help environment`, not from review findings.
+
+    Each of these names a program gh will run, or a directory gh will run a
+    program out of. They are asserted as a SET so that dropping one fails here
+    rather than in the next review round — the routes arrived one review at a
+    time, which is the signature of a denylist, and the fix for that is to bind
+    the whole documented set at once.
+
+    `GH_PATH` is deliberately absent, and that absence is asserted below rather
+    than left ambiguous: it was MEASURED inert — with a planted value an
+    ordinary read still ran the real gh, and with extensions already unreachable
+    it redirects nothing.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: "/seal")
+    hardened = inv_mod._gh_hardening()
+    assert hardened is not None
+    assert hardened == {
+        "GH_CONFIG_DIR": "/seal",
+        "XDG_DATA_HOME": "/seal",
+        "GH_PAGER": "cat",
+        "PAGER": "cat",
+        "GH_EDITOR": "true",
+        "GIT_EDITOR": "true",
+        "VISUAL": "true",
+        "EDITOR": "true",
+        "GH_BROWSER": "true",
+        "BROWSER": "true",
+    }
+    assert "GH_PATH" not in hardened
+    # CREDENTIALS ARE DELIBERATELY ABSENT from this dict, and their absence is
+    # asserted rather than left implicit. They were briefly splatted in here, which
+    # tied "no dispatched session holds a credential" — a claim about EVERY session
+    # — to a check that only runs for an allowlisted one. They now live in
+    # `_assert_no_gh_credentials`, called unconditionally.
+    #
+    # Asserting absence also closes a live hazard: the splat sat LAST in this
+    # literal, so a name added to `_GH_CREDENTIAL_ENV` that collided with a key
+    # above — `GH_CONFIG_DIR` being the obvious one — would have silently
+    # overwritten the seal pin with `""` and passed every check, because
+    # `_assert_hardening_present` recomputes the same wrong dict.
+    assert not (set(inv_mod._GH_CREDENTIAL_ENV) & set(hardened)), (
+        "a credential variable is back in the binary hardening — that scopes an "
+        "every-session claim to allowlisted sessions only"
+    )
+    # And the constant must not have drifted BELOW what is asserted above — a
+    # name removed from it would silently stop being pinned in `_build_env`,
+    # which this dict cannot see.
+    assert set(inv_mod._GH_CREDENTIAL_ENV) == {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    }, (
+        "the credential-variable enumeration changed. It comes from "
+        "`gh help environment`; if gh added or removed one, update this list and "
+        "cite the release — the first version of this pinned GH_TOKEN alone and "
+        "was bypassed by GITHUB_TOKEN, documented on the same line."
+    )
+
+
+def test_the_confinement_reaches_the_env_a_dispatch_would_receive(invoker, monkeypatch):
+    """End of the chain: the pins are in the dict the spawn paths launch.
+
+    The unit above proves `_gh_hardening` returns them. This proves they
+    survive everything `_build_env` does afterwards, which is where a later
+    edit would quietly drop them.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", lambda **_k: "/seal")
+    env = invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
+    assert env["XDG_DATA_HOME"] == "/seal"
+    assert env["GH_CONFIG_DIR"] == "/seal"
+    assert env["BROWSER"] == "true"
+    assert env["EDITOR"] == "true"
+
+
+# --- No dispatched session inherits a GitHub credential --------------------
+#
+# Two separate mechanisms, and they close different holes. The GH_TOKEN pin
+# closes the INHERITED-ENV route for every dispatch. The GH_CONFIG_DIR pin
+# closes the ON-DISK route, and only for external-untrusted origins. MEASURED
+# 2026-09-25, which is why both exist: `GH_TOKEN="" gh auth status` with no
+# GH_CONFIG_DIR pin is STILL FULLY AUTHENTICATED, because gh reads an empty
+# GH_TOKEN as unset and falls back to hosts.yml. Anyone who deletes one of
+# these two believing the other covers it is repeating that error.
+
+
+def test_every_documented_credential_variable_is_pinned(invoker, monkeypatch):
+    """THE BYPASS THAT SHIPPED, and the discipline that would have caught it.
+
+    The first version pinned `GH_TOKEN` alone. `gh help environment` (gh 2.100.0)
+    documents FOUR credential variables — "`GH_TOKEN`, `GITHUB_TOKEN` (in order of
+    precedence)" and "`GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` (in order
+    of precedence)" — and MEASURED, `GH_TOKEN="" GITHUB_TOKEN=<value> gh auth
+    token` returns the fallback. So the pin was bypassed by the variable on the
+    same documentation line.
+
+    Each variable is its own arm, and each is INHERITED non-empty first, because
+    the failure mode was a whole name being absent rather than a value being
+    wrong. A loop over `_GH_CREDENTIAL_ENV` would pass for any contents of that
+    tuple, including the broken one.
+    """
+    for var in (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ):
+        monkeypatch.setenv(var, f"ghp_INHERITED_{var}")
+        for inv in (
+            CCInvocation(prompt="hi"),
+            CCInvocation(prompt="hi", bash_allowlist=("gh",)),
+        ):
+            env = invoker._build_env(inv)
+            assert env[var] == "", (
+                f"{var} survived into a dispatch with "
+                f"bash_allowlist={inv.bash_allowlist!r}. gh resolves it as a "
+                f"credential, so this outranks the credential-free seal."
+            )
+
+
+@pytest.mark.parametrize(
+    "var",
+    ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"],
+)
+def test_env_overrides_cannot_restore_a_credential_on_ANY_session(invoker, var):
+    """THE HOLE THIS ROUND EXISTS FOR, and the arm the first version lacked.
+
+    The enforcement used to live in `_gh_hardening`'s returned dict, checked by
+    `_assert_hardening_present` — which `_launch_env` calls only
+    `if inv.bash_allowlist:`. Exactly one shipped profile declares an allowlist on
+    this branch (`steward`, for `gh`) and it has never been dispatched (MEASURED:
+    0 rows), with a companion change removing it — so the pin was SET by the
+    builder and ENFORCED only for a shape that has never occurred, and an
+    `env_overrides` credential won silently on every session that has ever run.
+
+    So this drives a session with NO allowlist, which is the case that was broken.
+    The previous version of this test passed `bash_allowlist=("gh",)` and therefore
+    could not have caught it.
+
+    Parametrised per variable because the failure mode was a whole NAME being
+    absent from the enumeration, not a value being wrong.
+    """
+    inv = CCInvocation(prompt="hi", env_overrides={var: "ghp_RESTORED"})
+    env = invoker._build_env(inv)
+    with pytest.raises(RuntimeError, match=var):
+        invoker._launch_env(env, inv)
+
+
+def test_the_credential_check_runs_on_a_session_with_no_allowlist(invoker):
+    """The same property stated positively: the check is UNCONDITIONAL.
+
+    Distinct from the parametrised test above, which proves a refusal. This proves
+    the ordinary case still LAUNCHES — without it, a check that raised for every
+    session would satisfy the refusals and break every background dispatch on the
+    box.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    inv = CCInvocation(prompt="hi")
+    env = invoker._build_env(inv)
+    assert invoker._launch_env(env, inv) is env
+    for var in inv_mod._GH_CREDENTIAL_ENV:
+        assert env[var] == ""
+
+
+def test_an_allowlist_entry_is_classified_into_one_of_THREE_states(invoker):
+    """HARDENED / deliberately-needs-none / UNREVIEWED-and-refused.
+
+    A bare `dict.get` + skip was a DENYLIST wearing allowlist grammar: it silently
+    permitted every binary nobody had considered. `git` is the concrete case and
+    the next entry anyone adds for PR work — `git -c core.pager=…`,
+    `-c alias.x='!sh'`, `core.sshCommand`, a writable ~/.gitconfig — each makes it
+    run a program of its own accord, exactly like gh. Skipping it handed out an
+    unsealed escape with no warning.
+
+    `basename` earns its place and `strip` does not, and both are asserted for
+    what they actually do. MEASURED against the shipped guard predicate, varying
+    the ALLOWLIST ENTRY: entry `/usr/bin/gh` with command `/usr/bin/gh …` is
+    PERMITTED (rc=0) while a raw lookup misses — a real unsealed launch. Entry
+    `"gh "` or `" gh"` is REFUSED for every command (rc=2), because the guard takes
+    the first token with `awk '{print $1}'`, which can never yield a token
+    containing whitespace — so `strip` closes no hole and is normalisation only.
+    An earlier version of this test claimed both were permitted; only the path
+    form is.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    # HARDENED — and `/usr/bin/gh` is the spelling that was launching unsealed.
+    for token in ("gh", "/usr/bin/gh", "/opt/homebrew/bin/gh"):
+        required = inv_mod._required_hardening(token)
+        assert required and required.get("GH_CONFIG_DIR"), f"{token!r} lost its seal"
+        # Resolution alone proves nothing; an UNSEALED env for that spelling must
+        # also be refused, which is the property that matters.
+        with pytest.raises(RuntimeError):
+            inv_mod._assert_hardening_present({}, (token,))
+
+    # DELIBERATELY NEEDS NONE — returns None, and still launches.
+    assert inv_mod._required_hardening("jq") is None
+    assert inv_mod._required_hardening("/usr/bin/jq") is None
+    inv = CCInvocation(prompt="hi", bash_allowlist=("jq",))
+    env = invoker._build_env(inv)
+    assert invoker._launch_env(env, inv) is env
+
+    # UNREVIEWED — refused, with the binary named so the reader knows what to
+    # classify. `git` is called out in the message because it is the likely one.
+    for token in ("git", "npm", "python3", "curl", "GH"):
+        with pytest.raises(RuntimeError, match="neither _BINARY_HARDENING"):
+            inv_mod._required_hardening(token)
+
+    # And an unreviewed entry stops a LAUNCH, not just the classifier.
+    inv = CCInvocation(prompt="hi", bash_allowlist=("git",))
+    with pytest.raises(RuntimeError, match="neither _BINARY_HARDENING"):
+        invoker._build_env(inv)
+
+
+def test_reconcile_gh_seal_strips_a_credential_from_an_existing_seal(monkeypatch, tmp_path):
+    """THE MIGRATION, and why it cannot live on a dispatch path.
+
+    The seal's stale sweep runs only inside `_sealed_gh_config_dir`, whose single
+    caller is `_gh_hardening` — reachable only for an invocation that declares a
+    Bash allowlist. Once no shipped profile declares one, nothing calls it again,
+    so an install that already ran the copying version keeps the operator's token
+    in the seal indefinitely while the changelog claims installs "heal themselves
+    with no migration step". This is what makes that claim true.
+
+    Driven with a pre-heal seal built at the CORRECT modes — the shape
+    `_seal_matches`'s fast path accepts — because that is the state an install is
+    actually in, and a wrong-modes seal would be repaired for the wrong reason.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    target = tmp_path / "gh-sealed"
+    target.mkdir()
+    for name, body in (
+        ("config.yml", inv_mod._SEALED_GH_CONFIG_YML),
+        ("hosts.yml", "github.com:\n  oauth_token: LEAKED\n"),
+    ):
+        (target / name).write_text(body, encoding="utf-8")
+        (target / name).chmod(0o400)
+    target.chmod(0o500)
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", target)
+
+    # CONTROL: the planted credential is really there and really readable before
+    # the sweep, or a passing assertion below would prove nothing.
+    assert (target / "hosts.yml").read_text(encoding="utf-8").endswith("LEAKED\n")
+
+    inv_mod.reconcile_gh_seal()
+
+    assert not (target / "hosts.yml").exists(), (
+        "the sweep left the copied credential in place — an install that ran the "
+        "old code keeps the operator's token forever"
+    )
+    assert (target / "config.yml").exists(), "the sweep removed the seal itself"
+    assert target.stat().st_mode & 0o777 == 0o500, "the seal was left writable"
+
+
+def test_reconcile_gh_seal_does_not_CREATE_a_seal(monkeypatch, tmp_path):
+    """A no-op where no seal exists — asserted, because the opposite is worse.
+
+    This runs at startup on EVERY install. Building a seal unprompted would put a
+    directory on every box to solve a problem only some have, and would make the
+    machinery look used when it is not.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    absent = tmp_path / "never-built"
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", absent)
+    inv_mod.reconcile_gh_seal()
+    assert not absent.exists(), "the startup sweep created a seal that was not there"
+
+
+def test_the_credential_gate_refuses_an_ABSENT_variable_not_only_a_set_one():
+    """An absent key is as unverified as a restored one.
+
+    `env.get(v) != ""` already refused an absent key, which is the right
+    polarity — but it reported it as "arrived non-empty", sending a reader after
+    a value that is not there. This locks BOTH the polarity and the two
+    distinguishable messages, because the remedies differ: a non-empty value is
+    something that set it, an absent one is something that deleted it.
+
+    Unreachable from the invoker today (`_build_env` sets all four, and nothing
+    between it and the gate removes a key), so this is a lock on a direct caller
+    and on a future refactor — which is exactly when it would otherwise be
+    quietly relaxed to `.get(v, "")`.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    complete = {v: "" for v in inv_mod._GH_CREDENTIAL_ENV}
+    # CONTROL: the complete, all-empty env is PERMITTED, or the assertions below
+    # would pass for a gate that simply refuses everything.
+    inv_mod._assert_no_gh_credentials(complete)
+
+    for victim in inv_mod._GH_CREDENTIAL_ENV:
+        short = {k: v for k, v in complete.items() if k != victim}
+        with pytest.raises(RuntimeError, match="ABSENT") as absent:
+            inv_mod._assert_no_gh_credentials(short)
+        assert victim in str(absent.value)
+
+        restored = dict(complete)
+        restored[victim] = "ghp_value"
+        with pytest.raises(RuntimeError, match="NON-EMPTY") as nonempty:
+            inv_mod._assert_no_gh_credentials(restored)
+        assert victim in str(nonempty.value)
+
+    # Both classes at once, each named for what it is.
+    both = {k: v for k, v in complete.items() if k != inv_mod._GH_CREDENTIAL_ENV[-1]}
+    both[inv_mod._GH_CREDENTIAL_ENV[0]] = "ghp_value"
+    with pytest.raises(RuntimeError) as exc:
+        inv_mod._assert_no_gh_credentials(both)
+    assert "NON-EMPTY" in str(exc.value) and "ABSENT" in str(exc.value)
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("planted", ["fifo", "socket"])
+@pytest.mark.parametrize("entry_name", ["hosts.yml", "config.yml"])
+def test_only_a_REGULAR_FILE_counts_as_a_seal_entry(
+    monkeypatch, tmp_path, planted, entry_name
+):
+    """The fifth file type, and why the check is now an ALLOWLIST.
+
+    `_seal_matches` filtered entries with `is_file()` after rejecting symlinks and
+    directories — a DENYLIST of types, and every review round found the next one
+    nobody had listed. A FIFO is not a symlink, not a directory, and `is_file()`
+    is ALSO False for it, so it was silently dropped from `present`,
+    `set(present)` still equalled `set(desired)`, and this function reported the
+    seal CLEAN. MEASURED: a seal holding a correct `config.yml` plus
+    `mkfifo hosts.yml` survived both the boot reconciliation and the dispatch
+    rewrite with nothing logged, and gh then read the planted `hosts.yml` THROUGH
+    the FIFO and adopted the account in it — the credential this change exists to
+    remove, restored by a named pipe.
+
+    So the polarity is inverted: an entry must be `S_ISREG`, and a FIFO, socket,
+    device, directory or symlink is a non-match by construction. Parametrised over
+    two types deliberately — a fix that special-cased FIFOs would be the sixth
+    round of the same mistake, and the socket arm is the one that proves it did
+    not.
+
+    PARAMETRISED OVER THE NAME as well as the type, because the two names fail
+    for DIFFERENT reasons and a sweep caught the first version testing only the
+    weaker one. Under a name NOT in `desired` the set comparison rejects the seal
+    whatever the type is — so that arm passes with the type check deleted, which is
+    exactly what a mutation arm reported. Under `config.yml` — a name that IS in
+    `desired` — the set matches and only the type check can say no.
+
+    WHICH GATE REJECTS WHICH TYPE, measured rather than assumed, because an earlier
+    version of this docstring claimed the socket arm was the one proving the type
+    check and that was false — the MODE check was rejecting it first, making three
+    of these four arms vacuous. Under the descriptor form
+    (`open(O_RDONLY|O_NOFOLLOW|O_NONBLOCK)` then `fstat` then `S_ISREG`):
+
+      * fifo      -> open SUCCEEDS, rejected by the S_ISREG gate
+      * directory -> open SUCCEEDS, rejected by the S_ISREG gate
+      * socket    -> rejected by the OPEN, errno 6 (ENXIO)
+      * symlink   -> rejected by the OPEN, errno 40 (ELOOP)
+
+    So `S_ISREG` is load-bearing for the FIFO and the directory; the socket and the
+    symlink never reach it. All four are refusals and all four are worth pinning,
+    but only the first two exercise the type test, and saying otherwise is how the
+    vacuity got missed.
+
+    `O_NONBLOCK` is what makes the FIFO arm safe to run at all. MEASURED:
+    `Path.read_text()` on a FIFO with no writer BLOCKS INDEFINITELY, so a version
+    that read before testing the type would wedge `_seal_matches` on every dispatch
+    and, since the reconciliation calls it, every boot. The 30s timeout marker is
+    here so such a regression fails this test rather than hanging the suite.
+
+    Each arm asserts BOTH halves: the fast path says no, and the rewrite actually
+    removes it. Reporting the mismatch without repairing it would leave the seal
+    rewritten on every dispatch forever.
+    """
+    import os
+    import socket as socket_mod
+
+    import genesis.cc.invoker as inv_mod
+
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    if entry_name != "config.yml":
+        # Under a name not in `desired` the seal also needs a VALID config.yml,
+        # or it would be rejected for the boring reason.
+        (seal / "config.yml").write_text(inv_mod._SEALED_GH_CONFIG_YML)
+        (seal / "config.yml").chmod(0o400)
+    if planted == "fifo":
+        os.mkfifo(seal / entry_name, 0o400)
+    else:
+        sock = socket_mod.socket(socket_mod.AF_UNIX)
+        sock.bind(str(seal / entry_name))
+    seal.chmod(0o500)
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    # CONTROL: the planted entry really is present and really is not a regular
+    # file, or neither assertion below means anything.
+    assert (seal / entry_name).exists()
+    assert not (seal / entry_name).is_file()
+
+    assert not inv_mod._seal_matches(seal, {"config.yml": inv_mod._SEALED_GH_CONFIG_YML}), (
+        f"a {planted} named {entry_name} reported the seal CLEAN — under a name gh "
+        f"reads, gh opens the planted entry and adopts what comes out of it"
+    )
+
+    inv_mod.reconcile_gh_seal()
+    assert sorted(p.name for p in seal.iterdir()) == ["config.yml"], (
+        f"the {planted} named {entry_name} survived the reconciliation"
+    )
+    assert (seal / "config.yml").is_file(), "the replacement is not a regular file"
+
+
+@pytest.mark.timeout(30)
+def test_a_fifo_that_already_holds_the_bytes_is_refused(
+    monkeypatch, tmp_path
+):
+    """The arm that was retired on a false premise, restored with the right fixture.
+
+WHAT THIS PINS, stated carefully because the claim around it was wrong four
+    times running and this test was named after the fourth version of it.
+
+    It pins the OUTCOME: a pipe holding exactly the expected bytes is refused. It
+    does NOT pin which gate does the refusing, and it must not be read as doing so
+    — in the shipped order the type test fires first, but deleting that line alone
+    changes no outcome here, because the size gate refuses the same fixture (a pipe
+    reports st_size 0, MEASURED). The two shadow each other, so the sweep arm for
+    this fixture is a COMBINED mutation removing both; a single-gate arm is
+    unpinnable by construction and reads as coverage if left in place.
+
+    The history is worth keeping because it is the failure mode, not the bug. Round
+    A: the type test is redundant, "a FIFO reads as b'' under O_NONBLOCK so the
+    content compare rejects it anyway" — true of an EMPTY pipe, generalised without
+    testing a full one. Round B: therefore it is the SOLE gate — wrong, see above.
+    Round C: the read ceiling is belt-and-braces — backwards, it is the
+    load-bearing half. Round D: this test's own control drained the pipe it was
+    establishing.
+
+    A pipe can hold data with no writer attached. Open a reader, write the seal
+    constant, close the WRITE end: the bytes stay buffered in the pipe, and a
+    descriptor read returns them. MEASURED: those exact 36 bytes come back, so
+    `st_nlink` is 1, the mode is 0400 and the contents are EQUAL — every gate
+    passes except the type test, which is therefore the only thing standing between
+    a planted pipe and a seal reported CLEAN. And the commit already measured what
+    happens then: gh reads the planted name through the pipe and adopts the account
+    in it.
+
+    The reader is held open for the lifetime of the assertion, because closing it
+    would drain the pipe and quietly restore the empty case this test exists to
+    stop being confused with.
+    """
+    import fcntl
+    import os
+    import stat
+    import struct
+    import termios
+
+    import genesis.cc.invoker as inv_mod
+
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    fifo = seal / "config.yml"
+    os.mkfifo(fifo, 0o600)
+
+    reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        writer = os.open(fifo, os.O_WRONLY)
+        try:
+            os.write(writer, inv_mod._SEALED_GH_CONFIG_YML.encode("utf-8"))
+        finally:
+            os.close(writer)
+        os.chmod(fifo, 0o400)
+        seal.chmod(0o500)
+        monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+        # CONTROL: this really is a pipe, and it really does still hold the bytes.
+        #
+        # COUNT them, do not READ them. The first version of this control opened
+        # the pipe and read it to prove the bytes were there — which CONSUMED
+        # them, so by the time the assertion below ran the pipe was empty and the
+        # function refused it for the empty-pipe reason. That is precisely the case
+        # the original false claim was about, so the test passed while proving
+        # nothing, and a mutation arm deleting BOTH gates still could not turn it
+        # red. FIONREAD reports how many bytes are available without removing any.
+        st = os.lstat(fifo)
+        assert stat.S_ISFIFO(st.st_mode) and not stat.S_ISREG(st.st_mode)
+        assert st.st_nlink == 1 and st.st_mode & 0o777 == 0o400
+        available = struct.unpack("i", fcntl.ioctl(reader, termios.FIONREAD, b"\0" * 4))[0]
+        assert available == len(inv_mod._SEALED_GH_CONFIG_YML.encode("utf-8")), (
+            f"the pipe holds {available} bytes, not the expected "
+            f"{len(inv_mod._SEALED_GH_CONFIG_YML.encode('utf-8'))} — if it is empty "
+            f"this test is back to the case that made the original claim look true"
+        )
+
+        assert not inv_mod._seal_matches(
+            seal, {"config.yml": inv_mod._SEALED_GH_CONFIG_YML}
+        ), (
+            "a pipe holding the right bytes reported the seal CLEAN. gh would read "
+            "the planted name through that pipe and adopt the account in it "
+            "(MEASURED). Both the type test and the size gate refuse this fixture, "
+            "so BOTH must have been removed for this to fire"
+        )
+    finally:
+        os.close(reader)
+
+
+def test_an_oversized_entry_is_refused_WITHOUT_being_read(monkeypatch, tmp_path):
+    """A size gate, and it is a denial-of-service fix rather than a tidy-up.
+
+    The content read had no bound, so a planted `config.yml` of any size was read
+    into memory in full before the comparison rejected it. MEASURED on the
+    unbounded version: 64 MiB sparse cost 0.33s and +192 MiB RSS — roughly three
+    times the file, resident, and linear, so a multi-GiB plant is free to create
+    with `truncate` and would exhaust this box. It matters more than an ordinary
+    slow path because `reconcile_gh_seal` calls this at bootstrap step ONE,
+    synchronously, ahead of secrets and database init, and the read happens BEFORE
+    the purge — so the seal cannot heal its way out of it either.
+
+    Comparing `st_size` first is also strictly more correct than reading: a size
+    that differs from the expected bytes is a content mismatch by definition.
+
+    ASSERTED BY COUNTING READS, not by timing or memory, and the first version of
+    this test got that wrong in a way worth recording. It asserted `elapsed < 5`
+    and an `ru_maxrss` delta under 64 MiB. Neither can fail: MEASURED, the
+    UNBOUNDED read of this 256 MiB fixture takes 0.45-0.88s, so the time ceiling is
+    unreachable; and `ru_maxrss` is a process HIGH-WATER MARK, so once anything
+    earlier in the run has peaked above the fixture size the delta is 0 and the
+    memory ceiling passes regardless. CI runs the whole suite in ONE process, which
+    is exactly the condition that makes it pass. A high-water-mark metric can never
+    serve as a negative control.
+
+    So this counts `os.read` calls instead: with the size gate in place the entry is
+    refused before any read happens, and zero calls is a fact that cannot be
+    masked by an earlier peak or a loaded machine.
+    """
+    import os
+
+    import genesis.cc.invoker as inv_mod
+
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    big = seal / "config.yml"
+    with open(big, "wb") as fh:
+        fh.truncate(256 * 1024 * 1024)  # sparse: costs no disk
+    big.chmod(0o400)
+    seal.chmod(0o500)
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    # CONTROL: the file really is that large, and the seal is otherwise correct.
+    assert os.stat(big).st_size == 256 * 1024 * 1024
+    assert os.stat(big).st_mode & 0o777 == 0o400
+
+    reads: list[int] = []
+    real_read = os.read
+
+    def counting_read(fd, n):
+        reads.append(n)
+        return real_read(fd, n)
+
+    monkeypatch.setattr(os, "read", counting_read)
+    verdict = inv_mod._seal_matches(seal, {"config.yml": inv_mod._SEALED_GH_CONFIG_YML})
+
+    assert verdict is False
+    assert reads == [], (
+        f"the oversized entry was READ before its size was compared "
+        f"({len(reads)} call(s), first for {reads[0] if reads else 0} bytes) — that "
+        f"is the unbounded read this size gate exists to prevent, and it runs at "
+        f"bootstrap step one before the purge"
+    )
+
+
+def test_the_rewrite_VERIFIES_what_it_produced_before_reporting_success(
+    monkeypatch, tmp_path
+):
+    """The rewrite used to be write-only, so success meant "I wrote", not "it is".
+
+    An entry planted between the last create and the final chmod ends up INSIDE
+    the finished 0500 seal, and `_sealed_gh_config_dir` returned the path as
+    though it were clean — MEASURED with an extension subtree. `_seal_matches`
+    catches it on the NEXT call, which is one dispatch too late: the session that
+    should have been refused has already run with a seal that contains an
+    extension directory, which is precisely what the seal exists to prevent.
+
+    Driven by planting in the real window rather than by stubbing the verifier,
+    so what is asserted is the behaviour and not the check. The seal is left
+    holding the planted entry, and that is correct: refusing the LAUNCH is the
+    contract, and repairing a directory somebody is actively writing to is not
+    something this function can win.
+    """
+    import os
+
+    import genesis.cc.invoker as inv_mod
+
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    (seal / "hosts.yml").write_text("github.com:\n  oauth_token: LEAKED\n")
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    real_purge = inv_mod._purge_dir_entries
+    planted: list[str] = []
+
+    def purge_then_plant(dir_fd, label, depth=0):
+        real_purge(dir_fd, label, depth)
+        os.mkdir("gh", 0o700, dir_fd=dir_fd)
+        planted.append("gh")
+
+    monkeypatch.setattr(inv_mod, "_purge_dir_entries", purge_then_plant)
+
+    result = inv_mod._sealed_gh_config_dir()
+
+    assert planted == ["gh"], "the plant never happened — this test is inert"
+    assert result is None, (
+        "reported a prepared seal while an extension directory sat inside it; the "
+        "caller reads a non-None return as 'this directory is safe to hand gh'"
+    )
+
+
+def test_a_deeply_nested_plant_answers_None_and_leaves_the_seal_SEALED(
+    monkeypatch, tmp_path
+):
+    """Two failures in one, and the mode is the one that matters.
+
+    The purge recursion was unbounded. MEASURED on a 1200-deep planted tree:
+    `RecursionError` — which is not an `OSError` — escaped
+    `_sealed_gh_config_dir`'s except clause and therefore its documented "answers
+    None" contract, surfacing in the caller instead of the refusal. And on the way
+    out it left the seal at **0700**, which is its only write protection, with
+    nothing restoring it.
+
+    Both are asserted, and the mode assertion is the load-bearing one: wrong
+    CONTENTS after a failure are self-correcting, because `_seal_matches` refuses
+    them and the next call rewrites. A WRITABLE seal is not — it stays writable
+    until something else happens to rewrite it, and the whole mechanism rests on
+    that directory being unwritable.
+
+    The depth used here is far below Python's frame limit, so this fails on the
+    BOUND rather than on recursion, which is the point: the bound converts the
+    failure into one the contract covers.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    (seal / "config.yml").write_text("wrong, so the rewrite runs\n")
+    deep = seal / "nest"
+    deep.mkdir()
+    for _ in range(inv_mod._MAX_SEAL_PURGE_DEPTH + 40):
+        deep = deep / "n"
+        deep.mkdir()
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    result = inv_mod._sealed_gh_config_dir()  # must not raise
+
+    assert result is None, "a refused purge reported a prepared seal"
+    assert seal.stat().st_mode & 0o777 == 0o500, (
+        "the seal was left WRITABLE after the rewrite failed — its only write "
+        "protection, gone, until something else rewrites it"
+    )
+
+    # And reconcile must not raise either, on the same tree.
+    inv_mod.reconcile_gh_seal()
+
+    # CONTROL: the bound is not so tight that a legitimate extension tree — the
+    # thing the sweep exists for — stops being purged.
+    shallow = tmp_path / "shallow"
+    shallow.mkdir()
+    (shallow / "config.yml").write_text("wrong\n")
+    (shallow / "gh" / "extensions" / "gh-evil").mkdir(parents=True)
+    (shallow / "gh" / "extensions" / "gh-evil" / "payload.sh").write_text("id\n")
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", shallow)
+    assert inv_mod._sealed_gh_config_dir() == str(shallow)
+    assert sorted(p.name for p in shallow.iterdir()) == ["config.yml"]
+
+
+def test_a_HARDLINKED_seal_entry_is_not_written_through(monkeypatch, tmp_path):
+    """The route that four path-level symlink checks could not see.
+
+    `is_symlink()` is False for a hardlink, `is_file()` is True, and the name is
+    in `desired` — so the old sweep's "keep a matching entry" branch KEPT it and
+    the write landed on the other name's inode. MEASURED before the fix:
+    `ln <victim> <seal>/config.yml` plus one junk entry, and the next
+    reconciliation replaced the victim's contents with the seal constant and
+    chmod'd it 0400. Byte for byte the effect the symlink round reports as closed.
+
+    This is why the rewrite stopped enumerating link tricks: the seal is opened
+    once with `O_DIRECTORY|O_NOFOLLOW` and everything runs against that
+    descriptor, nothing is kept, and each file is created `O_EXCL|O_NOFOLLOW` —
+    so the new `config.yml` is a fresh inode at `st_nlink == 1` by construction
+    rather than by a check someone remembered to write.
+
+    The nlink assertion is the one that matters. Content alone would pass against
+    a sweep that wrote the right bytes through the planted link.
+    """
+    import os
+
+    import genesis.cc.invoker as inv_mod
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("PRECIOUS\n")
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    os.link(victim, seal / "config.yml")
+    (seal / "junk.txt").write_text("forces a mismatch so the rewrite runs\n")
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    # CONTROL: the hardlink really is one, and really is invisible to is_symlink.
+    assert victim.stat().st_nlink == 2
+    assert not (seal / "config.yml").is_symlink()
+
+    inv_mod.reconcile_gh_seal()
+
+    assert victim.read_text() == "PRECIOUS\n", (
+        "wrote through the hardlink — the seal constant landed on an inode that a "
+        "writable name outside the seal also points at"
+    )
+    assert victim.stat().st_mode & 0o777 != 0o400, "chmod'd the victim to 0400"
+    assert sorted(p.name for p in seal.iterdir()) == ["config.yml"]
+    assert (seal / "config.yml").stat().st_nlink == 1, (
+        "the seal's config.yml still shares its inode with a name outside the seal"
+    )
+
+
+def test_seal_matches_never_resolves_an_entry_NAME_TWICE(monkeypatch, tmp_path):
+    """The TOCTOU lock, and it is deliberately structural rather than statistical.
+
+    The first version of the file-type allowlist answered type, link count and
+    mode from one `lstat` per path, then read the CONTENT with a fresh
+    `read_text()` by path. Those are two resolutions of the same name, so the
+    gates described one inode and the bytes came from whatever the name pointed at
+    by the time of the read. MEASURED by an adversarial reviewer against a racing
+    writer: 1 false-CLEAN verdict in 509,533 trials, in a setup where a clean
+    verdict was only reachable by following a link the type gate had rejected.
+
+    A RACE PROBE CANNOT PIN THIS, which is why the assertion below is not one. Run
+    against the fixed code the same probe reports 0 in 600,000 — but its oracle arm
+    reports 60,000 of 60,000 CLEAN when the bytes are genuinely right, meaning the
+    swapping thread never once won the window. A run that never reproduces the
+    race says nothing about whether the race is closed, and one hit in half a
+    million is exactly the frequency a green run hides.
+
+    So this asserts the PROPERTY instead: no entry name may be resolved a second
+    time. `Path.read_text` and `Path.open` are booby-trapped for the duration, so
+    reverting to a path-addressed read fails here immediately and deterministically
+    rather than one time in 500,000. The positive control matters as much — the
+    seal must still be judged CLEAN with the traps armed, or this would pass
+    against a function that simply stopped working.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    (seal / "config.yml").write_text(inv_mod._SEALED_GH_CONFIG_YML)
+    (seal / "config.yml").chmod(0o400)
+    seal.chmod(0o500)
+
+    # Both fixtures FIRST. The traps below catch any path resolution, and
+    # `write_text` is one — arming them before the fixtures exist makes the test
+    # fail on its own setup, which is how the first version of it failed.
+    (tmp_path / "other").mkdir()
+    wrong = tmp_path / "other" / "gh-sealed"
+    wrong.mkdir()
+    (wrong / "config.yml").write_text("not the seal constant\n")
+    (wrong / "config.yml").chmod(0o400)
+    wrong.chmod(0o500)
+
+    resolved: list[str] = []
+
+    def trap(self, *a, **kw):
+        resolved.append(str(self))
+        raise AssertionError(
+            f"_seal_matches resolved {self} by PATH after gating on a stat; that is "
+            f"the time-of-check window the descriptor form exists to close"
+        )
+
+    monkeypatch.setattr(Path, "read_text", trap, raising=True)
+    monkeypatch.setattr(Path, "open", trap, raising=True)
+
+    # POSITIVE CONTROL: still answers CLEAN with the traps armed.
+    assert inv_mod._seal_matches(seal, {"config.yml": inv_mod._SEALED_GH_CONFIG_YML}), (
+        "the seal is no longer recognised as clean — this test would then pass for "
+        "the wrong reason, since a function that always answers False resolves no "
+        "paths either"
+    )
+    assert resolved == [], f"paths re-resolved: {resolved}"
+
+    # And the negative direction reaches its verdict without touching a path
+    # either — a mismatch must be decided from the descriptor too, or the window
+    # is merely narrower rather than closed.
+    assert not inv_mod._seal_matches(wrong, {"config.yml": inv_mod._SEALED_GH_CONFIG_YML})
+    assert resolved == [], f"paths re-resolved on the mismatch path: {resolved}"
+
+
+def test_seal_matches_rejects_a_HARDLINKED_entry(monkeypatch, tmp_path):
+    """The worse half: the seal reporting itself CLEAN while somebody else owns it.
+
+    `_seal_matches` compared name, mode and bytes. A hardlink satisfies all three,
+    so a planted one made the fast path return True, the rewrite never ran, and a
+    WRITABLE name outside the 0500 directory owned gh's `config.yml`. MEASURED: an
+    alias was written through that outside name and read back from inside the seal
+    — the `gh alias` escape this entire mechanism exists to close.
+
+    The 0500 directory mode is the seal's only write protection, and a second link
+    to the inode is a way around it that no content or mode check can detect. So
+    the check belongs HERE as well as in the rewrite: this function decides whether
+    the rewrite happens at all, and a check the rewrite has and this one lacks is a
+    check that never runs.
+
+    Paired with a positive control, because "reject everything" would also pass.
+    """
+    import os
+
+    import genesis.cc.invoker as inv_mod
+
+    desired = {"config.yml": inv_mod._SEALED_GH_CONFIG_YML}
+
+    # POSITIVE CONTROL: a genuine single-link seal MUST match.
+    good = tmp_path / "genuine"
+    good.mkdir()
+    (good / "config.yml").write_text(inv_mod._SEALED_GH_CONFIG_YML)
+    (good / "config.yml").chmod(0o400)
+    good.chmod(0o500)
+    assert inv_mod._seal_matches(good, desired), (
+        "a genuine seal does not match, so a False below would prove nothing"
+    )
+
+    # The hardlink: identical name, bytes and modes; only st_nlink differs.
+    outside = tmp_path / "attacker-writable.yml"
+    outside.write_text(inv_mod._SEALED_GH_CONFIG_YML)
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    os.link(outside, seal / "config.yml")
+    (seal / "config.yml").chmod(0o400)
+    seal.chmod(0o500)
+
+    assert not inv_mod._seal_matches(seal, desired), (
+        "a hardlinked entry reported the seal as already correct — the fast path "
+        "returns early, the rewrite never runs, and a writable name outside the "
+        "seal keeps ownership of gh's config.yml"
+    )
+
+    # And it is actually REPAIRED, not merely reported.
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+    inv_mod.reconcile_gh_seal()
+    assert (seal / "config.yml").stat().st_nlink == 1
+
+
+def test_the_purge_addresses_entries_BY_DESCRIPTOR_and_never_by_path():
+    """A structural lock, because the behavioural difference is a RACE.
+
+    `_purge_dir_entries` deliberately avoids `shutil.rmtree` and every other
+    path-addressed removal: walking by PATH is the property that let the previous
+    version write through planted links, and a component swapped DURING the walk
+    redirects it. Substituting `shutil.rmtree` back in is behaviourally identical
+    for every static case a test can set up — a mutation arm doing exactly that
+    stayed GREEN — so the choice cannot be pinned by observing behaviour, only by
+    asserting the code makes it.
+
+    Asserted on the FUNCTION source rather than the module, so an unrelated
+    `shutil.which` elsewhere in the file does not satisfy or break it. Every
+    removal must carry `dir_fd=`, which is what makes it relative to the pinned
+    descriptor instead of to a path that can be re-pointed.
+    """
+    import ast
+    import inspect
+    import re
+    import textwrap
+
+    import genesis.cc.invoker as inv_mod
+
+    # The DOCSTRING names `shutil.rmtree` in order to say it is not used, so a
+    # whole-source check reads the explanation as the offence. Strip the
+    # docstring and assert on the code, which is what the claim is about.
+    whole = textwrap.dedent(inspect.getsource(inv_mod._purge_dir_entries))
+    fn = ast.parse(whole).body[0]
+    body = fn.body[1:] if ast.get_docstring(fn) is not None else fn.body
+    assert body, "the purge has no body left — this lock is inert"
+    src = "\n".join(ast.unparse(node) for node in body)
+
+    assert "shutil" not in src, (
+        "the purge reaches for shutil again; rmtree walks by PATH, which is the "
+        "property this helper exists to avoid"
+    )
+    for removal in ("os.unlink(", "os.rmdir("):
+        calls = re.findall(re.escape(removal) + r"[^)]*\)", src)
+        assert calls, f"{removal} disappeared from the purge — this lock is inert"
+        for call in calls:
+            assert "dir_fd=" in call, (
+                f"{call!r} addresses an entry by path; a component of that path "
+                f"can be replaced after the descriptor was opened"
+            )
+
+    # The ENUMERATION must also be descriptor-relative. Pinning only the
+    # removals left the door open to `os.scandir(label)` or `label.iterdir()`,
+    # which walks by path — the names would then come from a directory that may
+    # no longer be the one the descriptor points at, and every "relative" removal
+    # after it would be relative to the right descriptor but the wrong list.
+    assert "os.scandir(dir_fd)" in src, (
+        "the purge enumerates by PATH; the entry names must come from the same "
+        "descriptor the removals are relative to"
+    )
+    # The list below is a DENYLIST and cannot be complete — it is a convenience
+    # that names the spellings someone would actually reach for, so the failure
+    # message points at the mistake. The positive assertion above is the real
+    # check: the enumeration must BE `os.scandir(dir_fd)`, which no path walker
+    # can satisfy.
+    for walk in ("iterdir(", "os.walk(", "os.listdir(label", "glob("):
+        assert walk not in src, f"the purge walks by path via {walk!r}"
+
+    # And the recursion opens subdirectories relative to the parent descriptor,
+    # with O_NOFOLLOW — not by joining a path.
+    assert "dir_fd=dir_fd" in src, "the recursion no longer opens relative to the parent"
+    assert "O_NOFOLLOW" in src and "O_DIRECTORY" in src, (
+        "a subdirectory is opened without O_NOFOLLOW|O_DIRECTORY, so a symlinked "
+        "one would be followed into"
+    )
+
+
+def test_O_EXCL_refuses_a_name_planted_between_the_purge_and_the_create(
+    monkeypatch, tmp_path
+):
+    """The RACE arm, and the only thing that makes O_EXCL observable.
+
+    Everything is unlinked before anything is created, so in a static seal
+    `O_CREAT|O_WRONLY` and `O_CREAT|O_EXCL|O_WRONLY` behave identically — a
+    mutation arm dropping `O_EXCL` stayed GREEN for exactly that reason, and the
+    honest reading is that the flag guards the WINDOW between the two steps, not
+    the static case. Rather than leave the flag unpinned, this forces the window
+    open.
+
+    The interleave is real, not stubbed: the genuine purge runs, and a hardlink is
+    then planted under the name the create is about to use. Without `O_EXCL` the
+    create opens that name and the write lands on the other inode — the same
+    effect as the static hardlink defect, reachable by a writer that loses the
+    static race but wins this one.
+
+    `FileExistsError` is an OSError, so the caller answers None and the launch is
+    REFUSED. The seal is left mid-repair, which is correct: refusing is the
+    documented behaviour for a seal that cannot be prepared, and the alternative
+    is writing through a link somebody else planted.
+    """
+    import os
+
+    import genesis.cc.invoker as inv_mod
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("PRECIOUS\n")
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    (seal / "hosts.yml").write_text("github.com:\n  oauth_token: LEAKED\n")
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    real_purge = inv_mod._purge_dir_entries
+    planted: list[str] = []
+
+    def purge_then_plant(dir_fd, label):
+        real_purge(dir_fd, label)
+        # The window: every name is gone, and nothing has been created yet.
+        os.link(victim, "config.yml", dst_dir_fd=dir_fd)
+        planted.append("config.yml")
+
+    monkeypatch.setattr(inv_mod, "_purge_dir_entries", purge_then_plant)
+
+    result = inv_mod._sealed_gh_config_dir()
+
+    assert planted == ["config.yml"], "the interleave never ran — this test is inert"
+    assert victim.read_text() == "PRECIOUS\n", (
+        "the create wrote through a hardlink planted after the purge; O_EXCL is "
+        "what refuses a name that exists at that point"
+    )
+    assert victim.stat().st_mode & 0o777 != 0o400, "the victim was chmod'd to 0400"
+    assert result is None, (
+        "the seal reported success despite being unable to create its own file"
+    )
+
+
+def test_a_real_nested_subtree_is_removed_without_following_links(monkeypatch, tmp_path):
+    """`shutil.rmtree` is gone, so the subtree sweep needs its own coverage.
+
+    The seal's purpose since the extension finding is that
+    `<seal>/gh/extensions/...` does not exist. The old sweep used `shutil.rmtree`,
+    which walks by PATH — the property that made the previous version write
+    through planted links. The replacement recurses through descriptors, so both
+    halves need asserting: a REAL nested subtree is removed, and a SYMLINKED
+    subdirectory is unlinked as the link it is rather than followed into.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    # Arm 1 — a real nested subtree, several levels deep.
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    (seal / "config.yml").write_text(inv_mod._SEALED_GH_CONFIG_YML)
+    deep = seal / "gh" / "extensions" / "gh-evil"
+    deep.mkdir(parents=True)
+    (deep / "payload.sh").write_text("#!/bin/sh\nid\n")
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    inv_mod.reconcile_gh_seal()
+
+    assert sorted(p.name for p in seal.iterdir()) == ["config.yml"], (
+        "the extension subtree survived — which is what the seal exists to prevent"
+    )
+
+    # Arm 2 — a symlinked subdirectory must be unlinked, its target untouched.
+    other = tmp_path / "somewhere-else"
+    other.mkdir()
+    (other / "precious.txt").write_text("keep\n")
+    seal2 = tmp_path / "seal2"
+    seal2.mkdir()
+    (seal2 / "config.yml").write_text(inv_mod._SEALED_GH_CONFIG_YML)
+    (seal2 / "gh").symlink_to(other)
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal2)
+
+    inv_mod.reconcile_gh_seal()
+
+    assert (other / "precious.txt").exists(), "recursed THROUGH the symlinked subdir"
+    assert sorted(p.name for p in other.iterdir()) == ["precious.txt"]
+    assert not (seal2 / "gh").exists()
+
+
+def test_the_LOCK_FILE_is_not_a_symlink_truncation_primitive(monkeypatch, tmp_path):
+    """A DIFFERENT spelling of the symlink class, missed by the first fix.
+
+    The rewrite lock lives in the seal's PARENT as `<seal>.lock`, and it was
+    opened `"w"` — which follows a symlink AND truncates whatever it lands on.
+    Every symlink check added for the seal itself runs LATER than that line, so
+    none of them covered it. MEASURED on the intermediate code: with
+    `<seal>.lock` symlinked at an unrelated file, that file was truncated to zero
+    bytes while the seal reconciled normally and nothing logged a problem.
+
+    This test exists as much for the METHOD as for the bug. The first fix closed
+    the three routes a finding named; asking "what else writes through a path an
+    attacker controls?" found a fourth. The sweep cannot find these — a mutation
+    only tests the guard someone already wrote.
+
+    `O_NOFOLLOW` raises ELOOP on a symlinked final component, which
+    `_sealed_gh_config_dir` catches as an OSError and answers None, so the caller
+    REFUSES THE LAUNCH. Dropping `O_TRUNC` is the second half: a real lock file
+    is reused rather than emptied, and flock needs no content.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    victim = tmp_path / "unrelated.txt"
+    victim.write_text("PRECIOUS DATA\n")
+
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    (seal / "hosts.yml").write_text("github.com:\n  oauth_token: LEAKED\n")
+    (tmp_path / "gh-sealed.lock").symlink_to(victim)
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    inv_mod.reconcile_gh_seal()  # must not raise, even though the open fails
+
+    assert victim.read_text() == "PRECIOUS DATA\n", (
+        "the lock open truncated a symlink's target — an arbitrary-file "
+        "truncation primitive reachable by anything that can write the seal's "
+        "parent directory"
+    )
+    assert inv_mod._sealed_gh_config_dir() is None, (
+        "the dispatch path continued despite being unable to take the lock"
+    )
+
+
+def test_an_existing_real_lock_file_is_reused_not_emptied(monkeypatch, tmp_path):
+    """Dropping O_TRUNC is load-bearing, and this is what pins it.
+
+    `O_NOFOLLOW` alone would still have truncated a REAL lock file on every
+    rewrite. Harmless today — nothing reads the lock's bytes — but it is the
+    reason the open is `O_CREAT|O_RDWR` rather than `"w"`, and without a test the
+    next edit reaches for `"w"` again because it is shorter.
+
+    The control is the seal itself reconciling: if the lock could not be taken at
+    all, the credential would still be there and this test would pass for the
+    wrong reason.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    (seal / "config.yml").write_text(inv_mod._SEALED_GH_CONFIG_YML)
+    (seal / "hosts.yml").write_text("github.com:\n  oauth_token: LEAKED\n")
+    lock = tmp_path / "gh-sealed.lock"
+    lock.write_text("pre-existing marker\n")
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    inv_mod.reconcile_gh_seal()
+
+    assert lock.read_text() == "pre-existing marker\n", "the lock file was truncated"
+    assert not (seal / "hosts.yml").exists(), (
+        "CONTROL: the credential survived, so the lock was never taken and the "
+        "assertion above proves nothing"
+    )
+
+
+def test_a_symlinked_seal_DIRECTORY_is_refused_not_rewritten_through(monkeypatch, tmp_path):
+    """The destructive one, and this PR is what made it reachable.
+
+    Every operation the rewrite performs — `chmod`, `iterdir`, `rmtree`,
+    `touch`, `write_text` — FOLLOWS symlinks. Before `reconcile_gh_seal` the
+    sweep was reachable only from an allowlisted dispatch, of which this install
+    has run zero, so a symlinked seal was a latent hazard. Wiring the sweep into
+    startup makes it fire on EVERY boot, which is what turns "latent" into
+    "runs tonight".
+
+    MEASURED before the fix, driving this function against a seal symlinked at a
+    directory holding three entries: it came back holding only `config.yml`, the
+    subdirectory was `rmtree`'d, and the target was chmod'd 0500. The planter
+    needs only same-uid write access — the adversary the seal already assumes,
+    since its whole premise is a dispatched session that can be told what to do
+    by the content it reads.
+
+    Asserted on the TARGET, not on the seal: the point is that nothing outside
+    the seal is touched.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    victim = tmp_path / "somebody-elses-config"
+    victim.mkdir()
+    (victim / "hosts.yml").write_text("github.com:\n  oauth_token: PRETEND\n")
+    (victim / "unrelated.txt").write_text("keep me\n")
+    (victim / "subdir").mkdir()
+    (victim / "subdir" / "deep.txt").write_text("keep me too\n")
+    before = sorted(p.name for p in victim.iterdir())
+    before_mode = victim.stat().st_mode & 0o777
+
+    seal = tmp_path / "gh-sealed"
+    seal.symlink_to(victim)
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    inv_mod.reconcile_gh_seal()
+
+    assert sorted(p.name for p in victim.iterdir()) == before, (
+        "the sweep reached THROUGH the symlink and modified a directory that is "
+        "not the seal"
+    )
+    assert victim.stat().st_mode & 0o777 == before_mode, "the target was chmod'd"
+
+    # And the dispatch path refuses rather than proceeding — None is what makes
+    # the caller REFUSE THE LAUNCH, so this is not merely a skip.
+    assert inv_mod._sealed_gh_config_dir() is None
+
+    # RE-CHECK THE TARGET AFTERWARDS. The assertions above ran before that call,
+    # so on their own they say nothing about what it did — and a mutation arm
+    # dropping `O_NOFOLLOW` from the directory open passed this test for exactly
+    # that reason: the post-write verification still answered None while the
+    # rewrite had already emptied the symlink's target.
+    assert sorted(p.name for p in victim.iterdir()) == before, (
+        "the dispatch path reached THROUGH the symlink and modified the target, "
+        "even though it correctly reported failure"
+    )
+    assert victim.stat().st_mode & 0o777 == before_mode
+
+
+def test_reconcile_does_not_even_CALL_the_sealer_on_a_symlinked_seal(monkeypatch, tmp_path):
+    """Pins the OUTER guard, which its sibling test cannot.
+
+    Both layers refuse a symlinked seal — `reconcile_gh_seal` returns early, and
+    `_sealed_gh_config_dir` refuses again under the lock. That redundancy is
+    deliberate, and it is also why a mutation sweep deleting the OUTER guard left
+    `test_a_symlinked_seal_DIRECTORY_is_refused_not_rewritten_through` GREEN: the
+    inner one still held, so the observable outcome was identical. MEASURED —
+    that arm was the one failure in an 8-arm sweep, and this test is the answer
+    to it.
+
+    A guard no test pins is a guard someone deletes as redundant. So this asserts
+    the thing that differs between the layers rather than the outcome they share:
+    on a symlinked seal, reconciliation must not reach the sealer AT ALL. The
+    control matters as much as the assertion — on an ordinary seal it must reach
+    it, or this would pass against a reconcile that never calls anything.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        inv_mod, "_sealed_gh_config_dir", lambda **_k: calls.append("called") or "x"
+    )
+
+    # CONTROL: an ordinary seal DOES reach the sealer.
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir()
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", ordinary)
+    inv_mod.reconcile_gh_seal()
+    assert calls == ["called"], (
+        "reconciliation did not reach the sealer even for an ordinary seal — the "
+        "assertion below would then prove nothing"
+    )
+
+    # The symlink case: refused before the sealer is consulted.
+    calls.clear()
+    linked = tmp_path / "linked"
+    linked.symlink_to(ordinary)
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", linked)
+    inv_mod.reconcile_gh_seal()
+    assert calls == [], (
+        "reconciliation passed a symlinked seal through to the sealer; the inner "
+        "guard would catch it today, but this boot-path check must not rely on "
+        "that — remove one and the other becomes the only thing standing"
+    )
+
+
+def test_a_symlink_INSIDE_the_seal_is_unlinked_never_written_through(monkeypatch, tmp_path):
+    """A link named `config.yml` is the arbitrary-write primitive.
+
+    `stale.is_file()` follows the link, so a symlink named `config.yml` is both
+    `is_file()` and in `desired` — the old sweep therefore KEPT it, and the
+    write that follows landed on its target. MEASURED before the fix: an
+    unrelated file's contents were replaced with the seal constant and the file
+    was chmod'd 0400.
+
+    `_seal_matches` had to be fixed alongside it, or this test could pass for
+    the wrong reason: a link pointing at bytes that already match, at 0400,
+    would have made the fast path report the seal ALREADY CORRECT and return
+    before the sweep ever ran.
+
+    The credential assertion is the CONTROL — a fix that refused the whole
+    directory would pass the symlink half while silently dropping the migration.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    important = tmp_path / "important.txt"
+    important.write_text("DO NOT OVERWRITE\n")
+
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    (seal / "config.yml").symlink_to(important)
+    (seal / "hosts.yml").write_text("github.com:\n  oauth_token: LEAKED\n")
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    inv_mod.reconcile_gh_seal()
+
+    assert important.read_text() == "DO NOT OVERWRITE\n", (
+        "wrote THROUGH the symlink — arbitrary-file overwrite with fixed content"
+    )
+    assert not (seal / "config.yml").is_symlink(), "the planted link survived"
+    assert (seal / "config.yml").read_text() == inv_mod._SEALED_GH_CONFIG_YML
+    assert not (seal / "hosts.yml").exists(), (
+        "CONTROL: the credential survived — the symlink fix broke the migration"
+    )
+
+
+def test_a_symlinked_DIRECTORY_inside_the_seal_is_not_rmtree_followed(monkeypatch, tmp_path):
+    """The extension-route sweep must not become an rmtree of somewhere else.
+
+    The purge removes directory entries recursively, because `<seal>/gh/extensions`
+    is exactly what the seal exists to prevent. It no longer uses `shutil.rmtree`
+    at all — that walks by PATH, which is the property that let an earlier version
+    write through planted links — so this asserts the replacement: a symlinked
+    subdirectory is unlinked as the LINK it is, and its target is untouched.
+
+    On ordering, stated correctly because an earlier version of this docstring had
+    it backwards: `S_ISDIR` is tested FIRST and the symlink branch second. That is
+    safe here only because the stat is an `lstat`, so a symlinked directory is
+    never `S_ISDIR` and falls through to the link branch. The order is not the
+    protection; `lstat` is.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "precious.txt").write_text("keep\n")
+
+    seal = tmp_path / "gh-sealed"
+    seal.mkdir()
+    (seal / "config.yml").write_text(inv_mod._SEALED_GH_CONFIG_YML)
+    (seal / "gh").symlink_to(elsewhere)
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", seal)
+
+    inv_mod.reconcile_gh_seal()
+
+    assert (elsewhere / "precious.txt").exists(), "rmtree followed the link"
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["precious.txt"]
+    assert not (seal / "gh").exists(), "the planted link survived the sweep"
+
+
+def test_seal_matches_never_reports_a_symlinked_entry_as_correct(monkeypatch, tmp_path):
+    """The fast path is what would have skipped the repair entirely.
+
+    Driven at the exact shape that defeats a content-and-mode check: a symlink
+    named `config.yml`, pointing at a file holding precisely the right bytes, at
+    0400, inside a directory at 0500. Every value `_seal_matches` compares is
+    correct; only the entry's TYPE is wrong.
+
+    Paired with a positive control — the same seal with a real file rather than
+    a link MUST match — so a `False` here cannot be about the modes or the bytes.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    desired = {"config.yml": inv_mod._SEALED_GH_CONFIG_YML}
+
+    # POSITIVE CONTROL: a real file at the right bytes and modes matches.
+    good = tmp_path / "good-seal"
+    good.mkdir()
+    (good / "config.yml").write_text(inv_mod._SEALED_GH_CONFIG_YML)
+    (good / "config.yml").chmod(0o400)
+    good.chmod(0o500)
+    assert inv_mod._seal_matches(good, desired), (
+        "the control seal does not match, so a False below would prove nothing"
+    )
+
+    # The symlink case: same bytes, same modes, different TYPE.
+    src = tmp_path / "decoy.yml"
+    src.write_text(inv_mod._SEALED_GH_CONFIG_YML)
+    src.chmod(0o400)
+    linked = tmp_path / "linked-seal"
+    linked.mkdir()
+    (linked / "config.yml").symlink_to(src)
+    linked.chmod(0o500)
+    assert not inv_mod._seal_matches(linked, desired), (
+        "a symlinked entry reported the seal as already correct — the fast path "
+        "returns early, the sweep never runs, and the link stays"
+    )
+
+    # And a symlinked seal DIRECTORY is never a match either.
+    linked_dir = tmp_path / "linked-dir"
+    linked_dir.symlink_to(good)
+    assert not inv_mod._seal_matches(linked_dir, desired)
+
+
+def test_reconcile_gh_seal_never_raises(monkeypatch, tmp_path):
+    """It runs on a startup path where a failure must not block boot.
+
+    TWO ARMS, because one of them was not testing what it claimed. The realistic
+    arm drives a seal whose PARENT is unwritable, so the rewrite fails for real —
+    but that failure is an OSError, which `_sealed_gh_config_dir` already catches
+    and answers None for. MEASURED: this test still passed with
+    `reconcile_gh_seal`'s own blanket guard DELETED, so it covered the inner
+    function's contract and never the outer one.
+
+    The second arm is what covers the guard: an exception that is NOT an OSError,
+    from the call `reconcile_gh_seal` makes itself. Stubbing is right here
+    precisely because the claim is about TYPE-INDIFFERENCE — "nothing escapes,
+    whatever it is" cannot be driven by picking one realistic failure, and the
+    route that actually raised in practice (an eager `os.readlink` in a log
+    argument) was a plain OSError that the old reasoning also missed.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    parent = tmp_path / "ro"
+    parent.mkdir()
+    target = parent / "gh-sealed"
+    target.mkdir()
+    (target / "hosts.yml").write_text("github.com:\n  oauth_token: x\n", encoding="utf-8")
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", target)
+    parent.chmod(0o500)
+    try:
+        inv_mod.reconcile_gh_seal()  # must not raise
+    finally:
+        parent.chmod(0o700)
+
+    # ARM 2 — a NON-OSError out of the call this function makes. Only the blanket
+    # guard stops this one; delete it and this arm fails while arm 1 still passes.
+    def explode() -> str | None:
+        raise RuntimeError("something nobody enumerated")
+
+    monkeypatch.setattr(inv_mod, "_sealed_gh_config_dir", explode)
+    inv_mod.reconcile_gh_seal()  # must not raise either
+
+
+def test_every_dispatched_session_gets_gh_token_pinned_empty(invoker, monkeypatch):
+    """The pin is UNCONDITIONAL — not gated on the gh allowlist.
+
+    `bash_allowlist=` is assigned at exactly ONE call site in the tree, so every
+    other dispatch takes the `()` default and `_build_env` skips the whole
+    hardening block. Gating the pin there would have left those sessions holding
+    the operator token, including ones that run Bash on external input.
+
+    Both arms are asserted, because the no-allowlist arm is the one a
+    hardening-only implementation fails.
+    """
+    monkeypatch.setenv("GH_TOKEN", "ghp_INHERITED_FROM_THE_OPERATOR")
+    for inv in (
+        CCInvocation(prompt="hi"),
+        CCInvocation(prompt="hi", bash_allowlist=("gh",)),
+        CCInvocation(prompt="hi", bash_allowlist=("jq",)),
+    ):
+        env = invoker._build_env(inv)
+        assert env["GH_TOKEN"] == "", (
+            f"an inherited GH_TOKEN survived into a dispatch with "
+            f"bash_allowlist={inv.bash_allowlist!r} — gh resolves GH_TOKEN "
+            f"ahead of hosts.yml, so this outranks the credential-free seal"
+        )
+
+
+def test_no_session_without_a_gh_allowlist_has_gh_pointed_anywhere(invoker, monkeypatch):
+    """The SCOPE of the token pin, asserted from the other side.
+
+    `GH_CONFIG_DIR` is pinned by `_gh_hardening` and NOWHERE else, so a dispatch
+    with no gh allowlist must not acquire one however it is stamped. This is a
+    guard against a specific REJECTED design, kept because the design looked
+    right: pinning the seal for `origin == external_untrusted`, to close the
+    ON-DISK route that the empty token demonstrably does not close.
+
+    It was rejected on two MEASURED grounds. That origin is far wider than it
+    reads — SIX dispatch profiles via `_PROFILE_ORIGIN` (campaign,
+    community-responder, interact, mail, research, steward) plus every
+    non-owner-attended conversation channel via `session_origin_for_channel`,
+    dashboard included — and it would also have pinned `XDG_DATA_HOME`, a
+    process-global base directory, at a read-only tree for those sessions. And
+    pinning the SEAL is a fail-OPEN on exactly the installs that need it:
+    REPRODUCED, a rewrite that fails before the stale sweep leaves a pre-heal
+    seal still holding the copied credential, and a fallback that pins the path
+    anyway points the session AT it.
+
+    The arms below therefore include external-untrusted DELIBERATELY: if a later
+    change reintroduces that pin, this fails and sends the reader to this
+    docstring instead of to a rediscovery.
+
+    `delenv` first — `_build_env` copies `os.environ` wholesale, so a developer
+    with GH_CONFIG_DIR exported would otherwise see this fail for a reason that
+    has nothing to do with the code.
+    """
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, ORIGIN_FIRST_PARTY
+
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    for inv in (
+        CCInvocation(prompt="hi", origin=ORIGIN_EXTERNAL_UNTRUSTED),
+        CCInvocation(prompt="hi", origin=ORIGIN_FIRST_PARTY),
+        CCInvocation(prompt="hi"),
+        CCInvocation(prompt="hi", bash_allowlist=("jq",)),
+    ):
+        env = invoker._build_env(inv)
+        assert "GH_CONFIG_DIR" not in env, (
+            f"gh was pointed somewhere for a session with no gh allowlist "
+            f"(origin={inv.origin!r}, allowlist={inv.bash_allowlist!r}) — read "
+            f"this test's docstring before making that deliberate"
+        )
+        assert "XDG_DATA_HOME" not in env, (
+            "XDG_DATA_HOME is a process-global base dir; pinning it at the "
+            "read-only seal outside the allowlisted path is unmeasured"
+        )
+        # The TOKEN pin IS unconditional — the two have different scopes.
+        assert env["GH_TOKEN"] == ""
+
+
+# DELETED: test_the_gh_token_pin_is_enforced_fail_closed_not_merely_set.
+#
+# It asserted `_gh_hardening()["GH_TOKEN"] == ""` and drove the refusal through
+# `_assert_hardening_present(..., ("gh",))` — i.e. it proved the enforcement for an
+# ALLOWLISTED session, which is the only case that was never broken. No shipped
+# profile grants an allowlist, so `_launch_env` never reached that check and the pin
+# was set-but-unenforced on every real session. Keeping the test would have gone on
+# reporting green over exactly that hole.
+#
+# Replaced by `test_env_overrides_cannot_restore_a_credential_on_ANY_session` (a
+# session with NO allowlist, per variable) and by the absence assertion in
+# `test_the_gh_confinement_pins_every_documented_program_route`, which pins that
+# credentials are no longer part of the binary hardening at all.
+
+
+@pytest.mark.parametrize("key", ["GH_CONFIG_DIR", "GH_PAGER"])
+async def test_refuses_when_env_overrides_would_strip_the_gh_hardening(
+    invoker, monkeypatch, tmp_path, key
+):
+    """env_overrides is applied LAST in _build_env and wins over everything.
+
+    Defending `GENESIS_BASH_ALLOWLIST` by name was the narrow version of this:
+    the same mechanism can replace the confinement of the allowlisted binary
+    after every other check has passed, and the guard cannot see it — a command
+    whose first token is `gh` is genuinely allowlisted.
+    """
+    _arm(monkeypatch, tmp_path, ["bash", str(_REAL_GUARD)])
+    with pytest.raises(RuntimeError, match="not in the environment"):
+        await _verify(
+            invoker,
+            CCInvocation(
+                prompt="hi",
+                bash_allowlist=("gh",),
+                env_overrides={key: "/tmp/attacker-writable"},
+            ),
+        )
+
+
+def test_a_seal_with_the_right_bytes_at_the_wrong_modes_is_not_a_seal(monkeypatch, tmp_path):
+    """The modes ARE the mechanism, so the match test compares them too.
+
+    A rewrite interrupted between its chmod-writable and its chmod-back leaves
+    correct content at writable permissions. A content-only check would call
+    that good and skip the repair, leaving a session pointed at a config it can
+    write — which is the escape, restored quietly.
+    """
+    import genesis.cc.invoker as inv_mod
+
+    sealed = Path(_seal(monkeypatch, tmp_path))
+    assert inv_mod._seal_matches(sealed, {"config.yml": (sealed / "config.yml").read_text()})
+
+    desired = {"config.yml": (sealed / "config.yml").read_text()}
+
+    # DIRECTORY mode alone, files left at 0400. Asserted separately because the
+    # file-mode check below would otherwise catch a combined case and the
+    # directory check could be deleted without any test noticing — a writable
+    # directory lets gh CREATE config.yml even when the existing files are
+    # read-only, so this is the half that matters most.
+    sealed.chmod(0o700)
+    assert not inv_mod._seal_matches(sealed, desired), (
+        "a writable seal DIRECTORY compared equal; gh could add a config file"
+    )
+    sealed.chmod(0o500)
+    assert inv_mod._seal_matches(sealed, desired), "restoring the mode did not restore the match"
+
+    sealed.chmod(0o700)
+    (sealed / "config.yml").chmod(0o600)
+    assert not inv_mod._seal_matches(sealed, desired), (
+        "a writable seal compared equal — the repair would be skipped"
+    )
+
+
+def test_seal_rewrites_are_serialised_against_a_concurrent_writer(monkeypatch, tmp_path):
+    """The rewrite is not atomic, so it must not interleave.
+
+    It chmods the directory writable, unlinks, writes, then chmods back. Two
+    dispatches arriving together — first run, or just after the operator's
+    token changes — would otherwise collide, and the loser gets a
+    PermissionError mid-write, returns None, and the caller refuses a launch
+    that should have succeeded.
+
+    Tested by holding the lock and asserting the rewrite BLOCKS rather than by
+    asserting a lock file exists: the file existing says a lock was opened, not
+    that anything waits on it.
+    """
+    import fcntl
+    import threading
+
+    import genesis.cc.invoker as inv_mod
+
+    source = tmp_path / "src-gh"
+    source.mkdir()
+    (source / "hosts.yml").write_text("github.com:\n  oauth_token: x\n", encoding="utf-8")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(source))
+    target = tmp_path / "sealed"
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", target)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.parent / f"{target.name}.lock"
+    done = threading.Event()
+
+    with open(lock_path, "w", encoding="utf-8") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        worker = threading.Thread(target=lambda: (inv_mod._sealed_gh_config_dir(), done.set()))
+        worker.start()
+        blocked = not done.wait(timeout=1.5)
+        assert blocked, (
+            "the rewrite completed while another writer held the lock — two "
+            "concurrent dispatches can interleave mid-rewrite"
+        )
+    # Lock released: it should now finish on its own.
+    assert done.wait(timeout=10), "the rewrite never completed after the lock was freed"
+    worker.join(timeout=5)
+    assert inv_mod._seal_matches(target, {"config.yml": inv_mod._SEALED_GH_CONFIG_YML})
+
+
+# ── Settings-level env pins (#2385 round 4) ──────────────────────────
+
+
+def test_settings_env_pins_empty_every_credential_for_every_session():
+    """Every session pins all four gh credential variables to "" — the same
+    values the launch env carries — with no allowlist required."""
+    import genesis.cc.invoker as inv_mod
+
+    pins = inv_mod._settings_env_pins(())
+    assert pins == {var: "" for var in inv_mod._GH_CREDENTIAL_ENV}
+    assert len(pins) == 4
+
+
+def test_settings_env_pins_add_the_confinement_of_an_allowlisted_binary(monkeypatch):
+    """An allowlisted gh session also pins its sealed config at the settings
+    level, so a user or project settings GH_CONFIG_DIR cannot reopen it."""
+    import genesis.cc.invoker as inv_mod
+
+    sealed = {"GH_CONFIG_DIR": "/sealed", "XDG_DATA_HOME": "/sealed"}
+    monkeypatch.setitem(inv_mod._BINARY_HARDENING, "gh", lambda: dict(sealed))
+
+    pins = inv_mod._settings_env_pins(("gh",))
+    assert pins["GH_CONFIG_DIR"] == "/sealed"
+    assert pins["XDG_DATA_HOME"] == "/sealed"
+    assert all(pins[var] == "" for var in inv_mod._GH_CREDENTIAL_ENV)
+
+
+def test_settings_env_pins_refuse_when_hardening_cannot_be_prepared(monkeypatch):
+    """A seal that cannot be prepared refuses the launch here. Writing a settings
+    file without the seal pins would let a transient failure that clears before
+    _build_env pass every launch check with the seal unpinned."""
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setitem(inv_mod._BINARY_HARDENING, "gh", lambda: None)
+    with pytest.raises(RuntimeError):
+        inv_mod._settings_env_pins(("gh",))
+
+
+def test_cc_span_settings_path_with_pins_writes_a_sibling_env_file(monkeypatch, tmp_path):
+    """Pins go to a content-named sibling with an `env` block; the legacy
+    hooks-only file is neither written nor changed, so a process on older code
+    rewriting it cannot strip the pins."""
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, _hook = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    legacy = tmp_path / "settings.json"
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", legacy)
+
+    pins = {"GH_TOKEN": "", "GITHUB_TOKEN": ""}
+    first = inv_mod.cc_span_settings_path(pins)
+    again = inv_mod.cc_span_settings_path(dict(reversed(list(pins.items()))))
+    other = inv_mod.cc_span_settings_path({"GH_TOKEN": "", "GH_CONFIG_DIR": "/sealed"})
+
+    assert first == again, "the same pins must map to the same file"
+    assert first != other and first != str(legacy)
+    assert not legacy.exists()
+    data = json.loads(Path(first).read_text())
+    assert data["env"] == pins
+    assert data["hooks"]["PostToolUse"], "the dispatch hooks must stay registered"
+
+
+def test_build_args_passes_the_pinned_settings_file(invoker, monkeypatch, tmp_path):
+    """The file handed to --settings is the one carrying the credential pins."""
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, _hook = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", tmp_path / "settings.json")
+
+    args = invoker._build_args(CCInvocation(prompt="hi"))
+    data = json.loads(Path(args[args.index("--settings") + 1]).read_text())
+    assert data["env"] == {var: "" for var in inv_mod._GH_CREDENTIAL_ENV}
+
+
+# ── Restored from main: function-hook env pins (dropped by an earlier merge) ──
+
+
+def test_build_env_pins_function_hooks_off(invoker):
+    """A dispatched session never runs plugin JS modules: an opt-in inherited
+    from the server's env is overridden to 0 (genesis.cc.child_env)."""
+    with patch.dict("os.environ", {"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"}):
+        env = invoker._build_env()
+    assert env["CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"] == "0"
+
+
+def test_launch_env_repins_function_hooks_after_an_explicit_override(invoker):
+    """Review: env_overrides are merged after the builder's pin, and the login
+    fallback after that, so the pin is re-applied at the last gate."""
+    inv = CCInvocation(prompt="hi", env_overrides={"CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"})
+    env = invoker._build_env(inv)
+    assert invoker._launch_env(env, inv)["CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"] == "0"
+
+
+def test_build_env_pins_function_hooks_off_when_unset(invoker, monkeypatch):
+    """Unset is not off: Claude Code falls back to a server-side default, so
+    the pin must be written even when nothing was inherited."""
+    monkeypatch.delenv("CLAUDE_CODE_ENABLE_FUNCTION_HOOKS", raising=False)
+    env = invoker._build_env()
+    assert env["CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"] == "0"
+
+
+
+
+# ── cc.invocation_failed: one central failure event per CCError, then re-raise ──
+
+
+class _FakeBus:
+    def __init__(self):
+        self.emit = AsyncMock()
+
+    @property
+    def events(self) -> list[tuple]:
+        return [c.args + (c.kwargs,) for c in self.emit.await_args_list]
+
+
+@pytest.fixture
+def fail_bus(monkeypatch):
+    """Route the invoker's runtime-bus lookup to a fake; reset the coalescer."""
+    import genesis.cc.invoker as inv_mod
+
+    bus = _FakeBus()
+    monkeypatch.setattr(inv_mod, "_runtime_event_bus", lambda: bus)
+    inv_mod._reset_failure_event_state()
+    yield bus
+    inv_mod._reset_failure_event_state()
+
+
+def _failing_invoker(monkeypatch, exc: BaseException | None, *, preflight_exc=None):
+    """A CCInvoker whose inner run raises ``exc`` (or succeeds when None)."""
+    from genesis.cc.types import CCOutput
+
+    invoker = CCInvoker(claude_path="/usr/bin/claude")
+
+    async def _preflight(_inv):
+        if preflight_exc is not None:
+            raise preflight_exc
+
+    async def _inner(*_a, **_k):
+        if exc is not None:
+            raise exc
+        return CCOutput(
+            session_id="s",
+            text="ok",
+            model_used="sonnet",
+            cost_usd=0.0,
+            input_tokens=0,
+            output_tokens=0,
+            duration_ms=1,
+            exit_code=0,
+        )
+
+    monkeypatch.setattr(invoker, "_network_preflight", _preflight)
+    monkeypatch.setattr(invoker, "_run_inner", _inner)
+    monkeypatch.setattr(invoker, "_run_streaming_inner", _inner)
+    return invoker
+
+
+async def _call(invoker, entry: str, inv: CCInvocation):
+    if entry == "run":
+        return await invoker.run(inv)
+    return await invoker.run_streaming(inv)
+
+
+def _error_cases():
+    from genesis.cc.exceptions import (
+        CCMCPError,
+        CCNetworkOfflineError,
+        CCOverloadedError,
+        CCParsingError,
+        CCQuotaExhaustedError,
+        CCRateLimitError,
+        CCSessionError,
+    )
+
+    return [
+        (CCRateLimitError("limit"), "warning"),
+        # Limit family: a provider-capacity overload is expected and recovers.
+        (CCOverloadedError("overloaded"), "warning"),
+        (CCQuotaExhaustedError("quota"), "warning"),
+        (CCTimeoutError("slow"), "error"),
+        (CCProcessError("exit 1"), "error"),
+        (CCStreamTruncatedError("dropped"), "error"),
+        (CCParsingError("bad json"), "error"),
+        (CCSessionError("expired"), "error"),
+        (CCMCPError("mcp down"), "error"),
+        (CCNetworkOfflineError("offline"), "error"),
+    ]
+
+
+def _case_id(value):
+    return type(value).__name__ if isinstance(value, Exception) else str(value)
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+@pytest.mark.parametrize(("exc", "severity"), _error_cases(), ids=_case_id)
+async def test_invocation_failed_event_per_error_class(
+    monkeypatch,
+    fail_bus,
+    entry,
+    exc,
+    severity,
+):
+    invoker = _failing_invoker(monkeypatch, exc)
+    inv = CCInvocation(prompt="x", caller_tag="unit.test")
+    with pytest.raises(type(exc)) as raised:
+        await _call(invoker, entry, inv)
+    assert raised.value is exc, "the original error must be re-raised unchanged"
+    assert len(fail_bus.events) == 1
+    subsystem, sev, event_type, _msg, payload = fail_bus.events[0]
+    assert event_type == "cc.invocation_failed"
+    assert str(subsystem) == "providers"
+    assert str(sev) == severity
+    assert payload["error_class"] == type(exc).__name__
+    assert payload["streaming"] is (entry == "run_streaming")
+    assert payload["caller_tag"] == "unit.test"
+    assert payload["model"] == str(inv.model)
+    assert "session_id" in payload
+    assert payload["coalesced"] == 0
+    # Raw error text (CLI stderr/stdout) is never persisted — only its length.
+    assert str(exc) not in _msg
+    assert str(exc) not in {str(v) for v in payload.values()}
+    assert payload["error_text_omitted_chars"] == len(str(exc))
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_event_covers_network_preflight(monkeypatch, fail_bus, entry):
+    from genesis.cc.exceptions import CCNetworkOfflineError
+
+    pre = CCNetworkOfflineError("offline")
+    invoker = _failing_invoker(monkeypatch, None, preflight_exc=pre)
+    with pytest.raises(CCNetworkOfflineError):
+        await _call(invoker, entry, CCInvocation(prompt="x"))
+    assert [e[2] for e in fail_bus.events] == ["cc.invocation_failed"]
+    assert fail_bus.events[0][4]["error_class"] == "CCNetworkOfflineError"
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_no_event_on_success(monkeypatch, fail_bus, entry):
+    invoker = _failing_invoker(monkeypatch, None)
+    out = await _call(invoker, entry, CCInvocation(prompt="x"))
+    assert out.text == "ok"
+    assert fail_bus.events == []
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_no_event_on_cancel(monkeypatch, fail_bus, entry):
+    invoker = _failing_invoker(monkeypatch, asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await _call(invoker, entry, CCInvocation(prompt="x"))
+    assert fail_bus.events == []
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_no_event_for_probe(monkeypatch, fail_bus, entry):
+    from genesis.cc.exceptions import CCRateLimitError
+    from genesis.cc.types import PROBE_CALLER_TAG
+
+    invoker = _failing_invoker(monkeypatch, CCRateLimitError("limit"))
+    with pytest.raises(CCRateLimitError):
+        await _call(invoker, entry, CCInvocation(prompt="x", caller_tag=PROBE_CALLER_TAG))
+    assert fail_bus.events == []
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_probe_malfunction_still_emits(monkeypatch, fail_bus, entry):
+    """Only the probe's EXPECTED answer (limit/quota) is exempt; a probe that
+    times out or loses its binary is a malfunction and must surface."""
+    from genesis.cc.types import PROBE_CALLER_TAG
+
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    with pytest.raises(CCTimeoutError):
+        await _call(invoker, entry, CCInvocation(prompt="x", caller_tag=PROBE_CALLER_TAG))
+    assert len(fail_bus.events) == 1
+    assert fail_bus.events[0][4]["caller_tag"] == PROBE_CALLER_TAG
+
+
+async def test_invocation_failed_untagged_callers_never_coalesce(monkeypatch, fail_bus):
+    """Untagged calls come from unrelated subsystems; sharing a (class, None)
+    key would suppress one subsystem's failure behind another's."""
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    for _ in range(3):
+        with pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x"))
+    assert len(fail_bus.events) == 3
+    assert all(e[4]["caller_tag"] is None for e in fail_bus.events)
+
+
+async def test_invocation_failed_emit_failure_does_not_open_a_window(monkeypatch, fail_bus):
+    """A bus fault must not record an emission that never happened."""
+    fail_bus.emit.side_effect = [RuntimeError("bus broke"), None]
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    for _ in range(2):
+        with pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x", caller_tag="a"))
+    assert fail_bus.emit.await_count == 2, "the retry inside the window was suppressed"
+
+
+async def test_invocation_failed_coalesced_count_is_in_the_message(monkeypatch, fail_bus):
+    """health_errors returns the message, not details — the count must be visible there."""
+    import genesis.cc.invoker as inv_mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    for _ in range(3):
+        with pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x", caller_tag="a"))
+    clock["t"] += 61.0
+    with pytest.raises(CCTimeoutError):
+        await invoker.run(CCInvocation(prompt="x", caller_tag="a"))
+    assert "2 similar failure(s) coalesced" in fail_bus.events[-1][3]
+    assert "coalesced" not in fail_bus.events[0][3]
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_no_bus_still_reraises(monkeypatch, entry):
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "_runtime_event_bus", lambda: None)
+    inv_mod._reset_failure_event_state()
+    exc = CCTimeoutError("slow")
+    invoker = _failing_invoker(monkeypatch, exc)
+    with pytest.raises(CCTimeoutError) as raised:
+        await _call(invoker, entry, CCInvocation(prompt="x"))
+    assert raised.value is exc
+
+
+@pytest.mark.asyncio
+async def test_error_result_overload_carries_the_real_turn_count(invoker):
+    """Exit 0 with an is_error result: the classifier gets the result prose as
+    text, but the status code and turn count come from the raw stdout result
+    object — so the overload retry's replay guard sees the real turn count."""
+    from genesis.cc.exceptions import CCReplayUnsafeError
+
+    result_line = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "api_error_status": 529,
+            "num_turns": 6,
+            "result": "API Error: 529 Overloaded. This is a server-side issue.",
+            "session_id": "sess-529",
+            "total_cost_usd": 0.0,
+            "duration_ms": 10,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+    )
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(result_line.encode(), b""))
+    mock_proc.returncode = 0
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCReplayUnsafeError) as raised,
+    ):
+        await invoker.run(CCInvocation(prompt="hello"))
+    assert raised.value.__cause__.num_turns == 6
+
+
+@pytest.mark.asyncio
+async def test_streaming_error_result_overload_carries_the_real_turn_count(
+    invoker,
+    monkeypatch,
+):
+    from genesis.cc.exceptions import CCReplayUnsafeError
+
+    _no_host_syscalls(monkeypatch)
+    ev = _error_result_event("API Error: 529 Overloaded. This is a server-side issue.")
+    ev["api_error_status"] = 529
+    ev["num_turns"] = 9
+    data = _make_stream_lines({"type": "system", "subtype": "init", "session_id": "s1"}, ev)
+    proc = _streaming_proc(data)
+    proc.pid = 424207
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCReplayUnsafeError) as raised,
+    ):
+        await invoker.run_streaming(CCInvocation(prompt="x"))
+    assert raised.value.__cause__.num_turns == 9
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_error_result_preserves_mcp_evidence_from_actual_stderr(invoker, monkeypatch, streaming):
+    from genesis.cc.exceptions import CCReplayUnsafeError
+    from genesis.cc.peer_availability import mentions_mcp
+
+    _no_host_syscalls(monkeypatch)
+    ev = _error_result_event("API Error: 529 Overloaded")
+    ev.update(api_error_status=529, num_turns=1)
+    stderr = b"MCP backend returned 529"
+    if streaming:
+        proc = _streaming_proc(_make_stream_lines(ev))
+        proc.stderr = _make_mock_stderr(stderr)
+        proc.pid = 424207
+    else:
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(json.dumps(ev).encode(), stderr))
+        proc.returncode = 0
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=proc),
+        pytest.raises(CCReplayUnsafeError) as raised,
+    ):
+        await _call(invoker, "run_streaming" if streaming else "run", CCInvocation(prompt="x"))
+    assert raised.value.__cause__.num_turns == 1
+    assert mentions_mcp(raised.value.__cause__)
+
+
+async def test_invocation_failed_emit_error_does_not_mask_original(monkeypatch, fail_bus):
+    fail_bus.emit.side_effect = RuntimeError("bus broke")
+    exc = CCProcessError("exit 1")
+    invoker = _failing_invoker(monkeypatch, exc)
+    with pytest.raises(CCProcessError) as raised:
+        await invoker.run(CCInvocation(prompt="x"))
+    assert raised.value is exc
+
+
+async def test_invocation_failed_coalesces_per_class_and_tag(monkeypatch, fail_bus):
+    import genesis.cc.invoker as inv_mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+
+    for _ in range(3):  # same (class, tag) inside the window -> one event
+        with pytest.raises(CCTimeoutError):
+            await invoker.run(CCInvocation(prompt="x", caller_tag="a"))
+    assert len(fail_bus.events) == 1
+
+    with pytest.raises(CCTimeoutError):  # different tag -> its own event
+        await invoker.run(CCInvocation(prompt="x", caller_tag="b"))
+    assert len(fail_bus.events) == 2
+
+    clock["t"] += 61.0  # window elapsed -> emits again, declaring the 2 swallowed
+    with pytest.raises(CCTimeoutError):
+        await invoker.run(CCInvocation(prompt="x", caller_tag="a"))
+    assert len(fail_bus.events) == 3
+    assert fail_bus.events[-1][4]["caller_tag"] == "a"
+    assert fail_bus.events[-1][4]["coalesced"] == 2
+
+
+def test_failure_event_bus_lookup_never_constructs_a_runtime():
+    """Observability must not lazily build a blank runtime singleton."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.runtime import GenesisRuntime
+
+    saved = GenesisRuntime._instance
+    GenesisRuntime._instance = None
+    try:
+        assert inv_mod._runtime_event_bus() is None
+        assert GenesisRuntime._instance is None
+    finally:
+        GenesisRuntime._instance = saved
+
+
+@pytest.mark.parametrize("entry", ["run", "run_streaming"])
+async def test_invocation_failed_attributes_and_keys_by_routed_model(monkeypatch, fail_bus, entry):
+    """Two sessions with one caller_tag but different roster routes are
+    different outages: neither may be coalesced behind the other, and the
+    event names the routed model, not just the requested tier."""
+    from dataclasses import replace as dc_replace
+
+    import genesis.cc.invoker as inv_mod
+
+    def _apply_active(inv):
+        if inv.prompt == "peer":
+            return dc_replace(inv, model_id_override="peer-model"), "peer-model"
+        return inv, "claude"
+
+    monkeypatch.setattr(inv_mod.roster, "apply_active", _apply_active)
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    for prompt in ("native", "peer"):
+        with pytest.raises(CCTimeoutError):
+            await _call(
+                invoker, entry, CCInvocation(prompt=prompt, caller_tag="direct_session.observe")
+            )
+    assert [e[4]["roster_model"] for e in fail_bus.events] == ["claude", "peer-model"]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"model_id_override": "peer-x"}, "peer-x"),
+        ({"anthropic_base_url": "https://peer.invalid"}, "routed"),
+        ({}, "claude"),
+    ],
+)
+async def test_invocation_failed_attributes_pre_routed_non_roster_calls(
+    monkeypatch,
+    fail_bus,
+    overrides,
+    expected,
+):
+    """A call pre-stamped with peer overrides but roster_eligible=False (e.g. the
+    fallback probe of a peer) is routed to that peer even though apply_active
+    reports native; the event must attribute and key it to the peer."""
+    invoker = _failing_invoker(monkeypatch, CCTimeoutError("slow"))
+    with pytest.raises(CCTimeoutError):
+        await invoker.run(CCInvocation(prompt="x", caller_tag="t", **overrides))
+    assert fail_bus.events[0][4]["roster_model"] == expected
+
+
+def test_settings_env_pins_pin_the_bash_allowlist_itself(monkeypatch):
+    """The guard reads GENESIS_BASH_ALLOWLIST; a settings file must not be able
+    to empty or widen it after the launch checks, so it is pinned with exactly
+    the value _build_env exports."""
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setitem(inv_mod._BINARY_HARDENING, "gh", lambda: {"GH_CONFIG_DIR": "/sealed"})
+    pins = inv_mod._settings_env_pins(("gh", "jq"))
+    assert pins["GENESIS_BASH_ALLOWLIST"] == "gh,jq"
+    assert "GENESIS_BASH_ALLOWLIST" not in inv_mod._settings_env_pins(())
+
+
+def test_allowlist_pin_matches_the_launch_env(invoker, monkeypatch):
+    """Pinned value and exported value come from one expression; assert they agree."""
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setitem(inv_mod._BINARY_HARDENING, "gh", lambda: {"GH_CONFIG_DIR": "/sealed"})
+    inv = CCInvocation(prompt="hi", bash_allowlist=("gh", "jq"))
+    env = invoker._build_env(inv)
+    assert inv_mod._settings_env_pins(tuple(inv.bash_allowlist))["GENESIS_BASH_ALLOWLIST"] == env["GENESIS_BASH_ALLOWLIST"]
+
+
+def test_build_args_uses_precomputed_pins_without_recomputing(invoker, monkeypatch, tmp_path):
+    """The async run paths compute the pins in a worker thread and hand them in;
+    _build_args must not redo that work on the event loop."""
+    import genesis.cc.invoker as inv_mod
+
+    fake_repo, _hook = _fake_genesis_hook_repo(tmp_path)
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(fake_repo))
+    monkeypatch.setattr(inv_mod, "_CC_SPAN_SETTINGS_PATH", tmp_path / "settings.json")
+
+    def _must_not_run(*_a, **_k):
+        raise AssertionError("pins recomputed on the event loop")
+
+    monkeypatch.setattr(inv_mod, "_settings_env_pins", _must_not_run)
+    pins = {"GH_TOKEN": "", "PROBE": "x"}
+    args = invoker._build_args(CCInvocation(prompt="hi"), settings_pins=pins)
+    assert json.loads(Path(args[args.index("--settings") + 1]).read_text())["env"] == pins
+
+
+async def test_run_paths_compute_pins_in_a_worker_thread(invoker, monkeypatch):
+    """Both run paths hand _settings_env_pins to asyncio.to_thread."""
+    import inspect
+
+    import genesis.cc.invoker as inv_mod
+
+    for name in ("_run_inner_with_admission", "_run_streaming_inner_with_admission"):
+        src = inspect.getsource(getattr(inv_mod.CCInvoker, name))
+        assert "asyncio.to_thread(_settings_env_pins" in src, name
+        assert "settings_pins=pins" in src, name
+        assert "verify_allowlist_enforceable(invocation, settings_pins=pins)" in src, name
+
+
+def _track_checkout_admission(monkeypatch, invoker, *, streaming, spawn_error=None):
+    import genesis.cc.invoker as inv_mod
+
+    events = []
+
+    class Admission:
+        released = False
+
+        def release(self):
+            if not self.released:
+                events.append("release")
+                self.released = True
+
+    async def admit():
+        events.append("admit")
+        return Admission()
+
+    def pins(*_args):
+        events.append("pins")
+        return {}
+
+    async def probe(*_args, **_kwargs):
+        events.append("probe")
+
+    async def fallback(env, _invocation):
+        return env
+
+    monkeypatch.setattr(inv_mod, "admit_launch", admit)
+    monkeypatch.setattr(inv_mod, "_settings_env_pins", pins)
+    monkeypatch.setattr(inv_mod, "_get_scope_args", AsyncMock(return_value=[]))
+    monkeypatch.setattr(inv_mod, "set_oom_score_adj", lambda *_args: None)
+    monkeypatch.setattr(invoker, "verify_allowlist_enforceable", probe)
+    monkeypatch.setattr(invoker, "_build_env", lambda _invocation: {})
+    monkeypatch.setattr(invoker, "_apply_login_fallback", fallback)
+    monkeypatch.setattr(invoker, "_launch_env", lambda env, _invocation: env)
+    monkeypatch.setattr(invoker, "_register_proc", lambda *_args: None)
+    monkeypatch.setattr(invoker, "_unregister_proc", lambda *_args: None)
+
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "ok",
+        "session_id": "s",
+    }
+    proc = SimpleNamespace(
+        pid=41,
+        returncode=0,
+        communicate=AsyncMock(return_value=(json.dumps(result).encode(), b"")),
+    )
+    if streaming:
+        proc.stdout = _make_async_stdout(_make_stream_lines(result))
+        proc.stdin = _make_mock_stdin()
+        proc.stderr = _make_mock_stderr()
+        proc.wait = AsyncMock()
+        proc.terminate = MagicMock()
+
+    async def create(*_args, **_kwargs):
+        events.append("spawn")
+        if spawn_error:
+            raise spawn_error
+        return proc
+
+    monkeypatch.setattr(inv_mod.asyncio, "create_subprocess_exec", create)
+    return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("streaming", "spawn_error"), [(False, False), (False, True), (True, False), (True, True)])
+async def test_checkout_admission_order_and_release(invoker, monkeypatch, streaming, spawn_error):
+    events = _track_checkout_admission(
+        monkeypatch,
+        invoker,
+        streaming=streaming,
+        spawn_error=FileNotFoundError("claude") if spawn_error else None,
+    )
+    method = invoker._run_streaming_inner if streaming else invoker._run_inner
+    if spawn_error:
+        with pytest.raises(CCProcessError):
+            await method(CCInvocation(prompt="hello"))
+    else:
+        await method(CCInvocation(prompt="hello"))
+    assert events.index("admit") < events.index("pins") < events.index("probe")
+    assert events.index("probe") < events.index("spawn")
+    assert events.index("spawn") + 1 == events.index("release")
+    if spawn_error:
+        assert events[-1] == "release"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_a_launch_waiting_for_checkout_admission_is_listed_in_flight(
+    invoker, monkeypatch, streaming
+):
+    """A launch is registered in flight BEFORE it waits for checkout admission, so
+    while a deploy holds the lock the waiting launch is visible to the deploy's
+    session scan, which then refuses the restart instead of ending it unlisted."""
+    import genesis.cc.invoker as inv_mod
+    from genesis.util import inflight
+
+    _track_checkout_admission(monkeypatch, invoker, streaming=streaming)
+    seen = []
+    real_admit = inv_mod.admit_launch
+
+    async def admit():
+        seen.append([item.kind for item in inflight.snapshot()])
+        return await real_admit()
+
+    monkeypatch.setattr(inv_mod, "admit_launch", admit)
+    if streaming:
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+    else:
+        await invoker.run(CCInvocation(prompt="hello"))
+    assert seen and "claude" in seen[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_the_roster_read_happens_under_checkout_admission(invoker, monkeypatch, streaming):
+    """The roster read and the network preflight read checkout files, so a
+    checkout mutation must not start between them and the spawn: admission is
+    taken before the roster read and released once, after the spawn."""
+    import genesis.cc.invoker as inv_mod
+
+    events = _track_checkout_admission(monkeypatch, invoker, streaming=streaming)
+    real_apply = inv_mod.roster.apply_active
+
+    def apply_active(inv):
+        events.append("roster")
+        return real_apply(inv)
+
+    monkeypatch.setattr(inv_mod.roster, "apply_active", apply_active)
+    if streaming:
+        await invoker.run_streaming(CCInvocation(prompt="hello"))
+    else:
+        await invoker.run(CCInvocation(prompt="hello"))
+    assert events.index("admit") < events.index("roster") < events.index("probe")
+    assert events.count("admit") == 1
+    assert events.count("release") == 1
+    assert events.index("spawn") + 1 == events.index("release")
+
+
+def test_verify_checks_the_settings_file_built_from_the_launch_pins(invoker, monkeypatch):
+    """The binding check must read the file built from the SAME pins the
+    launch used, not recompute them (a recomputation can hash to another file)."""
+    import genesis.cc.invoker as inv_mod
+
+    def _must_not_run(*_a, **_k):
+        raise AssertionError("pins recomputed in the binding check")
+
+    seen = []
+    monkeypatch.setattr(inv_mod, "_settings_env_pins", _must_not_run)
+    monkeypatch.setattr(inv_mod, "cc_span_settings_path", lambda pins=None: seen.append(pins))
+    pins = {"GH_TOKEN": "", "GENESIS_BASH_ALLOWLIST": "gh"}
+    inv = CCInvocation(prompt="hi", bash_allowlist=("gh",))
+    with pytest.raises(RuntimeError, match="could not be written"):
+        invoker._verify_allowlist_enforceable_blocking(inv, pins)
+    assert seen == [pins]
+
+
+def test_reconcile_gh_seal_does_not_hang_boot_on_a_held_lock(monkeypatch, tmp_path, caplog):
+    """Boot reconcile takes the seal lock non-blocking: a lock held by a stuck
+    process must not hang server startup. It logs and leaves the seal as it was."""
+    import fcntl
+    import logging
+    import threading
+
+    import genesis.cc.invoker as inv_mod
+
+    target = tmp_path / "gh-sealed"
+    target.mkdir()
+    (target / "config.yml").write_text(inv_mod._SEALED_GH_CONFIG_YML, encoding="utf-8")
+    (target / "hosts.yml").write_text("github.com:\n  oauth_token: LEAKED\n", encoding="utf-8")
+    monkeypatch.setattr(inv_mod, "_SEALED_GH_CONFIG_DIR", target)
+
+    lock_path = target.parent / f"{target.name}.lock"
+    with open(lock_path, "a+") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        done = threading.Event()
+        worker = threading.Thread(target=lambda: (inv_mod.reconcile_gh_seal(), done.set()))
+        with caplog.at_level(logging.WARNING, logger=inv_mod.logger.name):
+            worker.start()
+            finished = done.wait(timeout=10)
+        assert finished, "boot reconcile blocked on a held seal lock"
+        worker.join(timeout=5)
+    assert (target / "hosts.yml").exists(), "nothing may change while another holder has the lock"
+    assert "could not be reconciled" in caplog.text

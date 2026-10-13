@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import os
 import py_compile
 import subprocess
 import time
@@ -29,8 +30,9 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from genesis.autonomy.types import WatchdogAction
+from genesis.db.integrity import database_is_quarantined
+from genesis.env import genesis_db_path, update_in_progress
 from genesis.env import secrets_path as default_secrets_path
-from genesis.env import update_in_progress
 from genesis.util.systemd import systemctl_env
 
 if TYPE_CHECKING:
@@ -41,6 +43,19 @@ OutreachFn = Callable[[str, str, str], Coroutine[Any, Any, None]]
 
 logger = logging.getLogger(__name__)
 
+# I/O culprit sample (_log_io_culprits): the top 5 readers/writers over 1 s.
+# 1 s because the stalls it explains last minutes (READ 2026-10-07 from this watchdog's
+# own log: full avg10 over 25% at 5 of the 6 five-minute ticks from 22:09Z to 22:34Z), and it
+# runs only while pressure is already high.
+_IO_CULPRIT_TOP_N = 5
+_IO_CULPRIT_SAMPLE_S = 1.0
+
+
+def _rate(bytes_per_s: float) -> str:
+    """A byte rate in MB/s, or KB/s below 1 MB/s so small rates do not read as 0.0."""
+    if bytes_per_s >= 1e6:
+        return f"{bytes_per_s / 1e6:.1f}MB/s"
+    return f"{bytes_per_s / 1e3:.0f}KB/s"
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent.parent / "config" / "autonomy.yaml"
 
 # Restart reasons persisted under an older name, normalised once on load.
@@ -448,6 +463,17 @@ class WatchdogChecker:
 
     def _restart_if_allowed(self, state: dict, *, reason: str) -> WatchdogAction:
         """Shared restart logic: backoff → validation → restart or skip."""
+        # A corrupt DB is a durable stop condition, not a crash to retry.  This
+        # check precedes failure accounting so a quarantined database cannot
+        # consume the restart/flap budget every watchdog tick.
+        if database_is_quarantined(genesis_db_path()):
+            logger.critical(
+                "Database quarantine active — suppressing %s restart until a "
+                "verified replacement database is installed",
+                reason,
+            )
+            return WatchdogAction.SKIP
+
         # Defer restarts while a deploy is running. update.sh intentionally stops
         # genesis-server for its merge/bootstrap/migrate window; a watchdog revival
         # there takes the DB write lock and deadlocks bootstrap's seed (incident
@@ -700,7 +726,75 @@ class WatchdogChecker:
                             "I/O pressure elevated: full avg10=%.1f%%",
                             avg10,
                         )
+                    if avg10 > 25:
+                        self._log_io_culprits(avg10)
                     break
+
+    def _log_io_culprits(self, avg10: float) -> None:
+        """Log the processes doing I/O during a stall: identity AT the event.
+
+        The pressure line says THAT the container stalled; this line says who
+        was doing I/O in it. Top processes by current I/O rate over a 1 s sample,
+        each with its systemd unit and, when it runs under a Claude Code session,
+        that session's ``claude`` pid (which ``cc_sessions.pid`` resolves).
+
+        The summed rate of every readable process is the denominator: a stall
+        with a small in-container total was caused by something this watchdog
+        cannot see (the host, a neighbouring container, a process owned by
+        another user, or I/O that byte counters miss such as fsync storms and
+        swap). Command lines are deliberately not logged: argv can carry a
+        credential.
+        """
+        try:
+            from genesis.util.proc_io import claude_ancestor, rank_by_io_rate, systemd_unit
+
+            def _pids() -> list[int]:
+                return [int(d) for d in os.listdir("/proc") if d.isdigit()]
+
+            pids = _pids()
+            rates, readable, total, churn = rank_by_io_rate(
+                pids,
+                top_n=_IO_CULPRIT_TOP_N,
+                sample_interval_s=_IO_CULPRIT_SAMPLE_S,
+                pid_source=_pids,
+            )
+            parts = []
+            for r in rates:
+                if r["total_rate"] <= 0:
+                    continue
+                session = "" if r["comm"] == "claude" else (
+                    f" <-claude[{c}]" if (c := claude_ancestor(r["pid"])) else ""
+                )
+                parts.append(
+                    f"{r['comm']}[{r['pid']}] {systemd_unit(r['pid']) or '?'}{session} "
+                    f"r={_rate(r['read_rate'])} w={_rate(r['write_rate'])}"
+                )
+            missed = (
+                f"; {churn['exited']} exited during the sample, their I/O not counted"
+                if churn["exited"]
+                else ""
+            )
+            logger.warning(
+                "I/O pressure: top I/O processes (full avg10=%.1f%%; this container's "
+                "readable processes only, %d of %d readable, %d started mid-sample, "
+                "total %s%s): %s",
+                avg10,
+                readable,
+                len(pids),
+                churn["started"],
+                _rate(total),
+                missed,
+                "; ".join(parts)
+                if parts
+                # Two reads only: a process that started and exited between
+                # them is in neither list, so "none did I/O" is never provable.
+                else (
+                    "none of the measured processes did I/O (one that started and "
+                    "exited inside the sample is not visible)"
+                ),
+            )
+        except Exception:
+            logger.warning("I/O culprit sample failed", exc_info=True)
 
     def _record_check(self) -> None:
         """Record that the watchdog ran (even on SKIP). Enables staleness detection."""
@@ -1354,5 +1448,4 @@ def restart_bridge(service: str = "genesis-server.service", *, timeout_s: int = 
         return 0
     logger.error("%s not active after restart attempt", service)
     return 1
-
 

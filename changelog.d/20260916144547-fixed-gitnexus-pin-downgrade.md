@@ -1,0 +1,4 @@
+- Pin GitNexus 1.6.12 from one shared version file so fresh installs and updates cannot downgrade an index into an unreadable storage format. Installers upgrade older versions but refuse to auto-downgrade a newer one; indexing and a fail-closed MCP launcher refuse every unreviewed version. Installers also enforce the package's Node engine range instead of falling back to a floating npm release.
+- Align fresh-install and bootstrap Node checks with the repository's documented Node 22 floor for the pinned Claude Code release.
+- Preserve the machine-local Codebase MCP kill switch across new sessions and bootstrap registration while its OOM fix remains under review.
+- Give GitNexus rebuilds their measured 8 GiB scope instead of the shared 2 GiB cap that killed every full rebuild; Codebase indexing retains its separate 2 GiB limit.

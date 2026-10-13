@@ -1,0 +1,1 @@
+- Every plan and every issue that specifies work now answers five premise questions before it starts — the questions live in `.claude/docs/premise-check.md` ("At plan and issue time"), are restated in `CLAUDE.md` and the feature-request issue template, and are pointed to by the genesis-development `references/plan-docs.md`.

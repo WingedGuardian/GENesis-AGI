@@ -1,0 +1,200 @@
+"""PreToolUse hook: anything that touches ``secrets.env`` needs the user.
+
+``secrets.env`` holds the credentials for Genesis's own cognitive architecture —
+its routing providers, its channels, its embedding and reranking stack. Those
+keys are not a general-purpose key drawer for whatever an agent decides to do;
+CLAUDE.md states the principle directly ("Cognitive architecture is not a
+service"). Until this hook existed, reading that file and spending a key it holds
+was completely ungated: no prompt, no record, no accounting.
+
+**Why an ASK and not a silent block.** The owner wants to KNOW when the
+credentials are tapped, and to decide. Sourcing the file is legitimate often
+enough (a setup script, an operator one-liner) that a hard block in a foreground
+session would obstruct real work — but consequential enough that it should never
+happen unseen. That is what an ``ask`` is for, and this hook is a deliberate
+instance of the rare "hook that asks the user" exception rather than a drift into
+asking.
+
+**Dispatched sessions are DENIED, loudly** — see ``needs_user``.
+
+**An install may turn the prompt off** with ``hooks.asks.secrets_env: off`` in
+``~/.genesis/config/genesis.yaml``. That is a decision about approval fatigue on
+one box, not a change to the public default (which stays ``ask``) and not a
+change to the dispatched deny, which ``needs_user.decide`` reaches before the
+policy is consulted. Turning the prompt off does NOT approve the command: the
+guard emits no permission decision, only a context note naming the setting, so
+other hooks and Claude Code's own permission settings still decide it, and the
+transcript still shows the credentials were touched — "stop asking me" rather
+than "stop telling me". See ``hook_ask_policy``.
+
+**Matching is by RESOLVED PATH, not by command text.** The first version matched
+the literal string ``secrets.env`` in a Bash command and was broken in seconds by
+``cat ~/genesis/secrets.*``, ``cat s*.env`` and friends — and it never saw
+``Read``/``Grep`` at all. Enumerating spellings is the hand-rolled-matcher tar
+pit; ``secrets_target.touches_secrets`` instead expands globs and compares
+inodes, so a spelling nobody imagined still resolves to the same file.
+
+**What it does NOT catch is larger than this docstring used to say.** It said
+the residuals were two (shell variables, and a copy gated only at the copy).
+They are not: MEASURED at this head, the gate holds on 3 of 11 real access
+paths, and ``grep -R API_KEY`` over the repo prints credential values
+ungated. So this hook closes the DIRECT spellings — a named path, a glob that
+expands to the file, a heredoc fed to a recognised interpreter — and is not
+the boundary. The measured table lives in ``secrets_target``'s docstring and
+is the acceptance bar of **issue #2230**, which moves enforcement to the
+filesystem and credential boundaries where one check answers every row.
+
+Read that table before trusting this hook. The sentence it replaces was the
+kind of completeness claim that is worse than silence: it told a reader the
+gap was bounded and named, when nobody had enumerated it.
+
+Fail-open on a malformed payload: this is a consent gate on a file access, not a
+destructive-action guard, and a crashed hook must not wedge every tool call.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+# Self-locate so sibling hook modules resolve whether run as a script or imported.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from hook_input import degraded_exit, read_payload, tool_input  # noqa: E402
+except Exception:  # noqa: BLE001 — hook_input itself failed; nothing imports it back.
+    if __name__ != "__main__":
+        raise
+    # Reverse version skew: this guard may be newer than hook_input.py. Fail
+    # closed locally — a bare exit 1 is NON-blocking to Claude Code. See
+    # hook_input.degraded_exit for the fail-open this shape prevents.
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (secrets_env_access_guard): shared hook_input could "
+            "not be imported; BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        pass
+    os._exit(2)
+
+# DEGRADED-path mention set, bound ABOVE the guarded imports. This guard also
+# fires on Read/Grep/Edit payloads that carry no `command`, and degraded_exit
+# blocks those outright — that is the intended direction: a credentials gate
+# whose helpers are missing must not let file reads through unjudged.
+_DEGRADED_GATED = r"secrets?|\.env"
+
+try:
+    from needs_user import decide  # noqa: E402
+    from secrets_target import touches_secrets  # noqa: E402
+except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
+    if __name__ != "__main__":
+        raise
+    degraded_exit("secrets_env_access_guard", gated=_DEGRADED_GATED, exc=_exc)
+
+#: Fields carrying a path across the tools this hook is wired to. Read/Edit/Write
+#: use `file_path`; Grep uses `path` AND `glob`; NotebookEdit uses
+#: `notebook_path`. Collected generously — a field we do not read is a hole, and
+#: `glob` was exactly that: MEASURED, the first version silently allowed
+#: `Grep {"pattern":"API_KEY","path":"~/genesis","glob":"secrets.env"}`,
+#: which with `output_mode: "content"` returns the key VALUES. The tests only
+#: exercised Bash, so nothing caught it.
+#: `pattern` is NOT in this set: it is a path for Glob but a CONTENT regex for
+#: Grep — `Grep {"pattern": "secrets.env", "path": "src"}` only searches file
+#: text for the string, so treating it as a path gated a mention the same way
+#: the first Bash version did.
+_PATH_FIELDS = ("file_path", "path", "notebook_path", "glob")
+
+#: Tools whose `pattern` field IS a path selector.
+_PATTERN_IS_PATH_TOOLS = ("Glob",)
+
+
+def main() -> int:
+    payload = read_payload()
+    ti = tool_input(payload)
+
+    paths = [ti[f] for f in _PATH_FIELDS if isinstance(ti.get(f), str)]
+    if payload.get("tool_name") in _PATTERN_IS_PATH_TOOLS and isinstance(ti.get("pattern"), str):
+        paths.append(ti["pattern"])
+    command = ti.get("command") if isinstance(ti.get("command"), str) else ""
+
+    # Grep's `glob` is relative to its `path` (or the cwd). Checking it alone
+    # only catches the case where the pattern happens to resolve from here, so
+    # also offer the joined form — `path="~/genesis"` + `glob="secrets.env"` is
+    # a read of the real file and must gate the same as the full path would.
+    base, pat = ti.get("path"), ti.get("glob")
+    if isinstance(base, str) and isinstance(pat, str) and base and pat:
+        paths.append(os.path.join(os.path.expanduser(base), pat))
+
+    if not touches_secrets(paths=paths, command=command):
+        return 0
+
+    # One line, quoted, so the owner sees WHAT is happening rather than being
+    # asked to approve an abstraction. Bounded: a prompt nobody reads is a prompt
+    # that gets clicked through, and the full text is in the transcript anyway.
+    subject = " ".join((command or " ".join(paths)).split())
+    if len(subject) > 240:
+        subject = subject[:240] + " …"
+
+    reason = (
+        "GENESIS CREDENTIALS — this is not a routine approval.\n\n"
+        "Something is about to access secrets.env, which holds the API keys for "
+        "Genesis's own cognitive architecture (routing providers, channels, "
+        "embeddings). Approving this lets it use those keys, and any spend made "
+        "outside a Genesis call site is invisible to cost tracking, the budget "
+        "cap, and provider-health accounting.\n\n"
+        f"{'Command' if command else 'Path'}:\n  {subject}\n\n"
+        "Approve only if you know why this needs the credentials. If it is an "
+        "LLM call, it belongs in a routing call site instead."
+    )
+
+    # ``ask_key`` lets THIS install silence the prompt (hooks.asks.secrets_env:
+    # off in ~/.genesis/config/genesis.yaml) without changing the public default
+    # or reaching the dispatched-session deny — see needs_user.decide, which
+    # checks the dispatched branch first.
+    # REVERSE version skew, and the fail direction is the point. This guard has
+    # no run_guard wrapper and no try/except around main(): its documented
+    # posture is that a crash exits non-zero, which Claude Code treats as
+    # NON-blocking — so an uncaught TypeError here would let the credentials
+    # access through with no prompt, no block and no record. That is the one
+    # outcome this file exists to prevent, and it would be reachable purely by
+    # deploying this file next to an older needs_user.py that has no `ask_key`
+    # parameter. Retry without it: the prompt is exactly what this guard did
+    # before the knob existed, so the degraded path is the old behaviour rather
+    # than a new one.
+    try:
+        decision = decide(
+            "access secrets.env",
+            reason,
+            detail=subject,
+            payload=payload,
+            ask_key="secrets_env",
+        )
+    except TypeError:
+        decision = decide("access secrets.env", reason, detail=subject, payload=payload)
+    # Bounded: the decision carries operator-written NOTEs, and a payload over
+    # the harness's output cap is persisted instead of read, which would lose
+    # the ask and let the access through ungated. Only the free text is trimmed;
+    # the envelope (the decision itself) always survives.
+    # ANY failure of the output helper (missing, or present but broken, e.g. a
+    # syntax error mid-deploy) must still deliver the decision: an uncaught
+    # error here exits non-zero with no stdout, which Claude Code does not
+    # treat as blocking, so the access would proceed with no prompt. The plain
+    # print stays small because the notes are already clipped at their source.
+    try:
+        from hook_output import print_json_bounded
+
+        print_json_bounded(
+            decision,
+            text_keys=(
+                "hookSpecificOutput.permissionDecisionReason",
+                "hookSpecificOutput.additionalContext",
+            ),
+        )
+    except Exception:  # noqa: BLE001 - the decision must be delivered regardless
+        print(json.dumps(decision))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

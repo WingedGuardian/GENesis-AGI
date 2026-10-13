@@ -64,11 +64,38 @@ Think broadly about:
 
 Include concrete lessons learned that Genesis should remember for future sessions.
 
+### Observation strings
+
+Keep each entry in `observations` a string with four short labeled lines:
+
+- **Observation:** State one useful finding or change in plain language. It need
+  not be a problem.
+- **Evidence:** Name the actual source, its time when relevant, and what it
+  supports. Distinguish observed facts from inference or missing evidence. A
+  prior reflection is not independent proof; never invent sources.
+- **Why it matters:** Explain the consequence or decision this informs and what
+  is new compared with available history. If history is unavailable, novelty is
+  unknown.
+- **Next:** Give a concrete action and an observable completion condition when
+  warranted. Verify uncertain claims before prescribing fixes. If no action is
+  warranted, say so.
+
+Do not repeat unchanged known facts or invent problems/actions to fill the format.
+Use `observations: []` when nothing useful is new. Expand jargon the user needs to
+understand. Preserve source timestamps with explicit timezone/offset; use supplied
+runtime UTC and user-local representations when available. Never invent dates,
+weekdays, IDs, task dispatches or results. Keep the other strategic output fields
+in their existing forms.
+
+Encode line breaks as `\n` inside each JSON string. The example below assumes a
+supplied `health_status` result reports the previously affected component healthy;
+it illustrates the format, not a live finding.
+
 Respond with valid JSON:
 
 ```json
 {
-  "observations": ["observation 1", "observation 2"],
+  "observations": ["Observation: The earlier failure claim is stale.\nEvidence: Supplied health_status reports healthy now.\nWhy it matters: The old claim should not guide work.\nNext: Remove it from the assessment; done when it is absent."],
   "patterns": ["pattern 1", "pattern 2"],
   "recommendations": ["recommendation 1", "recommendation 2"],
   "learnings": ["concrete lesson 1", "concrete lesson 2"],

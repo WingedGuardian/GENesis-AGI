@@ -3,8 +3,10 @@
   `POST /v1/desk/chat/completions` instead of a model vendor. Every turn then
   routes through Genesis's router, so provider choice, cost tracking, circuit
   breakers and observability are Genesis's — and the desktop holds no model
-  credential of its own. Authenticate with `GENESIS_MCP_HTTP_TOKEN`, the same
-  token the voice API uses.
+  credential of its own. Authenticate with `GENESIS_DESK_TOKEN`, which opens
+  this route and nothing else; the broad `GENESIS_MCP_HTTP_TOKEN` also works
+  here, but it opens every other `/v1` route too, so it is the wrong credential
+  to hand a desktop client.
 
   **Two lanes, because the turns are not the same shape.** `desk_primary` leads
   with a capable model: a client that fires its own tools by emitting an exact

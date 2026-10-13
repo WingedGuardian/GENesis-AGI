@@ -16,7 +16,7 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="${1:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 # Compute CC project directory name: /path/to/genesis -> -path-to-genesis

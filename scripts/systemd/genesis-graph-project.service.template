@@ -1,0 +1,51 @@
+[Unit]
+Description=Genesis Graph Projection — hourly rebuild of the memory-graph projection
+# After= ONLY — deliberately no Wants= and no Requires=.
+#
+# Requires= would fail this unit on every install that never provisioned an
+# engine, which is the opposite of the clean no-op the runner exists to give.
+#
+# Wants= looks like the safe middle and is not: systemd.unit(5) says units
+# listed there "will be started if the configuring unit is started". So an
+# operator who deliberately stopped genesis-falkordb would have it RESURRECTED
+# every hour by a timer whose only job is to refresh a projection — and the
+# runner's own config check could not prevent it, because dependency resolution
+# happens before ExecStart ever runs.
+#
+# After= alone gives the ordering (don't race the engine during boot) with no
+# activation. If the engine is not running, the runner sees no socket and exits
+# 0, which is exactly the intended behaviour.
+After=genesis-falkordb.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=/bin/bash __REPO_DIR__/scripts/graph_project_runner.sh
+# The failure mode this bounds is a WEDGED projector holding the runner lock,
+# which would silence every later tick — not a slow one. A full projection
+# MEASURED 16.1s against 285,683 edges on a live install, and the store bounds
+# each batch internally at 30s, so 30 minutes is ~100x the measured whole-run
+# time and kills nothing legitimate. It is deliberately not the project floor of
+# 2h: this unit repeats hourly, so a 2h cap would let two wedged ticks overlap
+# the lock it is supposed to release.
+# COHERENCE NOTE, because the number above is not the binding constraint and an
+# earlier version of this comment implied it was. The publication lease in the
+# store is taken with a 300s TTL and is never renewed, so a build that outlasts
+# five minutes loses its lease and fails with a clear error long before this
+# timeout is reached. The EFFECTIVE ceiling on a projection is therefore ~300s;
+# this value only bounds a projector wedged somewhere that never reaches the
+# publish step at all. Both are far above the MEASURED 13-21s run.
+TimeoutStartSec=1800
+# Only the venv interpreter, flock, mkdir and the shell. No node, no npm prefix
+# — this unit runs one Python module and takes no path through the CC tooling.
+Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+# Writes only under $HOME: the runner lock under ~/.genesis/locks, and the
+# projection itself into the engine over its unix socket (also under $HOME).
+ProtectSystem=strict
+ReadWritePaths=%h
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

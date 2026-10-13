@@ -105,7 +105,8 @@ def test_an_existing_dirty_patch_file_is_not_overwritten(
     monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash")
     monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb.jsonl")
     entry = {"path": str(wt), "branch": "feature/collide", "head": "", "detached": False}
-    assert wl._trash_worktree(entry, repo) is True
+    # A dirty worktree is archived only on the unmerged lane.
+    assert wl._trash_worktree(entry, repo, lane="unmerged") is True
 
     moved = _moved_worktree(tmp_path / "trash", "wt-collide", tmp_path / "unpacked")
 
@@ -128,7 +129,8 @@ def test_a_worktree_with_no_collision_still_gets_the_plain_name(
     monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash2")
     monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tmp_path / "tomb2.jsonl")
     entry = {"path": str(wt), "branch": "feature/plain", "head": "", "detached": False}
-    assert wl._trash_worktree(entry, repo) is True
+    # A dirty worktree is archived only on the unmerged lane.
+    assert wl._trash_worktree(entry, repo, lane="unmerged") is True
 
     moved = _moved_worktree(tmp_path / "trash2", "wt-plain", tmp_path / "unpacked2")
     assert (moved / ".dirty.patch").exists()
@@ -155,7 +157,8 @@ def test_an_untracked_only_worktree_is_recorded_as_uncommitted(
     monkeypatch.setattr(wl, "TRASH_DIR", tmp_path / "trash3")
     monkeypatch.setattr(wl, "TOMBSTONE_INDEX", tomb)
     entry = {"path": str(wt), "branch": "feature/untracked", "head": "", "detached": False}
-    assert wl._trash_worktree(entry, repo) is True
+    # A dirty worktree is archived only on the unmerged lane.
+    assert wl._trash_worktree(entry, repo, lane="unmerged") is True
 
     row = json.loads(tomb.read_text().strip().splitlines()[-1])
     assert row["had_uncommitted_changes"] is True, (

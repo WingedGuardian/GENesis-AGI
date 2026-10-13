@@ -1,0 +1,1 @@
+- **Inbox alerts identify stopped items by line number.** An alert about an item the inbox stopped evaluating now names each link by its site and the line it sits on in the file (for example `example.com — line 12`), instead of a partly masked link path. No part of a link's path or query string, where share links keep their access tokens, appears in the alert any more.

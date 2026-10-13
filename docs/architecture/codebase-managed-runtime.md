@@ -119,6 +119,19 @@ empty queue.
 
 ## Resource and verification contract
 
+The separate `code_intel_index.sh` batch prerequisite requests a 4 GiB
+Codebase scope by default. Each tool probes its own cap independently; only
+Codebase requests inherited-slice placement, while GitNexus retains its
+pre-existing default-slice launch policy. The
+Codebase pre-exec check runs inside its scope, verifies the effective (possibly
+page-aligned) memory and zero-swap limits, and checks full effective-cap headroom
+at visible shared ancestors and on the host. Unknown placement or capacity
+defers the queued request. The check reads kernel-owned `/proc` paths and uses
+pinned system executables; inherited `PATH` and fixture paths cannot replace its
+scope or capacity evidence. An explicit cap remains a ceiling and does not skip
+the check. This batch policy does not size or contain the planned shared v0.11
+daemon; the service ceiling and acceptance gates below remain independent.
+
 The provisional test ceiling is **5 GiB for the aggregate Codebase service**,
 not per session, with zero swap allowance. It is a test setting, not a measured
 production requirement or permission to grow automatically. Validate visible

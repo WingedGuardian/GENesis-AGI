@@ -10,7 +10,7 @@ _WHATSAPP_MAX = 4096
 
 class ResponseFormatter:
     def format(self, text: str, *, channel: ChannelType) -> list[str]:
-        if channel in (ChannelType.TERMINAL, ChannelType.WEB):
+        if channel in (ChannelType.TERMINAL, ChannelType.WEB, ChannelType.AGENT):
             return [text]
         max_len = _TELEGRAM_MAX if channel == ChannelType.TELEGRAM else _WHATSAPP_MAX
         return self._split_preserving_code(text, max_len)

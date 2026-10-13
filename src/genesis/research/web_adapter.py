@@ -63,7 +63,7 @@ class WebSearchAdapter:
                 title=r.title,
                 url=r.url,
                 snippet=r.snippet,
-                source=str(response.backend_used),
+                source=str(r.backend),
                 score=r.score,
             )
             for r in response.results

@@ -35,11 +35,14 @@ def _all_init_patches():
         patch("genesis.runtime.GenesisRuntime._init_pipeline", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_surplus", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_learning", new_callable=AsyncMock),
+        patch("genesis.runtime.GenesisRuntime._init_board", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_inbox", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_reflection", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_health_data"),
         patch("genesis.runtime.GenesisRuntime._init_outreach", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_autonomy"),
+        # Spawns a subprocess; test_browser_capability.py covers it.
+        patch("genesis.runtime.GenesisRuntime._init_browser_automation", new_callable=AsyncMock),
     ]
 
 
@@ -155,13 +158,15 @@ class TestBootstrap:
              patch("genesis.runtime.GenesisRuntime._init_db", new_callable=AsyncMock) as mock_init_db, \
              patch("genesis.runtime.GenesisRuntime._init_observability"), \
              patch("genesis.runtime.GenesisRuntime._init_providers"), \
-             patch("genesis.runtime.GenesisRuntime._init_awareness", new_callable=AsyncMock) as mock_awareness:
+             patch("genesis.runtime.GenesisRuntime._init_awareness", new_callable=AsyncMock) as mock_awareness, \
+             patch("genesis.runtime._core.write_bootstrap_manifest_file") as write_manifest:
             # _init_db doesn't set _db → stays None → bootstrap returns early
             mock_init_db.side_effect = AsyncMock(return_value=None)
 
             await rt.bootstrap()
             assert rt.is_bootstrapped is False
             mock_awareness.assert_not_called()
+            write_manifest.assert_called_once_with(rt)
 
     @pytest.mark.asyncio
     async def test_bootstrap_graceful_qdrant_failure(self):

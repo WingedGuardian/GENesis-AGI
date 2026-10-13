@@ -102,6 +102,84 @@ _RERANK_TIMEOUT_S = 1.0
 # — slow calls become diagnosable from the journal without live probing.
 _SLOW_RECALL_LOG_MS = 2000.0
 
+# Stages carried by the compact every-call line, in a fixed order so the line is
+# grep/awk-friendly (``total=… embed=… …``). A stage absent from a call is
+# omitted rather than printed as 0 — absent and zero-cost are different facts.
+_COMPACT_TIMING_KEYS: tuple[str, ...] = (
+    "total",
+    "embed",
+    "recall",
+    "vector",
+    "expand",
+    "fts",
+    "activation",
+    "rerank",
+    "enrich",
+    "procedure",
+)
+
+
+def _compact_timings(timings: dict[str, Any]) -> str:
+    """``total=812.3 embed=120.0 …`` for the per-call INFO line."""
+    return " ".join(f"{k}={timings[k]}" for k in _COMPACT_TIMING_KEYS if k in timings)
+
+
+def _trace_enabled() -> bool:
+    """``proactive.trace`` kill switch for the per-recall retrieval trace (live;
+    default on). Anything but an explicit off/false/no keeps it on."""
+    val = _proactive_config().get("trace", True)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() not in {"off", "false", "no"}
+    return True
+
+
+def _degraded_reasons(
+    engine_stats: dict[str, Any],
+    vector: Any,
+    rerank_requested: bool,
+    trace: dict[str, Any] | None = None,
+) -> list[str]:
+    """Why this recall ran below its full pipeline (empty = not degraded)."""
+    reasons: list[str] = []
+    # Prefer recall's own verdict (it embeds independently); fall back to ours.
+    emb = (trace or {}).get("embedding_available")
+    if emb is False or (emb is None and vector is None):
+        reasons.append("no_embedding")  # FTS-only retrieval
+    if engine_stats.get("rerank_timed_out"):
+        reasons.append("rerank_timed_out")
+    if engine_stats.get("rerank_skipped_breaker_open"):
+        reasons.append("rerank_breaker_open")
+    if engine_stats.get("rerank_skipped_ratelimited"):
+        reasons.append("rerank_ratelimited")
+    rerank_specific = any(
+        engine_stats.get(k)
+        for k in ("rerank_timed_out", "rerank_skipped_breaker_open", "rerank_skipped_ratelimited")
+    )
+    # Reranking runs on query TEXT + candidate content, not the vector, so a
+    # missing embedding never explains a rerank that did not run — only a
+    # rerank-specific reason replaces the generic one.
+    if rerank_requested and not engine_stats.get("rerank_executed") and not rerank_specific:
+        reasons.append("rerank_not_executed")
+    return reasons
+
+
+def _schedule_trace_write(db: Any, trace: dict[str, Any] | None, session_id: str) -> None:
+    """Hand the trace to a background task — the request never waits on it."""
+    if trace is None or db is None:
+        return
+    from genesis.memory.recall_trace import write_trace
+
+    coro = write_trace(db, trace, session_id=session_id)
+    try:
+        from genesis.util.tasks import tracked_task
+
+        tracked_task(coro, name="proactive_recall_trace")
+    except Exception:
+        coro.close()
+        logger.debug("recall trace scheduling failed", exc_info=True)
+
 
 def _proactive_config() -> dict[str, Any]:
     """The ``proactive`` section of the merged memory_recall config (live)."""
@@ -305,41 +383,20 @@ class _ProcedureCache:
 
 
 _procedure_cache: _ProcedureCache | None = None
+# Single-flight guard for the background refresh (one event loop → a plain flag).
+_procedure_refresh_in_flight = False
 
 
-async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
-    """Return the cached surfaceable-procedure matrix, rebuilding past the TTL.
+def _build_procedure_matrix(rows: list[Any], built_at: float) -> _ProcedureCache:
+    """CPU-bound half of a rebuild (BLOB unpack + row normalisation).
 
-    On a DB/read error the last good cache is served (returns None only when one
-    was never built) — more resilient than the old per-call path, which surfaced
-    nothing on a transient error. Staleness is normally ≤ TTL, but during a
-    *sustained* read outage the last snapshot is served until the DB recovers
-    (acceptable for a soft top-1 advisory; a down DB fails ``recall()`` upstream
-    long before this matters). The cache is process-global and NOT keyed on
-    ``db`` — correct because the runtime passes exactly one process-global
-    connection (``memory_mod._db``) for its whole lifetime.
+    Pure and synchronous so it can run in a worker thread: MEASURED on a
+    1,000-row read of a production-shaped copy, a full rebuild costs 263–573ms,
+    almost all of it here, which is too much to spend on the event loop.
     """
-    global _procedure_cache
-    now = time.monotonic()
-    cache = _procedure_cache
-    if cache is not None and (now - cache.built_at) < _PROCEDURE_CACHE_TTL_S:
-        return cache
+    import numpy as np
 
     from genesis.learning.procedural.embedding import normalize_rows, unpack_embedding
-
-    try:
-        rows = await db.execute_fetchall(
-            "SELECT id, task_type, principle, principle_embedding, activation_tier "
-            "FROM procedural_memory "
-            "WHERE deprecated = 0 AND quarantined = 0 "
-            "AND principle_embedding IS NOT NULL "
-            "ORDER BY confidence DESC LIMIT 1000"
-        )
-    except Exception:
-        logger.debug("procedure cache reload failed — keeping prior cache", exc_info=True)
-        return cache  # table absent / DB error — never block the endpoint
-
-    import numpy as np
 
     vectors: list[list[float]] = []
     meta: list[tuple[str, str, str, str]] = []
@@ -356,8 +413,73 @@ async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
         meta.append((row[0], row[1] or "", (row[2] or "")[:200], row[4] or "DORMANT"))
 
     matrix = normalize_rows(np.asarray(vectors, dtype=np.float64)) if vectors else np.empty((0, 0))
-    _procedure_cache = _ProcedureCache(matrix=matrix, meta=meta, built_at=now)
-    return _procedure_cache
+    return _ProcedureCache(matrix=matrix, meta=meta, built_at=built_at)
+
+
+async def _rebuild_procedure_cache(db: Any) -> _ProcedureCache | None:
+    """Read + rebuild the cache; on a DB/read error keep (and return) the prior one."""
+    global _procedure_cache
+    now = time.monotonic()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT id, task_type, principle, principle_embedding, activation_tier "
+            "FROM procedural_memory "
+            "WHERE deprecated = 0 AND quarantined = 0 "
+            "AND principle_embedding IS NOT NULL "
+            "ORDER BY confidence DESC LIMIT 1000"
+        )
+        built = await asyncio.to_thread(_build_procedure_matrix, list(rows), now)
+    except Exception:
+        logger.debug("procedure cache reload failed — keeping prior cache", exc_info=True)
+        return _procedure_cache  # table absent / DB error — never block the endpoint
+    _procedure_cache = built
+    return built
+
+
+async def _background_procedure_refresh(db: Any) -> None:
+    global _procedure_refresh_in_flight
+    try:
+        await _rebuild_procedure_cache(db)
+    finally:
+        _procedure_refresh_in_flight = False
+
+
+async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
+    """Return the cached surfaceable-procedure matrix (stale-while-revalidate).
+
+    The FIRST build runs inline (nothing to serve yet). Past the TTL the current
+    snapshot is served and ONE background rebuild is scheduled, so the per-prompt
+    path never pays for a rebuild. Why: recall calls on a single-user install
+    arrive minutes apart — MEASURED 385 calls in ~41h, a mean gap above the 300s
+    TTL — so under refresh-on-read almost every call found the cache expired and
+    rebuilt inline (59 of 87 journal slow-lines showed ≥200ms in this stage).
+
+    Staleness is bounded by TTL + one rebuild, and the one surfaced winner is
+    still re-verified live in :func:`_surface_procedure`, so a procedure
+    quarantined since the snapshot is never advised. On a DB/read error the last
+    good cache is kept (returns None only when one was never built). The cache
+    is process-global and NOT keyed on ``db`` — correct because the runtime
+    passes exactly one process-global connection (``memory_mod._db``) for its
+    whole lifetime.
+    """
+    global _procedure_refresh_in_flight
+    cache = _procedure_cache
+    if cache is None:
+        return await _rebuild_procedure_cache(db)
+    if (
+        time.monotonic() - cache.built_at
+    ) >= _PROCEDURE_CACHE_TTL_S and not _procedure_refresh_in_flight:
+        _procedure_refresh_in_flight = True
+        from genesis.util.tasks import tracked_task
+
+        refresh = _background_procedure_refresh(db)
+        try:
+            tracked_task(refresh, name="procedure_cache_refresh")
+        except Exception:
+            refresh.close()  # never scheduled — don't leak an un-awaited coroutine
+            _procedure_refresh_in_flight = False
+            logger.debug("procedure cache refresh scheduling failed", exc_info=True)
+    return cache
 
 
 async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
@@ -404,9 +526,21 @@ async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
     # path (a minority of prompts). Fail-closed — if it is gone, excluded, or the
     # check errors, surface nothing this turn (self-heals at the next rebuild)
     # rather than advise a procedure the rest of the system now excludes.
+    #
+    # The same lookup also returns the winner's LIVE text and tier, which are
+    # what get surfaced. Under stale-while-revalidate the snapshot can be older
+    # than the TTL (the first call after an idle gap is served the old snapshot),
+    # so surfacing the cached principle could advise text that was since
+    # rewritten; the live tier is re-checked against its own bar for the same
+    # reason (a promotion/demotion changes which threshold applies).
+    #
+    # A refine rewrites principle AND embedding together, so the live text must
+    # also be SCORED on the live embedding — a prompt matching the old advice
+    # must not surface revised advice that does not clear the bar on its own
+    # vector. An unusable live embedding fails closed (surface nothing).
     try:
         live = await db.execute_fetchall(
-            "SELECT 1 FROM procedural_memory "
+            "SELECT principle, activation_tier, principle_embedding FROM procedural_memory "
             "WHERE id = ? AND deprecated = 0 AND quarantined = 0 LIMIT 1",
             (proc_id,),
         )
@@ -414,8 +548,26 @@ async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
         return None
     if not live:
         return None
+    from genesis.learning.procedural.embedding import cosine_similarity, unpack_embedding
 
-    return {"id": proc_id, "task_type": task_type, "principle": principle[:200], "tier": tier}
+    live_vec = unpack_embedding(live[0][2])
+    if live_vec is None:
+        return None
+    live_sim = cosine_similarity(live_vec, vector)
+    live_principle = live[0][0] if live[0][0] is not None else principle
+    live_tier = live[0][1] or "DORMANT"
+    live_bar = (
+        _DORMANT_SURFACE_THRESHOLD if live_tier == "DORMANT" else _PROCEDURE_SURFACE_THRESHOLD
+    )
+    if live_sim < live_bar:
+        return None
+
+    return {
+        "id": proc_id,
+        "task_type": task_type,
+        "principle": live_principle[:200],
+        "tier": live_tier,
+    }
 
 
 def _render_procedure_line(proc: dict) -> str:
@@ -599,6 +751,34 @@ async def proactive_context(
         "engine": {},
     }
     if budget <= 0:
+        # A configured zero budget skips retrieval entirely, but the call still
+        # happened: it gets the every-call timing line and (if on) a trace row
+        # saying WHY nothing was injected, so the journal/trace denominators
+        # count every endpoint call.
+        total = round((time.monotonic() - t0) * 1000, 1)
+        empty["timings_ms"] = {"total": total}
+        logger.info("proactive recall timing: total=%s skipped=zero_budget", total)
+        if _trace_enabled():
+            from genesis.memory.recall_trace import new_trace_id
+
+            try:
+                from genesis.mcp.memory import core as _core
+
+                skip_db = _core._memory_mod()._db
+            except Exception:
+                skip_db = None
+            if skip_db is not None:
+                skip_trace = {
+                    "trace_id": new_trace_id(),
+                    "caller": "proactive_endpoint",
+                    "profile": profile,
+                    "stance": stance,
+                    "budget": budget,
+                    "outcome": "skipped:zero_budget",
+                    "timings_ms": {"total": total},
+                }
+                _schedule_trace_write(skip_db, skip_trace, session_id)
+                empty["engine"] = {"trace_id": skip_trace["trace_id"]}
         return empty
 
     from genesis.mcp.memory import core as _core
@@ -629,6 +809,20 @@ async def proactive_context(
     phase_started_at = time.monotonic()
     vector: list[float] | None = None
     engine_stats: dict[str, Any] = {}
+    rerank_live = False
+    # Per-recall retrieval trace (recall_trace.py): a caller-owned sink the
+    # engine drops references into; built + written OFF-path at the end.
+    trace: dict[str, Any] | None = None
+    if _trace_enabled():
+        from genesis.memory.recall_trace import new_trace_id
+
+        trace = {
+            "trace_id": new_trace_id(),
+            "caller": "proactive_endpoint",
+            "profile": profile,
+            "stance": stance,
+            "budget": budget,
+        }
     try:
         # Embed once (cache-shared with recall's internal embed of the same text
         # → a warm hit) — reused for procedure cosine + returned for the ambient
@@ -672,6 +866,7 @@ async def proactive_context(
             # write-backs/emits + the immunity emit off the request path so the
             # 4.5s route budget isn't spent on post-result DB writes (ac27b693).
             defer_side_effects=True,
+            trace=trace,
         )
         timings["recall"] = round((time.monotonic() - t_recall) * 1000, 1)
 
@@ -768,6 +963,18 @@ async def proactive_context(
             default_executor_pending(),
             timings,
         )
+        if trace is not None:
+            trace["outcome"] = f"cancelled:{phase}"
+            trace["timings_ms"] = dict(timings)
+            trace["degraded_reasons"] = _degraded_reasons(engine_stats, vector, rerank_live, trace)
+            _schedule_trace_write(db, trace, session_id)
+        raise
+    except Exception:
+        if trace is not None:
+            trace["outcome"] = f"error:{phase}"
+            trace["timings_ms"] = dict(timings)
+            trace["degraded_reasons"] = _degraded_reasons(engine_stats, vector, rerank_live, trace)
+            _schedule_trace_write(db, trace, session_id)
         raise
 
     shadow = _shadow_projection(dicts, suppress)
@@ -788,6 +995,22 @@ async def proactive_context(
         # from the journal alone (the 503 path discards timings_ms entirely —
         # this was the observability gap behind the #1169 timeout hunt).
         logger.info("proactive recall slow: %s", timings)
+    else:
+        # Every OTHER completed call gets one compact line too. Logging only the
+        # slow tail made true p50/p95 unmeasurable — the journal held a sample
+        # conditioned on being slow. Slow calls keep their original full line
+        # (existing greps depend on it) and 503s keep the CANCELLED warning, so
+        # together the three lines cover every call exactly once. Volume is one
+        # line per prompt (hundreds per day on a busy install).
+        logger.info("proactive recall timing: %s", _compact_timings(timings))
+    intent_category = classify_intent(prompt).category
+    if trace is not None:
+        trace["outcome"] = "ok"
+        trace["intent"] = intent_category
+        trace["timings_ms"] = dict(timings)
+        trace["delivered"] = [d.get("memory_id") for d in dicts if d.get("memory_id")]
+        trace["degraded_reasons"] = _degraded_reasons(engine_stats, vector, rerank_live, trace)
+        _schedule_trace_write(db, trace, session_id)
     return {
         "status": "ok",
         "lines": lines,
@@ -806,7 +1029,9 @@ async def proactive_context(
             "rerank_requested": rerank_live,
             "rerank_timed_out": bool(engine_stats.get("rerank_timed_out", False)),
             "graph_expansion": graph_expansion.expansion_mode(),
-            "intent": classify_intent(prompt).category,
+            "intent": intent_category,
             "profile": profile,
+            # Join key for the off-path ``recall_trace`` eval row (None = off).
+            "trace_id": trace["trace_id"] if trace is not None else None,
         },
     }

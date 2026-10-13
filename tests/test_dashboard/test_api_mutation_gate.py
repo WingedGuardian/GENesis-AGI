@@ -91,6 +91,24 @@ def test_wrong_bearer_blocked(client, monkeypatch):
     assert resp.status_code == 401
 
 
+def test_non_ascii_bearer_is_401_not_500(client, monkeypatch):
+    # The header arrives as a latin-1 str; comparing it as str against the token
+    # raised TypeError inside compare_digest, so a bad credential became a 500.
+    _pw(monkeypatch)
+    resp = client.post("/api/genesis/thing", headers={"Authorization": "Bearer tök"})
+    assert resp.status_code == 401
+
+
+def test_internal_bearer_compares_the_bytes_the_client_sent(client, monkeypatch):
+    # WSGI delivers header bytes latin-1-decoded; the internal token is hex, so the
+    # correct token still passes and its UTF-8 look-alike does not.
+    _pw(monkeypatch)
+    token = auth_mod.get_or_create_internal_api_token()
+    wire = f"Bearer {token}".encode().decode("latin-1")
+    ok = client.post("/api/genesis/thing", environ_overrides={"HTTP_AUTHORIZATION": wire})
+    assert ok.status_code == 200
+
+
 def test_auth_endpoints_exempt(client, monkeypatch):
     _pw(monkeypatch)
     assert client.post("/api/genesis/auth/login").status_code == 200

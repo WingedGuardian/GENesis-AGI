@@ -89,6 +89,16 @@ _MAX_BODY = 65_536
 _COMMENT_OPEN, _COMMENT_CLOSE = "<!--", "-->"
 _FENCE_MARKS = ("```", "~~~")
 
+#: Markdown line endings ONLY (``\n``, ``\r\n``, ``\r``) — ``splitlines()``
+#: also breaks on ``\x85``/``\u2028``/``\u2029``, which the rendered view does
+#: not. Mirrors the sibling scanner.
+_LINE_ENDS = re.compile(r"\r\n|\r|\n")
+
+#: A fence marker RUN: three or more of one character. The closer must use the
+#: opener's character and be at least as long. Mirrors the sibling scanner.
+_FENCE_RUN = re.compile(r"`{3,}|~{3,}")
+
+
 #: Words that state an omission rather than a decision. `none` is deliberately NOT
 #: here — it is a VALID declaration when it carries a reason, and is classified
 #: before this set is consulted.
@@ -197,17 +207,35 @@ def _load_sibling_readable_body():
     return None
 
 
-def _local_readable_body(body: str) -> str:
+def _local_readable_body(body: str, *, keep_blank: bool = False) -> str:
     """Line scanner: drop fenced blocks and HTML comments. Mirrors the sibling's
     rules (a fenced line is opaque and never interpreted; an unterminated opener
-    hides to the end, as CommonMark does)."""
+    hides to the end, as CommonMark does). With ``keep_blank=True`` a blank
+    source line outside both is emitted as ``""`` so a paragraph-aware caller
+    sees paragraph boundaries."""
     visible: list[str] = []
     in_comment = False
     fence: str | None = None
-    for line in body[:_MAX_BODY].splitlines():
+    for line in _LINE_ENDS.split(body[:_MAX_BODY]):
         if fence is not None:
-            if line.strip().startswith(fence):
+            stripped_close = line.strip()
+            closer = _FENCE_RUN.match(stripped_close)
+            if (
+                closer
+                and closer.group(0)[0] == fence[0]
+                and len(closer.group(0)) >= len(fence)
+                and not stripped_close[closer.end() :].strip()
+            ):
                 fence = None
+            continue
+        # Same keep_blank rule as the sibling: only a RAW blank line outside a
+        # comment counts — a line emptied by comment removal, or blank inside an
+        # open comment, is still hidden.
+        # Blank per CommonMark 0.31.2 ("Characters and lines"): empty, or only
+        # U+0020 spaces and U+0009 tabs. Not str.strip(), which would also call
+        # NBSP, form feed, vertical tab or U+2028 blank and invent a boundary.
+        if keep_blank and not in_comment and not line.strip(" \t"):
+            visible.append("")
             continue
         out: list[str] = []
         rest = line
@@ -229,20 +257,21 @@ def _local_readable_body(body: str) -> str:
             rest = rest[open_at + len(_COMMENT_OPEN) :]
         kept = "".join(out)
         stripped = kept.strip()
-        for mark in _FENCE_MARKS:
-            if stripped.startswith(mark):
-                fence = mark
-                break
-        else:
+        run = _FENCE_RUN.match(stripped)
+        if run:
+            fence = run.group(0)
+        elif stripped:
+            # The sibling drops empty lines — blank and comment-only alike.
             visible.append(kept)
-            continue
     return "\n".join(visible)
 
 
-def readable_body(body: str) -> str:
+def readable_body(body: str, *, keep_blank: bool = False) -> str:
     """The part of a PR body a human actually reads."""
     fn = _load_sibling_readable_body()
-    return fn(body[:_MAX_BODY]) if fn else _local_readable_body(body)
+    if fn:
+        return fn(body[:_MAX_BODY], keep_blank=keep_blank)
+    return _local_readable_body(body, keep_blank=keep_blank)
 
 
 def _reason_is_real(value: str) -> bool:

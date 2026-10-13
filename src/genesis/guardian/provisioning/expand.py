@@ -9,6 +9,8 @@ supported substrates, forked on the incus pool driver:
     set the thin-pool autoextend profile (threshold 80 / percent 20) + ensure
     dmeventd monitoring → verify vg_free>0. The data LV is NEVER extended here —
     the whole point is leaving vg_free ABOVE the pool as autoextend headroom.
+    (Pool relief's ``pool_extend`` is the one place that grows it, and only
+    into VG free that autoextend itself cannot use: less than one step.)
 
 **btrfs-on-LVM** (pool driver ``btrfs``, backing device a regular LVM LV —
 the three-layer topology: PVE disk → guest VG → linear LV → btrfs):
@@ -44,10 +46,16 @@ from genesis.guardian.pool import (
 logger = logging.getLogger(__name__)
 
 _AUTOEXTEND_PROFILE_NAME = "genesis-thinpool"
+# Public: pool_extend reads these to tell when dmeventd's own autoextend cannot
+# fire (it needs a FULL percent step of VG free, and does nothing at all when
+# less is available).
+AUTOEXTEND_PROFILE_NAME = _AUTOEXTEND_PROFILE_NAME
+AUTOEXTEND_THRESHOLD_PCT = 80
+AUTOEXTEND_PERCENT = 20
 _AUTOEXTEND_PROFILE = (
     "activation {\n"
-    "\tthin_pool_autoextend_threshold=80\n"
-    "\tthin_pool_autoextend_percent=20\n"
+    f"\tthin_pool_autoextend_threshold={AUTOEXTEND_THRESHOLD_PCT}\n"
+    f"\tthin_pool_autoextend_percent={AUTOEXTEND_PERCENT}\n"
     "}\n"
 )
 

@@ -17,12 +17,12 @@
 set -u
 set -o pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)"
 VERSIONS_FILE="$REPO_ROOT/.genesis-hook-versions"
 
 # Keep in lockstep with update_hook_versions.sh, sync-hooks.sh, and
 # check_hook_versions_complete.sh.
-TRACKED_HOOKS=(commit-msg post-commit pre-commit prepare-commit-msg pre-push)
+TRACKED_HOOKS=(commit-msg post-commit pre-commit prepare-commit-msg pre-push pre-merge-commit)
 
 # Get list of staged files (relative to repo root)
 STAGED=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || echo "")

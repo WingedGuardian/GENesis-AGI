@@ -284,7 +284,9 @@ async def _promote_live(db_path: Path | str, session_id: str, *, trigger: str) -
     mode_stopped = False
     sweep_error = False
     try:
-        async with aiosqlite.connect(str(db_path), timeout=10) as db:
+        from genesis.db.connection import connect_aiosqlite_rw
+
+        async with connect_aiosqlite_rw(db_path, timeout=10) as db:
             # Row factory is REQUIRED, not tidiness: `crud.get` builds
             # `dict(row)`, which raises on a plain tuple. That exception was
             # swallowed by refresh_mirror's best-effort `except`, so the mirror
@@ -572,10 +574,10 @@ async def _mark_run_failed(db_path: Path | str, run_id: str, note: str) -> None:
     caller has already surfaced the failure through telemetry and its outcome,
     so a miss here loses only the run-row copy of a fact recorded elsewhere.
     """
-    import aiosqlite
-
     try:
-        async with aiosqlite.connect(str(db_path), timeout=10) as db:
+        from genesis.db.connection import connect_aiosqlite_rw
+
+        async with connect_aiosqlite_rw(db_path, timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             await db.execute(
                 "UPDATE session_ledger_shadow_runs SET status = 'failed', "
@@ -593,10 +595,10 @@ async def _record_run(db_path: Path | str, **kwargs) -> bool:
     Returns False when the write demonstrably did not land (pre-migration
     tables, locked DB) — the caller must then leave the cursor alone.
     """
-    import aiosqlite
+    from genesis.db.connection import connect_aiosqlite_rw
 
     try:
-        async with aiosqlite.connect(str(db_path), timeout=10) as db:
+        async with connect_aiosqlite_rw(db_path, timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             return await shadow_crud.record_run(db, **kwargs)
     except Exception:

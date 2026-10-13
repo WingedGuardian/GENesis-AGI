@@ -9,7 +9,12 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# A relative entrypoint puts CDPATH in play, and CDPATH is not merely noise here:
+# `cd` SEARCHES it, so this capture could both collect an extra echoed line and
+# resolve into a DIFFERENT checkout entirely. Clear CDPATH inside the
+# substitution — remove the cause rather than the symptom. stderr stays visible
+# so a genuine cd failure still speaks.
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # HOME may be unset in some container environments; derive from passwd (uid,
@@ -25,22 +30,77 @@ echo "=== Genesis Bootstrap ==="
 echo "Genesis root: $GENESIS_ROOT"
 echo
 
-# ── Live-system guard — BEFORE anything mutating (incl. the crash-recovery
-# block below, whose git reset --hard is also unsafe on a live system).
+# ── Live-system guard — BEFORE anything mutating, including crash recovery.
 # update.sh opts out via GENESIS_BOOTSTRAP_ALLOW_LIVE=1; humans use --force.
 # shellcheck source=lib/live_system_guard.sh
 . "$SCRIPT_DIR/lib/live_system_guard.sh"
 bootstrap_refuse_if_server_live "$@" || exit 3
 
-# ── Crash recovery: check for interrupted update ─────────
+# shellcheck source=lib/deploy_marker.sh
+. "$SCRIPT_DIR/lib/deploy_marker.sh"
+# shellcheck source=lib/deploy_checkout.sh
+. "$SCRIPT_DIR/lib/deploy_checkout.sh"
+# shellcheck source=lib/deploy_recovery.sh
+. "$SCRIPT_DIR/lib/deploy_recovery.sh"
+
+# BEGIN crash-recovery
 UPDATE_STATE="$HOME/.genesis/update_state.json"
+_crash_recovery_refuse() {
+    local _reason="$1" _current_branch _current_head
+    _current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+    _current_head="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null || true)"
+    echo "  REFUSE: $_reason." >&2
+    echo "  Current branch/HEAD: ${_current_branch:-<detached>} @ ${_current_head:-<unreadable>}; rollback tag: ${ROLLBACK_TAG:-<missing>} @ ${rb_commit:-<unresolved>}." >&2
+    echo "  Resolve the checkout, then re-run scripts/bootstrap.sh; or finish forward with scripts/update.sh --post-merge; or remove ~/.genesis/update_state.json once decided." >&2
+    exit 1
+}
+
 if [ -f "$UPDATE_STATE" ]; then
     echo "--- Detected interrupted update state file ---"
-    # Read phase and PID from state file
-    STATE_PHASE=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('phase','unknown'))" 2>/dev/null || echo "unknown")
-    STATE_PID=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('pid',0))" 2>/dev/null || echo "0")
+    ROLLBACK_TAG=""
+    rb_commit=""
+    if ! _state_fields="$(python3 - "$UPDATE_STATE" 2>/dev/null <<'PY'
+import json
+import sys
 
-    # Check if the update process is still alive
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        state = json.load(f)
+    if not isinstance(state, dict):
+        raise ValueError("state is not an object")
+    def text_field(key, default=""):
+        value = state.get(key, default)
+        if not isinstance(value, str):
+            raise ValueError(f"{key} is not a string")
+        return value
+    pid = state.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        raise ValueError("pid is not an integer")
+    fields = [
+        text_field("phase", "unknown"),
+        str(pid),
+        text_field("rollback_tag"),
+        text_field("original_branch"),
+        text_field("own_head"),
+        text_field("deploy_head"),
+        "1" if "original_branch" in state else "0",
+    ]
+    if any(ord(char) < 0x20 for value in fields for char in value):
+        raise ValueError("control character in state field")
+    print("\x1f".join(fields))
+except Exception:
+    sys.exit(1)
+PY
+)"; then
+        _crash_recovery_refuse "update state is unreadable"
+    fi
+    IFS=$'\x1f' read -r STATE_PHASE STATE_PID ROLLBACK_TAG ORIGINAL_BRANCH OWN_HEAD DEPLOY_HEAD ORIGINAL_BRANCH_PRESENT \
+        <<< "$_state_fields"
+
+    # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
+    # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
+    # zombie or reused pid: the "dead" branch below resets the tree, so here a
+    # stale holder must err toward "still running", never toward the reset.
     if [ "$STATE_PID" -gt 1 ] 2>/dev/null && kill -0 "$STATE_PID" 2>/dev/null; then
         echo "  Update process (pid $STATE_PID) still running in phase '$STATE_PHASE' — not interfering."
     elif [ "$STATE_PHASE" = "done" ]; then
@@ -48,34 +108,129 @@ if [ -f "$UPDATE_STATE" ]; then
         rm -f "$UPDATE_STATE"
     else
         echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID is dead)."
+        if [ -z "$ROLLBACK_TAG" ] || ! git -C "$GENESIS_ROOT" check-ref-format "refs/tags/$ROLLBACK_TAG" >/dev/null 2>&1; then
+            _crash_recovery_refuse "no valid rollback tag is recorded"
+        fi
+        rb_commit="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "refs/tags/$ROLLBACK_TAG^{commit}" 2>/dev/null)" \
+            || _crash_recovery_refuse "rollback tag $ROLLBACK_TAG cannot be resolved to a commit"
 
-        # Abort any in-progress merge
-        if [ -f "$GENESIS_ROOT/.git/MERGE_HEAD" ]; then
-            echo "  Aborting in-progress merge..."
-            git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+        current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+        if [ "$ORIGINAL_BRANCH_PRESENT" = "1" ]; then
+            [ -n "$ORIGINAL_BRANCH" ] || _crash_recovery_refuse "the recorded original branch is empty"
+            recovery_branch="$ORIGINAL_BRANCH"
+        else
+            recovery_branch="$current_branch"
         fi
 
-        # Read rollback tag from state file
-        ROLLBACK_TAG=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('rollback_tag',''))" 2>/dev/null || echo "")
+        # update.sh aborts its own conflicted merges before exiting, so a
+        # remaining MERGE_HEAD means a kill mid-merge or an external merge.
+        # Aborting can discard subsequent work; leave that decision to the operator.
+        recovery_git_dir="$(git -C "$GENESIS_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" \
+            || _crash_recovery_refuse "cannot read the git directory"
+        if [ -e "$recovery_git_dir/MERGE_HEAD" ]; then
+            _crash_recovery_refuse "a merge is in progress; save any edits you want to keep, run git -C \"$GENESIS_ROOT\" merge --abort yourself, then re-run scripts/bootstrap.sh"
+        fi
 
-        if [ -n "$ROLLBACK_TAG" ] && git -C "$GENESIS_ROOT" rev-parse "$ROLLBACK_TAG" >/dev/null 2>&1; then
-            echo "  Rolling back to $ROLLBACK_TAG..."
-            git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1 || true
-            echo "  Rollback complete."
+        # The state does not say whether migrations ran or which database
+        # snapshot matches, so neither a code rollback nor clearing the state is
+        # safe once the update reached them. This comes before the "already at
+        # the tag" branch: a no-delta update still runs activation when tier-2
+        # work is pending, so it reaches these phases with HEAD at the tag.
+        case "$STATE_PHASE" in
+            migrations|health_check)
+                _crash_recovery_refuse "the update died in phase '$STATE_PHASE', after its database migrations may have run; the code was left in place with the database it may have migrated (restore data/genesis.db.pre-update by hand only together with the old code)"
+                ;;
+            fetching|merging|bootstrap) ;;
+            *)
+                # update.sh writes only the phases above (and done, handled
+                # earlier); anything else is a hand edit or another version.
+                _crash_recovery_refuse "unknown update phase '$STATE_PHASE'"
+                ;;
+        esac
+
+        if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$recovery_branch"; then
+            # In the merging phase, a dirty checkout at the tag is what a
+            # fast-forward killed mid-write leaves: HEAD unmoved, files half
+            # new. update.sh treats that state as CRITICAL; installing over it
+            # would run half-written code, so refuse and keep the state file.
+            # Every tracked path counts here, the ephemeral allowlist included:
+            # the merge writes those too, and the deployability predicate below
+            # skips them. git status cannot see a file whose index entry is
+            # flagged skip-worktree or assume-unchanged, so the lib's hidden-edit
+            # scan runs as well.
+            if [ "$STATE_PHASE" = "merging" ]; then
+                merge_dirty="" merge_hidden=""
+                if ! merge_dirty="$(git -C "$GENESIS_ROOT" status --porcelain --untracked-files=no --no-renames 2>/dev/null)"; then
+                    merge_dirty="(status unreadable)"
+                fi
+                if ! merge_hidden="$(_genesis_hidden_dirty_lines "$GENESIS_ROOT" 2>/dev/null)"; then
+                    merge_hidden="(flagged-entry status unreadable)"
+                fi
+                # A fast-forward killed after writing only the files the range
+                # ADDS leaves them untracked, which status cannot show. update.sh's
+                # pre-stop scan refuses a range that lands on an existing
+                # untracked path, so one present now appeared during the run.
+                merge_new=""
+                if [ -n "$DEPLOY_HEAD" ]; then
+                    collide_rc=0
+                    merge_new="$(genesis_range_collisions "$GENESIS_ROOT" "$rb_commit" "$DEPLOY_HEAD" 2>/dev/null)" \
+                        || collide_rc=$?
+                    if [ "$collide_rc" -eq 2 ]; then
+                        merge_new="(the update's incoming range cannot be listed)"
+                    fi
+                fi
+                merge_dirty="$(printf '%s\n%s\n%s\n' "$merge_dirty" "$merge_hidden" "$merge_new" | grep -v '^$' || true)"
+                if [ -n "$merge_dirty" ]; then
+                    printf '%s\n' "$merge_dirty" | sed 's/^/    /'
+                    _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but tracked files changed during the merge (a half-written update or edits by someone else)"
+                fi
+            fi
+            dirty_paths=""
+            if ! dirty_paths="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")"; then
+                dirty_paths="(status unreadable)"
+            fi
+            if [ -n "$dirty_paths" ]; then
+                echo "  WARNING: tracked paths may be an interrupted merge's files or someone's edits; nothing was reset:"
+                printf '%s\n' "$dirty_paths" | sed 's/^/    /'
+            fi
+            echo "  The checkout is already at $ROLLBACK_TAG on $recovery_branch; nothing to undo."
+        elif [ "$ORIGINAL_BRANCH_PRESENT" != "1" ]; then
+            _crash_recovery_refuse "old-format update state and the checkout has moved from its rollback tag"
         else
-            echo "  No rollback tag found — resetting to HEAD."
-            git -C "$GENESIS_ROOT" reset --hard HEAD 2>&1 || true
+            case "$STATE_PHASE" in
+                merging) ;;
+                bootstrap)
+                    # bootstrap.sh seeds the schema (create_all_tables) in this
+                    # phase, so the database may already match the merged code.
+                    _crash_recovery_refuse "the update died in phase 'bootstrap', which can change the database schema; the merged code was left in place with the database"
+                    ;;
+                *)
+                    _crash_recovery_refuse "the checkout moved while the update was in phase '$STATE_PHASE', before it could have merged"
+                    ;;
+            esac
+            # Only the exact head update.sh recorded as its own merge is undone.
+            # It records that head the moment it adopts the merge, so a checkout
+            # anywhere else (someone's commit or pull, another branch) is left.
+            genesis_checkout_unmoved "$GENESIS_ROOT" "$OWN_HEAD" "$ORIGINAL_BRANCH" \
+                || _crash_recovery_refuse "the checkout is not at the merge this update recorded as its own; refusing to change code it does not own"
+            if ! genesis_rollback_checkout \
+                "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH" "$EPHEMERAL_BACKUP_ROOT" "$rb_commit"; then
+                _crash_recovery_refuse "the non-forced rollback checkout was refused; code was left in place"
+            fi
+            echo "  Recovery checkout returned $ORIGINAL_BRANCH to $ROLLBACK_TAG."
         fi
 
         # Record crash recovery
         echo "  Recording crash recovery in update_history..."
         DB_PATH="$GENESIS_ROOT/data/genesis.db"
         if [ -f "$DB_PATH" ]; then
-            python3 -c "
+            PYTHONPATH="$GENESIS_ROOT/src" python3 -c "
 import sqlite3, uuid, json
 from datetime import datetime, timezone
+from genesis.db.integrity import assert_not_quarantined
 state = json.load(open('$UPDATE_STATE'))
 try:
+    assert_not_quarantined('$DB_PATH')
     con = sqlite3.connect('$DB_PATH', timeout=5)
     con.execute(
         'INSERT INTO update_history (id, old_tag, new_tag, old_commit, new_commit, status, '
@@ -94,10 +249,11 @@ except Exception as e:
 
         rm -f "$UPDATE_STATE"
         rm -f "$HOME/.genesis/update_in_progress.pid"
-        echo "  Crash recovery complete. Continuing bootstrap with rolled-back code."
+        echo "  Crash recovery complete. Continuing bootstrap."
         echo ""
     fi
 fi
+# END crash-recovery
 
 # --- Prerequisites ---
 echo "--- Checking and installing prerequisites ---"
@@ -271,7 +427,9 @@ else
     echo "  Git identity: $(git -C "$GENESIS_ROOT" config user.name) <$(git -C "$GENESIS_ROOT" config user.email)>"
 fi
 
-# Node.js >= 20 (required for Claude Code)
+# Node.js >= 22 (required by the pinned Claude Code release), raised to the
+# pinned GitNexus engine range (^22.18.0 || >=24.11.0) so an install does not
+# strand GitNexus on a Node its pin refuses — see scripts/lib/gitnexus_version.sh.
 _node_version_ok() {
     command -v node &>/dev/null || return 1
     local ver
@@ -280,26 +438,30 @@ _node_version_ok() {
     # caller instead of returning "not ok". Latent today (every call site is
     # `if _node_version_ok`), which is exactly how this class hides.
     ver=$(node --version 2>/dev/null | sed 's/^v//') || ver=""
-    local major="${ver%%.*}"
-    [[ "$major" -ge 20 ]] 2>/dev/null
+    local major="${ver%%.*}" minor="${ver#*.}"
+    minor="${minor%%.*}"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+    { [[ "$major" -eq 22 && "$minor" -ge 18 ]] \
+        || [[ "$major" -eq 24 && "$minor" -ge 11 ]] \
+        || [[ "$major" -gt 24 ]]; } 2>/dev/null
 }
 if ! _node_version_ok; then
     if command -v node &>/dev/null; then
-        echo "  Node.js $(node --version) is too old (need >= 20) — upgrading..."
+        echo "  Node.js $(node --version) is too old (need ^22.18.0 or >=24.11.0) — upgrading..."
     else
         echo "  Node.js not found — installing..."
     fi
     install_pkg nodejs || true
     if ! _node_version_ok; then
-        echo "  WARNING: Node.js >= 20 not available. Claude Code will not work."
-        echo "           Install via: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -"
+        echo "  WARNING: Node.js ^22.18.0 or >=24.11.0 not available. Claude Code will not work."
+        echo "           Install via: curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"
         echo "                        sudo apt-get install -y nodejs"
     fi
 fi
 if _node_version_ok; then
     echo "  Node: $(node --version)"
 else
-    echo "  Node: $(node --version 2>/dev/null || echo 'not available') (needs >= 20)"
+    echo "  Node: $(node --version 2>/dev/null || echo 'not available') (needs ^22.18.0 or >=24.11.0)"
 fi
 
 # --- Claude Code version pin (install or align to the pinned version) ---
@@ -317,15 +479,14 @@ if [ -f "$_cc_env" ]; then
     # not swallow the suppression outcome — this was the one caller with no
     # signal at all: `|| true` discarded the return code AND nothing read the
     # state, so bootstrap completed cleanly over a failed suppression check.
-    case "${CC_SUPPRESSION_STATE:-unverified}" in
-        ok|repaired) : ;;
-        *)
-            echo "  WARNING: CC auto-updater suppression not verified" \
-                 "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
-                 "the pin; the daily genesis-cc-settings-align timer will retry" \
-                 "and its unit goes red if it cannot"
-            ;;
-    esac
+    # The shared predicate (scripts/lib/cc_version.sh), never a local list of
+    # good states: a reader that did not know a new state would warn falsely.
+    if ! cc_suppression_verified; then
+        echo "  WARNING: CC auto-updater suppression not verified" \
+             "(${CC_SUPPRESSION_STATE:-unverified}) — CC may self-update past" \
+             "the pin; the daily genesis-cc-settings-align timer will retry" \
+             "and its unit goes red if it cannot"
+    fi
     cc_shadow_scan || true
 fi
 
@@ -368,38 +529,91 @@ echo "--- Installing code intelligence tools ---"
 # --skip-config: the installer's own agent-config step registers the RAW binary
 # in ~/.claude/.mcp.json, bypassing our 2G-capped launcher. We register the
 # capped wrapper below via _register_mcp, so the installer must NOT self-register.
-echo "  codebase-memory-mcp: installing/upgrading..."
-# Download-to-temp before executing: `curl … | bash` runs bytes as they stream,
-# so a mid-transfer connection drop executes a truncated script. -f fails the
-# download on a partial transfer; running from a file executes only a fully
-# downloaded installer. B9.
-_cbm_installer=$(mktemp 2>/dev/null) || _cbm_installer=""
-if [[ -n "$_cbm_installer" ]] \
-    && curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh -o "$_cbm_installer" 2>/dev/null; then
-    bash "$_cbm_installer" --ui --skip-config \
-        || echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)"
-else
-    echo "  WARNING: codebase-memory-mcp installer download failed (non-critical)"
+# The kill-switch path resolves through the ONE shared site — an override via
+# CODEBASE_MEMORY_MCP_DISABLE_FILE is honoured here the same way the launcher
+# and indexer honour it, and an UNRESOLVABLE path refuses rather than falling
+# through to an install the machine may have disabled.
+_cbm_disable=""
+if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
+    # shellcheck source=lib/cbm_disable_file.sh
+    . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
+    _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
 fi
-[[ -n "$_cbm_installer" ]] && rm -f "$_cbm_installer"
-if command -v codebase-memory-mcp &>/dev/null; then
+if [ -z "$_cbm_disable" ]; then
+    echo "  WARNING: codebase-memory-mcp kill-switch path unresolvable — refusing install (fail closed)"
+elif [ -e "$_cbm_disable" ]; then
+    echo "  codebase-memory-mcp: install/upgrade skipped (machine kill switch active: $_cbm_disable)"
+else
+    echo "  codebase-memory-mcp: installing/upgrading..."
+    # The pin, the digest and the install itself live in ONE place, shared with
+    # install.sh, so the commit and its digest cannot drift apart.
+    # shellcheck source=lib/cbm_installer.sh
+    . "$SCRIPT_DIR/lib/cbm_installer.sh"
+    _cbm_rc=0
+    genesis_cbm_install || _cbm_rc=$?
+    case "$_cbm_rc" in
+        0) ;;
+        1) echo "  WARNING: codebase-memory-mcp installer download failed (non-critical)" ;;
+        3) echo "  ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
+        4) echo "  WARNING: codebase-memory-mcp install refused — machine kill switch active" ;;
+        *) echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)" ;;
+    esac
+fi
+if [ -z "$_cbm_disable" ]; then
+    echo "  codebase-memory-mcp status probe skipped (kill-switch path unresolvable)"
+elif [ -e "$_cbm_disable" ]; then
+    echo "  codebase-memory-mcp status probe skipped (machine kill switch active)"
+elif command -v codebase-memory-mcp &>/dev/null; then
     echo "  codebase-memory-mcp: $(codebase-memory-mcp --version 2>/dev/null || echo 'installed')"
 fi
 
 # GitNexus (blast radius, impact analysis, execution flows)
-# Exact pin to 1.6.8 — only ship versions we've actually verified. 1.6.8 (stable):
-# `analyze` works; FTS degrades gracefully when the extension is absent. The prior
-# 1.6.4-rc line crashed `analyze` silently. Re-verify before bumping further.
-if _node_version_ok; then
-    if ! command -v gitnexus &>/dev/null; then
-        echo "  GitNexus not found — installing..."
-        npm install -g gitnexus@1.6.8 2>/dev/null || echo "  WARNING: GitNexus install failed (non-critical)"
-    else
-        echo "  GitNexus: ensuring pin..."
-        npm install -g gitnexus@1.6.8 2>/dev/null || echo "  WARNING: GitNexus upgrade failed (non-critical)"
+# Exact, shared pin — GitNexus index storage formats can change between
+# releases. Installing an older binary after a newer rebuild makes the
+# otherwise-healthy index unreadable. Bump only after index + query E2E.
+_GITNEXUS_PIN_READY=0
+_gitnexus_pin_file="$SCRIPT_DIR/lib/gitnexus_version.sh"
+if [ -r "$_gitnexus_pin_file" ]; then
+    # shellcheck source=lib/gitnexus_version.sh
+    if source "$_gitnexus_pin_file"; then
+        if [[ "${GENESIS_GITNEXUS_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            && declare -F genesis_gitnexus_node_supported >/dev/null \
+            && declare -F genesis_gitnexus_resolve_binary >/dev/null \
+            && declare -F genesis_gitnexus_installed_version >/dev/null \
+            && declare -F genesis_gitnexus_installed_is_pinned >/dev/null \
+            && declare -F genesis_gitnexus_ensure_pin >/dev/null; then
+            _GITNEXUS_PIN_READY=1
+        fi
     fi
-    if command -v gitnexus &>/dev/null; then
-        echo "  GitNexus: $(gitnexus --version 2>/dev/null)"
+fi
+if [ "$_GITNEXUS_PIN_READY" -ne 1 ]; then
+    echo "  WARNING: GitNexus pin metadata unavailable — GitNexus skipped (non-critical)"
+elif ! genesis_gitnexus_node_supported; then
+    echo "  WARNING: GitNexus ${GENESIS_GITNEXUS_VERSION} requires Node ^22.18.0 or >=24.11.0; found $(node --version 2>/dev/null || echo unavailable) — skipped"
+else
+    if ! genesis_gitnexus_resolve_binary >/dev/null; then
+        echo "  GitNexus not found — installing reviewed pin..."
+    else
+        echo "  GitNexus: checking reviewed pin..."
+    fi
+    if genesis_gitnexus_ensure_pin; then
+        :
+    else
+        _gitnexus_rc=$?
+        if [ "$_gitnexus_rc" -eq 2 ]; then
+            echo "  WARNING: newer GitNexus $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) left installed; refusing automatic downgrade to ${GENESIS_GITNEXUS_VERSION}"
+        elif [ "$_gitnexus_rc" -eq 3 ]; then
+            echo "  WARNING: unrecognized GitNexus version output left installed; refusing unsafe replacement with ${GENESIS_GITNEXUS_VERSION}"
+        else
+            echo "  WARNING: GitNexus install/upgrade failed (non-critical)"
+        fi
+    fi
+    if genesis_gitnexus_resolve_binary >/dev/null; then
+        if genesis_gitnexus_installed_is_pinned; then
+            echo "  GitNexus: $(genesis_gitnexus_installed_version 2>/dev/null)"
+        else
+            echo "  WARNING: stale GitNexus $(genesis_gitnexus_installed_version 2>/dev/null || echo unknown) remains on disk but will not be registered or indexed"
+        fi
     fi
 fi
 
@@ -418,14 +632,10 @@ if ! command -v uv &>/dev/null; then
     [[ -n "$_uv_installer" ]] && rm -f "$_uv_installer"
     export PATH="$HOME/.local/bin:$PATH"
 fi
+# shellcheck source=lib/serena_install.sh
+. "$SCRIPT_DIR/lib/serena_install.sh"
 if command -v uv &>/dev/null; then
-    if ! command -v serena &>/dev/null; then
-        echo "  Serena not found — installing..."
-        uv tool install serena-agent 2>/dev/null || echo "  WARNING: Serena install failed (non-critical)"
-    else
-        echo "  Serena: upgrading..."
-        uv tool upgrade serena-agent 2>/dev/null || echo "  WARNING: Serena upgrade failed (non-critical)"
-    fi
+    _install_serena
 fi
 if command -v serena &>/dev/null; then
     echo "  Serena: $(serena --version 2>/dev/null || echo 'installed')"
@@ -671,7 +881,7 @@ else
 fi
 if [[ -n "$HOOKS_DST" ]]; then
     # Phase 6: prefer sync-hooks.sh if available — it handles the
-    # full set (pre-commit, pre-push, post-commit) + helper scripts
+    # full set (HOOKS_TO_SYNC in sync-hooks.sh) + helper scripts
     # (emit_bugfix_audit.py) + version tracking via
     # .genesis-hook-versions. Legacy loop remains as a fallback for
     # very old installs that don't have sync-hooks.sh yet.
@@ -679,7 +889,7 @@ if [[ -n "$HOOKS_DST" ]]; then
         "$HOOKS_SRC/sync-hooks.sh" --quiet || echo "  WARNING: sync-hooks.sh exited non-zero (may be user-modified — leaving alone)"
         echo "  + hooks synced via sync-hooks.sh"
     else
-        for hook in pre-commit pre-push; do
+        for hook in pre-commit pre-push pre-merge-commit; do
             if [[ -f "$HOOKS_SRC/$hook" ]]; then
                 cp "$HOOKS_SRC/$hook" "$HOOKS_DST/$hook"
                 chmod +x "$HOOKS_DST/$hook"
@@ -697,22 +907,44 @@ echo "--- Registering code intelligence MCP servers ---"
 # shellcheck source=lib/mcp_register.sh
 . "$SCRIPT_DIR/lib/mcp_register.sh"
 
-if command -v gitnexus &>/dev/null; then
-    _register_mcp "gitnexus" "user" "gitnexus" "mcp"
+if [ -x "$GENESIS_ROOT/.claude/mcp/run-gitnexus" ]; then
+    _register_mcp "gitnexus" "user" "$GENESIS_ROOT/.claude/mcp/run-gitnexus" "mcp"
 fi
 if command -v codebase-memory-mcp &>/dev/null; then
     # Registered via the repo launcher (NOT the bare binary): the launcher
     # wraps the server in a systemd scope with MemoryMax to contain upstream's
     # unbounded leak (DeusData/codebase-memory-mcp#581). See
     # .claude/mcp/run-codebase-memory for the full rationale.
+    # REGISTERED EVEN WHEN THE KILL SWITCH IS ACTIVE, deliberately. Registration
+    # does not start anything, and the launcher is fail-closed on the sentinel
+    # (.claude/mcp/run-codebase-memory exits 1 with "disabled by <file>"), so
+    # writing the registration while disabled cannot run the server.
+    #
+    # Skipping preserved the exact drift this helper exists to repair: a
+    # PRE-EXISTING registration pointing at the bare `codebase-memory-mcp`
+    # binary survives untouched, bypasses the launcher entirely, and starts the
+    # uncapped raw server in the next session — and stays uncapped after the
+    # sentinel is removed until somebody runs this again.
     _register_mcp "codebase-memory-mcp" "user" "$GENESIS_ROOT/.claude/mcp/run-codebase-memory"
+    if [ -n "${_cbm_disable:-}" ] && [ -e "$_cbm_disable" ]; then
+        echo "  codebase-memory-mcp registered to the launcher; the kill switch is active, so it will refuse to start"
+    fi
 fi
-if command -v serena &>/dev/null; then
+if _serena_registration_available; then
     # `-s project` writes .mcp.json keyed to the git-root of the CURRENT dir (no
     # flag overrides this), so register from the repo root regardless of the
     # caller's cwd — else bootstrap run from elsewhere writes to the wrong repo. B5.
-    ( cd "$GENESIS_ROOT" && _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT" )
+    ( cd "$GENESIS_ROOT" && _register_serena "$GENESIS_ROOT" )
 fi
+# grep-app (grep.app) — literal/regex code search over ~1M public GitHub repos.
+# Registered as `grep-app`, NOT the `grep` that grep.app's own docs use: a name
+# Genesis owns is one whose entries it can safely heal, and it leaves an
+# operator's own `grep` server alone.
+# No API key and no local binary: it is a REMOTE server, so there is nothing to
+# gate on `command -v`. User scope so it reaches worktree sessions too, which is
+# where most work here happens; project scope would cover only the main tree.
+# Registering does not start anything and costs nothing when unused.
+_register_mcp_http "grep-app" "user" "$GENESIS_GREP_MCP_URL"
 echo
 
 # --- Code Intelligence Indexing ---
@@ -794,14 +1026,18 @@ CC_TMP_DIR="$HOME/.genesis/cc-tmp"
 mkdir -p "$CC_TMP_DIR"
 chmod 700 "$CC_TMP_DIR"
 
-# Watchgod config — 500MB budget, 150MB sacred ground
+# Watchgod config. The watchgod (scripts/tmp_watchgod.sh) guards whole
+# filesystems and measures cc-tmp's real capacity itself — statvfs plus the
+# btrfs quota on the volume — so the only thing it needs from here is where
+# cc-tmp lives. The v1 keys this block used to write (a 500 MB budget, a
+# "sacred ground", a hand-propagated volume capacity) are gone with the budget
+# they served. Install-local overrides — observe mode, thresholds, extra
+# watched paths — belong in watchgod.local.conf, which nothing regenerates.
 mkdir -p "$HOME/.genesis/config"
 cat > "$HOME/.genesis/config/watchgod.conf" <<WEOF
 CC_TMP_DIR=$CC_TMP_DIR
-CC_TMP_BUDGET_MB=500
-SACRED_GROUND_MB=150
 WEOF
-echo "  CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
+echo "  CC temp: ${CC_TMP_DIR}"
 
 echo "  ~/.genesis/ initialized"
 echo
@@ -891,22 +1127,33 @@ read -r -d '' TMUX_WRAP_BLOCK <<'WRAPEOF' || true
 # SSH or closed browser tab just detaches the session — reattach with
 # `tmux attach -t cc-N`. Opt out: GENESIS_NO_TMUX_WRAP=1.
 claude() {
-    local arg
+    local arg genesis_root=__GENESIS_ROOT__
     for arg in "$@"; do
         case "$arg" in
             -p|--print|--version|-v|--help|-h) command claude "$@"; return $? ;;
         esac
     done
     if [ -t 0 ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ -z "${GENESIS_NO_TMUX_WRAP:-}" ] \
-        && [ -x "$HOME/genesis/scripts/cc-slot.sh" ] \
+        && [ -x "$genesis_root/scripts/cc-slot.sh" ] \
         && command -v tmux >/dev/null 2>&1; then
-        "$HOME/genesis/scripts/cc-slot.sh" manual "$@"
+        "$genesis_root/scripts/cc-slot.sh" manual "$@"
     else
         command claude "$@"
     fi
 }
 # <<< genesis tmux-wrap <<<
 WRAPEOF
+_tmux_wrap_root=$(printf '%q' "$GENESIS_ROOT")
+_tmux_wrap_patsub_replacement_was_set=0
+if shopt -q patsub_replacement 2>/dev/null; then
+    _tmux_wrap_patsub_replacement_was_set=1
+    shopt -u patsub_replacement
+fi
+TMUX_WRAP_BLOCK="${TMUX_WRAP_BLOCK//__GENESIS_ROOT__/${_tmux_wrap_root}}"
+if [ "$_tmux_wrap_patsub_replacement_was_set" -eq 1 ]; then
+    shopt -s patsub_replacement
+fi
+unset _tmux_wrap_root _tmux_wrap_patsub_replacement_was_set
 touch "$BASHRC"
 if grep -qF "# >>> genesis tmux-wrap >>>" "$BASHRC" 2>/dev/null; then
     # Replace the existing block in place (idempotent update path). Capture the
@@ -1012,7 +1259,7 @@ else
 fi
 echo
 
-# --- Network resilience (KeepConfiguration + networkd watchdog) ---
+# --- Network resilience (KeepConfiguration + networkd and Tailscale watchdogs) ---
 # Same guarded-source contract as memory resilience: a partial checkout without
 # the lib degrades to a warning, never aborts bootstrap under set -e.
 if [[ -f "$SCRIPT_DIR/lib/network_resilience.sh" ]]; then
@@ -1021,6 +1268,24 @@ if [[ -f "$SCRIPT_DIR/lib/network_resilience.sh" ]]; then
     network_resilience_apply
 else
     echo "  WARNING: lib/network_resilience.sh missing — skipping network-resilience setup"
+fi
+echo
+
+# --- Graph engine (FalkorDB) provisioning ---
+# Same guarded-source contract as the resilience libs. Fetches and verifies the
+# engine MODULE under ~/.genesis/deps and stops there — no system change; the
+# redis-server that loads it is an operator step (SETUP.md). The unit rendered
+# below is left DISABLED, so a box where this skips entirely is fully
+# functional — the memory graph keeps using its in-process NetworkX projection.
+echo "--- Graph engine (optional) ---"
+if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
+    # shellcheck source=lib/falkordb_install.sh
+    source "$SCRIPT_DIR/lib/falkordb_install.sh"
+    falkordb_provision
+else
+    echo "  WARNING: lib/falkordb_install.sh missing — skipping graph-engine provisioning"
+    # Nothing could be verified, so an existing unit must not be re-rendered.
+    falkordb_unit_keep_existing() { [[ -f "$1" ]]; }
 fi
 echo
 
@@ -1037,29 +1302,80 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     # exits 0 when claude isn't on PATH yet, so split the pipeline and resolve
     # the real npm prefix explicitly.
     _cc_path="$(command -v claude 2>/dev/null || true)"
+    # Needed in both branches: the npm prefix's bin is where `npm install -g`
+    # (gitnexus, and claude via cc_ensure_local in scripts/lib/cc_version.sh)
+    # actually lands — nvm's bin after an nvm fallback, ~/.npm-global, or a
+    # system prefix. A pinned claude already on PATH (e.g. /usr/local/bin)
+    # resolves `command -v` while GitNexus lands in the nvm bin; rendering only
+    # claude's dir would leave it invisible to the units. Same empty/`/usr`
+    # guards as install.sh; hardcoding ~/.npm-global would miss nvm.
+    _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
+    [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
+    [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
     if [[ -n "$_cc_path" ]]; then
         CC_BIN_DIR="$(dirname "$_cc_path")"
     else
-        # claude not yet on PATH (units render before CC installs). Point at
-        # wherever cc_ensure_local (scripts/lib/cc_version.sh) will `npm install
-        # -g` it: its target is `$(npm config get prefix)/bin` (nvm bin,
-        # ~/.npm-global, or a system prefix) with the same empty/`/usr` guards.
-        # Hardcoding ~/.npm-global would miss an nvm-based Node install.
-        _cc_prefix="$(npm config get prefix 2>/dev/null || true)"
-        [ -n "$_cc_prefix" ] || _cc_prefix="/usr/local"
-        [ "$_cc_prefix" = "/usr" ] && _cc_prefix="/usr/local"
         CC_BIN_DIR="$_cc_prefix/bin"
     fi
+    if [[ "$_cc_prefix/bin" != "$CC_BIN_DIR" ]]; then
+        CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
+    fi
 
-    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
+    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template "$SYSTEMD_TEMPLATE_DIR"/*.slice.template; do
         [[ -f "$template" ]] || continue
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
-        rendered=$(sed -e "s|__HOME__|$HOME|g" \
-                       -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \
-                       -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
-                       -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
+        # The graph engine's unit only advances to a module that is verified on
+        # disk. Provisioning above returns 0 when it skips or fails, so without
+        # this a failed or unpinned provision would point a working unit at a
+        # missing .so, breaking the engine at its next restart.
+        if [[ "$svc_name" == "genesis-falkordb.service" ]] \
+            && falkordb_unit_keep_existing "$target"; then
+            # Keeping the unit does not keep its module: provisioning removes (or,
+            # failing that, de-executes) a cached module it cannot authenticate,
+            # which may be the very file this unit loads. Say which one this is.
+            _kept_module="$(falkordb_unit_loaded_module "$target" 2>/dev/null || true)"
+            if [[ -n "$_kept_module" && ! -x "$_kept_module" ]]; then
+                echo "  WARNING: kept $svc_name, but the module it loads is missing or not executable ($_kept_module):"
+                echo "           the engine will not start until bootstrap verifies a module."
+            else
+                echo "  Kept: $svc_name (FalkorDB module ${FALKORDB_VERSION:-unknown} not verified on disk; unit not re-rendered)"
+            fi
+            continue
+        fi
+        # Escape every replacement for the `s|...|...|` grammar (`\`, `&`, `|`)
+        # the same way install.sh's renderer does: a `&` in $HOME or a `|` in an
+        # overridden FALKORDB_VERSION would corrupt the expression or make sed
+        # fail outright, and a failing render aborts bootstrap — the UPDATE
+        # path — under set -e.
+        _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+        _home_esc=$(_sed_repl_esc "$HOME")
+        _venv_esc=$(_sed_repl_esc "$GENESIS_ROOT/.venv")
+        _repo_esc=$(_sed_repl_esc "$GENESIS_ROOT")
+        _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
+        # Every token any template uses must appear here, and `sed` will NOT
+        # tell you when one is missing — an unknown `__TOKEN__` passes through
+        # verbatim into a unit that then installs and enables reporting success.
+        # __AZ_ROOT__ is the instance that proves it: install.sh gained the
+        # expression, this loop never did, and agent-zero.service rendered here
+        # with a literal `WorkingDirectory=__AZ_ROOT__` (MEASURED on a live
+        # install). Parity with install.sh is pinned by
+        # tests/test_scripts/test_systemd_template_placeholders.py.
+        _az_root_esc=$(_sed_repl_esc "${AZ_ROOT:-$HOME/agent-zero}")
+        # FALKORDB_VERSION is set by lib/falkordb_install.sh, sourced just above (the
+        # source of truth for the pin); the literal fallback keeps the render
+        # working when that lib is absent, in which case the unit is inert
+        # anyway because no module was installed.
+        _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
+        _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
+        rendered=$(sed -e "s|__HOME__|$_home_esc|g" \
+                       -e "s|__VENV__|$_venv_esc|g" \
+                       -e "s|__REPO_DIR__|$_repo_esc|g" \
+                       -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
+                       -e "s|__AZ_ROOT__|$_az_root_esc|g" \
+                       -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
+                       -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")
@@ -1082,6 +1398,19 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
     if [[ "$SERVICES_UPDATED" = "1" ]]; then
         echo "  systemd daemon reloaded (units changed)"
+    fi
+
+    # A user manager stops at logout without lingering, taking every enabled
+    # timer with it — `Persistent=true` only replays the miss once the manager
+    # next starts, which for a daily watcher may be never. Mirror install.sh.
+    if command -v loginctl &>/dev/null; then
+        if ! loginctl show-user "$(whoami)" 2>/dev/null | grep -q "Linger=yes"; then
+            if loginctl enable-linger "$(whoami)" 2>/dev/null; then
+                echo "  + linger enabled for $(whoami)"
+            else
+                echo "  WARNING: could not enable linger (timers stop on logout)"
+            fi
+        fi
     fi
 
     # Enable + start every rendered timer (idempotent), EXCEPT timers that are a

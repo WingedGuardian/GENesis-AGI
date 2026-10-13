@@ -1,15 +1,14 @@
-"""Tests for the idle-aware process reaper.
+"""Global discovery is observation-only, including legacy operator arms.
 
-Covers the pure classifier, the dry-run/armed orchestrator, the manual
-operator-arm switch (state flag + env, with the hard kill-switch override),
-non-claude age paths, marker GC, protected PIDs, and job wiring. The
-2026-07-11 incident (interactive claude sessions killed purely on 7d age)
-is the regression these lock down.
+Tests retain candidate filtering, audit, marker liveness and scheduling coverage.
+All CLI/browser trees must survive discovery; owned launchers cancel their own jobs.
 """
 
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -187,10 +186,10 @@ def _patch_io(
     monkeypatch.setattr(pr, "_live_ttys", fake_live)
     monkeypatch.setattr(pr, "_get_descendants", fake_desc)
     monkeypatch.setattr(pr, "_gc_markers", lambda live: gc_calls.append(set(live)))
-    monkeypatch.setattr(pr, "_signal", lambda pid, s: signals.append((pid, s)))
+    monkeypatch.setattr(pr.os, "kill", lambda pid, s: signals.append((pid, s)))
+    monkeypatch.setattr(signal, "pidfd_send_signal", lambda fd, s, *args: signals.append((fd, s)))
     monkeypatch.setattr(pr, "_load_state", lambda: dict(state or {}))
     monkeypatch.setattr(pr, "_save_state", fake_save)
-    monkeypatch.setattr(pr, "_KILL_GRACE_SECS", 0)
     monkeypatch.delenv(pr._ENV_HARD_DISABLE, raising=False)
     monkeypatch.delenv(pr._ENV_ARM, raising=False)
     return signals, saved, gc_calls
@@ -219,11 +218,11 @@ async def test_dry_run_never_signals(monkeypatch, caplog):
 
     assert signals == []  # dry-run never signals
     assert captured == {"dry_run": True, "count": 1}
-    assert "WOULD KILL pid 900001" in caplog.text
+    assert "OBSERVE ONLY: pid 900001" in caplog.text
     assert rt.successes == ["process_reaper"]
 
 
-async def test_armed_kills_detached_claude_tree(monkeypatch):
+async def test_legacy_arm_only_observes_detached_claude_tree(monkeypatch):
     signals, _, _ = _patch_io(
         monkeypatch,
         pids_by_pattern={"claude": [900001]},
@@ -236,9 +235,7 @@ async def test_armed_kills_detached_claude_tree(monkeypatch):
     )
     rt = _FakeRT()
     await run_reaper(rt, now=_NOW)
-    # SIGTERM (15) then SIGKILL (9) for both tree members.
-    assert (900001, 15) in signals and (900002, 15) in signals
-    assert (900001, 9) in signals and (900002, 9) in signals
+    assert signals == []  # an arm flag does not prove tree ownership
     assert rt.successes == ["process_reaper"]
 
 
@@ -272,7 +269,7 @@ async def test_armed_spares_live_tty_claude(monkeypatch):
     assert signals == []
 
 
-async def test_non_claude_reaped_by_age(monkeypatch):
+async def test_opencode_age_only_observes(monkeypatch):
     signals, _, _ = _patch_io(
         monkeypatch,
         pids_by_pattern={"opencode-ai": [900010, 900011]},
@@ -281,9 +278,8 @@ async def test_non_claude_reaped_by_age(monkeypatch):
     )
     rt = _FakeRT()
     await run_reaper(rt, now=_NOW)
-    killed = {pid for pid, _ in signals}
-    assert 900010 in killed  # >24h
-    assert 900011 not in killed  # <24h
+    assert signals == []
+    assert rt.successes == ["process_reaper"]
 
 
 async def test_protected_pid_never_signalled(monkeypatch):
@@ -351,8 +347,8 @@ async def test_env_arm_non_affirmative_does_not_arm(monkeypatch):
         assert signals == [], f"value {val!r} wrongly armed the reaper"
 
 
-async def test_env_arm_kills_detached_claude(monkeypatch):
-    """Arming via GENESIS_REAPER_ARMED (no state flag) reaps a detached idle claude."""
+async def test_env_arm_only_observes_detached_claude(monkeypatch):
+    """Legacy environment arming cannot authorize a global process signal."""
     signals, _, _ = _patch_io(
         monkeypatch,
         pids_by_pattern={"claude": [900001]},
@@ -366,7 +362,79 @@ async def test_env_arm_kills_detached_claude(monkeypatch):
     monkeypatch.setenv(pr._ENV_ARM, "1")  # …armed via env
     rt = _FakeRT()
     await run_reaper(rt, now=_NOW)
-    assert (900001, 15) in signals and (900001, 9) in signals
+    assert signals == []
+
+
+@pytest.mark.parametrize("pattern", ["claude", "codex", "opencode", "opencode-ai"])
+@pytest.mark.parametrize("arm", ["state", "env", "both"])
+async def test_every_cli_tree_is_observation_only(monkeypatch, pattern, arm):
+    signals, _, _ = _patch_io(
+        monkeypatch,
+        pids_by_pattern={pattern: [900001]},
+        ages={900001: 30 * _DAY},
+        descendants={900001: [900002, 900003]},
+        state={"armed_by_operator": True} if arm in {"state", "both"} else {},
+    )
+    if arm in {"env", "both"}:
+        monkeypatch.setenv(pr._ENV_ARM, "true")
+    observed = []
+
+    async def record(rt, candidates, *, dry_run):
+        observed.extend(candidates)
+        assert dry_run is True
+
+    monkeypatch.setattr(pr, "_record_observation", record)
+    await run_reaper(_FakeRT(), now=_NOW)
+    assert signals == []
+    assert observed and observed[0][4] == [900002, 900003, 900001]
+
+
+async def test_browser_tree_is_observation_only_when_armed(monkeypatch):
+    from genesis.browser.types import BROWSER_PGREP_PATTERNS
+
+    signals, _, _ = _patch_io(
+        monkeypatch,
+        pids_by_pattern={BROWSER_PGREP_PATTERNS[0]: [900010]},
+        ages={900010: 30 * _DAY},
+        descendants={900010: [900011]},
+        state={"armed_by_operator": True},
+    )
+    await run_reaper(_FakeRT(), now=_NOW)
+    assert signals == []
+
+
+def test_marker_gc_spares_live_process_not_in_name_inventory(tmp_path, monkeypatch):
+    monkeypatch.setattr(pr, "_MARKER_DIR", tmp_path)
+    marker = tmp_path / str(os.getpid())
+    marker.write_text("live activity")
+    pr._gc_markers(set())
+    assert marker.exists()
+
+
+def test_malformed_legacy_state_has_no_arm_authority(tmp_path, monkeypatch):
+    monkeypatch.setattr(pr, "_STATE_PATH", tmp_path / "reaper_state.json")
+    pr._STATE_PATH.write_text('["armed_by_operator"]')
+    assert pr._load_state() == {}
+
+
+async def test_real_candidate_survives_legacy_arm(monkeypatch):
+    native_kill = os.kill
+    with subprocess.Popen(["sleep", "30"]) as child:
+        try:
+            _patch_io(
+                monkeypatch,
+                pids_by_pattern={"claude": [child.pid]},
+                ages={child.pid: 30 * _DAY},
+                state={"armed_by_operator": True},
+            )
+            # Actual signal transport for this test: a mocked kill would make
+            # survival vacuous. Only the owned sleep child is a candidate.
+            monkeypatch.setattr(pr.os, "kill", native_kill)
+            await run_reaper(_FakeRT(), now=_NOW)
+            assert child.poll() is None
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
 
 
 async def test_hard_disable_overrides_operator_arm(monkeypatch):
@@ -387,17 +455,13 @@ async def test_hard_disable_overrides_operator_arm(monkeypatch):
     assert signals == []  # kill-switch wins over the arm flag
 
 
-def test_set_operator_armed_roundtrip(tmp_path, monkeypatch):
-    """set_operator_armed flips the persisted flag; _operator_armed reflects it."""
+def test_legacy_arm_can_be_cleared_but_not_enabled(tmp_path, monkeypatch):
     monkeypatch.setattr(pr, "_STATE_PATH", tmp_path / "reaper_state.json")
-    monkeypatch.delenv(pr._ENV_ARM, raising=False)
-    assert pr._operator_armed(pr._load_state()) is False  # default: dry-run
-    pr.set_operator_armed(True)
-    assert pr._load_state().get("armed_by_operator") is True
-    assert pr._operator_armed(pr._load_state()) is True
+    pr._STATE_PATH.write_text('{"armed_by_operator": true, "other": 7}')
+    with pytest.raises(ValueError, match="observation-only"):
+        pr.set_operator_armed(True)
     pr.set_operator_armed(False)
-    assert "armed_by_operator" not in pr._load_state()
-    assert pr._operator_armed(pr._load_state()) is False
+    assert pr._load_state() == {"other": 7}
 
 
 async def test_job_failure_recorded(monkeypatch):

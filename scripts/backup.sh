@@ -26,7 +26,14 @@
 #                                up to the same NAS, or their GFS prunes delete
 #                                each other's snapshots. Read symmetrically by
 #                                restore.sh to locate the source snapshot dir.
+#   GENESIS_BACKUP_EXTRA_DIRS  — ':'-separated directories under $HOME (`~/` ok) to
+#                                keep as encrypted, off-site-only tar archives
+#                                (§6f). Unset = none. Restored by restore.sh §4c.
+#   GENESIS_BACKUP_EXTRA_EXCLUDES — ':'-separated names excluded at any depth from
+#                                those archives, on top of the built-in rebuildable
+#                                caches (.venv, node_modules, __pycache__, …).
 set -euo pipefail
+umask 077
 
 # Resolve HOME when unset: stripped-env/systemd/sandbox invocations can leave
 # HOME unset, which under `set -u` aborts at the first ${HOME} use. Fall back
@@ -40,7 +47,7 @@ fi
 
 # Pluggable Tier-2 (off-site) backend interface — selects none/local/smb at runtime
 # (backward-compat: a configured GENESIS_BACKUP_NAS with no selector → smb).
-_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/backup_backends.sh
 source "$_SCRIPT_DIR/lib/backup_backends.sh"
 # Durable alert queue (F.3): if a Telegram alert can't send, persist it so the
@@ -71,24 +78,58 @@ fi
 # pre-deploy backup while update.sh prints "Backup complete".
 # shellcheck source=scripts/lib/dr_lock.sh
 source "$_SCRIPT_DIR/lib/dr_lock.sh"
+_GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
+_STATUS_FILE="$_GENESIS_HOME/backup_status.json"
+_RUN_ID="${GENESIS_BACKUP_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+_TRIGGER="${GENESIS_BACKUP_TRIGGER:-timer}"
 dr_lock_open
 if ! flock -n "$DR_LOCK_FD"; then
     _holder="$(cat "$DR_LOCK_FILE" 2>/dev/null || true)"
+    if [ "$_TRIGGER" = "update" ]; then
+        mkdir -p "$(dirname "$_STATUS_FILE")"
+        _safe_holder=$(printf '%s' "${_holder:-unknown}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g')
+        cat > "$_STATUS_FILE" <<STATUSEOF
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":false,"sqlite_lines":0,"failure_reason":"backup-restore lock held by $_safe_holder","failure_class":"db_integrity","failure_stage":"lock_busy","db_integrity_status":"indeterminate","sqlite_backup_verified":false,"tier2_status":"unknown","tier2_backend":"none","tier1_pushed":false}
+STATUSEOF
+        echo "[genesis-backup] $(date -Iseconds) FAILED: backup-restore lock held by ${_holder:-unknown} — update backup not run" >&2
+        exit 73
+    fi
     echo "[genesis-backup] $(date -Iseconds) SKIPPED: backup-restore lock held by ${_holder:-unknown} — backup not run"
     exit 0
 fi
 dr_lock_stamp backup
 
 # ── Status tracking ──────────────────────────────────────────────────
-_STATUS_FILE="$HOME/.genesis/backup_status.json"
 _STARTED_AT=$(date +%s)
 _SQLITE_LINES=0
 _QDRANT_COUNT=0
 _TRANSCRIPT_COUNT=0
 _MEMORY_COUNT=0
+_EXTRA_SKIP_LABELS=()  # declared before the EXIT trap can fire: its status write reads it
+_EXTRA_PARTIAL_LABELS=()
+# What this run's off-site alert block actually ANNOUNCED (or carried forward from a
+# run that did). A run that dies before the alert block records nothing announced, so
+# the next run alerts instead of assuming the earlier one did.
+_ALERTED_CORE=false
+_ALERTED_GAP=""
+# A short fingerprint of WHICH listed directories this run left out (empty when none),
+# so the off-site alert re-fires when a different directory goes missing.
+_extras_gap_fingerprint() {
+    declare -p _EXTRA_SKIP_LABELS _EXTRA_PARTIAL_LABELS >/dev/null 2>&1 || return 0
+    [ $((${#_EXTRA_SKIP_LABELS[@]} + ${#_EXTRA_PARTIAL_LABELS[@]})) -gt 0 ] || return 0
+    local _l
+    {
+        for _l in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do printf 'skipped %s\n' "$_l"; done
+        for _l in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do printf 'partial %s\n' "$_l"; done
+    } | LC_ALL=C sort -u | sha1sum | cut -c1-12
+}
 _SECRETS_OK=false
 _SUCCESS=false
 _FAILURE_REASON=""
+_FAILURE_CLASS="none"
+_FAILURE_STAGE=""
+_DB_INTEGRITY_STATUS="indeterminate"
+_SQLITE_BACKUP_VERIFIED=false
 # SF3 freshness tracking: only payloads regenerated THIS run may enter the
 # off-site dated snapshot — a leftover .gpg from a prior run must never be
 # re-badged under a fresh COMPLETE stamp (it silently misrepresents recency,
@@ -99,6 +140,9 @@ _SQL_ESCROW_DRIFT=false # env-decryptable but escrow stale → off-site DR degra
 _QDRANT_FRESH=""    # space-separated collections snapshotted+encrypted this run
 _QDRANT_FAILED=""   # collections that EXIST (HTTP 200) but failed to snapshot this run
 _SQL_TMP=""         # plaintext ~269MB dump temp — trap-cleaned (N2, credential-bearing)
+_SQL_ARTIFACT_TMP="" # encrypted candidate — promoted only after round-trip verification
+_SQL_VERIFY_TMP=""   # decrypted candidate used for exact restore validation
+_VERIFY_DB=""         # imported verification DB and sidecars — trap-cleaned
 # Tier-1 replication: true once the local repo is in sync with the GitHub remote.
 _TIER1_PUSHED=false
 # Off-site snapshot bookkeeping. _T2_SNAPSHOT_COUNT / _T2_PRUNED stay UNSET until
@@ -116,9 +160,17 @@ _write_status() {
     # offsite_confirmed: true only when the off-site copy fully succeeded.
     local _offsite_confirmed=false
     if [ "${_T2_STATUS:-}" = "ok" ]; then _offsite_confirmed=true; fi
+    # Separate signals so a chronic opt-in extras gap can never mask (or be masked
+    # by) a real off-site failure in the alert dedup below.
+    local _offsite_core_complete=false _extras_complete=true _extras_gap
+    _extras_gap="$(_extras_gap_fingerprint)"
+    if [ "${_T2_STATUS:-}" = "ok" ] || [ "${_T2_EXTRAS_ONLY_PARTIAL:-false}" = true ]; then
+        _offsite_core_complete=true
+    fi
+    if [ $((${_EXTRA_SKIPPED:-0} + ${_EXTRA_UPLOAD_FAILED:-0} + ${_EXTRA_PARTIAL:-0})) -gt 0 ]; then _extras_complete=false; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -157,7 +209,11 @@ _on_exit() {
     backend_cleanup || true
     # N2: the credential-bearing plaintext SQL dump must not outlive the script
     # if it died mid-section (before its inline rm).
-    rm -f "${_SQL_TMP:-}" 2>/dev/null || true
+    rm -f "${_SQL_TMP:-}" "${_SQL_ARTIFACT_TMP:-}" "${_SQL_VERIFY_TMP:-}" 2>/dev/null || true
+    rm -f "${_EXTRA_TAR_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f plaintext tar + its file-name diagnostics
+    if [ -n "${_VERIFY_DB:-}" ]; then
+        rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
+    fi
     return 0
 }
 trap _on_exit EXIT
@@ -168,6 +224,8 @@ BACKUP_DIR="$HOME/backups/genesis-backups"
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
+# shellcheck source=scripts/lib/backup_core_paths.sh
+source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-backup]"
@@ -208,8 +266,9 @@ _send_telegram() {
 }
 
 # Large intermediate files (the multi-hundred-MB SQLite .dump) must NOT land in the
-# inherited TMPDIR: for a CC-launched run that is ~/.genesis/cc-tmp (the watchgod-policed
-# "oxygen" folder — filling it kills CC sessions); for the 6h timer unit it is /tmp (tmpfs/RAM).
+# inherited TMPDIR: for a CC-launched run that is ~/.genesis/cc-tmp (the quota-capped
+# "oxygen" volume — filling it breaks every CC session's temp); for the 6h timer unit
+# it is /tmp (often tmpfs/RAM).
 # Route them to a dedicated on-disk dir, per the tmp_filesystem_limit procedure ("use ~/tmp
 # for large temporary files"). We do NOT export TMPDIR — only the big files move; everything
 # else (and Claude Code) keeps its normal TMPDIR.
@@ -225,22 +284,20 @@ log "big-temp dir: $GENESIS_BIG_TMP"
 # to a private repo is not acceptable).
 _BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
 _ENCRYPT_READY=false
+if [ -f "$SECRETS_FILE" ] && ! backup_passphrase_file_valid "$SECRETS_FILE"; then
+    die "Backup secrets file is unreadable or contains NUL"
+fi
 if [ -n "$_BACKUP_PASSPHRASE" ]; then
+    backup_passphrase_valid "$_BACKUP_PASSPHRASE" || die "Backup passphrase must be a single line without a terminator"
     _ENCRYPT_READY=true
 fi
-
-# encrypt_stdin <output_path> — read plaintext from stdin, write <output_path>.
-encrypt_stdin() {
-    local out="$1"
-    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
-        --symmetric --cipher-algo AES256 -o "$out" 2>/dev/null
-}
 
 # encrypt_file <src> <dst> — encrypt file contents to <dst> (e.g. *.gpg).
 encrypt_file() {
     local src="$1"
     local dst="$2"
-    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
+    backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
+    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --no-symkey-cache --passphrase-fd 0 \
         --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
 }
 
@@ -252,25 +309,39 @@ encrypt_file() {
 _GIT_NET_TIMEOUT="${GENESIS_BACKUP_GIT_TIMEOUT:-300}"
 _git_net() { timeout -k 10 "$_GIT_NET_TIMEOUT" git "$@"; }
 
-# _roundtrip_ok <passphrase> <artifact.gpg> [stderr_file] — decrypt-verify that
-# <artifact.gpg> decrypts with <passphrase> AND ends with the sqlite `.dump`
-# success marker `COMMIT;` (a mid-dump failure ends `ROLLBACK; -- due to
-# errors`). Returns 0 on verified, 1 otherwise. Streams (no plaintext temp).
-# Captures the decrypt tail into a var FIRST so `grep -q` matching early can't
-# SIGPIPE `tail` and flip the pipeline non-zero under pipefail on a good dump.
+# _roundtrip_ok <passphrase> <artifact.gpg> [stderr_file] — prove that the exact
+# encrypted candidate decrypts, imports into a new database, and passes full
+# integrity, foreign-key, and non-empty-schema checks.  Checking only the live
+# source before `.dump` leaves a race; checking only the dump's COMMIT trailer
+# misses broken UNIQUE indexes and other logical inconsistencies.
 _roundtrip_ok() {
-    local _pass="$1" _art="$2" _errf="${3:-/dev/null}" _tailf _rc _grc
-    _tailf=$(mktemp -p "$GENESIS_BIG_TMP")
-    # Real pipeline (NOT inside $()) so PIPESTATUS reflects gpg's own exit; tail
-    # buffers to a file (not piped into grep) so nothing can SIGPIPE gpg/tail and
-    # flip the result under pipefail. tail -5 reads to EOF, so gpg always runs
-    # fully and its exit at PIPESTATUS[1] (printf=0, gpg=1, tail=2) is authoritative.
-    printf '%s' "$_pass" | gpg --batch --passphrase-fd 0 -d "$_art" 2>"$_errf" | tail -5 > "$_tailf"
-    _rc=${PIPESTATUS[1]}
-    if [ "$_rc" -ne 0 ]; then rm -f "$_tailf"; return 1; fi
-    grep -q '^COMMIT;' "$_tailf"; _grc=$?
-    rm -f "$_tailf"
-    return "$_grc"
+    local _pass="$1" _art="$2" _errf="${3:-/dev/null}" _gpg_rc _sqlite_rc _ic _fk _schema
+    backup_passphrase_valid "$_pass" || return 1
+    _VERIFY_DB=$(mktemp -p "$GENESIS_BIG_TMP")
+    rm -f "$_VERIFY_DB"
+    _SQL_VERIFY_TMP=$(mktemp -p "$GENESIS_BIG_TMP")
+    printf '%s' "$_pass" | python3 \
+        "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup "$_art" "$_SQL_VERIFY_TMP" 2>"$_errf"
+    _gpg_rc=${PIPESTATUS[1]}
+    if [ "$_gpg_rc" -eq 0 ]; then
+        sqlite3 "$_VERIFY_DB" ".bail on" ".read $_SQL_VERIFY_TMP" 2>>"$_errf"
+        _sqlite_rc=$?
+    else
+        _sqlite_rc=1
+    fi
+    if [ "$_gpg_rc" -ne 0 ] || [ "$_sqlite_rc" -ne 0 ]; then
+        rm -f "$_SQL_VERIFY_TMP" "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm"
+        _SQL_VERIFY_TMP=""
+        _VERIFY_DB=""
+        return 1
+    fi
+    _ic=$(sqlite3 "$_VERIFY_DB" "PRAGMA integrity_check;" 2>>"$_errf") || _ic=""
+    _fk=$(sqlite3 "$_VERIFY_DB" "PRAGMA foreign_key_check;" 2>>"$_errf") || _fk="CHECK_FAILED"
+    _schema=$(sqlite3 "$_VERIFY_DB" "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%';" 2>>"$_errf") || _schema=0
+    rm -f "$_SQL_VERIFY_TMP" "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm"
+    _SQL_VERIFY_TMP=""
+    _VERIFY_DB=""
+    [ "$_ic" = "ok" ] && [ -z "$_fk" ] && [ "${_schema:-0}" -gt 0 ]
 }
 
 # _verify_sql_roundtrip <artifact.gpg> — classify the freshly-encrypted SQL
@@ -295,14 +366,14 @@ _verify_sql_roundtrip() {
     if [ -n "$ESCROW_PASSPHRASE" ]; then _primary="$ESCROW_PASSPHRASE"; _have_escrow=true; fi
     if _roundtrip_ok "$_primary" "$_art" "$_errf"; then
         rm -f "$_errf"
-        echo RESTORABLE
+        ROUNDTRIP_VERDICT=RESTORABLE
         return 0
     fi
     # Primary failed. If the primary WAS escrow, an env-passphrase success means
     # drift (artifact good, escrow stale); env failure means genuine corruption.
     if $_have_escrow && _roundtrip_ok "$_BACKUP_PASSPHRASE" "$_art" /dev/null; then
         rm -f "$_errf"
-        echo DRIFT
+        ROUNDTRIP_VERDICT=DRIFT
         return 0
     fi
     # Surface the gpg error, sanitized to printable ASCII: _write_status only
@@ -312,9 +383,55 @@ _verify_sql_roundtrip() {
     # or JSONDecodeError (swallowed → suppresses the very CRITICAL this raises).
     ROUNDTRIP_DETAIL=$(LC_ALL=C tr -cd '[:print:]' < "$_errf" | cut -c1-200)
     rm -f "$_errf"
-    echo CORRUPT
+    ROUNDTRIP_VERDICT=CORRUPT
     return 0
 }
+
+# Refuse before touching the backup clone or any canonical artifact.  A dump
+# can sometimes finish despite index corruption, but promoting it would erase
+# the provenance boundary between a known-good backup and a damaged source.
+DB_FILE="$GENESIS_DIR/data/genesis.db"
+if [ ! -f "$DB_FILE" ]; then
+    die "SQLite source database not found at $DB_FILE"
+fi
+_DB_CHECK_OUTPUT=""
+_DB_CHECK_RC=0
+if [ -x "$GENESIS_DIR/.venv/bin/python" ] \
+    && [ -f "$GENESIS_DIR/src/genesis/db/integrity.py" ]; then
+    _DB_CHECK_OUTPUT=$(PYTHONPATH="$GENESIS_DIR/src" \
+        "$GENESIS_DIR/.venv/bin/python" -m genesis.db.integrity check \
+        "$DB_FILE" --source backup --quarantine-on-failure 2>&1) \
+        || _DB_CHECK_RC=$?
+else
+    _DB_INTEGRITY_STATUS="indeterminate"
+    _FAILURE_CLASS="db_integrity"
+    _FAILURE_STAGE="integrity_checker_unavailable"
+    die "SQLite integrity checker unavailable — refusing to create an unverified backup"
+fi
+if [ "$_DB_CHECK_RC" -ne 0 ] || [ "$_DB_CHECK_OUTPUT" != "OK" ]; then
+    _DB_CHECK_SAFE=$(printf '%s' "${_DB_CHECK_OUTPUT:-no output}" \
+        | LC_ALL=C tr -cd '[:print:]\n' | tr '\n' ';' | cut -c1-500)
+    _DB_INTEGRITY_STATUS="indeterminate"
+    _FAILURE_CLASS="db_integrity"
+    _FAILURE_STAGE="source_integrity"
+    # A stable failure creates the durable marker. Contain every long-lived
+    # writer only when that marker exists; an identity-race result is
+    # indeterminate evidence and must not claim that a replacement was corrupt.
+    if PYTHONPATH="$GENESIS_DIR/src" "$GENESIS_DIR/.venv/bin/python" -c '
+import sys
+from genesis.db.integrity import database_is_quarantined
+raise SystemExit(0 if database_is_quarantined(sys.argv[1]) else 1)
+' "$DB_FILE"; then
+        _DB_INTEGRITY_STATUS="corrupt"
+        for _svc in genesis-server.service genesis-bridge.service; do
+            systemctl --user stop "$_svc" 2>/dev/null \
+                || log "WARNING: could not stop $_svc after DB quarantine"
+        done
+    fi
+    die "SQLite source integrity check failed — last-known-good SQL artifact and NAS snapshots preserved ($_DB_CHECK_SAFE)"
+fi
+_DB_INTEGRITY_STATUS="healthy"
+log "SQLite source integrity check: ok"
 
 # --- Clone or pull backup repo ---
 if [ ! -d "$BACKUP_DIR/.git" ]; then
@@ -344,7 +461,6 @@ _git_net pull --rebase --quiet 2>/dev/null || log "WARNING: git pull failed, con
 # --- 1. SQLite dump (encrypted — may hold memory-stored credentials/PII) ---
 log "Backing up SQLite database..."
 mkdir -p data
-DB_FILE="$GENESIS_DIR/data/genesis.db"
 # Purge any pre-encryption plaintext dumps so they don't persist in the
 # backup repo alongside the new encrypted form.
 rm -f data/genesis.sql data/genesis.db
@@ -355,17 +471,23 @@ if [ -f "$DB_FILE" ]; then
         _SQL_TMP=$(mktemp -p "$GENESIS_BIG_TMP")  # ~269MB dump — keep off cc-tmp/RAM
         if sqlite3 "$DB_FILE" .dump > "$_SQL_TMP" 2>/dev/null; then
             _SQLITE_LINES=$(wc -l < "$_SQL_TMP")
-            if encrypt_file "$_SQL_TMP" data/genesis.sql.gpg; then
-                _SQL_FRESH=true
+            _SQL_ARTIFACT_TMP="data/.genesis.sql.gpg.partial.$$"
+            if encrypt_file "$_SQL_TMP" "$_SQL_ARTIFACT_TMP"; then
                 log "SQLite: $_SQLITE_LINES lines (encrypted)"
                 # SF4 round-trip: classify the fresh artifact's restorability
                 # (see _verify_sql_roundtrip). ROUNDTRIP_DETAIL is set (sanitized)
                 # only on CORRUPT. _SQL_RESTORABLE gates the OFF-SITE upload so a
                 # DR box never auto-selects a COMPLETE snapshot it can't decrypt.
                 ROUNDTRIP_DETAIL=""
-                case "$(_verify_sql_roundtrip data/genesis.sql.gpg)" in
+                ROUNDTRIP_VERDICT=""
+                _verify_sql_roundtrip "$_SQL_ARTIFACT_TMP"
+                case "$ROUNDTRIP_VERDICT" in
                     RESTORABLE)
+                        mv "$_SQL_ARTIFACT_TMP" data/genesis.sql.gpg
+                        _SQL_ARTIFACT_TMP=""
+                        _SQL_FRESH=true
                         _SQL_RESTORABLE=true
+                        _SQLITE_BACKUP_VERIFIED=true
                         log "SQLite: round-trip decrypt verified"
                         ;;
                     DRIFT)
@@ -377,22 +499,36 @@ if [ -f "$DB_FILE" ]; then
                         # pre-rotation passphrase == the escrow, stays restorable)
                         # and surface a distinct re-escrow alert via the off-site
                         # path (never CRITICAL "backup failed").
+                        mv "$_SQL_ARTIFACT_TMP" data/genesis.sql.gpg
+                        _SQL_ARTIFACT_TMP=""
+                        _SQL_FRESH=true
                         _SQL_RESTORABLE=false
+                        _SQLITE_BACKUP_VERIFIED=true
                         _SQL_ESCROW_DRIFT=true
                         log "WARNING: SQL round-trip failed with the ESCROWED passphrase but SUCCEEDED with the env one — escrow is stale (secrets.env rotated?). Local backup OK; off-site DR degraded until re-escrow."
                         ;;
                     *)  # CORRUPT
                         _SQL_RESTORABLE=false
+                        _FAILURE_CLASS="db_backup"
+                        _FAILURE_STAGE="sqlite_roundtrip"
                         _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }SQL archive failed round-trip decrypt with its own env passphrase (${ROUNDTRIP_DETAIL:-no gpg output}) — corrupt/unrestorable, withheld from off-site"
                         log "WARNING: $_FAILURE_REASON"
                         _SQLITE_LINES=0
+                        rm -f "$_SQL_ARTIFACT_TMP"
+                        _SQL_ARTIFACT_TMP=""
                         ;;
                 esac
             else
+                _FAILURE_CLASS="db_backup"
+                _FAILURE_STAGE="sqlite_encrypt"
                 log "WARNING: SQLite encryption failed"
                 _SQLITE_LINES=0
+                rm -f "$_SQL_ARTIFACT_TMP"
+                _SQL_ARTIFACT_TMP=""
             fi
         else
+            _FAILURE_CLASS="db_backup"
+            _FAILURE_STAGE="sqlite_dump"
             log "WARNING: sqlite3 dump failed"
         fi
         rm -f "$_SQL_TMP"
@@ -426,14 +562,16 @@ for collection in episodic_memory knowledge_base; do
         continue
     elif [ "$_probe_code" != "200" ]; then
         # Server unreachable/erroring (000/timeout/5xx) — we CANNOT confirm the
-        # collection exists, so this is NOT the audit's "collections exist but
-        # weren't captured" failure. Qdrant is rebuildable from the (round-trip-
-        # verified) SQLite dump, and restore.sh likewise treats an unreachable
-        # Qdrant as a skip — so degrade gracefully (WARNING, backup still
-        # succeeds) instead of paging CRITICAL every 6h forever on a host where
-        # Qdrant is optional, still booting, or briefly down. Only a REACHABLE
-        # collection (HTTP 200) that then fails to snapshot is a hard failure.
+        # collection exists. Qdrant is rebuildable from the verified SQL dump,
+        # so this does not invalidate the SQLite artifact and an update may
+        # continue. It is nevertheless an incomplete backup: persist and alert
+        # it as a non-DB failure instead of reporting a false success.
         log "WARNING: Qdrant unreachable probing $collection (HTTP $_probe_code) — skipping (rebuildable from SQL)"
+        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }Qdrant unreachable probing $collection (HTTP $_probe_code)"
+        if [ "$_FAILURE_CLASS" = "none" ]; then
+            _FAILURE_CLASS="non_db"
+            _FAILURE_STAGE="qdrant_probe"
+        fi
         continue
     fi
     # Create snapshot via Qdrant API. --max-time 600: snapshot creation is a
@@ -486,6 +624,10 @@ done
 # the newest COMPLETE snapshot, so silence here would let stale-or-missing
 # vectors masquerade as current until a disaster surfaces it.
 if [ -n "$_QDRANT_FAILED" ]; then
+    if [ "$_FAILURE_CLASS" = "none" ]; then
+        _FAILURE_CLASS="non_db"
+        _FAILURE_STAGE="qdrant_snapshot"
+    fi
     _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }Qdrant backup failed for:${_QDRANT_FAILED}"
 fi
 
@@ -608,6 +750,279 @@ if [ -d "$_EVAL_DIR" ]; then
         _EVAL_COUNT=$(find eval -type f -name '*.gpg' 2>/dev/null | wc -l)
         log "Eval golden sets: $_EVAL_COUNT files (encrypted)"
     fi
+fi
+
+# --- 6f. Opt-in extra directories (encrypted, Tier 2 / off-site only) ---
+# GENESIS_BACKUP_EXTRA_DIRS lists ':'-separated directories UNDER $HOME (a leading
+# `~/` is expanded) that this install wants kept — install-local data no other
+# section knows about. Each becomes ONE encrypted tar, extra/<name>.tar.gpg, so a
+# nested tree survives the single-level off-site listing restore.sh reads back.
+# Members are stored relative to $HOME and restore writes them back there.
+# extra/ is gitignored like transcripts/: off-site only, never the git tier.
+# Rebuildable caches are excluded at any depth (MEASURED, GNU tar 1.35:
+# `--exclude=.venv` drops a/.venv and a/sub/.venv but keeps a/keep.venvx), plus
+# GENESIS_BACKUP_EXTRA_EXCLUDES (tar patterns, wildcards allowed).
+# `--exclude-vcs-ignores` is NOT used: measured on the same tar, it kept a `.venv/`
+# the directory's .gitignore excluded.
+# FRESH ONLY: extra/ is emptied at the start of every run and holds only what this
+# run archived, so the snapshot never carries an old archive under a new date and
+# nothing ever needs pruning. A listed directory that is not archived this run
+# (refused, missing, unreadable, emptied by an exclude) is simply absent from this
+# snapshot, counted in extra_dirs_skipped, and marks the off-site copy partial;
+# older snapshots keep it until retention drops them. It never fails the backup.
+_EXTRA_COUNT=0
+_EXTRA_SKIPPED=0       # listed directories NOT archived this run, for any reason
+_EXTRA_TAR_TMP=""
+_EXTRA_TAR_ERR=""
+_EXTRA_UPLOAD_FAILED=0
+_EXTRA_UPLOADED=()     # names that reached the off-site snapshot (recorded in COMPLETE)
+_EXTRA_BUILT=()        # names archived THIS run: the only ones uploaded
+_EXTRA_SKIP_LABELS=()  # listed entries not archived this run (recorded in COMPLETE)
+_EXTRA_PARTIAL=0       # archived, but a restore will refuse some of their members
+_EXTRA_PARTIAL_LABELS=()
+_extra_prev=0
+if mkdir -p extra 2>/dev/null; then
+    _extra_prev="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l || true)"
+    find extra -maxdepth 1 -type f -delete 2>/dev/null || true
+    # A file cleanup could not remove is never restored: restore takes only the
+    # names .extra-manifest lists, which is rewritten below on every run. It sits
+    # outside extra/, so an extra/ that cannot be written cannot pin an old one.
+    if find extra -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
+        log "WARNING: extra/ still holds files from an earlier run that could not be removed; restore ignores them (only .extra-manifest's names are restored)"
+    fi
+else
+    log "WARNING: cannot create $BACKUP_DIR/extra; extra directories have no local copy this run"
+fi
+_extra_skip() {  # <reason> <entry>
+    log "WARNING: extra dir skipped ($1): $2"
+    _EXTRA_SKIPPED=$((_EXTRA_SKIPPED + 1))
+    # Shown $HOME-relative in the COMPLETE marker, so restore can say which listed
+    # directory a snapshot does not hold. Shell-quoted under the C locale, so every
+    # byte becomes printable ASCII and no name ever shrinks to an empty label.
+    _EXTRA_SKIP_LABELS+=("$(LC_ALL=C printf '%q' "${2#"$HOME"/}" | cut -c1-200)")
+}
+if [ -z "${GENESIS_BACKUP_EXTRA_DIRS:-}" ]; then
+    [ "$_extra_prev" -gt 0 ] && log "NOTE: GENESIS_BACKUP_EXTRA_DIRS is unset; the previous run's $_extra_prev extra archive(s) are not carried forward (older off-site snapshots keep them until retention)"
+elif [[ "$GENESIS_BACKUP_EXTRA_DIRS" == *$'\n'* ]] || [[ "${GENESIS_BACKUP_EXTRA_EXCLUDES:-}" == *$'\n'* ]]; then
+    _extra_skip "the list contains a newline; entries are ':'-separated" "GENESIS_BACKUP_EXTRA_DIRS / GENESIS_BACKUP_EXTRA_EXCLUDES"
+else
+    # Compare RESOLVED paths: a symlinked or slash-terminated $HOME must not reject every entry.
+    _home_real="$(realpath -- "$HOME")"
+    _home_lex="$(realpath -s -m -- "$HOME")"
+    _bdir_real="$(realpath -m -- "$BACKUP_DIR")"
+    _btmp_real="$(realpath -m -- "$GENESIS_BIG_TMP")"
+    _lroot_real=""
+    if [ "$(_backend_resolve)" = local ] && [ -n "${GENESIS_BACKUP_LOCAL_PATH:-}" ]; then
+        _lroot_real="$(realpath -m -- "$GENESIS_BACKUP_LOCAL_PATH")"
+    fi
+    # Class 3 — an archive is only worth keeping if a restore can extract it. The
+    # restore helper refuses a Python whose tarfile lacks the 2025 extraction-filter
+    # fixes, so find that out NOW (loudly, as a partial backup), not during a disaster
+    # recovery. (The restore box needs a fixed Python too; SETUP.md says so.)
+    _extra_py_why=""
+    if ! _extra_py_why="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" check 2>&1)"; then
+        _extra_py_why="${_extra_py_why:-the restore helper could not run}"
+    else
+        _extra_py_why=""
+    fi
+    _EXTRA_DEFAULT_EXCLUDES=(.venv venv node_modules __pycache__ .pytest_cache .ruff_cache .mypy_cache .tox)
+    _extra_ex_args=()
+    for _x in "${_EXTRA_DEFAULT_EXCLUDES[@]}"; do _extra_ex_args+=("--exclude=$_x"); done
+    IFS=':' read -r -a _extra_user_ex <<< "${GENESIS_BACKUP_EXTRA_EXCLUDES:-}"
+    for _x in "${_extra_user_ex[@]+"${_extra_user_ex[@]}"}"; do
+        [ -n "$_x" ] && _extra_ex_args+=("--exclude=$_x")
+    done
+    _extra_abs_seen=()
+    _extra_listed=0
+    IFS=':' read -r -a _extra_dirs <<< "$GENESIS_BACKUP_EXTRA_DIRS"
+    for _d in "${_extra_dirs[@]+"${_extra_dirs[@]}"}"; do
+        [ -n "$_d" ] || continue
+        _extra_listed=$((_extra_listed + 1))
+        # The quoted "~" patterns match the literal `~` TEXT a config value carries,
+        # which is then expanded here by hand — not a tilde the shell should expand.
+        # shellcheck disable=SC2088
+        case "$_d" in
+            "~") _d="$HOME" ;;
+            "~/"*) _d="$HOME/${_d#\~/}" ;;
+        esac
+        case "$_d" in
+            /*) ;;
+            *)
+                # A relative entry would resolve against this script's cwd (the backups repo).
+                _extra_skip "must be an absolute path or start with ~/" "$_d"
+                continue
+                ;;
+        esac
+        _abs="$(realpath -m -- "$_d")"
+        case "$_abs" in
+            "$_home_real"/?*) ;;
+            *)
+                _extra_skip "must be a directory under \$HOME, not \$HOME itself" "$_d"
+                continue
+                ;;
+        esac
+        _rel="${_abs#"$_home_real"/}"
+        # A symlinked entry (or one under a symlinked dir) would be archived under its
+        # target's path, and restore would never recreate the path that was listed.
+        _lex="$(realpath -s -m -- "$_d")"
+        _rel_lex="${_lex#"$_home_lex"/}"
+        [ "$_rel_lex" = "$_lex" ] && _rel_lex="${_lex#"$_home_real"/}"
+        if [ "$_rel_lex" != "$_rel" ]; then
+            _extra_skip "it is, or runs through, a symlink; list the real directory ~/$_rel" "$_d"
+            continue
+        fi
+        _overlap=""
+        for _guard in "$_bdir_real" "$_btmp_real" "$_lroot_real"; do
+            [ -n "$_guard" ] || continue
+            case "$_abs/" in "$_guard"/*) _overlap="$_guard" ;; esac
+            case "$_guard/" in "$_abs"/*) _overlap="$_guard" ;; esac
+        done
+        if [ -n "$_overlap" ]; then
+            # Archiving the backups repo, the backup temp dir or a local off-site root
+            # (or anything containing one) would archive the backup's own output.
+            _extra_skip "same as, inside, or containing the backup's own output $_overlap" "$_d"
+            continue
+        fi
+        if _core_hit="$(backup_core_overlap "$_abs")"; then
+            # restore.sh puts an extra directory back as a unit, which would swap this
+            # core path out of the way; the core backup already covers it.
+            _extra_skip "overlaps $_core_hit, which the core backup restores" "$_d"
+            continue
+        fi
+        _dup=""
+        for _prev in "${_extra_abs_seen[@]+"${_extra_abs_seen[@]}"}"; do
+            case "$_abs/" in "$_prev"/*) _dup="$_prev" ;; esac
+            case "$_prev/" in "$_abs"/*) _dup="$_prev" ;; esac
+        done
+        if [ -n "$_dup" ]; then
+            _extra_skip "same as, inside, or containing another listed entry ~/${_dup#"$_home_real"/}" "$_d"
+            continue
+        fi
+        if [ ! -d "$_abs" ]; then
+            _extra_skip "missing; not in this snapshot" "$_d"
+            continue
+        fi
+        # Recorded only for directories that exist, so a missing nested entry can
+        # never get its existing parent refused.
+        _extra_abs_seen+=("$_abs")
+        _ex_hit=""
+        IFS='/' read -r -a _rel_parts <<< "$_rel"
+        for _part in "${_rel_parts[@]}"; do
+            for _x in "${_extra_ex_args[@]}"; do [ "--exclude=$_part" = "$_x" ] && _ex_hit="$_part"; done
+        done
+        if [ -n "$_ex_hit" ]; then
+            _extra_skip "its path contains the excluded name '$_ex_hit'; the archive would be empty" "$_d"
+            continue
+        fi
+        if ! $_ENCRYPT_READY; then
+            _extra_skip "GENESIS_BACKUP_PASSPHRASE not set — refusing plaintext" "$_d"
+            continue
+        fi
+        if [ -n "$_extra_py_why" ]; then
+            _extra_skip "a restore could not extract it: $_extra_py_why" "$_d"
+            continue
+        fi
+        _name="$(printf '%s' "$_rel" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)-$(printf '%s' "$_rel" | sha1sum | cut -c1-8).tar.gpg"
+        # Temp creation can fail (a full or inode-exhausted temp filesystem): skip this
+        # directory, never abort the whole backup over an optional payload.
+        if ! _tar_tmp="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.tar 2>/dev/null)"; then
+            _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
+            continue
+        fi
+        _EXTRA_TAR_TMP="$_tar_tmp"
+        if ! _tar_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
+            rm -f "$_tar_tmp"
+            _EXTRA_TAR_TMP=""
+            _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
+            continue
+        fi
+        _EXTRA_TAR_ERR="$_tar_err"
+        _gpg_tmp="extra/.${_name}.partial.$$"
+        _tar_rc=0
+        # --hard-dereference: a hard link is stored as file content, so restore never
+        # meets a hard-link member. Symlinks are kept as links; restore accepts the
+        # ones that stay inside the restored directory.
+        tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" -cf "$_tar_tmp" -- "$_rel" 2>"$_tar_err" || _tar_rc=$?
+        # GNU tar exit 1 = some files changed while being read: the archive is written,
+        # but a file that was changing may be torn. 2+ = fatal.
+        _tar_head="$(head -3 "$_tar_err" | tr '\n' ' ')"
+        rm -f "$_tar_err"
+        _EXTRA_TAR_ERR=""
+        if [ "$_tar_rc" -ge 2 ]; then
+            rm -f "$_tar_tmp"
+            _EXTRA_TAR_TMP=""
+            _extra_skip "tar failed rc=$_tar_rc: $_tar_head" "$_d"
+            continue
+        fi
+        [ "$_tar_rc" -eq 1 ] && log "NOTE: ~/$_rel changed while archiving; a file that was changing may be torn: $_tar_head"
+        # tar treats excludes as wildcards, so a pattern can match the directory itself
+        # and yield an archive without it, with rc 0. Check with the reader and the
+        # member filter restore uses (never by parsing `tar -t`, which escapes
+        # backslashes and, under a C locale, non-ASCII names), so backup keeps exactly
+        # what restore will accept.
+        _tar_root="" _tar_root_why="" _tar_verify_rc=0
+        if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
+            _EXTRA_TAR_ERR="$_tar_root_err"
+            _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify "$_tar_tmp" "$GENESIS_BIG_TMP" 2>"$_tar_root_err")" || _tar_verify_rc=$?
+            _tar_root_why="$(head -c 300 "$_tar_root_err" | tr '\n' ' ')"
+            rm -f "$_tar_root_err"
+            _EXTRA_TAR_ERR=""
+        else
+            _tar_verify_rc=5
+            _tar_root_why="cannot create a temp file in $GENESIS_BIG_TMP"
+        fi
+        _tar_partial=false
+        if [ "$_tar_verify_rc" -eq 4 ] && [ "$_tar_root" = "$_rel" ]; then
+            # Kept: everything else in the directory still restores. Recorded as
+            # partial, so the off-site copy is not reported complete and the alert fires.
+            _tar_partial=true
+        elif [ "$_tar_verify_rc" -eq 0 ] && [ -n "$_tar_root" ] && [ "$_tar_root" != "$_rel" ]; then
+            rm -f "$_tar_tmp"
+            _EXTRA_TAR_TMP=""
+            _extra_skip "the archive holds ${_tar_root} instead; does an exclude pattern match the directory itself?" "$_d"
+            continue
+        elif [ "$_tar_verify_rc" -ne 0 ] || [ "$_tar_root" != "$_rel" ]; then
+            rm -f "$_tar_tmp"
+            _EXTRA_TAR_TMP=""
+            _extra_skip "restore could not use the archive (rc=$_tar_verify_rc: ${_tar_root_why:-no directory member}); does an exclude pattern match the directory itself?" "$_d"
+            continue
+        fi
+        if encrypt_file "$_tar_tmp" "$_gpg_tmp" && mv -f "$_gpg_tmp" "extra/$_name"; then
+            _EXTRA_COUNT=$((_EXTRA_COUNT + 1))
+            _EXTRA_BUILT+=("$_name")
+            if $_tar_partial; then
+                log "WARNING: extra dir archived without members a restore would refuse (exclude them with GENESIS_BACKUP_EXTRA_EXCLUDES): $_d: $_tar_root_why"
+                _EXTRA_PARTIAL=$((_EXTRA_PARTIAL + 1))
+                _EXTRA_PARTIAL_LABELS+=("$(LC_ALL=C printf '%q' "$_rel" | cut -c1-200)")
+            fi
+        else
+            rm -f "$_gpg_tmp"
+            _extra_skip "encryption failed" "$_d"
+        fi
+        rm -f "$_tar_tmp"
+        _EXTRA_TAR_TMP=""
+    done
+    if [ "$_extra_listed" -eq 0 ]; then
+        _extra_skip "the list has no entries" "GENESIS_BACKUP_EXTRA_DIRS=$GENESIS_BACKUP_EXTRA_DIRS"
+    fi
+    log "Extra dirs: $_EXTRA_COUNT archived ($_EXTRA_PARTIAL partial), $_EXTRA_SKIPPED skipped"
+fi
+# Local manifest (same format as the off-site COMPLETE marker), written on EVERY run,
+# the setting unset included: a restore without an off-site pull restores only the
+# names it lists and reports what it says was skipped. Outside extra/ (gitignored
+# below), written to a temp name and renamed, so a reader never sees half of it; on
+# failure none is left behind, and a restore then restores no local extra archive
+# rather than a stale one.
+if {
+    printf 'genesis-snapshot 1\n'
+    for _n in "${_EXTRA_BUILT[@]+"${_EXTRA_BUILT[@]}"}"; do printf 'extra %s\n' "$_n"; done
+    for _n in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do printf 'skipped %s\n' "$_n"; done
+    for _n in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do printf 'partial %s\n' "$_n"; done
+} 2>/dev/null > .extra-manifest.tmp && mv -f .extra-manifest.tmp .extra-manifest 2>/dev/null; then
+    :
+else
+    rm -f .extra-manifest.tmp .extra-manifest 2>/dev/null || true
+    log "WARNING: could not write .extra-manifest; a restore from this checkout will not restore its extra archives (the off-site snapshot is unaffected)"
 fi
 
 # --- 6d. Hook audit stores (Tier 1) ---
@@ -934,6 +1349,29 @@ else
         done < <(find eval -type f -name '*.gpg' -print0 2>/dev/null)
     fi
 
+    # Upload opt-in extra-dir archives (§6f). Flat by construction — one file
+    # per directory — so restore's single-level off-site pull reads them back.
+    # Only the archives THIS run built (never whatever else sits in extra/), so a
+    # stale file can never reach a new snapshot under a new date.
+    if [ "${#_EXTRA_BUILT[@]}" -gt 0 ]; then
+        backend_mkdir "${_T2_DIR}/extra" || true  # a failed put below is counted per archive
+        for fname in "${_EXTRA_BUILT[@]}"; do
+            f="extra/$fname"
+            if backend_put "$f" "${_T2_DIR}/extra/${fname}"; then
+                _EXTRA_UPLOADED+=("$fname")
+                log "  off-site: uploaded extra/${fname}"
+            else
+                # Opt-in payload: it never withholds the core snapshot's COMPLETE marker
+                # (restore would then skip the core data too), but it does mark the off-site
+                # copy unconfirmed below (tier2_status=partial, offsite_confirmed=false).
+                log "WARNING: off-site upload failed for extra/${fname} (core snapshot still COMPLETE)"
+                # Named in COMPLETE (written after this loop) so restore reports the gap.
+                _EXTRA_SKIP_LABELS+=("${fname} (upload failed)")
+                _EXTRA_UPLOAD_FAILED=$((_EXTRA_UPLOAD_FAILED + 1))
+            fi
+        done
+    fi
+
     backend_mkdir "${_T2_DIR}/config_overrides"
     while IFS= read -r -d '' f; do
         fname=$(basename "$f")
@@ -981,7 +1419,22 @@ else
     # marker itself fails to upload, the snapshot is unusable for restore — treat
     # that as an off-site failure (partial + alert), not ok.
     if [ "$_T2_OK" = true ]; then
-        _T2_MARKER=$(mktemp)  # empty marker, uploaded only after a full snapshot
+        _T2_MARKER=$(mktemp)  # uploaded only after a full snapshot
+        # The marker lists the extra archives this snapshot holds. restore.sh reads it
+        # back to know what to expect, because a failed off-site LISTING looks the same
+        # as an empty one, while a failed download of this file is detectable.
+        {
+            printf 'genesis-snapshot 1\n'
+            for _n in "${_EXTRA_UPLOADED[@]+"${_EXTRA_UPLOADED[@]}"}"; do
+                printf 'extra %s\n' "$_n"
+            done
+            for _n in "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}"; do
+                printf 'skipped %s\n' "$_n"
+            done
+            for _n in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do
+                printf 'partial %s\n' "$_n"
+            done
+        } > "$_T2_MARKER"
         if ! backend_put "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
             log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"
             _T2_OK=false
@@ -989,7 +1442,14 @@ else
         rm -f "$_T2_MARKER"
     fi
 
-    if [ "$_T2_OK" = true ]; then
+    if [ "$_T2_OK" = true ] && [ $((_EXTRA_UPLOAD_FAILED + _EXTRA_SKIPPED + _EXTRA_PARTIAL)) -gt 0 ]; then
+        # Core snapshot is COMPLETE and restorable, but the off-site copy is not the
+        # full set the operator asked for (an extra dir was not archived this run, or
+        # its archive did not upload), so it is not reported as confirmed.
+        _T2_STATUS="partial"
+        _T2_EXTRAS_ONLY_PARTIAL=true  # core is complete: retention still runs (below)
+        log "WARNING: Tier 2 snapshot ${_T2_STAMP} is COMPLETE but extra dirs are incomplete (${_EXTRA_SKIPPED} not archived, ${_EXTRA_PARTIAL} partial, ${_EXTRA_UPLOAD_FAILED} not uploaded)"
+    elif [ "$_T2_OK" = true ]; then
         _T2_STATUS="ok"
         log "Tier 2 backup copied to off-site snapshot ${_T2_STAMP} (backend: ${_T2_BACKEND})"
     else
@@ -1004,8 +1464,10 @@ else
     # Transcripts are preserved elsewhere (local git keep-forever + the latest snapshot
     # re-uploads the full set every run), so deleting an aged snapshot's transcripts/ copy
     # loses nothing. Only the off-site dated tree is touched; the local ~/backups git repo
-    # is never pruned here. Runs only after a fully-uploaded (ok) snapshot this run.
-    if [ "${_T2_STATUS:-}" = "ok" ] && backend_available; then
+    # is never pruned here. Runs only after a fully-uploaded (ok) snapshot this run, or
+    # one whose core is COMPLETE and only opt-in extra dirs are missing: otherwise a
+    # listed directory that stays missing would stop retention for good.
+    if { [ "${_T2_STATUS:-}" = "ok" ] || [ "${_T2_EXTRAS_ONLY_PARTIAL:-false}" = true ]; } && backend_available; then
         # DR-safety: the host segment flows into a DESTRUCTIVE backend_delete (smb deltree /
         # local rm -rf), so refuse to prune unless it is the plain filename charset — then a
         # pathological hostname can never break out of the snapshot path. (The stamps below
@@ -1046,7 +1508,7 @@ backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
 # Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/, audit/
-# Tier 2 (off-site): data/, transcripts/
+# Tier 2 (off-site): data/, transcripts/, extra/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'
 # Tier 2 files — backed up off-site, not GitHub
@@ -1054,6 +1516,19 @@ data/
 transcripts/
 GITIGNORE
     log "Added Tier 2 exclusions to .gitignore"
+fi
+# extra/ (§6f) joined Tier 2 after the block above shipped: an existing install
+# already has that block, so it would never receive this line from it.
+if ! grep -qx 'extra/' .gitignore 2>/dev/null; then
+    # Keep the appended line on its own even if the file lacks a final newline.
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
+    printf 'extra/\n' >> .gitignore
+    log "Added extra/ to the Tier 2 .gitignore exclusions"
+fi
+if ! grep -qx '.extra-manifest' .gitignore 2>/dev/null; then
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
+    printf '.extra-manifest\n.extra-manifest.tmp\n' >> .gitignore
+    log "Added .extra-manifest to the .gitignore exclusions"
 fi
 
 # --- Commit and push (Tier 1 only) ---
@@ -1075,6 +1550,10 @@ else
             # Append, never overwrite — an earlier SF3/SF4 failure reason must
             # survive into the status file alongside the push failure.
             _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }git push failed — backup exists locally only (not replicated to remote)"
+            if [ "$_FAILURE_CLASS" = "none" ]; then
+                _FAILURE_CLASS="non_db"
+                _FAILURE_STAGE="git_push"
+            fi
             log "ERROR: git push failed — backup exists locally only (not replicated to remote)"
         else
             _TIER1_PUSHED=true
@@ -1082,15 +1561,24 @@ else
         fi
     else
         _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }git commit failed (corrupt repo or index error)"
+        if [ "$_FAILURE_CLASS" = "none" ]; then
+            _FAILURE_CLASS="non_db"
+            _FAILURE_STAGE="git_commit"
+        fi
         log "ERROR: git commit failed — repository may need re-clone from remote"
     fi
 fi
 
-if [ "$_SQLITE_LINES" -gt 0 ] && [ -z "$_FAILURE_REASON" ]; then
+if [ "$_SQLITE_LINES" -gt 0 ] && [ "$_SQLITE_BACKUP_VERIFIED" = "true" ] \
+    && [ -z "$_FAILURE_REASON" ]; then
     _SUCCESS=true
 else
     if [ -z "$_FAILURE_REASON" ]; then
         _FAILURE_REASON="No SQLite data backed up"
+    fi
+    if [ "$_SQLITE_BACKUP_VERIFIED" != "true" ] && [ "$_FAILURE_CLASS" = "none" ]; then
+        _FAILURE_CLASS="db_backup"
+        _FAILURE_STAGE="sqlite_not_verified"
     fi
     log "WARNING: Backup incomplete — marking as failure (reason: $_FAILURE_REASON)"
 fi
@@ -1103,16 +1591,51 @@ fi
 # off-site copy did not fully land. Local-only installs (no off-site backend) are
 # a valid choice and do NOT alert.
 if [ "${_T2_BACKEND:-none}" != "none" ] && [ "$_T2_STATUS" != "ok" ]; then
-    # Dedup: alert only on the transition INTO off-site failure. The status file
-    # still holds the PREVIOUS run's state at this point (the EXIT trap rewrites
-    # it after). This avoids a 6-hourly alert while the off-site target stays down; it re-alerts
-    # once off-site recovers (offsite_confirmed flips true) and then fails again.
-    _prev_offsite=$(python3 -c "import json; print(json.load(open('$_STATUS_FILE')).get('offsite_confirmed', True))" 2>/dev/null || echo "True")
-    if [ "$_prev_offsite" != "False" ]; then
+    # Dedup: alert only on the transition INTO a failure. The status file still
+    # holds the PREVIOUS run's state at this point (the EXIT trap rewrites it after).
+    # This avoids a 6-hourly alert while the off-site target stays down; it re-alerts
+    # once that signal recovers and then fails again. The core copy and the opt-in
+    # extras are deduplicated SEPARATELY: one shared flag let a chronic extras gap
+    # (a listed directory that stays missing) silence a later real off-site failure.
+    # Older status files have no offsite_core_complete; offsite_confirmed stands in.
+    # Each signal is suppressed only when the previous run ANNOUNCED the same thing
+    # (offsite_core_alerted / extras_alerted_gap). Status files from before those
+    # fields fall back to the older inference.
+    _prev_flags=$(python3 -c "
+import json
+s = json.load(open('$_STATUS_FILE'))
+core_was_down = s.get('offsite_core_complete', s.get('offsite_confirmed', True)) is False
+core = s.get('offsite_core_alerted', core_was_down)
+gap = s.get('extras_alerted_gap')
+if gap is None:
+    gap = s.get('extras_gap') if s.get('extras_complete', True) is False and not core_was_down else ''
+print(core, gap or '-')
+" 2>/dev/null || echo "False -")
+    read -r _prev_core_alerted _prev_alerted_gap <<<"$_prev_flags"
+    if [ "${_T2_EXTRAS_ONLY_PARTIAL:-false}" = true ]; then
+        _alert_kind=extras
+        _cur_gap="$(_extras_gap_fingerprint)"
+        _ALERTED_GAP="$_cur_gap"  # announced now, or already announced by the last run
+        [ "${_prev_alerted_gap:-}" = "${_cur_gap:--}" ] && _alert_kind=""
+    else
+        _alert_kind=core
+        _ALERTED_CORE=true
+        [ "$_prev_core_alerted" = "True" ] && _alert_kind=""
+    fi
+    if [ -n "$_alert_kind" ]; then
         # Escrow drift withheld the SQL dump from the off-site snapshot (the
         # target is fine — the escrowed passphrase is stale), so name the real
         # cause + fix instead of pointing at the off-site target.
-        if [ "$_SQL_ESCROW_DRIFT" = true ]; then
+        if [ "$_alert_kind" = extras ]; then
+            _send_telegram "⚠️ *Off-site copy incomplete — extra directories*
+
+The core backup reached the off-site snapshot and is restorable, but the
+extra directories are incomplete: ${_EXTRA_SKIPPED:-0} not archived this run,
+${_EXTRA_UPLOAD_FAILED:-0} not uploaded, ${_EXTRA_PARTIAL:-0} archived without members a
+restore would refuse. Missing or partial in this snapshot:
+$(printf '%s\n' "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}" "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]/%/ (partial)}"}" | head -5)
+Time: $(date -Is)"
+        elif [ "$_SQL_ESCROW_DRIFT" = true ]; then
             _send_telegram "⚠️ *Off-site DR degraded — backup passphrase escrow drift*
 
 The local backup is OK (decrypts with the env passphrase), but the ESCROWED

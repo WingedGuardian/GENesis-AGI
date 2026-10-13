@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from genesis.db.connection import connect_sqlite_rw
 from genesis.env import genesis_db_path
 
 requires_operator = False
@@ -39,7 +40,7 @@ requires_operator = False
 
 
 def migrate() -> dict:
-    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
+    db = connect_sqlite_rw(genesis_db_path(), timeout=30.0)
     try:
         cur = db.execute(
             "DELETE FROM user_goals WHERE origin = 'user' AND evidence_source LIKE 'extraction:%'"

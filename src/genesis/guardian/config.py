@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,9 @@ from pathlib import Path
 import yaml
 
 logger = logging.getLogger(__name__)
+
+#: ``swap_ceiling_pct`` value that removes a swap ceiling (see GuardianConfig).
+SWAP_CEILING_OFF = "off"
 
 _DEFAULT_CONFIG_PATH = (
     Path(__file__).resolve().parent.parent.parent.parent / "config" / "guardian.yaml"
@@ -112,23 +116,32 @@ class SnapshotConfig:
     take_pre_recovery: bool = True  # Take snapshot before recovery action
     # Daily 'healthy' snapshot while the guardian state is HEALTHY — produces
     # the offline SNAPSHOT_ROLLBACK lifeline (without it, rollback has no
-    # target and always fails). Rotated on each take: exactly one healthy
-    # snapshot, ≤1 maintenance interval old, so CoW divergence never
-    # accumulates. Set false to stop taking (existing healthy snapshots then
-    # age out via max_age_days / expiry).
+    # target and always fails). Rotation is create-then-delete, so it keeps
+    # exactly one healthy snapshot ONLY while creates succeed: a refused
+    # create (the pool gate, or LVM's own threshold) leaves the old one in
+    # place, still diverging. mark_healthy therefore rotates delete-first when
+    # a MEASURED pool refusal meets a lifeline that is over a day old AND LVM
+    # shows the snapshots hold space no live volume maps (LVM-thin only); a
+    # pool full of live data keeps it. Set false to stop taking (existing healthy
+    # snapshots then age out via expiry / pool relief).
     healthy_enabled: bool = True
     max_pool_usage_pct: float = 80.0  # Fallback threshold if headroom check unavailable
     min_headroom_gb: float = 5.0  # Minimum free space floor for headroom check
-    # Age-based prune: delete guardian-* snapshots older than this many days,
-    # regardless of retention count — EXCEPT the newest and the latest healthy
-    # (the offline snapshot-rollback lifeline). Backstops the incident where
+    # Age-based prune: delete non-healthy guardian snapshots older than this
+    # many days, regardless of retention count. Healthy (rollback) snapshots are
+    # never pruned — they are rotated after a successful create and freed by
+    # pool relief under pressure, both via SnapshotManager.delete_healthy.
+    # Backstops the incident where
     # stale guardian-pre-recovery snapshots accumulated CoW divergence for months.
     max_age_days: int = 14
-    # incus `snapshots.expiry` — daemon-side auto-deletion of SCHEDULED snapshots
-    # after this interval (units: s/m/h/d/w/M/y). A guardian-independent kill
-    # switch that fires even if the guardian process is dead. Deliberately does
-    # NOT set `snapshots.expiry.manual` (instance-wide; would expire snapshots
-    # the user creates by hand). Empty string disables enforcement.
+    # incus `snapshots.expiry` — daemon-side auto-deletion after this interval
+    # (units: s/m/h/d/w/M/y). A guardian-independent kill switch that fires even
+    # if the guardian process is dead. Which snapshots it covers depends on the
+    # Incus version: on Incus 6.0.0 it was measured stamping manually-created
+    # snapshots too (a guardian snapshot carried expires_at = created + 2w);
+    # newer releases split manual snapshots out to `snapshots.expiry.manual`,
+    # which this deliberately does not set (instance-wide; it would expire
+    # snapshots the user creates by hand). Empty string disables enforcement.
     expiry: str = "2w"
 
 
@@ -168,6 +181,49 @@ class StoragePoolConfig:
     # Re-alert cadence while a tier is sustained (avoids per-tick spam but keeps
     # a live problem visible). Tier *increases* always alert immediately.
     realert_hours: float = 6.0
+
+    # --- Pressure RELIEF (pool_relief.py) -----------------------------------
+    # The tiers above only ALERT. A thin pool once filled to 100% while CRITICAL
+    # alerts fired every 6h for four days, because the space was held by a
+    # guardian snapshot nothing was allowed to delete. Relief FREES guardian-
+    # owned space (one snapshot per pass, the rollback lifeline last) when free
+    # data or metadata space drops below its reserve.
+    #   live       — delete guardian snapshots under the reserve
+    #   alert_only — alert, never act
+    #   off        — no relief (and no delete-first rotation)
+    # Invalid values degrade to alert_only. Env kill switch:
+    # GUARDIAN_POOL_RELIEF_DISABLED=1 forces alert_only.
+    relief_mode: str = "live"
+    # Data reserve, % of the pool: relief acts at or below this much free. Sized
+    # to cover a backup-sized write burst (~2 GB) on a ~70 GB pool. A floor, not
+    # the whole defence: delete-first rotation (snapshots.mark_healthy) stops
+    # the snapshot-divergence fill long before the reserve is reached.
+    min_reserve_pct: float = 3.0
+    # Metadata reserve, % of the metadata LV. Higher than data's: metadata is
+    # small (tens of MiB), a thin snapshot steps it up several points at once,
+    # and a full metadata LV needs an offline repair. LVM's autoextend
+    # (threshold 80%) grows metadata first when it can.
+    min_meta_reserve_pct: float = 10.0
+
+    # --- EARLY relief from the MEASURED growth rate (pool_runway.py) ---------
+    # The reserve above is a floor. Relief also acts EARLY when the pool's
+    # measured growth would fill data or metadata within early_horizon_hours.
+    # Early relief has less authority than the reserve: it may delete
+    # pre-recovery and superseded healthy snapshots, and the rollback lifeline
+    # only once it is older than lifeline_max_age_hours (an old lifeline has
+    # diverged the most) and, on LVM, measured holding space. A young lifeline
+    # is only ever taken by the reserve rule. 0 disables early relief. An
+    # invalid value in these keys disables early relief and the extend only.
+    early_horizon_hours: float = 48.0
+    lifeline_max_age_hours: float = 48.0
+    # Pool history: one sample per interval, the newest max_samples kept
+    # (2016 x 5 min = 7 days).
+    history_sample_interval_s: int = 300
+    history_max_samples: int = 2016
+    # LVM partial extend (pool_extend.py; autoextend's own trigger, not the
+    # rate): left unallocated in the VG (or twice the metadata LV, if larger)
+    # so the metadata LV can still grow.
+    extend_keep_free_mib: int = 512
 
 
 @dataclass
@@ -370,6 +426,22 @@ class GuardianConfig:
     # limits.memory.swap=true + live cgroup activation each tick. Kill switch
     # for hosts where swap-off is a deliberate operator choice.
     swap_reconcile_enabled: bool = True
+
+    # Opt-in ceiling on the container's share of HOST swap, as a percentage of
+    # host SwapTotal (not bytes — this is the one knob here expressed as a
+    # percentage rather than an absolute, so it tracks the pool if the host's
+    # swap grows or shrinks). None (the public default) means unmanaged:
+    # swap_watch neither sets nor removes a ceiling. SWAP_CEILING_OFF ("off")
+    # removes one (limits.memory.swap back to true, a finite live cap lifted
+    # to max). Install-local: set in the deployed guardian.yaml, never in the
+    # repo's shipped template. Validated in _finalize (bool handled first —
+    # bool is an int subclass, and YAML reads a bare `off`, `no` or `false` as
+    # False, which therefore means off too; a QUOTED "false" or "no" is just
+    # an unknown string and is ignored, only "off" is the word; a huge or
+    # non-finite or out-of-range number warns and falls back to None, never
+    # to 0, since 0 would mean swap-off, the opposite of this reconciler's
+    # whole purpose).
+    swap_ceiling_pct: float | str | None = None
 
     # Host VM details — used by container for bidirectional monitoring (SSH → gateway)
     host_ip: str = ""      # Auto-detected by installer; empty = not installed
@@ -631,6 +703,51 @@ def _finalize(config: GuardianConfig) -> GuardianConfig:
             "deploy stand-down will NOT engage. Set it >= the largest caller TTL.",
             config.gateway_pause_max_ahead_s,
         )
+
+    # swap_ceiling_pct: a percentage of HOST SwapTotal, never a byte count —
+    # tolerate None (default), "off" (or YAML's bare off, i.e. False) and a
+    # plain int/float in (0, 100]; anything else falls back to None
+    # (unmanaged), loudly. Never falls back to 0:
+    # 0 would mean "cap swap at nothing", the opposite of what this knob is
+    # for, and would hand swap_watch a target that disables swap outright.
+    pct = config.swap_ceiling_pct
+    if pct is not None:
+        # YAML 1.1 reads a bare `off` as boolean False, so False is the same
+        # request as the string "off" (any case). True has no such meaning.
+        if pct is False or (isinstance(pct, str) and pct.strip().lower() == SWAP_CEILING_OFF):
+            config.swap_ceiling_pct = SWAP_CEILING_OFF
+        elif isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            logger.warning(
+                "swap_ceiling_pct=%r is not a number or 'off' — ignoring (the "
+                "ceiling stays unmanaged). Set a number greater than 0 and at "
+                "most 100, or off to remove a ceiling.",
+                pct,
+            )
+            config.swap_ceiling_pct = None
+        elif isinstance(pct, int) and not (0 < pct <= 100):
+            # Caught before any float conversion: an oversized YAML int (e.g.
+            # ~300+ digits) makes math.isfinite(float(pct)) raise OverflowError
+            # rather than returning False, which would abort config loading
+            # entirely instead of the intended "warn and ignore" (architect
+            # review on the stacked rework PR, 2026-10-08). Any such int is
+            # necessarily out of (0, 100] anyway, so this range check alone
+            # rejects it with no conversion ever attempted.
+            logger.warning(
+                "swap_ceiling_pct=%r is out of range — ignoring (the ceiling "
+                "stays unmanaged). Must be greater than 0 and at most 100.",
+                pct,
+            )
+            config.swap_ceiling_pct = None
+        elif not math.isfinite(pct) or not (0 < pct <= 100):
+            logger.warning(
+                "swap_ceiling_pct=%r is out of range — ignoring (the ceiling "
+                "stays unmanaged). Must be greater than 0 and at most 100.",
+                pct,
+            )
+            config.swap_ceiling_pct = None
+        else:
+            config.swap_ceiling_pct = float(pct)
+
     return config
 
 
@@ -653,7 +770,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         "container_name", "container_ip", "container_user",
         "health_api_port", "check_interval_s", "state_dir",
         "host_ip", "host_user", "maintenance_file",
-        "swap_reconcile_enabled", "gateway_pause_max_ahead_s",
+        "swap_reconcile_enabled", "swap_ceiling_pct", "gateway_pause_max_ahead_s",
     }
     top_kwargs = {k: v for k, v in raw.items() if k in top_fields}
 

@@ -13,6 +13,138 @@ documentation.
 4. Confirm whether the Agent Zero tree is dirty before assuming any upstream
    version is compatible.
 
+## Database integrity, quarantine, and backup admission
+
+`scripts/backup.sh` verifies the live SQLite database through
+`genesis.db.integrity` before touching the backup clone. There is deliberately
+no raw `sqlite3 quick_check` fallback: if the inode-bound checker is unavailable
+or the database changes identity throughout the check, integrity is
+`indeterminate` and no new backup is admitted. A stable failure writes the
+external, mode-0600 `~/.genesis/db_quarantine.json` marker and stops
+`genesis-server.service` plus the legacy bridge writer. The marker is external
+because a damaged database cannot reliably store its own stop condition.
+Only explicit `quick_check` findings or SQLite's `SQLITE_CORRUPT` /
+`SQLITE_NOTADB` result families establish corruption. Operational failures such
+as lock contention or I/O errors remain indeterminate: backup and update still
+fail loudly, but Genesis is not permanently quarantined on that evidence alone.
+The same external marker also acts as a non-corruption restart fence when a
+restore has installed a candidate whose final verification could not complete;
+its `source` records `restore-final-verification-incomplete` for that case.
+
+The encrypted SQL artifact must then decrypt, import into a fresh mode-0600
+database, pass full integrity and foreign-key checks, and contain a non-empty
+schema. Temporary plaintext, the verification database, and all SQLite sidecars
+are trap-cleaned. `backup_status.json` binds the result to a per-run `run_id`
+and reports `db_integrity_status`, `sqlite_backup_verified`, `failure_class`,
+and `failure_stage`.
+
+`scripts/update.sh` admits only the status written for its exact requested run:
+
+- corrupt, quarantined, indeterminate, stale/malformed status, lock contention,
+  or an unverified SQLite artifact aborts before repository or schema changes;
+- non-database failures may continue because the verified SQLite recovery point
+  exists, but the full backup log and a prominent degraded-mode banner are
+  printed, and `backup:<failure_stage>` is persisted in `update_history`;
+- the separate pre-migration online snapshot must also pass `quick_check` or the
+  update aborts.
+
+Restore acquires locks in the global `update → backup/restore` order. A
+database-only recovery is available both as `scripts/restore.sh --database-only`
+and `python -m genesis restore --database-only`; the staged replacement is
+validated before atomic installation. A healthy replacement inode makes the old
+quarantine stale and permits service restart, while the failed original remains
+preserved as the pre-restore forensic copy.
+When the live database is currently quarantined, database-only recovery may
+replace it even if the damaged file has a newer mtime; the newer-destination
+guard remains in force for non-quarantined databases.
+If restore cannot determine that quarantine state (for example, the integrity
+checker cannot start), it aborts instead of treating the database as healthy.
+
+### Restored peer permissions
+
+Full and database-only backup restores disable peer access, clear capability
+grants, and renew relationship epochs in the staged database before installation.
+Identities and historical records remain; saved jobs and approval consent cannot
+be replayed as current authority. Incompatible peer schemas refuse before the
+live database is touched. Older databases without peer state remain compatible.
+Peer-bearing candidates require SQLite 3.37 or newer to verify that reset targets
+are ordinary tables. Reset refuses triggers or foreign-key actions that could
+change other rows; the staged transaction rolls back instead of publishing those
+effects. Unrelated triggers, foreign keys and full-text tables remain supported.
+An owner must explicitly configure peer access and grant capabilities again;
+a runtime that started disabled also requires a restart to enable execution.
+
+Update prepares a separate, guarded `.pre-update.peer-restore` candidate before
+stopping services or changing code, retaining the original `.pre-update` snapshot.
+Migration rollback uses the guarded candidate; an incomplete database rollback
+does not explicitly restart services. External watchdog recovery is unchanged.
+
+Guardian whole-container snapshot rollback is different: its existing second
+approval prompt warns that saved peer permissions, jobs and consent return.
+Approving that specific action explicitly reauthorizes the saved peers. Both
+existing approval gates still apply; failed prompt delivery or denial cannot
+authorize rollback.
+
+### Restore preconditions and the holder scan
+
+Database-only recovery refuses unless it can establish that no process still
+holds the database. Before replacing anything, `restore.sh` scans
+`/proc/<pid>/fd` for open handles on exactly the live database artifacts —
+the main file, `-wal`, `-shm`, and `-journal`, matched by their **resolved**
+path and including their unlinked-but-still-open `` (deleted)`` forms. A handle on this
+script's own `.pre-restore.<epoch>` safety copies does not refuse a restore.
+
+That scan needs visibility the invoking uid may not have: an unreadable
+`/proc/<pid>/fd` entry is an **unknown** holder, not an absent one, so the scan
+borrows authority — as uid 0, or via non-interactive `sudo` when available.
+With neither, the restore **refuses** rather than assuming no holder exists.
+Grant non-interactive `sudo` for the scan, run as root, or establish a verified
+offline boundary and declare it (below). The privileged scan is invoked as a
+`sh -c 'find /proc/[0-9]*/fd ...'` wrapper (the PID glob must expand inside the
+privileged shell), so a least-privilege sudoers rule must permit that `sh`
+invocation — there is no `sudo true` capability probe, and a rule granting
+exactly the scan command is sufficient.
+
+`GENESIS_RESTORE_HOLDER_SCAN` selects the mode:
+
+| value | behaviour |
+|---|---|
+| `auto` (default) | uid 0, else `sudo -n`, else refuse |
+| `plain` | unprivileged scan; refuses when the scan reports an error, and refuses outright where procfs is mounted with any enabled `hidepid` value (numeric or symbolic — anything not `0`/`off`) |
+| `sudo` | require `sudo -n`; refuse if unavailable |
+| `none` | **skip the scan entirely** — see the warning below |
+
+> **`none` removes the only holder check on this path.** It does not bypass the
+> quarantine marker, the staged-candidate validation, or the post-install
+> verification — but it *does* drop the check that no process holds the database
+> while it is replaced. Use it only when exclusion is established by other means,
+> such as a verified offline boundary; it exists so an operator who genuinely has
+> that boundary can proceed deliberately rather than being refused. It is not a
+> convenience switch for a busy machine.
+
+The scan is a **supplementary guard, never exclusion**: it cannot by itself
+prevent a holder appearing between inspection and replacement. Exclusion comes
+from whatever keeps holders out — not from this scan.
+
+Script-side hooks and workers (the audit trail, edit sensor, precompact,
+procedure advisor, proactive memory, session context/heartbeat/alerts, repo
+pulse, snapshot GC) consult a shared admission check before opening the
+database (`genesis.db.admission.database_is_fenced`), and every connection
+factory in `genesis.db.connection` asserts it at open time. While the database
+is quarantined they silently skip it and resume on their own once the
+quarantine clears. The check fails closed: if state cannot be established, the
+opener skips.
+
+Scope this precisely, because the useful question during a recovery is what is
+NOT covered. The check binds the enumerated automatic openers under `scripts/`
+and the connection factories. It does **not** yet bind every opener in
+`src/genesis/` — several modules open the database directly rather than through
+a factory, and the inventory test that would catch them does not reach read-only
+opens. Treat the fence as removing the hook-writer class that drove the
+2026-09-18 recurrence, not as proof that nothing can touch the file. Exclusion
+during a replacement still comes from stopping the services that hold it.
+
+
 ## During Migration Work
 
 1. Keep Genesis changes on a dedicated hardening branch.
@@ -27,7 +159,9 @@ The public repo (`GENesis-AGI`) is the primary repo, so there is no separate
 "strip and stage" step. Leak protection is enforced on every PR by the
 `leak-detector` job in `.github/workflows/ci.yml` (detect-secrets + gitleaks
 with the repo's `.gitleaks.toml` PII/infrastructure rules + portability
-+ email scans).
++ email scans), and on every push to any non-main branch by
+`.github/workflows/branch-leak-scan.yml`, so a branch is scanned the moment it
+is published, PR or not. Both run the same steps from `scripts/ci/leak_scan.sh`.
 
 Releases are cut on a **release branch**, never on `main` — the pre-commit hook
 rejects direct commits there and branch discipline requires a PR, so the fold
@@ -121,6 +255,37 @@ The mirror/archive carry only GPG-encrypted `*.gpg` files; the decryption
 passphrase is escrowed separately. The guardian **refuses to overwrite the
 archive from an empty or incomplete mirror**, so a container-side zeroing event
 can never propagate into the last-line copy.
+
+GPG's `--passphrase-fd` reads only the first line, so backup and decryption
+reject embedded LF; the guardian's byte-oriented decryption also rejects NUL.
+Existing single-line keys retain their spaces, quotes, carriage returns and
+Unicode bytes. Missing-key handling remains the caller's existing policy.
+
+Encrypted backup readers share the standalone `guardian/cred_integrity.py`
+decryption boundary, which also runs under system Python during credential
+recovery. A `.gpg` suffix or successful GPG exit alone is insufficient: readers
+require a single integrity-protected message successfully decrypted using the
+supplied passphrase. Unencrypted literal/signed packets, public-key fallback,
+unprotected encryption, damaged trailers, and incomplete decryption are rejected.
+Protected MDC and AEAD messages remain supported. File restores publish a private
+staged result only after authentication, preserving an existing destination on
+decryption failure. Historical unencrypted `.gpg` files are reported incomplete;
+the explicitly supported legacy plaintext forms remain separate.
+
+Standalone recovery needs the trusted checkout's
+`src/genesis/guardian/cred_integrity.py` alongside the scripts; it needs no
+installed Genesis package or working virtual environment. A minimal copied
+transcript-recovery bundle must preserve that file's checkout-relative path
+alongside `scripts/lib/transcript_archive.py`, plus the trusted catalog validator
+when restoring catalog-bearing analytics archives. Missing decoder code fails
+closed; copying only the archive script is insufficient for encrypted recovery.
+
+Secret-file syntax uses ASCII whitespace outside quotes. The Bash loader uses
+literal ASCII trim patterns and runs its `sed` parser under `LC_ALL=C`; guardian
+readers split on LF and trim ASCII whitespace. Unicode spaces and separators
+remain value bytes. Ordinary `LC_ALL` records still export to the caller, but
+cannot change later syntax parsing. This candidate has passed disposable
+locale/byte checks; final regression and recovery tests remain required.
 
 **Rebuild runbook (no network required):**
 

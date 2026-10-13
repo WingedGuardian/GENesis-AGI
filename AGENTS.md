@@ -4,6 +4,114 @@ Cross-tool agent entry point (Codex, Cursor, OpenCode, …). The canonical
 project instructions live in **CLAUDE.md** — read it first; everything below
 is supplementary.
 
+## Codex external-client boundary
+
+Codex connects to Genesis through the project `.codex/config.toml` as an
+external MCP client. It can request Genesis capabilities on demand, but it is
+not a Genesis foreground or background session: never register its transcript,
+create a charter for it, send its identifiers to session tools, or add lifecycle
+hooks that make Genesis manage the conversation. See
+`.agents/skills/genesis-external-client/SKILL.md` when working through Codex.
+
+## Deploy and working-tree boundary
+
+The repository checkout you are working in is the tree the running server
+deploys from. Do not mutate it in place.
+
+- **Never edit tracked files in the main checkout directly.** Make changes on a
+  branch in a git worktree and open a PR; the checkout is advanced only by a
+  deploy, never by hand.
+- **Deploy only through the scripts** — `scripts/update.sh` (full update) or
+  `scripts/deploy_code_only.sh` (locked code-only pull + restart). Do not run
+  `git pull`, `git checkout <ref>`, `git reset`, or `pip install` against the
+  checkout yourself: those bypass the deploy lock, the guardian pause, and the
+  serving-commit record that the deploy path maintains.
+- **Never run `scripts/deploy_candidates`.** It is the operator tool for the
+  local `live` integration branch — running unmerged candidate branches on this
+  install before their PRs merge — not a development action.
+
+## Rebuilding a PR that was sent back
+
+A `needs-rework` PR, or a `needs-architecture-session` PR whose owner decision
+has since been posted as a rework spec, carries that spec in a maintainer
+comment headed `## Rework spec` (and any design issue that comment names). An
+audit or proposal without that heading is not a spec. A
+`needs-architecture-session` PR with no posted spec has an undecided design: do
+not build it. When you build a rework:
+
+- **Before building, acknowledge the spec on the OLD PR** in one comment headed
+  `## Rework acknowledgement`. Give the spec in your own words, the split you
+  will build, and every question you need answered first. Open no PR, not even
+  a draft, until it is posted. If it asks no questions, proceed once it is
+  posted; otherwise wait for an answer on the old PR. On a Devin-built old PR,
+  put `(aside)` on the first line and the heading under it, or the comment
+  starts a paid Devin session. Post it with
+  `gh api repos/<owner>/<repo>/issues/<N>/comments -F body=@<file>`;
+  `gh pr comment` can be refused on a PR past its review limit.
+- **Open NEW PRs** with fresh round counts. When the last one opens, close the
+  old PR with a comment that maps every part of it, file by file, to the
+  `file:line` in a
+  replacement covering it (or says why that part is moot), and leave its labels
+  on. If any part is neither, leave the old PR open and name that part on it.
+  If the spec ends with a `Follow-up: <id>` line, copy that line into the body
+  of the replacement that will merge into main LAST. A merge into any other
+  base completes it too, so never put it on a PR that merges into another PR.
+- **Follow the spec's split plan.** Each PR carries one concern and names the
+  PRs it depends on. Open them in dependency order against main; a PR whose
+  dependency has not merged waits as a branch, or opens stacked with its base
+  named. Being a rework is not itself a reason to stay unsplit.
+- **Size every PR in counted lines** (`python3 scripts/pr_shape.py --base origin/main`; the rule is in `.claude/docs/premise-check.md`, step 6).
+  - Under 500 is the target.
+  - From 500 to 1,000, add a `Shape:` line to the PR body saying why it cannot
+    be smaller.
+  - Over 1,000 needs the owner's approval: ask in the acknowledgement or the
+    PR body; the owner decides before merge.
+
+  Size a stacked PR against its parent branch, not main.
+
+  This is a guideline: from 500 to 1,000, a stated, legitimate reason is enough.
+- **Report against the spec** in each PR body:
+  ```
+  ## Rework
+  Replaces: #N (spec: <link>; acknowledged: <link to your comment on the old PR>)
+  Split: PR k of n (<the others>)
+  Kept / deleted / reshaped as the spec asked: <one line each, or "as specified">
+  Deviations: <each: what differs, and the complication that forced it> | none
+  Questions answered: <each question the spec delegated or missed: the answer and why>
+  ```
+  Unforeseen complications are expected; unexplained deviations are not. Never
+  settle a question the spec left open silently, and never in the most
+  defensive direction without saying so. That is a design decision, and it
+  belongs in this section.
+
+Devin builds a rework the same way, as fresh PR(s) naming the old one, but never
+closes the old PR: the closing session closes it after the same coverage check.
+
+Full contract: `CLAUDE.md` ("Rework is a contract with two sides"),
+`.claude/docs/premise-check.md` ("Handing a verdict to a builder"), and the
+genesis-development skill ("Building a rework").
+
+## Genesis skill path resolution
+
+**Every entry in the generated "Genesis Capability Surface" below carries its
+own path — read it, never construct one from the name.** The exporter indexes
+TWO roots recursively, `.claude/skills/` (Tier 1) and `src/genesis/skills/`
+(Tier 2), and a skill can sit at any depth under either, so no naming rule you
+could infer holds across the whole inventory.
+
+Two things the listing cannot tell you on its own:
+
+- A name CAN exist under both roots — `voice-master` does today, with differing
+  content. The inventory always means the Tier 1 copy: `.claude/skills/` wins a
+  collision.
+- A skill listed there does NOT live under `.agents/skills/`; only the
+  external-client skill named above does.
+
+This section used to carry a measured breakdown of which skills sit flat, which
+nest, and which are Tier 2. The paths in the listing answer that directly now,
+and a hand-maintained census of a generated artifact is a second source of truth
+that can only go stale.
+
 ## Code Review Mandate (adversarial)
 
 When reviewing a diff or PR (including automated PR review), review ADVERSARIALLY,
@@ -108,8 +216,9 @@ This repo is indexed by GitNexus. The MCP tools (`impact`, `query`,
 and execution-flow answers that grep can't. Use them when they fit the
 question — **none is a mandatory pre-edit gate** (see CLAUDE.md → Code
 Intelligence for the tool-selection matrix; Serena is the live-symbol
-default, GitNexus is snapshot-based so run `node .gitnexus/run.cjs analyze`
-first when freshness matters).
+default, GitNexus is snapshot-based. From the main checkout, run
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` when freshness matters;
+linked worktrees deliberately skip indexing, so use Serena for live branch truth).
 
 Useful entry points:
 
@@ -136,49 +245,52 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 
 ### Skills
 
-- **aws-fde-delivery** — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
-- **browser-automation** — Web automation with 4-layer escalation (Fetch, Genesis Browser, On-Demand MCP, Computer Use), anti-detection, and persistent profiles
-- **cc-update** — Update Claude Code (the CC CLI / "clog code") to a new version, or bump the pinned CC version. Use when the user asks to update Claude Code, bump the CC pin, evaluate a new CC release, or says "clog code update". Routes to the canonical, standardized process in docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every time. Do NOT use for general "what changed in CC" trivia with no intent to update.
-- **closing-session** — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "close out the open PRs", "review and fix the open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and stops at the merge gate for the user's per-PR approval. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
-- **code-intelligence** — Code understanding tool selection. Use when exploring architecture, finding definitions, tracing call chains, assessing blast radius of changes, or debugging code paths in the Genesis codebase.
-- **content-publish** — End-to-end content creation and publishing. Takes a topic (or generates one), drafts in the user's voice, gets approval via Telegram, and publishes to Medium via browser automation. Invoke with "publish a post about X", "write and publish to Medium", "content-publish", or when an ego-dispatched session needs to create and distribute content.
-- **debugging** — Systematic debugging of issues — use when a test fails, runtime error occurs, unexpected behavior is reported, or an awareness tick produces anomalous results
-- **deliverable-builder** — Produce a professional, send-ready deliverable on the user's behalf — in the correct file format (never raw markdown), in the user's voice, structured to lead with the strongest material, and free of document-level AI tells. Runs a gated pipeline with a fresh-context verification policeman and a Stop-hook that won't let the session finish without a verified PASS. Use when producing a job take-home, client report, executive one-pager, slide deck, proposal, or anything going out under the user's name.
-- **evaluate** — Evaluate technologies and competitive developments against Genesis architecture
-- **forecasting** — Superforecasting with calibrated reasoning, Brier score tracking, and prediction ledger management
-- **genesis-development** — This skill should be used when developing, debugging, refactoring, or building Genesis itself — tasks like "fix this in Genesis", "add a new MCP tool", "wire up the runtime", "Genesis won't start", "create a worktree", "debug the bridge", or "add a capability". Applies to any task modifying files under src/, .claude/, or tests/. Do NOT load for Genesis-as-tool work ("summarize this", "write a LinkedIn post", "research X") or general questions unrelated to Genesis internals.
-- **genesis-voice** — Apply when Genesis writes as itself — outreach, public content, community posts, emails, DMs. Not for writing in the user's voice (that's voice-master). Activate when Genesis is the author, not the ghostwriter.
-- **gitnexus-cli** — Use when the user needs to run GitNexus CLI commands like analyze/index a repo, check status, clean the index, generate a wiki, or list indexed repos. Examples: "Index this repo", "Reanalyze the codebase", "Generate a wiki"
-- **gitnexus-debugging** — Use when the user is debugging a bug, tracing an error, or asking why something fails. Examples: "Why is X failing?", "Where does this error come from?", "Trace this bug"
-- **gitnexus-exploring** — Use when the user asks how code works, wants to understand architecture, trace execution flows, or explore unfamiliar parts of the codebase. Examples: "How does X work?", "What calls this function?", "Show me the auth flow"
-- **gitnexus-guide** — Use when the user asks about GitNexus itself — available tools, how to query the knowledge graph, MCP resources, graph schema, or workflow reference. Examples: "What GitNexus tools are available?", "How do I use GitNexus?"
-- **gitnexus-impact-analysis** — Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: "Is it safe to change X?", "What depends on this?", "What will break?"
-- **gitnexus-refactoring** — Use when the user wants to rename, extract, split, move, or restructure code safely. Examples: "Rename this function", "Extract this into a module", "Refactor this class", "Move this to a separate file"
-- **integrate-module** — Turn any external program into a Genesis module via structured discovery, connection mapping, config generation, and verification.
-- **lead-generation** — Prospect discovery, enrichment, scoring, and reporting against an Ideal Customer Profile
-- **linkedin-comment-strategy** — This skill should be used when the user asks to "write a comment for this LinkedIn post", "help me respond to this post", "what should I comment on this", "craft a LinkedIn comment", or when Genesis identifies high-value posts in the user's network worth engaging with. Also triggered by "how should I engage on LinkedIn" or "help me be more visible on LinkedIn".
-- **linkedin-content-calendar** — This skill should be used when the user asks to "plan my LinkedIn content", "create a content calendar", "what should I post about this week", "plan my posting schedule", or when Genesis proactively suggests a weekly content plan during surplus compute. Also triggered by "I need post ideas" or "I don't know what to write about".
-- **linkedin-dm-outreach** — This skill should be used when the user asks to "write a LinkedIn message", "draft a connection request", "help me reach out to someone on LinkedIn", "write an InMail", "message this person", or when the prospect-researcher skill identifies a high-value contact worth reaching out to. Also triggered by "how should I approach [person/company]" in a LinkedIn context.
-- **linkedin-hook-writer** — This skill should be used when the user asks to "write a hook for my post", "give me opening lines", "help me start this LinkedIn post", "I need a better opener", or when the linkedin-post-writer skill needs strong opening options. Also triggered by "my posts aren't getting clicks" or "how do I get people to read my posts".
-- **linkedin-post-writer** — This skill should be used when the user asks to "write a LinkedIn post", "draft a post about", "help me post on LinkedIn", "create LinkedIn content", or when Genesis proactively generates post ideas during surplus compute. Also triggered by content calendar execution or when the user shares a topic they want to write about.
-- **linkedin-profile-optimizer** — This skill should be used when the user asks to "optimize my LinkedIn profile", "update my LinkedIn headline", "rewrite my LinkedIn summary", "improve my LinkedIn about section", or when Genesis identifies that the user's profile doesn't align with their current goals or target audience.
-- **obstacle-resolution** — Resolve obstacles using fallback chains — use when an approach fails, a dependency is unavailable, an API returns errors, or a task is blocked and needs an alternative path forward
-- **onboarding** — First-run onboarding — guides new users through Genesis setup on their first CC session. Configures user profile, essential API keys, Telegram, GitHub backup, and service verification. Triggered automatically while the install is not yet FUNCTIONAL (the setup floor — Claude Code login + an LLM key + an embedding key — is unmet), not merely while ~/.genesis/setup-complete is absent. Re-runnable by asking Genesis to "run setup" or "reconfigure [section]".
-- **osint** — OSINT investigation — discover, track, and report on people, companies, and technologies
-- **prospect-researcher** — This skill should be used when the user asks to "research this company", "look into this person", "find the best angle for reaching out to", "who should I contact at [company]", "what does [company] care about", or when preparing outreach to a specific target. Also triggered by "help me prepare for an interview with [company]" or "I want to apply to [company]". Combines lead-generation intelligence with LinkedIn-specific approach planning.
-- **research** — Deep research on a topic — use when investigating unfamiliar domains, answering complex questions requiring multiple sources, or when an evaluation flags something for deeper analysis
-- **retrospective** — Post-interaction retrospective analysis — use after completing a significant task, conversation, or phase to extract lessons, identify process improvements, and update procedures
-- **shelve** — Shelve the current session — create a bookmark so you can find and resume it later with /unshelve.
-- **stealth-browser** — Anti-detection behavioral rules for stealth browser automation
-- **subsystem-map** — This skill should be used before answering "does Genesis have X", "does Genesis lack X", auditing Genesis capabilities, comparing Genesis to an external system, or reviewing/summarizing the architecture. It routes to the canonical judgment-layer subsystem map so audits start from the map, not from a cold grep. Also fires after changing a subsystem's capabilities, to keep the map current.
-- **taste** — Use before generating, editing, or reviewing any user interface — a dashboard panel, a landing page, an email, a slide, an app screen. Sets three deliberate design dials (variance, motion, density) BEFORE generation so the output has a point of view instead of defaulting to the timid, uniform look that reads as "AI made this". Applies to Genesis's OWN dashboard UI, not only things built for others.
-- **triage-calibration** — Daily triage accuracy calibration — use during scheduled calibration runs to verify triage classification accuracy against few-shot examples and adjust confidence thresholds
-- **unshelve** — Search for shelved sessions — find past bookmarked sessions by keyword or browse recent ones.
-- **user_evaluate** — Evaluate content for personal relevance to the user using the user model
-- **video-processing** — Download, transcribe, analyze, and clip video content — vertical shorts, captions, thumbnails
-- **voice-master** — Foundational voice authority and AI humanizer — writes content in the user's authentic voice with built-in AI detection, and supports stealth / anti- attribution writing (forum personas, anonymous posts, "write as not-me"). Use when asked to write/draft/generate content, invoke /voice, /write-as-me, or /humanize, run voice calibration, check "does this sound like me?", "make this sound human" / "de-AI this", "write a forum post as [persona]", or run AI detection ("does this sound like AI?", "check for AI patterns", "anti-slop check"). Do NOT use this skill for code, technical docs, or any output the user has not asked to be written in their voice — code styling defers to the separate code-voice skill.
-- **web-research** — Evidence-driven web and open-source research for questions that require multiple sources, factual verification, comparisons, or an adopt/adapt/build decision. Use for substantial research in foreground sessions, the genesis-researcher subagent, and research-profile background sessions. Skip for a single stable fact or a known URL that only needs fetching.
-- **youtube-fetch** — Fetches YouTube video metadata and transcripts using yt-dlp. Activate when the user shares a YouTube URL (youtube.com, youtu.be), asks to 'fetch this video', 'get the transcript', 'what does this video say', 'summarize this YouTube video', or references video content that needs to be retrieved. Also activate when processing multiple YouTube URLs in batch. Do NOT use for non-YouTube video platforms, local video files, or audio-only podcast URLs.
+Each entry gives the full path to the skill's instruction file. The filename is usually `SKILL.md` but not always, so read the path as given rather than assuming one — and never infer a path from the name, because the name is not the directory. Some skills nest inside a container (`gitnexus-cli` lives under `.claude/skills/gitnexus/`, not `.claude/skills/gitnexus-cli/`), and skills live under two roots.
+
+- **aws-fde-delivery** (`src/genesis/skills/aws-fde-delivery/SKILL.md`) — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
+- **browser-automation** (`src/genesis/skills/browser-automation/SKILL.md`) — Canonical guide to Genesis browser automation - layers (Camoufox, Chromium, the user's Chrome over CDP, TinyFish, desktop), per-tool timeouts, safety gates, verify-after-act, what a click checks (scroll, hit test, covered targets), overlays, iframes, tabs, and failure diagnosis
+- **cc-update** (`.claude/skills/cc-update/SKILL.md`) — Update Claude Code (the CC CLI / "clog code") to a new version, or bump the pinned CC version. Use when the user asks to update Claude Code, bump the CC pin, evaluate a new CC release, or says "clog code update". Routes to the canonical, standardized process in docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every time. Do NOT use for general "what changed in CC" trivia with no intent to update.
+- **closing-session** (`.claude/skills/closing-session/SKILL.md`) — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "close out the open PRs", "review and fix the open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and stops at the merge gate for the user's per-PR approval. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
+- **code-intelligence** (`.claude/skills/code-intelligence/SKILL.md`) — Code understanding tool selection. Use when exploring architecture, finding definitions, tracing call chains, assessing blast radius of changes, or debugging code paths in the Genesis codebase.
+- **content-publish** (`.claude/skills/content-publish/SKILL.md`) — End-to-end content creation and publishing. Takes a topic (or generates one), drafts in the user's voice, gets approval via Telegram, and publishes to Medium via browser automation. Invoke with "publish a post about X", "write and publish to Medium", "content-publish", or when an ego-dispatched session needs to create and distribute content.
+- **debugging** (`src/genesis/skills/debugging/SKILL.md`) — Systematic debugging of issues — use when a test fails, runtime error occurs, unexpected behavior is reported, or an awareness tick produces anomalous results
+- **deliverable-builder** (`.claude/skills/deliverable-builder/SKILL.md`) — Produce a professional, send-ready deliverable on the user's behalf — in the correct file format (never raw markdown), in the user's voice, structured to lead with the strongest material, and free of document-level AI tells. Runs a gated pipeline with a fresh-context verification policeman and a Stop-hook that won't let the session finish without a verified PASS. Use when producing a job take-home, client report, executive one-pager, slide deck, proposal, or anything going out under the user's name.
+- **evaluate** (`src/genesis/skills/evaluate/SKILL.md`) — Evaluate technologies and competitive developments against Genesis architecture
+- **forecasting** (`src/genesis/skills/forecasting/SKILL.md`) — Superforecasting with calibrated reasoning, Brier score tracking, and prediction ledger management
+- **genesis-development** (`.claude/skills/genesis-development/SKILL.md`) — This skill should be used when developing, debugging, refactoring, or building Genesis itself — tasks like "fix this in Genesis", "add a new MCP tool", "wire up the runtime", "Genesis won't start", "create a worktree", "debug the bridge", or "add a capability". Applies to any task modifying files under src/, .claude/, or tests/. Do NOT load for Genesis-as-tool work ("summarize this", "write a LinkedIn post", "research X") or general questions unrelated to Genesis internals.
+- **genesis-voice** (`.claude/skills/genesis-voice/SKILL.md`) — Apply when Genesis writes as itself — outreach, public content, community posts, emails, DMs. Not for writing in the user's voice (that's voice-master). Activate when Genesis is the author, not the ghostwriter.
+- **gitnexus-cli** (`.claude/skills/gitnexus/gitnexus-cli/SKILL.md`) — Use when the user needs to run GitNexus CLI commands like analyze/index a repo, check status, clean the index, generate a wiki, or list indexed repos. Examples: "Index this repo", "Reanalyze the codebase", "Generate a wiki"
+- **gitnexus-debugging** (`.claude/skills/gitnexus/gitnexus-debugging/SKILL.md`) — Use when the user is debugging a bug, tracing an error, or asking why something fails. Examples: "Why is X failing?", "Where does this error come from?", "Trace this bug"
+- **gitnexus-exploring** (`.claude/skills/gitnexus/gitnexus-exploring/SKILL.md`) — Use when the user asks how code works, wants to understand architecture, trace execution flows, or explore unfamiliar parts of the codebase. Examples: "How does X work?", "What calls this function?", "Show me the auth flow"
+- **gitnexus-guide** (`.claude/skills/gitnexus/gitnexus-guide/SKILL.md`) — Use when the user asks about GitNexus itself — available tools, how to query the knowledge graph, MCP resources, graph schema, or workflow reference. Examples: "What GitNexus tools are available?", "How do I use GitNexus?"
+- **gitnexus-impact-analysis** (`.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md`) — Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: "Is it safe to change X?", "What depends on this?", "What will break?"
+- **gitnexus-refactoring** (`.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md`) — Use when the user wants to rename, extract, split, move, or restructure code safely. Examples: "Rename this function", "Extract this into a module", "Refactor this class", "Move this to a separate file"
+- **integrate-module** (`src/genesis/skills/integrate-module/SKILL.md`) — Turn any external program into a Genesis module via structured discovery, connection mapping, config generation, and verification.
+- **lead-generation** (`src/genesis/skills/lead-generation/SKILL.md`) — Prospect discovery, enrichment, scoring, and reporting against an Ideal Customer Profile
+- **linkedin-comment-strategy** (`src/genesis/skills/linkedin-comment-strategy/SKILL.md`) — This skill should be used when the user asks to "write a comment for this LinkedIn post", "help me respond to this post", "what should I comment on this", "craft a LinkedIn comment", or when Genesis identifies high-value posts in the user's network worth engaging with. Also triggered by "how should I engage on LinkedIn" or "help me be more visible on LinkedIn".
+- **linkedin-content-calendar** (`src/genesis/skills/linkedin-content-calendar/SKILL.md`) — This skill should be used when the user asks to "plan my LinkedIn content", "create a content calendar", "what should I post about this week", "plan my posting schedule", or when Genesis proactively suggests a weekly content plan during surplus compute. Also triggered by "I need post ideas" or "I don't know what to write about".
+- **linkedin-dm-outreach** (`src/genesis/skills/linkedin-dm-outreach/SKILL.md`) — This skill should be used when the user asks to "write a LinkedIn message", "draft a connection request", "help me reach out to someone on LinkedIn", "write an InMail", "message this person", or when the prospect-researcher skill identifies a high-value contact worth reaching out to. Also triggered by "how should I approach [person/company]" in a LinkedIn context.
+- **linkedin-hook-writer** (`src/genesis/skills/linkedin-hook-writer/SKILL.md`) — This skill should be used when the user asks to "write a hook for my post", "give me opening lines", "help me start this LinkedIn post", "I need a better opener", or when the linkedin-post-writer skill needs strong opening options. Also triggered by "my posts aren't getting clicks" or "how do I get people to read my posts".
+- **linkedin-post-writer** (`src/genesis/skills/linkedin-post-writer/SKILL.md`) — This skill should be used when the user asks to "write a LinkedIn post", "draft a post about", "help me post on LinkedIn", "create LinkedIn content", or when Genesis proactively generates post ideas during surplus compute. Also triggered by content calendar execution or when the user shares a topic they want to write about.
+- **linkedin-profile-optimizer** (`src/genesis/skills/linkedin-profile-optimizer/SKILL.md`) — This skill should be used when the user asks to "optimize my LinkedIn profile", "update my LinkedIn headline", "rewrite my LinkedIn summary", "improve my LinkedIn about section", or when Genesis identifies that the user's profile doesn't align with their current goals or target audience.
+- **obstacle-resolution** (`src/genesis/skills/obstacle-resolution/SKILL.md`) — Resolve obstacles using fallback chains — use when an approach fails, a dependency is unavailable, an API returns errors, or a task is blocked and needs an alternative path forward
+- **onboarding** (`src/genesis/skills/onboarding/SKILL.md`) — First-run onboarding — guides new users through Genesis setup on their first CC session. Configures user profile, essential API keys, Telegram, GitHub backup, and service verification. Triggered automatically while the install is not yet FUNCTIONAL (the setup floor — Claude Code login + an LLM key + an embedding key — is unmet), not merely while ~/.genesis/setup-complete is absent. Re-runnable by asking Genesis to "run setup" or "reconfigure [section]".
+- **osint** (`src/genesis/skills/osint/SKILL.md`) — OSINT investigation — discover, track, and report on people, companies, and technologies
+- **prospect-researcher** (`src/genesis/skills/prospect-researcher/SKILL.md`) — This skill should be used when the user asks to "research this company", "look into this person", "find the best angle for reaching out to", "who should I contact at [company]", "what does [company] care about", or when preparing outreach to a specific target. Also triggered by "help me prepare for an interview with [company]" or "I want to apply to [company]". Combines lead-generation intelligence with LinkedIn-specific approach planning.
+- **research** (`src/genesis/skills/research/SKILL.md`) — Deep research on a topic — use when investigating unfamiliar domains, answering complex questions requiring multiple sources, or when an evaluation flags something for deeper analysis
+- **retrospective** (`src/genesis/skills/retrospective/SKILL.md`) — Post-interaction retrospective analysis — use after completing a significant task, conversation, or phase to extract lessons, identify process improvements, and update procedures
+- **shelve** (`.claude/skills/shelve/SKILL.md`) — Shelve the current session — create a bookmark so you can find and resume it later with /unshelve.
+- **stealth-browser** (`src/genesis/skills/stealth-browser/SKILL.md`) — Anti-detection behaviour for Genesis browser automation - what the Camoufox tools already do, what the agent must still do, Cloudflare Turnstile handling, and per-site notes for bot-hostile sites
+- **subsystem-map** (`.claude/skills/subsystem-map/SKILL.md`) — This skill should be used before answering "does Genesis have X", "does Genesis lack X", auditing Genesis capabilities, comparing Genesis to an external system, or reviewing/summarizing the architecture. It routes to the canonical judgment-layer subsystem map so audits start from the map, not from a cold grep. Also fires after changing a subsystem's capabilities, to keep the map current.
+- **taste** (`.claude/skills/taste/SKILL.md`) — Use before generating, editing, or reviewing any user interface — a dashboard panel, a landing page, an email, a slide, an app screen. Sets three deliberate design dials (variance, motion, density) BEFORE generation so the output has a point of view instead of defaulting to the timid, uniform look that reads as "AI made this". Applies to Genesis's OWN dashboard UI, not only things built for others.
+- **triage-calibration** (`src/genesis/skills/triage-calibration/SKILL.md`) — Daily triage accuracy calibration — use during scheduled calibration runs to verify triage classification accuracy against few-shot examples and adjust confidence thresholds
+- **unshelve** (`.claude/skills/unshelve/SKILL.md`) — Search for shelved sessions — find past bookmarked sessions by keyword or browse recent ones.
+- **user_evaluate** (`src/genesis/skills/user_evaluate/SKILL.md`) — Evaluate content for personal relevance to the user using the user model
+- **validating-merges** (`.claude/skills/validating-merges/SKILL.md`) — This skill should be used when a session's job is POST-MERGE VERIFICATION — taking merged PRs and establishing whether the change actually does what it claimed, then recording the result against its `pr_verifications` obligation. "validate the merged PRs", "work the verification backlog", "did that PR actually work", "run the post-merge E2E". It owns the obligation ledger the repo-pulse worker fills. Do NOT load it for building a change and opening its PR (that is `genesis-development`), or for driving open PRs to merge (that is `closing-session`).
+- **video-processing** (`src/genesis/skills/video-processing/SKILL.md`) — Download, transcribe, analyze, and clip video content — vertical shorts, captions, thumbnails
+- **voice-master** (`.claude/skills/voice-master/SKILL.md`) — Foundational voice authority and AI humanizer — writes content in the user's authentic voice with built-in AI detection, and supports stealth / anti- attribution writing (forum personas, anonymous posts, "write as not-me"). Use when asked to write/draft/generate content, invoke /voice, /write-as-me, or /humanize, run voice calibration, check "does this sound like me?", "make this sound human" / "de-AI this", "write a forum post as [persona]", or run AI detection ("does this sound like AI?", "check for AI patterns", "anti-slop check"). Do NOT use this skill for code, technical docs, or any output the user has not asked to be written in their voice — code styling defers to the separate code-voice skill.
+- **web-research** (`.claude/skills/web-research/SKILL.md`) — Evidence-driven web and open-source research for questions that require multiple sources, factual verification, comparisons, or an adopt/adapt/build decision. Use for substantial research in foreground sessions, the genesis-researcher subagent, and research-profile background sessions. Skip for a single stable fact or a known URL that only needs fetching.
+- **youtube-fetch** (`.claude/skills/youtube-fetch/SKILL.md`) — Fetches YouTube video metadata and transcripts (genesis web_fetch MCP tool first, yt-dlp via Bash as the fallback). Activate when the user shares a YouTube URL (youtube.com, youtu.be), asks to 'fetch this video', 'get the transcript', 'what does this video say', 'summarize this YouTube video', or references video content that needs to be retrieved. Also activate when processing multiple YouTube URLs in batch. Do NOT use for non-YouTube video platforms, local video files, or audio-only podcast URLs.
 
 ### MCP Tools
 
@@ -190,8 +302,11 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 
 **genesis-health**
 
+- `board_item` — One issue or PR on the work board: its column and Genesis status (a live read), what blocks it (GitHub's blocked-by list, flagged when truncated), unverified open questions blocking it, and whether it was promoted from a private record.
+- `board_promote` — Propose turning a private ledger row or follow-up into a PUBLIC GitHub issue on the work board. Held for the owner's approval; nothing is posted by this call.
+- `board_status` — The work board as the reconciler last read it: counts by column, by Genesis status and by kind, coverage (open repo issues and PRs on the board against the repo's open total), drags logged, and whether the reconciler is alive. Reads stored heartbeats only, never GitHub, so it is cheap and safe.
 - `bootstrap_manifest` — Which subsystems initialized successfully, failed, or degraded at startup.
-- `browser_clear_domain` — Clear cookies for a specific domain (selective logout).
+- `browser_clear_domain` — Clear cookies for a domain and its subdomains (selective logout).
 - `browser_click` — Click an element on the current page by CSS selector or text.
 - `browser_collaborate` — Toggle collaborative timing mode.
 - `browser_fill` — Fill a form field on the current page.
@@ -199,7 +314,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `browser_press_key` — Press a keyboard key on the current page.
 - `browser_run_js` — Execute JavaScript in the browser's console on the current page.
 - `browser_screenshot` — Take a screenshot of the current page.
-- `browser_sessions` — List logged-in sessions from the persistent browser profile.
+- `browser_sessions` — List logged-in sessions in both local browser profiles.
 - `browser_snapshot` — Return the accessibility tree of the current page.
 - `browser_upload` — Upload a file to a file input element on the current page.
 - `build_lane_status` — What has the autonomous capability-build lane done — and how well do its verdicts track your decisions?
@@ -228,7 +343,12 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `job_health` — Scheduled job health: last run, last success, consecutive failures per job.
 - `module_call` — Execute an operation on an external module.
 - `module_list` — List all external modules and their available operations.
+- `open_question_block` — Add (or with ``remove=True`` drop) a block from an UNVERIFIED question to ``ledger:<id>``, ``follow_up:<id>`` or ``card:owner/repo#N``.
+- `open_question_list` — List open questions, one page at a time (newest first, with their blocks). ``total`` is the full count for the filter and ``listed`` what this page holds; ``next_offset`` is set while more remain (default page 50, max 200). Pages are offsets: a question raised or closed between two calls shifts the later pages by one, so if ``total`` changed, re-read from 0 rather than trusting the walk. ``status`` is ``unverified`` / ``resolved`` / ``dropped``, or empty for all. With ``target`` (``ledger:<id>`` / ``follow_up:<id>`` / ``card:owner/repo#N``) it answers instead whether that target is blocked, and by which unverified questions.
+- `open_question_raise` — Park a genuine owner fork as an open question, optionally blocking work.
+- `open_question_resolve` — Close an open question: ``status`` is ``resolved`` (answered) or ``dropped`` (no longer matters). ``resolution`` is required — say what settled it; an assumption is not an answer. Closing releases every block the question held (the edges are kept as history).
 - `provider_activity` — Per-provider call metrics: counts, error rates, latency percentiles, cache hits.
+- `session_address` — Which SendMessage name each Claude Code session id answers to.
 - `session_charter` — Read a session's charter: immutable origin, living mission/pointers, and the full ledger with item ids and status counts.
 - `session_charter_update` — Set the session's living mission and/or edit its pointer list.
 - `session_config` — Set model and/or effort for a Genesis conversation session.
@@ -250,6 +370,8 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `web_agent` — Run a goal-based browser automation and return structured results.
 - `web_fetch` — Fetch URL(s) and return clean text content.
 - `web_search` — Search the web and return structured results.
+- `zero_drop_ack` — Acknowledge a stranded-work finding — suppression with a reason.
+- `zero_drop_status` — Stranded work: what exists but is in no pipeline, enumerated.
 
 **genesis-outreach**
 
@@ -261,7 +383,7 @@ Body-scope inventory for cross-tool agents — Genesis's skills and action tools
 - `outreach_pending` — List messages QUEUED but not yet sent — the ones `outreach_cancel` can act on.
 - `outreach_poll` — Create a Discord poll via webhook. Returns JSON with message_id.
 - `outreach_preferences` — Get/set user channel preferences and quiet hours.
-- `outreach_queue` — View recent outreach messages.
+- `outreach_queue` — List the 20 most recent SENT outreach messages, newest first.
 - `outreach_send` — Queue a message for delivery. Returns outreach_id.
 - `outreach_send_and_wait` — Send a message and wait for user reply. Returns JSON with reply or timeout.
 - `provision_grow` — Grow this VM's or container's capacity — approval-gated.

@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -83,7 +84,15 @@ async def _sqlite_wal_truncate(db) -> None:
 _WAL_SIZE_WARN_BYTES = 100 * 1024 * 1024  # 100 MB → "high" (morning report)
 _WAL_SIZE_CRIT_BYTES = 500 * 1024 * 1024  # 500 MB → "critical" (Telegram now)
 _WAL_ALERT_COOLDOWN_S = 3600  # one alert per hour max
-_WAL_TRUNCATE_EVERY_N_TICKS = 12  # hourly TRUNCATE (tick ≈ 5 min)
+#: Hourly TRUNCATE (tick ≈ 5 min). NOTE the first fire is NOT at T+60m: the
+#: scheduler uses ``next_run_time=now`` so tick 1 lands at T+0, ``_tick_count``
+#: is incremented before the ``% N`` test, and tick 12 therefore falls at
+#: T + 11x5 = T+55m. The CADENCE is 60m; only the first interval is 55m. Both
+#: halves of that have been misread — 12x5=60 ignores the immediate first tick,
+#: and "every 55 minutes" over-generalises one interval — and it matters when
+#: correlating this block against an incident timeline, where T is the awareness
+#: loop's start, not the server's (init lag was ~4 min on one measured restart).
+_WAL_TRUNCATE_EVERY_N_TICKS = 12
 # None = "never alerted". Must NOT be 0.0: time.monotonic() is since boot, so on a
 # freshly-booted host `now - 0.0` is small and would wrongly suppress the first alert.
 _last_wal_alert_at: float | None = None
@@ -135,6 +144,16 @@ async def _check_wal_health(db) -> None:
         logger.warning("WAL health alert: %.0f MB (%s)", mb, priority)
     except Exception:
         logger.debug("Failed to create WAL health alert observation", exc_info=True)
+
+
+async def _record_tailscale_watchdog_events(db) -> None:
+    """Best-effort: never raises into the tick (see resilience.tailscale_watchdog_events)."""
+    try:
+        from genesis.resilience.tailscale_watchdog_events import record_new_events
+
+        await record_new_events(db)
+    except Exception:
+        logger.debug("tailscale watchdog event check skipped", exc_info=True)
 
 
 async def _persist_health_alerts(db) -> None:
@@ -521,6 +540,22 @@ _last_memory_integrity_alert_at: float = 0.0
 _last_memory_integrity_key: str = ""
 
 
+# Shared by every graph-engine posture text. Standing the engine down while the
+# lever still selects it is not safe: with `mode: falkordb` every traversal read
+# depends on it (each recall degrades to NetworkX with a warning) and
+# `probe_falkordb` reports it DOWN. So the lever moves back first.
+_FALKORDB_STAND_DOWN = (
+    "To stand it down instead, first set graphstore `mode: networkx` "
+    '(settings_update("graphstore", {"mode": "networkx"}), or '
+    "~/.genesis/config/graphstore.local.yaml) — while `mode: falkordb` is "
+    "selected, memory-graph reads depend on the engine, every recall falls back "
+    "to NetworkX with a warning, and the health probe reports it DOWN — then "
+    "`systemctl --user disable --now genesis-falkordb`. This alert reads the "
+    "infrastructure profile, refreshed at boot and daily, so after either fix "
+    "take a refresh (`infrastructure_profile(refresh=true)`) and it clears at "
+    "the next hourly posture check"
+)
+
 # Human-readable defect + remediation per rule slug (alert content).
 _INFRA_POSTURE_DETAIL = {
     "container_swap_disabled": (
@@ -563,8 +598,9 @@ _INFRA_POSTURE_DETAIL = {
         "(scripts/host-setup.sh prints the swapfile recipe)"
     ),
     "container_swap_knob_off": (
-        "incus limits.memory.swap is explicitly false — swap stays disabled "
-        "across container restarts. On the host: incus config set <container> "
+        "incus limits.memory.swap holds an Incus false value (false/0/no/off, "
+        "any case, or a zero byte size) — swap stays disabled across container "
+        "restarts. On the host: incus config set <container> "
         "limits.memory.swap true (scripts/host-setup.sh sets this; the host "
         "guardian also reconciles it when healthy)"
     ),
@@ -581,6 +617,17 @@ _INFRA_POSTURE_DETAIL = {
         "never auto-healed and stays down until a manual restart. Re-run "
         "scripts/bootstrap.sh (installs + enables the watchdog timer via "
         "lib/network_resilience.sh)"
+    ),
+    "tailscale_watchdog_absent": (
+        "tailscaled is installed but genesis-tailscale-watchdog.timer is not "
+        "enabled (missing, or its install or enable failed) — a stuck Tailscale "
+        "tunnel is never auto-healed or reported, and SSH over Tailscale stays "
+        "dead until a manual `systemctl restart tailscaled`. Re-run "
+        "scripts/bootstrap.sh (lib/network_resilience.sh installs and enables "
+        "it). If it is meant to be off, set NETWD_TS_MODE=off in a drop-in on "
+        "genesis-tailscale-watchdog.service and leave the timer enabled: the "
+        "installer re-enables a disabled timer, and a unit installed in "
+        "/etc/systemd/system cannot be masked"
     ),
     "cc_tmp_shared_fs": (
         "the Claude Code scratch dir (~/.genesis/cc-tmp) shares a filesystem "
@@ -601,7 +648,75 @@ _INFRA_POSTURE_DETAIL = {
         "persists across many quiet windows. To close it immediately, a deliberate "
         "container restart runs the apply in the guaranteed-quiet boot window"
     ),
+    "falkordb_socket_missing": (
+        "the graph engine's unit (genesis-falkordb) is ACTIVE but its unix socket "
+        "is absent, so every reader will fail to connect while systemd reports the "
+        "service healthy. The unit is Type=notify, so it reached readiness with the "
+        "socket open — something removed it afterwards (usually the data dir "
+        "~/.genesis/falkordb). `systemctl --user restart genesis-falkordb` "
+        "recreates it. " + _FALKORDB_STAND_DOWN
+    ),
+    "falkordb_unit_failed": (
+        "the graph engine's unit (genesis-falkordb) is ARMED (enabled, or selected "
+        "by graphstore `mode: falkordb`) but FAILED: it never signalled readiness, "
+        "so the start limiter gave up and no reader can connect. Usually the module "
+        "failed to load — check `journalctl --user -u genesis-falkordb -n 30` for a "
+        "load error (a module without the execute bit, or a redis older than "
+        "8.0.0, both refuse at startup; a redis built without systemd support "
+        "never signals ready). Re-run scripts/bootstrap.sh to re-provision, then "
+        "`systemctl --user reset-failed genesis-falkordb` and start it again. "
+        + _FALKORDB_STAND_DOWN
+    ),
+    "falkordb_selected_not_running": (
+        "graphstore `mode: falkordb` selects the graph engine, but nothing is "
+        "serving it: its unit (genesis-falkordb) is stopped, or absent with no "
+        "socket. A unit that was only STARTED (the documented path) does not come "
+        "back after a reboot. `systemctl --user start genesis-falkordb` brings it "
+        "back; `systemctl --user enable genesis-falkordb` makes it survive the "
+        "next reboot. " + _FALKORDB_STAND_DOWN
+    ),
 }
+
+# UnitFileState values that mean an operator ENABLED the graph engine.
+_FALKORDB_ENABLED_STATES = frozenset({"enabled", "enabled-runtime"})
+
+# Unit states that mean nothing is serving the engine. The transitional ones
+# (activating, deactivating, reloading) are deliberately absent: the profile is a
+# point-in-time sample, and a restart it happened to catch is not a posture.
+_FALKORDB_STOPPED_STATES = frozenset({"inactive", "failed"})
+
+
+def _falkordb_selected(facts: dict) -> bool:
+    """Does the graphstore lever SELECT the engine (reads depend on it)?
+
+    The lever, not the unit's enablement, is what makes reads depend on the
+    engine. The repo's own guidance arms it START-only
+    (`systemctl --user start genesis-falkordb`, in config/graphstore.yaml and
+    the settings tool's refusal text), so a selected engine is often a DISABLED
+    unit, and keying "armed" on enablement alone left exactly that engine
+    without an alert when it failed.
+    """
+    return facts.get("graphstore_mode") == "falkordb"
+
+
+def _falkordb_armed(facts: dict) -> bool:
+    """Selected by the lever, or enabled by an operator — either is intent."""
+    return _falkordb_selected(facts) or facts.get("unit_enabled") in _FALKORDB_ENABLED_STATES
+
+
+def _falkordb_could_alert(section: dict) -> bool:
+    """Whether this falkordb section's state could feed a posture rule.
+
+    Mirrors the falkordb rules in _infra_missing_protections: an ACTIVE unit
+    (the socket rule) or an ARMED one (the failed and not-running rules). The
+    collector always records the unit name and socket path, so non-empty facts
+    alone do not mean an engine that was ever in play.
+    """
+    facts = section.get("facts")
+    metrics = section.get("metrics")
+    facts = facts if isinstance(facts, dict) else {}
+    metrics = metrics if isinstance(metrics, dict) else {}
+    return _falkordb_armed(facts) or metrics.get("unit_active_state") == "active"
 
 
 def _infra_profile_age_days(profile: dict) -> float | None:
@@ -639,6 +754,17 @@ def _infra_missing_protections(profile: dict) -> list[str]:
         facts = section.get("facts")
         return facts if isinstance(facts, dict) else {}
 
+    def _metrics(plane: str) -> dict:
+        # Same status gate as _facts: a not-ok section RETAINS its previous
+        # values, and asserting posture from stale readings is the defect that
+        # gate exists to prevent. Metrics (not facts) because volatile states
+        # must not be hashed — see infra_profile/types.py.
+        section = sections.get(plane)
+        if not isinstance(section, dict) or section.get("status") != "ok":
+            return {}
+        metrics = section.get("metrics")
+        return metrics if isinstance(metrics, dict) else {}
+
     def _explicit_zero(value: object) -> bool:
         # bool is an int subclass (False == 0), so a malformed bool fact must
         # never read as "explicitly zero".
@@ -671,12 +797,17 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     # container (meminfo swap isn't virtualized; verified live 2026-07-16).
     if _explicit_zero(_facts("host_system").get("swap_total_kb")):
         missing.append("host_swap_absent")
-    # Persistent incus knob, visible container-side. Explicit "false" only —
-    # the incus default is true, so absent/unset is healthy. Covers installs
-    # WITHOUT a working guardian (the guardian reconciles this knob itself).
+    # Persistent incus knob, visible container-side. Any nonempty Incus false
+    # value is off; the Incus default is true, so absent/unset is healthy.
+    # Covers installs WITHOUT a working guardian (the guardian reconciles this
+    # knob itself).
     limits = _facts("host_virt").get("container_limits")
-    if isinstance(limits, dict) and limits.get("limits.memory.swap") == "false":
-        missing.append("container_swap_knob_off")
+    raw = limits.get("limits.memory.swap") if isinstance(limits, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        from genesis.guardian.swap_watch import is_swap_on
+
+        if not is_swap_on(raw):
+            missing.append("container_swap_knob_off")
     # Network plane, gated on networkd actually managing the default route
     # (collectors/container.py::_networkd_manages_link). On a NetworkManager
     # box the fact is False/absent, so these rules stay silent — the
@@ -687,6 +818,17 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("networkd_keepconfig_missing")
         if network.get("network_watchdog_enabled") is False:
             missing.append("network_watchdog_absent")
+    # Independent of networkd: wherever tailscaled is installed, its watchdog
+    # should be. A mask, where one exists (masked before install), is
+    # deliberate; the durable off switch is a NETWD_TS_MODE=off drop-in, which
+    # leaves the timer enabled. Unknown (None) stays silent.
+    ts_state = network.get("tailscale_watchdog_unit_state")
+    if (
+        network.get("tailscaled_loaded") is True
+        and isinstance(ts_state, str)
+        and ts_state not in ("enabled", "masked", "masked-runtime")
+    ):
+        missing.append("tailscale_watchdog_absent")
     # Storage plane: cc-tmp blast-radius isolation (EFFECTIVE-state fact from
     # collectors/container.py::collect_storage). Gated on an lxc container —
     # the remedy is a dedicated incus volume, which only exists on a container
@@ -706,10 +848,50 @@ def _infra_missing_protections(profile: dict) -> list[str]:
             missing.append("cc_tmp_apply_blocked_on_cc")
         else:
             missing.append("cc_tmp_shared_fs")
+    # Graph engine. An unselected, disabled or stopped engine is the deliberate
+    # default (reads use the in-process NetworkX projection), so it stays
+    # silent — alerting there would fire on every install that has simply not
+    # adopted it. Three states are wrong. Active-without-a-socket: systemd
+    # reports the service healthy while every reader would fail to connect.
+    # Armed-and-failed: the unit is Type=notify, so a module that will not load
+    # (or a redis that never signals readiness) never reaches `active` at all —
+    # it cycles through the start limiter into `failed`. Selected-and-not-
+    # running: the lever routes reads to an engine nothing is serving — the
+    # state a START-only unit is in after any reboot, which never reaches
+    # `failed` and which enablement cannot see. Explicit values only, per this
+    # function's contract.
+    falkordb = _metrics("falkordb")
+    falkordb_facts = _facts("falkordb")
+    falkordb_state = falkordb.get("unit_active_state")
+    if falkordb_state == "active" and falkordb.get("socket_present") is False:
+        missing.append("falkordb_socket_missing")
+    elif falkordb_state == "failed" and _falkordb_armed(falkordb_facts):
+        missing.append("falkordb_unit_failed")
+    elif _falkordb_selected(falkordb_facts) and (
+        falkordb_state in _FALKORDB_STOPPED_STATES
+        or (falkordb_state is None and falkordb.get("socket_present") is False)
+    ):
+        missing.append("falkordb_selected_not_running")
     return sorted(missing)
 
 
-_POSTURE_PLANES = ("memory", "host_system", "host_virt", "network", "storage")
+_POSTURE_PLANES = (
+    "memory",
+    "host_system",
+    "host_virt",
+    "network",
+    "storage",
+    # The falkordb rules' only inputs come from this section. Without it here, a
+    # collector failure (which RETAINS stale values under status=error) would
+    # make the rules fall silent AND leave `unverifiable` empty — resolving an
+    # open engine alert while the engine is still broken and unobservable.
+    "falkordb",
+)
+
+# Planes whose retained facts are non-empty even when they could never have fed
+# a rule. For these, "retained facts" is not evidence of a prior posture, so the
+# hold applies only when the retained state could actually have alerted.
+_POSTURE_PLANE_RELEVANT = {"falkordb": _falkordb_could_alert}
 
 
 def _infra_unverifiable_planes(profile: dict) -> list[str]:
@@ -717,7 +899,9 @@ def _infra_unverifiable_planes(profile: dict) -> list[str]:
     retained (stale) facts — we previously knew something there and currently
     cannot verify it, so an all-clear must be held. A not-ok section with
     EMPTY facts (e.g. host planes on a guardian-less install, permanently
-    "unavailable") never contributed a rule and blocks nothing."""
+    "unavailable") never contributed a rule and blocks nothing; neither does
+    a plane whose retained state its relevance check rules out (an unarmed
+    graph engine)."""
     sections = profile.get("sections") or {}
     unverifiable: list[str] = []
     for plane in _POSTURE_PLANES:
@@ -727,6 +911,7 @@ def _infra_unverifiable_planes(profile: dict) -> list[str]:
             and section.get("status") != "ok"
             and isinstance(section.get("facts"), dict)
             and section.get("facts")
+            and _POSTURE_PLANE_RELEVANT.get(plane, lambda _s: True)(section)
         ):
             unverifiable.append(plane)
     return unverifiable
@@ -1195,6 +1380,10 @@ async def _resolve_memory_integrity_posture(db) -> None:
 # days old AND ≥20 commits behind; thresholds live beside derive_findings in
 # deploy_health.py, the single producer of finding keys), or a missing
 # systemd unit that has been alerted for >24h.
+# The same check also reports tracked files edited in place in the deploy
+# checkout (main_checkout_dirty, judged by the deploy scripts' own predicate):
+# not drift, but the state in which the next deploy refuses. Its own wording,
+# no update.sh advice (update.sh refuses a dirty tree), never critical.
 # Slow-moving by nature → hourly cadence (the WAL-truncate block).
 _DEPLOY_MISSING_UNIT_CRITICAL_S = 24 * 3600
 _DEPLOY_ALERT_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
@@ -1203,8 +1392,54 @@ _DEPLOY_ALERT_COOLDOWN_S = 6 * 3600  # same-state re-alerts at most every 6h
 # (or unresolved) so escalating cannot reset its own clock; recovery rewrites
 # the note so retired anchors can never resurrect a future alert.
 _DEPLOY_SUPERSEDED_NOTE = "superseded by a new deploy-staleness alert state"
+
+
+def _finding_like(finding_class: str) -> str:
+    """A LIKE pattern matching an alert row by a finding class in its
+    structured `[findings: ...]` suffix, never by the prose before it, which
+    carries free text (edited file names, a probe's error) that can contain the
+    class name; `_` is a LIKE wildcard, so `missing-units` would match too."""
+    return f"%[findings: %{finding_class}%"
+
+
 _last_deploy_alert_at: float = 0.0
 _last_deploy_alert_key: str = ""
+# The deploy checkout's status on the previous tick (deploy_health's
+# main_checkout["status"]). An unreadable status raises its finding only on the
+# SECOND consecutive tick, so one slow git call never alerts.
+_last_main_checkout_status: str = ""
+# The main_checkout dict from the last tick whose reading the check acted on.
+# A tick whose own reading cannot be acted on (the first unreadable one, or one
+# during a deploy) uses this instead: the checkout component keeps its previous
+# state while every other finding class is reconciled as usual. Acting on the
+# reading itself would resolve a standing dirty alert as if the tree had been
+# restored; holding the whole check would also hold missing-unit and staleness
+# findings that were read conclusively on the same tick. None until this
+# process's first actionable tick, which after a restart (several a day) is
+# usually the first check. Then the store decides: with no unresolved dirty
+# alert, the checkout contributes nothing; with one standing, the dirty class
+# is carried with its count and names unknown, so a drift-only alert never
+# supersedes it. Either way every other finding class is reconciled on the
+# same tick.
+_last_actionable_main_checkout: dict | None = None
+# Likewise for the `live` classes (deploy_health's live["state"]): a deploy in
+# progress, or the FIRST unreadable tick, carries the last actionable tick's
+# live findings rather than resolving or raising them.
+_last_live_state: str = ""
+_last_actionable_live_findings: list[str] | None = None
+# Whether the previous tick's live reading was unknown (off `live`, the engine
+# did not answer). A second consecutive one is not carried again: it raises
+# live_unreadable while a live alert stands in the store, else nothing, so an
+# install that never uses `live` never alerts on a slow engine.
+_last_live_unknown: bool = False
+# On `live` the tier-2 and Guardian comparisons run against the base `live` was
+# built on. A tick with no base (unreadable, mid-deploy, ambiguous bases) runs
+# neither, so their findings are carried from the last tick that had one, never
+# resolved by a comparison that did not run.
+_BASE_DEPENDENT_CLASSES = frozenset(
+    {"tier2_pending", "host_guardian_drift", "host_guardian_unknown_commit"}
+)
+_last_actionable_base_findings: list[str] | None = None
 
 
 async def _check_deploy_staleness(db) -> None:
@@ -1212,18 +1447,143 @@ async def _check_deploy_staleness(db) -> None:
 
     Best-effort — the whole body is guarded and never raises into the tick."""
     global _last_deploy_alert_at, _last_deploy_alert_key
+    global _last_main_checkout_status, _last_actionable_main_checkout
+    global _last_live_state, _last_actionable_live_findings, _last_live_unknown
+    global _last_actionable_base_findings
     if db is None:
         return
     try:
         # Submodule import (the package __init__ shadows the submodule name
         # with the function of the same name) — resolved per call, so tests
         # can monkeypatch the module attribute.
-        from genesis.observability.snapshots.deploy_health import deploy_health
+        from genesis.observability.snapshots.deploy_health import (
+            deploy_health,
+            live_unknown,
+            main_checkout_findings,
+        )
 
         snap = await deploy_health(db)
         if snap.get("status") == "error":
             return
         findings = snap.get("findings") or []
+        checkout = snap.get("main_checkout") or {}
+        checkout_status = checkout.get("status") or ""
+        previous_checkout_status = _last_main_checkout_status
+        _last_main_checkout_status = checkout_status
+        # A deploy in progress (its own merge reads as dirty) or the FIRST
+        # unreadable tick: this tick's checkout reading is not acted on. Its
+        # checkout findings are replaced by the last actionable reading's, so a
+        # standing dirty alert is neither resolved as if the tree had been
+        # restored nor superseded, while every other finding class on the tick
+        # is reconciled as usual. A second consecutive unreadable tick IS acted
+        # on: it raises main_checkout_unreadable, which supersedes the dirty
+        # row. One tick is an hour.
+        carried = False
+        if checkout_status == "deploying" or (
+            checkout_status == "unknown" and previous_checkout_status != "unknown"
+        ):
+            if _last_actionable_main_checkout is not None:
+                checkout = _last_actionable_main_checkout
+                carried = True
+            elif await observations.has_unresolved_matching(
+                db,
+                source="deploy_staleness_monitor",
+                content_like=_finding_like("main_checkout_dirty"),
+            ):
+                # A dirty alert stands and nothing in memory says its count or
+                # names: carry the class alone, so the alert is kept (or
+                # superseded, never resolved) while the rest is reconciled.
+                checkout = {"status": "dirty", "count": None, "paths": []}
+                carried = True
+            elif await observations.has_unresolved_matching(
+                db,
+                source="deploy_staleness_monitor",
+                content_like=_finding_like("main_checkout_unreadable"),
+            ):
+                # Likewise for a standing unreadable alert: nothing was read on
+                # this tick, so it stands rather than being resolved here and
+                # re-raised by the next unreadable tick.
+                checkout = {
+                    "status": "unknown",
+                    "count": 0,
+                    "paths": [],
+                    "reason": "carried from the standing alert",
+                }
+                carried = True
+            else:
+                checkout = {}
+            findings = [
+                f for f in findings if f.split(":", 1)[0] not in _DEPLOY_CHECKOUT_CLASSES
+            ] + main_checkout_findings(checkout)
+        else:
+            _last_actionable_main_checkout = checkout
+        live = snap.get("live") or {}
+        live_state = live.get("state") or ""
+        previous_live_state = _last_live_state
+        _last_live_state = live_state
+        unknown = live_unknown(live)
+        previous_unknown = _last_live_unknown
+        _last_live_unknown = unknown
+        # Not acted on: a deploy in progress, the FIRST unreadable tick, or the
+        # FIRST reading that says nothing either way (off `live`, the engine did
+        # not answer). The last actionable live findings are carried.
+        if unknown and previous_unknown:
+            # A second unknown tick in a row: escalate from the store, not from
+            # memory (a restart clears memory several times a day). With a live
+            # alert standing it becomes live_unreadable; with none, nothing.
+            standing = False
+            for cls in sorted(_DEPLOY_LIVE_CLASSES):
+                if await observations.has_unresolved_matching(
+                    db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                ):
+                    standing = True
+                    break
+            if not standing:
+                logger.info("deploy staleness: live reading unknown twice, no live alert stands")
+            findings = [f for f in findings if f.split(":", 1)[0] not in _DEPLOY_LIVE_CLASSES] + (
+                ["live_unreadable"] if standing else []
+            )
+        elif (
+            live_state == "deploying"
+            or (live_state == "unreadable" and previous_live_state != "unreadable")
+            or unknown
+        ):
+            carried_live = _last_actionable_live_findings
+            if carried_live is None:
+                # Nothing in memory (the process restarted): carry the class of
+                # every standing live alert, as the checkout path does, so it is
+                # kept (or superseded), never resolved by a tick that read nothing.
+                carried_live = []
+                for cls in sorted(_DEPLOY_LIVE_CLASSES):
+                    if await observations.has_unresolved_matching(
+                        db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                    ):
+                        carried_live.append(cls if cls == "live_unreadable" else f"{cls}:?")
+            findings = [
+                f for f in findings if f.split(":", 1)[0] not in _DEPLOY_LIVE_CLASSES
+            ] + list(carried_live)
+        else:
+            _last_actionable_live_findings = [
+                f for f in findings if f.split(":", 1)[0] in _DEPLOY_LIVE_CLASSES
+            ]
+        on_live = live_state == "live" or bool(live.get("on_live_branch"))
+        if on_live and not live.get("base"):
+            carried_base = _last_actionable_base_findings
+            if carried_base is None:
+                # A restart cleared memory: carry the class of each standing alert.
+                carried_base = []
+                for cls in sorted(_BASE_DEPENDENT_CLASSES):
+                    if await observations.has_unresolved_matching(
+                        db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                    ):
+                        carried_base.append(f"{cls}:?" if cls == "tier2_pending" else cls)
+            findings = [
+                f for f in findings if f.split(":", 1)[0] not in _BASE_DEPENDENT_CLASSES
+            ] + list(carried_base)
+        else:
+            _last_actionable_base_findings = [
+                f for f in findings if f.split(":", 1)[0] in _BASE_DEPENDENT_CLASSES
+            ]
         if not findings:
             await _resolve_deploy_staleness(db)
             return
@@ -1254,7 +1614,7 @@ async def _check_deploy_staleness(db) -> None:
                 source="deploy_staleness_monitor",
                 from_notes=_DEPLOY_SUPERSEDED_NOTE,
                 to_notes="deploy staleness cleared",
-                content_like="%missing_units%",
+                content_like=_finding_like("missing_units"),
             )
         if not critical and "missing_units" in classes:
             # Escalate a missing unit that has been alerted for >24h. Anchor =
@@ -1265,7 +1625,7 @@ async def _check_deploy_staleness(db) -> None:
             anchor_created_at = await observations.oldest_created_at(
                 db,
                 source="deploy_staleness_monitor",
-                content_like="%missing_units%",
+                content_like=_finding_like("missing_units"),
                 resolution_notes=_DEPLOY_SUPERSEDED_NOTE,
             )
             if anchor_created_at:
@@ -1299,40 +1659,33 @@ async def _check_deploy_staleness(db) -> None:
             resolution_notes=_DEPLOY_SUPERSEDED_NOTE,
         )
 
-        missing_units = snap.get("missing_units") or []
-        tier2 = snap.get("tier2_pending") or []
-        host = snap.get("host_gateway") or {}
-        detail: list[str] = []
-        if age_days is not None:
-            detail.append(f"last successful update.sh: {age_days} days ago")
-        if behind is not None:
-            fetch_age = git_facts.get("fetch_age_hours")
-            detail.append(
-                f"{behind} commits behind upstream"
-                + (f" (as of last fetch, {fetch_age}h ago)" if fetch_age is not None else "")
-            )
-        if missing_units:
-            detail.append("missing systemd units: " + ", ".join(missing_units))
-        if tier2:
-            detail.append(f"{len(tier2)} update.sh-only file(s) changed since the last update")
-        if host.get("status") in ("drift", "unknown_commit"):
-            detail.append(
-                f"host guardian: {host.get('status')} "
-                f"(deployed_commit={host.get('deployed_commit')})"
+        paragraphs: list[str] = []
+        # The drift paragraph (and its update.sh recovery sentence) only when a
+        # drift class is present: update.sh REFUSES a dirty deploy checkout, so
+        # telling someone to run it for a dirty-only state is wrong advice.
+        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES:
+            paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
+        if set(classes) & _DEPLOY_LIVE_CLASSES:
+            paragraphs.append(_deploy_live_paragraph(snap, findings))
+        if "main_checkout_dirty" in classes:
+            paragraph = _deploy_checkout_dirty_paragraph(checkout)
+            if carried and checkout.get("count") is not None:
+                paragraph += (
+                    " (As of the previous check: this check could not read the deploy checkout.)"
+                )
+            paragraphs.append(paragraph)
+        if "main_checkout_unreadable" in classes:
+            paragraphs.append(
+                "The deploy checkout's tracked-file status could not be read on two "
+                f"consecutive checks ({checkout.get('reason') or 'no reason given'}), so "
+                "whether the next deploy would refuse is unknown."
             )
         created = await observations.create(
             db,
             id=str(uuid.uuid4()),
             source="deploy_staleness_monitor",
             type="infrastructure_alert",
-            content=(
-                "Merged changes are NOT fully deployed on this install — "
-                + "; ".join(detail)
-                + ". Bare git merges deploy code but skip tier-2 activation "
-                "(systemd units, guardian host redeploy, CC/Node pins). "
-                "Recovery: run scripts/update.sh from ~/genesis. "
-                f"[findings: {', '.join(findings)}]"
-            ),
+            content=" ".join(paragraphs) + f" [findings: {', '.join(findings)}]",
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
             content_hash=content_hash,
@@ -1345,6 +1698,155 @@ async def _check_deploy_staleness(db) -> None:
         logger.warning("Deploy staleness alert (%s): %s", priority, ", ".join(findings))
     except Exception:
         logger.debug("Failed deploy staleness check", exc_info=True)
+
+
+#: Finding classes about the deploy checkout's own tree, not about merged code
+#: that has not been deployed. They get their own wording and never page:
+#: the critical branch keys only on stale_update and missing_units.
+_DEPLOY_CHECKOUT_CLASSES = frozenset({"main_checkout_dirty", "main_checkout_unreadable"})
+#: Finding classes about `live`, the integration branch scripts/deploy_candidates
+#: rebuilds from the deploy manifest (deploy_health.live_findings). Their own
+#: wording, no update.sh drift paragraph, and they never page.
+_DEPLOY_LIVE_CLASSES = frozenset(
+    {
+        "live_unbound",
+        "live_unreadable",
+        "live_off_branch",
+        "live_unbuilt",
+        "live_unlisted",
+        "live_candidate_tier2",
+    }
+)
+
+
+def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> str:
+    missing_units = snap.get("missing_units") or []
+    tier2 = snap.get("tier2_pending") or []
+    host = snap.get("host_gateway") or {}
+    detail: list[str] = []
+    if age_days is not None:
+        detail.append(f"last successful update.sh: {age_days} days ago")
+    if behind is not None:
+        fetch_age = git_facts.get("fetch_age_hours")
+        detail.append(
+            f"{behind} commits behind upstream"
+            + (f" (as of last fetch, {fetch_age}h ago)" if fetch_age is not None else "")
+        )
+    if missing_units:
+        detail.append("missing systemd units: " + ", ".join(missing_units))
+    if tier2:
+        detail.append(f"{len(tier2)} update.sh-only file(s) changed since the last update")
+    if host.get("status") in ("drift", "unknown_commit"):
+        detail.append(
+            f"host guardian: {host.get('status')} (deployed_commit={host.get('deployed_commit')})"
+        )
+    return (
+        "Merged changes are NOT fully deployed on this install — "
+        + "; ".join(detail)
+        + ". Bare git merges deploy code but skip tier-2 activation "
+        "(systemd units, guardian host redeploy, CC/Node pins). "
+        + (
+            "Recovery: run scripts/update.sh from ~/genesis (on `live` it rebuilds "
+            "`live` from the deploy manifest first)."
+            if (git_facts.get("live") == "live")
+            else "Recovery: run scripts/update.sh from ~/genesis."
+        )
+    )
+
+
+def _deploy_live_paragraph(snap: dict, findings: list[str]) -> str:
+    live = snap.get("live") or {}
+    parts: list[str] = []
+    for f in findings:
+        cls, _, value = f.partition(":")
+        if cls == "live_unreadable":
+            parts.append(
+                "Whether this install runs the `live` integration branch as its deploy "
+                "manifest says could not be read on two consecutive checks "
+                f"({live.get('reason') or 'no reason given'}): scripts/deploy_candidates "
+                "status shows what the engine reads."
+            )
+        elif cls == "live_unbound":
+            parts.append(
+                "HEAD is the branch `live`, but no deploy manifest of this repository "
+                "binds it (the manifest is missing or names another repository). The "
+                "deploy scripts refuse this checkout, restart included, until the "
+                "manifest is restored or the checkout leaves `live` "
+                "(scripts/deploy_candidates status shows what it holds)."
+            )
+        elif cls == "live_unbuilt":
+            parts.append(
+                "The deploy manifest lists "
+                + ("candidates" if value == "?" else f"{value} candidate(s)")
+                + " that `live` does not hold: added since the last rebuild, or left out "
+                "of it (a conflict, a hook without approval, a failed check). "
+                "scripts/deploy_candidates status names each one and why; a rebuild "
+                "brings in the ones it can."
+            )
+        elif cls == "live_unlisted":
+            parts.append(
+                "`live` holds "
+                + ("candidates" if value == "?" else f"{value} candidate(s)")
+                + " that no deploy manifest of this repository lists (dropped without a "
+                "rebuild, or the manifest is missing), so their code is checked out with "
+                "nothing tracking it. scripts/deploy_candidates status names them; the "
+                "next rebuild removes them from `live`."
+            )
+        elif cls == "live_off_branch":
+            parts.append(
+                "The deploy manifest lists "
+                + (
+                    "candidates (their count was not read on this check)"
+                    if value == "?"
+                    else f"{value} candidate(s)"
+                )
+                + ", but the checkout is not "
+                "on `live`, so its files do not have them. To run them: scripts/deploy_candidates "
+                "rebuild (it rebuilds `live` from the manifest and moves the checkout onto "
+                "it; a bare git switch would run whatever `live` held before), then "
+                "scripts/deploy_code_only.sh restart. To stop listing one: "
+                "scripts/deploy_candidates drop <branch>. A candidate whose PR has "
+                "merged stays listed until the next rebuild retires it, or until that "
+                "drop; scripts/deploy_candidates status shows which."
+            )
+        elif cls == "live_candidate_tier2":
+            parts.append(
+                "`live` carries "
+                + ("update.sh-only files" if value == "?" else f"{value} update.sh-only file(s)")
+                + " from its candidates, over "
+                "the base it was built on; they are active only if scripts/update.sh ran "
+                "after the last rebuild."
+            )
+    return " ".join(parts)
+
+
+def _deploy_checkout_dirty_paragraph(checkout: dict) -> str:
+    count = checkout.get("count")
+    names = ", ".join(checkout.get("paths") or [])
+    omitted = checkout.get("paths_omitted") or 0
+    if omitted:
+        names += f", and {omitted} more"
+    if count is None:
+        # Carried from a standing alert after a restart: the class is known,
+        # its count and names are not.
+        lead = (
+            "Tracked files edited in place in the deploy checkout, as an earlier "
+            "alert recorded (this process has not yet read the checkout; the "
+            "deploy-health snapshot's main_checkout field has the live list)."
+        )
+    else:
+        lead = (
+            f"{count} tracked file(s) edited in place in the deploy checkout "
+            f"(as first detected: {names}; the deploy-health snapshot's main_checkout "
+            "field has the live list)."
+        )
+    return (
+        lead + " Deploys refuse until each is restored or brought "
+        "in through a pull request. In-place writers include hand edits, coding "
+        "clients without the repo's edit hooks, and runtime writers such as the "
+        "learning pipeline's steering rules and the dashboard's config and file "
+        "editors."
+    )
 
 
 async def _resolve_deploy_staleness(db) -> None:
@@ -1638,6 +2140,15 @@ async def _resolve_follow_up_watchdog(db) -> None:
 _NOCOW_ALERT_COOLDOWN_S = 24 * 3600
 # None = "never alerted" (same monotonic-since-boot caveat as the WAL alert).
 _last_nocow_alert_at: float | None = None
+#: The one probe child we SIGKILLed and could not collect, if any. Holds the
+#: accumulation bounded at ONE — see :func:`_nocow_flag`'s "at most one
+#: survivor" clause. None means there is nothing outstanding.
+_stuck_nocow_probe = None
+#: When that survivor was recorded (``time.monotonic``). Only for the WARNING
+#: that says how long this monitor has been disabled — nothing branches on it,
+#: deliberately: a deadline that re-probed would re-open the very leak the
+#: survivor represents.
+_stuck_nocow_probe_since: float | None = None
 _FS_IOC_GETFLAGS = 0x80086601
 _FS_NOCOW_FL = 0x00800000
 
@@ -1663,25 +2174,286 @@ def _fs_type_for(path) -> str | None:
         return None
 
 
+#: Reads FS_IOC_GETFLAGS in a CHILD process and prints 1/0 for the nodatacow bit.
+#: The ioctl needs a descriptor on the file, and that is the whole problem — see
+#: :func:`_nocow_flag` for why this cannot run in the server's own process. The
+#: constants are passed in as argv rather than re-spelled here so this string
+#: cannot drift away from the module-level definitions above.
+_NOCOW_PROBE_SRC = (
+    "import fcntl, os, struct, sys\n"
+    "path, getflags, nocow = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])\n"
+    "fd = os.open(path, os.O_RDONLY)\n"
+    "try:\n"
+    "    raw = fcntl.ioctl(fd, getflags, struct.pack('l', 0))\n"
+    "finally:\n"
+    "    os.close(fd)\n"
+    "print(1 if struct.unpack('l', raw)[0] & nocow else 0)\n"
+)
+
+
+#: Bound on the flag probe. MEASURED latency over 15 runs: median 25.9 ms, max
+#: 28.9 ms. The failure mode this guards is a child wedged in uninterruptible
+#: sleep on a stuck filesystem — not slowness, which does not happen here. 3s is
+#: ~100x the measured worst case and stays far under the tick's
+#: ``misfire_grace_time=60``, which matters because the tick awaits this inline
+#: and a stall delays every check after it.
+_NOCOW_PROBE_TIMEOUT_S = 3
+
+#: Separate, much SHORTER bound on reaping a child we have already SIGKILLed.
+#: Reusing the probe timeout here silently doubled the worst-case tick stall to
+#: 6s (measured at a scaled constant), and bought nothing for it: a killed child
+#: that has not been collected within a few hundred milliseconds is in
+#: uninterruptible sleep and will not exit in three seconds either. MEASURED: a
+#: killed child reaches GONE within 0.5s via asyncio's child watcher. So the only
+#: outcomes are "collected almost immediately" or "not collected at all", and a
+#: long bound merely delays the tick before reaching the same conclusion.
+_NOCOW_REAP_TIMEOUT_S = 0.5
+
+
+async def _kill_probe(proc) -> None:
+    """Reap a probe child we are abandoning. Never raises, never blocks forever.
+
+    The wait is BOUNDED, and that bound is the whole point. SIGKILL cannot
+    complete while the child sits in uninterruptible sleep — which is precisely
+    the failure mode :data:`_NOCOW_PROBE_TIMEOUT_S` exists to bound. An unbounded
+    ``await proc.wait()`` here would therefore defeat that timeout and hang the
+    awareness tick indefinitely: the probe would be bounded and its reaper would
+    not.
+
+    If the bounded wait expires the child is left UN-REAPED — not, as an earlier
+    revision of this docstring claimed, "left for the OS to reap". The OS cannot
+    reap a live parent's child; only a wait from this process does. MEASURED: a
+    killed child whose ``wait()`` is never awaited still reaches ``GONE`` within
+    0.5s, collected by asyncio's own ``PidfdChildWatcher`` independently of any
+    awaiter — and in the one case this bound exists for, a genuinely
+    uninterruptible child, nothing collects it at all and the pidfd registration
+    stays. So: the watcher will collect it if it ever leaves uninterruptible
+    sleep, and one leaked registration is strictly better than a stalled tick.
+    The decision was right; the reason given for it was false.
+
+    "ONE leaked registration" is only true because the CALLER makes it true.
+    Review pointed out that this function alone bounds nothing: the check runs
+    hourly, so a filesystem wedged for a week would leave ~168 un-reaped
+    children and as many watcher registrations, not one. :func:`_nocow_flag`
+    records the survivor in :data:`_stuck_nocow_probe` and declines to spawn
+    beside it, which is where the bound actually lives. Do not read this
+    docstring as a guarantee this function provides.
+
+    ``CancelledError`` derives from ``BaseException``, so neither handler below
+    catches it and it propagates by construction — correct, because this is
+    called from the cancellation path and must not convert a cancellation into a
+    shrug. VERIFIED rather than recalled: ``TimeoutError is asyncio.TimeoutError``
+    and its MRO is (TimeoutError, OSError, Exception, BaseException, object), so
+    ``except TimeoutError`` catches what ``wait_for`` raises while
+    ``CancelledError`` passes through both handlers untouched.
+    """
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_NOCOW_REAP_TIMEOUT_S)
+    except TimeoutError:
+        logger.debug(
+            "nodatacow probe child survived SIGKILL for %ss (uninterruptible?); "
+            "leaving it un-reaped rather than blocking the tick",
+            _NOCOW_REAP_TIMEOUT_S,
+        )
+    except Exception:
+        logger.debug("nodatacow probe reap failed", exc_info=True)
+
+
+async def _nocow_flag(db_path: Path) -> bool | None:
+    """Is the nodatacow (+C) attribute set on *db_path*? None = could not tell.
+
+    Runs the ioctl in a SHORT-LIVED CHILD PROCESS, and that indirection is the
+    entire point of this function.
+
+    POSIX releases EVERY record lock a process holds on a file as soon as that
+    process closes ANY descriptor to it — not merely the descriptor that took
+    the lock. SQLite's unix VFS defends against this for descriptors IT opened
+    (``unixInodeInfo`` defers the real close) but it cannot see a descriptor
+    opened by other code in the same process. This function runs inside the
+    server, which holds SQLite's locks on this exact file.
+
+    So the obvious spelling — ``open(db_path, "rb")`` for the ioctl — silently
+    dropped the server's SHARED lock on the main database every time it ran.
+    The next short-lived opener could then take an exclusive lock, conclude it
+    was the last connection, checkpoint its partial view into the main file and
+    unlink the ``-shm`` and ``-wal``. The server kept writing through the now
+    detached descriptors while other processes wrote the live ones, and the
+    database was malformed inside two minutes.
+
+    MEASURED 2026-09-21, five arms with controls, on both ext4 and btrfs:
+    with the in-process open the holder's main-file lock went 1 -> 0 and a
+    following opener orphaned the sidecars while the holder was still writing;
+    without it the identical opener left the lineage untouched. A child process
+    closing its own descriptor cannot release this process's locks, and the
+    same harness measured the lock surviving (1 -> 1) through this path.
+
+    Two alternatives were measured rather than reasoned about:
+
+    * ``O_PATH`` — REFUTED. ``FS_IOC_GETFLAGS`` on such a descriptor fails with
+      ``EBADF``.
+    * **A descriptor on the parent DIRECTORY** — works, and preserves the locks
+      (confirmed independently on btrfs). Rejected only because it answers a
+      PROXY question: the directory's flag governs files created inside it, not
+      the flag on the database that is actually there. The two normally agree —
+      ``restore.sh`` stages at ``${DB_FILE}.restore-stage.$$``, inside the same
+      directory, so its swap inherits ``+C`` and does NOT diverge — but they can
+      part company if the file is renamed in from a directory without the
+      attribute, or has it cleared explicitly. Reading the file keeps the check
+      answering the question its own alert text asks.
+
+    The cost of that fidelity is one short-lived process per hourly check.
+
+    AT MOST ONE SURVIVOR, EVER. A child wedged in uninterruptible sleep cannot
+    be collected — :func:`_kill_probe` gives up on it deliberately rather than
+    stall the tick. Left there, the hourly cadence would accumulate one such
+    child (and one asyncio child-watcher registration) per hour for as long as
+    the filesystem stayed wedged. So the survivor is recorded in
+    :data:`_stuck_nocow_probe` and no new probe is spawned while it is still
+    running; the check simply reports "could not tell", which is the same answer
+    the spawn would have produced. The latch clears itself the first time the
+    child's ``returncode`` is set — asyncio's watcher does that without an
+    awaiter — so recovery needs no timer and no cleanup path.
+
+    Returns None — never raises — for EVERY failure mode: spawn failure, a
+    timeout, a non-zero exit, unparseable output. The caller's own blanket
+    ``except`` would swallow an exception anyway, so raising here would only
+    make the failure harder to see, not safer.
+    """
+    global _stuck_nocow_probe, _stuck_nocow_probe_since
+
+    if _stuck_nocow_probe is not None:
+        if _stuck_nocow_probe.returncode is None:
+            # A previous probe is STILL wedged. Spawning beside it is what turns
+            # one leaked child into one per hour, so decline instead — the answer
+            # would be "could not tell" either way, which is what we return.
+            #
+            # WARNING, not debug, and that is the point. While this holds, the
+            # nodatacow monitor is OFF: it reports "could not tell" every hour
+            # and raises nothing. The shipped log level is INFO, so a debug line
+            # here would make a disabled health check invisible — which is the
+            # failure this very function's spawn-failure comment warns about.
+            # It does not self-clear on a timer: a child that never leaves
+            # uninterruptible sleep keeps the monitor off until the server
+            # restarts, and saying so out loud is the remedy, because retrying
+            # into a wedged filesystem buys nothing and re-opens the leak.
+            held_for = (
+                time.monotonic() - _stuck_nocow_probe_since
+                if _stuck_nocow_probe_since is not None
+                else float("nan")
+            )
+            logger.warning(
+                "nodatacow check SKIPPED and will stay skipped: probe pid %s has "
+                "not exited after %.0fs (uninterruptible — a wedged filesystem?). "
+                "This monitor is disabled until that child exits or the server "
+                "restarts.",
+                getattr(_stuck_nocow_probe, "pid", "?"),
+                held_for,
+            )
+            return None
+        # It exited on its own. asyncio's child watcher sets ``returncode``
+        # without anyone awaiting — MEASURED on this install (Python 3.12.3,
+        # PidfdChildWatcher, returncode set ~10ms after SIGKILL with no awaiter)
+        # — so this clears itself on the next check with no extra machinery and
+        # no timer.
+        _stuck_nocow_probe = None
+        _stuck_nocow_probe_since = None
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            _NOCOW_PROBE_SRC,
+            str(db_path),
+            str(_FS_IOC_GETFLAGS),
+            str(_FS_NOCOW_FL),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError:
+        # A broken/missing interpreter path. The contract is bool | None, and
+        # the caller's blanket except would hide this entirely — log it, because
+        # a permanently failing probe silently disables the monitor forever on
+        # the one filesystem where its alert matters.
+        logger.debug("nodatacow probe could not be spawned", exc_info=True)
+        return None
+
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_NOCOW_PROBE_TIMEOUT_S)
+    except TimeoutError:
+        # RECORD FIRST, clear on success — never the other way round. `_kill_probe`
+        # awaits, so it is a cancellation point: a tick cancelled during the reap
+        # would propagate CancelledError straight past a trailing assignment,
+        # leaving the child killed but UNTRACKED and the next check free to spawn
+        # beside it. That is precisely the accumulation this latch exists to stop,
+        # so the window must not exist. Review found this by executing it:
+        # `kills=1 latch=None -> LEAKED, UNTRACKED`.
+        _stuck_nocow_probe = proc
+        _stuck_nocow_probe_since = time.monotonic()
+        await _kill_probe(proc)
+        if proc.returncode is not None:
+            # collected; nothing is outstanding
+            _stuck_nocow_probe = None
+            _stuck_nocow_probe_since = None
+        logger.debug("nodatacow probe timed out after %ss", _NOCOW_PROBE_TIMEOUT_S)
+        return None
+    except asyncio.CancelledError:
+        # Shutdown, or the tick being cancelled. The old code was synchronous
+        # and had no await point, so this window is NEW: without the kill the
+        # child outlives us. Reap it, then let cancellation propagate — never
+        # convert it into a verdict.
+        #
+        # Same record-first ordering, and here it is not a corner: this handler
+        # runs BECAUSE something cancelled us, so a second cancellation arriving
+        # during the reap is the ordinary case rather than the exotic one.
+        _stuck_nocow_probe = proc
+        _stuck_nocow_probe_since = time.monotonic()
+        await _kill_probe(proc)
+        if proc.returncode is not None:
+            _stuck_nocow_probe = None
+            _stuck_nocow_probe_since = None
+        raise
+
+    if proc.returncode != 0:
+        logger.debug(
+            "nodatacow probe exited %s: %s",
+            proc.returncode,
+            stderr.decode(errors="replace").strip()[:200],
+        )
+        return None
+    out = stdout.decode(errors="replace").strip()
+    if out in ("0", "1"):
+        return out == "1"
+    logger.debug("nodatacow probe returned unparseable output: %r", out[:80])
+    return None
+
+
 async def _check_db_nodatacow(db) -> None:
     """Create a 'high' observation (morning-report tier) when the SQLite DB
     sits on btrfs WITHOUT the nodatacow attribute. Non-btrfs filesystems are
     exempt (the flag is meaningless there). Best-effort; never raises into the
-    tick, and never alerts on a probe failure."""
+    tick, and never alerts on a probe failure.
+
+    The flag read is delegated to :func:`_nocow_flag`, which runs it out of
+    process. Do NOT inline it back here: this function runs on the server's own
+    event loop, and a descriptor opened on the database from inside that process
+    drops SQLite's locks on close. That is not a theoretical hazard — it was the
+    root cause of repeated database corruption on a btrfs install, and this
+    branch is reached ONLY on btrfs, which is exactly why one install corrupted
+    and its ext4 sibling never did."""
     global _last_nocow_alert_at
     try:
-        import fcntl
-        import struct
-
         from genesis.env import genesis_db_path
 
         db_path = genesis_db_path()
         if not db_path.exists() or _fs_type_for(db_path) != "btrfs":
             return
-        with open(db_path, "rb") as fh:
-            raw = fcntl.ioctl(fh.fileno(), _FS_IOC_GETFLAGS, struct.pack("l", 0))
-        if struct.unpack("l", raw)[0] & _FS_NOCOW_FL:
-            return  # +C set — healthy
+        flag = await _nocow_flag(db_path)
+        if flag is not False:
+            # True  -> +C set, healthy.
+            # None  -> could not determine; never alert on a probe failure.
+            return
     except Exception:
         return  # can't determine — nothing to alert on
 
@@ -1809,15 +2581,68 @@ async def _check_git_health(db) -> None:
 # so it still runs in a router-degraded startup, the exact window a
 # belt-and-suspenders integrity check matters. A monotonic >=24h guard gives a
 # daily cadence that also fires once on the first tick after any restart (no
-# interval-reset starvation). The fsck runs in a thread (check_git_deep ->
-# to_thread) so it never blocks the tick. None = "never run this boot".
+# interval-reset starvation). The tick dispatches it OUT-OF-BAND (fsck can run up
+# to its 900 s timeout, twice with the re-check, and must not hold the tick lock);
+# the daily slot is claimed before the run, so overlapping ticks stay
+# single-flight. None = "never run this boot".
 _GIT_DEEP_INTERVAL_S = 24 * 3600
 _last_git_deep_run_at: float | None = None
+_git_deep_task = None  # strong reference to the out-of-band run
+# Set by a service stop, cleared by start: a tick that resumes after the stop
+# signal must not launch a scan nothing will cancel before the DB closes.
+_git_deep_stopped = False
+_git_deep_stuck_warned = False
+
+
+def _git_deep_stuck_s() -> int:
+    """Two fsck timeouts, the re-check wait and the object lookup, plus 5 min."""
+    from genesis.observability import git_health as g
+
+    return 2 * g._DEEP_TIMEOUT_S + g._FSCK_RECHECK_DELAY_S + g._LOOKUP_TIMEOUT_S + 300
+
+
+def _cancel_git_deep_task() -> None:
+    """Stop an in-flight deep scan at shutdown: a scan cut off by the stop
+    proves nothing and must not leave a verdict or a page behind. Also refuses
+    every later dispatch until the loop starts again."""
+    global _git_deep_stopped
+    _git_deep_stopped = True
+    if _git_deep_task is not None and not _git_deep_task.done():
+        _git_deep_task.cancel()
+
+
+def _dispatch_git_health_deep(db) -> None:
+    """Start the daily deep scan as a background task when it is due and not
+    already running, and never after a service stop; the tick never awaits it."""
+    global _git_deep_task, _git_deep_stuck_warned
+    if _git_deep_stopped:
+        return
+    if _git_deep_task is not None and not _git_deep_task.done():
+        # Two fsck timeouts plus the re-check wait bound a healthy run; past that
+        # the git child is stuck in uninterruptible I/O (a timeout kills any other)
+        # and the daily scan has stopped.
+        started = _last_git_deep_run_at
+        limit = _git_deep_stuck_s()
+        stalled = started is not None and time.monotonic() - started > limit
+        if stalled and not _git_deep_stuck_warned:
+            _git_deep_stuck_warned = True
+            logger.warning("git deep fsck still running after %ds; daily scan stalled", limit)
+        return
+    _git_deep_stuck_warned = False
+    last = _last_git_deep_run_at
+    if last is not None and time.monotonic() - last < _GIT_DEEP_INTERVAL_S:
+        return
+    from genesis.util.tasks import tracked_task
+
+    _git_deep_task = tracked_task(
+        _check_git_health_deep(db), name="git-deep-fsck", subsystem=Subsystem.AWARENESS
+    )
 
 
 async def _check_git_health_deep(db) -> None:
     """Daily `git fsck --full` content-verifying scan: writes the deep verdict
-    slot and, on failure, a critical observation. Best-effort; never raises.
+    slot and, on failure, a critical observation. Best-effort; never raises except
+    CancelledError, which a service stop uses to abort the scan with no verdict.
 
     Runs at most once per ``_GIT_DEEP_INTERVAL_S`` (and once on the first tick
     after a restart). NOT gated on ``db``: git integrity matters most when the DB
@@ -1839,7 +2664,8 @@ async def _check_git_health_deep(db) -> None:
 
     if report.ok:
         # Self-heal: a passing content-verifying fsck clears open DEEP alerts
-        # (category="git_deep" only). The verdict file already self-heals per
+        # (category="git_deep" only; git_deep_transient rows are records of past
+        # events and expire on their own TTL). The verdict file already self-heals per
         # slot; without this, the observations outlive recovery as stale
         # criticals and get amplified into false actions (2026-07-16 "git
         # corruption" alarm, seeded by a transient fsck race across ~112
@@ -1862,6 +2688,9 @@ async def _check_git_health_deep(db) -> None:
                     logger.info("git deep-health recovered: resolved %d alert(s)", healed)
             except Exception:
                 logger.debug("git deep-health auto-resolve failed", exc_info=True)
+            transient = report.details.get("fsck_transient")
+            if transient:
+                await _record_git_deep_transient(db, transient, report.checked_at)
         return
     if db is None:
         return
@@ -1883,6 +2712,11 @@ async def _check_git_health_deep(db) -> None:
         if len(detail_lines) >= 5:
             break
     detail = ("\n" + "\n".join(detail_lines)) if detail_lines else ""
+    recheck = report.details.get("fsck_recheck")
+    if report.details.get("fsck_reproduced"):
+        failures += " (reproduced on re-check)"
+    elif recheck:
+        failures += f" (re-check did not complete: {recheck})"
     try:
         created = await observations.create(
             db,
@@ -1917,6 +2751,42 @@ async def _check_git_health_deep(db) -> None:
             logger.debug("git deep-health alert suppressed (duplicate unresolved): %s", failures)
     except Exception:
         logger.debug("Failed to create git deep-health observation", exc_info=True)
+
+
+async def _record_git_deep_transient(db, transient: dict, checked_at: str) -> None:
+    """One 'high' row PER transient event (a fsck failure that passed on
+    re-check): shown in the morning report and dashboard, never paged (only
+    critical rows reach Telegram). A clean run does not resolve it; it expires on
+    the infrastructure_alert TTL, so a recurrence shows as more rows. The verdict
+    leads the body because those surfaces truncate content."""
+    lines = (transient.get("lines") or "").strip()
+    if transient.get("recheck_lines"):
+        lines += f"\nre-check reported (all present on lookup):\n{transient['recheck_lines']}"
+    if transient.get("race"):
+        verdict = (
+            "git fsck failed twice, but every object the re-check called missing exists "
+            "— a scan race with another writer"
+        )
+    else:
+        verdict = f"git fsck failed once and PASSED on re-check {transient.get('delay_s')}s later"
+    try:
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="git_health_monitor",
+            type="infrastructure_alert",
+            category="git_deep_transient",
+            skip_if_duplicate=True,
+            content_hash=hashlib.sha256(f"git_deep_transient:{checked_at}".encode()).hexdigest(),
+            content=(
+                f"{verdict} — transient, no action needed unless this recurs "
+                f"(rc={transient.get('rc')}).\n{lines}"
+            ),
+            priority="high",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+    except Exception:
+        logger.debug("Failed to create git deep-transient observation", exc_info=True)
 
 
 # Daily offline git-bundle publish (F.4). Publishes a *verified* `git bundle` of
@@ -1958,8 +2828,14 @@ async def _publish_repo_bundle_if_due() -> None:
 # key-existence check (a missing key means "never alerted"), NEVER a default of
 # 0.0 — on a host booted <cooldown ago, `now - 0.0` is small and would wrongly
 # suppress the first alert for a slot.
-_last_slot_alert_at: dict[str, float] = {}
-_SLOT_ALERT_COOLDOWN_S = 3600  # one alert per slot per hour
+# pid-key -> (last alert monotonic time, priority it was sent at). The priority
+# rides along because the cooldown must NOT swallow an ESCALATION: a WARN
+# ("high") at minute 0 used to silence the CRIT that crossed ten minutes later
+# for the rest of the hour — and CRIT is the tier that actually reaches
+# Telegram. With the tree denominator this is a live shape, not a theoretical
+# one: a session that starts a heavy job can cross WARN->CRIT within one window.
+_last_slot_alert_at: dict[str, tuple[float, str]] = {}
+_SLOT_ALERT_COOLDOWN_S = 3600  # one alert per slot per hour (per severity step)
 
 
 async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
@@ -1990,10 +2866,20 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
     # lifetime); an entry older than the cooldown no longer suppresses anything,
     # so dropping it is behaviour-neutral and prevents slow growth on a
     # long-running server.
-    for k in [k for k, t in _last_slot_alert_at.items() if now - t >= _SLOT_ALERT_COOLDOWN_S]:
+    for k in [k for k, v in _last_slot_alert_at.items() if now - v[0] >= _SLOT_ALERT_COOLDOWN_S]:
         del _last_slot_alert_at[k]
     for slot in slots:
-        rss = slot.get("rss_mb", 0.0)
+        # `rss_mb` is the slot's WHOLE TREE (claude + Serena + the MCP fleet).
+        # Comparing the threshold against the root process alone — which is what
+        # this did before — meant the alert could not fire in the regime it
+        # exists for: the root stays ~0.8 GB while the tree balloons.
+        # `or`, not a .get default, on BOTH keys: a present-None survives a
+        # default, and `rss` is compared outside the inner try, where a None
+        # raises out of a function whose contract is "never raises into the
+        # tick". Defensive — no production caller passes rows today (the one
+        # call site enumerates live slots).
+        rss = slot.get("rss_mb") or 0.0
+        proc_rss = slot.get("proc_rss_mb") or rss
         if rss < SLOT_RSS_WARN_MB:
             continue
         # Key the cooldown by PID (unique per process), never the slot label: rows
@@ -2005,15 +2891,22 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
         pid = slot.get("pid")
         key = f"pid:{pid}"
         label = f"slot cc-{raw_slot}" if raw_slot is not None else f"pid {pid}"
+        priority = "critical" if rss >= SLOT_RSS_CRIT_MB else "high"
         last = _last_slot_alert_at.get(key)
-        if last is not None and (now - last) < _SLOT_ALERT_COOLDOWN_S:
+        # Within the window a repeat at the SAME (or lower) severity stays
+        # suppressed; an escalation high -> critical always re-alerts, since
+        # critical is the tier that reaches Telegram.
+        if (
+            last is not None
+            and (now - last[0]) < _SLOT_ALERT_COOLDOWN_S
+            and not (priority == "critical" and last[1] == "high")
+        ):
             continue
         if db is None:
             continue  # can't write the observation now; retry next tick
-        priority = "critical" if rss >= SLOT_RSS_CRIT_MB else "high"
         # Consumed only once we can actually write (after the db-None guard), and
         # set before the await so a failed create still suppresses per-tick retries.
-        _last_slot_alert_at[key] = now
+        _last_slot_alert_at[key] = (now, priority)
         try:
             await observations.create(
                 db,
@@ -2022,9 +2915,14 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
                 type="infrastructure_alert",
                 content=(
                     f"CC {label} (pid {pid}) is using "
-                    f"{rss / 1024:.1f} GB RAM (warn {SLOT_RSS_WARN_MB // 1024} GB, "
-                    f"crit {SLOT_RSS_CRIT_MB // 1024} GB). A single Claude Code "
-                    f"session may be leaking — consider restarting {label}."
+                    f"{rss / 1024:.1f} GB RAM across its whole process tree "
+                    f"({proc_rss / 1024:.1f} GB in the claude process itself, the rest "
+                    f"in its Serena and MCP children) — warn "
+                    f"{SLOT_RSS_WARN_MB // 1024} GB, crit {SLOT_RSS_CRIT_MB // 1024} GB. "
+                    f"A single Claude Code session may be leaking — or may be "
+                    f"running a legitimately memory-heavy job (the tree counts "
+                    f"anything the session started). Check {label}'s process "
+                    f"tree before restarting it."
                 ),
                 priority=priority,
                 created_at=datetime.now(UTC).isoformat(),
@@ -2268,14 +3166,58 @@ async def _check_provider_outage_notify(db) -> None:
         # config) is raised through so the sweep's own catch skips that
         # provider — fail toward silence.
         provider_still_failing = None
+        current_incident_identity = None
+        incident_owner = None
+        # SEVERITY FOLLOWS COVERAGE: a dead provider pages (critical) only when
+        # an essential call site that uses it has no available provider left.
+        # Otherwise its notice is "high" — dashboard + morning report, not
+        # Telegram — because fallback is working. Unknown coverage keeps the
+        # mode's priority. (MEASURED 2026-10-07: neither the NIM nor the Gemini
+        # outage that paged critical left any essential site uncovered.)
+        coverage_for = None
         try:
             from genesis.routing.types import ProviderState
             from genesis.runtime import GenesisRuntime
 
             _breakers = getattr(GenesisRuntime.instance(), "_circuit_breakers", None)
             if _breakers is not None:
+                current_incident_identity = _breakers.current_incident_identity
+                incident_owner = _breakers.incident_owner
+
                 def provider_still_failing(name, _reg=_breakers):
                     return _reg.get(name).state != ProviderState.CLOSED
+
+                coverage_for = _breakers.uncovered_essential_sites_for
+                # The router skips some providers whose breakers read healthy:
+                # a spent daily quota, and a paid one on a never_pays site or
+                # while the spend budget is exceeded (router.py's chain walk and
+                # _filter_chain). Those cover nothing.
+                _router = getattr(GenesisRuntime.instance(), "_router", None)
+                if _router is not None:
+                    _ledger = getattr(_router, "_daily_budget", None)
+                    _exceeded = False
+                    try:
+                        from genesis.routing.types import BudgetStatus
+
+                        _ct = getattr(_router, "cost_tracker", None)
+                        if _ct is not None:
+                            _exceeded = await _ct.check_budget() == BudgetStatus.EXCEEDED
+                    except Exception:
+                        _exceeded = False  # unknown: the breaker's word stands
+
+                    def _ineligible(name, site, _r=_router, _l=_ledger, _x=_exceeded):
+                        cfg = _r.config.providers.get(name)
+                        if cfg is None:
+                            return False
+                        if _l is not None and _l.exhausted(cfg):
+                            return True
+                        if not cfg.is_free:
+                            cs = _r.config.call_sites.get(site)
+                            return _x or bool(cs is not None and cs.never_pays)
+                        return False
+
+                    def coverage_for(name, _reg=_breakers, _d=_ineligible):
+                        return _reg.uncovered_essential_sites_for(name, also_unavailable=_d)
         except Exception:
             provider_still_failing = None
 
@@ -2287,10 +3229,19 @@ async def _check_provider_outage_notify(db) -> None:
             # nothing. Resolve the demoted rows; the sweep below re-creates
             # them at critical in this same tick, which delivers the pending
             # notification — the point of turning the lever up.
-            await _promote_demoted_provider_notify(db)
+            await _promote_demoted_provider_notify(
+                db,
+                coverage_for=coverage_for,
+                incident_owner=incident_owner,
+            )
 
         written = await sweep_due_notifications(
-            db, priority=priority, provider_still_failing=provider_still_failing
+            db,
+            priority=priority,
+            provider_still_failing=provider_still_failing,
+            current_incident_identity=current_incident_identity,
+            incident_owner=incident_owner,
+            coverage_for=coverage_for,
         )
         if written:
             logger.info(
@@ -2328,18 +3279,48 @@ async def _open_notify_rows(db) -> list[dict]:
     return out
 
 
-async def _promote_demoted_provider_notify(db) -> None:
+async def _promote_demoted_provider_notify(
+    db,
+    *,
+    coverage_for=None,
+    incident_owner=None,
+) -> None:
     """Resolve high-priority notify rows so live mode can rewrite them critical.
 
     Without this, a row written under `propose_only` blocks the critical write
     via `skip_if_duplicate` (dedup keys exclude priority) and upgrading the
     lever silently delivers nothing — found at review.
+
+    With ``coverage_for``, only rows whose provider would be written critical
+    NOW are resolved (an essential site it serves is uncovered, or coverage is
+    unknown). A covered provider's row is high on purpose: resolving it would
+    only have the sweep re-create it at high, every tick. A row whose provider
+    later becomes the cause of an uncovered site is promoted then.
     """
     try:
+        import json as _json
+
         from genesis.db.crud import observations
 
-        demoted = [r["id"] for r in await _open_notify_rows(db)
-                   if r.get("priority") == "high"]
+        def _now_critical(row) -> bool:
+            if coverage_for is None:
+                return True
+            try:
+                blob = _json.loads(row.get("content") or "")
+                name = blob.get("provider")
+                if incident_owner is not None:  # same mapping as the sweep
+                    name = incident_owner(name, blob.get("incident_identity"))
+                if name is None:
+                    return True
+                return coverage_for(name) != []
+            except Exception:
+                return True  # unknown → the sweep keeps critical, so promote
+
+        demoted = [
+            r["id"]
+            for r in await _open_notify_rows(db)
+            if r.get("priority") == "high" and _now_critical(r)
+        ]
         if demoted:
             from datetime import UTC, datetime
 
@@ -2348,7 +3329,8 @@ async def _promote_demoted_provider_notify(db) -> None:
                 demoted,
                 resolved_at=datetime.now(UTC).isoformat(),
                 resolution_notes=(
-                    "superseded: lever raised to live — re-created at critical"
+                    "superseded: lever raised to live, or essential coverage lost — "
+                    "re-created at critical"
                 ),
             )
             logger.info(
@@ -2911,6 +3893,7 @@ class AwarenessLoop:
         Does NOT stop the scheduler — that happens in stop().
         """
         self._stopping = True
+        _cancel_git_deep_task()
 
     @property
     def tick_count(self) -> int:
@@ -2973,6 +3956,8 @@ class AwarenessLoop:
         waiting one full interval.  This keeps status.json fresh from the
         moment the bridge starts, preventing watchdog false-positives.
         """
+        global _git_deep_stopped
+        _git_deep_stopped = False
         self._scheduler.add_job(
             self._on_tick,
             IntervalTrigger(minutes=self._interval),
@@ -3042,6 +4027,7 @@ class AwarenessLoop:
     async def stop(self) -> None:
         """Stop the scheduler, waiting for any running tick to finish."""
         self._stopping = True
+        _cancel_git_deep_task()
         self._scheduler.shutdown(wait=True)
         logger.info("Awareness Loop stopped")
 
@@ -3238,10 +4224,11 @@ class AwarenessLoop:
             # inside). Writes a verdict to the shared mount for the guardian.
             await _check_git_health(self._db)
             # Daily deep fsck (F.1) — content-verifying scan for zeroed-but-present
-            # objects the cheap probe misses. Self-guards to ~daily and runs in a
-            # thread. Loop-driven (not the learning scheduler) so it survives a
-            # router-degraded startup.
-            await _check_git_health_deep(self._db)
+            # objects the cheap probe misses. Self-guards to ~daily; dispatched
+            # OUT-OF-BAND so its fsck (and a failing run's re-check) never holds
+            # the tick lock. Loop-driven (not the learning scheduler) so it
+            # survives a router-degraded startup.
+            _dispatch_git_health_deep(self._db)
             # Daily offline git-bundle publish (F.4) — a verified `git bundle` of
             # the repo to the shared mount, health-gated, so the host guardian can
             # archive an offline re-clone lifeline. Self-guards to ~daily and runs
@@ -3267,7 +4254,8 @@ class AwarenessLoop:
                     # backlog clears. Best-effort (guarded internally).
                     await _check_embedding_backlog(self._db)
                     # Deploy staleness — merged-vs-deployed drift (update.sh age,
-                    # commits behind, missing units, host guardian). Day-scale
+                    # commits behind, missing units, host guardian), plus tracked
+                    # edits in the deploy checkout that would refuse a deploy. Day-scale
                     # signal → hourly; self-resolves on recovery. Best-effort
                     # (guarded internally); collectors never do network I/O.
                     await _check_deploy_staleness(self._db)
@@ -3302,6 +4290,10 @@ class AwarenessLoop:
                     # Conservative threshold; self-resolves when a cycle lands.
                     await _check_ego_liveness(self._db)
                 await _check_wal_health(self._db)
+                # The root Tailscale watchdog writes only its own /run file; its
+                # events become observations here. Every tick, so a failed
+                # restart pages within ~5 minutes.
+                await _record_tailscale_watchdog_events(self._db)
                 # WS-2 M10: persist the alert/incident open-set to alert_events.
                 # Every tick (5 min), not hourly — a short-lived alert that fires
                 # and clears within the hour must still leave a durable incident

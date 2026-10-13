@@ -3,10 +3,11 @@
 # settings_update("pr_watch", {...}) or a hand edit takes effect at the next
 # session start — no restart.
 #
-# What it does: mirrors the upstream-pr-steward campaign's own owner
-# notifications (already in outreach_history) inline, as a one-line nudge, so a
-# tracked-PR status change you missed on Telegram still reaches you next
-# foreground session.
+# What it does: mirrors the GitHub-steward owner notifications already in
+# outreach_history inline, as a one-line nudge, so a tracked-PR status change you
+# missed on Telegram still reaches you next foreground session. Those rows come
+# from recon/account_activity.py (a poller in genesis-server; its topics are
+# prefixed "GitHub steward: ") and from the github-activity-digest campaign.
 #
 # Master switch: false stops the hook before any DB/sidecar work.
 # Hook-level kill switch (separate, stdlib-cheap): GENESIS_PR_WATCH_DISABLED=1

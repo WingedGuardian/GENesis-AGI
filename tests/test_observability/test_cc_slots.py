@@ -86,7 +86,13 @@ class TestEnumerateCcSlots:
         _make_proc_entry(tmp_path, 1001, "claude", "3", 870_000)          # slot 3, healthy
         _make_proc_entry(tmp_path, 1002, "node", "3", 120_000)            # not claude → skip
         _make_proc_entry(tmp_path, 1003, "claude", None, 500_000)         # interactive, no slot → INCLUDED (slot None)
-        _make_proc_entry(tmp_path, 1004, "claude", "7", 7 * 1024 * 1024)  # slot 7, CRIT (7 GB)
+        # Sized RELATIVE to the constant, not a magic 7 GB: the thresholds are
+        # explicitly tunable, and a literal here silently re-aims the assertion
+        # at "degraded" the next time they move (which is exactly what happened
+        # when they were rebased onto the whole-tree denominator).
+        _make_proc_entry(
+            tmp_path, 1004, "claude", "7", (SLOT_RSS_CRIT_MB + 1024) * 1024
+        )  # slot 7, over CRIT
         _make_proc_entry(
             tmp_path, 1005, "claude", None, 400_000, cmdline=_PRINT_CMD
         )  # cognitive `claude -p` → EXCLUDED
@@ -209,13 +215,16 @@ def _write_btime(root, btime: int):
     )
 
 
-def _write_stat(root, pid: int, comm: str, starttime_ticks: int):
+def _write_stat(root, pid: int, comm: str, starttime_ticks: int, ppid: int = 0):
     """Fake /proc/<pid>/stat. comm is parenthesised and may contain spaces/parens
-    — field 22 (starttime) sits 19 tokens after the LAST ')'."""
+    — after the LAST ')' the tokens start at field 3 (state), which puts ppid
+    (field 4) at index 1 and starttime (field 22) at index 19."""
     d = root / str(pid)
     d.mkdir(exist_ok=True)
     # fields 3..21 (state..itrealvalue) = 19 placeholder tokens, then field 22.
-    tail = " ".join(["0"] * 19 + [str(starttime_ticks)])
+    _fields = ["0"] * 19
+    _fields[1] = str(ppid)  # field 4 = ppid
+    tail = " ".join(_fields + [str(starttime_ticks)])
     (d / "stat").write_text(f"{pid} ({comm}) {tail} 0 0 0\n")
 
 
@@ -279,3 +288,84 @@ class TestReadProcStartIso:
         _make_proc_entry(tmp_path, 5002, "claude", "1", 800_000)
         rows = enumerate_cc_slots()
         assert rows[0]["started_at"] is None
+
+
+# ── whole-tree accounting (a slot is not one process) ───────────────────────
+
+
+def _tree_fixture(tmp_path, monkeypatch, root_rss_kb: int, children: dict[int, int]):
+    """A `claude` slot at pid 100 plus non-claude children hanging off it.
+
+    `children` maps pid -> rss_kb, each parented to 100 unless the pid is also a
+    key in another child's subtree (callers build deeper shapes by hand).
+    """
+    _write_btime(tmp_path, 1_700_000_000)
+    _make_proc_entry(tmp_path, 100, "claude", "1", root_rss_kb)
+    _write_stat(tmp_path, 100, "claude", 500_000, ppid=1)
+    for pid, rss_kb in children.items():
+        _make_proc_entry(tmp_path, pid, "python", None, rss_kb, cmdline=b"python\x00-m\x00srv\x00")
+        _write_stat(tmp_path, pid, "python", 500_000, ppid=100)
+    monkeypatch.setattr(cc_slots, "_PROC", str(tmp_path))
+
+
+class TestSlotTreeRss:
+    """A slot carries a Serena LSP and a fleet of MCP servers as children; they
+    are most of its memory. Counting only the root understates it ~3x."""
+
+    def test_tree_sums_the_root_and_its_descendants(self, tmp_path, monkeypatch):
+        _tree_fixture(tmp_path, monkeypatch, 800 * 1024, {101: 900 * 1024, 102: 300 * 1024})
+        children = cc_slots.build_child_map([100, 101, 102])
+        assert cc_slots.slot_tree_rss_mb(100, children) == pytest.approx(2000.0, abs=1.0)
+
+    def test_tree_reaches_grandchildren(self, tmp_path, monkeypatch):
+        # A depth-2 descendant must count: MCP servers spawn their own helpers.
+        _tree_fixture(tmp_path, monkeypatch, 800 * 1024, {101: 900 * 1024})
+        _make_proc_entry(tmp_path, 102, "node", None, 100 * 1024, cmdline=b"node\x00x\x00")
+        _write_stat(tmp_path, 102, "node", 500_000, ppid=101)
+        children = cc_slots.build_child_map([100, 101, 102])
+        assert cc_slots.slot_tree_rss_mb(100, children) == pytest.approx(1800.0, abs=1.0)
+
+    def test_a_ppid_cycle_terminates(self, tmp_path, monkeypatch):
+        # A malformed/recycled ppid chain must not hang the dashboard thread.
+        _tree_fixture(tmp_path, monkeypatch, 800 * 1024, {101: 100 * 1024})
+        _write_stat(tmp_path, 100, "claude", 500_000, ppid=101)  # 100 -> 101 -> 100
+        children = cc_slots.build_child_map([100, 101])
+        assert cc_slots.slot_tree_rss_mb(100, children) == pytest.approx(900.0, abs=1.0)
+
+    def test_an_unreadable_descendant_is_skipped_not_fatal(self, tmp_path, monkeypatch):
+        # A child that exits mid-walk contributes nothing and must not raise.
+        _tree_fixture(tmp_path, monkeypatch, 800 * 1024, {101: 900 * 1024})
+        (tmp_path / "102").mkdir()
+        (tmp_path / "102" / "stat").write_text("102 (gone) 0 100 " + " ".join(["0"] * 18) + " 5\n")
+        children = cc_slots.build_child_map([100, 101, 102])
+        assert cc_slots.slot_tree_rss_mb(100, children) == pytest.approx(1700.0, abs=1.0)
+
+    def test_row_reports_tree_as_rss_mb_and_root_as_proc_rss_mb(self, tmp_path, monkeypatch):
+        _tree_fixture(tmp_path, monkeypatch, 800 * 1024, {101: 900 * 1024, 102: 300 * 1024})
+        (row,) = enumerate_cc_slots()
+        assert row["proc_rss_mb"] == pytest.approx(800.0, abs=1.0)
+        assert row["rss_mb"] == pytest.approx(2000.0, abs=1.0)
+
+    def test_status_is_decided_by_the_tree_not_the_root(self, tmp_path, monkeypatch):
+        """THE regression this change exists for.
+
+        Before, `status` and the awareness alert both keyed on the root process,
+        so a slot whose tree had ballooned past the threshold still reported a
+        small `claude` process and read healthy — the alert could not fire in
+        the regime it was built for.
+        """
+        root_kb = 800 * 1024
+        child_kb = (SLOT_RSS_WARN_MB + 200) * 1024  # tree well over WARN
+        _tree_fixture(tmp_path, monkeypatch, root_kb, {101: child_kb})
+        (row,) = enumerate_cc_slots()
+        assert slot_status(row["proc_rss_mb"]) == "healthy", "root alone must look fine"
+        assert row["rss_mb"] > SLOT_RSS_WARN_MB
+        assert row["status"] == "degraded"
+
+    def test_thresholds_are_ordered_and_tree_scaled(self):
+        # Guards a careless edit: CRIT above WARN, and WARN above the observed
+        # healthy-tree MAX (~3.5 GB — the distribution is bimodal, so the max,
+        # not the mean, is what a normal slot can actually reach). Asserting
+        # only the mean would let a normal working slot sit at WARN.
+        assert SLOT_RSS_WARN_MB < SLOT_RSS_CRIT_MB
+        assert SLOT_RSS_WARN_MB > 3500

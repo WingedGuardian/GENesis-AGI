@@ -245,6 +245,44 @@ class TestRecoveryRevertCode:
         assert result.success is True
         assert "reverted" in result.detail.lower()
 
+    @staticmethod
+    def _recording_subprocess(stash_result: tuple[int, str, str]):
+        calls: list[str] = []
+
+        async def mock(*args, **kwargs):
+            command = args[-1]
+            calls.append(command)
+            if "git stash" in command:
+                return stash_result
+            return (0, "", "")
+
+        return mock, calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stash_result", "expected"),
+        [
+            ((1, "", "fatal: index.lock exists"), "failed"),
+            ((-1, "", "timeout"), "did not report"),
+        ],
+    )
+    async def test_failed_stash_never_reverts(
+        self, engine: RecoveryEngine, stash_result, expected
+    ) -> None:
+        mock, calls = self._recording_subprocess(stash_result)
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            ok, detail = await engine._revert_code("genesis")
+        assert ok is False
+        assert expected in detail
+        assert not any("git revert" in c for c in calls), calls
+
+    @pytest.mark.asyncio
+    async def test_clean_tree_stash_still_reverts(self, engine: RecoveryEngine) -> None:
+        mock, calls = self._recording_subprocess((0, "No local changes to save", ""))
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            await engine._revert_code("genesis")
+        assert any("git revert" in c for c in calls), calls
+
 
 class TestRestartContainerStopped:
     """`incus restart` fails on a STOPPED instance (2026-07-04 outage: unclean
@@ -335,3 +373,27 @@ class TestSnapshotRollbackRetry:
         assert ok is False
         snapshots.delete.assert_not_called()
         assert snapshots.restore.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_rollback_retry_follows_listing_order_not_names(config, sm, dispatcher) -> None:
+    """Review: 'newer' is what the manager lists BEFORE the healthy snapshot
+    (created-at order), never a lexical name comparison. A pre-recovery
+    snapshot created after the healthy one but carrying an earlier-looking
+    name must still be removed; an older one with a later-looking name must
+    not be."""
+    from unittest.mock import MagicMock
+
+    healthy = "guardian-20260701-000000-healthy"
+    newer_by_time = "guardian-20260601-000000-pre-recovery"
+    older_by_time = "guardian-20260801-000000-pre-recovery"
+    snapshots = MagicMock()
+    snapshots.get_latest_healthy = AsyncMock(return_value=healthy)
+    snapshots.restore = AsyncMock(side_effect=[False, True])
+    snapshots.list_snapshots = AsyncMock(return_value=[newer_by_time, healthy, older_by_time])
+    snapshots.delete = AsyncMock(return_value=True)
+
+    engine = RecoveryEngine(config, sm, snapshots, dispatcher)
+    ok, _ = await engine._snapshot_rollback()
+    assert ok is True
+    snapshots.delete.assert_called_once_with(newer_by_time)

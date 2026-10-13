@@ -78,6 +78,7 @@ def _mark(repo: Path, home: Path, evidence: str) -> subprocess.CompletedProcess:
     """
     (home / ".genesis" / "last_code_review.txt").write_text(evidence)
     env = {**os.environ, "HOME": str(home)}
+    env.setdefault("_TEST_REVIEW_BUDGET_PR", "none")
     return subprocess.run(
         [
             sys.executable,

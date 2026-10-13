@@ -25,22 +25,37 @@ Add this entry to `~/genesis/.mcp.json` under `mcpServers`:
   "args": [
     "chrome-devtools-mcp@0.21.0",
     "--headless",
-    "--executablePath", "/usr/bin/google-chrome",
-    "--userDataDir", "${HOME}/.genesis/browser-profile",
-    "--no-sandbox"
+    "--executablePath", "<path to a Chrome or Chromium binary>",
+    "--userDataDir", "${HOME}/.genesis/devtools-profile",
+    "--chrome-arg=--no-sandbox"
   ]
 }
 ```
 
+- `--executablePath`: Genesis installs do not ship Google Chrome. Use any
+  installed Chrome/Chromium. Playwright's own Chromium, if installed, is under
+  `~/.cache/ms-playwright/chromium-*/`, in `chrome-linux64/chrome` on recent
+  Playwright and `chrome-linux/chrome` on older releases; list the executable
+  itself with `ls ~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`.
+- `--userDataDir`: keep it separate from `~/.genesis/browser-profile`, which the
+  Chromium fallback layer uses. Two Chromium processes on one profile fail to
+  start or corrupt it.
+- `--chrome-arg=--no-sandbox`: Chrome flags must go through `--chrome-arg`. A
+  bare `--no-sandbox` is read as an option of chrome-devtools-mcp itself, which
+  has no such option, and is dropped without a warning.
+
 Then restart the CC session to pick up the new MCP server.
 
-## Remote Browser (CDP-over-SSH)
+## Remote Browser (the user's Chrome)
 
-To connect to the user's real Chrome:
-
-1. User launches Chrome with `--remote-debugging-port=9222`
-2. Set up SSH tunnel: `ssh -N -L 9222:localhost:9222 user@host`
-3. Replace the config above with:
+Launching the user's Chrome for remote debugging and reaching its port is
+described in ONE place: the `browser-automation` skill, "Remote CDP setup"
+(`src/genesis/skills/browser-automation/SKILL.md`). Chrome 136+ ignores
+`--remote-debugging-port` on the default profile, and headed Chrome binds the
+port to loopback, so follow that section. Once the endpoint answers, replace
+the config above with the following, using the same endpoint as
+`GENESIS_CDP_URL` in place of `http://127.0.0.1:9222` (that value is the SSH
+tunnel case):
 
 ```json
 "chrome-devtools-remote": {
@@ -55,14 +70,14 @@ To connect to the user's real Chrome:
 ## Deactivation
 
 When done with heavy browser work, remove the `chrome-devtools` entry from
-`.mcp.json` and restart the session. This reclaims ~17k tokens of context
-budget that the 29 Chrome DevTools MCP tools consume.
+`.mcp.json` and restart the session. This reclaims the ~17,000 chars of tool
+descriptions that the 29 Chrome DevTools MCP tools add to the context.
 
 ## Token Cost
 
 | Mode | Tools | Context Cost |
 |------|-------|-------------|
-| Genesis browser tools (always on) | 8 | ~800 chars |
+| Genesis browser tools (always on) | 11 | ~4,600 chars of tool descriptions (measured 2026-10-04) |
 | + Chrome DevTools MCP | +29 | ~17,000 chars |
 | + Playwright MCP | +27 | ~13,700 chars |
 

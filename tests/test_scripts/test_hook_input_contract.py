@@ -18,6 +18,7 @@ synthetic payloads, subprocess isolation, no network, no live DB.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -166,6 +167,27 @@ _ALLOWED_ENV_READERS = {"hook_input.py"}
 _DEAD_ENV_VARS = ("CLAUDE_TOOL_INPUT", "CLAUDE_TOOL_USE_RESULT", "CLAUDE_SESSION_ID")
 
 
+#: An actual READ of the environment. The bare substring ``environ`` is NOT
+#: enough: the word "environment" contains it, so a docstring explaining why the
+#: dead variable must not be read was itself reported as an offender — the guard
+#: flagging the very comment that documents it.
+#:
+#: A word BOUNDARY is the whole fix, and enumerating access forms instead is a
+#: trap: an earlier revision here matched ``environ.get``/``environ[`` and thereby
+#: LOST three spellings the crude substring had caught —
+#: ``if "X" in os.environ:`` (the natural presence check),
+#: ``dict(os.environ).get("X")`` and ``os.environ.copy().get("X")``. Narrowing a
+#: guard to the forms you happened to think of is how it stops guarding.
+#: ``\benviron\b`` rejects "environment" (the next character is a word char) while
+#: keeping every access form, including ones nobody has written yet.
+#:
+#: ``getenv`` is the second alternative because it is the MOST idiomatic spelling
+#: of the exact regression this guard exists to prevent — and neither the crude
+#: substring nor the enumerated version ever caught it, while the docstring below
+#: claimed they did.
+_ENV_READ = re.compile(r"\benviron\b|\bgetenv\s*\(")
+
+
 def test_no_hook_reads_dead_env_var_directly():
     """Static guard: no hook reads the dead payload env vars via os.environ.
 
@@ -178,7 +200,7 @@ def test_no_hook_reads_dead_env_var_directly():
         if path.name in _ALLOWED_ENV_READERS:
             continue
         for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if "environ" in line and any(v in line for v in _DEAD_ENV_VARS):
+            if _ENV_READ.search(line) and any(v in line for v in _DEAD_ENV_VARS):
                 offenders.append(f"{path.relative_to(_REPO).as_posix()}: {line.strip()}")
     assert not offenders, (
         "These hooks read a dead payload env var via os.environ instead of "
@@ -204,3 +226,41 @@ def test_no_settings_json_pipes_dead_env_var():
         "These settings files still reference the dead CLAUDE_TOOL_INPUT env var "
         f"(hooks must read the payload from stdin): {offenders}"
     )
+
+
+def _hook_input():
+    hooks = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
+    sys.path.insert(0, str(hooks))
+    try:
+        import hook_input
+    finally:
+        sys.path.remove(str(hooks))
+    return hook_input
+
+
+def test_tool_response_parses_an_mcp_json_string():
+    """MCP tools deliver tool_response as a JSON STRING (measured from the
+    session observer). Reading only dicts made every MCP-triggered PostToolUse
+    hook see {} and never fire."""
+    hi = _hook_input()
+    payload = {"tool_response": json.dumps({"layer": "camoufox", "url": "u"})}
+    assert hi.tool_response(payload) == {"layer": "camoufox", "url": "u"}
+
+
+def test_tool_response_keeps_the_dict_shape_and_rejects_non_objects():
+    hi = _hook_input()
+    assert hi.tool_response({"tool_response": {"ok": 1}}) == {"ok": 1}
+    assert hi.tool_response({"tool_response": "plain text"}) == {}
+    assert hi.tool_response({"tool_response": json.dumps([1, 2])}) == {}
+
+
+def test_a_present_tool_response_never_falls_back_to_the_legacy_env(monkeypatch):
+    """When the payload carries ``tool_response`` it is authoritative, whatever
+    its value: the legacy env var could hold an EARLIER tool's result, and a
+    hook would then act on the wrong call (claim a sentinel, keep a marker)."""
+    hi = _hook_input()
+    monkeypatch.setenv("CLAUDE_TOOL_USE_RESULT", '{"layer": "camoufox"}')
+    for present in ("{}", "plain text", json.dumps([1]), None, [1], 3):
+        assert hi.tool_response({"tool_response": present}) == {}, present
+    # Absent key: the legacy channel still answers.
+    assert hi.tool_response({}) == {"layer": "camoufox"}

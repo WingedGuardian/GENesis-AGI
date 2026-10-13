@@ -20,6 +20,21 @@ AWAITING_APPROVAL_PREFIX = "awaiting_approval:"
 # invalidated-failed rows with still-awaiting rows.
 APPROVAL_INVALIDATED_PREFIX = "approval_invalidated:"
 
+# Prefix marking a row whose approval request ENDED without an answer (expired,
+# cancelled, or no longer known to the approval manager). Deliberately NOT the
+# invalidated prefix: the item was never evaluated and its content is still
+# wanted, so the row stays an ordinary retriable failure the retry lane re-asks
+# about, with its retry budget untouched (#2447 review).
+APPROVAL_ENDED_PREFIX = "approval_ended:"
+
+# Unlike retry exhaustion, this hold must survive a raised retry cap. SQL
+# compares a literal prefix: '_' in an unescaped LIKE is a wildcard.
+REPLAY_UNSAFE_PREFIX = "replay_unsafe:"
+_REPLAY_HOLD_SQL = (
+    f"substr(COALESCE(error_message, ''), 1, {len(REPLAY_UNSAFE_PREFIX)})"
+    f" = '{REPLAY_UNSAFE_PREFIX}'"
+)
+
 # Prefix marking a row that has been CLAIMED for an in-flight dispatch (the CC
 # call is about to run / is running).  The resume pass flips a parked row from
 # ``awaiting_approval:`` to ``dispatching:`` via ``claim_for_dispatch`` BEFORE
@@ -46,7 +61,7 @@ def _decode_v2_items(stored: str) -> list[str] | None:
     """Strictly decode a v2 payload, returning ``None`` on any corruption."""
     try:
         values = json.loads(stored.removeprefix(BATCH_ITEMS_V2_PREFIX))
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, RecursionError):
         return None
     if (
         not isinstance(values, list)
@@ -80,6 +95,17 @@ def _handled_items_from_storage(stored: object) -> list[str]:
     # A legacy one-line batch is one unambiguous item. Multiple lines may be a
     # single annotated item or several items whose blank boundary was erased.
     return [stored] if "\n" not in stored and "\r" not in stored else []
+
+
+def stored_item_texts(stored: object) -> list[str]:
+    """The logical item texts a row's ``batch_items`` holds, where storage can
+    say them unambiguously; ``[]`` for blank, corrupt or ambiguous legacy data.
+
+    Public name for :func:`_handled_items_from_storage`, for callers outside
+    this module that need item boundaries (an alert naming each parked item)
+    rather than the flattened batch text.
+    """
+    return _handled_items_from_storage(stored)
 
 
 async def create(
@@ -183,8 +209,8 @@ async def count_live_rows_for_approval(
     A row is 'live' iff it is in ``processing`` state carrying an
     ``awaiting_approval:<request_id>`` or ``dispatching:<request_id>`` marker —
     i.e. a batch that is parked on, or mid-dispatch against, exactly this
-    approval. Invalidated (``approval_invalidated:``), failed, and completed
-    rows do NOT count.
+    approval. Invalidated (``approval_invalidated:``), superseded, failed, and
+    completed rows do NOT count.
 
     A return of ``0`` means the approval is **orphaned**: no inbox row will
     ever be dispatched against it (its rows were invalidated or superseded
@@ -226,11 +252,16 @@ async def supersede_parked_rows(
     the request with zero live rows (content removed entirely), the monitor's
     orphan-recovery guard cancels it on a later scan with no replacement.
 
+    Rows move to ``status='superseded'`` — being replaced by a newer snapshot
+    is not a failure, and writing ``failed`` buried real failures under them.
+    ``error_message`` keeps the reason for audit and ``retry_count`` is left
+    untouched.
+
     Returns the number of rows superseded.
     """
     cursor = await db.execute(
         """UPDATE inbox_items
-           SET status = 'failed',
+           SET status = 'superseded',
                error_message = ? || 'superseded by newer modification',
                processed_at = ?
            WHERE file_path = ? AND status = 'processing'
@@ -332,6 +363,7 @@ async def get_all_known(
 
     Excludes (allows reprocessing):
     - failed items with retry_count < max_retries (retriable)
+    - superseded items (a newer drop replaced their snapshot)
     - completed items whose response file was deleted (user wants re-eval)
     """
     from pathlib import Path
@@ -349,12 +381,15 @@ async def get_all_known(
     # order is NOT recency.
     #
     # Rows INVISIBLE to the scan (siblings decide; they never supply a hash):
-    # - retriable failed rows (retry_count < max): the retry lane owns their
+    # - retriable failed rows (retry_count < max, not replay-held): the retry lane owns their
     #   re-queueing; letting one erase the file from "known" would re-classify
     #   the file as NEW and re-evaluate FULL content.
+    # - superseded rows: a newer drop replaced their snapshot, so their hash is
+    #   stale by definition. (Written as retriable 'failed' until the
+    #   'superseded' status existed, and invisible here for that reason.)
     # - completed rows whose response file was deleted: user-initiated re-eval.
     cursor = await db.execute(
-        "SELECT file_path, content_hash, status, response_path, retry_count "
+        "SELECT file_path, content_hash, status, response_path, retry_count, error_message "
         "FROM inbox_items "
         "ORDER BY created_at ASC, rowid ASC",
     )
@@ -364,7 +399,10 @@ async def get_all_known(
         file_path, content_hash, status, response_path, retry_count = (
             row[0], row[1], row[2], row[3], row[4],
         )
-        if status == "failed" and (retry_count or 0) < max_retries:
+        if status == "superseded":
+            continue
+        held = str(row[5] or "").startswith(REPLAY_UNSAFE_PREFIX)
+        if status == "failed" and not held and (retry_count or 0) < max_retries:
             continue
         if status == "completed" and response_path and not Path(response_path).exists():
             continue
@@ -610,8 +648,9 @@ async def get_retriable_failed(
     ``retry_count=0``.
     """
     cursor = await db.execute(
-        """SELECT * FROM inbox_items
+        f"""SELECT * FROM inbox_items
            WHERE file_path = ? AND status = 'failed' AND retry_count < ?
+             AND NOT ({_REPLAY_HOLD_SQL})
              AND (error_message IS NULL
                   OR error_message NOT LIKE ? || '%')
            ORDER BY created_at DESC LIMIT 1""",
@@ -633,8 +672,9 @@ async def get_retriable_failed_rows(
     approval-invalidated rows (those need fresh rows + fresh approvals).
     """
     cursor = await db.execute(
-        """SELECT * FROM inbox_items
+        f"""SELECT * FROM inbox_items
            WHERE file_path = ? AND status = 'failed' AND retry_count < ?
+             AND NOT ({_REPLAY_HOLD_SQL})
              AND (error_message IS NULL
                   OR error_message NOT LIKE ? || '%')
            ORDER BY created_at ASC""",
@@ -659,8 +699,9 @@ async def get_retriable_failure_files(
     Excludes approval-invalidated rows (those need a fresh approval, not a retry).
     """
     cursor = await db.execute(
-        """SELECT DISTINCT file_path FROM inbox_items
+        f"""SELECT DISTINCT file_path FROM inbox_items
            WHERE status = 'failed' AND retry_count < ?
+             AND NOT ({_REPLAY_HOLD_SQL})
              AND (error_message IS NULL
                   OR error_message NOT LIKE ? || '%')
              AND file_path NOT IN (
@@ -678,15 +719,29 @@ async def get_handled_batch_content(
     *,
     max_retries: int = 3,
 ) -> list[str]:
-    """Return exact batch blocks that are completed or retry-exhausted."""
+    """Return exact blocks that are completed, retry-exhausted or replay-held.
+
+    Held blocks suppress replay in deltas; they are NOT completed evaluation
+    content and never advance the baseline returned by get_evaluated_content.
+
+    A ``superseded`` row is never handled, whatever its retry_count: its
+    snapshot was replaced before it was evaluated. (While supersession was
+    written as ``failed``, a row at the retry cap was counted here, so its
+    never-evaluated items were dropped from later deltas.)
+    """
     cursor = await db.execute(
-        """SELECT batch_items FROM inbox_items
+        f"""SELECT batch_items FROM inbox_items
            WHERE file_path = ?
              AND batch_items IS NOT NULL AND TRIM(batch_items) != ''
              AND (status = 'completed'
-                  OR (status = 'failed' AND retry_count >= ?))
+                  OR (status = 'failed' AND (retry_count >= ? OR {_REPLAY_HOLD_SQL})
+                      -- An invalidated row was never evaluated: counting it as
+                      -- handled silently subtracted its lines from every
+                      -- future delta (review N1, 2026-09-26).
+                      AND (error_message IS NULL
+                           OR error_message NOT LIKE ? || '%')))
            ORDER BY created_at ASC, rowid ASC""",
-        (file_path, max_retries),
+        (file_path, max_retries, APPROVAL_INVALIDATED_PREFIX),
     )
     handled: list[str] = []
     for row in await cursor.fetchall():
@@ -694,9 +749,81 @@ async def get_handled_batch_content(
     return handled
 
 
+async def get_opaque_replay_hold_files(db: aiosqlite.Connection) -> list[str]:
+    """Fail closed when a held batch cannot prove which logical items ran."""
+    cursor = await db.execute(
+        f"SELECT file_path, batch_items FROM inbox_items "
+        f"WHERE status = 'failed' AND ({_REPLAY_HOLD_SQL}) ORDER BY file_path",
+    )
+    return sorted({row[0] for row in await cursor.fetchall()
+                   if not _handled_items_from_storage(row[1])})
+
+
+async def release_replay_hold(
+    db: aiosqlite.Connection, row: dict, *, released_at: str,
+) -> bool:
+    """Explicit operator release; compare-and-set refuses stale row snapshots.
+
+    Caller validates the current source hash and acknowledges replay. Release
+    is not dispatch or a capability grant: the normal scanner/approval path owns
+    the next attempt. Preserve the prior reason until normal re-arming.
+    """
+    if row.get("status") != "failed" or not str(row.get("error_message", "")).startswith(
+        REPLAY_UNSAFE_PREFIX
+    ) or not _handled_items_from_storage(row.get("batch_items")):
+        return False
+    cursor = await db.execute(
+        "UPDATE inbox_items SET retry_count = 0, error_message = ?, processed_at = ? "
+        "WHERE id = ? AND status = 'failed' AND error_message = ? "
+        "AND content_hash = ? AND batch_items = ? AND file_path = ?",
+        (f"replay_authorized:{released_at}:{row['error_message']}", released_at,
+         row["id"], row["error_message"], row["content_hash"], row["batch_items"], row["file_path"]),
+    )
+    await db.commit()
+    return cursor.rowcount == 1
+
+
+async def mark_failed_keeping_retries(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    error_message: str,
+    processed_at: str | None = None,
+    retriable_below: int | None = None,
+) -> bool:
+    """Fail a row WITHOUT spending its retry budget, in one UPDATE.
+
+    :func:`update_status` increments ``retry_count`` on ``failed`` unless the
+    caller supplies a value, and supplying one means reading the row first. A
+    failure that is not the item's fault (the network was down) must neither
+    spend a retry nor depend on that read succeeding.
+
+    ``retriable_below`` (the active ``max_retries``) additionally keeps the row
+    RETRIABLE: its count is lowered to ``retriable_below - 1`` when it already
+    sits at or above that cap. A row whose count predates a LOWERED cap would
+    otherwise land at the cap, where nothing retries it and its never-evaluated
+    content counts as handled (#2447 review).
+    """
+    if retriable_below is None:
+        sql = """UPDATE inbox_items
+           SET status = 'failed', processed_at = ?, error_message = ?
+           WHERE id = ?"""
+        params: tuple = (processed_at, error_message, id)
+    else:
+        sql = """UPDATE inbox_items
+           SET status = 'failed', processed_at = ?, error_message = ?,
+               retry_count = MIN(retry_count, ?)
+           WHERE id = ?"""
+        params = (processed_at, error_message, max(retriable_below - 1, 0), id)
+    cursor = await db.execute(sql, params)
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def mark_file_failures_abandoned(
     db: aiosqlite.Connection, file_path: str, *, max_retries: int = 3,
     reason: str = "content removed before retry",
+    error_like: str | None = None,
 ) -> int:
     """Mark a file's retriable failed rows as approval-invalidated (abandoned).
 
@@ -707,16 +834,26 @@ async def mark_file_failures_abandoned(
     forever; flipping them to the ``approval_invalidated:<reason>`` prefix
     excludes them from :func:`get_retriable_failure_files` /
     :func:`get_retriable_failed_rows`. Returns the number of rows updated.
+
+    ``error_like`` (a SQL LIKE pattern) narrows the abandon to one failure
+    class. The retry-storm park passes ``'partial_url_failure%'``: a storm of URL
+    failures is no reason to ABANDON a crashed CC call, a restart requeue or a
+    corruption row in the same file (review, 2026-09-26). Those rows stay
+    retriable, but the file-level storm guard still skips the file until its
+    exhausted URL rows leave the 48-hour window, so they are delayed, not lost.
     """
-    cursor = await db.execute(
-        """UPDATE inbox_items
+    sql = f"""UPDATE inbox_items
            SET error_message = ? || ?
            WHERE file_path = ? AND status = 'failed' AND retry_count < ?
+             AND NOT ({_REPLAY_HOLD_SQL})
              AND (error_message IS NULL
-                  OR error_message NOT LIKE ? || '%')""",
-        (APPROVAL_INVALIDATED_PREFIX, reason, file_path, max_retries,
-         APPROVAL_INVALIDATED_PREFIX),
-    )
+                  OR error_message NOT LIKE ? || '%')"""
+    params: list = [APPROVAL_INVALIDATED_PREFIX, reason, file_path, max_retries,
+                    APPROVAL_INVALIDATED_PREFIX]
+    if error_like is not None:
+        sql += " AND error_message LIKE ?"
+        params.append(error_like)
+    cursor = await db.execute(sql, tuple(params))
     await db.commit()
     return cursor.rowcount
 
@@ -745,11 +882,11 @@ async def reuse_as_pending(
     created_at-keyed consumers at the source).
     """
     cursor = await db.execute(
-        """UPDATE inbox_items
+        f"""UPDATE inbox_items
            SET status = 'pending', error_message = NULL,
                drop_id = ?, batch_items = ?, content_hash = ?,
                created_at = ?
-           WHERE id = ?""",
+           WHERE id = ? AND status = 'failed' AND NOT ({_REPLAY_HOLD_SQL})""",
         (drop_id, batch_items, content_hash, created_at, id),
     )
     await db.commit()

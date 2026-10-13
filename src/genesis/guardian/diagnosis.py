@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+from genesis.cc.child_env import pin_dispatched_env
 from genesis.cc.types import model_name_supports_effort
 from genesis.guardian.briefing import read_guardian_briefing
 from genesis.guardian.collector import DiagnosticSnapshot
@@ -573,7 +574,8 @@ class DiagnosisEngine:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(work_dir),
-            env=await self._resolve_cc_env(cc_path),
+            # None means inherit; the pin needs a dict either way.
+            env=pin_dispatched_env(dict(await self._resolve_cc_env(cc_path) or os.environ)),
             # Own session/group so the timeout below can reap the WHOLE
             # claude tree — the agentic brain forks tool children, and a
             # leaked tree on the host has no genesis-server cgroup to

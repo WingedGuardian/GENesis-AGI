@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
+import hashlib
 import json
 import logging
 import os
+import re
+import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
@@ -16,18 +21,23 @@ from dataclasses import replace
 from pathlib import Path
 
 from genesis.cc import roster
+from genesis.cc.checkout_lock import CheckoutAdmission, admit_launch
+from genesis.cc.child_env import pin_dispatched_env
 from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
     CCNetworkOfflineError,
+    CCOverloadedError,
     CCProcessError,
     CCQuotaExhaustedError,
     CCRateLimitError,
+    CCReplayUnsafeError,
     CCSessionError,
     CCStreamTruncatedError,
     CCTimeoutError,
 )
 from genesis.cc.types import (
+    PROBE_CALLER_TAG,
     CCInvocation,
     CCModel,
     CCOutput,
@@ -37,6 +47,7 @@ from genesis.cc.types import (
     model_supports_effort,
 )
 from genesis.observability.spans import SpanKind, start_span
+from genesis.util.inflight import inflight
 from genesis.util.proc_kill import (
     kill_process_group,
     process_group_alive,
@@ -44,6 +55,115 @@ from genesis.util.proc_kill import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Free-text status matching in ``_classify_error``. A bare substring match on
+# "429" also hit identifiers that merely contain the digits (UUIDs, request
+# ids), so the code is matched as a whole token. The overload pattern is
+# narrower still, because it drives a RE-RUN: "529" counts only beside the
+# word "overloaded" or after "API Error:", and the word "overloaded" alone does
+# not count at all (a model's own text can say a queue "looks overloaded").
+# The CLI's JSON result is classified from its structured fields instead (see
+# ``_cli_result_payload``), so this only sees stderr and error prose.
+_OVERLOADED_RE = re.compile(r"overloaded_error|\b529\b\W{0,3}overloaded\b|\bapi error:?\s*529\b")
+_STATUS_429_RE = re.compile(r"\b429\b")
+
+
+def _cli_result_payload(stdout_text: str) -> dict | None:
+    """Select the last raw CLI result, allowing trailing cleanup diagnostics.
+
+    Never call on decoded model prose. Physical LF framing keeps Unicode line
+    separators inside JSON strings from forging protocol records.
+    """
+    for line in reversed(stdout_text.split("\n")):
+        if not line.lstrip().startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(data, dict) and data.get("type") == "result":
+            return data
+    return None
+
+
+def _result_error_texts(payload: dict) -> list[str]:
+    """The human-readable error strings a CLI result object carries."""
+    texts: list[str] = []
+    for key in ("result", "error"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            texts.append(value)
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        texts.extend(e for e in errors if isinstance(e, str))
+    return texts
+
+
+def _int_or_none(value: object) -> int | None:
+    """An int from a JSON field: a real int, or a string of digits. Never a bool."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _overload_error(message: str, raw_text: str, payload: dict | None) -> CCError:
+    """Keep replay eligibility separate from the original overload diagnosis."""
+    from genesis.cc.transient_retry import replay_unsafe
+
+    overload = CCOverloadedError(
+        message,
+        raw_text=raw_text,
+        raw_event=payload,
+        num_turns=_int_or_none(payload.get("num_turns")) if payload else None,
+    )
+    if replay_unsafe(overload):
+        return CCReplayUnsafeError(message, cause=overload)
+    return overload
+
+
+# From CC 2.1.277 a headless resume RESTORES the CC session's saved totals — its
+# changelog: a resume no longer starts "the session's cost and usage totals at
+# zero; headless sessions now save their totals at exit". So a resumed `-p` call
+# reports `total_cost_usd` (and `modelUsage`) as running totals for the whole CC
+# session, while `usage` tokens stay per call. MEASURED on 2.1.280 across a
+# resumed haiku -> haiku -> sonnet session: totals 0.0383 -> 0.0421 -> 0.1475,
+# the earlier model's entry carried over, the session id unchanged. Nothing in the
+# result itself marks the change: `num_turns` is 1 every call, there is no version
+# field, and the switched-to model's own entry starts at this call's tokens — so
+# the VERSION, which is what defines the behaviour, is the signal.
+_CC_CUMULATIVE_COST_SINCE = (2, 1, 277)
+_CC_VERSION_RE = re.compile(r"\s*(\d+)\.(\d+)\.(\d+)")
+# After a failed `claude --version` read, how long before the same binary is
+# asked again. The read sits on the turn path (CCInvoker._cc_version), so a CLI
+# that HANGS on --version would otherwise hold every reply for the full 15 s
+# timeout; with this, at most one reply per 10 minutes pays it. A transient
+# failure recovers within the same window, and a replaced binary is a new key
+# and is read at once.
+_CC_VERSION_RETRY_S = 600.0
+
+
+def parse_cc_version(text: str) -> tuple[int, int, int] | None:
+    """Parse the leading ``X.Y.Z`` of ``claude --version`` output, else None."""
+    m = _CC_VERSION_RE.match(text or "")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def cost_is_cumulative_for(version: tuple[int, int, int] | None) -> bool:
+    """Whether a CC of this version reports a resumed session's running totals.
+
+    True on a FRESH session too, which is harmless: its first running total is
+    its own cost, and ``cc_sessions.record_turn_cost`` keys its cursor by CC
+    session, so a new session is never diffed against an old one. An unknown
+    version reads as False — the additive reading CC used before 2.1.277.
+    """
+    return version is not None and version >= _CC_CUMULATIVE_COST_SINCE
 
 
 def set_oom_score_adj(pid: int, score: int = 500) -> None:
@@ -260,10 +380,1058 @@ async def _get_scope_args() -> list[str]:
         return _SCOPE_ARGS or []
 
 
-# A minimal, runtime-generated CC settings file that registers ONLY the span
-# PostToolUse hook. Lives outside the repo so it is install-local and never
-# committed; regenerated idempotently (see cc_span_settings_path).
+# A minimal, runtime-generated CC settings file that registers the hooks a
+# dispatched session cannot otherwise receive. Lives outside the repo so it is
+# install-local and never committed; regenerated idempotently (see
+# cc_span_settings_path).
 _CC_SPAN_SETTINGS_PATH = Path.home() / ".genesis" / "cc-span-settings.json"
+
+# The hook that enforces GENESIS_BASH_ALLOWLIST, named once so the registration
+# and the pre-launch checks that verify it cannot drift apart.
+_ALLOWLIST_GUARD_SCRIPT = "hooks/bash_allowlist_guard.sh"
+
+# The guard that keeps hand edits out of the install's primary checkout (it blocks
+# the file tools and reports Bash changes after the fact); registered for
+# dispatched sessions by cc_span_settings_path.
+_MAIN_CHECKOUT_GUARD_SCRIPT = "hooks/main_checkout_guard.py"
+
+
+def _main_checkout_guard_entry(genesis_hook: Path, matcher: str) -> dict[str, object]:
+    """One hook entry running the main-checkout guard on ``matcher``. 30s: a killed
+    PreToolUse hook lets the call proceed, and the guard stops its own git queries
+    at 20s so it can say so; the same bound serves its after-the-fact Bash check."""
+    return {
+        "matcher": matcher,
+        "hooks": [
+            {
+                "type": "command",
+                "command": shlex.join([str(genesis_hook), _MAIN_CHECKOUT_GUARD_SCRIPT]),
+                "timeout": 30,
+            },
+        ],
+    }
+
+
+# A sealed `gh` configuration for allowlisted sessions. Shared rather than
+# per-dispatch because its content is derived from the operator's own gh config
+# and is identical for every dispatch, so one idempotently-maintained directory
+# has no cleanup surface and no concurrent-writer problem.
+_SEALED_GH_CONFIG_DIR = Path.home() / ".genesis" / "gh-sealed"
+
+# EVERY environment variable gh reads as a CREDENTIAL. Enumerated from
+# `gh help environment` (gh 2.100.0, consulted 2026-09-26), NOT from recall:
+#
+#   "`GH_TOKEN`, `GITHUB_TOKEN` (in order of precedence): an authentication
+#    token that will be used when ..."
+#   "`GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` (in order of precedence):
+#    an authentication token that will be used when a command targets a GitHub
+#    Enterprise Server host."
+#
+# The first version of this pinned `GH_TOKEN` ALONE, which was a denylist of one
+# wearing the grammar of a fix. MEASURED: with `GH_TOKEN=""` and
+# `GITHUB_TOKEN=<value>`, `gh auth token` returns the fallback — so the pin was
+# bypassed by the variable one line below it in gh's own documentation.
+#
+# ENFORCEMENT IS NOT HERE. `_assert_no_gh_credentials` checks these at the launch
+# gate, for every invocation. Do not move the check into a per-binary hardening:
+# that is where it started, and it made an every-session claim depend on an
+# invocation shape almost nothing uses.
+#
+# The lesson is narrow and worth keeping: `_gh_hardening` already enumerates gh's
+# PROGRAM routes from this same document, and says so proudly. The token half was
+# then hand-picked from memory. Read the doc for BOTH halves, or the discipline is
+# decoration. If a future gh release adds a credential variable, add it here and
+# cite the release — a name recalled without a citation is how this broke.
+#
+# EMPTY, NOT POPPED, and the tradeoff is stated because the reasons cut both
+# ways. Empty is what gh reads as unset (MEASURED), and a present-and-empty key
+# is something the launch gate can VERIFY — a popped key is indistinguishable
+# from one that was never set, so `_assert_no_gh_credentials` would have nothing
+# to assert. The cost: for a NON-gh reader of these names, empty is still SET,
+# which yields an empty-credential 401 rather than a clean unauthenticated path.
+# No in-repo consumer exists today — MEASURED 2026-09-26, every reference in
+# `src/` and `scripts/` is in this file, and the only other uses are CI
+# workflows, which do not run in a dispatched session's environment. Revisit if
+# a library reading `GITHUB_TOKEN` is ever added to a dispatch path.
+_GH_CREDENTIAL_ENV = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+)
+
+# gh reads `config.yml` for aliases, pager and editor. Synthesised rather than
+# copied: the session needs a file to exist (gh writes one on migration
+# otherwise, which a read-only directory would turn into a hard failure), and
+# the values we want are exactly "no aliases, no shell-spawning pager".
+_SEALED_GH_CONFIG_YML = 'version: "1"\npager: cat\naliases: {}\n'
+
+
+#: How deep the purge will recurse before refusing. The seal is a FLAT set of
+#: files by construction, so any nesting at all is planted; 32 is far past
+#: anything legitimate and far short of Python's frame limit. Unbounded recursion
+#: raised RecursionError out of ``_sealed_gh_config_dir``'s documented
+#: "returns None" contract — MEASURED on a 1200-deep planted tree, it escaped into
+#: the caller AND left the seal at 0700, which is its only write protection.
+_MAX_SEAL_PURGE_DEPTH = 32
+
+
+def _purge_dir_entries(dir_fd: int, label: Path, depth: int = 0) -> None:
+    """Empty a directory through its DESCRIPTOR, never through its path.
+
+    Every removal is relative to ``dir_fd``, so nothing here can be redirected by
+    replacing a component of the path after the caller opened it. Subdirectories
+    recurse the same way: opened with ``O_DIRECTORY | O_NOFOLLOW`` relative to
+    their parent's descriptor, so a symlinked subdirectory raises rather than
+    being followed, and is then unlinked as the link it is.
+
+    ``shutil.rmtree`` is deliberately not used. It walks by PATH, which is the
+    property that made the previous version write through planted links, and its
+    ``dir_fd``-based hardening is not available on every platform this runs on.
+
+    ``label`` is for logging only — it is the path the descriptor was opened
+    from, which may no longer resolve there, and it is never used to address
+    anything.
+
+    DEPTH IS BOUNDED. A deep planted tree previously raised RecursionError, which
+    is not an OSError, so it escaped ``_sealed_gh_config_dir``'s except clause and
+    its documented "answers None" contract — and left the seal at 0700 on the way
+    out. Refusing with OSError keeps the failure inside the contract.
+    """
+    # NOT SELF-HEALING, and that is deliberate rather than overlooked. Refusing
+    # leaves the planted tree in place, so every later call refuses too and the
+    # seal stays unusable until somebody removes it by hand. The alternative is
+    # recursing without limit through a structure an attacker chose the depth of.
+    # The message therefore says what to do, because an operator reading a log is
+    # the recovery path.
+    if depth > _MAX_SEAL_PURGE_DEPTH:
+        raise OSError(
+            f"gh seal at {label} nests deeper than {_MAX_SEAL_PURGE_DEPTH} levels; "
+            f"refusing to recurse further. A seal is a flat set of files, so this "
+            f"was planted, and dispatches needing it will keep failing until the "
+            f"directory is removed by hand."
+        )
+    for entry in os.scandir(dir_fd):
+        st = os.lstat(entry.name, dir_fd=dir_fd)
+        if stat.S_ISDIR(st.st_mode):
+            # A real subdirectory. The seal is a flat set of files by
+            # construction, so its whole purpose since the extension finding is
+            # that `<seal>/gh/extensions` does not exist.
+            sub_fd = os.open(
+                entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+            )
+            try:
+                os.fchmod(sub_fd, 0o700)
+                _purge_dir_entries(sub_fd, label / entry.name, depth + 1)
+            finally:
+                os.close(sub_fd)
+            os.rmdir(entry.name, dir_fd=dir_fd)
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            logger.warning(
+                "removing a symlink named %r from the gh seal at %s; a seal entry "
+                "is a real file by construction, so this was planted",
+                entry.name,
+                label,
+            )
+        elif st.st_nlink != 1:
+            # Not fatal — we are deleting it — but the only way this arises is a
+            # deliberately planted second name, so it is worth one line.
+            logger.warning(
+                "removing %r from the gh seal at %s: st_nlink=%d, so a name "
+                "outside the seal shares this inode",
+                entry.name,
+                label,
+                st.st_nlink,
+            )
+        os.unlink(entry.name, dir_fd=dir_fd)
+
+
+def _sealed_gh_config_dir(*, wait_for_lock: bool = True) -> str | None:
+    """A read-only ``GH_CONFIG_DIR`` that keeps ``gh`` from spawning a shell.
+
+    THE PROBLEM. ``gh`` can be told to run arbitrary commands through its own
+    configuration — a shell alias, a pager, an editor, an extension. Every one
+    of those is reached with ``gh`` as the first token, so a first-token
+    allowlist permits the command that installs the escape AND the command that
+    triggers it. VERIFIED executing: two permitted ``gh`` invocations were
+    enough to run an arbitrary program. That matters most on the one profile
+    that has an allowlist, which is also the one that reads external pull
+    request threads, i.e. attacker-authored text.
+
+    THE FIX. Point the session at a directory gh cannot write: an unwritable
+    ``config.yml`` means ``gh alias set`` and ``gh config set`` fail, and the
+    synthesised contents pin the pager to ``cat`` so the pager route is closed
+    even before that. MEASURED: both write paths (``gh alias set``,
+    ``gh config set``) return non-zero.
+
+    DO NOT expect gh to be otherwise transparent under this seal. An earlier
+    version of this paragraph said "auth still resolves, ordinary ``gh`` commands
+    including live API calls still work" — MEASURED in the era when the seal
+    copied a credential, and falsified by removing it. gh cannot authenticate
+    from this seal at all, which is deliberate rather than a side effect: a
+    public read exits 4 ("please run gh auth login"), so the capability is
+    non-functional and not merely write-limited.
+
+    NO CREDENTIAL IS COPIED, and that is deliberate. The seal is synthesised
+    end to end, so ``gh`` reading it holds no credential — MEASURED:
+    ``gh auth status`` against this seal reports "not logged into any GitHub
+    hosts", against a control that authenticates. That is a claim about ``gh``
+    and NOT about the session: what a session can reach is decided by its tool
+    scope, and the operator's own gh config stays on disk. See
+    ``_assert_no_gh_credentials`` for the environment half.
+
+    Until 2026-09-25 this copied ``hosts.yml``, because that is where gh finds
+    the token. The argument was that the copy moves a secret rather than widening
+    who can read it, which is true and was the wrong question: it handed a
+    session that can be talked into running one ``gh`` command a credential with
+    MEASURED scopes ``delete_repo``, ``gist``, ``read:org``, ``repo``,
+    ``workflow`` ON THE INSTALL WHERE THAT WAS MEASURED — the scope list is a
+    property of one operator's ``gh auth login``, not of this code; what is
+    general is that whatever the operator holds, the session held too. A profile
+    whose whole point is that it reads EXTERNAL pull requests should not hold a
+    token that can delete repositories.
+
+    THERE IS NO ARMING PATH YET, and this comment deliberately does not pretend
+    otherwise. Removing the credential removes a capability the ``steward``
+    profile's own prompt still asks for (comment / reopen / close), which is
+    survivable only because that profile has never run — MEASURED: 0 rows in
+    ``cc_sessions`` for it. A deliberate operator grant is the follow-up work,
+    not something this change quietly provides.
+
+    Returns the directory, or ``None`` when it cannot be prepared. The caller
+    REFUSES TO LAUNCH on that; it is not a degraded mode, because the fallback
+    is the operator's own writable config.
+
+    THIS DIRECTORY DOES NOT COVER EXTENSIONS. MEASURED: they resolve from the
+    data dir, not from here, so sealing the config dir alone leaves
+    ``gh extension`` wide open. ``_gh_hardening`` closes that by pointing
+    ``XDG_DATA_HOME`` at this same directory; the measurement lives there.
+
+    NOT a complete confinement of ``gh``. Subcommands that write files to
+    caller-chosen paths remain available. The allowlist bounds the binary; this
+    bounds one binary's self-reconfiguration. Both limits are documented in
+    ``.claude/docs/background-sessions.md``.
+    """
+    target = _SEALED_GH_CONFIG_DIR
+    try:
+        # ONE synthesised file, and nothing read from the operator's own gh
+        # config. There is therefore no source directory to resolve: the
+        # GH_CONFIG_DIR / $XDG_CONFIG_HOME/gh / ~/.config/gh precedence chain
+        # that used to live here existed only to locate `hosts.yml`, and went
+        # with the copy.
+        #
+        # `hosts.yml` is no longer in `desired`, so `_seal_matches` reports a
+        # mismatch on a seal that still holds one and the stale sweep below
+        # unlinks the copied token. DO NOT read that as the migration.
+        #
+        # THIS FUNCTION HAS TWO CALLERS, and the difference decides how urgently
+        # everything below matters. `_gh_hardening` reaches it only for an
+        # invocation declaring a Bash allowlist, and no such dispatch has ever run
+        # on this install (MEASURED: 0 rows) — that is the DORMANT caller.
+        # `reconcile_gh_seal()` reaches it at EVERY server start, which is what
+        # actually heals an install that ran the copying version, and what makes
+        # the link and race routes below live rather than theoretical. An earlier
+        # draft of this comment called `_gh_hardening` the only caller while
+        # naming the second one three lines later; that reading is what made a
+        # boot-time destructive path look like dead code.
+        desired = {"config.yml": _SEALED_GH_CONFIG_YML}
+        if _seal_matches(target, desired):
+            return str(target)
+        # REWRITES ARE SERIALISED. The seal is one shared directory, and the
+        # rewrite is not atomic — it chmods the directory writable, unlinks,
+        # writes, then chmods back. Two dispatches arriving together (first run,
+        # or just after the operator's token changes) would otherwise interleave,
+        # and the loser gets PermissionError mid-write, returns None, and the
+        # caller refuses a launch that should have succeeded.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = target.parent / f"{target.name}.lock"
+        # O_NOFOLLOW, AND NOT TRUNCATING. The lock lives in the seal's PARENT and
+        # was opened `"w"` — which both follows a symlink and truncates what it
+        # lands on, BEFORE any check on the seal itself. MEASURED: with
+        # `<seal>.lock` symlinked at an unrelated file, that file was truncated
+        # to zero bytes while the seal reconciled normally, so nothing reported a
+        # problem. This is the same class as the symlinked-seal routes below and
+        # a DIFFERENT spelling: the three checks added for those all run later
+        # than this line, so none of them covered it.
+        #
+        # O_NOFOLLOW raises ELOOP when the final component is a link, which is
+        # the refusal we want; O_CREAT|O_RDWR without O_TRUNC means an existing
+        # real lock file is reused rather than emptied, and flock needs no
+        # content. LIMIT, stated because O_NOFOLLOW does not imply it: only the
+        # FINAL component is guarded. A symlinked ANCESTOR still resolves — that
+        # is a broader compromise than this function can bound, and closing it
+        # needs openat2/RESOLVE_NO_SYMLINKS rather than a flag here.
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            lock_file = os.fdopen(lock_fd, "r+", encoding="utf-8")
+        except Exception:
+            # `fdopen` TAKES OWNERSHIP of the descriptor only once it succeeds.
+            # Without this the fd leaks on failure, and this function runs at
+            # every server start, so a repeating failure would exhaust the
+            # process table's descriptors rather than just failing.
+            os.close(lock_fd)
+            raise
+        with lock_file as lock:
+            # `wait_for_lock=False` is the boot path (`reconcile_gh_seal`): a
+            # lock held by a stuck process must not hang server startup before
+            # secrets and the database initialise. LOCK_NB raises
+            # BlockingIOError, an OSError, which the handler below turns into a
+            # logged None, and the next boot retries.
+            fcntl.flock(lock, fcntl.LOCK_EX if wait_for_lock else fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Re-check under the lock: the writer we queued behind may have
+            # already produced exactly what we want.
+            if _seal_matches(target, desired):
+                return str(target)
+            # EVERY OPERATION BELOW GOES THROUGH A PINNED DIRECTORY
+            # DESCRIPTOR, never through the path again. Four path-level checks
+            # used to stand here — one per link trick somebody had thought of —
+            # and each round of review found the next spelling they missed:
+            #
+            #   * a SYMLINKED seal directory: `chmod`/`iterdir`/`rmtree` follow
+            #     it, so the rewrite emptied somebody else's directory and left
+            #     it at 0500 (MEASURED).
+            #   * a SYMLINK named `config.yml`: `is_file()` follows it and the
+            #     name is in `desired`, so the sweep KEPT it and the write landed
+            #     on its target (MEASURED).
+            #   * the LOCK FILE, one directory up, opened in a truncating mode
+            #     before any of those checks ran (MEASURED, fixed above).
+            #   * a HARDLINK named `config.yml`: `is_symlink()` is False,
+            #     `is_file()` is True, the name is in `desired` — so the sweep
+            #     kept it and the write landed on the other name's inode. Worse,
+            #     `_seal_matches` had no `st_nlink` check, so a hardlink holding
+            #     the right bytes at 0400 reported the seal CLEAN while a
+            #     writable name outside it owned gh's `config.yml`. MEASURED: an
+            #     alias was written through that name and read back from inside
+            #     the seal, which is the escape this whole mechanism exists to
+            #     close. The 0500 directory mode is the seal's only write
+            #     protection, and a second link is a way around it.
+            #
+            # Enumerating link tricks was the wrong shape. `O_DIRECTORY |
+            # O_NOFOLLOW` refuses a symlinked directory by CONSTRUCTION (ELOOP,
+            # caught below), and the descriptor then pins that inode for the rest
+            # of the rewrite — so a swap between the check and the write has
+            # nothing to act on, which also closes the time-of-check window the
+            # path-level version had. `O_EXCL | O_NOFOLLOW` on each created file
+            # guarantees a brand-new inode at `st_nlink == 1`, so no pre-planted
+            # link of either kind can be written through.
+            #
+            # The seal may not exist yet, and `os.open(..., O_DIRECTORY)` cannot
+            # create it. `os.mkdir` rather than `Path.mkdir(exist_ok=True)`: on
+            # an existing entry mkdir raises EEXIST whatever that entry IS, and
+            # the O_NOFOLLOW open below then refuses a symlinked one. `exist_ok`
+            # would have accepted it silently, which is the shape of the first
+            # bug in this list.
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(target, 0o700)
+            dir_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                # THE MODE IS RESTORED WHATEVER HAPPENS. The rewrite opens the
+                # seal at 0700 to work inside it, and 0500 is the only write
+                # protection it has. Without this `finally`, any failure in
+                # between — a refused purge, a planted name, a write error —
+                # returned None while LEAVING THE SEAL WRITABLE. MEASURED on a
+                # 1200-deep planted tree: the seal was left at 0700. Wrong
+                # CONTENTS after a failure are self-correcting, because
+                # `_seal_matches` refuses them and the next call rewrites; being
+                # WRITABLE is not.
+                try:
+                    os.fchmod(dir_fd, 0o700)
+                    # EVERYTHING GOES, including a file whose name is in
+                    # `desired`. The old code kept a matching entry to avoid
+                    # churn, and that `continue` is what two of the earlier
+                    # defects were made of: it is the branch that preserves a
+                    # planted link. Nothing is kept now, so there is nothing to
+                    # vouch for — and it costs nothing, because `_seal_matches`
+                    # already returned early when the whole seal was correct, so
+                    # reaching here means something was wrong.
+                    _purge_dir_entries(dir_fd, target)
+                    for name, body in desired.items():
+                        # O_EXCL: the purge above removed every name, so a name
+                        # that exists NOW was created between the two, and
+                        # refusing is right. O_NOFOLLOW is belt-and-braces with
+                        # O_EXCL.
+                        fd = os.open(
+                            name,
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                            0o600,
+                            dir_fd=dir_fd,
+                        )
+                        try:
+                            # WRITE IN A LOOP. `os.write` may write FEWER bytes
+                            # than it was given and reports that only in its
+                            # return value, which the first version of this
+                            # discarded — the `write_text` it replaced looped
+                            # internally, so the rewrite INTRODUCED this gap
+                            # rather than inheriting it. Unlikely at 36 bytes on a
+                            # regular file, and silent when it happens: a
+                            # truncated `config.yml` can lose the `pager: cat`
+                            # line, re-opening the pager route.
+                            payload = body.encode("utf-8")
+                            written = 0
+                            while written < len(payload):
+                                n = os.write(fd, payload[written:])
+                                if n <= 0:  # pragma: no cover - defensive
+                                    raise OSError(
+                                        f"short write to the gh seal's {name!r}: "
+                                        f"{written} of {len(payload)} bytes"
+                                    )
+                                written += n
+                            os.fchmod(fd, 0o400)
+                        finally:
+                            os.close(fd)
+                finally:
+                    # Best effort, and deliberately swallowing: on the failure
+                    # path we are already carrying the real error, and failing to
+                    # re-seal must not replace it with a less informative one. On
+                    # the success path this IS the chmod that seals it.
+                    with contextlib.suppress(OSError):
+                        os.fchmod(dir_fd, 0o500)
+                # VERIFY WHAT WAS PRODUCED, under the lock, before reporting
+                # success. The rewrite was previously write-only: an entry planted
+                # between the last create and the final chmod ended up INSIDE the
+                # finished 0500 seal and this function returned the path as though
+                # it were clean (MEASURED with an extension subtree).
+                # `_seal_matches` would catch it — one dispatch later, i.e. after
+                # the session it should have stopped had already run. Checking here
+                # costs one lstat per entry and makes a success return mean what
+                # every caller already reads it as.
+                if not _seal_matches(target, desired):
+                    logger.error(
+                        "gh seal at %s does not match its intended contents "
+                        "immediately after being written; refusing the launch "
+                        "rather than reporting a seal that was not achieved",
+                        target,
+                    )
+                    return None
+            finally:
+                os.close(dir_fd)
+        return str(target)
+    except (OSError, UnicodeError):
+        logger.warning("Could not prepare the sealed gh config at %s", target, exc_info=True)
+        return None
+
+
+def reconcile_gh_seal() -> None:
+    """Bring an EXISTING sealed gh config back to its credential-free shape.
+
+    WHY THIS EXISTS, and why it is not merely tidy. Removing the credential copy
+    relies on the stale sweep inside ``_sealed_gh_config_dir``, which runs only
+    when that function is called — and its OTHER caller is ``_gh_hardening``,
+    reachable only for an invocation that declares a Bash allowlist. Exactly one
+    shipped profile declares one, it has never been dispatched, and a companion
+    change removes it; so without this, an install that already ran the copying
+    version would keep the operator's token in the seal INDEFINITELY, while the
+    change that removed the copy claims installs "heal themselves with no
+    migration step". That claim is only true with a sweep keyed on nothing but its
+    own existence, which is this.
+
+    AND THIS FUNCTION IS WHY THAT SWEEP IS A BOOT-TIME PATH. Calling it here turns
+    machinery that had effectively never executed into something that runs on
+    every start, which is the whole reason the link, hardlink, file-type and race
+    routes in ``_sealed_gh_config_dir`` were worth closing rather than noting.
+
+    Deliberately a NO-OP when no seal directory exists. This must not CREATE one:
+    the seal is machinery for a capability most installs never use, and building
+    it unprompted would put a directory on every box to solve a problem only some
+    have.
+
+    NEVER RAISES, and that is now enforced by an outer guard rather than argued
+    from which calls can fail. The earlier version reasoned that
+    ``_sealed_gh_config_dir`` catches OSError/UnicodeError itself — true, and it
+    missed that this function does its OWN filesystem work first: ``is_dir``,
+    ``is_symlink`` and an eager ``os.readlink`` in a log argument, the last of
+    which raises if the link is removed between the check and the read. It held
+    only because the startup caller wraps it in ``except Exception``, which is not
+    the reason the docstring gave. A blanket try here means the guarantee does not
+    depend on anyone re-deriving that list after the next edit.
+
+    The caller is a startup path where a failure must not block boot — an
+    unhealed seal is the status quo, not a regression.
+    """
+    try:
+        if not _SEALED_GH_CONFIG_DIR.is_dir():
+            # A non-directory HERE is not always "no seal yet". `is_dir()` is also
+            # False for a symlink pointing at a FILE, and for a file or FIFO left
+            # under that name — all of which are planted, not absent. Saying
+            # nothing would make a deliberate obstruction indistinguishable from
+            # the ordinary case of an install that has never dispatched.
+            if _SEALED_GH_CONFIG_DIR.exists() or _SEALED_GH_CONFIG_DIR.is_symlink():
+                logger.error(
+                    "gh seal path %s exists but is NOT a directory; not "
+                    "reconciling. A seal is a directory by construction, so this "
+                    "was planted. Nothing was modified.",
+                    _SEALED_GH_CONFIG_DIR,
+                )
+            return
+        # A SYMLINKED SEAL IS NOT RECONCILED, IT IS REPORTED. `is_dir()` follows
+        # the link, so without this the startup path would hand
+        # `_sealed_gh_config_dir` a directory belonging to something else. That
+        # function refuses too (its `O_NOFOLLOW` open cannot do otherwise), but
+        # this check keeps the refusal cheap and the log specific: this runs on
+        # EVERY boot, and converting a dormant sweep into a boot-time one is
+        # exactly what made these routes worth closing.
+        if _SEALED_GH_CONFIG_DIR.is_symlink():
+            # Read the target defensively: it is only for the log, and the link
+            # can be gone by now. Losing the target must not lose the WARNING.
+            try:
+                points_at: object = os.readlink(_SEALED_GH_CONFIG_DIR)
+            except OSError:
+                points_at = "<unreadable>"
+            logger.error(
+                "gh seal at %s is a SYMLINK (-> %s) — not reconciling. A seal is "
+                "a real directory by construction, so this was planted; nothing "
+                "was modified.",
+                _SEALED_GH_CONFIG_DIR,
+                points_at,
+            )
+            return
+        if _sealed_gh_config_dir(wait_for_lock=False) is None:
+            logger.warning(
+                "gh seal at %s could not be reconciled; if it holds a copied "
+                "credential from an older version, that copy is still present",
+                _SEALED_GH_CONFIG_DIR,
+            )
+    except Exception:
+        logger.warning(
+            "gh seal reconciliation at %s failed; an existing seal may still "
+            "hold a credential copied by an older version",
+            _SEALED_GH_CONFIG_DIR,
+            exc_info=True,
+        )
+
+
+def _seal_matches(target: Path, desired: dict[str, str]) -> bool:
+    """Is the sealed directory already exactly ``desired``?
+
+    Compares CONTENT and MODES both, because a seal whose files are writable is
+    not a seal — a rewrite interrupted between its chmod-writable and its
+    chmod-back leaves the right bytes at the wrong permissions, and a
+    content-only check would call that good.
+
+    ANY DIRECTORY ENTRY MEANS NO. Enumerating only ``is_file()`` was blind to
+    the one thing the seal exists to prevent: ``XDG_DATA_HOME`` points here, so
+    a planted ``gh/extensions/gh-x`` re-opens the extension route while this
+    function reports the seal CLEAN and the stale sweep — also file-only —
+    leaves it in place, permanently, at 0500. MEASURED before the fix: a
+    planted extension survived a reseal and ``_seal_matches`` returned True.
+    The seal is a flat set of files by construction, so a directory is never
+    legitimate here and needs no name check.
+
+    ANSWERS "NO" RATHER THAN RAISING when the directory moves under it. The
+    first caller runs this OUTSIDE the rewrite lock, so a concurrent writer
+    unlinking a stale file between the listing and the read is expected, not
+    exceptional. Letting that escape would reach the caller's fallback and
+    REFUSE a launch that should have succeeded — the queue-behind-the-lock path
+    exists precisely to handle it, and it is only reached by returning False.
+    Fail-closed is preserved: an unconfirmable seal is never reported as
+    matching.
+    """
+    try:
+        # EVERY ANSWER COMES FROM AN OPEN DESCRIPTOR, never from a path restated
+        # between the check and the read. Two defects drove this shape, and the
+        # second is why the first fix was not enough.
+        #
+        # FILE TYPE IS AN ALLOWLIST. This began as a denylist — reject symlinks,
+        # then also directories — and each review round found the next type
+        # nobody had listed. The fifth was a FIFO: not a symlink, not a
+        # directory, and `is_file()` is ALSO False for it, so it was dropped from
+        # the comparison set entirely, `set(present)` still equalled
+        # `set(desired)`, and this reported the seal CLEAN. MEASURED: it survived
+        # both the boot reconciliation and the dispatch rewrite unlogged, and gh
+        # then read the planted name THROUGH the pipe and adopted the account in
+        # it. So an entry must be a REGULAR FILE and every other type is a
+        # non-match by construction — the same correction made to the binary
+        # hardening in this change.
+        #
+        # AND THE CHECK MUST NOT BE ANSWERED FROM A CACHED STAT. The first
+        # version of the allowlist took one `lstat` per path and then read the
+        # CONTENT with a fresh `read_text()` by path — so the type gate described
+        # one inode and the read reached whatever the name pointed at by then.
+        # MEASURED with a racing writer: 1 false-CLEAN verdict in 509,533 trials,
+        # where a clean verdict was only reachable by following a link the type
+        # gate had rejected. One hit is one escape, because a True here returns
+        # without rewriting and gh then reads through the planted link.
+        #
+        # `O_NOFOLLOW` makes the type gate part of the OPEN — a symlink raises
+        # rather than resolving — and `fstat` on the resulting descriptor
+        # describes exactly the inode the bytes come from. `O_NONBLOCK` is what
+        # keeps a FIFO from hanging: `read_text` on one with no writer blocks
+        # INDEFINITELY (MEASURED), which would wedge this function on every
+        # dispatch and, since the reconciliation calls it, every boot.
+        #
+        # ORDER IS DELIBERATE: type, then link count, then mode, then bytes. An
+        # earlier test of this believed it was exercising the type gate while the
+        # MODE gate was rejecting its fixture first — three of its four arms were
+        # vacuous. Cheapest-and-most-fundamental first also means a planted entry
+        # is rejected before anything reads it.
+        #
+        # WHICH GATE CATCHES WHAT, measured rather than argued — this comment has
+        # been wrong in BOTH directions, and each time the error was reasoning
+        # where a five-line probe was available.
+        #
+        # It first claimed the type test was redundant: "a FIFO reads as b'' under
+        # O_NONBLOCK so the content compare rejects it anyway". True of an EMPTY
+        # pipe, generalised without testing a full one. A pipe holds data with no
+        # writer attached — hold a reader open, write the seal constant, close the
+        # write end, and a descriptor read returns those 36 bytes. In the code as
+        # it stood then, only the type test refused that.
+        #
+        # It then claimed the type test was therefore the SOLE gate. Also wrong,
+        # because the size gate further down landed in the same round: MEASURED, a
+        # loaded FIFO reports st_size == 0, and so do a socket and a directory. In
+        # the shipped ORDER this test runs FIRST, so it is what actually refuses a
+        # pipe — but REMOVE it and the size gate refuses the same fixture, so
+        # deleting this line alone changes no outcome. (An earlier version of this
+        # comment said the size gate fires "before" the type test. It does not; it
+        # is below. The shadowing conclusion was right and the ordering word was
+        # wrong, which is its own small lesson about writing down a sequence
+        # without reading it.)
+        #
+        # So the two SHADOW each other, and neither can be shown load-bearing by
+        # deleting it alone — which is why their sweep arms are deliberately
+        # COMBINED. Both stay: this one refuses before any read, and it is what
+        # still holds if `desired` ever carries an entry whose length is not
+        # fixed, which would make the size gate stop discriminating.
+        #
+        # The neighbouring judgement about this function's own `O_NOFOLLOW` on the
+        # DIRECTORY does stand: following a link to a VALID seal yields a correct
+        # answer, and gh reaches the same place by following the same link. The
+        # refusal that carries weight is in the REWRITE's open.
+        dir_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if os.fstat(dir_fd).st_mode & 0o777 != 0o500:
+                return False
+            names = os.listdir(dir_fd)
+            if set(names) != set(desired):
+                return False
+            for name in names:
+                fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    fst = os.fstat(fd)
+                    if not stat.S_ISREG(fst.st_mode):
+                        return False
+                    # st_nlink == 1: NO SECOND NAME FOR THIS INODE. A HARDLINK
+                    # holding the right bytes at 0400 otherwise reported this
+                    # seal CLEAN while a WRITABLE name outside it owned gh's
+                    # `config.yml` — MEASURED, an alias was written through that
+                    # outside name and read back from inside the seal, which is
+                    # the escape this whole mechanism exists to close. The 0500
+                    # directory mode is the seal's only write protection and a
+                    # second link goes around it, invisibly to any content or
+                    # mode check.
+                    if fst.st_nlink != 1:
+                        return False
+                    if fst.st_mode & 0o777 != 0o400:
+                        return False
+                    # SIZE GATE, and it is a denial-of-service fix rather than an
+                    # optimisation. The read had no bound, so a planted
+                    # `config.yml` of arbitrary size was read into memory in full
+                    # before the comparison rejected it. MEASURED: 64 MiB sparse
+                    # cost 0.33s and +192 MiB RSS — about 3x the file, linear, and
+                    # a multi-GiB plant is free to create with `truncate`. This
+                    # function runs from `reconcile_gh_seal` at bootstrap step
+                    # ONE, synchronously, before secrets and DB init, and the read
+                    # happens before the purge — so it is not self-healing either.
+                    #
+                    # It is also strictly MORE correct than reading first: a size
+                    # that differs from the expected bytes is a content mismatch by
+                    # definition, so there is nothing to learn from the contents.
+                    #
+                    # THE READ CEILING IS THE LOAD-BEARING HALF, though, and calling
+                    # it belt-and-braces was wrong. MEASURED by mutation: removing
+                    # this size gate ALONE does not restore the denial, because
+                    # `remaining` still caps the read at `len(expected) + 1`. Only
+                    # removing both reinstates it. What the size gate adds is
+                    # avoiding the read entirely, and rejecting every non-regular
+                    # type — all of which report st_size 0.
+                    expected = desired[name].encode("utf-8")
+                    if fst.st_size != len(expected):
+                        return False
+                    chunks: list[bytes] = []
+                    remaining = len(expected) + 1
+                    while remaining > 0:
+                        chunk = os.read(fd, remaining)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    if b"".join(chunks) != expected:
+                        return False
+                finally:
+                    os.close(fd)
+            return True
+        finally:
+            os.close(dir_fd)
+    except (OSError, UnicodeError):
+        # `UnicodeError` is unreachable for the `desired` this module ships, since
+        # the only encode here is of its own constant and the comparison is on
+        # BYTES (it used to decode what it read, which is where the clause came
+        # from). Kept because `desired` is a PARAMETER: a future caller passing
+        # text that cannot encode would otherwise raise out of a function whose
+        # contract is to answer False. Retained deliberately, not inherited.
+        return False
+
+
+def _gh_hardening() -> dict[str, str] | None:
+    """Environment that keeps an allowlisted ``gh`` from spawning a shell.
+
+    ``gh`` runs a program of its own accord in a set its own documentation
+    closes: an alias, the pager, the editor, the browser — and an extension,
+    which is a program outright. Every one is reached with ``gh`` as the first
+    token, so a first-token allowlist permits both the command that installs an
+    escape and the command that fires it. This set is enumerated from
+    ``gh help environment``, not from whatever a reviewer thought of next,
+    which is the difference between closing the question and adding another
+    round to a denylist.
+
+    THE EXTENSION ROUTE IS NOT CLOSED BY THE CONFIG SEAL, and that is the trap
+    worth stating loudly. MEASURED: extensions resolve from
+    ``$XDG_DATA_HOME/gh/extensions``, NOT from ``GH_CONFIG_DIR``. An extension
+    planted under the config dir was not found; one planted under the data dir
+    RAN. So an install followed by an exec was arbitrary execution with every
+    first token allowed. Pointing ``XDG_DATA_HOME`` at the same read-only seal
+    closes both halves: the install cannot create ``<seal>/gh``, and the exec
+    finds nothing. MEASURED alongside it, so the cure is known not to be worse
+    than the disease: auth, live API calls and pull-request reads all still
+    work under that pin.
+
+    Editor and browser are pinned to ``true``. gh runs them through a shell, so
+    a bare name suffices. Neither is reachable from inside a guarded session —
+    the guard refuses a command whose first token is an environment assignment
+    — but gh executes them from INHERITED environment, so they are pinned
+    rather than argued about.
+
+    CREDENTIALS ARE NOT PINNED HERE, and that is deliberate — the absence is
+    asserted by a test. They were briefly in this dict, which scoped an
+    every-session claim to the one invocation shape that declares a Bash
+    allowlist; they now live in ``_assert_no_gh_credentials``, called
+    unconditionally at the launch gate. What follows is about PROGRAM routes
+    only. ``_build_env`` starts from an unfiltered ``dict(os.environ)``, and
+    gh resolves ``GH_TOKEN`` AHEAD of ``hosts.yml`` — MEASURED: a bogus
+    ``GH_TOKEN`` returns 401 against a perfectly good ``hosts.yml``. So an
+    operator who exports ``GH_TOKEN`` in their own shell would have it inherited
+    by the child and beat the credential-free seal entirely. MEASURED: gh reads
+    an EMPTY value as UNSET. The set and its citation live at
+    ``_GH_CREDENTIAL_ENV``; the enforcement lives at
+    ``_assert_no_gh_credentials``. Neither belongs in this function.
+
+    MEASURED inert, and therefore deliberately NOT pinned: ``GH_PATH``. It
+    tells gh where its own binary is, for extension callbacks. With a planted
+    value an ordinary read still ran the real gh, and with extensions
+    unreachable it redirects nothing. Pinning it would be a speculative change.
+
+    Returns ``None`` when the seal could not be prepared. That is a REFUSAL
+    signal, not a degraded mode: without the sealed directory the session falls
+    back to the operator's own writable config, which is precisely where an
+    alias escape is installed — and where any alias the operator already has is
+    waiting. Pinning the pager alone would close one route of five and read as
+    hardening.
+    """
+    sealed = _sealed_gh_config_dir()
+    if sealed is None:
+        return None
+    return {
+        "GH_CONFIG_DIR": sealed,
+        # Extensions live under the DATA dir, not the config dir. Same seal.
+        "XDG_DATA_HOME": sealed,
+        "GH_PAGER": "cat",
+        "PAGER": "cat",
+        "GH_EDITOR": "true",
+        "GIT_EDITOR": "true",
+        "VISUAL": "true",
+        "EDITOR": "true",
+        "GH_BROWSER": "true",
+        "BROWSER": "true",
+    }
+
+
+def _unconfinable_binary_message(binary: str) -> str:
+    """Refusal text for a binary whose hardening could not be prepared."""
+    return (
+        f"Refusing to launch: this invocation allows {binary!r}, which can be "
+        f"reconfigured to run commands, and its confinement could not be "
+        f"prepared. Launching would give the session {binary!r} against a "
+        f"writable configuration, which is an escape from the allowlist rather "
+        f"than a weaker form of it."
+    )
+
+
+def _assert_no_gh_credentials(env: dict[str, str]) -> None:
+    """Raise unless every documented gh credential variable is empty.
+
+    UNCONDITIONAL, and that is the whole point. This used to live inside
+    ``_gh_hardening``'s returned dict, which meant it was only ever checked for an
+    invocation whose ``bash_allowlist`` was non-empty — ``_launch_env`` gates the
+    binary check on exactly that. ON THIS BRANCH exactly one shipped profile
+    declares an allowlist — ``steward``, for ``gh`` — and it has never been
+    dispatched (MEASURED: 0 rows). A companion change removes it, after which the
+    gated branch can never be taken at all. Either way the pin was SET by the
+    builder and ENFORCED only for a dispatch shape that has never occurred, so an
+    ``env_overrides`` credential won silently on every session that has ever run.
+    Stated in that order deliberately: an earlier draft of this paragraph wrote
+    the post-companion state in the PRESENT tense, which told a reader that a live
+    code path was dead.
+
+    Separated rather than left in the hardening dict because the two are different
+    claims with different scopes. "This binary cannot be reconfigured to run a
+    program" is about one allowlisted binary. "No dispatched session carries a
+    GitHub credential" is about every session, allowlisted or not, and gh is not
+    the only thing that would read these variables.
+
+    It also removes a live hazard: the credential keys were splatted LAST into
+    ``_gh_hardening``'s literal, so adding a name to ``_GH_CREDENTIAL_ENV`` that
+    collided with a hardening key — ``GH_CONFIG_DIR`` is the obvious one — would
+    have silently overwritten the seal pin with ``""`` and passed every check,
+    because ``_assert_hardening_present`` recomputes the same wrong dict.
+    """
+    # ABSENT and NON-EMPTY are both violations, and both must stay violations:
+    # a key deleted between the builder and the gate is exactly as unverified as
+    # one restored. They are reported SEPARATELY because the remedies differ and
+    # the old single message sent a reader looking for a value that is not there.
+    missing = sorted(v for v in _GH_CREDENTIAL_ENV if v not in env)
+    nonempty = sorted(v for v in _GH_CREDENTIAL_ENV if v in env and env[v] != "")
+    wrong = missing + nonempty
+    if wrong:
+        detail = []
+        if nonempty:
+            detail.append(f"arrived NON-EMPTY: {', '.join(nonempty)}")
+        if missing:
+            detail.append(f"ABSENT from the environment: {', '.join(missing)}")
+        raise RuntimeError(
+            f"Refusing to launch: {'; '.join(detail)}. Every one of "
+            f"{', '.join(_GH_CREDENTIAL_ENV)} must be present and empty in a "
+            f"dispatched session's environment — gh resolves these as credentials "
+            f"ahead of its config file, so a value here is the operator's GitHub "
+            f"identity, and an absent key is one this gate cannot vouch for. If a "
+            f"value came from `env_overrides`, that is not a supported way to arm "
+            f"a session."
+        )
+
+
+def _assert_hardening_present(env: dict[str, str], bash_allowlist: tuple[str, ...]) -> None:
+    """Raise unless every allowlisted binary's confinement is in ``env``.
+
+    Called on EVERY dict that is about to be launched, not once per build. The
+    builder was described as "the only thing every launch path shares" and that
+    was WRONG: both spawn paths merge ``_apply_login_fallback`` on top of the
+    built env and launch the merged result, so a check that ended at the
+    builder inspected a dict that was then added to. Same class as the
+    ``env_overrides`` hole this branch closed, one call later.
+
+    Recomputes the hardening rather than comparing against a remembered copy:
+    an enumeration of variable names goes stale the moment a hardening grows a
+    key, and a recompute also notices a seal that changed underneath us.
+    """
+    for binary in bash_allowlist:
+        # ONE decision point, shared with the loop that applies it — see
+        # `_required_hardening`. It raises for an unreviewed or unpreparable
+        # binary, and returns None only for one deliberately classified as
+        # needing no pins.
+        required = _required_hardening(binary)
+        if required is None:
+            continue
+        wrong = sorted(k for k, v in required.items() if env.get(k) != v)
+        if wrong:
+            raise RuntimeError(_unhardened_env_message(binary, wrong))
+
+
+def _unhardened_env_message(binary: str, wrong: list[str]) -> str:
+    """Refusal text for hardening that is absent from the env being launched."""
+    return (
+        f"Refusing to launch: this invocation allows {binary!r}, but its "
+        f"confinement is not in the environment the session would receive — "
+        f"{', '.join(wrong)} {'differs' if len(wrong) == 1 else 'differ'} from "
+        f"the hardened value. env_overrides is applied last and wins; drop the "
+        f"override or drop the allowlist."
+    )
+
+
+#: Per-allowlisted-binary environment hardening. Keyed by the binary as it
+#: appears in a profile's ``bash_allowlist``. A callable returning ``None``
+#: means "this binary cannot be confined right now", and the invoker refuses to
+#: launch rather than launching it unconfined.
+_BINARY_HARDENING: dict[str, Callable[[], dict[str, str] | None]] = {"gh": _gh_hardening}
+
+
+# Binaries deliberately judged to need NO hardening. An allowlist entry whose
+# canonical name is in neither this set nor `_BINARY_HARDENING` is REFUSED.
+#
+# The polarity is the point. A bare `dict.get(...)` + skip is a DENYLIST wearing
+# allowlist grammar: it silently permits every binary nobody has thought about.
+# `git` is the concrete case, and the next entry anyone adds for PR work:
+# `git -c core.pager=…`, `-c alias.x='!sh'`, `core.sshCommand`, or a writable
+# `~/.gitconfig` all make it run a program of its own accord, exactly like gh —
+# so skipping it would hand out an unsealed escape with no warning. It refuses
+# until someone writes its hardening.
+#
+# Each entry here is a JUDGEMENT, made once, in writing. Add one only after
+# checking BOTH halves:
+#
+#   (a) it cannot be told to run another program — through config, an alias, a
+#       pager, an editor, a plugin, or an environment variable; and
+#   (b) it cannot read a caller-chosen FILE or dump this process's environment.
+#
+# (b) is the half that was missing when this set was introduced, and it is the
+# one that matters for a credential: `_build_env` hands every child a copy of
+# this process's environment, which by then carries the secrets loaded at
+# startup. A binary that spawns nothing can still print all of them. An entry
+# satisfying (a) but not (b) is not wrong to allowlist — it is a TOOL-SCOPE
+# decision for the profile that allowlists it, which no environment pin can
+# make — but it must be recorded here rather than implied to be harmless.
+_NEEDS_NO_HARDENING: frozenset[str] = frozenset(
+    {
+        # (a) HOLDS: pure stdin/stdout JSON filter — no config file, no plugin
+        # mechanism, nothing in `jq --help` that execs.
+        #
+        # (b) DOES NOT HOLD, stated rather than implied. MEASURED on jq-1.7:
+        # `jq -n '$ENV.X'` prints an environment variable, and
+        # `jq -Rn --rawfile x <path> '$x'` prints any readable file (`--slurpfile`
+        # and `-f` likewise). So a profile allowlisting jq is NOT
+        # credential-confined, and nothing in this module can make it so. It
+        # stays here because the set answers "must the invoker refuse to launch
+        # this?", and for a binary that spawns nothing the answer is no.
+        "jq",
+    }
+)
+
+
+def _canonical_binary(entry: str) -> str:
+    """An allowlist entry reduced to the name the hardening map is keyed on.
+
+    ``basename`` earns its place and ``strip`` does not, and the difference is
+    worth recording because an earlier version of this comment claimed both.
+    MEASURED against the shipped predicate, varying the ALLOWLIST ENTRY:
+
+    * entry ``/usr/bin/gh`` + command ``/usr/bin/gh …`` -> rc=0, PERMITTED, while
+      a bare ``dict.get`` on that entry misses. That is a real unsealed launch,
+      and ``basename`` is what closes it.
+    * entry ``"gh "`` or ``" gh"`` -> rc=2 for EVERY command. The guard takes the
+      first token with ``awk '{print $1}'``, which can never yield a token
+      containing whitespace, so such an entry permits nothing at all. ``strip``
+      therefore closes no hole; it is normalisation so that a typo'd config and a
+      corrected one agree, and it is not load-bearing.
+
+    CASE IS NOT FOLDED. On a case-sensitive filesystem ``GH`` is a different
+    binary, and folding would apply gh's seal to whatever ``GH`` actually is.
+
+    IT ALSO WIDENS, and that is the cost of the hole it closes. Any entry whose
+    base name is ``gh`` resolves to gh's hardening — including
+    ``/tmp/anything/gh``, which is not gh. The guard permits only the literal
+    entry as the first token, so allowlisting such a path is already a decision to
+    run THAT binary; what this function adds is that the binary then launches with
+    gh's seal applied and ``_assert_hardening_present`` satisfied, i.e. stamped
+    confined when nothing about it was reviewed. Narrowing to absolute paths was
+    considered and rejected: it would re-open the measured ``/usr/bin/gh`` hole,
+    which is a real spelling an operator uses, against a case that requires
+    someone to allowlist an attacker-chosen path deliberately. A subcommand-level
+    allowlist is what would make either claim precise.
+    """
+    return os.path.basename(entry.strip())
+
+
+def _required_hardening(entry: str) -> dict[str, str] | None:
+    """The env an allowlisted binary must launch with, or ``None`` if it needs none.
+
+    ONE decision point for both call sites — the loop that APPLIES the hardening
+    and ``_assert_hardening_present`` which VERIFIES it. If they disagreed, a
+    session would launch with pins nobody checked, or be refused over pins that
+    were applied.
+
+    Raises rather than returning for the two failure modes, because both are
+    refusals and neither is a degraded mode:
+
+    * an UNREVIEWED binary (in neither table) — see ``_NEEDS_NO_HARDENING``;
+    * a binary whose hardening exists but could not be PREPARED, where the
+      fallback is the operator's own writable config.
+    """
+    canonical = _canonical_binary(entry)
+    if canonical in _NEEDS_NO_HARDENING:
+        return None
+    hardening = _BINARY_HARDENING.get(canonical)
+    if hardening is None:
+        raise RuntimeError(_unreviewed_binary_message(entry, canonical))
+    required = hardening()
+    if required is None:
+        raise RuntimeError(_unconfinable_binary_message(entry))
+    return required
+
+
+def _settings_env_pins(bash_allowlist: tuple[str, ...]) -> dict[str, str]:
+    """The env a dispatched session's ``--settings`` layer pins.
+
+    The same values the launch env carries: every credential variable in
+    ``_GH_CREDENTIAL_ENV`` empty, for every session, plus the confinement env of
+    each allowlisted binary from ``_required_hardening``. Pinned a second time
+    because Claude Code applies settings ``env`` after launch: without this a
+    user or project settings file could restore a credential, or point
+    ``GH_CONFIG_DIR`` back at the operator's own config, after
+    ``_assert_no_gh_credentials`` and ``_assert_hardening_present`` passed.
+    Managed (administrator) settings still outrank ``--settings``; they are the
+    operator's own policy and out of scope here.
+
+    A binary whose hardening cannot be prepared RAISES here, refusing the
+    launch. Swallowing it would write a settings file without the seal pins,
+    and a transient failure that clears before ``_build_env`` runs would then
+    pass every launch check while user or project settings reopen the
+    operator's gh config.
+
+    ``GENESIS_BASH_ALLOWLIST`` is pinned too, with exactly the value
+    ``_build_env`` exports: the PreToolUse guard reads it, so a settings file
+    that emptied or widened it would switch the guard off after every launch
+    check had passed.
+
+    Does filesystem work and may block on the seal lock when an allowlisted
+    binary needs hardening, so async callers run it in a worker thread.
+    """
+    pins = {var: "" for var in _GH_CREDENTIAL_ENV}
+    if bash_allowlist:
+        pins["GENESIS_BASH_ALLOWLIST"] = ",".join(bash_allowlist)
+    for entry in bash_allowlist:
+        required = _required_hardening(entry)
+        if required:
+            pins.update(required)
+    return pins
+
+
+def _unreviewed_binary_message(entry: str, canonical: str) -> str:
+    """Refusal text for an allowlist entry nobody has classified."""
+    return (
+        f"Refusing to launch: this invocation allows {entry!r} (canonical name "
+        f"{canonical!r}), which appears in neither _BINARY_HARDENING nor "
+        f"_NEEDS_NO_HARDENING — so nothing is recorded about whether it can be "
+        f"told to run other programs. Many binaries can: `git` alone does it "
+        f"through `-c core.pager`, `-c alias.*`, `core.sshCommand` and a writable "
+        f"~/.gitconfig. Classify {canonical!r} in one of those two tables — which "
+        f"means deciding, in writing, rather than defaulting."
+    )
+
+
+def _allowlist_guard_argv() -> list[str] | None:
+    """The argv that runs the allowlist guard, computed LOCALLY.
+
+    Single source of truth for two callers that must not disagree: the settings
+    writer, which registers this command for Claude Code to run, and the
+    pre-launch binding check, which runs it here to confirm it refuses.
+
+    The binding check deliberately does NOT execute the command it parses out
+    of the settings file. That file lives outside the repo and is writable by
+    any same-uid process, so executing its contents would run an attacker-
+    chosen argv inside the parent — which inherits the server's full
+    environment, credentials included. The parsed value is COMPARED to this,
+    and this is what runs.
+    """
+    from genesis import env
+
+    genesis_hook = env.repo_root() / ".claude" / "hooks" / "genesis-hook"
+    if not genesis_hook.exists():
+        return None
+    return [str(genesis_hook), _ALLOWLIST_GUARD_SCRIPT]
+
 
 # Keep an owned background-wait ceiling strictly below the hard timeout_s SIGKILL
 # so the CLI ends bg-wait + flushes a partial result (and prints its "terminating"
@@ -347,7 +1515,10 @@ async def _emit_bg_truncation_event(cc_session_id: str) -> None:
     try:
         from genesis.runtime import GenesisRuntime
 
-        bus = getattr(GenesisRuntime.instance(), "_event_bus", None)
+        # peek(), never instance(): observability must not construct a blank
+        # runtime singleton that later bootstrap/health code would mistake for
+        # a started one.
+        bus = getattr(GenesisRuntime.peek(), "_event_bus", None)
         if bus is None:
             return
         from genesis.observability.types import Severity, Subsystem
@@ -364,23 +1535,209 @@ async def _emit_bg_truncation_event(cc_session_id: str) -> None:
         logger.debug("cc.bg_truncated event emit failed", exc_info=True)
 
 
-def cc_span_settings_path() -> str | None:
-    """Generate (idempotently) a minimal CC settings file that registers ONLY
-    the span PostToolUse hook, and return its absolute path — or ``None`` if the
+# ``cc.invocation_failed`` coalescing. A burst of identical failures (a rate
+# limit hitting every caller of one lane, a network outage parking every
+# dispatch) would otherwise emit one event per call. One event per
+# (error_class, caller_tag, routed model) per window keeps the signal while bounding the
+# volume; the count swallowed in between rides on the NEXT emitted event
+# (``coalesced``), so the omission is declared, never silent. Untagged calls
+# (caller_tag None) are never coalesced: they share no identity to key on.
+# 60s: short enough that a recurring failure re-surfaces within a minute, long
+# enough to collapse one incident's fan-out burst into one row.
+_FAILURE_EVENT_COALESCE_S = 60.0
+# (error_class, caller_tag, roster_model) -> [monotonic time of last emit,
+# suppressed since]. Keyed on a small closed set (exception classes x call-site
+# tags x roster models) — bounded.
+_failure_event_state: dict[tuple[str, str | None, str], list[float]] = {}
+
+
+def _runtime_event_bus():
+    """The runtime singleton's event bus, or None (tests, early startup).
+
+    Uses ``peek()`` so a failure before the runtime exists never constructs a
+    blank singleton as a side effect of reporting it.
+    """
+    from genesis.runtime import GenesisRuntime
+
+    return getattr(GenesisRuntime.peek(), "_event_bus", None)
+
+
+def _reset_failure_event_state() -> None:
+    """Clear the coalescing window (tests)."""
+    _failure_event_state.clear()
+
+
+def _inflight_label(invocation: CCInvocation) -> str:
+    """How an in-flight invocation is shown to whoever decides on a restart: the
+    model and the resumed session, never the prompt."""
+    model = getattr(invocation.model, "value", invocation.model)
+    if invocation.resume_session_id:
+        return f"{model}, resumes {invocation.resume_session_id}"
+    return str(model)
+
+
+async def _emit_invocation_failed_event(
+    exc: CCError,
+    invocation: CCInvocation,
+    *,
+    streaming: bool,
+    roster_model: str = "",
+) -> None:
+    """Fire a ``cc.invocation_failed`` observability event for a raised CCError.
+
+    Called from ``CCInvoker.run`` / ``run_streaming`` on the way out of a failed
+    invocation, immediately before the error is re-raised — so every CC call
+    site gets one central failure signal without each caller emitting its own.
+    Rate-limit / quota errors — including a provider overload, which is a
+    ``CCRateLimitError`` subclass — are WARNING (expected, self-recovering);
+    every other CCError is ERROR. A liveness probe's EXPECTED answer (a rate-limit /
+    quota error while the home model is still limited) is skipped; any other
+    probe failure is a malfunction and is emitted. Coalescing applies only to
+    TAGGED callers — an untagged call has no identity to key on, and pooling
+    unrelated subsystems under ``(class, None)`` would hide one behind another.
+    The routed roster model is part of the key and the payload: one caller tag
+    can reach native Claude and a peer endpoint, and those are separate outages.
+    Same bus resolution as ``_emit_bg_truncation_event``: no-ops when the
+    runtime/bus is absent and never raises — observability must not mask the
+    real error the caller is about to receive.
+    """
+    is_limit = isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
+    key: tuple[str, str | None, str] | None = None
+    prev_state: list[float] | None = None
+    try:
+        if invocation.caller_tag == PROBE_CALLER_TAG and is_limit:
+            return
+        bus = _runtime_event_bus()
+        if bus is None:
+            return
+        error_class = type(exc).__name__
+        # A call pre-stamped with peer overrides but roster_eligible=False (e.g.
+        # the fallback probe of a peer) is reported native by apply_active, yet
+        # the subprocess targets the peer: attribute and key it to the peer.
+        if roster_model in ("", roster.CLAUDE) and (
+            invocation.model_id_override or invocation.anthropic_base_url
+        ):
+            roster_model = invocation.model_id_override or "routed"
+        coalesced = 0
+        if invocation.caller_tag is not None:
+            key = (error_class, invocation.caller_tag, roster_model)
+            now = time.monotonic()
+            prev_state = _failure_event_state.get(key)
+            if prev_state is not None and now - prev_state[0] < _FAILURE_EVENT_COALESCE_S:
+                prev_state[1] += 1
+                key = None  # suppressed: nothing to roll back
+                return
+            coalesced = int(prev_state[1]) if prev_state is not None else 0
+            # Claimed BEFORE the await so concurrent failures coalesce instead of
+            # racing to emit; rolled back below if the emit itself fails.
+            _failure_event_state[key] = [now, 0]
+
+        from genesis.observability.session_context import get_session_id
+        from genesis.observability.types import Severity, Subsystem
+
+        severity = Severity.WARNING if is_limit else Severity.ERROR
+        # The exception TEXT is deliberately not carried: CC errors are built
+        # from raw CLI stderr/stdout (see _classify_error), which is unbounded
+        # and can echo arbitrary tool output, and this event is persisted to
+        # the events table. Metadata only; the length marks the omission, and
+        # the caller receives the full error via the re-raise.
+        # The coalesced count is ALSO in the message, because health_errors
+        # returns the message but not the details.
+        message = (
+            f"CC invocation failed ({error_class}) for {invocation.caller_tag or 'untagged caller'}"
+        )
+        if roster_model and roster_model != roster.CLAUDE:
+            message += f" via {roster_model}"
+        if coalesced:
+            message += f" (+{coalesced} similar failure(s) coalesced in the prior window)"
+        await bus.emit(
+            Subsystem.PROVIDERS,
+            severity,
+            "cc.invocation_failed",
+            message,
+            error_class=error_class,
+            error_text_omitted_chars=len(str(exc)),
+            streaming=streaming,
+            model=str(invocation.model),
+            roster_model=roster_model,
+            session_id=get_session_id(),
+            caller_tag=invocation.caller_tag,
+            coalesced=coalesced,
+        )
+    except Exception:
+        # The emit failed: do not leave a window open for an event that never
+        # landed. Restore the prior state (keeping its suppressed count) so the
+        # next failure retries the bus instead of being coalesced away.
+        if key is not None:
+            if prev_state is None:
+                _failure_event_state.pop(key, None)
+            else:
+                _failure_event_state[key] = prev_state
+        logger.debug("cc.invocation_failed event emit failed", exc_info=True)
+
+
+def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:
+    """Generate (idempotently) the minimal CC settings file injected into every
+    dispatched session, and return its absolute path — or ``None`` if the
     launcher is unavailable.
+
+    ``env_pins`` adds a settings ``env`` block (see ``_settings_env_pins``) and
+    writes it to a sibling file named for its content; without it the legacy
+    hooks-only file is written, unchanged.
+
+    (The name is historical: the span hook was this file's first tenant. It now
+    carries the small set of hooks a dispatch cannot otherwise receive.)
 
     Why this exists: dispatched CC sessions run with a working directory outside
     any git repo (``~/.genesis/background-sessions``), and Claude Code discovers
     project ``.claude/settings.json`` via git-root detection — so the repo-level
     hook registration never loads there and ``cc_span_hook`` never fires. Passing
-    this file via ``--settings`` injects JUST that hook; CC merges it with the
-    user's settings, leaving every other hook untouched. The hook itself no-ops
-    unless ``GENESIS_TRACE_ID`` is set, so attaching it to every dispatch is safe
-    (and is why this is the *single* registration — the repo-level one was
-    removed to avoid a double-fire when a dispatch runs in a worktree cwd, which
-    *does* load repo settings).
+    this file via ``--settings`` injects JUST these hooks; CC merges them with
+    the user's settings, leaving every other hook untouched.
 
-    The hook command uses an ABSOLUTE path to the ``genesis-hook`` launcher,
+    Three hooks, ALL registered UNCONDITIONALLY, which is what lets this stay a
+    single fixed path written idempotently, with no per-invocation content for
+    two concurrent dispatches to race over. The first two are documented no-ops
+    unless an environment variable is set; the third is not a no-op — it is
+    always on, and is here precisely so dispatched sessions get it too:
+
+    * ``cc_span_hook`` (PostToolUse) no-ops unless ``GENESIS_TRACE_ID`` is set.
+      This is the *single* registration — the repo-level one was removed to
+      avoid a double-fire when a dispatch runs in a worktree cwd, which *does*
+      load repo settings.
+    * ``bash_allowlist_guard`` (PreToolUse/Bash) no-ops unless
+      ``GENESIS_BASH_ALLOWLIST`` is set, returning before it reads stdin. It is
+      what actually enforces a scoped profile's Bash restriction; without it the
+      restriction is declared by ``_build_env`` and read by nobody. See
+      ``scripts/hooks/bash_allowlist_lib.sh`` for the predicate and the reason
+      an install may safely have both this and the user-level chokepoint wired.
+      The no-op is cheap but not free: MEASURED ~30ms per Bash call on a live
+      install, spent in the launcher rather than the guard, and paid by EVERY
+      dispatched session rather than only scoped ones.
+    * ``main_checkout_guard`` keeps hand edits out of the install's primary
+      checkout — the deploy root. PreToolUse on Write/Edit/MultiEdit/NotebookEdit
+      REFUSES a change to a tracked file there. On Bash it never refuses:
+      PreToolUse records a snapshot of the deploy root's tracked state keyed by
+      the call's ``tool_use_id``, and PostToolUse plus PostToolUseFailure (an
+      erroring call ends in the latter) compare against it and
+      tell the session what changed and how to restore it. A dispatched
+      session's cwd is outside any repo, so the repo-level registration never
+      loads there; without these entries a background session could hand-edit
+      the deployed install unseen. Its off-switches are
+      ``GENESIS_MAIN_CHECKOUT_GUARD=0`` and the ``main_checkout_guard`` settings
+      domain, read by the guard itself, so the registration stays
+      unconditional. A dispatch whose cwd IS a checkout also loads the repo
+      registration, so the guard can run twice there: the file-tool check only
+      reads, the pre snapshot is rewritten atomically, and the post check claims
+      the snapshot by rename, so only one of two post runs reports.
+
+    MEASURED 2026-09-23 on CC 2.1.246, from a dispatch-shaped invocation (cwd
+    outside any repo, ``--dangerously-skip-permissions``): a PreToolUse Bash
+    hook supplied via ``--settings`` fires, and its exit 2 refuses the call —
+    the command demonstrably does not run. Controls: the same invocation without
+    ``--settings`` ran the command and left no hook marker.
+
+    The hook commands use an ABSOLUTE path to the ``genesis-hook`` launcher,
     which self-locates the install root from its own filesystem position — NOT
     ``${CLAUDE_PROJECT_DIR}``, which CC leaves unset in dispatched sessions.
     Written atomically and only when stale, so it tracks the install root across
@@ -391,28 +1748,97 @@ def cc_span_settings_path() -> str | None:
     genesis_hook = env.repo_root() / ".claude" / "hooks" / "genesis-hook"
     if not genesis_hook.exists():
         return None
+    guard_argv = _allowlist_guard_argv()
+    if guard_argv is None:  # pragma: no cover - same existence test as above
+        return None
 
-    desired = json.dumps(
-        {
-            "hooks": {
-                "PostToolUse": [
-                    {
-                        "matcher": ".*",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": f"{genesis_hook} hooks/cc_span_hook.py",
-                                "timeout": 500,
-                            },
-                        ],
-                    },
-                ],
-            },
+    payload: dict[str, object] = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    # ANCHORED, and measured rather than assumed: a matcher
+                    # is a REGEX (probed on CC 2.1.246 — a hook registered
+                    # as "^Bash$" fires on a Bash call), so a bare "Bash"
+                    # also matches "BashOutput". That tool carries no
+                    # .tool_input.command, so under an allowlist it would
+                    # hit this guard's fail-closed leg and be refused with a
+                    # message about a command it never had. The ~15 hooks in
+                    # .claude/settings.json using a bare "Bash" do not show
+                    # this because they all fail OPEN on an unreadable
+                    # payload.
+                    "matcher": "^Bash$",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            # Built from the same helper the pre-launch
+                            # binding check uses, so the command that is
+                            # registered and the command that is verified
+                            # cannot drift. shlex.join quotes it: an install
+                            # root containing a space would otherwise
+                            # produce a command CC's shell cannot resolve —
+                            # exit 127, which is non-blocking, i.e. a
+                            # permit.
+                            "command": shlex.join(guard_argv),
+                            # Generous by ~300x against the guard's real cost
+                            # (an env test, one jq, one awk — well under a
+                            # tenth of a second), because the failure
+                            # direction is asymmetric: a PreToolUse hook that
+                            # exceeds its declared timeout is killed and the
+                            # call PROCEEDS, so a tight bound on a
+                            # containment hook converts it into a silent
+                            # permit. Bounded rather than omitted so a hook
+                            # that somehow hangs cannot stall the session
+                            # indefinitely.
+                            "timeout": 30,
+                        },
+                    ],
+                },
+                # After the allowlist entry, never ahead of it: the pre-launch
+                # binding check matches that entry by content, and the tests pin
+                # it at index 0. Anchored matchers for the reason given above.
+                *(
+                    _main_checkout_guard_entry(genesis_hook, matcher)
+                    for matcher in ("^Bash$", "^(Write|Edit|MultiEdit|NotebookEdit)$")
+                ),
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": ".*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{genesis_hook} hooks/cc_span_hook.py",
+                            "timeout": 500,
+                        },
+                    ],
+                },
+                _main_checkout_guard_entry(genesis_hook, "^Bash$"),
+            ],
+            # A tool call that errors ends in PostToolUseFailure, not PostToolUse
+            # (READ from the CC 2.1.280 bundle, which defines both events with a
+            # tool_use_id). Which one a non-zero Bash exit reaches was not
+            # measured, so the guard's after-the-fact check is wired on both;
+            # whichever fires claims the snapshot.
+            "PostToolUseFailure": [_main_checkout_guard_entry(genesis_hook, "^Bash$")],
         },
-        indent=2,
-    )
-
+    }
     path = _CC_SPAN_SETTINGS_PATH
+    if env_pins:
+        # Settings `env` is applied AFTER launch and outranks every lower
+        # settings level and the inherited environment, so this is the layer
+        # that decides what the session's tools see. MEASURED on CC 2.1.280: a
+        # project `.claude/settings.local.json` that plants GH_TOKEN reaches
+        # Bash (length 18) when the launcher only cleared the launch env; with
+        # the same key pinned to "" here, Bash sees length 0, also when the
+        # variable is exported in the inherited environment. Per-content file
+        # name: the content is constant for a given pin set, so concurrent
+        # writers agree, and a process on older code — which rewrites the
+        # legacy path with its own hooks-only payload — never touches it.
+        payload["env"] = dict(sorted(env_pins.items()))
+        digest = hashlib.sha256(json.dumps(payload["env"]).encode()).hexdigest()[:12]
+        path = path.with_name(f"{path.stem}-{digest}{path.suffix}")
+    desired = json.dumps(payload, indent=2)
+
     try:
         if path.exists() and path.read_text(encoding="utf-8") == desired:
             return str(path)
@@ -460,6 +1886,13 @@ class CCInvoker:
         self._last_was_error = False
         self._status_lock = asyncio.Lock()
         self._protected_paths = protected_paths
+        # `claude --version` per binary FILE identity — see _cc_version. Per
+        # instance, never module-global: a module cache would let one invoker's
+        # answer (or a test's) stand in for another's binary.
+        self._cc_versions: dict[tuple[str, int, int], tuple[int, int, int]] = {}
+        self._cc_version_failed_at: dict[tuple[str, int, int], float] = {}
+        self._cc_version_warned: set[tuple[str, int, int] | str] = set()
+        self._clock: Callable[[], float] = time.monotonic  # injectable for tests
 
         # Advisory check — warn early if the CLI binary is not findable.
         resolved = shutil.which(claude_path)
@@ -472,6 +1905,78 @@ class CCInvoker:
                 "~/.npm-global/bin is on PATH.",
                 claude_path,
             )
+
+    async def _cc_version(self) -> tuple[int, int, int] | None:
+        """The version of the CC binary this invoker runs, or None if unreadable.
+
+        Keyed by the resolved file's (path, inode, mtime), so an update that
+        replaces the binary under a running server is read afresh, and read once
+        per file otherwise. A failed read is not cached for good — one bad moment
+        must not pin a long-lived server to the additive path — but it is not
+        retried for ``_CC_VERSION_RETRY_S`` either, and it warns once per file.
+
+        Runs via ``subprocess.run`` in a thread rather than the asyncio spawner,
+        which tests patch to impersonate a CC run. The 15 s bound: this runs on
+        the turn path after the answer is in hand, so a CLI that hangs on
+        ``--version`` holds that reply until the bound (``claude --version``
+        measured 25 ms on 2.1.280). The retry cooldown limits that to one reply
+        per window; the answer itself is never lost, only its cost reading
+        degrades to additive.
+        """
+        resolved = shutil.which(self._claude_path)
+        if not resolved:
+            self._warn_version_once(self._claude_path, "binary not found")
+            return None
+        real = os.path.realpath(resolved)
+        try:
+            st = os.stat(real)
+        except OSError as exc:
+            self._warn_version_once(real, f"stat failed: {exc}")
+            return None
+        key = (real, st.st_ino, st.st_mtime_ns)
+        cached = self._cc_versions.get(key)
+        if cached is not None:
+            return cached
+        failed_at = self._cc_version_failed_at.get(key)
+        if failed_at is not None and self._clock() - failed_at < _CC_VERSION_RETRY_S:
+            return None
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                [resolved, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._cc_version_failed_at[key] = self._clock()
+            self._warn_version_once(key, f"{type(exc).__name__}: {exc}")
+            return None
+        version = parse_cc_version(proc.stdout) if proc.returncode == 0 else None
+        if version is None:
+            self._cc_version_failed_at[key] = self._clock()
+            self._warn_version_once(
+                key, f"exit {proc.returncode}, stdout {proc.stdout.strip()[:80]!r}"
+            )
+            return None
+        self._cc_versions[key] = version
+        return version
+
+    def _warn_version_once(self, key: tuple[str, int, int] | str, why: str) -> None:
+        if key in self._cc_version_warned:
+            return
+        self._cc_version_warned.add(key)
+        logger.warning(
+            "Could not read the CC version (%s) — recording resumed-turn cost "
+            "ADDITIVELY, which over-counts on CC 2.1.277+ (cost is display-only)",
+            why,
+        )
+
+    async def _with_cost_semantics(self, output: CCOutput) -> CCOutput:
+        """Stamp whether ``output.cost_usd`` is a running total (see
+        ``cost_is_cumulative_for``). The one place the flag is set."""
+        return replace(output, cost_is_cumulative=cost_is_cumulative_for(await self._cc_version()))
 
     @property
     def working_dir(self) -> str | None:
@@ -519,7 +2024,271 @@ class CCInvoker:
         except Exception:
             logger.warning("CC empty-output callback failed", exc_info=True)
 
-    def _build_args(self, inv: CCInvocation) -> list[str]:
+    def _refuse_unenforceable_allowlist(self, inv: CCInvocation, span_settings: str | None) -> None:
+        """Refuse to launch a Bash-restricted profile whose restriction will not
+        be enforced.
+
+        ``_build_env`` exports ``GENESIS_BASH_ALLOWLIST`` for a scoped profile,
+        but the export is only a DECLARATION — a hook has to read it. If the
+        hook is not going to run, the profile launches with unrestricted Bash
+        while every declaration in the codebase says it is confined, which is
+        strictly worse than having no allowlist at all: the safety argument in
+        ``autonomy/audit.py`` rests on it.
+
+        Checked here rather than by parsing the user's settings — that would be
+        the wrong instrument, since it would also have to find a USER-level
+        registration, which an install may legitimately have, and refusing there
+        would strand a correctly-protected box. What the invoker can answer
+        exactly is whether IT armed the hook, and whether the hook BINDS.
+
+        Called from ``_build_args``, which is the chokepoint both spawn paths
+        share (``run`` and ``run_streaming``), so one check covers both.
+        """
+        if not inv.bash_allowlist:
+            return
+
+        allowlist = ",".join(inv.bash_allowlist)
+        if span_settings is None:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but the settings file that registers the "
+                f"enforcing hook could not be written, so the restriction "
+                f"would not be applied. Check that "
+                f".claude/hooks/genesis-hook exists and that ~/.genesis is "
+                f"writable."
+            )
+        # ORDER MATTERS, and not only for speed. The checks below are grouped
+        # cheapest-and-most-specific first: the three that read only fields of
+        # this invocation, then the file read, then the subprocess probes. A
+        # caller that trips one of the cheap conditions gets the message about
+        # THAT condition rather than a generic one from a later check it would
+        # also have failed — which is what stops a test asserting "it refuses"
+        # from passing for the wrong reason.
+        #
+        # env_overrides is applied LAST in _build_env and wins over everything,
+        # so it can blank the variable the guard reads after every other check
+        # has passed. Nothing does this today; this keeps it that way.
+        override = (inv.env_overrides or {}).get("GENESIS_BASH_ALLOWLIST")
+        if override is not None and override != allowlist:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but env_overrides sets "
+                f"GENESIS_BASH_ALLOWLIST={override!r}, and env_overrides wins — "
+                f"the guard would read that instead. Set one or the other."
+            )
+        if inv.bare:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but --bare skips hooks entirely, so the "
+                f"restriction would not be applied. Drop bare=True, or drop "
+                f"the bash_allowlist and confine the profile another way."
+            )
+        if inv.safe_mode:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but --safe-mode disables all hooks, so the "
+                f"restriction would not be applied. Drop safe_mode=True, or "
+                f"drop the bash_allowlist and confine the profile another way."
+            )
+
+    async def verify_allowlist_enforceable(
+        self, inv: CCInvocation, *, settings_pins: dict[str, str] | None = None
+    ) -> None:
+        """The EXPENSIVE half of the allowlist check, kept off the event loop.
+
+        ``_build_args`` stays synchronous — the tests call it directly, and the
+        cheap checks there answer from fields of the invocation alone. What
+        cannot stay there is this: a settings read, a seal write, and two
+        subprocess probes with a 30s ceiling each. ``_build_args`` is called
+        from inside coroutines, so running those inline would stall the whole
+        server loop — channels, other sessions, cancellations — for up to a
+        minute on a hanging guard.
+
+        ``_get_scope_args`` in this module was made async for exactly this
+        reason and says so; this follows it rather than inventing a second
+        shape.
+
+        MUST be awaited by every spawn path before the child is started. Both
+        of them do, immediately after ``_build_args``, and a test asserts it —
+        a path that skipped this would launch a profile whose confinement was
+        never demonstrated, which is the defect this whole change exists to
+        remove.
+        """
+        if not inv.bash_allowlist:
+            return
+        await asyncio.to_thread(self._verify_allowlist_enforceable_blocking, inv, settings_pins)
+
+    def _verify_allowlist_enforceable_blocking(
+        self, inv: CCInvocation, settings_pins: dict[str, str] | None = None
+    ) -> None:
+        """Body of :meth:`verify_allowlist_enforceable`; runs in a worker thread.
+
+        ``settings_pins`` are the pins the spawn path already handed to
+        ``_build_args``. Reusing them makes the settings file checked here the
+        file that launches: recomputing could land on a different, hash-named
+        file if seal preparation failed on one of the two calls.
+        """
+        allowlist = ",".join(inv.bash_allowlist)
+        pins = (
+            settings_pins
+            if settings_pins is not None
+            else _settings_env_pins(tuple(inv.bash_allowlist))
+        )
+        span_settings = cc_span_settings_path(pins)
+        if span_settings is None:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but the settings file that registers the "
+                f"enforcing hook could not be written."
+            )
+        # The settings file is ONE shared path, so a concurrently-running
+        # Genesis process on OLDER code recomputes the span-only payload, sees
+        # this content as stale, and rewrites it — after we wrote it. Re-read
+        # immediately before launch rather than trusting the write.
+        try:
+            registered = Path(span_settings).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but the settings file could not be re-read to "
+                f"confirm the enforcing hook is registered ({exc.strerror})."
+            ) from exc
+        # The child's REAL environment, not this process's. env_overrides is
+        # applied last and wins, so a probe run under os.environ would test a
+        # different PATH (where `jq`/`awk` resolve from) and a different
+        # GENESIS_HOOK_DEV_LOCAL (which root the guard is loaded from) than
+        # the session actually gets. Defending one variable by name was the
+        # narrower version of this; building the same env makes the check
+        # faithful by construction.
+        # _build_env is the chokepoint for the hardening itself: it refuses
+        # there, on the env it returns, so the environment that was checked IS
+        # the environment that gets launched. Checking a second copy here would
+        # re-open the gap it closes — both spawn paths rebuild the env after
+        # this runs, and only a check inside the builder covers that rebuild.
+        child_env = self._build_env(inv)
+        self._verify_allowlist_guard_binds(registered, inv.bash_allowlist, child_env)
+
+    @staticmethod
+    def _verify_allowlist_guard_binds(
+        registered: str, bash_allowlist: tuple[str, ...], child_env: dict[str, str]
+    ) -> None:
+        """Prove the registered guard REFUSES and PERMITS — by running it.
+
+        Every check above establishes that the guard is REGISTERED. None of them
+        establishes that it BINDS, and the gap between those is where this
+        failed once already: the launcher resolves a hook against the MAIN
+        worktree, while the registrar checks the INVOKING tree, so a guard
+        present to the registrar can be absent to the launcher. The launcher
+        then exits non-blocking and every command runs.
+
+        Rather than re-implement the launcher's root resolution here — which
+        would be a second copy of shell logic, free to drift from the first —
+        run the guard and read the verdicts. BOTH directions: a refusal alone
+        would also be produced by a launcher refusing everything because it
+        cannot find the guard at all, which is a contained session but not a
+        working one.
+
+        WHAT RUNS IS THE LOCALLY-COMPUTED ARGV, never the string parsed out of
+        the settings file. That file sits outside the repo and is writable by
+        any same-uid process, and this subprocess runs in the PARENT, which
+        carries the server's whole environment — every API key in secrets.env
+        among it. Executing a value read from a mutable file there would hand
+        an attacker who can win one write a credential-bearing shell. So the
+        registered command is parsed only to be COMPARED, and a mismatch is a
+        refusal rather than a thing to run.
+
+        The comparison is also why the entry is matched by CONTENT rather than
+        taken from index 0: a second PreToolUse hook registered ahead of this
+        one would otherwise be executed and its exit code read as the allowlist
+        verdict.
+
+        Costs two short subprocesses, paid only by an invocation that declares
+        an allowlist. Those are rare, and the alternative is launching a profile
+        whose confinement has never been demonstrated.
+        """
+        expected = _allowlist_guard_argv()
+        if expected is None:
+            raise RuntimeError(
+                "Refusing to launch: the genesis-hook launcher is not present, "
+                "so the Bash allowlist cannot be enforced."
+            )
+        try:
+            commands = [
+                hook.get("command", "")
+                for block in json.loads(registered)["hooks"].get("PreToolUse", [])
+                for hook in block.get("hooks", [])
+            ]
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise RuntimeError(
+                f"Refusing to launch: the registered Bash-allowlist hook could "
+                f"not be read out of the settings file to verify it ({exc})."
+            ) from exc
+        # Matched by CONTENT, which covers both ways this can be wrong with one
+        # test: the file was rewritten by another Genesis process on older code
+        # (so the guard is simply absent), or it was modified to name something
+        # else. Selecting by index would additionally have run a second hook
+        # registered ahead of this one and read ITS exit code as the verdict.
+        if not any(shlex.split(command) == expected for command in commands):
+            raise RuntimeError(
+                "Refusing to launch: the settings file does not register the "
+                "Bash-allowlist hook this process computed — it has been "
+                "rewritten since, most likely by another Genesis process "
+                "running older code. Refusing rather than running what it now "
+                "names."
+            )
+        argv = expected
+
+        allowlist = ",".join(bash_allowlist)
+        env = {**child_env, "GENESIS_BASH_ALLOWLIST": allowlist}
+
+        def _probe(cmd: str) -> int:
+            payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}})
+            try:
+                return subprocess.run(
+                    argv,
+                    input=payload,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    # Matches the timeout the hook is registered with, so a
+                    # guard slow enough to fail there fails here too rather
+                    # than passing this check and being killed in the session.
+                    timeout=30,
+                ).returncode
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError(
+                    f"Refusing to launch: this invocation restricts Bash to "
+                    f"[{allowlist}], but the enforcing hook could not be run to "
+                    f"verify it ({exc})."
+                ) from exc
+
+        # A token that cannot be on any allowlist, so a working guard refuses it.
+        refused = _probe("__genesis_allowlist_verification_probe__")
+        if refused != 2:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], but the registered hook returned {refused} for "
+                f"a command outside that list instead of refusing it, so the "
+                f"restriction is not in force. Check that "
+                f"scripts/hooks/bash_allowlist_guard.sh is present in the hook "
+                f"root the launcher resolves (the MAIN worktree, which can lag "
+                f"the tree this process is running from)."
+            )
+
+        permitted = _probe(bash_allowlist[0])
+        if permitted != 0:
+            raise RuntimeError(
+                f"Refusing to launch: this invocation restricts Bash to "
+                f"[{allowlist}], and the registered hook refuses even "
+                f"{bash_allowlist[0]!r} (returned {permitted}), so the session "
+                f"could do nothing at all. This usually means the guard is "
+                f"missing from the launcher's hook root and the launcher is "
+                f"refusing on its behalf."
+            )
+
+    def _build_args(
+        self, inv: CCInvocation, *, settings_pins: dict[str, str] | None = None
+    ) -> list[str]:
         args = [self._claude_path, "-p"]
         # Roster routing: when model_id_override is set, model selection comes
         # entirely from ANTHROPIC_MODEL (set in _build_env). A --model flag here
@@ -567,14 +2336,35 @@ class CCInvoker:
         # servers cleanly (probe-verified) — the secure-by-default posture.
         if inv.strict_mcp_config and not inv.bare:
             args.append("--strict-mcp-config")
-        # Register the span-capture PostToolUse hook for this dispatched session.
-        # Dispatched sessions run with a cwd outside any git repo, so CC never
-        # loads the repo's .claude/settings.json; --settings injects just this
-        # hook (CC merges it with the user's settings). No-op unless a trace is
-        # active (GENESIS_TRACE_ID). See cc_span_settings_path.
-        span_settings = cc_span_settings_path()
+        # Register the dispatch hooks (span capture, Bash allowlist enforcement,
+        # the main-checkout guard) for this session. Dispatched sessions run with
+        # a cwd outside any git repo, so CC never loads the repo's
+        # .claude/settings.json; --settings injects just these hooks and CC merges
+        # them with the user's settings. The first two no-op unless their env var
+        # is set; the guard is always on. See cc_span_settings_path.
+        # The same file pins the session's credential and confinement env at the
+        # settings level, which outranks user and project settings: see
+        # _settings_env_pins.
+        # The async run paths compute the pins in a worker thread (the seal
+        # preparation behind them can block on a lock) and pass them in.
+        pins = (
+            settings_pins
+            if settings_pins is not None
+            else _settings_env_pins(tuple(inv.bash_allowlist))
+        )
+        span_settings = cc_span_settings_path(pins)
         if span_settings:
             args += ["--settings", span_settings]
+        else:
+            # No settings FILE (launcher absent, ~/.genesis unwritable): the hooks
+            # cannot be registered, but the env pins still must not be lost — a
+            # session launched without them lets a user or project settings file
+            # restore a credential. Pass them inline (`--settings` takes JSON as
+            # well as a path; the precedence probe used exactly this form). A
+            # Bash-restricted profile is still refused just below, because its
+            # guard is one of the hooks that could not be registered.
+            args += ["--settings", json.dumps({"env": dict(sorted(pins.items()))})]
+        self._refuse_unenforceable_allowlist(inv, span_settings)
         if inv.skip_permissions:
             args.append("--dangerously-skip-permissions")
         if inv.allowed_tools:
@@ -591,17 +2381,84 @@ class CCInvoker:
         # prompts safely.
         return args
 
-    # CC's Bash sandbox root — persistent disk, managed by tmp_watchgod.
+    # CC's Bash sandbox root — persistent disk; tmp_watchgod sweeps what ended
+    # sessions leave behind.
     _CC_SANDBOX_TMPDIR = Path.home() / ".genesis" / "cc-tmp"
 
     def _build_env(self, inv: CCInvocation | None = None) -> dict[str, str]:
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        # NO DISPATCHED SESSION INHERITS A GITHUB CREDENTIAL FROM OUR OWN
+        # ENVIRONMENT. Pinned for EVERY invocation, not only gh-allowlisted
+        # ones: `bash_allowlist=` is set at exactly one call site in the tree,
+        # so every other dispatch takes the `()` default and skips the whole
+        # hardening block below — while `dict(os.environ)` above copies
+        # everything this process holds. MEASURED: gh reads an empty GH_TOKEN as
+        # UNSET, so this neutralises an inherited token without inventing one.
+        # ENFORCED by `_assert_no_gh_credentials` at the launch gate, which runs for
+        # EVERY invocation — not by the per-binary hardening, which only runs for
+        # one that declares a Bash allowlist. An earlier draft put the pin in
+        # `_gh_hardening`'s dict and this comment told the next author to "teach
+        # `_gh_hardening` the value" to arm a session; that is now exactly wrong,
+        # because the unconditional check would refuse any non-empty value it
+        # produced. There is no arming path, and adding one means changing the
+        # check, deliberately, not feeding it a value from elsewhere.
+        #
+        # ALL FOUR, from the enumeration at `_GH_CREDENTIAL_ENV`. Pinning
+        # `GH_TOKEN` alone was the first version and was bypassed by
+        # `GITHUB_TOKEN`, which gh documents on the very same line.
+        for _cred_var in _GH_CREDENTIAL_ENV:
+            env[_cred_var] = ""
+        #
+        # AND THE PINS ABOVE CLOSE THE ENV ROUTE ONLY — read this before adding a
+        # stronger claim on top of it. MEASURED: with no GH_CONFIG_DIR pin, a
+        # session with every credential variable empty is STILL FULLY
+        # AUTHENTICATED, because gh falls back to `hosts.yml` on disk. The
+        # deciding variable for de-authenticating gh is GH_CONFIG_DIR, and this
+        # function does NOT pin it outside the allowlisted path.
+        #
+        # THE CLAIM THIS SUPPORTS IS ABOUT gh, NOT ABOUT THE SESSION, and the
+        # difference is the whole finding. Even where gh cannot authenticate, the
+        # session may still hold the operator's token: tool scope decides that,
+        # not the environment. The `steward` profile denies `Write` but permitted
+        # `Read`/`Glob`/`Grep` and runs with `skip_permissions=True`, so
+        # attacker-authored PR content could read `~/.config/gh/hosts.yml`
+        # directly and exfiltrate through its allowed `outreach_send` — a path no
+        # env pin touches. That is closed in the profile's own tool scope, not
+        # here. Say "gh holds no credential", never "the session is
+        # unauthenticated".
+        #
+        # That was deliberately NOT done here, and the reasons are worth keeping
+        # so the next attempt starts further along. Keying it on
+        # `origin == external_untrusted` looks tight and is not: MEASURED, that
+        # origin is produced for SIX dispatch profiles via `_PROFILE_ORIGIN`
+        # (campaign, community-responder, interact, mail, research, steward) and
+        # for every non-owner-attended CONVERSATION channel via
+        # `session_origin_for_channel` — dashboard, web, WhatsApp, voice, agent,
+        # OpenClaw, mail, and any unknown channel, which fails closed to it. A
+        # pin there would also have pointed `XDG_DATA_HOME`, a process-global
+        # base directory, at a read-only tree for ordinary dashboard sessions.
+        #
+        # And pinning the SEAL specifically is a fail-OPEN on exactly the
+        # installs that need it. REPRODUCED: with a pre-heal seal still holding
+        # a copied `hosts.yml`, a rewrite that fails before the stale sweep
+        # (unwritable parent, so the lock file cannot be opened) returns None —
+        # and a fallback that pins the seal path anyway points the session AT
+        # the credential rather than away from it.
+        #
+        # So the remaining exposure is the ON-DISK route for sessions that have
+        # Bash and no allowlist, and the honest fix is denying Bash on the one
+        # path that processes external content, not an env pin: unrestricted
+        # Bash can read the operator's config file whatever GH_CONFIG_DIR says,
+        # so a pin would remove AMBIENT authentication and never confinement.
         # Signal to SessionStart hooks that this is a Genesis-dispatched session.
         # The genesis_session_context.py hook skips identity injection when set,
         # preventing double injection (identity is in the system prompt arg).
         env["GENESIS_CC_SESSION"] = "1"
+        # Shared dispatched-session pins (function hooks off, beating the
+        # server-side default a rollout would flip).
+        pin_dispatched_env(env)
         # Propagate Genesis session_id to child CC + MCP server processes
         # so eval hooks can attribute recall events to specific sessions.
         from genesis.observability.session_context import get_session_id
@@ -696,8 +2553,8 @@ class CCInvoker:
         # failures break the Bash tool for entire sessions.
         # A per-invocation override isolates blast radius: e.g. the model-roster
         # gauntlet points its throwaway CC sessions at a separate sandbox so a
-        # fixture that fills it can't trip genesis-tmp-watchgod into SIGKILLing a
-        # LIVE foreground/background session sharing the default cc-tmp.
+        # fixture that fills it can't exhaust the quota-capped default cc-tmp that
+        # every LIVE foreground/background session's temp shares.
         env["CLAUDE_CODE_TMPDIR"] = str(
             (inv.claude_code_tmpdir if inv and inv.claude_code_tmpdir else None)
             or self._CC_SANDBOX_TMPDIR
@@ -707,7 +2564,7 @@ class CCInvoker:
         # sandbox isolation above: without it a headless session's *subprocess*
         # temp (e.g. the gauntlet agent running the fixture's pytest, whose
         # tmp_path defaults under $TMPDIR) still lands in the inherited cc-tmp and
-        # can trip genesis-tmp-watchgod. For the default sandbox both resolve to
+        # can fill the shared volume. For the default sandbox both resolve to
         # cc-tmp (unchanged); for an override (gauntlet) TMPDIR follows it off
         # cc-tmp.
         env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]
@@ -715,11 +2572,29 @@ class CCInvoker:
         # in Linux/tmux.  No-op on CC <2.1.132; required post-migration.
         env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"
         # Restrict Bash to an allowlist of command binaries for scoped profiles
-        # (e.g. "steward" → gh only). scripts/bash_safety_hook.sh reads this and
+        # (a profile scoped to one binary). scripts/bash_safety_hook.sh reads this and
         # blocks any non-allowlisted command. Absent → no restriction (the var
         # must not leak from the parent, so pop when the field is empty).
+        required_hardening: dict[str, dict[str, str]] = {}
         if inv and inv.bash_allowlist:
             env["GENESIS_BASH_ALLOWLIST"] = ",".join(inv.bash_allowlist)
+            # PER-BINARY HARDENING. A first-token allowlist bounds WHICH binary
+            # runs; it cannot bound what that binary can be told to do, and an
+            # allowlisted binary with a shell escape hands the session an
+            # unrestricted shell while every token is still the allowed one.
+            # Each entry that needs it gets its hardening applied here.
+            for binary in inv.bash_allowlist:
+                # ONE decision point, shared with `_assert_hardening_present`, so
+                # the env we APPLY and the env it VERIFIES cannot diverge. It
+                # raises for an unreviewed binary and for one whose hardening
+                # could not be prepared — the latter FAILS CLOSED because
+                # launching anyway would put the session against the operator's
+                # writable configuration, the exact escape the hardening removes.
+                applied = _required_hardening(binary)
+                if applied is None:
+                    continue
+                required_hardening[binary] = applied
+                env.update(applied)
         else:
             env.pop("GENESIS_BASH_ALLOWLIST", None)
         # Per-invocation overrides win over EVERYTHING above (inherited environ,
@@ -733,6 +2608,37 @@ class CCInvoker:
             # silently desync). An explicit TMPDIR override still wins.
             if "CLAUDE_CODE_TMPDIR" in inv.env_overrides and "TMPDIR" not in inv.env_overrides:
                 env["TMPDIR"] = env["CLAUDE_CODE_TMPDIR"]
+        # LAST WORD, deliberately after env_overrides. Overrides are applied
+        # last and win over everything, so they can replace a confinement that
+        # was correctly applied above. Re-read the env being returned rather
+        # than trusting that the update stuck: this function is the only thing
+        # every launch path shares, so a check here is a check on what actually
+        # runs. Comparing against the freshly computed hardening, not a list of
+        # variable names, keeps it honest when a hardening grows a key.
+        for binary, required in required_hardening.items():
+            wrong = sorted(k for k, v in required.items() if env.get(k) != v)
+            if wrong:
+                raise RuntimeError(_unhardened_env_message(binary, wrong))
+        return env
+
+    @staticmethod
+    def _launch_env(env: dict[str, str], inv: CCInvocation) -> dict[str, str]:
+        """Last gate between a built env and the process that receives it.
+
+        Exists because ``_build_env`` is NOT the final word: both spawn paths
+        merge the login fallback on top of it. Anything that mutates the env
+        after the builder goes through here, so the dict that was checked is
+        the dict that launches.
+        """
+        # UNCONDITIONAL: every dispatched session, allowlisted or not. See
+        # `_assert_no_gh_credentials` — gating this on the allowlist is what made
+        # the pin decorative once no profile declared one.
+        _assert_no_gh_credentials(env)
+        if inv.bash_allowlist:
+            _assert_hardening_present(env, tuple(inv.bash_allowlist))
+        # Re-applied here, after every merge (env_overrides, the login fallback),
+        # so no later layer can turn function hooks back on (review).
+        pin_dispatched_env(env)
         return env
 
     def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:
@@ -770,7 +2676,12 @@ class CCInvoker:
             proc.send_signal(signal.SIGINT)
 
     @staticmethod
-    def _classify_error(stderr_text: str, stdout_text: str = "") -> CCError:
+    def _classify_error(
+        stderr_text: str,
+        stdout_text: str = "",
+        *,
+        result: dict | None = None,
+    ) -> CCError:
         """Classify CC output into a typed CC exception.
 
         Checks both stderr and stdout — when CC runs in streaming-JSON
@@ -779,9 +2690,28 @@ class CCInvoker:
         Limiting classification to stderr would mis-categorize those as
         generic CCProcessError and skip downstream retry branches that
         key off the typed exception.
+
+        ``stdout_text`` must be the subprocess's RAW stdout (or empty).
+        ``result`` is the CLI's already-parsed result object, for callers that
+        parsed it themselves; it wins over one parsed from ``stdout_text``.
         """
         combined = f"{stderr_text}\n{stdout_text}"
-        lower = combined.lower()
+        # When stdout ends with the CLI's JSON result object, classify from its
+        # structured fields and its error TEXT, never from the serialized blob:
+        # the blob carries dozens of numbers (durations, token counts, costs)
+        # and UUIDs, so a text match over it can read "output_tokens":529 as an
+        # overload or a UUID's "429" as a rate limit.
+        parsed_stdout = _cli_result_payload(stdout_text)
+        payload = result if isinstance(result, dict) else parsed_stdout
+        pattern_parts = [stderr_text]
+        if parsed_stdout is None:
+            pattern_parts.append(stdout_text)
+        if payload is not None:
+            pattern_parts.extend(_result_error_texts(payload))
+        lower = "\n".join(pattern_parts).lower()
+        status = _int_or_none(payload.get("api_error_status")) if payload is not None else None
+        if status == 529:
+            return _overload_error(stderr_text or stdout_text, combined, payload)
         # Session expiry
         if "session" in lower and ("not found" in lower or "expired" in lower):
             return CCSessionError(stderr_text or stdout_text)
@@ -806,18 +2736,36 @@ class CCInvoker:
             "session limit",
             "weekly limit",
         )
+        # A server-side throttle whose own text says it is NOT the usage limit
+        # ("Server is temporarily limiting requests (not your usage limit)")
+        # must not match the "usage limit" quota pattern below: that parks on
+        # the hours-long quota horizon for a transient capacity condition.
+        if "not your usage limit" in lower or "temporarily limiting requests" in lower:
+            return CCRateLimitError(stderr_text or stdout_text, raw_text=combined)
         if any(p in lower for p in _QUOTA_PATTERNS):
             return CCQuotaExhaustedError(stderr_text or stdout_text, raw_text=combined)
+        # Provider overload (HTTP 529) in free text: "API Error: 529 Overloaded.
+        # This is a server-side issue, usually temporary", "Repeated 529
+        # Overloaded errors", or the API body type ``overloaded_error``. The
+        # structured ``api_error_status`` is handled above. Checked before the
+        # rate-limit family because it is the more specific signal, and typed as
+        # retry-eligible overloads retain rate-limit behavior; known-work or
+        # MCP-backed overloads leave through the non-replayable boundary.
+        if _OVERLOADED_RE.search(lower):
+            return _overload_error(stderr_text or stdout_text, combined, payload)
         # Transient rate limit (429, recovers in minutes)
         # CC CLI says "You've hit your limit · resets Xpm" — not "rate limit"
         _RATE_LIMIT_PATTERNS = (
             "rate limit",
             "rate_limit",
-            "429",
             "hit your limit",
             "hit the limit",
         )
-        if any(p in lower for p in _RATE_LIMIT_PATTERNS):
+        if (
+            status == 429
+            or any(p in lower for p in _RATE_LIMIT_PATTERNS)
+            or _STATUS_429_RE.search(lower)
+        ):
             return CCRateLimitError(stderr_text or stdout_text, raw_text=combined)
         # MCP server error
         source = stderr_text or stdout_text
@@ -931,7 +2879,49 @@ class CCInvoker:
             logger.debug("network preflight check errored — proceeding", exc_info=True)
 
     async def run(self, invocation: CCInvocation) -> CCOutput:
-        """Run a dispatched CC session (traced).
+        """Run a dispatched CC session (traced; see ``_run_traced``).
+
+        Any ``CCError`` — the pre-spawn network preflight's included — emits a
+        ``cc.invocation_failed`` event and is then re-raised unchanged.
+        ``CancelledError`` is a BaseException, not a CCError, so it propagates
+        untouched and emits nothing. Roster routing is resolved HERE (it never
+        raises) so the failure event names the routed model, not only the
+        requested tier.
+
+        Checkout admission is taken before the roster read: that read and the
+        network preflight read checkout files too, so a checkout mutation must
+        not start between them and the spawn. The launch is registered in flight
+        before it waits, so a deploy's session scan sees it (the label does not
+        depend on roster routing, which never changes ``model``). The spawn path
+        releases admission once the subprocess exists; the ``finally`` covers
+        every path that never spawns.
+        """
+        # Registered for the whole call: a restart now would cancel it
+        # (genesis.util.inflight; a no-op inside a caller's open unit).
+        with inflight("claude", _inflight_label(invocation)):
+            admission = await admit_launch()
+            try:
+                invocation, roster_model = roster.apply_active(invocation)
+                try:
+                    return await self._run_traced(invocation, roster_model, admission)
+                except CCError as exc:
+                    await _emit_invocation_failed_event(
+                        exc,
+                        invocation,
+                        streaming=False,
+                        roster_model=roster_model,
+                    )
+                    raise
+            finally:
+                admission.release()
+
+    async def _run_traced(
+        self,
+        invocation: CCInvocation,
+        roster_model: str,
+        admission: CheckoutAdmission | None = None,
+    ) -> CCOutput:
+        """Run an already-roster-routed CC session (traced).
 
         Opens a ``cc.session`` span spanning the whole subprocess lifetime so
         (a) the active trace context is injected into the child env (see
@@ -939,7 +2929,6 @@ class CCInvoker:
         and (b) any LLM/operation spans share one trace. Best-effort — a no-op
         when capture is disabled.
         """
-        invocation, roster_model = roster.apply_active(invocation)
         await self._network_preflight(invocation)
         with start_span(
             "cc.session",
@@ -952,7 +2941,7 @@ class CCInvoker:
             },
         ) as span:
             output = replace(
-                await self._run_inner(invocation),
+                await self._run_inner(invocation, admission),
                 roster_model=roster_model,
             )
             with contextlib.suppress(Exception):
@@ -1006,10 +2995,28 @@ class CCInvoker:
             logger.debug("login fallback check failed", exc_info=True)
         return env
 
-    async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
-        args = self._build_args(invocation)
+    async def _run_inner(
+        self, invocation: CCInvocation, admission: CheckoutAdmission | None = None
+    ) -> CCOutput:
+        if admission is None:
+            admission = await admit_launch()
+        try:
+            return await self._run_inner_with_admission(invocation, admission)
+        finally:
+            admission.release()
+
+    async def _run_inner_with_admission(
+        self, invocation: CCInvocation, admission: CheckoutAdmission
+    ) -> CCOutput:
+        # Off the event loop: the pins may prepare the gh seal (filesystem
+        # work behind a blocking lock) for a Bash-restricted profile.
+        pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
+        args = self._build_args(invocation, settings_pins=pins)
+        # Off the event loop: settings read, seal write, two probes.
+        await self.verify_allowlist_enforceable(invocation, settings_pins=pins)
         env = self._build_env(invocation)
         env = await self._apply_login_fallback(env, invocation)
+        env = self._launch_env(env, invocation)
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort
@@ -1043,6 +3050,7 @@ class CCInvoker:
                 # kill paths can killpg the whole claude tree.
                 start_new_session=True,
             )
+            admission.release()
             reg_key = invocation.session_key or f"pid:{proc.pid}"
             self._register_proc(reg_key, proc)
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
@@ -1136,6 +3144,7 @@ class CCInvoker:
             raise err
 
         output = self._parse_output(stdout.decode(errors="replace"), invocation, elapsed)
+        output = await self._with_cost_semantics(output)
         if _stderr_bg_truncated(stderr.decode(errors="replace")):
             output = replace(output, bg_truncated=True)
             logger.warning(
@@ -1146,7 +3155,12 @@ class CCInvoker:
             await _emit_bg_truncation_event(output.session_id)
         if output.is_error:
             error_text = output.error_message or output.text or "CC error"
-            err = self._classify_error(error_text)
+            # The structured result (status code, turn count) comes from the
+            # raw stdout; error_text is prose and is never parsed as JSON.
+            err = self._classify_error(
+                error_text + "\n" + stderr.decode(errors="replace"),
+                result=_cli_result_payload(stdout.decode(errors="replace")),
+            )
             await self._notify_status_change(err)
             raise err
 
@@ -1165,8 +3179,37 @@ class CCInvoker:
         invocation: CCInvocation,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
-        """Run CC with stream-json output (traced — see run() for span rationale)."""
-        invocation, roster_model = roster.apply_active(invocation)
+        """Run CC with stream-json output; emit-then-reraise on CCError (see run()).
+
+        In flight first, then checkout admission, then the roster read, as in run().
+        """
+        with inflight("claude", _inflight_label(invocation)):
+            admission = await admit_launch()
+            try:
+                invocation, roster_model = roster.apply_active(invocation)
+                try:
+                    return await self._run_streaming_traced(
+                        invocation, roster_model, on_event, admission
+                    )
+                except CCError as exc:
+                    await _emit_invocation_failed_event(
+                        exc,
+                        invocation,
+                        streaming=True,
+                        roster_model=roster_model,
+                    )
+                    raise
+            finally:
+                admission.release()
+
+    async def _run_streaming_traced(
+        self,
+        invocation: CCInvocation,
+        roster_model: str,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+        admission: CheckoutAdmission | None = None,
+    ) -> CCOutput:
+        """Run an already-roster-routed stream-json session (traced — see _run_traced)."""
         await self._network_preflight(invocation)
         with start_span(
             "cc.session",
@@ -1179,7 +3222,7 @@ class CCInvoker:
             },
         ) as span:
             output = replace(
-                await self._run_streaming_inner(invocation, on_event),
+                await self._run_streaming_inner(invocation, on_event, admission),
                 roster_model=roster_model,
             )
             with contextlib.suppress(Exception):
@@ -1195,9 +3238,28 @@ class CCInvoker:
         self,
         invocation: CCInvocation,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+        admission: CheckoutAdmission | None = None,
     ) -> CCOutput:
         """Run CC with stream-json output, calling on_event for each line."""
-        args = self._build_args(invocation)
+        if admission is None:
+            admission = await admit_launch()
+        try:
+            return await self._run_streaming_inner_with_admission(invocation, on_event, admission)
+        finally:
+            admission.release()
+
+    async def _run_streaming_inner_with_admission(
+        self,
+        invocation: CCInvocation,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None,
+        admission: CheckoutAdmission,
+    ) -> CCOutput:
+        # Off the event loop: the pins may prepare the gh seal (filesystem
+        # work behind a blocking lock) for a Bash-restricted profile.
+        pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
+        args = self._build_args(invocation, settings_pins=pins)
+        # Off the event loop: settings read, seal write, two probes.
+        await self.verify_allowlist_enforceable(invocation, settings_pins=pins)
         # Override output format to stream-json (requires --verbose with -p).
         # Target the --output-format value by its flag, not a bare args.index("json")
         # scan — other args (e.g. --settings .../cc-span-settings.json) can contain
@@ -1208,6 +3270,7 @@ class CCInvoker:
 
         env = self._build_env(invocation)
         env = await self._apply_login_fallback(env, invocation)
+        env = self._launch_env(env, invocation)
         start = time.monotonic()
 
         # Extract dispatched effort from args — may differ from invocation.effort
@@ -1240,6 +3303,7 @@ class CCInvoker:
                 # kill paths can killpg the whole claude tree.
                 start_new_session=True,
             )
+            admission.release()
         except FileNotFoundError:
             logger.error(
                 "Claude CLI not found at %r. Ensure @anthropic-ai/claude-code "
@@ -1542,8 +3606,7 @@ class CCInvoker:
             await asyncio.sleep(_ESCALATION_GRACE_S)
         if proc.returncode is None or process_group_alive(proc):
             logger.warning(
-                "CC streaming group survived graceful stop/kill "
-                "(PID %s, rc=%s) — group-killing",
+                "CC streaming group survived graceful stop/kill (PID %s, rc=%s) — group-killing",
                 proc.pid,
                 proc.returncode,
             )
@@ -1625,6 +3688,7 @@ class CCInvoker:
 
         if result_data is not None:
             output = self._parse_result_dict(result_data, invocation, elapsed)
+            output = await self._with_cost_semantics(output)
             # () is a real report ("the runtime watched and saw no tool_use"),
             # distinct from None ("nothing watched"). A `if tools_seen:` guard
             # here would silently downgrade the former to the latter on every
@@ -1679,7 +3743,9 @@ class CCInvoker:
             if output.is_error:
                 stderr_hint = stderr_data.decode(errors="replace") if stderr_data else ""
                 error_text = output.error_message or output.text or stderr_hint or "CC error"
-                err = self._classify_error(error_text)
+                # result_data is the CLI's own result event (structured status
+                # and turn count); error_text is prose, never parsed as JSON.
+                err = self._classify_error(error_text + "\n" + stderr_hint, result=result_data)
                 await self._notify_status_change(err)
                 if oversized_dropped:
                     raise _unreplayable_after_drop(
@@ -1745,8 +3811,7 @@ class CCInvoker:
             if oversized_dropped and not output.text.strip():
                 raise _unreplayable_after_drop(
                     oversized_dropped,
-                    "the result carried no text — the answer was almost "
-                    "certainly one of them",
+                    "the result carried no text — the answer was almost certainly one of them",
                 )
 
             # Success — notify recovery if previously errored
@@ -1794,8 +3859,7 @@ class CCInvoker:
         if oversized_dropped and result_data is None and not (bg_truncated and partial_text):
             raise _unreplayable_after_drop(
                 oversized_dropped,
-                "NO result event arrived — the result line was almost "
-                "certainly one of them",
+                "NO result event arrived — the result line was almost certainly one of them",
             )
 
         # No result event — treat collected text as response (success path)
@@ -1858,12 +3922,18 @@ class CCInvoker:
         """Build CCOutput from a parsed result dict."""
         usage = result_data.get("usage", {})
         model_usage = result_data.get("modelUsage", {})
-        # modelUsage lists EVERY model the session touched, including CC's
-        # auxiliary haiku calls (title/topic generation) — and dict order is
+        # modelUsage lists EVERY model the session touched, and dict order is
         # not tier order. Taking the first key false-positived downgrade
-        # detection whenever an auxiliary call was listed before the main
-        # model (observed 2026-07-09: {haiku, sonnet-5} on a sonnet session).
-        # The MAIN conversation model is the highest tier present.
+        # detection whenever another model was listed before the main one
+        # (observed 2026-07-09: {haiku, sonnet-5} on a sonnet session, where the
+        # haiku row was CC's auxiliary title/topic call). CC 2.1.277 dropped
+        # that auxiliary row from `-p` output (measured 2026-09-22), but the
+        # dict still carries SUBAGENT models — a sonnet session that spawns a
+        # haiku subagent lists both. Taking the highest tier is right for a
+        # FRESH call. It is NOT right for a RESUMED one on 2.1.277+: resume
+        # restores every earlier model's entry (measured 2026-09-26 across a
+        # haiku -> sonnet switch), so a higher tier used earlier in the session
+        # wins over this call's own model — issue #2391.
         model_name = (
             max(
                 model_usage,
@@ -1875,6 +3945,9 @@ class CCInvoker:
             if model_usage
             else str(inv.model)
         )
+        # `cost_is_cumulative` is NOT decided here: the result carries no signal
+        # for it (see _CC_CUMULATIVE_COST_SINCE), so the run paths stamp it from
+        # the CC version via _with_cost_semantics.
         downgraded = self._detect_downgrade(inv.model, model_name)
         if downgraded:
             logger.warning(
@@ -1915,18 +3988,7 @@ class CCInvoker:
             ...
         }
         """
-        result_data = None
-        for line in reversed(raw.strip().splitlines()):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-                if isinstance(parsed, dict) and parsed.get("type") == "result":
-                    result_data = parsed
-                    break
-            except json.JSONDecodeError:
-                continue
+        result_data = _cli_result_payload(raw)
 
         if result_data is not None:
             return self._parse_result_dict(result_data, inv, elapsed_ms)

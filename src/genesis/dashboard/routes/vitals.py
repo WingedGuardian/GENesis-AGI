@@ -12,8 +12,6 @@ from flask import jsonify
 
 from genesis.dashboard._blueprint import _async_route, blueprint
 from genesis.env import (
-    dashscope_api_key,
-    deepinfra_api_key,
     genesis_db_path,
     ollama_enabled,
     ollama_tags_url,
@@ -318,6 +316,13 @@ async def _build_sqlite_section(rt) -> dict:
     return section
 
 
+def _embedder_chain(embedder) -> list[str]:
+    """Backend names of a built EmbeddingProvider, in chain order."""
+    if embedder is None:
+        return []
+    return [b.name.removesuffix("_embedding") for b in embedder.backends]
+
+
 async def _build_embedding_section(rt) -> dict:
     """Embedding pipeline: per-backend stats, active model, dual chain order."""
     section: dict = {
@@ -326,23 +331,40 @@ async def _build_embedding_section(rt) -> dict:
         "error": None,
     }
 
-    section["active_model"] = os.environ.get(
-        "OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:0.6b-fp16",
-    )
+    # Read the chains the runtime ACTUALLY built, rather than re-deriving them
+    # from env. A hand-mirrored list desynced twice: it reported
+    # ["ollama", "deepinfra"] for a storage chain that had been flipped, and
+    # named the Ollama model as "active" while the cloud backend was writing.
+    storage_chain = _embedder_chain(getattr(rt, "_storage_embedder", None))
+    recall_chain = _embedder_chain(getattr(rt, "_recall_embedder", None))
+    storage_embedder = getattr(rt, "_storage_embedder", None)
+    lead = storage_embedder.backends[0] if storage_embedder and storage_embedder.backends else None
+    # `active_model` is the model that OBSERVABLY wrote the most recent storage
+    # vector in this process: during a cloud outage the fallback rung answers,
+    # and naming the first rung would show the cloud model while the local one
+    # writes. Before any write has happened there is nothing to observe, so it
+    # falls back to the configured primary and says so.
+    def _model_of(backend) -> str | None:
+        # Only a real string counts, so a mocked runtime never leaks a Mock.
+        model = getattr(backend, "_model", None) if backend is not None else None
+        return model if isinstance(model, str) else None
 
-    # Build both chain orderings from env config (mirrors EmbeddingProvider.build_chain)
-    ollama_names = ["ollama"] if ollama_enabled() else []
-    cloud_names = []
-    if deepinfra_api_key():
-        cloud_names.append("deepinfra")
-    if dashscope_api_key():
-        cloud_names.append("dashscope")
+    last = getattr(storage_embedder, "last_backend", None) if storage_embedder else None
+    observed_model = _model_of(last)
+    primary = _model_of(lead)
+    space = getattr(storage_embedder, "vector_space", None)
+    section["primary_model"] = primary
+    section["active_model"] = observed_model if observed_model is not None else primary
+    section["active_model_observed"] = observed_model is not None
+    section["vector_space"] = space if isinstance(space, str) else None
 
-    storage_chain = ollama_names + cloud_names  # writes: Ollama first
-    recall_chain = cloud_names + ollama_names    # reads: cloud first
+    def _label(embedder, chain: list[str]) -> list[str]:
+        if embedder is None:
+            return ["not initialized"]
+        return chain if chain else ["none configured"]
 
-    section["storage_chain"] = storage_chain if storage_chain else ["none configured"]
-    section["recall_chain"] = recall_chain if recall_chain else ["none configured"]
+    section["storage_chain"] = _label(storage_embedder, storage_chain)
+    section["recall_chain"] = _label(getattr(rt, "_recall_embedder", None), recall_chain)
     # Backward compat: keep chain_order as the storage chain
     section["chain_order"] = section["storage_chain"]
 

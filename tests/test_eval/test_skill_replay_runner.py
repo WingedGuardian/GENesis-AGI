@@ -21,6 +21,15 @@ from genesis.eval.skill_replay.types import (
     VERDICT_REGRESSION,
     SkillReplayConfig,
 )
+from genesis.util import run_lock
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_run_locks(tmp_path, monkeypatch):
+    """Keep the replay's run lock off the live ~/.genesis/locks and ~/tmp."""
+    monkeypatch.setattr(run_lock, "lock_dir", lambda: tmp_path / "run-locks")
+    monkeypatch.setattr(run_lock, "legacy_dir", lambda: tmp_path / "run-locks-legacy")
+
 
 _FIXTURE = Path(__file__).parent / "skill_golden_fixtures" / "voice_master_fixture.jsonl"
 _CFG = SkillReplayConfig(epsilon=0.05, min_pairs=3)

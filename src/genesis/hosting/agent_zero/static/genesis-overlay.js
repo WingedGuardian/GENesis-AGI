@@ -587,12 +587,22 @@ async function openGenesisTasksModal() {
 
 // ── Inbox Modal ─────────────────────────────────────────────────────
 
+const INBOX_FILTERS = ["all", "pending", "completed", "failed", "superseded"];
+
+/** URL for one inbox tab. A status tab asks the SERVER for that status, so a
+ *  newest-50 window full of other statuses can never empty it. */
+function inboxUrlForFilter(filter) {
+  const base = "/api/genesis/ui/inbox?limit=50";
+  return filter === "all" ? base : base + "&status=" + encodeURIComponent(filter);
+}
+
 async function openGenesisInboxModal() {
   const existing = document.getElementById("genesis-inbox-modal");
   if (existing) existing.remove();
 
-  const items = (await fetchJson("/api/genesis/ui/inbox?limit=50")) || [];
-  const filters = ["all", "pending", "completed", "failed"];
+  const items = (await fetchJson(inboxUrlForFilter("all"))) || [];
+  const filters = INBOX_FILTERS;
+  const rowsByFilter = { all: items };
 
   const overlay = el("div", "genesis-modal-overlay");
   overlay.id = "genesis-inbox-modal";
@@ -643,11 +653,24 @@ async function openGenesisInboxModal() {
   requestAnimationFrame(() => overlay.classList.add("visible"));
 
   let activeFilter = "all";
+  let renderSeq = 0;
 
-  function renderInbox() {
+  async function renderInbox() {
+    const seq = ++renderSeq;
+    const filter = activeFilter;
+    if (!(filter in rowsByFilter)) {
+      const rows = await fetchJson(inboxUrlForFilter(filter));
+      if (rows !== null) rowsByFilter[filter] = rows;
+      if (seq !== renderSeq) return; // a newer tab click owns the view
+      if (rows === null) {
+        resultsDiv.replaceChildren(
+          el("div", "genesis-mem-empty", "Could not load inbox items."),
+        );
+        return;
+      }
+    }
     resultsDiv.replaceChildren();
-    const filtered = activeFilter === "all" ? items
-      : items.filter((i) => i.status === activeFilter);
+    const filtered = rowsByFilter[filter];
 
     if (filtered.length === 0) {
       resultsDiv.appendChild(el("div", "genesis-mem-empty", "No inbox items found."));

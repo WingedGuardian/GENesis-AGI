@@ -12,13 +12,15 @@ import logging
 import os
 import random
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 from aiosqlite.context import Result
+
+from genesis.db._slow_log import timed
 
 # BUSY_TIMEOUT_MS moved to genesis.env (it is an env-tunable default; env.py
 # sits below this module in the import graph) — re-exported here for the many
@@ -29,6 +31,103 @@ from genesis.env import db_busy_timeout_ms, genesis_db_path
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = genesis_db_path()
+
+
+def connect_sqlite_rw(
+    path: str | Path = DEFAULT_DB_PATH, *args: Any, **kwargs: Any
+) -> sqlite3.Connection:
+    """Return a synchronous RW connection after enforcing DB admission.
+
+    Admission is QUARANTINE — "this artifact failed an integrity check". It
+    is deliberately not more than that: a maintenance fence was built and
+    removed before shipping (see :mod:`genesis.db.admission`), so nothing here
+    protects a database an operator is replacing. Do not write recovery
+    procedure against a guarantee this does not make.
+
+    The assertion takes the caller's spelling, before the ``.resolve()``
+    below, so the path checked is the path the caller named.
+    """
+    from genesis.db.admission import assert_admitted
+
+    admission_path = Path(path).expanduser()
+    assert_admitted(admission_path)
+    return sqlite3.connect(str(admission_path.resolve()), *args, **kwargs)
+
+
+class _GuardedAiosqliteConnector:
+    """Preserve aiosqlite's dual await/context API with open-time guards."""
+
+    def __init__(
+        self, db_path: Path, kwargs: dict[str, Any], admission_path: Path | None = None,
+        *, existing_only: bool = False,
+    ) -> None:
+        self._db_path = db_path
+        # The caller's ORIGINAL spelling, kept for admission checks only, so
+        # the path asserted is the path the caller named rather than whatever
+        # it resolves to.
+        self._admission_path = admission_path if admission_path is not None else db_path
+        self._kwargs = kwargs
+        self._existing_only = existing_only
+        self._connection: aiosqlite.Connection | None = None
+
+    async def _open(self) -> aiosqlite.Connection:
+        from genesis.db.admission import assert_admitted
+
+        # Construction and opening are separate for aiosqlite.  Re-check here
+        # so a connector retained before admission changed cannot open after.
+        assert_admitted(self._admission_path)
+        target = (
+            self._db_path.as_uri() + "?mode=rw"
+            if self._existing_only else str(self._db_path)
+        )
+        connection = await aiosqlite.connect(target, **self._kwargs)
+        try:
+            # Quarantine may have become active while the worker thread
+            # opened SQLite.  Never return that newly opened writable handle.
+            assert_admitted(self._admission_path)
+        except BaseException as open_error:
+            try:
+                await connection.close()
+            except BaseException as close_error:
+                open_error.add_note(f"connection cleanup failed: {close_error!r}")
+            raise
+        self._connection = connection
+        return connection
+
+    def __await__(self) -> Generator[Any, None, aiosqlite.Connection]:
+        return self._open().__await__()
+
+    async def __aenter__(self) -> aiosqlite.Connection:
+        return await self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self._connection is not None:
+            await self._connection.close()
+
+
+def connect_aiosqlite_rw(
+    path: str | Path = DEFAULT_DB_PATH, *, existing_only: bool = False, **kwargs: Any
+) -> _GuardedAiosqliteConnector:
+    """Return an awaitable/context-manager guarded through actual DB open.
+
+    The default remains create-capable. ``existing_only=True`` opens an encoded
+    file URI in SQLite's ``mode=rw`` so a missing database cannot be created,
+    while retaining the same pre/post-open quarantine checks. This option
+    requires URI handling; explicitly disabling it is an error.
+    """
+    from genesis.db.admission import assert_admitted
+
+    if existing_only:
+        if not kwargs.get("uri", True):
+            raise ValueError("existing_only requires uri=True")
+        kwargs["uri"] = True
+    admission_path = Path(path).expanduser()
+    assert_admitted(admission_path)
+    db_path = admission_path.resolve()
+    return _GuardedAiosqliteConnector(
+        db_path, kwargs, admission_path=admission_path, existing_only=existing_only,
+    )
+
 
 # Per-connection page cache. Negative = KiB (SQLite convention), so -262144 is
 # 256 MiB. SQLite's default is ~2 MiB, which forces hot read paths to keep
@@ -271,6 +370,10 @@ class SerializedConnection:
             "_reconnect_fn",
             "_consecutive_errors",
             "_max_errors",
+            "_db_path",
+            "_holder",
+            "_cancelled_holder",
+            "_inflight",
         }
     )
 
@@ -281,12 +384,22 @@ class SerializedConnection:
         conn: aiosqlite.Connection,
         *,
         reconnect_fn: Callable[[], Awaitable[aiosqlite.Connection]] | None = None,
+        db_path: Path | None = None,
     ) -> None:
         object.__setattr__(self, "_conn", conn)
         object.__setattr__(self, "_lock", asyncio.Lock())
         object.__setattr__(self, "_reconnect_fn", reconnect_fn)
         object.__setattr__(self, "_consecutive_errors", 0)
         object.__setattr__(self, "_max_errors", self._MAX_LOCK_ERRORS)
+        object.__setattr__(self, "_db_path", db_path)
+        # Slow-statement attribution (genesis.db._slow_log): the SQL holding the
+        # lock, the last one cancelled while holding it (its statement keeps
+        # running on the worker thread), and the cursor fetches in progress, in
+        # the order they were queued (one entry per fetch, removed by that fetch
+        # alone: fetches on different cursors overlap and finish in any order).
+        object.__setattr__(self, "_holder", None)
+        object.__setattr__(self, "_cancelled_holder", None)
+        object.__setattr__(self, "_inflight", {})
 
     # -- Attribute passthrough (e.g. row_factory, in_transaction) ----------
 
@@ -300,6 +413,35 @@ class SerializedConnection:
             setattr(self._conn, name, value)
 
     # -- Error tracking and recovery ----------------------------------------
+
+    @asynccontextmanager
+    async def _locked_timed(self, sql: str) -> AsyncIterator[None]:
+        """Hold ``self._lock`` for one operation, timing the wait and the run.
+
+        A slow operation is named in the log (``genesis.db._slow_log``) with
+        what it was most likely stuck behind: a cursor fetch still running on
+        the worker thread, else the lock holder when it started waiting, else a
+        statement cancelled while holding the lock (it keeps running after the
+        lock is released). ``sql`` is the statement text; parameters never
+        reach it."""
+        if self._inflight:
+            # aiosqlite runs one request queue, first in first out: the oldest
+            # fetch still in progress is the one ahead of this statement.
+            blocked_by = next(iter(self._inflight.values()))
+        elif self._lock.locked():
+            blocked_by = self._holder
+        else:
+            blocked_by = self._cancelled_holder
+        with timed(sql, blocked_by=blocked_by) as t:
+            async with self._lock:
+                t.acquired()
+                object.__setattr__(self, "_holder", sql)
+                object.__setattr__(self, "_cancelled_holder", None)
+                try:
+                    yield
+                except asyncio.CancelledError:
+                    object.__setattr__(self, "_cancelled_holder", sql)
+                    raise
 
     def _reset_error_count(self) -> None:
         object.__setattr__(self, "_consecutive_errors", 0)
@@ -365,6 +507,10 @@ class SerializedConnection:
         slept = 0.0
         for attempt in range(1, attempts + 1):
             try:
+                if self._db_path is not None:
+                    from genesis.db.integrity import assert_not_quarantined
+
+                    assert_not_quarantined(self._db_path)
                 result = await fn()
                 self._reset_error_count()
                 return result
@@ -402,10 +548,11 @@ class SerializedConnection:
         parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> aiosqlite.Cursor:
-            async with self._lock:
-                return await self._retry_locked(lambda: self._conn.execute(sql, parameters))
+            async with self._locked_timed(sql):
+                cursor = await self._retry_locked(lambda: self._conn.execute(sql, parameters))
+            return _TimedCursor(cursor, sql, self)  # type: ignore[return-value]
 
-        return Result(_locked())
+        return _CursorResult(_locked())
 
     def executemany(
         self,
@@ -417,7 +564,7 @@ class SerializedConnection:
             # consumed by a failed first attempt, so the retry would silently
             # execute zero/partial rows and "succeed".
             params = list(parameters)
-            async with self._lock:
+            async with self._locked_timed(sql):
                 return await self._retry_locked(lambda: self._conn.executemany(sql, params))
 
         return Result(_locked())
@@ -428,7 +575,7 @@ class SerializedConnection:
         parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> list[aiosqlite.Row]:
-            async with self._lock:
+            async with self._locked_timed(sql):
                 return await self._retry_locked(
                     lambda: self._conn.execute_fetchall(sql, parameters)
                 )
@@ -441,7 +588,7 @@ class SerializedConnection:
         parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> tuple | None:
-            async with self._lock:
+            async with self._locked_timed(sql):
                 return await self._retry_locked(lambda: self._conn.execute_insert(sql, parameters))
 
         return Result(_locked())
@@ -451,7 +598,11 @@ class SerializedConnection:
         # partially apply before the lock error, so re-running it is not
         # idempotent. Keeps the pre-retry behavior: count + re-raise.
         async def _locked() -> aiosqlite.Cursor:
-            async with self._lock:
+            async with self._locked_timed(sql):
+                if self._db_path is not None:
+                    from genesis.db.integrity import assert_not_quarantined
+
+                    assert_not_quarantined(self._db_path)
                 try:
                     result = await self._conn.executescript(sql)
                     self._reset_error_count()
@@ -466,7 +617,7 @@ class SerializedConnection:
     # -- Simple async operations -------------------------------------------
 
     async def commit(self) -> None:
-        async with self._lock:
+        async with self._locked_timed("COMMIT"):
             await self._retry_locked(lambda: self._conn.commit())
 
     async def rollback(self) -> None:
@@ -474,7 +625,7 @@ class SerializedConnection:
         # ROLLBACK that never lands leaves in_transaction=True permanently —
         # the exact wedge this class exists to prevent. Previously this path
         # had NO lock handling at all.
-        async with self._lock:
+        async with self._locked_timed("ROLLBACK"):
             await self._retry_locked(lambda: self._conn.rollback())
 
     async def close(self) -> None:
@@ -483,6 +634,10 @@ class SerializedConnection:
 
     async def cursor(self) -> aiosqlite.Cursor:
         async with self._lock:
+            if self._db_path is not None:
+                from genesis.db.integrity import assert_not_quarantined
+
+                assert_not_quarantined(self._db_path)
             return await self._conn.cursor()
 
     # -- Async iteration support (used by some callers) --------------------
@@ -511,6 +666,9 @@ async def get_db(
     deliberate, separate decision).
     """
     path = Path(path)
+    from genesis.db.admission import assert_admitted
+
+    assert_admitted(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     async def _configure(conn: aiosqlite.Connection) -> None:
@@ -535,11 +693,12 @@ async def get_db(
 
     # Build reconnect closure (SQLite-specific; replace for PostgreSQL)
     async def _reconnect() -> aiosqlite.Connection:
+        assert_admitted(path)
         conn = await aiosqlite.connect(str(path))
         await _configure(conn)
         return conn
 
-    return SerializedConnection(db, reconnect_fn=_reconnect)
+    return SerializedConnection(db, reconnect_fn=_reconnect, db_path=path)
 
 
 @asynccontextmanager
@@ -560,6 +719,9 @@ async def get_raw_db(
     shared across coroutines. Yields the connection and closes it on exit.
     """
     path = Path(path)
+    from genesis.db.admission import assert_admitted
+
+    assert_admitted(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(path))
     try:
@@ -597,7 +759,17 @@ async def open_ro_connection(
     Deliberately does NOT run ``journal_mode=WAL`` or ``synchronous`` — those
     need write access to the DB header and are no-ops (or raise
     ``SQLITE_READONLY`` on some builds) on a read-only handle.
+
+    Admission (quarantine) is enforced here like every other open-time
+    factory. Read-only is not a reason to skip it: a reader still opens the
+    file and its ``-wal``, still holds a descriptor on it, and still surfaces
+    rows from an artifact already judged untrustworthy. This was the one
+    connect site in
+    this module guarded by nothing at all.
     """
+    from genesis.db.admission import assert_admitted
+
+    assert_admitted(Path(path))
     uri = f"file:{Path(path)}?mode=ro"
     conn = await aiosqlite.connect(uri, uri=True)
     conn.row_factory = aiosqlite.Row
@@ -610,6 +782,80 @@ class ReadPoolClosed(Exception):
     """Raised by :meth:`ReadConnectionPool.acquire` when the pool is closed or
     was never opened. Callers treat it as "use the shared connection instead."
     """
+
+
+class _TimedCursor:
+    """The cursor ``SerializedConnection.execute`` hands back, with its row
+    fetches timed under the statement's SQL.
+
+    Rows are fetched AFTER ``execute`` returns and the lock is released, so for
+    a streaming read the fetch is where the work happens. Timing it names the
+    scan itself, and marks it in flight so a statement queued behind it on the
+    worker thread is attributed to it. Everything else, reads and writes of
+    attributes alike, passes through to the aiosqlite cursor.
+    """
+
+    __slots__ = ("_cursor", "_sql", "_owner")
+
+    def __init__(self, cursor: aiosqlite.Cursor, sql: str, owner: SerializedConnection) -> None:
+        object.__setattr__(self, "_cursor", cursor)
+        object.__setattr__(self, "_sql", sql)
+        object.__setattr__(self, "_owner", owner)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._cursor, name, value)  # e.g. row_factory, arraysize
+
+    async def _timed_fetch(self, fetch: Callable[..., Awaitable[Any]], *args: Any) -> Any:
+        owner = self._owner
+        token = object()  # this fetch's own entry; another cursor's may overlap it
+        with timed(self._sql) as t:
+            t.acquired()  # a fetch queues for no lock of ours: all of it is run time
+            owner._inflight[token] = self._sql
+            try:
+                return await fetch(*args)
+            except asyncio.CancelledError:
+                # Its fetch keeps running on the worker thread, like a cancelled
+                # statement: let the next statement name it.
+                object.__setattr__(owner, "_cancelled_holder", self._sql)
+                raise
+            finally:
+                owner._inflight.pop(token, None)
+
+    async def fetchone(self) -> Any:
+        return await self._timed_fetch(self._cursor.fetchone)
+
+    async def fetchmany(self, size: int | None = None) -> Any:
+        return await self._timed_fetch(self._cursor.fetchmany, size)
+
+    async def fetchall(self) -> Any:
+        return await self._timed_fetch(self._cursor.fetchall)
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        # aiosqlite's own iteration batch (64), not sqlite3's arraysize (1).
+        while rows := await self.fetchmany(self._cursor.iter_chunk_size):
+            for row in rows:
+                yield row
+
+    async def close(self) -> None:
+        await self._cursor.close()
+
+    async def __aenter__(self) -> _TimedCursor:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
+
+
+class _CursorResult(Result):
+    """``Result`` for ``execute``: aiosqlite's ``Result.__aexit__`` closes only a
+    real ``aiosqlite.Cursor`` (an isinstance check), so ``async with
+    db.execute(...)`` would leave a ``_TimedCursor`` open. This closes it."""
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self._obj.close()
 
 
 class ReadConnectionPool:

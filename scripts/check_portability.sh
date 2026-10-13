@@ -9,7 +9,7 @@
 # 203.0.113.0/24) — those are deliberately NOT flagged.
 #
 # Scope split with CI: this script owns NETWORK-ADDRESS portability;
-# the ci.yml "Portability scan" step owns paths (/home/<user>/genesis)
+# the CI class scan (scripts/ci/leak_scan.sh `class`) owns paths (/home/<user>/genesis)
 # and timezone literals with its own curated excludes. Don't re-add a
 # path pattern here — provisioning scripts (host-setup.sh, install.sh)
 # legitimately construct the standard /home/ubuntu container layout and
@@ -39,7 +39,7 @@ if [ "${1:-}" = "--warn" ]; then
     shift
 fi
 
-REPO_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+REPO_DIR="${1:-$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)}"
 
 patterns=(
   # RFC1918 IPv4 literals (any private address, not just known subnets)

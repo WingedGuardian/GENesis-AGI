@@ -3,6 +3,13 @@
 Writes are owned by ``scripts/update.sh`` (the deploy script records each run);
 this module provides read access through the CRUD layer so callers never issue
 raw SQL against ``genesis.db``.
+
+Both functions are FULL-ACTIVATION baselines: ``status = 'success'`` is the
+whole predicate, and rows carrying ``genesis-server-not-restarted`` in
+``degraded_subsystems`` deliberately still qualify — a not-restarted update
+moved the checkout, ran migrations, and redeployed the host Guardian. For the
+live-server fact on those rows, see
+``genesis.observability.deploy_record.row_facts``.
 """
 
 from __future__ import annotations

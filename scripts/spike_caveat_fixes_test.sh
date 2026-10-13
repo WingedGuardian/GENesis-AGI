@@ -31,7 +31,7 @@ PASS=0
 FAIL=0
 FAIL_DETAILS=()
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 WORKTREE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEST_ROOT=$(mktemp -d ~/tmp/phase6-caveat-XXXXXX)
@@ -58,6 +58,8 @@ mkdir -p "$REPO_A/scripts/hooks"
 cp "$WORKTREE_ROOT/scripts/hooks/sync-hooks.sh" "$REPO_A/scripts/hooks/sync-hooks.sh"
 cp "$WORKTREE_ROOT/scripts/hooks/post-commit" "$REPO_A/scripts/hooks/post-commit"
 cp "$WORKTREE_ROOT/scripts/hooks/emit_bugfix_audit.py" "$REPO_A/scripts/hooks/emit_bugfix_audit.py"
+# Colocated helper dependency — see HELPERS_TO_SYNC in sync-hooks.sh.
+cp "$WORKTREE_ROOT/scripts/hooks/db_admission_check.py" "$REPO_A/scripts/hooks/db_admission_check.py"
 chmod +x "$REPO_A/scripts/hooks/"*.sh "$REPO_A/scripts/hooks/"*.py
 
 cd "$REPO_A"

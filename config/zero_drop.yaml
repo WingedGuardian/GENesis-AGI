@@ -60,10 +60,14 @@ worktree_min_age_hours: 6
 # manufacture either an escalation or a clean board.
 escalation_k: 3
 
-# gh --limit for the PR-history join. MEASURED 2026-09-05: the whole repo
-# (1651 PRs) returned in one 6s call. n == limit records a loud limit_hit and
-# FREEZES the branch classes for that run rather than guessing at the tail.
-max_prs: 2000
+# gh --limit for the PR-history join. It is a ceiling, not a cost: gh pages
+# until the PRs run out, so a value far above the repository's size reads the
+# whole history in the same time (MEASURED 2026-10-01, 2044 PRs: 2000 took 8s
+# and truncated, 100000 took 9s and returned all of them). Keep it far above
+# the PR count. A cap the repository outgrows makes every read hit it, and
+# n == limit records a loud limit_hit and FREEZES the branch classes for that
+# run rather than guessing at the tail. That froze every sweep at 2000 (#2770).
+max_prs: 100000
 
 # Local ancestry probes per sweep. Each tests one branch tip against the head
 # SHA a merged/closed PR recorded, to answer "did that PR actually contain

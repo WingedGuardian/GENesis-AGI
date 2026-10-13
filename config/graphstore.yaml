@@ -22,6 +22,14 @@ enabled: true
 #              separately and is staged during the cutover; where it is already
 #              installed, `systemctl --user start genesis-falkordb`) and a
 #              projection built (`python -m genesis.memory.graphstore_project`).
+#              Once the engine is running, `genesis-graph-project.timer` keeps
+#              that projection current HOURLY on its own, so the first manual
+#              build is the only one you have to remember. The timer does not
+#              wait for this lever to move — it refreshes whenever the engine
+#              exists, so flipping to falkordb lands on a current graph rather
+#              than on whatever was last built by hand. An hour is a BOUND, not
+#              freshness-on-write: a burst of writes inside the hour can still
+#              leave the projection behind (issue #1641).
 #              Missing any of those, the facade falls back to networkx and logs
 #              loudly rather than answering empty — an empty answer would read
 #              as "no neighbours", and an unbuilt projection makes EVERY root

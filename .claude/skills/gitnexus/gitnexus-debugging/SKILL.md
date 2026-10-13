@@ -22,7 +22,7 @@ description: "Use when the user is debugging a bug, tracing an error, or asking 
 4. gitnexus_cypher({query: "MATCH path..."})                 → Custom traces if needed
 ```
 
-> If "Index is stale" → run `npx gitnexus analyze` in terminal.
+> If "Index is stale" → refresh through `scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` only from the main checkout; in a linked worktree, use Serena for live branch truth.
 
 ## Checklist
 

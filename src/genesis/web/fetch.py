@@ -17,13 +17,34 @@ _USER_AGENT = "Genesis/3.0 (research bot)"
 
 # Scrapling gives TLS fingerprint impersonation via curl_cffi —
 # requests appear as real Chrome, bypassing most anti-bot detection.
+# The fallback is to plain httpx, which works but loses the impersonation, so
+# an import failure is recorded and logged once rather than swallowed.
+# `scrapling.fetchers` imports browser-automation packages (playwright and
+# browserforge, among others) even for the plain AsyncFetcher, so a missing
+# piece used to degrade every fetch with no trace.
+_SCRAPLING_IMPORT_ERROR: ImportError | None = None
 try:
     from scrapling.fetchers import AsyncFetcher as _ScraplingFetcher
 
     _HAS_SCRAPLING = True
-except ImportError:
+except ImportError as _exc:
     _ScraplingFetcher = None  # type: ignore[misc,assignment]
     _HAS_SCRAPLING = False
+    _SCRAPLING_IMPORT_ERROR = _exc
+_scrapling_failure_logged = False
+
+
+def _log_scrapling_unavailable_once() -> None:
+    global _scrapling_failure_logged
+    if _HAS_SCRAPLING or _scrapling_failure_logged:
+        return
+    _scrapling_failure_logged = True
+    logger.warning(
+        "Scrapling is unavailable: its fetcher could not be imported, so web "
+        "fetches use plain httpx without TLS impersonation. Import error: %s",
+        _SCRAPLING_IMPORT_ERROR,
+        exc_info=_SCRAPLING_IMPORT_ERROR,
+    )
 
 
 class WebFetcher:
@@ -42,6 +63,7 @@ class WebFetcher:
         self._timeout_s = timeout_s
         self._client: httpx.AsyncClient | None = None
         self._max_chars = max_chars
+        _log_scrapling_unavailable_once()
 
     def _get_httpx_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -52,17 +74,27 @@ class WebFetcher:
             )
         return self._client
 
-    async def fetch(self, url: str, *, max_chars: int | None = None) -> FetchResult:
+    async def fetch(
+        self,
+        url: str,
+        *,
+        max_chars: int | None = None,
+        client: str | None = None,
+    ) -> FetchResult:
         """Fetch a URL and return cleaned text. Never raises."""
         limit = max_chars or self._max_chars
+        actual_client = "scrapling" if _HAS_SCRAPLING and client != "httpx" else "httpx"
 
-        if _HAS_SCRAPLING:
+        if actual_client == "scrapling":
             body, status_code, content_type, error = await self._fetch_scrapling(url)
         else:
             body, status_code, content_type, error = await self._fetch_httpx(url)
 
         if error:
-            return FetchResult(url=url, text="", status_code=status_code, error=error)
+            return FetchResult(
+                url=url, text="", status_code=status_code, error=error,
+                client=actual_client,
+            )
 
         is_html = (
             "text/html" in content_type
@@ -80,7 +112,7 @@ class WebFetcher:
         else:
             return FetchResult(
                 url=url, text="", status_code=status_code,
-                error=f"Unsupported content type: {content_type}",
+                error=f"Unsupported content type: {content_type}", client=actual_client,
             )
 
         truncated = len(text) > limit
@@ -92,7 +124,7 @@ class WebFetcher:
 
         return FetchResult(
             url=url, text=text, title=title,
-            status_code=status_code, truncated=truncated,
+            status_code=status_code, truncated=truncated, client=actual_client,
         )
 
     async def _fetch_scrapling(self, url: str) -> tuple[str, int, str, str | None]:
@@ -118,7 +150,7 @@ class WebFetcher:
         return body, resp.status, content_type, None
 
     async def _fetch_httpx(self, url: str) -> tuple[str, int, str, str | None]:
-        """Fetch via plain httpx (fallback when Scrapling not installed).
+        """Fetch via plain httpx (fallback when Scrapling's fetcher cannot be imported).
 
         Returns (body, status_code, content_type, error).
         """

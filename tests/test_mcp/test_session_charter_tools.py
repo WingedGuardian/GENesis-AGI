@@ -809,3 +809,61 @@ async def test_a_foreign_prefix_is_not_made_self_by_the_raw_check(
         res = await tools._impl_session_ledger_add(OTHER_SID[:8], "for the foreground session")
     assert "error" not in res, res
     assert res["session_id"] == OTHER_SID, res
+
+
+# --- session_address: the SendMessage name a session id answers to ---------
+
+
+@pytest.fixture
+def live_resolver(monkeypatch):
+    from genesis.session_awareness import peer_address as pa
+
+    def resolve_many(ids, **_k):
+        return {s: pa.Resolution(s, pa.OK, name="genesis-7f", pane="cc-2:@1.%1") for s in ids}
+
+    monkeypatch.setattr(pa, "resolve_many", resolve_many)
+
+
+async def test_session_address_expands_a_prefix_through_the_database(db, live_resolver):
+    await db.execute(
+        "INSERT INTO session_heartbeats (cc_session_id, updated_at) VALUES (?, ?)",
+        (SID, "2026-01-01T00:00:00+00:00"),
+    )
+    await db.commit()
+    with patch.object(tools, "_get_db", return_value=db):
+        res = await tools._impl_session_address([SID[:8]])
+    (row,) = res["results"]
+    assert (row["session_id"], row["status"], row["name"]) == (SID, "ok", "genesis-7f")
+    assert row["display"] == "-> genesis-7f (cc-2:@1.%1)"
+
+
+async def test_session_address_needs_no_database_for_a_full_id(live_resolver):
+    """Unlike the charter tools: the database only expands a prefix."""
+    with patch.object(tools, "_get_db", return_value=None):
+        res = await tools._impl_session_address([SID, "abc"])
+    by_query = {r["query"]: r for r in res["results"]}
+    assert by_query[SID]["status"] == "ok"
+    assert by_query["abc"]["status"] == "unresolved-prefix"
+
+
+async def test_session_address_rejects_an_empty_request():
+    assert "error" in await tools._impl_session_address([])
+    assert "error" in await tools._impl_session_address(["  "])
+
+
+async def test_session_address_reports_a_resolver_failure(monkeypatch):
+    from genesis.session_awareness import peer_address as pa
+
+    def boom(*_a, **_k):
+        raise RuntimeError("registry exploded")
+
+    monkeypatch.setattr(pa, "resolve_many", boom)
+    with patch.object(tools, "_get_db", return_value=None):
+        res = await tools._impl_session_address([SID])
+    assert "registry exploded" in res["error"]
+
+
+async def test_session_address_is_a_registered_tool():
+    from genesis.mcp.health import mcp
+
+    assert "session_address" in await mcp.get_tools()

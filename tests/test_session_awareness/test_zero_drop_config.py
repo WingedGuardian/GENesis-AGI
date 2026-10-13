@@ -59,6 +59,15 @@ def test_damaged_int_knob_falls_back_rather_than_zeroing_a_limit(bad):
     assert cfg_mod.knob_int({"max_prs": bad}, "max_prs") == cfg_mod.DEFAULTS["max_prs"]
 
 
+def test_the_pr_history_ceiling_is_far_above_any_plausible_repo_size():
+    """max_prs is gh's --limit for the FULL PR history, and a read that fills it
+    freezes the branch classes. A ceiling the repository can outgrow therefore
+    turns the detector off once it does: 2000 against 2044 PRs froze every
+    sweep (#2770). gh pages until the PRs run out, so a high ceiling costs
+    nothing (measured: --limit 100000 read 2044 PRs in 9s, --limit 2000 in 8s)."""
+    assert cfg_mod.DEFAULTS["max_prs"] >= 50_000
+
+
 def test_int_knob_accepts_a_real_override():
     assert cfg_mod.knob_int({"escalation_k": 5}, "escalation_k") == 5
 

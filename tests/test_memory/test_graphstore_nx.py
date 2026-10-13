@@ -176,6 +176,39 @@ async def test_networkx_store_satisfies_the_seam():
     for member in ("name", "traverse", "centrality", "invalidate"):
         assert hasattr(store, member), f"GraphStore contract member missing: {member}"
     assert isinstance(store.name, str) and store.name
+    _assert_accepts_visibility_choice(store)
+
+
+def _assert_accepts_visibility_choice(store) -> None:
+    """A member EXISTING is not that member ACCEPTING the facade's call.
+
+    ``hasattr(store, "traverse")`` is satisfied by a store carrying the
+    pre-#1896 signature, and ``memory/graph.py`` now passes ``include_deprecated``
+    UNCONDITIONALLY. Such a store raises ``TypeError``, which is not
+    ``GraphUnavailableError`` — so it bypasses the facade's entire degrade chain
+    (no NetworkX tier, no CTE fallback, no warning) and lands in the bare
+    ``except Exception`` at ``mcp/memory/core.py``, which appends the memory with
+    NO ``graph_neighbors``. That is indistinguishable from "this memory has no
+    neighbours", i.e. the exact symptom #1896 exists to fix, produced by the
+    fix's own plumbing.
+
+    So the assertion binds the KIND, not the presence: the parameter must exist
+    AND default to False, because the default is what every existing caller
+    relies on. Shared by both stores' conformance tests so a third backend
+    cannot satisfy one and not the other.
+    """
+    import inspect
+
+    params = inspect.signature(store.traverse).parameters
+    assert "include_deprecated" in params, (
+        "GraphStore.traverse must accept the caller's visibility choice — "
+        "memory/graph.py passes include_deprecated unconditionally, and a store "
+        "without it raises TypeError, which the facade does not catch"
+    )
+    assert params["include_deprecated"].default is False, (
+        "include_deprecated must default to False, or every existing caller "
+        "silently starts traversing memories recall hides"
+    )
 
 
 async def test_the_facade_re_exports_the_seam_error_type_itself_not_a_copy():

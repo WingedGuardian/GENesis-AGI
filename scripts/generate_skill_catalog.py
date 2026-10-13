@@ -69,13 +69,21 @@ CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
 _MAX_FRONTMATTER_CHARS = 65_536
 
 
+# The instruction-file names a skill directory may use, in precedence order.
+# Module-level so consumers can IMPORT it instead of restating it: a second
+# hand-written copy is how a future fourth spelling gets handled in one place
+# and silently missed in the other (export_agents_md.py publishes these names
+# into AGENTS.md, where a wrong one is a path an external client cannot open).
+SKILL_MARKERS = ("SKILL.md", "skill.md", "README.md")
+
+
 def _extract_skill_info(skill_dir: Path) -> dict | None:
     """Extract name and description from a skill directory.
 
     Looks for SKILL.md with YAML frontmatter, or any .md file with a
     name/description pattern.
     """
-    for md_name in ("SKILL.md", "skill.md", "README.md"):
+    for md_name in SKILL_MARKERS:
         md_file = skill_dir / md_name
         if md_file.exists():
             try:
@@ -207,18 +215,52 @@ def _parse_frontmatter_legacy(content: str, fallback_name: str = "") -> dict:
     return {"name": name, "description": description, "keywords": keywords}
 
 
-# A directory without its own SKILL.md may be a container of real skills
+# SELF markers: the files that make a directory a skill IN ITS OWN RIGHT.
+# Deliberately NARROWER than SKILL_MARKERS, which is the broader set of files
+# that may DESCRIBE a skill. README.md is in the second set and not this one:
+# a container of skills legitimately carries a README about the collection,
+# and a plugin repo's docs/ or hooks/ directory may carry one too, so treating
+# it as a self-marker would turn support directories into phantom skills.
+_SELF_MARKERS = ("SKILL.md", "skill.md")
+
+# A directory without a self-marker may be a container of real skills
 # (e.g. gitnexus/<skill>/SKILL.md, or a plugin repo laid out as
-# <plugin>/skills/<skill>/SKILL.md). These fixed-depth globs detect that.
-_NESTED_SKILL_GLOBS = ("*/SKILL.md", "skills/*/SKILL.md", "*/skills/*/SKILL.md")
+# <plugin>/skills/<skill>/SKILL.md). These fixed-depth shapes detect that.
+#
+# DERIVED from _SELF_MARKERS rather than spelled out, because this glob and
+# _has_own_skill_md answer the SAME question from opposite sides — "is the
+# child a skill?" — and they disagreed: the glob matched only uppercase
+# SKILL.md while _has_own_skill_md also accepted skill.md. A skill defined by
+# skill.md below a container was therefore discovered as the CONTAINER,
+# emitted with an empty marker, and aborted the whole AGENTS export at the
+# render guard. One source, so the next spelling added cannot desynchronise
+# them again.
+_NESTED_SKILL_SHAPES = ("*/{m}", "skills/*/{m}", "*/skills/*/{m}")
+_NESTED_SKILL_GLOBS = tuple(
+    shape.format(m=marker) for shape in _NESTED_SKILL_SHAPES for marker in _SELF_MARKERS
+)
 # Recursion cap: tier dir = depth 0; deepest known layout is
 # skill-library/<vendor>/<plugin>/skills/<skill>/SKILL.md (depth 3).
 _MAX_SCAN_DEPTH = 3
 
 
 def _has_own_skill_md(entry: Path) -> bool:
-    """True if the directory is itself a skill (has a SKILL.md marker)."""
-    return (entry / "SKILL.md").exists() or (entry / "skill.md").exists()
+    """True if the directory is ITSELF a skill (has a SKILL.md/skill.md marker).
+
+    Deliberately NARROWER than SKILL_MARKERS: README.md is excluded, because a
+    CONTAINER of skills legitimately carries a README describing the
+    collection, and counting it here would make that container look like a
+    skill and shadow everything nested below it
+    (test_scan_tier_container_readme_does_not_shadow_nested_skills pins this).
+
+    README.md still reaches _extract_skill_info as a last-resort source for a
+    LEAF directory, and still appears in the nested globs above, so a skill
+    defined only by a README is discovered under its own name rather than
+    collapsing into its parent. The asymmetry is the point: "does this
+    directory define a skill?" and "can this file describe one?" are different
+    questions, and only the second admits README.md.
+    """
+    return any((entry / marker).is_file() for marker in _SELF_MARKERS)
 
 
 def _has_nested_skills(entry: Path) -> bool:

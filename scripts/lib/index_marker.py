@@ -167,8 +167,23 @@ def _valid_queue_data(data: object) -> bool:
     return _normalize_queue_data(data) is not None
 
 
+# SQLITE_BUSY=5 / SQLITE_LOCKED=6 — spelled out because the sqlite3 module
+# only grew named constants (and exceptions grew sqlite_errorcode) in 3.11;
+# the runner invokes this with the SYSTEM python, which can be older.
+_BUSY_ERRCODES = {
+    getattr(sqlite3, "SQLITE_BUSY", 5),
+    getattr(sqlite3, "SQLITE_LOCKED", 6),
+}
+
+
 def _is_busy(exc: sqlite3.OperationalError) -> bool:
-    return getattr(exc, "sqlite_errorcode", None) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return code in _BUSY_ERRCODES
+    # Python < 3.11: no sqlite_errorcode — fall back to the driver message
+    # ("database is locked", "database table is locked", "database is busy").
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
 
 
 def _initialize(db: sqlite3.Connection) -> None:

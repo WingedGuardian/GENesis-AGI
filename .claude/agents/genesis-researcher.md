@@ -22,7 +22,7 @@ When searching for repos, libraries, or implementation patterns on GitHub:
 
 - **`gh search repos "query" --limit 10`** — Find repos by topic/description. Via Bash.
 - **`gh search code "query" --limit 10`** — Search code across all public repos. Via Bash.
-- **`web_fetch("https://grep.app/search?q=QUERY")`** — Semantic code search across GitHub. Better than GitHub native search for finding implementation patterns.
+- **`searchGitHub`** (the `grep-app` MCP server, `https://mcp.grep.app`, no API key) — LITERAL/regex code search over ~1M public repos. Query with real code (`useState(`, `def handle_`, `(?s)try {.*await`), never keywords or a question; it greps, it does not embed. Filter by `language`, `repo`, `path`; modify with `useRegexp`, `matchCase`, `matchWholeWords`. **Foreground sessions only** — a background research session gets health/memory/recon and nothing else, and `Bash` is denied to it as well (`PROFILES["research"]`), so the `gh` fallbacks above are unavailable there too. **There is no exact-code search in a background session, and no substitute for one**: `recon_github_search` finds repositories and issues, never code (`kind` accepts only `repositories`/`issues`), and `web_search` is semantic. Do the code search from a foreground session, or hand the session a concrete question its own tools can answer. Issue #2329 tracks exposing this as a Genesis-owned recon tool, which is what would close the gap.
 - **`gh api search/repositories?q=QUERY`** — Structured JSON results. Via Bash.
 
 **When to use:** Any time the prompt asks to "search GitHub," "find repos," "look for libraries," or "how do other projects handle X." These are FAR more targeted than web search for code discovery.
@@ -46,7 +46,8 @@ When searching for repos, libraries, or implementation patterns on GitHub:
 | Fetch failed on anti-bot/paywall/JS | `web_fetch(url, backend="firecrawl")` (paid, last resort) |
 | Search the internet | `web_search(query)` |
 | Search GitHub repos | `gh search repos "query"` via Bash |
-| Search GitHub code | `gh search code "query"` or grep.app via `web_fetch` |
+| Search GitHub code (exact pattern) | `gh search code "query"` or `searchGitHub` (`grep-app`) — both foreground-only; no background equivalent exists |
+| Search GitHub code (concept, no pattern) | `web_search(query, backend="exa")` |
 | Find a function/class | CBM `search_graph` or Serena `find_symbol` |
 | Who calls this? | Serena `find_referencing_symbols` |
 | Call chain trace | CBM `trace_path` |
@@ -57,3 +58,25 @@ When searching for repos, libraries, or implementation patterns on GitHub:
 
 - Follow the evidence, verification, depth, and output rules in `web-research`.
 - For code discovery, prefer CBM/Serena over raw text search when those tools are available.
+
+<!-- scratch-rule -->
+## Scratch files
+
+If your task has you create scratch files (repro scripts, fixtures, test runs,
+downloads; not files the task asks you to write), put them in ONE directory you
+make for this run: `mkdir -p ~/tmp && mktemp -d -p ~/tmp genesis-researcher-XXXX`. Note the
+absolute path it prints and reuse that literal path: shell variables do not carry
+over between calls. Pass it explicitly every time (`mktemp -p <dir>`,
+`tempfile.mkdtemp(dir=<dir>)`, `pytest --basetemp <dir>/pt`) and never rely on
+the default temp location. That is usually Claude Code's working temp, which
+every session on the machine shares, and filling it, with bytes or with many
+small files, breaks all of them at once. This overrides any harness-provided
+"scratchpad directory": it lives on that same shared temp, so keep it for small
+notes only.
+
+- Never export or persistently change `TMPDIR`. When code you run (not your own)
+  uses the default temp location, prefix that one command: `TMPDIR=<dir> <cmd>`.
+- A reproduction that creates many files or large files (load, fuzzing, DoS,
+  "N files" cases) caps the count and size, and stays inside that directory.
+- Remove the directory when you finish, unless the caller needs its contents;
+  then give its path in your report.

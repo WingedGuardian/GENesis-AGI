@@ -29,10 +29,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
 
 # Command-line markers (unique real statements, not comment prose).
-FETCH = 'git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main'
+# The fetch is an explicit refspec continued onto the next line; the merge takes
+# the head pinned from that fetch (see test_update_activation.py).
+FETCH = 'git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" \\'
 STOP = "--- Stopping services for update ---"
 TRAP = "\ntrap _on_err ERR"
-MERGE = 'git -C "$GENESIS_ROOT" merge "$UPDATE_REMOTE/main" --no-edit'
+MERGE = 'git -C "$GENESIS_ROOT" merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit'
 RESTART = "--- Restarting services ---"
 REFRESH = "--- Refreshing Network Identity in ~/.claude/CLAUDE.md ---"
 DONE = '\n_write_state "done"'
@@ -72,6 +74,28 @@ def test_fetch_before_stop_before_trap_before_merge(text):
     )
 
 
+def test_checkout_lock_covers_premerge_clears_and_merge(text):
+    call = _idx(text, "_checkout_unmoved_or_roll_back\n# END checkout-unmoved")
+    acquire = text.index('if ! genesis_checkout_lock "$GENESIS_ROOT"; then', call)
+    clear = text.index('checkout HEAD -- "$SETTINGS_LOCAL"', acquire)
+    verify = _idx(
+        text,
+        'if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD',
+    )
+    release = text.index("genesis_checkout_unlock", verify)
+    new_tag = text.index("NEW_TAG=", verify)
+    assert acquire < clear < verify < release < new_tag
+
+
+def test_rollback_takes_checkout_lock_after_stopping_bridge_and_unlocks_before_restart(text):
+    stop = _idx(text, "systemctl --user stop genesis-bridge")
+    skip = text.index('if [ "${_CHECKOUT_LOCK_BUSY:-0}" != "1" ]; then', stop)
+    acquire = text.index('genesis_checkout_lock "$GENESIS_ROOT"', stop)
+    release = text.index("genesis_checkout_unlock", acquire)
+    restart = text.index('if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then', acquire)
+    assert stop < skip < acquire < release < restart
+
+
 def test_rollback_tag_created_before_trap(text):
     assert _idx(text, ROLLBACK_TAG) < _idx(text, TRAP)
 
@@ -92,8 +116,11 @@ def test_pre_stop_fetch_is_post_merge_gated(text):
     """The hoisted fetch must be inside an ``if [[ "$POST_MERGE" == "false" ]]``
     so the --post-merge CC-conflict re-entry (code already merged) skips it."""
     f = _idx(text, FETCH)
-    preamble = text[max(0, f - 300) : f]
-    assert '[[ "$POST_MERGE" == "false" ]]' in preamble, "pre-stop fetch must be POST_MERGE-gated"
+    # The nearest gate opener before the fetch, with no column-0 `fi` closing it
+    # in between: the fetch sits INSIDE that block, however long the comments.
+    gate = text.rfind('if [[ "$POST_MERGE" == "false" ]]; then', 0, f)
+    assert gate != -1, "pre-stop fetch must be POST_MERGE-gated"
+    assert "\nfi\n" not in text[gate:f], "the POST_MERGE gate closes before the fetch"
 
 
 def test_fetch_failure_cleans_up_and_exits_without_rollback(text):

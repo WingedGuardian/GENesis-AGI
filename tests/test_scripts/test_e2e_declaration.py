@@ -64,6 +64,13 @@ def test_the_two_scanners_agree_on_marker_visibility(e2e):
         "<!--\nE2E: hidden in a comment\n-->\nreal text\n",
         "```\nE2E: inside a fence\n```\n",
         "intro\n<!-- unterminated\nE2E: after an open comment\n",
+        # Issue #2773 — both scanners fixed together: a ```` fence does not end
+        # at an inner ```, and NEL/LS/PS do not split a rendered line.
+        "````\n```\nE2E: inside a longer fence\n```\n````\n",
+        "prose\x85E2E: joined by NEL\n",
+        "prose\u2028E2E: joined by a line separator\n",
+        # Devin Review on #2777 — a closer may carry no trailing text.
+        "````\n````python\nE2E: inside a mis-marked fence\n````\n",
     ]
     for body in bodies:
         shared = e2e.readable_body(body)
@@ -365,3 +372,50 @@ def test_guidance_names_both_forms_and_the_seam(e2e):
     g = e2e.GUIDANCE
     assert "E2E: <one-line plan" in g and "E2E: none —" in g
     assert "validator" in g.lower()
+
+
+# ── keep_blank (issue #2786) ─────────────────────────────────────────────────
+
+_KEEP_BLANK_BODIES = [
+    ("a\n\nb", "a\n\nb"),
+    ("a\n   \nb", "a\n\nb"),
+    ("a\n```\nx\n```\nb", "a\nb"),
+    ("a\n<!--x-->\nb", "a\nb"),
+    ("a\n<!--\nx\n-->\nb", "a\nb"),
+    ("a\n<!-- c -->\n\nb", "a\n\nb"),
+    ("a\n<!-- open\n\nstill\nb", "a"),
+    # CommonMark 0.31.2 "Characters and lines": blank = empty or only U+0020 /
+    # U+0009, and CR / CRLF are line endings, so these are boundaries...
+    ("a\n \t \nb", "a\n\nb"),
+    ("a\r\n\r\nb", "a\n\nb"),
+    # ...and these are not: other Unicode whitespace leaves no boundary.
+    ("a\n \nb", "a\nb"),
+    ("a\n\x0c\nb", "a\nb"),
+    ("a\n\x0b\nb", "a\nb"),
+    ("a\n \nb", "a\nb"),
+]
+
+
+def test_keep_blank_agrees_across_both_scanners(e2e):
+    """Shared scanner and local fallback must give identical keep_blank output on
+    every case — the whole point of sharing the scanner is that the two cannot
+    disagree about what is visible."""
+    for body, want in _KEEP_BLANK_BODIES:
+        assert e2e._local_readable_body(body, keep_blank=True) == want, body
+        shared = e2e._load_sibling_readable_body()
+        assert shared is not None
+        assert shared(body, keep_blank=True) == want, body
+
+
+def test_wrapper_forwards_keep_blank_to_the_shared_scanner(e2e):
+    for body, want in _KEEP_BLANK_BODIES:
+        assert e2e.readable_body(body, keep_blank=True) == want, body
+
+
+def test_wrapper_forwards_keep_blank_to_the_fallback(e2e, monkeypatch):
+    """Same result when the sibling cannot load: patch the loader to None and the
+    wrapper must still honour keep_blank identically."""
+    monkeypatch.setattr(e2e, "_load_sibling_readable_body", lambda: None)
+    for body, want in _KEEP_BLANK_BODIES:
+        assert e2e.readable_body(body, keep_blank=True) == want, body
+    assert e2e.readable_body("a\n\nb") == "a\nb"

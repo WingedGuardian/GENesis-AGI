@@ -359,17 +359,23 @@ def _disk_reclaim_command() -> list[str]:
     """Build the reactive disk-reclaim command (absolute, venv-python).
 
     Runs from the genesis-server context (has passwordless sudo), so --system
-    also clears /var (apt/journald). ``--if-above 90`` gates the reindex-heavy
-    MEDIUM tier; the CHEAP tier (regenerable package caches) always clears.
+    also clears /var (apt/journald). ``--if-above 90`` gates the MEDIUM tier,
+    which holds no targets today; the CHEAP tier (regenerable package caches)
+    always clears.
     ``--fail-above 90`` makes the script exit non-zero if the disk is still
     critical afterwards, so the registry escalates via max_attempts.
+    ``--last-resort-above 101`` keeps the code-intel index DBs out of this
+    path at every disk level: deleting them forces full re-index storms, and
+    that call belongs only to the disk guardian's RED pass (#2567). Passed
+    explicitly rather than relying on the script's default.
     """
     from genesis.env import repo_root
 
     script = repo_root() / "scripts" / "disk_reclaim.py"
     return [
         sys.executable, str(script),
-        "--apply", "--if-above", "90", "--fail-above", "90", "--system",
+        "--apply", "--if-above", "90", "--fail-above", "90",
+        "--last-resort-above", "101", "--system",
     ]
 
 
@@ -421,13 +427,12 @@ DEFAULT_REMEDIATIONS: list[RemediationAction] = [
         name="disk_cleanup",
         probe_name="disk",
         condition=(
-            "Disk DEGRADED (>=85%): clear regenerable caches + /var. "
-            "At >=90% also clears reindex-heavy caches (CBM/GitNexus). "
-            "Escalates if still >=90% after cleanup."
+            "Disk DEGRADED (>=85%): clear regenerable package caches + /var. "
+            "Never clears the code-intel indexes (the disk guardian's RED "
+            "pass does that). Escalates if still >=90% after cleanup."
         ),
-        # L2 auto-run: deletes ONLY regenerable caches (package caches,
-        # reindexable graph caches) + journald/apt vacuum. Self-gated by
-        # --if-above so the expensive tier only clears under real pressure.
+        # L2 auto-run: deletes ONLY regenerable package caches + journald/apt
+        # vacuum. The code-intel index DBs are pinned out (#2567).
         command=_disk_reclaim_command(),
         governance_level=2,
         reversible=True,

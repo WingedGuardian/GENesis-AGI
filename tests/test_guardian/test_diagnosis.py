@@ -498,7 +498,8 @@ class TestCCSubprocessTreeKill:
     it. Same for the `claude auth status` pre-flight probe."""
 
     @pytest.mark.asyncio
-    async def test_diagnosis_timeout_group_kills(self, tmp_path, monkeypatch) -> None:
+    @pytest.mark.parametrize("resolved", [None, {"CLAUDE_CODE_OAUTH_TOKEN": "tok"}])
+    async def test_diagnosis_timeout_group_kills(self, tmp_path, monkeypatch, resolved) -> None:
         import asyncio as _asyncio
         from unittest.mock import AsyncMock, MagicMock
 
@@ -525,8 +526,9 @@ class TestCCSubprocessTreeKill:
         # to the inherit-env default so the test reaches the diagnosis spawn.
         monkeypatch.setattr(
             "genesis.guardian.diagnosis.DiagnosisEngine._resolve_cc_env",
-            AsyncMock(return_value=None),
+            AsyncMock(return_value=resolved),
         )
+        monkeypatch.setenv("CLAUDE_CODE_ENABLE_FUNCTION_HOOKS", "1")
 
         captured: dict = {}
         proc = MagicMock()
@@ -551,6 +553,11 @@ class TestCCSubprocessTreeKill:
         assert killpg_calls[0][0] == 55555
         assert captured.get("start_new_session") is True
         assert "preexec_fn" not in captured
+        # The recovery brain is a dispatched session: function hooks off whether
+        # the env is inherited or carries the fallback token (genesis.cc.child_env).
+        assert captured["env"]["CLAUDE_CODE_ENABLE_FUNCTION_HOOKS"] == "0"
+        if resolved:
+            assert captured["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "tok"
 
     @pytest.mark.asyncio
     async def test_auth_probe_timeout_group_kills(self, tmp_path, monkeypatch) -> None:

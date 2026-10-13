@@ -1,0 +1,1 @@
+- Let capped GitNexus refreshes run on cache-heavy systems by excluding reclaimable file-page cache from memory admission while retaining sibling and cache reserves.

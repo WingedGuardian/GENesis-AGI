@@ -74,7 +74,12 @@ enforces ONLY when the merge targets the configured PUBLIC repo — the declared
 ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``
 (``_scheduled_gate_applies`` / ``_canonical_public_repo``). A merge to any OTHER repo
 (a private fork, the voice repo, backups) no-ops, since the required ``/schedule``
-routines run only on the public repo. Deployment note: on the public repo the leaks
+routines run only on the public repo. One per-PR exception: an OUTSIDE contribution
+(a human non-maintainer's fork PR whose every commit and title rename is theirs, whose
+body only they or a named review app edited, and whose CI leak-detector is green at head;
+``_outside_contribution``) needs no ``leaks`` marker, since the review guards the
+owner's private data and an outsider's text cannot hold it -- unless a leaks review ran
+in the PR and objected. Deployment note: on the public repo the leaks
 routine IS configured (the deploy precondition); a clone that runs on its own public
 repo without a producer uses `# scheduled-review-override` — since the only default kind
 is the irreducible one, config cannot relax it, and the override valve is the escape by
@@ -109,6 +114,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -140,20 +146,141 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
         pass
     os._exit(2)
 
+try:
+    from native_approval import emit_native_ask  # noqa: E402
+except Exception as _approval_exc:  # noqa: BLE001 — missing new helper must block.
+    if __name__ != "__main__" or sys.argv[1:2] == ["--check-pr"]:
+        raise
+    try:
+        sys.stderr.write(
+            "GUARD DEGRADED (git_push_guard): native approval helper is incompatible; "
+            "BLOCKING until the hook tree is repaired.\n"
+        )
+        sys.stderr.flush()
+    except BaseException:
+        pass
+    os._exit(2)
+
+# The install-local ask policy (`hooks.asks.push_publish`). SOFT, and the fallback
+# is the prompt: a missing or older policy module means "nothing declared", which
+# is the public default, so version skew costs an extra prompt, never a silence.
+try:
+    from hook_ask_policy import ask_suppressed as _ask_suppressed  # noqa: E402
+    from hook_ask_policy import drain_notes as _drain_ask_notes  # noqa: E402
+    from hook_ask_policy import suppressed_reason as _suppressed_reason  # noqa: E402
+except Exception:  # noqa: BLE001 — skew falls back to ASKING.
+    def _ask_suppressed(key: str) -> bool:  # type: ignore[misc]
+        return False
+
+    def _drain_ask_notes() -> str:  # type: ignore[misc]
+        return ""
+
+    def _suppressed_reason(key: str, detail: str = "") -> str:  # type: ignore[misc]
+        return ""
+
+# The primary reviewer, the known review formats and the per-reviewer severity
+# parsers live in a stdlib sibling so every gate reads the SAME definitions, and
+# so the round counter can read findings with the same code this gate scores them
+# with. Only the MERGE gate needs them, so a missing or broken module (including a
+# registry edit that fails its import-time validation) must not take down every
+# push and git command this guard sees. It degrades to stubs that fail closed
+# where they are read: each findings scanner and freshness block, naming the
+# error; no primary reviewer is known, so no review is fresh; no substitute is
+# offered; and a parser raises, which `run_guard` turns into a block.
+_REVIEW_FINDINGS_ERROR: str | None = None
+try:
+    from review_findings import (  # noqa: E402
+        CR_SEVERITIES as _CR_SEVERITIES,
+    )
+    from review_findings import (
+        INLINE_P1_RE as _INLINE_P1_RE,
+    )
+    from review_findings import (
+        INLINE_P2_RE as _INLINE_P2_RE,
+    )
+    from review_findings import (
+        cr_header_fields as _cr_header_fields,
+    )
+    from review_findings import (
+        cr_severity as _cr_severity,
+    )
+    from review_findings import (
+        devin_finding as _devin_finding,
+    )
+    from review_findings import (
+        enforced_logins,
+        is_substitute_candidate,
+        primary_reviewer_login,
+    )
+except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate only.
+    # Only the exception's TYPE name is rendered, never the exception: even
+    # __str__ can raise (the hook_input block above), and an exception escaping
+    # here exits 1 before `run_guard` exists, which disengages every gate.
+    try:
+        _findings_exc_type = type(_findings_exc).__name__
+    except BaseException:  # noqa: BLE001 — diagnostics cannot change fail direction.
+        _findings_exc_type = "an exception"
+    _REVIEW_FINDINGS_ERROR = (
+        f"scripts/review_findings.py is unimportable ({_findings_exc_type}); "
+        f"repair the hook tree"
+    )
+    _INLINE_P1_RE = _INLINE_P2_RE = None  # type: ignore[assignment]
+    _CR_SEVERITIES = frozenset()  # type: ignore[assignment]
+
+    def _cr_header_fields(line, *, skip_partial=False):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def enforced_logins():  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def primary_reviewer_login():  # type: ignore[no-redef]
+        return None
+
+    def is_substitute_candidate(login, user_type):  # type: ignore[no-redef]
+        return False
+
+    def _cr_severity(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+    def _devin_finding(body):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
 # import): an unimportable review_state must degrade ONLY the round-escalation
 # advisory to its documented default — never crash this module at load time.
 # A module-load exception exits 1 BEFORE run_guard's fail-closed wrapper can
 # convert it to a block, and CC treats non-2 as non-blocking → EVERY fail-closed
 # gate in this file (force-push, merge, sqlite) would silently vanish.
+# `ESCALATION_ROUND_CAP` is deliberately NOT imported here. AST-verified 2026-09-25:
+# it had ZERO Load references in this file — an ImportFrom and an except-branch Store
+# and nothing else — so no gate here ever consulted it, and the six-line rationale
+# about "every fail-closed gate in this file" protected a name none of them read. Its
+# real consumers import it from `review_state` directly, each behind its own degrade
+# (`review_enforcement_commit.py`, `ask_gate_menu.py`, `genesis_statusline.py`).
+#
+# That is the same criterion this change applied to the retired `FINAL_ROUND_CAP`,
+# and applying it to one name in a two-name import while leaving its sibling is how
+# the next audit re-finds this. Note grep alone reports the name as live here — it
+# counts a docstring mention and the Store — so the check has to be AST.
+
 try:
-    from review_state import ESCALATION_ROUND_CAP, FINAL_ROUND_CAP  # noqa: E402
-except Exception:  # noqa: BLE001 — ANY failure (absent OR broken: SyntaxError,
-    # read error, top-level runtime error in review_state) must degrade to the
-    # default cap, NEVER propagate: a module-load exception exits 1 (non-blocking)
-    # and silently disables every fail-closed gate in this file (round-6 P1).
-    ESCALATION_ROUND_CAP = 3  # the genesis-development SKILL.md prose cap
-    FINAL_ROUND_CAP = 7  # keep in step with review_state.FINAL_ROUND_CAP
+    from review_deadline import bounded_timeout as _bounded_timeout  # noqa: E402
+except Exception:  # Reverse skew: retain a conservative fail-fast local fallback.
+    def _bounded_timeout(deadline, cap, *, monotonic=time.monotonic):
+        if deadline is None:
+            return cap
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise RuntimeError("aggregate review-gate deadline expired")
+        return min(cap, remaining)
+
+# The cloud-backed round budget is a newer soft dependency than this guard. A
+# missing/broken evaluator is UNKNOWN, never "zero rounds"; the request gate
+# turns that into a native ask (foreground) or a deny (autonomous).
+try:
+    import review_budget as _review_budget  # noqa: E402
+except Exception:  # noqa: BLE001 — reverse-skew must not crash every guard.
+    _review_budget = None
 
 # SOFT dependency, for the reason spelled out directly above: this module is
 # NEW, and audit LOGGING must never be able to disarm the gates it audits. If it
@@ -174,21 +301,62 @@ except Exception:  # noqa: BLE001 — see above: a load failure exits 1 = non-bl
 # separator starved it. Both copies carried it, so both were corrected — fixing the
 # degraded one alone would have left the LIVE net starved while the comment claimed
 # the class was closed.
+# `commit` IS here, and it is the one word whose membership differs by consumer.
+# MEASURED: paired with a `shell_parse` that predates `_REPARSE_CARRIERS`, the
+# import above fails and this matcher becomes the ONLY enforcement — and without
+# `commit` BOTH `eval git commit -n -m x` AND the direct `git commit -n -m x`
+# exited 0, i.e. the hook-skip gate vanished entirely in that pairing. This PR
+# adds `_REPARSE_CARRIERS` to that import, so it is this change that makes the
+# pairing reachable; the gap is therefore this change's to close.
+#
+# It does NOT follow that `_GATED_MENTION` should carry it — that one is read by
+# the LIVE blind-spot arm, where the same word cost +283 refusals on ordinary
+# heredocs (see its own note). This matcher only ever runs against a BROKEN hook
+# tree, where the file's stated direction is deliberate over-breadth and the
+# remedy printed to the caller is "repair the tree".
 _DEGRADED_GATED = (
     r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b"
-    r"|\b(?:push|merge)\b|\bgh\b|\bsqlite3\b"
+    r"|\b(?:push|merge|commit)\b|\bgh\b|\bsqlite3\b"
 )
 
 try:
+    # Inside this block on purpose: a broken module degrades the guard closed
+    # (degraded_exit below) instead of exiting 1, which the harness reads as allow.
+    from gh_merge import (  # noqa: E402
+        api_merge_reason,
+        body_file_path,
+        body_file_path_problem,
+        command_words,
+        compose_squash_body,
+        files_trusted,
+        is_help_only,
+        read_body_file,
+        shell_rewrites,
+        write_body_file,
+    )
+    from git_repo_selection import (  # noqa: E402
+        raw_sets_repo_env,
+        seg_redirects_repo,
+    )
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
+        _REPARSE_CARRIERS,
+        PushArg,
+        PushArgKind,
         analyze,
         analyze_checked,
         commit_skips_hooks,
+        gh_api_request,
+        gh_command,
         gh_pr_subcommand,
+        gh_requests_help,
         git_subcommand,
+        git_subcommand_index,
         has_trailing_override,
+        mentions,
+        push_arg_stream,
         split_segments,
+        unresolved_verb_programs,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
     if __name__ != "__main__" or (len(sys.argv) >= 3 and sys.argv[1] == "--check-pr"):
@@ -231,8 +399,40 @@ except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degrad
 # NOT. A word boundary asks the one thing that was meant — that the flag is a whole
 # token — without naming the characters that may follow it. MEASURED cost of the
 # widening over 74,282 real commands: 15,945 -> 15,995, i.e. +50 (+0.07%).
+# The three GraphQL merge mutations are named because `\bmerge\b` cannot match
+# inside `mergePullRequest` (#2768). MEASURED cost on the blind-spot arm over
+# 117,280 recorded commands (2026-10-05): 0 newly matched, since no unparseable
+# command named one of them without also naming `merge`.
+_MERGE_MUTATION_WORDS = r"\b(?:mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)\b"
 _GATED_MENTION = re.compile(
-    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b"
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge)\b|"
+    + _MERGE_MUTATION_WORDS
+)
+
+# The CARRIER arm's own net. It is `_GATED_MENTION` plus `\bcommit\b`, and it is
+# SEPARATE on purpose — the two arms are different consumers with costs that
+# differ by more than an order of magnitude, and widening the shared pattern
+# charged the difference to a path that had no reason to pay it.
+#
+# Why `commit` is needed here: `git commit`'s short hook-skip form is `-n`, and a
+# pattern holding only `--no-verify` let `eval git commit -n -m x` through while
+# the direct spelling blocked via `commit_skips_hooks` (MEASURED). A narrower
+# `commit … -Xn` clause was measured and REJECTED — length-bounded, so it missed
+# `git commit --amend --no-edit --author="A B" --date=now -n`, and a case it did
+# match matched the word `commit` inside "commit message" rather than the
+# subcommand, i.e. passed for a reason unrelated to its intent.
+#
+# Why it must NOT be in the shared pattern. MEASURED over 83,201 recorded
+# commands: on the carrier arm the word costs 13 -> 22 (+9). On the BLIND-SPOT
+# arm, which reads the same pattern, it costs 404 -> 687 (+283) — and those are
+# real: 12 of 12 sampled corpus commands go allow on origin/main and BLOCK on
+# the widened pattern through the actual guard. They are ordinary
+# `python - <<'PY'` heredocs whose BODY happens to mention commit. An earlier
+# revision published the +9 as this guard's rate, having counted one arm of a
+# two-arm change.
+_CARRIER_GATED_MENTION = re.compile(
+    r"--force(?:-with-lease)?\b|--no-verify\b|--admin\b|\b(?:push|merge|commit)\b|"
+    + _MERGE_MUTATION_WORDS
 )
 
 # `gh pr create` is the FOURTH gated operation (it can push or fork the branch —
@@ -251,6 +451,17 @@ _GATED_MENTION = re.compile(
 # nothing and would have measured 0 false positives by never firing at all.
 _GH_MENTION = re.compile(r"\bgh\b")
 _CREATE_MENTION = re.compile(r"\bcreate\b")
+#: The blind branch's view of a REVIEW REQUEST. The round-budget gate finds a
+#: `gh pr comment … @codex review` in the SEGMENTS, so a command whose segments are
+#: withheld (a bounds-type blind spot) reaches GitHub with no budget check unless
+#: the blind branch names it too. It names the same shape the parsed check does:
+#: `gh`, `pr` and `comment`, all in one reading. `gh` + `comment` alone refused an
+#: issue comment and every `gh api …/comments -f body=…` review reply, neither of
+#: which the parsed check gates (MEASURED: 33 continued commands -> 21). An opaque
+#: body (a file, an editor) already counts as a possible request on the parsed
+#: path, so the body is not inspected here either.
+_PR_MENTION = re.compile(r"\bpr\b")
+_COMMENT_MENTION = re.compile(r"\bcomment\b")
 
 #: The programs whose SUBCOMMAND this guard gates. Used on the blind path to ask
 #: whether a segment that resolved to one of them left its operation unreadable —
@@ -261,10 +472,13 @@ _GATED_EXES = frozenset({"git", "gh"})
 
 
 def _mentions_gated_op(command: str) -> bool:
-    """Whether the RAW text names any gated operation, on the blind path only."""
-    if _GATED_MENTION.search(command):
-        return True
-    return bool(_GH_MENTION.search(command) and _CREATE_MENTION.search(command))
+    """Whether the text names any gated operation, on the blind path only.
+
+    Searches every reading `shell_parse.mentions` searches, the text the shell would
+    assemble among them, so a gated word split by quotes or a line continuation is
+    still named here. `gh` and `create` must share one reading.
+    """
+    return mentions(command, _GATED_MENTION) or mentions(command, _GH_MENTION, _CREATE_MENTION)
 
 
 # Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
@@ -345,6 +559,11 @@ def _seg_dash_C(argv) -> str | None:
     return None
 
 
+# Repository selection by --git-dir / --work-tree / GIT_DIR & co. lives in
+# git_repo_selection (imported above, shared with pre_push_privacy_review) so the
+# two hooks cannot disagree about what counts as a redirect.
+
+
 def _cd_target(raw: str):
     """Classify a top-level command segment as a ``cd``.
 
@@ -419,20 +638,279 @@ def _effective_cwd(cmd: str, payload: dict, seg=None):
         for raw in split_segments(cmd):
             if raw == target_raw:
                 break
+            # PERSISTENT: an `export GIT_DIR=…` earlier in the command stays in
+            # force for everything after it, including after an absolute `cd` that
+            # would otherwise recover a known cwd. So it returns rather than setting
+            # cur. A COMMAND-scoped `GIT_DIR=… git status` does not persist and is
+            # not counted here (git_repo_selection.seg_sets_repo_env).
+            if raw_sets_repo_env(raw):
+                return _CWD_UNKNOWN
             cd = _cd_target(raw)
             if cd is _CWD_UNKNOWN:
                 cur = _CWD_UNKNOWN
             elif cd is not None:
                 cur = _resolve_against(cur, cd)
     if seg is not None:
+        if seg_redirects_repo(seg):
+            return _CWD_UNKNOWN
         dash_c = _seg_dash_C(getattr(seg, "argv", None))
         if dash_c is not None:
             return _resolve_against(cur, dash_c)
     return cur
 
 
-def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool:
-    """True if ANY executed ``git merge`` would run on main/master (fail-closed).
+def _api_merge_deny(segs, cmd: str, payload: dict) -> str | None:
+    """The refusal for a PR merge spelled through the GitHub API, or None (#2768).
+
+    Reads argv only (plus a local query file the command names); runs no
+    subprocess, so the verdict lands before any network call this guard makes.
+    """
+    for seg in segs:
+        if seg.exe != "gh":
+            continue
+        # No cwd in the payload, or an ambiguous one, leaves a relative query
+        # file unreadable (refused) rather than read from the hook's own directory.
+        cwd = _effective_cwd(cmd, payload, seg=seg)
+        if not isinstance(cwd, str):
+            cwd = None
+        # A query file is read only when nothing else in the command could write it
+        # after this check and before gh reads it.
+        found = api_merge_reason(
+            seg.argv, cwd, raw=seg.raw, trusted=files_trusted(cmd, len(segs))
+        )
+        if found is None:
+            continue
+        pr = found.pr if found.pr and found.pr.isdigit() else "<N>"
+        if found.unreadable:
+            head = (
+                f"BLOCKED: {found.reason}. It may merge a pull request through the "
+                "GitHub API, which skips every merge-gate check (CI, review findings, "
+                "Codex at head, the head binding)."
+            )
+        else:
+            head = (
+                f"BLOCKED: {found.reason} merges a pull request through the GitHub API, "
+                "which skips every merge-gate check (CI, review findings, Codex at "
+                "head, the head binding)."
+            )
+        lines = [
+            head,
+            f"Merge with the gated command instead: run `python3 "
+            f"scripts/hooks/git_push_guard.py --check-pr {pr}` and use its merge-with "
+            f"line (`gh pr merge {pr} --squash --admin --match-head-commit <sha>`).",
+        ]
+        if found.hint:
+            lines.append(found.hint)
+        return "\n".join(lines)
+    return None
+
+
+def _git_common_dir(cwd: str | None) -> str | None:
+    """Absolute git common dir for ``cwd`` (shared by all its worktrees), or None."""
+    try:
+        args = ["git"] + (["-C", cwd] if cwd else [])
+        args += ["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        out = result.stdout.strip()
+        # One absolute line or nothing: git before 2.31 does not know
+        # `--path-format`, exits 0, and echoes the option back beside a relative
+        # `.git`, which must read as unreadable (fail closed), never as an identity.
+        if result.returncode != 0 or "\n" in out or not os.path.isabs(out):
+            return None
+        return os.path.realpath(out)
+    except Exception:
+        return None
+
+
+def _live_manifest_present() -> bool:
+    """Whether this install declares a local integration branch at all."""
+    return os.path.isfile(
+        os.path.join(os.path.expanduser("~"), ".genesis", "deploy_manifest.json")
+    )
+
+
+def _live_manifest_binding() -> tuple[str, str | None]:
+    """What the deploy manifest says about WHICH repository it belongs to.
+
+    The manifest may carry a top-level ``"repo"``: the ABSOLUTE git common dir of
+    the checkout it belongs to. Returns one of:
+
+    * ``("bound", <canonical path>)`` — the key names an existing git common dir
+      (a directory holding ``objects/`` and ``HEAD``);
+    * ``("absent", None)`` — a JSON object without the key: the caller keeps its
+      rule for manifests written before the key existed;
+    * ``("malformed", None)`` — anything else: unreadable or malformed JSON, not a
+      JSON object, or a key that is not the absolute path of an existing git
+      common dir (a work-tree path, a checkout that has since moved). The caller
+      ARMS, for every target: a broken manifest fails closed.
+
+    The same rule is kept in ``review_enforcement_commit._live_manifest_binding`` and in the git hooks'
+    ``live_manifest_applies``; ``TestManifestRepoBinding`` pins all four copies
+    to one verdict table."""
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".genesis", "deploy_manifest.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:  # noqa: BLE001 — unreadable fails closed, never "disarmed"
+        return ("malformed", None)
+    if not isinstance(data, dict):
+        return ("malformed", None)
+    if "repo" not in data:
+        return ("absent", None)
+    repo = data["repo"]
+    if (
+        isinstance(repo, str)
+        and os.path.isabs(repo)
+        and os.path.isdir(os.path.join(repo, "objects"))
+        and os.path.isfile(os.path.join(repo, "HEAD"))
+    ):
+        return ("bound", os.path.realpath(repo))
+    return ("malformed", None)
+
+
+def _live_integration_active(cwd: str | None) -> bool:
+    """Whether ``cwd``'s repository runs a local integration branch named ``live``.
+
+    Two conditions. The deploy manifest declares that this install runs one;
+    without it, a branch named ``live`` is just an ordinary branch. And the
+    target must be the repository the manifest is about
+    (``_live_manifest_binding``): when it names one, that repository and no
+    other; when it has no ``"repo"`` key, THIS repository (the one this guard
+    ships in, any of its worktrees), since a session can run git in unrelated
+    checkouts whose own `live` branches the manifest says nothing about. A
+    malformed manifest, or a repository identity that cannot be read, fails
+    closed, as this guard does for an unreadable branch."""
+    if not _live_manifest_present():
+        return False
+    kind, bound = _live_manifest_binding()
+    if kind == "malformed":
+        return True
+    there = _git_common_dir(cwd)
+    if kind == "bound":
+        return there is None or there == bound
+    here = _git_common_dir(os.path.dirname(os.path.abspath(__file__)))
+    if here is None or there is None:
+        return True
+    return here == there
+
+
+# Git subcommands that cannot change WHICH branch HEAD is on. An ALLOWLIST on
+# purpose: the set of commands that can switch branches is open (checkout,
+# switch, rebase <upstream> <branch>, worktree, stash branch, branch -M, bisect,
+# and whatever a later git adds), while this set is closed and checkable.
+_KEEPS_HEAD_BRANCH = frozenset(
+    {
+        "add",
+        "blame",
+        "cat-file",
+        "check-attr",
+        "check-ignore",
+        "cherry-pick",
+        "clean",
+        "commit",
+        "config",
+        "describe",
+        "diff",
+        "fetch",
+        "for-each-ref",
+        "grep",
+        "init",
+        "log",
+        "ls-files",
+        "ls-remote",
+        "ls-tree",
+        "merge",
+        "merge-base",
+        "mv",
+        "pull",
+        "remote",
+        "reset",
+        "restore",
+        "rev-list",
+        "rev-parse",
+        "revert",
+        "rm",
+        "shortlog",
+        "show",
+        "show-ref",
+        "status",
+        "tag",
+    }
+)
+# `init` creates or re-initializes a repository and never moves this one's HEAD;
+# a merge in a repository it creates is not a merge into this repository's branch.
+# `stash` is decided by one token, in `_moves_head`: only `git stash branch`
+# switches (MEASURED 2026-09-30: 0 of 24 stash segments in 288 historical merge
+# commands were that form, and treating every stash as a mover refused 14 of them).
+# Deliberately NOT here: `worktree` (`git worktree add <dir> live` into an empty
+# directory that already exists inside this checkout makes the branch read at hook
+# time the enclosing one, while the merge lands on `live`), `branch` (`git branch
+# -M` renames the current branch) and `rebase` (`--abort` returns to the branch it
+# started from). Telling their forms apart would mean modelling their argv; chained
+# before a merge they are refused, and run separately they pass.
+
+
+def _moves_head(seg) -> bool:
+    """Whether ``seg`` can change the branch a LATER merge in the same command
+    lands on, after this guard has read that branch.
+
+    Decided by SUBCOMMAND, with no argv parsing, against an allowlist
+    (``_KEEPS_HEAD_BRANCH``): a ``git`` command counts unless its subcommand is
+    one that cannot move HEAD to another branch, and any ``gh`` command counts
+    (``gh pr checkout``). Telling a HEAD-moving form from one that leaves HEAD
+    put is an open-set question about git's argv (``git checkout live --``
+    switches branches although it looks like a file restore; ``git rebase
+    <upstream> <branch>`` ends on <branch>), and here a miss is not backstopped:
+    a fast-forward runs no git hook. A file restore chained before a merge is
+    therefore refused too; the remedy, running the two separately, costs one
+    more command.
+
+    ACCEPTED RESIDUE: a git ALIAS (``co``), a dashed executable
+    (``/usr/lib/git-core/git-checkout``, which this guard family does not read as
+    git anywhere, merges included), and anything hidden from the shell parser
+    (``eval``, ``xargs``, a script). ``git pull`` is not in this walk's
+    population as a merge at all."""
+    exe = getattr(seg, "exe", None)
+    if exe == "gh":
+        return True
+    if exe != "git":
+        return False
+    argv = getattr(seg, "argv", None) or []
+    sub = git_subcommand(argv)
+    if sub == "stash":
+        # `git stash branch <name>` checks out a new branch; every other stash form
+        # leaves HEAD where it is. Any `branch` token counts, wherever it sits, so a
+        # value that happens to read "branch" refuses rather than slips through.
+        return "branch" in argv
+    return sub not in _KEEPS_HEAD_BRANCH
+
+
+def _mover_label(seg) -> str:
+    """``git <subcommand>``, or ``gh``, for a refusal message: never the rest of
+    argv (a command line can carry a credential)."""
+    exe = getattr(seg, "exe", None) or "?"
+    if exe != "git":
+        # `gh` alone: its first positional can be a flag's value (`gh --repo x pr
+        # checkout`), and naming it would mean modelling gh's argv.
+        return exe
+    sub = git_subcommand(getattr(seg, "argv", None) or [])
+    return f"git {sub}" if sub else "git"
+
+
+def _walk_merge_into_main(
+    cmd: str, payload: dict, merge_git_segs: list, *, fired_on: list | None = None
+) -> bool:
+    """True if ANY executed ``git merge`` would run on main/master (fail-closed),
+    or on ``live`` where the install runs a local integration branch.
+
+    ``live`` is rebuilt by ``git commit-tree`` and therefore never the target of
+    a legitimate ``git merge`` (see ``_live_integration_active``). The
+    ``# merge-to-main-override`` sigil does NOT waive it: the git hooks refuse a
+    merge on ``live`` with no override, and this guard is what stops the one merge
+    they cannot see, a fast-forward. With the sigil present the branch is still
+    resolved, and where it cannot be (a redirected repository, an unresolvable
+    directory, a nested merge) on an install that declares a ``live``, the merge
+    is refused. When a caller passes ``fired_on``, "live" or "unresolved" is
+    appended to it for those refusals, so the message can say which.
 
     Walks the top-level segments in bash order tracking the ABSOLUTE cwd (last
     ``cd`` wins; relative cds/-C resolved against it), and checks EACH ``git
@@ -442,6 +920,16 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
     segment. Fail closed: a merge nested at depth>0, reached under an unresolvable
     cwd, OR whose branch cannot be read (None) is treated as targeting main and
     blocked (unless overridden). A detached HEAD ("") is left allowed.
+
+    Every branch is read BEFORE the command runs, so a merge that follows a
+    ``git checkout``, ``git switch``, ``git rebase`` or any other command that
+    can change the current branch, in the same command
+    (``_moves_head``; earlier segments, or a substitution inside the merge's own
+    segment) lands on a branch the read never saw: ``git checkout live && git
+    merge --ff-only feature`` moves ``live`` with no git hook firing. Such a
+    merge is unresolvable and refused, "switched" in ``fired_on``, whatever the
+    stale read says. The main override still passes it where no ``live`` is
+    declared, as it does any merge it covers.
     """
     # depth>0 merges cannot be associated with a top-level cwd → fail closed.
     #
@@ -454,32 +942,97 @@ def _walk_merge_into_main(cmd: str, payload: dict, merge_git_segs: list) -> bool
     # asserts a waiver that was never consulted, in a store whose entire purpose
     # is answering "was this escape reached for?", and the row carries nothing to
     # reconcile it against. An honest row needs the branch resolved first; see
-    # the follow-up. `# escalation-ack` / `# final-round-accept` are likewise
-    # unlogged, but for a DIFFERENT reason now — see the note in
-    # `_check_codex_round_escalation`, where the short-circuit that made a row
-    # unattributable in principle no longer exists.
+    # the follow-up. `# escalation-ack` belongs to the local commit-streak gate;
+    # `# final-round-accept` is recognized only for stale-tree compatibility.
     for s in merge_git_segs:
-        if getattr(s, "depth", 0) > 0 and not has_trailing_override(
-            s.raw, "merge-to-main-override"
-        ):
-            return True
+        if getattr(s, "depth", 0) > 0:
+            if not has_trailing_override(s.raw, "merge-to-main-override"):
+                return True
+            # The override covers main only. A nested merge's branch cannot be
+            # resolved here, so where a `live` may exist it is refused.
+            if _live_manifest_present():
+                if fired_on is not None:
+                    fired_on.append("unresolved")
+                return True
 
     base = payload.get("cwd") if isinstance(payload, dict) else None
     cur = os.path.normpath(base) if isinstance(base, str) and base else None
+    repo_env_redirected = False  # persistent, for the same reason as in _effective_cwd
+    head_moved = False  # a segment earlier in this command may have changed branch
+    head_mover = None  # the first such segment, named in the refusal
     for raw in split_segments(cmd):
-        top = [s for s in analyze(raw) if getattr(s, "depth", 0) == 0]
+        segs_here = analyze(raw)
+        top = [s for s in segs_here if getattr(s, "depth", 0) == 0]
         merge_here = next(
             (s for s in top if s.exe == "git" and git_subcommand(s.argv) == "merge"),
             None,
         )
-        if merge_here is not None and not has_trailing_override(raw, "merge-to-main-override"):
+        overridden = merge_here is not None and has_trailing_override(
+            raw, "merge-to-main-override"
+        )
+        # A switch nested in the merge's own segment (a command substitution)
+        # runs before the merge, so it counts as earlier too.
+        nested_mover = next(
+            (s for s in segs_here if s is not merge_here and _moves_head(s)), None
+        )
+        switched = merge_here is not None and (head_moved or nested_mover is not None)
+        if switched:
+            # The branch read above predates the switch. Unresolvable: refused, and
+            # with the main override refused wherever a `live` may exist, exactly
+            # like an unresolvable directory below.
+            if not overridden or _live_manifest_present():
+                if fired_on is not None:
+                    fired_on.append("switched")
+                    mover = head_mover if head_mover is not None else nested_mover
+                    fired_on.append("switched-by:" + _mover_label(mover))
+                return True
+        elif overridden:
+            # The override acknowledges a merge into main, never into `live`. So
+            # the branch is still resolved; where it cannot be (a redirected
+            # repository, an unresolvable directory) and a `live` may exist, the
+            # merge is refused rather than waved through on the override.
+            dash_c = _seg_dash_C(merge_here.argv)
+            mcwd = _resolve_against(cur, dash_c) if dash_c is not None else cur
+            if repo_env_redirected or seg_redirects_repo(merge_here) or mcwd is _CWD_UNKNOWN:
+                if _live_manifest_present():
+                    if fired_on is not None:
+                        fired_on.append("unresolved")
+                    return True
+            else:
+                ocwd = mcwd if isinstance(mcwd, str) else None
+                if _current_branch(cwd=ocwd) == "live" and _live_integration_active(ocwd):
+                    if fired_on is not None:
+                        fired_on.append("live")
+                    return True
+        if merge_here is not None and not overridden and not switched:
+            # This walk resolves the repo itself rather than through
+            # `_effective_cwd`, so it carried the same hole: a merge pointed at a
+            # repository on main by --git-dir / GIT_DIR was checked against the
+            # checkout it ran in. Fail closed exactly as an unresolvable cwd does.
+            if repo_env_redirected or seg_redirects_repo(merge_here):
+                return True
             dash_c = _seg_dash_C(merge_here.argv)
             mcwd = _resolve_against(cur, dash_c) if dash_c is not None else cur
             if mcwd is _CWD_UNKNOWN:
                 return True
             branch = _current_branch(cwd=mcwd if isinstance(mcwd, str) else None)
+            # `live` (the local integration branch) never takes a merge: it is
+            # rebuilt with `git commit-tree`, so any `git merge` there is foreign.
+            # Only where the deploy manifest exists: an install's own branch that
+            # happens to be named `live` is left alone.
             if branch is None or branch in ("main", "master"):
                 return True  # None branch (error/unresolved) fails closed
+            if branch == "live" and _live_integration_active(
+                mcwd if isinstance(mcwd, str) else None
+            ):
+                if fired_on is not None:
+                    fired_on.append("live")
+                return True
+        if not head_moved:
+            head_mover = next((s for s in segs_here if _moves_head(s)), None)
+            head_moved = head_mover is not None
+        if raw_sets_repo_env(raw):
+            repo_env_redirected = True
         cd = _cd_target(raw)
         if cd is _CWD_UNKNOWN:
             cur = _CWD_UNKNOWN
@@ -606,17 +1159,23 @@ _MERGE_GATE_BUDGET_S = 45.0
 _merge_deadline: float | None = None
 
 
+#: Successful PR body / createdAt reads, kept for the rest of ONE merge-hook
+#: invocation (only while ``_merge_deadline`` is armed; ``main`` clears it on
+#: entry). The E2E and pin gates read both early in the merge arm, while budget is
+#: left. The `rework` gate runs last, and a fresh body read there could fail on a
+#: spent deadline and make a DECLARED rebuild look undeclared, which fails open.
+#: The report path never arms the deadline, so it never caches.
+_MERGE_READ_CACHE: dict[tuple[str, str, str], str] = {}
+
+
 def _gh_timeout(cap: float) -> float:
     """Per-call subprocess timeout under the shared merge-path deadline (``_merge_deadline``).
 
     ``cap`` when no merge deadline is set (every non-merge caller, and the tests, are
-    unaffected). Under a deadline, the smaller of ``cap`` and the time remaining, floored
-    at 1s so a nearly-expired budget makes the call fail FAST — its caller's existing
-    error path then returns its fail-closed/open value — rather than overrun the
-    wall-clock and get the whole hook SIGKILLed mid-gate. Never raises."""
-    if _merge_deadline is None:
-        return cap
-    return max(1.0, min(cap, _merge_deadline - time.monotonic()))
+    unaffected). Under a deadline, the smaller of ``cap`` and the time remaining.
+    An expired budget raises before another process starts; the outer fail-closed
+    guard or a caller's explicit error path then decides safely."""
+    return _bounded_timeout(_merge_deadline, cap, monotonic=time.monotonic)
 
 
 def _derive_repo_from_cwd(cwd: str) -> str | None:
@@ -812,17 +1371,17 @@ _CI_GREEN = {"SUCCESS"}
 # a required context that has not reported a status yet (not started); it must not
 # read green. (A CheckRun uses `status` for this; a StatusContext uses `state`.)
 _CI_PENDING_STATES = {"PENDING", "EXPECTED"}
-# A CANCELLED check-run carries NO pass/fail verdict — the run was aborted,
-# almost always by a `concurrency: cancel-in-progress` supersession, which leaves
-# the cancelled dup attached to the head commit. It is red BY DEFAULT (it is also
-# in _CI_RED_CONCLUSIONS), and dropped ONLY when a check of the SAME identity
-# (name + workflowName, see _ci_identity) concluded SUCCESS STRICTLY AFTER it on this
-# head (so a SUCCESS-then-cancel re-run on an unchanged head still blocks, and so does
-# an EQUAL second-precision timestamp, which orders nothing — see
-# _drop_superseded_cancels for why an unprovable ordering fails closed).
-# Deliberately scoped to CANCELLED alone: FAILURE/TIMED_OUT/ACTION_REQUIRED/
-# STARTUP_FAILURE carry real verdicts and always block, even with a success sibling.
-_CI_CANCEL_CONCLUSIONS = {"CANCELLED"}
+# Rollup entries are reduced to the NEWEST workflow run per workflow before
+# classification — see _newest_run_per_workflow for the rule.
+#
+# The ONLY detailsUrl shape that yields a workflow run id: an Actions JOB page on
+# github.com. Anchored at both ends, https only, exactly OWNER/REPO, a run id and a
+# job id with no leading zero and at most 19 digits (so int() is exact and bounded),
+# and nothing after. The CheckRun page form (`/<owner>/<repo>/runs/<n>`) is
+# deliberately NOT accepted: its number is a check-run id, not a workflow run id.
+_CI_ACTIONS_JOB_URL_RE = re.compile(
+    r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/actions/runs/([1-9][0-9]{0,18})/job/[1-9][0-9]{0,18}"
+)
 # The only CheckRun.status that means "finished". Everything else
 # (QUEUED/IN_PROGRESS/PENDING/WAITING/REQUESTED/…) is treated as unfinished, so
 # a new/renamed non-terminal state can never be silently mistaken for green.
@@ -836,27 +1395,26 @@ _CI_NAMELESS = "check"
 def _check_name(c: dict) -> str:
     """Human-facing display label for one statusCheckRollup entry: a CheckRun
     ``name`` or a legacy StatusContext ``context``, falling back to _CI_NAMELESS.
-    Used only to build the problem-check list — NOT the sibling-match key (that is
+    Used only to build the problem-check list — NOT the grouping key (that is
     _ci_identity, which is stricter)."""
     return c.get("name") or c.get("context") or _CI_NAMELESS
 
 
 def _ci_identity(c: dict) -> tuple[str, str] | None:
-    """Strict same-check identity for the concurrency-cancel sibling match:
+    """Strict same-check identity. An entry with an identity is an Actions CheckRun
+    that ``_newest_run_per_workflow`` may group by its ``workflowName``:
     ``(name, workflowName)`` for a GitHub Actions CheckRun, or ``None`` when the
     entry cannot be identity-matched — a legacy StatusContext (no workflowName) or
     a CheckRun from a non-Actions app (empty workflowName). ``None`` means the
-    entry is NEVER a sibling and NEVER droppable → it fails CLOSED (a cancel with
-    no resolvable identity stays red).
+    entry is NEVER grouped: it never causes a drop and is never dropped, so it
+    fails CLOSED (a red entry with no resolvable identity stays red).
 
     Keying on name ALONE would be unsafe: this gate forces `--admin`, which
     bypasses GitHub's server-side required-status-checks, so _pr_ci_status is the
     SOLE CI enforcement for every merge it allows. A bare-name match would let a
     same-named SUCCESS from a DIFFERENT workflow (an accidental collision, or a
-    decoy job) mask a genuinely-cancelled required check → wrong-green. Requiring
-    workflowName to match scopes the drop to a true same-job re-run — the only
-    thing `cancel-in-progress` produces. Still pure set-membership: no
-    time-ordering (that surface was the pulled #1420 finding-magnet)."""
+    decoy job) mask a genuinely-red required check → wrong-green. Requiring
+    workflowName to match scopes any comparison to runs of the same workflow."""
     name = (c.get("name") or "").strip()
     wf = (c.get("workflowName") or "").strip()
     if name and wf:
@@ -864,137 +1422,149 @@ def _ci_identity(c: dict) -> tuple[str, str] | None:
     return None
 
 
-def _ci_completed_at(entry: dict) -> _dt.datetime | None:
-    """A check-run's ``completedAt`` as an OFFSET-AWARE datetime, or None.
+def _ci_actions_run_url(entry: dict) -> tuple[str, str] | None:
+    """``(OWNER/REPO, RUN_ID)`` parsed strictly from an Actions CheckRun's
+    ``detailsUrl``, or None when the value is not exactly an Actions JOB page.
 
-    None on anything that cannot be established: absent, blank, unparseable, or
-    parsed but NAIVE. A NON-STRING value is the one shape that does not return
-    None -- ``.strip()`` raises AttributeError out of this helper, which
-    ``run_guard`` converts to exit 2, a BLOCK. Unreachable from GitHub (the
-    ``DateTime`` scalar is string-or-null) and fail-closed either way, but the
-    enumeration above would otherwise be false. Every caller treats None as "cannot be compared", which on
-    this path means an unparseable SUCCESS supersedes nothing and an unparseable
-    CANCEL is kept — the fail-closed direction.
+    Accepted, whole string after trimming whitespace:
+    ``https://github.com/<OWNER>/<REPO>/actions/runs/<RUN>/job/<JOB>``. None on a
+    missing, blank or non-string value; any other scheme, host or path shape
+    (including the CheckRun page ``/runs/<n>``, whose number is a check-run id,
+    not a workflow run id); a non-numeric, zero-padded or over-long id; or
+    trailing text.
 
-    Naive is rejected rather than assumed UTC. Comparing a naive datetime against
-    an aware one raises TypeError, and the alternative to rejecting it is guessing
-    a zone, which is exactly the kind of assumption this function exists to stop
-    relying on. GitHub has always sent an offset; if it ever sends a bare value,
-    the gate should get stricter, not luckier.
+    This is only the SHAPE half. Provenance — that the slug is THIS repo — is
+    decided by ``_newest_run_per_workflow`` against a resolved repo identity, with
+    the same rule ``_pr_ci_status`` applies to its self-exclusion: host pinned to
+    github.com AND the slug equal to this repo's, casefolded.
     """
-    raw = (entry.get("completedAt") or "").strip()
-    if not raw:
+    raw = entry.get("detailsUrl")
+    if not isinstance(raw, str):
         return None
-    try:
-        # `fromisoformat` accepts a literal `Z` from 3.11, but normalising first
-        # costs nothing and keeps this readable against older interpreters.
-        parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
+    m = _CI_ACTIONS_JOB_URL_RE.fullmatch(raw.strip())
+    if not m:
         return None
-    return parsed if parsed.tzinfo is not None else None
+    return m.group(1), m.group(2)
 
 
-def _drop_superseded_cancels(checks: list) -> list:
-    """Return *checks* with superseded ``concurrency: cancel-in-progress`` duplicates
-    removed — a CANCELLED CheckRun is dropped ONLY when a SUCCESS of the EXACT same
-    ``(name, workflowName)`` identity completed STRICTLY AFTER it; every other entry is
-    returned unchanged, in order.
+def _newest_run_per_workflow(checks: list, *, repo: str | None = None) -> list:
+    """Return *checks* with every entry from an OLDER workflow run of the same
+    workflow removed, so that per workflow the NEWEST run decides as a whole. Every
+    entry this does not remove is returned unchanged, in order.
 
-    STRICTLY after, not at-or-after. ``completedAt`` is second-precision, so an EQUAL
-    timestamp does not order the two runs at all — it says only that they finished in
-    the same second, which is not evidence that the success came second. On a
-    supersession the successful run STARTS when the cancel fires and finishes a whole
-    job later, so a tie is not even the shape this drop exists to recognise; a tie is
-    far likelier to be two unrelated runs, or a genuinely-cancelled latest attempt.
-    An unprovable ordering therefore fails CLOSED, like every other unresolvable case
-    below. MEASURED before tightening (the Actions runs API over 400 runs / 2 days,
-    30 real cancelled jobs on 25 shas): 18/30 had a strictly-later success, 12/30 had
-    none, and **0/30 turned on a tie** — so this costs nothing observed, and 30 is a
-    small denominator, which is precisely why the direction matters more than the
-    rate: being wrong here over-blocks, it cannot wrong-green.
+    THE RULE (issue #2607). For each Actions CheckRun the workflow RUN id is parsed
+    strictly from its ``detailsUrl`` (``_ci_actions_run_url``; this repo's slug
+    only). Entries are grouped by ``workflowName``; within a workflow the highest
+    parseable run id is the newest run, and every parseable entry of that workflow
+    from a LOWER run id is dropped. ALL entries of the newest run are kept exactly as
+    they are — its failures, cancels, pending and skipped jobs count normally.
 
-    THE ONE home of that rule. It had two: ``_pr_ci_status`` (which has always
-    applied it) and ``_mechanical_scan_is_green`` (added later, which re-derived a
-    naive ``all(c == "SUCCESS")`` and never handled a cancel at all). A doubled
-    workflow dispatch — two ``pull_request`` runs for one sha, leaving EVERY
-    check-run as a success+cancelled pair — made the two disagree about one payload
-    inside ONE process: ``ci: green`` alongside "'leak-detector' is not green at
-    this head", a message that sends the reader to inspect a job that is green.
-    Deterministic for as long as that head stands, not a flake. Any FUTURE consumer
-    of check-run conclusions calls this rather than re-deriving it a third time.
+    WHY THE UNIT IS THE RUN, NOT THE JOB. ``statusCheckRollup`` keeps every workflow
+    run on the head commit, so a PR whose run failed on a broken base and then passed
+    in a new run after the base was fixed used to read ``ci: red`` forever (PR
+    #2484: ``lint`` and ``test`` FAILED in two runs, then PASSED in a third). An
+    earlier revision kept the latest result per JOB by ``completedAt``, and review
+    showed that synthesizes green from two failed runs: an older run with
+    ``test=FAILURE`` and a late ``lint=SUCCESS`` plus a newer run with
+    ``lint=FAILURE`` and ``test=SUCCESS`` kept one success from each. Choosing one
+    coherent run per workflow cannot do that. It is also how GitHub itself presents
+    a PR's checks: the latest run of each workflow. One consequence, stated on
+    purpose: a newer run that SKIPPED a job drops that job's failure from an older
+    run, because the newest run decides.
 
-    Every condition below fails CLOSED — a cancel that cannot be PROVEN superseded
-    is returned, and the caller's own red/not-green logic then sees it:
+    RUN ORDER IS RUN ID ORDER. INFERRED, not documented as a contract: Actions run
+    ids are sequential database ids, so a later-created run has a larger id. If that
+    ever failed, an older-created run could decide a workflow. No timestamp is
+    consulted anywhere in this rule.
 
-    * Only GitHub Actions CheckRuns with a resolvable identity AND a ``completedAt``
-      may serve as the superseding sibling (``_ci_identity`` → None for a legacy
-      StatusContext or a non-Actions check; a timestampless SUCCESS is skipped). So
-      a StatusContext SUCCESS can never drop a same-named CheckRun cancel.
-    * A cancel with no identity, no ``completedAt``, or no qualifying success STAYS.
-      That includes SUCCESS-then-cancel on an unchanged head: the latest attempt
-      never passed, so nothing supersedes the cancel.
-    * ONLY ``_CI_CANCEL_CONCLUSIONS`` (deliberately ``{"CANCELLED"}`` alone) is
-      droppable. FAILURE / TIMED_OUT / ACTION_REQUIRED / STARTUP_FAILURE / STALE
-      carry real verdicts and are never dropped, whatever completed beside them —
-      so this can never widen into "ignore anything that is not SUCCESS".
-    * Non-terminal entries (an in-flight re-run) are not conclusions and are never
-      touched; the caller still counts them PENDING.
-    * Entries that are not dicts are passed through untouched, so a caller's own
-      shape checks still see the payload it was given.
+    Every case that cannot be proven fails CLOSED — the entry is KEPT, so the
+    caller's own red/pending logic sees it:
 
-    Comparison PARSES both ``completedAt`` values and compares datetimes, in both
-    passes. This is NOT the pulled #1420 finding-magnet, which sorted the WHOLE set
-    (including QUEUED runs with a null ``startedAt``) to pick a global "latest".
+    * An entry with no identity (``_ci_identity`` → None: a legacy StatusContext, a
+      non-Actions check with no ``workflowName``, a nameless entry) is always kept
+      and takes no part in choosing a newest run.
+    * An Actions entry whose run id cannot be parsed, or whose URL names another
+      repo, is always kept and never causes anything to be dropped.
+    * If the repo identity cannot be resolved (*repo* None and the cwd does not
+      resolve), nothing is dropped. It is resolved LAZILY, only when some entry has
+      a parseable job URL, so a payload with nothing to decide costs no ``gh`` call.
+    * A workflow is only ever reduced by run ids parsed from ITS OWN entries; two
+      workflows are judged independently.
+    * Within the newest run, duplicate entries of one job (which the rollup should
+      not produce, since it lists only a run's latest attempt) are all kept.
+    * Entries that are not dicts pass through untouched.
 
-    IT USED TO BE A LEXICOGRAPHIC STRING COMPARE, and the reason it no longer is
-    was written down here before it was acted on. GitHub's GraphQL ``completedAt``
-    is emitted as second-precision UTC with a literal ``Z`` (MEASURED 2017/2017
-    entries across 122 PR rollups — every one ``Z``-suffixed with no fractional
-    part). That is an OBSERVATION, not a contract: the schema documents the
-    ``DateTime`` scalar only as "An ISO-8601 encoded UTC date string", which
-    constrains neither sub-second precision nor the offset spelling. String order
-    equals chronological order only while EVERY value shares one format, and two
-    real shapes break it — a ``+00:00`` offset instead of ``Z``, and fractional
-    seconds (``'Z'`` sorts ABOVE ``'.'``, so a SUCCESS at ``:00Z`` compares as later
-    than a cancel at ``:00.9Z`` and wrongly drops it). The consequence is not
-    cosmetic: `_mechanical_scan_is_green` consumes this, so a reversed ordering
-    drops a real cancellation and carries an old leaks review forward — and under
-    ``# ci-override`` that relief is the only remaining check of the mechanical
-    layer. An observation is not a thing to gate on when parsing costs one call.
+    RE-RUN-UNTIL-GREEN IS NOT BLOCKED, and this function does not pretend to block
+    it. GitHub's rollup lists only the LATEST attempt of a re-attempted run:
+    MEASURED 2026-09-30 on 2 of 2 re-attempted ``ci.yml`` runs sampled
+    (36283456055, 35647361203; ``gh api .../actions/runs/<id>/attempts/1`` plus the
+    commit's GraphQL ``statusCheckRollup`` and the REST check-runs list with
+    ``filter=all``), a first attempt's ``test`` FAILURE was absent from the rollup.
+    So a passing ``gh run rerun`` has already replaced its failure before any reader
+    of the rollup sees it, before this change as after it. For scale, per issue
+    #2607, 11 of 4,776 ``ci.yml`` ``pull_request`` runs were same-input re-runs
+    from failure to success. Real re-run protection needs a different read path and
+    is tracked as #2624.
 
-    ``_ci_completed_at`` fails CLOSED on anything it cannot parse into an
-    OFFSET-AWARE datetime, including a naive value: an unparseable SUCCESS cannot
-    supersede anything, and an unparseable CANCEL is kept. Naive is excluded rather
-    than assumed-UTC because comparing naive against aware raises, and guessing a
-    zone to avoid that is how a wrong-green gets built.
+    Residuals, stated rather than assumed away:
+    * ``workflowName`` is a DISPLAY name. A second workflow file declaring the same
+      name would share the group, and its newer run would decide for both. The
+      precondition is closed by the uniqueness test cited at
+      ``_MECHANICAL_RESCAN_BY_KIND``.
+    * The trigger EVENT is not part of the grouping. ``ci.yml`` also declares
+      ``workflow_dispatch``; if a dispatch run on the PR branch appeared in the PR's
+      rollup, as the newest run it would decide CI while testing the head alone
+      rather than the merge ref. One sampled dispatch run on a PR's head sha was
+      ABSENT from that PR's rollup (1 of 1 — not proof), and the rollup does not
+      expose the event; this belongs with #2624.
+    * A newer run that has not yet published any check-run for a workflow is
+      invisible, so until it does the older run decides — as it did before. The
+      same holds for a newer run that has published SOME jobs but not yet a job
+      gated by ``needs:``: until that job's check-run exists, the older run's
+      result for it is dropped with the rest of the older run. The required
+      ``CI`` workflow has no ``needs:`` chains today; ``contributor-review.yml``
+      does. When GitHub creates a dependent job's check-run is not established.
+
+    THE ONE home of this rule. Two consumers call it — ``_pr_ci_status`` and
+    ``_mechanical_scan_is_green`` — and neither re-derives it. They once disagreed
+    about one payload inside ONE process (``ci: green`` beside "'leak-detector' is
+    not green at this head") because the mechanical scan had its own naive
+    ``all(c == "SUCCESS")``; any future consumer of check-run conclusions calls this.
     """
-    # Pass 1: the latest completedAt among SUCCESS runs, per strict identity.
-    success_latest: dict[tuple[str, str], _dt.datetime] = {}
-    for c in checks:
-        if not isinstance(c, dict) or c.get("conclusion") not in _CI_GREEN:
+    # Pass 1: every entry with an identity AND a job URL of the right shape.
+    candidates: list[tuple[int, str, str, int]] = []
+    for i, c in enumerate(checks):
+        if not isinstance(c, dict):
             continue
         ident = _ci_identity(c)
-        ts = _ci_completed_at(c)
-        if ident is None or ts is None:
-            continue
-        known = success_latest.get(ident)
-        if known is None or ts > known:
-            success_latest[ident] = ts
+        if ident is None:
+            continue  # no identity: kept, takes no part
+        url = _ci_actions_run_url(c)
+        if url is None:
+            continue  # no parseable run id: kept, never drops anything
+        candidates.append((i, ident[1], url[0], int(url[1])))
+    if not candidates:
+        return list(checks)
 
-    # Pass 2: drop only the cancels pass 1 proves superseded. STRICTLY after, so a
-    # tie keeps the cancel: equal second-precision stamps make the ordering
-    # unprovable, and unprovable must not mean droppable.
-    kept: list = []
-    for c in checks:
-        if isinstance(c, dict) and c.get("conclusion") in _CI_CANCEL_CONCLUSIONS:
-            ident = _ci_identity(c)
-            cts = _ci_completed_at(c)
-            if ident is not None and cts is not None:
-                latest = success_latest.get(ident)
-                if latest is not None and latest > cts:
-                    continue
-        kept.append(c)
-    return kept
+    own = repo if repo is not None else _derive_repo_from_cwd(os.getcwd())
+    if not own:
+        return list(checks)  # no provenance: drop nothing
+    own = own.casefold()
+
+    # Pass 2: the newest run id per workflow, from this repo's runs only.
+    run_of: dict[int, tuple[str, int]] = {}
+    newest: dict[str, int] = {}
+    for i, wf, slug, run_id in candidates:
+        if slug.casefold() != own:
+            continue  # a foreign repo's run: kept, never drops anything
+        run_of[i] = (wf, run_id)
+        if run_id > newest.get(wf, 0):
+            newest[wf] = run_id
+
+    # Pass 3: drop only this repo's entries from an OLDER run of the same workflow.
+    return [
+        c for i, c in enumerate(checks) if not (i in run_of and run_of[i][1] < newest[run_of[i][0]])
+    ]
 
 
 def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]:
@@ -1002,14 +1572,15 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
 
     Returns ``(state, problem_checks)`` where state is one of:
       * ``"green"``   — every non-skipped check concluded SUCCESS
-      * ``"red"``     — at least one check failed/timed-out, or was cancelled
-                        with NO same-identity SUCCESS completing STRICTLY AFTER it.
-                        A CANCELLED CheckRun that a same (name, workflowName)
-                        SUCCESS completed strictly after is a superseded
-                        `concurrency: cancel-in-progress` duplicate and is dropped
-                        by the SHARED _drop_superseded_cancels helper (see
-                        _ci_identity) — strict identity, terminal completedAt
-                        comparison only, fail-closed.
+      * ``"red"``     — at least one surviving check is a failure, timeout,
+                        cancel or other red conclusion. Entries from OLDER
+                        workflow runs are first dropped by the SHARED
+                        _newest_run_per_workflow helper (issue #2607): per
+                        workflow the newest run (highest run id parsed from
+                        detailsUrl) decides as a whole; anything whose run id
+                        cannot be parsed is always kept. Re-run-until-green is
+                        NOT blocked (the rollup shows only a re-run's latest
+                        attempt; see that helper and #2624).
       * ``"pending"`` — a check is still queued/running (and none are red)
       * ``"absent"``  — a READABLE but genuinely EMPTY rollup (``[]``): zero checks
                         exist, i.e. CI has NOT run. A DEFINITE fact, not a read
@@ -1079,21 +1650,76 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         # never fired (e.g. a conflicting branch suppresses the whole suite).
         return "absent", []
 
-    # Drop superseded `concurrency: cancel-in-progress` duplicates via the SHARED
-    # primitive (_drop_superseded_cancels — read its docstring for the strict
-    # identity + strictly-after rule and every fail-closed case). Filtering here rather
-    # than branching inside the classify loop is behaviour-identical: a drop implies
-    # a same-identity SUCCESS in this very list, and that sibling sets
-    # `saw_recognized` and contributes the same casefolded `workflowName` to
-    # `workflows_ran` on its own. A cancel that is NOT dropped falls through to the
-    # red branch below, because CANCELLED is also in _CI_RED_CONCLUSIONS.
+    # Self-exclusion for the check-run form of this gate (issue #1670). The
+    # `genesis-merge-gate` check only MIRRORS this gate's verdict, so its
+    # entries must never classify — in ANY environment: under Actions a run
+    # would deadlock on its own IN_PROGRESS entry or inherit a stale FAILURE
+    # from an earlier run on the same head, and locally the mirror would
+    # double-count real blocks as `ci: red (genesis-merge-gate)` and demand a
+    # spurious ci-override on top of the genuine sigils. workflowName
+    # "merge-gate" covers the ambient job check. For API-published verdicts the
+    # NAME is the identity — `genesis-merge-gate` is OUR check name — measured
+    # on PR #1954: a published verdict was attached to a check suite owned by a
+    # DIFFERENT workflow ("Labeler"), because GitHub assigns the suite, not the
+    # publisher, so the empty-workflowName lane the first version relied on
+    # does not hold. The name lane is therefore gated on the check's detailsUrl
+    # pointing at this repo's run pages (name alone is not provenance — a
+    # same-named foreign check must still count).
+    # The GITHUB_WORKFLOW/GITHUB_JOB env lanes stay as a drift-proof backup for
+    # the ambient-run case where the workflow is renamed but the job is not.
+    self_wf = (os.environ.get("GITHUB_WORKFLOW") or "").strip().casefold()
+    self_job = (os.environ.get("GITHUB_JOB") or "").strip().casefold()
+
+    # Host-pinned to github.com: an arbitrary host could serve a run URL whose
+    # path carries this repo's slug — host + slug together are the provenance.
+    _run_url_re = re.compile(
+        r"^https?://github\.com/([^/]+/[^/]+)/(?:runs|actions/runs)/\d+", re.IGNORECASE
+    )
+
+    _self_repo = repo if repo is not None else _derive_repo_from_cwd(os.getcwd())
+
+    def _details_url_is_own_run(c: dict) -> bool:
+        m = _run_url_re.match((c.get("detailsUrl") or "").strip())
+        if not m:
+            return False
+        # Fail-CLOSED on unresolvable repo identity: a check we cannot prove is
+        # ours is not our mirror, so it must still classify.
+        return _self_repo is not None and m.group(1).casefold() == _self_repo.casefold()
+
+    def _is_self_check(c: object) -> bool:
+        if not isinstance(c, dict):
+            return False
+        wf = (c.get("workflowName") or "").strip().casefold()
+        name = (c.get("name") or "").strip().casefold()
+        if wf == "merge-gate" or (self_wf and wf == self_wf) or (self_job and wf == self_job):
+            return True
+        # Name alone is not provenance — check names are not unique identities.
+        # The mirror must also link into THIS repo's run pages: a same-named
+        # check from another app or workflow carries its own detailsUrl.
+        return name == "genesis-merge-gate" and _details_url_is_own_run(c)
+
+    checks = [c for c in checks if not _is_self_check(c)]
+    if not checks:
+        # The ONLY thing in the rollup is our own run: zero OTHER checks
+        # have run — the same definite "CI has not run" fact a genuinely
+        # empty rollup carries.
+        return "absent", []
+
+    # Keep only the newest workflow run per workflow via the SHARED primitive
+    # (_newest_run_per_workflow — read its docstring for the rule and every
+    # fail-closed case). `_self_repo` is the provenance its detailsUrl parse checks.
+    # Filtering here is safe for the required-workflow check below: a workflow is
+    # only reduced when its newest run has at least one entry, and that run's
+    # entries are kept whole, so the workflow is vouched for only by a SUCCESS in
+    # the newest run or by an entry the helper could not place in a run (kept
+    # whole, fail-closed) — and reads red or pending on any such entry.
     #
     # Deliberately AFTER the empty-rollup "absent" return above, which reads the
     # RAW payload: "zero checks exist" must stay a fact about what GitHub reported,
     # never an artefact of our own filtering. (The filter cannot empty a non-empty
-    # list anyway — a drop requires a surviving SUCCESS sibling — but the ordering
+    # list anyway — the newest run of every workflow survives — but the ordering
     # makes that independent of this helper's behaviour.)
-    checks = _drop_superseded_cancels(checks)
+    checks = _newest_run_per_workflow(checks, repo=_self_repo)
 
     red: list[str] = []
     pending: list[str] = []
@@ -1115,11 +1741,10 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
         if conclusion in _CI_SKIP_CONCLUSIONS:
             saw_recognized = True
             continue
-        # Any CANCELLED entry still present here was NOT superseded (the shared
-        # filter above proved it, or could not) and falls through to the red branch,
-        # because CANCELLED is in _CI_RED_CONCLUSIONS. The dropped ones need no arm
-        # of their own: each implies a same-identity SUCCESS in this list, which
-        # sets saw_recognized and adds the identical workflowName to workflows_ran.
+        # Any red entry still present here belongs to the newest run of its
+        # workflow, or could not be placed in a run, and falls through to the red
+        # branch. The dropped ones need no arm of their own: they came from an older
+        # run of a workflow whose newest run is still here and decides it.
         if conclusion in _CI_RED_CONCLUSIONS or state in _CI_RED_STATES:
             saw_recognized = True
             red.append(name)
@@ -1206,46 +1831,45 @@ _CLEAN_PATTERNS = [
     re.compile(r"VERDICT:\s*PASS", re.IGNORECASE),
 ]
 
-# Bot usernames that post automated reviews
-_REVIEW_BOTS = {"chatgpt-codex-connector[bot]", "github-actions[bot]"}
+
+def _enforced_logins_or_block() -> tuple[dict[str, frozenset[str]], str]:
+    """``(sets, "")`` or ``({}, block message)``: which parser each finding scanner
+    reads a known login's findings with (see `review_findings.enforced_logins`).
+    When that module could not be imported, a scanner cannot know whose findings it
+    is reading, so it BLOCKS rather than read none — after its own override check,
+    so `# review-override` still waives it."""
+    if _REVIEW_FINDINGS_ERROR:
+        return {}, (
+            f"the hook tree is broken: {_REVIEW_FINDINGS_ERROR}. Review findings cannot "
+            f"be attributed to their reviewers until it is, or append '# review-override'."
+        )
+    return enforced_logins(), ""
+
+
+def _review_bots(sets: dict[str, frozenset[str]]) -> frozenset[str]:
+    """The review-body verdict scan's authors: every known badge-format reviewer,
+    plus the CI bot, whose marker-less comments are walked and skipped as
+    non-verdicts. Each author's verdict is its OWN: the walk keeps every login's
+    newest verdict separately, so one login's clean verdict never clears another's
+    finding (#2683), and every badge reviewer's own finding is still read."""
+    return sets.get("codex-badge", frozenset()) | {"github-actions[bot]"}
+
 
 # ── Inline review comments (pulls/N/comments — a DIFFERENT endpoint) ──
 # Codex posts its actual P1/P2 findings ONLY as inline review comments;
 # its review body is boilerplate. This endpoint was never scanned, so
 # the gate was blind to them (audited 2026-07-10: 173 findings across
 # 118 merged PRs passed unseen, 64 of them P1).
-_INLINE_P1_RE = re.compile(r"!\[P1 Badge\]")
-_INLINE_P2_RE = re.compile(r"!\[P2 Badge\]")
 
-# CodeRabbit states severity in a pipe-separated italic header on its FIRST line:
+# CodeRabbit states severity in a pipe-separated header on its FIRST line, italic
+# through 2026-10-05 and bold since 2026-10-06 (#2992):
 #   _🔒 Security & Privacy_ | _🟠 Major_ | _🏗️ Heavy lift_
+#   **🩺 Stability & Availability** | **🟠 Major** | **⚡ Quick win**
 # Its findings were already REACHED by the scan below — `user.type` is "Bot", so
 # they pass the author filter — and then dropped, because neither badge pattern
 # above matches and the if/elif has no else. Read, not recognised; a PR carrying
 # a Major reported `inline-findings: ok`, indistinguishable from a clean one.
-_CODERABBIT_LOGINS = {"coderabbitai[bot]"}
-# The documented ladder. An unrecognised level is NON-BLOCKING (surfaced with a
-# canary) — a severity name this set has not seen must not silently start
-# blocking every PR the moment the vendor adds one.
-_CR_SEVERITIES = frozenset({"critical", "major", "minor", "trivial", "info"})
 _CR_BLOCKING_SEVERITIES = frozenset({"critical", "major"})
-# ONE header field: an italic span carrying no interior underscore. Anchored
-# whole (`^…$`) so a field is recognised only as a complete span, never as a
-# substring found somewhere inside one.
-#
-# The 64-char bound is deliberately double the observed ceiling, not tight to
-# it. MEASURED across 124 real findings, the longest category field is
-# `📐 Maintainability & Code Quality` at EXACTLY 32 characters — so a 32-char
-# bound sits precisely on live data, and a vendor renaming one category one
-# character longer would push a genuine Critical into the non-blocking path.
-# The bound is a sanity check against runaway prose, not a filter doing real
-# work, so it costs nothing to give it real headroom.
-_CR_HEADER_FIELD_RE = re.compile(r"^_([^_\n]{1,64})_$")
-# A line that LOOKS like an attempted severity header — italic markers and a
-# field separator — used only to tell "not a header" apart from "a header this
-# code failed to parse". Conflating those two makes an unparsed finding print
-# as "below Major", a false statement about a level that was never read.
-_CR_HEADER_SHAPE_RE = re.compile(r"^_.*\|.*_$")
 # CodeRabbit bundles SEVERAL findings into ONE inline comment, separated by a
 # markdown rule, when they land near each other in the diff. Each segment is
 # its own finding with its own severity.
@@ -1258,6 +1882,40 @@ _CR_FINDING_SPLIT_RE = re.compile(r"^ {0,3}-{3,}\s*$", re.M)
 # the SAME weighted machinery as the Codex findings rather than a second blocking
 # path, so there is one score and one threshold to reason about.
 _CR_BLOCKING_WEIGHT = 1.0
+
+# ── Devin's inline findings — SCORED, like Codex (owner ruling, 2026-09-24) ──
+# Until this existed every Devin comment fell to the unrecognised bucket:
+# surfaced, never scored, so a severe bug Devin raised could not stop a merge.
+# MEASURED 2026-09-24 over every Devin comment on the 33 open non-draft PRs:
+# 166 comments, each opening with `<!-- devin-review-comment {json} -->` and
+# then exactly one of the five markers in `review_findings.DEVIN_MARKERS`. Red
+# is Devin's severe tier (a severe bug, or a critical security finding on the
+# red square), yellow its
+# non-severe tier (a bug, or a security warning on the yellow square), and the
+# magnifier is informational. The strongest evidence for that reading is the
+# comments themselves: on a later count of 253 open-queue comments the marker
+# agreed with the metadata `kind` every time (red/yellow = bug, the squares =
+# security, magnifier = analysis). The owner kept the yellow security warning at
+# the same weight as any yellow finding rather than lifting it to the floor.
+#
+# A CLOSED set, and deliberately so: a marker this table has not seen is
+# surfaced as format drift and never scored. Guessing a severity from an
+# unknown marker would be worse than the blindness, and the vendor adding a
+# level must not silently start blocking every PR.
+# Strength order among the copies of a duplicated finding. Compared only AFTER
+# each copy's scope is judged on its own anchor (see `_devin_disposition`).
+_DEVIN_SEVERITY_RANK: dict[str | None, int] = {"floor": 3, "minor": 2, "analysis": 1, None: 0}
+# Devin may WITHDRAW its own finding: a reply from the SAME bot login, in that
+# finding's thread, whose first line starts with this marker clears it (owner
+# ruling, 2026-09-24). Consulted for DEVIN findings only — Codex and CodeRabbit
+# findings still clear on a maintainer reply alone. MEASURED on the open queue in a
+# later snapshot than the 166-comment count above (so the denominators differ): 50
+# of 167 Devin finding groups carried Devin's own "resolved" reply and no
+# maintainer reply. Only
+# this exact lead counts — Devin also posts builder-style prose ("Fixed in …"),
+# which is a claim about work, not the reviewer's verdict — and no bot can clear
+# ANOTHER reviewer's finding.
+_BOT_SELF_RESOLVED_LEAD = "✅ **Resolved**"
 # Weighted review score for inline findings: a P1 is a full blocker (1.0), a P2
 # is half (0.5). What that BUYS depends on the lane: see the per-lane thresholds
 # below. Two P2s block a `critical` change, four a `standard` one, six a `light`
@@ -1282,10 +1940,71 @@ _INLINE_P2_SCORE_WEIGHT = 0.5
 # property of the change; varying by INSTALL would be a property of the operator,
 # and only the second is what that sentence refuses. No config key is added.
 _INLINE_SCORE_BLOCK_THRESHOLDS = {"critical": 1.0, "standard": 2.0, "light": 3.0}
-_INLINE_REVIEW_BOTS = {
-    "chatgpt-codex-connector[bot]",
-    "github-advanced-security[bot]",
-}
+# Which accounts' inline comments are review output even when GitHub does not type
+# the author a Bot: the known logins whose parser reads badges, plus CodeQL's
+# (surfaced, never scored). Derived from `review_findings.KNOWN_FORMATS` inside
+# the scan, never listed here: a second copy of reviewer logins is what drifts.
+_INLINE_REVIEW_PARSERS = ("codex-badge", "codeql")
+#: The template's distinctive sentence. A body that does not contain it is NOT
+#: this template and is never suppressed, however short it is — see the gate at
+#: the top of `_is_wrapper_review_body`, which exists because the residue test
+#: alone silently dropped brief real findings.
+_WRAPPER_REVIEW_BODY_SIGNATURE = "automated review suggestions for this pull request"
+#: Pieces of the known review TEMPLATE, removed one at a time to see whether
+#: anything a human would read is left. Order does not matter; each is deleted
+#: wherever it appears. The `<details>` block is matched non-greedily and its
+#: content is vendor chrome ("About Codex in GitHub"), not review output.
+_WRAPPER_REVIEW_BODY_PARTS = (
+    re.compile(r"<details>.*?</details>", re.S),
+    re.compile(r"^#+.*Codex Review.*$", re.M),
+    re.compile(r"Here are some automated review suggestions for this pull request\.?"),
+    re.compile(r"\*\*Reviewed commit:\*\*\s*`?[0-9a-f]{7,40}`?"),
+)
+#: Below this many characters of residue, what is left of a stripped template is
+#: punctuation and whitespace rather than content. MEASURED: the live template
+#: leaves 0 characters; the smallest real finding body in the same corpus is
+#: over 400. Any value in that gap behaves identically, so this is a threshold
+#: with a measured margin either side rather than a number chosen to fit.
+_WRAPPER_RESIDUE_MAX_CHARS = 24
+
+
+def _is_wrapper_review_body(body: str) -> bool:
+    """True when a review BODY is a template carrying no findings of its own.
+
+    SUBTRACTIVE, not a marker denylist. An earlier revision asked "does this
+    body contain the template's two marker phrases?", which suppressed anything
+    that OPENED with the template and then appended real content — re-creating
+    the review-body blind spot for the one shape most likely to carry a finding
+    (Codex P2, and its own suggested remedy). This instead REMOVES the template
+    and asks what survives: a pure wrapper leaves nothing, a wrapper with a
+    summary bolted on leaves the summary, and the summary is what gets surfaced.
+
+    Used to keep the uncounted tail from annotating every PR. A list of logins
+    whose bodies are wrappers was measured WORSE on fail direction, not on
+    accuracy: when the template changes this predicate stops matching and the
+    body is SURFACED (noise, visible, recoverable), where a login list silently
+    drops a body that had started carrying findings.
+
+    Bounded work: each pattern is anchored to a literal and the `<details>`
+    match is non-greedy, so this is linear in the body. That matters because it
+    runs on a hook path, where a scan an author can make slow is a fail-open —
+    a killed hook does not block.
+    """
+    # GATE ON THE SIGNATURE FIRST. Without this the residue test alone suppresses
+    # any SHORT body — "first pass: found a race." reduces to 19 characters of
+    # content and would be silently dropped. Caught by its own test, and it is
+    # the same silent-drop class this bucket exists to close: a threshold that
+    # cannot tell "a template with nothing left" from "a brief real finding".
+    if _WRAPPER_REVIEW_BODY_SIGNATURE not in body:
+        return False
+    residue = body
+    for part in _WRAPPER_REVIEW_BODY_PARTS:
+        residue = part.sub("", residue)
+    # Strip markdown furniture the template leaves behind so residue measures
+    # CONTENT, not the punctuation between removed pieces.
+    return len(re.sub(r"[\s*_`>#|:\-]", "", residue)) <= _WRAPPER_RESIDUE_MAX_CHARS
+
+
 # A reply "engages" (silences) an inline P1 finding ONLY when authored by someone with
 # repository authority — otherwise any GitHub account (a throwaway, or the PR author on
 # their own PR) could post a one-word reply and clear a real P1 (PR #1434 security
@@ -1294,7 +2013,7 @@ _INLINE_REVIEW_BOTS = {
 # NOT count as acknowledgement.
 _MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 # Badge/markup prefix stripped when rendering a finding's title line.
-_INLINE_MARKUP_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}")
+_INLINE_MARKUP_RE = re.compile(r"<!--.*?-->|!\[[^\]]*\]\([^)]*\)|</?sub>|[*]{1,2}", re.S)
 # A finding title is a one-line PREVIEW in a list of them; the full body is on
 # the PR, so this bounds a pointer-backed value rather than cutting the only
 # copy. `_inline_title` states the cut when it makes one.
@@ -1485,6 +2204,15 @@ def _inline_title(body: str) -> str:
     """
     # split("\n") not splitlines(): a NEL (U+0085) inside the body must not shift
     # which line is shown as the title (consistent with the JSONL parser).
+    #
+    # Line 0 of the STRIPPED text, which is load-bearing and was nearly
+    # over-engineered away: one review bot opens every comment with an HTML
+    # metadata comment, and a first attempt at fixing that added a scan for the
+    # first NON-EMPTY line, on the belief that removing the comment left line 0
+    # blank. MEASURED over 35 real comments from that bot: the scan and plain
+    # line 0 agree on 35/35 and neither renders empty, because `.strip()`
+    # already removes the leading newlines the comment left behind. The scan was
+    # justified by an artifact of the probe that "found" it, not by the data.
     first = _INLINE_MARKUP_RE.sub("", body).strip().split("\n")
     return _safe_title(first[0].strip() if first else "")
 
@@ -1515,65 +2243,6 @@ def _safe_title(raw: str) -> str:
     # bounding it is a selection rather than an amputation — but say that a cut
     # happened, so a clipped title is never read as the whole finding.
     return safe[: _INLINE_TITLE_MAX_CHARS - 1].rstrip() + "…"
-
-
-def _cr_severity(body: str) -> tuple[str | None, bool]:
-    """Severity read from a CodeRabbit finding's header LINE. -> (level, header_seen)
-
-    Anchored to the header rather than searched for anywhere in the body, because
-    a review-bot comment is a CODE-BEARING DOCUMENT: it quotes the diff and embeds
-    ```suggestion``` blocks. `_` is simultaneously CodeRabbit's severity delimiter,
-    markdown emphasis, AND the snake_case separator, so a body-wide search for a
-    `_`-delimited severity word matches ordinary source. MEASURED against this
-    repo, a whole-body search matched `MAX_CRITICAL_ERRORS`, `def is_major_bump`,
-    the prose NEGATION `_not critical_`, the path `runtime_critical_path.py` —
-    152 such tokens — and, self-demonstratingly, this feature's own test fixture
-    `_CR_MAJOR_BODY`. A *Minor* finding quoting any one of them would have blocked
-    the merge and been reported as "Critical/Major": worse than the blindness it
-    replaces, since issue #1642 warns that poor precision trains reflex overrides.
-
-    Every field must be a COMPLETE italic span, so a line is accepted as a header
-    only if it is entirely one. Severity is read as the field's LAST word, never
-    by position — one observed finding omits the severity field entirely, and a
-    positional read would take the effort field ("Heavy lift") for a severity.
-    The emoji is deliberately not matched: only Minor and Major were ever observed
-    across 104 findings, so the emoji for Critical, Trivial and Info is unknown
-    here and guessing it would silently miss the most severe level.
-
-    `header_seen` separates "a CodeRabbit finding whose level we do not recognise"
-    from "a comment with no severity header at all". Neither blocks; only the
-    first is a canary worth printing. A line that LOOKS like a header but does
-    not fully parse counts as SEEN — reporting it as "below Major" would be a
-    false statement about a level this code never actually read.
-    """
-    for line in body.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        fields = [_CR_HEADER_FIELD_RE.match(f.strip()) for f in stripped.split("|")]
-        if not all(fields):
-            # Header-SHAPED but unparseable is a canary, not a clean miss.
-            return None, bool(_CR_HEADER_SHAPE_RE.match(stripped))
-        hits = []
-        for fld in fields:
-            words = fld.group(1).split()  # type: ignore[union-attr]
-            if words and words[-1].casefold() in _CR_SEVERITIES:
-                hits.append(words[-1].casefold())
-        if len(set(hits)) == 1 and hits:
-            # Exactly one DISTINCT level — including the unanimous-duplicate
-            # case (`_Business Critical_ | _🔴 Critical_`), where demoting a
-            # real Critical to the non-blocking canary would be the worse read.
-            return hits[0], True
-        if len(hits) > 1:
-            # Two severity-looking fields (`_Business Critical_ | _🟡 Minor_`)
-            # is a format this code cannot adjudicate. First-match-wins read
-            # that example as Critical — a false block; last-match-wins would
-            # hide a real Major behind a decorative trailing field. Neither
-            # guess is safe, so it is reported as unknown, the canary path
-            # (Codex P2, PR #1677).
-            return None, True
-        return None, True  # a header, but no field names a level we know
-    return None, False
 
 
 #: An opening or closing code fence: three-or-more backticks/tildes, then an
@@ -1774,10 +2443,20 @@ def _coderabbit_title(body: str) -> str:
     the finding, and reporting one of those as the title misnames the finding in
     the pre-merge report a human reads to decide a merge.
     """
+    first = True
     for line, is_markup in zip(body.split("\n"), _cr_markup_mask(body), strict=True):
         if is_markup:
             continue
         stripped = line.strip()
+        if not stripped:
+            continue
+        # The header is bold since 2026-10-06 (#2992), so it would be read as the
+        # title. Skip it, and only it: the header is always the FIRST line, and a
+        # later bold title holding a `|` (`str | None`) is header-shaped too.
+        if first:
+            first = False
+            if _cr_severity(stripped)[1]:
+                continue
         if stripped.startswith("**") and stripped.rstrip("*").strip():
             # Through _safe_title, NOT a bare slice: this is the branch a real
             # CodeRabbit finding takes, so it is the one that matters most.
@@ -1793,7 +2472,7 @@ def _coderabbit_title(body: str) -> str:
 # cannot create an inline review comment for it, so it puts the finding in the
 # review BODY under a collapsible section instead. NEITHER existing scan sees
 # these: `_check_inline_review_findings` reads `pulls/N/comments` (a different
-# endpoint entirely), and `_check_pr_review_findings` gates on `_REVIEW_BOTS`,
+# endpoint entirely), and `_check_pr_review_findings` gates on `_review_bots(...)`,
 # which does not contain CodeRabbit.
 #
 # MEASURED 2026-09-07, all 84 then-open non-draft PRs: 27 deduped findings
@@ -2220,7 +2899,7 @@ def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
     — the exact shape `_cr_severity`'s own docstring already adjudicates).
 
     So: split on `|`, accept only chunks that are COMPLETE italic fields
-    (`_CR_HEADER_FIELD_RE`, the anchored parser's own matcher), read each
+    (`_cr_header_fields`, the anchored parser's own matcher, italic or bold), read each
     field's LAST word, and adjudicate as `_cr_severity` does — exactly one
     DISTINCT level wins (unanimous duplicates included); two distinct levels
     are a format this code cannot adjudicate and land in the caller's
@@ -2234,11 +2913,8 @@ def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
     direction for a merge gate.
     """
     hits: list[str] = []
-    for chunk in text.split("|"):
-        fld = _CR_HEADER_FIELD_RE.match(chunk.strip())
-        if not fld:
-            continue
-        words = fld.group(1).split()
+    for field_text in _cr_header_fields(text, skip_partial=True) or []:
+        words = field_text.split()
         if words and words[-1].casefold() in _CR_SEVERITIES:
             hits.append(words[-1].casefold())
     if hits and len(set(hits)) == 1:
@@ -2410,11 +3086,242 @@ def _fetch_comments_paged(
     return acc, False
 
 
+#: A single file holding at least this share of a round's scored findings is
+#: reported as CONCENTRATED. Not a threshold anything blocks on — it only decides
+#: whether the report adds the mechanism note, so being approximately right is
+#: enough and no value here can change a verdict.
+_CONCENTRATION_SHARE = 0.5
+
+#: …and below this many findings the share is noise (2 of 3 is 67% and means
+#: nothing). Concentration is a claim about a distribution; a distribution needs
+#: enough points to have a shape.
+_CONCENTRATION_MIN_FINDINGS = 4
+
+
+#: Content budget for one rendered path, and how much of it the tail keeps.
+#: Smaller than the gate-text budget because six of these share one report; the
+#: head still gets 40 characters, which is what keeps two same-basename paths
+#: apart. No second ENCODED budget: nothing expands any more (see below).
+_REPORT_PATH_MAX_CHARS = 80
+_REPORT_PATH_TAIL_CHARS = 40
+#: Width of the identity tag appended when — and ONLY when — the rendering is
+#: lossy. Six hex characters is 16.7M buckets against a table that shows at most
+#: six rows; the job is telling two rows apart, not resisting a preimage attack.
+_REPORT_PATH_DIGEST_CHARS = 6
+
+
+def _safe_report_path(path: str) -> str:
+    """A path rendered safe for a terminal report: defanged, flattened, BOUNDED.
+
+    Composes the primitives this file already uses for every other untrusted
+    value it prints. It does NOT bring its own answer, and the history of it
+    doing so is the reason this docstring is long.
+
+    THE THREE EARLIER VERSIONS ALL ESCAPED WITH ``json.dumps``, and each drew a
+    finding in consecutive review rounds (PR #2005 rounds 1, 2, 3, 4). The cause
+    was not any one of the bugs: it was that ``json.dumps`` is a NON-LINEAR
+    length transform, expanding a non-ASCII or control character six-fold. That
+    forced a second budget on the encoded form, and a two-stage budget loses
+    information in a different way each time you look at it — a front-slice that
+    discarded the basename, then a clip that discarded IDENTITY, so two paths
+    differing only in their leading directory rendered as the same string.
+
+    MEASURED, the three axes that decided this (``premise_probe_2005``):
+
+    ==================  ==========================  ====================
+    axis                ``json.dumps`` renderer     these primitives
+    ==================  ==========================  ====================
+    terminal threats    neutralised                 neutralised, 0/7 residue
+    characters kept     88% / 26% / 44%             100%
+    two paths, one tail identical  (the bug)        distinguishable
+    ==================  ==========================  ====================
+
+    (kept: ASCII / CJK / control-dense. A non-ASCII path lost three quarters of
+    itself to escaping before any budget applied.)
+
+    ``_defang_gate_text`` classifies by unicodedata CATEGORY rather than
+    enumerating codepoints, which is why it holds U+061C and the rest of the
+    bidi family — a lesson that file paid for once already (Codex P2, PR #1638).
+    It is 1:1 on length, so no second budget exists to disagree with the first.
+
+    THE ONE THING IT DOES NOT DO is remove ``\\n``: it splits on newlines to
+    preserve multi-line gate messages. A path is one row, and a newline inside
+    one would forge another, so it is flattened here rather than in the shared
+    primitive, where it would corrupt every other caller.
+
+    Bounding is ``_bound_with_stated_omission`` at the path budget — head AND
+    tail, with the omission counted. Keeping the head is exactly what fixes the
+    identity defect; keeping the tail is what preserves the basename, which is a
+    path's informative end. An earlier docstring claimed the full value was "one
+    row up in the findings list": it is not. Those rows print ``_inline_title``
+    output, which is a title and carries no path, so this rendering is the only
+    one there is and losing information here loses it outright.
+    """
+    rendered = _bound_with_stated_omission(
+        _defang_gate_text(path).replace("\n", " "),
+        _REPORT_PATH_MAX_CHARS,
+        _REPORT_PATH_TAIL_CHARS,
+    )
+    # LOSSY RENDERING DESTROYS IDENTITY, and both transforms above are lossy in
+    # different ways. Defang is many-to-one — `src/a b.py` and `src/a\x1bb.py`
+    # both render `src/a b.py`. The bound drops the MIDDLE — two 90-character
+    # paths sharing a head and a basename produce the same text, the same
+    # omission count and the same tail. Either way the distribution groups by
+    # the RAW path but LABELS by this one, so two real buckets can print as the
+    # same row and the reader cannot tell which file is which.
+    #
+    # Rounds 1-4 of this PR were all one property (length under an expanding
+    # encoding). This is a DIFFERENT one, and it was latent the whole time —
+    # fixing the expansion is what made it visible. Codex and Devin found it
+    # independently at the same head and prescribed the same remedy.
+    #
+    # The equality test is the exact condition, not an approximation of it: if
+    # the rendering is byte-identical to its input then it IS the identifier and
+    # needs nothing. Only a rendering that actually changed something pays for a
+    # tag, so an ordinary path stays clean and the tag never becomes noise the
+    # reader learns to skip.
+    if rendered == path:
+        return rendered
+    # `surrogatepass` because a hash must never raise: paths arrive from JSON and
+    # can carry lone surrogates, which plain utf-8 encoding refuses.
+    digest = hashlib.sha256(path.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"{rendered} [#{digest[:_REPORT_PATH_DIGEST_CHARS]}]"
+
+
+def _findings_distribution(
+    scored_at: list[tuple[str, str]],
+    *,
+    renames: dict[str, str] | None = None,
+    reliable: bool = True,
+) -> str:
+    """Where the SCORED findings LAND, as a report — never a verdict.
+
+    The denominator is `scored_at` and the wording says so, because getting
+    this wrong is the same defect one level up. A scan routinely holds findings
+    that are unresolved and NOT scored — CodeRabbit below-Major, unrecognised
+    review bots, off-diff and documentation-path anchors — so "100% of the
+    unresolved findings" can be printed while unscored findings sit in other
+    files entirely, inviting a class diagnosis from a denominator that never
+    included them. Two earlier wordings were both wrong: "this round's
+    findings" (the scorer accumulates across rounds) and "the unresolved
+    findings" (it counts only the scored subset). Say the narrow thing.
+
+    WHY THE GATE PRINTS THIS AT ALL, including on round one. A list of findings
+    reads as a work queue, so the default response is to answer them one by one;
+    the same findings arranged BY FILE can show something a list cannot — that
+    several of them share one seam and may therefore share one cause. That is
+    information the gate already holds (every finding is parsed with its path, to
+    diff-scope it) and used to discard. Printing it costs nothing and puts the
+    evidence in front of whoever is deciding what to do about the round.
+
+    DELIBERATELY NOT A VERDICT, and the distinction is the whole design. This
+    function states counts and, when one file dominates, names what that MIGHT
+    mean. It never concludes the approach is wrong — one round rarely carries
+    that, and a gate that cried "premise!" at every round would be tuned out
+    within a week, which would cost more than it bought. What it does instead is
+    grant permission explicitly, because the failure this exists for is not that
+    sessions cannot see concentration; it is that answering the findings feels
+    like the whole job and stepping back feels like exceeding the brief.
+
+    Origin, stated because it is the acceptance case: a change whose round-one
+    findings were 8-of-11 in one file, three of them on code written to answer an
+    earlier round, was about to be answered as eleven separate patches. One
+    question from a human — are the premises right? — turned it into a single
+    mechanism change, using facts that were already on the table.
+    """
+    if not scored_at:
+        return ""
+
+    # Findings with no path (outdated anchors, path omitted by the API) count in
+    # the total — they are real findings — but they are NOT a file: four of them
+    # bucketing together proves nothing about a shared seam, so the None bucket
+    # is listed (sorted last) and excluded from the concentration call below.
+    by_file: dict[str | None, list[str]] = {}
+    for severity, path in scored_at:
+        # A file renamed during the PR leaves older comments anchored to its
+        # previous name; fold the alias into the current path before grouping,
+        # or one logical file reads as two and its share is underreported.
+        by_file.setdefault(
+            (renames or {}).get(path, path) or None, []
+        ).append(severity)
+
+    total = len(scored_at)
+    n_files = sum(1 for k in by_file if k is not None)
+    # The pathless bucket sorts LAST unconditionally, not merely as a tiebreak.
+    # As a tiebreak it only lost to files with MORE findings, so five pathless
+    # findings outranked a file with three — and with six real files present the
+    # display cap then elided an actual file to make room for the bucket that is
+    # not a file at all (Devin, PR #2005, round 5). It is listed, because it
+    # holds real findings; it is just never allowed to displace a location.
+    ranked = sorted(
+        by_file.items(),
+        key=lambda kv: (kv[0] is None, -len(kv[1]), kv[0] or ""),
+    )
+    lines = [
+        f"DISTRIBUTION: {total} scored finding(s) across {n_files} file(s)"
+        + ("" if reliable else " — PARTIAL: the scan did not read everything, so this shape is provisional")
+        + " — read as a class before answering as a list:"
+    ]
+    for path, sevs in ranked[:6]:
+        share = 100.0 * len(sevs) / total
+        mix = ", ".join(
+            f"{sevs.count(s)} {s}" for s in ("P1", "P2", "CR", "DV", "DVm") if sevs.count(s)
+        )
+        lines.append(
+            f"    {len(sevs):>2} ({share:4.0f}%)  "
+            f"{_safe_report_path(path) if path is not None else '(no path)'}  [{mix}]"
+        )
+    if len(ranked) > 6:
+        # The elided remainder is counted in FILES, and the pathless bucket is
+        # not one — counting rows here would report "2 more file(s)" when one
+        # file and the pathless bucket were dropped. It is also named rather
+        # than silently folded away: it holds real findings, and an omission
+        # nobody declares is the thing the elision marker exists to prevent.
+        elided = ranked[6:]
+        elided_files = sum(1 for path, _ in elided if path is not None)
+        parts = []
+        if elided_files:
+            parts.append(f"{elided_files} more file(s)")
+        if elided_files != len(elided):  # at most one None bucket exists
+            parts.append("the pathless bucket")
+        lines.append(f"    … and {' + '.join(parts)}")
+
+    # The single-seam note needs ONE file that actually dominates: a pathless
+    # bucket is not a file, and a 2–2 tie names a lexicographic winner that does
+    # not exist. No concentration inference at all on a partial read — an
+    # unread page could hold the finding that changes the shape.
+    known_ranked = [(path, sevs) for path, sevs in ranked if path is not None]
+    concentrated = (
+        reliable
+        and bool(known_ranked)
+        and total >= _CONCENTRATION_MIN_FINDINGS
+        and len(known_ranked[0][1]) / total >= _CONCENTRATION_SHARE
+        and (len(known_ranked) == 1 or len(known_ranked[0][1]) > len(known_ranked[1][1]))
+    )
+    if concentrated:
+        top_path, top_sevs = known_ranked[0]
+        lines.append(
+            f"  NOTE: {100.0 * len(top_sevs) / total:.0f}% of the SCORED findings are in ONE "
+            f"file ({_safe_report_path(top_path)}). Findings that concentrate on a single seam — or that land on "
+            "code added to answer an EARLIER round — are a mechanism signal: they often share "
+            "one cause, and fixing the cause retires them together while fixing them "
+            "individually tends to produce the next round's findings."
+        )
+    lines.append(
+        "  Deciding this round is a CLASS rather than a list is part of answering it, not a "
+        "detour from it — and concluding the approach itself is wrong is a legitimate verdict "
+        "that needs nobody's permission. One round is a lead, not a proof: say what THIS "
+        "round's evidence supports, and no more. Method: .claude/docs/premise-check.md"
+    )
+    return "\n".join(lines)
+
+
 def _check_inline_review_findings(
     pr_num: str,
     *,
     force: bool = False,
     repo: str | None = None,
+    uncounted_out: list[dict[str, int]] | None = None,
 ) -> tuple[bool, str]:
     """Scan review findings from BOTH delivery channels and apply a weighted score.
 
@@ -2468,6 +3375,9 @@ def _check_inline_review_findings(
     """
     if force:
         return False, ""  # override NOTE already printed by the body gate
+    scanner_sets, table_block = _enforced_logins_or_block()
+    if table_block:
+        return True, table_block
     # Paginate via the shared helper (findings beyond the first REST page must still
     # gate); it accumulates ALL pages as parsed dicts, NEL-safe. ``raw is None`` = the
     # first page was unreadable; ``complete`` False = a later page failed. Fetch in the
@@ -2495,8 +3405,69 @@ def _check_inline_review_findings(
         for c in raw
         if c.get("reply_to") and c.get("assoc") in _MAINTAINER_ASSOCIATIONS
     }
+    # DEVIN, grouped BEFORE the classify loop — for the same reason `replied_to`
+    # is: a finding posted twice is two comments sharing one Devin id, and a
+    # reply attaches to only one of them. Deciding per COMMENT would clear the
+    # answered copy and keep scoring its twin. So a group is cleared when ANY
+    # copy carries a maintainer reply, or Devin's own `✅ **Resolved**` reply —
+    # the second only when the reply comes from the SAME bot login as the copy
+    # it answers, so a reviewer can withdraw its own finding and never another's.
+    _login_of = {c.get("id"): c.get("login") or "" for c in raw if c.get("id") is not None}
+    self_withdrawn = {
+        c.get("reply_to")
+        for c in raw
+        if c.get("reply_to")
+        and c.get("type") == "Bot"
+        and (c.get("login") or "") == _login_of.get(c.get("reply_to"))
+        and (c.get("body") or "").lstrip().split("\n", 1)[0].startswith(_BOT_SELF_RESOLVED_LEAD)
+    }
+    # The known-format registry decides which parser reads which login (read ONCE
+    # per scan).
+    devin_logins = scanner_sets.get("devin-marker", frozenset())
+    coderabbit_logins = scanner_sets.get("coderabbit-header", frozenset())
+    inline_review_logins = frozenset().union(
+        *(scanner_sets.get(p, frozenset()) for p in _INLINE_REVIEW_PARSERS)
+    )
+    # Every Devin-format structure is keyed by (login, finding_id), never the bare
+    # id: two reviewers' ids can collide, and one reviewer's answered finding must
+    # never clear another's. Same-login duplicate copies still group.
+    devin_cleared: set[tuple[str, str]] = set()
+    # Groups a MAINTAINER answered. A group cleared only by Devin's own reply is
+    # surfaced below rather than dropped: Devin's reviewer and its builder post
+    # under ONE login (MEASURED: the same account posts "Fixed in <sha>" replies
+    # on a devin/* branch), so a self-withdrawal is reply TEXT, not an identity.
+    # It still clears (owner ruling), but never silently (owner, 2026-09-24).
+    devin_maint_cleared: set[tuple[str, str]] = set()
+    devin_copies: dict[tuple[str, str], list[dict]] = {}
+    for c in raw:
+        if c.get("reply_to") or (c.get("login") or "") not in devin_logins:
+            continue
+        if c.get("type") != "Bot":
+            continue
+        fid, _sev = _devin_finding(c.get("body") or "")
+        if fid is None:
+            continue
+        dkey = (c.get("login") or "", fid)
+        devin_copies.setdefault(dkey, []).append(c)
+        if c.get("id") in replied_to or c.get("id") in self_withdrawn:
+            devin_cleared.add(dkey)
+        if c.get("id") in replied_to:
+            devin_maint_cleared.add(dkey)
+    devin_seen: set[tuple[str, str]] = set()
+    devin_block: list[str] = []  # severe bug / critical security — the floor, 1.0 each
+    devin_minor: list[str] = []  # non-severe bug / security warning — 0.5 each
+    devin_analysis: list[str] = []  # informational — surfaced, never scored
+    devin_unknown: list[str] = []  # unrecognised shape — surfaced as drift, never scored
+    devin_self_withdrawn: list[str] = []  # cleared by Devin's own reply only — surfaced
+    devin_doc_skipped: list[str] = []  # scoring Devin findings on a doc path
+    devin_off_diff: list[tuple[str, str]] = []  # scoring Devin findings outside the diff
     p1: list[str] = []
     p2: list[str] = []
+    # (severity, path) for every finding that SCORES, kept alongside the title
+    # lists so the distribution below can be computed without a second fetch.
+    # The off-diff lists already carry (title, path) tuples for the same reason;
+    # this is that shape applied to the findings that actually count.
+    scored_at: list[tuple[str, str]] = []
     doc_skipped: list[str] = []  # P1s on doc paths — surfaced, never blocking
     doc_skipped_p2: list[str] = []  # P2s on doc paths — surfaced, excluded from score
     cr_block: list[str] = []  # CodeRabbit Critical/Major — 1.0 each
@@ -2538,14 +3509,158 @@ def _check_inline_review_findings(
             _scope_cache.append(set(files) if files else None)
         changed = _scope_cache[0]
         return changed is not None and path not in changed
+
+    def _devin_disposition(copy: dict) -> tuple[str, str | None]:
+        """Where ONE copy of a Devin finding lands, judged on its OWN anchor.
+
+        ``("drift" | "analysis" | "off_diff" | "doc" | "scored", severity)``.
+        Severity and scope are decided per copy and only THEN compared, never
+        folded into one ranking key: a finding Devin posted twice can carry a
+        different marker AND a different anchor on each copy, and a single
+        (severity, in-diff) key let an off-diff red copy outrank an in-diff
+        yellow one and take the whole group out of scoring with it.
+        """
+        sev = _devin_finding(copy.get("body") or "")[1]
+        if sev is None:
+            return "drift", None
+        if sev == "analysis":
+            return "analysis", sev
+        path = copy.get("path")
+        if _off_diff(path):
+            return "off_diff", sev
+        # The doc-path lever, read the way each Codex branch reads it for the
+        # matching weight: a floor finding is excluded only under `skip`, a
+        # 0.5 finding under `skip` or `p1_only`. Same modes, same meaning, so
+        # one reviewer is never enforced where the other is not.
+        if _is_doc_path(path or ""):
+            mode = _doc_findings_mode()
+            if mode == "skip" or (sev == "minor" and mode == "p1_only"):
+                return "doc", sev
+        return "scored", sev
+
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
-        if utype != "Bot" and login not in _INLINE_REVIEW_BOTS:
-            continue
+        # NO AUTHOR FILTER. This used to drop every non-Bot, non-allowlisted
+        # author with a bare `continue`, so a human collaborator's inline review
+        # comment reached no accumulator and the row could still read `ok`.
+        #
+        # OWNER DIRECTIVE 2026-09-20: never willfully ignore a review that offers
+        # to help — another bot, or just another GitHub user. The gate's job is to
+        # make the session AWARE the input exists; judging it is the session's.
+        # These land in the unrecognised bucket below: surfaced, never scored,
+        # never blocking, and they make the rendered total a FLOOR rather than an
+        # equality, because nothing here read their finding cardinality.
+        #
+        # `pulls/N/comments` carries DIFF-ANCHORED comments only — PR chatter
+        # lives on the issue endpoint, which this scan never reads — so the
+        # population widened to is review-shaped by the endpoint's own contract,
+        # not by an assumption about who wrote it.
         if c.get("reply_to"):
             continue  # replies aren't findings
-        if login in _CODERABBIT_LOGINS:
+        # WHOSE OUTPUT MAY BE PARSED FOR SEVERITY — deliberately the SAME
+        # population the removed filter used to admit: a Bot, or an allowlisted
+        # review account. Widening WHO IS SEEN must not widen WHO IS BELIEVED.
+        #
+        # This distinction is load-bearing and its absence was caught by an
+        # existing lock (`test_human_inline_comments_ignored`) rather than by
+        # review: `_INLINE_P1_RE` matches the BODY, not the author, so simply
+        # deleting the filter let ANY GitHub account block a merge by posting a
+        # comment carrying a P1 badge. That is the authority hole
+        # `_MAINTAINER_ASSOCIATIONS` exists to prevent on the reply side,
+        # reproduced on the finding side.
+        #
+        # So an unrecognised author skips the matchers entirely and falls to the
+        # unrecognised branch: SURFACED, never scored, never blocking.
+        parseable = utype == "Bot" or login in inline_review_logins
+        if login in devin_logins and utype == "Bot":
+            # EXCLUSIVE and terminal, and placed BEFORE the badge branches below:
+            # Devin quotes guard output and code in its findings, so a body can
+            # contain `![P1 Badge]` as QUOTED TEXT. Falling through to the badge
+            # match would score one finding twice — once as a P1 on the floor and
+            # once as Devin's own severity. Keyed on the login AND Bot type, so a
+            # human pasting Devin's exact body is never believed (the authority
+            # rule the unrecognised-author branch below exists to keep).
+            fid, _sev = _devin_finding(body)
+            if fid is None:
+                # An unidentifiable comment is FORMAT DRIFT and is reported as
+                # such even when a maintainer answered it: the note is about this
+                # gate's parser, not the finding, and it never scored either way.
+                devin_unknown.append(_inline_title(body))
+                continue
+            dkey = (login, fid)
+            if dkey in devin_seen:
+                continue  # another post of a finding already classified
+            devin_seen.add(dkey)
+            copies = devin_copies.get(dkey, [c])
+            # Drift is a fact about a COMMENT, so every unreadable copy is
+            # reported: before dedup can fold it into a readable sibling under
+            # the same id, and before clearing, for the reason given above.
+            # This is the parser alone. The per-copy SCOPE judgement below
+            # reads the PR's changed files, so it must stay AFTER the clearing
+            # check: an answered finding never pays for that read, exactly as
+            # the Codex and CodeRabbit branches check `replied_to` first.
+            has_readable = any(_devin_finding(cp.get("body") or "")[1] is not None for cp in copies)
+            for cp in copies:
+                if _devin_finding(cp.get("body") or "")[1] is None:
+                    drift_title = _inline_title(cp.get("body") or "")
+                    if has_readable:
+                        drift_title += " (a copy of a finding classified by its readable copy)"
+                    devin_unknown.append(drift_title)
+            if dkey in devin_cleared:
+                # Answered: a maintainer reply, or Devin withdrew it. The second
+                # is listed, from the parser alone (no file-list read).
+                if dkey not in devin_maint_cleared:
+                    devin_self_withdrawn.append(
+                        next(
+                            (
+                                _inline_title(cp.get("body") or "")
+                                for cp in copies
+                                if _devin_finding(cp.get("body") or "")[1] is not None
+                            ),
+                            _inline_title(copies[0].get("body") or ""),
+                        )
+                    )
+                continue
+            judged = [(cp, *_devin_disposition(cp)) for cp in copies]
+            # The group SCORES on its strongest copy that is eligible to score.
+            # Only when no copy is eligible is it reported, once, through its
+            # strongest copy's reason. So neither a weaker copy nor an
+            # out-of-scope one can hide a scoring finding. `sorted` is stable,
+            # so equal severities keep their posting order.
+            readable = sorted(
+                (t for t in judged if t[1] != "drift"),
+                key=lambda t: _DEVIN_SEVERITY_RANK[t[2]],
+                reverse=True,
+            )
+            if not readable:
+                continue  # every copy was drift, reported above
+            eligible = [t for t in readable if t[1] == "scored"]
+            best, disp, sev = eligible[0] if eligible else readable[0]
+            title = _inline_title(best.get("body") or "")
+            dv_path = best.get("path")
+            # A stronger copy that could not score is not dropped silently: the
+            # reader sees that Devin marked the same finding more severely on an
+            # anchor this gate did not score (off-diff, or an excluded doc path).
+            # Surfaced on the title only, so no count changes.
+            if eligible and _DEVIN_SEVERITY_RANK[readable[0][2]] > _DEVIN_SEVERITY_RANK[sev]:
+                title += (
+                    " (another copy was marked more severe on an anchor this gate did not score)"
+                )
+            if disp == "analysis":
+                devin_analysis.append(title)
+            elif disp == "off_diff":
+                devin_off_diff.append((title, dv_path or ""))
+            elif disp == "doc":
+                devin_doc_skipped.append(title)
+            elif sev == "floor":
+                devin_block.append(title)
+                scored_at.append(("DV", dv_path or ""))
+            else:
+                devin_minor.append(title)
+                scored_at.append(("DVm", dv_path or ""))
+            continue
+        if login in coderabbit_logins:
             # Engagement is checked ONCE, for the whole comment, BEFORE severity —
             # not per-severity below. It used to sit inside the blocking branch, so
             # only Critical/Major honoured a maintainer reply while every Minor,
@@ -2575,7 +3690,7 @@ def _check_inline_review_findings(
                         # No recognised severity — whether the header names a
                         # level this gate does not know, is ambiguous, or is
                         # missing entirely. Every observed CodeRabbit finding
-                        # leads with the italic pipe header, so a headerless
+                        # leads with the pipe header, so a headerless
                         # original is FORMAT DRIFT: filing it as an ordinary
                         # advisory printed "below Major" about a level that was
                         # never read, and a drifted Major would ride through
@@ -2604,8 +3719,9 @@ def _check_inline_review_findings(
                     cr_doc_skipped.append(_coderabbit_title(seg))
                     continue
                 cr_block.append(_coderabbit_title(seg))
+                scored_at.append(("CR", c.get("path") or ""))
             continue
-        if _INLINE_P1_RE.search(body):
+        if parseable and _INLINE_P1_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — treated as acknowledged
             if _off_diff(c.get("path")):
@@ -2623,7 +3739,8 @@ def _check_inline_review_findings(
                 doc_skipped.append(_inline_title(body))
                 continue
             p1.append(_inline_title(body))
-        elif _INLINE_P2_RE.search(body):
+            scored_at.append(("P1", c.get("path") or ""))
+        elif parseable and _INLINE_P2_RE.search(body):
             if c.get("id") in replied_to:
                 continue  # thread engaged — maintainer consciously accepted the P2
             if _off_diff(c.get("path")):
@@ -2638,6 +3755,7 @@ def _check_inline_review_findings(
                 doc_skipped_p2.append(_inline_title(body))
                 continue
             p2.append(_inline_title(body))
+            scored_at.append(("P2", c.get("path") or ""))
         else:
             # The silent-drop CLASS, not just its CodeRabbit instance. A comment
             # that reached this loop was authored by a Bot or an allowlisted review
@@ -2650,6 +3768,16 @@ def _check_inline_review_findings(
             # Surfaced, never scored: recognising a format is what earns a weight,
             # and guessing a severity from an unknown format would be worse than
             # the blindness. The point is that it can no longer be INVISIBLE.
+            #
+            # ENGAGEMENT applies here too, and it became load-bearing when the
+            # author filter above was removed: without it, a comment a maintainer
+            # has already answered in-thread keeps re-surfacing on every run
+            # forever. That is the same burial this branch exists to prevent —
+            # "a growing list of already-settled advisories is how a genuinely
+            # unresolved one gets buried", two comments up — so the rule that
+            # protects the CodeRabbit path protects this one on the same terms.
+            if c.get("id") in replied_to:
+                continue
             unmatched_bot.append((login, _inline_title(body)))
 
     # ── The SECOND delivery channel: findings CodeRabbit could not post inline ──
@@ -2674,15 +3802,40 @@ def _check_inline_review_findings(
     # A body that declares more findings than this parser read: an INCOMPLETE
     # scan, which blocks like any other incomplete read.
     outside_shortfall: list[str] = []
+    # Review bodies from an author this scan does not recognise — another bot, or
+    # a human collaborator. Until this existed the loop below dropped them with a
+    # bare `continue`, so a reviewer who delivered findings in a review BODY
+    # contributed NOTHING to any accumulator and the row fell back to a bare
+    # `ok` — the exact blind spot this change exists to remove, one channel over.
+    #
+    # OWNER DIRECTIVE 2026-09-20: never willfully ignore a review that offers to
+    # help, whoever wrote it. The gate's job here is AWARENESS, not adjudication —
+    # it makes the session aware the input exists and lets the session judge it.
+    # So these are SURFACED and make the total a floor; they are never SCORED,
+    # because guessing a severity from an unrecognised reviewer would be worse
+    # than the blindness, and never BLOCK, because a human comment is not a gate.
+    # ONE ENTRY PER REVIEW, not per reviewer. Deduping on login understated the
+    # input and mislabelled its own unit (Codex P2): re-reviews are routine after
+    # a push, and MEASURED on PR #2191 a single author posted FOUR distinct
+    # bodies — potentially four different findings — which a login-deduped list
+    # announced as "1 review". The count and the unit have to describe the same
+    # thing, which is the defect class this whole change exists to remove.
+    unclassified_reviews: list[str] = []  # one login per REVIEW, order preserved
     reviews, reviews_complete = _pr_review_bodies(pr_num, repo=repo)
-    # An unreadable second channel still BLOCKS — but at the END, next to the
+    # An unreadable second channel is handled at the END, next to the
     # incomplete-read check, not by returning from here. Returning early would
     # discard every list the inline loop just built (p1, p2, cr_block,
     # cr_unknown, off-diff, doc-skipped, unmatched_bot) BEFORE any of them is
     # printed, so one transient `gh` failure would replace the whole pre-merge
-    # report with a single "UNREADABLE" line. Same fail direction, far less
-    # information — and this function's docstring promises nothing unaddressed
-    # is dropped.
+    # report with a single "UNREADABLE" line. Far less information — and this
+    # function's docstring promises nothing unaddressed is dropped.
+    #
+    # It does NOT block. This comment used to say "still BLOCKS", which stopped
+    # being true when the review-body channel became advisory (see the long note
+    # at the emit site below) — the tail only prints and falls through to a clean
+    # return. Corrected here because it is the comment a reader would use to
+    # conclude that an under-read channel cannot reach a passing row: it can, and
+    # `channel_under_read` above is what keeps that state from rendering as `ok`.
     reviews_unreadable = reviews is None
     if reviews is None:
         reviews = []
@@ -2714,7 +3867,63 @@ def _check_inline_review_findings(
             # actor would need the timeline endpoint and another call on the
             # merge clock; that trade is open, not settled.
             continue
-        if (review.get("login") or "") not in _CODERABBIT_LOGINS:
+        review_login = review.get("login") or ""
+        if review_login not in coderabbit_logins:
+            # NOT a silent drop any more. An author this scan cannot parse still
+            # gets NAMED, so the session knows the input exists.
+            #
+            # Narrowed by CONTENT, never by AUTHORSHIP. An empty body is a bare
+            # approval; a WRAPPER body is a template that carries no findings by
+            # construction. Deduped on login: one reviewer re-reviewing is one.
+            #
+            # MEASURED 2026-09-20 over 21 live review bodies on 6 PRs — which is
+            # the step whose absence caused both of this change's regressions:
+            #   * one reviewer posts a byte-identical 621-byte template on 6 of 6
+            #     PRs. Its findings go INLINE; the body is a wrapper. PR #2194
+            #     itself carried findings in BOTH rounds and its body was 621
+            #     bytes both times, so the body is constant regardless.
+            #   * another reviewer's bodies vary 432-690 bytes and say things
+            #     like "found 3 potential issues" and "1 flag NOT posted on this
+            #     PR" — a finding that never reached the PR at all, which is
+            #     exactly the invisible-finding class this scan exists to expose.
+            # So AUTHORSHIP does not predict whether a body carries findings, and
+            # an earlier revision that excluded every recognised login made this
+            # tail fire on 6 of 6 PRs — a signal that is always on is a signal
+            # nobody reads, and it also pinned `approx >= 1`, which meant the
+            # exact/approx split could never render an exact count on this repo.
+            #
+            # FAIL DIRECTION, and it is why this is a content test rather than a
+            # list of logins: if the template changes, this stops matching and
+            # the body is SURFACED — noise, visible, recoverable. A login list
+            # fails the other way, silently dropping a body that started
+            # carrying findings, which is the defect class this change removes.
+            #
+            # Substring tests, not a regex: this runs on a hook path where a
+            # super-linear scan over third-party text is a fail-open, and two
+            # `in` checks cannot backtrack.
+            #
+            # ⚠ A SECOND narrowing was here and was WRONG — Codex P2, round 2,
+            # confirmed by reading all three readers. It skipped every recognised
+            # review login on the grounds that they are "already handled by
+            # another path". They are not, for BODIES: `_check_pr_review_findings`
+            # reads `issues/N/comments`, the inline scanner reads
+            # `pulls/N/comments`, and `_codex_reviews`'s jq projection keeps
+            # `{login, commit_id, state}` and discards `body` entirely. So NOTHING
+            # in this file reads a Codex or Advanced-Security review BODY, and
+            # excluding them re-created a silent drop for the reviewers we trust
+            # MOST — inside the change written to remove silent drops.
+            #
+            # Recognised or not, an unparsed body is surfaced. The noise this was
+            # meant to avoid is bounded by the empty-body test above: a routine
+            # boilerplate approval has no body to surface. Surfacing a Codex body
+            # that DOES carry prose is the correct outcome, not noise.
+            #
+            # This still SURFACES rather than PARSES. Reading a review body for
+            # findings is a different capability and a different risk (see the
+            # filed issue); awareness is the contract here.
+            review_body = (review.get("body") or "").strip()
+            if review_body and not _is_wrapper_review_body(review_body):
+                unclassified_reviews.append(review_login)
             continue
         parsed, declared, declared_known, depth_drift = _cr_outside_diff_entries(
             review.get("body") or ""
@@ -2775,7 +3984,14 @@ def _check_inline_review_findings(
             ):
                 outside_seen[key] = severity
     for (path, line_range, title), severity in outside_seen.items():
-        label = f"{title or '(untitled)'} ({path}:{line_range})"
+        # `title` is sanitised at its producer and `line_range` is safe by
+        # construction — `_CR_ENTRY_RE` captures `\d+(?:-\d+)?`, digits and one
+        # hyphen. `path` is neither: `_CR_FILE_HEADER_RE` captures `[^<>]+?`,
+        # which excludes angle brackets and NOTHING ELSE, so a file header can
+        # carry ESC, CR or bidi straight into this label. Rendered at display
+        # time because the raw value is still needed for the diff-scope match
+        # carried alongside it in the tuples below.
+        label = f"{title or '(untitled)'} ({_safe_report_path(path)}:{line_range})"
         if not severity:
             cr_unknown.append(label)
         elif severity == "critical":
@@ -2821,13 +4037,47 @@ def _check_inline_review_findings(
 
     if unmatched_bot:
         print(
-            f"NOTE: PR #{pr_num} — {len(unmatched_bot)} review-bot comment(s) in a "
-            f"format this gate does not recognise. NOT scored; listed so an "
-            f"unrecognised reviewer cannot be silently invisible:",
+            f"NOTE: PR #{pr_num} — {len(unmatched_bot)} inline review comment(s) in a "
+            f"format this gate does not recognise, or from an author it does not "
+            f"know. NOT scored — read them yourself; listed so a reviewer cannot "
+            f"be silently invisible:",
             file=sys.stderr,
         )
         for bot_login, title in unmatched_bot[:5]:
             print(f"  [unrecognised: {bot_login}] {title}", file=sys.stderr)
+        if len(unmatched_bot) > 5:
+            print(
+                f"  … and {len(unmatched_bot) - 5} more (listing bounded to 5; the "
+                f"count above is the total)",
+                file=sys.stderr,
+            )
+    if unclassified_reviews:
+        # The SECOND channel's version of the same silent drop. Logins only — no
+        # body text: this NOTE's line 0 is not the one `check_pr_report` renders
+        # raw, but the whole block is untrusted third-party content and a login
+        # is the smallest thing that still makes the input findable.
+        # BOTH numbers, because they answer different questions and reporting
+        # either alone misleads: the REVIEW count is how many bodies went
+        # unread, the REVIEWER count is how many distinct sources they came
+        # from. A login-deduped total announced four bodies as one review.
+        distinct = sorted(set(unclassified_reviews))
+        print(
+            f"NOTE: PR #{pr_num} — {len(unclassified_reviews)} review(s) from "
+            f"{len(distinct)} reviewer(s), delivered in a review BODY this gate "
+            f"cannot parse. NOT scored and NOT blocking — go read them; a review "
+            f"that offers to help is never willfully ignored here, whoever wrote it:",
+            file=sys.stderr,
+        )
+        for who in distinct[:5]:
+            count = unclassified_reviews.count(who)
+            suffix = f" ×{count}" if count > 1 else ""
+            print(f"  [unclassified reviewer: {who}{suffix}]", file=sys.stderr)
+        if len(distinct) > 5:
+            print(
+                f"  … and {len(distinct) - 5} more reviewer(s) (listing bounded to 5; "
+                f"the counts above are the totals)",
+                file=sys.stderr,
+            )
     if _scope_cache and _scope_cache[0] is None:
         # Resolution was ATTEMPTED (a candidate finding consulted it) and
         # failed — say so loudly, because from here the scan behaves exactly
@@ -2847,7 +4097,17 @@ def _check_inline_review_findings(
             file=sys.stderr,
         )
         for title, fpath in cr_off_diff[:8]:
-            print(f"  [off-diff CodeRabbit Critical/Major] {title} ({fpath})", file=sys.stderr)
+            # `title` is already safe — `_inline_title` sanitises at the PRODUCER.
+            # A path cannot follow that rule: the raw value is what `_off_diff`
+            # matches against the changed-file list and what the rename map keys
+            # on, so defanging at the producer would corrupt the comparison. It is
+            # therefore rendered at DISPLAY time, here and at every other site
+            # that prints one. See `_safe_report_path`.
+            print(
+                f"  [off-diff CodeRabbit Critical/Major] {title} "
+                f"({_safe_report_path(fpath)})",
+                file=sys.stderr,
+            )
     if off_diff_p1 or off_diff_p2:
         print(
             f"NOTE: PR #{pr_num} — {len(off_diff_p1)} [P1] + {len(off_diff_p2)} "
@@ -2857,9 +4117,9 @@ def _check_inline_review_findings(
             file=sys.stderr,
         )
         for title, fpath in off_diff_p1[:5]:
-            print(f"  [off-diff P1] {title} ({fpath})", file=sys.stderr)
+            print(f"  [off-diff P1] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
         for title, fpath in off_diff_p2[:5]:
-            print(f"  [off-diff P2] {title} ({fpath})", file=sys.stderr)
+            print(f"  [off-diff P2] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
     if cr_unknown:
         print(
             f"NOTE: PR #{pr_num} — {len(cr_unknown)} CodeRabbit finding(s) whose "
@@ -2910,11 +4170,79 @@ def _check_inline_review_findings(
     # Criticals in 27 findings across 23 PRs (2026-09-07, all 84 then-open
     # non-draft PRs), so this path has never once fired on live data, while the
     # surfacing keeps 100% of the value the channel was built for.
+    # Devin sits on the SAME weights as Codex (owner ruling, 2026-09-24): a
+    # severe bug or critical security finding is a full 1.0 and joins the floor
+    # below; a non-severe bug or security warning is a P2's 0.5. One score, one
+    # threshold — never a second blocking path.
     score = (
         len(p1)
         + _INLINE_P2_SCORE_WEIGHT * len(p2)
         + _CR_BLOCKING_WEIGHT * len(cr_block)
+        + len(devin_block)
+        + _INLINE_P2_SCORE_WEIGHT * len(devin_minor)
     )
+    if devin_analysis:
+        print(
+            f"NOTE: PR #{pr_num} — {len(devin_analysis)} Devin informational "
+            f"finding(s) (an explanation, not a defect claim) — surfaced and NOT "
+            f"counted toward the review score:",
+            file=sys.stderr,
+        )
+        for title in devin_analysis[:5]:
+            print(f"  [Devin analysis] {title}", file=sys.stderr)
+    if devin_self_withdrawn:
+        print(
+            f"NOTE: PR #{pr_num} — {len(devin_self_withdrawn)} Devin finding(s) "
+            f"cleared by Devin's own '✅ Resolved' reply, with no maintainer reply. "
+            f"Devin's reviewer and builder share one login, so check the fix "
+            f"really landed before relying on it:",
+            file=sys.stderr,
+        )
+        for title in devin_self_withdrawn[:5]:
+            print(f"  [Devin self-withdrawn] {title}", file=sys.stderr)
+    if devin_unknown:
+        print(
+            f"NOTE: PR #{pr_num} — {len(devin_unknown)} Devin comment(s) whose "
+            f"format this gate could not read (no metadata tag, unreadable "
+            f"metadata, or a severity marker outside the known set — the format "
+            f"may have changed). NOT scored — verify the level by hand:",
+            file=sys.stderr,
+        )
+        for title in devin_unknown[:5]:
+            print(f"  [Devin unknown format] {title}", file=sys.stderr)
+    if devin_off_diff:
+        print(
+            f"NOTE: PR #{pr_num} — {len(devin_off_diff)} Devin finding(s) on files "
+            f"outside this PR's diff (base-branch content) — NOT scored:",
+            file=sys.stderr,
+        )
+        for title, fpath in devin_off_diff[:5]:
+            print(f"  [off-diff Devin] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
+    if devin_doc_skipped:
+        print(
+            f"NOTE: PR #{pr_num} — {len(devin_doc_skipped)} Devin finding(s) on "
+            f"documentation paths — surfaced for conscious acceptance, NOT counted "
+            f"toward the review score:",
+            file=sys.stderr,
+        )
+        for title in devin_doc_skipped[:5]:
+            print(f"  [doc Devin] {title}", file=sys.stderr)
+    if devin_block:
+        print(
+            f"WARNING: PR #{pr_num} has {len(devin_block)} Devin severe-bug / "
+            f"critical-security finding(s) (each adds 1.0 and is always-fix):",
+            file=sys.stderr,
+        )
+        for title in devin_block[:8]:
+            print(f"  [Devin severe] {title}", file=sys.stderr)
+    if devin_minor:
+        print(
+            f"WARNING: PR #{pr_num} has {len(devin_minor)} Devin non-severe "
+            f"finding(s) (each adds {_INLINE_P2_SCORE_WEIGHT} to the review score):",
+            file=sys.stderr,
+        )
+        for title in devin_minor[:8]:
+            print(f"  [Devin] {title}", file=sys.stderr)
     if cr_advisory:
         print(
             f"NOTE: PR #{pr_num} — {len(cr_advisory)} CodeRabbit finding(s) below "
@@ -2942,6 +4270,116 @@ def _check_inline_review_findings(
         )
         for title in p2[:8]:
             print(f"  [P2] {title}", file=sys.stderr)
+    # Printed with the findings themselves, not with the verdict, because this is
+    # for whoever is deciding what to do about them — and that decision is made
+    # while reading the list, before any threshold is consulted. Emitted on EVERY
+    # round including the first: one round is a lead rather than a proof, but a
+    # lead nobody is shown is a lead nobody follows.
+    # The report is only as good as the scan behind it: a truncated comment read
+    # or a failed changed-file resolution makes every percentage below a shape
+    # nobody actually measured, so a PARTIAL scan prints counts but never the
+    # concentration inference.
+    # Guarded on `scored_at` rather than leaning on the empty-input early
+    # return inside `_findings_distribution`: Python evaluates arguments BEFORE
+    # the call, so the rename lookup — its own `pulls/N/files` fetch behind its
+    # own cache — would run on every clean PR to build a map for a report that
+    # is never rendered. This path also runs inside the merge hook, which has a
+    # wall-clock deadline, so a fetch for a discarded result is not free.
+    if scored_at:
+        reliable = complete and (not _scope_cache or _scope_cache[0] is not None)
+        distribution = _findings_distribution(
+            scored_at,
+            renames=_pr_rename_map(pr_num, repo=repo),
+            reliable=reliable,
+        )
+        if distribution:
+            print(distribution, file=sys.stderr)
+    # ONE write point for the uncounted categories, deliberately — not one per
+    # return. Every accumulator above is final here, and no `return` sits between
+    # this line and the four exits below, so a single record cannot miss one of
+    # them. Recording at each return instead would be a convention four sites had
+    # to remember, which is the shape that produces "the fifth return forgot".
+    #
+    # The two EARLY returns above (`force`, and an unreadable first page) are
+    # deliberately NOT recorded: they exit before these lists exist, so the
+    # caller sees an EMPTY out-param and must render UNKNOWN rather than zero.
+    # "0 uncounted" on a path that counted nothing is the false confidence this
+    # gate exists to remove, and reproducing it one field over would be worse
+    # than the row it replaces.
+    #
+    # ⚠ THAT STATE IS A FORWARD GUARD, NOT A LIVE ONE, and saying so is the
+    # point — an earlier revision described it as shipped behaviour and put that
+    # claim in a public changelog. VERIFIED: exactly one caller passes
+    # `uncounted_out` (`check_pr_report`) and it never passes `force`, while the
+    # unreadable-first-page return goes through `_scan_unreadable`, which blocks,
+    # so the row renders BLOCK and the clause is never called. `_uncounted_clause
+    # ([])` is therefore unreachable from production TODAY. The branch stays
+    # because it is right for the next caller; the claim about it does not.
+    if uncounted_out is not None:
+        uncounted_out.append(
+            {
+                # TWO SUB-DICTS, and the split is the POINT — it is a lock, not
+                # tidiness. Every bucket here is a count of something the scan
+                # did not score, but they do NOT share a UNIT, and an earlier
+                # version summed them into one number labelled "finding(s)".
+                #
+                # `exact` holds buckets where one comment IS one finding, because
+                # the format was RECOGNISED and its cardinality read.
+                #
+                # `approx` holds review output whose finding cardinality is
+                # UNKNOWN — an unrecognised format, or an unrecognised author. One
+                # such comment may carry five findings or none, so its length is a
+                # count of COMMENTS and can never be a count of findings. Anything
+                # in here makes the rendered total a FLOOR, never an equality.
+                #
+                # Nesting rather than a flat dict plus a remembered list: a new
+                # bucket cannot be added without choosing a side, so "which of
+                # these were exact again?" is not a question a later reader has to
+                # answer correctly from memory. That question is exactly what
+                # produced the defect — the convention-not-chokepoint shape.
+                "exact": {
+                    "doc_path": (
+                        len(doc_skipped)
+                        + len(doc_skipped_p2)
+                        + len(cr_doc_skipped)
+                        + len(devin_doc_skipped)
+                    ),
+                    "below_major": len(cr_advisory),
+                    "off_diff": (
+                        len(cr_off_diff)
+                        + len(off_diff_p1)
+                        + len(off_diff_p2)
+                        + len(devin_off_diff)
+                    ),
+                    "unanchored": (
+                        len(outside_critical) + len(outside_major) + len(outside_minor)
+                    ),
+                },
+                "approx": {
+                    "unrecognised_format": len(cr_unknown) + len(devin_unknown),
+                    "unrecognised_reviewer": len(unmatched_bot),
+                    "unclassified_review_bodies": len(unclassified_reviews),
+                },
+                # NOT a count — a FLAG, popped before the sum.
+                #
+                # The counters above are correct about the ACCUMULATORS and can
+                # still be wrong about the world. When the review-body channel
+                # under-reports — unreadable, an incomplete read, a declared-count
+                # shortfall, or a surplus batch quarantined whole — findings may
+                # exist that NO accumulator could ever have counted, and every
+                # counter is legitimately 0. Without this flag that renders as
+                # "nothing went uncounted", which is the bare `ok` this change
+                # exists to remove, one field over.
+                #
+                # MEASURED on the pre-fix tree: a clean scan, an unreadable channel
+                # and an incomplete channel all printed BYTE-IDENTICAL rows. The
+                # flags were already in scope here; only the design was not looking
+                # at them.
+                "channel_under_read": int(
+                    reviews_unreadable or not reviews_complete or bool(outside_shortfall)
+                ),
+            }
+        )
     # The lane is resolved ONLY when there is a score to compare, so a PR with no
     # blocking findings still pays nothing — the same laziness `_scope_cache`
     # above was built for. `_pr_changed_files` is memoized, and the pin-receipt
@@ -2969,15 +4407,18 @@ def _check_inline_review_findings(
     # so a CodeRabbit MINOR naming a fail-open scores 0.0 and passes here. The
     # mechanical floor is the labelled subset; the rest still rests on somebody
     # reading the report.
-    floor_hits = len(p1) + len(cr_block)
+    floor_hits = len(p1) + len(cr_block) + len(devin_block)
     if floor_hits:
         listing = "\n".join(
             [f"  [P1] {t}" for t in p1[:5]]
             + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
+            + [f"  [Devin severe] {t}" for t in devin_block[:5]]
         )
         return True, (
             f"always-fix floor: {len(p1)} unresolved [P1] + {len(cr_block)} "
-            f"CodeRabbit Critical/Major finding(s), none maintainer-replied "
+            f"CodeRabbit Critical/Major + {len(devin_block)} Devin severe "
+            f"finding(s), none cleared (a maintainer reply, or Devin's own "
+            f"'Resolved' reply to a Devin finding) "
             f"(review score {score:.1f}). Severity blocks in EVERY lane (this "
             f"change is {lane.upper()}); the per-lane score threshold "
             f"({threshold:.1f} here) governs how many P2s may accumulate, never "
@@ -2986,17 +4427,19 @@ def _check_inline_review_findings(
             f"to the merge command to acknowledge and proceed."
         )
     if score >= threshold:
-        # P1s and CodeRabbit Critical/Majors cannot reach here — the floor above
-        # returned on any of them — so this branch is purely a P2 accumulation,
-        # and naming the other two terms would describe counts that are provably
-        # zero.
-        listing = "\n".join(f"  [P2] {t}" for t in p2[:8])
+        # Floor findings cannot reach here — the floor above returned on any of
+        # them — so this branch is purely an accumulation of 0.5-weight findings
+        # (Codex P2 and Devin non-severe), and naming the floor terms would
+        # describe counts that are provably zero.
+        listing = "\n".join(
+            [f"  [P2] {t}" for t in p2[:8]] + [f"  [Devin] {t}" for t in devin_minor[:8]]
+        )
         return True, (
             f"review score {score:.1f} >= {threshold:.1f} blocks this "
-            f"{lane.upper()} change: {len(p2)} unresolved [P2] finding(s) at "
-            f"{_INLINE_P2_SCORE_WEIGHT} each, none maintainer-replied. (A P1 or a "
-            f"CodeRabbit Critical/Major would have blocked at the always-fix "
-            f"floor, whatever the lane.)\n{listing}\n"
+            f"{lane.upper()} change: {len(p2)} unresolved [P2] + {len(devin_minor)} "
+            f"Devin non-severe finding(s) at {_INLINE_P2_SCORE_WEIGHT} each, none "
+            f"cleared. (A P1, a CodeRabbit Critical/Major or a Devin severe finding "
+            f"would have blocked at the always-fix floor, whatever the lane.)\n{listing}\n"
             f"Fix and reply in-thread, or append '# review-override' "
             f"to the merge command to acknowledge and proceed."
         )
@@ -3068,6 +4511,9 @@ def _check_pr_review_findings(
             file=sys.stderr,
         )
         return False, ""
+    scanner_sets, table_block = _enforced_logins_or_block()
+    if table_block:
+        return True, table_block
 
     # Paginate via the shared helper (a review-body finding beyond the first REST
     # page must still gate). ``comments is None`` = the first page was unreadable;
@@ -3093,14 +4539,21 @@ def _check_pr_review_findings(
     # This closes the fail-open (Codex P1) where the old terminal clause
     # ``if is_clean or not blocking_matches: return clean`` let ANY marker-less
     # comment from a Bot-typed account (Dependabot, or github-actions — which is IN
-    # _REVIEW_BOTS) end the walk clean, silently clearing an earlier ERROR. Requiring
+    # _review_bots()) end the walk clean, silently clearing an earlier ERROR. Requiring
     # a recognized verdict marker closes BOTH the unrecognized-bot and the
     # recognized-but-non-verdict (status-comment) masking paths.
+    #
+    # PER LOGIN (#2683): each author's NEWEST verdict is its own. A blocking newest
+    # verdict from ANY author blocks; a clean one settles only that author, and the
+    # walk goes on for the others. Under a single shared verdict a second badge
+    # reviewer's `VERDICT: PASS` ended the walk clean over the primary's `[P1]`.
+    review_bots = _review_bots(scanner_sets)
+    settled: set[str] = set()  # authors whose newest verdict was clean
     for c in reversed(comments):
         login = c.get("login") or ""
         body = c.get("body") or ""  # GitHub returns null body for deleted comments
-        # Only recognized review bots set the verdict.
-        if login not in _REVIEW_BOTS:
+        # Only recognized review bots set a verdict, and only their NEWEST one.
+        if login not in review_bots or login in settled:
             continue
         # Codex quota-exhausted messages are not a review.
         if "reached your Codex usage limits" in body and not any(
@@ -3122,18 +4575,19 @@ def _check_pr_review_findings(
                 f"the merge command to acknowledge and proceed."
             )
         if is_clean:
-            # An explicit clean verdict ends the walk — but trust it only on a
-            # COMPLETE read. On an incomplete read the pages we have are the
+            # An explicit clean verdict settles THIS author: its older comments are
+            # superseded. It is trusted only on a COMPLETE read, which the check
+            # below enforces: on an incomplete read the pages we have are the
             # EARLIEST, so a newer finding could sit on an unread page.
-            if complete:
-                return False, ""
-            return _scan_unreadable("review-body comments (incomplete read)")
+            settled.add(login)
+            continue
         # Neither blocking nor clean → not a verdict comment → keep walking.
 
-    # No verdict-bearing finding among the comments we read. On an INCOMPLETE read a
+    # No blocking newest verdict among the comments we read. On an INCOMPLETE read a
     # newer finding could exist on an unread page — fail per _scan_unreadable rather
-    # than report clean. An empty/complete result is clean: the freshness gate
-    # (_check_codex_reviewed_head) separately requires a CURRENT review to EXIST.
+    # than report clean, whether or not a clean verdict was seen. An empty/complete
+    # result is clean: the freshness gate (_check_codex_reviewed_head) separately
+    # requires a CURRENT review to EXIST.
     if not complete:
         return _scan_unreadable("review-body comments (incomplete read)")
     return False, ""
@@ -3148,7 +4602,15 @@ def _check_pr_review_findings(
 # (the review object's ``commit_id``) — NOT a short prefix from the body, which a
 # stale prefix (or a ground SHA sharing it) could satisfy. Waived by
 # '# review-override' (the conscious "merge without a current Codex review" case).
-_CODEX_REVIEW_BOT = "chatgpt-codex-connector[bot]"
+# WHICH reviewer merge freshness requires is `review_findings.CODEX_LOGIN`: THE
+# primary, a named constant rather than a list role.
+def _primary_reviewer_login() -> str | None:
+    """The primary reviewer's REST login, or None when the list is unimportable.
+
+    None makes every lookup keyed on it find no review, so freshness blocks: a
+    reviewer list the gate could not load never counts as a review.
+    """
+    return primary_reviewer_login()
 
 
 def _pr_head_sha(pr_num: str, repo: str | None = None) -> str | None:
@@ -3274,19 +4736,16 @@ def _pr_base_sha(pr_num: str, repo: str | None = None) -> str | None:
     return sha
 
 
-def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
-    """EVERY Codex review record ``{commit_id, state}`` on the PR, oldest-first,
-    or None on any API/parse error (distinct from ``[]`` = query succeeded, no
-    Codex review). INCLUDES ``DISMISSED`` reviews — consumers filter per their
-    need: freshness (``_codex_review_commit_ids``) skips dismissed (a dismissed
-    review vouches for NO commit); the escalation counter COUNTS them (a
-    dismissed round already RAN and consumed the review budget — #1385 round-5:
-    3 dismissed rounds must still trip the 3-round cap). Uses GitHub's
-    authoritative per-review ``commit_id`` (immune to prefix grinding); the
-    ``/pulls/N/reviews`` endpoint returns reviews oldest-first. Tests inject via
-    ``_TEST_GH_CODEX_REVIEWS`` (one JSON object per line: ``{login,
-    commit_id[, state]}``; missing ``state`` = active). Fail-safe: None on error.
-    """
+def _pr_review_records(pr_num: str, repo: str | None = None) -> list[dict] | None:
+    """EVERY review record ``{login, type, commit_id, state, has_body}`` on the PR,
+    oldest-first, or
+    None on any API/parse error. The one implementation behind both the Codex reader
+    below and the substitute-review lookup, so they parse GitHub's answer the same
+    way. It is NOT one fetch: the substitute path calls it again after the Codex
+    check, which costs a second read on that path only. Same seam as before: ``_TEST_GH_CODEX_REVIEWS`` (one JSON object
+    per line, ``{login, commit_id[, state][, type]}``; missing ``state`` = active;
+    missing ``type`` reads as a Bot exactly when the login carries the ``[bot]``
+    suffix, which a human login cannot)."""
     raw = os.environ.get("_TEST_GH_CODEX_REVIEWS")
     if raw is None:
         try:
@@ -3297,7 +4756,8 @@ def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
                     f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/reviews",
                     "--paginate",
                     "--jq",
-                    ".[] | {login: .user.login, commit_id: .commit_id, state: .state}",
+                    ".[] | {login: .user.login, type: .user.type, commit_id: .commit_id, "
+                    "state: .state, has_body: (((.body // \"\") | length) > 0)}",
                 ],
                 capture_output=True,
                 text=True,
@@ -3311,7 +4771,7 @@ def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
             raw = result.stdout
         except Exception:
             return None
-    reviews: list[dict] = []
+    records: list[dict] = []
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line:
@@ -3322,24 +4782,56 @@ def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
             continue
         if not isinstance(obj, dict):
             continue
-        if (obj.get("login") or "") != _CODEX_REVIEW_BOT:
-            continue
-        reviews.append(
+        login = obj.get("login") or ""
+        utype = obj.get("type")
+        if not isinstance(utype, str):
+            utype = "Bot" if isinstance(login, str) and login.endswith("[bot]") else "User"
+        records.append(
             {
+                "login": login,
+                "type": utype,
                 "commit_id": (obj.get("commit_id") or "").strip().lower(),
                 "state": (obj.get("state") or "").upper(),
+                # Absent (the test seam, an older projection) reads as True so the
+                # Codex reader keeps its exact behaviour; only the substitute
+                # lookup consults it.
+                "has_body": bool(obj.get("has_body", True)),
             }
         )
-    return reviews
+    return records
+
+
+def _codex_reviews(pr_num: str, repo: str | None = None) -> list[dict] | None:
+    """EVERY Codex review record ``{commit_id, state}`` on the PR, oldest-first,
+    or None on any API/parse error (distinct from ``[]`` = query succeeded, no
+    Codex review). INCLUDES ``DISMISSED`` reviews — consumers filter per their
+    need: freshness (``_codex_review_commit_ids``) skips dismissed (a dismissed
+    review vouches for NO commit); the escalation counter COUNTS them (a
+    dismissed round already RAN and consumed the review budget — #1385 round-5:
+    3 dismissed rounds must still trip the 3-round cap). Uses GitHub's
+    authoritative per-review ``commit_id`` (immune to prefix grinding); the
+    ``/pulls/N/reviews`` endpoint returns reviews oldest-first. Tests inject via
+    ``_TEST_GH_CODEX_REVIEWS`` (one JSON object per line: ``{login,
+    commit_id[, state]}``; missing ``state`` = active). Fail-safe: None on error.
+    """
+    records = _pr_review_records(pr_num, repo=repo)
+    primary = _primary_reviewer_login()
+    if records is None or primary is None:
+        return None
+    return [
+        {"commit_id": r["commit_id"], "state": r["state"]}
+        for r in records
+        if r["login"] == primary
+    ]
 
 
 def _codex_review_commit_ids(pr_num: str, repo: str | None = None) -> list[str] | None:
     """NON-DISMISSED Codex review commit oids, oldest-first, or None on error.
 
     Freshness identity — a dismissed review vouches for no commit, so the #1366
-    reviewed-head gate must not treat its sha as reviewed. For ROUND COUNTING
-    (dismissed rounds still ran) the escalation gate uses ``_codex_reviews``
-    directly. Consumer: ``_latest_codex_reviewed_sha`` (last entry).
+    reviewed-head gate must not treat its sha as reviewed. ROUND COUNTING
+    (where dismissed rounds still ran) is ``review_budget.evaluate_pr``'s, not
+    this function's. Consumer: ``_latest_codex_reviewed_sha`` (last entry).
     """
     reviews = _codex_reviews(pr_num, repo=repo)
     if reviews is None:
@@ -3393,8 +4885,7 @@ def _comment_positional(argv: list[str]) -> tuple[str | None, str | None]:
     the whole target and a later one is not a second candidate to fall back on.
     None means the request carries no positional at all
     (``gh pr comment --body …``, which resolves the PR from the checked-out
-    branch); that keeps its documented fail-open, since there is no target to
-    count against.
+    branch). The review-budget caller treats that as unknown identity.
 
     ``unreadable_flag`` is a dash token this walk does not model, encountered
     BEFORE any positional. It matters because an allowlist on the target's VALUE
@@ -3475,7 +4966,8 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     OWNER/REPO (counting against the hook cwd's repo for a cross-repo URL could
     produce a wrong count and a FALSE block — Codex round-1 finding). An
     explicit ``--repo``/``-R`` flag wins over the URL-derived repo. A branch
-    target (non-numeric, non-URL positional) yields (None, …) → fail-open.
+    target (non-numeric, non-URL positional) yields (None, …); the caller treats
+    that unresolved identity as unknown evidence and asks/denies.
 
     Reads the FIRST positional only (``_comment_positional``), where this used
     to scan every one of them for something number-shaped. gh accepts at most
@@ -3521,9 +5013,10 @@ def _unresolvable_identity(argv: list[str]) -> str | None:
     present and future — is refused by construction, without this function
     knowing anything about shell expansion syntax.
 
-    Two fail-opens are DELIBERATELY kept, both documented and both locked by
-    tests: a request with NO positional at all (nothing to count against), and a
-    literal branch target (resolvable by anyone who cares to look it up).
+    A request with no positional and a literal branch target are syntactically
+    valid gh forms, but neither is a stable PR number at pre-execution time.
+    The caller therefore routes both through the unknown-evidence policy instead
+    of treating them as requests with nothing to count against.
 
     The cost, stated plainly because it is real: ``shell_parse._argv`` runs
     ``shlex.split`` first, so quoting is already gone by the time argv exists,
@@ -3638,251 +5131,412 @@ def _comment_repo(argv: list[str]) -> str | None:
     return val
 
 
-def _final_round_chained_advisory(pr_num: str) -> str:
-    """A second terminal-stage dispatch behind the SAME acceptance.
 
-    The sigil is matched command-wide so the documented nested form
-    (`bash -c '…' # final-round-accept`) keeps working, which also meant
-    `request && request # final-round-accept` could chain arbitrarily many rounds
-    behind one decision while the advisory promised "ONE more round".
+def _review_budget_message(pr_num: str, result: dict, repo: str) -> str:
+    """Native-approval reason for one review request; no self-issued sigil exists."""
+    if result.get("status") != "ok":
+        # Name what failed, so one occurrence says why rather than only that.
+        errors = result.get("errors")
+        why = ""
+        if isinstance(errors, list) and errors:
+            shown = ", ".join(str(e)[:80] for e in errors[:5])
+            more = f" (+{len(errors) - 5} more)" if len(errors) > 5 else ""
+            why = f" Evaluator: {shown}{more}."
+        return (
+            f"Review evidence for PR #{pr_num} in {repo} could not be read reliably."
+            f"{why} "
+            "Treating the round budget as zero would silently reopen an exhausted "
+            "review loop. Approve this one request only if you have independently "
+            "checked the PR history."
+        )
+    count = int(result.get("count") or 0)
+    next_round = count + 1
+    if result.get("gate_surface"):
+        # The gate lane is terminal at its OWN limit, not at four, and this branch
+        # returns before the ordinary notice below can ever be reached — so the
+        # decision has to be named here too. But it has TWO sub-states and only one
+        # of them is terminal, which a single message got wrong: naming the terminal
+        # decision forecloses options, so it is a terminality claim even without the
+        # literal "no round N+1" sentence, and it must not appear while the evaluator
+        # is still holding a round open.
+        limit = _review_budget.GATE_DISCOVERY_ROUND_LIMIT
+        if result.get("confirmation_exempt"):
+            # STILL WITHIN BUDGET (`reason="gate_confirmation"`): this lane grants one
+            # exact-head confirmation dispatch at the limit, and evaluate_pr has just
+            # said this PR qualifies. Naming the terminal decision here would
+            # foreclose an option the evaluator is holding open.
+            # No "an earlier segment already spent it" sub-state is needed, and adding
+            # one would be speculative: a compound command carrying two review
+            # requests is DENIED at the `len(triggers) > 1` check above, before any
+            # budget lookup or exemption is consulted, so a later segment can never
+            # reach this message with the exemption already used. That deny is the
+            # stronger protection and it is pinned by test, including in this exempt
+            # state where an exact-head marker could otherwise license a sibling.
+            #
+            # Deliberately does NOT assert WHY the exemption did not apply. Four
+            # conditions gate it, and only one is "the marker is absent": the body
+            # may be OPAQUE to this guard (`--body-file`, an editor body), in which
+            # case a request that really does carry the marker lands here and must
+            # not be told it does not.
+            return (
+                f"PR #{pr_num} changes the review-gate surface and has {count} "
+                f"review rounds (heads that drew findings), its {limit} discovery rounds. One "
+                "exact-head confirmation request is STILL BUDGETED, but this guard "
+                "cannot see the current head's marker in this request — either it is "
+                "absent, or the body is opaque here (--body-file, editor). If you did "
+                "post the marked confirmation, approving is correct; otherwise post "
+                "it rather than spending a further discovery round."
+            )
+        # Reachable at EXACTLY the limit (the exemption is off once the head
+        # is reviewed or a confirmation was already requested), where "past"
+        # would be the same off-by-one this prompt exists to remove.
+        where = "past" if count > limit else "at the end of"
+        return (
+            f"PR #{pr_num} changes the review-gate surface and already has {count} "
+            f"review rounds (heads that drew findings), {where} its {limit} discovery "
+            "rounds. "
+            f"{_review_budget.TERMINAL_DECISION} Approve only after deciding that "
+            "another gate-design round is worth the risk; earlier approval never "
+            "carries forward."
+        )
+    # ROUND 4 IS TERMINAL (owner ruling, 2026-09-25), and this is the surface the
+    # owner reads AT the decision — so it must not frame round 5 as an ordinary
+    # next round. `strongly_discouraged` is `count >= 5`, one tier LATE for that
+    # purpose, so the terminal framing goes in BOTH branches; the discouraged one
+    # adds that every further round is equally terminal. The MECHANISM still
+    # permits round 5+ under this per-request approval (review_budget.py keeps
+    # STANDING_REVIEWED_HEAD_LIMIT=4 / STRONGLY_DISCOURAGED_REVIEWED_HEADS=5);
+    # aligning it is later work, and until then this prompt is what carries the
+    # rule to the person deciding.
+    #
+    # Read from the evaluator rather than spelled here: the commit gate states the
+    # same rule at its own approval, and two copies drift. See
+    # `review_budget.TERMINAL_DECISION` for why no local fallback is owed.
+    terminal = _review_budget.ORDINARY_TERMINAL_NOTICE
+    if result.get("strongly_discouraged"):
+        # TERMINAL_DECISION, never the NOTICE: this branch fires at
+        # STRONGLY_DISCOURAGED_REVIEWED_HEADS, so the notice's "there is no
+        # ordinary round 5" would be rendered to someone already holding five
+        # heads — the same rule the commit gate's matching branch follows.
+        return (
+            f"PR #{pr_num} already has {count} review rounds (heads that drew findings) — past the "
+            f"terminal boundary, so round {next_round} is strongly discouraged: "
+            "stop, narrow or redesign the change, accept documented residue, or "
+            f"abandon it. {_review_budget.TERMINAL_DECISION} Approve only to "
+            "authorize this one further round anyway; every later round is terminal "
+            "in the same way and needs its own approval, and earlier approval never "
+            "carries forward."
+        )
+    return (
+        f"PR #{pr_num} already has {count} review rounds (heads that drew findings); standing "
+        f"authorization ended after {_review_budget.STANDING_REVIEWED_HEAD_LIMIT}. "
+        f"{terminal} This approval covers exactly "
+        f"this one round-{next_round} request and does not carry forward."
+    )
+
+
+def _format_rounds(result: dict) -> str:
+    """Render one ``review_budget.evaluate_pr`` result as the ``rounds`` row."""
+    if result.get("status") != "ok":
+        errors = ", ".join(str(e) for e in result.get("errors") or []) or "evidence unknown"
+        return f"unreadable ({errors})"
+    count = int(result.get("count") or 0)
+    gate = bool(result.get("gate_surface"))
+    limit = (
+        _review_budget.GATE_DISCOVERY_ROUND_LIMIT
+        if gate
+        else _review_budget.STANDING_REVIEWED_HEAD_LIMIT
+    )
+    parts = [f"{count} ({'gate' if gate else 'ordinary'} lane, terminal at {limit})"]
+    rounds = result.get("rounds") or []
+    if result.get("round_state") == "open" and rounds:
+        newest = rounds[-1]
+        who = ", ".join(newest.get("reviewers") or []) or "pre-cutover rule"
+        parts.append(f"open at {str(newest.get('head'))[:10]} ({who})")
+    elif result.get("round_state") == "complete":
+        parts.append("complete (a commit has landed since the last round)")
+    counts = [r.get("findings") for r in rounds if r.get("findings") is not None]
+    if counts:
+        trend = result.get("trend")
+        mark = {"rising": " (RISING)", "falling": " (falling)", "flat": " (flat)"}.get(trend, "")
+        parts.append("findings per round " + "→".join(str(c) for c in counts) + mark)
+    legacy = int(result.get("legacy_heads") or 0)
+    if legacy:
+        parts.append(f"{legacy} head(s) counted by the pre-cutover rule")
+    line = " — ".join(parts)
+    if result.get("confirmation_exempt"):
+        # Still within budget: naming the terminal decision here would foreclose
+        # an option the evaluator is holding open (`_review_budget_message`).
+        line += " — one exact-head confirmation request still budgeted"
+    elif count > limit:
+        line += " — PAST TERMINAL: every further round needs the owner's approval"
+    elif count == limit:
+        line += (
+            " — TERMINAL: a clean review merges; findings mean send it back (your call) "
+            "or merge-and-accept (the owner's call)"
+        )
+    return line
+
+
+def _rounds_row(pr_num: str, repo: str | None = None) -> str:
+    """The ``rounds`` line of ``--check-pr``: ADVISORY, never a failure.
+
+    The round budget is enforced where it acts (the review-request ask above and
+    the commit gate); counting it here too would be a second enforcer of one rule.
+    It is printed so the round number is read from the evaluator rather than
+    re-derived by hand (#1719), with findings per round so a rising count is
+    visible without remembering the last one (#1957).
+    ``_TEST_ROUNDS_ROW`` short-circuits it: report tests, including subprocess
+    ones, must never make a live GraphQL call.
     """
-    return (
-        f"BLOCKED: a second terminal-stage review request for PR #{pr_num} in the "
-        "same command. '# final-round-accept' authorises ONE dispatch — the user "
-        "directed one more round, not a chain of them.\n\n"
-        "Run the requests separately, each with its own decision behind it."
-    )
+    seam = os.environ.get("_TEST_ROUNDS_ROW")
+    if seam is not None:
+        return seam
+    target = repo or _derive_repo_from_cwd(os.getcwd())
+    if not target or _review_budget is None:
+        return "unreadable (no repository or evaluator)"
+    try:
+        result = _review_budget.evaluate_pr(target, pr_num, timeout_for=_gh_timeout)
+    except Exception:  # noqa: BLE001 - an advisory row never takes the report down.
+        return "unreadable (lookup failed)"
+    return _format_rounds(result)
 
 
-def _final_round_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
-    """The terminal, stated for the DISPATCH side of the loop.
+def _comment_body(argv: list[str]) -> tuple[str | None, bool]:
+    """Effective inline body of a ``gh pr comment`` argv, plus opacity.
 
-    Counted from the PR's own review history rather than the local counter, so it
-    fires even when every round ran in the cloud and none was marked locally —
-    which is the case this gate exists for, and therefore the case the commit-side
-    terminal cannot see.
-
-    DELIBERATELY STATELESS, unlike the commit-side terminal. That one spends its
-    acceptance because it licenses a state change (a commit that lands work); this
-    one licenses a review REQUEST, which changes nothing on its own — a session
-    that can re-request reviews but cannot commit fixes achieves nothing, so the
-    commit gate remains the terminal that bites. Making an advisory, fail-open
-    gate carry per-branch consumption state would also contradict the
-    "stateless, authoritative" property the rest of this scan is built on. The
-    consequence is stated rather than hidden: the ack is required on EVERY
-    dispatch past the terminal, and it is not one-shot here.
-    """
-    repo_arg = f" --repo {repo}" if repo else ""
-    return (
-        f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
-        f"{rounds} rounds already ran on this PR, at or past the terminal "
-        f"({FINAL_ROUND_CAP}). Two full escalation cycles have run and each already "
-        "asked for a fresh decision. '# escalation-ack' does NOT clear this one; if "
-        "it did, the cycle would simply continue, which is what the terminal exists "
-        "to end.\n\n"
-        "There are exactly two ways out, and neither is this session's to choose "
-        "alone:\n"
-        "  (a) ACCEPT the outstanding findings and merge — document each one and why "
-        "it is acceptable in the PR body. The COMMIT gate is where that decision is "
-        "recorded, and there the acceptance is one-shot.\n"
-        "  (b) ABANDON the branch and restart from a design that does not need this "
-        "many rounds.\n\n"
-        "If the user directs ONE more round, that decision rides on this command:\n"
-        f"    gh pr comment {pr_num}{repo_arg} --body '@codex review'  # final-round-accept\n"
-        "Required on EVERY dispatch past the terminal — this gate keeps no state, so "
-        "the sigil is not spent here.\n\n"
-        "Take it to the user. A dispatched session with nobody reading cannot pick "
-        "any of these — surface it and stop."
-    )
-
-
-def _escalation_advisory(pr_num: str, rounds: int, repo: str | None = None) -> str:
-    repo_arg = f" --repo {repo}" if repo else ""
-    return (
-        f"BLOCKED: this would be Codex round {rounds + 1} on PR #{pr_num} — "
-        f"{rounds} rounds already ran (cap {ESCALATION_ROUND_CAP}). Repeated "
-        "rounds each finding NEW defects is the whack-a-mole signature: the "
-        "fixes themselves are becoming the bug source. STEP BACK before "
-        "requesting another round:\n"
-        "  1. TRIAGE every open finding FIRST — classify each as {live bug | "
-        "latent trap | hardening | observation}. Only live bugs and "
-        "cheaper-now-than-later traps may change already-reviewed code; "
-        "everything else gets a documented acceptance or routes to the PR that "
-        "owns that area. Findings are inputs to judgment, not a to-do list.\n"
-        "  2. Fix MECHANISMS, not instances — ask 'what made this bug "
-        "possible?' and remove that; patching the named instance leaves the "
-        "class alive for the next round to find.\n"
-        "  3. State-machine/queue/lifecycle code: enumerate EVERY status value "
-        "and trace your change under each one. Your tests encode your own "
-        "model of the states — they cannot catch the states you didn't "
-        "consider.\n"
-        "  4. Consider REVERTING a prior round's fix instead of patching it "
-        "again — less code is often the real fix.\n"
-        "  5. ESCALATE to the user with a minimize-change recommendation — "
-        "past the cap, standing approval is consumed; each extra round needs "
-        "a fresh, conscious decision.\n"
-        "After doing the above (triage table produced, user consulted), "
-        "re-run with a trailing shell comment (outside any quotes):\n"
-        f'  gh pr comment {pr_num}{repo_arg} --body "@codex review"  # escalation-ack'
-    )
-
-
-def _check_codex_round_escalation(segs) -> tuple[bool, str]:
-    """Block a ``gh pr comment … @codex review`` once the PR already carries
-    ``ESCALATION_ROUND_CAP`` Codex reviews, until a trailing ``# escalation-ack``.
-
-    Companion to the commit gate's Rule 3 (review_enforcement_commit.py): that
-    counter tracks LOCAL review→fix rounds and stays asleep when every local
-    review is clean while the loop churns through CODEX rounds on the PR — the
-    exact blind spot of the 2026-08-12 MW-3 #1372 whack-a-mole (5 Codex rounds,
-    local counter at 0). This gate counts the PR's actual Codex reviews from the
-    GitHub API (stateless, authoritative) at the one moment the groove happens:
-    requesting the next round.
-
-    FAIL-OPEN state table (advisory logic must never break workflow — the
-    opposite posture from the fail-closed merge gates, on purpose):
-      segment isn't `gh pr comment`               → untouched
-      comment without an '@codex review' body     → untouched (body-file/stdin
-        bodies are unresolvable here — documented coverage limit, fail-open;
-        blocking unresolvable bodies would false-block non-trigger comments)
-      '# escalation-ack' trailing ANY segment     → allow the whole command (a
-        nested `bash -c '…' # escalation-ack` carries the ack on the OUTER
-        segment; the ack is a conscious human-directed act, so one ack licenses
-        the command it trails) — BUT ONLY BELOW THE TERMINAL. At or past
-        FINAL_ROUND_CAP it does not clear the block; '# final-round-accept' does.
-        This is why the ack is no longer a top-of-function short-circuit: a
-        short-circuit could never see the count it needed to be bounded by.
-      rounds >= FINAL_ROUND_CAP, no final-accept → BLOCK with the terminal (an
-        escalation-ack here is deliberately not enough)
-      no positional / literal branch target       → that segment allows;
-        SCANNING CONTINUES (an allowed segment must not shield a later one)
-      identity not written literally (target OR
-        repo)                                     → BLOCK. The one fail-CLOSED
-        leg, and the ack does not clear it: `acked` is command-wide, so one
-        sigil on a loop would license a round on every PR it touches. See
-        `_unresolvable_identity` for why the accepted forms are an ALLOWLIST
-      gh/API/parse error (ids is None)            → that segment allows, scan on
-      rounds < ESCALATION_ROUND_CAP               → that segment allows, scan on
-      cap <= rounds < FINAL_ROUND_CAP, no ack    → BLOCK with the step-back order
-      any segment at rounds >= cap, no ack        → BLOCK with the step-back
-        order (URL targets carry their OWN repo into the count — counting the
-        hook cwd's repo for a cross-repo URL could produce a FALSE block)
-    Any unexpected exception → allow (caught here, NOT left to run_guard's
-    fail-closed exit-2, which would turn an advisory bug into a hard block).
+    Returns ``(body, opaque)``: the LAST ``-b``/``--body``/``--body=`` value
+    (gh string flags take the last supplied value, so earlier overridden
+    bodies never reach GitHub) and whether any opaque body channel is present
+    (body file, editor, web, or a missing -b value). ``(None, False)`` means a
+    body-free invocation.
     """
     try:
-        # Both sigils resolved up front, and the escalation-ack short-circuit is
-        # now CONDITIONAL on not having reached the terminal. It used to return
-        # before any counting, which meant this gate — the one that counts the
-        # PR's ACTUAL Codex rounds, and exists precisely because the local counter
-        # sleeps through them — could be re-acked forever. The commit-side terminal
-        # reads only that sleeping local counter, so it inherited the same blind
-        # spot: a review/fix loop driven entirely through cloud rounds never
-        # reached it.
-        #
-        # NEITHER SIGIL IS LOGGED to the override audit store this PR adds, and
-        # that is an OPEN scope question rather than a settled no. Both are
-        # resolved here with any() over every segment, and `escalation-ack` is
-        # SHARED with the commit gate (review_enforcement_commit.py prints it on
-        # `git commit` too), so the sigil's presence alone says nothing about
-        # which gate consulted it. Under the older BARE short-circuit — which
-        # returned here before any counting — a row was unattributable in
-        # principle: it fired for any Bash command carrying the ack and claimed a
-        # cap was waived that was never reached. The restructure above removes
-        # that objection, but only partly, and the remainder is worth stating
-        # rather than rounding off. Both sigils are now honoured only inside the
-        # scan loop below, at a segment whose PR NUMBER and real round count are
-        # resolved — so a row written AT THE HONOUR POINT would name a waiver that
-        # actually happened, which the old shape could not. `repo` is the part that
-        # is still not resolved there: `_comment_target` returns it only when the
-        # command carries `--repo`/`-R` or a PR URL, and a bare `gh pr comment 1234`
-        # — the form this gate's OWN advisory prints — yields None and counts
-        # against the hook cwd's repo. That is the same blank-`repo` case
-        # `_note_override`'s call site documents rather than papers over. Whether
-        # the audit store should carry ack-class sigils at all is a scope decision
-        # this PR does not take — see the follow-up.
-        acked = any(has_trailing_override(s.raw, "escalation-ack") for s in segs)
-        final_acked = any(has_trailing_override(s.raw, "final-round-accept") for s in segs)
-        # Bound this scan's gh (_codex_reviews) calls by the SHARED hook deadline,
-        # so a slow API + a compound command can't push the aggregate past the
-        # ~60s hook wall-clock and get the WHOLE hook SIGKILLed — which fails open
-        # on every gate (round-6 P1). Idempotent: a later merge gate reuses this
-        # same deadline (it arms only when None), never resets it.
-        global _merge_deadline
-        if _merge_deadline is None:
-            _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
-        # Earlier trigger segments in THIS command count toward the total: each
-        # segment sees the same pre-execution API count, so `request && request`
-        # at cap-1 would otherwise dispatch round N+1 unacknowledged (round-2
-        # finding). Keyed per (repo, pr) so distinct PRs don't cross-count.
-        in_cmd: dict[str, int] = {}
-        # One '# final-round-accept' authorises ONE dispatch across the whole
-        # command; see where it is spent below.
-        terminal_license_spent = False
-        for seg in segs:
-            # Stop scanning once the shared budget is drained. Past that point every
-            # remaining gh call still gets the 1.0s floor, so a long compound command
-            # against a hung API could walk the aggregate toward the hook wall-clock
-            # and get the WHOLE hook SIGKILLed — which fails open on every gate. The
-            # merge path already breaks here; this scan did not, and it now makes gh
-            # calls on acked commands that previously short-circuited before arming.
-            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
-                break
-            if gh_pr_subcommand(seg.argv) != "comment":
+        start = argv.index("comment") + 1
+    except ValueError:
+        return None, False
+    inline_body: str | None = None
+    opaque = False
+    i = start
+    while i < len(argv):
+        tok = argv[i]
+        if tok in {"-b", "--body"}:
+            if i + 1 >= len(argv):
+                opaque = True
+            else:
+                inline_body = argv[i + 1]
+                i += 1
+        elif tok.startswith("--body="):
+            inline_body = tok.split("=", 1)[1]
+        elif tok.startswith("-b") and len(tok) > 2:
+            inline_body = tok[2:]
+        elif tok in {"-F", "--body-file", "-e", "--editor", "-w", "--web"}:
+            opaque = True
+            if tok in {"-F", "--body-file"} and i + 1 < len(argv):
+                i += 1
+        elif tok.startswith("--body-file=") or (tok.startswith("-F") and len(tok) > 2):
+            opaque = True
+        i += 1
+    # shell_parse preserves expansion spelling in argv rather than evaluating it.
+    # The eventual body is therefore unknowable when it contains parameter or
+    # command substitution. Treat it like a body-file/editor source. This is
+    # deliberately conservative for a single-quoted literal containing "$" or
+    # backticks: the process gate cannot recover quote provenance from argv, and
+    # asking at a spent budget is safer than treating dynamic content as ordinary.
+    if inline_body is not None and ("$" in inline_body or "`" in inline_body):
+        opaque = True
+    return inline_body, opaque
+
+
+def _comment_review_request(argv: list[str]) -> tuple[str | None, bool, bool | None]:
+    """Parse a comment body once and derive its ``@codex review`` signal.
+
+    Returns ``(effective_inline_body, opaque, signal)``. A ``None`` signal means
+    the body is opaque at pre-execution time (body file, editor, web flow, or an
+    omitted body). Opaque is evaluated as a possible request: standing
+    authorization may still allow it, while an approval boundary asks or denies.
+    This avoids a body-file spelling becoming a cap bypass without pretending a
+    file cannot be rewritten earlier in the same shell command.
+    """
+    try:
+        start = argv.index("comment") + 1
+    except ValueError:
+        return None, False, False
+    inline_body, opaque = _comment_body(argv)
+    delete_only = "--delete-last" in argv[start:]
+    if opaque:
+        return inline_body, True, None
+    if inline_body is not None and "@codex review" in inline_body.lower():
+        return inline_body, opaque, True
+    if inline_body is not None:
+        return inline_body, opaque, None if opaque else False
+    if delete_only and not opaque and "--edit-last" not in argv[start:]:
+        return inline_body, opaque, False
+    return inline_body, opaque, None
+
+
+def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = None) -> tuple[str, str]:
+    """Return (allow|ask|note|deny, reason) for Codex review requests.
+
+    ``note`` is an ask this install silenced (``hooks.asks.review_request: off``,
+    unreadable history only); the caller treats it as an ask for a dispatched
+    session and a compound command, and otherwise emits a context note.
+
+    Review rounds from ``review_budget`` are authoritative. Legacy escalation/final sigils
+    are intentionally ignored: at the approval boundary only the hook's native
+    user decision can authorize the action.
+    """
+    triggers = [
+        (seg, body, signal)
+        for seg in segs
+        if gh_pr_subcommand(seg.argv) == "comment" and not gh_requests_help(seg.argv)
+        for body, _opaque, signal in (_comment_review_request(seg.argv),)
+        if signal is not False
+    ]
+    if not triggers:
+        return "allow", ""
+
+    # One native decision must authorize exactly one request. Reject compounds
+    # before any network lookup or confirmation exemption so standing capacity,
+    # an exact-head marker, or opaque input cannot license a sibling request.
+    if len(triggers) > 1:
+        return (
+            "deny",
+            "BLOCKED: this command contains multiple review requests. Run each "
+            "request separately so every action receives its own policy decision.",
+        )
+
+    global _merge_deadline
+    if _merge_deadline is None:
+        _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
+
+    decisions: list[tuple[str, str]] = []
+    exemption_used = False
+    for seg, effective_body, body_signal in triggers:
+        unresolvable = _unresolvable_identity(seg.argv)
+        if unresolvable is not None:
+            return "deny", _unresolvable_identity_advisory(unresolvable)
+        pr_num, explicit_repo = _comment_target(seg.argv)
+        effective_cwd = _effective_cwd(cmd, payload or {}, seg=seg) if cmd else None
+        if effective_cwd is _CWD_UNKNOWN:
+            repo = explicit_repo
+        else:
+            repo = explicit_repo or _derive_repo_from_cwd(
+                effective_cwd if isinstance(effective_cwd, str) else os.getcwd()
+            )
+        if not pr_num:
+            # ``gh pr comment`` accepts both a literal branch and no target
+            # (current-branch inference).  Neither form gives this pre-execution
+            # guard a stable PR identity without another resolution protocol, so
+            # it is UNKNOWN evidence, not "no request".  Native approval is the
+            # safe foreground result; dispatched sessions are denied by main().
+            repo_label = repo or "the current repository"
+            decisions.append(
+                (
+                    "ask",
+                    f"The pull request targeted by this @codex review command in "
+                    f"{repo_label} could not be resolved to a literal PR number. "
+                    "Approve this one request only after checking its review history, "
+                    "or rewrite it with a literal PR number/URL so the round budget "
+                    "can be enforced automatically.",
+                )
+            )
+            continue
+        if not repo or _review_budget is None:
+            result = {
+                "status": "unknown",
+                "errors": ["repository_unresolved" if not repo else "review_budget_unimportable"],
+            }
+            repo_label = repo or "the current repository"
+        else:
+            repo_label = repo
+            try:
+                result = _review_budget.evaluate_pr(
+                    repo,
+                    pr_num,
+                    timeout_for=_gh_timeout,
+                )
+            except Exception as exc:  # noqa: BLE001 - unknown asks/denies; never crashes open.
+                result = {"status": "unknown", "errors": [f"evaluator_raised:{type(exc).__name__}"]}
+
+        if result.get("status") == "ok" and result.get("confirmation_exempt"):
+            marker = _review_budget.confirmation_marker(
+                str(result.get("current_head") or "")
+            )
+            # The exemption licenses ONE dispatch: every request is judged on
+            # pre-command state, so a second marked request in the same command
+            # would also read exempt. The first consumes it; the rest ask.
+            # The marker must sit in the EFFECTIVE body — an overridden earlier
+            # -b value never reaches GitHub, so argv-wide matching would exempt
+            # a request that posts no marker at all.
+            if (
+                body_signal is True
+                and effective_body is not None
+                and marker in effective_body
+                and not exemption_used
+            ):
+                exemption_used = True
+                decisions.append(("allow", ""))
                 continue
-            if not any("@codex review" in tok.lower() for tok in seg.argv):
-                continue
-            # BEFORE resolving the number, not after: a literal number with an
-            # unreadable `--repo` resolves fine and still counts the wrong repo,
-            # so a check gated on `not pr_num` would never see it.
-            unresolvable = _unresolvable_identity(seg.argv)
-            if unresolvable is not None:
-                return True, _unresolvable_identity_advisory(unresolvable)
-            pr_num, repo = _comment_target(seg.argv)
-            if not pr_num:
-                # A missing positional or a literal branch target keeps its
-                # documented fail-open; every other spelling was refused above.
-                continue
-            # Count ALL Codex review rounds — including DISMISSED, which still
-            # ran and consumed the budget (#1385 round-5). Freshness uses the
-            # dismissed-filtered ``_codex_review_commit_ids``; the cap does not.
-            reviews = _codex_reviews(pr_num, repo=repo)
-            if reviews is None:
-                continue
-            key = f"{repo or ''}|{pr_num}"
-            effective = len(reviews) + in_cmd.get(key, 0)
-            # TERMINAL tier, checked first and NOT clearable by the repeatable
-            # sigil — the whole point of a terminal is that the cycle cannot reach
-            # past it. Counted from the PR's real review history, so it holds even
-            # when every one of those rounds went unmarked locally.
-            if effective >= FINAL_ROUND_CAP:
-                if not final_acked:
-                    return True, _final_round_advisory(pr_num, effective, repo)
-                # ONE decision licenses ONE dispatch. `final_acked` is computed with
-                # any() over the whole command — deliberately, because a nested
-                # `bash -c '…' # final-round-accept` carries the sigil on the OUTER
-                # segment, so per-segment binding would break the documented nested
-                # form. But command-wide truth also let `request && request # sigil`
-                # chain arbitrarily many rounds behind a single decision, while the
-                # advisory promises the user is directing "ONE more round". Spending
-                # the license on first use keeps the nested form working and closes
-                # the chain.
-                if terminal_license_spent:
-                    return True, _final_round_chained_advisory(pr_num)
-                terminal_license_spent = True
-            elif effective >= ESCALATION_ROUND_CAP and not acked:
-                return True, _escalation_advisory(pr_num, effective, repo)
-            in_cmd[key] = in_cmd.get(key, 0) + 1
-    except Exception:
-        return False, ""
-    return False, ""
+            # The exemption is mechanically one-shot only when the request
+            # records its exact head. An unmarked request is indistinguishable
+            # from discovery and therefore needs the normal native approval.
+            decisions.append(("ask", _review_budget_message(pr_num, result, repo_label)))
+            continue
+        if (
+            result.get("status") != "ok"
+            # getattr: an older evaluator without the allowlist (version skew)
+            # reads as "not transient", which asks — never a crash, never a note.
+            and getattr(_review_budget, "errors_are_transient", lambda _e: False)(
+                result.get("errors")
+            )
+        ):
+            # GitHub could not be read JUST NOW (every error code is on the
+            # producer's transient allowlist). The only ask
+            # `hooks.asks.review_request` may silence; a persistent or tamper
+            # code (deleted findings, truncation, config) stays an ordinary ask.
+            decisions.append(("ask_unreadable", _review_budget_message(pr_num, result, repo_label)))
+        elif result.get("status") != "ok" or result.get("approval_required"):
+            decisions.append(("ask", _review_budget_message(pr_num, result, repo_label)))
+        else:
+            decisions.append(("allow", ""))
+
+    asks = [reason for decision, reason in decisions if decision in ("ask", "ask_unreadable")]
+    if asks:
+        reason = asks[0]
+        # A stale worktree still emits the retired terminal sigil. It is parsed
+        # (kept in _KNOWN_SIGILS so a compound stays order-independent) but
+        # authorizes nothing — name that in the prompt so an old habit does not
+        # read an ask as a gate misfire.
+        if any(has_trailing_override(seg.raw, "final-round-accept") for seg, _, _ in triggers):
+            reason += (
+                "\n\nNOTE: `# final-round-accept` is retired and no longer "
+                "authorizes any gate; only this native approval admits the request."
+            )
+        # `hooks.asks.review_request: off` turns ONLY an unreadable-history ask
+        # into a "note" (no decision, a context line). Every other ask in the
+        # command keeps it an ask; the caller still denies a dispatched session
+        # and still refuses a compound command. The policy is read only when it
+        # could apply, so an install without the key pays nothing.
+        # Only when the review request IS the whole command, as `push_publish`
+        # silences only one plain push: a silenced prompt must not carry other
+        # steps the human would otherwise have seen.
+        if (
+            len(segs) == 1
+            and all(d != "ask" for d, _ in decisions)
+            and _ask_suppressed("review_request")
+        ):
+            return "note", reason
+        return "ask", reason
+    return "allow", ""
 
 
 # A CLEAN Codex re-review is posted as an ISSUE COMMENT (not a review object): the body
 # opens "Codex Review: Didn't find any major issues." (the flavour sentence after —
 # "Swish!", "You're on a roll.", "Keep them coming!", … — VARIES, so anchor ONLY on the
 # stable prefix) and carries a "**Reviewed commit:** `<sha>`" line with a 10-char
-# ABBREVIATED sha. Both must be present for the comment to vouch for a commit.
+# ABBREVIATED sha. Both must be present for the comment to be REPORTED; it never vouches
+# for a commit by itself (see ``_codex_clean_signal_at_head``).
 _CODEX_CLEAN_COMMENT_RE = re.compile(
     r"Codex Review:\s*Didn'?t find any major issues", re.IGNORECASE
 )
@@ -3891,41 +5545,242 @@ _CODEX_REVIEWED_COMMIT_RE = re.compile(
 )
 
 
-def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str | None:
-    """The ABBREVIATED commit sha from Codex's most recent CLEAN issue-comment, or None.
-
-    Codex posts a clean RE-review as an ISSUE COMMENT, not a review object, so
-    ``_latest_codex_reviewed_sha`` (which reads the reviews API) never sees it — a clean
-    re-review would then false-block the merge (bit PR #1386 twice). This is the fallback
-    the freshness gate consults when the review-object path would otherwise block: it
-    reads ``issues/N/comments``, and for a comment authored by the Codex bot (login AND
-    ``user.type == "Bot"``) requires BOTH the clean marker AND a parseable
-    ``Reviewed commit: <sha>`` line — a marker alone never vouches (fail-closed to None).
-
-    Returns a PREFIX (>=7 hex, lowercased). The caller confirms it against the
-    AUTHORITATIVE head via ``head.startswith(...)``: there is NO prefix-grinding surface
-    because the head is a fixed value read from GitHub and the comment author is verified
-    as the Codex bot (a human cannot post as ``chatgpt-codex-connector[bot]``). The
-    reviews-API path keeps its full-oid identity; only this comment fallback is a prefix,
-    and only against a known head. Comments come oldest-first, so the last match (most
-    recent clean comment) wins. Tests inject via ``_TEST_GH_CODEX_COMMENTS`` (one JSON
-    object per line: ``{login, type, body}``). Fail-safe: None on any API/parse error.
-    """
-    raw = os.environ.get("_TEST_GH_CODEX_COMMENTS")
-    if raw is None:
+#: Codex's PR summary comment: ONE comment, edited in place, whose table shows the
+#: latest review of each kind. MEASURED 2026-09-29 on the live queue:
+#: ``| 📝 **Code Review** | ✅ **Completed** <relative-time …>…</relative-time> | `<7hex>` | <trigger> |``.
+#: The status also reads ``🔄 **Running** since …`` and ``⚠️ **Failed**``; only
+#: Completed counts, and only the Code Review row (a security review is another kind).
+_CODEX_SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
+_CODEX_SUMMARY_ROW_RE = re.compile(
+    r"^\|\s*📝\s*\*\*Code Review\*\*\s*\|\s*✅\s*\*\*Completed\*\*\s*"
+    r"<relative-time datetime=\"([^\"]+)\"[^|\n]*\|"
+    r"\s*`([0-9a-fA-F]{7,40})`\s*\|",
+    re.MULTILINE,
+)
+#: A Codex issue comment that CARRIES findings rather than reporting none. MEASURED
+#: 2026-09-29: on 2 of 339 PRs with Codex activity (#1833, #2390) Codex posted its
+#: P1/P2 findings as an ISSUE comment (`### 💡 Codex Review` + severity badges, each
+#: finding linking `/blob/<full sha>/…`) and left NO review object, while its summary
+#: row still read Completed. So "no review object" alone does not mean "clean".
+_CODEX_FINDINGS_COMMENT_RE = re.compile(r"!\[P\d Badge\]|💡 Codex Review")
+def _commit_at_prefix(short: str, repo: str | None = None) -> str | None:
+    """The full lowercase oid GitHub resolves ``short`` to across the WHOLE repository
+    (``GET repos/{o}/{r}/commits/{short}``), or None. MEASURED 2026-10-01: an id shared
+    by two objects (commit+commit or commit+blob), an unknown id and one under 7 hex
+    all answer 422 "No commit found", so None covers ambiguity, absence, any error,
+    timeout and malformed output alike. Tests inject ``_TEST_GH_COMMIT_AT_PREFIX``: a
+    JSON object {short: full_sha_or_null}; empty, unparseable or a missing key is None."""
+    if not isinstance(short, str) or not re.fullmatch(r"[0-9a-fA-F]{7,40}", short):
+        return None
+    raw = os.environ.get("_TEST_GH_COMMIT_AT_PREFIX")
+    if raw is not None:
         try:
-            result = subprocess.run(
+            payload = json.loads(raw)
+            result = payload.get(short) if isinstance(payload, dict) else None
+        except Exception:
+            return None
+        if not isinstance(result, str):
+            return None
+        result = result.strip().lower()
+    else:
+        try:
+            response = subprocess.run(
                 [
                     "gh",
                     "api",
-                    f"repos/{repo or ':owner/:repo'}/issues/{pr_num}/comments",
-                    "--paginate",
+                    f"repos/{repo or ':owner/:repo'}/commits/{short}",
                     "--jq",
-                    ".[] | {login: .user.login, type: .user.type, body: .body}",
+                    ".sha",
                 ],
                 capture_output=True,
                 text=True,
-                # See the merge-path timeout budget note in main(): fail-safe → None.
+                timeout=_gh_timeout(6),
+            )
+            if response.returncode != 0:
+                return None
+            result = response.stdout.strip().lower()
+        except Exception:
+            return None
+    return result if re.fullmatch(r"[0-9a-f]{40}", result) else None
+
+
+def _codex_clean_signal_at_head(
+    pr_num: str, head: str, repo: str | None = None, why: dict | None = None
+) -> str | None:
+    """``"comment"`` / ``"summary"`` when Codex said it finished at ``head`` clean, else None.
+
+    Codex posts NO review object when it finds nothing. Its word on a clean head is a
+    comment: a clean re-review ("Codex Review: Didn't find any major issues … Reviewed
+    commit: `<10hex>`"), or a ``✅ Completed`` row in its PR summary comment (on PR
+    open, often the only signal: #2418). Both name the commit by an ABBREVIATED id,
+    and an abbreviated id alone identifies no commit (#2487). So a signal counts
+    only when ALL hold:
+
+    - the comment is authored by the configured Codex login with ``type == "Bot"``;
+    - its abbreviated id resolves repo-wide to exactly ``head``; a 422 (ambiguous or
+      unknown) refuses it. Matching the head implies the commit is the PR's;
+    - NO Codex review object exists at ``head`` in any state (dismissed included),
+      and NO Codex issue comment on the PR carries findings — Codex usually files
+      findings as a review object, but MEASURED on 2 of 339 PRs it posted them as a
+      `💡` issue comment with no review object while the summary read Completed;
+    - no non-Codex edit or deleted edit revision exists on any Codex comment;
+    - the PR's history beneath the signal has not moved: no head force-push,
+      head-branch deletion or restore, or base change. A base change stays a veto
+      because the signal names the head, not the base Codex reviewed against;
+      retargeting changes the effective diff without moving the head. A base
+      force-push stays retired: merging requires the default base
+      (``_check_base_is_default``), whose ruleset forbids force-push and deletion,
+      so a force-pushed non-default base can reach a merge only through a base
+      change, which vetoes. MEASURED 2026-10-01: all 541 commits dropped by 191
+      force-pushes (PR #65 to #2309) still resolve repo-wide by 7-hex id; the
+      oldest is from 2026-04-17. Dropped head commits are therefore not the
+      binding risk. A deleted comment leaves no trace in the API.
+
+    Residual, stated: a branch or tag named exactly after the short id takes priority
+    in GitHub's lookup (it uses git's name-guessing rules; measured:
+    ``pull/2720/head`` and ``main`` resolve). Creating one needs push rights to the
+    base repo, whose sole collaborator is the owner, and no hex-named ref exists.
+    Fork authors cannot create base-repo refs.
+
+    Anything unreadable is None: the gate then blocks exactly as before. When a
+    clean signal WAS seen and refused, ``why`` (if given) receives ``signal`` (what
+    was seen), ``reason`` (why it did not count) and ``permanent`` (True when no
+    later clean signal on this PR can count either), so the block can say so
+    rather than send the reader to re-request a review that cannot help.
+    """
+    note = why if why is not None else {}
+    primary = _primary_reviewer_login()
+    if primary is None:
+        return None
+    evidence = _codex_signal_evidence(pr_num, repo=repo)
+    if evidence is None:
+        note["reason"] = "Codex's comments on this PR could not be read in full"
+        return None
+    codex = primary.removesuffix("[bot]")  # GraphQL names an App by its slug
+    candidates: list[tuple[str, str]] = []
+    findings = False
+    foreign: tuple[str, str] | None = None
+    for c in evidence["comments"]:
+        if c["login"] != codex or c["type"] != "Bot":
+            continue
+        body = c["body"]
+        summary = _CODEX_SUMMARY_MARKER in body
+        if c["foreign_edit"]:
+            if foreign is None:
+                foreign = ("summary" if summary else "comment", c["foreign_edit"])
+            continue
+        # Findings delivered as an issue comment veto the signal, at ANY commit: no
+        # gate scores that channel yet, so a clean signal on a later head must not
+        # walk past findings filed there on an earlier one (2 of 339 PRs, measured).
+        if not summary and _CODEX_FINDINGS_COMMENT_RE.search(body):
+            findings = True
+            continue
+        if _CODEX_CLEAN_COMMENT_RE.search(body):
+            m = _CODEX_REVIEWED_COMMIT_RE.search(body)
+            if m:
+                candidates.append(("comment", m.group(1).lower()))
+        if summary:
+            for m in _CODEX_SUMMARY_ROW_RE.finditer(body):
+                candidates.append(("summary", m.group(2).lower()))
+    if foreign:
+        kind, desc = foreign
+        note["signal"] = f"{kind} by Codex"
+        note["reason"] = (
+            f"it was {desc}, an account other than Codex, so it no longer speaks for Codex"
+        )
+        note["permanent"] = True
+        return None
+    if not candidates:
+        return None  # nothing clean was said; there is nothing to explain
+    kind, short = candidates[-1]
+    note["signal"] = f"{kind} naming commit {short}"
+    if findings:
+        note["reason"] = "a Codex findings comment sits on this PR, and no gate scores that channel yet"
+        note["permanent"] = True
+        return None
+    if evidence["history_moved"]:
+        note["reason"] = (
+            "this PR's history moved (a head force-push, a head-branch deletion or "
+            "restore, or a base change), so a clean signal no longer binds to what "
+            "Codex reviewed"
+        )
+        note["permanent"] = True
+        return None
+    reviews = _codex_reviews(pr_num, repo=repo)
+    if reviews is None:
+        note["reason"] = "Codex's reviews on this PR could not be read"
+        return None
+    if any((r.get("commit_id") or "").lower() == head for r in reviews):
+        note["reason"] = "a Codex review object (dismissed or pending) sits at the head"
+        return None
+    looked_up: set[str] = set()
+    for kind, short in reversed(candidates):
+        # A prefix of anything but the head cannot resolve to the head: no call needed.
+        if not head.startswith(short) or short in looked_up:
+            continue
+        looked_up.add(short)
+        if _commit_at_prefix(short, repo=repo) == head:
+            note.clear()
+            return kind
+    note["reason"] = (
+        "its abbreviated id does not resolve uniquely to the head across this "
+        "repository (it names an older commit, is ambiguous, or could not be looked up)"
+    )
+    return None
+
+
+_CODEX_SIGNAL_QUERY = (
+    "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, "
+    "name: $name) { pullRequest(number: $number) { comments(last: 100) { totalCount "
+    "nodes { body author { login __typename } editor { login } "
+    "userContentEdits(first: 50) { totalCount nodes { editor { login } deletedAt } } } } "
+    "timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT, HEAD_REF_DELETED_EVENT, "
+    "HEAD_REF_RESTORED_EVENT, BASE_REF_CHANGED_EVENT], first: 1) { filteredCount "
+    "nodes { __typename } } } } }"
+)
+
+
+def _codex_signal_evidence(pr_num: str, repo: str | None = None) -> dict | None:
+    """``{"comments": [...], "history_moved": bool}`` for the clean-signal check, or
+    None when unreadable. ONE GraphQL read, because a comment's ``editor`` and
+    ``userContentEdits`` exist only there (REST keeps the ORIGINAL author on an edited
+    comment, so the author says nothing about the body). Edit-history completeness
+    is required only for Codex Bot comments; unrelated comments' edit data is ignored.
+    History moved includes head force-push, head-branch delete/restore, and
+    ``BASE_REF_CHANGED_EVENT``. A base change stays a veto because a clean signal
+    names the head, not the base it was reviewed against; retargeting changes the
+    effective diff without moving the head. A base force-push is retired: merging
+    requires the default base (``_check_base_is_default``), whose ruleset forbids
+    force-push and deletion, so a force-pushed non-default base can reach a merge
+    only through a base change, which vetoes. Delete and restore stay because
+    recreating the head branch can replace history without a force-push event.
+    MEASURED 2026-10-01: 541 of 541 commits dropped by 191 force-pushes (PR #65 to
+    #2309) still resolve repo-wide by 7-hex id; the oldest is from 2026-04-17, so
+    dropped head commits are not the binding risk.
+
+    History moved when the type-filtered timeline has ANY node. Two readings must
+    agree, or the read is refused: the documented one (the ``itemTypes`` filter on
+    ``nodes``) and ``filteredCount``, whose schema text does not say it honours
+    ``itemTypes`` though it MEASURABLY does. Never ``totalCount``: on a filtered
+    connection it counts the WHOLE timeline (MEASURED 2026-09-30: #2619 totalCount
+    7, filteredCount 0; #65 12 vs 1, matching its one REST timeline force-push).
+    More than 100 comments is None (fail closed).
+    Tests inject ``_TEST_GH_CODEX_SIGNAL`` (the raw GraphQL response).
+    """
+    raw = os.environ.get("_TEST_GH_CODEX_SIGNAL")
+    if raw is None:
+        owner, _, name = (repo or "{owner}/{repo}").partition("/")
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "api", "graphql",
+                    "-f", f"query={_CODEX_SIGNAL_QUERY}",
+                    "-F", f"owner={owner}",
+                    "-F", f"name={name}",
+                    "-F", f"number={pr_num}",
+                ],
+                capture_output=True,
+                text=True,
                 timeout=_gh_timeout(8),
             )
             if result.returncode != 0:
@@ -3933,31 +5788,71 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
             raw = result.stdout
         except Exception:
             return None
-    latest: str | None = None
-    for line in (raw or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        if (obj.get("login") or "") != _CODEX_REVIEW_BOT:
-            continue
-        # Require the GitHub-enforced Bot author type too — belt-and-suspenders against
-        # a spoofed login string in an injected/malformed payload.
-        if (obj.get("type") or "") != "Bot":
-            continue
-        body = obj.get("body") or ""
-        if not _CODEX_CLEAN_COMMENT_RE.search(body):
-            continue
-        m = _CODEX_REVIEWED_COMMIT_RE.search(body)
-        if not m:
-            continue  # clean marker but no parseable sha → does not vouch (fail-closed)
-        latest = m.group(1).strip().lower()
-    return latest
+    try:
+        payload = json.loads(raw or "")
+        if payload.get("errors"):
+            return None
+        pr = payload["data"]["repository"]["pullRequest"]
+        comments = pr["comments"]
+        if comments["totalCount"] > len(comments["nodes"]):
+            return None
+        primary = _primary_reviewer_login()
+        if primary is None:
+            return None
+        codex = primary.removesuffix("[bot]")
+        rows = []
+        for node in comments["nodes"]:
+            author = node.get("author") or {}
+            editor = node.get("editor") or {}
+            foreign_edit = None
+            if author.get("login") == codex and author.get("__typename") == "Bot":
+                edits = node.get("userContentEdits")
+                if not isinstance(edits, dict):
+                    return None
+                edit_nodes = edits.get("nodes")
+                edit_count = edits.get("totalCount")
+                if (
+                    not isinstance(edit_nodes, list)
+                    or type(edit_count) is not int
+                    or edit_count > len(edit_nodes)
+                ):
+                    return None
+                current_editor = editor.get("login")
+                if current_editor is not None and current_editor != codex:
+                    foreign_edit = f"edited by {current_editor}"
+                else:
+                    for edit in edit_nodes:
+                        edit_editor = (edit.get("editor") or {}).get("login")
+                        if edit.get("deletedAt"):
+                            foreign_edit = (
+                                "had an edit revision deleted "
+                                f"(edit by {edit_editor or 'an unknown account'})"
+                            )
+                            break
+                    if foreign_edit is None:
+                        for edit in edit_nodes:
+                            edit_editor = (edit.get("editor") or {}).get("login")
+                            if edit_editor != codex:
+                                foreign_edit = f"edited by {edit_editor or 'an unknown account'}"
+                                break
+            rows.append(
+                {
+                    "login": author.get("login"),
+                    "type": author.get("__typename"),
+                    "editor": editor.get("login"),
+                    "body": node.get("body") or "",
+                    "foreign_edit": foreign_edit,
+                }
+            )
+        timeline = pr["timelineItems"]
+        count, nodes = timeline["filteredCount"], timeline["nodes"]
+        if type(count) is not int or count < 0 or not isinstance(nodes, list):
+            return None
+        if (count > 0) != bool(nodes):
+            return None  # the two readings disagree: trust neither
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+        return None
+    return {"comments": rows, "history_moved": bool(nodes)}
 
 
 # ── Hook-surface merge teeth (2026-08-23, user decision) ─────────────────────
@@ -3983,7 +5878,11 @@ def _latest_codex_clean_comment_sha(pr_num: str, repo: str | None = None) -> str
 # config/behavioral_rules/ rides as a prefix: behavioral_linter.py loads every
 # YAML under it (decision config = enforcement surface, see the note in
 # _HOOK_SURFACE_FILES).
-_HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/", "config/behavioral_rules/")
+_HOOK_SURFACE_PREFIXES = (
+    _review_budget.HOOK_SURFACE_PREFIXES
+    if _review_budget is not None
+    else ("scripts/hooks/", ".claude/hooks/", "config/behavioral_rules/")
+)
 # EVERY hook wired in .claude/settings.json is fence surface — not only the
 # blocking gates: any script auto-executing inside sessions is enforcement-
 # adjacent (architect SHOULD-FIX 2026-08-23: the named-list-as-sample trap this
@@ -3991,44 +5890,60 @@ _HOOK_SURFACE_PREFIXES = ("scripts/hooks/", ".claude/hooks/", "config/behavioral
 # original 4-file fence). Over-fencing costs only stricter review; a guardrail
 # test (test_git_push_guard_hook_surface.py) parses settings.json and FAILS CI
 # if a wired hook ever falls outside this fence, so the set is self-maintaining.
-_HOOK_SURFACE_FILES = frozenset(
-    {
-        "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
-        "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
-        "scripts/review_state.py",  # escalation counter + review markers
-        ".claude/settings.json",  # hook wiring (inline blob + matchers)
-        # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
-        # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
-        # covered by the prefix above.
-        "scripts/behavioral_linter.py",
-        "scripts/check_stale_pending.py",
-        "scripts/content_safety_hook.py",
-        "scripts/contribution_offer_hook.py",
-        "scripts/edit_failure_sensor.py",
-        "scripts/file_context_hook.py",
-        "scripts/file_modification_audit_hook.py",
-        "scripts/genesis_precompact.py",
-        "scripts/genesis_session_context.py",
-        "scripts/genesis_session_end.py",
-        "scripts/genesis_stop_hook.py",
-        "scripts/genesis_urgent_alerts.py",
-        "scripts/plan_bookmark_hook.py",
-        "scripts/pretool_check.py",
-        "scripts/proactive_memory_hook.py",
-        "scripts/procedure_advisor.py",
-        "scripts/review_enforcement_commit.py",
-        "scripts/review_enforcement_prompt.py",
-        "scripts/review_invalidate_on_commit.py",
-        "scripts/surface_open_prs.py",
-        "scripts/surface_pr_updates.py",
-        # Hook-owned DECISION CONFIGURATION (Codex P2, round 1): these files
-        # determine what the wired hooks enforce, and the ordinary
-        # substantiality classifier treats YAML as docs/config (review-trivial)
-        # — so a rewrite that removes blocking patterns could merge on a stale
-        # review. Config that drives enforcement is enforcement surface.
-        "config/protected_paths.yaml",  # pretool_check.py
-        "config/repo_topology.yaml",  # repo_routing_guard.py
-    }
+_HOOK_SURFACE_FILES = (
+    _review_budget.HOOK_SURFACE_FILES
+    if _review_budget is not None
+    else frozenset(
+        {
+            "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
+            "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
+            "scripts/review_state.py",  # escalation counter + review markers
+            "scripts/review_budget.py",  # distinct-head policy evaluator
+            "scripts/review_findings.py",  # reviewer list + severity parsers
+            "scripts/review_reflection.py",  # round reflection tool + validator
+            "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
+            "scripts/external_review.py",  # autonomous review-request boundary
+            "scripts/lib/gate_menu.py",  # cap decision menu shown to the user
+            ".claude/settings.json",  # hook wiring (inline blob + matchers)
+            # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
+            # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
+            # covered by the prefix above.
+            "scripts/behavioral_linter.py",
+            "scripts/check_stale_pending.py",
+            "scripts/content_safety_hook.py",
+            "scripts/contribution_offer_hook.py",
+            "scripts/edit_failure_sensor.py",
+            "scripts/file_context_hook.py",
+            "scripts/file_modification_audit_hook.py",
+            "scripts/genesis_precompact.py",
+            "scripts/genesis_session_context.py",
+            "scripts/genesis_session_end.py",
+            "scripts/genesis_stop_hook.py",
+            "scripts/genesis_urgent_alerts.py",
+            "scripts/plan_bookmark_hook.py",
+            "scripts/pretool_check.py",
+            "scripts/proactive_memory_hook.py",
+            "scripts/procedure_advisor.py",
+            "scripts/review_enforcement_commit.py",
+            "scripts/review_enforcement_prompt.py",
+            "scripts/review_invalidate_on_commit.py",
+            "scripts/surface_handoffs.py",
+            "scripts/surface_open_prs.py",
+            "scripts/surface_pr_updates.py",
+            # Hook-owned DECISION CONFIGURATION (Codex P2, round 1): these files
+            # determine what the wired hooks enforce, and the ordinary
+            # substantiality classifier treats YAML as docs/config (review-trivial)
+            # — so a rewrite that removes blocking patterns could merge on a stale
+            # review. Config that drives enforcement is enforcement surface.
+            "config/protected_paths.yaml",  # pretool_check.py
+            "config/repo_topology.yaml",  # repo_routing_guard.py
+            "config/external_review.yaml",  # external review identity + dispatch
+            "src/genesis/session_awareness/external_review.py",
+            "src/genesis/session_awareness/external_review_config.py",
+            "scripts/hooks/main_checkout_guard.py",  # deploy-root edit guard
+            "config/main_checkout_guard.yaml",  # main_checkout_guard.py
+        }
+    )
 )
 
 
@@ -4459,6 +6374,8 @@ def _bind_pr_files_cache_head(head: str) -> None:
     global _PR_FILES_CACHE_HEAD
     if head != _PR_FILES_CACHE_HEAD:
         _PR_FILES_CACHE.clear()
+        _PR_RENAME_CACHE.clear()
+        _PR_STATUS_CACHE.clear()
         _PR_FILES_CACHE_HEAD = head
 
 
@@ -4466,6 +6383,8 @@ def _reset_pr_files_cache() -> None:
     """Drop the memo AND its head binding. For tests; a hook process never needs it."""
     global _PR_FILES_CACHE_HEAD
     _PR_FILES_CACHE.clear()
+    _PR_RENAME_CACHE.clear()
+    _PR_STATUS_CACHE.clear()
     _PR_FILES_CACHE_HEAD = None
 
 
@@ -4483,7 +6402,10 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
                     f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/files",
                     "--paginate",
                     "--jq",
-                    ".[] | {filename: .filename, previous_filename: .previous_filename}",
+                    # `status` feeds only the advisory `main-reverts` row (which
+                    # needs to know a file was ADDED); no gate reads it.
+                    ".[] | {filename: .filename, previous_filename: .previous_filename, "
+                    "status: .status}",
                 ],
                 capture_output=True,
                 text=True,
@@ -4506,6 +6428,18 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
         except Exception:
             return None
     files: list[str] = []
+    # The rename pairing is KEPT from this parse rather than re-read. It is right
+    # here in the same rows, and discarding it used to cost a second, BYTE-IDENTICAL
+    # `pulls/N/files` call — same endpoint, same --paginate, same --jq, same
+    # _gh_timeout(8) — issued by `_pr_rename_map` purely to recover a field this
+    # loop already has in hand. That second call is what CodeRabbit's Major on PR
+    # #2005 caught the sharp edge of: when changed-file resolution has already
+    # failed, the "separate" lookup is a retry of a command that just failed,
+    # inside the merge deadline. Guarding the retry treats the symptom; not
+    # fetching twice removes it. Published through `_pr_rename_map`, which reads
+    # this cache and never calls out.
+    renames: dict[str, str] = {}
+    statuses: dict[str, str] = {}
     rows = 0
     for line in (raw or "").splitlines():
         line = line.strip()
@@ -4532,12 +6466,72 @@ def _pr_changed_files_uncached(pr_num: str, repo: str | None = None) -> list[str
             if not isinstance(prev, str) or not prev:
                 return None
             files.append(prev)
+            renames[prev] = fname
+        # Optional and advisory: a missing or odd status is simply not recorded,
+        # never a reason to fail the read every gate shares.
+        status = obj.get("status")
+        if isinstance(status, str) and status:
+            statuses[fname] = status
     if rows >= 3000:
         # The cap applies to API ROWS, not the expanded path list (renames
         # contribute two paths per row — Codex P2, round 1): at the documented
         # 3000-entry endpoint cap a hook file may be hidden beyond it.
         return None
+    # Published ONLY on the success path, and only after the cap check, so a
+    # truncated or malformed read can never leave a half-built pairing behind for
+    # a later reader to mistake for a complete one. Keyed exactly as the file memo
+    # is, and cleared by the same `_reset_pr_files_cache`.
+    _PR_RENAME_CACHE[(pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))] = renames
+    _PR_STATUS_CACHE[(pr_num, repo, os.environ.get("_TEST_GH_PR_FILES"))] = statuses
     return files
+
+
+#: previous_filename -> current filename for every file this PR renamed, written
+#: by ``_pr_changed_files_uncached`` as a by-product of the read it already makes.
+#: Advisory data: an absent entry yields an empty map (the report degrades to raw
+#: paths) rather than None, because there is no verdict here to fail closed on.
+#: Keyed and cleared exactly as ``_PR_FILES_CACHE`` is.
+_PR_RENAME_CACHE: dict[tuple[str, str | None, str | None], dict[str, str]] = {}
+
+#: filename -> GitHub file status ("added", "modified", "removed", "renamed", …)
+#: for the PR's changed files, written by the same parse as ``_PR_RENAME_CACHE``
+#: and keyed and cleared exactly as it is. Read only by the advisory
+#: ``main-reverts`` row; an absent entry means "status unknown", never "modified".
+_PR_STATUS_CACHE: dict[tuple[str, str | None, str | None], dict[str, str]] = {}
+
+
+def _pr_file_statuses(pr_num: str, repo: str | None = None) -> dict[str, str]:
+    """filename -> status for this PR's changed files, ``{}`` when unknown.
+
+    Reads the memo ``_pr_changed_files`` fills and never calls out; call it after
+    that read. Keyed exactly as the file memo is.
+    """
+    return _PR_STATUS_CACHE.get((pr_num, repo, os.environ.get("_TEST_GH_PR_FILES")), {})
+
+
+def _pr_rename_map(pr_num: str, repo: str | None = None) -> dict[str, str]:
+    """previous_filename -> filename for this PR's renames, ``{}`` when unknown.
+
+    MAKES NO API CALL OF ITS OWN. It asks ``_pr_changed_files`` — memoized, so
+    free once anything on this merge has asked — and then reads the pairing that
+    read kept. An earlier version issued a second, byte-identical
+    ``pulls/N/files`` request to recover ``previous_filename``, a field the first
+    request had already fetched and thrown away.
+
+    Going through ``_pr_changed_files`` rather than reading the cache directly is
+    what makes this ORDER-INDEPENDENT. Reading the dict alone would return ``{}``
+    whenever this happened to run before the file list was needed — correctness
+    resting on call order, which is the kind of coupling that holds until someone
+    moves a caller.
+
+    The failure direction falls out for free and answers CodeRabbit's Major on PR
+    #2005 at the cause rather than the symptom: when changed-file resolution
+    fails, ``_pr_changed_files`` returns None, nothing was published, and this
+    returns ``{}`` having spent nothing. There is no separate lookup left to skip.
+    """
+    if _pr_changed_files(pr_num, repo=repo) is None:
+        return {}
+    return _PR_RENAME_CACHE.get((pr_num, repo, os.environ.get("_TEST_GH_PR_FILES")), {})
 
 
 def _pr_lane(pr_num: str, repo: str | None = None) -> str:
@@ -5096,7 +7090,13 @@ def _classify_base_advance_delta(
     return "inline"
 
 
-def _check_codex_reviewed_head(
+#: Why the last freshness check PASSED, when that is something other than a review
+#: object at head. Read by the ``--check-pr`` row so the report states the gate's own
+#: reason instead of re-deriving it from a second read that could disagree.
+_FRESHNESS_PASS: dict[str, str] = {}
+
+
+def _check_codex_reviewed_head_core(
     pr_num: str, *, force: bool = False, repo: str | None = None
 ) -> tuple[bool, str, str | None]:
     """Block a merge unless Codex has reviewed the PR's CURRENT head commit —
@@ -5127,6 +7127,7 @@ def _check_codex_reviewed_head(
     ``--match-head-commit`` so a push landing between this check and the merge
     cannot smuggle an unreviewed head through (TOCTOU — Codex P1, PR #1366).
     """
+    _FRESHNESS_PASS.clear()
     if force:
         # Hook-surface teeth rule 2: the sigil alone is not enough when the PR
         # touches the enforcement-hook surface — recorded fallback-review
@@ -5178,6 +7179,18 @@ def _check_codex_reviewed_head(
             None,
         )
     head = head.strip().lower()
+    # An unimportable reviewer list would otherwise surface as "no Codex review
+    # found", sending the operator to re-request a review that cannot help.
+    if _REVIEW_FINDINGS_ERROR:
+        return (
+            True,
+            (
+                f"the hook tree is broken: {_REVIEW_FINDINGS_ERROR}. No review can be "
+                f"matched to its reviewer until it is. "
+                f"Retry, or append '# stale-review-override' to merge anyway."
+            ),
+            None,
+        )
     # This is the one place a head becomes authoritative on the NON-FORCED arm, so
     # it is where the changed-file memo gets bound to it. The pin-receipt gate has
     # already populated that memo against whatever the head was when IT asked; the
@@ -5193,17 +7206,42 @@ def _check_codex_reviewed_head(
     _bind_pr_files_cache_head(head)
     reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
     if reviewed == head:
+        _FRESHNESS_PASS.update(head=head, reason="current")
         return False, "", head
-    # The review-object path can't vouch for the current head (Codex has no review, or
-    # only a STALE one). A clean Codex RE-review is an ISSUE COMMENT (not a review object)
-    # carrying a "Reviewed commit: <sha>" marker — accept it as freshness when it names
-    # THIS head (follow-up 7ff0fdc6). Consulted ONLY on the would-block path, so the common
-    # green case (a review object already at head, above) adds no extra API call. The
-    # comment sha is an abbreviated PREFIX, matched against the AUTHORITATIVE head — no
-    # grinding surface (fixed head, bot-verified author); see the helper's docstring.
-    clean_short = _latest_codex_clean_comment_sha(pr_num, repo=repo)
-    if clean_short and head.startswith(clean_short):
+    # Codex posts no review object when it finds nothing; its word on a clean head is
+    # a comment naming an abbreviated id. That counts only when the id resolves
+    # repo-wide to exactly the head and no Codex review object
+    # sits at the head (#2418; the resolution is what answers #2487's objection that
+    # a prefix alone binds nothing). The merge stays bound to this head.
+    refused: dict = {}
+    clean_kind = _codex_clean_signal_at_head(pr_num, head, repo=repo, why=refused)
+    if clean_kind:
+        _FRESHNESS_PASS.update(head=head, reason=f"clean signal at head: {clean_kind}")
+        print(
+            f"NOTE: PR #{pr_num} — Codex's clean {clean_kind} names head {head[:12]} "
+            f"(its abbreviated id resolves repo-wide to exactly the head, "
+            f"and nothing Codex filed says otherwise) — accepted as a current review.",
+            file=sys.stderr,
+        )
         return False, "", head
+    # Neither a review object nor a resolvable clean signal vouches for the head.
+    # When a clean signal WAS seen, say which and why it did not count; when no later
+    # clean signal can count either, say that too, so the reader is not sent to
+    # re-request a review that cannot clear this.
+    clean_note = ""
+    if refused.get("signal"):
+        clean_note = (
+            f"\nNOTE: Codex's clean {refused['signal']} was read but not accepted as a "
+            f"review of head {head[:12]}: {refused.get('reason', 'it did not qualify')}."
+        )
+        if refused.get("permanent"):
+            clean_note += (
+                " That holds for every clean signal on this PR, so a finding-free Codex "
+                "re-review (which posts no review object) cannot clear this block. What "
+                "can: '# substitute-review' with the owner's approval, "
+                "'# stale-review-override', or a Codex review that posts a review object "
+                "at the head (only a review WITH findings does)."
+            )
     if not reviewed:
         return (
             True,
@@ -5221,6 +7259,7 @@ def _check_codex_reviewed_head(
                 f"— so treat each surface as independently available until proven otherwise: "
                 f"post '@codex review' and check for a review at head BEFORE concluding "
                 f"Codex is unavailable."
+                f"{clean_note}"
             ),
             None,
         )
@@ -5253,6 +7292,10 @@ def _check_codex_reviewed_head(
                     f"git log {reviewed[:12]}..{head[:12]} --oneline",
                     file=sys.stderr,
                 )
+                _FRESHNESS_PASS.update(
+                    head=head,
+                    reason=f"STALE review of {reviewed[:12]}, base-advance delta inline",
+                )
                 return False, "", head
             # The unreviewed delta is provably review-trivial — allow, but still
             # bind the merge to THIS head (TOCTOU): the triviality claim is about
@@ -5262,6 +7305,9 @@ def _check_codex_reviewed_head(
                 f"{head[:12]}), but the delta since is review-trivial — allowing. "
                 f"Inspect: git log {reviewed[:12]}..{head[:12]} --oneline",
                 file=sys.stderr,
+            )
+            _FRESHNESS_PASS.update(
+                head=head, reason=f"STALE review of {reviewed[:12]}, delta since is trivial"
             )
             return False, "", head
         delta_note = (
@@ -5289,10 +7335,197 @@ def _check_codex_reviewed_head(
                 f"\n"
                 f"  (inspect the unreviewed commits: git log {reviewed[:12]}..{head[:12]} "
                 f"--oneline)"
+                f"{clean_note}"
             ),
             None,
         )
     return False, "", head
+
+
+# The reviewers that may stand in for Codex at head — owner standing order,
+# 2026-09-24, ASKED AND APPROVED per PR. Codex stays the official cross-model
+# reviewer; this exists for its outages. Devin and CodeRabbit review automatically
+# on every push here (MEASURED 2026-09-24: of 33 open non-draft PRs, 25 carried a
+# Devin or CodeRabbit review at their current head, 4 a Codex one).
+# WHICH reviewers may stand in is `review_findings.is_substitute_candidate`: any
+# Bot-typed App reviewer except the primary, a bot the PR's own workflow can
+# drive, and a surface-only one (owner ruling 2026-09-30) — a new reviewer needs
+# no list entry. A module the gate could not load offers no substitute at all.
+
+
+def _substitute_format_note(login: str) -> str:
+    """What the gate appends where it names a stand-in to the owner. A login no
+    known format reads has findings no scanner scores yet (that enforcement is a
+    later change), so the owner is told before approving, not after. Empty for a
+    known format, so those lines read exactly as before."""
+    if _REVIEW_FINDINGS_ERROR is None and any(
+        login in logins for logins in enforced_logins().values()
+    ):
+        return ""
+    return " (format unknown: its findings are not scored yet)"
+
+
+def _substitute_label(login: str) -> str:
+    """``login`` plus its `_substitute_format_note`."""
+    return f"{login}{_substitute_format_note(login)}"
+
+
+def _substitute_available_note(pr_num: str, repo: str | None = None) -> str:
+    """The ``--check-pr`` freshness row's stand-in offer, or ``""`` when none.
+
+    Through the SAME lookup the merge gate uses, so the report can never offer a
+    substitute the gate would refuse. Only logins `is_substitute_candidate`
+    validated reach this raw row — never reviewer-controlled text.
+    """
+    head = _pr_head_sha(pr_num, repo=repo)
+    if not head:
+        return ""
+    found = _substitute_reviewers_at_head(pr_num, head.strip().lower(), repo=repo)
+    if not (found and found[0]):
+        return ""
+    return (
+        f" — substitute available: "
+        f"{' and '.join(_substitute_label(x) for x in found[0])} reviewed this "
+        f"head (with the owner's yes in conversation, merge with "
+        f"'# substitute-review')"
+    )
+
+
+def _substitute_reviewers_at_head(
+    pr_num: str, head: str, repo: str | None = None
+) -> tuple[list[str], list[tuple[str, str]]] | None:
+    """``(reviewers_at_head, substitute_reviews_elsewhere)`` or None when unreadable.
+
+    ONE implementation for both consumers — the merge gate and the ``--check-pr``
+    row — so the report can never offer a substitute the gate would refuse.
+    A review counts only when it is NOT dismissed, NOT pending and NOT
+    body-less: a dismissal vouches for nothing (the Codex reader applies the
+    same rule), a pending review is an unpublished draft, and an empty-body
+    record is a thread-reply wrapper rather than a review of the head (see the
+    measurement at the skip). Any other state, CHANGES_REQUESTED included,
+    counts: freshness asks only that a review EXISTS at head; what it found is the
+    findings scans' job. ``reviewers_at_head`` is in order of first appearance and
+    holds only logins `is_substitute_candidate` validated against GitHub's App
+    login alphabet, so it is safe to print raw.
+    """
+    records = _pr_review_records(pr_num, repo=repo)
+    if records is None or _REVIEW_FINDINGS_ERROR:
+        return None
+    at_head: list[str] = []
+    elsewhere: list[tuple[str, str]] = []
+    for r in records:
+        login = r["login"]
+        if not is_substitute_candidate(login, r["type"]):
+            continue
+        if r["state"] in ("DISMISSED", "PENDING"):
+            continue
+        # A review record with an EMPTY body is, on this repo, the wrapper
+        # GitHub creates when the bot replies inside a thread — stamped with
+        # the head at reply time. MEASURED 2026-09-24: of the empty records
+        # at head sampled, every one held only replies ("agreed, I withdraw
+        # this finding", "same finding re-anchored…"), and on 4 of 23 open
+        # PRs such wrappers were the ONLY substitute record at head. Counting
+        # them would tell the owner "<bot> reviewed this exact head" when it
+        # only replied in a thread. A real review carries its summary body
+        # ("Devin Review found N potential issues", "Actionable comments
+        # posted: N") — 19 of 29 open PRs had one at head.
+        if not r.get("has_body", True):
+            continue
+        if r["commit_id"] == head:
+            if login not in at_head:
+                at_head.append(login)
+        elif r["commit_id"] and (login, r["commit_id"]) not in elsewhere:
+            elsewhere.append((login, r["commit_id"]))
+    return at_head, elsewhere
+
+
+def _check_codex_reviewed_head(
+    pr_num: str,
+    *,
+    force: bool = False,
+    repo: str | None = None,
+    substitute: bool = False,
+    substitute_out: list[dict] | None = None,
+) -> tuple[bool, str, str | None]:
+    """The Codex freshness gate, plus the owner-approved SUBSTITUTE path.
+
+    Everything the core does is unchanged; see
+    ``_check_codex_reviewed_head_core``. What this adds runs ONLY when the core
+    would block AND the merge carries ``# substitute-review``: a non-dismissed,
+    non-pending review by another reviewer whose ``commit_id`` is EXACTLY the
+    current head then satisfies freshness, the head is returned so the merge stays
+    bound to it by ``--match-head-commit``, and the substitute is recorded in
+    ``substitute_out`` so the caller can announce and log it. The owner's
+    approval is given IN CONVERSATION before the session adds the sigil (owner
+    ruling f7e8d2ed, 2026-09-24, which replaced a native permission prompt): the
+    sigil is the record of that yes. This function only reports that a
+    substitute exists; it never authorises the merge by itself.
+
+    ``# stale-review-override`` wins over the substitute (owner ruling,
+    2026-09-24): the core's force arm returns before this is consulted, so the
+    substitute is never used. That is no looser than the stale override on its
+    own, which is already permitted.
+
+    Unlike the stale override, the substitute does NOT waive the base-branch
+    check and does NOT drop the head binding, and it asks for no fallback-evidence
+    file. That file does two jobs on the stale-override path: it vouches for the
+    BASE (which this path still checks directly) and it proves a substantive
+    review of the head (its length floor plus the head sha). Here the second job
+    is carried by the substitute review itself — a body-bearing review record at
+    the exact head — and by the owner's per-merge approval. The owner ruled
+    (2026-09-24) that this bar applies on the hook surface too.
+    """
+    blocked, msg, verified = _check_codex_reviewed_head_core(pr_num, force=force, repo=repo)
+    if not blocked or force:
+        return blocked, msg, verified
+    if not substitute:
+        return (
+            True,
+            msg
+            + (
+                "\nIf Codex is unavailable: with the owner's approval, append "
+                "'# substitute-review' to accept another reviewer's review AT THIS "
+                "HEAD in Codex's place (ask the owner in conversation first; the sigil "
+                "records their yes)."
+            ),
+            None,
+        )
+    head = _pr_head_sha(pr_num, repo=repo)
+    if not head:
+        return blocked, msg, verified
+    head = head.strip().lower()
+    # The lane and the off-diff scoping downstream must judge the file list of
+    # the head this path returns (and `--match-head-commit` then binds), not a
+    # memo populated against an earlier read. Same reason the core binds it.
+    _bind_pr_files_cache_head(head)
+    found = _substitute_reviewers_at_head(pr_num, head, repo=repo)
+    if found is None:
+        return (
+            True,
+            msg + "\n'# substitute-review' could not be evaluated: the review list was unreadable.",
+            None,
+        )
+    at_head, elsewhere = found
+    if at_head:
+        if substitute_out is not None:
+            substitute_out.append({"reviewers": at_head, "head": head})
+        return False, "", head
+    seen = (
+        ", ".join(
+            f"{login}@{sha[:12]}{_substitute_format_note(login)}" for login, sha in elsewhere
+        )
+        or "none"
+    )
+    return (
+        True,
+        msg
+        + (
+            f"\n'# substitute-review' found no other reviewer's review at head "
+            f"{head[:12]} (substitute reviews on other commits: {seen}). A substitute "
+            f"must have reviewed the EXACT head being merged."
+        ),
+        None,
+    )
 
 
 # ── Scheduled Claude review FRESHNESS (a review by the repo OWNER, at HEAD) ──
@@ -5408,8 +7641,10 @@ _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 # GitHub does not require `name:` to be unique across workflow files (its workflow-syntax
 # reference states no such constraint; an OMITTED name falls back to the file path, which
 # is unique — an explicit one is not). So a second file declaring `name: CI` with a job
-# named `leak-detector` would share this tuple, and its SUCCESS could both supersede the
-# real scanner's CANCELLED in _drop_superseded_cancels and satisfy the pin below.
+# named `leak-detector` would share this tuple, and — worse, since #2607 groups by
+# workflowName — a newer run of that decoy file would count as the newest run of `CI`
+# in _newest_run_per_workflow, dropping every older real CI entry, and could then
+# satisfy the pin below.
 # Real provenance exists in GraphQL (checkSuite.workflowRun.workflow.databaseId, or
 # checkSuite.workflowRun.file.path) but `gh pr view --json statusCheckRollup` does NOT
 # expose it — a rollup entry carries only __typename/completedAt/conclusion/detailsUrl/
@@ -5421,7 +7656,7 @@ _IRREDUCIBLE_REQUIRED_SCHEDULED_REVIEW_KINDS = ("leaks",)
 # display name, or if this pin stops resolving to exactly one file. That is complete for
 # the reachable case — workflowName is populated only for Actions check-runs, and those
 # come from this repo's own workflow files; a non-Actions check-run has no workflowName,
-# so _ci_identity returns None and it is never a sibling.
+# so _ci_identity returns None and it is never grouped.
 _MECHANICAL_RESCAN_BY_KIND = {"leaks": ("leak-detector", "CI")}
 # Every kind an install is ALLOWED to name in config. A configured kind outside this set
 # (a typo, a wrong type, a stale routine name) can never be satisfied by a real marker, so
@@ -6150,9 +8385,9 @@ def _mechanical_scan_is_green(
     class this file already documents at _ci_identity, and the whole point of
     this relief is that the mechanical layer really ran.
 
-    Superseded ``concurrency: cancel-in-progress`` duplicates are dropped first, by
-    the SHARED ``_drop_superseded_cancels`` — the same primitive ``_pr_ci_status``
-    uses, so the two gates cannot disagree about one rollup.
+    The rollup is first reduced to the newest workflow run per workflow by the
+    SHARED ``_newest_run_per_workflow`` (#2607) — the same primitive
+    ``_pr_ci_status`` uses, so the two gates cannot disagree about one rollup.
 
     Returns False on ANY doubt: a gh error, an unparseable payload, a head that
     does not match, no entry with that identity, or any surviving conclusion other
@@ -6207,23 +8442,26 @@ def _mechanical_scan_is_green(
     wanted_workflow = (workflow or "").strip().lower()
     if not wanted_workflow:
         return False  # an unpinned kind can never be established -> fail closed
-    # Drop superseded `concurrency: cancel-in-progress` duplicates FIRST, through the
-    # SAME primitive the CI gate uses (_drop_superseded_cancels — strict
-    # (name, workflowName) identity, a SUCCESS completing STRICTLY AFTER, fail-closed on
-    # every unresolvable case). This path used to have no cancel handling at all, so a
-    # doubled workflow dispatch — which leaves every check-run as a success+cancelled
-    # pair — made ONE `--check-pr` run report `ci: green` and, on the same rollup,
+    # Keep only the newest workflow run per workflow FIRST, through the SAME
+    # primitive the CI gate uses (_newest_run_per_workflow — run id parsed strictly
+    # from detailsUrl, the newest run decides as a whole, anything unparseable kept).
+    # This path once had its own naive reading, so a doubled
+    # workflow dispatch — which leaves every check-run as a success+cancelled pair —
+    # made ONE `--check-pr` run report `ci: green` and, on the same rollup,
     # "'leak-detector' is not green at this head", pointing the reader at a green job
     # while relief stayed unreachable for as long as that head stood.
     #
-    # Note what the drop does NOT do, because this is where it would be dangerous: it
-    # removes ONLY cancels proven superseded. FAILURE/TIMED_OUT/STALE and an
-    # unsuperseded cancel all survive into `conclusions` and still contradict SUCCESS,
-    # so the guarantee below is intact.
-    rollup = _drop_superseded_cancels(rollup)
-    # Collect EVERY same-identity entry, never the first match. One head can carry
-    # several runs of one job (a re-run after a ruleset change, a superseded
-    # concurrency sibling), and rollup ORDER is not a guarantee -- _pr_ci_status
+    # Note what the reduction does NOT do, because this is where it would be
+    # dangerous: it removes ONLY entries from an OLDER run of the same workflow. Every
+    # entry of the newest run, and anything that could not be placed in a run, all
+    # survive into `conclusions`, and any of them that is not SUCCESS still
+    # contradicts it, so the guarantee below is intact. If the newest run has no
+    # scanner entry at all, nothing matches and relief is refused. No re-derivation
+    # here: the helper is the rule.
+    rollup = _newest_run_per_workflow(rollup, repo=repo)
+    # Collect EVERY same-identity entry, never the first match. After the reduction
+    # one job can still have several entries (ones the helper could not place in a
+    # run, or same-run duplicates), and rollup ORDER is not a guarantee -- _pr_ci_status
     # refuses to trust it for exactly this reason. A first-match read of a
     # SUCCESS-then-FAILURE pair reports green while the scanner is red, and under
     # `# ci-override` this relief is the ONLY remaining check of the mechanical
@@ -6309,6 +8547,42 @@ def _sha_is_ancestor(ancestor: str, descendant: str, repo: str | None = None) ->
     return status == "ahead"
 
 
+def _kind_has_blocking_evidence(
+    kind: str, rejected: dict[str, set[str]], residue: dict[str, set[str]]
+) -> tuple[str, str] | None:
+    """``(cause, remedy)`` when ``kind`` has a blocking finding somewhere in the PR,
+    else None.
+
+    Shared by the mechanical-rescan relief and the outside-contribution exemption:
+    neither may clear a kind whose review ran and objected. ANY refusal for the kind,
+    at ANY head, counts (see THE RULE in ``_relieve_kinds_by_mechanical_rescan``).
+    So does RESIDUE: blocking evidence the scan could not credit to ``rejected`` (a
+    same-timestamp tie at some head, or a malformed / unknown-kind marker whose body
+    reads as blocking), at ANY head, since the finding was never provably retracted
+    and the head axis is not a time axis. A "*" entry is a blocking body under no
+    creditable kind: it counts for every kind. This closes the path an adversarial
+    audit REPRODUCED (2026-08-30): a [P1] body under a 12-char `head=` at HEAD landed
+    in `unusable`, and relief carried the older clean review straight over it.
+    """
+    if any(kind in kinds for kinds in rejected.values()):
+        return (
+            "a scheduled review for this kind was REFUSED in this PR and never "
+            "retracted at the commit it was made about",
+            "read that finding rather than re-running the review",
+        )
+    residue_kinds: set[str] = set()
+    for kinds in residue.values():
+        residue_kinds |= kinds
+    if kind in residue_kinds or "*" in residue_kinds:
+        return (
+            "a marker in this PR carries a blocking finding that could not be "
+            "credited to a head or a kind (a malformed field, or a verdict tied "
+            "with a clean one)",
+            "resolve that finding first",
+        )
+    return None
+
+
 def _relieve_kinds_by_mechanical_rescan(
     missing: list[str],
     accepted: dict[str, set[str]],
@@ -6381,32 +8655,10 @@ def _relieve_kinds_by_mechanical_rescan(
         if not pin:
             continue
         check_name, workflow = pin
-        # ANY refusal for this kind, at ANY head -> no relief. See THE RULE above.
-        if any(kind in kinds for kinds in rejected.values()):
-            reasons[kind] = (
-                "a scheduled review for this kind was REFUSED in this PR and never "
-                "retracted at the commit it was made about, so no earlier review is "
-                "carried forward -- read that finding rather than re-running the review"
-            )
-            continue
-        # Blocking evidence the scan could not credit to `rejected` -- a same-timestamp
-        # tie at some head, or a malformed / unknown-kind marker whose body reads as
-        # blocking -- is RESIDUE, and it denies exactly as a refusal does, at ANY head:
-        # the finding was never provably retracted, and the head axis is not a time
-        # axis. A "*" entry is a blocking body under no creditable kind: it denies
-        # every kind. This closes the path an adversarial audit REPRODUCED (2026-08-30):
-        # a [P1] body under a 12-char `head=` at HEAD landed in `unusable`, and relief
-        # carried the older clean review straight over it.
-        residue_kinds: set[str] = set()
-        for kinds in residue.values():
-            residue_kinds |= kinds
-        if kind in residue_kinds or "*" in residue_kinds:
-            reasons[kind] = (
-                "a marker in this PR carries a blocking finding that could not be "
-                "credited to a head or a kind (a malformed field, or a verdict tied "
-                "with a clean one), so no earlier review is carried forward -- "
-                "resolve that finding first"
-            )
+        blocking = _kind_has_blocking_evidence(kind, rejected, residue)
+        if blocking is not None:
+            cause, remedy = blocking
+            reasons[kind] = f"{cause}, so no earlier review is carried forward -- {remedy}"
             continue
         candidates = [h for h, kinds in accepted.items() if h != head and kind in kinds]
         if not candidates:
@@ -6458,6 +8710,172 @@ def _relieve_kinds_by_mechanical_rescan(
     return [k for k in missing if k not in relieved_kinds], relieved, reasons
 
 
+#: The one GraphQL read behind the outside-contribution exemption: who opened the
+#: PR (and as what), where its head lives, and who edited its title or body.
+_OUTSIDE_PR_QUERY = (
+    "query($owner:String!,$name:String!,$num:Int!){repository(owner:$owner,name:$name){"
+    "pullRequest(number:$num){headRefOid isCrossRepository authorAssociation "
+    "author{__typename login} "
+    "userContentEdits(first:100){totalCount nodes{editor{__typename login}}} "
+    "timelineItems(itemTypes:[RENAMED_TITLE_EVENT],first:100){filteredCount "
+    "nodes{... on RenamedTitleEvent{actor{login}}}} "
+    "forcePushes: timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT],first:1)"
+    "{filteredCount}}}}"
+)
+
+
+def _pr_outside_facts(pr_num: str, repo: str | None = None) -> dict | None:
+    """The ``pullRequest`` object of ``_OUTSIDE_PR_QUERY``, or None on any error.
+
+    Tests inject via ``_TEST_GH_OUTSIDE_PR`` (that object as JSON; ``__error__``
+    simulates a failed read).
+    """
+    raw = os.environ.get("_TEST_GH_OUTSIDE_PR")
+    if raw is None:
+        if repo is not None and not isinstance(repo, str):
+            return None
+        slug = _normalize_repo(repo) if repo else _derive_repo_from_cwd(os.getcwd())
+        if not slug or "/" not in slug or not str(pr_num).isdigit():
+            return None
+        owner, name = slug.split("/", 1)
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    f"query={_OUTSIDE_PR_QUERY}",
+                    "-f",
+                    f"owner={owner}",
+                    "-f",
+                    f"name={name}",
+                    # -F: the number must reach GraphQL as an Int.
+                    "-F",
+                    f"num={pr_num}",
+                    "--jq",
+                    ".data.repository.pullRequest",
+                ],
+                capture_output=True,
+                text=True,
+                # Merge path, under the shared deadline; a failure means no exemption.
+                timeout=_gh_timeout(6),
+            )
+        except Exception:
+            return None
+        raw = result.stdout if result.returncode == 0 else ""
+    try:
+        facts = json.loads(raw)
+    except Exception:
+        return None
+    return facts if isinstance(facts, dict) else None
+
+
+#: Review apps whose own edits to an outside PR's body (a summary, a badge) keep the
+#: leaks exemption. MEASURED 2026-10-05 over 7 exempt-shaped merged outside PRs: every
+#: one carried a ``coderabbitai`` edit and all but one a ``devin-ai-integration`` edit.
+#: Named, not "any Bot": an unknown app's edit is not known to be generated text.
+_BODY_EDIT_REVIEW_APPS = frozenset({"coderabbitai", "devin-ai-integration"})
+
+#: A ``Co-authored-by:`` trailer names someone else's text inside a commit the
+#: contributor made -- GitHub adds one when a review suggestion is committed.
+_CO_AUTHOR_TRAILER = re.compile(r"(?im)^co-authored-by:")
+
+
+def _outside_contribution(pr_num: str, repo: str | None, head: str) -> tuple[str | None, str]:
+    """``(login, "")`` when PR ``pr_num`` at ``head`` is wholly an outside
+    contribution, else ``(None, why)`` (``why`` is "" when the PR is not even a
+    fork PR, so a maintainer PR's block message stays unchanged).
+
+    The leaks review exists to stop the OWNER's private data reaching the public repo,
+    and an outsider's own text cannot hold it (owner ruling, 2026-10-05). So the
+    marker is not required when ALL of these hold, read live and bound to ``head``:
+      * the PR was opened by a human account (a Bot never qualifies) whose
+        association is not OWNER, MEMBER or COLLABORATOR;
+      * its head lives in a fork, and is ``head``, and the branch was never
+        force-pushed (a rewrite can fold a commit of ours into one of theirs);
+      * every commit's author is that account, and every committer is that account
+        or ``web-flow`` (the committer GitHub records for the contributor's web
+        edits, and for an Update-branch merge or UI rebase, which bring in only the
+        base's content); and no commit carries a ``Co-authored-by:`` trailer, which
+        is how a committed review suggestion of ours would arrive;
+      * every edit of the PR body was the author's or a named review app's
+        (``_BODY_EDIT_REVIEW_APPS``), and every title rename was the author's;
+      * CI's leak-detector is green at ``head`` (the same identity check the
+        carried-forward relief uses). On a fork that job runs its pattern-class scan
+        but not the private-pattern step, which needs a repo secret forks do not get.
+    A commit or a text edit of ours, an unlinked commit identity (session commits
+    carry none), or any failed read means no exemption: the marker stays required.
+    Not covered, as before this exemption existed: text a session writes into the
+    squash commit itself at merge time (``gh pr merge --body``).
+    """
+    facts = _pr_outside_facts(pr_num, repo)
+    if facts is None:
+        return None, "the PR facts could not be read"
+    if facts.get("isCrossRepository") is not True:
+        return None, ""
+    author = facts.get("author") or {}
+    login = author.get("login") if isinstance(author, dict) else None
+    if not isinstance(login, str) or not login or author.get("__typename") != "User":
+        return None, "the PR was not opened by a human account"
+    me = login.lower()
+    assoc = facts.get("authorAssociation")
+    if not isinstance(assoc, str) or not assoc or assoc.upper() in _MAINTAINER_ASSOCIATIONS:
+        return None, "the PR author is a maintainer"
+    if (facts.get("headRefOid") or "").lower() != head:
+        return None, "the PR head moved"
+    # The commit checks below read the CURRENT commit list. A force-push rewrites
+    # it: a commit of ours could be squashed or rebased into one authored and
+    # committed by the contributor, leaving no trace in today's list. So any
+    # rewrite of the head branch, by anyone, ends the exemption (none of the
+    # outside PRs merged so far had one, MEASURED 2026-10-06 over 7).
+    forced = facts.get("forcePushes")
+    if not isinstance(forced, dict) or forced.get("filteredCount") != 0:
+        return None, "the PR branch was force-pushed, so its earlier commits cannot be checked"
+    # The body's FULL edit history (``editor`` alone names only the last editor, so
+    # an edit of ours followed by a review app's would hide). GitHub lists it
+    # newest first; every node is checked, so the order does not matter.
+    edits = facts.get("userContentEdits")
+    edit_nodes = edits.get("nodes") if isinstance(edits, dict) else None
+    if not isinstance(edit_nodes, list) or edits.get("totalCount") != len(edit_nodes):
+        return None, "the PR body's edit history could not be read in full"
+    for node in edit_nodes:
+        editor = node.get("editor") if isinstance(node, dict) else None
+        if not isinstance(editor, dict):
+            return None, "a PR body edit has no known editor"
+        name = str(editor.get("login") or "").lower()
+        if name != me and not (
+            editor.get("__typename") == "Bot" and name in _BODY_EDIT_REVIEW_APPS
+        ):
+            return None, f"the PR body was edited by {name or 'an unknown account'}"
+    # filteredCount, not totalCount: totalCount counts every timeline item, whatever
+    # the type filter (MEASURED: 8 and 22 on two PRs with no renames).
+    renames = facts.get("timelineItems")
+    nodes = renames.get("nodes") if isinstance(renames, dict) else None
+    if not isinstance(nodes, list) or renames.get("filteredCount") != len(nodes):
+        return None, "the PR title's rename history could not be read in full"
+    for node in nodes:
+        actor = node.get("actor") if isinstance(node, dict) else None
+        if not isinstance(actor, dict) or str(actor.get("login") or "").lower() != me:
+            return None, "the PR title was renamed by another account"
+    rows, why = _pr_commit_rows(pr_num, repo)
+    if rows is None:
+        return None, why
+    if head not in {r["sha"].lower() for r in rows}:
+        return None, "the PR head is not among its commits"
+    for r in rows:
+        if (r["author"] or "").lower() != me:
+            return None, f"commit {r['sha'][:12]} was not authored by {login}"
+        if (r["committer"] or "").lower() not in (me, "web-flow"):
+            return None, f"commit {r['sha'][:12]} was committed by another account"
+        if r["message"] is None or _CO_AUTHOR_TRAILER.search(r["message"]):
+            return None, f"commit {r['sha'][:12]} names a co-author (or its message is unread)"
+    check_name, workflow = _MECHANICAL_RESCAN_BY_KIND["leaks"]
+    if not _mechanical_scan_is_green(pr_num, head, check_name, workflow, repo=repo):
+        return None, f"CI's {check_name} is not green at this head"
+    return login, ""
+
+
 def _check_scheduled_claude_reviewed_head(
     pr_num: str,
     head_sha: str | None = None,
@@ -6465,6 +8883,7 @@ def _check_scheduled_claude_reviewed_head(
     *,
     force: bool = False,
     relief_out: list[tuple[str, str, str]] | None = None,
+    exempt_out: list[tuple[str, str]] | None = None,
 ) -> str | None:
     """Block a merge unless EVERY required scheduled Claude review (by the repo OWNER)
     has run on the PR's CURRENT head. Returns ``None`` when a valid owner marker for
@@ -6549,6 +8968,17 @@ def _check_scheduled_claude_reviewed_head(
     kinds_here = markers.get(head, set())
     required = _required_scheduled_review_kinds()
     missing = [k for k in required if k not in kinds_here]
+    # An outside contribution needs no leaks review (see _outside_contribution) --
+    # unless a leaks review ran in this PR and objected: an exemption is a reason
+    # not to ask, never a reason to overrule a finding. Read only when leaks is
+    # actually missing, so a PR carrying its marker pays nothing.
+    exempt_login, exempt_why = None, ""
+    if "leaks" in missing and _kind_has_blocking_evidence("leaks", rejected, residue) is None:
+        exempt_login, exempt_why = _outside_contribution(pr_num, repo, head)
+        if exempt_login:
+            missing = [k for k in missing if k != "leaks"]
+            if exempt_out is not None:
+                exempt_out.append(("leaks", exempt_login))
     if missing:
         # A kind already ACCEPTED at an earlier head of this PR is satisfied when its
         # mechanical scanner is green at THIS head (see _MECHANICAL_RESCAN_BY_KIND).
@@ -6569,6 +8999,17 @@ def _check_scheduled_claude_reviewed_head(
                     file=sys.stderr,
                 )
     if not missing:
+        # Announced here, once the gate is known to clear, so a relieved other kind
+        # beside it never hides the note.
+        if exempt_login:
+            print(
+                f"NOTE: scheduled 'leaks' review not required for PR #{pr_num}: it is "
+                f"an outside contribution by {exempt_login} (fork, never force-pushed, "
+                f"every commit theirs, no edit of ours, CI's leak-detector green at this "
+                f"head -- on a fork its pattern-class scan only, without the "
+                f"private-pattern step).",
+                file=sys.stderr,
+            )
         return None
     # The message is an INVENTORY, not a verdict. Every marker block the scan found is
     # listed under the kind it names, with its status, and NOTHING is subtracted from
@@ -6674,6 +9115,16 @@ def _check_scheduled_claude_reviewed_head(
                 f"  (relief for '{k}' was attempted and declined: {r}.)\n"
                 for k, r in sorted(relief_blocked.items())
             )
+        )
+        + (
+            f"  (leaks is not required: an outside contribution by {exempt_login}.)\n"
+            if exempt_login
+            else ""
+        )
+        + (
+            f"  (leaks exemption for an outside contribution not applied: {exempt_why}.)\n"
+            if exempt_why and "leaks" in missing
+            else ""
         )
         + "A marker is a comment/review by the repo OWNER carrying "
         f"'<!-- genesis-scheduled-review: head={head} kind=<name> -->' — the FULL 40-hex "
@@ -7039,6 +9490,9 @@ def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
     raw = os.environ.get("_TEST_GH_PR_BODY")
     if raw is not None:
         return raw
+    key = ("body", str(pr_num), repo or "")
+    if _merge_deadline is not None and key in _MERGE_READ_CACHE:
+        return _MERGE_READ_CACHE[key]
     try:
         result = subprocess.run(
             ["gh", "pr", "view", pr_num, *_repo_args(repo), "--json", "body", "--jq", ".body"],
@@ -7048,7 +9502,10 @@ def _pr_body_text(pr_num: str, repo: str | None) -> str | None:
         )
     except Exception:
         return None
-    return result.stdout if result.returncode == 0 else None
+    got = result.stdout if result.returncode == 0 else None
+    if got is not None and _merge_deadline is not None:
+        _MERGE_READ_CACHE[key] = got
+    return got
 
 
 #: MIRROR of e2e_declaration.E2E_CUTOFF_ISO, for the degraded path only. Without it
@@ -7146,6 +9603,9 @@ def _pr_created_at(pr_num: str, repo: str | None = None) -> str | None:
     raw = os.environ.get("_TEST_GH_PR_CREATED_AT")
     if raw is not None:
         return raw
+    key = ("createdAt", str(pr_num), repo or "")
+    if _merge_deadline is not None and key in _MERGE_READ_CACHE:
+        return _MERGE_READ_CACHE[key]
     try:
         result = subprocess.run(
             [
@@ -7158,7 +9618,10 @@ def _pr_created_at(pr_num: str, repo: str | None = None) -> str | None:
         )
     except Exception:
         return None
-    return result.stdout.strip() if result.returncode == 0 else None
+    got = result.stdout.strip() if result.returncode == 0 else None
+    if got is not None and _merge_deadline is not None:
+        _MERGE_READ_CACHE[key] = got
+    return got
 
 
 def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
@@ -7512,6 +9975,1368 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     return verdict.blocked, verdict.message
 
 
+# --- main-reverts: a merge-from-main that kept the branch's stale copies (#2809) ---
+
+#: The four states `_check_main_reverts` reports (guard failure semantics, rule 1).
+#: Kept distinct so no caller can render "could not check" as "clean".
+MAIN_REVERTS_FINDINGS = "findings"
+MAIN_REVERTS_CLEAN = "clean"
+MAIN_REVERTS_UNCHECKED = "could-not-check"
+MAIN_REVERTS_NA = "n/a"
+
+#: GitHub's documented ceilings. ``pulls/N/commits`` returns at most 250 commits;
+#: ``commits/<sha>`` lists at most 3000 files. A read that reaches either cannot
+#: prove the unseen remainder did not touch a file, so it is COULD-NOT-CHECK.
+_PR_COMMITS_CAP = 250
+_COMMIT_FILES_CAP = 3000
+
+#: How many files the report names before stating how many it left out.
+_MAIN_REVERTS_LIST_MAX = 10
+
+#: How many uncovered ADDED files get a main-history lookup (one call each). The
+#: rest stay findings: unknown is never resolved toward clean.
+_MAIN_REVERTS_HISTORY_LOOKUPS = 20
+
+#: Wall-clock budget for the row's per-commit fan-out and history lookups (the
+#: commit-list and changed-file reads before them carry their own single-call
+#: timeouts). Report mode arms no merge deadline, so
+#: without this a degraded API could hold `--check-pr` for one 15 s timeout per
+#: commit read (about 10 minutes at the 250-commit cap). MEASURED 2026-10-03: one
+#: `commits/<sha>` read took 0.57 s (10 sequential reads on this repo), so the
+#: largest PR the cap admits (249 own commits over 6 workers, ~42 reads each)
+#: needs about 24 s, plus up to 20 history lookups of similar cost. 90 s is about
+#: 2.5x that healthy maximum; past it the row reports COULD-NOT-CHECK.
+_MAIN_REVERTS_BUDGET_S = 90.0
+
+
+def _pr_commit_list(pr_num: str, repo: str | None = None) -> tuple[list[tuple[str, int]] | None, str]:
+    """``([(sha, parent_count), ...], "")`` for the PR's commits, or ``(None, reason)``."""
+    rows, why = _pr_commit_rows(pr_num, repo)
+    if rows is None:
+        return None, why
+    return [(r["sha"], r["parents"]) for r in rows], ""
+
+
+def _pr_commit_rows(pr_num: str, repo: str | None = None) -> tuple[list[dict] | None, str]:
+    """``([{sha, parents, author, committer, message}, ...], "")`` for the PR's
+    commits, or ``(None, reason)``. ``author`` / ``committer`` are GitHub logins, None
+    when the commit's git identity is linked to no account.
+
+    A saturated read (``>= _PR_COMMITS_CAP`` rows) is returned as None with the cap
+    named: GitHub stops at 250 here, so the commits beyond it are unknown. An EMPTY
+    read is also None — every PR has a commit, so empty is a degraded response.
+
+    Tests inject via ``_TEST_GH_PR_COMMITS`` (one JSON object per line:
+    ``{"sha": ..., "parents": <int>, "author": ..., "committer": ..., "message": ...}``,
+    all but sha and parents optional; the literal ``__error__`` simulates an API error).
+    """
+    raw = os.environ.get("_TEST_GH_PR_COMMITS")
+    if raw == "__error__":
+        return None, "the PR's commit list could not be read (gh error)"
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    # per_page in the PATH: `-f` would send a POST body field
+                    # and flip the method (see review_budget._PAGE_SIZE).
+                    f"repos/{repo or ':owner/:repo'}/pulls/{pr_num}/commits?per_page=100",
+                    "--paginate",
+                    "--jq",
+                    ".[] | {sha: .sha, parents: (.parents | length), "
+                    "author: .author.login, committer: .committer.login, "
+                    "message: .commit.message}",
+                ],
+                capture_output=True,
+                text=True,
+                # One paginated read, on the merge path for two gates: the leaks
+                # exemption and the `rework` gate (`_check_rework`). So the cap is
+                # clamped to what is left of the shared merge deadline; an expired
+                # deadline raises before the process starts and lands in the
+                # `except` below as an unreadable list, which each gate maps per
+                # its fail-direction table. The `main-reverts` row reads it in
+                # report mode.
+                timeout=_gh_timeout(15),
+            )
+        except Exception:
+            return None, "the PR's commit list could not be read (gh did not answer)"
+        if result.returncode != 0:
+            return None, "the PR's commit list could not be read (gh error)"
+        raw = result.stdout
+    commits: list[dict] = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return None, "the PR's commit list was malformed"
+        sha = obj.get("sha") if isinstance(obj, dict) else None
+        parents = obj.get("parents") if isinstance(obj, dict) else None
+        if not isinstance(sha, str) or not sha or not isinstance(parents, int):
+            return None, "the PR's commit list was malformed"
+        author, committer = obj.get("author"), obj.get("committer")
+        message = obj.get("message")
+        commits.append(
+            {
+                "sha": sha,
+                "parents": parents,
+                "author": author if isinstance(author, str) and author else None,
+                "committer": committer if isinstance(committer, str) and committer else None,
+                "message": message if isinstance(message, str) else None,
+            }
+        )
+    if not commits:
+        return None, "the PR's commit list came back empty"
+    if len(commits) >= _PR_COMMITS_CAP:
+        return None, (
+            f"the PR has at least {_PR_COMMITS_CAP} commits, GitHub's cap on "
+            f"pulls/N/commits, so the commits beyond it are unknown"
+        )
+    return commits, ""
+
+
+def _commit_touched_files(sha: str, repo: str | None = None) -> tuple[set[str] | None, str]:
+    """Every path one commit touched (rename sources included), or ``(None, reason)``.
+
+    For a non-merge commit GitHub's list is its diff against its only parent.
+    Saturated at ``_COMMIT_FILES_CAP`` → None, naming the cap.
+
+    Tests inject via ``_TEST_GH_COMMIT_FILES``: a JSON object mapping sha → list of
+    ``{filename, previous_filename}`` or the literal ``"__error__"``. A sha the map
+    does not name is an error, so a test can never pass on an unseeded read.
+    """
+    raw = os.environ.get("_TEST_GH_COMMIT_FILES")
+    short = sha[:12]
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(sha)
+        except Exception:
+            got = None
+        if not isinstance(got, list):
+            return None, f"commit {short}'s file list could not be read (gh error)"
+        rows = got
+    else:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/commits/{sha}",
+                    "--paginate",
+                    "--jq",
+                    # A page with no `files` array is a degraded response, not
+                    # "this commit touched nothing": emit a sentinel the parser
+                    # below refuses, so the row fails toward COULD-NOT-CHECK.
+                    'if (.files | type) == "array" then (.files[] | {filename: .filename, '
+                    'previous_filename: .previous_filename}) else {"__no_files__": true} end',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(15),
+            )
+        except Exception:
+            return None, f"commit {short}'s file list could not be read (gh did not answer)"
+        if result.returncode != 0:
+            return None, f"commit {short}'s file list could not be read (gh error)"
+        rows = []
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                return None, f"commit {short}'s file list was malformed"
+    if len(rows) >= _COMMIT_FILES_CAP:
+        return None, (
+            f"commit {short} touches at least {_COMMIT_FILES_CAP} files, GitHub's cap "
+            f"on a commit's file list"
+        )
+    paths: set[str] = set()
+    for obj in rows:
+        if isinstance(obj, dict) and obj.get("__no_files__"):
+            return None, f"commit {short}'s response carried no file list"
+        name = obj.get("filename") if isinstance(obj, dict) else None
+        if not isinstance(name, str) or not name:
+            return None, f"commit {short}'s file list was malformed"
+        paths.add(name)
+        prev = obj.get("previous_filename")
+        if isinstance(prev, str) and prev:
+            paths.add(prev)
+    return paths, ""
+
+
+def _path_in_base_history(path: str, base_sha: str, repo: str | None = None) -> bool | None:
+    """Has any commit reachable from the base tip ever touched ``path``? None = unknown.
+
+    ``commits?path=<p>&sha=<base>&per_page=1`` — one commit is enough to answer.
+    Tests inject via ``_TEST_GH_PATH_ON_BASE`` (a JSON object path → bool; a path it
+    does not name is unknown).
+    """
+    raw = os.environ.get("_TEST_GH_PATH_ON_BASE")
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(path)
+        except Exception:
+            return None
+        return got if isinstance(got, bool) else None
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                "-X",
+                "GET",
+                f"repos/{repo or ':owner/:repo'}/commits",
+                "-f",
+                f"path={path}",
+                "-f",
+                f"sha={base_sha}",
+                "-f",
+                "per_page=1",
+                "--jq",
+                "length",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip()) > 0
+    except ValueError:
+        return None
+
+
+def _safe_path(path: str) -> str:
+    """A PR-author-controlled path, with terminal-acting characters neutralised."""
+    return "".join("?" if _gate_text_unsafe(ch) else ch for ch in path)
+
+
+def _check_main_reverts(pr_num: str, repo: str | None = None) -> tuple[str, str]:
+    """Does the PR's diff carry files that only a MERGE put there? (issue #2809)
+
+    THE DEFECT: a branch's "merge main in" commit resolves by keeping the branch's
+    stale copy of files main has since changed. The PR diff then reverts main's
+    later edits to those files, and a squash merge would land the revert. MEASURED
+    on a real PR: its head was a merge whose second parent was main, its diff listed
+    126 files, and its own commits touched 4; 122 files arrived only through the
+    merge.
+
+    THE RULE: on a correctly merged branch, every file in the PR's diff was touched
+    by one of the PR's own NON-merge commits — a merge that takes main's side for a
+    file the branch never touched leaves that file out of the diff entirely. A diff
+    file no non-merge commit touched reached the diff only through a merge
+    resolution. MEASURED 2026-10-03 across all 46 open PRs: the bare rule fired on
+    4; one was the stale merge above, and the other three were each a changelog
+    fragment written inside a merge commit. Hence one refinement: an uncovered file
+    the PR ADDS that main's history never contained cannot be a revert of main, so
+    it is named in a note rather than counted. An added file main DID once hold is
+    a revert of main deleting it, and stays a finding.
+
+    Returns ``(state, message)``; state is one of the four ``MAIN_REVERTS_*``
+    constants. Line 0 of the message carries counts and fixed text only — it is
+    printed unsanitized — and every path goes on lines 1+, which the report
+    sanitizes.
+
+    GUARD AXIOMS, stated because every gate change owes them:
+      * VERDICT: **advisory** (owner decision on #2809: the ADVISORY form only).
+        Nothing blocks on it, no sigil exists, and the merge arm does not call it.
+        The report prints it as a row that never counts toward ``failures``.
+      * AUDIENCE: the agent driving the merge. The detail names the files (bounded,
+        with the total stated) and the remedy, because "merge main again" is the
+        intuitive fix and does not work.
+      * BACKGROUND: none — background sessions cannot merge, and the row runs only
+        in the ``--check-pr`` report, never on a hook path.
+
+    STATES (guard failure semantics, rule 1 — never collapsed):
+      * OUT-OF-SCOPE (``n/a``): the commit list is complete and has no merge commit,
+        so the diff is exactly the union of the commits and the defect cannot occur.
+        Decided from the commit list alone; nothing else is read.
+      * COULD-NOT-CHECK: any read failed, or reached a GitHub cap (250 commits on
+        ``pulls/N/commits``, 3000 files on ``pulls/N/files`` or on one commit).
+        Never rendered as clean.
+      * CHECKED-CLEAN and FINDINGS: as named.
+
+    KNOWN LIMITS: a partial revert INSIDE a file the PR's own commits also touched
+    is invisible to this rule (the file is covered). A file the BASE renamed after
+    the branch edited it under its old path is reported as a false positive (paths
+    are compared literally, not traced across the merge), so the remedy text tells
+    the reader to check for a rename before restoring anything, and deliberately
+    prints no copy-paste command. A deliberate edit made inside a
+    merge (a semantic-conflict fix to a file the branch never touched) is reported,
+    and the message says that case exists.
+    """
+    commits, why = _pr_commit_list(pr_num, repo)
+    if commits is None:
+        return MAIN_REVERTS_UNCHECKED, why
+    merges = [sha for sha, parents in commits if parents > 1]
+    if not merges:
+        return MAIN_REVERTS_NA, "no merge commits in the PR, so nothing can arrive through one"
+    diff_files = _pr_changed_files(pr_num, repo)
+    if diff_files is None:
+        return MAIN_REVERTS_UNCHECKED, (
+            "the PR's changed-file list could not be read (gh error, or GitHub's "
+            "3000-file cap on pulls/N/files)"
+        )
+    deadline = time.monotonic() + _MAIN_REVERTS_BUDGET_S
+    over_budget = (
+        f"reading the PR's history took longer than the "
+        f"{int(_MAIN_REVERTS_BUDGET_S)} s budget for this row"
+    )
+    own = [sha for sha, parents in commits if parents <= 1]
+    touched: set[str] = set()
+    if own:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import TimeoutError as _FuturesTimeout
+
+        # One read per commit, side by side. The first failure returns at once
+        # and the whole fan-out shares one deadline; queued reads are cancelled
+        # rather than waited for (shutdown(wait=False)), so a degraded API costs
+        # at most the budget plus one in-flight subprocess timeout.
+        pool = ThreadPoolExecutor(max_workers=min(6, len(own)))
+        try:
+            futures = [pool.submit(_commit_touched_files, sha, repo) for sha in own]
+            try:
+                for fut in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
+                    paths, reason = fut.result()
+                    if paths is None:
+                        return MAIN_REVERTS_UNCHECKED, reason
+                    touched |= paths
+            except _FuturesTimeout:
+                return MAIN_REVERTS_UNCHECKED, over_budget
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+    uncovered = sorted(set(diff_files) - touched)
+
+    # Refinement: an uncovered file the PR ADDS that main never held is not a
+    # revert. Only an "added" status qualifies, and unknown history keeps it a
+    # finding.
+    statuses = _pr_file_statuses(pr_num, repo)
+    added = [p for p in uncovered if statuses.get(p) == "added"]
+    new_in_merge: list[str] = []
+    if added:
+        base_sha = _pr_base_sha(pr_num, repo=repo)
+        if base_sha:
+            for path in added[:_MAIN_REVERTS_HISTORY_LOOKUPS]:
+                # Out of budget here would otherwise leave an unchecked added
+                # file counted as a revert; say we could not check instead.
+                if time.monotonic() >= deadline:
+                    return MAIN_REVERTS_UNCHECKED, over_budget
+                if _path_in_base_history(path, base_sha, repo) is False:
+                    new_in_merge.append(path)
+    not_reverts = set(new_in_merge)
+    reverted = [p for p in uncovered if p not in not_reverts]
+
+    def _listing(paths: list[str]) -> list[str]:
+        shown = [f"  - {_safe_path(p)}" for p in paths[:_MAIN_REVERTS_LIST_MAX]]
+        if len(paths) > _MAIN_REVERTS_LIST_MAX:
+            shown.append(
+                f"  … and {len(paths) - _MAIN_REVERTS_LIST_MAX} more "
+                f"({len(paths)} in total; the first {_MAIN_REVERTS_LIST_MAX} are shown)"
+            )
+        return shown
+
+    note: list[str] = []
+    if new_in_merge:
+        note = [
+            f"{len(new_in_merge)} file(s) were added only inside a merge commit and "
+            f"never existed on the base branch — not a revert, but invisible to a "
+            f"commit-by-commit review:",
+            *_listing(new_in_merge),
+        ]
+    if not reverted:
+        if new_in_merge:
+            head = (
+                f"no revert of the base branch: every file in the diff except the "
+                f"{len(new_in_merge)} added-in-merge file(s) below was touched by one "
+                f"of the PR's {len(own)} own commit(s)"
+            )
+        else:
+            head = (
+                f"every file in the diff was touched by one of the PR's "
+                f"{len(own)} own commit(s)"
+            )
+        return MAIN_REVERTS_CLEAN, "\n".join([head, *note])
+
+    base = _pr_base_ref(pr_num, repo=repo) or "<base-branch>"
+    lines = [
+        f"{len(reverted)} file(s) in the PR diff were touched by none of the PR's "
+        f"{len(own)} own commit(s) — they arrive only through a merge, which usually "
+        f"means the merge kept the branch's stale copy and the PR reverts the base "
+        f"branch's later edits to them",
+        f"Files (sorted; {len(reverted)} in total):",
+        *_listing(reverted),
+        "Check each listed file before acting: if the base branch renamed or moved "
+        "it, the branch's edit may be correct and this listing is a false positive "
+        "(renames are not tracked across the merge), so do not overwrite it.",
+        f"Remedy for a real revert: give each such file the content it has on "
+        f"{base} in the repository this report checked (a file {base} deleted is "
+        "removed instead), commit that, then merge the base branch again.",
+        f"Merging {base} again alone does not fix it: git treats the stale copies as "
+        "the branch's intended content, so they survive every later merge.",
+        "If a listed file was edited inside a merge on purpose (a semantic-conflict "
+        "fix), move that edit into an ordinary commit so the PR's own history shows it.",
+        *note,
+        "Advisory only: this row never blocks a merge.",
+    ]
+    return MAIN_REVERTS_FINDINGS, "\n".join(lines)
+
+
+# --- rework: a rebuild of a sent-back PR carries its contract (owner decision) ---
+
+#: The four states `_check_rework` reports. BLOCK is the only one that blocks.
+REWORK_BLOCK = "block"
+REWORK_OK = "ok"
+REWORK_NA = "n/a"
+REWORK_UNCHECKED = "could-not-check"
+
+#: The labels that mark a PR as sent back for rework.
+_REWORK_LABELS = ("needs-rework", "needs-architecture-session")
+
+#: `gh pr list --limit` for the sent-back read. A result this long is truncated.
+_REWORK_LIST_LIMIT = 500
+
+def _rework_ack_bot_logins() -> frozenset[str]:
+    """Bot logins whose acknowledgement counts despite a NONE author association.
+
+    EXACT logins from the reviewer registry (its ``devin-marker`` parser), never a
+    pattern: Devin builds rework itself and comments as a GitHub App whose
+    association is NONE. An unimportable registry allows no bot (fails closed).
+    """
+    try:
+        return frozenset(enforced_logins().get("devin-marker", frozenset()))
+    except Exception:  # noqa: BLE001 — the registry stub raises when unimportable.
+        return frozenset()
+
+
+#: The heading an acknowledgement comment opens with (after leading whitespace).
+_REWORK_ACK_HEADING = "## rework acknowledgement"
+
+#: What may follow a spec or acknowledgement heading: a qualifier set off by
+#: punctuation and carrying at least one word, such as `(amended,
+#: decision-complete)`, `: v2` or a dash and a note. A bare following WORD is
+#: not allowed: "Rework acknowledgement needed" is an instruction, not an
+#: acknowledgement. The qualifier's MEANING is not judged. This row checks
+#: form; whether a spec is decision-complete is the closing session's call, as
+#: the closing-session skill's gate table says. A word list cannot tell a draft
+#: from a decision: it blocks "(final; no open questions)" and passes
+#: "(proposed)".
+_REWORK_HEADING_QUALIFIER = r"(?:\s*[(\[:,;\u2010-\u2015\u2212\uff1a-]\s*\w.*)?"
+
+#: The fields the `## Rework` section must carry, each with text after the colon.
+_REWORK_FIELDS = (
+    "Replaces",
+    "Split",
+    "Kept / deleted / reshaped as the spec asked",
+    "Deviations",
+    "Questions answered",
+)
+
+#: `#N` only standing alone: never `other/repo#10` (a cross-repository shorthand)
+#: or a URL fragment (`page#10`).
+_REWORK_REF = r"(?:(?<![\w/.#-])#(\d+)\b|https?://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+))"
+#: Signal (a): a STRUCTURED declaration, a line whose field is `Replaces:` or
+#: `Supersedes:` (optionally a bullet, optionally bold), naming PRs as `#N` or as
+#: this repository's PR URLs anywhere in its value. Owner ruling 2026-10-05: prose
+#: is never read as a declaration. Two review rounds showed every prose matcher
+#: misreads some sentence ("This PR never supersedes #11"), so a builder declares
+#: a replacement the way the `## Rework` section already asks, and undeclared
+#: rebuilds are left to commit containment (signal b) and the closing session.
+#: Linear: anchored, no nested quantifier over whitespace.
+#: A field line, read from rendered paragraph text (emphasis already dropped):
+#: `Name: value`. Linear: anchored, no nested quantifier over whitespace.
+_REWORK_DECL_FIELD_RE = re.compile(
+    r"^[ \t]*(?:replaces|supersedes)[ \t]*:(?P<value>.*)$", re.IGNORECASE
+)
+_REWORK_REF_RE = re.compile(_REWORK_REF, re.IGNORECASE)
+#: The `## Rework` heading's rendered text: `Rework`, optionally followed by more
+#: (`Rework (replaces #10)`), but never the spec or acknowledgement heading, which
+#: belong on the OLD PR: a body that copies the spec is not a report against it.
+_REWORK_HEADING_TEXT_RE = re.compile(
+    r"^rework\b(?![ \t_-]*(?:acknowledg|spec\b))", re.IGNORECASE
+)
+#: The most declared PRs one body may name. Each unlisted one costs a PR read
+#: and a timeline read on a path with no shared deadline (`--check-pr`), so the
+#: bound keeps a degraded API from stalling the report. A rebuild replaces one
+#: to three PRs in practice; more blocks and takes the owner's override.
+_REWORK_MAX_DECLARED = 5
+_REWORK_FIELD_RE = re.compile(
+    r"^[ \t]*("
+    + "|".join(re.escape(f).replace(r"\ ", r"[ \t]+") for f in _REWORK_FIELDS)
+    + r")[ \t]*:(.*)$",
+    re.IGNORECASE,
+)
+#: Another `Label:` line (`Testing: pytest`, `E2E: none`). It ends the field above
+#: it rather than filling it. The colon must end the label (followed by a space
+#: or the line end), so a URL (`https://...`) is a value, never a label.
+_REWORK_OTHER_FIELD_RE = re.compile(r"^[ \t]*[A-Za-z][\w /()-]{0,60}:(?:[ \t]|$)")
+
+
+def _rework_markdown():
+    """A CommonMark parser (markdown-it-py), or None when it is not installed.
+
+    The rework readers judge the body AS IT RENDERS, so a quoted template in a code
+    block, a blockquote or an HTML comment is never a declaration, a field value or
+    a heading. Hand-written line rules missed some CommonMark construct in each of
+    three review passes, so the body is parsed instead. None makes every reader
+    report the body unreadable, which the fail-direction table handles.
+    """
+    try:
+        from markdown_it import MarkdownIt  # noqa: PLC0415 — optional at import time
+    except ImportError:
+        return None
+    return MarkdownIt("commonmark")
+
+
+class _ReworkUnreadable(Exception):
+    """The body could not be parsed (no Markdown parser installed)."""
+
+
+def _rework_inline_text(inline) -> str:
+    """An inline token's rendered text: emphasis markers and inline HTML dropped,
+    line breaks kept as newlines, link text kept, images dropped."""
+    out: list[str] = []
+    for child in inline.children or []:
+        if child.type in ("text", "code_inline"):
+            out.append(child.content)
+        elif child.type in ("softbreak", "hardbreak"):
+            out.append("\n")
+    return "".join(out)
+
+
+def _rework_blocks(body: str) -> list[tuple[str, object, str]]:
+    """The body's rendered blocks, in order, as ``(kind, where, text)``.
+
+    ``kind`` is ``"heading"`` (``where`` = level), ``"para"`` (``where`` = the tuple
+    of list-item positions enclosing it, empty at the top level), or ``"other"``
+    for a block that renders but carries no readable text (code, raw HTML, a
+    blockquote: their content is quoted material, never the author's field).
+    An HTML block that is only a comment renders nothing and is omitted. Raises
+    ``_ReworkUnreadable`` when no parser is installed.
+    """
+    md = _rework_markdown()
+    if md is None:
+        raise _ReworkUnreadable("the Markdown parser (markdown-it-py) is not installed")
+    tokens = md.parse((body or "").replace("\r\n", "\n"))
+    blocks: list[tuple[str, object, str]] = []
+    quote = 0
+    items: list[int] = []
+    counter = 0
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        t = tok.type
+        if t == "blockquote_open":
+            if quote == 0:
+                blocks.append(("other", (), ""))
+            quote += 1
+        elif t == "blockquote_close":
+            quote -= 1
+        elif quote:
+            pass
+        elif t == "list_item_open":
+            counter += 1
+            items.append(counter)
+        elif t == "list_item_close":
+            items.pop()
+        elif t == "heading_open":
+            inline = tokens[i + 1]
+            blocks.append(("heading", int(tok.tag[1:]), _rework_inline_text(inline)))
+            i += 2
+        elif t == "paragraph_open":
+            inline = tokens[i + 1]
+            blocks.append(("para", tuple(items), _rework_inline_text(inline)))
+            i += 2
+        elif t in ("fence", "code_block", "hr"):
+            blocks.append(("other", tuple(items), ""))
+        elif t == "html_block":
+            if re.sub(r"<!--.*?-->", "", tok.content, flags=re.DOTALL).strip():
+                blocks.append(("other", tuple(items), ""))
+        i += 1
+    return blocks
+
+
+def _rework_field_values(
+    blocks: list[tuple[str, object, str]], field_re: re.Pattern[str]
+) -> list[tuple[str, list[str]]]:
+    """Every field line ``field_re`` matches in ``blocks``, as ``(name, values)``.
+
+    A field's value is the rest of its line, the following lines of the same
+    paragraph up to another ``Label:`` line, and the paragraphs nested under the
+    field: inside the same list item, or, for a top-level field whose own line is
+    empty, the list that directly follows it. A nested item may itself start with a
+    label; only another field of this kind ends the value. Prose in a later
+    paragraph is never a value.
+    """
+    out: list[tuple[str, list[str]]] = []
+    for bi, (kind, where, text) in enumerate(blocks):
+        if kind != "para":
+            continue
+        lines = text.split("\n")
+        for li, line in enumerate(lines):
+            m = field_re.match(line)
+            if not m:
+                continue
+            values = [m.group(m.lastindex).strip()] if m.group(m.lastindex).strip() else []
+            for nxt in lines[li + 1 :]:
+                if field_re.match(nxt) or _REWORK_OTHER_FIELD_RE.match(nxt):
+                    break
+                if nxt.strip():
+                    values.append(nxt.strip())
+            ends_paragraph = li == len(lines) - 1 or not any(
+                field_re.match(n) or _REWORK_OTHER_FIELD_RE.match(n) for n in lines[li + 1 :]
+            )
+            # A field inside a list item owns the list nested under it. A top-level
+            # field owns the list directly below it only when its own line is empty
+            # (`Replaces:` then `- #10`); `Replaces: #10` followed by an unrelated
+            # list (`- Closes #200`) must not absorb it.
+            if ends_paragraph and (where or not values):
+                for k2, w2, t2 in blocks[bi + 1 :]:
+                    if k2 != "para":
+                        if k2 == "heading" or not where:
+                            break
+                        continue
+                    nested = (
+                        len(w2) > len(where) and w2[: len(where)] == where
+                        if where
+                        else bool(w2)
+                    )
+                    if not nested:
+                        break
+                    # Only another field of this kind ends the value. A nested
+                    # item that starts with a label (`- Storage: SQLite, because`)
+                    # is the field's value, not a new field.
+                    if field_re.match(t2.split("\n", 1)[0]):
+                        break
+                    values.extend(v.strip() for v in t2.split("\n") if v.strip())
+            name = m.group(1) if m.lastindex and m.lastindex > 1 else ""
+            out.append((name, values))
+    return out
+
+
+def _rework_deadline_passed() -> bool:
+    """True when the shared merge deadline is armed and already spent."""
+    return _merge_deadline is not None and time.monotonic() >= _merge_deadline
+
+
+def _rework_unreadable(what: str) -> str:
+    """Reason text for a failed read, naming the deadline when that is the cause."""
+    if _rework_deadline_passed():
+        return f"{what} could not be read (the merge-gate deadline passed)"
+    return f"{what} could not be read"
+
+
+def _rework_repo(repo: str) -> str:
+    """``repo`` as an ``OWNER/REPO`` REST path segment: host and scheme dropped as
+    the merge arm drops them, and a trailing ``.git`` removed (gh accepts
+    ``https://github.com/o/r.git`` for ``-R``, but ``repos/o/r.git/...`` is a 404).
+    A value that does not normalize is returned unchanged; its reads then fail and
+    take the unreadable path."""
+    norm = _normalize_repo(repo)
+    if norm is None:
+        return repo
+    owner, _, name = norm.partition("/")
+    return f"{owner}/{name.removesuffix('.git')}"
+
+
+def _rework_declared_refs(body: str, pr_num: str, repo: str | None) -> set[int]:
+    """PR numbers this body declares it replaces; see ``_rework_declarations``."""
+    return _rework_declarations(body, pr_num, repo)[0]
+
+
+def _rework_declarations(
+    body: str, pr_num: str, repo: str | None
+) -> tuple[set[int], list[str]]:
+    """``(refs, problems)``: the PRs this body declares it replaces (signal a),
+    excluding itself, and why a declaration could not be resolved.
+
+    A ``Replaces:`` or ``Supersedes:`` FIELD line declares, anywhere in the body,
+    and so does the ``## Rework`` section's ``Replaces:`` value, including the
+    lines under it, read by the same traversal as the completeness check. Every
+    reference in a value counts, read from the body as it renders
+    (``_rework_blocks``). A URL counts only when it names THIS repository:
+    ``repo`` (normalized), or with ``repo`` unknown the repository gh resolves from the cwd (the
+    one a bare merge targets). Problems, each making the PR a declared rebuild that
+    cannot be verified (so it blocks): a URL whose repository cannot be resolved.
+    Raises ``_ReworkUnreadable`` when the body cannot be parsed.
+    """
+    me = int(pr_num) if str(pr_num).isdigit() else -1
+    refs: set[int] = set()
+    problems: list[str] = []
+    # `-R github.com/o/r` is a valid spelling of `o/r`; compare the normalized form,
+    # as the merge arm does. A repository that does not normalize cannot be checked.
+    norm = _rework_repo(repo) if repo else None
+    want: str | None = norm.lower() if norm and _normalize_repo(norm) else None
+    resolved = repo is not None
+    blocks = _rework_blocks(body)
+    values = [v for _n, vals in _rework_field_values(blocks, _REWORK_DECL_FIELD_RE) for v in vals]
+    fields = _rework_section_fields(body)
+    values.extend((fields or {}).get("Replaces", []))
+    for value in values:
+        for m in _REWORK_REF_RE.finditer(value):
+            if m.group(1):
+                n = int(m.group(1))
+            else:
+                if not resolved:
+                    derived = _derive_repo_from_cwd(os.getcwd())
+                    want = derived.lower() if derived else None
+                    resolved = True
+                if want is None:
+                    problems.append(
+                        "a declared PR URL could not be checked against this "
+                        "repository (the repository could not be resolved)"
+                    )
+                    continue
+                if m.group(2).lower() != want:
+                    continue
+                n = int(m.group(3))
+            if n != me:
+                refs.add(n)
+    return refs, problems
+
+
+def _rework_section_fields(body: str) -> dict[str, list[str]] | None:
+    """The `## Rework` section's fields and their values, or None with no section.
+
+    The section is the first level-2 heading whose text starts with `Rework` (never
+    the acknowledgement heading), up to the next heading of any level. Each field
+    maps to its values as ``_rework_field_values`` reads them, the same reading
+    the declaration reader uses. Raises ``_ReworkUnreadable`` when the body cannot
+    be parsed.
+    """
+    blocks = _rework_blocks(body)
+    start = next(
+        (
+            i
+            for i, (kind, where, text) in enumerate(blocks)
+            if kind == "heading" and where == 2 and _REWORK_HEADING_TEXT_RE.match(text.strip())
+        ),
+        None,
+    )
+    if start is None:
+        return None
+    end = next(
+        (j for j in range(start + 1, len(blocks)) if blocks[j][0] == "heading"), len(blocks)
+    )
+    fields: dict[str, list[str]] = {}
+    for name, values in _rework_field_values(blocks[start + 1 : end], _REWORK_FIELD_RE):
+        canon = next(
+            f for f in _REWORK_FIELDS if f.lower() == " ".join(name.split()).lower()
+        )
+        fields.setdefault(canon, []).extend(values)
+    return fields
+
+
+def _rework_section_problems(body: str) -> list[str]:
+    """What the body's `## Rework` section lacks; empty when it is complete."""
+    fields = _rework_section_fields(body)
+    if fields is None:
+        return ["the PR body has no `## Rework` heading"]
+    problems = []
+    for name in _REWORK_FIELDS:
+        if name not in fields:
+            problems.append(f"the `## Rework` section has no `{name}:` line")
+        elif not fields[name]:
+            problems.append(f"the `## Rework` section's `{name}:` line is empty")
+    return problems
+
+
+def _rework_sent_back(repo: str | None) -> tuple[dict[int, tuple[str, str]] | None, set[int], str]:
+    """``({number: (head, state)}, merged_numbers, "")`` for every sent-back PR.
+
+    One ``gh pr list --state all --label <l>`` per label in ``_REWORK_LABELS``,
+    merged. MERGED PRs are dropped from the map and returned separately, since a
+    merged PR is never sent back. ``(None, set(), reason)`` when either read fails
+    or saturates ``_REWORK_LIST_LIMIT`` (a truncated list cannot prove absence).
+
+    Test seam ``_TEST_GH_REWORK_SENT_BACK``: one JSON object per line,
+    ``{"number": N, "head": sha, "state": "OPEN"|"CLOSED"|"MERGED"}``, covering both
+    labels; the literal ``__error__`` is an unreadable read.
+    """
+    raw = os.environ.get("_TEST_GH_REWORK_SENT_BACK")
+    rows: list[dict] = []
+    if raw is not None:
+        if raw.strip() == "__error__":
+            return None, set(), _rework_unreadable("the sent-back PR list")
+        for line in raw.splitlines():
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    return None, set(), "the sent-back PR list was malformed"
+    else:
+        for label in _REWORK_LABELS:
+            timeout = _gh_timeout(8)  # an expired deadline raises to the caller
+            try:
+                result = subprocess.run(
+                    [
+                        "gh", "pr", "list", *_repo_args(repo),
+                        "--state", "all", "--label", label,
+                        "--limit", str(_REWORK_LIST_LIMIT),
+                        "--json", "number,headRefOid,state",
+                        "--jq", ".[] | {number: .number, head: .headRefOid, state: .state}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except Exception:
+                return None, set(), _rework_unreadable(f"the `{label}` PR list")
+            if result.returncode != 0:
+                return None, set(), _rework_unreadable(f"the `{label}` PR list")
+            got = []
+            for line in result.stdout.splitlines():
+                if line.strip():
+                    try:
+                        got.append(json.loads(line))
+                    except Exception:
+                        return None, set(), f"the `{label}` PR list was malformed"
+            if len(got) >= _REWORK_LIST_LIMIT:
+                return None, set(), (
+                    f"the `{label}` PR list reached its {_REWORK_LIST_LIMIT}-row limit, "
+                    f"so it may be truncated"
+                )
+            rows.extend(got)
+    out: dict[int, tuple[str, str]] = {}
+    merged: set[int] = set()
+    for row in rows:
+        num = row.get("number") if isinstance(row, dict) else None
+        head = row.get("head") if isinstance(row, dict) else None
+        state = str(row.get("state") or "").upper() if isinstance(row, dict) else ""
+        if not isinstance(num, int) or not isinstance(head, str) or not state:
+            return None, set(), "the sent-back PR list was malformed"
+        if state == "MERGED":
+            merged.add(num)
+        else:
+            out[num] = (head.lower(), state)
+    # One PR can appear once per label, and a merge between the two reads gives
+    # CLOSED then MERGED. A merged PR is never sent back, whatever order it came in.
+    for num in merged:
+        out.pop(num, None)
+    return out, merged, ""
+
+
+def _rework_is_issue(num: int, repo: str | None) -> bool:
+    """True only when ``num`` is confirmed to be an issue in ``repo``.
+
+    A 404 on the PR endpoint also happens for a wrong repository spelling or a
+    number that does not exist, and reading either as "an issue" would turn a
+    declared reference into "not sent back". So the issue endpoint must answer
+    without a ``pull_request`` key; anything else (including a failed read) is
+    False, and the reference stays unverified.
+    """
+    timeout = _gh_timeout(8)
+    try:
+        got = subprocess.run(
+            [
+                "gh", "api", f"repos/{repo or ':owner/:repo'}/issues/{num}",
+                "--jq", 'has("pull_request")',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:  # noqa: BLE001 — any failure leaves the reference unverified
+        return False
+    return got.returncode == 0 and got.stdout.strip() == "false"
+
+
+def _rework_timeline(num: int, repo: str | None) -> tuple[bool | None, str, str]:
+    """Was PR ``num`` ever sent back, by its issue timeline? ``(was, why, state)``.
+
+    ``was`` is None when a read failed (``why`` says which). ``state`` is the PR's
+    current state (``OPEN``/``CLOSED``), or "" when unknown. A number that is an
+    ISSUE, not a pull request, is never a sent-back PR: GitHub's timeline endpoint
+    serves both, so the PR endpoint is asked first and a 404 there means "issue".
+    True when a ``labeled`` event for a label in ``_REWORK_LABELS`` exists and the PR
+    was never merged. Labels can be removed; events stay.
+
+    Test seam ``_TEST_GH_REWORK_TIMELINE``: a JSON object mapping the PR number (as a
+    string) to a list of ``{"event": ..., "label": ...}`` rows (state unknown), an
+    object ``{"state": "OPEN"|"CLOSED", "events": [...]}``, ``"__issue__"`` (not a
+    pull request) or ``"__error__"``. A number the map does not name is unreadable,
+    so a test cannot pass on an unseeded read.
+    """
+    what = f"PR #{num}'s timeline"
+    raw = os.environ.get("_TEST_GH_REWORK_TIMELINE")
+    state = ""
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(str(num))
+        except Exception:
+            got = None
+        if got == "__issue__":
+            return False, "", ""
+        if isinstance(got, dict) and isinstance(got.get("events"), list):
+            state = str(got.get("state") or "").upper()
+            got = got["events"]
+        if not isinstance(got, list):
+            return None, _rework_unreadable(what), ""
+        rows = got
+    else:
+        timeout = _gh_timeout(8)  # an expired deadline raises to the caller
+        try:
+            pr = subprocess.run(
+                [
+                    "gh", "api", f"repos/{repo or ':owner/:repo'}/pulls/{num}",
+                    "--jq", '.state + " " + (.merged_at // "")',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except Exception:
+            return None, _rework_unreadable(f"PR #{num}"), ""
+        if pr.returncode != 0:
+            if "HTTP 404" in (pr.stderr or "") and _rework_is_issue(num, repo):
+                return False, "", ""  # an issue, not a pull request
+            return None, _rework_unreadable(f"PR #{num}"), ""
+        parts = pr.stdout.split()
+        if not parts:
+            return None, f"PR #{num} was malformed", ""
+        if len(parts) > 1:
+            return False, "", "MERGED"  # merged_at is set: never sent back
+        state = parts[0].upper()
+        timeout = _gh_timeout(8)
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "api", f"repos/{repo or ':owner/:repo'}/issues/{num}/timeline",
+                    "--paginate", "--jq",
+                    '.[] | select(.event=="labeled" or .event=="merged") '
+                    "| {event: .event, label: .label.name}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except Exception:
+            return None, _rework_unreadable(what), ""
+        if result.returncode != 0:
+            return None, _rework_unreadable(what), ""
+        rows = []
+        for line in result.stdout.splitlines():
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    return None, f"{what} was malformed", ""
+    labeled = merged = False
+    for row in rows:
+        if not isinstance(row, dict):
+            return None, f"{what} was malformed", ""
+        if row.get("event") == "merged":
+            merged = True
+        elif row.get("event") == "labeled" and row.get("label") in _REWORK_LABELS:
+            labeled = True
+    return labeled and not merged, "", state
+
+
+def _rework_ack_comments(num: int, repo: str | None) -> tuple[list[dict] | None, str]:
+    """PR ``num``'s issue comments as ``{login, association, body, created}`` rows.
+
+    Modelled on ``_scheduled_review_rows`` but deliberately separate: that helper's
+    ``stamp`` is the LAST MODIFICATION, and an acknowledgement is judged by when it
+    was CREATED (an edited acknowledgement keeps its creation time).
+
+    Test seam ``_TEST_GH_REWORK_ACK``: a JSON object mapping the PR number (as a
+    string) to a list of rows or ``"__error__"``. A number the map does not name is
+    unreadable.
+    """
+    what = f"PR #{num}'s comments"
+    raw = os.environ.get("_TEST_GH_REWORK_ACK")
+    if raw is not None:
+        try:
+            got = json.loads(raw).get(str(num))
+        except Exception:
+            got = None
+        if not isinstance(got, list):
+            return None, _rework_unreadable(what)
+        rows = got
+    else:
+        timeout = _gh_timeout(8)  # an expired deadline raises to the caller
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "api", f"repos/{repo or ':owner/:repo'}/issues/{num}/comments",
+                    "--paginate", "--jq",
+                    ".[] | {login: .user.login, association: .author_association, "
+                    "body: .body, created: .created_at}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except Exception:
+            return None, _rework_unreadable(what)
+        if result.returncode != 0:
+            return None, _rework_unreadable(what)
+        rows = []
+        for line in result.stdout.splitlines():
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    return None, f"{what} were malformed"
+    if not all(isinstance(r, dict) for r in rows):
+        return None, f"{what} were malformed"
+    return rows, ""
+
+
+def _rework_ts(value: object) -> _dt.datetime | None:
+    """An ISO-8601 timestamp as an aware datetime, or None when it is not one."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        got = _dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return got if got.tzinfo is not None else None
+
+
+def _rework_heading_comment(body: str, heading: str) -> bool:
+    """True when the comment's first rendered block is the level-2 heading
+    ``heading`` (ATX or setext, whitespace-normalized, case-insensitive),
+    optionally followed by a punctuation-led qualifier whose meaning is not
+    judged (``_REWORK_HEADING_QUALIFIER``) but never by a bare word, and optionally
+    preceded by a paragraph that is only ``(aside)``. "acknowledgement" also
+    matches the US spelling "acknowledgment". AGENTS.md puts
+    ``(aside)`` on the first line of a comment on a Devin-built PR so the comment
+    does not start a paid Devin session. Raises ``_ReworkUnreadable`` when the
+    comment cannot be parsed.
+    """
+    blocks = _rework_blocks(body)
+    if blocks and blocks[0][0] == "para" and blocks[0][2].strip().lower() == "(aside)":
+        blocks = blocks[1:]
+    if not blocks:
+        return False
+    kind, where, text = blocks[0]
+    if kind != "heading" or where != 2:
+        return False
+    pattern = re.escape(heading).replace("acknowledgement", "acknowledge?ment")
+    normalized = " ".join(text.split()).lower()
+    return re.fullmatch(pattern + _REWORK_HEADING_QUALIFIER, normalized) is not None
+
+
+def _rework_is_ack(body: str) -> bool:
+    """True when the comment opens with the "Rework acknowledgement" heading (see
+    ``_rework_heading_comment``). A qualifier set off by punctuation may follow;
+    a bare word may not: "## Rework acknowledgement needed" is an instruction,
+    not an acknowledgement.
+    """
+    return _rework_heading_comment(body, _REWORK_ACK_HEADING.removeprefix("## "))
+
+
+def _rework_spec_times(rows: list[dict]) -> list[_dt.datetime] | None:
+    """Creation times of the maintainer `## Rework spec` comments in ``rows``.
+
+    None when there is no such comment at all; a spec whose time does not parse
+    is left out of the list, so it can never be the one that predates a PR.
+    Only OWNER, MEMBER or COLLABORATOR count: a builder bot can rework a shape
+    but cannot decide one.
+    """
+    specs = [
+        r for r in rows
+        if isinstance(r.get("body"), str)
+        and r.get("association") in _MAINTAINER_ASSOCIATIONS
+        and _rework_heading_comment(r["body"], "rework spec")
+    ]
+    if not specs:
+        return None
+    return sorted(t for t in (_rework_ts(r.get("created")) for r in specs) if t)
+
+
+def _rework_spec_problem(num: int, rows: list[dict], created: _dt.datetime) -> str | None:
+    """Why PR ``num`` lacks a rework spec this PR could be built from, or None.
+
+    AGENTS.md orders it spec, then acknowledgement, then the new PR: a sent-back
+    PR is rebuilt only from a maintainer comment headed ``## Rework spec``, and a
+    ``needs-architecture-session`` PR without one has an undecided design and
+    must not be rebuilt. A spec posted after this PR opened does not count: the
+    PR was built before the decision it would cite. Ties count as before, as
+    for the acknowledgement.
+    """
+    times = _rework_spec_times(rows)
+    if times is None:
+        return (
+            f"PR #{num} has no maintainer `## Rework spec` comment: a sent-back PR is "
+            f"rebuilt only from a posted spec (for needs-architecture-session, the "
+            f"owner's decision)"
+        )
+    if not times or times[0] > created:
+        return (
+            f"PR #{num}'s `## Rework spec` was posted after this PR was opened; "
+            f"a rebuild is built from a spec that already exists"
+        )
+    return None
+
+
+def _rework_ack_problem(num: int, rows: list[dict], created: _dt.datetime) -> str | None:
+    """Why PR ``num`` lacks a valid acknowledgement, or None when it has one.
+
+    Valid means from a maintainer or an allowlisted bot, created no later than
+    this PR, and no earlier than the first spec that predates this PR: an
+    acknowledgement acknowledges a spec, so one written before any spec existed
+    acknowledged nothing. With no such spec, ``_rework_spec_problem`` reports it
+    and the time order here is judged against this PR alone.
+    """
+    candidates = [
+        r for r in rows
+        if isinstance(r.get("body"), str) and _rework_is_ack(r["body"])
+    ]
+    if not candidates:
+        return f"PR #{num} has no `## Rework acknowledgement` comment"
+    bots = _rework_ack_bot_logins()
+    authorised = [
+        r for r in candidates
+        if r.get("association") in _MAINTAINER_ASSOCIATIONS or r.get("login") in bots
+    ]
+    if not authorised:
+        return (
+            f"PR #{num}'s `## Rework acknowledgement` comment is not from a maintainer "
+            f"(OWNER, MEMBER or COLLABORATOR) or an allowlisted bot"
+        )
+    specs = [t for t in (_rework_spec_times(rows) or []) if t <= created]
+    not_before = specs[0] if specs else None
+    stamps = [t for t in (_rework_ts(r.get("created")) for r in authorised) if t]
+    if any(t <= created and (not_before is None or t >= not_before) for t in stamps):
+        return None
+    if not_before is not None and any(t < not_before for t in stamps):
+        return (
+            f"PR #{num}'s `## Rework acknowledgement` predates its `## Rework spec`; "
+            f"the builder acknowledges the posted spec, so post the acknowledgement "
+            f"after it"
+        )
+    return (
+        f"PR #{num}'s `## Rework acknowledgement` was created after this PR was "
+        f"opened; the builder acknowledges the spec on the old PR BEFORE opening "
+        f"the new one"
+    )
+
+
+def _check_rework(
+    pr_num: str,
+    repo: str | None = None,
+    *,
+    head: str | None = None,
+    force: bool = False,
+) -> tuple[str, str]:
+    """Does a REBUILD of a sent-back PR carry its rework contract? (owner decision)
+
+    A PR is a rebuild when (a) a ``Replaces:`` or ``Supersedes:`` FIELD line in its
+    body names a PR that was sent back (labelled ``needs-rework`` or
+    ``needs-architecture-session`` now, or — for a PR the body names — at any time
+    per its timeline; a referenced ISSUE never counts), or (b) its commits include
+    the head of a sent-back PR. Prose is never read as a declaration (owner ruling
+    2026-10-05). This PR never counts against itself, so a PR that is itself sent
+    back is not its own rebuild. A MERGED PR is never sent back.
+
+    A rebuild must carry (1) a ``## Rework`` section with non-empty ``Replaces:``,
+    ``Split:``, ``Deviations:`` and ``Questions answered:`` lines, and (2) on EACH
+    replaced PR a ``## Rework acknowledgement`` comment from a maintainer (or an
+    allowlisted bot) CREATED no later than this PR. A replaced PR still OPEN gets a
+    NOTE: its builder closes it when the last replacement opens.
+
+    Signal (c) — a maintainer's closing comment on a CLOSED sent-back PR linking
+    this one — is NOT implemented: discovering it costs a comment read for every
+    closed sent-back PR on every merge (a set that only grows), and restricted to
+    the PRs the body already declares it adds nothing signal (a) did not find.
+
+    Returns ``(state, message)``; state is one of the four ``REWORK_*`` constants.
+    Line 0 summarises; lines 1+ are the detail. The gate checks FORM only.
+
+    GUARD AXIOMS:
+      * VERDICT: **block** on BLOCK only (owner decision), with the logged override
+        ``# rework-override`` (``force=True`` passes).
+      * FAIL DIRECTION: not a rebuild → ``n/a``. A rebuild whose requirements cannot
+        be verified (a read failed, was truncated, or the merge deadline passed)
+        BLOCKS with "could not verify". When nothing is declared and the reads that
+        decide rebuild-ness fail, the state is ``could-not-check``: advisory, never
+        a block. The merge deadline's RuntimeError never propagates.
+      * AUDIENCE: the agent driving the merge; the detail names each missing item.
+      * BACKGROUND: background sessions cannot merge; the gate adds no ask.
+    """
+    if force:
+        return REWORK_OK, "waived by # rework-override (logged)"
+    # `-R github.com/o/r` is a valid gh spelling of `o/r`, but not a REST path:
+    # normalize once, before any endpoint is built, as the merge arm does.
+    if repo:
+        repo = _rework_repo(repo)
+    ctx: dict[str, object] = {"declared": False, "reading": "the PR body"}
+    try:
+        return _check_rework_inner(pr_num, repo, head, ctx)
+    except Exception as exc:  # noqa: BLE001 — the deadline error must never propagate.
+        what = str(ctx["reading"])
+        if _rework_deadline_passed() or "deadline" in str(exc):
+            reason = f"the merge-gate deadline passed while reading {what}"
+        else:
+            reason = f"reading {what} raised {type(exc).__name__}"
+        if ctx["declared"]:
+            return REWORK_BLOCK, f"could not verify — {reason}"
+        return REWORK_UNCHECKED, reason
+
+
+def _check_rework_inner(
+    pr_num: str, repo: str | None, head: str | None, ctx: dict[str, object]
+) -> tuple[str, str]:
+    body = _pr_body_text(pr_num, repo)
+    body_why = _rework_unreadable("the PR body")
+    me = int(pr_num) if str(pr_num).isdigit() else -1
+    refs: set[int] = set()
+    decl_problems: list[str] = []
+    if body is not None:
+        try:
+            refs, decl_problems = _rework_declarations(body, pr_num, repo)
+        except _ReworkUnreadable as exc:
+            # Unparseable is unreadable: whether it declares is unknown, so it takes
+            # the unreadable-body path (advisory unless containment finds a rebuild).
+            body, body_why = None, f"the PR body could not be read ({exc})"
+    ctx["declared"] = bool(refs) or bool(decl_problems)
+    if decl_problems:
+        # A declaration we cannot resolve: fail closed (declared => BLOCK).
+        return REWORK_BLOCK, "could not verify — " + "; ".join(dict.fromkeys(decl_problems))
+
+    ctx["reading"] = "the sent-back PR list"
+    sent_back, merged, list_why = _rework_sent_back(repo)
+
+    # Signal (a): declared references that are sent-back PRs.
+    replaced: set[int] = set()
+    unverified: list[str] = []
+    #: Current state of each replaced PR, for the advisory open-PR note. The
+    #: sent-back list carries it; a PR classified through its timeline (its label
+    #: since removed) carries it from the PR read.
+    states: dict[int, str] = {}
+    if sent_back is not None:
+        states.update({n: st for n, (_h, st) in sent_back.items()})
+    if len(refs) > _REWORK_MAX_DECLARED:
+        return REWORK_BLOCK, (
+            f"could not verify — the body declares {len(refs)} replaced PRs; at most "
+            f"{_REWORK_MAX_DECLARED} are checked (owner override for more)"
+        )
+    for ref in sorted(refs):
+        if sent_back is not None and ref in sent_back:
+            replaced.add(ref)
+            continue
+        if ref in merged:
+            continue  # merged: never sent back
+        ctx["reading"] = f"PR #{ref}'s timeline"
+        was, why, state = _rework_timeline(ref, repo)
+        if was is None:
+            unverified.append(why)
+            break  # the verdict is already a block; read nothing more
+        elif was:
+            replaced.add(ref)
+            states[ref] = state
+    if unverified:
+        # A declaration we cannot resolve: fail closed (declared ⇒ BLOCK).
+        return REWORK_BLOCK, "could not verify — " + "; ".join(unverified)
+
+    # Signal (b): this PR's commits include a sent-back PR's head.
+    containment_why = ""
+    if sent_back is None:
+        containment_why = list_why
+    else:
+        others = {n: h for n, (h, _s) in sent_back.items() if n != me}
+        if others:
+            ctx["reading"] = "this PR's commit list"
+            commits, why = _pr_commit_list(pr_num, repo)
+            if commits is None:
+                containment_why = (
+                    f"{why} (the merge-gate deadline passed)"
+                    if _rework_deadline_passed() and "deadline" not in why
+                    else why
+                )
+            else:
+                shas = {sha.lower() for sha, _p in commits}
+                # A sent-back head in the list proves a rebuild whatever head the
+                # list was read at; a lagging list only means the set may be short.
+                replaced |= {n for n, h in others.items() if h in shas}
+                if head and head.strip().lower() not in shas:
+                    containment_why = (
+                        "this PR's commit list does not include the verified head "
+                        f"{head.strip().lower()[:12]}, so it was read at another head"
+                    )
+
+    if not replaced:
+        if body is None:
+            return REWORK_UNCHECKED, body_why
+        if containment_why:
+            return REWORK_UNCHECKED, containment_why
+        return REWORK_NA, "not a rebuild of a sent-back PR"
+
+    # A rebuild. Every requirement must be verifiable; a failed read BLOCKS, and so
+    # does any exception from here on (the wrapper reads this flag), however the
+    # rebuild was found: containment alone declares nothing.
+    ctx["declared"] = True
+    names = ", ".join(f"#{n}" for n in sorted(replaced))
+    problems: list[str] = []
+    if containment_why:
+        problems.append(
+            f"could not verify the full set of replaced PRs — {containment_why}"
+        )
+    if body is None:
+        problems.append("could not verify — " + body_why)
+    else:
+        problems.extend(_rework_section_problems(body))
+    ctx["reading"] = "this PR's creation time"
+    created = _rework_ts(_pr_created_at(pr_num, repo))
+    for num in sorted(replaced):
+        ctx["reading"] = f"PR #{num}'s comments"
+        rows, why = _rework_ack_comments(num, repo)
+        if rows is None:
+            problems.append("could not verify — " + why)
+        elif created is None:
+            problems.append(
+                "could not verify — " + _rework_unreadable("this PR's creation time")
+            )
+        else:
+            for problem in (
+                _rework_spec_problem(num, rows, created),
+                _rework_ack_problem(num, rows, created),
+            ):
+                if problem:
+                    problems.append(problem)
+    notes = [
+        f"NOTE: PR #{n} is still open; its builder closes it when the last "
+        f"replacement opens (advisory)."
+        for n in sorted(replaced)
+        if states.get(n) == "OPEN"
+    ]
+    if problems:
+        # One problem line per item; the creation-time failure repeats per PR, so
+        # keep each distinct line once, in order.
+        seen: list[str] = []
+        for p in problems:
+            if p not in seen:
+                seen.append(p)
+        lines = [
+            f"rebuild of sent-back PR(s) {names} — rework contract unmet "
+            f"({len(seen)} item(s)):",
+            *[f"  - {p}" for p in seen],
+            # Three short lines: the report bounds each detail line, and one long
+            # remedy line lost its middle there.
+            "Remedy: each old PR carries a maintainer's `## Rework spec`, and the",
+            "builder's `## Rework acknowledgement` posted before the rebuild opened;",
+            "the rebuild's body carries `## Rework` with Replaces:, Split:,",
+            "Kept / deleted / reshaped as the spec asked:, Deviations: and",
+            "Questions answered: lines.",
+            "An acknowledgement posted AFTER this PR opened can never satisfy it:",
+            "open a fresh PR after posting it, or override with the owner's yes.",
+            "Overriding takes the owner's yes: `# rework-override` (logged).",
+            *notes,
+        ]
+        return REWORK_BLOCK, "\n".join(lines)
+    return REWORK_OK, "\n".join(
+        [f"rebuild of {names}; acknowledgement and `## Rework` section present", *notes]
+    )
+
+
 def _check_base_is_default(
     pr_num: str, *, force: bool = False, repo: str | None = None
 ) -> tuple[bool, str]:
@@ -7659,14 +11484,67 @@ def _merge_match_head(argv: list[str]) -> str | None:
     return result
 
 
+def _merge_body_file(argv: list[str]) -> tuple[str | None, str | None]:
+    """``(path, problem)`` for a merge's ``--body-file``, read with the SAME
+    consumption model as :func:`_merge_match_head`.
+
+    ``(None, None)``: no ``--body-file``. ``(path, None)``: exactly one, long
+    form (``--body-file P`` / ``--body-file=P``), naming a file the gate itself
+    writes (``gh_merge.body_file_path_problem``). Anything else is a problem: two
+    of them (pflag keeps the last, the hook would judge one), a missing value, a
+    value gh could read as a flag or stdin, or a path the hook and gh might
+    resolve to different files. The short ``-F`` stays a shadow flag.
+    """
+    argv = argv or []
+    values: list[str | None] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break
+        if tok in _GH_MERGE_VALUE_FLAGS:
+            if tok == "--body-file":
+                values.append(argv[i + 1] if i + 1 < len(argv) else None)
+            i += 2
+            continue
+        if tok.startswith("--body-file="):
+            values.append(tok.split("=", 1)[1])
+            i += 1
+            continue
+        if _short_cluster_consumes_next(tok):
+            i += 2
+            continue
+        i += 1
+    if not values:
+        return None, None
+    if len(values) > 1:
+        return None, "--body-file is given more than once"
+    path = values[0]
+    if not path or path == "-" or path.startswith("-"):
+        return None, "--body-file needs a file path as its value"
+    problem = body_file_path_problem(path)
+    if problem:
+        return None, f"--body-file {path}: {problem}"
+    return path, None
+
+
 def _merge_has_shadow_flag(argv: list[str]) -> bool:
     """Whether the merge carries a content flag that could shadow the head-match
     binding — long form, ``=`` form, bare short, or inside a short cluster
-    (``-db`` etc.). Refused outright as a fail-closed belt."""
+    (``-db`` etc.). Refused outright as a fail-closed belt.
+
+    A long ``--body-file`` naming a file the gate wrote is the one exemption: it
+    is how the squash body gets its provenance trailers, and the merge arm
+    compares that file with a body it recomputes. The exemption is keyed off
+    :func:`_merge_body_file`, so a ``--body-file`` whose value could be a flag is
+    still a shadow."""
+    body_file_ok = _merge_body_file(argv)[0] is not None
     for tok in argv or []:
         if tok == "--":
             break
         base = tok.split("=", 1)[0]
+        if base == "--body-file" and body_file_ok:
+            continue
         if base in _GH_MERGE_SHADOW_FLAGS:
             return True
         if _is_short_cluster(base):
@@ -7696,9 +11574,10 @@ def _require_match_head(
     # (gh takes it as text → no binding) and have no use on a gated squash-merge.
     if _merge_has_shadow_flag(merge_argv):
         return (
-            "--body/--subject/--body-file/--author-email are not allowed on a gated "
-            "merge — they can shadow the --match-head-commit binding. Remove them "
-            "(set a squash message via the GitHub UI if needed)."
+            "--body/--subject/--author-email/-F are not allowed on a gated merge — they "
+            "can shadow the --match-head-commit binding, and text they carry reaches "
+            "main unreviewed. Remove them; the only body a merge may carry is the "
+            "--body-file that --check-pr writes and prints in its merge-with line."
         )
     match_head = _merge_match_head(merge_argv)
     if match_head is None:
@@ -7716,6 +11595,92 @@ def _require_match_head(
     return None
 
 
+def _expected_squash_body(pr_num: str, repo: str | None, head: str) -> tuple[str | None, str]:
+    """``(body, "")``: the squash body for ``head``, recomputed from the LIVE PR
+    (its body and its commits' ``Genesis-Session:`` trailers), or ``(None, why)``.
+
+    ``head`` must be one of the PR's commits, so a stale or foreign head yields no
+    body rather than a body that merely names it. The commits are read first: a
+    head outside them settles the answer without the second read."""
+    rows, why = _pr_commit_rows(pr_num, repo)
+    if rows is None:
+        return None, why
+    if head not in {r["sha"] for r in rows}:
+        return None, f"{head[:12]} is not one of the PR's commits"
+    pr_body = _pr_body_text(pr_num, repo)
+    if pr_body is None:
+        return None, "the PR body could not be read"
+    try:
+        return compose_squash_body(pr_body, head, [r["message"] for r in rows]), ""
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def _recheck_squash_body_file(path: str, expected: str) -> str | None:
+    """The merge arm's LAST step: re-read the file and require the body the early
+    check approved. The early check runs right after the binding, so a hook killed
+    by its wall clock can never skip it; this second read, just before the hook
+    allows, narrows the window in which another process could change the file
+    before gh reads it. Local only, no network."""
+    text, why = read_body_file(path)
+    if text is None:
+        return f"--body-file {path} could not be re-read before the merge: {why}."
+    if text != expected:
+        return f"--body-file {path} changed after it was checked. Re-run --check-pr."
+    return None
+
+
+def _check_squash_body_file(
+    pr_num: str, repo: str | None, head: str, path: str, *, expected_out: list[str] | None = None
+) -> str | None:
+    """None when ``path`` holds exactly the body recomputed for ``head``, else a
+    block message. Every failure blocks: the remedy (drop --body-file, or re-run
+    --check-pr) is always available, so nothing here needs a sigil. On success the
+    approved body is appended to ``expected_out`` for :func:`_recheck_squash_body_file`."""
+    remedy = (
+        "Re-run --check-pr and use its merge-with line, or drop --body-file to merge "
+        "without the provenance trailer."
+    )
+    text, why = read_body_file(path)
+    if text is None:
+        return f"--body-file {path} cannot be used: {why}. {remedy}"
+    expected, why = _expected_squash_body(pr_num, repo, head.strip().lower())
+    if expected is None:
+        return f"the squash body could not be recomputed to check --body-file: {why}. {remedy}"
+    if text != expected:
+        return (
+            f"--body-file {path} is not the body this gate computes for head "
+            f"{head[:12]} (the PR body or its commits changed, or the file was edited). "
+            + remedy
+        )
+    if expected_out is not None:
+        expected_out.append(expected)
+    return None
+
+
+def _prepare_squash_body_file(pr_num: str, repo: str | None, head: str) -> tuple[str | None, str]:
+    """For ``--check-pr``: write the squash body for ``head`` and return its path,
+    or ``(None, why)``. Not written in CI, where the path would mean nothing to
+    the reader of the log, nor under the hook tests' ``_TEST_SQUASH_BODY_FILE=off``
+    pin, which keeps report tests from writing into the real home directory."""
+    if os.environ.get("GITHUB_ACTIONS") or os.environ.get("_TEST_SQUASH_BODY_FILE") == "off":
+        return None, ""
+    body, why = _expected_squash_body(pr_num, repo, head)
+    if body is None:
+        return None, why
+    path = body_file_path(repo, pr_num, head)
+    # The merge arm would refuse a path that fails this, and printed unquoted it
+    # could split in the shell, so say why and fall back to the plain command.
+    problem = body_file_path_problem(path)
+    if problem:
+        return None, f"the body file path {path!r} is unusable: {problem}"
+    try:
+        write_body_file(path, body)
+    except OSError as exc:
+        return None, f"the body file could not be written ({exc.strerror or exc})"
+    return path, ""
+
+
 def _is_dispatched() -> bool:
     """True in a Genesis-dispatched (autonomous/headless) CC session.
 
@@ -7729,9 +11694,430 @@ def _is_dispatched() -> bool:
     return os.environ.get("GENESIS_CC_SESSION") == "1"
 
 
-# git push flags that consume the NEXT token as their value — so a value that
-# happens to start with '+' or contain 'f' is not misread as a force.
-_PUSH_VALUE_FLAGS = frozenset({"-o", "--push-option", "--repo", "--receive-pack", "--exec"})
+def _is_subagent(payload) -> bool:
+    """True when this hook call comes from inside a SUBAGENT (an Agent-tool worker).
+
+    Keyed on ``agent_id`` in the hook input and nothing else. Claude Code's own
+    hook-input schema (READ in the 2.1.280 binary, and the hooks reference) says
+    ``agent_id`` is "Present only when the hook fires from within a subagent …
+    Absent for the main thread, even in --agent sessions. Use this field (not
+    agent_type) to distinguish subagent calls from main-thread calls."
+    ``agent_type`` is deliberately NOT read: a main session started with
+    ``--agent`` carries it too, and that session has a human at the prompt.
+
+    A missing, empty or non-string ``agent_id`` reads as the main thread, so a
+    payload this guard does not recognise keeps today's behaviour (the ordinary
+    push gates) rather than inventing a refusal."""
+    if not isinstance(payload, dict):
+        return False
+    agent_id = payload.get("agent_id")
+    return isinstance(agent_id, str) and bool(agent_id.strip())
+
+
+#: What a SUBAGENT may run of git and gh: an ALLOWLIST (owner ruling 2026-10-10).
+#: The earlier denylist of writing commands lost a write verb to every review
+#: round, because the write verbs of git, git-lfs and gh are an open set. Now a
+#: segment is allowed only when it is on these lists; anything else, and anything
+#: whose command this guard cannot read, is refused.
+#:
+#: git: every subcommand that works on the local repository, plus the network
+#: READS (fetch, pull, clone, ls-remote, fetch-pack). Taken from
+#: ``git --list-cmds=main,others`` (git 2.43) MINUS the network writers (push,
+#: send-pack, http-push), the server and transport ends (receive-pack,
+#: upload-pack, upload-archive, daemon, http-backend, shell, remote-*, instaweb),
+#: mail (imap-send), credential access (credential*), commands whose job is to
+#: run other commands (for-each-repo, filter-branch, difftool, mergetool, hook)
+#: and git's internal helpers. Options that make a listed command run a program
+#: are refused per command (``_GIT_RUNS_A_PROGRAM``, ``_GIT_REBASE_EXEC``); config
+#: and environment that do the same (``-c core.sshCommand``) are not read. Not listed, so refused: a git alias, an external
+#: ``git-<name>``, ``subtree``, ``svn``, ``send-email``, a newer git's command.
+_GIT_SUBAGENT_OK = frozenset(
+    """
+    add am annotate apply archive bisect blame branch bugreport bundle cat-file
+    check-attr check-ignore check-mailmap check-ref-format checkout
+    checkout-index cherry cherry-pick clean clone column commit commit-graph
+    commit-tree config count-objects describe diagnose diff diff-files
+    diff-index diff-tree fast-export fast-import fetch fetch-pack fmt-merge-msg
+    for-each-ref format-patch fsck fsck-objects gc get-tar-commit-id grep
+    hash-object help index-pack init init-db interpret-trailers lfs log ls-files
+    ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file
+    merge-index merge-tree mktag mktree multi-pack-index mv name-rev notes
+    pack-objects pack-redundant pack-refs patch-id prune prune-packed pull
+    quiltimport range-diff read-tree rebase reflog remote repack replace
+    request-pull rerere reset restore rev-list rev-parse revert rm shortlog show
+    show-branch show-index show-ref sparse-checkout stage stash status
+    stripspace submodule switch symbolic-ref tag unpack-file unpack-objects
+    update-index update-ref update-server-info var verify-commit verify-pack
+    verify-tag version whatchanged worktree write-tree
+    """.split()  # noqa: SIM905 - a word list kept readable
+)
+#: git commands that are families: their first word after the family name must
+#: be one of these (none at all lists or prints help). Left out on purpose:
+#: ``lfs push``/``lock``/``unlock`` (write the LFS server), ``lfs pre-push``,
+#: ``submodule foreach`` and ``bisect run`` (run arbitrary commands).
+_GIT_FAMILY_VERBS: dict[str, frozenset[str]] = {
+    "lfs": frozenset({
+        "checkout", "clone", "env", "fetch", "fsck", "install", "locks",
+        "logs", "ls-files", "migrate", "pointer", "prune", "pull", "status",
+        "track", "uninstall", "untrack", "update", "version", "help"
+    }),
+    "submodule": frozenset({
+        "status", "summary", "init", "deinit", "update", "sync",
+        "absorbgitdirs", "set-branch", "set-url", "add"
+    }),
+    "remote": frozenset({
+        "add", "rename", "remove", "rm", "set-head", "set-branches",
+        "get-url", "set-url", "show", "prune", "update"
+    }),
+    "bisect": frozenset({
+        "start", "bad", "good", "new", "old", "terms", "skip", "reset",
+        "visualize", "view", "replay", "log", "help"
+    }),
+}
+#: Options that make an allowlisted git command run a program it names:
+#: ``(long options, short option letters)``. git accepts any unambiguous prefix
+#: of a long option, so a token counts when it is a prefix of one listed here
+#: (four characters or more, which over-refuses a few harmless prefixes).
+_GIT_RUNS_A_PROGRAM: dict[str, tuple[tuple[str, ...], str]] = {
+    "fetch": (("--upload-pack",), ""),
+    "pull": (("--upload-pack",), ""),
+    "clone": (("--upload-pack", "--config", "--template"), "uc"),
+    "ls-remote": (("--upload-pack",), "u"),
+    "fetch-pack": (("--upload-pack", "--exec"), ""),
+    "archive": (("--exec",), ""),
+    "grep": (("--open-files-in-pager",), "O"),
+}
+#: ``git rebase --exec``/``-x`` runs a command per commit. git accepts any
+#: unambiguous prefix of a long option, so ``--ex`` is ``--exec``.
+_GIT_REBASE_EXEC = re.compile(r"--ex|-[A-Za-z]*x")
+
+#: gh: the read-only subcommands of each group. Every other subcommand, and every
+#: group not listed (``codespace``, ``browse``, ``completion``, an extension or a
+#: ``gh alias`` name), is refused. ``auth`` keeps only ``status``: ``login`` can
+#: upload an SSH key and ``refresh`` changes token scopes.
+_GH_SUBAGENT_READS: dict[str, frozenset[str]] = {
+    "pr": frozenset({"list", "ls", "view", "diff", "checks", "status", "checkout", "co"}),
+    "issue": frozenset({"list", "ls", "view", "status"}),
+    "run": frozenset({"list", "ls", "view", "watch", "download"}),
+    "workflow": frozenset({"list", "ls", "view"}),
+    "release": frozenset({"list", "ls", "view", "download", "verify", "verify-asset"}),
+    "repo": frozenset({"list", "ls", "view", "clone", "gitignore", "license"}),
+    "search": frozenset({"code", "commits", "issues", "prs", "repos"}),
+    "label": frozenset({"list", "ls"}),
+    "gist": frozenset({"list", "ls", "view", "clone"}),
+    "cache": frozenset({"list", "ls"}),
+    "secret": frozenset({"list", "ls"}),
+    "variable": frozenset({"list", "ls", "get"}),
+    "project": frozenset({"list", "ls", "view", "field-list", "item-list"}),
+    "ruleset": frozenset({"list", "ls", "view", "check"}),
+    "discussion": frozenset({"list", "ls", "view"}),
+    "org": frozenset({"list", "ls"}),
+    "extension": frozenset({"list", "ls", "search"}),
+    "alias": frozenset({"list", "ls"}),
+    "auth": frozenset({"status"}),
+    "config": frozenset({"get", "list"}),
+    "ssh-key": frozenset({"list", "ls"}),
+    "gpg-key": frozenset({"list", "ls"}),
+    "attestation": frozenset({"verify"}),
+}
+#: gh commands with no subcommands that only print: allowed whatever follows.
+_GH_SUBAGENT_LEAF_READS = frozenset({"status", "version", "help", "reference", "licenses"})
+#: gh's own aliases (``gh ext``, ``gh rs``; root ``gh co`` is ``gh pr checkout``).
+_GH_GROUP_ALIASES = {
+    "ext": "extension",
+    "extensions": "extension",
+    "rs": "ruleset",
+    "at": "attestation",
+}
+_GH_ROOT_READ_ALIASES = frozenset({"co"})
+
+#: A gh command word: what a real group, alias or extension name looks like
+#: (extensions and aliases may carry capitals, digits, dots and underscores).
+#: A segment whose "group" is anything else (``=`` from a here-doc line
+#: ``gh = Fake()``) is text, not a gh call: gh would reject it as an unknown
+#: command, so it runs nothing.
+_GH_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+#: Before the verb, gh's command lookup treats any flag the group does not
+#: declare as taking a value and swallows the next word (MEASURED, gh 2.101:
+#: ``gh pr --admin view merge --help`` prints ``pr merge``'s help). Only these
+#: are declared at the group level: ``-R``/``--repo`` take a value, help takes
+#: none. ``--version`` is NOT one: it belongs to the root command alone, so
+#: after a group word gh swallows the next word for it too (MEASURED:
+#: ``gh pr --version view comment`` resolves to ``pr comment``).
+_GH_PREPATH_VALUE = frozenset({"-R", "--repo"})
+_GH_PREPATH_BOOL = frozenset({"-h", "--help"})
+
+_GRAPHQL_READ_START = re.compile(r"\s*(?:(?:query|fragment)\b|\{)")
+_GRAPHQL_NAME = re.compile(r"[_A-Za-z][_0-9A-Za-z]*")
+
+
+def _graphql_without_literals(q: str) -> str | None:
+    """``q`` with every GraphQL string, block string and comment replaced by a
+    space, so ``mutation`` inside a search string or a comment is not read as an
+    operation. Per the GraphQL lexical grammar: ``\"\"\"`` opens a block string
+    closed by an unescaped ``\"\"\"`` (``\\\"\"\"`` is its only escape), ``"`` opens a
+    string closed by an unescaped ``"`` on the same line, and ``#`` outside a
+    string runs to the end of the line. None for an unterminated string: the
+    caller then counts the query as a write."""
+    out: list[str] = []
+    i, n = 0, len(q)
+    while i < n:
+        if q.startswith('"""', i):
+            j = i + 3
+            while not q.startswith('"""', j):
+                if j >= n:
+                    return None
+                j += 4 if q.startswith('\\"""', j) else 1
+            i = j + 3
+            out.append(" ")
+        elif q[i] == '"':
+            j = i + 1
+            while j < n and q[j] != '"':
+                if q[j] in "\r\n":
+                    return None
+                j += 2 if q[j] == "\\" else 1
+            if j >= n:
+                return None
+            i = j + 1
+            out.append(" ")
+        elif q[i] == "#":
+            while i < n and q[i] not in "\r\n":
+                i += 1
+            out.append(" ")
+        else:
+            out.append(q[i])
+            i += 1
+    return "".join(out)
+
+
+def _graphql_is_query(q: str) -> bool:
+    """Whether the GraphQL document ``q`` defines only queries (and fragments).
+
+    An operation's kind is the keyword at the document's TOP LEVEL, outside every
+    ``{}`` and ``()``: there ``mutation``/``subscription`` start an operation and
+    ``{`` an anonymous query. Inside the brackets the same word is an alias, a
+    field or a ``$variable``, and in a string or comment it is text, so neither
+    makes a read a write. The document must also start as a query or a fragment
+    (``query``, ``fragment`` or ``{``). Anything this cannot read is not a query: a shell expansion, an
+    unterminated string, unbalanced brackets."""
+    if "$(" in q or "${" in q or "`" in q or not _GRAPHQL_READ_START.match(q):
+        return False
+    bare = _graphql_without_literals(q)
+    if bare is None:
+        return False
+    depth, top = 0, []
+    for ch in bare:
+        if ch in "{(":
+            depth += 1
+            top.append(" ")
+        elif ch in "})":
+            depth -= 1
+            if depth < 0:
+                return False
+            top.append(" ")
+        else:
+            top.append(ch if depth == 0 else " ")
+    if depth:
+        return False
+    return not {"mutation", "subscription"} & set(_GRAPHQL_NAME.findall("".join(top)))
+
+
+def _gh_api_is_read(argv: list[str]) -> bool:
+    """Whether a ``gh api`` argv only reads from GitHub.
+
+    REST: the effective method is GET or HEAD (``shell_parse.gh_api_request``
+    applies gh's defaulting: a parameter makes it POST unless ``-X GET`` keeps
+    it a query string), with no ``--input``, no method-override header and no
+    flag the parse does not model (its value could be a method). GraphQL is
+    always POST, so it is a read only when every ``query`` field is a literal
+    document :func:`_graphql_is_query` accepts and there is no ``--input``. A
+    query from a file (``@``), a variable or a substitution is not a read."""
+    req = gh_api_request(argv)
+    if req is None or req.unmodelled or req.has_input:
+        return False
+    if any("method-override" in t.lower() for t in argv):
+        return False
+    if (req.endpoint or "").strip("/").lower() == "graphql":
+        queries = [v for k, v in req.fields if k == "query"]
+        return bool(queries) and all(_graphql_is_query(q) for q in queries)
+    return req.method in ("GET", "HEAD")
+
+
+def _gh_prepath_is_plain(argv: list[str], path_end: int) -> bool:
+    """Whether every flag before the verb is one gh's lookup reads as we do.
+
+    Any other flag there makes gh swallow the next word (see
+    ``_GH_PREPATH_VALUE``), so the word this guard reads as the verb may be a
+    value and the real verb the word after it: ``gh pr --admin view merge`` runs
+    ``pr merge``. Rather than model which words are swallowed, such a command is
+    not trusted as a read."""
+    i = 1
+    while i < path_end and i < len(argv):
+        tok = argv[i]
+        if tok.startswith("-") and tok != "-":
+            name = tok.split("=", 1)[0]
+            if name in _GH_PREPATH_VALUE or tok[:2] == "-R":
+                i += 1 if ("=" in tok or (tok[:2] == "-R" and len(tok) > 2)) else 2
+                continue
+            if tok in _GH_PREPATH_BOOL:
+                i += 1
+                continue
+            return False
+        i += 1
+    return True
+
+
+def _git_subagent_refusal(argv: list[str]) -> str | None:
+    """Why a subagent may not run this git argv, or None when it may."""
+    idx = git_subcommand_index(argv)
+    if idx is None:
+        return None  # `git`, `git --version`, `git -C dir`: no subcommand runs
+    sub, rest = argv[idx], argv[idx + 1 :]
+    if sub not in _GIT_SUBAGENT_OK:
+        return f"git {sub}"
+    verbs = _GIT_FAMILY_VERBS.get(sub)
+    if verbs is not None:
+        word = next((t for t in rest if not t.startswith("-")), None)
+        if word is not None and word not in verbs:
+            return f"git {sub} {word}"
+    if sub == "rebase" and any(_GIT_REBASE_EXEC.match(t) for t in rest):
+        return "git rebase --exec"
+    runs = _GIT_RUNS_A_PROGRAM.get(sub)
+    if runs is not None:
+        longs, shorts = runs
+        for t in rest:
+            name = t.split("=", 1)[0]
+            if (name.startswith("--") and len(name) >= 4 and any(o.startswith(name) for o in longs)) or (
+                shorts and re.match(rf"-[A-Za-z]*[{shorts}]", t)
+            ):
+                return f"git {sub} {name} (runs a program)"
+    return None
+
+
+def _subagent_refusal(seg) -> str | None:
+    """A short label for a git or gh segment a subagent may NOT run, else None.
+
+    Allowed: what :data:`_GIT_SUBAGENT_OK` and :data:`_GIT_FAMILY_VERBS` list
+    for git; for gh, a subcommand :data:`_GH_SUBAGENT_READS` lists, a leaf in
+    :data:`_GH_SUBAGENT_LEAF_READS`, a help request, or a ``gh api`` call
+    :func:`_gh_api_is_read` accepts. Everything else is refused, including a
+    segment whose verb the parse could not resolve. Other programs are not this
+    rule's subject and return None."""
+    exe = getattr(seg, "exe", "")
+    if exe not in ("git", "gh"):
+        return None
+    argv = list(getattr(seg, "argv", None) or [])
+    if getattr(seg, "verb_unresolved", False):
+        return f"{exe} (its subcommand is built at run time)"
+    if exe == "git":
+        return _git_subagent_refusal(argv)
+    inv = gh_command(argv)
+    if inv is None:
+        # No command path: bare `gh`, `gh --version`, or flags only.
+        extra = [t for t in argv[1:] if t not in ("--help", "--version", "-h", "-v")]
+        return "gh (no readable command)" if extra else None
+    # A flag gh's root does not declare swallows the NEXT word, so with one
+    # before the group the word read as the group is a value and the command
+    # runs from the word after it (MEASURED, gh 2.101: `gh --yes o/r repo
+    # delete` is `repo delete`). Checked before every early return below.
+    if not _gh_prepath_is_plain(argv, inv.path_end):
+        return f"gh {inv.group} (a flag before the command hides which command runs)"
+    if not _GH_WORD.fullmatch(inv.group):
+        return None  # here-doc text such as `gh = Fake()`, not a gh call
+    if inv.group in _GH_ROOT_READ_ALIASES and argv[1] == inv.group:
+        # gh's default `co` alias (`gh pr checkout`). gh expands an alias only
+        # as the first word. A user can redefine `co` with `gh alias set
+        # --clobber`; that is not visible here.
+        return None if "--" not in argv else "gh co (git options after --)"
+    group = _GH_GROUP_ALIASES.get(inv.group, inv.group)
+    verb = inv.subcommand or (inv.positionals[0] if inv.positionals else None)
+    # Where the command path ends in argv: after the verb when there is one (a
+    # group gh_command does not model leaves its verb as the first positional,
+    # so find it). With no verb, every word after the group was a flag value,
+    # for gh as for the walk, so nothing is hidden: the path ends at the group.
+    if inv.subcommand is not None or verb is None or group not in _GH_SUBAGENT_READS:
+        lookup_end = inv.path_end
+    elif verb in argv[inv.path_end :]:
+        lookup_end = argv.index(verb, inv.path_end) + 1
+    else:
+        lookup_end = len(argv)
+    if not _gh_prepath_is_plain(argv, lookup_end):
+        return f"gh {group} (a flag before the verb hides which command runs)"
+    if gh_requests_help(argv):
+        return None  # help only: gh prints it and runs nothing
+    if group == "api":
+        return None if _gh_api_is_read(argv) else "gh api (not a plain read)"
+    if group in _GH_SUBAGENT_LEAF_READS:
+        return None
+    reads = _GH_SUBAGENT_READS.get(group)
+    if reads is None:
+        return f"gh {group}"
+    if verb is None or verb in reads:
+        # `gh repo clone`/`gh pr checkout` pass words after `--` to git, which
+        # can name a program to run (`--upload-pack`, `--config`).
+        if "--" in argv and verb in ("clone", "checkout", "co"):
+            return f"gh {group} {verb} (git options after --)"
+        return None
+    return f"gh {group} {verb}"
+
+
+#: The refusal for a non-read from inside a subagent. Written for the agent, and
+#: complete enough that it needs no human: what to do instead, and what to hand
+#: back. The owner sees nothing — a deny is not a prompt. Policy, not a scope
+#: judgement: it covers re-pushes of already-published branches, dry runs, PR
+#: comments and review requests too, which from the main thread may pass without
+#: any prompt.
+_SUBAGENT_PUBLISH_DENY = (
+    "BLOCKED: only the main session publishes. A subagent may run only known "
+    "read-only git/gh commands, and this one is not on that list ({what}); by "
+    "owner policy pushes, PRs, comments, review requests and every other GitHub "
+    "write are the main session's steps, whatever the branch's state.\n"
+    "Instead: commit your work locally on its branch and STOP. Report back to "
+    "the main session: the worktree path, the branch name, the head SHA "
+    "(`git rev-parse HEAD`), and the PR title and body you would have used "
+    "(write the body to a file and give its path), plus any comment, review "
+    "request or reply you would have posted. The main session publishes them. "
+    "Do not retry the write in another spelling. If it is in fact a read, "
+    "write it in the plain form (`gh pr view`, `gh api <endpoint>`, `git fetch`)."
+)
+#: A command whose segments the parse withholds (a line continuation, a length
+#: or nesting bound), or one whose program is named by an expansion
+#: (``G=gh; $G pr comment``), cannot be checked against the allowlist, so a
+#: subagent's such command naming git or gh is refused.
+_GIT_OR_GH_MENTION = re.compile(r"\b(?:git|gh)\b")
+_VAR_REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _program_may_be_git_or_gh(seg, cmd: str) -> bool:
+    """Whether a segment's program is an expansion that can be git or gh: a
+    substitution naming either (``$(echo gh) pr comment``), or a variable this
+    command assigns a git/gh path to (``G=gh; $G pr comment``). A variable set
+    outside the command is not visible here. Narrow on purpose (MEASURED over
+    44,279 recorded subagent commands, 2026-10-10): refusing every expanded
+    program in a command that merely mentions git refused 195, nearly all
+    scripts run from a variable path; this test refuses 51, mostly
+    ``G="git -C <dir>"; $G …`` spellings, which do run git."""
+    argv = list(getattr(seg, "argv", None) or [])
+    word = argv[0] if argv else ""
+    if "$(" in word or "`" in word:
+        # The substitution's text spans argv words; read the segment's own text.
+        return bool(_GIT_OR_GH_MENTION.search(getattr(seg, "raw", "") or word))
+    m = _VAR_REF.match(word)
+    if not m:
+        return False
+    assign = rf"(?:^|[\s;&|(]){re.escape(m.group(1))}=[\"']?(?:\S*/)?(?:git|gh)[\"']?(?=[\s;&|)]|$)"
+    return re.search(assign, cmd) is not None
+_SUBAGENT_UNREADABLE_DENY = (
+    "BLOCKED: this command names `git` or `gh` in a form this guard cannot read "
+    "(a line continuation, a command too long or too deeply nested, or a "
+    "program named by a variable or substitution), from "
+    "inside a subagent, so it cannot be checked against the read-only list. Put "
+    "each git/gh command on one line, as its own short command: a read then runs, "
+    "and a GitHub write is the main session's step (commit locally and report "
+    "back the worktree path, branch and head SHA instead)."
+)
+
 
 # The first-push-only skip uses an ALLOWLIST posture (git's push surface is too
 # flexible to blocklist safely): a push qualifies as a "plain current-branch
@@ -7757,15 +12143,53 @@ _PUSH_SAFE_LONG_FLAGS = frozenset(
         "--no-thin",
     }
 )
-# Ref-neutral value flags (skip the flag AND its value token). ``--repo`` (redirects
-# the push) and ``--receive-pack``/``--exec`` (select a receive-pack PROGRAM that git
-# EXECUTES on local/SSH transports — an arbitrary-code vector) are deliberately
-# EXCLUDED, so a push carrying any of them falls through to the approval prompt.
-_PUSH_SAFE_VALUE_FLAGS = frozenset({"-o", "--push-option"})
-# Ref-neutral short-flag letters (for bundles like ``-uq``). ``o`` is handled
-# separately (glued push-option value). ``f`` (force) and ``d`` (delete) are absent
-# by design — a bundle containing either is not a plain current-branch update.
-_PUSH_SAFE_SHORT_LETTERS = frozenset("uvqn46")
+# Ref-neutral long value flag. ``--repo`` redirects the push, and
+# ``--receive-pack``/``--exec`` select a program git executes, so they refuse.
+_PUSH_SAFE_VALUE_FLAGS = frozenset({"--push-option"})
+# Ref-neutral short-flag letters (for bundles like ``-uq``). ``o`` carries its
+# push-option value. ``f`` (force) and ``d`` (delete) are absent by design.
+_PUSH_SAFE_SHORT_LETTERS = frozenset("uvqn46o")
+# Git GLOBAL options (before ``push``) that a plain re-push may carry. ``-C`` is
+# resolved into the push's cwd by the caller; the pager switches change nothing
+# about the push. Every other global option — above all ``-c`` / ``--config-env``,
+# which supply config the repo-config reads cannot see — refuses.
+_PUSH_SAFE_GLOBAL_VALUE_FLAGS = frozenset({"-C"})
+_PUSH_SAFE_GLOBAL_FLAGS = frozenset({"-P", "--no-pager"})
+
+
+#: Short letters that set the same git variable as a long boolean.
+_PUSH_SHORT_BOOLEANS = {"f": "force", "n": "dry-run"}
+
+
+def _push_boolean_options(stream: list[PushArg] | None) -> dict[str, bool]:
+    """The effective value of each boolean option on a push, in argument order.
+
+    Git stores every occurrence of a boolean into one variable, so the LAST
+    spelling wins and ``--no-<name>`` clears it (MEASURED, git 2.43:
+    ``--force --no-force``, ``-f --no-force``, ``--mirr --no-mirror`` and
+    ``--force-w --no-force-with-lease`` are rejected as non-fast-forward;
+    ``--dry --no-dry-run`` and ``-n --no-dry-run`` really push). Names are the
+    stream's canonical long names without dashes; ``-f``/``-n`` map onto
+    ``force``/``dry-run``. ``--mirror`` shares force's bit, so it sets both
+    ``mirror`` and ``force`` and ``--no-mirror`` clears both (MEASURED, git
+    2.43 and 2.55: ``--force --no-mirror`` is not a force push).
+    """
+    state: dict[str, bool] = {}
+    for arg in stream or ():
+        if arg.kind is PushArgKind.LONG:
+            name = arg.text.split("=", 1)[0][2:]
+            if name.startswith("no-"):
+                name = name[3:]
+                state[name] = False
+                if name == "mirror":
+                    state["force"] = False
+            else:
+                state[name] = True
+                if name == "mirror":
+                    state["force"] = True
+        elif arg.kind is PushArgKind.SHORT and arg.text in _PUSH_SHORT_BOOLEANS:
+            state[_PUSH_SHORT_BOOLEANS[arg.text]] = True
+    return state
 
 
 def _push_is_force(argv: list[str]) -> bool:
@@ -7774,128 +12198,79 @@ def _push_is_force(argv: list[str]) -> bool:
     Argv comes from ``shell_parse`` (quote-stripped), so a quoted ``'-f'``
     counts and a branch/refspec name that merely contains ``-f`` (a bare
     positional) does not. Catches both the flag forms — ``--force`` /
-    ``--force-with-lease`` / ``--force-if-includes`` / ``--mirror`` / ``-f`` /
+    ``--force-with-lease`` / ``--mirror`` / ``-f`` /
     bundled ``-uf`` — and the ``+<refspec>`` shorthand (``git push origin +main``),
-    which git treats as ``--force`` for that ref. A short cluster stops at
-    ``o`` and the value token of ``-o`` / ``--push-option`` / ``--repo`` /
-    ``--exec`` / ``--receive-pack`` is skipped, so a push-option value that
-    starts with ``+`` or contains ``f`` (e.g. ``-oci.skip``) is not mistaken
-    for a force.
+    which git treats as ``--force`` for that ref. The shared stream consumes
+    option values, including ``-o`` ending a bundle and ``-c`` before ``push``.
+    ``--mirror`` sets the force bit as well as the mirror bit; a later
+    ``--no-mirror`` clears both. ``--force-if-includes`` alone is not a force
+    push; it only affects a push with ``--force-with-lease`` (MEASURED, git 2.43
+    and 2.55).
     """
-    i = 1  # skip argv[0] == "git"
-    while i < len(argv):
-        tok = argv[i]
-        if tok in _PUSH_VALUE_FLAGS:
-            i += 2  # skip the flag and its value token
-            continue
-        if tok == "--force" or tok.startswith("--force-"):
-            return True
-        if tok == "--mirror":
-            # --mirror force-updates EVERY ref and deletes remote refs that are
-            # absent locally — an unconditional destructive push, never a plain
-            # one, so it must hard-block rather than reach an approvable prompt.
-            return True
-        if tok.startswith("+"):
-            return True  # +<refspec> is git shorthand for --force on that ref
-        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
-            for ch in tok[1:]:
-                if ch == "o":  # -oVALUE glued push-option — rest is its value
-                    break
-                if ch == "f":
-                    return True
-        i += 1
-    return False
+    stream: list[PushArg] | None = push_arg_stream(argv)
+    if any(arg.kind is PushArgKind.PLUS for arg in stream or ()):
+        return True  # +<refspec> is git shorthand for --force on that ref; no flag undoes it
+    state = _push_boolean_options(stream)
+    # --mirror shares TRANSPORT_PUSH_FORCE's bit with TRANSPORT_PUSH_MIRROR.
+    # The state walk records that shared bit on `force`, so `--no-mirror`
+    # clears it and a later `--force` re-enables it, just as git does.
+    return any(
+        state.get(name, False)
+        for name in ("force", "force-with-lease", "mirror")
+    )
 
 
 def _push_named_remote(argv: list[str]) -> str | None:
     """The remote named on a ``git push <remote> …``, else None.
 
-    argv is quote-stripped from ``shell_parse``. Skips git global options (and
-    their values), the ``push`` token, and push flags/values; the first bare
-    positional after that is the remote. A ``+<refspec>`` positional is NOT a
-    remote (it is a force refspec) and is skipped.
+    The first positional in the shared stream; option values and ``+<refspec>``
+    force shorthands are not positional arguments.
     """
-    i = 1  # skip argv[0] == "git"
-    # advance past git global options to the `push` token
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return None
-    i += 1
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-") or t.startswith("+"):
-            i += 1
-            continue
-        return t  # first bare positional after `push` is the remote
+    for arg in push_arg_stream(argv) or ():
+        if arg.kind is PushArgKind.POSITIONAL:
+            return arg.text
     return None
 
 
 def _push_repo_flag(argv: list[str]) -> str | None:
     """The value of a ``--repo <value>`` / ``--repo=value`` on a git push, else None.
 
-    ``git push --repo <dest>`` overrides both the positional remote and the
-    branch upstream as the push DESTINATION (P1-C), so it must win when deciding
-    what a force push actually targets. The value may be a remote name OR a URL.
+    The value may be a remote name OR a URL. A positional repository takes
+    precedence over ``--repo``; this value is used only when no remote is named.
+    Git stores every occurrence into one option variable, so the LAST ``--repo``
+    wins and a later ``--no-repo`` clears it.
     """
-    i = 0
-    while i < len(argv):
-        t = argv[i]
-        if t == "--repo" and i + 1 < len(argv):
-            return argv[i + 1]
-        if t.startswith("--repo="):
-            return t.split("=", 1)[1]
-        i += 1
-    return None
+    stream: list[PushArg] | None = push_arg_stream(argv)
+    if stream is None:
+        return None
+    repo: str | None = None
+    for index, arg in enumerate(stream):
+        if arg.kind is not PushArgKind.LONG:
+            continue
+        option, equals, value = arg.text.partition("=")
+        if option == "--no-repo":
+            repo = None
+            continue
+        if option != "--repo":
+            continue
+        if equals:
+            repo = value
+        elif index + 1 < len(stream) and stream[index + 1].kind is PushArgKind.LONG_VALUE:
+            repo = stream[index + 1].text
+        else:
+            repo = None
+    return repo
 
 
-def _push_positionals(argv) -> list[str]:
+def _push_positionals(argv: list[str]) -> list[str]:
     """The bare positional args of a ``git push`` (``[remote, refspec, ...]``).
 
-    Parsed from a quote-stripped argv, mirroring ``_push_named_remote``: git global
-    options/values, the ``push`` token, and push flags/values are all skipped —
-    including no-value flags (``-u`` / ``--set-upstream`` / ``--force-with-lease``)
-    which take NO separate token, and value flags (``_PUSH_VALUE_FLAGS``:
-    ``-o`` / ``--push-option`` / ``--repo`` / ``--receive-pack`` / ``--exec``) which
-    take one. A ``+<refspec>`` (force) positional is excluded. Empty if not a push.
+    Only ``POSITIONAL`` entries are returned; options, values, and ``+`` force
+    refspecs have their own kinds in the shared stream.
     """
-    argv = argv or []
-    i = 1  # skip argv[0] == "git"
-    # advance past git global options (and their values) to the `push` token
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return []
-    i += 1
-    out: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-") or t.startswith("+"):
-            i += 1
-            continue
-        out.append(t)
-        i += 1
-    return out
+    return [
+        arg.text for arg in push_arg_stream(argv or []) or () if arg.kind is PushArgKind.POSITIONAL
+    ]
 
 
 # push.default modes that push the CURRENT branch to a SAME-NAMED remote ref (or
@@ -7916,8 +12291,9 @@ def _git_config_get(base: list[str], key: str, *, all_values: bool = False, as_b
     ``[section]\\n\\tkey`` shorthand) normalizes to a canonical ``"true"``/``"false"``.
 
     NOTE: this reads the effective REPO config; it does NOT see a command-line
-    ``git -c key=val`` override on the push itself (tabled residue — the config
-    check is best-effort for the common repo-config case, not a hard boundary).
+    ``git -c key=val`` override on the push itself. The push path does not rely
+    on it for that: ``_push_ref_positionals`` refuses ``-c`` / ``--config-env``
+    and ``_push_seg_has_no_prefix`` refuses an assignment prefix.
     """
     args = ["config"]
     if as_bool:
@@ -7939,27 +12315,83 @@ _SAFE_RECURSE_SUBMODULES = frozenset({"no", "false", "off", "0", "check"})
 
 
 def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
-    """Whether a bare / remote-only push updates ONLY the current branch under the
-    effective REPO config — ALLOWLIST posture (mirrors ``_push_targets_current_branch``).
+    """Whether the effective config leaves a plain current-branch push PLAIN —
+    the ONE config-safety predicate every auto-allowed re-push must pass.
 
-    Broadening/redirecting knobs checked (each case-insensitive):
-      • ``remote.<remote>.push`` refspec (``push = HEAD:main`` → sends HEAD to main);
-      • ``remote.<remote>.mirror`` (a bare push mirrors ALL refs — force-updates /
-        deletes unrelated remote refs);
-      • ``push.default`` other than ``simple``/``current`` (``upstream``/``tracking``
-        push cur to a differently-named upstream; ``matching`` pushes every
-        same-named branch);
-      • ``push.recurseSubmodules``/``submodule.recurse`` (side-channel-publishes
-        submodule commits).
-    Simple ONLY when NONE is set to a broadening value. Fail-closed: an unresolved
-    remote, any of the above, or any config-read error → False (prompt).
+    ``_push_targets_current_branch`` calls this on EVERY path that can return
+    True (bare, ``<remote>``, ``<remote> <ref>`` and ``<remote> <src>:<dst>``), so
+    the re-push relaxation never reaches a push whose config was not read here.
+    ALLOWLIST posture: simple only when NONE of the keys below is set to a
+    value that changes the push.
 
-    BEST-EFFORT, not a hard boundary (`remote` is already resolved with git's
-    pushRemote/pushDefault precedence by the caller). It reads REPO config only, so a
-    command-line ``git -c key=val push`` override, ``remote.<remote>.mirror``,
-    ``push.followTags``, or a ``url.*.pushInsteadOf`` rewrite are NOT caught — tabled
-    adversarial residue (each needs a deliberately unusual command / hostile config,
-    and `git config` writes are already soft-warned). Bounded by 5s timeouts.
+    WHICH keys, and why these. Enumerated from git-config(1) and git-push(1)
+    (git 2.43, consulted 2026-09-29) for the keys that change WHAT a push
+    executes, WHERE it lands, or WHICH refs it sends — and that apply to a push
+    WITHOUT applying equally to the fetch-side ``git ls-remote`` that
+    ``_push_is_republish`` runs to prove the branch is already published:
+
+      where it lands / which ref it updates
+      • ``remote.<r>.push`` — a configured push refspec remaps or broadens;
+      • ``push.default`` other than ``simple``/``current`` — ``upstream``/
+        ``tracking`` push to a differently-named branch, ``matching`` to every
+        same-named one (both MEASURED with git 2.43 to update ``main`` from
+        ``git push origin <cur>``);
+      • push URL ≠ fetch URL — ``remote.<r>.pushurl`` or a
+        ``url.<base>.pushInsteadOf`` rewrite sends the push somewhere OTHER than
+        the URL ``ls-remote`` checked (MEASURED: ``git remote get-url --push``
+        reflects both rewrites while ``ls-remote`` still answered from the fetch
+        URL), so "already published" would be a fact about a different
+        repository. A remote with more than one URL refuses too: the push goes
+        to every URL, ``ls-remote`` asks only the first (MEASURED). For a
+        raw-URL destination (no remote section to compare), any
+        ``pushInsteadOf`` rule refuses;
+      • a legacy ``$GIT_COMMON_DIR/remotes/<r>`` or ``branches/<r>`` file —
+        push refspecs ``git config`` never reports (MEASURED: a ``Push:`` line
+        created another branch while ``remote.<r>.push`` read as unset);
+      which refs go with it
+      • ``remote.<r>.mirror`` — every ref, force and delete;
+      • ``push.followTags`` — annotated tags ride along (MEASURED: a colon
+        refspec push published a new tag);
+      • ``push.recurseSubmodules`` / ``submodule.recurse`` — submodule commits
+        are pushed to the SUBMODULE's remote, a different repository (MEASURED:
+        ``git push origin HEAD:refs/heads/<cur>`` under ``on-demand`` created
+        ``<cur>`` in the submodule's remote);
+      what it executes
+      • ``remote.<r>.receivepack`` — the program run for the push, the config
+        twin of ``--receive-pack``, which the argv scan already refuses
+        (MEASURED: a configured helper ran on ``git push origin HEAD``);
+      • ``push.gpgSign`` — signing runs ``gpg.program``, on a push only.
+
+    Deliberately NOT here, and why (the stated residue):
+      • ``core.sshCommand`` / ``GIT_SSH*``, ``credential.helper``,
+        ``remote.<r>.vcs`` helpers, ``remote.<r>.proxy`` / ``core.gitProxy``,
+        ``remote.<r>.uploadpack``, ``url.<base>.insteadOf``: each runs (or
+        rewrites) for a FETCH as well — ``insteadOf`` rewrites ``ls-remote`` the
+        same way, so the republish probe sees the push's real destination — and
+        refusing a push cannot stop a program an unprompted ``git fetch`` (or
+        this guard's own ``ls-remote``) already runs;
+      • ``core.hooksPath`` and the ``pre-push`` hook it selects: this one DOES
+        run only on a push, and is left out on purpose — installs set
+        ``core.hooksPath`` to their own hook directory, so refusing it would
+        turn every ordinary re-push into an ask. The hook FILE is also
+        editable by any write, which no config read can see;
+      • ``push.pushOption``, ``push.autoSetupRemote``, ``push.negotiate``,
+        ``push.useBitmaps``: ref-neutral; ``push.useForceIfIncludes`` only acts
+        with a force, which takes the force arm;
+      • config supplied by the PUSH COMMAND ITSELF (``git -c``, ``--config-env``,
+        a ``GIT_CONFIG_*`` assignment prefix) is invisible to these reads, so
+        ``_push_ref_positionals`` refuses those spellings instead; and config
+        an EARLIER segment of the same command would write (``git config …``,
+        ``git remote set-url --add …``, an ``export``) does not exist yet when
+        this runs, so the push arm drops the relaxation for any command whose
+        other segments are not on ``_push_compound_is_inert``'s allowlist.
+        (Inherited process environment IS visible: the hook launcher passes
+        the git config channels through by design.)
+      • timeouts: each read here is a flat 5s local call, not charged to the
+        shared hook deadline the network probes use — residue, local reads only.
+
+    Fail-closed: an unresolved remote, any key above, or any config-read error
+    → False (prompt). Bounded by 5s timeouts per read.
     """
     if not remote:
         return False
@@ -7977,6 +12409,13 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
         return False
     rc, out = got
     if rc == 0 and out == "true":
+        return False
+    # 1c. A configured receive-pack PROGRAM — the config twin of --receive-pack.
+    got = _git_config_get(base, f"remote.{remote}.receivepack")
+    if got is None:
+        return False
+    rc, out = got
+    if rc == 0 and out:
         return False
     # 2. push.default must be a same-name mode (unset → simple → safe).
     got = _git_config_get(base, "push.default")
@@ -7998,7 +12437,91 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
     if got is None:
         return False
     rc, out = got
-    return not (rc == 0 and out == "true")
+    if rc == 0 and out == "true":
+        return False
+    # 4. push.followTags publishes annotated tags alongside the branch.
+    got = _git_config_get(base, "push.followTags", as_bool=True)
+    if got is None:
+        return False
+    rc, out = got
+    if rc == 0 and out == "true":
+        return False
+    # 5. push.gpgSign (a boolean OR "if-asked") runs gpg.program on the push.
+    #    Only an explicit false is safe; unset is the default (no signing).
+    got = _git_config_get(base, "push.gpgSign")
+    if got is None:
+        return False
+    rc, out = got
+    if rc == 0 and out.lower() not in ("false", "no", "off", "0"):
+        return False
+    # 6. A legacy remote FILE carries push refspecs `git config` never shows.
+    if _legacy_remote_file_exists(remote, base):
+        return False
+    # 7. The push must land where the republish probe looked.
+    return _push_url_matches_probe(remote, base)
+
+
+def _legacy_remote_file_exists(remote: str, base: list[str]) -> bool:
+    """Whether ``<git-common-dir>/remotes/<remote>`` or ``…/branches/<remote>``
+    exists — git's pre-config remote definitions. MEASURED (git 2.43): a
+    ``remotes/<name>`` file with a ``Push: HEAD:refs/heads/<other>`` line made
+    ``git push <name>`` create ``<other>`` while ``git config --get-all
+    remote.<name>.push`` reported unset. Existence refuses, whatever the file
+    says; an unreadable git dir also refuses (True)."""
+    got = _run_git_lines(base + ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if got is None or got[0] != 0 or len(got[1]) != 1:
+        return True
+    common = got[1][0]
+    # Concatenate, never os.path.join: a raw-URL "remote" starting with `/`
+    # would make join discard the prefix and test the URL path itself.
+    return any(os.path.lexists(f"{common}/{kind}/{remote}") for kind in ("remotes", "branches"))
+
+
+def _push_url_matches_probe(remote: str, base: list[str]) -> bool:
+    """Whether a push to ``remote`` lands on the URL ``git ls-remote`` answers from.
+
+    ``_push_is_republish`` proves "already published" with ``git ls-remote
+    <remote>``, which resolves the FETCH URL (``insteadOf`` applied). The push
+    itself goes to the PUSH URL, which ``remote.<r>.pushurl`` and
+    ``url.<base>.pushInsteadOf`` both move. When the two sets differ, the probe
+    describes a different repository and cannot vouch for this push.
+
+    For a raw URL/path destination there is no remote section to compare
+    (``git remote get-url`` exits 2), so any ``pushInsteadOf`` rule at all
+    refuses — the rule could match that URL, and working out whether it does
+    would be re-implementing git's longest-prefix rewrite by hand.
+    """
+    fetch = _run_git_lines(base + ["remote", "get-url", "--all", remote])
+    push = _run_git_lines(base + ["remote", "get-url", "--push", "--all", remote])
+    if fetch is None or push is None:
+        return False  # an error reading either → fail closed
+    frc, furls = fetch
+    prc, purls = push
+    if frc == 0 and prc == 0:
+        # EXACTLY one URL, identical on both sides. A remote with several
+        # `url` entries pushes to EVERY one while ls-remote answers from the
+        # first only (MEASURED: equal two-URL sets, ls-remote hit on the first,
+        # and the push created the branch on the second).
+        return len(set(furls)) == 1 and set(furls) == set(purls)
+    if frc == 2 and prc == 2:
+        # Not a configured remote NAME — a raw URL/path destination.
+        rules = _run_git_lines(
+            base + ["config", "--get-regexp", r"^url\..*\.pushinsteadof$"]
+        )
+        if rules is None:
+            return False
+        rrc, _lines = rules
+        return rrc == 1  # 1 = no such key: nothing can rewrite the push URL
+    return False
+
+
+def _run_git_lines(argv: list[str]) -> tuple[int, list[str]] | None:
+    """``(returncode, non-empty stripped stdout lines)``, or None on an exception."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return r.returncode, [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
 def _push_is_dry_run(seg) -> bool:
@@ -8007,18 +12530,17 @@ def _push_is_dry_run(seg) -> bool:
     `-n` / `--dry-run` publish nothing, so none of the states the adjacency
     prompt reports can result from them. `-n` also travels inside a short
     bundle (`-un`), which is why this reads the letters rather than the token.
+
+    Reads only the PUSH's own options, and skips each value-taking flag's
+    value: ``git push -o --dry-run origin HEAD`` sends ``--dry-run`` to the
+    server as a push-option and performs a REAL push (git-push(1): ``-o``
+    takes the next argument). Read through ``push_arg_stream`` — the same
+    value rules as every other consumer — so a value is never read as the
+    flag, and a ``-n`` after ``--`` is a positional, not the flag.
     """
     argv = getattr(seg, "argv", None) or []
-    for t in argv[1:]:
-        if t == "--dry-run" or t.split("=", 1)[0] == "--dry-run":
-            return True
-        if t.startswith("-") and not t.startswith("--") and len(t) > 1:
-            for ch in t[1:]:
-                if ch == "o":
-                    break
-                if ch == "n":
-                    return True
-    return False
+    # Effective value: `--dry --no-dry-run` really pushes (MEASURED, git 2.43).
+    return _push_boolean_options(push_arg_stream(argv)).get("dry-run", False)
 
 
 def _push_ref_positionals(argv: list[str]) -> list[str] | None:
@@ -8036,54 +12558,50 @@ def _push_ref_positionals(argv: list[str]) -> list[str] | None:
     None means "a flag here changes the ref set" (``--all``, ``--tags``,
     ``--delete``, ``--mirror``, ``--stdin``, ``--repo``, a ``+refspec`` force
     shorthand, or anything unknown). Both callers treat None as a refusal.
+
+    GIT GLOBAL options are an allowlist too (``_PUSH_SAFE_GLOBAL_*``): only
+    ``-C <dir>`` (the caller resolves the push's cwd from it) and the pager
+    switches pass. Everything else before ``push`` → None, because the global
+    options are where a push carries its OWN config and environment, which
+    ``_push_config_is_simple`` reads from the repository and cannot see:
+    ``-c key=val`` and ``--config-env`` (MEASURED: ``git -c
+    remote.origin.receivepack=<helper> push origin HEAD`` was auto-allowed
+    before this), ``--exec-path`` (where git finds the programs it runs),
+    ``--namespace``, ``--git-dir`` / ``--work-tree``, and anything unknown.
     """
-    # Advance past git global options to the `push` token.
-    i = 1
-    while i < len(argv):
-        t = argv[i]
-        if t in _GIT_GLOBAL_VALUE_FLAGS:
-            i += 2
-            continue
-        if t.startswith("-"):
-            i += 1
-            continue
-        break
-    if i >= len(argv) or argv[i] != "push":
-        return None
-    i += 1
     positionals: list[str] = []
-    while i < len(argv):
-        t = argv[i]
-        if t in _PUSH_SAFE_VALUE_FLAGS:
-            i += 2  # ref-neutral value flag: skip the flag and its value token
-            continue
-        if t.startswith("--"):
-            base = t.split("=", 1)[0]
-            if "=" in t and base in _PUSH_SAFE_VALUE_FLAGS:
-                i += 1  # --push-option=value etc.
-                continue
-            if "=" not in t and base in _PUSH_SAFE_LONG_FLAGS:
-                i += 1
+    dash_c = 0
+    stream: list[PushArg] | None = push_arg_stream(argv)
+    if stream is None:
+        return None  # not a `git push` — the bare-push `[]` does not apply
+    for arg in stream:
+        if arg.kind is PushArgKind.GLOBAL_VALUE:
+            # git applies repeated -C cumulatively; the caller resolves only
+            # the first, so a second one would make it probe the wrong repo.
+            if arg.text not in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+                return None  # -c / --config-env / --git-dir / unknown
+            dash_c += 1
+            if dash_c > 1:
+                return None
+        elif arg.kind is PushArgKind.GLOBAL:
+            if arg.text not in _PUSH_SAFE_GLOBAL_FLAGS:
+                return None
+        elif arg.kind is PushArgKind.LONG:
+            base = arg.text.split("=", 1)[0]
+            if base in _PUSH_SAFE_VALUE_FLAGS:
+                continue  # --push-option; a separate value arrives as LONG_VALUE
+            if "=" not in arg.text and base in _PUSH_SAFE_LONG_FLAGS:
                 continue
             return None  # unknown/broadening long flag (or a =form of a no-value flag)
-        if t.startswith("+"):
+        elif arg.kind in {PushArgKind.SHORT_VALUE, PushArgKind.LONG_VALUE}:
+            continue  # the value of a value-flag the flag check already passed
+        elif arg.kind is PushArgKind.SHORT:
+            if arg.text not in _PUSH_SAFE_SHORT_LETTERS:
+                return None  # f/d/unknown letters change the ref set
+        elif arg.kind is PushArgKind.PLUS:
             return None  # +<refspec> force shorthand
-        if t.startswith("-") and len(t) > 1:
-            # Short single/bundle — every letter must be ref-neutral. An `o` starts a
-            # glued push-option value, so the rest of the token is that value.
-            safe = True
-            for ch in t[1:]:
-                if ch == "o":
-                    break
-                if ch not in _PUSH_SAFE_SHORT_LETTERS:
-                    safe = False
-                    break
-            if not safe:
-                return None
-            i += 1
-            continue
-        positionals.append(t)
-        i += 1
+        else:  # POSITIONAL
+            positionals.append(arg.text)
     return positionals
 
 
@@ -8099,50 +12617,322 @@ def _push_targets_current_branch(
     itself, never a parsed destination. True ONLY when BOTH hold:
       1. Every flag after ``push`` is ref-set-neutral — a member of
          ``_PUSH_SAFE_LONG_FLAGS`` / ``_PUSH_SAFE_VALUE_FLAGS``, or a short bundle
-         whose every letter is in ``_PUSH_SAFE_SHORT_LETTERS`` (``o`` = glued
+         whose every letter is in ``_PUSH_SAFE_SHORT_LETTERS`` (``o`` carries a
          push-option value). ANY other flag (``--all`` / ``--tags`` / ``--delete``
          / a bundled ``-d`` / ``--stdin`` / ``--repo`` / unknown) → False.
       2. The positionals name a plain current-branch update:
-         • ``git push <remote> <cur>`` (no ``src:dst`` colon) → an explicit refspec
-           overrides ``remote.push`` / ``push.default`` / ``pushRemote`` → True;
-         • bare ``git push`` / ``git push <remote>`` → True only if
-           ``_push_config_is_simple(remote)`` (no redirecting/broadening repo config);
-         • a colon refspec, a differently-named branch, or ≥2 refspecs → False.
-    Conservative by construction: any unrecognized form re-prompts. argv-based
+         • ``git push <remote> <ref>`` where ``<ref>`` names the current branch
+           (``_ref_names_current_branch``: ``<cur>``, ``HEAD``, ``@`` or
+           ``refs/heads/<cur>``);
+         • ``git push <remote> <src>:<dst>`` when BOTH halves name the current
+           branch (``_colon_refspec_updates_current_branch``);
+         • bare ``git push`` / ``git push <remote>``;
+         • a differently-named branch, a tag, a delete, or ≥2 refspecs → False.
+      3. The segment runs ``git`` directly — no ``VAR=value`` assignment or
+         wrapper before it (``_push_seg_has_no_prefix``): an assignment such as
+         ``GIT_CONFIG_COUNT=…`` hands the push config the checks below cannot see.
+      4. ``_push_config_is_simple(remote)`` — for EVERY recognised shape. This is
+         the single exit that can return True, so no spelling reaches the
+         re-push relaxation without the config check. Colon refspecs included:
+         their spelled-out destination is immune to the ``remote.<r>.push`` /
+         ``push.default`` remap (MEASURED), but not to the side channels that
+         ride along with any push — submodule recursion, followed tags, a
+         configured receive-pack program, a divergent push URL. One predicate
+         for all shapes costs an ask on the rare remap config and removes the
+         per-shape subset that let those side channels through.
+    The explicit ``--`` terminator is accepted, so ``git push -- origin HEAD``
+    follows the same re-push path as its plain spelling. Tokens after it are
+    positional, not options. Any unrecognized option re-prompts. argv-based
     (quote-stripped).
     """
     if not cur:
+        return False
+    if not _push_seg_has_no_prefix(seg):
         return False
     positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
     if positionals is None:
         return False
     if len(positionals) >= 3:
         return False  # multiple refspecs → not a single plain current-branch update
+    if positionals and positionals[0] != remote:
+        # The positionals and resolved destination must agree.
+        return False
     if len(positionals) == 2:
         refspec = positionals[1]
-        # Explicit `<remote> <cur>` — an explicit refspec overrides remote.push /
-        # push.default / pushRemote, so it is a plain current-branch update.
-        return ":" not in refspec and refspec == cur
-    # Bare `git push` or `git push <remote>` → the ref set depends on repo config,
-    # keyed on the remote git will ACTUALLY push to (resolved by the caller).
+        if ":" in refspec:
+            shape_ok = _colon_refspec_updates_current_branch(refspec, cur)
+        else:
+            shape_ok = _ref_names_current_branch(refspec, cur)
+        if not shape_ok:
+            return False
+    # Every recognised shape — bare, `<remote>`, `<remote> <ref>`, `<remote>
+    # <src>:<dst>` — ends here, keyed on the remote git will ACTUALLY push to
+    # (resolved by the caller).
     return _push_config_is_simple(remote, cwd=cwd)
+
+
+#: git subcommands that may share a command with an auto-allowed re-push. None
+#: of them writes config, remotes, or the legacy remote files, and none takes a
+#: program or output-file option (``fetch --upload-pack``, ``log --output`` are
+#: why those are absent).
+_INERT_GIT_NEIGHBOURS = frozenset({"status", "rev-parse", "add", "commit"})
+
+
+def _push_compound_is_inert(segs, push_seg, command: str) -> bool:
+    """Whether every OTHER segment of the command leaves push config alone.
+
+    The hook reads config BEFORE any of the command runs, so a config write in
+    an earlier segment is invisible to ``_push_config_is_simple`` — MEASURED:
+    ``git config remote.origin.receivepack <prog> && git push origin HEAD`` was
+    auto-allowed, as was ``git remote set-url --add origin <url> && git push``.
+    What can write config is an open set (``git config``, ``git remote``,
+    ``git submodule``, an ``export``, any script), so this is an ALLOWLIST: a
+    ``cd``, or git running one of ``_INERT_GIT_NEIGHBOURS`` with no global
+    option but ``-C``. Anything else keeps the ask. Same shape as the
+    close-then-push check beside its caller.
+
+    A subcommand name alone is not evidence: MEASURED by audit,
+    ``git log … >> .git/config``, ``git status <(git config …)`` and
+    ``git -c core.fsmonitor=<cmd> status`` each wrote config ahead of an
+    auto-allowed push. The parse drops redirects from BOTH a segment's argv
+    and its ``raw`` (MEASURED: ``git rev-parse … >> .git/config`` yields raw
+    ``git rev-parse …`` and no recorded redirect), and strips the ``<``/``>``
+    of a process substitution. So redirection and process substitution are
+    tested on the RAW COMMAND: in a command with any other segment, a ``<`` or
+    ``>`` anywhere asks (``git status 2>/dev/null && git push`` included — an
+    accepted over-block; a lone ``git push … 2>&1`` is unaffected). Each
+    neighbour must additionally re-tokenize to exactly its argv, which refuses
+    a stripped wrapper. A substring match only ever keeps the ask."""
+    others = [s for s in segs if s is not push_seg]
+    if "<(" in command or ">(" in command:
+        return False
+    if others and ("<" in command or ">" in command):
+        return False
+    for s in others:
+        try:
+            words = shlex.split(s.raw or "", comments=True)
+        except ValueError:
+            return False
+        if words != list(s.argv or []):
+            return False  # a stripped wrapper (sudo / env / command …)
+        if s.exe == "cd":
+            continue
+        if s.exe != "git":
+            return False
+        i = 1
+        while i < len(s.argv) and s.argv[i].startswith("-"):
+            if s.argv[i] != "-C":
+                return False  # -c / --exec-path / --git-dir / -p …
+            i += 2
+        if git_subcommand(s.argv) not in _INERT_GIT_NEIGHBOURS:
+            return False
+    return True
+
+
+def _push_seg_has_no_prefix(seg) -> bool:
+    """Whether the push segment's own text starts with the ``git`` word itself.
+
+    The parse strips ``VAR=value`` assignments and wrappers (``env …``,
+    ``command``) from ``argv``, so ``GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=… git
+    push`` and ``git push`` have the same argv (MEASURED) while only the first
+    carries config the repository reads cannot see. Rather than enumerate which
+    variables matter — an open set that includes ``HOME`` and
+    ``GIT_CONFIG_GLOBAL`` — refuse ANY prefix: a plain re-push is typed as
+    ``git …``. Unparseable text also refuses.
+    """
+    raw = getattr(seg, "raw", None)
+    if not raw:
+        return False
+    try:
+        # comments=True: an apostrophe in a trailing `# don't` comment is not
+        # an unbalanced quote.
+        words = shlex.split(raw, comments=True)
+    except ValueError:
+        return False
+    # Exactly `git`: a path-qualified `./git` could be any program.
+    return bool(words) and words[0] == "git"
+
+
+def _push_carries_command_config(seg) -> bool:
+    """Whether a push segment has a prefix, wrapper, or untrusted git global.
+
+    Only ``-C <dir>``, ``-P`` and ``--no-pager`` are safe before ``push``.
+    Git config supplied through any other global option, or an unrecognized
+    argv shape, is not visible to the guard's repository-config reads. This
+    structural decision is independent of destination: supplied config can
+    retarget a remote or introduce a force refspec before Git runs.
+    Repeated ``-C`` is refused because Git applies each directory change
+    cumulatively, while the cwd resolvers only read the first one.
+
+    A push reparsed from a shell-wrapper body (``bash -c '…'``, depth > 0) is
+    wrapped by definition: the outer shell can export config before running it
+    (``BASH_ENV=<file> bash -c 'git push …'`` sources the file first), and the
+    nested segment's own text no longer shows that prefix.
+    """
+    if getattr(seg, "depth", 0):
+        return True
+    if not _push_seg_has_no_prefix(seg):
+        return True
+    argv = list(getattr(seg, "argv", None) or [])
+    push_index = git_subcommand_index(argv)
+    if push_index is None or argv[push_index] != "push":
+        return True
+
+    i = 1
+    dash_c_count = 0
+    while i < push_index:
+        option = argv[i]
+        if option in _PUSH_SAFE_GLOBAL_VALUE_FLAGS:
+            if option == "-C":
+                dash_c_count += 1
+                if dash_c_count > 1:
+                    return True
+            if i + 1 >= push_index:
+                return True
+            i += 2
+        elif option in _PUSH_SAFE_GLOBAL_FLAGS:
+            i += 1
+        else:
+            return True
+    return False
+
+
+def _ref_names_current_branch(ref: str, cur: str | None) -> bool:
+    """Whether a push refspec (one side of it) names the CURRENT branch ``cur``.
+
+    Four spellings do, and under default push config git treats them identically
+    on a push: the bare branch name, ``HEAD``, its one-character alias ``@``, and
+    the fully-qualified ``refs/heads/<cur>``. (Under ``remote.<r>.push`` or
+    ``push.default=upstream`` the bare name and ``refs/heads/<cur>`` are REMAPPED;
+    the caller therefore also requires ``_push_config_is_simple``.) MEASURED with git 2.43 against a local bare remote:
+    ``git push origin @`` creates ``refs/heads/<cur>`` exactly as
+    ``git push origin HEAD`` does — and it still did with a local branch
+    literally named ``@`` present at a different commit (git allows creating
+    one): the push sent HEAD to ``refs/heads/<cur>``, not that branch.
+
+    Before this function the predicate accepted only the bare name, so
+    ``git push -u origin HEAD`` — the form this repo's development workflow
+    prescribes for a branch's first publication — fell to the push arm's
+    catch-all. That arm asks unconditionally, so the re-push relaxation, the
+    no-open-PR check and the close-then-push check never ran for it.
+
+    This is a deliberate, bounded LOOSENING: these spellings now reach the
+    re-push relaxation, where an ask becomes an allow only when ``<cur>`` is
+    already on the remote with an open PR. Everything else stays False — another
+    branch's name, a tag, and ``refs/heads/main`` pushed from a feature branch
+    are still unrecognised and keep prompting. A falsy ``cur`` (detached HEAD) never matches — there is no
+    current branch for a ref to name.
+    """
+    if not cur:
+        return False
+    return ref in (cur, "HEAD", "@", f"refs/heads/{cur}")
+
+
+def _colon_refspec_updates_current_branch(refspec: str, cur: str | None) -> bool:
+    """Whether a ``src:dst`` refspec plainly updates the current branch.
+
+    ``git push origin HEAD:refs/heads/<cur>`` is how a session republishes a
+    branch whose upstream it cannot rely on. The predicate used to reject every
+    colon outright, which sent it to the catch-all ask.
+
+    Established POSITIVELY, both halves, because a colon refspec is where the
+    dangerous forms live and they must all stay False:
+
+        ``HEAD:refs/heads/main``      publishing a feature branch ONTO main
+        ``:refs/heads/<branch>``      an empty source DELETES the remote branch
+        ``main:refs/heads/<cur>``     another branch's tip under this name
+        ``HEAD:refs/tags/v1``         a tag, not a branch publish
+        ``HEAD:<cur>``                unqualified — see below
+        ``HEAD:a:b`` / ``HEAD:``      refused by the destination equality
+
+    The destination must be FULLY QUALIFIED. git-push(1): "If <dst>
+    unambiguously refers to a ref on the <repository> remote, then push to that
+    ref" — MEASURED against a remote holding ``refs/tags/<cur>`` and no
+    ``refs/heads/<cur>``, git 2.43 resolved ``HEAD:<cur>`` against the tag and
+    rejected it ("the tag already exists in the remote"). Nothing publishes in
+    that case, but calling it a plain update of the current branch would be
+    false.
+
+    On splitting: git splits a refspec on the LAST colon, this uses the first.
+    That cannot yield a false True: ``git check-ref-format --branch 'a:b'`` is
+    fatal, so ``cur`` never contains a colon, and a True verdict therefore implies
+    a colon-free destination, where both splits coincide.
+
+    A leading ``+`` (git's force shorthand) never reaches here:
+    ``_push_is_force`` returns True on it and ``_push_ref_positionals`` returns
+    None, so the push takes the force arm.
+    """
+    if not cur:
+        return False
+    src, sep, dst = refspec.partition(":")
+    if not sep:
+        return False  # no colon — the caller routes those elsewhere
+    if not src or not dst:
+        return False  # `:dst` is a DELETE; `src:` is not a plain update
+    if not _ref_names_current_branch(src, cur):
+        return False  # the source must resolve to the current branch
+    return dst == f"refs/heads/{cur}"
+
+
+def _refspec_onto_other_branch(
+    seg, cur: str | None, remote: str | None, cwd: str | None = None
+) -> str | None:
+    """The branch a ``git push <remote> <cur>:refs/heads/<dst>`` updates, or None.
+
+    The shape a session uses to bring a pull request's branch up to date from a
+    scratch checkout when that branch is checked out in another worktree (git
+    refuses a second checkout of one branch). Its own install key,
+    ``hooks.asks.push_pr_branch``, may silence it once the caller has also shown
+    ``<dst>`` has an open PR (owner ruling 2026-10-10); ``push_routine`` never
+    reaches it. This answers the SHAPE question only.
+
+    Same allowlist posture as ``_push_targets_current_branch``: no prefix
+    assignment, only ref-neutral flags, exactly one refspec, the positional
+    remote equal to the resolved one, and ``_push_config_is_simple``. The source
+    must name the current branch (``_ref_names_current_branch``), so a detached
+    HEAD never matches; the destination must be FULLY QUALIFIED for the reason
+    ``_colon_refspec_updates_current_branch`` measured (an unqualified name can
+    resolve to a tag). A destination equal to ``cur`` is the current-branch
+    path's, and ``main`` / ``master`` never match; a recorded default branch is
+    refused later by ``_routine_dest_owned``. A force, a delete (``:dst``) or a
+    tag destination always returns None.
+    """
+    if not cur or not _push_seg_has_no_prefix(seg):
+        return None
+    positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
+    if positionals is None or len(positionals) != 2 or positionals[0] != remote:
+        return None
+    src, sep, dst = positionals[1].partition(":")
+    if not sep or not src or not _ref_names_current_branch(src, cur):
+        return None
+    prefix = "refs/heads/"
+    if not dst.startswith(prefix):
+        return None
+    branch = dst[len(prefix):]
+    if not branch or branch == cur or branch in ("main", "master") or ":" in branch:
+        return None
+    if not _push_config_is_simple(remote, cwd=cwd):
+        return None
+    return branch
 
 
 def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
     """The push DESTINATION (remote name or URL) for a segment, or None if UNKNOWN.
 
-    Resolution order: an explicit ``--repo <dest>`` (P1-C) → an explicitly named
-    positional remote → else the current branch's upstream remote (the part
-    before ``/`` of ``@{upstream}``); else None. Callers FAIL CLOSED on None — an
+    Resolution order: an explicitly named positional remote → ``--repo <dest>``
+    when no positional remote is present → the current branch's upstream remote
+    (the part before ``/`` of ``@{upstream}``); else None. Measured with git
+    2.34.1: when both ``--repo`` and a positional repository are present, git
+    uses the positional repository. Callers FAIL CLOSED on None — an
     undeterminable destination is treated as origin/public and blocked.
     """
     argv = getattr(seg, "argv", None) or []
-    repo = _push_repo_flag(argv)
-    if repo:
-        return repo
     remote = _push_named_remote(argv)
     if remote:
         return remote
+    repo = _push_repo_flag(argv)
+    if repo:
+        return repo
     try:
         args = ["git"]
         if cwd:
@@ -8161,24 +12951,34 @@ def _resolve_push_remote(seg, cwd: str | None = None) -> str | None:
 def _effective_push_remote(seg, cur: str | None, cwd: str | None = None) -> str | None:
     """The remote a ``git push`` will ACTUALLY push to, honoring git's precedence.
 
-    An explicit ``--repo`` or positional remote wins. For a bare ``git push`` git
-    picks, in order: ``branch.<cur>.pushRemote`` → ``remote.pushDefault`` →
+    A positional repository takes precedence over ``--repo``; when neither is
+    present, a bare ``git push`` picks, in order:
+    ``branch.<cur>.pushRemote`` → ``remote.pushDefault`` →
     ``branch.<cur>.remote`` (the ``@{upstream}`` remote) → ``origin``. The
     republish + config checks MUST target this remote, not the fetch/upstream
     remote — otherwise a triangular fork workflow (pull from origin, push to fork)
     checks the wrong remote and can silently allow a first push to the fork.
+
+    ``branch.<cur>.remote`` is read from CONFIG, not via ``@{upstream}``: the
+    upstream expression fails when the remote-tracking ref is missing (never
+    fetched, or pruned after the remote branch was deleted), and git still pushes
+    to ``branch.<cur>.remote`` then. Answering "origin" there sent the republish
+    and scope checks to a remote the push never reaches. A config read error, or
+    a ``.`` (the local repository) value, returns None — callers treat an
+    unresolved remote as "ask".
     """
     argv = getattr(seg, "argv", None) or []
     if _push_repo_flag(argv) or _push_named_remote(argv):
-        return _resolve_push_remote(seg, cwd=cwd)  # explicit --repo / positional wins
+        return _resolve_push_remote(seg, cwd=cwd)  # positional wins over --repo
     base = ["git"] + (["-C", cwd] if cwd else [])
-    if cur:
-        got = _git_config_get(base, f"branch.{cur}.pushRemote")
-        if got and got[0] == 0 and got[1]:
-            return got[1]
-    got = _git_config_get(base, "remote.pushDefault")
-    if got and got[0] == 0 and got[1]:
-        return got[1]
+    keys = ([f"branch.{cur}.pushRemote"] if cur else []) + ["remote.pushDefault"]
+    keys += [f"branch.{cur}.remote"] if cur else []
+    for key in keys:
+        got = _git_config_get(base, key)
+        if got is None:
+            return None  # unreadable config → unresolved → the caller asks
+        if got[0] == 0 and got[1]:
+            return None if got[1] == "." else got[1]
     return _resolve_push_remote(seg, cwd=cwd) or "origin"
 
 
@@ -8227,6 +13027,23 @@ def _push_dest_urls(dest: str, cwd: str | None = None) -> set[str]:
     if _looks_like_url(dest):
         return {dest}
     return set()
+
+
+def _push_dest_meets_origin(remote: str | None, pcwd: str | None, pcwd_unknown: bool) -> bool:
+    """Whether a push destination is public or cannot be proven disjoint from origin."""
+    if pcwd_unknown or remote is None or remote == "origin":
+        return True
+    dest_urls = _push_dest_urls(remote, cwd=pcwd)
+    origin_urls = _remote_push_urls("origin", cwd=pcwd)
+    if not dest_urls or not origin_urls or dest_urls & origin_urls:
+        return True
+    # Spellings of ONE repository differ as strings (https vs git@host:owner/repo,
+    # a trailing .git), so compare the (host, owner/repo) identity as well. A URL
+    # whose identity cannot be parsed (a relative path) cannot be the public repo,
+    # whose URL always parses, so the exact-string comparison above stands for it.
+    origin_ids = {_repo_identity_from_url(u) for u in origin_urls} - {None}
+    dest_ids = {_repo_identity_from_url(u) for u in dest_urls} - {None}
+    return bool(origin_ids & dest_ids)
 
 
 def _remote_branch_sha(remote: str, branch: str, cwd: str | None = None) -> str | None:
@@ -8412,6 +13229,44 @@ def _urls_name_repo(urls: set[str], canonical: str) -> bool:
     return all(_repo_identity_from_url(u) == want for u in urls)
 
 
+def _no_pr_block_applies(urls: set[str]) -> bool:
+    """Whether the no-open-PR BLOCK enforces for a push to ``urls``.
+
+    Scoped to the configured PUBLIC repo only — the declared
+    ``github.user``/``github.public_repo`` in ``~/.genesis/config/genesis.yaml``,
+    the same source ``_scheduled_gate_applies`` uses. The reason it has to be
+    scoped at all is that the thing being enforced is not a property of branches
+    in general: ``ci.yml`` and the leak detector live in THIS repo and trigger on
+    ``pull_request`` to ITS default branch. On a private fork, on the backups
+    repo, on the voice repo, on any unrelated checkout a session wanders into,
+    "this branch has no open PR" is an ordinary state with no consequence — and
+    blocking it would refuse routine work for a reason that does not exist there.
+
+    Scoped by the push DESTINATION, not by the repo ``gh`` resolves for the
+    checkout. The two differ whenever ``branch.<name>.pushRemote`` or
+    ``remote.pushDefault`` points at a fork, and it is the destination that
+    decides whether CI will ever see the branch. Every URL must name the public
+    repo (``_urls_name_repo`` is ALL, host included). It is also a pure local
+    comparison — no second ``gh`` round-trip that could time out after the count
+    already answered.
+
+    **THE FAIL DIRECTION IS THE OPPOSITE OF ITS SIBLING, and that is deliberate.**
+    ``_scheduled_gate_applies`` returns True when the repo is undeterminable,
+    because silently skipping would be an evasion path on the very repo it
+    protects. Here an undeterminable repo returns False. The asymmetry follows
+    from what each failure costs: that gate withholds a MERGE, which a human is
+    standing over and can override with a sigil; this one refuses a PUSH, in
+    every session on the box, for a hygiene property — so a config this hook
+    cannot read, or push URLs it cannot resolve, would wedge ordinary work
+    everywhere with no way through and no way to tell why.
+    """
+    canonical = _canonical_public_repo()
+    if not canonical:
+        return False  # no declared public repo → nothing to scope to → do not block
+    # `github.user`/`github.public_repo` name a github.com repository.
+    return _urls_name_repo(urls, f"https://github.com/{canonical}")
+
+
 def _base_repo_identity(cwd: str | None = None) -> tuple[str, str, str] | None:
     """``(default_branch, owner_login, canonical_url)`` for the repo gh resolves, or None.
 
@@ -8443,6 +13298,781 @@ def _base_repo_identity(cwd: str | None = None) -> tuple[str, str, str] | None:
         return None
 
 
+#: The ONLY spelling of a destination the ``push_publish`` switch accepts:
+#: ``https://github.com/<owner>/<repo>`` with an optional ``.git`` and trailing
+#: slash — nothing else (no userinfo, no port, no extra path, and never the ssh or
+#: scp forms, whose transport is a program this hook cannot vouch for). An
+#: ALLOWLIST: two audit rounds found ways to reroute ssh and http transports that
+#: a denylist of config keys missed. Stricter than ``_repo_identity_from_url`` on
+#: purpose — that one keeps the LAST two path parts.
+_GH_HTTPS_URL = re.compile(
+    r"https://github\.com/(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)"
+    r"/(?P<repo>[A-Za-z0-9._-]+?)(?:\.git)?/?"
+)
+
+
+def _strict_github_slug(url: str) -> str | None:
+    """``owner/repo`` (lower-cased) when ``url`` is exactly the github.com https
+    form in ``_GH_HTTPS_URL``, else None. Matched on the RAW value: a URL with
+    leading or trailing whitespace is not that form, so it never qualifies."""
+    m = _GH_HTTPS_URL.fullmatch(url)
+    return f"{m.group('owner')}/{m.group('repo')}".lower() if m else None
+
+
+def _all_urls_are_public_repo(urls: set[str]) -> bool:
+    """Whether ``urls`` is NON-EMPTY and EVERY member names the configured public
+    repo exactly. An undeterminable public repo, an empty set, or one URL that is
+    not an exact match → False (keep the prompt)."""
+    canonical = _canonical_public_repo()
+    if not canonical or not urls:
+        return False
+    want = canonical.strip().lower()
+    return all(_strict_github_slug(u) == want for u in urls)
+
+
+def _recorded_remote_defaults(cwd: str | None) -> set[str] | None:
+    """Every default-branch ref the checkout RECORDED for any remote: the targets
+    of ``refs/remotes/*/HEAD`` (set by ``git clone`` and ``git remote set-head``),
+    e.g. ``refs/remotes/origin/develop``. One local call, no network, and keyed on
+    no remote name, so a push spelled as a raw URL or through a second remote with
+    the same URL is compared too. None on any error. Recorded state can be stale
+    or absent, so this can only ADD a default-branch name to compare against,
+    never vouch that a branch is not one."""
+    try:
+        args = ["git"] + (["-C", cwd] if cwd else [])
+        args += ["for-each-ref", "--format=%(symref)", "refs/remotes/*/HEAD"]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def _routine_dest_owned(
+    push_remote: str | None, urls: set[str], cwd: str | None, branch: str | None = None
+) -> bool:
+    """The ``push_routine`` destination scope: every push URL is a github.com
+    https repo of the configured public repo's OWNER (``github.user``), i.e. one
+    of this install's own repos. A raw-URL destination qualifies only when no
+    ``insteadOf`` rule could move it. An undeterminable owner, an empty set, an
+    ssh/scp form or any other host keeps the prompt. So does ``branch`` when ANY
+    remote's recorded default ref ends in ``/<branch>`` (or the refs cannot be
+    read): the caller's literal ``main``/``master`` check cannot see a default
+    named anything else. Over-matching only keeps a prompt."""
+    canonical = _canonical_public_repo()
+    if not canonical or not urls or not push_remote:
+        return False
+    if _looks_like_url(push_remote) and not _no_url_rewrite_rules(cwd):
+        return False
+    if branch:
+        defaults = _recorded_remote_defaults(cwd)
+        if defaults is None or any(ref.endswith(f"/{branch}") for ref in defaults):
+            return False
+    owner = canonical.split("/", 1)[0].strip().lower()
+    return all((_strict_github_slug(u) or "").split("/", 1)[0] == owner for u in urls)
+
+
+def _no_url_rewrite_rules(cwd: str | None) -> bool:
+    """True only when NO ``url.<base>.insteadOf``/``pushInsteadOf`` rule is set.
+
+    Needed for a RAW-URL destination: no remote section exists for ``git remote
+    get-url`` to expand, so the URL as typed is only the real destination when
+    nothing can rewrite it. A read error counts as "a rule may exist"."""
+    base = ["git"] + (["-C", cwd] if cwd else [])
+    got = _run_git_lines(base + ["config", "--get-regexp", r"^url\..*insteadof$"])
+    return got is not None and got[0] == 1
+
+
+#: Environment variables that pick a DIFFERENT repository, ref namespace or git
+#: program set than the one the checks below read through ``git -C <cwd>``. Set
+#: in the hook's environment, any of them keeps the ask. A per-command
+#: ``GIT_DIR=…`` prefix is refused separately (``_push_seg_has_no_prefix``); an
+#: ``export`` earlier in the command makes the cwd unknown (``_effective_cwd``).
+#: Same residue as ``_TRANSPORT_ENV``: a variable exported only in the Bash
+#: tool's shell profile is invisible here.
+_REPO_SELECTION_ENV = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_EXEC_PATH",
+)
+
+
+def _repo_selection_env_set() -> bool:
+    """Whether any ``_REPO_SELECTION_ENV`` variable is set in this process."""
+    return any(os.environ.get(v) for v in _REPO_SELECTION_ENV)
+
+
+def _push_publish_scope_holds(
+    push_remote, segs, push_seg, cmd, cwd, branch=None, hook_cwd=None
+) -> bool:
+    """Whether a FIRST push of the current branch may go unprompted under
+    ``hooks.asks.push_publish: off`` — i.e. every place it can land is the public
+    repo and nothing else in the command can change that.
+
+    Reached only from the first-publish ask of a push that already passed
+    ``_push_targets_current_branch`` (allowlisted flags, no env/wrapper prefix, no
+    ``-c``, and ``_push_config_is_simple``: one URL, push URL == fetch URL, no push
+    refspec / mirror / receivepack / followTags / submodule recursion). On top of
+    that:
+      * the destination's push URLs come from ``git remote get-url --push``, which
+        applies ``insteadOf``/``pushInsteadOf``; a raw-URL destination has no remote
+        to expand, so it qualifies only when no rewrite rule exists at all;
+      * every URL must be an EXACT public-repo match (``_all_urls_are_public_repo``);
+      * the command is exactly ONE plain ``git push`` (``_is_single_plain_push``)
+        — no other segment that runs before or beside it, since any neighbour can
+        change the push after this check (a ``cd``, a hook, an fsmonitor, a clean
+        filter). The two harmless spellings it admits — ``git -C <the top of a
+        worktree of this same repository>`` and an output-only ``2>&1 | tail -N``
+        suffix — are judged there; ``cwd`` is the directory every check below
+        reads, so a ``-C`` push is judged in the worktree it names;
+        OR that same plain push (no ``-C``, no output suffix) followed by ``&&``
+        and one ready ``gh pr create`` (``_push_then_pr_create``). The create
+        runs only after the push has finished, so it cannot change where the
+        push went. On the public repo a first push that is not that chained form
+        (other than a dry run) is denied before this is consulted, so there the
+        chained form is what reaches here;
+      * no repository-selecting variable (``_REPO_SELECTION_ENV``) is set in the
+        hook's environment;
+      * a live probe confirms the branch is absent on the destination.
+    Anything else returns False and the prompt stands."""
+    if not push_remote:
+        return False
+    # FIRST, before any helper shells out: every probe below inherits this
+    # environment, so a repository-selecting variable would answer each of them
+    # about the overriding repository instead of the one named.
+    if _repo_selection_env_set():
+        return False
+    if not (
+        _is_single_plain_push(segs, push_seg, cmd, hook_cwd=hook_cwd, push_cwd=cwd)
+        or _push_then_pr_create(segs, push_seg, cmd, cwd) is not None
+    ):
+        return False
+    named = _raw_remote_push_urls(push_remote, cwd)
+    if named is None:
+        return False
+    if named:
+        urls = named
+    elif _looks_like_url(push_remote) and _no_url_rewrite_rules(cwd):
+        urls = {push_remote}
+    else:
+        return False
+    if not _all_urls_are_public_repo(urls):
+        return False
+    if not _transport_is_plain(push_remote if named else None, cwd):
+        return False
+    # LAST, because it is the one network call: the caller reached here because
+    # `_push_is_republish` said "not confirmed present", which is ALSO its answer
+    # to an ls-remote error or timeout. Silencing on that would let an
+    # already-public branch with no open PR skip the no-open-PR check.
+    return len(urls) == 1 and _remote_branch_definitely_absent(next(iter(urls)), branch, cwd)
+
+
+#: Characters that make a command anything other than ONE simple command:
+#: separators and control operators (``;``, ``&``, ``|``, newlines), redirections
+#: and here-docs (``<``, ``>``), subshells, groups and substitutions (``(``,
+#: ``)``, ``{``, ``}``, ``$``, backtick), and the backslash (escapes and line
+#: continuations), plus the glob characters ``*``, ``?`` and ``[``: a branch name
+#: cannot contain them, but a remote name written straight into config can, so a
+#: glob could expand to a different word than the one judged. Inside quotes they
+#: would be harmless, but a quoted ``;`` in a first push is not worth modelling:
+#: the command simply keeps its prompt.
+_SINGLE_PUSH_FORBIDDEN = frozenset(";&|<>(){}$`\\\n\r*?[")
+
+
+#: The only later stages a silenced first push may pipe into: ``head`` or ``tail``
+#: with a line count, and nothing else — no file operand, no ``-f``, no ``-c``,
+#: no ``+N``. Both only read stdin and write stdout, so neither can change where
+#: the push lands. One side effect is stated rather than hidden: ``head`` exits
+#: after N lines, and git's next write to the pipe can then die of SIGPIPE, cutting
+#: a push short (perhaps before ``-u`` records the upstream). That can only make
+#: less happen, never something else. A CLOSED set on purpose:
+#: ``tee`` writes files, ``xargs``/``sh``/``bash`` run what they read, and an
+#: open "filters are fine" rule is the neighbour allowlist that two audit rounds
+#: already outran.
+_PUSH_OUTPUT_FILTER = re.compile(r"(?:head|tail)[ \t]+(?:-[0-9]{1,6}|-n[ \t]+[0-9]{1,6})")
+_PUSH_OUTPUT_FILTER_EXES = frozenset({"head", "tail"})
+#: ``2>&1`` on the push itself: stderr joins stdout, which goes to the pipe or
+#: the terminal. Never a file — ``>`` with a path stays forbidden.
+_PUSH_STDERR_MERGE = re.compile(r"(?P<text>.*?)[ \t]+2>&1[ \t]*", re.DOTALL)
+
+
+def _split_push_output_suffix(cmd: str):
+    """``(push_text, filter_argvs)`` when ``cmd`` is ``<push_text>[ 2>&1][ | <filter>]…``
+    with every filter matching ``_PUSH_OUTPUT_FILTER``; ``(cmd, [])`` when there
+    is no such suffix; None when a ``|`` stage is anything else.
+
+    Text-level and CLOSED: the suffix vocabulary is ``|``, ``2>&1``, ``head``,
+    ``tail``, ``-n``, digits and blanks, so no quote, ``#``, ``&``, ``;``, ``>``
+    or newline can hide in it. A ``|`` inside a quoted push argument splits the
+    push text here, which leaves an unbalanced quote or a non-filter stage and
+    so refuses — never the other way round. ``|&`` and ``||`` leave a stage that
+    is not a filter, and refuse too."""
+    head, *stages = cmd.split("|")
+    filters: list[list[str]] = []
+    for stage in stages:
+        stage = stage.strip(" \t")
+        if not _PUSH_OUTPUT_FILTER.fullmatch(stage):
+            return None
+        filters.append(stage.split())
+    m = _PUSH_STDERR_MERGE.fullmatch(head)
+    text = m.group("text") if m else head
+    if not stages and not m:
+        return cmd, []
+    if "#" in cmd:
+        # A comment would swallow the suffix (or the push's own tail) in bash
+        # while this split still reads it. Never worth modelling.
+        return None
+    return text, filters
+
+
+def _git_toplevel(path: str) -> str | None:
+    """``git -C <path> rev-parse --show-toplevel``, or None on any failure."""
+    got = _run_git_lines(["git", "-C", path, "rev-parse", "--show-toplevel"])
+    if got is None or got[0] != 0 or len(got[1]) != 1:
+        return None
+    return got[1][0]
+
+
+def _dash_c_names_sibling_worktree(path: str, hook_cwd) -> bool:
+    """Whether ``git -C <path>`` provably names the TOP of a worktree of the same
+    repository as the session's own cwd — the one ``-C`` the ``push_publish``
+    suppression admits.
+
+    Each condition closes a way ``-C`` reached a different repository than the
+    one the guard judged:
+      * ``path`` is ABSOLUTE and equals its own ``realpath`` — no symlink in any
+        component, no ``..``, no ``~`` (bash expands a leading tilde; Python's
+        realpath does not, so an unexpanded ``~`` can never compare equal), no
+        trailing slash. That is the audited ``-C lnk/..`` class: git follows the
+        link before applying ``..``, ``normpath`` does not;
+      * ``path`` IS the worktree's top level (``rev-parse --show-toplevel``), so
+        it is not a subdirectory whose own nested repository git would find;
+      * its git common dir equals the hook cwd's (both realpath'd), so it is a
+        worktree of THIS repository. Per-worktree config (``config.worktree``
+        under ``extensions.worktreeConfig``) can still differ — a pushurl, a
+        rewrite, a ``core.hooksPath`` — which is why every scope check after
+        this one reads ``push_cwd``, the ``-C`` directory itself: the push is
+        judged exactly as a plain ``git push`` run inside that worktree.
+    Anything unreadable → False, and the push keeps its prompt. The literalness
+    of the word itself (no ``$``, glob, brace or backslash) is enforced by the
+    caller's ``_SINGLE_PUSH_FORBIDDEN`` scan.
+
+    Refuses on its own when a ``_REPO_SELECTION_ENV`` variable is set, rather than
+    relying on its caller to have checked: the git probes below inherit this
+    environment, and a ``GIT_DIR`` there makes ``-C`` irrelevant, so two
+    unrelated directories would both report the overriding repository's top
+    level and common dir (MEASURED by review: the comparison then passes)."""
+    if _repo_selection_env_set():
+        return False
+    if not isinstance(path, str) or not isinstance(hook_cwd, str) or not hook_cwd:
+        return False
+    if not os.path.isabs(path):
+        return False
+    try:
+        if os.path.realpath(path) != path:
+            return False
+    except (OSError, ValueError):
+        return False
+    if _git_toplevel(path) != path:
+        return False
+    mine = _git_common_dir(path)
+    return mine is not None and mine == _git_common_dir(hook_cwd)
+
+
+def _is_single_plain_push(
+    segs, push_seg, cmd: str, hook_cwd=None, push_cwd=None, *, allow_output_filters: bool = True
+) -> bool:
+    """Whether the WHOLE command is exactly one top-level ``git push …``, in one
+    of the few spellings that cannot change what the push does.
+
+    The ``push_publish`` suppression judges the repository the push's cwd names,
+    before anything runs. Anything else in the command can change what the push
+    does after that judgement — a ``cd`` (through ``CDPATH``, in a pipeline, in
+    the background), a ``git status`` that runs ``core.fsmonitor``, a ``git
+    add`` that runs a clean filter, a ``git commit`` whose hook rewrites the push
+    URL or switches branch, a ``-C`` through a symlink. Two audit rounds found
+    members of that class faster than a neighbour allowlist could absorb them,
+    so the rule is structural: the push is the only segment that is not an
+    output filter; no shell metacharacter in the push text; the text
+    re-tokenizes to exactly its argv (no assignment prefix, no wrapper); and
+    ``push`` immediately follows ``git`` — except for exactly ONE global option:
+
+      * ``git -C <path> push …`` where ``_dash_c_names_sibling_worktree`` holds
+        for the payload's cwd (``hook_cwd``) and ``<path>`` is the directory the
+        caller resolved and judged (``push_cwd``). Every other global option —
+        ``-c``, ``--git-dir``, ``--work-tree``, ``--namespace``,
+        ``--config-env``, a second ``-C``, the pager switches — still refuses.
+
+    And exactly one suffix (``_split_push_output_suffix``): ``2>&1`` on the push
+    and/or a pipeline into ``head``/``tail`` line counts. Those stages start
+    beside the push, but they read stdin and write stdout and cannot touch the
+    repository, its config or the network; each must also be a parsed top-level
+    segment whose argv is the filter exactly. Applies to the suppression only;
+    the re-push allow keeps ``_push_compound_is_inert``.
+
+    ``allow_output_filters=False`` (the force path) refuses that suffix too: a
+    force push off the public repo must be the push and nothing else, since a
+    ``tail`` resolved through a shell function or PATH shim is a step the
+    approval prompt never describes."""
+    split = _split_push_output_suffix(cmd)
+    if split is None:
+        return False
+    text, filters = split
+    if not allow_output_filters and (filters or text != cmd):
+        return False
+    if len(segs) != 1 + len(filters) or segs[0] is not push_seg:
+        return False
+    for seg, words in zip(segs[1:], filters, strict=True):
+        if getattr(seg, "depth", 0) or getattr(seg, "exe", "") not in _PUSH_OUTPUT_FILTER_EXES:
+            return False
+        if list(getattr(seg, "argv", None) or []) != words:
+            return False
+    return _text_is_plain_push(text, push_seg, hook_cwd=hook_cwd, push_cwd=push_cwd)
+
+
+def _text_is_plain_push(
+    text: str, push_seg, hook_cwd=None, push_cwd=None, *, allow_dash_c: bool = True
+) -> bool:
+    """Whether ``text`` is exactly ``push_seg`` spelled as one plain ``git push …``:
+    top level, no character of ``_SINGLE_PUSH_FORBIDDEN``, no prefix or wrapper,
+    re-tokenizing to exactly the segment's argv with ``push`` straight after
+    ``git`` — or, when ``allow_dash_c``, after one ``-C`` that
+    ``_dash_c_names_sibling_worktree`` accepts. The text-level half of
+    ``_is_single_plain_push``, shared with ``_push_then_pr_create`` so the push
+    half of the chained shape is held to the identical rule. That caller passes
+    ``allow_dash_c=False``: its ``gh pr create`` runs in the session's own
+    directory, not the ``-C`` one, so it would open the PR for whatever branch
+    is checked out THERE."""
+    if getattr(push_seg, "depth", 0):
+        return False
+    if any(c in _SINGLE_PUSH_FORBIDDEN for c in text):
+        return False
+    if not _push_seg_has_no_prefix(push_seg):
+        return False
+    try:
+        words = shlex.split(text, comments=True)
+    except ValueError:
+        return False
+    argv = list(getattr(push_seg, "argv", None) or [])
+    if words != argv or len(words) < 2 or words[0] != "git":
+        return False
+    if words[1] == "push":
+        return True
+    if allow_dash_c and len(words) >= 4 and words[1] == "-C" and words[3] == "push":
+        return push_cwd == words[2] and _dash_c_names_sibling_worktree(words[2], hook_cwd)
+    return False
+
+
+#: ``gh pr create`` options the chained first-push shape accepts — a CLOSED set,
+#: so an option nobody listed (``--draft``/``-d``, ``--web``/``-w``,
+#: ``--dry-run``, ``--head``/``-H``, ``--repo``/``-R``, ``--base``/``-B``,
+#: ``--editor``/``-e``, a bundle such as ``-fd``, a positional) disqualifies the
+#: shape rather than being guessed about. Each of those can leave the branch with
+#: no PR, a draft PR, or a PR that is not this branch's PR onto the default
+#: branch. Value-taking options consume the next token, as gh's flag parser does
+#: for a separate value (``--title -d`` is a title, not ``--draft``).
+#:
+#: The metadata options — ``--label``/``-l``, ``--assignee``/``-a``,
+#: ``--reviewer``/``-r``, ``--milestone``/``-m``, ``--project``/``-p`` — are
+#: deliberately OUT of the set: gh resolves each name before it creates the PR
+#: and fails the whole create on one it cannot resolve (reported by the review
+#: that found this gap; not re-measured here), which in the chained shape
+#: happens AFTER the push has published the branch. They go on afterwards with
+#: ``gh pr edit``, where a failure leaves the PR in place.
+_CREATE_VALUE_LONG = frozenset({"title", "body", "body-file"})
+_CREATE_VALUE_SHORT = frozenset("tbF")
+_CREATE_BOOL_LONG = frozenset({"fill", "fill-first", "fill-verbose", "no-maintainer-edit"})
+_CREATE_BOOL_SHORT = frozenset({"-f"})
+
+#: Characters that make the create's text more than literal words, refused
+#: wherever they appear (quoted or not — telling the two apart is shell
+#: modelling): a newline or CR would start another command; ``$`` and backtick
+#: expand at run time (a substitution can yield ``--draft``); a backslash
+#: escapes; ``*``, ``?`` and ``[`` glob (``--title *`` becomes several words in
+#: a directory with several files, and gh then fails AFTER the push); ``{``
+#: brace-expands; ``~`` tilde-expands. A body carrying one belongs in
+#: ``--body-file``; a title carrying one needs rewording.
+_CREATE_TEXT_FORBIDDEN = frozenset("$`\\\n\r*?[{~")
+
+
+#: Short value flags spelled out, so a value can be filed under its long name.
+_CREATE_SHORT_TO_LONG = {"t": "title", "b": "body", "F": "body-file"}
+_CREATE_FILL_FLAGS = frozenset({"fill", "fill-first", "fill-verbose"})
+
+#: The most of a ``--body-file`` the hook reads, in bytes. A larger file does
+#: not qualify: the hook will not read an unbounded file. The byte bound only
+#: limits the read; the real limit is ``_CREATE_BODY_MAX_CHARS``.
+_CREATE_BODY_FILE_MAX = 1024 * 1024
+#: The longest PR body GitHub accepts, in characters (its API rejects a longer
+#: one, per the review of this rule; not re-measured here). A longer body fails
+#: the create AFTER the push, so it does not qualify, from a file or literal.
+_CREATE_BODY_MAX_CHARS = 65536
+#: The longest PR title that qualifies, in characters. GitHub rejects longer
+#: titles, so the create would fail AFTER the push. The figure is the one this
+#: repository already enforces for issue titles (scripts/file_tracker_issue.py,
+#: "GitHub rejects titles beyond ~256"); not re-measured for PRs here.
+_CREATE_TITLE_MAX_CHARS = 256
+
+
+def _body_file_is_readable(path: str) -> bool:
+    """Whether ``path`` is a regular file this process can open and read in full
+    (at most ``_CREATE_BODY_FILE_MAX`` bytes) as UTF-8 — i.e. gh, running as the
+    same user right after the push, will be able to read the body from it.
+
+    An existence check is not enough: an unreadable regular file passes
+    ``os.path.isfile`` while gh's open of it fails AFTER the push, leaving the
+    branch public with no PR. Only a regular file is opened, so a FIFO, a device
+    or ``/dev/stdin`` can never block the hook or consume its input: the path is
+    opened ONCE, non-blocking, and the type is checked on that descriptor
+    (``fstat``), so nothing can swap the file between the check and the read.
+    The decoded text must also fit ``_CREATE_BODY_MAX_CHARS``. Any failure →
+    False."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        chunks: list[bytes] = []
+        remaining = _CREATE_BODY_FILE_MAX + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > _CREATE_BODY_FILE_MAX:
+            return False
+        return len(data.decode("utf-8")) <= _CREATE_BODY_MAX_CHARS
+    except (OSError, ValueError):
+        return False
+    finally:
+        os.close(fd)
+
+
+def _create_opts_open_a_ready_pr(argv: list[str], cwd: str | None = None) -> bool:
+    """Whether a ``gh pr create`` argv uses only ``_CREATE_*`` options AND is a
+    form gh accepts with no terminal, so as far as the TEXT can say it opens a
+    ready (non-draft) PR for the current branch onto gh's resolved base (what gh
+    resolves at run time is not modelled; see ``_push_then_pr_create``). Anything
+    outside the closed set, or any form gh refuses non-interactively → False.
+
+    The second half matters because the create runs AFTER the push: a create that
+    fails leaves the branch public with no PR, the very state this shape exists to
+    rule out. MEASURED with gh 2.101 and stdin from /dev/null:
+
+      * gh refuses unless it has a title AND a body, or one fill flag — "must
+        provide `--title` and `--body` (or `--fill` or `fill-first` or
+        `--fillverbose`) when not running interactively". So a bare create, a
+        lone ``--title``, a lone ``--body``/``--body-file`` all fail;
+      * two different fill flags fail ("`--fill` is not supported with
+        `--fill-first`");
+      * a ``--body-file`` that does not exist ("open nope.md: no such file or
+        directory") or is a directory ("read adir: is a directory") fails.
+
+    So a qualifying create carries a title (``--title``/``-t``) and a body
+    (``--body``/``-b`` or ``--body-file``/``-F``), or exactly one of ``--fill``/
+    ``-f``, ``--fill-first``, ``--fill-verbose``. Every ``--body-file`` must name
+    a regular file the hook can actually read as UTF-8 (``_body_file_is_readable``),
+    resolved against ``cwd`` (the push's directory; the chained shape has no
+    ``cd``), and never ``-`` (stdin, whose content the hook cannot see). A short
+    value flag's value is read as gh reads it: ``-F=body.md`` names ``body.md``. A ``--title`` that is present must not be blank: gh's
+    flag check accepts ``--title ""``, but a PR cannot be created without a title
+    (INFERRED from the API, not measured — refusing it costs nothing). An
+    unknown ``cwd`` fails any ``--body-file`` check. ``--body`` and
+    ``--body-file`` together fail (gh: "specify only one of `--body` or
+    `--body-file`"), and so does a body longer than ``_CREATE_BODY_MAX_CHARS``
+    characters, literal or read from the file."""
+    if argv[:3] != ["gh", "pr", "create"]:
+        return False
+    values: dict[str, list[str]] = {}
+    fills: set[str] = set()
+    i = 3
+    while i < len(argv):
+        tok = argv[i]
+        if tok.startswith("--"):
+            name, eq, value = tok[2:].partition("=")
+            if name in _CREATE_VALUE_LONG:
+                if not eq:
+                    if i + 1 >= len(argv):
+                        return False
+                    value = argv[i + 1]
+                values.setdefault(name, []).append(value)
+                i += 1 if eq else 2
+            elif name in _CREATE_BOOL_LONG and not eq:
+                if name in _CREATE_FILL_FLAGS:
+                    fills.add(name)
+                i += 1
+            else:
+                return False
+        elif tok in _CREATE_BOOL_SHORT:
+            fills.add("fill")
+            i += 1
+        elif len(tok) >= 2 and tok[0] == "-" and tok[1] in _CREATE_VALUE_SHORT:
+            if len(tok) == 2:
+                if i + 1 >= len(argv):
+                    return False
+                value = argv[i + 1]
+            else:
+                # gh's flag parser (pflag) reads `-F=body.md` as the value
+                # `body.md`: one `=` straight after a short flag is a separator,
+                # not part of the value. Strip it so the checks below judge the
+                # value gh will use. A bare `-t=` therefore reads as an empty
+                # title and is refused (pflag may instead take it as the title
+                # "=" — not measured; refusing costs nothing).
+                value = tok[2:]
+                if value.startswith("="):
+                    value = value[1:]
+            values.setdefault(_CREATE_SHORT_TO_LONG[tok[1]], []).append(value)
+            i += 1 if len(tok) > 2 else 2
+        else:
+            return False
+    if len(fills) > 1:
+        return False
+    titles = values.get("title", [])
+    if titles and not titles[-1].strip():
+        return False  # gh keeps the LAST value of a repeated flag
+    if any(len(t) > _CREATE_TITLE_MAX_CHARS for t in titles):
+        return False
+    if values.get("body") and values.get("body-file"):
+        # gh: "specify only one of `--body` or `--body-file`", after the push.
+        return False
+    if any(len(b) > _CREATE_BODY_MAX_CHARS for b in values.get("body", [])):
+        return False
+    for path in values.get("body-file", []):
+        if path == "-" or cwd is None:
+            return False
+        if not _body_file_is_readable(os.path.join(cwd, path)):
+            return False
+    has_body = bool(values.get("body") or values.get("body-file"))
+    return bool(fills) or (bool(titles) and has_body)
+
+
+def _push_then_pr_create(segs, push_seg, cmd: str, cwd: str | None):
+    """The ``gh pr create`` segment when the WHOLE command is exactly
+    ``<one plain git push> && <one gh pr create>``, else None. ``cwd`` is the
+    push's directory (the create runs there too); the create opens the PR for
+    the current branch.
+
+    This is the only shape in which a first publication is followed by its PR
+    deterministically: ``&&`` runs the create exactly when the push succeeded,
+    and at that moment the branch is on the remote, so gh opens the PR rather
+    than pushing. Structural, like ``_is_single_plain_push``, and for the same
+    reason — a closed shape is checkable, a neighbour allowlist is not:
+
+      * exactly two parsed segments, both top level: the push, then the create;
+      * the text up to the FIRST ``&&`` is the push alone, held to
+        ``_text_is_plain_push`` and containing no ``#`` (bash would comment out
+        everything after it, ``&& gh pr create`` included). That text can hold no
+        ``;``, ``|``, ``&`` or newline, so the operator right after the push IS
+        that ``&&`` — a ``||`` or ``;`` join never qualifies;
+      * the text after it re-tokenizes to exactly the create's argv (no prefix,
+        wrapper, redirect, group or trailing ``&``), carries no
+        ``_CREATE_TEXT_FORBIDDEN`` character, and passes
+        ``_create_opts_open_a_ready_pr`` (no ``--draft``/``-d``, ``--web``,
+        ``--dry-run``, ``--head``, ``--repo``, ``--base``; a title and a body, or
+        one fill flag; any ``--body-file`` a readable UTF-8 file in ``cwd``).
+
+    This judges TEXT only. What gh resolves at run time — the base repository
+    (``gh repo set-default``, ``GH_REPO``/``GH_HOST`` in the environment), the
+    base branch (``branch.<b>.gh-merge-base``), whether the branch has commits
+    ahead of that base — is not knowable from the command, so it is not modelled
+    here. The guarantee that no branch stays public unchecked is the server-side
+    leak scan that runs on every branch push; this rule only makes the ordinary
+    case open its PR.
+
+    Anything else is None, and the caller treats the push as a bare first push."""
+    if len(segs) != 2 or segs[0] is not push_seg:
+        return None
+    create = segs[1]
+    if getattr(create, "depth", 0) or gh_pr_subcommand(create.argv) != "create":
+        return None
+    left, sep, right = cmd.partition("&&")
+    if sep != "&&" or "#" in left:
+        return None
+    if not _text_is_plain_push(left.strip(" \t"), push_seg, allow_dash_c=False):
+        return None
+    if any(c in _CREATE_TEXT_FORBIDDEN for c in right):
+        return None
+    try:
+        words = shlex.split(right, comments=True)
+    except ValueError:
+        return None
+    argv = list(getattr(create, "argv", None) or [])
+    if words != argv or not _create_opts_open_a_ready_pr(argv, cwd):
+        return None
+    return create
+
+
+def _remote_branch_definitely_absent(url: str, branch: str | None, cwd: str | None) -> bool:
+    """True ONLY when ``git ls-remote --exit-code`` against ``url`` answers that
+    ``refs/heads/<branch>`` does not exist (exit 2). A hit, any other exit code,
+    a timeout or any error is False, so the caller asks. Same shared deadline as
+    ``_remote_branch_sha``, plus two things that probe does not need:
+
+    * ``http.followRedirects=false`` — a renamed or moved repository answers with
+      a redirect; following it would vouch for a DIFFERENT repository than the
+      URL the push names, so a redirect fails the probe (non-2) and the prompt
+      stands;
+    * no interactive prompt (``GIT_TERMINAL_PROMPT=0``, empty ``GIT_ASKPASS``/
+      ``SSH_ASKPASS``) — a credential prompt would otherwise hang the hook until
+      its timeout."""
+    if not branch:
+        return False
+    try:
+        args = ["git", "-c", "http.followRedirects=false"] + (["-C", cwd] if cwd else [])
+        args += ["ls-remote", "--exit-code", "--heads", url, f"refs/heads/{branch}"]
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "SSH_ASKPASS": ""}
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=_gh_timeout(10.0), env=env
+        )
+    except Exception:
+        return False
+    return result.returncode == 2
+
+
+def _raw_remote_push_urls(name: str, cwd: str | None) -> set[str] | None:
+    """A remote's push URLs exactly as git prints them — only the line break is
+    removed, never surrounding whitespace, so a URL configured with a stray space
+    cannot be normalised into an exact match. Empty set: not a configured remote
+    (git exits 2). None: any other failure."""
+    try:
+        r = subprocess.run(
+            ["git"] + (["-C", cwd] if cwd else []) + ["remote", "get-url", "--push", "--all", name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if r.returncode == 2:
+        return set()
+    if r.returncode != 0:
+        return None
+    lines = r.stdout.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return set(lines) if lines and all(lines) else None
+
+
+#: Environment variables that can move or weaken an https push (proxies, TLS
+#: trust, ssh/proxy programs, injected git config). Any of them set in the
+#: HOOK's environment keeps the ask. Residue, stated rather than hidden: the
+#: hook does NOT see the environment the push runs in. The Bash tool's shell is
+#: initialised from the user's profile and hooks are not, so a variable exported
+#: only in a shell profile is invisible here. A per-command ``VAR=…`` prefix is
+#: refused separately (``_push_seg_has_no_prefix`` / ``_push_compound_is_inert``).
+_TRANSPORT_ENV = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+    "GIT_SSL_NO_VERIFY", "GIT_SSL_CAINFO", "GIT_SSL_CAPATH", "GIT_SSL_CERT", "GIT_SSL_KEY",
+    "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "GIT_PROXY_COMMAND", "GIT_SSH", "GIT_SSH_COMMAND",
+    "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+)
+
+
+def _transport_is_plain(remote: str | None, cwd: str | None) -> bool:
+    """Whether an https push to github.com goes out with stock transport.
+
+    ALLOWLIST posture for the http layer: ANY ``http.*`` key in the config git
+    reads for this repository (proxy, sslVerify, curloptResolve, per-URL
+    sections, extra headers …) keeps the ask, as does an unreadable config. On
+    top: ``remote.<r>.proxy`` (an http proxy outside ``http.*``) and
+    ``remote.<r>.vcs`` (hands the push to a remote helper whatever the URL), and
+    any of ``_TRANSPORT_ENV`` set in the hook's environment. ssh-only and
+    git://-only keys (``core.sshCommand``, ``core.gitProxy``) are not checked:
+    only the https form qualifies. Applied only by the ``push_publish``
+    suppression; the re-push allow is unchanged."""
+    if any(os.environ.get(v) for v in _TRANSPORT_ENV):
+        return False
+    base = ["git"] + (["-C", cwd] if cwd else [])
+    got = _run_git_lines(base + ["config", "--get-regexp", r"^http\."])
+    if got is None or got[0] != 1:
+        return False  # 0 = some http.* key is set; anything else = unreadable
+    if remote:
+        for key in (f"remote.{remote}.vcs", f"remote.{remote}.proxy"):
+            got = _git_config_get(base, key, all_values=True)
+            if got is None or (got[0] == 0 and got[1]):
+                return False
+    return True
+
+
+#: Appended to a first-publish ask that ``push_publish: off`` did not silence.
+_PUBLISH_OFF_MISS = (
+    "hooks.asks.push_publish is off, but this command did not qualify: "
+    "it is silenced only when EVERY destination resolves exactly to the "
+    "configured public repo and nothing else in the command can change that."
+)
+
+
+def _publish_ask_text(reason: str, publish_off: bool) -> str:
+    """The first-publish ask, plus why ``push_publish: off`` did not silence it
+    and any NOTE the policy raised (Claude Code drops an exit-0 hook's stderr, so
+    the prompt is the only place a misconfigured key can be reported)."""
+    if publish_off:
+        reason += f"\n\n{_PUBLISH_OFF_MISS}"
+    notes = _drain_ask_notes()
+    return f"{reason}\n\n{notes}" if notes else reason
+
+
+def _first_push_needs_pr_text(branch: str) -> str:
+    """The refusal for a first push to the public repo with no PR chained after
+    it. Written for the agent: what goes wrong, the exact command that passes,
+    and what to do instead when the work is not ready for review."""
+    return (
+        f"BLOCKED: this is the first push of '{branch}' to the public repo, and "
+        f"nothing in the command opens its PR. Pushed alone, the branch would be "
+        f"PUBLIC with NO PR, so CI never runs on it (ci.yml triggers on "
+        f"pull_request). This hook checks only this current-branch shape; the "
+        f"guarantee that no branch stays public unchecked is the server-side "
+        f"leak scan on branch pushes, not this check.\n"
+        f"Publish it and open its PR in ONE command, from the branch's own "
+        f"checkout:\n"
+        f'  git push -u origin HEAD && gh pr create --title "..." --body-file <file>\n'
+        f"Exactly that shape: one plain `git push` (no `cd`, `git -C` or other "
+        f"step), joined by `&&`, then one ready `gh pr create`. Without a "
+        f"terminal gh needs BOTH a non-empty title (--title/-t) AND a body "
+        f"(--body/-b, or --body-file/-F naming a readable UTF-8 file — not `-`; "
+        f"only one of the two, and at most 65,536 characters), OR "
+        f"exactly one of --fill/-f, --fill-first, --fill-verbose; a title is at "
+        f"most 256 characters; otherwise it "
+        f"fails after the push and leaves the branch with no PR. It may also "
+        f"carry --no-maintainer-edit. Values must be literal: no `$`, backtick, "
+        f"backslash, `*`, `?`, `[`, `{{` or `~` anywhere in the create (put the "
+        f"body in --body-file). No --label/-l, --assignee/-a, --reviewer/-r, "
+        f"--milestone/-m or --project/-p: gh fails the whole create on a name it "
+        f"cannot resolve, after the push — add them once the PR exists, with "
+        f"`gh pr edit --add-label …` etc. Never --draft/-d, --web, --dry-run, "
+        f"--head, --repo or --base.\n"
+        f"Do not reach for another push spelling instead: one this check does not "
+        f"read (another refspec, an extra flag) only raises an approval prompt, and "
+        f"once approved it still leaves the branch public with NO PR. Use the "
+        f"chained form above.\n"
+        f"Work that is not ready for a PR stays committed locally, unpushed.\n"
+        f"(If '{branch}' is in fact already on the remote, the presence check "
+        f"could not confirm it — a network failure reads as absent here — so "
+        f"retry the push.)"
+    )
+
+
+def _emit_context_only(note: str) -> int:
+    """Emit NO permission decision — only ``additionalContext`` — and return 0.
+
+    The house shape for a silenced ask (``needs_user.decide`` with an
+    ``ask_key``): this hook stops objecting and approves nothing, so Claude
+    Code's own permission settings and the other hooks still decide the command.
+    An ``allow`` here would approve every other step of a compound command."""
+    payload = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": note}}
+    try:
+        from hook_output import print_json_bounded
+
+        print_json_bounded(payload, text_keys=("hookSpecificOutput.additionalContext",))
+    except Exception:  # noqa: BLE001 — the note must be delivered regardless
+        print(json.dumps(payload))
+    return 0
+
+
 def _ask(reason: str) -> int:
     """Emit a PreToolUse ``ask`` decision — a native approve/deny dialog.
 
@@ -8456,24 +14086,7 @@ def _ask(reason: str) -> int:
     """
     global _ASK_EMITTED
     _ASK_EMITTED = True
-    # Nothing is discarded YET here — the decision is still open — so this warns
-    # about what DECLINING costs, which is the thing a "block the push?" dialog
-    # otherwise hides.
-    if discarded_write is not None:
-        extra = discarded_write.prompt_note()
-        if extra:
-            reason = f"{reason}\n\n{extra}"
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "ask",
-                    "permissionDecisionReason": reason,
-                }
-            }
-        )
-    )
+    emit_native_ask(reason)
     return 0
 
 
@@ -8654,6 +14267,7 @@ def main() -> int:
     """
     global _ASK_EMITTED
     _PENDING_OVERRIDES.clear()  # a second call in-process must not inherit rows
+    _MERGE_READ_CACHE.clear()  # nor reads cached during another invocation
     _ASK_EMITTED = False
     outcome = "error"
     try:
@@ -8669,6 +14283,14 @@ def main() -> int:
 def _run_merge_and_push_gates() -> int:
     # An armed refusal must survive the malformed-payload exception tail.
     blind_spot_deny: str | None = None
+    round_compound_deny: str | None = None
+    round_autonomous_deny: str | None = None
+    #: A push that would leave a branch on the CONFIGURED PUBLIC repo with no
+    #: open PR: a RE-push of a PR-less branch, or a FIRST push not chained
+    #: `&& gh pr create` (`_push_then_pr_create`). A BLOCK there, because
+    #: PR-less public branches kept accumulating under the ask. Everywhere else
+    #: the ask is unchanged. Scoped by `_no_pr_block_applies`. See the sites below.
+    no_open_pr_deny: str | None = None
     try:
         payload = read_payload()
         cmd = field(payload, "command")
@@ -8688,8 +14310,26 @@ def _run_merge_and_push_gates() -> int:
 
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
-        create_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "create"]
-        merge_pr_segs = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"]
+        # A help request creates nothing; it used to raise the create arm's ask.
+        create_segs = [
+            s for s in segs
+            if gh_pr_subcommand(s.argv) == "create" and not gh_requests_help(s.argv)
+        ]
+        # `gh pr merge --help` merges nothing; it used to be refused as a merge
+        # without --admin (#2768).
+        merge_pr_segs = [
+            s for s in segs if gh_pr_subcommand(s.argv) == "merge" and not is_help_only(s.argv)
+        ]
+
+        # ── A PR merge spelled through the GitHub API → DENY (#2768) ──────
+        # Owner ruling 2026-10-05: refuse the SPELLING and name the gated
+        # command, so the merge runs every check below. Decided here, before
+        # any subprocess and before the blind-spot net, the same way in
+        # foreground and dispatched sessions: this path has no ask.
+        api_merge = _api_merge_deny(segs, cmd, payload)
+        if api_merge is not None:
+            print(api_merge, file=sys.stderr)
+            return 2
 
         # ── Blind-spot net: unverifiable near a gated op → DENY ────────────
         # Keep the broad raw-mention predicate: a failed parse cannot prove an
@@ -8721,6 +14361,74 @@ def _run_merge_and_push_gates() -> int:
         # honest split: an unreadable program naming a publish is worth
         # refusing, an unreadable program naming nothing is a Tuesday.
         hidden_gated_verb = any(s.verb_unresolved and s.exe in _GATED_EXES for s in segs)
+        # A bounds-type blind spot withholds the segments, and this fact with them:
+        # MEASURED, a continuation elsewhere in the command changed this guard's
+        # verdict on an unresolved verb. Recover the fact from the command itself.
+        if blind is not None and blind.bounds_induced and not hidden_gated_verb:
+            hidden_gated_verb = bool(unresolved_verb_programs(cmd) & _GATED_EXES)
+        # A LAUNCHER THE RESOLVER REFUSES TO MODEL, carrying a gated operation.
+        # `eval git push --no-verify` parses CLEANLY — `blind` is None — and
+        # resolves to `exe == "eval"`, so every predicate above sees no push and
+        # the raw-text net below never runs. MEASURED on the deployed guard:
+        # silent allow, where the bare spelling asks. Same class as
+        # `hidden_gated_verb` (an unreadable program naming a publish is worth
+        # refusing) and so it arms the SAME deferred deny, but it must sit
+        # OUTSIDE the `blind is not None` conjunct below — that is the whole
+        # defect: these segments are not blind, they are opaque.
+        # The carrier is what arms this, but the guard's own SUBJECT MATTER is
+        # what scopes it — the same shape `protected_paths_guard` uses at :262,
+        # where `\brm\b` gates its carrier arm.
+        #
+        # The distinction matters and an earlier revision of this line got it
+        # backwards. A text test is unsound for FINDING the operation: bash
+        # concatenates adjacent quoted fragments, so `eval "git pu""sh origin
+        # main"` runs `git push` while carrying no `push` token (MEASURED). It
+        # is sound for SCOPING a guard to the thing it gates, because a command
+        # that mentions no publish at all is not this guard's business however
+        # it is spelled. Dropping the scope made the branch ban the launcher
+        # rather than gate the operation: `eval ls -la`, `unshare -r whoami` and
+        # `systemd-run --user --scope -- /bin/true` were all refused by a PUSH
+        # guard, and the deny text told the reader to "run the git/gh command
+        # directly" on a command containing no git.
+        #
+        # MEASURED over the recorded corpus: 126 carrier hits unscoped, 22 once
+        # scoped — an 83% cut, with every attack spelling this change documents
+        # still refused, because each contains the literal `git`.
+        #
+        # The mention is read through `mentions`, the text the shell would
+        # assemble, so a word split by quotes or backslashes inside the carrier's
+        # own segment is still seen. The sibling guards read their carrier
+        # segments the same way, so they keep failing identically rather than
+        # taking opposite sides of one question.
+        # PER SEGMENT, not per command. A carrier verdict is "a fact about a
+        # SPECIFIC segment" — this file says so where it explains why
+        # `hidden_gated_verb` must not be suppressed by a different segment
+        # parsing — and reading the whole command string made it a fact about
+        # the command. MEASURED cost of that: `eval "$(ssh-agent -s)" && git
+        # commit -m x` was REFUSED, where the `eval` carries nothing gated and
+        # the `git commit` is a separate, fully-parsed segment the ordinary
+        # commit gate already handles.
+        #
+        # `_mentions_gated_op` OR the carrier net: the former is this guard's
+        # own definition of its business and already includes `gh pr create` —
+        # the FOURTH gated operation, which a hand-built regex silently dropped
+        # (MEASURED: `eval gh pr create …` scored mentions_gated=True,
+        # carrier_net=False, and was ALLOWED). The carrier net adds only
+        # `commit`, which the shared pattern must not carry — see its
+        # definition.
+        #
+        # Every attack spelling keeps the gated word INSIDE the carrier's own
+        # segment, so none of them is affected: `eval git push`,
+        # `eval git commit -n -m x`, `eval "git pu""sh origin main"`,
+        # `su ubuntu -c 'git push'`, `eval gh pr create …`.
+        carried_gated_op = any(
+            s.exe in _REPARSE_CARRIERS
+            and (
+                _mentions_gated_op(s.raw)
+                or mentions(s.raw, _CARRIER_GATED_MENTION)
+            )
+            for s in segs
+        )
         # The two predicates are NOT suppressed by the same thing, and collapsing
         # them into one `not (…parsed…)` guard was the defect.
         #
@@ -8741,7 +14449,33 @@ def _run_merge_and_push_gates() -> int:
             hidden_gated_verb
             or (
                 not (push_segs or merge_pr_segs or merge_git_segs or create_segs)
-                and _mentions_gated_op(cmd)
+                # The mention is read through `mentions`, the text the shell
+                # assembles: a word split by a line continuation is exactly the blind
+                # spot that returned no segments, so the raw text is the wrong place
+                # to look for it.
+                and (
+                    _mentions_gated_op(cmd)
+                    # BOUNDS-TYPE ONLY, both arms: an untokenizable command still
+                    # returns its segments, so the gates below see them.
+                    #
+                    # A hook-skipping COMMIT. On one line this guard refuses
+                    # `commit -n` from the segment (`commit_skips_hooks`); a withheld
+                    # parse has no segment, and `_GATED_MENTION` deliberately omits
+                    # `commit`, so the carrier net's word list is read instead. The
+                    # commit gate refuses the same commands on its own blind branch,
+                    # so this adds no refusal overall — it keeps this guard from
+                    # quietly depending on another one.
+                    or (
+                        blind.bounds_induced
+                        and mentions(cmd, _CARRIER_GATED_MENTION)
+                    )
+                    # A review request: widening this on an untokenizable command
+                    # would refuse every PR comment whose body carries an apostrophe.
+                    or (
+                        blind.bounds_induced
+                        and mentions(cmd, _GH_MENTION, _PR_MENTION, _COMMENT_MENTION)
+                    )
+                )
             )
         ):
             # Defer the syntax refusal so specific sqlite/no-verify blocks keep
@@ -8757,6 +14491,74 @@ def _run_merge_and_push_gates() -> int:
             )
             if blind.bounds_induced:
                 print(blind_spot_deny, file=sys.stderr)
+                return 2
+
+        if carried_gated_op and blind_spot_deny is None:
+            # Its OWN message: the blind one interpolates `blind.cause`/`.hint`,
+            # and there is no `blind` here — these segments parse cleanly. The
+            # blind branch keeps precedence when both fire, because its
+            # diagnosis is the sharper one.
+            #
+            # The remedy is deliberately NOT "rephrase until the guard stops
+            # matching" — that would be a bypass instruction. Both routes it
+            # offers submit to the gate: drop the launcher so the operation is
+            # visible, or keep the launcher and run the gated command as its own
+            # tool call where the ordinary gates see it.
+            blind_spot_deny = (
+                "BLOCKED: this command names a gated operation and runs a "
+                "launcher whose payload this guard cannot recover, so it "
+                "cannot verify what would actually run. The payload is not "
+                "inspected on purpose: adjacent quoted fragments concatenate, "
+                "so a carried command can be spelled past any inspection.\n"
+                "To proceed: run the git/gh command directly, without the "
+                "launcher, so the ordinary push and merge gates can see it — or "
+                "keep the launcher for the work that needs it and issue the "
+                "gated command as its own Bash call."
+            )
+
+        # ── Only the main session publishes ────────────────────────────────
+        # Inside an Agent-tool worker, git and gh run only from an ALLOWLIST of
+        # reads and local git work (owner policy 2026-10-05, made an allowlist
+        # 2026-10-10 after each review round found a write verb the denylist
+        # missed). A fan-out of agents each publishing its own branch put a run
+        # of approval prompts in front of the owner, and a subagent's `@codex
+        # review` request prompted the same way. Classified per segment by
+        # `_subagent_refusal`; anything not listed, including a verb built at run
+        # time, is refused with the hand-back message. It is a blanket rule, not
+        # a prompt substitute: a re-push the main thread would be allowed
+        # silently, a dry run, an ordinary PR comment and an in-thread finding
+        # reply are refused too. Ahead of the multiple-publish check so a
+        # subagent is not first told to split a command whose halves are each
+        # refused, and ahead of the round-escalation lookup, so a subagent's
+        # review request costs no network call. Reach: every segment the parse
+        # resolves, nested ones included; a command whose segments the parse
+        # withholds, or whose program is an expansion, and that names git or gh
+        # is refused below. NOT reached: a write run through a launcher the parse
+        # does not open (`eval`, `find -exec`, `watch`, a pipe into `bash`,
+        # process substitution, `env -S`, a shell function's body), a program
+        # git itself starts from config or the environment (a hook,
+        # `-c core.sshCommand`, `GIT_SSH_COMMAND`, `GIT_SEQUENCE_EDITOR`, a
+        # credential helper), a write made by a program that is not git or gh
+        # (curl to the API, another CLI), and anything outside the Bash tool (an
+        # MCP GitHub tool).
+        # This instructs a cooperating agent; it is not a security boundary. A
+        # main-thread session carries no `agent_id` and is unaffected, `--agent`
+        # sessions included.
+        if _is_subagent(payload):
+            refused = [w for w in map(_subagent_refusal, segs) if w]
+            if refused:
+                print(_SUBAGENT_PUBLISH_DENY.format(what=", ".join(refused)), file=sys.stderr)
+                return 2
+            # A line continuation or a length/nesting bound withholds the
+            # segments, so the check above saw nothing; the shell may still run
+            # a write there, including one whose verb it builds at run time
+            # (`git "$(printf …)"`). Without segments nothing can be matched to
+            # the allowlist, so a command naming git or gh is refused.
+            withheld = blind is not None and blind.bounds_induced
+            if (withheld and mentions(cmd, _GIT_OR_GH_MENTION)) or any(
+                _program_may_be_git_or_gh(s, cmd) for s in segs
+            ):
+                print(_SUBAGENT_UNREADABLE_DENY, file=sys.stderr)
                 return 2
 
         # Each git push / gh pr merge is a SEPARATE gated action. A single Bash
@@ -8779,40 +14581,95 @@ def _run_merge_and_push_gates() -> int:
             )
             return 2
 
-        # ── Codex round-escalation gate (`gh pr comment … @codex review`) ──
-        # Once a PR already carries ESCALATION_ROUND_CAP Codex reviews,
-        # requesting another round is the whack-a-mole moment — force the
-        # step-back (triage / mechanism / state-space) before round N+1.
-        # Fail-open inside the check; '# escalation-ack' is the conscious
-        # continue after a fresh user decision.
         # ARM THE SHARED SUBPROCESS DEADLINE, once, for every gate below.
-        # It was previously armed only as a SIDE EFFECT of the escalation gate,
-        # which is documented fail-open, wraps its whole body in `except
-        # Exception: return`, and has already once had a top-of-function
-        # short-circuit that returned before the arming. The push path's
-        # wall-clock safety must not depend on another gate's internals: without
-        # a deadline the probes below are five sequential 10s caps plus an
-        # ls-remote, over the hook's registration — and a SIGKILLed PreToolUse
-        # hook fails OPEN, disengaging every gate in the stack.
+        # The push path's wall-clock safety must not depend on a review request
+        # being present: its sequential network probes can otherwise outlive the
+        # hook registration, and a SIGKILLed PreToolUse hook fails open.
         global _merge_deadline
         if _merge_deadline is None:
             _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
 
-        esc_block, esc_msg = _check_codex_round_escalation(segs)
-        if esc_block:
+        # ── Codex round-authorization gate (`gh pr comment … @codex review`) ──
+        # Review rounds (heads that drew findings; before the round-rule cutover,
+        # heads Codex reviewed) decide when standing authorization ends. A dispatched session cannot
+        # satisfy the native user decision; unreadable evidence takes the same
+        # safe direction rather than becoming zero rounds.
+        esc_decision, esc_msg = _check_codex_round_escalation(segs, cmd, payload)
+        if esc_decision == "deny":
             print(esc_msg, file=sys.stderr)
             return 2
+
+        if esc_decision in ("ask", "note") and _is_dispatched():
+            # Defer until the hard checks below have run. This remains a deny,
+            # but a force-push/no-verify/merge violation should retain its more
+            # specific diagnostic when both appear in one command.
+            round_autonomous_deny = esc_msg
+
+        if esc_decision in ("ask", "note"):
+            other_gated_actions = [
+                s
+                for s in segs
+                if git_subcommand(s.argv) in {"commit", "push", "merge"}
+                or gh_pr_subcommand(s.argv) in {"create", "merge", "close"}
+            ]
+            if other_gated_actions:
+                # Defer this refusal to the tail. Specific hard checks below
+                # (force push, --no-verify, merge gates, sqlite) must retain
+                # precedence over a compound-action diagnostic.
+                round_compound_deny = (
+                    "BLOCKED: this review request needs its own fresh user approval, "
+                    "but the same command also contains a commit, push, merge, close, "
+                    "or PR-create action. Run the review request separately so one "
+                    "approval cannot authorize multiple actions."
+                )
 
         # An interactive push defers to a native approve/deny dialog at the END
         # of main(), so every hard-block below (merge-into-main, the pr-merge
         # gates, sqlite, --no-verify) still takes precedence — a compound
         # `git push && git commit --no-verify` blocks, never asks.
-        ask_reason: str | None = None
+        ask_reason: str | None = (
+            esc_msg if esc_decision == "ask" and round_autonomous_deny is None else None
+        )
+        # An unreadable-history review prompt this install silenced
+        # (`hooks.asks.review_request: off`). Emitted at the tail as NO decision
+        # plus a context note, only if no block or other ask returned first.
+        review_note: str | None = (
+            _suppressed_reason("review_request", esc_msg)
+            if esc_decision == "note" and round_autonomous_deny is None
+            else None
+        )
         # A first-push-only re-push AUTO-ALLOW is ALSO deferred to the END (same
         # reason): emitting `_allow` inline would short-circuit the whole Bash
         # invocation before the hard-blocks run, so `git push <republish> && git
         # commit --no-verify` would sail through. Set the reason here; emit at the tail.
         push_allow_reason: str | None = None
+        # A first-publish prompt this install silenced (`hooks.asks.push_publish:
+        # off`, public-repo destinations only). Emitted at the tail as NO decision
+        # plus a context note, and only if nothing else set an ask or a block.
+        publish_note: str | None = None
+        # The `gh pr create` chained `&&` after a FIRST push (see
+        # `_push_then_pr_create`). It runs only once that push has succeeded, so
+        # it cannot itself publish; the create arm below skips its would-publish
+        # probe, which reads the remote BEFORE the push and would otherwise turn
+        # every chained first push into an ask.
+        first_push_create_seg = None
+        # A push onto an OPEN PR's branch from another checkout that this install
+        # silenced (`hooks.asks.push_pr_branch: off`). Same tail treatment as
+        # publish_note: no decision, a context note, and only if nothing else in
+        # the command set an ask or a block.
+        pr_branch_note: str | None = None
+        # Routine prompts this install silenced (`hooks.asks.push_routine: off`).
+        # Each ask below is classed: ROUTINE (a first push in any spelling,
+        # close-then-push, a PR-less re-push off the public repo, a re-push
+        # chained with other steps) or NOT (the round-cap ask this starts from, a
+        # force push, a publishing `gh pr create`, any other push). The tail
+        # silences only when every ask was routine and every push lands on a
+        # GitHub repo of the configured owner.
+        ask_routine = False
+        ask_nonroutine = ask_reason is not None
+        # (push_remote, urls, cwd, branch) of each routine ask, judged at the tail
+        # only when the key is off, so an install without it pays no git calls.
+        routine_dests: list[tuple] = []
 
         # ── git push (any branch) ──────────────────────────────────
         # Interactive → the user approves in a dialog only they can satisfy.
@@ -8838,20 +14695,44 @@ def _run_merge_and_push_gates() -> int:
             # all count as public ⇒ blocked (fail closed). Only a destination
             # whose push urls resolve AND are DISJOINT from origin's gets the
             # softer cautious-ask path — interactive asks, dispatched denies.
+            # A force push known to target origin is blocked before checking the
+            # command shape, preserving the specific public-destination message.
+            # Off-origin force pushes must be exactly one plain `git push`: a
+            # prefix, wrapper, global option, redirect or other step can make
+            # the pre-command destination read differ from what Git will push.
+            # For non-force pushes, command-borne config or a prefix is blocked
+            # regardless of destination; config-writing neighbour steps remain
+            # outside this command-config rule.
             force_segs = [s for s in push_segs if _push_is_force(s.argv)]
             if force_segs:
-                remote = _resolve_push_remote(force_segs[0], cwd=pcwd)
+                # The remote git will ACTUALLY push to: a bare push honours
+                # branch.<cur>.pushRemote and remote.pushDefault before the
+                # upstream, so the upstream alone could name a disjoint remote
+                # while the force lands on origin. Unresolvable is None: blocked.
+                remote = _effective_push_remote(
+                    force_segs[0], _current_branch(cwd=pcwd), cwd=pcwd
+                )
                 if pcwd_unknown or remote is None or remote == "origin":
                     print(
                         "BLOCKED: Force push to origin/<public> is not allowed — open a PR.",
                         file=sys.stderr,
                     )
                     return 2
+                if not _is_single_plain_push(
+                    segs, force_segs[0], cmd, allow_output_filters=False
+                ):
+                    print(
+                        "BLOCKED: a force push off the public repo must be the whole "
+                        "command — one plain `git push`, with no prefix, wrapper, git "
+                        "global option, redirect, pipe or other step — because the "
+                        "guard reads its destination before anything runs.",
+                        file=sys.stderr,
+                    )
+                    print("Run the force push on its own.", file=sys.stderr)
+                    return 2
                 # Classify by PUSH-url set — a non-"origin" name/url that shares any
                 # push url with origin is still a public force. Unresolvable ⇒ block.
-                dest_urls = _push_dest_urls(remote, cwd=pcwd)
-                origin_urls = _remote_push_urls("origin", cwd=pcwd)
-                if not dest_urls or not origin_urls or (dest_urls & origin_urls):
+                if _push_dest_meets_origin(remote, pcwd, pcwd_unknown):
                     print(
                         "BLOCKED: Force push to origin/<public> is not allowed — open a PR.",
                         file=sys.stderr,
@@ -8866,6 +14747,7 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                     return 2
+                ask_nonroutine = True
                 ask_reason = (
                     f"FORCE push detected — this REWRITES remote history on "
                     f"'{remote}' (a non-origin remote). Approve only if you "
@@ -8873,6 +14755,22 @@ def _run_merge_and_push_gates() -> int:
                 )
                 # Fall through: any hard-block below still takes precedence.
             else:
+                for push_seg in push_segs:
+                    if _push_carries_command_config(push_seg):
+                        print(
+                            "BLOCKED: this push carries a prefix, wrapper or git config "
+                            "option (-c / --config-env / VAR=…). Config supplied that "
+                            "way can retarget the push or make it a force push (e.g. "
+                            "remote.<name>.push=+…, remote.<name>.pushurl=…) that no "
+                            "flag shows, and the guard cannot read it before the "
+                            "command runs.",
+                            file=sys.stderr,
+                        )
+                        print(
+                            "Retype it as a plain `git push` (`-C <dir>` is fine).",
+                            file=sys.stderr,
+                        )
+                        return 2
                 # Non-force push: interactive asks, dispatched hard-denies.
                 _remote, branch = _get_push_remote_and_branch(push_segs[0], cwd=pcwd)
                 if _is_dispatched():
@@ -8899,8 +14797,12 @@ def _run_merge_and_push_gates() -> int:
                 #   • cur not in (main, master) → a push to the default branch never
                 #     goes silent (it is always on the remote);
                 #   • _push_targets_current_branch → a bare / `<remote>` / `<remote>
-                #     <cur>` push with only ref-neutral flags and (for bare/remote-only)
-                #     a simple repo config — everything else prompts;
+                #     <cur|HEAD|@|refs/heads/cur>` / `<remote> HEAD:refs/heads/<cur>`
+                #     push with only allowlisted global options and ref-neutral flags,
+                #     and — for EVERY shape — a config `_push_config_is_simple`
+                #     accepts; everything else prompts;
+                #   • _push_compound_is_inert (below) → no other segment could write
+                #     config before the push runs;
                 #   • _push_is_republish → live ls-remote confirms `cur` is present on
                 #     the remote git will ACTUALLY push to (pushRemote/pushDefault
                 #     resolved by _effective_push_remote, so a triangular fork workflow
@@ -8928,7 +14830,11 @@ def _run_merge_and_push_gates() -> int:
                     # first push was already approved), so it can never authorize a
                     # genuine first push; a broken/absent push_allowlist degrades to
                     # the pure ls-remote path (import guarded to None above).
-                    urls = _remote_push_urls(push_remote, cwd=pcwd) if push_remote else set()
+                    # `_push_dest_urls`, not `_remote_push_urls`: a destination
+                    # spelled as a raw URL names no configured remote, and without
+                    # its URL the open-PR lookup below sees no target, answers None,
+                    # and the public-repo no-PR block never runs.
+                    urls = _push_dest_urls(push_remote, cwd=pcwd) if push_remote else set()
                     # Deferred (NOT an inline return) so any hard-block in a compound
                     # command still takes precedence — see push_allow_reason above.
                     if push_allowlist is not None and push_allowlist.is_recorded(urls, cur):
@@ -8944,10 +14850,83 @@ def _run_merge_and_push_gates() -> int:
                             f"its first push); only the first push of a branch/PR prompts."
                         )
                     else:
-                        ask_reason = (
-                            f"git push needs your approval before publishing externally "
-                            f"(target: {branch or 'default'})."
-                        )
+                        # FIRST publication of `cur`. The install may silence this
+                        # one prompt (owner ruling 2026-10-01) — policy read first
+                        # so a misconfigured key announces itself on every such
+                        # ask, scope checked only when the key is off.
+                        publish_off = _ask_suppressed("push_publish")
+                        dry_run = _push_is_dry_run(push_segs[0])
+                        chained_create = _push_then_pr_create(segs, push_segs[0], cmd, pcwd)
+                        # The create is exempt from its would-publish probe only
+                        # where THIS rule judged it: a push that really
+                        # publishes (after a dry run the branch is still not on
+                        # the remote) to the configured public repo, whose
+                        # first push is denied unless the create qualifies.
+                        # Everywhere else the create keeps its probe and its
+                        # non-routine prompt, exactly as without this rule:
+                        # off the public repo `push_routine: off` could
+                        # otherwise silence a create that gh aims at another
+                        # repository (an inherited GH_REPO, say).
+                        if not dry_run and _no_pr_block_applies(urls):
+                            first_push_create_seg = chained_create
+                        # ON THE PUBLIC REPO a first push of the CURRENT branch
+                        # must bring its PR with it. Nothing else makes the PR
+                        # follow — the re-push block below only catches the
+                        # branch on its NEXT push, and a session that stops
+                        # after one push leaves it public with no PR. So the push
+                        # is refused unless the same command opens a ready PR
+                        # right after it (`&&`), whatever push_publish says: the
+                        # ask was never what created the PR. This is the client
+                        # half only, for the case a hook can read from text; the
+                        # guarantee that no branch stays public unchecked is the
+                        # server-side leak scan on every branch push. Other push
+                        # spellings keep the ask below. Same scope predicate, and the same
+                        # deferred slot, as the re-push block — so a hard block
+                        # elsewhere in the command still speaks first. A dry run
+                        # publishes nothing and keeps its old path. Dispatched
+                        # sessions never get here (denied above).
+                        if (
+                            chained_create is None
+                            and not dry_run
+                            and _no_pr_block_applies(urls)
+                        ):
+                            no_open_pr_deny = _first_push_needs_pr_text(cur)
+                        elif publish_off and _push_publish_scope_holds(
+                            push_remote, segs, push_segs[0], cmd, pcwd, branch=cur,
+                            hook_cwd=payload.get("cwd") if isinstance(payload, dict) else None,
+                        ):
+                            publish_note = _suppressed_reason(
+                                "push_publish",
+                                f"first push of '{cur}' to the configured public repo "
+                                f"({_canonical_public_repo()}).",
+                            )
+                            # Policy NOTEs (an unknown key, say) are drained
+                            # where this note is EMITTED, not here: a later arm's
+                            # ask can still win, and its own drain must find them.
+                        else:
+                            # `_push_is_republish` answers False on an ls-remote
+                            # error or timeout too, so "not confirmed present" is
+                            # not "absent": a branch already public with no open
+                            # PR would skip the no-open-PR block. Under
+                            # push_routine only (the probe is a network call),
+                            # this is routine only when every destination
+                            # definitely lacks the branch. Still classed routine
+                            # so the ask names why the key did not apply.
+                            ask_routine = True
+                            routine_dests.append((push_remote, urls, pcwd, cur))
+                            if _ask_suppressed("push_routine") and not (
+                                urls
+                                and all(
+                                    _remote_branch_definitely_absent(u, cur, pcwd)
+                                    for u in urls
+                                )
+                            ):
+                                ask_nonroutine = True
+                            ask_reason = _publish_ask_text(
+                                f"git push needs your approval before publishing "
+                                f"externally (target: {branch or 'default'}).",
+                                publish_off,
+                            )
                     # A RE-PUSH earns its silence by having been approved at
                     # first publication — but a public branch with NO OPEN PR is
                     # outside CI and the leak-detector (ci.yml triggers on
@@ -8971,6 +14950,8 @@ def _run_merge_and_push_gates() -> int:
                     )
                     if push_allow_reason and closes_pr:
                         push_allow_reason = None
+                        ask_routine = True
+                        routine_dests.append((push_remote, urls, pcwd, cur))
                         ask_reason = (
                             f"re-push to '{cur}': an earlier step in this command "
                             f"CLOSES a pull request, so the push that follows may "
@@ -8979,24 +14960,132 @@ def _run_merge_and_push_gates() -> int:
                             f"separate commands so each is judged on the state it "
                             f"actually runs in."
                         )
+                    # NO `gh pr create` exemption: whether a same-command create
+                    # yields a PR for THIS branch is not decidable from argv
+                    # (another --head, --dry-run, a failing create before `&&`,
+                    # a configured merge base). The ordinary push-then-create
+                    # flow is a first push and never reaches this arm.
+                    #
                     # A DRY RUN publishes nothing, so it cannot create the
-                    # unchecked-branch state this prompt reports. `-n` and
-                    # `--dry-run` are both accepted by the predicate above, so
-                    # they reach here; asking about them is pure friction on an
-                    # inspection command.
+                    # unchecked-branch state. `-n` and `--dry-run` both reach here
+                    # via the predicate above; refusing an inspection command is
+                    # pure friction.
+                    #
                     elif (
                         push_allow_reason
                         and not _push_is_dry_run(push_segs[0])
                         and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
                     ):
                         push_allow_reason = None
+                        if _no_pr_block_applies(urls):
+                            # BLOCKED on the public repo: PR-less branches kept
+                            # accumulating there under the ask (2 of 60 public
+                            # branches on 2026-09-25, both after the previous
+                            # cleanup). Only a RE-push reaches here; a first push
+                            # is judged above, where it may pass only chained
+                            # `&& gh pr create`, since the create needs the branch
+                            # on the remote. Dispatched sessions never get here
+                            # (`_is_dispatched()` denies every push above).
+                            no_open_pr_deny = (
+                                f"BLOCKED: re-push to '{cur}' — this branch is "
+                                f"PUBLIC but has NO OPEN PR, so CI and the leak "
+                                f"detector never run on it (ci.yml triggers on "
+                                f"pull_request; a branch with no PR matches no "
+                                f"trigger).\n"
+                                f"Open its PR first — `gh pr create` — then push "
+                                f"again. Or close the branch out if it is "
+                                f"finished with. Both leave the branch in a state "
+                                f"something actually looks at."
+                            )
+                        else:
+                            # Off the public repo — or when the public repo is not
+                            # declared — the pre-existing ask, unchanged.
+                            ask_routine = True
+                            routine_dests.append((push_remote, urls, pcwd, cur))
+                            ask_reason = (
+                                f"re-push to '{cur}': this branch is PUBLIC but has "
+                                f"NO OPEN PR, so CI and the leak scan never run on "
+                                f"it. Approve to push, then open its PR "
+                                f"(gh pr create) — or close the branch out."
+                            )
+                    # Ordered AFTER the no-PR arm: that arm denies on the public
+                    # repo, and a compound must not turn its deny into this ask.
+                    # Config is read before ANY segment runs, so a step that
+                    # writes config or remotes ahead of the push is invisible
+                    # to the predicate that just passed. Only an allowlisted
+                    # neighbour keeps the relaxation.
+                    elif push_allow_reason and not _push_compound_is_inert(segs, push_segs[0], cmd):
+                        push_allow_reason = None
+                        ask_routine = True
+                        routine_dests.append((push_remote, urls, pcwd, cur))
                         ask_reason = (
-                            f"re-push to '{cur}': this branch is PUBLIC but has "
-                            f"NO OPEN PR, so CI and the leak scan never run on "
-                            f"it. Approve to push, then open its PR "
-                            f"(gh pr create) — or close the branch out."
+                            f"re-push to '{cur}': another step in this command "
+                            f"may change git config or remotes before the push "
+                            f"runs, so the config check could not see what the "
+                            f"push will use. Run the push as its own command to "
+                            f"skip this prompt."
                         )
+                elif (
+                    not pcwd_unknown
+                    and cur
+                    and cur not in ("main", "master")
+                    and (
+                        pr_dst := _refspec_onto_other_branch(
+                            push_segs[0], cur, push_remote, cwd=pcwd
+                        )
+                    )
+                ):
+                    # `git push <remote> <cur>:refs/heads/<dst>` from a scratch
+                    # checkout: the way a session updates a PR's branch while that
+                    # branch is checked out in another worktree. Under its OWN key
+                    # (owner ruling 2026-10-10), so push_routine never reaches it:
+                    # it stays classed non-routine, as it was. Silenced only when
+                    # <dst> has an OPEN PR on this repository (which also means it
+                    # is already public and CI runs on it), the destination is an
+                    # owned GitHub repo and not a recorded default branch, and
+                    # nothing else in the command can change config first. An
+                    # unanswerable PR lookup (None) keeps the prompt. Steps before
+                    # the push pass on the re-push rule (_push_compound_is_inert),
+                    # not push_publish's single-command rule: the destination is
+                    # already public with an open PR, so a neighbouring `cd` or
+                    # `git status` changes nothing that leaves the machine. A silenced
+                    # push leaves ask_reason alone, so any ask already raised for
+                    # this command still wins at the tail.
+                    pr_branch_off = _ask_suppressed("push_pr_branch")
+                    if pr_branch_off:
+                        urls = _push_dest_urls(push_remote, cwd=pcwd) if push_remote else set()
+                        if (
+                            urls
+                            and _push_compound_is_inert(segs, push_segs[0], cmd)
+                            and _routine_dest_owned(push_remote, urls, pcwd, pr_dst)
+                            and (_open_pr_count_for_branch(pr_dst, cwd=pcwd, push_urls=urls) or 0)
+                            >= 1
+                        ):
+                            # Policy NOTEs are drained at emission, as for
+                            # publish_note, so an ask that wins keeps them.
+                            pr_branch_note = _suppressed_reason(
+                                "push_pr_branch",
+                                f"push of '{cur}' onto '{pr_dst}', the head of an open "
+                                f"pull request on this repository.",
+                            )
+                    if pr_branch_note is None:
+                        ask_nonroutine = True
+                        ask_reason = (
+                            f"git push needs your approval before publishing externally "
+                            f"(target: {branch or 'default'})."
+                        )
+                        if pr_branch_off:
+                            ask_reason += (
+                                "\n\nhooks.asks.push_pr_branch is off, but this push "
+                                "did not qualify: the destination branch has no open "
+                                "pull request here (or the lookup failed), the remote "
+                                "is not a github.com https repo of the configured "
+                                "owner, the branch is a recorded default branch, or "
+                                "another step in the command could change git config "
+                                "first."
+                            )
                 else:
+                    ask_nonroutine = True
                     ask_reason = (
                         f"git push needs your approval before publishing externally "
                         f"(target: {branch or 'default'})."
@@ -9010,15 +15099,56 @@ def _run_merge_and_push_gates() -> int:
         # main. A per-segment `# merge-to-main-override` acknowledges an intended
         # on-main merge; an ambiguous cwd fails closed (blocked). See
         # _walk_merge_into_main.
-        if merge_git_segs and _walk_merge_into_main(cmd, payload, merge_git_segs):
-            print(
-                "BLOCKED: Merging into main directly is not allowed.",
-                file=sys.stderr,
-            )
-            print(
-                "Use the PR workflow instead.",
-                file=sys.stderr,
-            )
+        merge_fired_on: list[str] = []
+        if merge_git_segs and _walk_merge_into_main(
+            cmd, payload, merge_git_segs, fired_on=merge_fired_on
+        ):
+            if "switched" in merge_fired_on:
+                mover = next(
+                    (f[len("switched-by:") :] for f in merge_fired_on if f.startswith("switched-by:")),
+                    "a git or gh command",
+                )
+                print(
+                    f"BLOCKED: `{mover}` runs before a merge in this command, and it is "
+                    "not one of the commands known to leave the current branch alone "
+                    "(add, commit, diff, fetch, log, pull, reset, restore, status and "
+                    "similar). This guard reads each merge's branch before the command "
+                    "runs, so it cannot tell which branch the merge lands on — main, "
+                    "or 'live', the local integration branch.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Run the branch switch and the merge as SEPARATE commands; the "
+                    "merge is then checked on the branch it actually runs on.",
+                    file=sys.stderr,
+                )
+            elif "unresolved" in merge_fired_on:
+                print(
+                    "BLOCKED: cannot tell which branch this merge lands on, and "
+                    "'# merge-to-main-override' covers main only, never 'live', the "
+                    "local integration branch.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Re-run it as a top-level command with a literal path "
+                    "(git -C /abs/path merge ...), without GIT_DIR or --git-dir.",
+                    file=sys.stderr,
+                )
+            elif "live" in merge_fired_on:
+                print(
+                    "BLOCKED: Merging into 'live', the local integration branch.",
+                    file=sys.stderr,
+                )
+                print(
+                    "'live' is rebuilt from origin/main plus the candidate branches "
+                    "in ~/.genesis/deploy_manifest.json, never merged into, and no "
+                    "override sigil applies. Put the change on a branch cut from "
+                    "origin/main and add that branch as a candidate.",
+                    file=sys.stderr,
+                )
+            else:
+                print("BLOCKED: Merging into main directly is not allowed.", file=sys.stderr)
+                print("Use the PR workflow instead.", file=sys.stderr)
             return 2
 
         # ── gh pr create ────────────────────────────────────────────
@@ -9027,8 +15157,17 @@ def _run_merge_and_push_gates() -> int:
         # create` prompts once (for the push) and the create rides along. BUT a
         # bare create from an UNPUSHED branch makes gh push (and possibly fork) the
         # branch itself — a code-publish that would bypass the push gate — so gate
-        # that form like a push: dispatched → deny, interactive → ask.
-        if create_segs and any(_pr_create_would_publish(s.argv) for s in create_segs):
+        # that form like a push: dispatched → deny, interactive → ask. The create
+        # chained `&&` after a first push is exempt from the probe: it runs only
+        # once the push succeeded, when the branch IS on the remote, and the push
+        # itself has already been judged (deny, ask, or a silenced note). The
+        # marker is set only for a push that is not a dry run — after `git push
+        # -n` the branch is still absent, so that create keeps its probe — and
+        # only when the push targets the configured public repo, where the
+        # first-push rule judged the create; off it the create keeps its probe.
+        if create_segs and any(
+            _pr_create_would_publish(s.argv) for s in create_segs if s is not first_push_create_seg
+        ):
             if _is_dispatched():
                 print(
                     "BLOCKED: this gh pr create would push a not-yet-pushed branch; "
@@ -9036,6 +15175,12 @@ def _run_merge_and_push_gates() -> int:
                     file=sys.stderr,
                 )
                 return 2
+            # NOT routine (owner ruling 2026-10-06): gh, not git, picks where the
+            # head is pushed (GH_REPO, --repo, its own remote choice), so the
+            # push_routine destination check cannot vouch for it. Marked whether
+            # or not a push already set the reason, so a create beside a silenced
+            # push still asks.
+            ask_nonroutine = True
             if ask_reason is None:
                 ask_reason = (
                     "gh pr create would push this (not-yet-pushed) branch — approve it like a push."
@@ -9151,6 +15296,16 @@ def _run_merge_and_push_gates() -> int:
                 sched_override = has_trailing_override(
                     merge_seg.raw, "scheduled-review-override"
                 )
+                # The owner-approved Codex stand-in (standing order, 2026-09-24).
+                # Like every row here it records the sigil's PRESENCE, noted before
+                # any gate can return. When the stand-in is actually USED, the merge
+                # arm amends the row's `waived` to `codex-freshness:used`; with Codex
+                # current, or with `# stale-review-override` beside it, the row keeps
+                # plain `codex-freshness`.
+                substitute_review = has_trailing_override(merge_seg.raw, "substitute-review")
+                # The rework-contract waiver (owner's yes required): passes a rebuild
+                # of a sent-back PR that lacks its acknowledgement or `## Rework`.
+                rework_override = has_trailing_override(merge_seg.raw, "rework-override")
                 # The FINDINGS waiver, read off the parsed segment rather than via
                 # has_trailing_override — which is why enumerating that helper's
                 # call sites missed the one sigil SKILL.md documents as logged.
@@ -9160,6 +15315,12 @@ def _run_merge_and_push_gates() -> int:
                     ("stale-review-override", stale_override, "codex-freshness+base-invariant"),
                     ("review-override", force_override, "review-body+inline-findings"),
                     ("scheduled-review-override", sched_override, "scheduled-claude-review"),
+                    (
+                        "substitute-review",
+                        substitute_review,
+                        "codex-freshness",
+                    ),
+                    ("rework-override", rework_override, "rework-contract"),
                 ):
                     if _present:
                         # `repo` is BLANK on one path, deliberately: a legacy
@@ -9186,6 +15347,67 @@ def _run_merge_and_push_gates() -> int:
                             repo=merge_repo,
                             head=merge_head,
                         )
+                # ── The squash body (argv only, no network, every merge) ──
+                # Text a merge writes into the squash commit is outside the leaks
+                # review, so the only body allowed is the file --check-pr wrote,
+                # which the content check after the binding recomputes. This used
+                # to run only inside the head binding, so `# stale-review-override`
+                # (which skips the binding) let --body/--subject text through.
+                # Both checks read the argv the HOOK parsed. A brace or glob in a
+                # word makes bash hand gh a different argv (`{--body,x}` is one word
+                # here and `--body x` to gh), so a merge segment carrying one is
+                # refused first, on every merge.
+                _expands = shell_rewrites(merge_seg.argv, redirects=False)
+                if _expands:
+                    print(
+                        f"BLOCKED: a gated merge cannot carry the shell character "
+                        f"{_expands!r}: brace and glob expansion make the shell pass gh "
+                        f"arguments this gate never saw. Run the merge-with line from "
+                        f"--check-pr as printed.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                body_file, body_file_problem = _merge_body_file(merge_seg.argv)
+                if body_file_problem or _merge_has_shadow_flag(merge_seg.argv):
+                    print(
+                        "BLOCKED: "
+                        + (body_file_problem + ". " if body_file_problem else "")
+                        + "--body/--subject/--author-email/-F can shadow the "
+                        "--match-head-commit binding, and text they carry reaches main "
+                        "unreviewed. Remove them; the only body a merge may carry is "
+                        "the --body-file that --check-pr writes and prints in its "
+                        "merge-with line.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if body_file is not None:
+                    _bf_why = ""
+                    if not merge_head:
+                        _bf_why = "it is not bound with --match-head-commit"
+                    elif len(segs) != 1 or not files_trusted(cmd, len(segs)):
+                        _bf_why = (
+                            "it is not a command of its own, so another part of the "
+                            "command could rewrite the file after this check reads it"
+                        )
+                    else:
+                        _words = command_words(cmd)
+                        _rewrite = (
+                            "unparseable" if _words is None
+                            else shell_rewrites(_words, redirects=True)
+                        )
+                        if _rewrite:
+                            _bf_why = (
+                                f"the command carries a redirect or expansion ({_rewrite!r}), "
+                                "which could change the file or the arguments after this check"
+                            )
+                    if _bf_why:
+                        print(
+                            f"BLOCKED: PR #{pr_num} — a merge carrying --body-file is "
+                            f"refused when {_bf_why}. Run the merge-with line from "
+                            f"--check-pr exactly as printed, as its own command.",
+                            file=sys.stderr,
+                        )
+                        return 2
                 # ── Merge-path gh TIMEOUT BUDGET ──────────────────────────
                 # This hook runs under a 60s CC wall-clock (settings.json). A
                 # wall-clock overrun SIGKILLs the hook MID-GATE, which "fails
@@ -9197,14 +15419,21 @@ def _run_merge_and_push_gates() -> int:
                 # (derive 6 + resolve 6 + mergeable 8 + ci 8 + base 6+6 +
                 # freshness 6+8 + delta 8 = 62s absolute worst; the FORCE
                 # branch swaps freshness+delta for its hook-surface evidence
-                # reads, files 8 + head 6 = strictly less) each reach
+                # reads, files 8 + head 6 = strictly less; a `# substitute-review`
+                # merge whose core freshness blocked adds head 6 + reviews 8,
+                # each clamped by `_gh_timeout` to what is left, so an overrun
+                # still fail-closes rather than running past the wall) each reach
                 # their own block/allow decision at or inside the budget, and
                 # any ONE of them timing out fail-closes IMMEDIATELY (the
                 # additive worst case needs every call slow-but-successful);
                 # the TOCTOU binding runs argv-only right after freshness, so
                 # only the tail advisory scanners (fail-OPEN by design) could
                 # ever be clipped, which nets the same outcome as their error
-                # path.
+                # path. A merge carrying --body-file adds the squash-body
+                # recompute right after the binding (commits 15 + body 6, each
+                # clamped by `_gh_timeout` to what is left): a drained budget
+                # there BLOCKS ("could not be recomputed"), never allows, and a
+                # merge without --body-file pays none of it.
                 # A timing-out fail-closed gate returns BLOCK immediately, so
                 # the additive worst case needs every call slow-but-successful.
                 mergeable = _check_mergeable(pr_num, repo=merge_repo)
@@ -9467,10 +15696,15 @@ def _run_merge_and_push_gates() -> int:
                 # blocks unless the unreviewed delta is provably review-trivial
                 # (smart-delta — see _check_codex_reviewed_head). Waived by
                 # # stale-review-override (NOT # review-override).
+                substitute_used: list[dict] = []
+                fresh_kwargs: dict = {}
+                if substitute_review:
+                    fresh_kwargs = {"substitute": True, "substitute_out": substitute_used}
                 should_block, fresh_msg, verified_head = _check_codex_reviewed_head(
                     pr_num,
                     force=stale_override,
                     repo=merge_repo,
+                    **fresh_kwargs,
                 )
                 if should_block:
                     print(
@@ -9479,6 +15713,39 @@ def _run_merge_and_push_gates() -> int:
                     )
                     print(_defang_gate_text(fresh_msg), file=sys.stderr)
                     return 2
+                bind_source = "Codex-verified"
+                if substitute_used:
+                    # A stand-in satisfied freshness. The owner approves each use IN
+                    # CONVERSATION before the session adds the sigil (ruling f7e8d2ed,
+                    # 2026-09-24, which replaced the native permission prompt this
+                    # arm used to raise): the sigil is the record of that yes, so the
+                    # gate announces the stand-in and marks the log row rather than
+                    # asking again. A dispatched session has nobody present who could
+                    # have approved it, so there the sigil cannot mean a yes: refused.
+                    _who = " and ".join(substitute_used[0]["reviewers"])
+                    bind_source = f"{_who}-verified"
+                    if _is_dispatched():
+                        print(
+                            f"BLOCKED: PR #{pr_num} — '# substitute-review' records the "
+                            f"owner's approval given in conversation, and a dispatched "
+                            f"session has nobody who could have given it. Codex has not "
+                            f"reviewed head "
+                            f"{verified_head[:12]}; {_who} has.",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    _amend_note("substitute-review", waived="codex-freshness:used")
+                    _who_labelled = " and ".join(
+                        _substitute_label(x) for x in substitute_used[0]["reviewers"]
+                    )
+                    print(
+                        f"NOTE: PR #{pr_num} — Codex has not reviewed head "
+                        f"{verified_head[:12]}; {_who_labelled} reviewed that exact head and "
+                        f"stands in for Codex under '# substitute-review' (the owner's "
+                        f"approval, given in conversation). Every other merge gate still "
+                        f"applies.",
+                        file=sys.stderr,
+                    )
 
                 # Bind the MERGE to the verified head (TOCTOU — Codex P1): a push
                 # landing between the check above and the merge would otherwise
@@ -9495,10 +15762,25 @@ def _run_merge_and_push_gates() -> int:
                 # TOCTOU race — must run first, while budget is guaranteed.
                 if verified_head:
                     bind_msg = _require_match_head(
-                        merge_seg.argv, pr_num, verified_head, merge_repo, "Codex-verified"
+                        merge_seg.argv, pr_num, verified_head, merge_repo, bind_source
                     )
                     if bind_msg:
                         print("BLOCKED: " + bind_msg, file=sys.stderr)
+                        return 2
+
+                # The squash body's CONTENT, right after the binding and before the
+                # slow scanners, for the binding's reason: a hook killed at its wall
+                # clock lets the command run, so the leak boundary goes early.
+                # A merge WITHOUT --body-file is allowed silently: the advisory for
+                # it lives in --check-pr's merge-with line, which is read, whereas
+                # stderr on this hook's exit-0 path is not delivered.
+                body_expected: list[str] = []
+                if body_file is not None:
+                    body_msg = _check_squash_body_file(
+                        pr_num, merge_repo, merge_head, body_file, expected_out=body_expected
+                    )
+                    if body_msg:
+                        print(f"BLOCKED: PR #{pr_num} — {body_msg}", file=sys.stderr)
                         return 2
 
                 # Unresolved review findings (review body) — AFTER freshness +
@@ -9548,7 +15830,8 @@ def _run_merge_and_push_gates() -> int:
 
                 # Scheduled Claude review at HEAD — its OWN fail-closed gate with its OWN
                 # sigil (# scheduled-review-override waives ONLY this gate; independent of
-                # # stale-review-override). Placed LAST, but ordering is no longer
+                # # stale-review-override). Placed after the finding scanners (only the
+                # `rework` gate follows it), but ordering is no longer
                 # safety-critical: the review-body + inline scanners now ALSO fail CLOSED
                 # on a clipped budget (PR #1434 removed their fail-open), so a drained
                 # merge-gate deadline BLOCKS at whichever gate hits its 1s floor first —
@@ -9583,6 +15866,36 @@ def _run_merge_and_push_gates() -> int:
                     )
                     print(_defang_gate_text(sched_msg), file=sys.stderr)
                     return 2
+
+                # Rework contract (owner decision): a rebuild of a sent-back PR needs
+                # the builder's acknowledgement on the old PR and a `## Rework`
+                # section. Same function and head as the `rework` report row, so the
+                # two agree. Waived ONLY by # rework-override (noted above). Never
+                # raises: the shared-deadline error is mapped inside the check.
+                rw_state, rw_msg = _check_rework(
+                    pr_num, merge_repo, head=verified_head, force=rework_override
+                )
+                if rw_state == REWORK_BLOCK:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — rework contract unmet.",
+                        file=sys.stderr,
+                    )
+                    print(_defang_gate_text(rw_msg), file=sys.stderr)
+                    return 2
+                if rw_state == REWORK_UNCHECKED:
+                    print(
+                        f"NOTE: rework gate could not check PR #{pr_num} — "
+                        f"{_defang_gate_text(rw_msg)} (advisory; not blocking).",
+                        file=sys.stderr,
+                    )
+                elif rw_state == REWORK_OK and "NOTE:" in rw_msg:
+                    print(_defang_gate_text(rw_msg), file=sys.stderr)
+                # Last, just before this arm allows: the body file once more.
+                if body_file is not None and body_expected:
+                    late_msg = _recheck_squash_body_file(body_file, body_expected[0])
+                    if late_msg:
+                        print(f"BLOCKED: PR #{pr_num} — {late_msg}", file=sys.stderr)
+                        return 2
 
         # ── sqlite3 write operations ────────────────────────────────
         # Whole-command match (never misses a fragmented/wrapped invocation),
@@ -9632,8 +15945,52 @@ def _run_merge_and_push_gates() -> int:
         if blind_spot_deny is not None:
             print(blind_spot_deny, file=sys.stderr)
             return 2
+        if round_compound_deny is not None:
+            print(round_compound_deny, file=sys.stderr)
+            return 2
+        if round_autonomous_deny is not None:
+            print(round_autonomous_deny, file=sys.stderr)
+            return 2
+        if no_open_pr_deny is not None:
+            print(no_open_pr_deny, file=sys.stderr)
+            return 2
         if ask_reason is not None:
-            return _ask(ask_reason)
+            routine_off = ask_routine and _ask_suppressed("push_routine")
+            if (
+                routine_off
+                and not ask_nonroutine
+                and routine_dests
+                and all(_routine_dest_owned(*d) for d in routine_dests)
+            ):
+                # The push_publish miss is noise once push_routine silenced it.
+                shown = ask_reason.replace(f"\n\n{_PUBLISH_OFF_MISS}", "")
+                note = _suppressed_reason("push_routine", shown)
+                notes = _drain_ask_notes()
+                return _emit_context_only(f"{note}\n\n{notes}" if notes else note)
+            if routine_off:
+                ask_reason += (
+                    "\n\nhooks.asks.push_routine is off, but this command did not "
+                    "qualify: a destination is not a github.com https repo of the "
+                    "configured owner, is a raw URL that an insteadOf rule could move, "
+                    "or the branch is a recorded default branch; or the branch could "
+                    "not be confirmed absent there; or the command also raised a "
+                    "prompt the key does not cover."
+                )
+            notes = _drain_ask_notes()
+            return _ask(f"{ask_reason}\n\n{notes}" if notes else ask_reason)
+
+        if review_note is not None:
+            notes = _drain_ask_notes()
+            return _emit_context_only(f"{review_note}\n\n{notes}" if notes else review_note)
+
+        # A first-publish prompt this install silenced — NO decision, only a
+        # context note. After every block and every ask above (an ask from any
+        # other arm wins), and BEFORE the create `_allow` below, which would
+        # otherwise approve the command on this hook's behalf.
+        if publish_note is not None or pr_branch_note is not None:
+            note = publish_note if publish_note is not None else pr_branch_note
+            notes = _drain_ask_notes()
+            return _emit_context_only(f"{note}\n\n{notes}" if notes else note)
 
         # A first-push-only re-push auto-allow — emitted ONLY here, after every
         # hard-block has had its chance to return 2, so a compound
@@ -9772,6 +16129,42 @@ def _defang_gate_text(text: str) -> str:
     )
 
 
+def _bound_with_stated_omission(
+    text: str,
+    max_chars: int = _GATE_TEXT_MAX_CHARS,
+    tail_chars: int = _GATE_TEXT_TAIL_CHARS,
+) -> str:
+    """Bound one line to *max_chars*, keeping BOTH ends and naming what was cut.
+
+    SELECT, do not amputate. A plain head-slice was silent and cut mid-word:
+    MEASURED on the real codex-at-head message, a 532-char line arrived as 200
+    characters ending "…to merge without a", losing the '# stale-review-override'
+    route it exists to hand the operator, with no marker to say anything had been
+    dropped. A gate that tells someone they are blocked and not how to proceed has
+    failed at the only job the detail line has.
+
+    Keeping the HEAD as well as the tail is what preserves IDENTITY, and that is
+    why this is the right primitive for a file path too. Two paths that differ
+    only in their leading directory — ``services/alpha/…/handler.py`` and
+    ``services/bravo/…/handler.py`` — are distinguishable here and were NOT under
+    the tail-only renderer this replaced (Codex P2, PR #2005, round 4).
+
+    Defaults are the gate-text constants, so ``_sanitize_gate_text``'s three
+    callers are byte-identical to before this was lifted out of it. The body is a
+    pure function of its arguments plus those two constants, which is what made
+    the extraction safe rather than merely plausible.
+
+    NOTE the output may exceed *max_chars* by the marker's own width. That is
+    deliberate: the budget bounds the CONTENT, and a cut that did not announce
+    itself would be the very failure above.
+    """
+    if len(text) <= max_chars:
+        return text
+    kept = max_chars - tail_chars
+    omitted = len(text) - kept - tail_chars
+    return f"{text[:kept]} … {omitted} char(s) omitted … {text[-tail_chars:]}"
+
+
 def _sanitize_gate_text(text: str) -> str:
     """Make an untrusted gate message safe to print, bounded in both dimensions.
 
@@ -9789,22 +16182,8 @@ def _sanitize_gate_text(text: str) -> str:
     removes an operator's recovery instruction without saying it did.
     """
     def _clean(line: str) -> str:
-        cleaned = "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
-        if len(cleaned) <= _GATE_TEXT_MAX_CHARS:
-            return cleaned
-        # SELECT, do not amputate — the same rule the LINE dimension below already
-        # follows, applied to characters. A plain head-slice was silent and cut
-        # mid-word: MEASURED on the real codex-at-head message, a 532-char line
-        # arrived as 200 characters ending "…to merge without a", losing the
-        # '# stale-review-override' route it exists to hand the operator, with no
-        # marker to say anything had been dropped. A gate that tells someone they
-        # are blocked and not how to proceed has failed at the only job the detail
-        # line has.
-        kept = _GATE_TEXT_MAX_CHARS - _GATE_TEXT_TAIL_CHARS
-        omitted = len(cleaned) - kept - _GATE_TEXT_TAIL_CHARS
-        return (
-            f"{cleaned[:kept]} … {omitted} char(s) omitted … "
-            f"{cleaned[-_GATE_TEXT_TAIL_CHARS:]}"
+        return _bound_with_stated_omission(
+            "".join(" " if _gate_text_unsafe(ch) else ch for ch in line)
         )
 
     lines = [_clean(ln) for ln in text.split("\n")]
@@ -9827,6 +16206,88 @@ def _sanitize_gate_text(text: str) -> str:
             *lines[-_GATE_TEXT_TAIL_LINES:],
         ]
     )
+
+
+def _uncounted_clause(uncounted: list[dict[str, int]]) -> str:
+    """Render the non-blocking `inline-findings` tail. COUNTS ONLY, never text.
+
+    The row this feeds is printed OUTSIDE ``_sanitize_gate_text`` — the caller
+    renders line 0 itself and ``_print_gate_detail`` sanitizes only lines 1+ — so
+    anything interpolated here reaches a terminal un-defanged. Integers are safe
+    there; a finding title, a path or a bot login is not. That is why this returns
+    a count and a pointer to the NOTEs rather than the findings themselves, and it
+    is a CONSTRAINT rather than a stylistic choice (issue #2044).
+
+    FIVE states. The count is the easy one; the other four are the point:
+
+    * findings exist and none went uncounted   -> "" (the row keeps its old text)
+    * findings went uncounted, all countable   -> the exact count, "finding(s)"
+    * some reviewer output could not be PARSED -> a FLOOR, and the unit is
+                                                  "item(s)" rather than findings
+    * a review CHANNEL under-reported          -> a FLOOR, or UNKNOWN
+    * the scan never got far enough to count   -> UNKNOWN
+
+    The UNIT matters as much as the number, and conflating them was a real defect
+    here rather than a hypothetical: an unrecognised reviewer's comment is ONE
+    entry in its bucket whatever it contains, so summing it with parsed findings
+    and labelling the result "N finding(s)" asserts a cardinality nobody read. It
+    can understate a bundle of five and overstate a comment carrying none. Hence
+    the producer's `exact`/`approx` split, and hence "item(s)" whenever `approx`
+    contributes: the sentence has to be true of the weakest bucket in it.
+
+    The third state is the one an adversarial review had to find, because the
+    first version of this function did not have it. Every counter can be 0 and
+    still be wrong about the world: when the review-body channel is unreadable,
+    incomplete, or short of its own declared count, findings may exist that no
+    accumulator could have counted. MEASURED on that version — a clean scan and
+    an unreadable channel printed byte-identical rows, which is precisely the
+    false confidence this whole change removes, reproduced one field over.
+
+    So a total under-read renders UNKNOWN, and a partial one renders `N+` rather
+    than `N`: the number is a floor, and saying `N` would assert a completeness
+    nobody measured.
+
+    An empty list means the scan returned BEFORE its accumulators existed (a
+    '# review-override' force, or an unreadable first page).
+    """
+    if not uncounted:
+        return " — uncounted findings UNKNOWN (scan exited before counting)"
+    record = uncounted[0]
+    # A flag, never a count — read separately, so it can never inflate a total.
+    under_read = bool(record.get("channel_under_read", 0))
+    exact = sum(record.get("exact", {}).values())
+    approx = sum(record.get("approx", {}).values())
+    total = exact + approx
+    # Either cause makes the number a LOWER BOUND, and they are INDEPENDENT, so
+    # both are rendered when both hold: `approx` means the scan READ some input
+    # and cannot count the findings inside it, while `under_read` means a channel
+    # did not deliver everything it had. Only the second is recoverable by
+    # re-running, so a reader shown one cause cannot tell whether retrying helps.
+    #
+    # An earlier version returned on `approx` FIRST and silently discarded a
+    # simultaneously-true `under_read` — while the sentence above it claimed the
+    # reason was "carried rather than collapsed". Codex P2, round 2. A comment
+    # asserting a property the code three lines below does not have is the defect
+    # class this whole change exists to remove, reproduced in its own renderer.
+    if total:
+        causes = []
+        if approx:
+            causes.append("some reviewer output could not be parsed into findings")
+        if under_read:
+            causes.append("a review channel under-reported")
+        if not causes:
+            return f" — but {total} finding(s) NOT scored, see the NOTEs above"
+        # The UNIT follows `approx` alone: an under-read channel withholds
+        # findings it never handed over, which makes the total a floor without
+        # making the things already counted stop being findings.
+        unit = "item(s)" if approx else "finding(s)"
+        return f" — but {total}+ {unit} NOT scored ({'; '.join(causes)}), see the NOTEs above"
+    # Reached only when `total` is 0 — the branch above returns on every path.
+    if under_read:
+        return " — uncounted findings UNKNOWN (a review channel under-reported, see the NOTEs above)"
+    # Nothing uncounted and nothing under-read: leave the row exactly as it was.
+    # A gate that annotates every row teaches nobody to read the annotation.
+    return ""
 
 
 def _print_gate_detail(msg: str) -> None:
@@ -9934,37 +16395,33 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         _print_gate_detail(msg)
     else:
         print(f"e2e-plan       : {msg.splitlines()[0]}")
+    _FRESHNESS_PASS.clear()
     blocked, msg, verified_head = _check_codex_reviewed_head(pr_num, repo=repo)
     if blocked:
         label = "BLOCK — " + msg.splitlines()[0]
+        label += _substitute_available_note(pr_num, repo=repo)
     else:
-        # Distinguish a genuinely-current review from a stale-but-trivial-delta
-        # allow — both return the same tuple, but the report must NOT assert
-        # "current" when Codex reviewed an older SHA (Codex P2, #1373). Re-derive
-        # the reviewed SHA vs HEAD for an honest label (structured-stdout consumers
-        # read this, not the stderr NOTE).
-        _reviewed = _latest_codex_reviewed_sha(pr_num, repo=repo)
-        _head = _pr_head_sha(pr_num, repo=repo)
-        _head_l = _head.strip().lower() if _head else None
-        if _head_l is not None and _reviewed == _head_l:
-            label = "ok (current)"
-        elif (
-            _head_l is not None
-            and (_clean := _latest_codex_clean_comment_sha(pr_num, repo=repo))
-            and _head_l.startswith(_clean)
-        ):
-            # Freshness satisfied by a clean Codex ISSUE-COMMENT at head (the review
-            # object is absent or stale) — the allow path added in follow-up 7ff0fdc6.
-            label = "ok (clean comment at head)"
-        elif _reviewed is None or _head is None:
-            # A transiently-failed re-read must NOT read as "current" (Codex P2
-            # #1373): the enforcement gate already passed, but the report must not
-            # ASSERT the head was reviewed when it could not confirm it.
-            label = "ok (freshness label unverified — re-read failed)"
-        elif _reviewed != _head_l:
-            label = f"ok (STALE review of {_reviewed[:12]}, delta since is trivial)"
+        # The label comes from the gate's own record for the head it verified. A
+        # later head move is stated below, not used to relabel that verified pass.
+        _vh = verified_head.strip().lower() if verified_head else None
+        _pass_reason = (
+            _FRESHNESS_PASS.get("reason")
+            if _vh and _FRESHNESS_PASS.get("head") == _vh
+            else None
+        )
+        if not _pass_reason:
+            label = "ok (freshness label unverified — pass reason not recorded)"
         else:
-            label = "ok (current)"
+            label = f"ok ({_pass_reason})"
+            _now = _pr_head_sha(pr_num, repo=repo)
+            _now_l = _now.strip().lower() if _now else None
+            if _now_l is None:
+                label += f"; verified at {_vh[:12]}, the current head could not be re-read"
+            elif _now_l != _vh:
+                label += (
+                    f"; HEAD MOVED to {_now_l[:12]} after the gate verified {_vh[:12]} — "
+                    f"merge-with stays bound to {_vh[:12]}, so GitHub will refuse it"
+                )
     print(f"codex-at-head  : {label}")
     if blocked:
         # The tail is the ONLY remediation text this gate gives: "@codex review then
@@ -9974,6 +16431,8 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         # gate disagree on exactly one gate.
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
+    # Advisory: never touches `failures` (see `_rounds_row`).
+    print(f"rounds         : {_rounds_row(pr_num, repo)}")
     # Scheduled Claude review at HEAD — the SAME always-fail-closed gate the merge arm
     # enforces (shared function). A missing/stale/unreadable scheduled review is a
     # FAILURE line, never a false all-clear — the report must not diverge from enforcement.
@@ -9986,20 +16445,28 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         print("scheduled-claude: n/a (scoped to the public repo only)")
     else:
         sched_relief: list[tuple[str, str, str]] = []
+        sched_exempt: list[tuple[str, str]] = []
         sched_msg = _check_scheduled_claude_reviewed_head(
-            pr_num, verified_head, repo, relief_out=sched_relief
+            pr_num, verified_head, repo, relief_out=sched_relief, exempt_out=sched_exempt
         )
         if sched_msg:
             sched_state = "BLOCK — " + sched_msg.splitlines()[0]
-        elif sched_relief:
+        elif sched_relief or sched_exempt:
             # NEVER render a carried-forward review as one made at head: this line is
             # what a human (and a structured consumer) reads to judge freshness, and
             # "ok (at head)" here would be a false assertion about what was reviewed.
+            # Same for an exempted kind: it was never reviewed, and the line says so.
             sched_state = (
                 "ok ("
                 + "; ".join(
-                    f"{kind} carried from {anc}, {check} green at head"
-                    for kind, anc, check in sched_relief
+                    [
+                        f"{kind} carried from {anc}, {check} green at head"
+                        for kind, anc, check in sched_relief
+                    ]
+                    + [
+                        f"{kind} not required: outside contribution by {who}"
+                        for kind, who in sched_exempt
+                    ]
                 )
                 + ")"
             )
@@ -10023,18 +16490,76 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if blocked:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
-    blocked, msg = _check_inline_review_findings(pr_num, repo=repo)
-    print(
-        f"inline-findings: {'BLOCK — ' + msg.splitlines()[0] if blocked else 'ok (P2s, if any, printed above)'}"
+    # The out-param is INFORMATIONAL and must never move the verdict: uncounted
+    # findings are uncounted BY DESIGN (below-Major, outside-diff, doc-path,
+    # unrecognised reviewer), so scoring them here would be a policy change wearing
+    # a reporting change's clothes. `failures` is untouched below for that reason —
+    # and the characterization suite locks report/enforcement agreement on the
+    # VERDICT, not on the text, which is what makes an informational tail safe here
+    # while a verdict flip would not be.
+    uncounted: list[dict[str, int]] = []
+    blocked, msg = _check_inline_review_findings(pr_num, repo=repo, uncounted_out=uncounted)
+    inline_state = (
+        "BLOCK — " + msg.splitlines()[0]
+        if blocked
+        else "ok (P2s, if any, printed above)" + _uncounted_clause(uncounted)
     )
+    print(f"inline-findings: {inline_state}")
     if blocked:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
+    # Merge-from-main reverts (#2809) — ADVISORY, like `e2e-plan` and `rounds`: it
+    # NEVER touches `failures`, and the merge arm does not run it, so the report and
+    # enforcement cannot disagree about it. Four states, rendered distinctly so a
+    # check that could not run never reads as `ok`. An advisory row must never take
+    # the report down, hence the catch-all.
+    try:
+        mr_state, mr_msg = _check_main_reverts(pr_num, repo=repo)
+    except Exception as exc:  # noqa: BLE001 - an advisory row never takes the report down.
+        mr_state, mr_msg = MAIN_REVERTS_UNCHECKED, f"the check raised {type(exc).__name__}"
+    mr_head = mr_msg.splitlines()[0] if mr_msg else ""
+    if mr_state == MAIN_REVERTS_FINDINGS:
+        print(f"main-reverts   : advisory — {mr_head}")
+    elif mr_state == MAIN_REVERTS_CLEAN:
+        print(f"main-reverts   : ok ({mr_head})")
+    elif mr_state == MAIN_REVERTS_NA:
+        print(f"main-reverts   : n/a ({mr_head})")
+    else:
+        print(f"main-reverts   : could not check — {mr_head}")
+    _print_gate_detail(mr_msg)
+    # Rework contract (owner decision) — BLOCKING, in the pin-receipts pattern: the
+    # merge arm runs the SAME function with the same verified head, so the two agree.
+    # `_check_rework` never raises (its deadline/exception mapping is internal).
+    rw_state, rw_msg = _check_rework(pr_num, repo=repo, head=verified_head)
+    rw_head = rw_msg.splitlines()[0] if rw_msg else ""
+    if rw_state == REWORK_BLOCK:
+        print(f"rework         : BLOCK — {rw_head}")
+    elif rw_state == REWORK_OK:
+        print(f"rework         : ok ({rw_head})")
+    elif rw_state == REWORK_NA:
+        print(f"rework         : n/a ({rw_head})")
+    else:
+        print(f"rework         : could not check — {rw_head}")
+    _print_gate_detail(rw_msg)
+    failures += 1 if rw_state == REWORK_BLOCK else 0
     # Emit the actionable merge command ONLY when EVERY gate passed — printing it earlier
     # (right after codex-at-head) suggested a mergeable PR even when the scheduled or finding
     # gate below would block. Bound to the Codex-verified head (the TOCTOU pin).
     if failures == 0 and verified_head:
-        print("merge-with     : " + _suggested_merge_cmd(pr_num, verified_head, repo))
+        # The squash body carries `Squashed-From: <head>` plus the branch's session
+        # trailers. The merge arm recomputes it, so the file is a convenience for gh,
+        # never a source of trust. On a failure the plain command still merges.
+        merge_cmd = _suggested_merge_cmd(pr_num, verified_head, repo)
+        body_path, body_why = _prepare_squash_body_file(pr_num, repo, verified_head)
+        if body_path:
+            merge_cmd += f" --body-file {body_path}"
+        elif body_why:
+            print(
+                f"NOTE: PR #{pr_num} — no squash body file ({body_why}); the merge-with "
+                f"line below merges without the Squashed-From trailer.",
+                file=sys.stderr,
+            )
+        print("merge-with     : " + merge_cmd)
     print(
         "verdict        :",
         "MERGEABLE (all gates pass)" if failures == 0 else f"{failures} gate(s) would block",

@@ -37,7 +37,18 @@ async def load_active_procedures(db_path: str | Path) -> str | None:
     Returns formatted markdown string, or None if no CORE procedures found.
     Budget: 200 words max.
     """
+    # Admission check. This opens aiosqlite DIRECTLY (not through a guarded
+    # factory) and runs on EVERY knowledge SessionStart, so before this it
+    # opened a QUARANTINED database read-WRITE on every session start —
+    # MEASURED. The degrade is the one this function already documents for an
+    # unopenable database: return None, inject nothing, self-heal once the
+    # database is admissible again.
+    from genesis.db.admission import database_is_fenced
     from genesis.env import db_busy_timeout_ms
+
+    if database_is_fenced(db_path):
+        logger.debug("Procedure injection skipped: database fenced")
+        return None
 
     try:
         db = await aiosqlite.connect(str(db_path))

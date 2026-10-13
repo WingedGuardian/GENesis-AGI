@@ -15,7 +15,15 @@ from datetime import UTC, datetime
 
 import aiosqlite
 
+from genesis.memory.provenance import UNTRUSTED_OBS_PREFIX
+from genesis.security import ContentSanitizer, ContentSource
+from genesis.security.sanitizer import strip_boundary_markers
+
 logger = logging.getLogger(__name__)
+
+_SANITIZER = ContentSanitizer()
+# The inbox judge's user_signal rows, as observation_write stores them.
+_UNTRUSTED_USER_SIGNAL = UNTRUSTED_OBS_PREFIX + "user_signal"
 
 
 @dataclass
@@ -115,6 +123,12 @@ class WorldSnapshot:
                 priority = sig.get("priority", "medium")
                 content = sig.get("content", "")[:150]
                 content = content.replace("\n", " ")
+                if str(sig.get("type", "")).startswith(UNTRUSTED_OBS_PREFIX):
+                    # Written by a session over untrusted content (the inbox
+                    # judge): its text is data, never an instruction.
+                    content = _SANITIZER.wrap_content(
+                        strip_boundary_markers(content), ContentSource.INBOX,
+                    )
                 parts.append(f"- [{priority}] {content}")
             parts.append("")
 
@@ -165,7 +179,7 @@ async def build(db: aiosqlite.Connection) -> WorldSnapshot:
             "SELECT source, type, category, content, priority, created_at "
             "FROM observations "
             "WHERE resolved = 0 "
-            "AND type IN ('user_signal', 'finding', 'interaction_theme') "
+            "AND type IN ('user_signal', 'finding', 'interaction_theme', ?) "
             "AND created_at >= datetime('now', '-7 days') "
             "ORDER BY "
             "  CASE priority "
@@ -176,6 +190,7 @@ async def build(db: aiosqlite.Connection) -> WorldSnapshot:
             "  END, "
             "  created_at DESC "
             "LIMIT 10",
+            (_UNTRUSTED_USER_SIGNAL,),
         )
         rows = await cursor.fetchall()
         snapshot.user_signals = [

@@ -54,6 +54,16 @@ _ROSTER_MODEL_ENV_VARS = (
     "CLAUDE_CODE_SUBAGENT_MODEL",
 )
 
+#: SWITCH, not a model slot — deliberately outside the tuple above (those are
+#: set to the model id; this is set to "1"). CC 2.1.251 demoted
+#: CLAUDE_CODE_SUBAGENT_MODEL to a default that agent-definition ``model:``
+#: frontmatter outranks, so a ``model: sonnet`` agent spawned mid-failover
+#: would ask the peer endpoint for an alias it cannot resolve. CC 2.1.257's
+#: _FORCE switch restores override semantics; measured against the 2.1.280
+#: binary ("Workflow agent model X ignored: CLAUDE_CODE_SUBAGENT_MODEL_FORCE
+#: is set"). Unknown-var inert on older CC, so setting it is always safe.
+_SUBAGENT_MODEL_FORCE_VAR = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE"
+
 
 def apply_routing_env(
     env: dict[str, str],
@@ -93,9 +103,11 @@ def apply_routing_env(
     if model_id:
         for _var in _ROSTER_MODEL_ENV_VARS:
             env[_var] = model_id
+        env[_SUBAGENT_MODEL_FORCE_VAR] = "1"
     else:
         for _var in _ROSTER_MODEL_ENV_VARS:
             env.pop(_var, None)
+        env.pop(_SUBAGENT_MODEL_FORCE_VAR, None)
     return env
 
 
@@ -114,31 +126,46 @@ class RosterEntry:
     validated: str | None = None
 
 
-def _load_yaml(path: Path) -> dict:
+def _load_yaml(path: Path, *, strict: bool = False) -> dict:
     if not path.is_file():
+        if strict:
+            raise RosterError(f"Roster configuration is missing or unreadable: {path}")
         return {}
     try:
         data = yaml.safe_load(path.read_text())
     except Exception:
+        if strict:
+            raise RosterError(f"Cannot load roster configuration {path}") from None
         logger.warning("Failed to read roster config %s", path, exc_info=True)
         return {}
     if not isinstance(data, dict):
+        if strict:
+            raise RosterError(f"Roster configuration {path} must be a mapping")
         if data is not None:
             logger.warning("Roster config %s is not a mapping — ignoring", path)
         return {}
     return data
 
 
-def load_roster(config_dir: Path | None = None) -> dict:
+def load_roster(config_dir: Path | None = None, *, strict: bool = False) -> dict:
     """Return the merged roster config (base file + ``.local`` overlay).
 
     The overlay is resolved user-dir-first (``~/.genesis/config/``, where the
     ``cc_roster`` settings writer lands) via the shared ``merge_local_overlay``
     helper, so the settings domain actually controls the active model
     (cfg-001: loaders and writers must agree on overlay location).
+    ``strict=True`` is foreground opt-in: invalid configuration raises rather
+    than discarding a billing preference. Existing automated callers are unchanged.
     """
     cfg_dir = config_dir or _CONFIG_DIR
     base_path = cfg_dir / _ROSTER_FILE
+    if strict:
+        from genesis._config_overlay import ConfigOverlayError
+
+        try:
+            return merge_local_overlay(_load_yaml(base_path, strict=True), base_path, strict=True)
+        except ConfigOverlayError as exc:
+            raise RosterError(str(exc)) from None
     return merge_local_overlay(_load_yaml(base_path), base_path)
 
 

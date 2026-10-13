@@ -212,7 +212,7 @@ class TestCrud:
         # row → max_held backpressure bypassed + duplicate proposals. The query
         # must be COLLATE NOCASE, matching posted_index_for_repo.
         await pip.create(db, **{**_ROW, "repo": "wingedguardian/genesis-agi"})
-        active = await pip.list_dedup_active(db, "WingedGuardian/GENesis-AGI")
+        active = await pip.list_dedup_active(db, "WingedGuardian/GENesis-AGI", now=_TS)
         assert [r["id"] for r in active] == ["p1"]
 
     @pytest.mark.asyncio
@@ -299,29 +299,45 @@ class TestCrud:
         assert (await pip.get_by_id(db, "p"))["status"] == "posted"
 
     @pytest.mark.asyncio
-    async def test_prune_reaps_adopted_posted_row_even_with_open_followup(self, db):
-        # An ADOPTED posted row is excluded from posted_index_for_repo, so it can never
-        # resolve a follow_up — the open-follow_up retention protection does NOT apply.
-        # It prunes on the normal age schedule instead of lingering uselessly.
-        await _seed_followup(db, id="fu-open2", status="pending")
-        await pip.create(db, **{**_ROW, "id": "ad", "request_id": "r-ad", "source_ref": "fu-open2"})
+    @pytest.mark.parametrize(
+        ("status", "adopted"),
+        [("pending", True), ("completed", False), ("blocked", False), ("completed", True)],
+    )
+    async def test_prune_keeps_a_posted_row_while_its_follow_up_exists(self, db, status, adopted):
+        # The posted row is the record that this follow-up already has a public
+        # issue; the work-board lane's cross-lane dedup reads it, so it is kept
+        # whatever the follow-up's state or the row's adoption.
+        await _seed_followup(db, id="fu-x", status=status)
+        await pip.create(db, **{**_ROW, "id": "p", "request_id": "r-p", "source_ref": "fu-x"})
         await pip.mark_posted(
-            db, "ad", issue_number=8, issue_url="u", posted_at="2026-01-01T00:00:00", adopted=True
+            db, "p", issue_number=6, issue_url="u", posted_at="2026-01-01T00:00:00", adopted=adopted
         )
         deleted = await pip.prune_terminal(db, older_than_days=30, now="2026-08-07T00:00:00")
-        assert deleted == 1  # adopted → not protected → pruned
-        assert await pip.get_by_id(db, "ad") is None
+        assert deleted == 0
+        assert (await pip.get_by_id(db, "p"))["status"] == "posted"
 
     @pytest.mark.asyncio
-    async def test_prune_reaps_posted_row_of_resolved_followup(self, db):
-        # A 'posted' row whose follow_up is RESOLVED (not open) is prunable — the
-        # close-loop will never act on it again.
-        await _seed_followup(db, id="fu-done", status="completed")
-        await pip.create(db, **{**_ROW, "id": "p", "request_id": "r-p", "source_ref": "fu-done"})
+    async def test_prune_keeps_a_board_lane_posted_row_naming_the_follow_up(self, db):
+        # The work-board lane spells the same record ``follow_up:<id>``; it is the
+        # cross-lane record just as the contributor lane's bare id is.
+        await _seed_followup(db, id="fu-b", status="completed")
+        row = {**_ROW, "id": "pb", "request_id": "r-pb", "source": "board"}
+        await pip.create(db, **{**row, "source_ref": "follow_up:fu-b"})
+        await pip.mark_posted(
+            db, "pb", issue_number=8, issue_url="u", posted_at="2026-01-01T00:00:00"
+        )
+        deleted = await pip.prune_terminal(db, older_than_days=30, now="2026-08-07T00:00:00")
+        assert deleted == 0
+        assert (await pip.get_by_id(db, "pb"))["status"] == "posted"
+
+    @pytest.mark.asyncio
+    async def test_prune_reaps_a_posted_row_whose_follow_up_is_gone(self, db):
+        # Bounded: once the follow-up row is deleted it can no longer be promoted,
+        # so nothing needs the record and it ages out.
+        await pip.create(db, **{**_ROW, "id": "p", "request_id": "r-p", "source_ref": "fu-gone"})
         await pip.mark_posted(
             db, "p", issue_number=6, issue_url="u", posted_at="2026-01-01T00:00:00"
         )
-
         deleted = await pip.prune_terminal(db, older_than_days=30, now="2026-08-07T00:00:00")
         assert deleted == 1
         assert await pip.get_by_id(db, "p") is None

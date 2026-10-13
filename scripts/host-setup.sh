@@ -614,12 +614,15 @@ echo "  + boot.autostart enabled (container survives host reboots)"
 # block so re-running host-setup retrofits existing containers too.
 incus config set "$CONTAINER_NAME" limits.memory.swap true
 echo "  + limits.memory.swap enabled (memory spikes degrade into swap, not thrash)"
-# incus applies limits.memory.swap only at container START, so the running
-# container (freshly created above, or an existing one being retrofitted) still
-# has memory.swap.max=0 until a restart — the setting silently no-ops meanwhile.
-# Activate it live now so swap works without a disruptive restart.
+# The `incus config set` just above is ITSELF a live update to a limits.memory*
+# key, and with `true` (boolean swap-on) that is exactly the value Incus writes
+# memory.swap.max=0 for, at both container start and on every such live update
+# (driver_lxc.go, v6.0.0 and main) -- so the running container (freshly created
+# above, or an existing one being retrofitted) has memory.swap.max=0 right now,
+# not only until the next restart. Activate it live now so swap works without
+# a disruptive restart.
 # shellcheck source=lib/container_swap.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib/container_swap.sh"
+. "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/container_swap.sh"
 container_swap_activate_live "$CONTAINER_NAME"
 if [ -z "$(swapon --noheadings --show 2>/dev/null)" ]; then
     echo "  WARNING: this host has NO swap — limits.memory.swap has nothing to swap to."
@@ -682,7 +685,7 @@ fi
 # session, so it applies immediately; on a busy retrofit the lib skips (it won't
 # attach over a live session) and a later apply converges.
 # shellcheck source=lib/cc_tmp_volume.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib/cc_tmp_volume.sh"
+. "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/cc_tmp_volume.sh"
 CCTMPVOL_CONTAINER="$CONTAINER_NAME"
 cc_tmp_volume_apply
 
@@ -1018,10 +1021,33 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -
     fi
 
     # shellcheck disable=SC2086  # Intentional: empty string should vanish
+    # CCTMPVOL_SIZE_GIB must cross into the container: install.sh writes
+    # CC_TMP_CAPACITY_MB from it, and the watchdog's oxygen floor keys on that
+    # number because statfs cannot see a btrfs volume's qgroup cap. Without the
+    # pass-through a custom-size volume records the 2 GiB default, and the
+    # watchdog would treat a larger volume as full — bypassing its in-flight
+    # guard and deleting active work at false headroom.
+    #
+    # Passed ONLY when isolation actually happened. cc_tmp_volume_apply returns
+    # 0 on unsupported-pool, volume-create-failed, attach-failed and
+    # verify-failed-rolledback, so an unconditional pass-through would record a
+    # custom cap for a volume that does not exist — cementing a fictional
+    # ceiling onto exactly the shared-filesystem install where it is least
+    # recoverable. The value is normalized through the volume lib's own helper.
+    #
+    # Residual, deliberately not papered over: the helper reports the REQUESTED
+    # size, and the lib has no resize branch — so re-running against a volume
+    # created at a different size records a number that disagrees with it.
+    # Tracked with the update-path reset in the same issue.
+    _cctmp_size_env=()
+    if [ "${_cctmpvol_result:-}" = "applied" ] || [ "${_cctmpvol_result:-}" = "already-isolated" ]; then
+        _cctmp_size_env=(--env "CCTMPVOL_SIZE_GIB=$(_cctmpvol_size_gib)")
+    fi
     incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
         --env "HOME=/home/ubuntu" \
         --env "XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID" \
         --env "GENESIS_TIMEZONE=$_final_tz" \
+        ${_cctmp_size_env[@]+"${_cctmp_size_env[@]}"} \
         $_incus_tty --cwd /home/ubuntu/genesis -- \
         bash scripts/install.sh $_install_flags || {
         echo ""
@@ -1110,7 +1136,7 @@ echo "  Writing network identity into ~/.claude/CLAUDE.md..."
 # available, using the shared builder so the format can't drift from
 # update.sh's in-container refresh (which rewrites this block every run).
 # shellcheck source=lib/claude_md_blocks.sh
-. "$(cd "$(dirname "$0")" && pwd)/lib/claude_md_blocks.sh"
+. "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/claude_md_blocks.sh"
 _NET_LINES="$(build_network_identity_block \
     "$CONTAINER_IPV4" "$CONTAINER_IPV6" "$HOST_IPV4" "$HOST_IPV6" "$TS_IPV4")"
 
@@ -1177,7 +1203,7 @@ echo ""
 
 # Run install_guardian.sh from the LOCAL checkout (this repo).
 # install_guardian.sh copies code from its parent dir into ~/.local/share/genesis-guardian.
-_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+_SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 _guardian_script="$_SCRIPT_DIR/install_guardian.sh"
 if [ -f "$_guardian_script" ]; then
     _guardian_flags="--container-name $CONTAINER_NAME"

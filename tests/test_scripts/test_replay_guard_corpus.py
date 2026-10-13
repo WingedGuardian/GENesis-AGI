@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import importlib.util
 import json
 import os
@@ -27,6 +28,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -53,6 +55,40 @@ def rgc():
 
 
 _ROWS = [("echo one", "/tmp"), ("echo two", "/tmp")]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_corpus_paths(tmp_path, rgc):
+    """Keep EVERY test in this module off the operator's real home.
+
+    `main()` calls `_cache_provenance()`, which stats `_CACHE` and walks
+    `_TRANSCRIPTS` — both module-level, both under `~` by default. Two
+    PRE-EXISTING tests reach `main()` without the `cache` fixture
+    (`test_all_runs_the_safe_guards_and_names_the_refused_ones`,
+    `test_a_run_with_no_valid_measurement_exits_2`), so adding that call made
+    them sweep the operator's REAL transcript tree and stat the real cache —
+    MEASURED on the origin install at 12,047 files and 75 MB, which turned two
+    unit tests' runtime into a function of whose machine they ran on. It also
+    falsified the `cache` fixture's own docstring claim that no test ever walks
+    the real tree.
+
+    Autouse and module-wide rather than a patch on those two, because the
+    POLARITY is the point: a test written next year that reaches `main()`
+    inherits the isolation instead of silently re-acquiring the leak. Tests that
+    want a populated tree still override `_TRANSCRIPTS` themselves.
+
+    Uses a fixture-OWNED `MonkeyPatch`, mirroring `tests/conftest.py`'s
+    `_isolate_alert_queue`, so a test calling `monkeypatch.undo()` mid-body
+    cannot revert suite isolation and re-expose the real paths.
+    """
+    mp = pytest.MonkeyPatch()
+    home = tmp_path / "isolated-home"
+    (home / ".claude" / "projects").mkdir(parents=True)
+    (home / ".genesis" / "output").mkdir(parents=True)
+    mp.setattr(rgc, "_CACHE", home / ".genesis" / "output" / "guard-corpus.jsonl")
+    mp.setattr(rgc, "_TRANSCRIPTS", home / ".claude" / "projects")
+    yield
+    mp.undo()
 
 
 @pytest.fixture
@@ -955,7 +991,11 @@ def test_rebuild_alone_is_a_reachable_path(rgc, monkeypatch, capsys, cache):
     assert rgc.main() == 0, "--rebuild alone must not be refused"
 
     assert cache.exists() and cache.read_text().strip(), "the cache was not built"
-    assert "corpus rebuilt" in capsys.readouterr().out
+    # stderr, not stdout: the notice interpolates the absolute cache path, which
+    # embeds the operator's home directory, and stdout is the surface this
+    # tool's output gets pasted from. This test's subject is that the path is
+    # REACHABLE — the stream is incidental to it.
+    assert "corpus rebuilt" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -1749,3 +1789,762 @@ def test_an_unparsable_cited_file_raises_instead_of_returning_raw_text(rgc, tmp_
     (hooks / "cited.py").write_text("def target(:\n    this is not python\n")
     with pytest.raises(rgc.DeclarationError):
         rgc.cite_source(rgc.Cite("cited", None, "anything"), hooks)
+
+
+# ── corpus provenance, and the limit denominator ─────────────────────────────
+
+
+def _stamped_tree(rgc, monkeypatch, tmp_path, count, *, mtime):
+    """A throwaway transcript tree of `count` files, every one stamped `mtime`."""
+    tree = tmp_path / "projects"
+    tree.mkdir(exist_ok=True)
+    for n in range(count):
+        leaf = tree / f"session-{n}.jsonl"
+        leaf.write_text("{}\n")
+        os.utime(leaf, (mtime, mtime))
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", tree)
+    return tree
+
+
+def test_a_stale_cache_reports_both_its_age_and_how_far_the_tree_moved(
+    cache, rgc, monkeypatch, tmp_path
+):
+    """The defect is SILENCE, not staleness.
+
+    A six-day-old cache was returned with nothing said about it, so a rate
+    measured over a short corpus read exactly like one measured over the whole
+    tree. BOTH numbers are load-bearing: a date alone does not say whether
+    anything actually moved, and a drift count alone does not say whether the
+    gap is an hour or a month.
+    """
+    cache.write_text('["echo one", "/tmp"]\n')
+    built = time.time() - 6 * 86400
+    os.utime(cache, (built, built))
+    _stamped_tree(rgc, monkeypatch, tmp_path, 10, mtime=time.time())
+
+    line = rgc._cache_provenance()
+
+    assert "6.0 days ago" in line
+    assert "10 of 10 transcript files have changed since" in line
+
+
+def test_a_current_cache_says_zero_drift_rather_than_going_quiet(cache, rgc, monkeypatch, tmp_path):
+    """Silence is ambiguous with 'nobody looked'. `0 of N` is a measurement."""
+    _stamped_tree(rgc, monkeypatch, tmp_path, 4, mtime=time.time() - 600)
+    cache.write_text('["echo one", "/tmp"]\n')  # written now: newer than all four
+
+    line = rgc._cache_provenance()
+
+    assert "0 of 4 transcript files have changed since" in line
+
+
+def test_no_cache_yields_no_provenance_line(cache, rgc, monkeypatch, tmp_path):
+    """Nothing to describe, so describe nothing — rather than invent a date."""
+    _stamped_tree(rgc, monkeypatch, tmp_path, 3, mtime=time.time())
+    assert not cache.exists()
+    assert rgc._cache_provenance() is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bits this test sets")
+def test_an_unreadable_SUBDIRECTORY_makes_the_count_a_declared_floor(
+    cache, rgc, monkeypatch, tmp_path
+):
+    """A real `chmod 000` directory, because the stub version tested nothing.
+
+    The first version of this test substituted an object whose `rglob` raised,
+    and passed — against behaviour `pathlib` does not have. MEASURED on CPython
+    3.12: `Path.walk` swallows a scandir failure when `on_error` is None and
+    `rglob` exposes no hook, so a real unreadable subtree yields a SHORT list
+    and raises NOTHING. The `except OSError` the old test exercised could never
+    fire in production, and the true failure was the opposite shape — not a
+    crash, but a confident count over a silently shrunken denominator.
+
+    So this asserts the honest form: the visible files are still counted, and
+    the line SAYS it could not see everything.
+    """
+    cache.write_text('["echo one", "/tmp"]\n')
+    built = time.time() - 86400
+    os.utime(cache, (built, built))
+    tree = tmp_path / "projects"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "visible.jsonl").write_text("{}\n")
+    (tree / "sub" / "hidden.jsonl").write_text("{}\n")
+    (tree / "sub").chmod(0o000)
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", tree)
+    try:
+        line = rgc._cache_provenance()
+    finally:
+        (tree / "sub").chmod(0o755)
+
+    assert "1 of 1 transcript files have changed since" in line
+    assert "1 unreadable directory" in line
+    assert "floors" in line
+
+
+def test_a_cache_that_exists_but_cannot_be_read_says_so(cache, rgc, monkeypatch):
+    """Absent and unreadable are different, and only one of them is silence.
+
+    `FileNotFoundError` returns None, which suppresses the line entirely — right,
+    because there is nothing to describe. Any OTHER OSError means the cache is
+    there and we failed to read it, and returning None for that would delete the
+    qualifier exactly when something is wrong.
+    """
+    cache.write_text('["echo one", "/tmp"]\n')
+    real_stat = Path.stat
+
+    def refuse(self, *a, **kw):
+        if self == cache:
+            raise PermissionError(13, "Permission denied")
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", refuse)
+
+    line = rgc._cache_provenance()
+
+    assert line is not None, "an unreadable cache must not render as no-cache-at-all"
+    assert "unreadable" in line
+    assert "age and drift are unknown" in line
+
+
+def test_a_future_cache_mtime_is_reported_not_clamped(cache, rgc, monkeypatch, tmp_path):
+    """The worst output this function can produce, so it gets its own test.
+
+    MEASURED before the fix: a cache stamped 30 days ahead printed
+    `(0 minutes ago); 0 of 1 transcript files have changed since` — the age
+    clamped by `max(0.0, …)` and every `st_mtime > built` false against a future
+    instant. Two independent paths both landing on "perfectly current", from an
+    input that is evidence the clock is broken.
+    """
+    _stamped_tree(rgc, monkeypatch, tmp_path, 3, mtime=time.time())
+    cache.write_text('["echo one", "/tmp"]\n')
+    future = time.time() + 30 * 86400
+    os.utime(cache, (future, future))
+
+    line = rgc._cache_provenance()
+
+    assert "FUTURE" in line
+    assert "the clock moved" in line
+    assert "minutes ago" not in line
+    assert "have changed since" not in line
+
+
+def test_an_empty_tree_reports_unknown_drift_not_zero_drift(cache, rgc, monkeypatch, tmp_path):
+    """The same claim reached by a different road: no transcripts at all is not
+    evidence that the cache is current."""
+    cache.write_text('["echo one", "/tmp"]\n')
+    _stamped_tree(rgc, monkeypatch, tmp_path, 0, mtime=time.time())
+
+    line = rgc._cache_provenance()
+
+    assert "no transcripts found" in line
+    assert "0 of 0" not in line
+
+
+def test_a_transcript_vanishing_mid_sweep_costs_one_row_not_the_line(
+    cache, rgc, monkeypatch, tmp_path
+):
+    """Transcripts rotate under the walk.
+
+    One failing stat loses a drift signal; it must not lose the whole
+    measurement — and the loss has to be DECLARED, because a skip that is merely
+    "slightly low" reads as "nothing changed" once a whole rotated subtree hits
+    it.
+
+    A DANGLING SYMLINK, not a stub: `os.walk` lists it among `files` (it cannot
+    be a directory) and `os.stat` on it raises FileNotFoundError, which is the
+    real shape of a transcript rotated between the walk and the stat. The
+    previous version hand-built objects with a `rglob` method, and hand-built
+    intermediates are where this exact bug hides — the production walk does not
+    call `rglob` at all any more, so that test would have kept passing against
+    code it no longer described.
+    """
+    cache.write_text('["echo one", "/tmp"]\n')
+    built = time.time() - 86400
+    os.utime(cache, (built, built))
+    tree = tmp_path / "projects"
+    tree.mkdir()
+    for n in range(2):
+        (tree / f"real-{n}.jsonl").write_text("{}\n")
+    (tree / "rotated.jsonl").symlink_to(tree / "gone-already.jsonl")
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", tree)
+
+    line = rgc._cache_provenance()
+
+    assert "2 of 3 transcript files have changed since" in line
+    assert "1 unreadable file" in line
+    assert "floors" in line, (
+        "a skipped file makes the drift a lower bound; reporting the bare count "
+        "would let a whole rotated subtree read as 'nothing has changed'"
+    )
+
+
+def test_the_corpus_line_carries_its_provenance_on_stdout(rgc, monkeypatch, capsys):
+    """Beside the number, not in the log.
+
+    The rate printed just below is what gets pasted into a PR body, and the
+    caveat print already carries this reasoning: a qualifier that does not travel
+    with the number is a qualifier nobody reads.
+    """
+    monkeypatch.setattr(
+        rgc, "GUARDS", {"double": rgc.Guard(run=lambda c, w: False, safety=_double_safe(rgc))}
+    )
+    monkeypatch.setattr(rgc, "load_corpus", lambda **kw: [("echo hi", "/tmp")])
+    monkeypatch.setattr(rgc, "_cache_provenance", lambda: "cache built AT SOME POINT")
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all"])
+
+    assert rgc.main() == 0
+
+    out = capsys.readouterr().out
+    assert "corpus: 1 unique real commands" in out
+    assert "    cache built AT SOME POINT" in out
+
+
+def test_a_limited_run_names_the_denominator_it_was_limited_from(rgc, monkeypatch, capsys):
+    """`--limit 1` used to print `corpus: 1 unique real commands` against three —
+    a subset wearing the grammar of a full sweep, one line above a rate. This
+    file already refuses an EMPTY corpus on exactly that reasoning; a TRUNCATED
+    one is the same failure carrying a plausible number, which is the harder one
+    to notice because it looks like a measurement."""
+    monkeypatch.setattr(
+        rgc, "GUARDS", {"double": rgc.Guard(run=lambda c, w: False, safety=_double_safe(rgc))}
+    )
+    monkeypatch.setattr(
+        rgc,
+        "load_corpus",
+        lambda **kw: [("echo one", "/tmp"), ("echo two", "/tmp"), ("echo three", "/tmp")],
+    )
+    monkeypatch.setattr(rgc, "_cache_provenance", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all", "--limit", "1"])
+
+    assert rgc.main() == 0
+
+    out = capsys.readouterr().out
+    assert "corpus: 1 of 3 unique real commands" in out
+    assert "--limit 1" in out
+    assert "SUBSET" in out
+
+
+def test_an_unlimited_run_never_claims_to_be_a_subset(rgc, monkeypatch, capsys):
+    """The other direction, without which the notice could become unconditional
+    and stop discriminating anything."""
+    monkeypatch.setattr(
+        rgc, "GUARDS", {"double": rgc.Guard(run=lambda c, w: False, safety=_double_safe(rgc))}
+    )
+    monkeypatch.setattr(
+        rgc, "load_corpus", lambda **kw: [("echo one", "/tmp"), ("echo two", "/tmp")]
+    )
+    monkeypatch.setattr(rgc, "_cache_provenance", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all"])
+
+    assert rgc.main() == 0
+
+    out = capsys.readouterr().out
+    assert "corpus: 2 unique real commands" in out
+    assert "SUBSET" not in out
+    assert "--limit" not in out
+
+
+def test_the_bash_safety_declaration_is_bound_to_the_tracked_settings_file():
+    """The declaration states that this repo does not wire the hook, and derives
+    two consequences from it. Bind the claim to the settings file rather than to
+    its own prose: asserting the SENTENCE is still present would pass forever,
+    while this fails the moment the world it describes changes.
+    """
+    settings = json.loads((_REPO_ROOT / ".claude" / "settings.json").read_text())
+    all_commands = [
+        hook.get("command", "")
+        for entries in settings.get("hooks", {}).values()
+        for entry in entries
+        for hook in entry.get("hooks", [])
+    ]
+    assert len(all_commands) > 10, (
+        "the settings walk found almost no hook commands — the schema this "
+        "comprehension hard-codes has moved, so the assertion below would pass "
+        "against an EMPTY set and the declaration's claim would be unbound. "
+        f"Found: {all_commands}"
+    )
+    wired = [c for c in all_commands if "bash_safety_hook" in str(c)]
+    assert not wired, (
+        "bash_safety_hook.sh is now wired in this repo's settings.json, so the "
+        "bash_safety declaration in replay_guard_corpus.py is stale: it states "
+        "that the repo does not wire it, and derives from that both the "
+        "fresh-clone caveat and the claim that its registration cannot be read "
+        f"from inside this repo. Wired as: {wired}"
+    )
+
+
+# ── binding the parts the first sweep left unbound ───────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("age_s", "expected"),
+    [
+        (30 * 60, "30 minutes ago"),
+        (5 * 3600, "5.0 hours ago"),
+        (6 * 86400, "6.0 days ago"),
+    ],
+)
+def test_each_age_unit_renders_in_its_own_band(cache, rgc, monkeypatch, tmp_path, age_s, expected):
+    """Only the DAYS branch was asserted anywhere, so the other two were free.
+
+    Surviving mutations the first sweep could not see: swap the two divisors,
+    swap the 3600/86400 thresholds, or flip a `<` to `>`. Each ships a
+    confidently wrong age on the line most likely to be pasted into a PR body —
+    "5.0 minutes ago" for a five-hour-old cache reads as fresh.
+    """
+    _stamped_tree(rgc, monkeypatch, tmp_path, 1, mtime=time.time())
+    cache.write_text('["echo one", "/tmp"]\n')
+    built = time.time() - age_s
+    os.utime(cache, (built, built))
+
+    assert expected in rgc._cache_provenance()
+
+
+def test_the_stamp_is_the_cache_mtime_not_the_current_time(cache, rgc, monkeypatch, tmp_path):
+    """`time.localtime(built)` → `time.localtime()` survived every assertion.
+
+    It renders `cache built <today> (6.0 days ago)` — a self-contradicting line
+    whose two halves disagree, and whose date half is the one a reader trusts.
+    Nothing pinned the stamp at all, so this asserts the exact rendered date of
+    a known mtime.
+    """
+    _stamped_tree(rgc, monkeypatch, tmp_path, 1, mtime=time.time())
+    cache.write_text('["echo one", "/tmp"]\n')
+    built = time.time() - 6 * 86400
+    os.utime(cache, (built, built))
+
+    expected = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(built))
+    line = rgc._cache_provenance()
+
+    assert f"cache built {expected}" in line
+    assert time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()) not in line
+
+
+def test_a_limit_at_or_above_the_corpus_size_is_not_a_subset(rgc, monkeypatch, capsys):
+    """The boundary the two limit tests left open.
+
+    They cover `--limit 1` over 3 rows and no limit at all, so mutating the
+    branch condition to `if args.limit is None:` keeps both green — while
+    printing `corpus: 3 of 3 unique real commands (--limit 5) — a SUBSET` for a
+    run that measured the WHOLE corpus. A false subset claim is the mirror of
+    the defect this PR fixes, and costs the same credibility.
+    """
+    monkeypatch.setattr(
+        rgc, "GUARDS", {"double": rgc.Guard(run=lambda c, w: False, safety=_double_safe(rgc))}
+    )
+    monkeypatch.setattr(
+        rgc,
+        "load_corpus",
+        lambda **kw: [("echo one", "/tmp"), ("echo two", "/tmp"), ("echo three", "/tmp")],
+    )
+    monkeypatch.setattr(rgc, "_cache_provenance", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all", "--limit", "5"])
+
+    assert rgc.main() == 0
+
+    out = capsys.readouterr().out
+    assert "corpus: 3 unique real commands" in out
+    assert "SUBSET" not in out
+    assert "--limit" not in out
+
+
+def test_a_missing_provenance_prints_no_line_at_all(rgc, monkeypatch, capsys):
+    """Deleting the `if provenance:` guard prints a bare indented `None`.
+
+    Both limit tests stub the provenance to None and assert nothing that a
+    literal `None` line would violate, so the guard was unbound. A stray `None`
+    under the corpus count is the kind of output a reader rounds off as noise
+    and then quotes anyway.
+    """
+    monkeypatch.setattr(
+        rgc, "GUARDS", {"double": rgc.Guard(run=lambda c, w: False, safety=_double_safe(rgc))}
+    )
+    monkeypatch.setattr(rgc, "load_corpus", lambda **kw: [("echo hi", "/tmp")])
+    monkeypatch.setattr(rgc, "_cache_provenance", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all"])
+
+    assert rgc.main() == 0
+
+    out = capsys.readouterr().out
+    assert "corpus: 1 unique real commands" in out
+    assert "None" not in out
+
+
+def test_the_provenance_is_read_AFTER_the_corpus_is_loaded(rgc, monkeypatch, capsys):
+    """Order is load-bearing and nothing pinned it.
+
+    `_cache_provenance()` reads the cache file, and `load_corpus(rebuild=True)`
+    REWRITES that file. Hoisting the provenance call above the load — a
+    plausible tidying, since it reads like a preamble — would make a
+    `--rebuild --all` run describe the PRE-rebuild cache: `cache built <6 days
+    ago>; 10 of 10 changed`, printed directly above a corpus that was rebuilt
+    from that same tree seconds earlier. That is precisely the confident-wrong
+    line this feature exists to prevent, reachable by a refactor no other test
+    would stop.
+    """
+    calls: list[str] = []
+
+    def loud_load(**_kw):
+        calls.append("load_corpus")
+        return [("echo hi", "/tmp")]
+
+    def loud_provenance():
+        calls.append("_cache_provenance")
+        return "cache built AT SOME POINT"
+
+    monkeypatch.setattr(
+        rgc, "GUARDS", {"double": rgc.Guard(run=lambda c, w: False, safety=_double_safe(rgc))}
+    )
+    monkeypatch.setattr(rgc, "load_corpus", loud_load)
+    monkeypatch.setattr(rgc, "_cache_provenance", loud_provenance)
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all"])
+
+    assert rgc.main() == 0
+
+    assert calls == ["load_corpus", "_cache_provenance"], (
+        "provenance must describe the cache the corpus was actually loaded from"
+    )
+
+
+def test_a_limited_run_says_the_subset_is_sort_ordered_not_sampled(rgc, monkeypatch, capsys):
+    """Truncation and BIAS are two claims, and the notice owes both.
+
+    `_extract_commands` returns `sorted(seen)` and the cache preserves that
+    order, so `corpus[:limit]` is a lexicographic PREFIX. Saying only "a SUBSET"
+    leaves a reader free to assume a representative sample of N, which is the
+    same overstatement one step in.
+    """
+    monkeypatch.setattr(
+        rgc, "GUARDS", {"double": rgc.Guard(run=lambda c, w: False, safety=_double_safe(rgc))}
+    )
+    monkeypatch.setattr(
+        rgc, "load_corpus", lambda **kw: [("a", "/tmp"), ("b", "/tmp"), ("c", "/tmp")]
+    )
+    monkeypatch.setattr(rgc, "_cache_provenance", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--all", "--limit", "1"])
+
+    assert rgc.main() == 0
+
+    out = capsys.readouterr().out
+    assert "SORT ORDER" in out
+    assert "rather than a sample" in out
+
+
+def test_no_test_in_this_module_can_reach_the_real_home(rgc):
+    """Guard-the-guard for `_isolate_corpus_paths`.
+
+    The isolation fixture has no failing test of its own: remove it and nothing
+    goes red, the suite just quietly starts walking the operator's real
+    transcript tree again. An autouse fixture whose absence is invisible is a
+    convention, and conventions decay — so this asserts the PROPERTY directly,
+    and fails the moment the fixture stops holding it.
+
+    Note the property is "not the PRODUCTION path", not "outside $HOME": on an
+    install whose TMPDIR sits under the home directory — which is the shipped
+    Claude Code arrangement here — `tmp_path` is itself inside $HOME, so the
+    stricter-looking assertion fails on a correctly isolated run. That is the
+    first version of this test, caught by running it.
+    """
+    production_cache = Path.home() / ".genesis" / "output" / "guard-corpus.jsonl"
+    production_transcripts = Path.home() / ".claude" / "projects"
+    assert production_cache != rgc._CACHE, (
+        "_CACHE is the production cache — the isolation fixture is not in "
+        "effect, and tests are statting the operator's real 75 MB corpus"
+    )
+    assert production_transcripts != rgc._TRANSCRIPTS, (
+        "_TRANSCRIPTS is the production transcript tree — tests are walking the "
+        "operator's real sessions, so their runtime depends on whose box it is"
+    )
+
+
+# ── round-2 review: the branches the 17-mutation sweep still left unbound ─────
+
+
+def test_the_cache_is_stamped_with_the_walks_START_not_its_end(cache, rgc, monkeypatch, tmp_path):
+    """The confident-wrong line this whole feature exists to prevent, reached by
+    a road the first round missed.
+
+    `os.replace` sets the cache mtime to the WRITE, which is the walk's END. A
+    transcript appended at minute 3 of a twenty-minute walk therefore lands with
+    an mtime EARLIER than the cache and reads as "unchanged" — over a corpus
+    that provably does not contain it. MEASURED before the fix: a file appended
+    2s into a walk produced `0 of 1 transcript files have changed since`.
+
+    The fix stamps the walk's START, so anything touched during the build is
+    reported as drift. That is deliberately the over-reporting direction: a
+    false "something changed" costs a rebuild, a false "nothing changed" costs
+    the measurement its meaning.
+    """
+    tree = tmp_path / "projects"
+    tree.mkdir()
+    appended = tree / "a.jsonl"
+    appended.write_text("{}\n")
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", tree)
+
+    def walk_that_takes_time():
+        # The sleep comes FIRST so the append lands measurably after the walk
+        # began. Linux stamps inode mtimes from the coarse clock (~1-4ms), so an
+        # append issued microseconds after the walk starts can share a timestamp
+        # bucket with it and the test proves nothing — that is how the first
+        # version of this test failed against a CORRECT fix.
+        time.sleep(1.1)
+        appended.write_text("{}\n{}\n")  # a live session appends during the walk
+        return list(_ROWS)
+
+    monkeypatch.setattr(rgc, "_extract_commands", walk_that_takes_time)
+    rgc.load_corpus(rebuild=True)
+
+    assert appended.read_text().count("\n") == 2, (
+        "guard-the-guard: the stub must actually have appended, or the drift "
+        "this test looks for was never created"
+    )
+    assert appended.stat().st_mtime > cache.stat().st_mtime, (
+        "the cache must be stamped with the walk's START, so a file touched "
+        "during the build is newer than the cache and reads as drift"
+    )
+    assert "1 of 1 transcript files have changed since" in rgc._cache_provenance()
+
+
+def test_the_provenance_population_matches_the_corpus_BUILD_population(
+    cache, rgc, monkeypatch, tmp_path
+):
+    """One parity test for two independent walks over the same tree.
+
+    `_extract_commands` uses `sorted(_TRANSCRIPTS.rglob("*.jsonl"))`;
+    `_cache_provenance` uses `os.walk` with an `endswith(".jsonl")` filter. Two
+    APIs, two filter spellings, two symlink policies — and a denominator that
+    means nothing unless they agree. Without this, dropping the `.jsonl` filter
+    or flipping `followlinks` both keep the suite green while the reported total
+    diverges from the corpus source (MEASURED on the real tree: 12,055 `.jsonl`
+    against 21,476 files, so an unfiltered walk overstates by 78%).
+
+    The mixed tree is the point: a dotfile, a non-`.jsonl` sibling, a nested
+    directory, and a SYMLINKED directory, which is the case where the two APIs
+    could legitimately disagree and where `followlinks=True` would double-count.
+    """
+    tree = tmp_path / "projects"
+    (tree / "nested").mkdir(parents=True)
+    (tree / "plain.jsonl").write_text("{}\n")
+    (tree / ".hidden.jsonl").write_text("{}\n")
+    (tree / "notes.md").write_text("not a transcript\n")
+    (tree / "data.json").write_text("{}\n")
+    (tree / "nested" / "deep.jsonl").write_text("{}\n")
+    (tree / "linked").symlink_to(tree / "nested", target_is_directory=True)
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", tree)
+    cache.write_text('["echo one", "/tmp"]\n')
+    built = time.time() - 86400
+    os.utime(cache, (built, built))
+
+    expected = len(sorted(tree.rglob("*.jsonl")))
+    line = rgc._cache_provenance()
+    reported = int(re.search(r"of (\d+) transcript files", line).group(1))
+
+    assert reported == expected, (
+        f"provenance counted {reported} files, the corpus build walk counts "
+        f"{expected} — the denominator does not describe the corpus"
+    )
+    assert expected == 3, (
+        "guard-the-guard: the fixture must contain exactly 3 .jsonl files among "
+        "6 entries plus a symlinked directory, or this parity check is trivial"
+    )
+
+
+def test_an_unrenderable_cache_mtime_degrades_instead_of_aborting(cache, rgc, monkeypatch):
+    """The branch whose own comment says an escape would discard a 20-minute run.
+
+    Nothing exercised it, so narrowing its `except` to an unrelated exception
+    kept the suite green. It is genuinely reachable: an mtime outside the
+    platform's range raises out of `time.localtime`.
+    """
+    cache.write_text('["echo one", "/tmp"]\n')
+    # Inject the out-of-range mtime at the stat boundary, not via os.utime:
+    # ext4 silently clamps 2**62 to its ~2446 max, which RENDERS and lands in
+    # the future-mtime branch instead of this one — the utime version was
+    # green only on filesystems that store the value unclamped.
+    class _OutOfRangeStat:
+        st_mtime = 2**62
+
+    monkeypatch.setattr(
+        type(cache), "stat", lambda self, *a, **k: _OutOfRangeStat()
+    )
+
+    line = rgc._cache_provenance()
+
+    assert "cannot be rendered" in line
+    assert "age is unknown" in line
+
+
+def test_a_transcript_tree_that_is_absent_says_so_rather_than_empty(
+    cache, rgc, monkeypatch, tmp_path
+):
+    """ "Nothing was found" and "nothing could be READ" are different diagnoses.
+
+    Deleting the `unreadable_dirs` arm of the zero-total branch left the suite
+    green while a completely unreachable tree reported "no transcripts found" —
+    which sends the reader after a missing corpus instead of a broken path.
+
+    Uses an ABSENT directory rather than `chmod 000`, so it needs no mode bits
+    and therefore runs as root too: the sibling permission test is skipped under
+    uid 0, which would otherwise leave `onerror` unbound wherever CI runs as root.
+    """
+    cache.write_text('["echo one", "/tmp"]\n')
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", tmp_path / "definitely-not-here")
+
+    line = rgc._cache_provenance()
+
+    assert "could not be read" in line
+    assert "no transcripts found" not in line
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bits this test sets")
+def test_BOTH_blind_spots_are_named_when_both_occur(cache, rgc, monkeypatch, tmp_path):
+    """Half a disclosure is the failure mode here.
+
+    `' and '.join(missed)` → `missed[0]` kept the suite green: with an unreadable
+    directory AND an unreadable file, one of the two silently stopped being
+    mentioned. No test produced both at once.
+    """
+    cache.write_text('["echo one", "/tmp"]\n')
+    built = time.time() - 86400
+    os.utime(cache, (built, built))
+    tree = tmp_path / "projects"
+    (tree / "locked").mkdir(parents=True)
+    (tree / "real.jsonl").write_text("{}\n")
+    (tree / "rotated.jsonl").symlink_to(tree / "gone.jsonl")
+    (tree / "locked").chmod(0o000)
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", tree)
+    try:
+        line = rgc._cache_provenance()
+    finally:
+        (tree / "locked").chmod(0o755)
+
+    assert "1 unreadable directory" in line
+    assert "1 unreadable file" in line
+    assert " and " in line, "both blind spots must be named, not just the first"
+    assert "floors" in line
+
+
+def test_no_provenance_line_can_leak_a_filesystem_path(cache, rgc, monkeypatch, tmp_path):
+    """The provenance line is printed to STDOUT precisely so it travels with the
+    number into a PR body — which makes it a PUBLIC surface, and the repo's hard
+    rule is that no /home/<user> path reaches one.
+
+    An `OSError`'s `str()` embeds the absolute filename, so the obvious
+    `f"… ({exc})"` spelling publishes the operator's home path on the one line
+    most likely to be copied. Every failure branch must render `strerror` alone.
+    The stderr warnings in this module deliberately DO print the path: stderr is
+    the operator's channel, not the published one, and this test is scoped to
+    the returned string.
+    """
+    cache.write_text('["echo one", "/tmp"]\n')
+    real_stat = Path.stat
+
+    def refuse(self, *a, **kw):
+        if self == cache:
+            raise PermissionError(errno.EACCES, "Permission denied", str(cache))
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", refuse)
+    line = rgc._cache_provenance()
+
+    assert "Permission denied" in line, "the cause must still be named"
+    assert str(cache) not in line, f"the cache path leaked into stdout: {line}"
+    assert str(Path.home()) not in line, f"a home path leaked into stdout: {line}"
+    assert "/" not in line.split("(")[-1], (
+        f"a filesystem path appears in the rendered cause: {line}"
+    )
+
+
+def _every_provenance_branch(rgc, cache, tmp_path, monkeypatch, built):
+    """Drive every branch of `_cache_provenance` that returns a string.
+
+    Returns `[(label, line)]`. Used by the allowlist test below, which has to
+    assert its property over the whole population rather than one member — the
+    defect it exists to prevent was found on the branch nobody had driven.
+    """
+    tree = tmp_path / "prov-tree"
+    tree.mkdir()
+    (tree / "one.jsonl").write_text("{}\n")
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", tree)
+    cache.write_text('["echo one", "/tmp"]\n')
+    os.utime(cache, (built, built))
+    out = [("normal", rgc._cache_provenance())]
+
+    empty = tmp_path / "empty-tree"
+    empty.mkdir()
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", empty)
+    out.append(("empty tree", rgc._cache_provenance()))
+
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", tmp_path / "absent")
+    out.append(("unreadable tree", rgc._cache_provenance()))
+
+    monkeypatch.setattr(rgc, "_TRANSCRIPTS", tree)
+    future = time.time() + 86400
+    os.utime(cache, (future, future))
+    out.append(("future mtime", rgc._cache_provenance()))
+
+    os.utime(cache, (built, built))
+    return out
+
+
+def test_no_provenance_branch_leaks_location_or_schedule(cache, rgc, monkeypatch, tmp_path):
+    """Allowlist polarity over EVERY stamped branch, because the round before
+    this one was an INSTANCE fix and the class bit back.
+
+    That round fixed one error branch's filesystem-path leak and left the HOT
+    path rendering `%Z` — the operator's timezone abbreviation — and a localtime
+    hour, i.e. their region and when they were at the machine. Those are the
+    INDIRECT personal context the privacy rule names explicitly, on the one
+    string in this module whose stated purpose is to be pasted into a PR body.
+
+    So this asserts the property across the whole population rather than the
+    member someone happened to report: a branch added later inherits the
+    guarantee instead of quietly reintroducing the defect.
+    """
+    built = time.time() - 6 * 86400
+    utc_stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(built))
+    local_render = time.strftime("%Y-%m-%d %H:%M", time.localtime(built))
+
+    branches = _every_provenance_branch(rgc, cache, tmp_path, monkeypatch, built)
+    assert len(branches) == 4, "guard-the-guard: all four stamped branches must be driven"
+
+    for label, line in branches:
+        # The FORMAT, not one fixed instant: the future branch legitimately
+        # renders a different timestamp, and pinning the exact stamp here would
+        # duplicate the dedicated stamp test while failing on that branch.
+        assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC", line), (
+            f"{label}: no UTC-rendered timestamp — {line}"
+        )
+        if label != "future mtime":
+            assert utc_stamp in line, f"{label}: stamp is not the UTC rendering — {line}"
+        if local_render != utc_stamp.removesuffix(" UTC"):
+            assert local_render not in line, (
+                f"{label}: the line carries the operator's LOCAL clock — {line}"
+            )
+        if "UTC" not in time.tzname:
+            for abbrev in time.tzname:
+                assert abbrev not in line, (
+                    f"{label}: the line names the operator's timezone {abbrev!r} — {line}"
+                )
+        assert str(Path.home()) not in line, f"{label}: home path leaked — {line}"
+        assert str(tmp_path) not in line, f"{label}: a filesystem path leaked — {line}"
+
+
+def test_the_rebuild_notice_keeps_the_cache_path_off_stdout(rgc, monkeypatch, capsys, tmp_path):
+    """The sibling of the provenance leak, in the same file and on the same
+    surface: `--rebuild` alone printed the absolute cache path to STDOUT.
+
+    Pre-existing rather than introduced here, but it contradicts the invariant
+    this change's own tests now assert, so it is fixed as a member of the class
+    rather than left as a counterexample sitting six hundred lines away.
+    """
+    monkeypatch.setattr(rgc, "_CACHE", tmp_path / "corpus.jsonl")
+    monkeypatch.setattr(rgc, "_extract_commands", lambda: [("echo hi", "/tmp")])
+    monkeypatch.setattr(sys, "argv", ["replay_guard_corpus.py", "--rebuild"])
+
+    assert rgc.main() == 0
+
+    captured = capsys.readouterr()
+    assert "corpus rebuilt" in captured.err, "the notice must still be emitted"
+    assert "corpus rebuilt" not in captured.out, "it must not be on the pasted surface"
+    assert str(tmp_path) not in captured.out, f"a path reached stdout: {captured.out!r}"

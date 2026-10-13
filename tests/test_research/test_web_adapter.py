@@ -27,7 +27,9 @@ class TestWebSearchAdapter:
         mock_searcher.search.return_value = SearchResponse(
             query="test",
             results=[
-                WebSearchResult(title="A", url="http://a.com", snippet="snip", backend=SearchBackend.SEARXNG),
+                WebSearchResult(
+                    title="A", url="http://a.com", snippet="snip", backend=SearchBackend.SEARXNG
+                ),
             ],
             backend_used=SearchBackend.SEARXNG,
         )
@@ -41,12 +43,30 @@ class TestWebSearchAdapter:
         assert results[0].source == "searxng"
 
     @pytest.mark.asyncio
+    async def test_source_comes_from_each_result_not_the_response(self):
+        # backend_used is None unless a backend produced the results, so the
+        # per-result source must come from the result itself — never "None".
+        mock_searcher = AsyncMock()
+        mock_searcher.search.return_value = SearchResponse(
+            query="test",
+            results=[
+                WebSearchResult(
+                    title="B", url="http://b.com", snippet="s", backend=SearchBackend.BRAVE
+                ),
+            ],
+        )
+        results = await WebSearchAdapter(searcher=mock_searcher).search("test")
+        assert results[0].source == "brave"
+
+    @pytest.mark.asyncio
     async def test_invoke(self):
         mock_searcher = AsyncMock()
         mock_searcher.search.return_value = SearchResponse(
             query="q",
             results=[
-                WebSearchResult(title="B", url="http://b.com", snippet="s", backend=SearchBackend.BRAVE),
+                WebSearchResult(
+                    title="B", url="http://b.com", snippet="s", backend=SearchBackend.BRAVE
+                ),
             ],
             backend_used=SearchBackend.BRAVE,
         )
@@ -70,7 +90,11 @@ class TestWebSearchAdapter:
         mock_searcher = AsyncMock()
         mock_searcher.search.return_value = SearchResponse(
             query="test",
-            results=[WebSearchResult(title="X", url="http://x", snippet="", backend=SearchBackend.SEARXNG)],
+            results=[
+                WebSearchResult(
+                    title="X", url="http://x", snippet="", backend=SearchBackend.SEARXNG
+                )
+            ],
         )
         adapter = WebSearchAdapter(searcher=mock_searcher)
         status = await adapter.check_health()
@@ -80,7 +104,8 @@ class TestWebSearchAdapter:
     async def test_health_check_unavailable_on_error(self):
         mock_searcher = AsyncMock()
         mock_searcher.search.return_value = SearchResponse(
-            query="test", error="all backends down",
+            query="test",
+            error="all backends down",
         )
         adapter = WebSearchAdapter(searcher=mock_searcher)
         status = await adapter.check_health()

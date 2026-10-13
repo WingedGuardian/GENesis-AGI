@@ -114,6 +114,22 @@ def run_gc(
     if not db_path.exists():
         _log(f"WARN db not found at {db_path} — keeping all snapshots (cannot verify labels)")
         return 0
+    # Admission fence (lazy, fail-closed — this script stays stdlib-only at
+    # import time): a fenced database cannot verify labels, and the fail-safe
+    # is the same as an unreadable one — keep everything.
+    _hooks = str(Path(__file__).resolve().parent / "hooks")
+    if _hooks not in sys.path:
+        sys.path.insert(0, _hooks)
+    try:
+        from db_admission_check import database_is_fenced
+    except Exception:
+        database_is_fenced = None  # type: ignore[assignment]
+    if database_is_fenced is None or database_is_fenced(db_path):
+        _log(
+            f"WARN db fenced or fence state unknowable at {db_path} — "
+            "keeping all snapshots (cannot verify labels)"
+        )
+        return 0
     # Read-only, direct SQL by design: this is a stdlib-only maintenance script (like
     # worktree_lifecycle.py / backup.sh) and cannot import the async genesis.db.crud layer.
     # The "crud-layer only" convention guards WRITES to genesis.db; this only ever reads

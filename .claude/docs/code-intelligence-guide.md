@@ -31,14 +31,19 @@ Config: `.serena/project.yml`
 
 ## GitNexus (Knowledge Graph)
 
-Graph of ~32K nodes and ~51K edges (v1.6.8). CLI: `gitnexus <command>`.
-Index: `.gitnexus/lbug` (LadybugDB). Refresh: `gitnexus analyze`.
+LadybugDB-backed graph pinned to GitNexus 1.6.12.
+Index: `.gitnexus/lbug` (LadybugDB). Refresh through the managed entrypoint:
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast`.
 
 **Snapshot-based — reindex when freshness matters.** The index reflects the
 commit it was built at; its auto-reindex fires on local commit, NOT on
-`git pull` of merged PRs, so it drifts after merges. Run `gitnexus analyze`
+`git pull` of merged PRs, so it drifts after merges. Run
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast`
 before trusting `impact`/flows for a load-bearing decision; for live "who calls
 X" during active editing, Serena (LSP) is always current.
+
+The managed indexer deliberately skips linked worktrees. Do not interpret its
+successful skip as a refreshed branch graph; use Serena for live worktree truth.
 
 **Best for:** impact analysis, execution flows, coupling, routes, tools.
 Text search (`gitnexus query`) needs the LadybugDB FTS extension (see Known
@@ -145,7 +150,7 @@ gitnexus impact "Method:src/genesis/autonomy/dispatcher.py:TaskDispatcher.submit
 ### Known Limitations
 
 - **FTS/text search depends on the LadybugDB extension.** When it isn't
-  pre-installed, `gitnexus analyze` logs "FTS extension unavailable; continuing
+  pre-installed, a managed GitNexus refresh logs "FTS extension unavailable; continuing
   without FTS" and `gitnexus query` is degraded — it does NOT crash. Use
   Serena/Grep for text/symbol search when FTS is off.
 - **Vector/embedding search not configured.** Requires `--embeddings`

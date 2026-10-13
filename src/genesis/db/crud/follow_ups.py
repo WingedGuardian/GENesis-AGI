@@ -494,6 +494,52 @@ async def absorb_followup(
     return cursor.rowcount > 0
 
 
+async def retire_by_dedup_keys(
+    db: aiosqlite.Connection,
+    dedup_keys: list[str],
+    *,
+    note: str,
+) -> int:
+    """Mark still-PENDING rows carrying one of *dedup_keys* 'completed', appending *note*.
+
+    For a producer whose own record has been superseded by a different owner:
+    the inbox's lane-off BUILD fallback, once the live build lane has taken the
+    item over (its greenlight card or calibration row now records the decision).
+    The row is RETIRED, never deleted: it keeps its history, and its dedup_key
+    keeps blocking a re-creation (pinned rows are exempt from
+    ``purge_completed``, so for those that is permanent).
+
+    PINNED ROWS — a deliberate, narrow exception to "only the user closes a
+    pinned follow-up" (migration 0008). The rows this retires are pinned
+    because they STAND IN for the lane's greenlight card while the lane is off;
+    when the lane takes the item, the card replaces the row as the user's
+    decision point, so nothing the user owns is decided on their behalf. The
+    exception is scoped by the caller's dedup keys, never by pinned state.
+
+    Only ``pending`` rows transition — the untouched state the producer created.
+    A row the user or a worker has moved (``blocked``/``failed``, taken up as
+    ``in_progress``/``scheduled``, or closed) is a human-or-worker decision and
+    is left alone, as ``absorb_followup`` does for a row "a user just set
+    blocked". Both lanes (``follow_up`` and ``tabled``) are covered — the key
+    identifies the record, the lane does not. A single conditional UPDATE, so
+    no check-then-act window. Returns the number of rows retired.
+    """
+    keys = [k for k in dedup_keys if k]
+    if not keys:
+        return 0
+    placeholders = ", ".join("?" for _ in keys)
+    cursor = await db.execute(
+        "UPDATE follow_ups SET status = 'completed', completed_at = ?, "
+        "resolution_notes = TRIM("
+        "COALESCE(resolution_notes || char(10) || char(10), '') || ?"
+        f") WHERE dedup_key IN ({placeholders}) "  # noqa: S608 — placeholders only
+        "AND status = 'pending'",
+        (_now_iso(), note, *keys),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def link_task(
     db: aiosqlite.Connection,
     id: str,

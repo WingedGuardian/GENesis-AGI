@@ -410,7 +410,9 @@ class TestParseRecommendations:
         assert r.build_spec["intended_paths"] == [
             "src/genesis/modules/star_velocity/"
         ]
-        # BUILD never produces a follow-up — the build lane owns it.
+        # BUILD is never generically actionable: the live build lane owns it,
+        # and the lane-off fallback is a separate, verdict-mapped path in
+        # InboxMonitor._create_follow_ups_from_eval (not is_actionable).
         assert r.is_actionable is False
 
     def test_dont_build_verdict_without_spec(self):

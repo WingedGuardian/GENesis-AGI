@@ -78,6 +78,7 @@ class ChannelType(StrEnum):
     WHATSAPP = "whatsapp"
     WEB = "web"
     VOICE = "voice"
+    AGENT = "agent"
 
 
 def origin_delivery_supported(channel: ChannelType | str | None) -> bool:
@@ -88,7 +89,7 @@ def origin_delivery_supported(channel: ChannelType | str | None) -> bool:
     that resolver returns a real ``(chat_id, thread_id)`` target ONLY for Telegram
     origins (a Telegram voice message arrives on the ``telegram`` channel — the
     ``VOICE`` channel is the separate S2S surface, which has no addressable thread).
-    Every other channel (WEB/OpenClaw, WhatsApp, VOICE, terminal) falls back to the
+    Every other channel (WEB/OpenClaw, WhatsApp, VOICE, AGENT, terminal) falls back to the
     default owner surface. The channel research-reroute nudge is gated on this so it
     never promises "I'll report back to this conversation" on a channel where the
     delivery model would silently redirect the result to the owner surface instead.
@@ -103,7 +104,7 @@ def is_owner_attended_channel(channel: ChannelType | str | None) -> bool:
     """Whether a conversation on *channel* is owner-authenticated at the message
     boundary — the single owner-ATTENDED channel set (terminal, Telegram).
 
-    Every gateway channel (web/OpenClaw, WhatsApp, voice) is NOT owner-
+    Every gateway channel (web/OpenClaw, WhatsApp, voice, agent) is NOT owner-
     authenticated when a message arrives, and an unknown/None channel is treated
     as not-attended (fail-closed). This is the one predicate for owner-vs-gateway
     trust at the conversation boundary; both :func:`task_detected_origin` (what
@@ -120,7 +121,7 @@ def session_origin_for_channel(channel: ChannelType | str | None) -> str | None:
     Owner-attended (terminal/Telegram) → ``None``: the invoker leaves
     ``GENESIS_SESSION_ORIGIN`` unset and the memory/observation chokepoints
     coalesce server/foreground writes to first_party (unchanged behaviour).
-    Every gateway channel (web/OpenClaw, WhatsApp, voice) → ``external_untrusted``
+    Every gateway channel (web/OpenClaw, WhatsApp, voice, agent) → ``external_untrusted``
     so the session's OWN memory/``observation_write`` calls are stamped untrusted —
     without this a gateway session runs with no origin env and its writes coalesce
     to first_party (mcp/memory/observations.py), which the read-side origin gate
@@ -140,7 +141,7 @@ def observation_origin_for_channel(channel: ChannelType | str | None) -> str:
     writes ABOUT a session on *channel*).
 
     Owner-attended (terminal/Telegram) → ``first_party``; every other channel
-    (web/OpenClaw, WhatsApp, voice, inbox, or unknown) → ``external_untrusted``
+    (web/OpenClaw, WhatsApp, voice, agent, inbox, or unknown) → ``external_untrusted``
     (fail-closed). Note the polarity difference from
     :func:`session_origin_for_channel`, which returns ``None`` for owner-attended:
     an OBSERVATION with NULL origin is EXCLUDED from surfacing (the read side
@@ -158,7 +159,7 @@ def task_detected_origin(channel: ChannelType | str | None) -> str:
 
     Owner-ATTENDED channels (terminal, Telegram) stamp ``owner`` — a task the
     owner typed legitimately carries dispatch authority. Every gateway channel
-    (web/OpenClaw, WhatsApp, voice) is NOT owner-authenticated at the message
+    (web/OpenClaw, WhatsApp, voice, agent) is NOT owner-authenticated at the message
     boundary, so its detected tasks are ``external_untrusted``: still visible,
     but never auto-dispatch-authorized (the autonomy dispatcher's origin gate
     bars them). Fail-closed: an unknown/None channel → external_untrusted.
@@ -311,6 +312,12 @@ def clamp_effort(model: CCModel, effort: EffortLevel) -> EffortLevel:
 VALID_MODEL_NAMES: frozenset[str] = frozenset(m.value for m in CCModel)
 VALID_EFFORT_NAMES: frozenset[str] = frozenset(e.value for e in EffortLevel)
 
+#: ``CCInvocation.caller_tag`` value marking a liveness probe. Its rate-limit /
+#: quota failures are the expected "not back yet" answer, so the invoker emits
+#: no ``cc.invocation_failed`` event for THOSE; any other probe failure (a
+#: timeout, a missing binary) is a malfunction and is emitted.
+PROBE_CALLER_TAG = "probe"
+
 
 @dataclass(frozen=True)
 class CCInvocation:
@@ -336,7 +343,7 @@ class CCInvocation:
     # Per-invocation override for CC's Bash sandbox root (CLAUDE_CODE_TMPDIR).
     # None → the shared default (~/.genesis/cc-tmp). Set by throwaway sessions
     # (e.g. the model-roster gauntlet) to isolate their tmp blast radius from
-    # live sessions policed by genesis-tmp-watchgod.
+    # the quota-capped cc-tmp that live sessions share.
     claude_code_tmpdir: str | None = None
     # When non-empty, the session's Bash is restricted to these command binaries
     # (enforced by scripts/bash_safety_hook.sh via the GENESIS_BASH_ALLOWLIST env
@@ -409,6 +416,14 @@ class CCInvocation:
     # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
     # a concurrent background one. None → keyed by pid (never cross-fired).
     session_key: str | None = None
+    # Observability label naming the call site that dispatched this invocation
+    # (e.g. "ego.cycle", "inbox.eval", "direct_session.<profile>"). Carried on the
+    # ``cc.invocation_failed`` event so a failure is attributable to its caller,
+    # and used as part of that event's coalescing key. PROBE_CALLER_TAG marks a
+    # liveness probe whose expected rate-limit/quota failures are NOT emitted
+    # (other probe failures are). None → untagged: always emitted, never
+    # coalesced. Never changes control flow.
+    caller_tag: str | None = None
     # WS-3 session-level provenance. When set, CCInvoker._build_env stamps
     # GENESIS_SESSION_ORIGIN so the session's memory MCP writes carry this
     # origin_class (memory.provenance.session_origin_from_env). Set it ONLY at
@@ -533,6 +548,14 @@ class CCOutput:
     # Collapsing the first two into () made "no report" indistinguishable from
     # "reported zero", which turned an absence of evidence into a claim.
     tools_used: tuple[str, ...] | None = None
+    # True when `cost_usd` is a SESSION-CUMULATIVE total rather than this call's
+    # cost. From CC 2.1.277 a resumed `-p` session restores its saved totals, so
+    # `total_cost_usd` (and `modelUsage`) are running totals while `usage` tokens
+    # stay per call. Set from the CC VERSION by the invoker's run paths
+    # (`CCInvoker._with_cost_semantics`) — the result itself carries no signal
+    # that survives a model switch. A caller that SUMS `cost_usd` across turns
+    # must record the difference, via `cc_sessions.record_turn_cost`.
+    cost_is_cumulative: bool = False
 
     # How many over-limit stream-json lines the reader DROPPED on this run.
     # Nonzero means the event stream this output was built from is INCOMPLETE:

@@ -93,8 +93,10 @@ async def ephemeral_store(
     ensure_collections(qdrant)
     db = await init_db(workdir / "lme.db")
 
+    # A brand-new in-memory collection has no corpus space to match, so the
+    # chain anchors to the leader of the requested (cloud-first) order.
     embedder = embedding_provider or EmbeddingProvider(
-        backends=EmbeddingProvider.build_chain(ollama_first=False),
+        backends=EmbeddingProvider.build_chain(ollama_first=False, fresh_collection=True),
         cache_dir=workdir / "cache",
     )
     linker = None

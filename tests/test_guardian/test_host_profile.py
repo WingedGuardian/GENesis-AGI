@@ -269,4 +269,21 @@ class TestGatherHostProfile:
             "vg_free_bytes",
             "pool_used_pct",
             "detail",
+            # Pool relief (revisited: pool_name was already a FACT, set by
+            # _host_storage_pool from the same detection; the other three land
+            # in METRICS via collectors/host.py's allowlist — the size changes
+            # on every pool grow, and the LVM identity adds nothing drift
+            # should hash on today).
+            "pool_size_bytes",
+            "pool_name",
+            "vg_name",
+            "thinpool_lv",
+            # Relief's runway and LVM extend (revisited: both METRICS — the
+            # metadata LV grows under autoextend, and the profile is LVM
+            # identity like vg_name/thinpool_lv above).
+            "metadata_size_bytes",
+            "thinpool_profile",
+            # btrfs/dir identity (relief history + re-check): a METRIC like
+            # the LVM identity fields above.
+            "pool_source",
         }

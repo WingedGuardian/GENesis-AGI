@@ -147,6 +147,12 @@ class OutreachRecoveryWorker:
                 # once-failed background result still reaches its exact origin thread.
                 target_chat_id=payload.get("target_chat_id"),
                 target_thread_id=payload.get("target_thread_id"),
+                # A failed RETRY must not defer a fresh row: this row is still
+                # open (reset_to_pending on failure), so a second row would be
+                # its own shadow — different signal_type ("deferred_retry" vs
+                # the original), so _defer's has_open dedup cannot see the
+                # original and BOTH deliver on recovery (issue #1781's class).
+                defer_retry=False,
             )
             content = payload.get("content", "")
             if not content:

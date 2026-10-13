@@ -29,9 +29,15 @@ async def insert_event(
     subject_id: str | None = None,
     session_id: str | None = None,
     timestamp: str | None = None,
+    event_id: str | None = None,
 ) -> str:
-    """Append an eval event. Returns the event id."""
-    eid = _new_id()
+    """Append an eval event. Returns the event id.
+
+    ``event_id`` lets a caller that must hand the id out BEFORE the row is
+    written (a join key minted on the request path, written later off-path)
+    supply it; default is a fresh id.
+    """
+    eid = event_id or _new_id()
     ts = timestamp or _now_iso()
     await db.execute(
         """INSERT INTO eval_events
@@ -43,6 +49,28 @@ async def insert_event(
     )
     await db.commit()
     return eid
+
+
+async def prune_event_type_older_than(
+    db: aiosqlite.Connection, *, event_type: str, days: int
+) -> int:
+    """Delete ``event_type`` rows older than ``days``. Returns rows removed.
+
+    Scoped to ONE event type on purpose: most eval_events rows are long-lived
+    quality history; only high-volume diagnostic types (``recall_trace``) carry
+    a retention window. The cutoff uses the same ``%Y-%m-%dT%H:%M:%S.%fZ``
+    format ``insert_event`` writes, so the lexical ``timestamp <`` comparison
+    is chronological, and it rides ``idx_eval_events_type (event_type, timestamp)``.
+    """
+    from datetime import timedelta
+
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    cur = await db.execute(
+        "DELETE FROM eval_events WHERE event_type = ? AND timestamp < ?",
+        (event_type, cutoff),
+    )
+    await db.commit()
+    return cur.rowcount or 0
 
 
 async def update_event_metrics(

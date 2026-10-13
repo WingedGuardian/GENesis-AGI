@@ -37,41 +37,77 @@ class WebSearcher:
         self._client = httpx.AsyncClient(timeout=timeout_s)
         self._event_bus = event_bus
 
-    async def search(self, query: str, *, max_results: int | None = None) -> SearchResponse:
-        """Search the web. Returns SearchResponse (never raises)."""
+    async def search(
+        self,
+        query: str,
+        *,
+        max_results: int | None = None,
+        backends: tuple[SearchBackend, ...] = (SearchBackend.SEARXNG, SearchBackend.BRAVE),
+    ) -> SearchResponse:
+        """Search the web, trying ``backends`` in order. Returns SearchResponse (never raises).
+
+        The default order is SearXNG then Brave. Pass a single backend to use
+        only that one: an explicit choice must not quietly fall through to a
+        different service. On total failure the error names every backend
+        tried and why it failed (unreachable, or no key), and ``backend_used``
+        stays None; it is set only by the backend that produced the results.
+        """
         limit = max_results or self._max_results
+        reasons: list[str] = []
 
-        # Try SearXNG
-        try:
-            return await self._search_searxng(query, limit)
-        except (httpx.HTTPError, KeyError, ValueError) as exc:
-            logger.warning("SearXNG search failed (%s), falling back to Brave", exc)
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.WEB, Severity.WARNING, "search.searxng_failed",
-                    f"SearXNG failed: {exc}",
+        for i, requested in enumerate(backends):
+            try:
+                backend = SearchBackend(requested)  # accept "brave" as well as the enum
+            except ValueError:
+                reasons.append(f"{requested}: not a supported search backend")
+                continue
+            try:
+                if backend == SearchBackend.SEARXNG:
+                    response = await self._search_searxng(query, limit)
+                    results = response.results
+                elif backend == SearchBackend.BRAVE:
+                    api_key = os.environ.get("API_KEY_BRAVE", "")
+                    if not api_key:
+                        reasons.append("brave: API_KEY_BRAVE is not set")
+                        continue
+                    results = await self._search_brave(query, limit, api_key)
+                else:  # a future SearchBackend member this loop does not know yet
+                    reasons.append(f"{backend.value}: no search implementation")
+                    continue
+                return SearchResponse(
+                    query=query,
+                    results=results,
+                    backend_used=backend,
+                    fallback_used=i > 0,
                 )
+            except (httpx.HTTPError, KeyError, ValueError) as exc:
+                # The reason reaches MCP callers and the voice model, so it carries
+                # the exception TYPE (and an HTTP status), never the message: httpx
+                # messages can embed the request URL, and SEARXNG_URL may be an
+                # internal address. The full message still goes to the log below.
+                reason = f"{backend.value}: {type(exc).__name__}"
+                if isinstance(exc, httpx.HTTPStatusError):
+                    reason += f": HTTP {exc.response.status_code}"
+                reasons.append(reason)
+                logger.warning("%s search failed (%s)", backend.value, exc)
+                if backend == SearchBackend.SEARXNG and self._event_bus:
+                    await self._event_bus.emit(
+                        Subsystem.WEB,
+                        Severity.WARNING,
+                        "search.searxng_failed",
+                        f"SearXNG failed: {exc}",
+                    )
 
-        # Try Brave
-        api_key = os.environ.get("API_KEY_BRAVE", "")
-        if not api_key:
-            logger.warning("Brave API key not configured, search unavailable")
-            return SearchResponse(query=query, error="All search backends unavailable")
-
-        try:
-            results = await self._search_brave(query, limit, api_key)
-            return SearchResponse(
-                query=query, results=results,
-                backend_used=SearchBackend.BRAVE, fallback_used=True,
+        detail = "; ".join(reasons) or "no backend requested"
+        logger.warning("All search backends failed for %r — %s", query, detail)
+        if self._event_bus:
+            await self._event_bus.emit(
+                Subsystem.WEB,
+                Severity.ERROR,
+                "search.all_failed",
+                f"All search backends failed for: {query} ({detail})",
             )
-        except (httpx.HTTPError, KeyError, ValueError) as exc:
-            logger.warning("Brave search also failed (%s)", exc)
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.WEB, Severity.ERROR, "search.all_failed",
-                    f"All search backends failed for: {query}",
-                )
-            return SearchResponse(query=query, error=f"All search backends failed: {exc}")
+        return SearchResponse(query=query, error=f"All search backends failed — {detail}")
 
     async def _search_searxng(self, query: str, limit: int) -> SearchResponse:
         resp = await self._client.post(
@@ -94,7 +130,10 @@ class WebSearcher:
         return SearchResponse(query=query, results=results, backend_used=SearchBackend.SEARXNG)
 
     async def _search_brave(
-        self, query: str, limit: int, api_key: str,
+        self,
+        query: str,
+        limit: int,
+        api_key: str,
     ) -> list[SearchResult]:
         resp = await self._client.get(
             self._brave_url,

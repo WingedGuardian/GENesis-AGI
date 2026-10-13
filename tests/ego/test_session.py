@@ -201,6 +201,71 @@ class TestUnifiedCycle:
         focus = await ego_crud.get_state(db, "ego_focus_summary")
         assert focus == "general system awareness"
 
+    async def test_previous_assessment_read_scoped_to_own_ego(
+        self, ego_session, mock_compaction,
+    ):
+        """The context read is scoped by the same tag the cycle is stored under.
+
+        Two egos share ego_cycles; if the read and the write disagree on the
+        tag, an ego is handed the other ego's previous assessment (#2695).
+        """
+        await ego_session.run_unified_cycle([_make_signal()])
+
+        read_tag = mock_compaction.assemble_context.call_args.kwargs.get("ego_source")
+        stored = mock_compaction.store_cycle.call_args.args[0]
+        assert read_tag
+        assert read_tag == stored.ego_source
+
+    async def test_recent_focuses_scoped_to_own_ego(self, ego_session, db):
+        """The focus selector's "recent focuses" are this ego's, not the other's.
+
+        Same class as #2695: ego_cycle_outcomes is shared by both egos, so an
+        unscoped read tells each ego to avoid repeating the OTHER ego's picks.
+        """
+        # ego_cycle_outcomes is created by a migration, not in TABLES.
+        await db.execute(
+            "CREATE TABLE ego_cycle_outcomes ("
+            " cycle_id TEXT PRIMARY KEY, focus_type TEXT NOT NULL,"
+            " focus_id TEXT, num_proposals INTEGER DEFAULT 0,"
+            " num_dispatches INTEGER DEFAULT 0, assessment TEXT,"
+            " signals_consumed TEXT, perception_rationale TEXT,"
+            " perceive_cost_usd REAL DEFAULT 0.0, created_at TEXT NOT NULL)"
+        )
+        own = ego_session._source_tag
+        # Two own outcomes, then five newer ones from the other ego: the
+        # other ego fills the selector's whole limit=5 window, so only a
+        # read scoped BEFORE the limit sees this ego's rows at all.
+        sources = [own, own] + ["other_ego_cycle"] * 5
+        for i, src in enumerate(sources):
+            cid = f"c{i}"
+            ts = f"2026-09-0{i + 1}T10:00:00+00:00"
+            await ego_crud.create_cycle(
+                db, id=cid, output_text="x", created_at=ts, ego_source=src,
+            )
+            await ego_crud.create_cycle_outcome(
+                db, cycle_id=cid, focus_type="proactive",
+                perception_rationale=f"rationale-{src}-{i}",
+            )
+            await db.execute(
+                "UPDATE ego_cycle_outcomes SET created_at = ? WHERE cycle_id = ?",
+                (ts, cid),
+            )
+        await db.commit()
+
+        seen: list[list[dict]] = []
+
+        class _Selector:
+            async def select(self, signals, recent_focuses):
+                seen.append(recent_focuses)
+                return None
+
+        ego_session._focus_selector = _Selector()
+        await ego_session._perceive([_make_signal()])
+
+        assert len(seen) == 1
+        rationales = [rf["rationale"] for rf in seen[0]]
+        assert rationales == [f"rationale-{own}-1", f"rationale-{own}-0"]
+
     async def test_no_proposals(
         self, ego_session, mock_invoker, mock_proposal_workflow,
     ):
@@ -253,6 +318,31 @@ class TestUnifiedCycle:
         assert invocation.effort.value == "high"  # from EgoConfig default
         assert invocation.append_system_prompt is True
         assert invocation.skip_permissions is True
+
+    @pytest.mark.parametrize(
+        ("source_tag", "expected"),
+        [("user_ego_cycle", "user_ego.cycle"), ("genesis_ego_cycle", "genesis_ego.cycle")],
+    )
+    async def test_cycle_caller_tag_names_the_ego(
+        self, ego_session, mock_invoker, source_tag, expected,
+    ):
+        """The two egos must not share a cc.invocation_failed tag: the event would
+        not say which failed, and one would be coalesced behind the other."""
+        ego_session._source_tag = source_tag
+        await ego_session.run_unified_cycle([_make_signal()])
+        invocation = mock_invoker.run.call_args_list[0][0][0]
+        assert invocation.caller_tag == expected
+
+    async def test_gate_caller_tag_names_the_ego(self, ego_session, mock_invoker):
+        ego_session._source_tag = "genesis_ego_cycle"
+        await ego_session._run_gate_cc("prompt", label="Reconcile")
+        invocation = mock_invoker.run.call_args_list[-1][0][0]
+        assert invocation.caller_tag == "genesis_ego.gate.reconcile"
+
+    def test_realist_caller_tag_names_the_ego(self, ego_session):
+        # The realist call site builds its tag through the same helper.
+        ego_session._source_tag = "user_ego_cycle"
+        assert ego_session._cc_caller_tag("realist") == "user_ego.realist"
 
     async def test_model_override(self, ego_session, mock_invoker):
         """model_override takes precedence over config default."""
@@ -1550,3 +1640,96 @@ async def test_parse_failure_still_ages_intentions(ego_session, monkeypatch):
     output = _cc_output(text="this is definitely not json")
     await ego_session._process_cycle_output(output, CCModel.SONNET, None)
     spy.assert_awaited_once_with({})
+
+
+# ---------------------------------------------------------------------------
+# Overloaded (529) retry at the three ego CC call sites
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_overload_sleep(monkeypatch):
+    from genesis.cc import transient_retry
+
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(transient_retry, "_sleep", _fake_sleep)
+    return slept
+
+
+class TestOverloadRetry:
+    """A 529 is re-run at the SAME already-approved dispatch: the cycle's
+    approval gate (``route()``) is consulted once, never re-asked."""
+
+    async def test_cycle_retries_overload_without_re_routing(
+        self, ego_session, mock_invoker, mock_session_manager, no_overload_sleep,
+    ):
+        from types import SimpleNamespace
+
+        from genesis.cc.exceptions import CCOverloadedError
+
+        route = AsyncMock(return_value=SimpleNamespace(mode="cli", reason=""))
+        ego_session.set_autonomous_dispatcher(SimpleNamespace(route=route))
+        outcomes = [CCOverloadedError("529 Overloaded")]
+
+        async def _run(_invocation):
+            # First call overloads; every later call (the retry, and any gate
+            # the cycle output triggers) succeeds.
+            if outcomes:
+                raise outcomes.pop(0)
+            return _cc_output()
+
+        mock_invoker.run.side_effect = _run
+
+        cycle = await ego_session.run_unified_cycle([_make_signal()])
+
+        assert cycle is not None
+        assert route.await_count == 1, "approval gate must be consulted exactly once"
+        first, second = mock_invoker.run.call_args_list[:2]
+        assert first.args[0] is second.args[0], "the same invocation is re-run"
+        assert no_overload_sleep == [30]
+        mock_session_manager.create_background.assert_awaited_once()
+        mock_session_manager.fail.assert_not_called()
+
+    async def test_cycle_does_not_retry_rate_limit(
+        self, ego_session, mock_invoker, mock_session_manager, no_overload_sleep,
+    ):
+        from genesis.cc.exceptions import CCRateLimitError
+
+        mock_invoker.run.side_effect = CCRateLimitError("429")
+        cycle = await ego_session.run_unified_cycle([_make_signal()])
+
+        assert cycle is None
+        assert mock_invoker.run.call_count == 1
+        assert no_overload_sleep == []
+        mock_session_manager.fail.assert_called_once()
+
+    async def test_gate_call_retries_overload(
+        self, ego_session, mock_invoker, no_overload_sleep,
+    ):
+        from genesis.cc.exceptions import CCOverloadedError
+
+        out = _cc_output(text="{}")
+        mock_invoker.run.side_effect = [CCOverloadedError("529"), out]
+        assert await ego_session._run_gate_cc("prompt", label="Reconcile") is out
+        assert mock_invoker.run.call_count == 2
+        assert no_overload_sleep == [30]
+
+    async def test_realist_retries_overload(
+        self, ego_session, mock_invoker, no_overload_sleep,
+    ):
+        from genesis.cc.exceptions import CCOverloadedError
+
+        proposals = [{"action_type": "investigate", "content": "x"}]
+        mock_invoker.run.side_effect = [
+            CCOverloadedError("529"),
+            _cc_output(text="not json"),
+        ]
+        out = await ego_session._filter_proposals(proposals)
+        # Unparseable verdicts pass through; what matters is the retry ran.
+        assert out == proposals
+        assert mock_invoker.run.call_count == 2
+        assert no_overload_sleep == [30]

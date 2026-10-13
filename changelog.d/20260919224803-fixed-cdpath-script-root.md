@@ -1,0 +1,1 @@
+- Stop shipped scripts from resolving their own directory through `CDPATH`. With `CDPATH` exported, `cd` searches it, so an install, update, or backup step could resolve into a different checkout — and the Bash command guard could locate its guard scripts outside the repository.

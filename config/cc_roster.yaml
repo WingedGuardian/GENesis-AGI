@@ -2,7 +2,7 @@
 # behind Claude Code), and the fallback used when the Anthropic subscription hits
 # its usage cap.
 #
-# THIS FILE SHIPS INFRASTRUCTURE, NOT PEERS — and the reason is VERSION CHURN,
+# THE AUTOMATED ROSTER SHIPS INFRASTRUCTURE, NOT PEERS — the reason is VERSION CHURN,
 # not "peers are user data". Be clear about which argument is load-bearing,
 # because the weaker one does not survive contact with this repo:
 # `config/model_routing.yaml` ships ~28 named vendor providers, every one of
@@ -64,6 +64,86 @@ models:
     native_subscription: true
     failover_order: 0
 
+# Foreground-only catalog: `gmodel <name> --route auto|subscription|api|openrouter`.
+# These entries NEVER enter the automated roster/failover chain above. Published
+# configuration, not a claim of live validation. Sources:
+# https://www.kimi.com/code/docs/en/third-party-tools/claude-code.html
+# https://platform.kimi.ai/docs/guide/claude-code-kimi
+# https://mimo.mi.com/docs/en-US/tokenplan/integration/claudecode
+# https://openrouter.ai/docs/cookbook/coding-agents/claude-code-integration
+#
+# Save preferences/overrides under `gmodel:` in cc_roster.local.yaml. Auto chooses
+# subscription -> api -> openrouter by configured endpoint + credential presence;
+# it does NOT probe entitlement, quota or compatibility. Errors never switch billing
+# routes. Auto chooses again on resume. Use --fork-session when switching providers.
+# Kimi subscriptions require personal interactive use. MiMo Token Plans are for
+# coding-tool usage; a website chat subscription alone does not supply these keys.
+#
+# Kimi K3 1M subscription requires an eligible tier. To use a 256K tier, override
+# subscription.model_id to k3-256k AND context_tokens to 262144. No automatic downgrade.
+# MiMo subscription URL is deliberately unset: copy YOUR region's Anthropic URL from
+# the Token Plan console (e.g. https://token-plan-sgp.xiaomimimo.com/anthropic).
+# Key VALUES belong in the environment/secrets.env, never in this YAML.
+#
+# Every route authenticates with ANTHROPIC_AUTH_TOKEN (bearer); there is no
+# API-key mode. Kimi's own guide shows ANTHROPIC_API_KEY, but its coding endpoint
+# reads a bearer header as the key too (probed 2026-10-04 with an invalid key:
+# the same "API Key appears to be invalid" error for either header, a different
+# one for none), and the commented automated Kimi peer below was validated on
+# bearer. An API key in interactive Claude Code is a credential the user may
+# decline, which falls back to the saved Anthropic login. The host is the one
+# Kimi's guide names today (api.kimi.ai); the older peer example's api.kimi.com
+# also still answers. The Kimi subscription key is the same Kimi Code key as that
+# peer (KIMI_CODING_API_KEY). The `[1m]` suffix is the form all three
+# vendors document for Claude Code; OpenRouter strips it before routing.
+# The launcher pins the chosen route through an owner-only --settings file as
+# well as the environment, so a settings file edited mid-session cannot re-route.
+gmodel:
+  models:
+    kimi-k3:
+      route: auto
+      routes:
+        subscription:
+          anthropic_base_url: https://api.kimi.ai/coding/
+          auth_env: KIMI_CODING_API_KEY
+          model_id: "k3[1m]"
+          context_tokens: 1048576
+          effort: high
+          interactive_only: true
+        api:
+          anthropic_base_url: https://api.moonshot.ai/anthropic
+          auth_env: MOONSHOT_API_KEY
+          model_id: "kimi-k3[1m]"
+          context_tokens: 1048576
+          effort: high
+        openrouter:
+          anthropic_base_url: https://openrouter.ai/api
+          auth_env: API_KEY_OPENROUTER
+          model_id: "moonshotai/kimi-k3[1m]"
+          context_tokens: 1048576
+          effort: high
+    mimo-v2.6-pro:
+      route: auto
+      routes:
+        subscription:
+          anthropic_base_url: null
+          auth_env: MIMO_TOKEN_PLAN_API_KEY
+          model_id: "mimo-v2.6-pro[1m]"
+          context_tokens: 1048576
+          effort: high
+        api:
+          anthropic_base_url: https://api.xiaomimimo.com/anthropic
+          auth_env: MIMO_API_KEY
+          model_id: "mimo-v2.6-pro[1m]"
+          context_tokens: 1048576
+          effort: high
+        openrouter:
+          anthropic_base_url: https://openrouter.ai/api
+          auth_env: API_KEY_OPENROUTER
+          model_id: "xiaomi/mimo-v2.6-pro[1m]"
+          context_tokens: 1048576
+          effort: high
+
 # ─────────────────────────────────────────────────────────────────────────────
 # EXAMPLE PEERS — copy one into ~/.genesis/config/cc_roster.local.yaml and fill
 # in your own key name. Nothing below is active.
@@ -114,12 +194,14 @@ models:
 #
 #     moonshot:      anthropic_base_url: "https://api.moonshot.cn/anthropic"
 #     minimax:       anthropic_base_url: "https://api.minimaxi.com/anthropic"
-#     deepseek:      anthropic_base_url: "https://api.deepseek.com/anthropic"
 #
-# Kimi Code is the one exception to "not verified": it was gauntlet-validated
-# 2026-08-27. It is still an EXAMPLE and not a shipped peer, for this file's own
-# reason — its `model_id` is tier-dependent, which is the stale-pinned-id
-# failure above with an extra way to go wrong. `kimi-for-coding` (256K) is the
+# TWO providers below are exceptions to "not verified" — Kimi Code and DeepSeek,
+# each gauntlet-validated on the install it was written against. Both are still
+# EXAMPLES and not shipped peers, for this file's own stale-pinned-id reason.
+#
+# Kimi Code was gauntlet-validated 2026-08-27, and its own extra hazard is a
+# tier-dependent `model_id` — the stale-pinned-id failure above with one more
+# way to go wrong. `kimi-for-coding` (256K) is the
 # entry tier; the larger k3 ids need a higher one. Set it from what YOUR account
 # exposes, and note that this endpoint bills a subscription quota rather than
 # per-token, which makes it a fallback for a rate-limited primary rather than a
@@ -138,7 +220,50 @@ models:
 # with an edit, because the tier decides the id: if your account exposes a
 # different one, change the KEY AND the `model_id` together, never just one.
 #
+# DeepSeek is the second exception (gauntlet-validated 3/3, 2026-09-19), and it
+# is written up here for a COST trap the other providers do not have. Endpoint
+# and model ids are from the vendor's own reference (api-docs.deepseek.com,
+# "Using the Anthropic API" and "Your First API Call", read 2026-09-19):
+#
+#     "deepseek-flash[1m]":
+#       anthropic_base_url: "https://api.deepseek.com/anthropic"
+#       auth_env: DEEPSEEK_CODING_API_KEY
+#       model_id: "deepseek-flash[1m]"
+#       failover_order: 2
+#
+# This endpoint bills PER TOKEN, so a peer here is a fallback for a rate-limited
+# primary, never a cheaper one — and unlike the subscription-quota case above,
+# the bill is a function of how much the failover actually runs.
+#
+# TWO VENDOR BEHAVIOURS MAKE THAT BILL EASY TO GET WRONG, and both are silent:
+#   1. An unsupported model name is MAPPED to `deepseek-flash` rather than
+#      rejected. So a typo'd `model_id` never errors — a 200 is not evidence
+#      that the id you wrote exists, which is exactly the check most people
+#      think they just performed.
+#   2. A model name beginning `claude-opus` is mapped to `deepseek-v4-pro` and
+#      BILLED AT THE PRO PRICE (`claude-haiku`/`claude-sonnet` map to
+#      `deepseek-flash`). The vendor's own quickstart configures two variables,
+#      `ANTHROPIC_BASE_URL` and the key — which leaves `ANTHROPIC_DEFAULT_OPUS_MODEL`
+#      holding a Claude id, so Claude Code's opus-tier calls quietly bill at the
+#      Pro rate while every other tier bills at Flash.
+#
+# The roster closes (2) by construction rather than by remembering it:
+# `apply_routing_env` sets EVERY slot in `_ROSTER_MODEL_ENV_VARS` — including
+# the opus, fable and sub-agent slots — to the peer's own `model_id`, so no
+# Claude id survives in the child env to be mapped. That is worth knowing if you
+# ever hand-roll this outside the roster.
+#
 # Prove a peer before you depend on it: `gmodel --print-env <name>` to check the
 # env resolves, then `genesis eval gauntlet -m <name>` to confirm it can
 # actually drive a coding fix-loop. Record the date in `validated:` yourself.
+#
+# ONE THING THAT RUN WILL LIE TO YOU ABOUT: its reported `cost_usd` is not the
+# peer's bill. The invoker takes that figure verbatim from Claude Code's own
+# `total_cost_usd`, which CC computes from its Anthropic price table and cannot
+# know a third-party provider's rates — so the number is real arithmetic over
+# the right token counts at the wrong prices, which is exactly the kind of wrong
+# that reads as authoritative. MEASURED on one gauntlet run against a per-token
+# peer: CC reported $1.1981 where the provider's dashboard billed about $0.05.
+# The direction depends on the peer, so do not treat 24x as a correction factor.
+# Read peer spend from the provider, never from `eval_results`.
 # ─────────────────────────────────────────────────────────────────────────────

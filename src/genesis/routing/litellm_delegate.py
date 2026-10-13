@@ -9,6 +9,7 @@ import time
 
 import litellm
 
+from genesis.routing.retry import daily_quota_reset_s
 from genesis.routing.types import CallResult, ProviderConfig, RoutingConfig
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,10 @@ class LiteLLMDelegate:
             profile_registry if profile_registry is not None else _load_profile_registry()
         )
 
+    def for_config(self, config: RoutingConfig) -> LiteLLMDelegate:
+        """Bind a new delegate without mutating one held by in-flight requests."""
+        return type(self)(config, profile_registry=self._profiles)
+
     def _cost_from_profile(self, cfg, usage) -> tuple[float, bool]:
         """Fallback cost from model_profiles cost_per_mtok when litellm can't
         price the model. Returns ``(cost_usd, cost_known)``."""
@@ -293,7 +298,20 @@ class LiteLLMDelegate:
         except litellm.RateLimitError as e:
             if _should_log_failure(provider):
                 logger.warning("Provider %s rate-limited: %s", provider, e)
-            return CallResult(success=False, error=str(e), status_code=429)
+            try:
+                reset_s = daily_quota_reset_s(str(e))
+            except Exception:
+                # Best-effort read of the body: a parse defect must leave the
+                # 429 handled as before, never escape the delegate.
+                logger.warning("daily-quota parse failed for %s", provider, exc_info=True)
+                reset_s = None
+            return CallResult(
+                success=False,
+                error=str(e),
+                status_code=429,
+                retry_after_s=reset_s,
+                daily_quota_exhausted=reset_s is not None,
+            )
         except litellm.AuthenticationError as e:
             if _should_log_failure(provider):
                 logger.warning("Provider %s auth failed: %s", provider, e)

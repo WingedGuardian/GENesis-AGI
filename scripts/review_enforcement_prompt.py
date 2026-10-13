@@ -120,17 +120,21 @@ def main() -> None:
         "next reviewer builds on. Exception: an ORPHAN (its session gone, or wedged "
         "holding a slot) is ordinary cleanup — establish it is orphaned first. "
         "Different diffs in parallel are fine.\n"
-        "ROUNDS ARE CAPPED IN TWO TIERS, and the one you hit FIRST is the one sessions "
-        "forget: at round 2 a MODE-SWITCH block demands you stop patching the named "
+        "THE LOCAL NON-CONVERGENCE STREAK HAS TWO TIERS: at round 2 a MODE-SWITCH "
+        "block demands you stop patching the named "
         "instance, audit the ENTIRE diff with a fresh-context reviewer, and fix the "
         "whole CLASS in one commit (`# audit-ack`; the counter does NOT reset). At "
         "round 3 it is a HARD STOP needing a fresh decision from the user "
-        "(`# escalation-ack`), which DOES reset the streak — so that cycle repeats. "
-        "A second counter does not reset: at 7 EXTERNAL rounds over the branch's "
-        "whole life the gate reaches its TERMINAL, where `# escalation-ack` no "
-        "longer helps and the only ways out are to accept the outstanding findings "
-        "and merge (`# final-round-accept`, which clears ONE commit and then blocks "
-        "again) or to abandon the branch and restart.\n\n"
+        "(`# escalation-ack`), which resets that local streak. Separately, GitHub-backed "
+        "review rounds (heads that drew reviewer findings) end standing authorization "
+        "after four ordinary rounds; "
+        "every later review request and fix commit gets its own native user approval. "
+        "ROUND 4 IS TERMINAL: there is no ordinary round 5 — past four rounds the "
+        "decision is merge-with-the-issues-filed or send it back for rework, and only "
+        "the owner's explicit approval, re-asked EVERY round, admits another. "
+        "Gate-surface PRs get two discovery "
+        "rounds plus one exact-head marked confirmation. Legacy `final-round-accept` "
+        "does not authorize any current gate.\n\n"
         "THE CROSS-MODEL GATE IS A DIFFERENT THING, and it lives on the PR AFTER you "
         "push — nothing about it is actionable here. Its point is a perspective from a "
         "different model: another Claude reviewing Claude's work shares its blind "
@@ -162,9 +166,17 @@ def main() -> None:
 
         block = render_reminder_block(build_manifest())
         if block:
-            # The base reminder above is 6,436 chars — 64% of the harness's
-            # 10,000-char cap before a single file is listed — and
-            # _MAX_LISTED_FILES caps the manifest's COUNT, not its characters.
+            # The base reminder above is ~6,950 chars (MEASURED 2026-09-25) — about
+            # 70% of the harness's 10,000-char cap, and 71% of the writer's 9,800
+            # budget, before a single file is listed — and _MAX_LISTED_FILES caps
+            # the manifest's COUNT, not its characters. ⚠ This figure DRIFTS on
+            # every prose edit above and has been stale before (it read 6,436 while
+            # the literal was 6,771); `test_review_enforcement_bounding.py` extracts
+            # the real value by AST, so trust that test over this comment, and
+            # re-measure rather than adjusting the number by hand. The worked
+            # example below was computed against the older, smaller base, so its
+            # absolute totals are now LOW by roughly the same drift — the shape of
+            # the problem is what it is for, not the digits.
             # MEASURED against real tracked paths: 50 median-length paths lands
             # at 9,030 total and 50 of the longest at 10,961, i.e. over by 961. Over the
             # cap the harness files the WHOLE block and shows a ~2 KB preview, so

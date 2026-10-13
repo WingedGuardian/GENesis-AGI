@@ -29,6 +29,45 @@ _WEBUI_DIR = Path(__file__).resolve().parent.parent / "dashboard" / "webui"
 _TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "dashboard" / "templates"
 
 
+def v1_token_warning(broad: str, desk: str) -> str | None:
+    """The boot warning for the /v1 bearer tokens, or ``None`` when all is enabled.
+
+    Takes the already-read values (``genesis.env.bearer_token``) so it is a pure
+    function a test can drive — the warning used to be untestable, buried in
+    blueprint registration (#2110).
+
+    It names EVERY surface that is actually disabled, no more and no fewer. A
+    warning that lists some of them is worse than one that lists none: an
+    operator who configured the desk endpoint and sees only voice and OpenClaw
+    named concludes their own surface is fine and goes looking elsewhere for the
+    503. And naming the desk route when ``GENESIS_DESK_TOKEN`` alone enables it
+    sends them hunting for a fault that does not exist. Anything added to these
+    tokens' consumers belongs here and in ``secrets.env.example``.
+    """
+    if broad and desk and broad == desk:
+        # The scope is a property of the VALUE, not the variable name: with the
+        # same value in both, a client holding the "desk" token holds the broad
+        # one, and every /v1 route accepts it.
+        return (
+            "GENESIS_DESK_TOKEN has the same value as GENESIS_MCP_HTTP_TOKEN, so it "
+            "is not scoped: it opens every /v1 route. Give it its own value."
+        )
+    if broad:
+        return None
+    if desk:
+        return (
+            "GENESIS_MCP_HTTP_TOKEN not configured — all /v1/voice/* routes and "
+            "/v1/chat/completions (OpenClaw) answer 503 (fail-closed). The desk "
+            "route is enabled by GENESIS_DESK_TOKEN."
+        )
+    return (
+        "GENESIS_MCP_HTTP_TOKEN not configured — all /v1/voice/* routes, "
+        "/v1/chat/completions (OpenClaw) AND /v1/desk/chat/completions (desk "
+        "brain) answer 503 (fail-closed; set the token in secrets.env to enable "
+        "them; GENESIS_DESK_TOKEN alone enables only the desk route)"
+    )
+
+
 class StandaloneAdapter:
     """Genesis running itself — no host framework needed.
 
@@ -746,25 +785,14 @@ class StandaloneAdapter:
             if "voice_api" not in app.blueprints:
                 app.register_blueprint(voice_api_bp)
                 logger.info("Voice API blueprint registered")
-            # .strip() to match check_bearer_token, which treats a quoted
-            # whitespace-only token as unconfigured. Without it the two
-            # disagree in exactly the case the warning exists for: every /v1
-            # surface answers 503 while boot stays silent, because the raw
-            # value is truthy.
-            if not os.environ.get("GENESIS_MCP_HTTP_TOKEN", "").strip():
-                # Names EVERY surface the token gates. A warning that lists
-                # some of them is worse than one that lists none: an operator
-                # who configured the desk endpoint and sees only voice and
-                # OpenClaw named concludes their own surface is fine and goes
-                # looking somewhere else for the 503. Anything added to this
-                # token's consumers belongs in this string and in
-                # secrets.env.example, which carries the same list.
-                logger.warning(
-                    "GENESIS_MCP_HTTP_TOKEN not configured — all /v1/voice/* "
-                    "routes, /v1/chat/completions (OpenClaw) AND "
-                    "/v1/desk/chat/completions (desk brain) answer 503 "
-                    "(fail-closed; set the token in secrets.env to enable them)"
-                )
+            from genesis.env import bearer_token
+
+            warning = v1_token_warning(
+                bearer_token("GENESIS_MCP_HTTP_TOKEN"),
+                bearer_token("GENESIS_DESK_TOKEN"),
+            )
+            if warning:
+                logger.warning(warning)
         except Exception:
             logger.exception("Failed to register voice API blueprint")
 

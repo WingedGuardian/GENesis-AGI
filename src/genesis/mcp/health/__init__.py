@@ -62,6 +62,7 @@ from genesis.mcp.health import (  # noqa: E402
     immunity_status,  # noqa: F401
     loop_closure_status,  # noqa: F401
 )
+from genesis.mcp.health import board_tools as _board_tools  # noqa: E402, F401
 from genesis.mcp.health import browser as _browser  # noqa: E402
 from genesis.mcp.health import build_lane_status as _build_lane_status  # noqa: E402, F401
 from genesis.mcp.health import calibration_status as _calibration_status  # noqa: E402, F401
@@ -84,6 +85,7 @@ from genesis.mcp.health import infrastructure_profile as _infrastructure_profile
 from genesis.mcp.health import j9_eval as _j9_eval  # noqa: E402, F401
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
 from genesis.mcp.health import module_ops as _module_ops  # noqa: E402
+from genesis.mcp.health import open_question_tools as _open_question_tools  # noqa: E402, F401
 from genesis.mcp.health import provider as _provider  # noqa: E402
 from genesis.mcp.health import reflex_resolve as _reflex_resolve  # noqa: E402, F401
 from genesis.mcp.health import reflex_status as _reflex_status  # noqa: E402, F401
@@ -124,6 +126,7 @@ _impl_session_charter = _session_charter_tools._impl_session_charter
 _impl_session_charter_update = _session_charter_tools._impl_session_charter_update
 _impl_session_ledger_add = _session_charter_tools._impl_session_ledger_add
 _impl_session_ledger_update = _session_charter_tools._impl_session_ledger_update
+_impl_session_address = _session_charter_tools._impl_session_address
 _impl_settings_list = _settings._impl_settings_list
 _impl_settings_get = _settings._impl_settings_get
 _impl_settings_update = _settings._impl_settings_update
@@ -186,6 +189,7 @@ __all__ = [
     "_impl_session_charter_update",
     "_impl_session_ledger_add",
     "_impl_session_ledger_update",
+    "_impl_session_address",
     "_impl_settings_list",
     "_impl_settings_get",
     "_impl_settings_update",

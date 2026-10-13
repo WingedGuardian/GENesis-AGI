@@ -1,34 +1,11 @@
-"""Process reaper — reap leaked/orphaned processes past their thresholds.
+"""Observe old process trees without granting global termination authority.
 
-Extracted from ``learning.py`` into a testable seam (cf.
-``_wire_drip_retention_jobs``). Non-``claude`` targets (opencode-ai, browser
-helpers) keep the original raw-age policy. ``claude`` TUI processes use an
-IDLE policy instead:
-
-  A ``claude`` process is a reap candidate ONLY when it is *all* of:
-    1. past the age floor (7 days since start), AND
-    2. idle beyond the activity window (no per-PID activity marker written
-       by the session-activity hook within the last 7 days), AND
-    3. detached from any live terminal (its controlling tty is not in the
-       union of CLIENT-ATTACHED tmux pane ttys and utmp login ttys —
-       WS-D2 2026-07-16: a detached tmux session's panes no longer count
-       as live, else the persistent cc-N slot model would make every slot
-       claude unreapable forever; an attached slot is spared indefinitely,
-       and a detached one stays spared while its activity marker is fresh).
-
-This is a strict subset of the old age-only rule (kill if age >= 7d),
-so arming the new logic can never reap something the current production
-reaper would have spared — it only *spares* active/attached sessions the
-old rule wrongly killed (the 2026-07-11 incident: interactive sessions
-killed 77 min after they went quiet).
-
-Ships in DRY-RUN by default: it logs ``WOULD KILL`` and writes an
-observation but never signals a process. It arms ONLY on an explicit
-operator opt-in — ``"armed_by_operator": true`` in the state JSON (set via
-``set_operator_armed``) or ``GENESIS_REAPER_ARMED=1`` in the environment.
-There is no automatic time-based arming: a human reviews the dry-run
-WOULD-KILL log and deliberately flips the switch. A hard env kill-switch
-(``GENESIS_REAPER_KILL_DISABLED``) forces dry-run regardless of the flag.
+Names, age, activity markers and terminal attachment are discovery hints, not
+proof of ownership or abandonment. This hourly sweep records candidates for
+operator inspection and never signals processes, including with legacy arm
+flags. Claude, Codex, OpenCode and browser helpers receive the same protection.
+Explicitly owned job launchers retain their separate cancellation contracts.
+The legacy observation type is retained for existing consumers and its TTL.
 """
 
 from __future__ import annotations
@@ -50,21 +27,19 @@ logger = logging.getLogger("genesis.runtime")
 # ── Policy constants ────────────────────────────────────────────────────
 _CLAUDE_AGE_FLOOR_SECS = 168 * 3600  # 7d — floor before a claude proc is even considered
 _CLAUDE_IDLE_WINDOW_SECS = 168 * 3600  # 7d — "active within" window (marker freshness)
-_KILL_GRACE_SECS = 5  # SIGTERM → SIGKILL grace (browsers flush SQLite)
 
 _GENESIS_DIR = Path.home() / ".genesis"
 _MARKER_DIR = _GENESIS_DIR / "session-activity"
 _STATE_PATH = _GENESIS_DIR / "reaper_state.json"
 
-# Hard kill-switch: when set (to a truthy value) the reaper can never arm —
-# it stays in dry-run regardless of persisted state. Owner's emergency brake.
+# Legacy controls are read only to explain ignored arm requests. No flag can
+# authorize signaling from global discovery.
 _ENV_HARD_DISABLE = "GENESIS_REAPER_KILL_DISABLED"
 
-# Operator opt-in to actually reap (env alternative to the state-file flag).
-# Absent both → dry-run. The reaper never arms itself; a human flips this.
+# Legacy environment arm request (diagnostic only).
 _ENV_ARM = "GENESIS_REAPER_ARMED"
 
-# State-file key an operator sets (via ``set_operator_armed``) to arm.
+# Legacy persisted arm request; set_operator_armed can only clear it.
 _STATE_ARMED_KEY = "armed_by_operator"
 
 
@@ -284,20 +259,11 @@ async def _get_descendants(pid: int, depth: int = 0) -> list[int]:
     return result
 
 
-def _signal(pid: int, sig: int) -> None:
-    # Defence-in-depth: never signal pid<=1 (0/-1 fan out to every process in
-    # the container; 1 is init). Callers already guard, but a mock/parse slip
-    # must never reach os.kill with a fan-out target.
-    if pid <= 1:
-        return
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.kill(pid, sig)
-
-
 # ── Persistent dry-run / arm state ──────────────────────────────────────
 def _load_state() -> dict:
     try:
-        return json.loads(_STATE_PATH.read_text())
+        state = json.loads(_STATE_PATH.read_text())
+        return state if isinstance(state, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError, NotADirectoryError):
         return {}
 
@@ -314,33 +280,18 @@ _ENV_AFFIRMATIVE = frozenset({"1", "true", "yes", "on"})
 
 
 def _operator_armed(state: dict) -> bool:
-    """True only if a human explicitly opted in to real kills — via the
-    ``armed_by_operator`` state flag or ``GENESIS_REAPER_ARMED`` set to an
-    explicit affirmative (``1``/``true``/``yes``/``on``).
-
-    The env value is parsed strictly: ``GENESIS_REAPER_ARMED=0`` / ``false`` —
-    a deployment documenting that the reaper is OFF — must NOT arm it (generic
-    truthiness would treat any non-empty string, including ``"0"``, as opt-in).
-    """
+    """Read a legacy arm request for diagnostics, never as kill authority."""
     if state.get(_STATE_ARMED_KEY):
         return True
     return os.environ.get(_ENV_ARM, "").strip().lower() in _ENV_AFFIRMATIVE
 
 
 def set_operator_armed(armed: bool) -> None:
-    """Operator switch: arm (real kills) or disarm (dry-run) the reaper.
-
-    Read-modify-writes the state JSON so the change takes effect on the next
-    pass (within the hour) with no server restart. Arming is a deliberate
-    human action taken after reviewing the dry-run WOULD-KILL log; disarming
-    clears the flag. The hard ``GENESIS_REAPER_KILL_DISABLED`` env stays an
-    independent emergency brake that overrides an armed flag.
-    """
-    state = _load_state()
+    """Clear a legacy arm flag; global discovery can no longer be armed."""
     if armed:
-        state[_STATE_ARMED_KEY] = True
-    else:
-        state.pop(_STATE_ARMED_KEY, None)
+        raise ValueError("Global process discovery is observation-only; use owned job cancellation")
+    state = _load_state()
+    state.pop(_STATE_ARMED_KEY, None)
     _save_state(state)
 
 
@@ -350,19 +301,22 @@ def _gc_markers(live_pids: set[int]) -> None:
         for marker in _MARKER_DIR.iterdir():
             if not marker.name.isdigit():
                 continue
-            if int(marker.name) not in live_pids:
+            if int(marker.name) in live_pids:
+                continue
+            # A missing name match is not evidence of death (new CLI names,
+            # permission failures and incomplete discovery must spare markers).
+            try:
+                Path(f"/proc/{marker.name}").stat()
+            except FileNotFoundError:
                 with contextlib.suppress(OSError):
                     marker.unlink()
+            except OSError:
+                continue
 
 
 # ── Orchestrator ────────────────────────────────────────────────────────
 async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
-    """One reaper pass. Dry-run unless an operator has explicitly armed it
-    (``armed_by_operator`` state flag or ``GENESIS_REAPER_ARMED`` env); the
-    hard kill-switch overrides. There is no automatic arming.
-
-    ``now`` is injectable (epoch secs) for deterministic tests.
-    """
+    """Record discovery hints only, regardless of legacy operator arm state."""
     from genesis.browser.types import BROWSER_PGREP_PATTERNS
 
     now = now if now is not None else datetime.now(UTC).timestamp()
@@ -370,9 +324,8 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
 
     hard_disabled = bool(os.environ.get(_ENV_HARD_DISABLE))
     state = _load_state()
-    # Arm ONLY on explicit operator opt-in (state flag or env). The hard
-    # kill-switch overrides both. There is no automatic time-based arming.
-    dry_run = not (_operator_armed(state) and not hard_disabled)
+    if _operator_armed(state) and not hard_disabled:
+        logger.warning("Legacy process reaper arm ignored: global discovery is observation-only")
 
     my_pid = os.getpid()
     protected = {my_pid, os.getppid()}
@@ -381,6 +334,8 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
     targets: list[tuple[str, str, int, str, bool]] = [
         ("-f", "opencode-ai", 24, "opencode-ai", False),
         ("-x", "claude", 168, "claude", True),
+        ("-x", "codex", 168, "codex", True),
+        ("-x", "opencode", 168, "opencode", True),
     ]
     for bp in BROWSER_PGREP_PATTERNS:
         targets.append(("-f", bp, 4, f"browser:{bp}", False))
@@ -427,91 +382,16 @@ async def run_reaper(rt: GenesisRuntime, *, now: float | None = None) -> None:
             rt.record_job_success("process_reaper")
             return
 
-        claude_hit = any(is_claude for _, _, _, is_claude, _ in candidates)
-
-        if dry_run:
-            for root, label, reason, _is_claude, tree in candidates:
-                logger.warning(
-                    "Process reaper DRY-RUN: WOULD KILL pid %d (%s, reason=%s, tree=%s)",
-                    root,
-                    label,
-                    reason,
-                    tree,
-                )
-            await _record_observation(rt, candidates, dry_run=True)
-            rt.record_job_success("process_reaper")
-            return
-
-        # ── Armed: actually reap ────────────────────────────────────────
-        killed: list[int] = []
-        for _root, _label, _reason, _is_claude, tree in candidates:
-            for p in tree:
-                if p <= 1 or p in protected:
-                    continue
-                _signal(p, 15)  # SIGTERM
-                killed.append(p)
-        if killed:
-            await asyncio.sleep(_KILL_GRACE_SECS)
-            for p in killed:
-                _signal(p, 9)  # SIGKILL
-        logger.info(
-            "Process reaper: killed %d process(es) across %d tree(s): %s",
-            len(killed),
-            len(candidates),
-            _summarize(candidates),
-        )
-        await _record_observation(rt, candidates, dry_run=False, claude_hit=claude_hit)
-        if claude_hit and rt._outreach_pipeline is not None:
-            await _notify_owner(
-                rt,
-                "⚠️ Process reaper killed a detached claude process "
-                f"(idle >7d, no live terminal): {_summarize(candidates)}. "
-                'To disarm, remove "armed_by_operator" from '
-                "~/.genesis/reaper_state.json (or call set_operator_armed(False)); "
-                f"to hard-stop immediately, export {_ENV_HARD_DISABLE}=1.",
+        for root, label, reason, _is_claude, tree in candidates:
+            logger.warning(
+                "Process discovery OBSERVE ONLY: pid %d (%s, reason=%s, tree=%s)",
+                root, label, reason, tree,
             )
+        await _record_observation(rt, candidates, dry_run=True)
         rt.record_job_success("process_reaper")
     except Exception as exc:  # noqa: BLE001 — job boundary
         rt.record_job_failure("process_reaper", exc=exc)
         logger.exception("Process reaper failed")
-
-
-def _summarize(candidates: list[tuple[int, str, str, bool, list[int]]]) -> str:
-    return ", ".join(f"{root}({label}/{reason})" for root, label, reason, _, _ in candidates)
-
-
-async def _notify_owner(rt: GenesisRuntime, message: str) -> bool:
-    """Send a verbatim ALERT to the owner. Returns True only if delivered.
-
-    Used to notify the owner when the (operator-armed) reaper actually kills
-    a detached claude process.
-    """
-    if rt._outreach_pipeline is None:
-        return False
-    from genesis.outreach.types import (
-        OutreachCategory,
-        OutreachRequest,
-        OutreachStatus,
-    )
-
-    req = OutreachRequest(
-        category=OutreachCategory.ALERT,
-        topic="Process reaper",
-        context=message,
-        salience_score=0.9,
-        signal_type="process_reaper",
-        channel="telegram",
-        verbatim=True,
-    )
-    try:
-        result = await rt._outreach_pipeline.submit_urgent(req)
-    except Exception:
-        logger.warning("Process reaper owner notification failed", exc_info=True)
-        return False
-    return getattr(result, "status", None) in (
-        OutreachStatus.DELIVERED,
-        OutreachStatus.ENGAGED,
-    )
 
 
 async def _record_observation(
@@ -519,7 +399,6 @@ async def _record_observation(
     candidates: list[tuple[int, str, str, bool, list[int]]],
     *,
     dry_run: bool,
-    claude_hit: bool = False,
 ) -> None:
     if rt._db is None:
         return
@@ -528,16 +407,16 @@ async def _record_observation(
 
         from genesis.db.crud import observations
 
-        priority = "high" if (claude_hit and not dry_run) else "low"
         await observations.create(
             rt._db,
             id=f"reaper-{uuid4().hex[:8]}",
             source="process_reaper",
-            type="process_reaper_would_kill" if dry_run else "process_reaper_kill",
-            priority=priority,
+            type="process_reaper_would_kill",  # legacy audit type; never a kill promise
+            priority="low",
             content=json.dumps(
                 {
-                    "dry_run": dry_run,
+                    "dry_run": True,
+                    "enforcement": "observation-only",
                     "count": len(candidates),
                     "processes": [
                         {"pid": root, "label": label, "reason": reason}

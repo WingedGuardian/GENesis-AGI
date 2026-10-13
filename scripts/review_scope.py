@@ -46,6 +46,19 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 try:
+    from review_deadline import DeadlineExpired, propagate_deadline_timeout  # noqa: E402
+except Exception:  # Reverse-version skew: advisory scope reads must stay available.
+
+    class DeadlineExpired(RuntimeError):
+        """Local reverse-skew equivalent of the shared deadline exception."""
+
+    def propagate_deadline_timeout(deadline, error):
+        if deadline is not None:
+            raise DeadlineExpired(
+                "aggregate review-gate deadline expired during subprocess"
+            ) from error
+
+try:
     from review_enforcement_commit import _is_docs_or_config, _is_prompt_surface
 except ImportError:  # pragma: no cover - sibling always present in scripts/
 
@@ -301,28 +314,128 @@ def _specialists(scope_tags: set[str], diff_lines: int) -> list[str]:
 
 
 # ── git plumbing — fail-open, always timed ────────────────────────────────────
-def _git(args: list[str], cwd: str | None, deadline: float | None = None) -> str | None:
-    """Run a git command; return stdout, or None on ANY error (fail-open).
+
+#: Ambient git environment variables scrubbed from every git call below. Each
+#: either redirects git away from the ``cwd`` a caller passed explicitly, or
+#: changes what the diff REPORTS from the right repository. MEASURED 2026-09-17:
+#: ``classify_change_substantiality()`` moved ``substantial`` -> ``inline`` with
+#: an ambient GIT_DIR/GIT_WORK_TREE pointing elsewhere — that value decides how
+#: deep a review a change must have, so the failure direction is OPEN.
+#:
+#: KEPT IN STEP WITH ITS COPIES BY TEST, NOT BY IMPORT. FOUR copies of this list
+#: exist (a fifth, narrower one in `scripts/worktree_lifecycle.py` is deliberately
+#: outside the parity set and tracked separately): this one, ``review_state.GIT_ENV_UNSET``,
+#: ``genesis.session_awareness.zero_drop_git._GIT_ENV_UNSET``, and the
+#: launcher's bash array. ``tests/test_hooks/test_git_env_scrub.py`` asserts all
+#: four are equal. Importing from ``review_state`` instead would close a cycle —
+#: that module already imports THIS one at function scope — and would put a
+#: module-load failure path into the enforcement layer, which is what the copy
+#: exists to avoid. The per-variable measurements live on the ``review_state``
+#: copy; do not restate them here, where they would drift.
+_GIT_ENV_UNSET = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+)
+
+#: NO git CONFIG channel is handled here — neither the FILE sources nor the
+#: injection channels. All four are PROTECTED config, which is the only place
+#: git reads `safe.directory` from, so removing any of them makes git refuse
+#: under a uid mismatch with empty stdout, and this module's classifiers then
+#: read that as a trivial change. The routes measured to move a gate decision
+#: are closed by FLAGS on the command instead. Full reasoning and the
+#: measurements live on the ``review_state`` copy; do not restate them here,
+#: where they would drift.
+_ATTRIBUTES_HARDENING = ("-c", f"core.attributesFile={os.devnull}")
+
+
+def _git_env() -> dict[str, str]:
+    """The ambient environment with git's own overrides removed."""
+    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV_UNSET}
+
+
+#: ``diff`` subcommands are hardened HERE, in the one runner, rather than at each
+#: call site. An external diff driver empties a diff, and every classifier in this
+#: module reads a diff to decide how substantial a change is — so a caller who
+#: forgot the flag would silently classify real work as trivial. MEASURED
+#: 2026-09-19: the driver reaches git through GIT_EXTERNAL_DIFF, GIT_CONFIG_COUNT,
+#: GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL, and a repo-local .git/config that no
+#: environment scrub can reach at all. Only the flag closes the whole set.
+def _harden(args: list[str]) -> list[str]:
+    """Insert the diff-immunity flags and config when the subcommand is ``diff``.
+
+    ``_ATTRIBUTES_HARDENING`` and ``--no-replace-objects`` are GLOBAL options and
+    must lead the SUBCOMMAND, not follow it — git accepts neither after ``diff``
+    — which is why they are prepended rather than added alongside the ``--no-*``
+    flags.
+
+    ``--no-replace-objects`` closes a route with NO environment component at all,
+    so no scrub could ever have reached it. ``git replace`` writes
+    ``refs/replace/<oid>``, and replacement applies at object-read time, so the
+    commit ``git diff --cached`` compares against can be swapped for one whose
+    tree already equals the index. MEASURED 2026-09-20 on 200 staged lines:
+    ``--numstat`` drops from ``200 0`` to EMPTY at rc=0, and every classifier
+    here then reads a trivial change. Same threat class as a repo-local
+    ``.git/config`` — repository CONTENT, not environment.
+    """
+    if args and args[0] == "diff":
+        return [
+            *_ATTRIBUTES_HARDENING,
+            "--no-replace-objects",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            *args[1:],
+        ]
+    return list(args)
+
+
+def _git(
+    args: list[str],
+    cwd: str | None,
+    deadline: float | None = None,
+    *,
+    strict_deadline: bool = False,
+) -> str | None:
+    """Run a git command; return stdout, or None on an ordinary error.
 
     ``deadline`` (a ``time.monotonic()`` value) caps the per-call timeout by the
     time remaining in the manifest's total git budget — so several serial calls
-    can't collectively overrun the hook timeout. Past the deadline → None.
+    cannot collectively overrun the hook timeout. Past the deadline returns
+    ``None`` for advisory callers or raises ``DeadlineExpired`` for a strict
+    commit check.
     """
     timeout = _GIT_TIMEOUT
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if strict_deadline:
+                raise DeadlineExpired("aggregate review-gate deadline expired")
             return None
         timeout = min(_GIT_TIMEOUT, remaining)
     try:
         result = subprocess.run(
-            ["git", *args],
+            ["git", *_harden(args)],
             capture_output=True,
             text=True,
             timeout=timeout,
             cwd=cwd,
+            env=_git_env(),
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, UnicodeDecodeError):
+    except subprocess.TimeoutExpired as exc:
+        if strict_deadline:
+            propagate_deadline_timeout(deadline, exc)
+        return None
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
         # UnicodeDecodeError: text=True strict-decodes stdout; a filename with
         # invalid UTF-8 bytes would otherwise raise it (not an OSError subclass)
         # and crash a standalone `main()` call, violating the fail-open contract.
@@ -632,11 +745,23 @@ def _substantiality_level(records: list[dict], per_file: dict[str, int], binary:
     return "substantial" if substantial else "inline"
 
 
-def _classify_diff(diff_args: list[str], cwd: str | None) -> str:
+def _classify_diff(
+    diff_args: list[str], cwd: str | None, deadline: float | None = None
+) -> str:
     """Run the two -z diffs, parse, and classify — or ``"unknown"`` on any git error
     (fail OPEN: no fabricated depth requirement; the CI check is the backstop)."""
-    name_status = _git(["diff", *diff_args, "-z", "--name-status", "-M"], cwd)
-    numstat = _git(["diff", *diff_args, "-z", "--numstat", "-M"], cwd)
+    name_status = _git(
+        ["diff", *diff_args, "-z", "--name-status", "-M"],
+        cwd,
+        deadline,
+        strict_deadline=deadline is not None,
+    )
+    numstat = _git(
+        ["diff", *diff_args, "-z", "--numstat", "-M"],
+        cwd,
+        deadline,
+        strict_deadline=deadline is not None,
+    )
     if name_status is None or numstat is None:
         return "unknown"
     per_file, binary = _parse_numstat_perfile(numstat)
@@ -975,7 +1100,9 @@ def classify_lane(paths: list[str], *, hook_surface: bool) -> str:
     return "standard"
 
 
-def classify_change_substantiality(cwd: str | None = None) -> str:
+def classify_change_substantiality(
+    cwd: str | None = None, *, deadline: float | None = None
+) -> str:
     """Substantiality of the STAGED change (--cached) — for the commit-time depth gate.
 
     Uses the staged index so it shares the review marker's basis (which hashes
@@ -983,7 +1110,7 @@ def classify_change_substantiality(cwd: str | None = None) -> str:
     commit-time re-check disagree on a byte-identical staged diff. Returns
     ``"substantial"`` | ``"inline"`` | ``"unknown"``.
     """
-    return _classify_diff(["--cached"], cwd)
+    return _classify_diff(["--cached"], cwd, deadline)
 
 
 def classify_range_substantiality(base: str, cwd: str | None = None) -> str:

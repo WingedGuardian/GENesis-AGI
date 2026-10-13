@@ -128,6 +128,45 @@ _SANDBOX_HOME_TD = tempfile.TemporaryDirectory(prefix="guard-suite-home-")
 _SANDBOX_HOME = _SANDBOX_HOME_TD.name
 
 
+def _assert_basetemp_is_outside_any_repo(cwd: str) -> None:
+    """Fail loudly if the scratch cwd sits inside a git repository.
+
+    The isolation these tests need is "a guard run in the scratch dir resolves
+    NO repository". That used to be bought with GIT_CEILING_DIRECTORIES; the
+    gates now scrub that variable (correctly — see the caller), so the property
+    has to be established by the filesystem instead of by the environment.
+
+    Deliberately not a fix-up: making the scratch dir a repo of its own would
+    also satisfy the walk, but it would change what the guards SEE (a repo, on
+    some branch) and quietly alter what these cases are testing. Refusing is the
+    honest option — it tells whoever moved --basetemp exactly what broke.
+    """
+    probe = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+    )
+    if probe.returncode != 0:
+        return  # no repository anywhere above — the property already holds
+    toplevel = Path(probe.stdout.strip()).resolve()
+    here = Path(cwd).resolve()
+    if toplevel == here:
+        # Resolving to the scratch dir ITSELF is the normal case — several of
+        # these cases `git init` their own cwd on purpose, and a repo standing
+        # where git starts terminates the walk regardless of any environment.
+        # (`here.is_relative_to(toplevel)` was also tested here and is dead:
+        # a toplevel discovered FROM `here` always contains it.)
+        return
+    raise AssertionError(
+        f"the scratch cwd ({here}) sits inside an ANCESTOR git repository "
+        f"({toplevel}), so these guards evaluate repo-state rules against that "
+        "repo instead of against nothing. GIT_CEILING_DIRECTORIES no longer "
+        "prevents this — the gates scrub it. Point --basetemp outside any repo."
+    )
+
+
 def _child_env(cwd: str | None = None, dispatched: str | None = None) -> dict[str, str]:
     """The ONE place that decides what a guard child may see.
 
@@ -154,6 +193,23 @@ def _child_env(cwd: str | None = None, dispatched: str | None = None) -> dict[st
         # "Direct commits to main are not allowed". A ceiling stops git walking
         # up out of the scratch dir. It must be the PARENT: naming the directory
         # itself does not stop the walk that starts there.
+        #
+        # ⚠ THE CEILING IS NO LONGER SUFFICIENT ON ITS OWN, since 2026-09-19.
+        # The gates now scrub git's ambient environment — GIT_CEILING_DIRECTORIES
+        # included — before every git call they make (review_state.git_env /
+        # review_scope._git_env, and the launcher's exec). That scrub is correct
+        # for production, where an ambient ceiling would make git find nothing
+        # and the gate fail OPEN. But it means a ceiling set HERE no longer
+        # reaches the reads these guards perform through review_state, so this
+        # line protects less than it used to and cannot be relied on alone.
+        #
+        # It stays because it still covers the guards' own direct git calls. The
+        # check below is what actually holds the property now: rather than
+        # blocking the walk, ensure there is nothing up there to find. MEASURED
+        # 2026-09-19: no ancestor of the pytest temp root on this install is a
+        # git repo, so this is inert today and exists to fail LOUDLY the day
+        # someone points --basetemp somewhere that changes it.
+        _assert_basetemp_is_outside_any_repo(cwd)
         env["GIT_CEILING_DIRECTORIES"] = str(Path(cwd).parent)
     if dispatched is not None:
         env["GENESIS_CC_SESSION"] = dispatched
@@ -758,7 +814,11 @@ class TestCommitGuardProbeFailure:
         hooks = scripts / "hooks"
         hooks.mkdir(parents=True)
         (scripts / _COMMIT_GUARD.name).write_text(_COMMIT_GUARD.read_text())
-        (hooks / "hook_input.py").write_text((_HOOKS_DIR / "hook_input.py").read_text())
+        for dep in ("hook_input.py", "native_approval.py"):
+            (hooks / dep).write_text((_HOOKS_DIR / dep).read_text())
+        (scripts / "review_deadline.py").write_text(
+            (_WORKTREE / "scripts" / "review_deadline.py").read_text()
+        )
         (hooks / "shell_parse.py").write_text(
             "import importlib.util, sys\n"
             "_s = importlib.util.spec_from_file_location(\n"
@@ -1013,10 +1073,11 @@ class TestAcceptanceCorpus:
         )
 
     def test_legit_ansic_commit_message_not_net_blocked(self, tmp_path):
-        # An ANSI-C message is the canonical way to embed an apostrophe. The
-        # commit segment IS parsed, so the blind-spot net must stand down and
-        # leave the verdict to the real review/branch rules — which may well
-        # block for their own reasons. Assert only that the NET did not decide.
+        # An ANSI-C message is a common way to embed an apostrophe. The escaped
+        # quote now counts as text the shell builds, so the commit gate refuses it
+        # through that blind spot, whose message names the file remedy (`-F`).
+        # Assert only that the untokenizable NET did not decide: its generic text
+        # would give no remedy for this shape.
         cmd = f"{GIT} {COMMIT} -m $'fix: it\\'s done'"
         r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
         assert "could not be parsed safely" not in (r.stdout + r.stderr)
@@ -1036,29 +1097,21 @@ class TestAcceptanceCorpus:
         r = _run(_COMMIT_GUARD, cmd, cwd=str(tmp_path))
         assert _decision(r) in ("ask", "block"), r.stdout + r.stderr
 
-    def test_decoy_segment_still_reaches_a_human(self, tmp_path):
-        """DOCUMENTED RESIDUE — a shape this net does not close.
+    def test_decoy_segment_is_refused(self, tmp_path):
+        """FORMERLY DOCUMENTED RESIDUE, now closed, and flipped here deliberately.
 
-        Closing this class needs per-occurrence accounting of every gated flag
-        against parsed segment spans: more argv-to-effect modelling, which is the
-        non-convergent tail this design deliberately avoids. Same accepted bucket
-        as eval / dynamic construction (2026-08-12 decision).
-
-        The human it reaches is the push/PR-create EGRESS approval, which the
-        2026-09-08 ruling left untouched — not the blind-spot prompt, which is
-        retired. The net never fires here: analyze() does resolve a push
-        segment, so the ordinary push gate owns this verdict.
-
-        The mechanism is deliberately NOT written out here. This repository is
-        public and the shape is not closed, so an explanation of why the guard
-        misses it would narrow the search for anyone reading. The assertion stays
-        — it locks the residue so a future fix flips it deliberately rather than
-        silently — and whoever does that work can derive the reason from the
-        code in a minute. Private detail lives in the tracked follow-ups below.
+        This cell used to assert that the push guard did NOT block this shape,
+        locking a residue the net could not close without per-occurrence flag
+        accounting. It is closed from a different direction: an escaped quote
+        inside ``$'…'`` now counts as text the shell builds (it is syntax to any
+        shell that reads the text again), so the parse is withheld as a
+        bounds-type blind spot and the guard refuses a command that names a
+        gated operation. No argv-to-effect modelling was added.
         """
         cmd = f"{GIT} {PUSH} origin main && x=$'a\\'b<<PWN'\n{GIT} {PUSH} origin evil {FORCE}\nPWN"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert _decision(r) != "block", r.stdout + r.stderr
+        assert _decision(r) == "block", r.stdout + r.stderr
+        assert "decodes before it runs" in r.stderr, r.stderr
 
     @pytest.mark.parametrize(
         "label,cmd_tpl",
@@ -1067,68 +1120,40 @@ class TestAcceptanceCorpus:
             # rather than spot-checking one form:
             #   'space + backslash'    -> segments as ['\\', None]
             #   'no space + backslash' -> segments as [None, None]  (exe is 'git\')
-            # A fix keying on the " \" TOKEN shape closes the first two and
-            # leaves the third silently open. The durable fix is continuation
-            # JOINING before segmentation, not token recognition after it.
+            # A fix keying on the " \" TOKEN shape would have closed the first
+            # two and left the third open; the parser now reports ANY
+            # backslash run before a newline, so all three share one fate.
             ("space_backslash", "{GIT} \\\n{PUSH} origin main {FORCE}"),
             ("space_backslash_then_space", "{GIT} \\\n {PUSH} origin main {FORCE}"),
             ("no_space_backslash", "{GIT}\\\n {PUSH} origin main {FORCE}"),
         ],
     )
-    def test_line_continuation_is_documented_residue(self, tmp_path, label, cmd_tpl):
-        """DOCUMENTED RESIDUE (not closed by this PR) — the WHOLE class, not one form.
+    def test_line_continuation_is_refused(self, tmp_path, label, cmd_tpl):
+        """Formerly DOCUMENTED RESIDUE, and locked so a fix would flip it on purpose.
 
-        A `\\`-newline continuation tokenizes cleanly, so the tokenizability
-        probe never fires — analyze() mis-attributing it is the SEPARATE
-        mis-segmentation class (follow-up `dc5ae7ff`). Locked here so the
-        boundary is explicit and a future fix flips these deliberately rather
-        than silently.
-
-        This is the one residue class measured to BOTH mis-parse and really
-        execute: bash joins the continuation before reading the command, so the
-        push actually runs. The `$( )` shapes mis-parse but never execute, which
-        makes them parser defects rather than gate bypasses.
-
-        NOT residue, asserted as the control in the sibling test below: a
-        continuation AFTER the subcommand (`git push \\<NL>origin`) still
-        resolves to `push`, because the subcommand was already read.
+        The parser splits where bash joins, and a split command is not the
+        command bash runs. It now REPORTS a continuation as a bounds-type blind
+        spot (`shell_parse._BLIND_CONTINUATION`), so the push guard refuses it
+        through its existing bounds branch, naming the one-line remedy.
         """
         cmd = cmd_tpl.format(GIT=GIT, PUSH=PUSH, FORCE=FORCE)
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        assert _decision(r) != "block", f"{label}: {r.stdout + r.stderr}"
+        assert _decision(r) == "block", f"{label}: {r.stdout + r.stderr}"
+        assert "one line" in r.stderr, f"{label}: {r.stderr}"
 
-    def test_continuation_after_subcommand_downgrades_the_verdict(self, tmp_path):
-        """A THIRD severity in the same class — measured, and worse than it reads.
+    def test_continuation_after_subcommand_is_refused_not_downgraded(self, tmp_path):
+        """The third severity in this class, and the worst: formerly a DOWNGRADE.
 
-        `git push \\<NL>origin main {FORCE}` was assumed harmless by two
-        independent readings, on the reasoning that `push` still resolves. It
-        does — but the FLAG is severed into the next segment:
-
-            seg[0] argv=['git', 'push', '\\\\']          <- subcommand, no flag
-            seg[1] argv=['origin', 'main', '--force']    <- flag, no exe
-
-        So the guard sees an ORDINARY push and emits `ask` instead of the hard
-        block a force-push warrants, and the prompt reads "git push needs your
-        approval before publishing externally" — it never mentions the force.
-        Bash, having joined the continuation before reading the command, really
-        does force-push. Consent is obtained under a description that omits the
-        dangerous flag, which is a worse failure than a silent allow: a silent
-        allow leaves no record of the operator agreeing to anything.
-
-        PRE-EXISTING, not introduced here — measured identical on the base
-        branch (base: ask, this branch: ask; plain force-push blocks on both,
-        which validates the comparison). Locked so the eventual segmentation fix
-        has to address flag ATTRIBUTION, not just subcommand resolution.
+        Splitting after the subcommand severed the flag into the next segment, so
+        the guard ASKED under a description of an ordinary push — consent sought for
+        a different operation than the one on the command line. The continuation is now a blind
+        spot, so no segment is trusted and the command is refused outright; the
+        human is never asked about a command whose flags the guard cannot read.
         """
         cmd = f"{GIT} {PUSH} \\\norigin main {FORCE}"
         r = _run(_PUSH_GUARD, cmd, cwd=str(tmp_path))
-        decision = _decision(r)
-        assert decision == "ask", r.stdout + r.stderr
-        # The point of the finding: the approval text omits the force flag.
-        assert FORCE not in r.stdout, (
-            "prompt now names the force flag — the downgrade may be fixed; "
-            "re-derive this test rather than loosening it"
-        )
+        assert _decision(r) == "block", r.stdout + r.stderr
+        assert '"ask"' not in (r.stdout or ""), "must never prompt for a continued push"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1428,7 +1453,10 @@ class TestNetDoesNotDowngradeHardBlocks:
         # win, the net's own generic text IS the right message. Without this,
         # the two `_NET_GENERIC not in` assertions would also pass against a
         # guard whose net had been deleted outright.
-        cmd = f"echo $'don\\'t {PUSH} yet' > /dev/null"
+        # Unparseable through an unmatched apostrophe rather than an escape: an
+        # escaped quote inside $'…' is now built text, reported by an earlier
+        # cause with its own message, so it could no longer arm the net.
+        cmd = f"echo don't {PUSH} yet > /dev/null"
         r = _run(_PUSH_GUARD, cmd, cwd=_REPO)
         assert _decision(r) == "block", r.stdout + r.stderr
         assert _NET_GENERIC in r.stderr, (
@@ -1560,6 +1588,14 @@ class TestVerbPositionIsUnestablished:
     @pytest.mark.parametrize("name,cmd", _HIDDEN_GIT_VERB + _HIDDEN_GH_VERB)
     def test_a_shell_built_verb_is_reported_as_a_blind_spot(self, name, cmd):
         segs, blind = sp.analyze_checked(cmd)
+        if sp.has_built_escape(cmd):
+            # A verb decoded from an escape is the bounds-type built-escape blind
+            # spot, which outranks this cause the way a line continuation does. Its
+            # segments are withheld, so the per-segment fact must stay recoverable.
+            assert blind is sp._BLIND_BUILT_ESCAPE, f"{name}: {blind!r}"
+            assert segs == []
+            assert sp.unresolved_verb_programs(cmd), f"{name}: the hidden verb was lost"
+            return
         assert blind is sp._BLIND_UNRESOLVED_VERB, (
             f"{name}: the parse resolved a verb bash never runs and reported "
             f"{blind!r}. A guard reading the empty gated-segment list cannot "

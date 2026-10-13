@@ -54,6 +54,26 @@ def _fresh_proactive_writer():
 
 
 @pytest.fixture(autouse=True)
+def _scrub_actions_self_workflow(monkeypatch):
+    """Delete the Actions job-identity vars for EVERY hook test.
+
+    ``_pr_ci_status`` drops rollup entries from the RUNNING workflow/job when it
+    detects ``GITHUB_ACTIONS``+``GITHUB_WORKFLOW``/``GITHUB_JOB`` (the
+    self-exclusion that keeps the gate's own check-run from deadlocking on
+    itself, issue #1670). Hook tests run INSIDE the repo's CI workflow, where
+    those vars mean "CI"/"test" — so a fixture rollup carrying
+    ``workflowName: "CI"`` or a check named ``test`` would be filtered out by
+    the very env the test cannot see, and green/absent verdicts would flip on
+    the Actions environment and nowhere else. Scrub them: tests for the
+    exclusion setenv the vars themselves and win. Local runs had none of them →
+    unchanged."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_WORKFLOW", raising=False)
+    monkeypatch.delenv("GITHUB_JOB", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _pin_required_ci_workflows(monkeypatch):
     """Pin the merge gate's required-CI-workflow identity policy to the shipped
     default ("CI") for EVERY hook test. The required set is config-driven from the
@@ -65,6 +85,54 @@ def _pin_required_ci_workflows(monkeypatch):
     has its own tests (TestRequiredCiWorkflowsConfig), which delete this seam;
     per-test overrides (e.g. "CodeQL") simply setenv later and win."""
     monkeypatch.setenv("_TEST_REQUIRED_CI_WORKFLOWS", "CI")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _pin_hook_ask_policy(monkeypatch):
+    """Pin the install-local ask policy to "nothing declared" for EVERY hook test.
+
+    ``hook_ask_policy`` reads the host's ``~/.genesis/config/genesis.yaml``, so a
+    developer who silences a prompt on their own box silently changes what these
+    tests assert. MEASURED 2026-09-25, and this fixture exists because of it:
+    setting ``hooks.asks.secrets_env: off`` on one install turned six passing
+    ``test_secrets_env_access_guard`` assertions red — the guard (in an earlier
+    shape of this knob) was correctly returning an ``allow`` the tests had no
+    idea was possible; today it returns no decision, which reddens them the
+    same way. The
+    suite had passed on that same box an hour earlier, before the config line
+    was written, so nothing about the test run itself signalled the dependency.
+
+    The exposure is wider than the tests that assert an ask. These guards are
+    driven through ``subprocess.run`` in several files, and a child inherits the
+    parent's environment — so pinning the seam here reaches the subprocess tests
+    too, which patching individual call sites would not do for the next file
+    someone adds. "Absent in CI" is true of a GitHub runner and false of a
+    self-hosted install running its own suite, which is this repo's documented
+    dev workflow.
+
+    Empty string, not unset: the reader treats a SET-but-empty seam as "no policy
+    declared" and skips the config file entirely, whereas unsetting it would send
+    the reader back to the host's real file. Tests that exercise the config-file
+    path (the ``config_file`` fixture in ``test_hook_ask_policy``) delete this seam and redirect
+    the module's path constant at a tmp file; per-test overrides simply setenv
+    later and win.
+    """
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_commit_lookup(monkeypatch):
+    """Give EVERY hook test an empty repo-wide commit lookup by default.
+
+    The freshness gate resolves a clean Codex signal's abbreviated id across the
+    repository; without this pin a test that never mentions commits would make a
+    live ``gh`` call. Empty resolves nothing, so no clean signal is accepted and
+    every test keeps the verdict it was written against. Tests of the clean signal
+    set ``_TEST_GH_COMMIT_AT_PREFIX`` themselves."""
+    monkeypatch.setenv("_TEST_GH_COMMIT_AT_PREFIX", "")
+    monkeypatch.setenv("_TEST_GH_CODEX_SIGNAL", "")
     yield
 
 
@@ -115,6 +183,80 @@ def _hermetic_review_bodies(monkeypatch):
     fail directions, dedupe, and the dismissed-review rule — is exercised in
     tests/test_hooks/test_outside_diff_findings.py, which overrides this per case."""
     monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", "")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_rounds_row(monkeypatch):
+    """Pin the ``--check-pr`` ``rounds`` row for EVERY hook test.
+
+    The row asks ``review_budget.evaluate_pr``, which reads GitHub over GraphQL.
+    ``check_pr_report`` is driven 59 times across 8 hook test files, two of them
+    as a SUBPROCESS, so the pin is an environment variable those children
+    inherit. Without it each report test makes a live call: green on a dev box
+    with gh authenticated, red in CI. The row's own rendering is tested in
+    tests/test_hooks/test_review_rounds.py, which clears this per case."""
+    monkeypatch.setenv("_TEST_ROUNDS_ROW", "hermetic (test pin)")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_squash_body_file(monkeypatch):
+    """Keep ``--check-pr`` from writing its squash body file for EVERY hook test.
+
+    When every gate passes, the report writes the body under ``~/tmp/merge-bodies``
+    in the REAL home directory, and reads the PR body and commits to build it.
+    Report tests whose commit seam includes their head would otherwise leave files
+    in the install (MEASURED: one did). tests/test_hooks/test_squash_body_trailer.py
+    clears this per case, with a temporary HOME."""
+    monkeypatch.setenv("_TEST_SQUASH_BODY_FILE", "off")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_main_reverts(monkeypatch):
+    """Pin the ``--check-pr`` ``main-reverts`` row's commit read for EVERY hook test.
+
+    The row reads ``pulls/N/commits`` first, so without this pin every test that
+    drives ``check_pr_report`` makes a live call (some as a subprocess, hence an
+    environment variable the children inherit). One NON-merge commit resolves the
+    row to ``n/a`` before any further read, so no other seam is consulted and no
+    existing verdict moves — the row is advisory and never counts toward one. Its
+    own behaviour is tested in tests/test_hooks/test_merge_gate_main_reverts.py,
+    which overrides this per case."""
+    monkeypatch.setenv("_TEST_GH_PR_COMMITS", '{"sha": "' + "0" * 40 + '", "parents": 1}')
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_rework(monkeypatch):
+    """Pin the BLOCKING ``rework`` gate's sent-back list EMPTY for EVERY hook test.
+
+    The gate reads ``gh pr list --label needs-rework`` (and the architecture label)
+    first, in both the ``--check-pr`` report and the merge arm, so without this pin
+    every test driving either one makes a live call (some as a subprocess, hence an
+    environment variable the children inherit). An empty list makes every PR ``n/a``
+    unless its body declares a replacement: a declared reference then falls to a
+    timeline read, whose seam is pinned empty here so it reads as UNREADABLE rather
+    than reaching the network. No existing test body declares one. The gate's own
+    behaviour is tested in tests/test_hooks/test_rework_gate.py, which overrides
+    these per case."""
+    monkeypatch.setenv("_TEST_GH_REWORK_SENT_BACK", "")
+    monkeypatch.setenv("_TEST_GH_REWORK_TIMELINE", "{}")
+    monkeypatch.setenv("_TEST_GH_REWORK_ACK", "{}")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_outside_contribution(monkeypatch):
+    """Pin the leaks exemption's PR read to a FAILED read for every hook test.
+
+    The scheduled-review gate asks whether a PR missing its leaks marker is an
+    outside contribution, which is a live GraphQL call without this seam. A failed
+    read means "not exempt", the gate's answer before the exemption existed, so no
+    existing verdict moves. tests/test_hooks/test_leaks_outside_contribution.py
+    overrides it per case."""
+    monkeypatch.setenv("_TEST_GH_OUTSIDE_PR", "__error__")
     yield
 
 

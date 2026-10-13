@@ -674,20 +674,220 @@ class TestCommandCarriersAreNotAHole:
         result = _run_guard(guard_cmd, {"command": inner})
         assert result.returncode == 2, result.stdout + result.stderr
 
-    def test_a_target_arriving_on_stdin_is_a_known_gap_in_every_version(
-        self, guard_cmd: str
-    ) -> None:
-        """NOT a regression — MEASURED allow on the pre-parser version too.
 
-        Piping a path into `xargs` puts the target BEFORE the phrase, so the
-        coarse extractor (which reads forward from its match) finds nothing
-        either. Neither predicate has ever caught this shape. Asserted as
-        current behaviour so the gap is visible rather than implicit; if this
-        starts failing the gap was closed and this test should go.
-        """
-        inner = f"echo /tmp/wt-x | xargs {_PHRASE}"
+
+# ---------------------------------------------------------------------------
+# A removal whose target the guard cannot read is refused, not waved through
+# ---------------------------------------------------------------------------
+
+_UNREAD = "cannot read which worktree"
+
+# Real removals whose worktree arrives from outside the text: on stdin or from a
+# list (`analyze` unwraps `xargs` to a `git` segment with no path yet). Each was
+# rc=0 on main before this change (measured against main's own guard), and each
+# is refused with the unread-target message, which names no target.
+_UNREAD_TARGET_REMOVALS = [
+    # A: a parsed removal that names no worktree
+    f"echo /tmp/wt-x | xargs {_PHRASE}",
+    f"xargs -a list {_PHRASE}",
+    f"find wt -print0 | xargs -0 {_PHRASE} --force",
+    # The cell only rule A catches: the parser unwraps a path-qualified `xargs` to
+    # the `git` it runs, so the carrier test sees no carrier name in the text.
+    f"echo /tmp/wt-x | /usr/bin/xargs {_PHRASE}",
+    f"echo /tmp/wt-x | sudo xargs {_PHRASE}",
+    f"echo /tmp/wt-x | '/usr/bin/xargs' {_PHRASE}",
+    f'echo /tmp/wt-x | "xargs" {_PHRASE}',
+    f"echo /tmp/wt-x | parallel {_PHRASE}",
+    # A here-document body a shell runs: the parser reads it as commands.
+    f"bash <<'EOF'\necho /tmp/wt-x | xargs {_PHRASE}\nEOF",
+    # B: a carrier whose payload names no worktree
+    f"echo /tmp/wt-x | eval 'xargs {_PHRASE}'",
+    # U: text the tokenizer cannot read (an apostrophe in a comment line the shell
+    # skips), with the target on stdin
+    "# it's a note\necho /tmp/wt-x | xargs " + _PHRASE,
+]
+
+# Real removals whose whole command is text handed to a shell or `source`, which
+# the parser never reads as a segment (a here-string's word is dropped). The path
+# IS in the text, so the coarse reader finds it and the ordinary refusal runs,
+# self-directory and cross-session checks included. Each was rc=0 on main.
+_UNREAD_PROGRAM_REMOVALS = [
+    # C: a shell that reads its program from somewhere the parser does not
+    f"bash <<< '{_PHRASE} /tmp/wt-x'",
+    f"echo '{_PHRASE} /tmp/wt-x' | bash",
+    f"printf '%s' '{_PHRASE} /tmp/wt-x' | sh -s",
+    f"echo '{_PHRASE} /tmp/wt-x' | sudo bash -x",
+    f"zsh <<< '{_PHRASE} /tmp/wt-x'",
+    f"bash - <<< '{_PHRASE} /tmp/wt-x'",
+    f"bash <(echo '{_PHRASE} /tmp/wt-x')",
+    f"bash /dev/stdin <<< '{_PHRASE} /tmp/wt-x'",
+    # `+c` runs its payload, but the parser flattens only a `-` bundle's `-c`.
+    f"bash +c '{_PHRASE} /tmp/wt-x'",
+    f"timeout 9 bash <<< '{_PHRASE} /tmp/wt-x'",
+    f"env bash -s <<< '{_PHRASE} /tmp/wt-x'",
+    # `-s` reads stdin even when positional words follow; `-o` takes a value.
+    f"bash -s arg <<< '{_PHRASE} /tmp/wt-x'",
+    f"bash -o pipefail <<< '{_PHRASE} /tmp/wt-x'",
+    # A here-document fed to one shell must not exempt a piped shell beside it.
+    f"bash <<'EOF'\necho harmless\nEOF\necho '{_PHRASE} /tmp/wt-x' | bash",
+    # C: `source` / `.`, which run a file's text as shell
+    f"source /dev/stdin <<< '{_PHRASE} /tmp/wt-x'",
+    f". <(echo '{_PHRASE} /tmp/wt-x')",
+    f"source <(echo '{_PHRASE} /tmp/wt-x')",
+    f". -- /dev/stdin <<< '{_PHRASE} /tmp/wt-x'",
+    f"echo '{_PHRASE} /tmp/wt-x' | source -- /dev/stdin",
+]
+
+# A launcher that supplies the OPERATION itself from stdin or a list: the parsed
+# segment is a `git worktree` naming no operation. Each was rc=0 on main.
+_UNREAD_OPERATION_REMOVALS = [
+    f"echo {_OP} /tmp/wt-x | xargs git {_SUB}",
+    f"echo {_OP} /tmp/wt-x | xargs -r git -C /r {_SUB}",
+    f"echo {_OP} | xargs -I{{}} git {_SUB} {{}} /tmp/wt-x",
+    # parallel substitutes `{}` without any option, so only the first-word rule sees it.
+    f"echo {_OP} | parallel git {_SUB} {{}} /tmp/wt-x",
+    f"parallel git {_SUB} ::: {_OP} ::: /tmp/wt-x",
+    # A wrapper's option value spelled `git` must not hide the supplier after it.
+    f"echo {_OP} /tmp/wt-x | env 'G=/usr/bin/git' xargs git {_SUB}",
+    f"echo {_OP} /tmp/wt-x | sudo -u 'git' xargs git {_SUB}",
+    # A placeholder spelled like an option, or like an operation name.
+    f"printf '{_OP}\\n' | xargs -I -h git {_SUB} -h /tmp/wt-x",
+    f"printf '{_OP}\\n' | xargs -I list git {_SUB} list /tmp/wt-x",
+]
+
+# Refused on main too, but only because the coarse reader took an operator
+# (`<`) for the target. Kept as regression cells: the verdict must survive.
+_ALREADY_REFUSED_REMOVALS = [
+    f"parallel {_PHRASE} < list",
+    f"xargs -r {_PHRASE} < list",
+    f"xargs git -C /r {_SUB} {_OP} < list",
+    f"xargs {_PHRASE} <<< /tmp/wt-x",
+    # An escape-built word inside $'...': refused by the escape blind spot.
+    "echo $'it\\'s' /tmp/wt-x | xargs " + _PHRASE,
+]
+
+
+class TestATargetTheGuardCannotReadIsRefused:
+    """Every direct removal is refused whatever it targets, so a removal whose
+    target the guard cannot read is refused too — with a message that names
+    only what is known. Replaces the earlier known-gap pin for the stdin case."""
+
+    @pytest.mark.parametrize("inner", _UNREAD_TARGET_REMOVALS)
+    def test_a_removal_whose_target_the_guard_cannot_read_is_refused(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert _UNREAD in result.stderr, result.stderr
+
+    @pytest.mark.parametrize("inner", _UNREAD_PROGRAM_REMOVALS)
+    def test_a_removal_handed_to_a_shell_or_source_is_refused(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    @pytest.mark.parametrize("inner", _UNREAD_OPERATION_REMOVALS)
+    def test_an_operation_supplied_by_a_launcher_is_refused(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert _UNREAD in result.stderr, result.stderr
+        assert "operation" in result.stderr, result.stderr
+
+    @pytest.mark.parametrize("inner", _ALREADY_REFUSED_REMOVALS)
+    def test_a_removal_refused_before_is_still_refused(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            f"rg '{_SUB} {_OP}' -l | xargs wc -l",
+            f"echo '{_PHRASE} docs' | tee notes.txt",
+            f'gh pr edit 1 --body "docs about {_PHRASE}"',
+            f"git commit -m 'doc {_PHRASE} usage'",
+            f"cat <<'EOF' > notes.md\nprose about {_PHRASE}\nEOF",
+            f"bash -c 'echo {_PHRASE}'",
+            f"bash scripts/setup.sh && git {_SUB} list",
+            f"source .venv/bin/activate && git {_SUB} list",
+            # A shell or `source` running a named FILE is not a carrier: the
+            # removal is not in text it runs. MEASURED false refusals before.
+            f'source .venv/bin/activate && grep "{_PHRASE}" .',
+            f'bash scripts/x.sh && echo "the {_PHRASE} doc"',
+            f'bash -x s.sh | grep "{_PHRASE}"',
+            # A bare `git worktree` is not reached through a launcher, and a
+            # variable assignment before `git` is not a launcher either.
+            f"git {_SUB}",
+            f"cat <<'EOF' > notes.md\nGIT_DIR=x {_PHRASE}\nEOF",
+            # House-style PR body: markdown backticks in a quoted here-document
+            # parse as a `git` segment naming no worktree. Only a removal reached
+            # through a launcher is refused for naming none.
+            "gh pr create --title t --body \"$(cat <<'EOF'\n## Why\n"
+            f"A bare `{_PHRASE}` with no path removes nothing.\nEOF\n)\"",
+            f"git commit -F - <<'EOF'\nfix: document `{_PHRASE}`\nEOF",
+            # A wrapper that supplies no words is not a launcher for this rule.
+            f"git commit -F - <<'EOF'\nfix: `sudo {_PHRASE}` names nothing\nEOF",
+            f"sudo git {_SUB}",
+        ],
+    )
+    def test_ordinary_commands_near_the_new_carriers_still_run(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        """TRUE-NEGATIVE CONTROLS. A shell given `-c` is not a carrier (the parser
+        reads its payload), nor is a shell or `source` given a file to run; text
+        that no shell or launcher runs is not a removal; and a removal naming no
+        worktree is refused only when a launcher reaches it."""
         result = _run_guard(guard_cmd, {"command": inner})
         assert result.returncode == 0, result.stdout + result.stderr
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            f"bash <<'EOF'\ngrep -rn \"{_PHRASE}\" docs/\nEOF",
+            f"sh <<'EOF'\ngit grep -n '{_SUB} {_OP}'\nEOF",
+        ],
+    )
+    def test_a_here_document_fed_shell_is_a_carrier_known_cost(
+        self, guard_cmd: str, inner: str
+    ) -> None:
+        """KNOWN COST, pinned. Segments keep no redirects, so which shell a
+        here-document feeds cannot be told from the parse, and a shell reading its
+        program from stdin is a carrier even when the body only mentions the
+        removal. Exempting here-document-fed shells from the raw text exempted a
+        piped shell beside one (review, round 1)."""
+        result = _run_guard(guard_cmd, {"command": inner})
+        assert result.returncode == 2, result.stdout + result.stderr
+
+    def test_prose_naming_a_supplied_removal_gets_an_honest_refusal(
+        self, guard_cmd: str
+    ) -> None:
+        """KNOWN COST, pinned. The parser keeps no here-document state, so prose that
+        names the removal under `xargs` in a here-document reads exactly like a body a
+        shell runs, and is refused. The refusal must not claim that anything runs or
+        name a target, and must give the remedy for text."""
+        cmd = f"git commit -F - <<'EOF'\nfix: refuse `xargs {_PHRASE}`\nEOF"
+        result = _run_guard(guard_cmd, {"command": cmd})
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert _UNREAD in result.stderr
+        assert "if it runs" in result.stderr
+        assert "Write tool" in result.stderr
+        assert "Cannot remove worktree '" not in result.stderr
+
+    def test_the_refusal_does_not_claim_a_removal_or_invent_a_target(
+        self, guard_cmd: str
+    ) -> None:
+        """The same refusal also fires on text that merely MENTIONS the removal
+        next to a carrier, so its wording must be true for prose too: no target
+        is named, and the remedy for text that is not a command is given."""
+        result = _run_guard(guard_cmd, {"command": f"eval 'echo {_PHRASE}'"})
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert _UNREAD in result.stderr
+        assert "Cannot remove worktree '" not in result.stderr
+        assert "Write tool" in result.stderr
 
 
 # ---------------------------------------------------------------------------

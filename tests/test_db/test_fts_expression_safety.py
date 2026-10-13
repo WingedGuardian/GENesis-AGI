@@ -78,6 +78,15 @@ _EXPANSION_CASES = [
 ]
 
 
+class _PassThroughReads:
+    """Stand-in ``self`` for the unbound call: the file-keyword lane prunes
+    bm25-inert terms through ``_ro_read``; returning the terms unchanged keeps
+    this cell about expression SYNTAX (pruning has its own tests)."""
+
+    async def _ro_read(self, fn, terms):
+        return terms
+
+
 @pytest.mark.parametrize("expansions", _EXPANSION_CASES)
 def test_expanded_query_is_parseable_by_fts5(fts, expansions):
     """Producer 1: tag-expansion output must survive _prepare_fts5 as valid FTS5."""
@@ -103,8 +112,8 @@ async def test_file_keyword_append_is_parseable_by_fts5(fts, extra_terms):
     dependency) out of scope, so the method touches no instance state and can run
     unbound; the extras append is the whole point of this cell.
     """
-    composed = await HybridRetriever._expand_fts_query(
-        None,  # no self state is reachable with expand_query_terms=False
+    composed, _fallback = await HybridRetriever._expand_fts_query(
+        _PassThroughReads(),  # only _ro_read is reachable with expand_query_terms=False
         query="graph expansion",
         collections=[],
         expand_query_terms=False,

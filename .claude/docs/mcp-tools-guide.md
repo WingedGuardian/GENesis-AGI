@@ -10,10 +10,12 @@ trees to pick the right one.
 | `memory_store` | Cross-session knowledge, syntheses, learnings | Sessions, extractions | "User prefers X approach" |
 | `observation_write` | Findings, task detections, reflections | Perception pipeline | "Found stale alert from Apr 17" |
 | `knowledge_ingest` | Authoritative external sources (docs, articles) | Knowledge base | "Ingest this API reference" |
-| `reference_store` | Credentials, URLs, IPs, identifiers | Reference ledger | "API key for service X" |
+| `reference_store` | Credentials, URLs, IPs, identifiers (never payment card numbers: refused) | Reference ledger | "API key for service X" |
 | `procedure_store` | Reusable multi-step workflows with confidence | Procedural memory | "Deploy pattern: steps 1-5" |
 | `follow_up_create` | Deferred USER-OWNED work needing tracking + completion | Follow-up ledger | "Finish the deck I asked for" |
 | `gh issue create` | Deferred GENESIS-REPO work (code, tests, docs, infra) | Public GitHub tracker | "Adapter for provider X is hardcoded" |
+| `open_question_raise` | A genuine OWNER FORK that blocks or shapes work — not work itself | Local open-questions store (never GitHub) | "Bind the API to loopback or the tailnet?" |
+| `board_promote` | A private ledger row / follow-up should become PUBLIC board work | Held for owner approval, then a public issue on the work board | "Promote follow-up 1a2b3c4d as a card" |
 
 **Quick rule:** If it's about the user → `memory_store`. If it's a finding
 during work → `observation_write`. If it's an external source to learn
@@ -46,7 +48,15 @@ DRAFT="$(mktemp -d)"                       # per-invocation, never a shared path
 # write the title and body with an EDITOR TOOL, not by echoing through a shell
 #   $DRAFT/title.txt   $DRAFT/body.md
 
-python3 scripts/file_tracker_issue.py \
+# .venv/bin/python, NOT a bare `python3`: the script runs a privacy scan whose
+# detect-secrets floor is resolved from the interpreter's own bin directory, and
+# it is installed only in the venv. Under the system python the scan cannot find
+# it and REFUSES every issue — correctly, since an issue is a terminal egress
+# surface with no CI backstop, but the refusal is then about your interpreter
+# rather than about the draft, and it says so.
+# From a WORKTREE, spell the interpreter absolutely: a worktree has no .venv of
+# its own, so the relative path below resolves to nothing there.
+.venv/bin/python scripts/file_tracker_issue.py \
   --title-file "$DRAFT/title.txt" --body-file "$DRAFT/body.md" \
   --area area:memory --difficulty "help wanted" --dry-run   # drop --dry-run to post
 # KEEP $DRAFT until the real filing reaches a known outcome — see below
@@ -129,12 +139,26 @@ IPs, hostnames, absolute home paths, identifiers, or raw install metrics (row
 counts and spend leak usage scale — state proportions instead). Nothing gates this
 path; `gh issue create` appears nowhere in `scripts/hooks/git_push_guard.py`.
 
-**Security defects never go public first.** An unpatched authentication bypass,
-credential exposure, injection path, or anything otherwise exploitable is not filed
-publicly while unfixed — publishing hands a working lead to anyone reading, against
-installs running the vulnerable code right now. Keep it local, fix it, then file.
-The privacy scan does not catch this: it looks for install-specific data, not for
-dangerous technical disclosure.
+**Security defects never go public first, and the test is WHO GAINS.** A defect
+is security-class when disclosure hands someone a capability they do not already
+have — an authentication or privilege bypass, a credential exposure, an injection
+path, anything reachable by a party with LESS access than it grants. Those are not
+filed publicly while unfixed: publishing hands a working lead to anyone reading,
+against installs running the vulnerable code right now. Keep it local, fix it,
+then file. The privacy scan does not catch this: it looks for install-specific
+data, not for dangerous technical disclosure.
+
+**Apply that test rather than the word "bypass".** A fail-open in a LOCAL
+development guard usually fails it: the hook runs only where an install wires it,
+whoever can trigger it already has commit access to that checkout, and the worst
+case is typically an under-reviewed change reaching a PR that still waits on
+maintainer approval — the state of any PR authored without those hooks. The
+earlier catch-all ("anything otherwise exploitable") swept in most of what this
+repo builds and withheld filable findings. The exception the test catches and the
+label does not: a guard whose job is stopping a secret or private data from
+reaching a public surface is security-class however local it is, because a branch
+on a public repo is public the moment it is pushed, merged or not. Borderline?
+Ask. CLAUDE.md, "Where deferred work goes", is the authority.
 
 If the script refuses (exit 2), the work stays a local `follow_up_create` row until
 a maintainer carries it across. That is a known gap, not a workaround.
@@ -151,12 +175,14 @@ retro-post). So it cannot serve "file this now".
 ### Dispatched / background sessions
 
 A dispatched session must NOT file issues — nothing gates the path and there is no one
-to approve. (`steward` gets `gh`-restricted Bash, so for that profile this is a policy
-line, not a locked door.) It records locally instead — but check the profile first:
+to approve. No shipped profile grants a shell, so for a shipped profile this is a
+locked door rather than a policy line; an install that grants one to a profile of its
+own through the overlay hook is back to policy. It records locally instead — but check
+the profile first:
 **naming a route a session cannot take is worse than naming none.** Check your OWN
 denylist rather than trusting a list here; three tiers exist today:
 
-- HAS `follow_up_create` (`interact`, `research`, `campaign`, `steward`; and
+- HAS `follow_up_create` (`interact`, `research`, `campaign`; and
   `sentinel` when NOT degraded) → file there AND state the finding in the session's
   returned output. Both, not either: the row is FORCED onto the cold `tabled` lane by
   sacred-board authorization whatever `work_state` you pass, tabled rows are excluded
@@ -261,3 +287,41 @@ See `.claude/docs/background-sessions.md` for the full guide. Quick rule:
 | `observation_write` | A finding, insight, or detection — informational, feeds the perception pipeline |
 
 Follow-ups are accountability. Observations are awareness.
+
+## Open Questions vs Follow-ups vs Asking Now
+
+An **open question** is a decision only the owner can make, parked so it is
+neither guessed at nor asked mid-flow. It is not work: when the owner settles
+it, the work it unblocks becomes a follow-up or a board card.
+
+| Situation | Tool |
+|-----|------|
+| Answerable from code, logs, docs or measurement | Answer it yourself, citing the evidence |
+| Covered by a standing rule or pre-approval | Proceed; say which rule |
+| Low-stakes and reversible | Decide, and note it for review at the next checkpoint |
+| A genuine owner fork, not urgent | `open_question_raise`, with `blocks` naming the work it holds up — and in a foreground session, tell the owner you parked it |
+| A genuine owner fork that stops the work now | Ask the owner (foreground) or stop as blocked (dispatched) |
+
+`blocks` entries are `ledger:<id>`, `follow_up:<id>` (full id or a unique 8+
+hex prefix) or `card:owner/repo#N`. `board_promote` REFUSES to promote a
+blocked record; everywhere else a block is advisory —
+`open_question_list(target=...)` answers whether something is blocked, and by
+what, and the morning report counts unverified questions so a parked one is
+never invisible. Close with
+`open_question_resolve` and say what settled it — an assumption is not an
+answer. Resolving, and removing a block, are the OWNER's call: a dispatched
+session is refused both, so it parks the question and leaves it. Background
+sessions attach blocks when they raise (`blocks=`); `open_question_block` as a
+whole is withheld from them, because the same tool also removes blocks. The store is
+LOCAL ONLY; nothing here reaches GitHub.
+
+**Reading the work board.** `board_status` answers "what is on the board and is
+the reconciler alive?" from the reconciler's stored heartbeats. It never calls
+GitHub, so it is cheap to ask often. Its `latest` block is the newest pulse
+(mode, paused, any error); `summary` is the newest SUCCESSFUL read: counts by
+column, Genesis status and kind, coverage against the repo's open total, and
+drags logged, all with its age. `board_item("#N")` (or `owner/repo#N`) answers
+"where is this one card and what blocks it?" with a live read: its column on
+the configured project, GitHub's blocked-by list (flagged when truncated),
+unverified open questions blocking it, and whether it was promoted from a
+private record. Both are read-only and open to reflection sessions.

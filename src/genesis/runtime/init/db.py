@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from typing import TYPE_CHECKING
+
+from genesis.db.integrity import DatabaseIntegrityError
 
 if TYPE_CHECKING:
     from genesis.runtime._core import GenesisRuntime
@@ -15,10 +18,23 @@ logger = logging.getLogger("genesis.runtime")
 async def init(rt: GenesisRuntime) -> None:
     """Initialize the SQLite database and apply pending schema migrations."""
     try:
-        from genesis.db.connection import init_db
+        from genesis.db.connection import DEFAULT_DB_PATH, init_db
+        from genesis.db.integrity import require_healthy_database
+
+        # Must run before init_db(): init_db creates/seeds schema and is already
+        # a writer.  A corrupt database is never opened write-capable.
+        await asyncio.to_thread(
+            require_healthy_database,
+            DEFAULT_DB_PATH,
+            source="runtime-startup",
+        )
 
         rt._db = await init_db()
         logger.info("Genesis DB initialized")
+    except DatabaseIntegrityError:
+        logger.critical("Genesis DB failed startup integrity verification", exc_info=True)
+        rt._db = None
+        raise
     except sqlite3.Error:
         logger.exception("DB error during initialization")
         return

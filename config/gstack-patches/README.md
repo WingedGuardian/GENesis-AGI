@@ -11,9 +11,13 @@ After any gstack upgrade, run `scripts/apply_gstack_patches.sh` to reapply.
 
 | File | Target | What It Does |
 |------|--------|-------------|
-| `codex-SKILL.md.tmpl` | `codex/SKILL.md.tmpl` | Codex 2.0 fallback chain (Codex CLI -> OpenCode/GLM5 -> Claude subagent). Custom three-tier adversarial review system. |
-| `codex-SKILL.md` | `codex/SKILL.md` | Generated from template. Must be regenerated if template changes. |
 | `review-checklist.md` | `review/checklist.md` | Adds verification taxonomy section (4-level: exists -> substantive -> wired -> data-flow verified). |
+
+Genesis no longer ships a `codex` overlay: the upstream gstack `codex` skill is
+used as-is. The old overlay was a whole-file copy captured at the v0.13 baseline
+below, so re-applying it replaced the current upstream skill with an outdated
+one. An install that customises its `codex` skill maintains that customisation
+locally.
 
 ### Patch Scripts
 

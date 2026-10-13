@@ -81,7 +81,8 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "(`graph_expansion.mode` off/shadow/live + neighbor caps) and the "
             "entity lane (PR-2, off/shadow for now), and the Voyage reranker on "
             "the recall tools (`reranker.mode` off/live, default live; kill via "
-            "GENESIS_MEMORY_RERANK_OFF). Read live per recall by "
+            "GENESIS_MEMORY_RERANK_OFF), and `proactive.trace` on/off (the "
+            "per-recall retrieval trace, default on). Read live per recall by "
             "genesis.memory.graph_expansion (no restart); shadow only emits "
             "eval_events metrics, live appends linked neighbors after the "
             "organic results."
@@ -172,6 +173,25 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         # overlay-file edit, never a UI round-trip.
         hidden_fields=frozenset({"require_approval"}),
     ),
+    "board": SettingsDomain(
+        name="board",
+        description=(
+            "Work board (GitHub Projects v2 front end) — master `enabled` + "
+            "`mode` off/propose_only/live. off (default, shipped) does nothing; "
+            "propose_only reads the board and holds promotions but writes "
+            "nothing to GitHub; live lets the reconciler and approved "
+            "promotions write, and is armed ONLY by an owner edit of "
+            "~/.genesis/config/board.local.yaml (settings_update rejects it). "
+            "Invalid mode degrades to propose_only. Kill "
+            "switch GENESIS_BOARD_DISABLED=1. A session may set enabled false or "
+            "mode off/propose_only, never live or enabled true (owner edits). "
+            "Read live per call by board promotion (board_promote and the drain), "
+            "so a change takes effect at the next promotion — no restart."
+        ),
+        config_filename="board.yaml",
+        readonly=False,
+        needs_restart=False,  # every consumer re-reads per call
+    ),
     "marketing_outreach": SettingsDomain(
         name="marketing_outreach",
         description=(
@@ -213,9 +233,10 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         name="pr_watch",
         description=(
             "PR-watch inline surface — master `enabled` plus lookback/resurface/"
-            "max_surface knobs. Mirrors the upstream-pr-steward campaign's own "
-            "owner notifications into foreground CC sessions as a one-line nudge, "
-            "so a tracked-PR status change missed on Telegram still reaches the "
+            "max_surface knobs. Mirrors the GitHub-steward owner notifications "
+            "(written by recon/account_activity.py and the github-activity-digest "
+            "campaign) into foreground CC sessions as a one-line nudge, so a "
+            "tracked-PR status change missed on Telegram still reaches the "
             "user next session. Read live by the SessionStart hook — takes effect "
             "next session start. Hook kill switch: GENESIS_PR_WATCH_DISABLED=1."
         ),
@@ -263,8 +284,9 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "Entity adjudication drainer — master `enabled` + `mode` "
             "off/propose_only/live, plus drain/sweep knobs. propose_only "
             "(default) records merge verdicts without applying them; live "
-            "applies double-agreed merges (loser entity tombstoned into "
-            "survivor) and applies the shadow-period backlog on the flip. "
+            "would apply double-agreed merges unattended, but is FENCED until "
+            "#2742 (refused here, run as propose_only if set by hand). "
+            "Approved merges apply via entity_adjudication_apply. "
             "Read live each hourly run — takes effect next run, no restart."
         ),
         config_filename="entity_adjudication.yaml",
@@ -288,15 +310,40 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         name="cc_foreground_reaper",
         description=(
             "Foreground-session liveness reaper (D3) — master `enabled` + `mode` "
-            "off/observe/notify, plus idle_hours/max_per_tick. notify (default) "
+            "off/observe/notify, plus idle_hours/max_per_tick and the "
+            "pid-evidence fast path (close_dead, dead_process_minutes). "
+            "notify (default) "
             "reaps abandoned foreground sessions to 'checkpointed' and tells the "
             "origin user their request was interrupted (crisp unanswered-user "
             "signal only); observe reaps + records without notifying; off does "
-            "nothing. Read live each reaper pass — takes effect next pass, no restart."
+            "nothing. Read live each reaper pass — takes effect next pass, no "
+            "restart. ONE exception: `dead_process_minutes` is read live for "
+            "candidate ELIGIBILITY but also bounds the dead-pid sweep's poll "
+            "interval, which is fixed when the job is registered — so the "
+            "eligibility half changes on the next pass and the cadence half "
+            "needs a server restart."
         ),
         config_filename="cc_foreground_reaper.yaml",
         readonly=False,
         needs_restart=False,  # re-read every reaper pass
+    ),
+    "youtube_fetch": SettingsDomain(
+        name="youtube_fetch",
+        description=(
+            "YouTube fetch (yt-dlp, behind web_fetch and knowledge ingestion) — "
+            "`tls`: verify | auto_fallback | off. auto_fallback (default) verifies "
+            "certificates and retries a call once unverified ONLY on a "
+            "certificate-verification error, logged at warning and flagged "
+            "tls_verified=false in the result; verify never skips; off always skips. "
+            "Unverified calls carry no cookies or config-file options. "
+            "`audio_max_minutes` (default 120; knowledge ingestion only, web_fetch "
+            "never transcribes audio): the audio-transcription fallback for "
+            "a captionless video runs only up to this length (0 = never). Read fresh "
+            "per fetch — takes effect immediately, no restart."
+        ),
+        config_filename="youtube_fetch.yaml",
+        readonly=False,
+        needs_restart=False,  # read per fetch
     ),
     "mcp_staleness_guard": SettingsDomain(
         name="mcp_staleness_guard",
@@ -343,6 +390,27 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="worktree_ownership.yaml",
         readonly=False,
         needs_restart=False,  # read live per call
+    ),
+    "main_checkout_guard": SettingsDomain(
+        name="main_checkout_guard",
+        description=(
+            "Main-checkout guard — master `enabled` (default true). Keeps a Claude "
+            "Code session's hand edits out of this install's primary checkout (the "
+            "deploy root hooks, scripts and the server run from). REFUSES a "
+            "Write/Edit/MultiEdit/NotebookEdit of a TRACKED file there. Never refuses "
+            "Bash: it snapshots the deploy root before each command and, after it, "
+            "tells the session which tracked files changed (or that HEAD moved) and "
+            "how to restore them. Untracked files, linked worktrees, other "
+            "repositories, the deploy scripts' known-ephemeral paths and the dashboard "
+            "update pipeline's sessions are left alone; anything it cannot evaluate is "
+            "allowed. Applies to foreground and dispatched sessions alike. Only "
+            "`enabled: false` turns it off; an invalid value keeps it ON. Read live "
+            "per tool call — takes effect immediately, no restart. Env kill switch "
+            "GENESIS_MAIN_CHECKOUT_GUARD=0 forces off."
+        ),
+        config_filename="main_checkout_guard.yaml",
+        readonly=False,
+        needs_restart=False,  # read live per tool call by the hook
     ),
     "ego_reconcile": SettingsDomain(
         name="ego_reconcile",
@@ -926,14 +994,20 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
 
     _validate_positive_int(section, "check_interval_seconds", errors)
     _validate_positive_int(section, "timeout_s", errors)
+    # #1953: these two were never bounded here, and 0 is harmful for both —
+    # items_per_eval=0 divides a drop into nothing, max_retries=0 parks on the
+    # first miss. config.py floors them too, for the paths this never sees.
+    _validate_positive_int(section, "items_per_eval", errors)
+    _validate_positive_int(section, "max_retries", errors)
 
-    if "batch_size" in section:
-        try:
-            val = int(section["batch_size"])
-            if val < 1 or val > 10:
-                errors.append("inbox_monitor.batch_size must be 1-10")
-        except (ValueError, TypeError):
-            errors.append("inbox_monitor.batch_size must be an integer")
+    # Same integer rule as every other numeric key here (#2447 review): the
+    # hand-written int() branch accepted `true` and 2.7 and raised on inf.
+    if _validate_int(section, "batch_size", errors) and not (
+        1 <= int(section["batch_size"]) <= 10
+    ):
+        errors.append("inbox_monitor.batch_size must be 1-10")
+    # 0 means "no cooldown", so the floor is 0, not 1 (config.py agrees).
+    _validate_int(section, "evaluation_cooldown_seconds", errors, minimum=0)
 
     valid_models = VALID_MODEL_NAMES
     model = section.get("model")
@@ -1369,6 +1443,23 @@ def _validate_session_ledger_shadow(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_youtube_fetch(changes: dict) -> list[str]:
+    """Validate the YouTube fetch lever (see
+    genesis.knowledge.processors.youtube_config)."""
+    from genesis.knowledge.processors.youtube_config import TLS_MODES
+
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key == "audio_max_minutes":
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                errors.append("'audio_max_minutes' must be a non-negative integer")
+        elif key != "tls":
+            errors.append(f"Unknown key '{key}'. Valid: tls, audio_max_minutes")
+        elif value not in TLS_MODES:
+            errors.append(f"'tls' must be one of {', '.join(TLS_MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_mcp_staleness_guard(changes: dict) -> list[str]:
     """Validate MCP stale-code-guard lever changes (see
     genesis.observability.mcp_staleness_guard_config)."""
@@ -1400,6 +1491,19 @@ def _validate_worktree_ownership(changes: dict) -> list[str]:
                 errors.append("'enabled' must be a boolean")
         elif value not in MODES:
             errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
+def _validate_main_checkout_guard(changes: dict) -> list[str]:
+    """Validate main-checkout guard lever changes (read by
+    scripts/hooks/main_checkout_guard.py, which keeps the guard ON for any value
+    other than the boolean false)."""
+    errors: list[str] = []
+    for key, value in changes.items():
+        if key != "enabled":
+            errors.append(f"Unknown key '{key}'. Valid: enabled")
+        elif not isinstance(value, bool):
+            errors.append("'enabled' must be a boolean")
     return errors
 
 
@@ -1571,6 +1675,58 @@ def _validate_contributor_worklog(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_board(changes: dict) -> list[str]:
+    """Validate work-board lever changes (see genesis.board.config).
+
+    ``mode`` accepts ``off``/``propose_only`` here, but ``live`` is REJECTED —
+    arming the board's GitHub writes is deliberately overlay-file-only, exactly
+    as ``_validate_marketing_outreach`` reserves its ``live``. A settings_update
+    (MCP tool or dashboard PUT) is reachable by any session, including a
+    dispatched one, so accepting ``live`` here would let a model arm public-repo
+    writes for itself. The owner arms it by editing
+    ``~/.genesis/config/board.local.yaml``, which ``board.config.load_config``
+    merges. (Safe to reject unconditionally: ``board`` is not a dashboard FORM
+    domain, so no whole-config PUT re-echoes an already-set ``live``.)
+    """
+    from genesis.board.config import MODES
+
+    errors: list[str] = []
+    valid_keys = ("enabled", "mode", "project_owner", "project_number")
+    for key, value in changes.items():
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
+        elif key == "enabled":
+            if not isinstance(value, bool):
+                errors.append("'enabled' must be a boolean")
+            elif value:
+                # Only an owner re-enables: `enabled: true` here would re-arm a
+                # `mode: live` overlay the owner paused with `enabled: false`.
+                errors.append(
+                    "'enabled: true' cannot be set through settings_update — "
+                    "re-enabling the board is an owner edit of "
+                    "~/.genesis/config/board.local.yaml"
+                )
+        elif key in ("project_owner", "project_number"):
+            # WHICH board the reconciler writes to is overlay-only, like `live`:
+            # a session that could repoint it could send Genesis's card writes
+            # to a project it controls. scripts/board_setup.py --write-config is
+            # the writer; it edits the overlay file directly.
+            errors.append(
+                f"'{key}' cannot be set through settings_update — run "
+                "scripts/board_setup.py --write-config, which records it in "
+                "~/.genesis/config/board.local.yaml"
+            )
+        elif value == "live":
+            errors.append(
+                "'mode: live' cannot be set through settings_update — arming the "
+                "board's GitHub writes is an owner edit of "
+                "~/.genesis/config/board.local.yaml"
+            )
+        elif value not in MODES:
+            errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+    return errors
+
+
 def _validate_marketing_outreach(changes: dict) -> list[str]:
     """Validate marketing-outreach lever changes (see
     genesis.outreach.marketing_config).
@@ -1663,6 +1819,18 @@ def _validate_memory_recall(changes: dict) -> list[str]:
         if key == "enabled":
             if not isinstance(value, bool):
                 errors.append("'enabled' must be a boolean")
+        elif key == "proactive":
+            # Only the trace kill switch is writable here; the rest of the
+            # proactive section (engine enable, per-profile budgets) stays
+            # file-edited until it gets its own validation.
+            if not isinstance(value, dict):
+                errors.append("'proactive' must be a mapping like {trace: off}")
+                continue
+            for sub_key, sub_value in value.items():
+                if sub_key != "trace":
+                    errors.append(f"Unknown key 'proactive.{sub_key}'. Valid: trace")
+                elif not (isinstance(sub_value, bool) or sub_value in ("on", "off")):
+                    errors.append(f"'proactive.trace' must be on/off or a boolean; got {sub_value!r}")
         elif key in section_modes:
             if not isinstance(value, dict):
                 errors.append(f"'{key}' must be a mapping like {{mode: shadow}}")
@@ -1690,7 +1858,8 @@ def _validate_memory_recall(changes: dict) -> list[str]:
                     errors.append(f"Unknown key '{key}.{sub_key}'")
         else:
             errors.append(
-                f"Unknown key '{key}'. Valid: enabled, graph_expansion, entity_lane, reranker"
+                f"Unknown key '{key}'. Valid: enabled, graph_expansion, entity_lane, reranker, "
+                "proactive"
             )
     return errors
 
@@ -1753,7 +1922,10 @@ def _validate_graphstore(changes: dict) -> list[str]:
 def _validate_entity_adjudication(changes: dict) -> list[str]:
     """Validate entity-adjudication lever changes (see
     genesis.memory.entity_adjudication_config)."""
-    from genesis.memory.entity_adjudication_config import INT_KNOBS, MODES
+    from genesis.memory.entity_adjudication_config import (
+        INT_KNOBS,
+        MODES,
+    )
 
     errors: list[str] = []
     valid_keys = ("enabled", "mode", "sweep_enabled", *INT_KNOBS)
@@ -1764,8 +1936,14 @@ def _validate_entity_adjudication(changes: dict) -> list[str]:
             if not isinstance(value, bool):
                 errors.append(f"'{key}' must be a boolean")
         elif key == "mode":
-            if value not in MODES:
-                errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
+            settable = [m for m in MODES if m != "live"]
+            if value == "live":
+                errors.append(
+                    "'live' is fenced until #2742 (a merge-time check that a pair's "
+                    f"approval has not gone stale); use one of {', '.join(settable)}"
+                )
+            elif value not in MODES:
+                errors.append(f"'mode' must be one of {', '.join(settable)}; got {value!r}")
         elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"'{key}' must be a positive int")
     return errors
@@ -1801,13 +1979,13 @@ def _validate_cc_foreground_reaper(changes: dict) -> list[str]:
     from genesis.cc.foreground_reaper_config import INT_KNOBS, MODES
 
     errors: list[str] = []
-    valid_keys = ("enabled", "mode", *INT_KNOBS)
+    valid_keys = ("enabled", "mode", "close_dead", *INT_KNOBS)
     for key, value in changes.items():
         if key not in valid_keys:
             errors.append(f"Unknown key '{key}'. Valid: {', '.join(valid_keys)}")
-        elif key == "enabled":
+        elif key in ("enabled", "close_dead"):
             if not isinstance(value, bool):
-                errors.append("'enabled' must be a boolean")
+                errors.append(f"'{key}' must be a boolean")
         elif key == "mode":
             if value not in MODES:
                 errors.append(f"'mode' must be one of {', '.join(MODES)}; got {value!r}")
@@ -2065,8 +2243,10 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "entity_adjudication": _validate_entity_adjudication,
     "cc_rate_limit_resume": _validate_cc_rate_limit_resume,
     "cc_foreground_reaper": _validate_cc_foreground_reaper,
+    "youtube_fetch": _validate_youtube_fetch,
     "mcp_staleness_guard": _validate_mcp_staleness_guard,
     "worktree_ownership": _validate_worktree_ownership,
+    "main_checkout_guard": _validate_main_checkout_guard,
     "voice_act": _validate_voice_act,
     "voice_recency_resume": _validate_voice_recency_resume,
     "tts": _validate_tts,
@@ -2077,6 +2257,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "repo_pulse": _validate_repo_pulse,
     "zero_drop": _validate_zero_drop,
     "contributor_worklog": _validate_contributor_worklog,
+    "board": _validate_board,
     "marketing_outreach": _validate_marketing_outreach,
     "pr_watch": _validate_pr_watch,
     "skill_evolution_gate": _validate_skill_evolution_gate,
@@ -2115,14 +2296,37 @@ def _validate_float_range(
 
 
 def _validate_positive_int(d: dict, key: str, errors: list[str]) -> None:
+    _validate_int(d, key, errors, minimum=1)
+
+
+def _validate_int(d: dict, key: str, errors: list[str], *, minimum: int = 1) -> bool:
+    """Append an error unless ``d[key]`` is an integer >= ``minimum``.
+
+    Returns True only when the key is present AND valid, so a caller can add
+    its own further bounds without re-parsing.
+    """
     if key not in d:
-        return
+        return False
+    raw = d[key]
+    # int() alone was too forgiving: `true` became 1, 2.7 became 2 and was
+    # reported "applied", and inf raised OverflowError out of the validator.
+    # Same rule as the inbox config loader, so what this accepts is what the
+    # loader keeps (#2447 review): no bools, no fractions; 4.0 and "4" are ints.
+    if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+        errors.append(f"{key} must be an integer, got {raw!r}")
+        return False
     try:
-        val = int(d[key])
-        if val <= 0:
-            errors.append(f"{key} must be a positive integer, got {val}")
-    except (ValueError, TypeError):
-        errors.append(f"{key} must be an integer, got {d[key]!r}")
+        val = int(raw)
+    except (ValueError, TypeError, OverflowError):
+        errors.append(f"{key} must be an integer, got {raw!r}")
+        return False
+    if val < minimum:
+        errors.append(
+            f"{key} must be a positive integer, got {val}" if minimum == 1
+            else f"{key} must be an integer >= {minimum}, got {val}"
+        )
+        return False
+    return True
 
 
 # ── Tool implementations ──────────────────────────────────────────────

@@ -242,7 +242,9 @@ def reembed_stale_procedure_embeddings(
         return summary
 
     changed = [0]
-    write = sqlite3.connect(db_path, timeout=30.0)
+    from genesis.db.connection import connect_sqlite_rw
+
+    write = connect_sqlite_rw(db_path, timeout=30.0)
     try:
 
         def _apply(conn: sqlite3.Connection, item: tuple[str, bytes, bytes | None]) -> None:

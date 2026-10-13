@@ -1,0 +1,1 @@
+- The commit gate's review-round lookup now reads a pull request's review evidence in one GitHub GraphQL query instead of five REST calls, cutting its typical time from about 5 seconds to under 2. Commits on busy pull requests now rarely fall back to an approval prompt (or a refusal, in background sessions) because the lookup ran out of time.

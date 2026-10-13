@@ -37,7 +37,7 @@ _warn() {
 }
 
 # Locate the source (this script's sibling hooks) and destination.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 HOOKS_SRC="$SCRIPT_DIR"
 
@@ -88,10 +88,21 @@ HOOKS_TO_SYNC=(
     "pre-commit"
     "prepare-commit-msg"
     "pre-push"
+    "pre-merge-commit"
 )
 # Colocated helpers (called by the hooks via $(dirname $0)/helper.py).
+#
+# A helper's OWN imports must be listed here too. `post-commit` runs the
+# INSTALLED copy out of $GIT_COMMON_DIR/hooks, so `sys.path[0]` is that
+# directory, not `scripts/hooks` — a sibling import resolves only if the
+# sibling was installed alongside. MEASURED: with `db_admission_check.py`
+# missing, `emit_bugfix_audit.py`'s fence import raised in the installed
+# context on EVERY `fix:` commit (and, being fail-closed, silently skipped the
+# bugfix_committed observation) while passing from the repo copy, where the
+# sibling happens to be present.
 HELPERS_TO_SYNC=(
     "emit_bugfix_audit.py"
+    "db_admission_check.py"
 )
 
 MODIFIED_FOUND=0

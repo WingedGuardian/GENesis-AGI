@@ -477,25 +477,26 @@ class TestDuplicateRollupEntries:
         assert _gate() is None
 
 
-# ── Superseded concurrency cancels (the shared _drop_superseded_cancels primitive) ──
+# ── Superseded runs (the shared _newest_run_per_workflow primitive) ──
 #
 # A doubled workflow dispatch (two `pull_request` runs for one sha) leaves EVERY
 # check-run on the head as a success+cancelled PAIR. _pr_ci_status has always
 # dropped the superseded cancel; this relief path was added later and re-derived a
 # naive `all(c == "SUCCESS")`, so the SAME rollup read `ci: green` and
-# `leak-detector is not green at this head` in ONE --check-pr run. That is not a
-# flake: on a doubled dispatch the relief is unreachable DETERMINISTICALLY for as
-# long as the head stands, and the block message points the reader at a job that
-# is green. Both consumers now call one helper.
-#
-# Times below are ISO-8601 Z strings, compared lexicographically exactly as the
-# helper does. CANCEL_AT precedes SUCCESS_AT.
+# `leak-detector is not green at this head` in ONE --check-pr run. Both consumers
+# now call one helper. Since #2607 the helper keeps, per workflow, only the NEWEST
+# workflow run (run id parsed from detailsUrl) — so the fixtures below carry the run
+# each entry came from. Timestamps are kept on the fixtures for realism only; the
+# rule consults none.
 CANCEL_AT = "2026-09-09T16:20:59Z"
 SUCCESS_AT = "2026-09-09T16:21:59Z"
 LATER_AT = "2026-09-09T16:30:00Z"
+SLUG = "acme/pub"
+R1, R2, R3 = 36000000001, 36000000002, 36000000003
+_JOB_IDS = iter(range(100000000001, 100000900000))
 
 
-def _run(conclusion, *, name="leak-detector", workflow="CI", completed_at=None):
+def _run(conclusion, *, name="leak-detector", workflow="CI", completed_at=None, run_id=None):
     entry = {
         "name": name,
         "workflowName": workflow,
@@ -504,6 +505,10 @@ def _run(conclusion, *, name="leak-detector", workflow="CI", completed_at=None):
     }
     if completed_at is not None:
         entry["completedAt"] = completed_at
+    if run_id is not None:
+        entry["detailsUrl"] = (
+            f"https://github.com/{SLUG}/actions/runs/{run_id}/job/{next(_JOB_IDS)}"
+        )
     return entry
 
 
@@ -512,24 +517,25 @@ def _rollup_entries(*entries, head=HEAD):
 
 
 class TestSupersededConcurrencyCancels:
-    """The relief path must drop a superseded `cancel-in-progress` duplicate on the
-    SAME terms as _pr_ci_status — and on no looser terms. Dropping superseded
-    cancels must never become 'ignore anything that is not SUCCESS'."""
+    """The relief path must drop superseded entries on the SAME terms as
+    _pr_ci_status — and on no looser terms: only entries from an OLDER run of the
+    same workflow. Dropping must never become 'ignore anything that is not
+    SUCCESS'."""
 
     def test_doubled_dispatch_pair_relieves(self, monkeypatch):
         """ACCEPTANCE BAR — the real PR #1839 shape, replayed.
 
-        Its head carried leak-detector CANCELLED(16:20:59) + SUCCESS(16:21:59)
-        under one identity, for 13+ identities. Relief was declined with
-        'leak-detector is not green at this head' while the CI gate on the very
-        same rollup reported green.
+        Its head carried leak-detector CANCELLED + SUCCESS under one identity, for
+        13+ identities: the cancelled run was superseded by a newer run. Relief was
+        declined with 'leak-detector is not green at this head' while the CI gate on
+        the very same rollup reported green.
         """
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv(
             "_TEST_GH_ROLLUP_WITH_HEAD",
             _rollup_entries(
-                _run("CANCELLED", completed_at=CANCEL_AT),
-                _run("SUCCESS", completed_at=SUCCESS_AT),
+                _run("CANCELLED", completed_at=CANCEL_AT, run_id=R1),
+                _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2),
             ),
         )
         assert _gate() is None
@@ -539,8 +545,8 @@ class TestSupersededConcurrencyCancels:
         Unrelated identities' pairs must neither block nor license the scanner."""
         entries = []
         for job in ("test", "lint", "leak-detector", "portability", "changelog"):
-            entries.append(_run("CANCELLED", name=job, completed_at=CANCEL_AT))
-            entries.append(_run("SUCCESS", name=job, completed_at=SUCCESS_AT))
+            entries.append(_run("CANCELLED", name=job, completed_at=CANCEL_AT, run_id=R1))
+            entries.append(_run("SUCCESS", name=job, completed_at=SUCCESS_AT, run_id=R2))
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv("_TEST_GH_ROLLUP_WITH_HEAD", _rollup_entries(*entries))
         assert _gate() is None
@@ -550,46 +556,45 @@ class TestSupersededConcurrencyCancels:
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv(
             "_TEST_GH_ROLLUP_WITH_HEAD",
-            _rollup_entries(_run("CANCELLED", completed_at=CANCEL_AT)),
+            _rollup_entries(_run("CANCELLED", completed_at=CANCEL_AT, run_id=R1)),
         )
         msg = _gate()
         assert msg and "leaks" in msg
 
-    def test_success_then_cancel_on_unchanged_head_blocks(self, monkeypatch):
-        """The LATEST attempt never passed: the cancel is not superseded."""
+    def test_success_then_cancel_in_a_newer_run_blocks(self, monkeypatch):
+        """The NEWEST run's attempt never passed: the older success does not count."""
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv(
             "_TEST_GH_ROLLUP_WITH_HEAD",
             _rollup_entries(
-                _run("SUCCESS", completed_at=CANCEL_AT),
-                _run("CANCELLED", completed_at=SUCCESS_AT),
+                _run("SUCCESS", completed_at=CANCEL_AT, run_id=R1),
+                _run("CANCELLED", completed_at=SUCCESS_AT, run_id=R2),
             ),
         )
         msg = _gate()
         assert msg and "leaks" in msg
 
-    def test_cancel_without_completedat_blocks(self, monkeypatch):
-        """Fail-closed: with no timestamp the cancel cannot be ORDERED against the
-        success, so it is not provably superseded."""
-        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
-        monkeypatch.setenv(
-            "_TEST_GH_ROLLUP_WITH_HEAD",
-            _rollup_entries(
-                _run("CANCELLED"),
-                _run("SUCCESS", completed_at=SUCCESS_AT),
-            ),
-        )
-        msg = _gate()
-        assert msg and "leaks" in msg
-
-    def test_timestampless_success_cannot_supersede(self, monkeypatch):
-        """The superseding sibling needs a completedAt of its own."""
+    def test_cancel_without_a_run_id_blocks(self, monkeypatch):
+        """Fail-closed: a cancel whose run cannot be established is never dropped."""
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv(
             "_TEST_GH_ROLLUP_WITH_HEAD",
             _rollup_entries(
                 _run("CANCELLED", completed_at=CANCEL_AT),
-                _run("SUCCESS"),
+                _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2),
+            ),
+        )
+        msg = _gate()
+        assert msg and "leaks" in msg
+
+    def test_success_without_a_run_id_cannot_supersede(self, monkeypatch):
+        """The superseding run must be established from its own detailsUrl."""
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
+        monkeypatch.setenv(
+            "_TEST_GH_ROLLUP_WITH_HEAD",
+            _rollup_entries(
+                _run("CANCELLED", completed_at=CANCEL_AT, run_id=R1),
+                _run("SUCCESS", completed_at=SUCCESS_AT),
             ),
         )
         msg = _gate()
@@ -597,16 +602,16 @@ class TestSupersededConcurrencyCancels:
 
     def test_dropping_a_cancel_does_not_launder_a_failure(self, monkeypatch):
         """THE GUARANTEE THIS PATH MUST KEEP. Under `# ci-override` this relief is
-        the only remaining check of the mechanical layer, so a SUCCESS-then-FAILURE
-        pair must still read red even when a superseded cancel is dropped beside
-        it. FAILURE is not in the cancel set and is never dropped."""
+        the only remaining check of the mechanical layer, so a newer run's FAILURE
+        must still read red even when an older run's entries are dropped beside it:
+        the newest run decides (#2607)."""
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv(
             "_TEST_GH_ROLLUP_WITH_HEAD",
             _rollup_entries(
-                _run("CANCELLED", completed_at=CANCEL_AT),
-                _run("SUCCESS", completed_at=SUCCESS_AT),
-                _run("FAILURE", completed_at=LATER_AT),
+                _run("CANCELLED", completed_at=CANCEL_AT, run_id=R1),
+                _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2),
+                _run("FAILURE", completed_at=LATER_AT, run_id=R3),
             ),
         )
         msg = _gate()
@@ -614,64 +619,74 @@ class TestSupersededConcurrencyCancels:
 
     @pytest.mark.parametrize(
         "conclusion",
-        # The COMPLETE set: _CI_RED_CONCLUSIONS minus CANCELLED. This test exists to
-        # stop the DROPPABLE set widening, so it must enumerate every member the
-        # constant holds, not a sample of them.
-        ["FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"],
+        # The COMPLETE red set (_CI_RED_CONCLUSIONS), locked by a derived-set test
+        # below: every red conclusion follows the newest-run rule, so every member
+        # must be exercised, not a sample.
+        ["CANCELLED", "FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"],
     )
-    def test_only_cancelled_is_droppable(self, monkeypatch, conclusion):
-        """Scope lock on _CI_CANCEL_CONCLUSIONS: every other non-green terminal
-        conclusion carries a real verdict and survives a later same-identity
-        success. STALE is a real GitHub conclusion, and it is red, not a pass."""
+    def test_every_red_conclusion_follows_newest_run(self, monkeypatch, conclusion):
+        """Newest run decides, both directions, for every red conclusion. A red result
+        in an older run is dropped when a newer run passed (relief granted); a red
+        result in the newer run overturns an older success (relief refused)."""
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv(
             "_TEST_GH_ROLLUP_WITH_HEAD",
             _rollup_entries(
-                _run(conclusion, completed_at=CANCEL_AT),
-                _run("SUCCESS", completed_at=SUCCESS_AT),
+                _run(conclusion, completed_at=CANCEL_AT, run_id=R1),
+                _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2),
+            ),
+        )
+        assert _gate() is None
+        monkeypatch.setenv(
+            "_TEST_GH_ROLLUP_WITH_HEAD",
+            _rollup_entries(
+                _run("SUCCESS", completed_at=CANCEL_AT, run_id=R1),
+                _run(conclusion, completed_at=SUCCESS_AT, run_id=R2),
             ),
         )
         msg = _gate()
         assert msg and "leaks" in msg
 
     def test_same_named_decoy_from_another_workflow_cannot_supersede(self, monkeypatch):
-        """Identity is (name, workflowName). A success published by a DIFFERENT
+        """Workflows are judged independently. A success published by a DIFFERENT
         workflow under the scanner's display name must not drop the real cancel."""
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv(
             "_TEST_GH_ROLLUP_WITH_HEAD",
             _rollup_entries(
-                _run("CANCELLED", completed_at=CANCEL_AT),
-                _run("SUCCESS", workflow="Decoy", completed_at=SUCCESS_AT),
+                _run("CANCELLED", completed_at=CANCEL_AT, run_id=R1),
+                _run("SUCCESS", workflow="Decoy", completed_at=SUCCESS_AT, run_id=R2),
             ),
         )
         msg = _gate()
         assert msg and "leaks" in msg
 
-    def test_equal_timestamp_cancel_blocks_relief(self, monkeypatch):
-        """The tie rule AT THE GATE, not only at the primitive. This is the cell Codex's
-        P1 named: a genuine cancellation in the same second as a success would, under
-        `>=`, let an OLD leaks review be carried forward while the latest scanner
-        attempt was in fact cancelled."""
+    def test_same_run_duplicate_blocks_relief(self, monkeypatch):
+        """Two entries of the scanner in the SAME (newest) run are both kept, so the
+        cancelled one still blocks. The rollup should not produce this shape — it
+        lists only a run's latest attempt — which is why it must fail closed."""
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv(
             "_TEST_GH_ROLLUP_WITH_HEAD",
             _rollup_entries(
-                _run("CANCELLED", completed_at=SUCCESS_AT),
-                _run("SUCCESS", completed_at=SUCCESS_AT),
+                _run("CANCELLED", completed_at=SUCCESS_AT, run_id=R2),
+                _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2),
             ),
         )
         msg = _gate()
         assert msg and "leaks" in msg
 
-    def test_cancel_survives_when_the_pair_is_entirely_dropped(self, monkeypatch):
-        """A rollup whose ONLY scanner entry is a droppable cancel is impossible by
-        construction (a drop implies a SUCCESS sibling), but the reader must still
-        never treat 'no surviving entry' as a pass."""
+    def test_newest_run_without_the_scanner_blocks(self, monkeypatch):
+        """The newest CI run has no leak-detector entry at all: the older run's
+        success is dropped with the rest of that run, nothing matches, and relief is
+        refused. 'No surviving entry' must never read as a pass."""
         monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", _marker("leaks"))
         monkeypatch.setenv(
             "_TEST_GH_ROLLUP_WITH_HEAD",
-            _rollup_entries(_run("SUCCESS", name="unrelated", completed_at=SUCCESS_AT)),
+            _rollup_entries(
+                _run("SUCCESS", completed_at=CANCEL_AT, run_id=R1),
+                _run("SUCCESS", name="unrelated", completed_at=SUCCESS_AT, run_id=R2),
+            ),
         )
         msg = _gate()
         assert msg and "leaks" in msg
@@ -693,196 +708,119 @@ class TestBothConsumersAgree:
             "_TEST_GH_ROLLUP_WITH_HEAD",
             json.dumps({"headRefOid": HEAD, "statusCheckRollup": rollup}),
         )
-        ci_state, _ = _mod._pr_ci_status("1", repo="acme/pub")
-        scanner = _mod._mechanical_scan_is_green("1", HEAD, *self._SCANNER, repo="acme/pub")
+        ci_state, _ = _mod._pr_ci_status("1", repo=SLUG)
+        scanner = _mod._mechanical_scan_is_green("1", HEAD, *self._SCANNER, repo=SLUG)
         return ci_state, scanner
 
     def test_superseded_cancel_is_green_to_both(self, monkeypatch):
         ci_state, scanner = self._both(
             monkeypatch,
-            _run("CANCELLED", completed_at=CANCEL_AT),
-            _run("SUCCESS", completed_at=SUCCESS_AT),
+            _run("CANCELLED", completed_at=CANCEL_AT, run_id=R1),
+            _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2),
         )
         assert (ci_state, scanner) == ("green", True)
 
     def test_unsuperseded_cancel_is_red_to_both(self, monkeypatch):
         ci_state, scanner = self._both(
             monkeypatch,
-            _run("SUCCESS", completed_at=CANCEL_AT),
-            _run("CANCELLED", completed_at=SUCCESS_AT),
+            _run("SUCCESS", completed_at=CANCEL_AT, run_id=R1),
+            _run("CANCELLED", completed_at=SUCCESS_AT, run_id=R2),
         )
         assert (ci_state, scanner) == ("red", False)
 
-    def test_equal_timestamp_cancel_is_red_to_both(self, monkeypatch):
-        """The tie rule must be the SAME rule on both sides. If a future edit relaxed
-        the boundary in one consumer only, this is where the two would part company —
-        which is the exact failure class this PR exists to remove."""
+    def test_same_run_duplicate_is_red_to_both(self, monkeypatch):
+        """Nothing within one run supersedes anything else in it, on both sides."""
         ci_state, scanner = self._both(
             monkeypatch,
-            _run("CANCELLED", completed_at=SUCCESS_AT),
-            _run("SUCCESS", completed_at=SUCCESS_AT),
+            _run("CANCELLED", completed_at=SUCCESS_AT, run_id=R2),
+            _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2),
         )
         assert (ci_state, scanner) == ("red", False)
 
     def test_failure_beside_a_dropped_cancel_is_red_to_both(self, monkeypatch):
         ci_state, scanner = self._both(
             monkeypatch,
-            _run("CANCELLED", completed_at=CANCEL_AT),
-            _run("SUCCESS", completed_at=SUCCESS_AT),
-            _run("FAILURE", completed_at=LATER_AT),
+            _run("CANCELLED", completed_at=CANCEL_AT, run_id=R1),
+            _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2),
+            _run("FAILURE", completed_at=LATER_AT, run_id=R3),
         )
         assert (ci_state, scanner) == ("red", False)
 
 
-class TestDropSupersededCancelsUnit:
-    """_drop_superseded_cancels in isolation: it filters, and nothing else."""
+class TestNewestRunPerWorkflowUnit:
+    """_newest_run_per_workflow in isolation: it filters, and nothing else."""
+
+    @staticmethod
+    def _keep(*entries):
+        return _mod._newest_run_per_workflow(list(entries), repo=SLUG)
 
     def test_non_dict_entries_are_preserved(self):
-        payload = ["junk", None, _run("SUCCESS", completed_at=SUCCESS_AT)]
-        assert _mod._drop_superseded_cancels(payload) == payload
+        payload = ["junk", None, _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R1)]
+        assert self._keep(*payload) == payload
 
-    def test_only_the_superseded_cancel_is_removed(self):
-        cancel = _run("CANCELLED", completed_at=CANCEL_AT)
-        success = _run("SUCCESS", completed_at=SUCCESS_AT)
-        other = _run("FAILURE", name="lint", completed_at=LATER_AT)
-        assert _mod._drop_superseded_cancels([cancel, success, other]) == [success, other]
+    def test_only_the_older_runs_entries_are_removed(self):
+        cancel = _run("CANCELLED", completed_at=CANCEL_AT, run_id=R1)
+        success = _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2)
+        other = _run("FAILURE", name="lint", completed_at=LATER_AT, run_id=R2)
+        assert self._keep(cancel, success, other) == [success, other]
 
-    def test_equal_timestamps_do_not_drop(self):
-        """STRICTLY AFTER: an EQUAL second-precision timestamp orders nothing, so it is
-        not evidence the success came second — and on a real supersession the successful
-        run starts when the cancel fires and finishes a whole job later, so a tie is not
-        even the shape this drop recognises. Unprovable ordering fails CLOSED.
+    def test_same_run_entries_are_all_kept(self):
+        a = _run("CANCELLED", completed_at=SUCCESS_AT, run_id=R2)
+        b = _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2)
+        assert self._keep(a, b) == [a, b]
 
-        (Codex P1. The `>=` was INHERITED from the working CI path, where 'at or after'
-        was deliberate wording; the extraction gave it a second caller — the relief
-        path — where the consequence is granting relief, and under `# ci-override` that
-        relief is the only remaining check of the mechanical layer.)"""
-        cancel = _run("CANCELLED", completed_at=SUCCESS_AT)
-        success = _run("SUCCESS", completed_at=SUCCESS_AT)
-        assert _mod._drop_superseded_cancels([cancel, success]) == [cancel, success]
+    def test_timestamps_are_not_consulted(self):
+        """The run decides, not the clock: a newer run whose entry reports an EARLIER
+        completedAt still supersedes, and odd timestamp spellings change nothing.
+        (The old per-job completedAt ordering is gone; see the helper docstring.)"""
+        old_run = _run("FAILURE", completed_at="2026-09-09T16:30:00.9Z", run_id=R1)
+        new_run = _run("SUCCESS", completed_at="2026-09-09T16:20:00+00:00", run_id=R2)
+        assert self._keep(old_run, new_run) == [new_run]
+        naive = _run("SUCCESS", completed_at="not-a-timestamp", run_id=R2)
+        assert self._keep(old_run, naive) == [naive]
 
-    def test_strictly_later_success_still_drops(self):
-        """CONTROL for the tie rule: tightening the boundary must not blind the drop.
-        One second later is still a supersession (the #1839 pair was 60s apart)."""
-        cancel = _run("CANCELLED", completed_at=CANCEL_AT)
-        success = _run("SUCCESS", completed_at=SUCCESS_AT)
-        assert _mod._drop_superseded_cancels([cancel, success]) == [success]
-
-    def test_fractional_seconds_do_not_reverse_the_ordering(self):
-        """The shape the old string compare got BACKWARDS, and the reason it is gone.
-
-        ``'Z'`` sorts above ``'.'``, so a SUCCESS at ``:00Z`` string-compares as LATER
-        than a cancel at ``:00.9Z`` — and the cancel is dropped even though it
-        genuinely completed afterwards. The docstring named this as the thing that
-        would invalidate the compare; GitHub's ``DateTime`` scalar is documented only
-        as "An ISO-8601 encoded UTC date string", which constrains neither sub-second
-        precision nor the offset spelling, so the old ordering rested on an
-        observation rather than a contract.
-
-        It is not cosmetic: `_mechanical_scan_is_green` consumes this, so a reversed
-        ordering carries an old leaks review forward, and under `# ci-override` that
-        relief is the only remaining check of the mechanical layer.
-        """
-        cancel = _run("CANCELLED", completed_at="2026-09-09T16:20:00.9Z")
-        success = _run("SUCCESS", completed_at="2026-09-09T16:20:00Z")
-        assert _mod._drop_superseded_cancels([cancel, success]) == [cancel, success], (
-            "a SUCCESS that finished BEFORE the cancel dropped it — string ordering"
-        )
-
-    def test_an_offset_spelling_does_not_reverse_the_ordering(self):
-        """The other shape: ``+00:00`` instead of ``Z``, at the SAME INSTANT.
-
-        The same instant has to be the fixture, and the first version of this test
-        got that wrong — it put the two five seconds apart, so the SECONDS DIGIT
-        decided the string comparison and the pre-fix code reached the same verdict.
-        It passed against the bug it was written to catch.
-
-        The discriminating case is a TIE with different spellings: ``+`` is 0x2B and
-        ``Z`` is 0x5A, so a ``+00:00`` cancel sorts BELOW a ``Z`` success at the same
-        second, and the string compare reads that as "the success came later" and
-        drops a cancellation that did not lose any race. A tie must KEEP.
-        """
-        cancel = _run("CANCELLED", completed_at="2026-09-09T16:20:00+00:00")
-        success = _run("SUCCESS", completed_at="2026-09-09T16:20:00Z")
-        assert _mod._drop_superseded_cancels([cancel, success]) == [cancel, success], (
-            "same instant, two spellings — the offset sorted below Z and dropped a "
-            "cancellation that nothing superseded"
-        )
-
-    def test_mixed_spellings_still_drop_a_genuinely_later_success(self):
-        """CONTROL for both cases above. Parsing must not blind the drop — a success
-        that really is later still supersedes, however either side is spelled."""
-        cancel = _run("CANCELLED", completed_at="2026-09-09T16:20:00.5Z")
-        success = _run("SUCCESS", completed_at="2026-09-09T16:21:00+00:00")
-        assert _mod._drop_superseded_cancels([cancel, success]) == [success]
-
-    def test_an_unparseable_timestamp_keeps_the_cancel(self):
-        """Fail CLOSED on both sides. An unparseable SUCCESS supersedes nothing, and
-        an unparseable CANCEL is kept — a value we cannot order is not evidence."""
-        cancel = _run("CANCELLED", completed_at=CANCEL_AT)
-        bad_success = _run("SUCCESS", completed_at="not-a-timestamp")
-        assert _mod._drop_superseded_cancels([cancel, bad_success]) == [cancel, bad_success]
-
-        bad_cancel = _run("CANCELLED", completed_at="not-a-timestamp")
-        success = _run("SUCCESS", completed_at=SUCCESS_AT)
-        assert _mod._drop_superseded_cancels([bad_cancel, success]) == [bad_cancel, success]
-
-    def test_a_naive_timestamp_is_not_assumed_utc(self):
-        """A value with no offset is rejected, not guessed at.
-
-        Comparing naive against aware raises, and the alternative to rejecting it is
-        picking a zone on the value's behalf — which is the same class of assumption
-        the string compare was removed for. If GitHub ever sends a bare value the gate
-        gets stricter, not luckier.
-        """
-        cancel = _run("CANCELLED", completed_at="2026-09-09T16:20:00")
-        success = _run("SUCCESS", completed_at="2026-09-09T16:21:00Z")
-        assert _mod._drop_superseded_cancels([cancel, success]) == [cancel, success]
+    def test_an_unparseable_run_id_is_kept_and_drops_nothing(self):
+        bare = _run("FAILURE", completed_at=CANCEL_AT)
+        success = _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2)
+        assert self._keep(bare, success) == [bare, success]
+        cancel = _run("CANCELLED", completed_at=CANCEL_AT, run_id=R1)
+        bare_ok = _run("SUCCESS", completed_at=SUCCESS_AT)
+        assert self._keep(cancel, bare_ok) == [cancel, bare_ok]
 
     def test_decoy_workflow_cannot_supersede(self):
-        """Identity is (name, workflowName). Locked AT THE PRIMITIVE, not only at its
-        callers: both of them independently filter by workflow, so a name-only
-        identity is invisible from either call site (verified by mutation — the
-        callers' own filters mask it) while still being wrong for the next consumer.
-        """
-        cancel = _run("CANCELLED", completed_at=CANCEL_AT)
-        decoy = _run("SUCCESS", workflow="Decoy", completed_at=SUCCESS_AT)
-        assert _mod._drop_superseded_cancels([cancel, decoy]) == [cancel, decoy]
+        """Workflows are independent. Locked AT THE PRIMITIVE, not only at its
+        callers: both callers independently filter by workflow, so a
+        workflow-blind grouping would be invisible from either call site while still
+        being wrong for the next consumer."""
+        cancel = _run("CANCELLED", completed_at=CANCEL_AT, run_id=R1)
+        decoy = _run("SUCCESS", workflow="Decoy", completed_at=SUCCESS_AT, run_id=R2)
+        assert self._keep(cancel, decoy) == [cancel, decoy]
 
     def test_statuscontext_success_cannot_supersede(self):
-        """A legacy StatusContext (no workflowName ⇒ no identity) is never a sibling."""
-        cancel = _run("CANCELLED", completed_at=CANCEL_AT)
+        """A legacy StatusContext (no workflowName ⇒ no identity) never takes part."""
+        cancel = _run("CANCELLED", completed_at=CANCEL_AT, run_id=R1)
         legacy = {"context": "leak-detector", "state": "SUCCESS", "completedAt": SUCCESS_AT}
-        assert _mod._drop_superseded_cancels([cancel, legacy]) == [cancel, legacy]
+        assert self._keep(cancel, legacy) == [cancel, legacy]
 
-    def test_timestampless_success_cannot_supersede(self):
-        """The sibling needs a completedAt of its own — there is no ordering without
-        one, and an unordered pair is not proof of supersession."""
-        cancel = _run("CANCELLED", completed_at=CANCEL_AT)
-        success = _run("SUCCESS")
-        assert _mod._drop_superseded_cancels([cancel, success]) == [cancel, success]
-
-    def test_scope_lock_enumerates_every_non_cancel_red_conclusion(self):
-        """DERIVED-SET GUARD. `test_only_cancelled_is_droppable` is the test that stops
-        the droppable set widening, so its parametrize must equal
-        `_CI_RED_CONCLUSIONS - _CI_CANCEL_CONCLUSIONS` — the WHOLE set, not a sample.
-        Without this, a conclusion added to the constant ships untested and the scope
-        lock silently covers less than it claims. (STARTUP_FAILURE was missing from the
-        first draft of that list; a reviewer caught it, which is precisely the kind of
-        arithmetic a test should be doing instead.)"""
-        marks = TestSupersededConcurrencyCancels.test_only_cancelled_is_droppable.pytestmark
-        parametrized = [m for m in marks if m.name == "parametrize"]
+    def test_newest_run_test_enumerates_every_red_conclusion(self):
+        """DERIVED-SET GUARD. `test_every_red_conclusion_follows_newest_run` must
+        enumerate the WHOLE of `_CI_RED_CONCLUSIONS`, not a sample. Without this, a
+        conclusion added to the constant ships untested. (STARTUP_FAILURE was missing
+        from the first draft of the older scope lock; a reviewer caught it, which is
+        precisely the kind of arithmetic a test should be doing instead.)"""
+        test = TestSupersededConcurrencyCancels.test_every_red_conclusion_follows_newest_run
+        parametrized = [m for m in test.pytestmark if m.name == "parametrize"]
         assert len(parametrized) == 1, "expected exactly one parametrize mark to read"
         covered = set(parametrized[0].args[1])
-        assert covered == set(_mod._CI_RED_CONCLUSIONS) - set(_mod._CI_CANCEL_CONCLUSIONS)
+        assert covered == set(_mod._CI_RED_CONCLUSIONS)
 
     def test_input_is_not_mutated(self):
         entries = [
-            _run("CANCELLED", completed_at=CANCEL_AT),
-            _run("SUCCESS", completed_at=SUCCESS_AT),
+            _run("CANCELLED", completed_at=CANCEL_AT, run_id=R1),
+            _run("SUCCESS", completed_at=SUCCESS_AT, run_id=R2),
         ]
         before = json.dumps(entries)
-        _mod._drop_superseded_cancels(entries)
+        _mod._newest_run_per_workflow(entries, repo=SLUG)
         assert json.dumps(entries) == before
 
 
@@ -897,12 +835,13 @@ class TestWorkflowDisplayNameIsUniqueProvenance:
     anywhere on that page, so two files CAN both declare `name: CI`.
 
     Why that matters HERE specifically: a decoy file named `CI` publishing a job named
-    `leak-detector` would share the scanner's tuple, so its SUCCESS could supersede the
-    real scanner's CANCELLED in `_drop_superseded_cancels` AND then satisfy the pin in
-    `_mechanical_scan_is_green`. Before this PR the relief path had no drop at all, so
-    both entries were collected and the cancel blocked; the extraction is what makes a
-    decoy able to erase a real cancellation. That widening is real and it is why this
-    guard exists.
+    `leak-detector` would share the scanner's tuple — and, since #2607 groups runs by
+    workflowName, ANY newer run of that decoy file would count as the newest `CI` run in
+    `_newest_run_per_workflow`, dropping every older real CI entry in `_pr_ci_status`
+    as well — AND its SUCCESS could then satisfy the pin in `_mechanical_scan_is_green`.
+    Before the shared drop existed the relief path collected both entries and the red
+    one blocked; the extraction is what makes a decoy able to erase a real red result.
+    That widening is real and it is why this guard exists.
 
     Unique provenance DOES exist in GitHub's GraphQL schema —
     `checkSuite.workflowRun.workflow.databaseId` and `checkSuite.workflowRun.file.path`
@@ -987,8 +926,8 @@ class TestWorkflowDisplayNameIsUniqueProvenance:
         produce the identical tuple just as easily, and nothing in GitHub's syntax
         forbids it: `jobs.<id>.name` has no uniqueness constraint either. If an
         auxiliary job in `CI` were also displayed as `leak-detector`, its SUCCESS
-        could supersede the real scanner's CANCELLED in `_drop_superseded_cancels`
-        and then satisfy the pin in `_mechanical_scan_is_green` — granting relief
+        in the newest run would sit beside the real scanner's entry and satisfy the
+        pin in `_mechanical_scan_is_green` if the real one were absent — granting relief
         from the irreducible leaks gate off a job that never scanned anything.
 
         Closing the precondition is the cheap complete move for the same reason
@@ -1011,7 +950,7 @@ class TestWorkflowDisplayNameIsUniqueProvenance:
         assert not collisions, (
             "two jobs in one workflow publish the same check-run display name, so "
             "`(name, workflowName)` no longer identifies a single job and one job's "
-            f"SUCCESS can erase another's CANCELLED: {collisions}"
+            f"SUCCESS can stand in for another's: {collisions}"
         )
 
     def test_the_job_scan_actually_sees_jobs(self):

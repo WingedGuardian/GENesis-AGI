@@ -62,6 +62,73 @@ async def test_list_cycle_outcomes_ordered_newest_first(db):
 
 
 @pytest.mark.asyncio
+async def test_list_cycle_outcomes_ego_source_filter(db):
+    """ego_source scopes outcomes to the ego whose cycle produced them.
+
+    ego_cycle_outcomes has no ego column; ownership comes from the cycle row
+    (cycle_id -> ego_cycles.ego_source). Outcomes whose cycle is untagged or
+    missing are excluded from a scoped read, like untagged cycles.
+    """
+    cycles = [
+        ("u1", "2026-01-01", "user_ego_cycle"),
+        ("g1", "2026-01-02", "genesis_ego_cycle"),
+        ("u2", "2026-01-03", "user_ego_cycle"),
+        ("legacy", "2026-01-04", ""),
+    ]
+    for cid, ts, src in cycles:
+        await ego_crud.create_cycle(
+            db, id=cid, output_text="x", created_at=ts, ego_source=src,
+        )
+    for cid, _ts, _src in cycles + [("orphan", "", "")]:
+        await ego_crud.create_cycle_outcome(
+            db, cycle_id=cid, focus_type=f"focus-{cid}",
+        )
+
+    user = await ego_crud.list_cycle_outcomes(
+        db, limit=10, ego_source="user_ego_cycle",
+    )
+    assert {r["cycle_id"] for r in user} == {"u1", "u2"}
+    genesis = await ego_crud.list_cycle_outcomes(
+        db, limit=10, ego_source="genesis_ego_cycle",
+    )
+    assert [r["cycle_id"] for r in genesis] == ["g1"]
+    everything = await ego_crud.list_cycle_outcomes(db, limit=10)
+    assert {r["cycle_id"] for r in everything} == {
+        "u1", "g1", "u2", "legacy", "orphan",
+    }
+
+
+@pytest.mark.asyncio
+async def test_scoped_cycle_outcomes_order_and_limit(db):
+    """Scoped read is newest-first and applies LIMIT after the ego filter.
+
+    The other ego owns the newest rows, so a LIMIT applied before scoping
+    returns nothing, and a reversed sort returns the oldest outcomes.
+    """
+    order = [
+        ("u1", "user_ego_cycle"), ("u2", "user_ego_cycle"),
+        ("u3", "user_ego_cycle"), ("g1", "genesis_ego_cycle"),
+        ("g2", "genesis_ego_cycle"), ("g3", "genesis_ego_cycle"),
+    ]
+    for i, (cid, src) in enumerate(order):
+        ts = f"2026-01-0{i + 1}T00:00:00+00:00"
+        await ego_crud.create_cycle(
+            db, id=cid, output_text="x", created_at=ts, ego_source=src,
+        )
+        await ego_crud.create_cycle_outcome(db, cycle_id=cid, focus_type="f")
+        await db.execute(
+            "UPDATE ego_cycle_outcomes SET created_at = ? WHERE cycle_id = ?",
+            (ts, cid),
+        )
+    await db.commit()
+
+    rows = await ego_crud.list_cycle_outcomes(
+        db, limit=2, ego_source="user_ego_cycle",
+    )
+    assert [r["cycle_id"] for r in rows] == ["u3", "u2"]
+
+
+@pytest.mark.asyncio
 async def test_create_cycle_outcome_with_focus_id(db):
     """focus_id should be stored correctly."""
     await ego_crud.create_cycle_outcome(

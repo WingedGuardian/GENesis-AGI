@@ -25,7 +25,7 @@ from genesis.guardian.alert.dispatcher import AlertDispatcher
 from genesis.guardian.config import GuardianConfig
 from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
 from genesis.guardian.health_signals import collect_all_signals
-from genesis.guardian.snapshots import SnapshotManager
+from genesis.guardian.snapshots import PRE_RECOVERY_LABEL, SnapshotManager
 from genesis.guardian.state_machine import ConfirmationStateMachine
 
 logger = logging.getLogger(__name__)
@@ -104,7 +104,7 @@ class RecoveryEngine:
             and await self._snapshots.safe_to_snapshot(snap_history)
         ):
             snap_name = await self._snapshots.take(
-                label="pre-recovery",
+                label=PRE_RECOVERY_LABEL,
                 snapshot_size_history=snap_history,
             )
             if snap_name:
@@ -295,13 +295,28 @@ class RecoveryEngine:
 
     async def _revert_code(self, container: str) -> tuple[bool, str]:
         """Stash uncommitted changes and revert last commit, then restart."""
-        # Stash any uncommitted work
-        rc, _, _ = await _run_subprocess(
+        # Stash any uncommitted work. git revert itself refuses to overwrite
+        # dirty files, so this guard is not about data loss: a failed stash
+        # leaves uncommitted code live, a revert commit cannot fix a fault that
+        # lives there, and an unfinished stash may still hold the index.
+        rc, _, stderr = await _run_subprocess(
             "incus", "exec", container, "--",
             "su", "-", "ubuntu", "-c",
             "cd ~/genesis && git stash",
-            timeout=15.0,
+            timeout=30.0,
         )
+        if rc == -1:
+            # _run_subprocess returns -1 for a timeout or exec error: the stash
+            # did not report, so whether it ran is unknown.
+            return False, (
+                f"git stash did not report ({stderr}); not reverting. "
+                "Check `git stash list` and the working tree before retrying"
+            )
+        if rc != 0:
+            return False, (
+                f"git stash (or the exec around it) failed ({stderr}); not "
+                "reverting. Check `git stash list` and the working tree"
+            )
 
         # Revert the last commit
         rc, stdout, stderr = await _run_subprocess(
@@ -357,11 +372,11 @@ class RecoveryEngine:
 
         ok = await self._snapshots.restore(healthy)
         if not ok:
-            # Names are timestamped and sort newest-first; anything sorting
-            # above the healthy name is newer.
-            newer = [
-                n for n in await self._snapshots.list_snapshots() if n > healthy
-            ]
+            # list_snapshots() is newest-first by incus's created_at (never by
+            # name string), and get_latest_healthy() reads the same order, so
+            # everything listed before the healthy snapshot is newer.
+            names = await self._snapshots.list_snapshots()
+            newer = names[: names.index(healthy)] if healthy in names else []
             if newer:
                 logger.warning(
                     "Restore of %s failed with newer snapshots present — "

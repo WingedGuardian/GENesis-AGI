@@ -257,14 +257,12 @@ class BuildLane:
         headers required by ``dispatcher._validate_plan_content`` are emitted
         verbatim as whole lines.
         """
-        if not isinstance(build_spec, dict):
+        if not build_spec_usable(build_spec):
             return None
         requirements = _as_list(build_spec.get("requirements"))
         steps = _as_list(build_spec.get("steps"))
         success = _as_list(build_spec.get("success_criteria"))
         risks = _as_list(build_spec.get("risks"))
-        if not (requirements and steps and success and risks):
-            return None
         intended_paths = _as_list(build_spec.get("intended_paths"))
 
         # Deterministic filename (no date): permanent item_key dedup means a
@@ -423,6 +421,22 @@ class BuildLane:
             logger.info(
                 "build_lane: candidate %s reconciled -> %s", cand["id"], outcome,
             )
+
+
+def build_spec_usable(build_spec: Any) -> bool:
+    """True when ``build_spec`` can be materialized into a plan.
+
+    The single definition of "usable": a mapping whose four required lists
+    (requirements, steps, success_criteria, risks) are all non-empty. The lane
+    downgrades an unusable ``build`` verdict to needs_discussion; the inbox
+    monitor's lane-off fallback applies the same rule through this function.
+    """
+    if not isinstance(build_spec, dict):
+        return False
+    return all(
+        _as_list(build_spec.get(k))
+        for k in ("requirements", "steps", "success_criteria", "risks")
+    )
 
 
 def _new_id() -> str:

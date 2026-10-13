@@ -549,9 +549,16 @@ async def outreach_poll(
 async def outreach_queue(
     category: str | None = None,
     channel: str | None = None,
-    status: str | None = None,
 ) -> list[dict]:
-    """View recent outreach messages."""
+    """List the 20 most recent SENT outreach messages, newest first.
+
+    Reads delivery history (id, category, channel, topic, delivered_at,
+    engagement_outcome), optionally filtered by ``category`` and ``channel``.
+    A row is written after its send; ``delivered_at`` can be null when
+    recording the delivery time failed.
+    The 20-row cap is fixed, so older messages are not reachable here. Messages
+    queued but not yet sent are in ``outreach_pending``.
+    """
     if not _db:
         return [{"error": "not initialized"}]
     try:

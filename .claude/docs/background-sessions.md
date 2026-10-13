@@ -61,7 +61,6 @@ lands elsewhere.
 | `observe` | ✗ | ✗ | ✗ | ✗ | ✓ |
 | `research` | ✗ | ✓ | ✗ | ✓ | ✓ |
 | `interact` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `steward` | ✗ | ✓ | ✓ | ✓ | ✓ |
 
 Most profiles block: Bash, Edit, task_submit, settings_update,
 direct_session_run, module_call. Use `interact` for workflows that operate
@@ -85,17 +84,207 @@ operator's full set. Only human-driven foreground/interactive sessions
 keep the full user-scoped toolset. As defense-in-depth, `_UNIVERSAL_DISALLOW` also
 denies the user-scoped servers by name (`_USER_SCOPED_MCP_WILDCARDS`).
 
-**`steward` is the one built-in Bash-enabled profile** — its Bash is restricted
-to the `gh` CLI only, enforced by `scripts/bash_safety_hook.sh` via the
-`GENESIS_BASH_ALLOWLIST` env var set from `CCInvocation.bash_allowlist`. It
-still blocks Edit/Write/browser. Built for the upstream-PR stewardship
-campaign: it reads/comments/reopens/closes Genesis's own PRs to external repos
-and escalates code-change requests rather than editing or pushing itself. A
-profile grants a scoped shell by appearing in `_PROFILE_BASH_ALLOWLIST`
+**NO BUILT-IN PROFILE GRANTS Bash.** A `steward` profile did until 2026-09-26 —
+the only one — and it was REMOVED rather than confined; see "Why the one
+Bash-enabled profile was removed" below. Everything in this section still applies,
+because it describes the MECHANISM rather than that profile, and an install can
+still grant a scoped shell to a profile of its own through
+`genesis.cc.profile_overlay`.
+
+A profile with Bash restricted to a single binary has that restriction enforced by
+`scripts/hooks/bash_allowlist_guard.sh`, which
+the invoker registers in the `--settings` file it injects into every dispatched
+session, reading the `GENESIS_BASH_ALLOWLIST` env var set from
+`CCInvocation.bash_allowlist`. That injected registration is the one that
+matters: a dispatched session's working directory is outside any git repo, so
+Claude Code's git-root settings discovery never loads the repo's
+`.claude/settings.json`, and this repo wires the hook there in no ref anyway.
+An install may ALSO wire the global chokepoint `scripts/bash_safety_hook.sh` in
+its user-level settings; both share one predicate
+(`scripts/hooks/bash_allowlist_lib.sh`), so the second copy reaches the same
+verdict rather than a different one. The invoker refuses to launch a profile
+whose allowlist it cannot arm, including when `bare` or `safe_mode` would
+disable hooks, and verifies the registered guard actually refuses and permits
+before launching.
+
+A profile grants a scoped shell by appearing in `_PROFILE_BASH_ALLOWLIST`
 (`src/genesis/cc/direct_session.py`); without an entry there, a Bash-granting
 profile's shell is governed only by the global destructive-op blocks. The
-allowlist matches the command's **first token** and blocks all
-chaining/piping/substitution/redirection (`; && | $() ` ` > <`).
+allowlist matches the command's **first token** and blocks embedded newlines
+plus chaining/piping/substitution/redirection — `; & && || |` backtick `$() > <`
+and also `( )`. Two of those are worth knowing about: `&` on its own backgrounds
+the first command and RUNS THE NEXT one, so it is not covered by `&&`; and the
+parentheses are defence in depth rather than a measured escape — against real
+bash a subshell is unreachable in every position the other entries leave open,
+so the cost they carry is real (a parenthesis in a `--jq` filter, a search
+query or a PR title is refused) while the protection is speculative. If that
+trade ever wants revisiting, the enumeration is in
+`scripts/hooks/bash_allowlist_lib.sh` and the cost is pinned by tests.
+
+**What first-token allowlisting cannot do on its own** — and this is now the
+reason no built-in profile uses it: it bounds WHICH binary runs, never what that
+binary can be told to do. An allowlisted binary
+that can be configured to run commands hands the session a shell while every
+token is still the allowed one — the same limit the overlay-profile note below
+records for interpreters.
+
+`gh` is such a binary, so it gets **per-binary hardening** alongside the
+allowlist. It will run a program of its own accord through an alias, the pager,
+the editor, the browser, or an extension — the set `gh help environment`
+documents — and every one of them is reached with `gh` as the first token, so
+the allowlist permits both the command that installs an escape and the command
+that fires it. An allowlisted session therefore runs with all of them pinned:
+`GH_CONFIG_DIR` at a read-only configuration Genesis maintains that carries no
+aliases and a pager that is not a shell, the editor and browser variables at an
+inert command, and `XDG_DATA_HOME` at that same read-only directory.
+
+**`XDG_DATA_HOME` is the one that is easy to get wrong**, so it is called out
+rather than left to the reader: extensions do NOT live under `GH_CONFIG_DIR`.
+MEASURED — an extension planted under the config directory was not found, while
+one under the data directory ran. Sealing the config directory alone therefore
+leaves `gh extension install` followed by `gh extension exec` as arbitrary
+execution with both first tokens allowed. Pinning the data directory at the
+same read-only seal closes both halves: the install cannot create the directory
+it needs, and the exec finds nothing.
+
+`GH_PATH` is deliberately NOT pinned. It tells `gh` where its own binary is for
+extension callbacks, and it was measured inert: with a planted value an
+ordinary read still ran the real `gh`, and with extensions unreachable it
+redirects nothing.
+
+NO CREDENTIAL IS IN THE SEALED DIRECTORY, as of 2026-09-25. It used to hold a
+copy of `hosts.yml`, because that is the only place `gh` looks for the token —
+owner-only inside an owner-only directory, so the copy widened nobody's read
+access. It was removed anyway: the reachability argument was sound and answered
+the wrong question, because it handed a session that reads external pull requests
+a token with the operator's full scopes (on the install where this was measured:
+`delete_repo`, `gist`, `read:org`, `repo`, `workflow` — the list is a property of
+that `gh auth login`, not of this code; what generalises is that the session held
+whatever the operator held). On an ALLOWLISTED session `gh` now holds no
+credential (MEASURED: `gh auth status` under the seal reports "not logged into any
+GitHub hosts", against a control that authenticates). That is a claim about `gh`,
+not about the session — the same profile permits `Read`, and the operator's own gh
+config is still on disk.
+
+**All four** of gh's documented credential variables are pinned to the empty
+string for EVERY dispatched session, not only allowlisted ones, because
+`_build_env` starts from an unfiltered copy of this process's environment and `gh`
+resolves them AHEAD of `hosts.yml` (MEASURED: a bogus token returns 401 against a
+good `hosts.yml`). An empty value reads as UNSET, so the pin neutralises an
+inherited token without inventing one.
+
+The set is enumerated from `gh help environment` (gh 2.100.0, consulted
+2026-09-26) and lives in
+`_GH_CREDENTIAL_ENV`: `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`,
+`GITHUB_ENTERPRISE_TOKEN`. The first version pinned `GH_TOKEN` alone and was
+bypassed — MEASURED, `GH_TOKEN="" GITHUB_TOKEN=<value> gh auth token` returns the
+fallback, and gh documents the two on the same line. If a gh release adds a
+credential variable, add it there and cite the release; a name recalled without a
+citation is how this broke.
+
+**Read this before assuming a non-allowlisted session is unauthenticated — it is
+not.** MEASURED: with no `GH_CONFIG_DIR` pin, a session with `GH_TOKEN=""` is
+STILL FULLY AUTHENTICATED, because `gh` falls back to `hosts.yml` on disk. The
+deciding variable is `GH_CONFIG_DIR`, and it is pinned ONLY on the allowlisted
+path. So a dispatched session that has `Bash` without a declared allowlist — the
+common case, since the allowlist is set at exactly one call site — still reaches
+the operator's GitHub credential.
+
+Pinning `GH_CONFIG_DIR` more widely was tried and rejected, for two reasons worth
+keeping. Keying it on `origin == external_untrusted` reads tight and is not:
+MEASURED, that origin covers six dispatch profiles and every non-owner-attended
+conversation channel, dashboard included, and the pin would also have pointed
+`XDG_DATA_HOME` — a process-global base directory — at a read-only tree for all
+of them. And pinning the SEAL is a fail-OPEN on exactly the installs that need
+it, because a rewrite that fails before its stale sweep leaves a pre-heal seal
+still holding the copied credential. The honest fix for that surface is denying
+`Bash` on the one path that processes external content: unrestricted `Bash` can
+read the config file whatever `GH_CONFIG_DIR` says, so an env pin buys the loss
+of AMBIENT authentication and never confinement.
+
+Hardening is keyed by
+binary in `_BINARY_HARDENING` (`src/genesis/cc/invoker.py`) and applied in
+`_build_env`, which REFUSES to return an environment whose hardening it could
+not prepare or that a later override stripped — the environment that was
+checked is the environment that launches, because there is only one that both
+spawn paths build. A new allowlisted binary that can spawn a shell needs an
+entry there, and the allowlist alone should not be read as confining it.
+
+### Why the one Bash-enabled profile was removed
+
+`steward` shipped with Bash-for-`gh` for upstream-PR stewardship: read PR state,
+comment, reopen, close, and escalate code-change requests rather than editing. It
+was removed on 2026-09-26 without ever having run — 0 sessions, against 257/167/154
+for the three busiest profiles — and the reasoning is the specification for anyone
+adding a Bash-granting profile next.
+
+Four MEASURED facts, each closing off a different repair:
+
+1. **`gh` runs arbitrary programs through its own configuration** — alias, pager,
+   editor, extension — each reached with `gh` as the first token. VERIFIED by
+   execution: two permitted calls ran an arbitrary program. The sealed config dir
+   closes this, and is retained.
+2. **`gh` READS arbitrary local files** through documented flags:
+   `gh pr comment -F <file>`, `gh api --input <file>`. So denying the
+   `Read`/`Glob`/`Grep` TOOLS does not deny filesystem reads while `gh` is
+   permitted — a tool-scope fix cannot make "no file reads" true, which is what
+   made the attempt to confine it by tool scope fail.
+3. **`gh` WRITES files to caller-chosen paths**, so "it only comments" was never a
+   property the allowlist conferred.
+4. **A profile's tool denials are re-enablable per request** via `tool_exceptions`
+   unless the tool sits in a protected set.
+
+All four converge on the same unbuilt mechanism: a SUBCOMMAND-level allowlist.
+Gating the profile behind an operator lever was built and discarded, because a
+lever only moves the decision — its live rung still hands a session that reads
+attacker-authored pull-request text the operator's GitHub identity plus file read
+and write. A capability whose enabled state cannot be made safe is not made safer
+by being switchable.
+
+So: do not re-add a Bash-granting profile that ingests external content without
+the subcommand bound. The machinery here is ready for it — the allowlist, the
+guard registration, and the per-binary hardening all key on the BINARY, not on any
+profile name.
+
+**Still NOT confined — and this is the sentence to read before granting any
+scoped shell.** The allowlist is enforced, which is a real improvement over a
+restriction nothing applied. It is not a sandbox. The permitted binary writes
+files to caller-chosen paths and makes API calls, so `Write`/`Edit` being blocked
+describes the TOOLS, not everything that can put bytes on disk or reach the
+network.
+
+**And mind the difference between "`gh` holds no credential" and "the session is
+unauthenticated" — they are not the same claim, and only the first is this
+change's to make.** The credential is gone from the seal and the environment, so
+`gh` cannot authenticate. Whether the SESSION can reach a credential is decided by
+its TOOL SCOPE: a profile permitting `Read` (or `Glob`/`Grep`), with permission
+prompts skipped and any outbound tool available, can be instructed by the external
+content it ingests to read an owner-readable credential file and send it onward.
+No environment pin touches that, and this change does not close it — a separate
+one removes the Bash-granting profile outright, which is what actually ends the
+exposure on this repository. Stated in the present tense on purpose: as of THIS
+change, a profile permitting `Read` with an outbound tool can still be told by the
+content it ingests to read a credential file and send it onward. "We removed the
+credential from the environment" is not a substitute, and a future Bash-granting
+profile needs the tool-scope treatment regardless of what the environment says.
+
+Two consequences worth stating plainly rather than leaving to be discovered:
+
+- a scoped session can modify files on this host, INCLUDING files that take
+  effect on a later run, so "it can only comment on pull requests" is not a
+  property the allowlist gives you;
+- the profile that has this grant also ingests external, attacker-authored
+  content, so treat its capability as "acts with whatever credential it was
+  armed with, plus filesystem write", not as "reads and replies". Unarmed,
+  `gh` itself holds no GitHub credential; the SESSION can still read the
+  operator's credential file through its tool scope. That is the floor, not the
+  confinement — and the distinction is the one drawn above, restated here
+  because this bullet is the line a reader skims for the verdict.
+
+Bounding this properly needs a SUBCOMMAND-level allowlist rather than a
+first-token one. Until that exists, do not write a safety argument that rests
+on a scoped shell being unable to do something — `autonomy/audit.py` carried
+exactly such an argument and it was wrong.
 
 ### Install-local profiles (overlay)
 

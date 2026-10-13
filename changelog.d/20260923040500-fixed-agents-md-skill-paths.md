@@ -1,0 +1,1 @@
+- The skills inventory in `AGENTS.md` now gives each skill's real directory, so an external agent client (Codex, Cursor, OpenCode) can open a skill instead of guessing its path from its name. Six skills nest inside a container directory and were unreachable by the obvious guess; twenty-three live under a second root entirely.

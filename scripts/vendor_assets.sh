@@ -18,7 +18,7 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 WEBUI_DIR="$REPO_DIR/src/genesis/dashboard/webui"
 AZ_ROOT="${AZ_ROOT:-$HOME/agent-zero}"

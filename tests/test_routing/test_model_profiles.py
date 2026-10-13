@@ -412,3 +412,22 @@ class TestPaidProviderProfilePricing:
         assert p.cost_per_mtok_in == 0.50
         assert p.cost_per_mtok_out == 1.50
         assert p.free_tier.get("available") is False
+
+
+def test_shipped_claude_profiles_use_the_openrouter_catalogue_id():
+    """recon/model_intelligence.py keys its pricing-drift check on api_id against
+    OpenRouter's catalogue ids (``anthropic/claude-sonnet-4.6``). An Anthropic-style
+    id (``anthropic/claude-sonnet-4-6``) or a dated one never matches, so that
+    profile's price drift goes unreported."""
+    import re
+    from pathlib import Path
+
+    import yaml
+
+    path = Path(__file__).resolve().parents[2] / "config" / "model_profiles.yaml"
+    profiles = yaml.safe_load(path.read_text())["profiles"]
+    claude = {k: v for k, v in profiles.items() if str(v.get("api_id", "")).startswith("anthropic/")}
+    assert claude, "no anthropic profiles found"
+    for name, prof in claude.items():
+        api_id = prof["api_id"]
+        assert re.fullmatch(r"anthropic/claude-[a-z]+-\d+(\.\d+)?", api_id), f"{name}: {api_id}"

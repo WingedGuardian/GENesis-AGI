@@ -41,6 +41,7 @@ def test_write_bootstrap_manifest_file_round_trips(tmp_path, monkeypatch):
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     rt = GenesisRuntime.__new__(GenesisRuntime)
     rt._bootstrap_mode = "full"
+    rt._bootstrapped = True
     rt._bootstrap_manifest = {
         "db": "ok", "outreach": "degraded: no token", "voice": "failed: no key",
     }

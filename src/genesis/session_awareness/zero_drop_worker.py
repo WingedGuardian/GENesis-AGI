@@ -575,7 +575,101 @@ async def _resolve_base_ref(root: str, runner=None) -> str | None:
     return name if rc == 0 and name else None
 
 
-async def _observe_worktrees(root: str, *, runner=None, budget_s: float | None = None) -> dict:
+# The reaper's ARCHIVE ANCHOR, as written by `scripts/worktree_lifecycle.py`
+# (`_trash_worktree` and the failed-recovery relock in `_restore_from_dir`):
+#     archived by the reaper -> <entry>; recover with --recover
+# The writer is a stdlib-only script that cannot import this package, so the
+# prefix is restated here and a contract test drives the REAL writer into this
+# reader rather than trusting the two spellings to stay aligned.
+REAPER_ARCHIVE_LOCK_PREFIX = "archived by the reaper -> "
+REAPER_ARCHIVE_LOCK_SUFFIXES = (
+    "; recover with --recover",
+    "; recovery did not complete, still recoverable with --recover",
+)
+REAPER_ARCHIVE_SUFFIX = ".tar.gz"
+
+
+def _default_trash_dir() -> Path:
+    """The reaper's trash directory, resolved EXACTLY as the writer resolves it
+    (`Path.home()`, not `genesis_home()`). Two resolutions could disagree under
+    GENESIS_HOME, and a reader looking in the wrong place would hold every
+    archived worktree again — safe, but the defect this exists to fix."""
+    return Path.home() / ".genesis" / "worktree-trash"
+
+
+def _is_reaper_archive(wt: dict, trash_dir: Path) -> bool:
+    """True ONLY on positive evidence that this registration is a reaper archive.
+
+    The sweep HOLDS a worktree it cannot read, deliberately: `prunable`, and a
+    failing `status`, are byte-identical between a DELETED directory and an
+    UNREACHABLE one (a moved-aside directory, an unmounted volume), and resolving
+    would destroy the acknowledgement of work that still exists. None of that
+    changes here. What changes is that ONE kind of missing directory can now be
+    told apart by evidence an unreachable volume cannot produce: the reaper's
+    own lock AND the verified tarball it names, together.
+
+    All four must hold, and every failure answers False — which keeps HOLDING:
+      * the lock reason is EXACTLY the reaper's archive marker: its prefix and
+        one of its known suffixes (a prefix-only match, cut at the first
+        ``;``, would read an entry named ``a;b`` as ``a``);
+      * the named entry is a single plain path component (the reason is text
+        anybody can write, so it may not steer the lookup outside the trash);
+      * ``<trash>/<entry>.tar.gz`` is a regular file (the reason names the entry
+        WITHOUT the extension — comparing verbatim reports every archive missing);
+      * the worktree path itself is ABSENT. A present directory is observed
+        normally: a lock does not make live, readable work disappear.
+
+    Legacy UNCOMPRESSED trash directories are not accepted: the spec names the
+    tarball, and a directory is also exactly what a moved-aside tree looks like.
+    """
+    reason = wt.get("locked")
+    if not isinstance(reason, str) or not reason.startswith(REAPER_ARCHIVE_LOCK_PREFIX):
+        return False
+    rest = reason[len(REAPER_ARCHIVE_LOCK_PREFIX) :]
+    entry = next(
+        (rest[: -len(sfx)] for sfx in REAPER_ARCHIVE_LOCK_SUFFIXES if rest.endswith(sfx)),
+        "",
+    )
+    if not entry or entry in (".", "..") or "/" in entry or "\0" in entry:
+        return False
+    path = wt.get("path")
+    if not path:
+        return False
+    try:
+        archive = trash_dir / f"{entry}{REAPER_ARCHIVE_SUFFIX}"
+        if not archive.is_file():
+            return False
+        if not _path_absent(path):
+            return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _path_absent(path: str) -> bool:
+    """True ONLY when ``lstat`` says the path does not exist.
+
+    ``os.path.lexists`` answers False for EVERY ``OSError``, so an EACCES or EIO
+    on a present tree would read as "gone" and resolve a finding the sweep must
+    hold. Here any error other than ENOENT/ENOTDIR means "could not tell", which
+    keeps holding.
+    """
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+async def _observe_worktrees(
+    root: str,
+    *,
+    runner=None,
+    budget_s: float | None = None,
+    trash_dir: Path | None = None,
+) -> dict:
     """Per-worktree dirty state + the newest mtime among the dirty paths.
 
     Sequential by design. MEASURED 2026-09-05: 161 worktrees in 12.3s with 0
@@ -583,7 +677,10 @@ async def _observe_worktrees(root: str, *, runner=None, budget_s: float | None =
     concurrency here would buy ~9s at the cost of a new failure mode (fd
     pressure, scheduling) on a swapless box.
 
-    Returns ``{"observations", "errors", "held", "prunable"}``. The two kinds
+    Returns ``{"observations", "errors", "held", "prunable", "archived",
+    "unvisited", "total"}``. ``archived`` counts registrations PROVEN to be
+    reaper archives (see ``_is_reaper_archive``); those are neither observed
+    nor held, so their findings resolve. The two kinds
     of "not observed" are kept apart deliberately:
 
     - **prunable** — the worktree's directory is gone and only the
@@ -613,16 +710,29 @@ async def _observe_worktrees(root: str, *, runner=None, budget_s: float | None =
             "errors": [str(listing["error"])],
             "held": None,
             "prunable": 0,
+            "archived": 0,
             "unvisited": 0,
         }
 
+    trash = trash_dir if trash_dir is not None else _default_trash_dir()
     observations: list[dict] = []
     errors: list[str] = []
     held: set[str] = set()
     prunable = 0
+    archived = 0
     unvisited = 0
     deadline = time.monotonic() + budget_s if budget_s else None
     for wt in listing["worktrees"]:
+        if _is_reaper_archive(wt, trash):
+            # RESOLVED, not held — and only here. The reaper's lock CLEARS the
+            # `prunable` marker (MEASURED on git 2.43), so before this check an
+            # archived registration fell through to `status`, failed rc=128 and
+            # was held as "unreadable" forever: 176 of 337 on one install. The
+            # archive holds the tree (uncommitted changes included, as a saved
+            # patch), so there is no stranded work left at this path to report.
+            # Everything that is not PROVABLY an archive keeps the holds below.
+            archived += 1
+            continue
         if wt.get("prunable"):
             # HELD, not resolved. The old reasoning was "a directory that does
             # not exist holds no uncommitted work", which is true of DELETION
@@ -684,10 +794,11 @@ async def _observe_worktrees(root: str, *, runner=None, budget_s: float | None =
         "errors": errors,
         "held": held,
         "prunable": prunable,
+        "archived": archived,
         "unvisited": unvisited,
-        # The REAL denominator. `len(observations)` is not it: three cases
-        # `continue` before a worktree is ever appended (prunable, over-budget,
-        # unreadable), so a count derived downstream from the observations
+        # The REAL denominator. `len(observations)` is not it: four cases
+        # `continue` before a worktree is ever appended (archived, prunable,
+        # over-budget, unreadable), so a count derived downstream from the observations
         # silently excludes exactly the worktrees a blindness report is about.
         # A wrong denominator on the alarm that says "I could not see
         # everything" is the one place this subsystem's every-count-with-its-
@@ -1258,11 +1369,12 @@ async def _run_locked(
             "terminal": classified_wt["stages"],
             "meta": {
                 "prunable_skipped": observed["prunable"],
+                "archived_skipped": observed.get("archived", 0),
                 "unreadable": len(observed["errors"]),
                 "unvisited_over_budget": observed["unvisited"],
                 "held_total": len(dirty_held),
                 # `worktrees_total` in `terminal` counts what was OBSERVED; this
-                # counts what was REGISTERED. They differ by exactly the three
+                # counts what was REGISTERED. They differ by exactly the four
                 # skip cases, and publishing both lets a reader SEE the gap
                 # instead of inferring it.
                 "worktrees_registered": observed["total"],

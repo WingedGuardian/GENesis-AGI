@@ -38,6 +38,8 @@ def run(args: argparse.Namespace) -> int:
         cmd.append("--dry-run")
     if args.force:
         cmd.append("--force")
+    if getattr(args, "database_only", False):
+        cmd.append("--database-only")
 
     # Inherit environment so GENESIS_BACKUP_PASSPHRASE and friends flow through.
     proc = subprocess.run(cmd, env=os.environ.copy(), check=False)
@@ -69,5 +71,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--force", action="store_true",
         help="Overwrite destinations newer than the backup (skip confirmations)",
+    )
+    p.add_argument(
+        "--database-only", action="store_true",
+        help="Restore and verify only SQLite, leaving other state untouched",
     )
     p.set_defaults(func=run)

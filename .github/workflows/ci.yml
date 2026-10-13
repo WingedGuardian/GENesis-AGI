@@ -163,139 +163,30 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Every step body lives in scripts/ci/leak_scan.sh, shared with
+      # .github/workflows/branch-leak-scan.yml (every non-main branch push), so
+      # the two cannot drift. Pins, checksums and --redact live there. Keep
+      # this job's id `leak-detector`: it is a required status check
+      # (.github/rulesets/checks.json) and the merge gate's leaks relief is
+      # pinned to the (leak-detector, CI) pair.
       - name: Install tools
-        # `detect-secrets` PINNED for the same reason `ruff` is: `leak-detector`
-        # is a required check with no bypass actor, it scans the WHOLE tree, and
-        # a new detector in an unpinned release would fire on pre-existing
-        # content and block every merge. See .github/rulesets/README.md.
-        run: |
-          pip install 'detect-secrets==1.5.0'
-          sudo apt-get install -y ripgrep
+        run: bash scripts/ci/leak_scan.sh install
 
       - name: Secret scan (detect-secrets)
-        run: |
-          set -euo pipefail
-          detect-secrets scan --all-files \
-              --exclude-files '\.git/' \
-              --exclude-files '__pycache__/' \
-              --exclude-files '\.pyc$' \
-              --exclude-files 'vendor/' \
-              src/ config/ scripts/ .github/ > /tmp/ds-results.json
-          count=$(python3 -c "
-          import json, sys
-          data = json.load(open('/tmp/ds-results.json'))
-          results = data.get('results', {})
-          real = sum(len([f for f in v if 'CACHEDIR' not in fp])
-                     for fp, v in results.items())
-          print(real)
-          ")
-          if [[ "$count" != "0" ]]; then
-            echo "::error::detect-secrets found $count potential secrets"
-            cat /tmp/ds-results.json
-            exit 1
-          fi
-          echo "Secret scan: CLEAN (0 findings)"
+        run: bash scripts/ci/leak_scan.sh detect-secrets
 
       - name: Leak scan (gitleaks)
-        # Blocking. Covers the whole tree (incl. docs/) with the repo's
-        # .gitleaks.toml PII/infrastructure rules — the scans above only
-        # cover src/config/scripts/.github. Version+checksum pinned;
-        # --redact is MANDATORY: these logs are public, a found secret
-        # must never be echoed into them.
-        run: |
-          set -euo pipefail
-          GITLEAKS_VERSION=8.22.1
-          GITLEAKS_SHA256=2f92ab3b8e08319ac30836c32b90818e01519c3a4982771e4f45a7f5607872f7
-          curl -sSfL -o /tmp/gitleaks.tgz \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
-          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
-          /tmp/gitleaks detect --no-git --redact -c .gitleaks.toml --source .
-          echo "Leak scan (gitleaks): CLEAN"
+        # Blocking, whole tree, version+checksum pinned, --redact mandatory.
+        run: bash scripts/ci/leak_scan.sh gitleaks
 
       - name: Class scan (advisory — non-gating)
-        # Broad RFC1918 / CGNAT / IPv6-ULA and /home/<user> CLASSES, surfaced as
-        # GitHub warnings and NEVER gating. Rationale: CI must not hard-block an
-        # external contributor for a legitimate private-range example (e.g.
-        # 10.0.0.1 in a docker-compose). This install's EXACT values are
-        # hard-gated by the private-pattern exact scan below. Doc examples should
-        # use the RFC 5737 ranges (192.0.2.x / 198.51.100.x / 203.0.113.x), which
-        # are deliberately not matched. Network-address class vocabulary comes
-        # from scripts/check_portability.sh --warn (single source of truth).
-        run: |
-          set -euo pipefail
-          net="$(bash scripts/check_portability.sh --warn 2>/dev/null || true)"
-          # Home-path + CC-slug classes (check_portability owns network only).
-          # Exclude scanner-definition files that embed these patterns as data.
-          paths="$(rg -n --hidden \
-            --glob '!**/.git/**' \
-            --glob '!**/src/genesis/contribution/sanitize.py' \
-            --glob '!**/scripts/hooks/commit-msg' \
-            --glob '!**/scripts/check_portability.sh' \
-            --glob '!**/.github/workflows/ci.yml' \
-            -e '/home/[a-z_][a-z0-9_-]*/genesis' \
-            -e '/home/[a-z_][a-z0-9_-]*/\.[A-Za-z]' \
-            -e '-home-[a-z0-9-]+-genesis' \
-            . 2>/dev/null || true)"
-          findings="$(printf '%s\n%s\n' "$net" "$paths" | grep -vE '^[[:space:]]*$' || true)"
-          if [[ -n "$findings" ]]; then
-            printf '%s\n' "$findings" | sed 's/^/::warning::/'
-            n="$(printf '%s\n' "$findings" | wc -l)"
-            echo "Class scan: $n advisory finding(s) — non-gating."
-          else
-            echo "Class scan: CLEAN"
-          fi
+        run: bash scripts/ci/leak_scan.sh class
 
       - name: Email scan
-        run: |
-          set -euo pipefail
-          hits=$(
-            rg -n --hidden \
-              --glob '!**/.git/**' \
-              --glob '!**/tests/**' \
-              --glob '!**/readme-legacy.md' \
-              --glob '!**/vendor/**' \
-              -e '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' \
-              src/ config/ scripts/ .github/ 2>/dev/null | \
-            grep -vE '(^|[^a-zA-Z0-9._+-])(noreply|no-reply)@' | \
-            grep -vE 'backup@genesis\.local\b' | \
-            grep -vE 'feedback@anthropic\.com\b' | \
-            grep -vE 'support@anthropic\.com\b' | \
-            grep -vE '@(example|example\.com|example\.org|localhost|test|invalid)\b' | \
-            grep -vE '@(claude|github|gitlab|sentry|grafana|slack|discord)\.com\b' | \
-            grep -vE 'user@[0-9]+\.service' \
-              || true
-          )
-          if [[ -n "$hits" ]]; then
-            echo "::error::Email scan found personal email addresses:"
-            printf '%s\n' "$hits"
-            exit 1
-          fi
-          echo "Email scan: CLEAN"
+        run: bash scripts/ci/leak_scan.sh email
 
       - name: Binary/data artifact scan
-        run: |
-          set -euo pipefail
-          # Voiceprints, audio, databases, and models match NONE of the text
-          # scans above, so a `git add -f` past .gitignore would commit one
-          # unnoticed. Block any TRACKED artifact of these types (uses the git
-          # index, so untracked local data is ignored).
-          data_globs=(
-            '*.wav' '*.flac' '*.pcm' '*.mp3' '*.m4a' '*.ogg' '*.opus'
-            '*.db' '*.db-wal' '*.db-shm' '*.sqlite' '*.sqlite3'
-            '*.onnx'
-            '*speaker_registry*.json' 'ambient_enroll_*.json'
-          )
-          # Allowlist: ':(exclude)path' entries for confirmed-legit files.
-          data_allow=()
-          hits=$(git ls-files -z -- "${data_globs[@]}" "${data_allow[@]}" 2>/dev/null \
-                 | tr '\0' '\n' || true)
-          if [[ -n "$hits" ]]; then
-            echo "::error::Binary/data artifacts must never be committed (voiceprints, audio, databases, models):"
-            printf '%s\n' "$hits"
-            exit 1
-          fi
-          echo "Binary/data artifact scan: CLEAN"
+        run: bash scripts/ci/leak_scan.sh binary
 
       - name: Private-pattern exact scan (hard gate)
         # The REAL install identifiers (private repo/host names, subnets,
@@ -306,7 +197,7 @@ jobs:
         # echoes matched content — counts only. Hard-fails on the canonical repo
         # for non-fork PRs and pushes; SKIPS on forks / other installs (no secret,
         # and they cannot know these values — the class scan above is their floor).
-        # Secrets are NOT readable in `if:`, so the empty check is done in-shell
+        # Secrets are NOT readable in `if:`, so the empty check is done in-script
         # after env-mapping; an `if:` keyed on secrets.* would be silently empty
         # (never runs = false green).
         # Skip Dependabot too: its PRs are same-repo (non-fork) so they'd enter
@@ -315,6 +206,8 @@ jobs:
         # empty and the fail-loud check would break every dependency-bump PR.
         # Dependency bumps never introduce install identifiers; the class-warn
         # scan remains their floor.
+        # Range selection (for a pull_request: merge-base with live main, NOT
+        # the stale pull_request.base.sha) is in scripts/ci/leak_scan_added_lines.py.
         if: >-
           github.repository == 'WingedGuardian/GENesis-AGI' &&
           github.actor != 'dependabot[bot]' &&
@@ -327,36 +220,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PUSH_BEFORE: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          # Write the raw secret; scripts/ci/private_pattern_scan.py does ALL
-          # filtering + validation (blank/comment lines, empty set, malformed
-          # ERE) in tested Python — the fragile parts that repeatedly bit the
-          # former inline-shell gate. It exits 0=clean, 1=leak (counts only,
-          # never content), 3=fail-loud (unprovisioned/corrupt secret); set -e
-          # propagates a nonzero exit as the gate's failure.
-          pf="$(mktemp)"
-          printf '%s' "$PRIV" > "$pf"
-
-          # Collect the ADDED lines across EVERY commit's patch in range — NOT
-          # the net tree-to-tree diff (a value added then removed within the same
-          # PR/push leaves the net diff clean yet stays in published history).
-          # RANGE SELECTION is security-critical and lives in tested Python:
-          # scripts/ci/leak_scan_added_lines.py. For a pull_request it anchors on
-          # the merge ref's first parent (HEAD^1 = main@ci), NOT the stale
-          # github.event.pull_request.base.sha — base.sha lags main, so
-          # base.sha..HEAD used to re-sweep (and re-flag) values main itself
-          # added-then-removed since the PR was opened. The helper keeps every
-          # '^+' line incl. '+++ b/path' headers, and fails CLOSED (nonzero exit)
-          # on an unresolvable range rather than emitting empty (a fail-OPEN).
-          # See tests/test_scripts/test_leak_scan_added_lines.py.
-          added="$(python3 scripts/ci/leak_scan_added_lines.py)"
-          body=""
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            body="$(gh pr view "$PR_NUMBER" --json body -q .body 2>/dev/null || echo '')"
-          fi
-
-          printf '%s\n%s\n' "$added" "$body" | python3 scripts/ci/private_pattern_scan.py --patterns "$pf"
+        run: bash scripts/ci/leak_scan.sh private
 
   migration-check:
     # Migration ids, three rules: every file in a migrations directory is a
@@ -504,7 +368,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-09-15: 63 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-10: 73 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -749,6 +613,15 @@ jobs:
           # NEITHER the -rf list nor the FAILURES block, so -rf alone leaves
           # the collection-time breakages -- the ones hardest to read off a
           # truncated log -- named nowhere.
+          # Falsifier for a claim this workflow's dormancy guard rests on:
+          # the fleet-door behavioural test needs a TERM to attach a tmux
+          # client, and is believed to have skipped on CI because runners set
+          # none. That was INFERRED, never measured -- the per-step `env:`
+          # echo above is what the step DECLARES, not the process
+          # environment (PATH and HOME are absent from it too). One line
+          # settles it in the log instead of leaving the next reader to
+          # re-derive it.
+          echo "TERM=[${TERM-UNSET}]"
           pytest -rfE --durations=25 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
@@ -811,71 +684,214 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
       # A test that stops running is invisible: it makes the suite SMALLER,
-      # not red. Two axes, because dormancy moves both ways — a broken
-      # skipif RAISES the skip count, while a lost marker or a dropped
-      # directory LOWERS it and is only visible in the collected count.
-      # REPORT ONLY until both bounds, measured on these runners, are
-      # recorded here — a threshold invented rather than measured is one
-      # nobody trusts. The step still has teeth meanwhile: a missing or
-      # unreadable report exits 2.
+      # not red. Two axes, because dormancy moves both ways: a broken skipif
+      # RAISES the skip count, while a lost marker or a dropped directory
+      # LOWERS the collected count. This step guards the SKIP axis. The
+      # collected axis is the `collected-floor` job below, which compares the
+      # collected test ids against the commit the change lands on, so no
+      # hand-maintained number sits on this line any more (#2743).
       - name: Suite dormancy guard
         # NOT always(): that also fires on cancellation, and this workflow
         # sets cancel-in-progress for every non-main ref — so a re-push
         # would kill pytest mid-suite, leave no report, and the step would
         # refuse with a cause that is not the cause.
         if: ${{ !cancelled() }}
-        # Baseline MEASURED on this PR's own green run (job 101515129147, head
-        # bbd11ad1): "95 skipped of 23164 collected". Exact-fit on both axes, not
-        # a padded guess — headroom would be a number nobody measured, and the
-        # whole point of shipping report-only first was to avoid inventing one.
-        # Raising either bound is a deliberate act that belongs in the same commit
-        # as the change that moves it; both failure messages say so.
-        #
-        # RAISED 95 -> 99 and 23164 -> 23217 by the FalkorDB store, both counted
-        # rather than padded. The skip axis: four engine-gated tests, which skip
-        # wherever the engine is not provisioned — CI included, by design, since
-        # no runner has a socket. MEASURED by running the file: "32 passed, 4
-        # skipped".
-        #
-        # The collected axis: +53. MEASURED by COLLECTION rather than by grepping
-        # for a test-function definition, because a parametrised case collects as
-        # many as it has params and reads as one. Collecting the three files that
-        # differ from main gives 94; main collects 41 from the one of the three
-        # that already existed.
-        #
-        # RE-COUNT AFTER THE LAST EDIT THAT ADDS A TEST. This line was wrong twice
-        # before it was right: first at 48, counted before a review round added
-        # four tests, then at 52, counted before that round's own audit added a
-        # fifth. Both times the skip axis WAS re-derived and this one was not,
-        # because a new skip announces itself by turning CI red while a new test
-        # does not. That asymmetry is the trap: an under-set floor still passes,
-        # so the guard quietly forfeits the exact fit it exists to hold and
-        # nothing says a word.
-        #
-        # +33 collected by the capped-read advisory (2026-09-14), MEASURED BY
-        # COLLECTION on the two files that change: the new suite collects 32 and
-        # the advisory-channel net gains 1. 23217 -> 23250.
-        #
-        # RE-COUNTED after the adversarial review's fixes added four cases (the
-        # literal defect command, the remedy-correctness lock, and two limit
-        # spellings). The first count of +29 was taken BEFORE those landed --
-        # which is the exact trap the comment below describes, caught this time
-        # by re-counting after the last test-adding edit rather than before.
-        #
-        # The CEILING is deliberately NOT raised. The one test that can skip is
-        # the gh-defaults drift check, gated on `shutil.which("gh")`, and gh is
-        # pre-installed on GitHub-hosted runners, so it RUNS rather than skips.
-        # That skip was kept rather than softened into a vacuous pass precisely
-        # because a test that silently no-ops when its tool is absent is the
-        # dormancy this ceiling exists to catch. If this line ever goes red at
-        # 100, that is the cause and the fix is one number.
-        # RE-COUNTED after the round that deleted the completeness claim and
-        # closed three silences: this suite is now 62 collected (+1 in the
-        # advisory-channel net) = +63 over the 23217 base, so 23280. Counted by
-        # --collect-only AFTER the last test-adding edit, per the comment above
-        # -- which has now caught a stale number FOUR times on this branch,
-        # every one from counting an edit too early.
-        # The base is deliberately NOT re-derived from the merged tree: this is
-        # a FLOOR, so a lagging base is conservative and can only under-catch,
-        # never go falsely red.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 99 --min-collected 23298
+        # The CEILING is the skip+xfail count measured on these runners. Raise
+        # it only in the commit that adds the skip, and count on the RUNNER from
+        # the junit report, never on a dev box: which optional tools are
+        # installed differs, so a local "N skipped" is the wrong denominator.
+        # Each raise was counted, not padded:
+        #   95   baseline, measured on the PR that shipped this guard (job
+        #        101515129147, head bbd11ad1).
+        #   99   FalkorDB store: four engine-gated tests skip wherever no
+        #        engine is provisioned, CI included.
+        #   102  wrapper-arity lock: three parametrisations skip because `doas`
+        #        and `uvx` are absent from the runner (and `time` is excluded,
+        #        a bash keyword), found by diffing the skip SETS of two junit
+        #        reports (main 8a465c7b1 against that branch).
+        #   104  branch leak scan (#2880): two workflow tests call ripgrep,
+        #        which this job does not install (the run at 3b14708f1
+        #        skipped 104).
+        #   124  native codex harness (#3075): test_codex_native.py's 20 cases
+        #        carry a module-wide skipif on GENESIS_CODEX_NATIVE_TESTS,
+        #        which CI never sets (native binaries are a separate opt-in).
+        # Before raising it to green, read each new skip's own message:
+        # raising the ceiling can CERTIFY a dormant test, and the ceiling
+        # cannot say which test skipped. The behavioural fleet-door and
+        # slot-door tests attach a real tmux client and take a RUNTIME skip
+        # if that fails, so read those first when the count rises.
+        # The collected-count floor that shared this line until #2743, and its
+        # ledger of hand counts, are in this file's git history.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124
+
+  collected-floor:
+    # Tests that stop being collected make the suite SMALLER, not red. This job
+    # collects test ids twice in the same workspace, the PR tree and then the
+    # commit it lands on, and fails when ids vanish from files the change did
+    # not touch, unless the PR body has a line `Collected-drop: <reason>`. The
+    # rule, its exit codes and the measurements behind it are in
+    # scripts/ci/collected_floor.py. It replaced the hand-maintained
+    # --min-collected number every test-adding PR edited (#2743).
+    #
+    # SAME PATH on purpose: three parametrize ids embed the checkout's absolute
+    # root, so collecting the base in a second directory flags them on every PR.
+    #
+    # The escape line is read from a MUTABLE body, so after adding it the author
+    # re-runs this job. That clears the red only while the merge gate reads a
+    # re-run's latest attempt; if #2624 changes that, the remedy becomes a push.
+    #
+    # pull_request and push only: a scheduled or manual run has no change to judge.
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Resolve the base commit
+        id: base
+        env:
+          # Passed via env, not interpolated into `run`.
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            # The checkout is GitHub's merge commit: parent 1 is the base tip,
+            # parent 2 the PR head (measured on refs/pull/3134/merge).
+            words="$(git rev-list --parents -n 1 HEAD | wc -w)"
+            if [[ "$words" != 3 ]]; then
+              echo "::error::collected-floor: expected a 2-parent merge commit, got $((words - 1)) parent(s)"
+              exit 2
+            fi
+            base="$(git rev-parse 'HEAD^1')"
+          else
+            # A push to main: the pre-push tip, guarded as migration-check does.
+            if [[ -z "${PUSH_BEFORE_SHA:-}" || "$PUSH_BEFORE_SHA" == "0000000000000000000000000000000000000000" ]] \
+               || ! git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+              echo "::error::collected-floor: the push's previous tip '${PUSH_BEFORE_SHA:-}' is not a readable commit"
+              exit 2
+            fi
+            base="$PUSH_BEFORE_SHA"
+          fi
+          echo "collected-floor: base $base, head $head"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+      - name: Collect test ids on both trees
+        env:
+          GENESIS_TESTING: "1"
+          BASE: ${{ steps.base.outputs.base }}
+          HEAD_SHA: ${{ steps.base.outputs.head }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/collected-floor"
+          mkdir -p "$out"
+          # The plugin must stay importable while the base is checked out.
+          cp scripts/ci/collect_ids_plugin.py "$RUNNER_TEMP/"
+          # -z: a non-ASCII path is otherwise C-quoted and matches no node id.
+          git diff -z --no-renames --name-only "$BASE" "$HEAD_SHA" > "$out/changed.txt"
+          collect() {
+            local rc=0
+            # The test job's three selection flags; tests/test_scripts/
+            # test_collected_floor.py fails if the two lists drift apart.
+            COLLECTED_FLOOR_OUT="$out/$1.json" PYTHONPATH="$RUNNER_TEMP" \
+              "$2" -m pytest --collect-only -q -p collect_ids_plugin --continue-on-collection-errors \
+              --ignore-glob='**/test_*az*.py' \
+              --ignore-glob='**/test_*shim*.py' \
+              --ignore=tests/test_ui/ > "$out/$1.log" 2>&1 || rc=$?
+            # 0 clean, 1 collection errors (the comparison judges them), 5 no
+            # tests (the comparison refuses an empty tree). Anything else is
+            # pytest itself failing.
+            if [[ "$rc" != 0 && "$rc" != 1 && "$rc" != 5 ]]; then
+              tail -n 50 "$out/$1.log"
+              echo "::error::collected-floor: pytest exited $rc collecting the $1 tree"
+              exit 2
+            fi
+            tail -n 1 "$out/$1.log"
+          }
+          collect pr python
+          # The base must collect under ITS OWN dependencies: under the PR's,
+          # a test the PR drops by removing or capping a dependency would skip
+          # on both trees and never show as vanished. pyproject.toml is the
+          # only dependency declaration, so when it differs between the trees
+          # the base gets a fresh venv (nothing the PR installed can leak in);
+          # when it does not, the installed environment is already the base's.
+          # A failed diff counts as "differs", the safe direction.
+          base_py=python
+          deps_differ=0
+          git diff --quiet "$BASE" "$HEAD_SHA" -- pyproject.toml || deps_differ=1
+          # --force: an untracked file in the way of a base file would
+          # otherwise stop the switch (measured, git 2.43).
+          git checkout --quiet --force --detach "$BASE"
+          if [[ "$deps_differ" == 1 ]]; then
+            echo "collected-floor: pyproject.toml differs; collecting the base in a fresh venv"
+            python -m venv "$RUNNER_TEMP/venv-base"
+            base_py="$RUNNER_TEMP/venv-base/bin/python"
+            "$base_py" -m pip install --quiet -e ".[test]" > "$out/base-install.log" 2>&1 \
+              || { tail -n 30 "$out/base-install.log"; echo "::error::collected-floor: installing the base tree's dependencies failed"; exit 2; }
+          fi
+          collect base "$base_py"
+          git checkout --quiet --force --detach "$HEAD_SHA"
+      - name: Read the PR body for a Collected-drop line
+        id: body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/collected-floor"
+          # Read at run time, never interpolated, so a re-run after a body
+          # edit sees the edit. A failed read is not an empty body: the
+          # comparison decides what it means, and it matters only when tests
+          # vanished from untouched files.
+          num="${PR_NUMBER:-}"
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            # The merged PR whose squash commit this push is.
+            if ! num="$(gh api "repos/$REPO/commits/$SHA/pulls" \
+                --jq "[.[] | select(.merged_at != null and .merge_commit_sha == \"$SHA\") | .number] | first // empty")"; then
+              echo "mode=unreadable" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ -z "$num" ]]; then
+              echo "mode=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          if gh pr view "$num" --repo "$REPO" --json body -q .body > "$out/body.txt"; then
+            echo "mode=file" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=unreadable" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Compare the collected ids
+        env:
+          MODE: ${{ steps.body.outputs.mode }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/collected-floor"
+          case "$MODE" in
+            file) body=(--body-file "$out/body.txt") ;;
+            none) body=(--no-body) ;;
+            *) body=(--body-unreadable) ;;
+          esac
+          python3 scripts/ci/collected_floor.py "$out/base.json" "$out/pr.json" \
+            --changed "$out/changed.txt" "${body[@]}"
+      # The full id sets, the changed-file list and both collection logs: the
+      # step summary is budgeted, this is not.
+      - name: Preserve the collected ids
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: collected-floor
+          path: ${{ runner.temp }}/collected-floor/
+          if-no-files-found: ignore
+          retention-days: 14

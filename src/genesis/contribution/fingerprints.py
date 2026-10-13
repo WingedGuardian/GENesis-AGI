@@ -19,12 +19,17 @@ Format contract (consumed by three readers — keep it strict)
   Comments MUST be on their own line — ``sanitize._check_fingerprints`` only
   skips lines that *start* with ``#`` (an inline ``pat # note`` would compile
   the note into the regex).
-* **ERE contract:** every emitted pattern must be valid for BOTH Python ``re``
-  AND GNU ``grep -E`` (the commit-msg hook greps the file with ``grep -E -f`` on
-  Linux dev boxes and GitHub Actions ``ubuntu-latest`` — the only consumers). We
-  emit only ``re.escape``'d literals and ``\\b`` (both GNU-supported), never
+* **Python ``re`` is the dialect.** Both current readers match with it: the
+  pre-push review (``sanitize._check_fingerprints``) and the commit-msg hook,
+  which reads the file with the same rules in a stdlib Python snippet.
+* **ERE contract, kept for the rollout:** every emitted pattern must ALSO be
+  valid for GNU ``grep -E``. An install's ``.git/hooks/commit-msg`` is a copy,
+  replaced only when ``scripts/hooks/sync-hooks.sh`` runs (on update or deploy),
+  and a copy that predates the Python reader greps the file with ``grep -E -f``.
+  We emit only ``re.escape``'d literals and ``\\b`` (both GNU-supported), never
   ``\\d``/``\\w``/``\\s`` — those are a *literal* ``d``/``w``/``s`` under some
-  ``grep -E`` builds, which would silently fail to match → a false-negative leak.
+  ``grep -E`` builds, which would silently fail to match → a false-negative leak
+  in such a copy. Hand-edited lines below the managed block are not bound by it.
 
 Structure of the managed file::
 

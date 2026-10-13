@@ -15,6 +15,19 @@ from genesis.security.sanitizer import strip_boundary_markers
 
 logger = logging.getLogger(__name__)
 
+# The single wrapper WebFetcher puts around a page: a complete opener at the very
+# start and the closer carrying the SAME id at the very end. Only that exact pair is
+# removed; text that merely looks like a marker is page content.
+_FETCH_WRAPPER_RE = re.compile(
+    r'\A<external-content [^<>]*\bid="([0-9a-f]{16})"[^<>]*>\n'
+    r'(?P<body>.*)\n</external-content id="\1">\Z',
+    re.DOTALL,
+)
+
+
+def _unwrap_fetched(text: str) -> str:
+    match = _FETCH_WRAPPER_RE.match(text)
+    return match.group("body") if match else text
 _URL_PATTERN = re.compile(r"^https?://")
 _THIN_CONTENT_THRESHOLD = 200  # chars after stripping markers
 
@@ -33,7 +46,13 @@ class WebProcessor:
 
         # Escalate to Cloudflare /markdown if the primary fetch returned
         # thin content (likely a JS-rendered shell like <div id="root">).
-        text = result.text
+        # WebFetcher wraps the whole page in exactly one boundary block. Remove
+        # that outer wrapper here, where it is known to be the fetcher's: its id
+        # depends on the install's boundary key, so leaving it in would make the
+        # ingest content hash change whenever the key does (#2572). Distillation
+        # wraps every chunk again before it reaches a model, and marker-shaped
+        # text inside the page is left untouched.
+        text = _unwrap_fetched(result.text)
         title = result.title
         escalated = False
         stripped = strip_boundary_markers(text).strip()

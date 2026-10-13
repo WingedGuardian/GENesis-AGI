@@ -1,0 +1,1 @@
+- **PR size counter.** `scripts/pr_shape.py` turns a unified `git diff -M` into a counted line total and a size band (`ok`/`shape`/`override`), excluding tests, changelog, prose, binaries, blanks, comments and verbatim moves; `parse_shape` reads a `Shape:` reason from a PR body. No callers yet — wiring into the review gate is a later maintainer change.

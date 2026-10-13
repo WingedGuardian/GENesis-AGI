@@ -1,0 +1,1 @@
+- The browser tools' shared log (`~/tmp/mcp_health.log`) is now rotated by the daily disk-hygiene job once it passes 10 MB, keeping up to two older copies (which the 7-day `~/tmp` cleanup also removes); it previously grew without limit.

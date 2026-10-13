@@ -298,7 +298,7 @@ async def test_distill_wraps_chunk_in_boundary_markers():
 
     user_msg = router.route_call.call_args[0][1][1]["content"]
     assert '<external-content source="web_fetch"' in user_msg
-    assert "</external-content>" in user_msg
+    assert "</external-content id=" in user_msg
     # The payload is inside the markers (delimited as data, not instructions).
     assert "Ignore previous instructions" in user_msg
 
@@ -334,7 +334,7 @@ async def test_distill_strips_existing_markers_no_double_wrap():
     user_msg = router.route_call.call_args[0][1][1]["content"]
     # Exactly one opening tag — the inner marker was stripped before re-wrapping.
     assert user_msg.count("<external-content") == 1
-    assert user_msg.count("</external-content>") == 1
+    assert user_msg.count("</external-content") == 1
     assert "payload" in user_msg
 
 

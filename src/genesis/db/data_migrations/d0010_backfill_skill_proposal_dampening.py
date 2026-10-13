@@ -23,6 +23,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta
 
+from genesis.db.connection import connect_sqlite_rw
 from genesis.env import genesis_db_path
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ _NEW_TTL_DAYS = 60
 def migrate() -> dict:
     """Backfill ``category`` (from ``content.skill_name``) and extend
     ``expires_at`` to ``created_at`` + 60d for unresolved skill_proposal rows."""
-    db = sqlite3.connect(genesis_db_path(), timeout=30.0)
+    db = connect_sqlite_rw(genesis_db_path(), timeout=30.0)
     try:
         # 1. category = skill_name where missing (parsed from the content JSON).
         cur = db.execute(

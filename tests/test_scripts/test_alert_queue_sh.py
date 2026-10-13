@@ -86,35 +86,86 @@ def test_queue_alert_never_breaks_caller(tmp_path):
     assert "REACHED" in r.stdout
 
 
-def test_watchgod_emergency_transition_only(tmp_path):
-    # Replicate the exact guard tmp_watchgod's red paths use, run it TWICE
-    # (two polls in one red episode) → exactly ONE queued page.
-    root = tmp_path / "queue"
-    alert_dir = tmp_path / "alerts"
-    alert_dir.mkdir()
-    guard = (
-        'mkdir -p "$ALERT_DIR"; '
-        'if [[ ! -f "$ALERT_DIR/tmp_emergency" ]]; then '
-        '  queue_alert emergency watchgod:cc "RED" "body" "watchgod:tmp_emergency"; '
-        "fi; "
-        'touch "$ALERT_DIR/tmp_emergency"'
-    )
-    env = {"GENESIS_ALERT_QUEUE_ROOT": str(root), "ALERT_DIR": str(alert_dir)}
-    assert _run_bash(guard, env).returncode == 0
-    assert _run_bash(guard, env).returncode == 0  # second poll, flag persists
-    assert len(_entries(root)) == 1  # only the transition paged
+def test_watchgod_pages_through_the_queue_with_per_tier_dedupe_keys():
+    """The watchgod's pages go through this queue, one dedupe key per
+    (filesystem, tier): a key shared across tiers would let the ORANGE
+    WARNING swallow the RED EMERGENCY that follows it. Behaviour (once per
+    episode, the EMERGENCY still arriving after a WARNING) is pinned against the
+    real script in test_watchgod_disk_guardian.py; this only checks the script
+    still routes both pages here with distinct keys.
 
-
-def test_watchgod_warning_tier_never_queues():
-    # D2: the warning/orange cleaners must NOT call queue_alert (warnings stay
-    # dashboard-only via watchgod_state.json). Only the red cleaners page.
+    v1 of the watchgod paged RED only and kept ORANGE dashboard-only (design
+    D2). v2 pages a WARNING at ORANGE by design: ORANGE now means the whole
+    disk is filling, not that one directory crossed a budget."""
     text = _WATCHGOD.read_text()
+    # _wg_page routes both through queue_alert_try with source watchgod:disk.
+    assert 'queue_alert_try "$1" "watchgod:disk"' in text
+    assert '_wg_page warning "Disk filling' in text
+    assert '_wg_page emergency "Disk nearly full' in text
+    assert '"watchgod:disk:${dev}:orange"' in text
+    assert '"watchgod:disk:${dev}:red"' in text
 
-    def _body(fn: str) -> str:
-        start = text.index(f"{fn}()")
-        return text[start : text.index("\n}\n", start)]  # to the closing brace
 
-    for fn in ("clean_cc_orange", "clean_sys_orange", "clean_sys_yellow"):
-        assert "queue_alert" not in _body(fn), f"{fn} must not page a warning"
-    for fn in ("clean_cc_red", "clean_sys_red"):
-        assert "queue_alert emergency" in _body(fn), f"{fn} must page emergency"
+def test_queue_alert_try_reports_failure_and_queue_alert_still_never_does(tmp_path):
+    """The watchgod marks a page sent only when queue_alert_try returned 0; a
+    queue it cannot write (a file where the directory should be) must say so,
+    while plain queue_alert keeps its never-break-the-caller contract."""
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    env = {"GENESIS_ALERT_QUEUE_ROOT": str(blocker / "queue")}
+    r = _run_bash('if queue_alert_try emergency x t b; then echo OK; else echo FAILED; fi', env)
+    assert r.stdout.strip() == "FAILED"
+    r = _run_bash("queue_alert emergency x t b; echo survived", env)
+    assert r.returncode == 0 and r.stdout.strip() == "survived"
+    good = tmp_path / "q"
+    r = _run_bash('queue_alert_try emergency x t b && echo OK', {"GENESIS_ALERT_QUEUE_ROOT": str(good)})
+    assert r.stdout.strip() == "OK" and len(_entries(good)) == 1
+
+
+def test_queue_alert_try_fails_when_the_write_itself_fails(tmp_path):
+    """The directory exists but cannot take a new file (a full or read-only
+    disk): the Python write fails, the status says so, and no partial temp is
+    left for the drainer."""
+    root = tmp_path / "queue"
+    root.mkdir()
+    root.chmod(0o555)
+    try:
+        r = _run_bash('if queue_alert_try emergency x t b; then echo OK; else echo FAILED; fi',
+                      {"GENESIS_ALERT_QUEUE_ROOT": str(root)})
+    finally:
+        root.chmod(0o755)
+    assert r.stdout.strip() == "FAILED"
+    assert list(root.iterdir()) == []
+
+
+def test_an_identity_already_waiting_is_not_queued_twice(tmp_path):
+    """A caller restarting in a loop while delivery is down re-sends the same
+    key; the queue keeps one copy and reports it durable."""
+    root = tmp_path / "queue"
+    r = _run_bash(
+        'queue_alert_try critical wg "T1" "B1" "wg:k1" && echo first\n'
+        'queue_alert_try critical wg "T2" "B2" "wg:k1" && echo second\n'
+        'queue_alert_try critical wg "T3" "B3" "wg:k2" && echo third\n'
+        'queue_alert_try critical wg "T4" "B4" && echo nokey1\n'
+        'queue_alert_try critical wg "T5" "B5" && echo nokey2',
+        {"GENESIS_ALERT_QUEUE_ROOT": str(root)},
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["first", "second", "third", "nokey1", "nokey2"]
+    titles = sorted(e["title"] for e in _entries(root))
+    assert titles == ["T1", "T3", "T4", "T5"], "same key once; no key never deduped"
+
+
+def test_bytes_that_are_not_utf8_still_queue(tmp_path):
+    """A file or process name may hold any bytes; the alert must still queue
+    (with replacement characters), never fail and retry forever."""
+    root = tmp_path / "queue"
+    r = _run_bash(
+        "queue_alert_try critical wg \"T $(printf 'a\\377b')\" \"B $(printf '\\376')\" \"k:$(printf '\\375')\" && echo QUEUED",
+        {"GENESIS_ALERT_QUEUE_ROOT": str(root)},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "QUEUED" in r.stdout
+    (e,) = _entries(root)
+    assert e["title"] == "T a\ufffdb" and e["body"] == "B \ufffd"
+    assert e["dedupe_key"] == "k:\ufffd"

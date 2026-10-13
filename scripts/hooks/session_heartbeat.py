@@ -70,6 +70,41 @@ _TAG_GRAMMAR_CHARS = str.maketrans({"[": "", "]": "", "|": "/", "\u00b7": "-"})
 _WHITESPACE_RUN = re.compile(r"\s+")
 
 
+def _connect_with_deadline(
+    db_uri: str,
+    *,
+    timeout: float,
+    deadline: float | None,
+):
+    """Open a read connection whose lock wait and query work share a deadline."""
+    import sqlite3
+
+    if deadline is not None and deadline - time.monotonic() <= 0:
+        return None
+    # Admission fence at this module's connect chokepoint (fail-closed): a
+    # fenced database reads as "could not read" (None), which every caller's
+    # three-valued contract already preserves correctly. `remaining` is
+    # computed AFTER the fence check so its cost is charged to the deadline.
+    try:
+        from db_admission_check import database_is_fenced
+
+        if database_is_fenced(db_uri):
+            return None
+    except Exception:
+        return None
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining <= 0:
+        return None
+    effective_timeout = timeout if remaining is None else min(timeout, remaining)
+    conn = sqlite3.connect(db_uri, uri=True, timeout=effective_timeout)
+    if deadline is not None:
+        conn.set_progress_handler(
+            lambda: 1 if time.monotonic() >= deadline else 0,
+            1000,
+        )
+    return conn
+
+
 def ro_uri(db_path: Path) -> str:
     """A WAL-aware read-only SQLite URI for ``db_path``, percent-encoding the path.
 
@@ -107,9 +142,11 @@ def sanitize_detail(text: str | None, limit: int) -> str:
         return ""
     # Strip the characters the TAG GRAMMAR owns, not only the bracket pair.
     # Brackets alone stop a forged LINE; the grammar is
-    # `[Concurrent | <src> <model> | <id>] <topic> - <digest>`, so a peer value
-    # containing "|" still forges an extra FIELD inside the surviving line --
-    # including the id position, which a reader attributes to the tag itself.
+    # `[Concurrent | <src> <model> | <id> -> <address>] <topic> - <digest>`, so a
+    # peer value containing "|" still forges an extra FIELD inside the surviving
+    # line -- including the id position, which a reader attributes to the tag
+    # itself. (The address is not passed through here: a name is an address, so
+    # session_awareness.peer_address allowlists it and omits it whole, never cuts.)
     # Substituted rather than deleted so the text stays readable.
     flattened = _WHITESPACE_RUN.sub(" ", text.translate(_TAG_GRAMMAR_CHARS)).strip()
     if limit <= 1:
@@ -193,7 +230,13 @@ def _is_newer(a: str | None, b: str | None) -> bool:
         return False
 
 
-def resolve_topic(db_path: Path, session_id: str, *, limit: int = _TOPIC_MAX) -> str | None:
+def resolve_topic(
+    db_path: Path,
+    session_id: str,
+    *,
+    limit: int = _TOPIC_MAX,
+    deadline: float | None = None,
+) -> str | None:
     """What this session is WORKING ON: charter mission, else newest live ledger item.
 
     Both sources are Genesis-authored, which is the point -- the injector must not
@@ -219,13 +262,21 @@ def resolve_topic(db_path: Path, session_id: str, *, limit: int = _TOPIC_MAX) ->
     if not session_id:
         return None  # cannot even attempt -> preserve
     try:
-        import sqlite3  # lazy: ~10ms, and never needed on the PostToolUse path
-
         if not db_path.exists():
             return None
-        conn = sqlite3.connect(ro_uri(db_path), uri=True, timeout=0.5)
+        conn = _connect_with_deadline(
+            ro_uri(db_path),
+            timeout=0.5,
+            deadline=deadline,
+        )
+        if conn is None:
+            return None
         try:
-            conn.execute("PRAGMA busy_timeout=300")
+            busy_timeout_ms = 300
+            if deadline is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+                busy_timeout_ms = min(busy_timeout_ms, int(remaining * 1000))
+            conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
             # FIRST: the topic Genesis ALREADY extracts. memory/
             # extraction_job.py writes cc_sessions.topic via
             # crud.cc_sessions.update_topic_and_keywords.

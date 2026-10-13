@@ -115,6 +115,17 @@ Attribution is possible but uneven. In rough order of strength:
   copied exactly as the row prints it; when two rows share a name, append that
   row's `[ref]` — that is what it is for. `ListAgents` also reports your OWN name,
   so sign with it rather than an invented handle.
+- **Have a session UUID, need its name?** Every `[Concurrent | …]` line already
+  carries it after the id — `a1b2c3d4 -> genesis-7f (cc-2:@1.%1)`, the name then
+  the tmux pane. For any other UUID (a charter, a ledger row, a commit trailer) use
+  the `session_address` MCP tool or `python -m genesis session-address <id-or-prefix>`.
+  It answers only when exactly one live process holds that session, so
+  `(not reachable)` means the session has ended (or its entry cannot be verified
+  from here) and `(ambiguous)` means two live processes claim it — both are
+  answers, never a cue to guess by topic. `(shared name)` means another live
+  session has the same name, so address it with the `[ref]` from `ListAgents`.
+  The address is a hint of the same strength as `ListAgents`, not proof of who is
+  on the other end: any process of the same OS user can write that registry.
 - **Commits already carry the session that made them.** `prepare-commit-msg` appends
   a `Genesis-Session: <8hex>` trailer (and an `Install: <8hex>`), so a commit names its
   own session without any forensics. Check the trailer first; it is the purpose-built

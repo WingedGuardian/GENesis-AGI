@@ -61,7 +61,9 @@ def _load(name: str, rel: str):
 hook_input = _load("hook_input", "hooks/hook_input.py")
 
 
-def _run_hook(script: str, payload: dict, home: Path, *, expect_ok: bool = True):
+def _run_hook(
+    script: str, payload: dict, home: Path, *, expect_ok: bool = True, cwd: Path | None = None
+):
     """Run a hook end to end against a sandboxed HOME, and PROVE it ran.
 
     One module-level helper rather than one per test class: the two copies this
@@ -91,6 +93,15 @@ def _run_hook(script: str, payload: dict, home: Path, *, expect_ok: bool = True)
         text=True,
         timeout=30,
         env=env,
+        # `cwd` is a REAL isolation axis, not a tidiness one: a hook that shells
+        # out to git resolves the repository from the PROCESS working directory,
+        # so inheriting pytest's cwd makes such a test depend on the state of
+        # whatever checkout it happened to run in — the same machine-dependence
+        # the env scrub above exists to remove. Callers that need a specific
+        # repository state must therefore CONSTRUCT one and point cwd at it.
+        # The default (None, inherit) is kept: the tests below compare two runs
+        # against each other rather than against a fixed expectation.
+        cwd=str(cwd) if cwd is not None else None,
     )
     if expect_ok:
         assert proc.returncode == 0, (
@@ -217,8 +228,8 @@ class TestUnsafeIdSkipsOnlyThePathRead:
     """An unsafe id must skip the session-SCOPED read, not the whole hook.
 
     Both of these hooks do path-INDEPENDENT work after reading the id
-    (`genesis_stop_hook` runs its giving-up / review-state checks from the hook
-    payload alone; `genesis_session_end` writes last-session metadata that uses
+    (`genesis_stop_hook` runs its giving-up / outcome-verification checks from
+    the hook payload alone; `genesis_session_end` writes last-session metadata that uses
     the id as JSON data, not as a path). An earlier revision of this guard
     returned early on an unsafe id and silently disabled that work.
     """

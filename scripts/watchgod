@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# watchgod — look at the disk guardian.
+#
+#   scripts/watchgod status          per-filesystem tier, free space, time to full
+#                                    and whether a quota binds, as of the last poll
+#
+# Reads ~/.genesis/watchgod_state.json, which the guardian
+# (scripts/tmp_watchgod.sh, the genesis-tmp-watchgod service) rewrites every poll.
+set -euo pipefail
+
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "watchgod: HOME is unset and could not be resolved" >&2; exit 1; }
+fi
+
+STATE_FILE="${WATCHGOD_STATE_FILE:-$HOME/.genesis/watchgod_state.json}"
+
+usage() {
+    sed -n '4,5p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+cmd_status() {
+    if [[ -f "$STATE_FILE" ]]; then
+        python3 - "$STATE_FILE" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(f"polled {d.get('poll_at', '?')}  mode: {'ACT' if d.get('act', 1) else 'OBSERVE'}")
+for path, fs in (d.get("disk") or {}).items():
+    eta = fs.get("eta_min")
+    print(f"  {fs.get('tier', '?'):7} {path}: {fs.get('free_mb')} MB free of {fs.get('total_mb')} MB"
+          f"{' (quota)' if fs.get('quota') else ''}; time to full: {'-' if eta is None else str(eta) + ' min'}")
+PY
+    else
+        echo "no state file at $STATE_FILE (is genesis-tmp-watchgod running?)"
+    fi
+}
+
+case "${1:-}" in
+    status) cmd_status ;;
+    -h|--help|help|"") usage 0 ;;
+    *) echo "watchgod: unknown command '$1'" >&2; usage 2 ;;
+esac
