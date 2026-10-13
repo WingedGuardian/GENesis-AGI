@@ -516,8 +516,10 @@ INT/TERM as it starts, so a second signal lands mid-rollback with default
 disposition, and the rollback has failure exits that report `ROLLBACK INCOMPLETE`.
 Either way: verify state (server active, no mid-rebase, pin, both CC versions)
 before re-running; it is idempotent. (A non-blocking PreToolUse advisory hook,
-`.claude/hooks/cc-deploy-timeout-guard`, nudges toward this on any deploy — it does
-not check whether you already detached, which is tracked in issue #2088.)
+`scripts/hooks/deploy_timeout_advisory.py`, nudges toward this whenever a command
+can run `update.sh`, and stays quiet on reads of it. It deliberately does not
+check whether you already detached: that needs systemd-run's option grammar, an
+open set, so a detached launch still gets the note.)
 
 **Why this paragraph is worded so defensively:** PR #1221 shipped both this policy
 and that hook on 2026-07-22 prescribing `run_in_background`, from a CC memory
