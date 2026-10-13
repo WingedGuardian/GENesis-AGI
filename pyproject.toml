@@ -124,6 +124,9 @@ test = [
     # once on a brace inside a `url()`, once on a rule nested in `@media` — so
     # the parser is a dependency rather than a regex.
     "tinycss2>=1.3",
+    # tests/test_payments exercise the real card vault crypto and passphrase check.
+    "pyrage>=1.4",
+    "zxcvbn>=4.5",
 ]
 browser = [
     "playwright>=1.40",
@@ -137,6 +140,12 @@ distribution = [
 ]
 documents = [
     "pageindex>=0.2.8",
+]
+payments = [
+    # The encrypted card vault (`python -m genesis vault`): age encryption and
+    # passphrase strength. Imported only by genesis.payments, at call time.
+    "pyrage>=1.4",
+    "zxcvbn>=4.5",
 ]
 release = []  # detect-secrets is now a core dep (see dependencies above)
 
