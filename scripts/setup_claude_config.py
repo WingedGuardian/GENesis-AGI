@@ -12,8 +12,11 @@ Usage:
     python scripts/setup_claude_config.py --dry-run    # Preview changes
 """
 import argparse
+import contextlib
 import json
 import os
+import shutil
+import stat
 import sys
 import tempfile
 from datetime import UTC, datetime
@@ -93,30 +96,73 @@ def _save_backup(data: bytes) -> Path:
     raise OSError(f"no free backup name in {backup_dir}")
 
 
+def _shown(text: str) -> str:
+    """Printable on any terminal: a lone surrogate or other non-ASCII text in a
+    server name (or a path) is shown escaped instead of crashing the print."""
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
 def _summary(line: str) -> None:
     # update.sh hides bootstrap's output behind `tail -10`; a deploy that wants
-    # the change named passes a summary file. Never "kept ...": bootstrap counts
-    # those lines as kept systemd units.
+    # the change named passes a summary file. update.sh sets it from #3138 on;
+    # before that this is a no-op. No line may start "kept ": that bootstrap
+    # counts those lines as kept systemd units.
     path = os.environ.get("GENESIS_DEPLOY_SUMMARY")
     if path:
         try:
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
-        except OSError:
+        except (OSError, UnicodeError):
             pass
 
 
-def _write_keeping_mode(path: Path, text: str) -> None:
+_ACL = "system.posix_acl_access"
+
+
+def _write_keeping_mode(path: Path, text: str, expected: bytes | None = None) -> str | None:
     """Write through a symlink to its target, atomically (same-dir temp file,
-    then rename), keeping the old file's mode."""
+    then rename), keeping the old file's mode, owner, group, ACL and xattrs.
+    Returns None once written, or why it declined (nothing replaced): a
+    replacement that could not carry the old file's group or ACL would change
+    who can read a file that may hold API keys. With ``expected``, it also
+    declines when the file no longer holds those bytes: someone wrote it
+    after it was read, and replacing it would lose that write."""
     target = Path(os.path.realpath(path))
-    mode = target.stat().st_mode & 0o777 if target.exists() else None
+    before = target.stat() if target.exists() else None
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".mcp.json.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
-        os.chmod(tmp, mode if mode is not None else 0o666 & ~_umask())
+            fh.flush()
+            os.fsync(fh.fileno())
+        if before is None:
+            os.chmod(tmp, 0o666 & ~_umask())
+        else:
+            # copystat carries mode, xattrs and (for the owner) the POSIX ACL;
+            # then a fresh mtime, so the rewrite looks rewritten.
+            try:
+                shutil.copystat(target, tmp)
+            except OSError:
+                os.chmod(tmp, before.st_mode & 0o777)
+            os.utime(tmp, None)
+            try:
+                lost_acl = _ACL in os.listxattr(target) and _ACL not in os.listxattr(tmp)
+            except OSError:
+                lost_acl = False  # no xattr support: nothing to carry
+            if lost_acl:
+                Path(tmp).unlink(missing_ok=True)
+                return "its POSIX ACL could not be carried to the replacement"
+            with contextlib.suppress(OSError):  # judged on the result below
+                os.chown(tmp, before.st_uid, before.st_gid)
+            now = os.stat(tmp)
+            if (now.st_uid, now.st_gid) != (before.st_uid, before.st_gid):
+                Path(tmp).unlink(missing_ok=True)
+                return f"its owner/group ({before.st_uid}:{before.st_gid}) could not be kept"
+        if expected is not None and target.read_bytes() != expected:
+            Path(tmp).unlink(missing_ok=True)
+            return "it changed while the merge ran (run bootstrap again)"
         os.replace(tmp, target)
+        return None
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
@@ -156,33 +202,63 @@ def merge_mcp(existing: object, rendered: dict, template_servers: set[str]) -> d
     return merged
 
 
-def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool:
+def _not_updated(reason: str) -> None:
+    # Failure is reported where update.sh shows it, not only on stdout,
+    # which bootstrap's `tail -10` hides.
+    print(f"  WARNING: .mcp.json left unchanged: {reason}.")
+    _summary(f"mcp.json NOT updated: {reason}")
+
+
+def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool | None:
     """Render .mcp.json from the template, keeping servers the template does not
-    own (#2413). Returns True if the file changed (or would, on a dry run)."""
+    own (#2413). Returns True if the file changed (or would, on a dry run),
+    False if it was already correct, None if it should have changed and could
+    not (no template, a .mcp.json that is not a regular file or cannot be read
+    or written, no backup, or a replacement that could not keep the old
+    file's owner or ACL). It never raises over the file: bootstrap runs it
+    under set -e."""
     template_path = genesis_root / "config" / "mcp.json.template"
     output_path = genesis_root / ".mcp.json"
 
     if not template_path.exists():
-        print(f"ERROR: MCP template not found at {template_path}", file=sys.stderr)
-        return False
+        print(f"ERROR: MCP template not found at {_shown(str(template_path))}", file=sys.stderr)
+        return None
 
     template_text = template_path.read_text()
     rendered = json.loads(render_mcp_text(template_text, genesis_root))
     template_servers = set(json.loads(template_text).get("mcpServers", {}))
 
-    old_bytes = output_path.read_bytes() if output_path.exists() else None
+    try:
+        st = os.stat(output_path)  # follows a symlink to the file it names
+    except FileNotFoundError:
+        st = None
+    except OSError as exc:
+        _not_updated(f"cannot stat it ({_shown(str(exc))})")
+        return None
+    if st is None and output_path.is_symlink():
+        _not_updated("it is a symlink to a missing file")
+        return None
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        # A FIFO would block the read forever; a directory cannot be parsed.
+        _not_updated("it is not a regular file")
+        return None
+    try:
+        old_bytes = output_path.read_bytes() if st is not None else None
+    except OSError as exc:
+        _not_updated(f"cannot read it ({_shown(str(exc))})")
+        return None
     if old_bytes is None:
         new, why = rendered, "created"
     else:
         try:
             existing = json.loads(old_bytes.decode("utf-8"), parse_constant=_reject_constant)
-        except ValueError:  # JSONDecodeError, UnicodeDecodeError, NaN/Infinity
+        except (ValueError, RecursionError):  # JSONDecodeError, UnicodeDecodeError, NaN/Infinity, absurd nesting
             existing = None
         merged = merge_mcp(existing, rendered, template_servers)
         # Compared as objects: key order and formatting are not changes (serena's
         # registration writes the same JSON without a trailing newline).
         if merged is not None and merged == existing:
-            print(f".mcp.json: already correct ({genesis_root})")
+            print(f".mcp.json: already correct ({_shown(str(genesis_root))})")
             return False
         if merged is None:
             new, why = rendered, "replaced an unreadable file with the template's servers"
@@ -198,7 +274,7 @@ def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool:
             removed = sorted(set(old_servers) - set(merged["mcpServers"]))
             kept = sorted(set(merged["mcpServers"]) - set(rendered["mcpServers"]))
             parts = [
-                f"{label} {', '.join(names)}"
+                f"{label} {', '.join(_shown(n) for n in names)}"
                 for label, names in (
                     ("updated", updated),
                     ("added", added),
@@ -209,7 +285,7 @@ def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool:
             ]
             why = "; ".join(parts) or "rewrote the file's other keys"
 
-    print(f".mcp.json: rendering with GENESIS_ROOT={genesis_root} ({why})")
+    print(f".mcp.json: rendering with GENESIS_ROOT={_shown(str(genesis_root))} ({why})")
     if dry_run:
         return True
     note = ""
@@ -218,10 +294,18 @@ def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool:
             saved = _save_backup(old_bytes)
         except OSError as exc:
             # No rewrite without a backup, but never abort bootstrap over it.
-            print(f"  WARNING: could not back up .mcp.json ({exc}); left unchanged.")
-            return False
-        note = f"; previous file saved as {saved}"
-    _write_keeping_mode(output_path, json.dumps(new, indent=2, allow_nan=False) + "\n")
+            _not_updated(f"could not back it up ({_shown(str(exc))})")
+            return None
+        note = f"; previous file saved as {_shown(str(saved))}"
+    try:
+        declined = _write_keeping_mode(
+            output_path, json.dumps(new, indent=2, allow_nan=False) + "\n", expected=old_bytes
+        )
+    except OSError as exc:
+        declined = f"cannot write it ({_shown(str(exc))})"
+    if declined is not None:
+        _not_updated(f"{declined}{note}")
+        return None
     print(f"  Written{note}.")
     if old_bytes is not None:
         _summary(f"mcp.json {why}{note}")
@@ -369,7 +453,10 @@ def main():
     genesis_root = (args.genesis_root or find_genesis_root()).resolve()
 
     if args.mcp_only:
-        render_mcp_config(genesis_root, args.dry_run)
+        if render_mcp_config(genesis_root, args.dry_run) is None:
+            # It should have rendered and could not: a stale file on disk is
+            # not a success.
+            sys.exit(1)
         # A missing template renders nothing: say so in the exit status, not only
         # on stderr, so a caller can tell. Judge the template, not the output: a
         # .mcp.json left by an earlier render, or --dry-run, must not turn the

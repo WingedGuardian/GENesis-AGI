@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -377,7 +378,7 @@ def test_a_failed_backup_leaves_the_file_unchanged_and_does_not_abort(tmp_path, 
     root = _root(tmp_path)
     (root / ".mcp.json").write_text('{"mcpServers": {"mine": {"command": "/m"}}}')
     before = (root / ".mcp.json").read_bytes()
-    assert mod.render_mcp_config(root, dry_run=False) is False
+    assert mod.render_mcp_config(root, dry_run=False) is None
     assert (root / ".mcp.json").read_bytes() == before
 
 
@@ -391,3 +392,210 @@ def test_the_notice_does_not_call_serena_the_users(tmp_path, capsys):
     mod.render_mcp_config(root, dry_run=False)
     out = capsys.readouterr().out
     assert "kept serena" in out and "your" not in out
+
+
+def _drifted(mod, root: Path, extra: dict) -> Path:
+    current = _render(mod, root)
+    current["mcpServers"]["genesis-health"]["command"] = "/old/path"
+    current["mcpServers"].update(extra)
+    path = root / ".mcp.json"
+    path.write_text(json.dumps(current, indent=2) + "\n")
+    return path
+
+
+def test_a_server_name_with_a_lone_surrogate_does_not_abort_the_render(
+    tmp_path, _scratch_home, capsys, monkeypatch
+):
+    """JSON (and Node's JSON.parse) accept "\\ud800"; printing it raw raised
+    UnicodeEncodeError before the backup, aborting bootstrap (#3284 review)."""
+    mod = _module()
+    root = _root(tmp_path)
+    summary = tmp_path / "summary.txt"
+    monkeypatch.setenv("GENESIS_DEPLOY_SUMMARY", str(summary))
+    path = _drifted(mod, root, {"\ud800odd": {"command": "/m"}})
+    assert mod.render_mcp_config(root, dry_run=False) is True
+    servers = json.loads(path.read_text())["mcpServers"]
+    assert "\ud800odd" in servers
+    assert servers["genesis-health"]["command"] != "/old/path"
+    out = capsys.readouterr().out
+    assert "\\ud800odd" in out
+    assert "\\ud800odd" in summary.read_text()
+
+
+def test_mcp_only_fails_when_the_render_could_not_be_written(tmp_path):
+    """A stale file left in place because no backup could be made is not a
+    successful render (#3284 review)."""
+    (tmp_path / "config").mkdir()
+    shutil.copyfile(TEMPLATE, tmp_path / "config" / "mcp.json.template")
+    stale = '{"mcpServers": {"genesis-health": {"command": "/old"}}}\n'
+    (tmp_path / ".mcp.json").write_text(stale)
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--mcp-only", "--genesis-root", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "GENESIS_MU_BACKUP_DIR": str(blocker / "sub")},
+    )
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert (tmp_path / ".mcp.json").read_text() == stale
+
+
+def _secondary_group() -> int | None:
+    others = [g for g in os.getgroups() if g != os.getgid()]
+    return others[0] if others else None
+
+
+def test_the_files_group_is_kept(tmp_path, _scratch_home):
+    gid = _secondary_group()
+    if gid is None:
+        pytest.skip("this user belongs to no second group")
+    mod = _module()
+    root = _root(tmp_path)
+    path = _drifted(mod, root, {})
+    os.chown(path, -1, gid)
+    assert mod.render_mcp_config(root, dry_run=False) is True
+    assert path.stat().st_gid == gid
+
+
+def test_a_group_that_cannot_be_kept_leaves_the_file_unchanged(tmp_path, _scratch_home, monkeypatch):
+    gid = _secondary_group()
+    if gid is None:
+        pytest.skip("this user belongs to no second group")
+    mod = _module()
+    root = _root(tmp_path)
+    path = _drifted(mod, root, {})
+    os.chown(path, -1, gid)
+    before = path.read_bytes()
+    monkeypatch.setattr(mod.os, "chown", lambda *a, **k: (_ for _ in ()).throw(PermissionError("no")))
+    assert mod.render_mcp_config(root, dry_run=False) is None
+    assert path.read_bytes() == before and path.stat().st_gid == gid
+    assert not list(root.glob(".mcp.json.*")), "temp file left behind"
+
+
+def _acl_bytes() -> bytes:
+    import struct
+
+    u = 0xFFFFFFFF
+    entries = [(1, 6, u), (2, 4, 65534), (4, 4, u), (0x10, 4, u), (0x20, 4, u)]
+    return struct.pack("<I", 2) + b"".join(struct.pack("<HHI", t, p, i) for t, p, i in entries)
+
+
+def _with_acl(path: Path) -> None:
+    try:
+        os.setxattr(path, "system.posix_acl_access", _acl_bytes())
+    except (OSError, AttributeError):
+        pytest.skip("no POSIX ACL support here")
+
+
+def test_a_posix_acl_is_kept(tmp_path, _scratch_home):
+    mod = _module()
+    root = _root(tmp_path)
+    path = _drifted(mod, root, {})
+    _with_acl(path)
+    acl = os.getxattr(path, "system.posix_acl_access")
+    assert mod.render_mcp_config(root, dry_run=False) is True
+    assert os.getxattr(path, "system.posix_acl_access") == acl
+
+
+def test_an_acl_that_cannot_be_carried_leaves_the_file_unchanged(tmp_path, _scratch_home, monkeypatch):
+    mod = _module()
+    root = _root(tmp_path)
+    path = _drifted(mod, root, {})
+    _with_acl(path)
+    before = path.read_bytes()
+    monkeypatch.setattr(mod.shutil, "copystat", lambda src, dst: os.chmod(dst, 0o600))
+    assert mod.render_mcp_config(root, dry_run=False) is None
+    assert path.read_bytes() == before
+    assert not list(root.glob(".mcp.json.*")), "temp file left behind"
+
+
+def _bootstrap_run(root: Path, tmp_path: Path, extra_env: dict | None = None) -> subprocess.CompletedProcess:
+    """The script on the command line, bounded so a hang fails, not blocks."""
+    env = {**os.environ, "GENESIS_DEPLOY_SUMMARY": str(tmp_path / "summary.txt"), **(extra_env or {})}
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "--mcp-only", "--genesis-root", str(root)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory", "dangling-symlink", "unreadable"])
+def test_a_file_it_cannot_use_is_reported_never_a_crash_or_a_hang(tmp_path, _scratch_home, kind):
+    """bootstrap runs this under set -e: a traceback would abort it, and a FIFO
+    used to block the read forever (#3284 class audit)."""
+    root = _root(tmp_path)
+    path = root / ".mcp.json"
+    if kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "directory":
+        path.mkdir()
+    elif kind == "dangling-symlink":
+        path.symlink_to(tmp_path / "missing-dir" / "mcp.json")
+    else:
+        path.write_text('{"mcpServers": {}}')
+        path.chmod(0)
+        if os.access(path, os.R_OK):
+            pytest.skip("running with privileges that ignore file modes")
+    try:
+        r = _bootstrap_run(root, tmp_path)
+    finally:
+        if kind == "unreadable":
+            path.chmod(0o600)
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr
+    assert "left unchanged" in r.stdout
+    assert "mcp.json NOT updated" in (tmp_path / "summary.txt").read_text()
+    reason = {
+        "fifo": "not a regular file",
+        "directory": "not a regular file",
+        "dangling-symlink": "symlink to a missing file",
+        "unreadable": "cannot read it",
+    }[kind]
+    assert reason in r.stdout, r.stdout
+
+
+def test_a_directory_it_cannot_write_into_is_reported(tmp_path, _scratch_home):
+    mod = _module()
+    root = _root(tmp_path)
+    path = root / ".mcp.json"
+    path.write_text('{"mcpServers": {"mine": {"command": "/m"}}}')
+    before = path.read_bytes()
+    root.chmod(0o555)
+    try:
+        if os.access(root, os.W_OK):
+            pytest.skip("running with privileges that ignore directory modes")
+        assert mod.render_mcp_config(root, dry_run=False) is None
+    finally:
+        root.chmod(0o755)
+    assert path.read_bytes() == before
+
+
+def test_a_write_landing_after_the_read_is_not_overwritten(tmp_path, _scratch_home, monkeypatch):
+    """Compare-and-swap: a `claude mcp add` landing between the read and the
+    replace would otherwise be lost (#3284 class audit)."""
+    mod = _module()
+    root = _root(tmp_path)
+    path = _drifted(mod, root, {})
+    theirs = '{"mcpServers": {"added-meanwhile": {"command": "/x"}}}\n'
+    real_copystat = mod.shutil.copystat
+
+    def copystat_then_someone_writes(src, dst):
+        real_copystat(src, dst)
+        Path(src).write_text(theirs)
+
+    monkeypatch.setattr(mod.shutil, "copystat", copystat_then_someone_writes)
+    assert mod.render_mcp_config(root, dry_run=False) is None
+    assert path.read_text() == theirs
+    assert not list(root.glob(".mcp.json.*")), "temp file left behind"
+
+
+def test_absurdly_deep_json_is_treated_as_unreadable_not_a_crash(tmp_path, _scratch_home):
+    mod = _module()
+    root = _root(tmp_path)
+    (root / ".mcp.json").write_text("[" * 100_000 + "]" * 100_000)
+    assert mod.render_mcp_config(root, dry_run=False) is True
+    assert "genesis-health" in json.loads((root / ".mcp.json").read_text())["mcpServers"]
