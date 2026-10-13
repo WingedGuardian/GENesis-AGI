@@ -712,6 +712,9 @@ jobs:
         #   104  branch leak scan (#2880): two workflow tests call ripgrep,
         #        which this job does not install (the run at 3b14708f1
         #        skipped 104).
+        #   124  native codex harness (#3075): test_codex_native.py's 20 cases
+        #        carry a module-wide skipif on GENESIS_CODEX_NATIVE_TESTS,
+        #        which CI never sets (native binaries are a separate opt-in).
         # Before raising it to green, read each new skip's own message:
         # raising the ceiling can CERTIFY a dormant test, and the ceiling
         # cannot say which test skipped. The behavioural fleet-door and
@@ -719,7 +722,7 @@ jobs:
         # if that fails, so read those first when the count rises.
         # The collected-count floor that shared this line until #2743, and its
         # ledger of hand counts, are in this file's git history.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 104
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 124
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job
