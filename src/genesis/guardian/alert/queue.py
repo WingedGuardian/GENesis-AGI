@@ -27,6 +27,7 @@ Schema v1 (one JSON file per alert, named ``<ts>-<uuid>.json``)::
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import math
@@ -157,6 +158,12 @@ def list_queued(root: Path | str) -> list[tuple[Path, dict[str, Any]]]:
         except FileNotFoundError:
             continue  # drained or quarantined by another reader meanwhile
         except OSError as exc:
+            if isinstance(exc, (IsADirectoryError, NotADirectoryError)) or exc.errno == errno.ELOOP:
+                # Not a file at all: no retry will ever read it, so quarantine
+                # it like bad content (review finding: kept, it warned forever).
+                logger.warning("alert-queue entry %s quarantined (%s)", path.name, exc)
+                _quarantine_corrupt(path)
+                continue
             # Unreadable right now (permissions, fd limit, I/O): the content may
             # be fine, so keep it for the next pass rather than quarantine it.
             logger.warning("alert-queue entry %s unreadable, kept (%s)", path.name, exc)
@@ -209,19 +216,31 @@ def prune(
     max_age_s: float = _PRUNE_MAX_AGE_S,
 ) -> int:
     """Bound the queue: drop entries older than ``max_age_s``, then oldest over
-    ``max_files``, and quarantined ``*.corrupt`` files older than ``max_age_s``
-    (nothing reads them). Best-effort — returns the number removed, never raises.
+    ``max_files``. Quarantined ``*.corrupt`` files (nothing reads them) get the
+    same two bounds: older than ``max_age_s``, then oldest over ``max_files``, so
+    a producer that keeps writing bad entries cannot grow them without limit
+    (review finding). A quarantined directory is never removed here.
+    Best-effort — returns the number removed, never raises.
     """
     removed = 0
     try:
         entries = list_queued(root)
         now = time.time()
+        kept_corrupt: list[tuple[float, str, Path]] = []
         for path in Path(root).expanduser().glob("*.corrupt"):
             try:
-                if now - path.stat().st_mtime > max_age_s:
+                st = path.lstat()
+                if not os.path.isfile(path) or os.path.islink(path):
+                    continue
+                if now - st.st_mtime > max_age_s:
                     removed += _safe_unlink(path)
+                else:
+                    kept_corrupt.append((st.st_mtime, path.name, path))
             except OSError:
                 continue
+        kept_corrupt.sort()
+        for _, _, path in kept_corrupt[: max(0, len(kept_corrupt) - max_files)]:
+            removed += _safe_unlink(path)
         survivors: list[tuple[Path, dict[str, Any]]] = []
         for path, entry in entries:
             if now - float(entry.get("ts", now)) > max_age_s:

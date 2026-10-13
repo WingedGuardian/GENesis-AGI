@@ -8,6 +8,7 @@ terminal-vs-transient send contract, corrupt-entry quarantine, and prune caps.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -457,3 +458,51 @@ def test_host_meta_keys_match_what_the_host_drain_reads() -> None:
     }
     assert read  # guard-the-guard: the reader really was parsed
     assert set(q._HOST_META_KEYS) == read
+
+
+
+# --- round 2 (#3287): structural entries; a bound on quarantined files -------
+
+
+def test_a_directory_named_like_an_entry_is_quarantined_once(tmp_path, caplog):
+    """A directory called *.json can never be read: it is quarantined like bad
+    content, not kept and warned about on every pass (review finding)."""
+    root = tmp_path / "q"
+    root.mkdir()
+    (root / "odd.json").mkdir()
+    (root / "ok.json").write_text(json.dumps(_valid()))
+    with caplog.at_level("WARNING"):
+        first = q.list_queued(root)
+    assert [p.name for p, _ in first] == ["ok.json"]
+    assert (root / "odd.json.corrupt").is_dir()
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        q.list_queued(root)
+    assert "odd" not in caplog.text, "no warning on the next pass"
+
+
+def test_quarantined_files_are_bounded_by_count(tmp_path):
+    """A producer writing bad entries every poll leaves at most max_files
+    quarantined files: the oldest go first."""
+    root = tmp_path / "q"
+    root.mkdir()
+    now = time.time()
+    for i in range(12):
+        p = root / f"bad{i:02d}.json.corrupt"
+        p.write_text("x")
+        os.utime(p, (now - 100 + i, now - 100 + i))
+    removed = q.prune(root, max_files=5)
+    left = sorted(p.name for p in root.glob("*.corrupt"))
+    assert removed == 7
+    assert left == [f"bad{i:02d}.json.corrupt" for i in range(7, 12)], "the newest kept"
+
+
+def test_a_quarantined_directory_is_left_alone_by_prune(tmp_path):
+    root = tmp_path / "q"
+    root.mkdir()
+    d = root / "odd.json.corrupt"
+    d.mkdir()
+    old = time.time() - 10 * q._PRUNE_MAX_AGE_S
+    os.utime(d, (old, old))
+    q.prune(root, max_files=0)
+    assert d.is_dir()
