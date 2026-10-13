@@ -455,7 +455,7 @@ _deps_ok() {
     out="$("$VENV_DIR/bin/python" -P "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
     case "$rc" in
         0) return 0 ;;
-        3) echo "ERROR: $what needs a newer Python than this venv runs, and a reinstall cannot change that:" >&2 ;;
+        3) echo "ERROR: $what needs a Python version (its requires-python) that this venv does not run, and a reinstall cannot change that:" >&2 ;;
         *) echo "ERROR: the venv does not match $what's pyproject.toml — run $remedy instead:" >&2 ;;
     esac
     echo "$out" | sed 's/^/         /' >&2

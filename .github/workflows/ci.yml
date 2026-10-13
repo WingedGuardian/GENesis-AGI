@@ -51,7 +51,8 @@ jobs:
     # passed this job at 18:41 EDT; by 23:30 the same tree failed it on four
     # different branches simultaneously. The four new IDs were litellm
     # CVE-2026-12771/12772/12773/12795, every one of them in `litellm/proxy/` —
-    # the same proxy-server class as the 28 already triaged below, and Genesis
+    # the same proxy-server class as the litellm IDs triaged at the time (since
+    # removed: the 1.93.2 pin is not affected by any of them), and Genesis
     # imports acompletion / completion_cost / model_cost / the exception types
     # and references the proxy NOWHERE (verified across src/, scripts/, config/
     # and pyproject.toml).
@@ -69,6 +70,8 @@ jobs:
     # they were judged unreachable; deleting it would discard that reasoning.
     # This reporting-policy change adds no new ignores: the four IDs discussed
     # above remain visible, along with any other ID outside the existing baseline.
+    # An ID is removed only when the pinned version is no longer affected by it
+    # (git history keeps the reasoning).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -94,26 +97,10 @@ jobs:
           # A NEW / untriaged advisory is NOT in this list, so it is REPORTED here —
           # it no longer fails the job (see continue-on-error above). Existing
           # ignores reduce log noise; all IDs outside that baseline stay visible.
-          #   litellm 1.78.7 — every ID is a proxy-server / JWT / OIDC / UI /
-          #     MCP-gateway vuln; Genesis uses acompletion/completion_cost only
-          #     (no proxy server), so none are reachable. Pinned <1.83 also dodges
-          #     1.82.x malware. The 2026-11 batch is the same class, each gated on
-          #     running the proxy Genesis never starts (advisory-verified):
-          #       CVE-2026-59819 — /health/test_connection OIDC file-read (proxy).
-          #       CVE-2026-59820 — /v1/skills archive path-traversal (proxy route).
-          #       CVE-2026-59821 — Guardrails create/update code-exec (proxy).
-          #       CVE-2026-59822 — MCP Streamable-HTTP OAuth2 auth bypass (proxy MCP
-          #         gateway; Genesis's own MCP servers are fastmcp, not litellm's).
-          #       CVE-2026-37004 — SSTI to OS command execution via the
-          #         dotprompt_content parameter of the /prompts/test endpoint, from
-          #         an unsandboxed jinja2.Environment. CVSS 9.8, and unreachable for
-          #         the same structural reason as the four above: the sink is
-          #         litellm/proxy/prompts/prompt_endpoints.py, served only by the
-          #         proxy. pip-audit names 1.83.7 as the fix, which is past the
-          #         1.82.x malware the pin exists to avoid — so the pin stays and
-          #         the reachability argument, not the version, is what holds here.
-          #     grep-verified: only litellm.acompletion / completion_cost /
-          #     model_cost + exception types are imported — no proxy surface.
+          #   litellm — no ignores. The 1.93.2 pin has no known advisories
+          #     (pip-audit, 2026-10-13). The twelve litellm IDs this list carried
+          #     for the old 1.78.7 pin (all proxy-server surface Genesis never runs)
+          #     are fixed by 1.93.2 and were removed with the bump; see git history.
           #   diskcache 5.6.3 (CVE-2025-69872) — pickle-by-default RCE, no fixed
           #     release. Genesis's only diskcache use (memory/embeddings.py) is a
           #     JSON-only _SafeDisk subclass, so the vulnerable pickle path is unused.
@@ -131,20 +118,8 @@ jobs:
           #     vulnerable OAuth flow. Revisit if Genesis ever adopts FastMCP
           #     OAuthProxy/OAuth auth, or a Windows `fastmcp install` path.
           pip-audit \
-            --ignore-vuln PYSEC-2026-390 \
-            --ignore-vuln PYSEC-2026-388 \
-            --ignore-vuln CVE-2026-35029 \
-            --ignore-vuln GHSA-69x8-hrgq-fjj8 \
-            --ignore-vuln CVE-2026-42271 \
-            --ignore-vuln CVE-2026-47102 \
-            --ignore-vuln CVE-2026-47101 \
-            --ignore-vuln CVE-2026-59819 \
-            --ignore-vuln CVE-2026-59820 \
-            --ignore-vuln CVE-2026-59821 \
-            --ignore-vuln CVE-2026-59822 \
             --ignore-vuln CVE-2025-69872 \
             --ignore-vuln PYSEC-2026-2475 \
-            --ignore-vuln CVE-2026-37004 \
             --ignore-vuln PYSEC-2026-2476
 
   leak-detector:
