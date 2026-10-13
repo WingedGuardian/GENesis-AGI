@@ -114,8 +114,9 @@ declare -gA _RW_PREV=() _RW_LAST=() _RW_PAGED=()
 # first (unset for the first one).
 declare -gA _RW_EP=()
 # Per generation: the writers' descriptors ("pid/fd ...") it was last seen
-# through, to follow it once paged; and the reason of a page that could not be
-# queued, sent on a later poll.
+# through, to follow it once paged. Per generation AND mode ("<gen><mode tag>"):
+# the reason of a page that could not be queued, sent on a later poll in that
+# mode only, and cleared only by that mode's page.
 declare -gA _RW_LINKS=() _RW_DUE=()
 # When a baseline in _RW_PREV is older than the last poll: a file an
 # incomplete walk did not report keeps its last size and the time it was
@@ -222,7 +223,7 @@ _rw_holders() {
 
 _rw_episode_open() {
     # $1 generation, $2 now. The file's episode ended: page it again from here.
-    unset "_RW_PAGED[$1]" "_RW_DUE[$1]"
+    unset "_RW_PAGED[$1]" "_RW_DUE[$1]" "_RW_DUE[${1}_observe]"
     _RW_EP[$1]="$2"
 }
 
@@ -257,14 +258,20 @@ wg_runaway_check() {
     done <<< "$scan"
     # Paged (or between episodes) and not reported: follow it through the
     # descriptors it was last seen through. Its size comes from the stat below.
-    local gen
+    local gen pf
     local -A follow=()
     for gen in "${!_RW_LINKS[@]}"; do
         [[ -n "${_RW_PAGED[$gen]:-}${_RW_EP[$gen]:-}" ]] || continue
         key="${gen%:*}"
-        [[ -n "${size_of[$key]:-}" ]] && continue
-        size_of[$key]=0; dev_of[$key]="${key%%:*}"; fds_of[$key]="${_RW_LINKS[$gen]}"
-        follow[$key]="$gen"
+        [[ -n "${size_of[$key]:-}" && -z "${follow[$key]:-}" ]] && continue
+        # An inode reused while an older generation is still remembered has
+        # two candidates: follow both, and let the stat's birth time say which
+        # one the descriptor leads to (review finding).
+        size_of[$key]=0; dev_of[$key]="${key%%:*}"
+        for pf in ${_RW_LINKS[$gen]}; do
+            [[ " ${fds_of[$key]:-} " == *" $pf "* ]] || fds_of[$key]="${fds_of[$key]:-}${fds_of[$key]:+ }$pf"
+        done
+        follow[$key]="${follow[$key]:-}${follow[$key]:+ }$gen"
     done
     local walk_ok=1
     if [[ ! "$scan_rc" =~ ^[01]$ ]]; then
@@ -273,7 +280,7 @@ wg_runaway_check() {
     fi
 
     local dt pg path dom dtotal dpath size_mb raw_b norm_b why sid body
-    local link id birth blk pf pfpid st_line st_rc=0 opened vlinks
+    local link id birth blk pfpid st_line st_rc=0 opened vlinks
     local -A size_now=() st_of=()
     local -a holders links=()
     pg="$(_wg_mode_tag)"
@@ -313,6 +320,9 @@ wg_runaway_check() {
             # finding). The scan already checked its own.
             [[ -n "${follow[$key]:-}" ]] && ! _rw_writer "$pfpid" "${pf#*/}" && continue
             [[ -n "$link" ]] || { link="$l"; birth="$b"; blk="$k"; }
+            # Once each: two generations' lists can name the same descriptor
+            # (review finding: the copies grew by one every poll).
+            [[ " $vlinks " == *" $pf "* ]] && continue
             vlinks+="${vlinks:+ }$pf"
             [[ -n "${counted[$pfpid]:-}" ]] && continue
             counted[$pfpid]=1
@@ -324,7 +334,7 @@ wg_runaway_check() {
         gen="${key}:${birth}"
         if [[ -n "${follow[$key]:-}" ]]; then
             # Followed: only the same generation, and its size from the stat.
-            [[ "$gen" == "${follow[$key]}" && "$blk" =~ ^[0-9]+$ ]] || continue
+            [[ " ${follow[$key]} " == *" $gen "* && "$blk" =~ ^[0-9]+$ ]] || continue
             size_of[$key]=$(( blk * 512 ))
         fi
         _RW_LAST[$gen]=$now
@@ -381,8 +391,8 @@ wg_runaway_check() {
         fi
         # Due in THIS mode only: an observe page never stands in for the one
         # an acting poll owes (review finding).
-        if [[ -z "$why" && "${_RW_DUE[$gen]:-}" == "${pg}|"* ]]; then
-            why="${_RW_DUE[$gen]#*|} (found at an earlier poll, whose page could not be queued)"
+        if [[ -z "$why" && -n "${_RW_DUE[$gen$pg]:-}" ]]; then
+            why="${_RW_DUE[$gen$pg]} (found at an earlier poll, whose page could not be queued)"
         fi
         [[ -n "$why" ]] || continue
         (( opened )) && continue
@@ -402,10 +412,12 @@ wg_runaway_check() {
         if _wg_page critical "Runaway file on ${dpath}: ${path##*/}${again}" "$body" \
                 "$pkey" "CRITICAL — runaway ${path} (${size_mb} MB)${again}"; then
             _RW_PAGED[$gen]="${_RW_PAGED[$gen]:-} mode${pg}"
-            unset "_RW_DUE[$gen]"
+            # Only this mode's debt: the other mode still owes its own page
+            # (review finding).
+            unset "_RW_DUE[$gen$pg]"
             log WARN "runaway file ${path} (${size_mb} MB; ${why}); writers: ${holders[*]}"
         else
-            _RW_DUE[$gen]="${pg}|${why% (found at an earlier poll*}"
+            _RW_DUE[$gen$pg]="${why% (found at an earlier poll*}"
         fi
     done
 
@@ -423,7 +435,7 @@ wg_runaway_check() {
             [[ -n "${_RW_PAGED[$gen]:-}${_RW_EP[$gen]:-}" ]] && ttl=$DG_RUNAWAY_PAGED_FORGET_S
             (( now - ${_RW_LAST[$gen]} > ttl )) || continue
             unset "_RW_LAST[$gen]" "_RW_PAGED[$gen]" "_RW_EP[$gen]" "_RW_PREV[$gen]" "_RW_PREV_AT[$gen]" \
-                  "_RW_LINKS[$gen]" "_RW_DUE[$gen]"
+                  "_RW_LINKS[$gen]" "_RW_DUE[$gen]" "_RW_DUE[${gen}_observe]"
         done
     fi
 

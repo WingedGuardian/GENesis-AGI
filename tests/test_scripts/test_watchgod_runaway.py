@@ -1311,3 +1311,86 @@ def test_a_due_page_is_sent_only_in_the_mode_that_owes_it(box):
     assert len(pages) == 1 and "observe" not in pages[0]["dedupe_key"], [
         p["dedupe_key"] for p in pages
     ]
+
+
+def test_a_page_in_one_mode_does_not_clear_the_debt_of_the_other(box):
+    """Codex (PR #3290, round 4): a growth page fails in ACT, the file keeps
+    growing and an OBSERVE page succeeds, growth stops, ACT resumes: ACT still
+    owes its page and sends it."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    dom = _domain(box, 4000)
+    q = box["queue"]
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_alloc(f, 460)}
+        : > '{q}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        rm -f '{q}'
+        WATCHGOD_ACT=0
+        {_alloc(f, 860)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        WATCHGOD_ACT=1
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo DUE=${{#_RW_DUE[@]}}
+        """,
+    )
+    keys = [p["dedupe_key"] for p in _pages(box)]
+    assert any(k.endswith(":observe") for k in keys), keys
+    assert any(not k.endswith(":observe") for k in keys), "the ACT page was still sent"
+    assert "DUE=0" in out.stdout
+
+
+def test_every_remembered_generation_of_an_inode_is_followed(box):
+    """Codex (PR #3290, round 4): two paged generations remembered for one
+    device:inode (an inode reused after a paged file was removed). Whichever
+    the descriptor now leads to is followed; the other never stands in for it,
+    whatever order the array is walked in."""
+    f = _file(box, "out.log", 200)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        g=$(printf '%s\\n' "${{!_RW_LINKS[@]}}")
+        key="${{g%:*}}"
+        # Stale, older generations of the same inode, also paged, with dead
+        # links: several, so the live one is not simply walked first.
+        for b in 1 2 3 4 5 6 7 8; do
+            _RW_LINKS["$key:$b"]="99$b/9"; _RW_PAGED["$key:$b"]=" mode"; _RW_LAST["$key:$b"]=$(date +%s)
+            _RW_PREV["$key:$b"]=$(( 300 * 1048576 ))
+        done
+        {_empty(f)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EP=${{_RW_EP[$g]:+open}}
+        """,
+    )
+    assert "EP=open" in out.stdout, out.stdout
+
+
+def test_a_descriptor_shared_by_two_generations_is_kept_once(box):
+    """The same writer descriptor in a stale generation's and the live
+    generation's list (a rotated log reopened on the same fd, its inode reused)
+    is followed and remembered once, poll after poll (review finding)."""
+    f = _file(box, "out.log", 200)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        g=$(printf '%s\\n' "${{!_RW_LINKS[@]}}")
+        key="${{g%:*}}"
+        _RW_LINKS["$key:1"]="5/1"; _RW_PAGED["$key:1"]=" mode"; _RW_LAST["$key:1"]=$(date +%s)
+        _RW_PREV["$key:1"]=$(( 300 * 1048576 ))
+        {_empty(f)}
+        for i in 1 2 3 4 5; do
+            _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        done
+        echo "L=[${{_RW_LINKS[$g]}}]"
+        """,
+    )
+    assert "L=[5/1]" in out.stdout, out.stdout
