@@ -207,7 +207,9 @@ launch on a new build, the profile is copied to
 back to the old build means restoring that copy with no browser open: an
 operator step, never one a session takes. The newest copy is kept, and the
 newest of each version for 90 days; older ones are deleted after 14 days.
-`scripts/browser.py` copies the Chromium profile the same way.
+`scripts/browser.py` copies the Chromium profile the same way when Genesis is
+importable from where it runs; otherwise it prints a note and launches without a
+copy.
 
 **Not installed?** If `browser_navigate` returns `Browser not available` or
 `Camoufox is not ready: …`, the browser packages or the Camoufox engine are

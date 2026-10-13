@@ -1199,3 +1199,11 @@ def test_a_removed_property_needs_no_type(cache, monkeypatch, tmp_path, linux):
         '[{"property": "a", "type": "str"}, {"property": "b", "removed": "140"}]'
     )
     assert engine.resolve_camoufox_engine().kind == engine.READY
+
+
+def test_a_versionless_package_is_unreadable_not_absent(monkeypatch):
+    """A dist-info with no Version answers None on Python 3.12 (MEASURED): a damaged
+    install, whose step is a reinstall, never "not installed"."""
+    monkeypatch.setattr(engine.metadata, "version", lambda name: None)
+    with pytest.raises(engine._UnreadableMetadata):
+        engine._dist_version("camoufox")

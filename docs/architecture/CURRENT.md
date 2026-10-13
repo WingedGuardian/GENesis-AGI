@@ -1490,7 +1490,8 @@ verified: 637f7f7bb679 2026-10-05
   copy's own burst would raise it), though a disk already ORANGE
   still gets one; never stops the launch, though a launch waits up to 10 minutes
   for another session's copy of the same profile).
-  `scripts/browser.py` copies too. The Chromium fallback and that CLI run
+  `scripts/browser.py` copies too when it can import Genesis (else it says so and
+  launches without a copy). The Chromium fallback and that CLI run
   through patchright when installed. `scripts/disk_hygiene.sh` keeps
   the newest copy per profile, and the newest per version for 90 days. The automation TOOLS live in
   `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
