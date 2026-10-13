@@ -583,11 +583,14 @@ async def _ensure_chromium_fallback():
             await _cleanup_chromium()
 
         package = _chromium_package()
-        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
+        # Selected once: every check below guards the package this launch imports,
+        # even if one is installed or removed meanwhile.
+        dists = (package,)
+        packages.check_loaded_browser_modules(dists)
         async_playwright = _chromium_async_playwright(package)
         # Again past the import: an upgrade that began after the first check
         # would have mixed old loaded modules with new files.
-        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
+        packages.check_loaded_browser_modules(dists)
         # Always headed — Xvfb :99 is always running. Set before the driver starts:
         # it copies the environment then, and the browser inherits the driver's.
         os.environ["DISPLAY"] = _VNC_DISPLAY
@@ -605,7 +608,7 @@ async def _ensure_chromium_fallback():
             )
             # And after the copy, which can wait minutes for another session's: an
             # upgrade in that window must not reach the launch.
-            packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
+            packages.check_loaded_browser_modules(dists)
             _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
             ctx = await pw.chromium.launch_persistent_context(

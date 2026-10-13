@@ -6799,6 +6799,34 @@ console.log(JSON.stringify([TARGET(E, [5, 5]), TARGET(E, null), at(N), at(M), TA
         assert original.listeners("popup") == []
 
 
+
+@pytest.mark.asyncio
+async def test_every_chromium_guard_checks_the_package_this_launch_selected(monkeypatch):
+    """The package is selected once; a removal or install between the checks must
+    not switch them to a package the launch is not using."""
+    from genesis.browser import packages, profile_backup
+
+    picks = iter(["patchright", "playwright", "playwright", "playwright"])
+    monkeypatch.setattr(browser, "_chromium_package", lambda: next(picks))
+    checked = []
+    monkeypatch.setattr(packages, "check_loaded_browser_modules", checked.append)
+    monkeypatch.setattr(profile_backup, "backup_chromium_profile", lambda *a: None)
+    monkeypatch.setattr(browser.chromium, "not_ready_at", lambda *a: None)
+    # The driver starts before the copy (it names the Chromium to check), so the
+    # last guard runs after it; stop at the launch itself.
+    pw = MagicMock()
+    pw.chromium.launch_persistent_context = AsyncMock(
+        side_effect=RuntimeError("stop at the launch")
+    )
+    pw.stop = AsyncMock()
+    starter = MagicMock()
+    starter.start = AsyncMock(return_value=pw)
+    monkeypatch.setattr(browser, "_chromium_async_playwright", lambda package: lambda: starter)
+    with pytest.raises(RuntimeError, match="stop at the launch"):
+        await browser._ensure_chromium_fallback()
+    assert checked == [("patchright",)] * 3
+
+
 @pytest.mark.asyncio
 async def test_chromium_rechecks_packages_after_the_backup(monkeypatch):
     """The copy can wait up to ten minutes for another session's: an upgrade in that

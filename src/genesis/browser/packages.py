@@ -36,7 +36,9 @@ def installed_versions() -> dict[str, str | None]:
     found: dict[str, str | None] = {}
     for dist in BROWSER_DISTS:
         try:
-            found[dist] = metadata.version(dist)
+            # A dist-info with no Version (a half-removed install) answers None on
+            # Python 3.12: present but unreadable, never absent.
+            found[dist] = metadata.version(dist) or UNREADABLE
         except metadata.PackageNotFoundError:
             found[dist] = None
         except Exception:  # noqa: BLE001 - a damaged install, reported as one
