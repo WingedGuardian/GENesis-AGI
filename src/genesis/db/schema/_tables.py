@@ -1244,7 +1244,8 @@ TABLES = {
             dream_cycle_run_id TEXT,
             -- When the dream merge soft-deleted this memory (ISO). The authoritative
             -- deprecation time — used to age out the original's stale links after the
-            -- rollback window. NULL for non-dream deprecations (e.g. entity adjudication).
+            -- rollback window. Set only by dream SYNTHESIS, which copies edges first;
+            -- NULL elsewhere, including dream entity merges (they copy no edges, #2993).
             deprecated_at    TEXT,
             origin_class     TEXT,
             -- GROUNDWORK(voice-graduation-w2): provenance/trust columns for

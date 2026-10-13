@@ -40,6 +40,14 @@ def test_nohup_fallback_closes_lock_fd(text: str) -> None:
     assert nohup != -1, "nohup fallback not found"
     block = text[nohup : nohup + 200]
     assert "{_UPDATE_LOCK_FD}>&-" in block, "nohup fallback must close the lock FD for the child"
+    # The checkout-lock FD too, closed in the child's subshell just before the
+    # exec (it is unset when the lock is not held).
+    pre = text[text.rfind("(", 0, nohup) : nohup]
+    assert (
+        'if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then exec {GENESIS_CHECKOUT_LOCK_FD}>&-; fi'
+        in pre
+    ), "nohup fallback must close the checkout-lock FD for the child"
+    assert text[nohup - 5 : nohup] == "exec ", "the subshell must exec, so $! is the server"
 
 
 def test_flock_after_worktree_refusal_before_backup(text: str) -> None:

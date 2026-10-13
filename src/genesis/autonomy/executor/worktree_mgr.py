@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +42,7 @@ async def _delete_branch(branch: str, repo_root: Path) -> None:
         cwd=str(repo_root),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_scrubbed_git_env(),
     )
     _, stderr = await proc.communicate()
     if proc.returncode == 0:
@@ -69,6 +71,31 @@ class BaseRef:
     sha: str
 
 
+#: Repository-local variables, as ``git rev-parse --local-env-vars`` lists them
+#: (git 2.43). Any of them can point git at another repository than repo_root,
+#: so every git call here runs without them: a classification read and the
+#: mutation that follows it must see the same repository.
+#: Except the two command-line config channels (``GIT_CONFIG_PARAMETERS``,
+#: ``GIT_CONFIG_COUNT`` with its ``GIT_CONFIG_KEY_n``/``GIT_CONFIG_VALUE_n``):
+#: they are protected config, the only place git accepts ``safe.directory``
+#: from besides the system and global files, so an install whose checkout uid
+#: differs from the executor's passes it there. Scrubbing them makes every git
+#: call here fail with "dubious ownership" (MEASURED, git 2.43). Config can
+#: still set ``core.worktree``; whoever launched the executor set it on
+#: purpose, unlike a ``GIT_DIR`` inherited from a parent git process.
+_GIT_LOCATION_VARS = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG",
+    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+)
+
+
+def _scrubbed_git_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_VARS}
+
+
 async def _git_read(repo_root: Path, *args: str) -> tuple[int, str]:
     """Run a read-only git command; (returncode, stripped stdout). A timeout
     reads as a failure (-1), never a hang."""
@@ -77,6 +104,7 @@ async def _git_read(repo_root: Path, *args: str) -> tuple[int, str]:
         cwd=str(repo_root),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_scrubbed_git_env(),
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=_GIT_READ_TIMEOUT_S)
@@ -123,8 +151,15 @@ async def _prune_worktrees(repo_root: Path) -> None:
         cwd=str(repo_root),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_scrubbed_git_env(),
     )
-    await proc.communicate()
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        # The add that follows then fails on the stale record; say why here.
+        logger.warning(
+            "git worktree prune failed in %s: %s",
+            repo_root, stderr.decode(errors="replace").strip(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +212,7 @@ async def create_worktree(
         cwd=str(repo_root),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_scrubbed_git_env(),
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
@@ -188,6 +224,7 @@ async def create_worktree(
                 cwd=str(repo_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=_scrubbed_git_env(),
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
@@ -231,9 +268,33 @@ async def _worktree_records(repo_root: Path) -> list[dict[str, str]] | None:
     return [r for r in records if "worktree" in r] or None
 
 
+def _as_named(path: Path) -> Path:
+    """``path`` with its parent resolved and its last component kept.
+
+    Not ``resolve()``: a task directory replaced by a symlink to the main
+    checkout would resolve to the main checkout's own record and top level,
+    and a resumed task would run there (#3061 review, reproduced on git 2.43).
+    Spelled this way it keeps its own name, so it can match only its own
+    record and is never its own top level.
+    """
+    path = Path(os.path.abspath(path))
+    return path.parent.resolve() / path.name
+
+
 def _record_for(records: list[dict[str, str]], wt_path: Path) -> dict[str, str] | None:
-    target = wt_path.resolve()
-    return next((r for r in records if Path(r["worktree"]).resolve() == target), None)
+    """The record git keeps for ``wt_path``, skipping a ``prunable`` one.
+
+    git marks a record prunable when the worktree's ``.git`` file is gone, i.e.
+    the directory was deleted (and possibly re-created) outside git; nothing
+    lives there, and treating it as registered would adopt an orphan directory
+    in which git walks up to the main checkout (MEASURED, git 2.43). A LOCKED
+    record is never marked prunable, so the caller checks the directory too.
+    """
+    target = _as_named(wt_path)
+    return next(
+        (r for r in records if "prunable" not in r and _as_named(Path(r["worktree"])) == target),
+        None,
+    )
 
 
 async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None:
@@ -247,7 +308,7 @@ async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None
     registered path). A directory git does not know is an orphan; it goes to
     the trash (#2926 G2) so the new worktree can take its place.
 
-    Registration comes from ``git worktree list``, not ``verify_worktree``:
+    Registration comes from ``git worktree list``, not ``git rev-parse`` inside the directory:
     task worktrees live under the repo, so ``git rev-parse`` inside an orphan
     directory walks up to the main repository and succeeds (MEASURED). An
     unreadable list deletes nothing.
@@ -257,6 +318,11 @@ async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None
         raise StaleWorktreeError(
             f"the previous worktree for this task, {wt_path}, was left in place: "
             "git's worktree list could not be read to tell an orphan from live work"
+        )
+    if wt_path.is_symlink():
+        raise StaleWorktreeError(
+            f"the previous worktree path for this task, {wt_path}, is a symlink; "
+            "nothing reaps it, so remove the link by hand before retrying"
         )
     record = _record_for(records, wt_path)
     if record is not None:
@@ -286,20 +352,55 @@ async def _clear_stale_dir(wt_path: Path, repo_root: Path, task_id: str) -> None
             f"the stale directory {wt_path} could not be moved to the trash: {exc}"
         ) from None
     logger.warning("Moved orphan task worktree dir %s to the trash (%s)", wt_path, stone.entry_id)
+    # A prunable record for this path survives the move, and ``git worktree
+    # add`` refuses "a missing but already registered worktree" (MEASURED).
+    await _prune_worktrees(repo_root)
 
 
-async def verify_worktree(wt_path: Path) -> bool:
-    """Check if a path is a valid git worktree."""
-    if not wt_path.exists():
-        return False
-    proc = await asyncio.create_subprocess_exec(
-        "git", "rev-parse", "--git-dir",
-        cwd=str(wt_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+async def is_registered_worktree(wt_path: Path, repo_root: Path) -> bool:
+    """Whether ``wt_path`` is a live linked worktree of ``repo_root`` (#3021).
+
+    git's own definition, the one ``git worktree remove`` enforces: the
+    directory's ``.git`` FILE points at an admin directory under the
+    repository's ``<common-dir>/worktrees/``, and that admin directory's
+    ``gitdir`` points back at this directory. Each half alone is imitable,
+    and every one of these was MEASURED (git 2.43) to pass a weaker check:
+    an orphan directory (git walks up to the main checkout), a record kept
+    prunable or locked after the directory was re-created, a directory given
+    its own ``git init``, a task path replaced by a symlink to the checkout or
+    to another task's worktree, and a ``.git`` file copied from another task.
+    Paths are compared as named (``_as_named``), never fully resolved.
+
+    False sends the caller to re-create, which removes a clean worktree and
+    force-deletes its branch, committed steps included. So anything that
+    cannot be READ raises StaleWorktreeError instead of reading as False.
+    """
+    dot_git = wt_path / ".git"
+    if wt_path.is_symlink() or not dot_git.is_file():
+        return False  # a symlink, an orphan, or its own repository: not a linked worktree
+
+    def unreadable(what: str) -> StaleWorktreeError:
+        return StaleWorktreeError(
+            f"the worktree for this task, {wt_path}, was left in place: {what} could not be read"
+        )
+
+    # One value per git call: a path may contain a newline.
+    rc, admin = await _git_read(wt_path, "rev-parse", "--absolute-git-dir")
+    rc2, common = await _git_read(
+        repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir"
     )
-    await proc.communicate()
-    return proc.returncode == 0
+    if rc != 0 or rc2 != 0:
+        raise unreadable("its git directory")
+    admin_dir = Path(admin)
+    if admin_dir.parent.resolve() != Path(common).resolve() / "worktrees":
+        return False  # not one of this repository's linked worktrees
+    try:
+        back = (admin_dir / "gitdir").read_text(errors="surrogateescape").rstrip("\n")
+    except FileNotFoundError:
+        return False  # pruned admin directory: nothing points back
+    except OSError:
+        raise unreadable("git's record of it") from None
+    return _as_named(Path(back)) == _as_named(wt_path) / ".git"
 
 
 async def cleanup_worktree(
@@ -323,6 +424,7 @@ async def cleanup_worktree(
         cwd=str(repo_root),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_scrubbed_git_env(),
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
