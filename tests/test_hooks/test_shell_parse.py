@@ -1501,6 +1501,18 @@ _UNPROVEN_DATA_HEREDOC_CASES = [
     ("rebase-exec", "git rebase --exec \"$(cat <<'EOF'", "EOF", (), (')"',), True, True),
     ("git-global-option", "git -c x=y commit -F - <<'EOF'", "EOF", (), (), True, True),
     ("python", "python3 - <<'PY'", "PY", (), (), True, True),
+    ("tail-glued-digit-2", "cat <<'EOF' >/dev/null2>/dev/null", "EOF", (), (), True, True),
+    ("tail-glued-digit-1", "cat <<'EOF' >/dev/null1>/dev/null", "EOF", (), (), True, True),
+    ("tail-glued-chain", "cat <<'EOF' >/dev/null1>/dev/null2>/dev/null", "EOF", (), (), True, True),
+    (
+        "second-data-heredoc",
+        "git commit -F - <<'ONE'",
+        "ONE",
+        (),
+        ("git tag -F - t <<'TWO'", "message", "TWO"),
+        True,
+        True,
+    ),
 ]
 
 

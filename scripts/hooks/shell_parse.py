@@ -699,6 +699,10 @@ def _data_heredoc_tail_is_allowed(tail: str) -> bool:
         if not tail.startswith("/dev/null", i):
             return False
         i += len("/dev/null")
+        # The word ends only at whitespace or another `>`: bash reads a glued
+        # digit (`>/dev/null2>/dev/null`) as part of the file name.
+        if i < len(tail) and tail[i] not in " \t>":
+            return False
     return True
 
 
@@ -817,6 +821,11 @@ def excise_data_heredoc(command: str) -> tuple[str, str] | None:
             after_start = line_end + 1 if line_end < len(command) else len(command)
             after = command[after_start:]
             if idiom is not None and not after.startswith(')"'):
+                return None
+            # Only one body is excised, so a later heredoc's body would be read
+            # as commands where main strips or parses it its own way: leave the
+            # whole command to main's path.
+            if "<<" in after:
                 return None
             return command[: newline + 1] + after, command[body_start:line_start]
         if line.lstrip().startswith(word) or line_end == len(command):

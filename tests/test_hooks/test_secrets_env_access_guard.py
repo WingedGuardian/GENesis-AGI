@@ -767,3 +767,14 @@ class TestAuditFindings:
     ) -> None:
         command = "git commit -m \"document secrets.env\" && cat > f <<'EOF'\nbody\nEOF"
         assert not self._touches(command=command), command
+
+    def test_a_mention_in_a_second_data_heredoc_body_is_data(self, fake_home: Path) -> None:
+        # Two data heredocs: neither body is scanned, as on main.
+        command = "cat <<'ONE'\nhello\nONE\ncat <<'TWO'\nsecrets.env\nTWO"
+        assert not self._touches(command=command), command
+
+    def test_a_glued_tail_redirect_does_not_hide_a_body_mention(self, fake_home: Path) -> None:
+        # `>/dev/null2` is a file named /dev/null2, outside the proven grammar,
+        # so the body is scanned as on main.
+        command = "cat <<'EOF' >/dev/null2>/dev/null\ncat ~/genesis/secrets.env\nEOF"
+        assert self._touches(command=command), command
