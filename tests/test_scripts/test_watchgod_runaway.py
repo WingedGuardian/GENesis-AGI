@@ -263,8 +263,9 @@ def test_two_holders_of_one_file_page_once(box):
 def test_a_short_absence_does_not_queue_the_page_again(box):
     """A writer that closes and reopens its file must not re-queue the page on
     each reappearance: during a delivery outage those copies pile up in the
-    queue. Only after DG_RUNAWAY_FORGET_S out of sight is it queued again, under
-    the same key."""
+    queue. A PAGED file is remembered for DG_RUNAWAY_PAGED_FORGET_S out of sight
+    (the drainer's 24 h dedupe window), not the shorter DG_RUNAWAY_FORGET_S; only
+    after that is it queued again, under the same key."""
     f = _file(box, "out.log", 60)
     _holder(box, 5, f)
     dom = _domain(box, 200)
@@ -283,9 +284,15 @@ def test_a_short_absence_does_not_queue_the_page_again(box):
         for g in "${{!_RW_LAST[@]}}"; do _RW_LAST[$g]=$(( _RW_LAST[$g] - DG_RUNAWAY_FORGET_S - 1 )); done
         wg_runaway_check '{dom}'; {show}
         wg_runaway_check '{dom}'
+        echo AFTER_HOUR=$(ls '{box["queue"]}' | wc -l)
+        {hide}
+        for g in "${{!_RW_LAST[@]}}"; do _RW_LAST[$g]=$(( _RW_LAST[$g] - DG_RUNAWAY_PAGED_FORGET_S - 1 )); done
+        wg_runaway_check '{dom}'; {show}
+        wg_runaway_check '{dom}'
         """,
     )
     assert "AFTER_SHORT=1" in out.stdout
+    assert "AFTER_HOUR=0" in out.stdout, "a paged file outlives DG_RUNAWAY_FORGET_S"
     first = next(ln.split("=", 1)[1] for ln in out.stdout.splitlines() if ln.startswith("FIRST="))
     keys = [p["dedupe_key"] for p in _pages(box)]
     assert keys == [first], keys
@@ -638,3 +645,252 @@ def test_a_long_walk_outage_does_not_expire_the_baselines_it_carries(box):
     )
     pages = _pages(box)
     assert len(pages) == 1 and "it grew 300 MB" in pages[0]["body"], pages
+
+
+# ── episodes and retained baselines (#3023, #3024) ────────────────
+
+
+def _legacy_key(f: Path) -> str:
+    st = os.stat(f)
+    birth = subprocess.run(
+        ["stat", "-c", "%W", str(f)], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    return f"watchgod:runaway:{st.st_dev}:{st.st_ino}:{birth}"
+
+
+def _alloc(f: Path, mb: int) -> str:
+    """Shell step: allocate `mb` MiB through a writer's descriptor."""
+    return (
+        "python3 -c 'import os; fd = os.open(\"" + str(f) + "\", os.O_WRONLY); "
+        f"os.posix_fallocate(fd, 0, {mb} * 1048576)'"
+    )
+
+
+def _empty(f: Path) -> str:
+    """Shell step: empty the file in place (same inode, same birth time)."""
+    return "python3 -c 'import os; os.truncate(\"" + str(f) + "\", 0)'"
+
+
+def test_an_emptied_and_refilled_file_pages_again_under_an_episode_key(box):
+    """Emptied while its writer still holds it, then refilled: a new episode,
+    so it pages again under its own key. The first episode keeps the legacy
+    key, so a restart still collapses with the old page (#3023)."""
+    f = _file(box, "out.log", 200)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 60)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 120)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    pages = _pages(box)
+    assert len(pages) == 2, [p["title"] for p in pages]
+    legacy = _legacy_key(f)
+    assert pages[0]["dedupe_key"] == legacy
+    assert pages[1]["dedupe_key"].startswith(legacy + ":e")
+    assert pages[1]["dedupe_key"][len(legacy) + 2 :].isdigit()  # a timestamp
+    assert "(again since " in pages[1]["title"]
+
+
+def test_a_small_shrink_does_not_open_an_episode(box):
+    """Allocated size moves a little (compaction, reallocation): only a shrink
+    to half the retained baseline or less ends an episode."""
+    f = _file(box, "out.log", 200)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}; {_alloc(f, 120)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 200)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    assert len(_pages(box)) == 1
+
+
+def test_a_shrink_of_a_file_never_paged_opens_no_episode(box):
+    f = _file(box, "out.log", 120)
+    _holder(box, 5, f)
+    dom = _domain(box, 4000)  # 3%: never a runaway
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}; {_alloc(f, 55)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EP=${{#_RW_EP[@]}}
+        """,
+    )
+    assert "EP=0" in out.stdout
+    assert not _pages(box)
+
+
+def test_a_complete_poll_absence_keeps_the_growth_baseline(box):
+    """A writer that closes its file for one COMPLETE poll and reopens it is
+    judged against its retained baseline, not as a first sighting (#3024)."""
+    f = _file(box, "grow.log", 60)
+    _holder(box, 7, f)
+    dom = _domain(box, 2048)
+    hide = f"mv '{box['proc']}/7' '{box['tmp']}/hidden7'"
+    show = f"mv '{box['tmp']}/hidden7' '{box['proc']}/7'"
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {hide}; wg_runaway_check '{dom}'; {show}
+        for g in "${{!_RW_PREV_AT[@]}}"; do _RW_PREV_AT[$g]=$(( _RW_PREV_AT[$g] - 60 )); done
+        {_alloc(f, 360)}
+        wg_runaway_check '{dom}'
+        echo FAST=$RUNAWAY_FAST
+        """,
+    )
+    pages = _pages(box)
+    assert len(pages) == 1 and "it grew 300 MB" in pages[0]["body"], pages
+    assert "FAST=1" in out.stdout
+
+
+def test_an_unpaged_file_is_still_forgotten_after_the_short_window(box):
+    """Only PAGED records are kept for the long window: an unpaged file out of
+    sight for DG_RUNAWAY_FORGET_S is forgotten, baseline included."""
+    f = _file(box, "quiet.log", 60)
+    _holder(box, 5, f)
+    dom = _domain(box, 4000)
+    hide = f"mv '{box['proc']}/5' '{box['tmp']}/hidden5'"
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {hide}
+        for g in "${{!_RW_LAST[@]}}"; do _RW_LAST[$g]=$(( _RW_LAST[$g] - DG_RUNAWAY_FORGET_S - 1 )); done
+        wg_runaway_check '{dom}'
+        echo LAST=${{#_RW_LAST[@]}} PREV=${{#_RW_PREV[@]}} AT=${{#_RW_PREV_AT[@]}}
+        """,
+    )
+    assert "LAST=0 PREV=0 AT=0" in out.stdout
+
+
+def test_paged_forget_window_is_the_drainers_dedupe_window():
+    src = (_ROOT / "scripts" / "lib" / "watchgod_runaway.sh").read_text()
+    assert "DG_RUNAWAY_PAGED_FORGET_S=86400" in src
+
+
+def test_a_forgotten_file_comes_back_under_the_legacy_key(box):
+    """Forgetting a paged file drops its episode too: seen again a day later it
+    is a first episode, under the bare generation key."""
+    f = _file(box, "out.log", 200)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    hide = f"mv '{box['proc']}/5' '{box['tmp']}/hidden5'"
+    show = f"mv '{box['tmp']}/hidden5' '{box['proc']}/5'"
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 60)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 120)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EPISODES=$(ls '{box["queue"]}' | wc -l)
+        rm -f '{box["queue"]}'/*.json   # delivered
+        {hide}
+        for g in "${{!_RW_LAST[@]}}"; do _RW_LAST[$g]=$(( _RW_LAST[$g] - DG_RUNAWAY_PAGED_FORGET_S - 1 )); done
+        wg_runaway_check '{dom}'; {show}
+        wg_runaway_check '{dom}'
+        """,
+    )
+    assert "EPISODES=2" in out.stdout
+    assert [p["dedupe_key"] for p in _pages(box)] == [_legacy_key(f)]
+
+
+def test_an_open_episode_outlives_the_short_forget_window(box):
+    """Between episodes the record is kept for the long window: a refill that
+    takes longer than DG_RUNAWAY_FORGET_S (an operator thawing hours later)
+    still pages under its episode key, never the bare key the drainer holds."""
+    f = _file(box, "out.log", 200)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    hide = f"mv '{box['proc']}/5' '{box['tmp']}/hidden5'"
+    show = f"mv '{box['tmp']}/hidden5' '{box['proc']}/5'"
+    _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}; {_alloc(f, 60)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_empty(f)}; {hide}
+        for g in "${{!_RW_LAST[@]}}"; do _RW_LAST[$g]=$(( _RW_LAST[$g] - DG_RUNAWAY_FORGET_S - 1 )); done
+        wg_runaway_check '{dom}'; {show}
+        {_alloc(f, 120)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    keys = [p["dedupe_key"] for p in _pages(box)]
+    assert len(keys) == 2 and keys[1].startswith(_legacy_key(f) + ":e"), keys
+
+
+def test_a_partial_shrink_still_over_threshold_does_not_page_at_once(box):
+    """Cutting a paged file to half still leaves it over the size threshold:
+    that poll opens the episode but pages nothing (nothing refilled)."""
+    f = _file(box, "out.log", 300)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}; {_alloc(f, 120)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    assert len(_pages(box)) == 1
+
+
+def test_exactly_half_ends_the_episode(box):
+    f = _file(box, "out.log", 200)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}; {_alloc(f, 100)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EP=${{#_RW_EP[@]}}
+        """,
+    )
+    assert "EP=1" in out.stdout
+
+
+def test_a_small_paged_file_emptied_below_the_floor_pages_again(box):
+    """Paged at 60 MB: emptied, it drops below the scan's 50 MB floor, so it is
+    never SEEN at half. Back from out of sight smaller than its baseline, it
+    has shrunk all the same."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    dom = _domain(box, 200)
+    _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 52)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 70)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    keys = [p["dedupe_key"] for p in _pages(box)]
+    assert len(keys) == 2 and keys[1].startswith(_legacy_key(f) + ":e"), keys

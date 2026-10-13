@@ -41,12 +41,28 @@
 # inode starts afresh instead of inheriting the old one's state (review
 # finding). It is derived, never remembered: a restart re-sends the same dedupe
 # key, which the alert drainer collapses. Known limit: an inode reused within
-# the same second, or on a filesystem without birth times, shares a generation.
+# the same second, or on a filesystem without birth times, shares a generation,
+# and with it a paged file's state for up to DG_RUNAWAY_PAGED_FORGET_S.
 #
-# A file pages once per mode while in sight, and is forgotten only after an
-# hour out of sight, so a writer that opens and closes its file cannot re-queue
-# the page on every reappearance (review finding: during a delivery outage
-# those copies would pile up in the queue).
+# A file pages once per mode per EPISODE. An episode ends when a paged file is
+# seen at half its retained size or less, or comes back smaller after being out
+# of sight (emptied below the scan's floor, truncated, rotated by copy-truncate):
+# the paged modes are cleared, and a refill pages again under its own key,
+# "<generation>:e<start time>" (#3023). Never on the poll that ended it: a
+# shrink is the cure, not a new runaway. The first episode keeps the bare
+# generation key, so a restart still collapses with the page it re-sends. Half,
+# not "any decrease", for a file in sight: allocated size moves a little on its
+# own. Episodes live in memory: a restart mid-episode re-sends the bare key, which
+# the drainer collapses (accepted).
+#
+# A file out of sight keeps its last size and when it was measured, so a writer
+# that closes its file for a poll and reopens it is judged against that
+# baseline over the whole gap, not as a first sighting (#3024). An unpaged file
+# is forgotten after DG_RUNAWAY_FORGET_S out of sight; a paged one only after
+# DG_RUNAWAY_PAGED_FORGET_S, the alert drainer's dedupe window, so a writer that
+# opens and closes its file cannot re-queue the page on every reappearance
+# (review finding: during a delivery outage those copies would pile up), and a
+# slow refill still finds the baseline that ends its episode.
 #
 # Pages name processes, never their arguments: a command line can carry a
 # credential, and a page leaves the machine (review finding, P1).
@@ -64,12 +80,19 @@ DG_RUNAWAY_SCAN_TIMEOUT_S=10
 # A page lists at most this many distinct writers, then "+N more". One line
 # each is about 60 characters, so the page stays well inside a chat message.
 DG_RUNAWAY_MAX_HOLDERS=20
-# Paging state outlives a file's absence by this long.
+# An unpaged file's state outlives its absence by this long.
 DG_RUNAWAY_FORGET_S=3600
+# A paged file's state outlives its absence by this long: the alert drainer's
+# dedupe window (governance's 24 h default for queued alerts). Forgotten
+# sooner, a refill would re-send the bare key while the drainer still holds it.
+DG_RUNAWAY_PAGED_FORGET_S=86400
 
 # Per generation (device:inode:birth): space used at the previous poll, when it
 # was last seen, and the modes it has been paged in.
 declare -gA _RW_PREV=() _RW_LAST=() _RW_PAGED=()
+# Per generation: when its current episode began, for every episode after the
+# first (unset for the first one).
+declare -gA _RW_EP=()
 # When a baseline in _RW_PREV is older than the last poll: a file an
 # incomplete walk did not report keeps its last size and the time it was
 # measured, so growth is still judged against it (review finding).
@@ -169,6 +192,12 @@ _rw_holders() {
     done
 }
 
+_rw_episode_open() {
+    # $1 generation, $2 now. The file's episode ended: page it again from here.
+    unset "_RW_PAGED[$1]"
+    _RW_EP[$1]="$2"
+}
+
 _rw_session_of() {
     # The Claude Code session that owns a resolved path under cc-tmp, or nothing.
     local path="$1" root
@@ -205,7 +234,7 @@ wg_runaway_check() {
     fi
 
     local dt pg path dom dtotal dpath size_mb raw_b norm_b why sid body
-    local link id birth gen pf pfpid st_line st_rc=0
+    local link id birth gen pf pfpid st_line st_rc=0 opened
     local -A size_now=() st_of=()
     local -a holders links=()
     pg="$(_wg_mode_tag)"
@@ -251,6 +280,17 @@ wg_runaway_check() {
         gen="${key}:${birth}"
         _RW_LAST[$gen]=$now
         size_now[$gen]="${size_of[$key]}"
+        # Emptied since it was paged: that episode is over. In sight, it must
+        # be down to half. Back from out of sight (a carried baseline), any
+        # smaller size counts: a file emptied below the scan's floor and refilled
+        # past it never shows half of a small baseline.
+        opened=0
+        if [[ -n "${_RW_PAGED[$gen]:-}" && -n "${_RW_PREV[$gen]:-}" ]] \
+                && { (( ${size_of[$key]} * 2 <= ${_RW_PREV[$gen]} )) \
+                     || { [[ -n "${_RW_PREV_AT[$gen]:-}" ]] && (( ${size_of[$key]} < ${_RW_PREV[$gen]} )); }; }; then
+            _rw_episode_open "$gen" "$now"
+            opened=1
+        fi
         path="$(readlink -- "$link" 2>/dev/null)" || path="?"
         dom="$(_rw_domain_for "${dev_of[$key]}" "${path% (deleted)}" "$domains")"
         [[ -n "$dom" ]] || continue   # not on a watched filesystem
@@ -275,41 +315,55 @@ wg_runaway_check() {
             RUNAWAY_FAST=1
         fi
         [[ -n "$why" ]] || continue
+        (( opened )) && continue
         [[ " ${_RW_PAGED[$gen]:-} " == *" mode${pg} "* ]] && continue
         sid="$(_rw_session_of "${path% (deleted)}")"
         body="${path}: ${size_mb} MB in use, held open for writing. Why flagged: ${why}."$'\n'"Writers:"$'\n'"$(_rw_holders "${holders[@]:0:DG_RUNAWAY_MAX_HOLDERS}")"
         (( ${#holders[@]} > DG_RUNAWAY_MAX_HOLDERS )) && body+=$'\n'"  +$(( ${#holders[@]} - DG_RUNAWAY_MAX_HOLDERS )) more"
         [[ -n "$sid" ]] && body+=$'\n'"Claude Code session: ${sid}"
+        local pkey="watchgod:runaway:${gen}" again=""
+        if [[ -n "${_RW_EP[$gen]:-}" ]]; then
+            local since
+            since="$(date -d "@${_RW_EP[$gen]}" '+%Y-%m-%d %H:%M %Z' 2>/dev/null)" || since="epoch ${_RW_EP[$gen]}"
+            pkey+=":e${_RW_EP[$gen]}"; again=" (again since ${since})"
+            body+=$'\n'"It shrank after an earlier page (at ${since}) and is over the threshold again."
+        fi
         body+=$'\n'"The guardian has not acted on it. Stop the writer, or empty the file, before the filesystem fills."
-        if _wg_page critical "Runaway file on ${dpath}: ${path##*/}" "$body" \
-                "watchgod:runaway:${gen}" "CRITICAL — runaway ${path} (${size_mb} MB)"; then
+        if _wg_page critical "Runaway file on ${dpath}: ${path##*/}${again}" "$body" \
+                "$pkey" "CRITICAL — runaway ${path} (${size_mb} MB)${again}"; then
             _RW_PAGED[$gen]="${_RW_PAGED[$gen]:-} mode${pg}"
             log WARN "runaway file ${path} (${size_mb} MB; ${why}); writers: ${holders[*]}"
         fi
     done
 
-    # Out of sight for DG_RUNAWAY_FORGET_S: forgotten. Seen again later, it is
-    # queued again under the same key, which the drainer collapses. Only a
-    # complete walk proves a file absent: during an outage of the walk nothing
-    # is forgotten, or the baselines it carries would expire (review finding).
+    # Out of sight long enough: forgotten (DG_RUNAWAY_FORGET_S, or
+    # DG_RUNAWAY_PAGED_FORGET_S once paged in this episode). Seen again later,
+    # it is queued again under the same key, which the drainer collapses. Only
+    # a complete walk proves a file absent: during an outage of the walk
+    # nothing is forgotten, or the baselines it carries would expire (review
+    # finding).
+    local ttl
     if (( walk_ok )); then
         for gen in "${!_RW_LAST[@]}"; do
-            (( now - ${_RW_LAST[$gen]} > DG_RUNAWAY_FORGET_S )) || continue
-            unset "_RW_LAST[$gen]" "_RW_PAGED[$gen]" "_RW_PREV[$gen]" "_RW_PREV_AT[$gen]"
+            ttl=$DG_RUNAWAY_FORGET_S
+            # Paged, or between episodes: the drainer still holds the last key.
+            [[ -n "${_RW_PAGED[$gen]:-}${_RW_EP[$gen]:-}" ]] && ttl=$DG_RUNAWAY_PAGED_FORGET_S
+            (( now - ${_RW_LAST[$gen]} > ttl )) || continue
+            unset "_RW_LAST[$gen]" "_RW_PAGED[$gen]" "_RW_EP[$gen]" "_RW_PREV[$gen]" "_RW_PREV_AT[$gen]"
         done
     fi
 
-    # A file an incomplete walk did not report keeps its baseline and its time:
-    # dropping it would make the next poll a first sighting, and repeated
-    # incomplete walks would hide a fast grower for good (review finding).
+    # A file this poll did not report keeps its baseline and its time until it
+    # is forgotten, whether the walk completed or not: dropping it would make
+    # its next sighting a first one, so a writer that closes its file for a
+    # poll, or repeated incomplete walks, would hide a fast grower (#3024,
+    # review finding).
     local -A carry=() carry_at=()
-    if (( ! walk_ok )); then
-        for gen in "${!_RW_PREV[@]}"; do
-            [[ -n "${size_now[$gen]:-}" ]] && continue
-            carry[$gen]="${_RW_PREV[$gen]}"
-            carry_at[$gen]="${_RW_PREV_AT[$gen]:-$_RW_PREV_T}"
-        done
-    fi
+    for gen in "${!_RW_PREV[@]}"; do
+        [[ -n "${size_now[$gen]:-}" ]] && continue
+        carry[$gen]="${_RW_PREV[$gen]}"
+        carry_at[$gen]="${_RW_PREV_AT[$gen]:-$_RW_PREV_T}"
+    done
     _RW_PREV=(); _RW_PREV_AT=()
     for gen in "${!size_now[@]}"; do _RW_PREV[$gen]="${size_now[$gen]}"; done
     for gen in "${!carry[@]}"; do
