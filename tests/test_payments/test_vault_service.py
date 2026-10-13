@@ -397,6 +397,81 @@ class TestReplacementReviewFollowUp:
         assert child.returncode == 4 and child.stdout == b""
 
 
+class TestRoundOneOf3281:
+    async def test_a_lost_correction_is_recorded_by_the_next_status(
+        self, service, vault, db, monkeypatch
+    ):
+        """The trail never stays on an "unlock" that did not take effect."""
+        real_record = audit.record_event
+        state = {}
+
+        async def record(conn, event, detail=None):
+            if event == "unlock" and "restore" not in state:
+                # The key file changes while the unlock row commits.
+                state["restore"] = (vault / vs.RECIPIENT).read_text()
+                (vault / vs.RECIPIENT).write_text(
+                    str(x25519.Identity.generate().to_public()) + "\n"
+                )
+            elif event == "unlock_refused" and "lost" not in state:
+                state["lost"] = True
+                raise sqlite3.OperationalError("disk full")
+            return await real_record(conn, event, detail)
+
+        monkeypatch.setattr(audit, "record_event", record)
+        result = await service.unlock(PASSPHRASE, None)
+        assert not result["ok"] and not service.unlocked
+        assert (await _events(db))[-1]["event"] == "unlock"  # the refusal row was lost
+        (vault / vs.RECIPIENT).write_text(state["restore"])
+        status = await service.status()  # the database works again
+        assert status["audit"] is True and status["last_event"]["event"] == "lock"
+        assert (await service.unlock(PASSPHRASE, None))["ok"]
+        assert [e["event"] for e in await _events(db)][-3:] == ["unlock", "lock", "unlock"]
+
+    async def test_a_lost_lock_row_is_recorded_by_the_next_status(self, service, db, monkeypatch):
+        assert (await service.unlock(PASSPHRASE, None))["ok"]
+        real_record = audit.record_event
+
+        async def lose_the_lock_row(conn, event, detail=None):
+            if event == "idle_relock":
+                raise sqlite3.OperationalError("disk full")
+            return await real_record(conn, event, detail)
+
+        monkeypatch.setattr(audit, "record_event", lose_the_lock_row)
+        await service.lock(None, event="idle_relock")
+        assert not service.unlocked and (await _events(db))[-1]["event"] == "unlock"
+        status = await service.status()
+        assert status["unlocked"] is False and status["last_event"]["event"] == "lock"
+
+    def test_the_default_relock_clock_counts_suspended_time(self, db, vault, tmp_path):
+        import time
+
+        svc = _make(db, vault, tmp_path)
+        assert abs(svc._clock() - time.clock_gettime(time.CLOCK_BOOTTIME)) < 1.0
+        assert svc._clock.__code__.co_names.count("CLOCK_BOOTTIME") == 1
+
+    async def test_status_reports_full_readiness_before_any_prompt(self, service, vault):
+        os.chmod(vault / vs.IDENTITY, 0o644)
+        status = await service.status()
+        assert status["initialised"] and "not private" in status["ready_error"]
+        os.chmod(vault / vs.IDENTITY, 0o600)
+        assert (await service.status())["ready_error"] is None
+
+    async def test_time_spent_suspended_counts_toward_the_idle_relock(self, db, vault, tmp_path):
+        now = {"t": 1000.0}
+        svc = _make(
+            db, vault, tmp_path, idle_relock_s=1800, idle_check_s=0.05, clock=lambda: now["t"]
+        )
+        await svc.start()
+        assert (await svc.unlock(PASSPHRASE, None))["ok"]
+        await asyncio.sleep(0.15)
+        assert svc.unlocked  # the loop's own time barely moved
+        now["t"] += 7200  # the host slept for two hours
+        await asyncio.sleep(0.2)
+        assert not svc.unlocked
+        assert (await _events(db))[-1]["event"] == "idle_relock"
+        await svc.stop()
+
+
 class TestFailClosed:
     async def test_no_audit_log_means_no_unlock(self, vault, tmp_path, monkeypatch):
         svc = _make(None, vault, tmp_path)

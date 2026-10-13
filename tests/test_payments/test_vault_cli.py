@@ -570,6 +570,29 @@ class TestPromptsNeverEcho:
         err = capsys.readouterr().err
         assert "cancelled" in err and "Traceback" not in err
 
+    def test_unlock_refuses_a_vault_the_service_would_refuse_before_the_prompt(
+        self, tty, monkeypatch, capsys
+    ):
+        sent = []
+
+        def service(request):
+            sent.append(request)
+            return {
+                "ok": True,
+                "unlocked": False,
+                "initialised": True,
+                "ready_error": "not private: identity.age; fix the modes (see `vault status`)",
+                "payments_extra": True,
+                "audit": True,
+            }
+
+        monkeypatch.setattr(cli, "_service", service)
+        getpass = _answers(monkeypatch, [])
+        assert _run(["unlock"]) == 2
+        getpass.assert_not_called()
+        assert [r["op"] for r in sent] == ["status"]
+        assert "not private" in capsys.readouterr().err
+
     def test_unlock_refuses_when_the_terminal_cannot_hide_input(self, tty, monkeypatch, capsys):
         sent = []
 
