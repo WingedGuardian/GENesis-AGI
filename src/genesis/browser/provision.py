@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import importlib
 import json
 import logging
 import math
@@ -732,20 +733,65 @@ def _libs_step(run: Runner, binaries: list[Path], notes: list[str]) -> tuple[str
     return "missing:" + ",".join(missing), False
 
 
-def _already_ready(run: Runner) -> bool:
-    """Whether the engine resolves and the Chromium the fallback launches is
-    complete (both builds, marker and executable, where its package says they
-    live), so a run would download nothing."""
-    if not _resolve().ready:
-        return False
-    package = chromium.launch_package()
-    if package is None:
-        return True
+# Read-only: whether camoufox's add-ons and its pinned fingerprint model are in
+# place (camoufox 0.5.8 fpgen_model.is_pinned, addons manifest.json), which a launch
+# would otherwise install first. Any failure, an older camoufox included, reads as
+# not in place.
+_EXTRAS_PRESENT = (
+    "import os, sys; "
+    "from camoufox.addons import DefaultAddons, get_addon_path; "
+    "from camoufox.fpgen_model import is_pinned; "
+    "sys.exit(0 if is_pinned() and all(os.path.exists(os.path.join("
+    "get_addon_path(a.name), 'manifest.json')) for a in DefaultAddons) else 1)"
+)
+
+
+def _extras_present(run: Runner) -> bool:
     try:
-        where = chromium.locations(package, run=run)
-    except chromium.ChromiumLayoutUnknown:
+        proc = run(
+            [sys.executable, "-c", _EXTRAS_PRESENT],
+            env=_child_env(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=_timeout(),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
         return False
-    return not any(chromium.problem(b, where[b][1]) for b in chromium.BUILDS)
+    return proc.returncode == 0
+
+
+def _already_ready(run: Runner) -> bool:
+    """Whether a run would install nothing: the engine resolves, the Chromium the
+    fallback launches is complete (both builds, marker and executable, where its
+    package says they live), camoufox's add-ons and fingerprint model are in place,
+    and the binaries' system libraries resolve. Read-only: it fetches, installs and
+    writes nothing, so a low-disk run can still tell ready from merely present."""
+    status = _resolve()
+    if not status.ready:
+        return False
+    binaries: list[Path] = []
+    if status.path is not None:
+        binaries += [status.path, status.path.parent / "libxul.so"]
+    package = chromium.launch_package()
+    if package is not None:
+        try:
+            where = chromium.locations(package, run=run)
+        except chromium.ChromiumLayoutUnknown:
+            return False
+        if any(chromium.problem(b, where[b][1]) for b in chromium.BUILDS):
+            return False
+        for build in chromium.BUILDS:
+            if (exe := chromium.executable(build, where[build][1])) is not None:
+                binaries.append(exe)
+    if _pin_capable() and not _extras_present(run):
+        return False
+    binaries = [b for b in binaries if b.is_file()]
+    if binaries:
+        missing, unreadable = _missing_libs(run, binaries)
+        if missing or unreadable:
+            return False
+    return True
 
 
 def provision(run: Runner | None = None) -> Outcome:
@@ -892,7 +938,33 @@ def unmet_packages(pyproject: Path | None = None) -> list[str]:
             unmet.append(f"{req.name} {installed} is outside {req.specifier}")
     if versions["camoufox"] and not _pin_capable():
         unmet.append(f"camoufox {versions['camoufox']} predates the browser pin (0.5.7)")
+    # pip counts a package as installed while its .dist-info survives, even with
+    # its module files gone; a launch then fails on the import.
+    for dist, module in _LAUNCH_MODULES.items():
+        if versions.get(dist) and (problem := _import_problem(module)):
+            unmet.append(
+                f"{dist} is installed but {module} does not import ({problem}); "
+                f"reinstall it ({engine.PACKAGE_HINT})"
+            )
     return unmet
+
+
+# What each browser layer imports at launch.
+_LAUNCH_MODULES = {
+    "camoufox": "camoufox.async_api",
+    "playwright": "playwright.async_api",
+    "patchright": "patchright.async_api",
+}
+
+
+def _import_problem(module: str) -> str | None:
+    """Why ``module`` does not import, or None. Run in check-packages' own process,
+    never the server's: importing camoufox imports playwright."""
+    try:
+        importlib.import_module(module)
+    except Exception as exc:  # noqa: BLE001 - any failure means the launch fails too
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:

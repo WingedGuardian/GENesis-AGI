@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -156,3 +157,60 @@ def test_a_secrets_path_override_is_honoured(repo, tmp_path):
     r = _run(repo, tmp_path, env_extra={"SECRETS_PATH": str(elsewhere)})
     assert r.returncode == 0, r.stdout + r.stderr
     assert out.read_text().split("|")[0] == "/other/pw"
+
+
+def test_with_a_wait_it_runs_once_the_other_run_finishes(repo, tmp_path):
+    """install.sh runs inline right after enabling the daily timer, whose
+    catch-up run can take the lock first. Waiting, then running (a no-op after a
+    complete run), reports the real outcome instead of a bare exit 0."""
+    lock_dir = tmp_path / "gh" / "locks"
+    lock_dir.mkdir(parents=True)
+    holder = subprocess.Popen(["flock", str(lock_dir / "browser-stack.lock"), "sleep", "2"])
+    try:
+        time.sleep(0.5)
+        r = _run(repo, tmp_path, rc=1, env_extra={"GENESIS_BROWSER_STACK_WAIT_S": "30"})
+    finally:
+        holder.wait(timeout=30)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert (tmp_path / "stub.log").read_text().split() == ["-m", "genesis.browser.provision", "run"]
+
+
+def test_a_wait_that_runs_out_is_exit_75(repo, tmp_path):
+    lock_dir = tmp_path / "gh" / "locks"
+    lock_dir.mkdir(parents=True)
+    with open(lock_dir / "browser-stack.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        r = _run(repo, tmp_path, env_extra={"GENESIS_BROWSER_STACK_WAIT_S": "1"})
+    assert r.returncode == 75
+    assert "still in progress" in r.stdout
+    assert not (tmp_path / "stub.log").exists()
+
+
+def _path_python(tmp_path, *, genesis_venv):
+    """A `python` first on PATH, as a unit rendered before it carried VENV_PATH
+    has (its PATH starts with the venv's bin)."""
+    bindir = tmp_path / "pathvenv" / "bin"
+    bindir.mkdir(parents=True)
+    py = bindir / "python"
+    check_rc = 0 if genesis_venv else 1
+    py.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = "-c" ]; then exit {check_rc}; fi\n'
+        'echo "$@" > "$STUB_LOG"\n'
+    )
+    py.chmod(0o755)
+    return f"{bindir}:{os.environ['PATH']}"
+
+
+def test_without_venv_path_the_venv_on_path_is_used(repo, tmp_path):
+    (repo / ".venv" / "bin" / "python").unlink()
+    r = _run(repo, tmp_path, env_extra={"PATH": _path_python(tmp_path, genesis_venv=True)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / "stub.log").read_text().split() == ["-m", "genesis.browser.provision", "run"]
+
+
+def test_a_python_on_path_that_is_not_a_genesis_venv_is_refused(repo, tmp_path):
+    (repo / ".venv" / "bin" / "python").unlink()
+    r = _run(repo, tmp_path, env_extra={"PATH": _path_python(tmp_path, genesis_venv=False)})
+    assert r.returncode == 75
+    assert not (tmp_path / "stub.log").exists()

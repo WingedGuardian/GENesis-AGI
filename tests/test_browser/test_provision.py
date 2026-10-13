@@ -68,6 +68,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("GENESIS_BROWSER_MIN_FREE_GB", raising=False)
     monkeypatch.setattr(provision, "free_bytes", lambda path: 100 * 1024**3)
     monkeypatch.setattr(provision, "_device_free", lambda path: 100 * 1024**3)
+    # check-packages imports each browser package's launch module; tests decide.
+    monkeypatch.setattr(provision, "_import_problem", lambda module: None, raising=False)
     monkeypatch.setattr(provision, "_pin_capable", lambda: True)
     monkeypatch.setattr(provision, "_explicit_choice", lambda: False)
     monkeypatch.setattr(provision, "_live_engine_in", lambda path: False)
@@ -100,7 +102,8 @@ def test_low_disk_with_nothing_to_install_succeeds(env, monkeypatch):
     _resolves(monkeypatch, READY)
     run = Runner()
     out = provision.provision(run)
-    assert out.ok and run.calls == []
+    # Only read-only probes ran: nothing was fetched or installed.
+    assert out.ok and not run.ran("camoufox fetch") and not run.ran(" install")
     assert "low disk" in out.line()
 
 
@@ -126,6 +129,25 @@ def test_low_disk_with_everything_in_place_is_a_success(env, monkeypatch):
     monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
     _resolves(monkeypatch, READY)
     assert provision.provision(Runner()).ok
+
+
+def test_low_disk_with_the_fingerprint_model_missing_fails_visibly(env, monkeypatch):
+    """A launch installs the add-ons and fingerprint model first; a full disk that
+    stops that install is not a ready stack."""
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
+    _resolves(monkeypatch, READY)
+    run = Runner({"is_pinned": (1, "")})
+    assert not provision.provision(run).ok
+    assert run.ran("is_pinned")
+
+
+def test_low_disk_with_a_missing_system_library_fails_visibly(env, monkeypatch):
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
+    status = _engine_on_disk(env)
+    _resolves(monkeypatch, status)
+    run = Runner({"ldd": (0, "\tlibgtk-3.so.0 => not found\n")})
+    out = provision.provision(run)
+    assert not out.ok and "low disk" in out.line()
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-1", "0", "abc", ""])
@@ -1010,6 +1032,26 @@ def test_check_packages_passes_with_the_whole_extra(env, monkeypatch, capsys):
     assert provision.main(["check-packages"]) == 0
     assert capsys.readouterr().out == ""
 
+
+
+def test_check_packages_names_a_package_whose_module_does_not_import(env, monkeypatch, capsys):
+    """pip counts a package whose .dist-info survived as installed even when its
+    module files are gone; the launch then fails on the import."""
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(
+        provision,
+        "_import_problem",
+        lambda module: "No module named 'patchright.async_api'"
+        if module.startswith("patchright")
+        else None,
+    )
+    assert provision.main(["check-packages"]) == 1
+    out = capsys.readouterr().out
+    assert "patchright" in out and "does not import" in out and "reinstall" in out
 
 @pytest.mark.parametrize(
     ("versions", "pin_capable", "expected"),

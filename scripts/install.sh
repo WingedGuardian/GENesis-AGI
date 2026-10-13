@@ -1420,7 +1420,8 @@ elif [ -n "${CLAUDECODE:-}" ]; then
     fi
 elif echo "    Browser stack: Camoufox engine and Chromium, about 1.5 GB the first time;" \
     && echo "    no progress is shown while it downloads..." \
-    && VENV_PATH="$VENV_PATH" bash "$SCRIPT_DIR/install_browser_stack.sh" 2>&1 | sed 's/^/    /'; then
+    && VENV_PATH="$VENV_PATH" GENESIS_BROWSER_STACK_WAIT_S=7200 \
+        bash "$SCRIPT_DIR/install_browser_stack.sh" 2>&1 | sed 's/^/    /'; then
     # Exit 0 is ready, or deliberately skipped (low disk, another run): its line says which.
     echo "    + browser stack step done (its browser-stack: line above says what it did)"
 else

@@ -40,6 +40,18 @@ LOCK_DIR="$GENESIS_HOME/locks"
 
 _log() { printf 'browser-stack: %s\n' "$1"; }
 
+# A unit rendered before it carried VENV_PATH (install.sh never re-renders an
+# existing unit) names a custom venv only in its PATH, whose first entry is that
+# venv's bin. Use the python found there, but only a venv that imports Genesis.
+if [ -z "${VENV_PATH:-}" ] && [ ! -x "$VENV_PY" ]; then
+    _path_py="$(command -v python 2>/dev/null)" || _path_py=""
+    if [ -n "$_path_py" ] && "$_path_py" -c \
+        'import sys, genesis.browser.provision; sys.exit(sys.prefix == sys.base_prefix)' \
+        </dev/null >/dev/null 2>&1; then
+        VENV_PY="$_path_py"
+    fi
+fi
+
 if [ ! -x "$VENV_PY" ]; then
     _log "no venv interpreter at $VENV_PY"
     exit 75
@@ -56,8 +68,21 @@ if ! command -v flock >/dev/null 2>&1 || ! { exec 8>"$RUNNER_LOCK"; } 2>/dev/nul
     _log "runner lock unavailable (flock missing, or $RUNNER_LOCK unopenable)"
     exit 75
 fi
+# GENESIS_BROWSER_STACK_WAIT_S (seconds): wait for a run in progress, then run
+# (a no-op after a complete run) and report the real outcome. install.sh sets it:
+# its timer loop enables the daily timer first, whose catch-up run can take the
+# lock, and a bare exit 0 would report a success it never observed.
 lock_rc=0
-flock -n -E 75 8 || lock_rc=$?
+_wait_s="${GENESIS_BROWSER_STACK_WAIT_S:-}"
+if [[ "$_wait_s" =~ ^[0-9]+$ ]] && [ "$_wait_s" -gt 0 ]; then
+    flock -w "$_wait_s" -E 75 8 || lock_rc=$?
+    if [ "$lock_rc" -eq 75 ]; then
+        _log "another run is still in progress after ${_wait_s}s; its result is in journalctl --user -u genesis-browser-stack"
+        exit 75
+    fi
+else
+    flock -n -E 75 8 || lock_rc=$?
+fi
 if [ "$lock_rc" -eq 75 ]; then
     _log "another run is in progress — exiting"
     exit 0
