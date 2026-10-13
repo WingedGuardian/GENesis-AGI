@@ -430,3 +430,25 @@ genesis_install_managed_unit scripts/systemd/demo.service.template {str(render)!
     assert unit.read_text().endswith("X=2\n")
     text = summary.read_text()
     assert "kept demo.service: it changed while" in text and "taken demo.service" not in text
+
+
+def test_a_render_that_cannot_be_stamped_fails_loudly(world):
+    """A unit that cannot be rendered is a failed deploy: the install step returns
+    non-zero (bootstrap runs under set -e) and names the unit in the summary,
+    which update.sh prints, since the warning itself is cut by `tail -10`."""
+    repo, home, units = world
+    summary = home / "summary"
+    render = home / "render-dir" / "render"
+    render.parent.mkdir(exist_ok=True)
+    render.write_text(RENDER + "# genesis-managed v1 sha256=" + "0" * 64 + "\n")
+    script = f"""
+GENESIS_ROOT={str(repo)!r}; HOME={str(home)!r}
+export GENESIS_DEPLOY_SUMMARY={str(summary)!r}
+source {str(LIB)!r}
+genesis_install_managed_unit scripts/systemd/demo.service.template {str(render)!r} {str(units / "demo.service")!r}
+echo "rc=$?"
+"""
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert "rc=1" in r.stdout, r.stdout + r.stderr
+    assert not (units / "demo.service").exists()
+    assert "not installed demo.service" in summary.read_text()

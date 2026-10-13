@@ -296,6 +296,27 @@ prune_guard_corpus() {
         || echo "guard-corpus prune exited $?"
 }
 
+prune_backup_runs() {
+    # prune_backup_runs <dir> <label> <days>: remove the per-run directories under
+    # a Genesis-owned backup dir once older than <days> (each is written once, so
+    # its mtime is its age), through remove_tree_one_fs, which spares a tree that
+    # is or holds a mount. A <dir> that is a symlink is refused: it points at a
+    # directory Genesis does not own, and every old directory there would go.
+    local dir="$1" label="$2" days="$3" root mounts run
+    if [ -L "$dir" ]; then
+        echo "$label prune SKIPPED: $dir is a symlink; pruning would delete at its target"
+        return 0
+    fi
+    root="$(cd -P -- "$dir" 2>/dev/null && pwd -P)" || return 0
+    if ! mounts="$(mount_targets "$root")"; then
+        echo "$label prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+        return 0
+    fi
+    while IFS= read -r -d '' run; do
+        remove_tree_one_fs "$run" "$mounts" 1 || echo "$label prune failed or spared $run"
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -mtime +"$days" -print0 2>/dev/null)
+}
+
 prune_browser_backups() {
     # genesis.browser.profile_backup copies a browser profile aside before a
     # different engine first opens it (<profile>.pre-v<version>-<UTC time>, a
@@ -581,34 +602,13 @@ main() {
     # files they discard before their merge (AGENTS.md, config/procedure_triggers.yaml)
     # under one directory per run. Written once and never touched again, so a
     # directory's mtime is its age.
-    # Same guarded removal as every other recursive deleter (remove_tree_one_fs,
-    # which spares a tree that is or holds a mount), over the CANONICAL root.
-    if ! _pmb_root="$(cd -P -- "$HOME/.genesis/premerge-backups" 2>/dev/null && pwd -P)"; then
-        :
-    elif ! _pmb_mounts="$(mount_targets "$_pmb_root")"; then
-        echo "premerge-backups prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
-    else
-        while IFS= read -r -d '' _pmb_dir; do
-            remove_tree_one_fs "$_pmb_dir" "$_pmb_mounts" 1 \
-                || echo "premerge-backups prune failed or spared $_pmb_dir"
-        done < <(find "$_pmb_root" -mindepth 1 -maxdepth 1 -type d -mtime +45 -print0 2>/dev/null)
-    fi
+    prune_backup_runs "$HOME/.genesis/premerge-backups" premerge-backups 45
 
     echo "--- replaced systemd unit backup retention prune (>90d) ---"
     # update.sh --take-template / bootstrap's GENESIS_TAKE_TEMPLATES save a hand-edited
     # unit here, one directory per run, before installing its template
-    # (lib/managed_units.sh). Written once, so a directory's mtime is its age. Same
-    # guarded removal as the prune above.
-    if ! _dbk_root="$(cd -P -- "$HOME/.genesis/deploy-backups" 2>/dev/null && pwd -P)"; then
-        :
-    elif ! _dbk_mounts="$(mount_targets "$_dbk_root")"; then
-        echo "deploy-backups prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
-    else
-        while IFS= read -r -d '' _dbk_dir; do
-            remove_tree_one_fs "$_dbk_dir" "$_dbk_mounts" 1 \
-                || echo "deploy-backups prune failed or spared $_dbk_dir"
-        done < <(find "$_dbk_root" -mindepth 1 -maxdepth 1 -type d -mtime +90 -print0 2>/dev/null)
-    fi
+    # (lib/managed_units.sh). Written once, so a directory's mtime is its age.
+    prune_backup_runs "$HOME/.genesis/deploy-backups" deploy-backups 90
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
     # The two store knobs, read BY NAME out of secrets.env.
