@@ -45,8 +45,9 @@
 # and with it a paged file's state for up to DG_RUNAWAY_PAGED_FORGET_S.
 #
 # A file pages once per mode per EPISODE. An episode ends when a paged file is
-# seen at half its retained size or less, or comes back smaller after being out
-# of sight (emptied below the scan's floor, truncated, rotated by copy-truncate):
+# seen at half its retained size or less, or comes back from out of sight at
+# least halfway down from that size to the scan's floor (emptied below the
+# floor, truncated, rotated by copy-truncate):
 # the paged modes are cleared, and a refill pages again under its own key,
 # "<generation>:e<start time>" (#3023). Never on the poll that ended it: a
 # shrink is the cure, not a new runaway. The first episode keeps the bare
@@ -281,13 +282,16 @@ wg_runaway_check() {
         _RW_LAST[$gen]=$now
         size_now[$gen]="${size_of[$key]}"
         # Emptied since it was paged: that episode is over. In sight, it must
-        # be down to half. Back from out of sight (a carried baseline), any
-        # smaller size counts: a file emptied below the scan's floor and refilled
-        # past it never shows half of a small baseline.
+        # be down to half. Back from out of sight (a carried baseline), half of
+        # a small baseline can never be seen (the scan stops at the floor), so
+        # it must be at least halfway down from its baseline to the floor; a
+        # file merely closed and reopened a little smaller is not a new episode
+        # (review finding).
         opened=0
         if [[ -n "${_RW_PAGED[$gen]:-}" && -n "${_RW_PREV[$gen]:-}" ]] \
                 && { (( ${size_of[$key]} * 2 <= ${_RW_PREV[$gen]} )) \
-                     || { [[ -n "${_RW_PREV_AT[$gen]:-}" ]] && (( ${size_of[$key]} < ${_RW_PREV[$gen]} )); }; }; then
+                     || { [[ -n "${_RW_PREV_AT[$gen]:-}" ]] \
+                          && (( ${size_of[$key]} * 2 <= ${_RW_PREV[$gen]} + DG_RUNAWAY_MIN_MB * 1048576 )); }; }; then
             _rw_episode_open "$gen" "$now"
             opened=1
         fi

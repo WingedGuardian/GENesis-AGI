@@ -894,3 +894,28 @@ def test_a_small_paged_file_emptied_below_the_floor_pages_again(box):
     )
     keys = [p["dedupe_key"] for p in _pages(box)]
     assert len(keys) == 2 and keys[1].startswith(_legacy_key(f) + ":e"), keys
+
+
+def test_a_reopened_file_a_little_smaller_is_not_a_new_episode(box):
+    """Closed for a poll and reopened slightly smaller (compaction,
+    reallocation) is not an emptied file: out of sight, a return counts as a
+    shrink only once it is at least halfway down from its baseline to the
+    scan floor (review finding, PR #3290)."""
+    f = _file(box, "out.log", 200)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    hide = f"mv '{box['proc']}/5' '{box['tmp']}/hidden5'"
+    show = f"mv '{box['tmp']}/hidden5' '{box['proc']}/5'"
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {hide}; _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'; {show}
+        {_empty(f)}; {_alloc(f, 199)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EP=${{#_RW_EP[@]}}
+        """,
+    )
+    assert "EP=0" in out.stdout
+    assert len(_pages(box)) == 1
