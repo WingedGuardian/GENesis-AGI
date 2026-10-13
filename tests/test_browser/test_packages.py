@@ -269,6 +269,25 @@ def test_unreadable_metadata_is_reported_not_raised(monkeypatch, exc):
     }
 
 
+@pytest.mark.parametrize("answer", ["none", "keyerror"])
+def test_a_versionless_install_is_unreadable_not_absent(monkeypatch, answer):
+    """A half-removed install can leave a dist-info whose METADATA has no Version.
+    importlib.metadata.version then returns None on Python 3.12 (MEASURED, with a
+    DeprecationWarning) and raises KeyError where that deprecation has landed. Read
+    as absent, the Chromium fallback would quietly swap patchright for plain
+    Playwright."""
+
+    def version(name):
+        if name != "patchright":
+            raise packages.metadata.PackageNotFoundError(name)
+        if answer == "keyerror":
+            raise KeyError("Version")
+        return None
+
+    monkeypatch.setattr(packages.metadata, "version", version)
+    assert packages.installed_versions()["patchright"] == packages.UNREADABLE
+
+
 def test_metadata_damaged_after_startup_says_reinstall(_baseline):
     _baseline(camoufox="0.5.7")
     with patch.object(

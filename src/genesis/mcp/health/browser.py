@@ -517,8 +517,57 @@ async def _ensure_browser():
         return _stealth_page
 
 
+def _patchright_installed() -> bool:
+    # Package metadata, not an import: a half-removed patchright whose metadata
+    # remains still counts as installed, so its import failure is reported.
+    return packages.installed_versions().get("patchright") is not None
+
+
+_warned_no_patchright = False
+# The operator step for patchright, named directly: the browser extra gains
+# patchright only with #3208, which replaces this with engine.PACKAGE_HINT.
+_PATCHRIGHT_STEP = "install 'patchright>=1.62.1,<1.63' into the Genesis venv"
+
+
+class PatchrightBroken(ImportError):
+    """patchright is installed but cannot be imported; the message is the repair."""
+
+
+def _chromium_package() -> str:
+    """The package the Chromium fallback runs through: patchright, which hides the
+    automation signals plain Playwright leaves, whenever it is installed."""
+    global _warned_no_patchright
+    if _patchright_installed():
+        return "patchright"
+    if not _warned_no_patchright:
+        _warned_no_patchright = True
+        logger.warning(
+            "patchright is not installed; the Chromium fallback uses plain Playwright, "
+            "which sites can detect. Operator step: %s",
+            _PATCHRIGHT_STEP,
+        )
+    return "playwright"
+
+
+def _chromium_async_playwright(package: str):
+    """``async_playwright`` from ``package``. An installed patchright whose import
+    fails is re-raised: switching silently to the detectable Chromium would hide
+    the broken install."""
+    if package == "patchright":
+        try:
+            from patchright.async_api import async_playwright
+        except ImportError as exc:
+            raise PatchrightBroken(
+                f"patchright is installed but cannot be imported ({exc}); tell the user; "
+                f"operator step: reinstall it ({_PATCHRIGHT_STEP})"
+            ) from exc
+    else:
+        from playwright.async_api import async_playwright
+    return async_playwright
+
+
 async def _ensure_chromium_fallback():
-    """Lazily initialize Playwright Chromium as fallback browser.
+    """Lazily initialize the Chromium fallback browser (patchright when installed).
 
     Use only when Camoufox fails on a specific site. Persistent profile at
     ~/.genesis/browser-profile/ (separate from Camoufox profile).
@@ -534,18 +583,22 @@ async def _ensure_chromium_fallback():
             logger.warning("Chromium page is stale — restarting Chromium")
             await _cleanup_chromium()
 
-        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
-        from playwright.async_api import async_playwright
+        package = _chromium_package()
+        # Selected once: every check below guards the package this launch imports,
+        # even if one is installed or removed meanwhile.
+        dists = (package,)
+        packages.check_loaded_browser_modules(dists)
+        async_playwright = _chromium_async_playwright(package)
         # Again past the import: an upgrade that began after the first check
         # would have mixed old loaded modules with new files.
-        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
+        packages.check_loaded_browser_modules(dists)
 
         await asyncio.to_thread(
-            profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, "playwright"
+            profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, package
         )
         # And after the copy, which can wait minutes for another session's: an
         # upgrade in that window must not reach the driver start.
-        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
+        packages.check_loaded_browser_modules(dists)
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
         # Always headed — Xvfb :99 is always running.
@@ -558,7 +611,9 @@ async def _ensure_chromium_fallback():
                 headless=False,
                 args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
                       "--start-maximized"],
-                viewport={"width": 1280, "height": 720},
+                # patchright's guidance: a fixed viewport is a fingerprint; the
+                # page follows the (maximized) window instead.
+                no_viewport=True,
             )
         except BaseException:
             # Stop the driver this launch started; left running, the next
@@ -1444,7 +1499,11 @@ async def _get_page(
 def _layer_dists(layer: BrowserLayer) -> tuple[str, ...]:
     """The browser packages ``layer`` imports: what its launch guard checks and its
     import-error advice weighs. One answer, so the two cannot drift apart."""
-    return packages.CAMOUFOX_DISTS if layer is BrowserLayer.CAMOUFOX else packages.PLAYWRIGHT_ONLY
+    if layer is BrowserLayer.CAMOUFOX:
+        return packages.CAMOUFOX_DISTS
+    if layer is BrowserLayer.CHROMIUM:
+        return (_chromium_package(),)  # the one package the fallback runs
+    return packages.PLAYWRIGHT_ONLY
 
 
 def _requested_layer(stealth: bool, remote: bool, tinyfish: bool) -> BrowserLayer:
@@ -3218,6 +3277,13 @@ async def _impl_browser_navigate(
         return {"error": f"{lead}Camoufox is not ready: {e}"}
     except packages.BrowserPackagesChanged as e:
         return {"error": str(e)}
+    except PatchrightBroken as e:
+        # Restarting comes first when a package changed under this session, as for
+        # any import error; otherwise the message is patchright's own repair.
+        dists = _layer_dists(BrowserLayer.CHROMIUM)
+        if packages.packages_changed_message(packages.stale_loaded_modules(dists)):
+            return {"error": packages.import_error_message(e, dists)}
+        return {"error": str(e)}
     except ImportError as e:
         return {"error": packages.import_error_message(e, _layer_dists(layer))}
 
@@ -4231,6 +4297,20 @@ async def _impl_browser_snapshot() -> dict:
         return {"error": f"Snapshot failed: {e}"}
 
 
+def _is_patchright_page(page) -> bool:
+    return type(page).__module__.startswith("patchright")
+
+
+async def _evaluate_main_world(page, expression: str):
+    """``page.evaluate`` in the page's own JavaScript world. patchright evaluates
+    in an isolated world by default (``isolated_context=True``), where the page's
+    own globals are invisible; browser_run_js is the DevTools console, so it asks
+    for the main world on patchright pages. DOM reads elsewhere work in either."""
+    if _is_patchright_page(page):
+        return await page.evaluate(expression, isolated_context=False)
+    return await page.evaluate(expression)
+
+
 async def _impl_browser_run_js(expression: str) -> dict:
     """Execute JavaScript on the current page and return the result.
 
@@ -4259,7 +4339,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
             return refused
         try:
             logger.info("browser_run_js: %s", expression[:200])
-            result = await page.evaluate(expression)
+            result = await _evaluate_main_world(page, expression)
             _update_remote_url()  # JS may cause navigation
             return {"result": result, "url": page.url}
         except Exception as e:
