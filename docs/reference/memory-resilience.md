@@ -154,6 +154,20 @@ TasksMax=<value>` for a runtime change. The live PID budget is on the dashboard
 Container panel (amber ≥ 80%, red ≥ 90%), and the awareness loop raises an
 explanatory alert on approach.
 
+**Who holds it.** On every 5-minute awareness tick while the binding level is
+at or above 80%, the loop also records which processes hold the tasks
+(`observability/pid_breakdown.py`), whether or not the alert itself is in its
+hourly cooldown. It reads only `/proc` and the cgroup filesystem (no fork) and
+writes one JSON file per tick to `~/.genesis/logs/pid_snapshots/`: every cgroup
+under the binding level with its task count, and every process in it grouped
+into trees (one per Claude Code session, and one per service or session scope
+otherwise), each with its thread total and its five largest members. A process
+is named by its program, plus the module or script for an interpreter, never
+its other arguments. The alert text carries the top five trees and cgroups and
+the file's path. Files older than 7 days are pruned, and the directory is kept
+under 20 MB. `GENESIS_PID_BREAKDOWN_DISABLED=1` in the server's environment
+turns the recording off.
+
 ## How the body schema surfaces it
 
 The infrastructure profile (`INFRASTRUCTURE.md`, `infra_profile` package)

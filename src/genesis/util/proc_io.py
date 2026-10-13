@@ -64,6 +64,25 @@ def read_proc_io(pid: int) -> dict | None:
         return None
 
 
+def read_stat(pid: int) -> tuple[str, str, int, int, int] | None:
+    """``(comm, state, ppid, threads, starttime)`` from ONE read of ``/proc/<pid>/stat``.
+
+    One read keeps the fields consistent with each other. ``comm`` (field 2) is
+    parenthesised and may hold spaces or ``)``, so fields are counted after the
+    LAST ``)``: state (3) is index 0, ppid (4) index 1, num_threads (20) index 17,
+    starttime (22) index 19. None when the pid is gone or the file is malformed.
+    """
+    try:
+        # Bytes, then a lenient decode: a process may name itself with any
+        # non-NUL bytes, and a strict decode would drop it (see read_proc_io).
+        stat = (Path(_PROC) / str(pid) / "stat").read_bytes().decode("utf-8", "replace")
+        comm = stat[stat.index("(") + 1 : stat.rindex(")")]
+        after = stat[stat.rindex(")") + 2 :].split()
+        return comm, after[0], int(after[1]), int(after[17]), int(after[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def read_starttime(pid: int) -> int | None:
     """The pid's start time (field 22 of ``/proc/<pid>/stat``, in clock ticks), or None.
 
@@ -72,7 +91,7 @@ def read_starttime(pid: int) -> int | None:
     from after the LAST ``)``: there field 3 is index 0, and field 22 index 19.
     """
     try:
-        stat = (Path(_PROC) / str(pid) / "stat").read_text()
+        stat = (Path(_PROC) / str(pid) / "stat").read_bytes().decode("utf-8", "replace")
         return int(stat[stat.rindex(")") + 2 :].split()[19])
     except (OSError, ValueError, IndexError):
         return None
