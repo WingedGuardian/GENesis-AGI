@@ -930,10 +930,12 @@ def test_a_reopened_file_a_little_smaller_is_not_a_new_episode(box):
 # ── Codex round 2 (PR #3290): a refill is growth or a crossing ────
 
 
-def test_a_file_back_over_the_threshold_from_out_of_sight_is_not_paged_again(box):
-    """Paged at 60 MB on a 200 MB domain (threshold 50), emptied below the
-    floor, back at 52 and left there: the episode opens, and nothing pages
-    while it sits there (it never crossed back over from below)."""
+def test_a_paged_file_seen_empty_below_the_floor_then_refilled_pages_again(box):
+    """Paged at 60 MB on a 200 MB domain (threshold 50), emptied while held:
+    under the scan floor the scan no longer reports it, but it is followed
+    through its writer's descriptor, so the empty is SEEN and the episode
+    opens. Refilled to 52 it crosses the threshold and pages again; left at 52
+    it pages nothing more (review findings, PR #3290)."""
     f = _file(box, "out.log", 60)
     _holder(box, 5, f)
     dom = _domain(box, 200)
@@ -943,15 +945,16 @@ def test_a_file_back_over_the_threshold_from_out_of_sight_is_not_paged_again(box
         wg_runaway_check '{dom}'
         {_empty(f)}
         _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EP=${{#_RW_EP[@]}}
         {_alloc(f, 52)}
         _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
         _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
         _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
-        echo EP=${{#_RW_EP[@]}}
         """,
     )
-    assert "EP=1" in out.stdout, "guard: the episode did open"
-    assert len(_pages(box)) == 1
+    assert "EP=1" in out.stdout, "the empty was seen on the poll it happened"
+    keys = [p["dedupe_key"] for p in _pages(box)]
+    assert len(keys) == 2 and keys[1].startswith(_legacy_key(f) + ":e"), keys
 
 
 def test_a_file_reopened_a_little_smaller_near_the_floor_is_not_paged_again(box):
@@ -1078,3 +1081,233 @@ def test_a_crossing_is_judged_in_the_same_units_as_the_size(box):
     pages = _pages(box)
     assert len(pages) == 2, [p["title"] for p in pages]
     assert "alone uses" in pages[1]["body"]
+
+
+def test_a_file_emptied_for_one_poll_then_refilled_past_its_old_size_pages_again(box):
+    """Codex (PR #3290): 200 MB, empty for one complete poll, then 250 MB before
+    the next. No size rule can see that as a shrink; following the writer's
+    descriptor sees the empty file directly."""
+    f = _file(box, "out.log", 200)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 250)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    keys = [p["dedupe_key"] for p in _pages(box)]
+    assert len(keys) == 2 and keys[1].startswith(_legacy_key(f) + ":e"), keys
+
+
+def test_a_page_that_could_not_be_queued_at_the_crossing_is_sent_later(box):
+    """Codex (PR #3290): 300 -> 60 -> 105 MB on a 400 MB domain, with the queue
+    unwritable only on the crossing poll. The next poll, unchanged, has no
+    crossing and no growth; the page is still due and is sent."""
+    f = _file(box, "out.log", 300)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    q = box["queue"]
+    hold = f"mv '{q}' '{box['tmp']}/q.held'; : > '{q}'"
+    back = f"rm -f '{q}'; mv '{box['tmp']}/q.held' '{q}'"
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}; {_alloc(f, 60)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 75)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 90)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 105)}
+        {hold}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo DUE=${{#_RW_DUE[@]}}
+        {back}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo DUE_AFTER=${{#_RW_DUE[@]}}
+        """,
+    )
+    assert "DUE=1" in out.stdout, "guard: the crossing page really failed"
+    assert "DUE_AFTER=0" in out.stdout
+    pages = _pages(box)
+    assert len(pages) == 2, [p["title"] for p in pages]
+    assert "could not be queued" in pages[1]["body"]
+
+
+def test_a_growth_page_that_could_not_be_queued_is_sent_after_growth_stops(box):
+    """Paged only for its growth, on a poll whose enqueue failed; it then
+    stops growing. The page is still due and is sent on the next poll."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    dom = _domain(box, 4000)
+    q = box["queue"]
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_alloc(f, 400)}
+        : > '{q}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo DUE=${{#_RW_DUE[@]}}
+        rm -f '{q}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    assert "DUE=1" in out.stdout
+    pages = _pages(box)
+    assert len(pages) == 1 and "grew" in pages[0]["body"], [p["body"] for p in pages]
+
+
+def test_a_followed_descriptor_now_on_another_file_opens_no_episode(box):
+    """The writer closed the paged file and its descriptor number now leads to
+    a different, small file: that is not the paged file emptied."""
+    f = _file(box, "out.log", 200)
+    other = _file(box, "other.log", 1)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    relink = f"ln -sfn '{other}' '{box['proc']}/5/fd/1'"
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        echo PREV0=${{_RW_PREV[*]}}
+        {relink}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EP=${{#_RW_EP[@]}} PREV1=${{_RW_PREV[*]}}
+        """,
+    )
+    assert "EP=0" in out.stdout
+    prev0 = out.stdout.split("PREV0=")[1].split()[0]
+    assert f"PREV1={prev0}" in out.stdout, "the other file did not stand in for the paged one"
+    assert len(_pages(box)) == 1
+
+
+def test_a_followed_file_under_the_floor_is_not_paged_until_it_is_over_it(box):
+    """Following a paged file only keeps its baseline: refilled fast but still
+    under the scan's 50 MB floor it pages nothing; over the floor it pages."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    dom = _domain(box, 100)
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 40)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo AT40=$(ls '{box["queue"]}' | wc -l)
+        {_alloc(f, 60)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    assert "AT40=1" in out.stdout
+    assert len(_pages(box)) == 2
+
+
+def test_a_followed_file_is_judged_by_its_own_size(box):
+    """Paged at 60 MB, cut to 40 MB while held: under the floor, followed, and
+    above half its size, so no episode opens; growing back to 60 MB is not a
+    refill. The followed size is the file's real size, not a placeholder."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    dom = _domain(box, 200)
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}; {_alloc(f, 40)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EP=${{#_RW_EP[@]}}
+        {_alloc(f, 60)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    assert "EP=0" in out.stdout
+    assert len(_pages(box)) == 1
+
+
+def test_a_new_writer_that_truncates_and_refills_pages_again(box):
+    """The writer exits, the file is emptied, and a NEW process refills it
+    (`while :; do cmd > out; done`). No writer was seen while it was empty, so
+    nothing could be followed: on return the size is the only evidence, and
+    halfway down to the floor counts (review finding, PR #3290)."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 6, f)
+    (box["proc"] / "6").rename(box["tmp"] / "new6")  # the next writer, not yet started
+    _holder(box, 5, f)
+    dom = _domain(box, 200)
+    gone = f"rm -rf '{box['proc']}/5'"
+    start = f"mv '{box['tmp']}/new6' '{box['proc']}/6'"
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {gone}; {_empty(f)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {start}; {_alloc(f, 52)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        {_alloc(f, 150)}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EP=${{#_RW_EP[@]}}
+        """,
+    )
+    assert "EP=1" in out.stdout
+    keys = [p["dedupe_key"] for p in _pages(box)]
+    assert len(keys) == 2 and keys[1].startswith(_legacy_key(f) + ":e"), keys
+
+
+def test_a_followed_descriptor_reopened_read_only_is_not_followed(box):
+    """The paged file's descriptor number now holds it read-only (written,
+    closed, opened again to read back): that is not the writer, so it is not
+    followed and no page names a reader as a writer."""
+    f = _file(box, "out.log", 200)
+    _holder(box, 5, f)
+    dom = _domain(box, 400)
+    ro = f"printf 'pos:\\t0\\nflags:\\t0100000\\n' > '{box['proc']}/5/fdinfo/1'"
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_empty(f)}; {ro}
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo EP=${{#_RW_EP[@]}}
+        """,
+    )
+    assert "EP=0" in out.stdout, "a reader is not followed"
+    assert len(_pages(box)) == 1
+
+
+def test_a_due_page_is_sent_only_in_the_mode_that_owes_it(box):
+    """A page that failed in ACT is not sent by an observing poll: the observe
+    page would stand in for the one an acting poll owes."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 5, f)
+    dom = _domain(box, 4000)
+    q = box["queue"]
+    out = _run(
+        box,
+        f"""
+        wg_runaway_check '{dom}'
+        {_alloc(f, 400)}
+        : > '{q}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        rm -f '{q}'
+        WATCHGOD_ACT=0
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        echo OBSERVED=$(ls '{q}' 2>/dev/null | wc -l)
+        WATCHGOD_ACT=1
+        _RW_PREV_T=$(( _RW_PREV_T - 30 )); wg_runaway_check '{dom}'
+        """,
+    )
+    assert "OBSERVED=0" in out.stdout, out.stdout
+    pages = _pages(box)
+    assert len(pages) == 1 and "observe" not in pages[0]["dedupe_key"], [
+        p["dedupe_key"] for p in pages
+    ]
