@@ -208,3 +208,96 @@ async def test_budget_none_reads_live_without_raising(monkeypatch):
     monkeypatch.setattr(loop.observations, "create", create)
     monkeypatch.setattr(loop, "_last_pid_alerts", {})
     await loop._check_pid_budget(object(), budget=None)  # no exception
+
+
+@pytest.mark.asyncio
+async def test_the_alert_names_who_holds_the_budget(_reset_cooldown_and_mock_create, monkeypatch):
+    """The alert carries the breakdown summary and the snapshot file, so the next
+    exhausted budget names the tree that filled it (2026-10-13: only the count)."""
+    from genesis.observability import pid_breakdown
+
+    seen = []
+
+    def fake_snapshot(budget):
+        seen.append(budget)
+        return {"text": "Top task holders: claude (pid 12): 613 tasks.", "file": "/s/x.json"}
+
+    monkeypatch.setattr(pid_breakdown, "snapshot_for", fake_snapshot)
+    create = _reset_cooldown_and_mock_create
+    budget = _budget("error", 100.0, 2400, 2400, scope="user-1000.slice")
+    budget["path"] = "/sys/fs/cgroup/user.slice/user-1000.slice"
+    await loop._check_pid_budget(object(), budget=budget)
+    content = create.await_args.kwargs["content"]
+    assert "claude (pid 12): 613 tasks" in content
+    assert "/s/x.json" in content
+    assert seen == [budget]
+
+
+@pytest.mark.asyncio
+async def test_the_breakdown_is_taken_inside_the_cooldown(
+    _reset_cooldown_and_mock_create, monkeypatch
+):
+    """A suppressed repeat alert still records who holds the budget: the holders
+    at the second tick may be different processes from the first."""
+    from genesis.observability import pid_breakdown
+
+    calls = []
+    monkeypatch.setattr(pid_breakdown, "snapshot_for", lambda b: calls.append(b) or None)
+    create = _reset_cooldown_and_mock_create
+    budget = _budget("error", 95.0, scope="user-1000.slice")
+    budget["path"] = "/cg"
+    await loop._check_pid_budget(object(), budget=budget)
+    await loop._check_pid_budget(object(), budget=budget)
+    assert create.await_count == 1  # second alert suppressed by the cooldown
+    assert len(calls) == 2  # but both ticks were recorded
+
+
+@pytest.mark.asyncio
+async def test_a_failed_breakdown_never_drops_the_alert(
+    _reset_cooldown_and_mock_create, monkeypatch
+):
+    from genesis.observability import pid_breakdown
+
+    def boom(_b):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(pid_breakdown, "snapshot_for", boom)
+    create = _reset_cooldown_and_mock_create
+    budget = _budget("error", 99.0, scope="user-1000.slice")
+    budget["path"] = "/cg"
+    await loop._check_pid_budget(object(), budget=budget)
+    create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_budget_takes_no_breakdown(_reset_cooldown_and_mock_create, monkeypatch):
+    from genesis.observability import pid_breakdown
+
+    calls = []
+    monkeypatch.setattr(pid_breakdown, "snapshot_for", lambda b: calls.append(b))
+    budget = _budget("healthy", 40.0)
+    budget["path"] = "/cg"
+    await loop._check_pid_budget(object(), budget=budget)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_no_thread_to_start_still_names_the_holders(
+    _reset_cooldown_and_mock_create, monkeypatch
+):
+    """At 100% the worker thread itself may fail to start; the snapshot then runs
+    inline so the alert for the exhausted tick still carries the breakdown."""
+    from genesis.observability import pid_breakdown
+
+    async def no_thread(*_a, **_k):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(loop.asyncio, "to_thread", no_thread)
+    monkeypatch.setattr(
+        pid_breakdown, "snapshot_for", lambda b: {"text": "Top task holders: x.", "file": "/f"}
+    )
+    create = _reset_cooldown_and_mock_create
+    budget = _budget("error", 100.0, scope="user-1000.slice")
+    budget["path"] = "/cg"
+    await loop._check_pid_budget(object(), budget=budget)
+    assert "Top task holders: x." in create.await_args.kwargs["content"]
