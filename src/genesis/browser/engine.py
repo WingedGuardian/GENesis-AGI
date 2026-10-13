@@ -99,11 +99,16 @@ class _UnreadableMetadata(Exception):
 
 def _dist_version(name: str) -> str | None:
     try:
-        return metadata.version(name)
+        version = metadata.version(name)
     except metadata.PackageNotFoundError:
         return None
     except Exception as exc:  # noqa: BLE001 - any other failure is a damaged install
         raise _UnreadableMetadata(name, exc) from exc
+    if not version:
+        # A dist-info with no Version (a half-removed install) answers None on
+        # Python 3.12: damaged, not absent.
+        raise _UnreadableMetadata(name, ValueError("its metadata has no Version"))
+    return version
 
 
 def _dist_files(name: str) -> list[str] | None:
