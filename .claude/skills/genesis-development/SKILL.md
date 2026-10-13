@@ -4947,19 +4947,27 @@ Standard open-source workflow: PRs go directly to the public repo.
   deletion in the PR body; if you suspect main's change is a bug rather than
   policy, file that before merging. A deleted test with no filed disagreement
   is how coverage disappears.
-- **The CI collected-test floor conflicts whenever main moved it while your
-  branch added tests.** `.github/workflows/ci.yml` carries one hand-maintained
-  `--min-collected` number, and both sides have raised it from a shared base.
-  Picking either side under-counts. The merged floor is MAIN's floor plus YOUR
-  branch's delta, and the delta is measured, never recalled. Run
-  `--collect-only` on main's version of each test file your branch changes and on
-  the merged version, after your LAST test-adding edit. A file new to the branch
-  counts in full. Keep main's comment block and add one paragraph showing your
-  per-file counts. The `--ceiling` on the same line merges the same way: main's
-  ceiling plus your branch's skip delta, counted on the CI runner from the junit
-  report, never locally (installed tools differ, so local skip counts are the
-  wrong denominator). Issue #2743 tracks replacing the hand-maintained number. A test path held in a shell variable reads to
-  `full_suite_guard` as a whole-suite run, so write the count as a script.
+- **Adding tests no longer touches `ci.yml`.** The collected-test count is
+  checked by the `collected-floor` CI job (#2743), which compares the test ids
+  your change collects against the commit it lands on. It is a required check
+  once `.github/rulesets/checks.json` is applied (`scripts/apply_rulesets.py`).
+  It goes red (exit 1) when ids vanish from test files your change did not
+  touch (a `conftest.py` edit does not count as touching the files below it),
+  or when your tree has a collection error the base does not. It refuses
+  (exit 2) when it cannot measure: a base it cannot resolve (not a 2-parent
+  merge, or an unreadable pre-push commit), base dependencies that would not
+  install, pytest exiting other than 0, 1 or 5, a collection that did not
+  finish or collected nothing, malformed collection output, an unreadable
+  changed-file list, a PR-body scanner that would not load, or an unexplained
+  drop whose PR body could not be read. Read the
+  step summary first; it names every vanished id. If a drop is deliberate, put
+  a line `Collected-drop: <reason>` in the PR body and re-run the job (or push,
+  if a re-run no longer clears it: #2624). A branch cut before #2743 that still edits the old
+  `--min-collected` line resolves that conflict by taking main's side and
+  deleting its own floor paragraph. The `--ceiling` (skip count) still lives on
+  the dormancy-guard line: raise it only in the commit that adds the skip,
+  counted on the CI runner from the junit report, never locally (installed
+  tools differ, so local skip counts are the wrong denominator).
 - **README is public-authoritative** — the public repo's `README.md` is
   hand-crafted and must NEVER be overwritten.
 - **Never edit `CHANGELOG.md` in an ordinary PR — add a `changelog.d/`
