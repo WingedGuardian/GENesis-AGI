@@ -169,3 +169,60 @@ def test_bytes_that_are_not_utf8_still_queue(tmp_path):
     (e,) = _entries(root)
     assert e["title"] == "T a\ufffdb" and e["body"] == "B \ufffd"
     assert e["dedupe_key"] == "k:\ufffd"
+
+
+# --- alert_stable_key: a dedupe key that ignores per-run lines (R3) ---------
+
+_FAILURE = (
+    "🚨 *Backup failed*\n\nReason: {reason}\nTime: {time}\n"
+    "SQLite lines: {lines}\nDuration: {dur}s"
+)
+
+
+def _stable_key(message: str, prefix: str = "backup") -> str:
+    r = _run_bash('alert_stable_key "$PREFIX" "$MSG"', {"PREFIX": prefix, "MSG": message})
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def test_stable_key_ignores_time_duration_and_sqlite_lines():
+    a = _FAILURE.format(reason="push rejected", time="2026-09-20T06:10:01-04:00", lines=101, dur=42)
+    b = _FAILURE.format(reason="push rejected", time="2026-09-20T12:10:07-04:00", lines=207, dur=97)
+    ka, kb = _stable_key(a), _stable_key(b)
+    assert ka == kb
+    assert ka.startswith("backup:") and len(ka) == len("backup:") + 12
+
+
+def test_stable_key_differs_for_a_different_reason():
+    a = _FAILURE.format(reason="push rejected", time="t1", lines=1, dur=1)
+    b = _FAILURE.format(reason="disk full", time="t1", lines=1, dur=1)
+    assert _stable_key(a) != _stable_key(b)
+
+
+def test_whole_message_md5_control_gives_two_keys():
+    """Negative control: the previous key (md5 of the whole message) changed on
+    every run, so a repeated failure was never collapsed by its key."""
+    import hashlib
+
+    a = _FAILURE.format(reason="push rejected", time="t1", lines=1, dur=1)
+    b = _FAILURE.format(reason="push rejected", time="t2", lines=1, dur=2)
+    old = [hashlib.md5(m.encode()).hexdigest()[:12] for m in (a, b)]
+    assert old[0] != old[1]
+    assert _stable_key(a) == _stable_key(b)
+
+
+def test_stable_key_survives_pipefail_when_every_line_is_filtered():
+    r = _run_bash(
+        'k=$(alert_stable_key backup "$MSG"); echo "k=$k"',
+        {"MSG": "Time: now\nDuration: 3s"},
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip().startswith("k=backup:")
+    assert len(r.stdout.strip()) == len("k=backup:") + 12
+
+
+def test_stable_key_keeps_lines_that_merely_mention_time():
+    # Only lines STARTING with the per-run labels are dropped.
+    a = "Reason: Time: budget exceeded\nTime: t1"
+    b = "Reason: Time: something else\nTime: t1"
+    assert _stable_key(a) != _stable_key(b)

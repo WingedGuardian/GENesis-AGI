@@ -132,9 +132,22 @@ test = [
     "pyrage>=1.4",
     "zxcvbn>=4.5",
 ]
+# Installed on every install, after the core packages and as a separate non-fatal
+# step (scripts/bootstrap.sh, scripts/install.sh); the engine and Chromium these
+# packages pin are then downloaded by scripts/install_browser_stack.sh
+# (genesis-browser-stack.service). playwright and patchright live ONLY here, never
+# in the core list: a core install that moved playwright to 1.62 would break a
+# camoufox < 0.5 engine the browser step has not replaced yet (measured:
+# "Protocol error (Browser.setDefaultViewport)").
 browser = [
-    "playwright>=1.40",
-    "camoufox>=0.4",
+    "camoufox>=0.5.7,<0.6",  # engine pinned by the package's browser-pin.json (Firefox 156).
+                             # Upper bound: 0.4 -> 0.5 shipped no migration guide and changed
+                             # the engine layout; take the next minor deliberately.
+    "playwright>=1.62,<1.63",  # camoufox 0.5.7 and 0.5.8 declare playwright<1.63.
+    "patchright>=1.62.1,<1.63",  # Chromium fallback layer (hides the Runtime.enable CDP signal).
+                                 # <1.63 so it ships the SAME Chromium build as playwright 1.62
+                                 # (151, build 1234; patchright 1.63 ships 153/1243): one download,
+                                 # and the profile is never opened by two Chromium versions.
 ]
 voice = [
     "openai[realtime]>=2.20",  # GPT-Realtime API for speech-to-speech voice sessions

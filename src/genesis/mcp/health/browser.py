@@ -35,7 +35,7 @@ from pathlib import Path
 
 from fastmcp import Context
 
-from genesis.browser import engine, packages, profile_backup
+from genesis.browser import chromium, engine, packages, profile_backup
 from genesis.browser.types import BrowserLayer
 from genesis.mcp.health import mcp
 from genesis.security.card_shapes import contains_card_number
@@ -524,9 +524,8 @@ def _patchright_installed() -> bool:
 
 
 _warned_no_patchright = False
-# The operator step for patchright, named directly: the browser extra gains
-# patchright only with #3208, which replaces this with engine.PACKAGE_HINT.
-_PATCHRIGHT_STEP = "install 'patchright>=1.62.1,<1.63' into the Genesis venv"
+# The browser extra carries patchright, pinned beside the playwright it pairs with.
+_PATCHRIGHT_STEP = engine.PACKAGE_HINT
 
 
 class PatchrightBroken(ImportError):
@@ -592,20 +591,29 @@ async def _ensure_chromium_fallback():
         # Again past the import: an upgrade that began after the first check
         # would have mixed old loaded modules with new files.
         packages.check_loaded_browser_modules(dists)
-
-        await asyncio.to_thread(
-            profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, package
-        )
-        # And after the copy, which can wait minutes for another session's: an
-        # upgrade in that window must not reach the driver start.
-        packages.check_loaded_browser_modules(dists)
-        _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-
-        # Always headed — Xvfb :99 is always running.
+        # Always headed — Xvfb :99 is always running. Set before the driver starts:
+        # it copies the environment then, and the browser inherits the driver's.
         os.environ["DISPLAY"] = _VNC_DISPLAY
-
         pw = await async_playwright().start()
         try:
+            # An upgrade while the driver started can remove the revision this
+            # loaded driver launches: that needs a restart, not provisioning.
+            packages.check_loaded_browser_modules(dists)
+            # Before the profile copy and the launch: Playwright's own error for a
+            # missing browser tells the reader to run `<package> install`, a download
+            # no session may start. Judged where the driver itself will launch from.
+            missing = chromium.not_ready_at(package, "chromium", pw.chromium.executable_path)
+            if missing:
+                raise chromium.ChromiumNotReady(missing)
+
+            await asyncio.to_thread(
+                profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, package
+            )
+            # And after the copy, which can wait minutes for another session's: an
+            # upgrade in that window must not reach the launch.
+            packages.check_loaded_browser_modules(dists)
+            _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
             ctx = await pw.chromium.launch_persistent_context(
                 user_data_dir=str(_CHROMIUM_PROFILE_DIR),
                 headless=False,
@@ -3275,6 +3283,8 @@ async def _impl_browser_navigate(
         )
         lead = f"{changed} " if changed else ""
         return {"error": f"{lead}Camoufox is not ready: {e}"}
+    except chromium.ChromiumNotReady as e:
+        return {"error": f"Chromium is not ready: {e}"}
     except packages.BrowserPackagesChanged as e:
         return {"error": str(e)}
     except PatchrightBroken as e:

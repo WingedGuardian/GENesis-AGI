@@ -46,6 +46,7 @@ on:
       - "scripts/code_intel_freeze.sh"
       - "scripts/code_intel_runner.sh"
       - "scripts/disk_hygiene.sh"
+      - "scripts/install_browser_stack.sh"
       - "scripts/tmp_watchgod.sh"
       - "scripts/hooks/pre-commit"
       - "scripts/hooks/pre-push"
@@ -131,6 +132,10 @@ jobs:
       - name: Run installer (non-interactive, strict)
         env:
           GENESIS_INSTALL_STRICT: "1"
+          # No GITHUB_TOKEN here, though the browser stack step's engine fetch lists
+          # releases through api.github.com (anonymous: 60 calls an hour per
+          # address): this job runs the pull request's own code, which must not
+          # read the token (see persist-credentials above).
         run: ./scripts/install.sh --non-interactive
 
       - name: Verify install outcome

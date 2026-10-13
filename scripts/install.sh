@@ -898,6 +898,7 @@ fi
 # ══════════════════════════════════════════════════════════════
 echo "  [6/$TOTAL_STEPS] Installing Genesis package..."
 
+_genesis_installed=0  # the browser stack step (step 11) needs Genesis importable
 if [ -d "$VENV_PATH" ]; then
     # Worktree guard + editable install + import verification — shared with
     # bootstrap.sh so the guard can't drift between the two entry points.
@@ -908,6 +909,14 @@ if [ -d "$VENV_PATH" ]; then
     case $_ei_rc in
         0)
             echo "    + Genesis installed in editable mode"
+            _genesis_installed=1
+            # The browser packages, after the core and never fatal (see
+            # install_browser_extra); their engine and Chromium download in step 11.
+            if install_browser_extra "$REPO_DIR" "$VENV_PATH" | sed 's/^/    /'; then
+                echo "    + browser packages installed"
+            else
+                setup_warn "browser packages incomplete (see above; re-run scripts/bootstrap.sh)"
+            fi
             ;;
         1)
             # Blocked (worktree) — guard already printed the reason; the
@@ -1393,6 +1402,31 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
                 echo "    + $timer_name enabled + started" || true
         fi
     done
+fi
+
+# The browser stack: the Camoufox engine and the Chromium the browser packages pin,
+# and their system libraries. Inline here, unlike bootstrap.sh, which starts it as a
+# unit: a fresh install has no browser running and the user is present, and a sudo
+# credential this run already cached lets the script's `sudo -n` install missing
+# libraries. Inside a Claude Code session the provisioner refuses to run, so the
+# unit runs it instead, as bootstrap.sh does.
+if [ "$_genesis_installed" != "1" ]; then
+    echo "    Browser stack: skipped (the Genesis package step above did not complete)"
+elif [ -n "${CLAUDECODE:-}" ]; then
+    if systemctl --user start --no-block genesis-browser-stack.service 2>/dev/null; then
+        echo "    + genesis-browser-stack.service started (journalctl --user -u genesis-browser-stack);"
+        echo "      unattended, it reports missing system libraries with the command to run"
+    else
+        setup_warn "browser stack not started (run scripts/install_browser_stack.sh from a terminal)"
+    fi
+elif echo "    Browser stack: Camoufox engine and Chromium, about 1.5 GB the first time;" \
+    && echo "    no progress is shown while it downloads..." \
+    && VENV_PATH="$VENV_PATH" GENESIS_BROWSER_STACK_WAIT_S=7200 \
+        bash "$SCRIPT_DIR/install_browser_stack.sh" 2>&1 | sed 's/^/    /'; then
+    # Exit 0 is ready, or deliberately skipped (low disk, another run): its line says which.
+    echo "    + browser stack step done (its browser-stack: line above says what it did)"
+else
+    setup_warn "browser stack not ready (see its browser-stack: line above; re-run scripts/install_browser_stack.sh)"
 fi
 
 # Enable the cc-tmp cold-start apply SERVICE (WantedBy=default.target, not a

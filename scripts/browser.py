@@ -53,21 +53,31 @@ def _sync_playwright():
     return sync_playwright(), "playwright"
 
 
-def _backup_profile(package: str) -> None:
-    """Copy the profile aside first when a different Chromium is about to open it
-    (genesis.browser.profile_backup, as the MCP tools do). Optional: this CLI also
-    runs where genesis is not importable, and then it makes no copy."""
+def _prepare(package: str) -> None:
+    """What the MCP tools do before a Chromium launch: refuse when the package's
+    Chromium is not installed (Playwright's own error says to run `<package>
+    install`, a download no session may start), then copy the profile aside when a
+    different Chromium is about to open it. Optional: this CLI also runs where
+    genesis is not importable, and then it does neither."""
     try:
-        from genesis.browser.profile_backup import backup_chromium_profile
+        from genesis.browser import chromium, profile_backup
     except ImportError:
-        print("Note: genesis is not importable here, so the profile is not copied first", file=sys.stderr)
+        print(
+            "Note: genesis is not importable here, so the profile is not copied first "
+            "and the Chromium install is not checked",
+            file=sys.stderr,
+        )
         return
-    backup_chromium_profile(USER_DATA_DIR, package)  # never raises
+    missing = chromium.not_ready(package, headless=True)  # _launch below is headless
+    if missing:
+        print(f"Chromium is not ready: {missing}", file=sys.stderr)
+        sys.exit(1)
+    profile_backup.backup_chromium_profile(USER_DATA_DIR, package)  # never raises
 
 
 def _open():
     manager, package = _sync_playwright()
-    _backup_profile(package)
+    _prepare(package)
     return manager
 
 
@@ -78,8 +88,8 @@ def _default_screenshot_path() -> str:
     life of the process, which is the bug this replaces. Same scheme as the
     MCP tool's `_impl_browser_screenshot` (genesis/mcp/health/browser.py):
     sortable timestamp + full uuid4 hex. Deliberately duplicated rather than
-    imported — this CLI runs standalone; its one genesis import (the profile
-    copy) is optional.
+    imported — this CLI runs standalone; its one genesis import (the launch
+    check and the profile copy) is optional.
     """
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     return str(Path.home() / "tmp" / f"browser_screenshot_{stamp}_{uuid.uuid4().hex}.png")
