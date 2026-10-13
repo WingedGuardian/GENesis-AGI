@@ -3528,7 +3528,20 @@ verified: ba9dd8a37 2026-10-09
   cannot work on a unit in `~/.config/systemd/user`). The dashboard's update
   card shows edited units (stamp check only); the supervised update tiers stop
   on exit 4 rather than escalate. `update.sh` prints what bootstrap changed
-  outside the checkout at the end of every run.
+  outside the checkout at the end of every run, a failed one included. A
+  symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
+  `--take-templates`.
+- **The restart guard, `~/.genesis/update_state.json`** (deploy scripts):
+  an update that merged code it has not activated leaves this file, and
+  `deploy_code_only.sh` and the live engine refuse to restart while it stands.
+  One rule decides whether it may be replaced or removed,
+  `scripts/lib/update_state_guard.py` (only phase `done`, or `fetching` whose
+  rollback tag is still HEAD, is safe; anything unreadable guards). The
+  dashboard's progress poll and Apply, and `update.sh` right after it takes
+  `update.lock`, all ask it: a plain `update.sh` run refuses over a guarding
+  state (finish it with `--post-merge`, or Dismiss), and names the conflict
+  remedy instead when an earlier run stopped on merge conflicts. A rollback that
+  did not restore the code keeps the file.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.

@@ -1392,8 +1392,11 @@ cc_shadow_scan() {
                 ;;
             *)
                 echo "  cc_shadow_scan: removing native-installer version blobs ($HOME/.local/share/claude/versions)"
-                rm -rf "$HOME/.local/share/claude/versions"
-                _cc_deploy_summary "removed Claude Code native-installer versions ($HOME/.local/share/claude/versions)"
+                if rm -rf "$HOME/.local/share/claude/versions"; then
+                    _cc_deploy_summary "removed Claude Code native-installer versions ($HOME/.local/share/claude/versions)"
+                else
+                    echo "  WARNING: cc_shadow_scan: could not remove $HOME/.local/share/claude/versions" >&2
+                fi
                 ;;
         esac
     fi
@@ -1477,9 +1480,19 @@ _cc_remove_shadow() {
             ;;
     esac
     echo "  cc_shadow_scan: removing shadow copy $candidate${pkg_dir:+ (+ $pkg_dir)}"
+    # Every caller runs `cc_shadow_scan || true`, which turns errexit off in
+    # here, so a failed rm would fall through silently. Check each, and name
+    # the removal in the run summary only once it happened.
+    if ! "${rm_link[@]}"; then
+        echo "  WARNING: cc_shadow_scan: could not remove $candidate${pkg_dir:+ (+ $pkg_dir)} — it may still shadow the canonical copy on PATH" >&2
+        return 1
+    fi
+    if [ -n "$pkg_dir" ] && ! "${rm_pkg[@]}"; then
+        echo "  WARNING: cc_shadow_scan: removed $candidate but could not remove $pkg_dir — delete it by hand" >&2
+        _cc_deploy_summary "removed a shadow Claude Code link $candidate; its package $pkg_dir could not be removed"
+        return 1
+    fi
     _cc_deploy_summary "removed a shadow Claude Code copy: $candidate${pkg_dir:+ (+ $pkg_dir)}"
-    "${rm_link[@]}"
-    [ -n "$pkg_dir" ] && "${rm_pkg[@]}"
     return 0
 }
 

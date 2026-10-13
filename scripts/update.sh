@@ -19,6 +19,7 @@
 #                 before anything stops (exit 4). This replaces that one unit with
 #                 its template instead, after saving the old file under
 #                 ~/.genesis/deploy-backups/. Repeatable. --take-templates: all.
+#                 A symlinked unit (a mask) is replaced only when named.
 #                 Local changes that should survive updates belong in a drop-in,
 #                 ~/.config/systemd/user/<unit>.d/*.conf, which updates never touch.
 #
@@ -77,7 +78,22 @@ fi
 # below names "$_SELF_COPY" instead, and it is readonly so no later code can
 # re-point it.
 readonly _SELF_COPY="${BASH_SOURCE[0]}"
-trap 'rm -f "$_SELF_COPY" 2>/dev/null' EXIT
+# What bootstrap changed outside the checkout (GENESIS_DEPLOY_SUMMARY, created
+# just before it runs) is printed on EVERY exit after that, not only on
+# success: a rollback restores the code but leaves units and /etc files as
+# bootstrap wrote them, so a failed run is exactly when the list matters. The
+# success path flushes it first with its own heading; this finds nothing then.
+# The traps remove the self-copy first, so a dead stdout cannot leak it.
+_flush_deploy_summary() {
+    local heading="${1:-Changed outside the checkout before this run stopped (not undone):}"
+    if [ -n "${GENESIS_DEPLOY_SUMMARY:-}" ] && [ -s "$GENESIS_DEPLOY_SUMMARY" ]; then
+        echo "  $heading"
+        sed 's/^/    /' "$GENESIS_DEPLOY_SUMMARY" 2>/dev/null || true
+    fi
+    rm -f "${GENESIS_DEPLOY_SUMMARY:-}" 2>/dev/null || true
+    GENESIS_DEPLOY_SUMMARY=""
+}
+trap 'rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
 # The copy handshake is spent. Nothing this run starts (bootstrap, a nohup'd
 # server, a later dashboard update) may inherit it.
 unset GENESIS_UPDATE_FROM_TEMP GENESIS_UPDATE_SELF_COPY
@@ -326,6 +342,35 @@ if ! flock -n "$_UPDATE_LOCK_FD"; then
     echo "       Refusing to run a second update concurrently."
     exit 1
 fi
+
+# BEGIN prior-state-guard
+# An earlier run that merged code but never activated it (a refused or
+# conflicted --post-merge, a crash) left update_state.json behind, and that file
+# is what stops deploy_code_only.sh and the live engine restarting onto the
+# unactivated code. This run's own _write_state would overwrite it, and its
+# exit paths would then delete it. So a plain run refuses while such a file
+# stands; --post-merge is the run that finishes it. The rule is
+# scripts/lib/update_state_guard.py, shared with the dashboard (#3139): exit 1
+# means safe to replace, anything else keeps the file (doubt keeps the guard).
+if [[ "$POST_MERGE" != "true" ]]; then
+    _prior_state_rc=0
+    python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$STATE_FILE" "$GENESIS_ROOT" || _prior_state_rc=$?
+    if [ "$_prior_state_rc" -eq 3 ]; then
+        echo "ERROR: an earlier update stopped on merge conflicts and nothing was merged"
+        echo "       ($STATE_FILE keeps its rollback point for the conflict resolver)."
+        echo "       Resolve it (~/.genesis/update_conflicts.json lists the files), or"
+        echo "       Dismiss it on the dashboard's update card, then run update.sh again."
+        echo "       Nothing was changed."
+        exit 1
+    elif [ "$_prior_state_rc" -ne 1 ]; then
+        echo "ERROR: an earlier update merged code it has not activated, or its state"
+        echo "       file cannot be read ($STATE_FILE)."
+        echo "       Finish it with: scripts/update.sh --post-merge"
+        echo "       (or Dismiss it on the dashboard's update card). Nothing was changed."
+        exit 1
+    fi
+fi
+# END prior-state-guard
 
 echo ""
 echo "  Genesis Update"
@@ -1403,7 +1448,7 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     # deploy). It is armed BEFORE the pause, so no signal can land between an
     # accepted pause and its resume; _guardian_resume no-ops until a pause is
     # accepted.
-    trap '_guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null' EXIT
+    trap '_guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
     _guardian_pause
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
@@ -1966,7 +2011,17 @@ with open(sys.argv[11], 'w') as f:
     # leftover entry can't suppress the watchdog's deploy-restart guard after a
     # rollback. The server is back up (above); once this invocation exits its PID
     # dies anyway, but removing the files closes the PID-reuse window proactively.
-    _clear_deploy_state
+    # BEGIN rollback-state-clear
+    # A rollback that did not put the code back keeps update_state.json: the
+    # tree may hold merged code bootstrap never ran on, and that file is what
+    # stops deploy_code_only.sh and the live engine restarting onto it.
+    if [ "$checkout_ok" = "true" ]; then
+        _clear_deploy_state
+    else
+        _clear_deploy_marker
+        echo "  update_state.json is kept as the restart guard: finish with update.sh --post-merge, or Dismiss on the dashboard."
+    fi
+    # END rollback-state-clear
 
     echo ""
     echo "  ──────────────────────────────────────"
@@ -3143,10 +3198,6 @@ _clear_deploy_state
 
 # ── Done ──────────────────────────────────────────────────
 echo "  ──────────────────────────────────────"
-if [ -n "${GENESIS_DEPLOY_SUMMARY:-}" ] && [ -s "$GENESIS_DEPLOY_SUMMARY" ]; then
-    echo "  Changed outside the checkout:"
-    sed 's/^/    /' "$GENESIS_DEPLOY_SUMMARY"
-fi
-rm -f "${GENESIS_DEPLOY_SUMMARY:-}" 2>/dev/null || true
+_flush_deploy_summary "Changed outside the checkout:"
 echo "  Updated: $OLD_TAG ($OLD_COMMIT) → $NEW_TAG ($NEW_COMMIT)"
 echo ""

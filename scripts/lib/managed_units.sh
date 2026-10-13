@@ -39,6 +39,20 @@ genesis_mu_taken() {
     return 1
 }
 
+# Whether <name> itself is in GENESIS_TAKE_TEMPLATES. `*` does not count: a
+# symlinked unit is usually a mask (-> /dev/null), and a blanket
+# --take-templates must never unmask one. Only --take-template <name> replaces it.
+genesis_mu_taken_explicitly() {
+    local name names=()
+    read -r -a names <<< "${GENESIS_TAKE_TEMPLATES:-}" || true
+    for name in "${names[@]}"; do
+        if [ "$name" = "$1" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Copy <target> (a symlink is copied as a symlink) under one backup dir per run.
 genesis_mu_backup() {
     : "${GENESIS_MU_BACKUP_DIR:=$HOME/.genesis/deploy-backups/$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -71,11 +85,12 @@ genesis_install_managed_unit() {
     fi
     if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
         # A link (a masked unit is one, to /dev/null) or a directory is never
-        # written through. A taken LINK is saved and replaced; a directory is kept.
-        if [ -L "$target" ] && genesis_mu_taken "$name" && genesis_mu_backup "$target"; then
+        # written through. A link taken BY NAME is saved and replaced (never by
+        # `*`, which would unmask); a directory is kept.
+        if [ -L "$target" ] && genesis_mu_taken_explicitly "$name" && genesis_mu_backup "$target"; then
             rm -f -- "$target"
         else
-            genesis_mu_keep "$name" "a symlink or not a regular file"
+            genesis_mu_keep "$name" "a symlink or not a regular file; only --take-template $name replaces it"
             rm -f "$stamped"
             return 0
         fi

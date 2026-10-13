@@ -131,12 +131,22 @@ def test_a_masked_unit_is_never_written_through(world):
     assert "Kept: demo.service (a symlink" in r.stdout
 
 
-def test_a_taken_symlink_is_saved_and_replaced_by_a_regular_file(world, tmp_path):
+def test_a_blanket_take_never_unmasks(world):
+    repo, home, units = world
+    (units / "demo.service").symlink_to("/dev/null")
+    r = _install(repo, home, units, take="*")
+    assert r.returncode == 0, r.stderr
+    assert os.readlink(units / "demo.service") == "/dev/null"
+    assert "only --take-template demo.service replaces it" in r.stdout
+    assert not (home / ".genesis" / "deploy-backups").exists()
+
+
+def test_a_symlink_taken_by_name_is_saved_and_replaced_by_a_regular_file(world, tmp_path):
     repo, home, units = world
     elsewhere = tmp_path / "elsewhere.service"
     elsewhere.write_text("mine\n")
     (units / "demo.service").symlink_to(elsewhere)
-    r = _install(repo, home, units, take="*")
+    r = _install(repo, home, units, take="demo.service")
     assert r.returncode == 0, r.stderr
     assert not (units / "demo.service").is_symlink()
     assert elsewhere.read_text() == "mine\n", "wrote through the link"
@@ -245,6 +255,29 @@ def test_install_writes_stamped_units_and_never_overwrites(tmp_path):
     assert rendered == stamp
     assert (udir / "kept.service").read_text() == "[Service]\nExecStart=/theirs\n"
     assert sorted(p.name for p in udir.iterdir()) == ["demo.service", "kept.service"]
+
+
+@pytest.mark.parametrize("link_to", ["/dev/null", "/nonexistent/dangling"], ids=["masked", "dangling"])
+def test_an_install_rerun_never_replaces_a_masked_unit(tmp_path, link_to):
+    """A masked unit is a symlink to /dev/null; replacing it would unmask it, and
+    the timer loop that follows would then enable it (#3138 review)."""
+    tdir, udir = tmp_path / "templates", tmp_path / "units"
+    tdir.mkdir()
+    udir.mkdir()
+    (tdir / "masked.timer.template").write_text(TEMPLATE)
+    (udir / "masked.timer").symlink_to(link_to)
+    script = (
+        "set -euo pipefail\n"
+        f"SYSTEMD_TEMPLATE_DIR={str(tdir)!r} SYSTEMD_USER_DIR={str(udir)!r}\n"
+        f"HOME={str(tmp_path)!r} VENV_PATH=/opt/v REPO_DIR=/opt/r CC_BIN_DIR=/opt/c\n"
+        f"SCRIPT_DIR={str(REPO / 'scripts')!r}\n"
+        "_falkordb_redis_server_bin() { echo /usr/bin/redis-server; }\n" + _install_step7_block()
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (udir / "masked.timer").is_symlink()
+    assert os.readlink(udir / "masked.timer") == link_to
+    assert "masked.timer is a symlink or not a regular file (masked?) — kept" in r.stdout
 
 
 def _no_change_branch() -> str:

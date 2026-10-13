@@ -1000,7 +1000,12 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
-        if [ -f "$target" ]; then
+        # Any existing path counts, not only a regular file: a masked unit is a
+        # symlink to /dev/null, and replacing it would unmask it (the timer loop
+        # below then enables it). Bootstrap keeps such a unit the same way.
+        if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
+            echo "    . $svc_name is a symlink or not a regular file (masked?) — kept"
+        elif [ -f "$target" ]; then
             echo "    . $svc_name already exists (not overwriting)"
         else
             # __AZ_ROOT__ (agent-zero.service.template's WorkingDirectory) was

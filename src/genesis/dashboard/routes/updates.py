@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import logging
 import os
@@ -36,6 +37,9 @@ _DB_PATH = _GENESIS_ROOT / "data" / "genesis.db"
 _FAILURE_FILE = _HOME / ".genesis" / "last_update_failure.json"
 _LIVE_CHECKOUT_SCRIPT = _GENESIS_ROOT / "scripts" / "lib" / "live_checkout.py"
 _MANAGED_UNITS_SCRIPT = _GENESIS_ROOT / "scripts" / "lib" / "managed_units.py"
+# The restart-guard rule shared with update.sh (#3139), from the tree this
+# module ships in (not _GENESIS_ROOT, which tests point at a scratch repo).
+_STATE_GUARD_SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "lib" / "update_state_guard.py"
 _UNIT_DIR = _HOME / ".config" / "systemd" / "user"
 
 
@@ -401,6 +405,10 @@ def update_apply():
         refusal = _live_refusal()
         if refusal is not None:
             return jsonify(refusal[0]), refusal[1]
+        # Both paths: update.sh itself refuses a plain run over this state, and on
+        # the direct path that refusal would land only in update_direct.log.
+        if _state_file_guards_merged_code():
+            return jsonify({"error": _EARLIER_UPDATE_UNFINISHED}), 409
         if supervised:
             # Writes the orchestrator's pid as the marker before the lock goes.
             return _apply_supervised(_PID_FILE)
@@ -516,7 +524,12 @@ You are supervising a Genesis update. Your role is WATCH AND ESCALATE.
      Write error context to {summary_file}
    - Done. Do NOT attempt code changes.
 
-5. If exit 4 (refused):
+5. If update.sh exits 1 saying an earlier update merged code it has not
+   activated: that file is the restart guard. Never delete or edit
+   ~/.genesis/update_state.json and never run --post-merge yourself. Write the
+   message to {summary_file}. Do not write {escalation_file}. Done.
+
+6. If exit 4 (refused):
    Exit 4 means update.sh REFUSED, before stopping anything, because systemd units
    were edited by hand. Never modify, delete, replace or re-stamp those unit files,
    and never pass --take-template or --take-templates: whether the hand edit goes is
@@ -570,6 +583,10 @@ and never pass --take-template or --take-templates: whether the hand edit goes i
 the user's decision. Write to {summary_file}: "refused: <the units it names>".
 Do not write {escalation_file}. Done.
 
+If update.sh says an earlier update merged code it has not activated, that file
+is the restart guard: never delete or edit ~/.genesis/update_state.json to get
+past it. Write the message to {summary_file} and stop.
+
 If SCRIPT ERROR:
 1. Diagnose the root cause from the error output
 2. If fixable (missing dep, config mismatch, import error): fix and retry.
@@ -615,6 +632,10 @@ and never pass --take-template or --take-templates: whether the hand edit goes i
 the user's decision. Write to {summary_file}: "refused: <the units it names>".
 Do not write {escalation_file}. Done.
 
+If update.sh says an earlier update merged code it has not activated, that file
+is the restart guard: never delete or edit ~/.genesis/update_state.json to get
+past it. Write the message to {summary_file} and stop.
+
 Write a resolution report to {summary_file} explaining each decision, unless
 update.sh exited 4: then the summary stays exactly "refused: <the units it names>".
 Use conventional commit format for any fixes (fix: ...).\
@@ -650,33 +671,44 @@ def _update_lock_unopenable(exc: UpdateLockError):
     return jsonify({"error": f"Cannot open update.lock ({exc}); nothing was started."}), 500
 
 
-def _state_guards_merged_code(state: dict | None) -> bool:
+def _load_state_guard():
+    """scripts/lib/update_state_guard.py, the one rule update.sh applies too.
+    Loaded from disk on each call, like live_checkout.py, so the copy that
+    answers is the one an update would run now."""
+    spec = importlib.util.spec_from_file_location("genesis_update_state_guard", _STATE_GUARD_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_STATE_GUARD_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _state_guards_merged_code(state: object) -> bool:
     """Whether update_state.json still stands between a restart and merged code
-    that bootstrap never ran on (#3139). Only "done", or a "fetching" state whose
-    rollback tag is still HEAD (git says nothing merged), is safe to retire; any
-    doubt keeps the guard, since only update.sh, bootstrap's crash recovery and
-    the user's Dismiss retire it on purpose."""
-    if not state:
-        return False
-    phase = state.get("phase")
-    if phase in (None, "done"):
-        return False
-    if phase != "fetching":
-        return True
-    tag = str(state.get("rollback_tag") or "")
-    if not tag or tag.startswith("-"):
-        return True
+    that bootstrap never ran on (#3139): scripts/lib/update_state_guard.py's
+    rule. ``None`` means there is no file. A guard that cannot be loaded keeps
+    the state (doubt keeps the guard)."""
     try:
-        heads = [
-            subprocess.run(
-                ["git", "-C", str(_GENESIS_ROOT), "rev-parse", "--verify", "-q", rev],
-                capture_output=True, text=True, timeout=10,
-            ).stdout.strip()
-            for rev in (f"{tag}^{{commit}}", "HEAD")
-        ]
-    except (OSError, subprocess.SubprocessError):
-        return True
-    return not heads[0] or heads[0] != heads[1]
+        return bool(_load_state_guard().state_guards(state, str(_GENESIS_ROOT)))
+    except Exception:  # noqa: BLE001 - any failure to decide must keep the guard
+        logger.warning("update_state guard could not be evaluated; keeping the state", exc_info=True)
+        return state is not None
+
+
+_EARLIER_UPDATE_UNFINISHED = (
+    "An earlier update merged code it has not activated yet (or its state file "
+    "cannot be read). Finish it with scripts/update.sh --post-merge, or Dismiss it first."
+)
+
+
+def _state_file_guards_merged_code() -> bool:
+    """`_state_guards_merged_code` for the file on disk: a file that exists but
+    cannot be read or parsed keeps the guard."""
+    try:
+        return bool(_load_state_guard().file_guards(str(_STATE_FILE), str(_GENESIS_ROOT)))
+    except Exception:  # noqa: BLE001 - any failure to decide must keep the guard
+        logger.warning("update_state guard could not be evaluated; keeping the state", exc_info=True)
+        return _STATE_FILE.exists()
 
 
 def _apply_supervised(pid_file: Path) -> tuple:
@@ -696,12 +728,8 @@ def _apply_supervised(pid_file: Path) -> tuple:
     # An earlier update that merged code it has not activated (a refused or
     # conflicted --post-merge) keeps update_state.json as the restart guard;
     # starting over would delete it. Finish that one first.
-    with contextlib.suppress(OSError, json.JSONDecodeError):
-        if _STATE_FILE.is_file() and _state_guards_merged_code(json.loads(_STATE_FILE.read_text())):
-            return jsonify({
-                "error": "An earlier update merged code it has not activated yet. "
-                "Finish it with scripts/update.sh --post-merge, or Dismiss it first.",
-            }), 409
+    if _state_file_guards_merged_code():
+        return jsonify({"error": _EARLIER_UPDATE_UNFINISHED}), 409
 
     # Clean up ALL state files from prior runs
     for f in (_SUMMARY_FILE, _ESCALATION_FILE, _CONFLICT_FILE, _STATE_FILE):
@@ -1116,7 +1144,9 @@ def update_progress():
     if _STATE_FILE.is_file():
         with contextlib.suppress(json.JSONDecodeError, OSError):
             state_data = json.loads(_STATE_FILE.read_text())
-            phase = state_data.get("phase")
+            # Not an object: no phase to report, and never treated as stale
+            # below (the guard keeps a state it cannot read).
+            phase = state_data.get("phase") if isinstance(state_data, dict) else None
 
     # Is an update process still running? Canonical liveness check (marker AND
     # state file) so a CLI `update.sh` run counts too -- which also keeps the

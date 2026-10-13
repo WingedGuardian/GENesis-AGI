@@ -75,6 +75,8 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(updates, "_ESCALATION_FILE", escalation)
     monkeypatch.setattr(updates, "_PID_FILE", tmp_path / "update.pid")
     monkeypatch.setattr(updates, "update_in_progress", lambda: False)
+    # Never the install's real ~/.genesis/update_state.json.
+    monkeypatch.setattr(updates, "_STATE_FILE", home / ".genesis" / "update_state.json")
     return {"home": home, "root": root}
 
 
@@ -205,6 +207,19 @@ def test_an_inherited_git_dir_does_not_hide_the_live_branch(
     r = client.post(route, json={})
     assert r.status_code == 409
     assert starters == []
+
+
+@pytest.mark.parametrize("supervised", [True, False], ids=["supervised", "direct"])
+def test_apply_refuses_over_an_earlier_updates_restart_guard(client, world, starters, supervised):
+    # The direct path used to start update.sh, whose refusal then landed only in
+    # update_direct.log while the card showed nothing.
+    state = world["home"] / ".genesis" / "update_state.json"
+    state.write_text(json.dumps({"phase": "bootstrap", "pid": 999999999}))
+    r = client.post("/api/genesis/updates/apply", json={"supervised": supervised})
+    assert r.status_code == 409
+    assert "--post-merge" in r.get_json()["error"]
+    assert starters == [], "a refused Apply started work"
+    assert state.exists()
 
 
 @pytest.mark.parametrize("route", ROUTES)

@@ -291,3 +291,38 @@ def test_a_supervised_update_will_not_start_over_a_post_merge_guard(progress):
     assert code == 409
     assert state.exists()
     assert "--post-merge" in body.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["{not json", "[1, 2]", '"text"', "{}", '{"pid": 1}'],
+    ids=["malformed", "array", "string", "empty-object", "no-phase"],
+)
+def test_a_state_file_the_guard_cannot_read_still_guards(progress, content):
+    """A file that exists but is not a readable state with a phase is doubt, and
+    doubt keeps the guard: the supervised pipeline refuses instead of deleting it."""
+    _client, state, _summary = progress
+    state.write_text(content)
+    from flask import Flask
+
+    with Flask(__name__).app_context():
+        _body, code = updates._apply_supervised(state.parent / "pid")
+    assert code == 409
+    assert state.read_text() == content
+
+
+@pytest.mark.parametrize("content", ["[1, 2]", "{not json"], ids=["array", "malformed"])
+def test_the_progress_poll_survives_a_state_file_it_cannot_read(progress, content):
+    client, state, _summary = progress
+    state.write_text(content)
+    os.utime(state, (1, 1))
+    assert client.get("/api/genesis/updates/progress").status_code == 200
+    assert state.read_text() == content
+
+
+@pytest.mark.parametrize("name", ["_TIER1_PROMPT", "_TIER2_PROMPT", "_TIER3_PROMPT"])
+def test_every_tier_is_told_never_to_delete_the_restart_guard(name):
+    """update.sh refuses a plain run over an earlier update's guard; a tier told
+    only to 'fix and retry' could delete the file to get past it."""
+    text = " ".join(getattr(updates, name).split())
+    assert "never delete or edit ~/.genesis/update_state.json" in text.lower()
