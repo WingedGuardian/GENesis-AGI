@@ -114,6 +114,17 @@ def native_item(case, runtime, workspace, request):
             "name": "exec_command", "arguments": json.dumps({"cmd": command})}
 
 
+def unified_item(item):
+    """Re-issue a direct shell or patch item through the unified functions.exec route."""
+    if item["type"] == "function_call":
+        cmd = json.loads(item["arguments"])["cmd"]
+        program = f"text(await tools.exec_command({{cmd: {json.dumps(cmd)}}}));"
+    else:
+        program = f"text(await tools.apply_patch({json.dumps(item['input'])}));"
+    return {"type": "custom_tool_call", "id": "ct_fixture", "call_id": "call_fixture",
+            "namespace": "functions", "name": "exec", "input": program}
+
+
 def completed_commands(events):
     commands = []
     for event in events:
@@ -126,16 +137,22 @@ def completed_commands(events):
 
 
 @pytest.mark.parametrize("client", ["cli", "app"])
-@pytest.mark.parametrize("case", ["probe", "unknown_request", "excluded_shell", "removed_gate", "noop", "create_request", "update_request", "delete_request", "public_request"])
+@pytest.mark.parametrize("case", ["probe", "unknown_request", "excluded_shell", "removed_gate", "noop", "create_request", "update_request", "delete_request", "public_request",
+                                  "code_probe", "code_update_request"])
 def test_native_request_boundary(tmp_path, native_binaries, client, case):
     binaries, versions = native_binaries
     evidence = {"versions": versions, "client": client, "case": case}
+    # code_* cases send the base case's action through the unified functions.exec route.
+    unified = case.startswith("code_")
+    case = case.removeprefix("code_")
     previous = os.umask(0o077)
     try:
         runtime = fixture_runtime(tmp_path, evidence, case)
         workspace = tmp_path / "workspace"
         request = workspace / "requests" / (TOKEN + ".json")
         item = native_item(case, runtime, workspace, request)
+        if unified:
+            item = unified_item(item)
         with fixture_provider(item) as (url, requests):
             evidence["requests"] = requests
             env = configure(tmp_path, url, "allow")
@@ -172,6 +189,11 @@ def test_native_request_boundary(tmp_path, native_binaries, client, case):
         assert any(code == 2 and "Validator request refused" in output for code, output in completed_commands(events)), events
     if case in {"create_request", "update_request"}:
         assert json.loads(request.read_text()) == PROBE
+        # Exact bytes: the update rewrites to sorted-key form, so a patch that is
+        # admitted but silently no-ops leaves the original bytes and fails here.
+        expected = json.dumps(PROBE, sort_keys=(case == "update_request"))
+        assert json.dumps(PROBE) != json.dumps(PROBE, sort_keys=True), "fixture must make the update observable"
+        assert request.read_text().rstrip("\n") == expected
         assert request.stat().st_mode & 0o777 == 0o600
     assert request.exists() == (case != "delete_request")
     assert not list((tmp_path / "codex" / ".tmp").glob("plugins-clone-*"))
