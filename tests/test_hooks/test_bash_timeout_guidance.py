@@ -539,6 +539,29 @@ class TestDeployGuardFires:
         'V=scripts/update.sh; su -c "$V" svc',
         "V=scripts/update.sh; systemd-run --user /bin/bash -c '\"$V\"'",
         "for f in scripts/update.sh; do python3 -c \"import os; os.system('$f')\"; done",
+        # Review round 1: a reader whose option value runs the script, and a
+        # heredoc receiver's explicit operand.
+        "git fetch --upload-pack ./scripts/update.sh /tmp/repo",
+        "git grep -O ./scripts/update.sh needle",
+        "git ls-remote -u ./scripts/update.sh origin",
+        "sort --compress-program=./scripts/update.sh -S 1K big",
+        "sort --compress-program ./scripts/update.sh -S 1K big",
+        "bash --rcfile ./scripts/update.sh -i -c ':'",
+        "bash --init-file scripts/update.sh -i",
+        "bash scripts/update.sh <<'EOF'\nhello\nEOF",
+        # Class audit after review round 1.
+        "python3 -m genesis.hostmetrics run --name d -- ./scripts/update.sh",
+        "~/genesis/.venv/bin/python -m genesis.hostmetrics run -- ./scripts/update.sh",
+        "python3 runner.py ./scripts/update.sh",
+        "node runner.js ./scripts/update.sh",
+        "awk -f prog.awk scripts/update.sh",
+        "sort -S 1K --compress-prog ./scripts/update.sh big.txt",
+        "git fetch --upload-p ./scripts/update.sh /tmp/repo",
+        "git ls-remote --upload ./scripts/update.sh /tmp/repo",
+        "rg --hostname-bin ./scripts/update.sh --hyperlink-format 'file://{host}{path}' x",
+        "cat x # see <<EOF\n./scripts/update.sh\nEOF",
+        "bash -c 'systemd-run --user --collect \"$1\"' _ ./scripts/update.sh",
+        "cat x; <<'EOF' python3\nimport os; os.system('./scripts/update.sh')\nEOF",
         # The heredoc's receiver spawns from its own -c text.
         "python3 -c \"import sys, os; os.system(sys.stdin.read())\" <<'EOF'\n./scripts/update.sh\nEOF",
     )

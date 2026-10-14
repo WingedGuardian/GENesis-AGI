@@ -51,21 +51,25 @@ it does not cover fires.
   (``grep``, ``sed``, ``cat``, ``cp``…), ``git`` with a read subcommand and no
   global ``-c``, a shell given ``-n`` before its script, a shell's ``-c``
   wrapper (its inner script is judged as its own segments), or ``python``,
-  ``node`` or ``awk`` whose program text has no process-spawn call. ``perl``
-  and ``ruby`` always fire: their spawn spellings are too many to list.
+  ``node`` or ``awk`` whose program text is INLINE and has no process-spawn
+  call (a module, a script file or ``awk -f`` cannot be read, so it fires).
+  An option that runs the script (``--upload-pack``, ``--compress-program``,
+  ``--rcfile``, ``rg --pre``…, abbreviated or not) fires. ``perl`` and
+  ``ruby`` always fire: their spawn spellings are too many to list.
 - An unrecognised program fires, including one the parser got wrong.
   Silencing unrecognised programs was tried and measured: the parser reads
   ``X=$(id -u) systemd-run …`` as a program named ``-u)`` without reporting a
   blind spot, so a real launch went quiet.
 
 MEASURED 2026-10-13 over 30 days of one install's transcripts (153 files):
-876 Bash commands mention the script and about 25 of them launch it. The old
-hook fired on all 876; this one fires on 192 and is silent on 684, and no
+881 Bash commands mention the script and about 25 of them launch it. The old
+hook fired on all 881; this one fires on 197 and is silent on 684, and no
 silent one is a launch (each launch-shaped silent command was read by hand; the
-five found are quoted prose). It also fires on every one of 71 constructed
-launch forms in the tests, 39 of which earlier drafts of this hook missed (found
-by three internal review passes and a cross-model one). That is a corpus and a
-matrix, not a proof: a form nobody wrote down can still be silent.
+five found are quoted prose). It also fires on every one of 91 constructed
+launch forms in the tests, 59 of which earlier drafts of this hook missed
+(found by internal review passes, a cross-model one, the PR's first review
+round and a class audit after it). That is a corpus and a matrix, not a proof:
+a form nobody wrote down can still be silent.
 
 A DETACHED launch still fires, on purpose: that is the moment the advice
 applies, and recognising detachment would need systemd-run's option grammar, an
@@ -74,7 +78,9 @@ stated rather than chased: ``sed 'e …'``, a script copied and then run under
 another name (a git hook included), a script launched from inside another
 program or script (``make``, a test, ``bash other.sh``) that the command does
 not name, and a program carried in an environment variable or config rather
-than in argv (``GIT_PAGER=``, ``BASH_ENV=``, ``EDITOR=``, a git or gh alias).
+than in argv (``GIT_PAGER=``, ``BASH_ENV=``, ``EDITOR=``, ``git --config-env``,
+a git or gh alias), and a command substitution inside an arithmetic subscript
+that a reader evaluates (``[[ 1 -eq 'a[$(…)]' ]]``, ``declare -i``).
 ``bootstrap.sh`` and ``host-setup.sh`` are deliberately not covered: both need
 a channel a detached service does not have.
 """
@@ -94,6 +100,21 @@ _PARSER = None
 _SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
 # Shell options that take the next word as a value (so it is not the script).
 _SHELL_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
+# Options whose VALUE is a program or startup file the program runs, given as
+# the next word (`git fetch --upload-pack <path>`, `sort --compress-program
+# <prog>`, `bash --rcfile <file> -i`). The attached spelling (`--opt=<path>`,
+# `-O<path>`) is caught for every program by _option_runs_target.
+# An option's own word (`--opt=…`, `-O…`), not prose that happens to start with
+# a dash (`'- Updates no longer …'`).
+_OPTION_WORD = re.compile(r"-{1,2}[A-Za-z][^\s]*\Z")
+_EXEC_VALUE_OPTIONS = {
+    "git": frozenset(
+        {"--upload-pack", "--receive-pack", "--exec", "-u", "-O", "--open-files-in-pager"}
+    ),
+    "sort": frozenset({"--compress-program"}),
+    "rg": frozenset({"--pre", "--hostname-bin"}),
+    **dict.fromkeys(("bash", "sh", "zsh", "dash", "ksh"), frozenset({"--rcfile", "--init-file"})),
+}
 # Interpreters whose program text is checked for a process-spawn call. perl and
 # ruby are not here: their spawn spellings (backticks, %x, open with a pipe) are
 # too many to list, so a perl or ruby segment that names the script fires.
@@ -144,7 +165,7 @@ _FEEDS_INPUT = re.compile(r"(?<!\|)\|(?!\|)|(?<!<)<(?![<(])|<<<")
 # A variable can carry the script's path into a program that never names it
 # (`V=scripts/update.sh; perl -e 'system("$V")'`, a `for` loop over it), so a
 # command that reads one is judged the same way: only known readers stay silent.
-_VARIABLE = re.compile(r"\$\{?[A-Za-z_]")
+_VARIABLE = re.compile(r"\$\{?[A-Za-z_0-9@*]")
 ADVISORY = r"""ADVISORY: this mentions scripts/update.sh. If you are LAUNCHING a deploy, it must be DETACHED from this session. Neither way of holding it in a Bash call works.
 
 FOREGROUND is impossible: the Bash tool's HARD CEILING is 600000ms (10 min), a larger 'timeout' value is not honoured, and an inner 'timeout N' does not extend it. MEASURED 2026-09-16: a bare update.sh ran 1022s. The SIGTERM at the ceiling is also not a silent truncation -- update.sh traps INT/TERM, and once the rollback trap is armed (just before the merge) an interrupt ROLLS BACK, unwinding a deploy that was going fine. Which phase a ten-minute kill lands in depends on the run, so treat it as "something will be undone", not as a clean stop.
@@ -223,6 +244,39 @@ def _is_consumer(segment, *, fed_heredoc: bool) -> bool:
     return False
 
 
+def _option_runs_target(segment) -> bool:
+    """Does an option of this program name the script as something to run?
+
+    The script in an option's own word (``--upload-pack=…``, ``-O…``,
+    ``--compress-program=…``) is never a file being read, so any program fires
+    on it. A separate value counts only after an option the program is known
+    to execute (:data:`_EXEC_VALUE_OPTIONS`), because ``grep -n update.sh`` is
+    an ordinary read.
+    """
+    argv = segment.argv
+    if any(_OPTION_WORD.match(a) and _TARGET in a for a in argv[1:]):
+        return True
+    runs_value = _EXEC_VALUE_OPTIONS.get(segment.exe, frozenset())
+    return any(
+        _runs_value(a, runs_value) and _TARGET in b
+        for a, b in zip(argv[1:], argv[2:], strict=False)
+    )
+
+
+def _runs_value(word: str, options: frozenset) -> bool:
+    """Is *word* one of *options*, or a GNU abbreviation of a long one?
+
+    ``sort --compress-prog X`` and ``git fetch --upload-p X`` run X exactly as
+    the full spelling does (MEASURED by the class audit with a stub script).
+    Matching a prefix the program would reject as ambiguous only over-fires.
+    """
+    if word in options:
+        return True
+    if not word.startswith("--") or len(word) < 4:
+        return False
+    return any(o.startswith("--") and o.startswith(word) for o in options)
+
+
 def _git_reads(segment) -> bool:
     subcommand = _PARSER.git_subcommand(segment.argv)
     position = segment.argv.index(subcommand) if subcommand in segment.argv else len(segment.argv)
@@ -230,14 +284,11 @@ def _git_reads(segment) -> bool:
     # (`git -c alias.x='!cmd' x`); after the subcommand, `-c` is that
     # subcommand's own option (`git log -c` is a combined diff).
     global_config = any(a.startswith("-c") for a in segment.argv[1:position])
-    # An option can name a program to run (`fetch --upload-pack=…`,
-    # `grep -O…`), so an option that names the script is never a read.
-    option_runs = any(a.startswith("-") and _TARGET in a for a in segment.argv[1:])
     reads_config = subcommand == "config" and any(
         a in ("--get", "--get-all", "--list", "-l") for a in segment.argv
     )
     reads = subcommand in _GIT_READ_SUBCOMMANDS or reads_config
-    return not global_config and not option_runs and reads
+    return not global_config and reads
 
 
 def _is_reader(segment) -> bool:
@@ -247,6 +298,8 @@ def _is_reader(segment) -> bool:
         # An assignment alone runs nothing (its substitution is its own
         # segment); a bare wrapper (`sudo -s`) also leaves no program.
         return bool(_ASSIGNMENTS_ONLY.fullmatch(segment.raw.strip()))
+    if _option_runs_target(segment):
+        return False
     if exe in _SOURCERS:
         return not any(
             _TARGET in a or "$" in a or a == "-" or _STDIN_PATH.match(a) for a in argv[1:]
@@ -256,19 +309,46 @@ def _is_reader(segment) -> bool:
         # before the script only checks syntax.
         return bool(_PARSER._nested_script(argv, exe)) or _shell_operand(argv)[2]
     if exe in _INTERPRETERS:
-        # Its program must be in argv (`-c`/`-e` or a script file) to be
-        # checked; one read from stdin could be anything.
+        # Given the script's name, the program must be inline (`-c`/`-e`) so
+        # it can be checked: a module or a file (`python -m genesis.hostmetrics
+        # run -- ./scripts/update.sh`, `node runner.js ./scripts/update.sh`) can
+        # run whatever it is handed. MEASURED: both launched a stub.
+        if _names_target(segment) and not any(a in ("-c", "-e") for a in argv):
+            return False
+        # Otherwise its program must be in argv (`-c`/`-e` or a script file)
+        # to be checked; one read from stdin could be anything.
         has_program = any(a in ("-c", "-e") for a in argv) or any(
             not a.startswith("-") for a in argv[1:]
         )
         return has_program and not _SPAWN.search(" ".join(argv[1:]))
     if exe == "awk":
+        # A program file (`-f`) is not text this hook can read.
+        program_file = any(a.startswith(("-f", "--file")) for a in argv[1:])
+        if _names_target(segment) and program_file:
+            return False
         return not _AWK_SPAWN.search(" ".join(argv[1:]))
     if exe == "git":
         return _git_reads(segment)
     if exe == "rg":
-        return not any(a.startswith("--pre") for a in argv)  # --pre runs a program
+        # --pre and --hostname-bin run a program (attached or abbreviated forms
+        # included); the separate-value form is caught by _option_runs_target.
+        return not any(_runs_value(a.split("=", 1)[0], _EXEC_VALUE_OPTIONS["rg"]) for a in argv)
     return exe in _READ_VERBS
+
+
+def _after_comment(command: str, at: int) -> bool:
+    """Is position *at* inside a ``#`` comment on its line (outside quotes)?"""
+    start = command.rfind("\n", 0, at) + 1
+    quote = None
+    for i in range(start, at):
+        c = command[i]
+        if quote:
+            quote = None if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and (i == start or command[i - 1] in " \t;&|("):
+            return True
+    return False
 
 
 def _split_heredoc(command: str):
@@ -279,7 +359,9 @@ def _split_heredoc(command: str):
     ``<<`` redirect from a segment's raw text, so it cannot be found there.
     """
     match = _HEREDOC.search(command)
-    if match is None:
+    if match is None or _after_comment(command, match.start()):
+        # A `<<` inside a comment opens nothing; the parser reads the lines
+        # after it as commands, which they are.
         return None
     newline = command.find("\n", match.end())
     if newline < 0:
@@ -312,6 +394,8 @@ def _runs_target(command: str) -> bool:
             outer, body, before, closed = split
             if not closed:
                 return True  # an unclosed body could hide anything after it
+            if not re.split(r"[;&|\n(]", before)[-1].strip():
+                return True  # `<<EOF python3`: the receiver follows the operator
             before_segments, before_blind = _PARSER.analyze_checked(before)
             receivers = _depth0(before_segments)
             if before_blind is not None or not receivers:
@@ -340,7 +424,11 @@ def _runs_target(command: str) -> bool:
         fed = segment.depth == 0 and position == fed_position
         if _is_consumer(segment, fed_heredoc=fed):
             return True
-        if (strict or _names_target(segment)) and not fed and not _is_reader(segment):
+        # A heredoc's receiver is excused from reading stdin (its body was
+        # judged above), never from what its own argv names: `bash
+        # scripts/update.sh <<EOF` still runs the script.
+        judged = _names_target(segment) or (strict and not fed)
+        if judged and not _is_reader(segment):
             return True
     return False
 
