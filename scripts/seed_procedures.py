@@ -207,16 +207,17 @@ def _lesson_from_file(path: Path) -> dict:
     for key in ("task_type", "principle"):
         if not isinstance(data[key], str) or not data[key].strip():
             raise ValueError(f"{key} must be non-empty text")
-    for key in ("steps", "patterns", "context_tags"):
+    for key in ("steps", "patterns", "context_tags", "tool_trigger"):
         value = data.get(key, [])
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ValueError(f"{key} must be a list of text")
     tools, cli_patterns, dropped = normalize_tool_trigger(data["tool_trigger"])
-    if dropped or cli_patterns or not tools:
+    if dropped or cli_patterns or not tools or tools != data["tool_trigger"]:
         # A shipped file names tools exactly; a shell command is Bash plus a pattern
-        # the author writes, never one derived silently from a command word.
+        # the author writes, never one derived silently from a command word, and an
+        # MCP tool is its full name, never a short name resolved from today's servers.
         raise ValueError(
-            f"tool_trigger must hold exact tool names (a shell command is Bash with a pattern): "
+            f"tool_trigger must hold exact, unique tool names (a shell command is Bash with a pattern): "
             f"{dropped or data['tool_trigger']}"
         )
     spec = validate_trigger_spec({"patterns": data["patterns"], "repeat": data["repeat"]})
@@ -276,10 +277,6 @@ async def seed_shipped_lessons(db: aiosqlite.Connection, directory: Path = LESSO
                 "authored_at": prior_lesson.get("authored_at", now),
             },
         )
-        if prior and prior["principle"] != lesson["principle"]:
-            # The stored vector describes the old text; the embedding backfill
-            # re-embeds a row whose vector is NULL.
-            await procedural.update(db, lesson["id"], principle_embedding=None)
         if prior and prior["deprecated"] and prior.get("deprecated_reason") == _RETIRED:
             # Only a row this seed retired comes back; an owner's deprecation stands.
             await procedural.update(db, lesson["id"], deprecated=0, deprecated_reason=None)
@@ -358,7 +355,8 @@ async def main(db_path: Path) -> None:
     for error in lesson_errors:
         print(f"  SKIPPED shipped lesson {error}")
     if lesson_errors:
-        print(f"SKIPPED {len(lesson_errors)} shipped lesson file(s); see above")
+        names = ", ".join(error.split(": ", 1)[0] for error in lesson_errors)
+        print(f"SKIPPED {len(lesson_errors)} shipped lesson file(s): {names}; reasons above")
 
 
 if __name__ == "__main__":

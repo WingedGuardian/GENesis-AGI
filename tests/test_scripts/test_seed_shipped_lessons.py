@@ -153,6 +153,8 @@ async def test_a_re_seed_keeps_usage_and_clears_a_stale_embedding(db, lessons):
         ("duplicate.yaml", _GOOD + "repeat: every\n"),
         ("deep.yaml", "task_type: " + "[" * 5000 + "]" * 5000 + "\n"),
         ("wrong.yml", _GOOD),
+        ("mcp_short.yaml", _GOOD.replace("[Bash]", "[browser_navigate]")),
+        ("scalar.yaml", _GOOD.replace("[Bash]", "Bash")),
     ],
 )
 async def test_more_invalid_files_are_reported(db, lessons, name, text):
@@ -160,3 +162,13 @@ async def test_more_invalid_files_are_reported(db, lessons, name, text):
     errors = await seed.seed_shipped_lessons(db, lessons)
     assert [e.split(":")[0] for e in errors] == [name]
     assert len(await _rows(db)) == 1
+
+
+async def test_the_last_line_names_every_skipped_file(tmp_path, monkeypatch, capsys):
+    async def two_errors(_db):
+        return ["a.yaml: bad", "b.yaml: worse"]
+
+    monkeypatch.setattr(seed, "seed_shipped_lessons", two_errors)
+    await seed.main(tmp_path / "genesis.db")
+    last = capsys.readouterr().out.strip().splitlines()[-1]
+    assert "a.yaml" in last and "b.yaml" in last

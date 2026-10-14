@@ -106,6 +106,9 @@ async def upsert(
            ON CONFLICT(id) DO UPDATE SET
              person_id = excluded.person_id,
              task_type = excluded.task_type, principle = excluded.principle,
+             -- A new principle drops the vector of the old text in the same write.
+             principle_embedding = CASE WHEN procedural_memory.principle IS excluded.principle
+               THEN procedural_memory.principle_embedding END,
              steps = excluded.steps, tools_used = excluded.tools_used,
              context_tags = excluded.context_tags, draft = excluded.draft,
              attempted_workarounds = excluded.attempted_workarounds,
