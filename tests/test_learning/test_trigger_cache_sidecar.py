@@ -24,6 +24,10 @@ def _fake_row(task_type: str) -> dict:
     }
 
 
+async def _no_lessons(db):
+    return []
+
+
 def test_regenerate_writes_yaml_and_json(tmp_path, monkeypatch):
     yaml_p = tmp_path / "procedure_triggers.yaml"
     json_p = tmp_path / "procedure_triggers.json"
@@ -39,6 +43,7 @@ def test_regenerate_writes_yaml_and_json(tmp_path, monkeypatch):
         return [_fake_row("core_tt")] if tier == "CORE" else [_fake_row("adv_tt")]
 
     monkeypatch.setattr(procedural, "list_by_tier", fake_list_by_tier)
+    monkeypatch.setattr(procedural, "list_lessons", _no_lessons)
 
     n = asyncio.run(trigger_cache.regenerate(object()))
     assert n == 2  # one CORE + one ADVISORY
@@ -70,6 +75,7 @@ def test_regenerate_json_matches_yaml(tmp_path, monkeypatch):
         return [_fake_row("core_tt")] if tier == "CORE" else []
 
     monkeypatch.setattr(procedural, "list_by_tier", fake_list_by_tier)
+    monkeypatch.setattr(procedural, "list_lessons", _no_lessons)
     asyncio.run(trigger_cache.regenerate(object()))
 
     ydata = _yaml.safe_load(yaml_p.read_text())

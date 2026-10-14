@@ -228,11 +228,18 @@ def _pin_capable() -> bool:
 
 
 def _explicit_choice() -> bool | None:
-    """Whether the user picked a build with ``camoufox set``; None when unreadable."""
+    """Whether the user picked a build with ``camoufox set``; None when unreadable.
+
+    The config is parsed here: camoufox's ``load_config()`` turns a malformed file
+    (an interrupted write) into ``{}``, which would read as no choice at all. A
+    symlink whose target is gone counts as unreadable too."""
     try:
         from camoufox import browser_pin, multiversion
 
-        return browser_pin.is_explicit_choice(multiversion.load_config())
+        path = Path(multiversion.CONFIG_FILE)
+        present = path.exists() or path.is_symlink()
+        config = json.loads(path.read_bytes()) if present else {}
+        return bool(browser_pin.is_explicit_choice(config))
     except Exception:  # noqa: BLE001 - unknown, and the caller treats it as a choice
         return None
 
@@ -260,22 +267,30 @@ def _pids(pattern: str) -> list[int] | None:
     return [int(p) for p in proc.stdout.split() if p.isdigit()]
 
 
-def _live_engine_in(path: Path) -> bool:
-    """Whether a running Camoufox executes from ``path``. Unknown counts as yes."""
+def live_camoufox_exes() -> list[Path] | None:
+    """The executables this user's running Camoufox processes run from (canonical
+    paths), or None when any of them cannot be read."""
     pids = _pids(BROWSER_PGREP_PATTERNS[0])
     if pids is None:
-        return True
+        return None
+    exes = []
     for pid in pids:
         try:
-            exe = Path(os.readlink(f"/proc/{pid}/exe"))
+            exes.append(Path(os.readlink(f"/proc/{pid}/exe")))
         except FileNotFoundError:
             continue  # exited
         except OSError:
-            return True
-        target = path.resolve()
-        if exe == target or target in exe.parents:
-            return True
-    return False
+            return None
+    return exes
+
+
+def _live_engine_in(path: Path) -> bool:
+    """Whether a running Camoufox executes from ``path``. Unknown counts as yes."""
+    exes = live_camoufox_exes()
+    if exes is None:
+        return True
+    target = path.resolve()
+    return any(exe == target or target in exe.parents for exe in exes)
 
 
 _PROC = Path("/proc")

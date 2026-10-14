@@ -35,6 +35,39 @@ _UPDATE_SCRIPT = _GENESIS_ROOT / "scripts" / "update.sh"
 _DB_PATH = _GENESIS_ROOT / "data" / "genesis.db"
 _FAILURE_FILE = _HOME / ".genesis" / "last_update_failure.json"
 _LIVE_CHECKOUT_SCRIPT = _GENESIS_ROOT / "scripts" / "lib" / "live_checkout.py"
+_MANAGED_UNITS_SCRIPT = _GENESIS_ROOT / "scripts" / "lib" / "managed_units.py"
+_UNIT_DIR = _HOME / ".config" / "systemd" / "user"
+
+
+def _managed_units_report() -> dict:
+    """Which installed systemd units the next update.sh would refuse over.
+
+    Stamp-only (no history scan, so it is cheap enough for a status poll): a unit
+    whose genesis-managed stamp no longer matches was edited by hand, and update.sh
+    refuses until the change moves into a drop-in or the template is taken. A unit
+    from before stamps existed that matches no current template is "unchecked":
+    the next update judges it against template history. Run afresh, like
+    live_checkout.py, so the copy that answers is the one on disk now.
+    """
+    try:
+        # Local reads only (git ls-tree / show, file hashes); 120 s bounds a
+        # request thread against a hung git, as _live_refusal does.
+        proc = subprocess.run(
+            [sys.executable, "-I", "-S", str(_MANAGED_UNITS_SCRIPT), "check",
+             "--repo", str(_GENESIS_ROOT), "--unit-dir", str(_UNIT_DIR),
+             "--upto", "HEAD", "--json"],
+            capture_output=True, text=True, timeout=120,
+        )
+        rows = json.loads(proc.stdout) if proc.returncode in (0, 4) else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        rows = None
+    if not isinstance(rows, list):
+        return {"edited": [], "unchecked": [], "error": "could not check the installed systemd units"}
+    return {
+        "edited": [r["unit"] for r in rows if r.get("state") == "edited"],
+        "unchecked": [r["unit"] for r in rows if r.get("state") == "unstamped"],
+        "error": None,
+    }
 
 
 def _live_refusal() -> tuple[dict, int] | None:
@@ -262,6 +295,7 @@ def update_status():
         "update_available": update_available,
         "last_update": last_update,
         "last_failure": last_failure,
+        "managed_units": _managed_units_report(),
         "update_script_found": _UPDATE_SCRIPT.is_file(),
     })
 
@@ -482,6 +516,13 @@ You are supervising a Genesis update. Your role is WATCH AND ESCALATE.
      Write error context to {summary_file}
    - Done. Do NOT attempt code changes.
 
+6. If exit 4 (refused):
+   Exit 4 means update.sh REFUSED, before stopping anything, because systemd units
+   were edited by hand. Never modify, delete, replace or re-stamp those unit files,
+   and never pass --take-template or --take-templates: whether the hand edit goes is
+   the user's decision. Write to {summary_file}: "refused: <the units it names>".
+   Do not write {escalation_file}. Done.
+
 You are a security guard, not an engineer. Press buttons, report status,
 call for backup when needed.\
 """
@@ -521,6 +562,18 @@ If MERGE CONFLICTS:
    - git branch -d update-merge-resolution
    - Run: bash {update_script} --post-merge 2>&1
      (--post-merge skips fetch/merge, runs only bootstrap + health)
+   - --post-merge keeps a systemd unit that was edited by hand and names it at
+     the end ("kept <unit>: edited by hand"). Never modify, delete, replace or
+     re-stamp those unit files, and never pass --take-template or
+     --take-templates: whether the hand edit goes is the user's decision. List
+     them in your summary.
+
+If update.sh EXITS 4:
+Exit 4 means update.sh REFUSED, before stopping anything, because systemd units
+were edited by hand. Never modify, delete, replace or re-stamp those unit files,
+and never pass --take-template or --take-templates: whether the hand edit goes is
+the user's decision. Write to {summary_file}: "refused: <the units it names>".
+Do not write {escalation_file}. Done.
 
 If SCRIPT ERROR:
 1. Diagnose the root cause from the error output
@@ -531,7 +584,8 @@ If SCRIPT ERROR:
    to {escalation_file}, done
 
 Commit any fixes with conventional format (fix: ...).
-Write final outcome to {summary_file}.
+Write final outcome to {summary_file}, unless update.sh exited 4: then the summary
+stays exactly "refused: <the units it names>".
 Log every action taken for user review.\
 """
 
@@ -559,6 +613,11 @@ IMPORTANT: The main working tree is CLEAN. Work on a temporary branch.
 8. git branch -d update-merge-resolution-opus
 9. Run: bash {update_script} --post-merge 2>&1
 
+--post-merge keeps a systemd unit that was edited by hand and names it at the
+end ("kept <unit>: edited by hand"). Never modify, delete, replace or re-stamp
+those unit files, and never pass --take-template or --take-templates: whether
+the hand edit goes is the user's decision. List them in your report.
+
 Write a resolution report to {summary_file} explaining each decision.
 Use conventional commit format for any fixes (fix: ...).\
 """
@@ -568,6 +627,10 @@ _GENESIS_DIR = _HOME / ".genesis"
 _SUMMARY_FILE = _GENESIS_DIR / "last_update_summary.txt"
 _ESCALATION_FILE = _GENESIS_DIR / "update_escalation.txt"
 _CONFLICT_FILE = _GENESIS_DIR / "update_conflicts.json"
+# Written by update.sh when its managed-units preflight refuses (exit 4), and
+# removed by every preflight that does not: the orchestrator's only evidence
+# that a refusal, not a script error, ended a tier.
+_REFUSED_FILE = _GENESIS_DIR / "update_refused.json"
 _STATE_FILE = _GENESIS_DIR / "update_state.json"
 # The deploy marker, read by env.update_in_progress() and written by the shell
 # deploys (scripts/lib/deploy_marker.sh). Same root as theirs and the reader's:
@@ -630,6 +693,7 @@ def _apply_supervised(pid_file: Path) -> tuple:
     orchestrator_code = _ORCHESTRATOR_TEMPLATE.format(
         summary_file=str(_SUMMARY_FILE),
         escalation_file=str(_ESCALATION_FILE),
+        refused_file=str(_REFUSED_FILE),
         pid_file=str(pid_file),
         genesis_root=str(_GENESIS_ROOT),
         tier1_prompt=tier1_prompt,
@@ -762,6 +826,7 @@ log = logging.getLogger("update-orchestrator")
 
 SUMMARY = Path({summary_file!r})
 ESCALATION = Path({escalation_file!r})
+REFUSED = Path({refused_file!r})
 PID_FILE = Path({pid_file!r})
 GENESIS_ROOT = Path({genesis_root!r})
 MY_PID = os.getpid()
@@ -813,6 +878,8 @@ def spawn_cc(prompt, model, effort=None):
         return 1
 
 # ── Tier 1: Haiku ──
+# A refusal record from before this pipeline is not this pipeline's verdict.
+REFUSED.unlink(missing_ok=True)
 log.info("Starting Tier 1 (Haiku)")
 rc1 = spawn_cc({tier1_prompt!r}, "haiku", None)
 
@@ -828,6 +895,23 @@ if rc1 != 0 and not ESCALATION.is_file():
     )
     cleanup()
     sys.exit(1)
+
+# A refusal over hand-edited systemd units is the user's decision, not a script
+# error: no tier above may act on it, whatever a session wrote. update.sh records
+# the refusal itself (REFUSED), so a session that overwrote the summary with prose
+# cannot escalate past one; a session's own "refused:" summary also stops it,
+# since not escalating is the safe direction.
+def refused():
+    if REFUSED.is_file():
+        return True
+    try:
+        return SUMMARY.read_text().lstrip().startswith("refused:")
+    except OSError:
+        return False
+
+if refused():
+    log.info("update.sh refused over hand-edited units; not escalating")
+    ESCALATION.unlink(missing_ok=True)
 
 # ── Check escalation ──
 if ESCALATION.is_file() and "tier2_needed" in ESCALATION.read_text():
@@ -845,6 +929,9 @@ if ESCALATION.is_file() and "tier2_needed" in ESCALATION.read_text():
         sys.exit(1)
 
     # Check if Tier 3 needed
+    if refused():
+        log.info("update.sh refused over hand-edited units; not escalating")
+        ESCALATION.unlink(missing_ok=True)
     if ESCALATION.is_file() and "tier3_needed" in ESCALATION.read_text():
         log.info("Tier 2 escalated -> Tier 3 (user-initiated Opus)")
         SUMMARY.write_text(
