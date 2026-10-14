@@ -694,12 +694,11 @@ def test_the_rollback_saves_edits_before_its_reset():
 
 
 def test_disk_hygiene_prunes_old_backup_runs_only(tmp_path):
+    # The prune is disk_hygiene's prune_backup_runs, called as main() calls it.
     text = HYGIENE.read_text()
-    start = text.index('if ! _pmb_root="$(cd -P -- "$HOME/.genesis/premerge-backups"')
-    stanza = (
-        f'. "{REPO_ROOT / "scripts" / "lib" / "tmp_liveness.sh"}"\n'
-        + text[start : text.index("\n    fi\n", start) + 8]
-    )
+    call = 'prune_backup_runs "$HOME/.genesis/premerge-backups" premerge-backups 45'
+    assert call in text, "main() no longer prunes premerge-backups this way"
+    stanza = f'source "{HYGIENE}"\n{call}\n'
     base = tmp_path / ".genesis" / "premerge-backups"
     old = base / "20260101T000000Z-1"
     new = base / "20260920T000000Z-2"
