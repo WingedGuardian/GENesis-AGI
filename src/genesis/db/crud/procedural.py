@@ -21,6 +21,16 @@ def _live_clause(live_only: bool) -> str:
     return f" AND ({LIVE_LESSON_SQL})"
 
 
+def _kind_clause(lessons: bool | None) -> str:
+    """SQL keeping only lessons (True), only earned rows (False), or both (None).
+
+    Chosen in SQL so rows of the other kind can never fill a caller's limit.
+    """
+    if lessons is None:
+        return ""
+    return " AND lesson IS NOT NULL" if lessons else " AND lesson IS NULL"
+
+
 async def create(
     db: aiosqlite.Connection,
     *,
@@ -183,7 +193,8 @@ async def find_by_context_overlap(
     if not query_tags:
         return []
 
-    rows = await list_active(db, limit=200)
+    # A held lesson is untrusted text: it never counts as an established procedure.
+    rows = await list_active(db, limit=200, live_only=True)
     scored = []
     for row in rows:
         if exclude_id and row["id"] == exclude_id:
@@ -205,7 +216,7 @@ async def list_by_task_type(
     task_type: str,
     *,
     person_id: str | None = None,
-    limit: int = 50,
+    limit: int | None = 50,
     live_only: bool = False,
     lessons: bool | None = None,
 ) -> list[dict]:
@@ -222,10 +233,11 @@ async def list_by_task_type(
         sql += " AND person_id = ?"
         params.append(person_id)
     sql += _live_clause(live_only)
-    if lessons is not None:  # only lessons, or only rows without one
-        sql += " AND lesson IS NOT NULL" if lessons else " AND lesson IS NULL"
-    sql += " ORDER BY confidence DESC LIMIT ?"
-    params.append(limit)
+    sql += _kind_clause(lessons)
+    sql += " ORDER BY confidence DESC"
+    if limit is not None:  # None: every row (an identity lookup must see them all)
+        sql += " LIMIT ?"
+        params.append(limit)
     cursor = await db.execute(sql, params)
     return [dict(r) for r in await cursor.fetchall()]
 
@@ -235,12 +247,14 @@ async def list_by_tier(
     tier: str,
     *,
     limit: int = 100,
+    lessons: bool | None = None,
 ) -> list[dict]:
     """List active procedures at a specific activation tier."""
     cursor = await db.execute(
-        """SELECT * FROM procedural_memory
-           WHERE activation_tier = ? AND deprecated = 0 AND quarantined = 0
-           ORDER BY confidence DESC LIMIT ?""",
+        "SELECT * FROM procedural_memory "  # noqa: S608 - fixed SQL fragments only
+        "WHERE activation_tier = ? AND deprecated = 0 AND quarantined = 0"
+        + _kind_clause(lessons)
+        + " ORDER BY confidence DESC LIMIT ?",
         (tier, limit),
     )
     return [dict(r) for r in await cursor.fetchall()]
@@ -342,17 +356,19 @@ async def list_active(
     person_id: str | None = None,
     limit: int = 100,
     live_only: bool = False,
+    lessons: bool | None = None,
 ) -> list[dict]:
     """List non-deprecated, non-quarantined procedures.
 
-    ``live_only`` leaves out held lessons in SQL, before the limit applies.
+    ``live_only`` leaves out held lessons and ``lessons`` picks a kind, both in
+    SQL, before the limit applies.
     """
     sql = "SELECT * FROM procedural_memory WHERE deprecated = 0 AND quarantined = 0"
     params: list = []
     if person_id is not None:
         sql += " AND person_id = ?"
         params.append(person_id)
-    sql += _live_clause(live_only)
+    sql += _live_clause(live_only) + _kind_clause(lessons)
     sql += " ORDER BY confidence DESC LIMIT ?"
     params.append(limit)
     cursor = await db.execute(sql, params)

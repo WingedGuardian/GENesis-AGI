@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from unittest.mock import MagicMock
 
@@ -280,3 +281,102 @@ async def test_lessons_never_crowd_an_earned_row_out_of_a_refine(env):
     await store(**_ARGS)
     rows = await db.execute_fetchall("SELECT id FROM procedural_memory WHERE lesson IS NULL")
     assert [r["id"] for r in rows] == [earned["id"]]  # refined in place, no duplicate
+
+
+_HELD = {
+    "authored_via": "mcp", "authored_in": "dispatched", "origin": "external_untrusted",
+    "reviewed": False, "authored_at": "2026-10-14T00:00:00Z",
+}
+
+
+async def _lesson_row(db, pid, *, lesson, task_type="deploy", confidence=0.99, embedding=None, **extra):
+    await procedural.create(
+        db, id=pid, task_type=task_type, principle=f"principle {pid}", steps=["s"],
+        tools_used=["Bash"], context_tags=["deploy"], created_at="2026-10-14T00:00:00Z",
+        confidence=confidence, principle_embedding=embedding, **extra,
+    )
+    await db.execute("UPDATE procedural_memory SET lesson = ? WHERE id = ?", (json.dumps(lesson), pid))
+    await db.commit()
+
+
+async def test_a_lesson_refine_finds_its_row_past_fifty_others(env):
+    db, store, _ = env
+    await store(**_ARGS, trigger_patterns=[r"update\.sh"])
+    (mine,) = [dict(r) for r in await db.execute_fetchall("SELECT id FROM procedural_memory")]
+    other = pack_embedding([0.0, 1.0] + [0.0] * 1022)  # a different principle
+    live = {**_HELD, "origin": "first_party", "authored_in": "foreground"}
+    for i in range(51):  # all ranked above the lesson being re-authored
+        await _lesson_row(db, f"other-{i}", lesson=live, embedding=other)
+    await store(**_ARGS, trigger_patterns=[r"deploy_code_only\.sh"])
+    row = dict((await db.execute_fetchall(
+        "SELECT trigger_spec FROM procedural_memory WHERE id = ?", (mine["id"],)))[0])
+    assert json.loads(row["trigger_spec"])["patterns"] == [r"deploy_code_only\.sh"]  # refined
+    assert len(await db.execute_fetchall("SELECT id FROM procedural_memory")) == 52  # no duplicate
+
+
+async def test_an_unreadable_stored_trigger_is_replaced(env):
+    db, store, _ = env
+    await store(**_ARGS)
+    (row,) = [dict(r) for r in await db.execute_fetchall("SELECT id FROM procedural_memory")]
+    await db.execute("UPDATE procedural_memory SET tool_trigger = '{bad' WHERE id = ?", (row["id"],))
+    await db.commit()
+    response = await store(**_ARGS)
+    assert not response.startswith("Refused")
+    (after,) = [dict(r) for r in await db.execute_fetchall("SELECT tool_trigger FROM procedural_memory")]
+    assert json.loads(after["tool_trigger"]) == ["Bash"]
+
+
+async def test_held_lessons_never_reach_novelty_or_validation_checks(env, monkeypatch):
+    from genesis.learning.procedural import extractor, validation_gate
+
+    db, _, _ = env
+    await _lesson_row(db, "held", lesson=_HELD, success_count=5)
+    assert await procedural.find_by_context_overlap(db, ["deploy"]) == []
+    flags: list[str] = []
+    assert not await validation_gate._check_regression(db, "deploy", "principle held", flags)
+    seen = []
+
+    async def record(_db, *args, **kwargs):
+        seen.append(kwargs.get("live_only"))
+        return []
+
+    monkeypatch.setattr(procedural, "list_by_task_type", record)
+    monkeypatch.setattr(procedural, "list_active", record)
+    for call in (
+        extractor._principle_is_novel(
+            db, task_type="deploy", new_principle="a principle", embedder=MagicMock()
+        ),
+        extractor._cross_type_duplicate(
+            db, task_type="deploy", principle="a principle", new_steps=None,
+            new_emb=[1.0] + [0.0] * 1023, router=MagicMock(),
+        ),
+    ):
+        with contextlib.suppress(Exception):  # only the listing arguments matter here
+            await call
+    assert seen == [True, True]
+
+
+async def test_lessons_never_crowd_earned_rows_out_of_the_promoter_or_the_cache(env):
+    from genesis.learning.procedural import promoter
+
+    db, store, cache = env
+    await procedural.create(
+        db, id="earned", task_type="deploy", principle="p", steps=["s"], tools_used=["Bash"],
+        context_tags=["deploy"], created_at="2026-10-14T00:00:00Z", confidence=0.6,
+        activation_tier="ADVISORY", tool_trigger=["Bash"], success_count=9, draft=0,
+    )
+    live = {**_HELD, "origin": "first_party", "authored_in": "foreground"}
+    for i in range(101):  # past both windows of 100, all ranked above the earned row
+        await _lesson_row(db, f"l-{i}", lesson=live, activation_tier="ADVISORY",
+                          tool_trigger=["Bash"])
+        await db.execute(
+            "UPDATE procedural_memory SET trigger_spec = ? WHERE id = ?",
+            (json.dumps({"patterns": ["x"], "repeat": "every"}), f"l-{i}"),
+        )
+    await db.commit()
+    await trigger_cache.regenerate(db)
+    assert "earned" in _cached(cache)
+    await db.execute("UPDATE procedural_memory SET confidence = 0.1, failure_count = 9 WHERE id = 'earned'")
+    await db.commit()
+    await promoter.promote_and_demote(db)
+    assert (await procedural.get_by_id(db, "earned"))["quarantined"] == 1  # it was evaluated

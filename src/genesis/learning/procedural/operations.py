@@ -248,7 +248,9 @@ async def store_procedure_checked(
         trigger_warnings.append(f"shell commands stored as Bash; patterns not kept: {patterns}")
     # A lesson refines only a lesson, a plain teach only an earned row; the kind
     # is chosen in SQL so rows of the other kind cannot fill the limit.
-    candidates = await procedural.list_by_task_type(db, task_type, lessons=lesson is not None)
+    candidates = await procedural.list_by_task_type(
+        db, task_type, lessons=lesson is not None, limit=None
+    )
     if caller_origin == ORIGIN_EXTERNAL_UNTRUSTED:
         # Never let outside text rewrite a lesson; it becomes a sibling instead.
         candidates = [c for c in candidates if c.get("lesson") is None]
@@ -295,7 +297,10 @@ async def store_procedure_checked(
         # through took a live CORE row out of the trigger cache.
         if trigger:
             update_fields["tool_trigger"] = trigger
-            stored = json.loads(matched["tool_trigger"]) if matched.get("tool_trigger") else None
+            try:
+                stored = json.loads(matched["tool_trigger"]) if matched.get("tool_trigger") else None
+            except (ValueError, TypeError, RecursionError):
+                stored = None  # unreadable: the new trigger replaces it, as a change
             if lesson is None and trigger != stored:
                 # An earned row's spec was written for its old trigger: drop it
                 # rather than gate new tools with a pattern meant for others.

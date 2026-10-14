@@ -200,8 +200,9 @@ async def _regenerate_locked(db: object) -> int:
 
     # Include both CORE and ADVISORY procedures — ADVISORY with tool triggers
     # are mature enough (5+ successes, 75%+ confidence) to warrant hook advisories.
-    rows_core = await procedural.list_by_tier(db, "CORE")  # type: ignore[arg-type]
-    rows_advisory = await procedural.list_by_tier(db, "ADVISORY")  # type: ignore[arg-type]
+    # Earned rows only: lessons (listed above) must not fill the tier windows.
+    rows_core = await procedural.list_by_tier(db, "CORE", lessons=False)  # type: ignore[arg-type]
+    rows_advisory = await procedural.list_by_tier(db, "ADVISORY", lessons=False)  # type: ignore[arg-type]
     for row in rows_core + rows_advisory:
         # A row with a lesson record is never an earned entry: a live one is
         # listed above, a held one stays out whatever its tier.
