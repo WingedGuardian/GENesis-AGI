@@ -181,7 +181,11 @@ def _kills(box) -> list[str]:
 
 def _frozen(box) -> list[list[str]]:
     f = box["home"] / ".genesis" / "watchgod" / "frozen"
-    return [line.split("\t") for line in f.read_text().splitlines()] if f.exists() else []
+    # Split on "\n" only, as the watchgod's bash readers do: str.splitlines()
+    # also breaks at U+2028 and other separators a path may hold.
+    if not f.exists():
+        return []
+    return [line.split("\t") for line in f.read_text().split("\n") if line]
 
 
 def _log(box) -> str:
@@ -474,6 +478,28 @@ def test_a_pause_left_in_place_is_reminded_without_raw_pids(box):
     _no_raw_kill(box)
 
 
+def test_a_task_output_name_cannot_forge_or_disguise_page_lines(box):
+    """A task output's path is shown in the action page, the reminder, the
+    kept tail's name and the log; a Unicode line separator or bidi control in
+    it is shown as "?" there, like a process name. The pause record keeps the
+    real path, and the file is still acted on (paused and emptied)."""
+    f = _task_output(box, rel="claude-1000/-pr\u2028oj/se\u202ess-1/tasks/b\u2029x.output")
+    _session(box, f)
+    out = _respond(box, f)
+    assert "ACTED=emptied" in out.stdout
+    assert [r[5] for r in _frozen(box)] == [str(f), str(f)], "the record keeps the real path"
+    _run(box, f"_rw_repage {int(time.time()) + 7 * 3600}")
+    pages = _pages(box)
+    assert {p["title"].split(" ")[0] for p in pages} >= {"Paused", "Still"}
+    for text in [x for p in pages for x in (p["title"], p["body"])] + [_log(box)]:
+        for ch in ("\u2028", "\u2029", "\u202e"):
+            assert ch not in text, text
+    act = next(p for p in pages if p["title"].startswith("Paused"))
+    assert "-pr?oj/se?ss-1/tasks/b?x.output" in act["body"]
+    assert "Claude Code session: se?ss-1" in act["body"]
+    assert "b?x.output." in act["body"], "the kept tail's name is shown safe too"
+
+
 def test_a_record_of_another_boot_is_not_reminded(box):
     f = _task_output(box)
     _session(box, f)
@@ -714,6 +740,69 @@ def test_a_file_whose_writers_are_all_paused_is_emptied_without_new_growth(box):
         and act[0]["title"]
         == "Emptied a runaway Claude Code task output (its writers were already paused)"
     )
+
+
+def test_a_thaw_between_the_owed_check_and_the_lock_pauses_nothing(box):
+    """The owed emptying is decided before the records lock; a thaw that
+    lands before the lock is taken resumes the writers and drops their
+    records. The response re-checks under the lock: nothing is recorded,
+    signalled or emptied, as the file did not grow (review finding)."""
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    _proc(box, 200, "bash", 100, f, starttime=2000, state="T")
+    _proc(box, 201, "grep", 200, f, starttime=2010, state="T")
+    proc = box["proc"]
+    thaw_once = (
+        _paused_records(box, f)
+        + "\n"
+        + "eval \"$(declare -f wg_records_lock | sed '1s/wg_records_lock/_wg_lock_orig/')\"\n"
+        + "_THAWED=0\n"
+        + "wg_records_lock() {\n"
+        + "  if (( ! _THAWED )); then _THAWED=1\n"
+        + "    : > \"$(wg_records_file)\"\n"
+        + f"    sed -i 's/^State:.*/State:\\tS (x)/' '{proc}/200/status' '{proc}/201/status'\n"
+        + f"    sed -i 's/) T /) S /' '{proc}/200/stat' '{proc}/201/stat'\n"
+        + "  fi\n"
+        + '  _wg_lock_orig "$@"\n'
+        + "}"
+    )
+    out = _respond(box, f, grow_mb=0, before=thaw_once)
+    assert _kills(box) == [], "a resumed writer is not paused again on size"
+    assert _frozen(box) == [], "and not recorded again"
+    assert f.stat().st_size >= 150 * _MB, "nor emptied"
+    assert "resumed" in _log(box), out.stdout + out.stderr
+
+
+def test_an_owed_emptying_never_stops_a_root_the_operator_resumed(box):
+    """The command root need not hold the file. Its holder is still paused,
+    but the root was thawed: with no growth, nothing is stopped, recorded or
+    emptied (review finding: the re-check covered the holders only)."""
+    f = _task_output(box, mb=150)
+    _proc(box, 100, "claude", 1, starttime=500)
+    _proc(box, 200, "bash", 100, starttime=2000)  # the root: no fd, no record, running
+    _proc(box, 201, "grep", 200, f, starttime=2010, state="T")
+    put = (
+        "wg_records_lock lk; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
+        f"wg_record_put 201 2010 grep \"$ts\" {os.stat(f).st_dev}:{os.stat(f).st_ino} '{f}' paused\n"
+        'wg_records_unlock "$lk"'
+    )
+    _respond(box, f, grow_mb=0, before=put)
+    assert _kills(box) == [], "the resumed root is not stopped again on size"
+    assert [r[0] for r in _frozen(box)] == ["201"], "and not recorded"
+    assert f.stat().st_size >= 150 * _MB, "nor is the file emptied"
+
+
+def test_an_owed_emptying_accepts_a_recorded_traced_stop(box):
+    """A holder this guardian paused can show t (its group stop under a
+    tracer) and still carry its "paused" record: the owed emptying accepts
+    it, as the pause and the re-walk do (review finding)."""
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    _proc(box, 200, "bash", 100, f, starttime=2000, state="t")
+    _proc(box, 201, "grep", 200, f, starttime=2010, state="t")
+    _respond(box, f, grow_mb=0, before=_paused_records(box, f))
+    assert f.stat().st_size < 150 * _MB, "emptied"
+    assert _kills(box) == [], "nothing new to pause"
 
 
 def test_a_thawed_writer_is_not_paused_again_for_the_size_it_left(box):
