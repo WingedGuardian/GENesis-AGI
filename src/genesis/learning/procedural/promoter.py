@@ -131,6 +131,11 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
             logger.info("Quarantined procedure %s (conf=%.2f)", row["task_type"], row["confidence"])
             continue
 
+        # A lesson is authored, not earned: metrics never move its tier.
+        # The quarantine check above still applies to it.
+        if row.get("lesson") is not None:
+            continue
+
         # Draft clearing: a draft graduates to validated once it has >=1 real
         # success and no failures (reads alone do NOT clear the draft flag).
         # Closes the gap where nothing ever cleared draft=1.
