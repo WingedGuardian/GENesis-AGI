@@ -515,8 +515,11 @@ def evaluate_evidence(
 
     legacy: set[str] = set()  # the old rule's heads, before cutover
     # When each legacy head was first counted by the old rule: the earliest TIMED
-    # pre-cutover evidence (a pending review has no time and records none).
+    # pre-cutover evidence. A head with ANY untimed evidence (a pending review)
+    # has no knowable opening: the untimed piece may be the earliest, so the
+    # minimum over the timed ones alone would be a made-up boundary.
     legacy_times: dict[str, tuple[datetime, object]] = {}
+    legacy_untimed: set[str] = set()
     confirmed: set[str] = set()  # heads the primary (or the identity) reviewed
     found: dict[str, dict[str, Any]] = {}  # round head -> what landed there
 
@@ -524,7 +527,9 @@ def evaluate_evidence(
         confirmed.add(sha)
         if before:
             legacy.add(sha)
-            if when is not None and (sha not in legacy_times or when < legacy_times[sha][0]):
+            if when is None:
+                legacy_untimed.add(sha)
+            elif sha not in legacy_times or when < legacy_times[sha][0]:
                 legacy_times[sha] = (when, raw)
 
     def add_round(
@@ -748,12 +753,27 @@ def evaluate_evidence(
     # a reader never re-derives it: a later review on a head that already opened
     # a round is late too, and still joins that round. Marks only accumulate, so
     # once one review on a head is late every later one is.
+    #
+    # The predicate runs for EVERY event, so it must not scan the marks each
+    # time (events x marks is quadratic at the supported 5,000-row reads, on a
+    # hook path a SIGKILL fails open). Precompute, for each head, the earliest
+    # time any strict descendant was marked: collapse the marks to the earliest
+    # per marked head, then walk each one's ancestors once. "Some descendant mark
+    # is strictly before ``when``" is then "the earliest one is".
+    first_mark: dict[str, datetime] = {}
+    for m_sha, m_when, _ in marks:
+        if m_when is not None and (m_sha not in first_mark or m_when < first_mark[m_sha]):
+            first_mark[m_sha] = m_when
+    descendant_marked: dict[str, datetime] = {}
+    for m_sha, m_when in first_mark.items():
+        for older in ancestors(m_sha):
+            if older not in descendant_marked or m_when < descendant_marked[older]:
+                descendant_marked[older] = m_when
+
     def marked_after(sha: str, when: datetime | None) -> bool:
         """Was a strict descendant of ``sha`` marked strictly before ``when``?"""
-        return when is not None and any(
-            m_when is not None and m_when < when and sha in ancestors(m_sha)
-            for m_sha, m_when, _ in marks
-        )
+        earliest = descendant_marked.get(sha)
+        return when is not None and earliest is not None and earliest < when
 
     opened: dict[str, bool] = {sha: True for sha in legacy}
     first_event: dict[str, dict[str, Any]] = {}  # each head's earliest finding review
@@ -794,12 +814,12 @@ def evaluate_evidence(
 
     def opened_at(sha: str) -> object:
         """When round ``sha`` opened: for a head the old rule counted, its
-        earliest timed pre-cutover evidence (None when it had none, such as a
-        pending review); otherwise its opening finding review. A legacy head
-        never takes a later post-cutover review's time, which would misplace it
-        in the order of rounds."""
+        earliest pre-cutover evidence, or None when any of that evidence has no
+        time (a pending review, which may be the earliest); otherwise its opening
+        finding review. A legacy head never takes a later post-cutover review's
+        time, which would misplace it in the order of rounds."""
         if sha in legacy:
-            stamp = legacy_times.get(sha)
+            stamp = None if sha in legacy_untimed else legacy_times.get(sha)
             return _iso(*stamp) if stamp else None
         event = first_event[sha]
         return _iso(event["when"], event["source"]["submitted_at"])

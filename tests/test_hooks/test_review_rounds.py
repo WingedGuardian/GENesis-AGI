@@ -1621,3 +1621,158 @@ def test_late_and_opened_at_never_depend_on_review_ids():
         assert [r["opened_at"] for r in plain.get("rounds", [])] == [
             r["opened_at"] for r in withids.get("rounds", [])
         ]
+
+
+# -- round 1 of #3347: `late` costs one lookup per review, and a legacy round with
+# any untimed evidence has no knowable opening time
+
+
+class _CountingTime(datetime):
+    """A datetime that counts its ``<`` comparisons, so cost is measured as
+    work done rather than by a wall clock that varies by machine."""
+
+    compared = 0
+
+    def __lt__(self, other):
+        type(self).compared += 1
+        return super().__lt__(other)
+
+
+_REAL_PARSE_TIME = rb._parse_time
+
+
+def _comparisons(monkeypatch, n):
+    real = _REAL_PARSE_TIME
+
+    def counting(raw):
+        ok, when = real(raw)
+        if when is None:
+            return ok, when
+        return ok, _CountingTime.fromisoformat(when.isoformat())
+
+    monkeypatch.setattr(rb, "_parse_time", counting)
+    # n finding reviews on H1, none late: a descendant (H2) is marked only after
+    # them. That is the worst case for a scan, which cannot stop early.
+    reviews = [_rv(CODEX, H1, P2, when=T1) for _ in range(n)]
+    reviews.append(_rv(CODEX, H2, when=T2, body="Looks good."))
+    _CountingTime.compared = 0
+    got = _ev(head=H2, commits=_dag(H1, H2), reviews=reviews)
+    assert got["status"] == "ok" and len(got["findings"]) == n
+    assert not any(f["late"] for f in got["findings"])
+    return _CountingTime.compared
+
+
+def test_late_costs_linear_work_in_the_number_of_reviews(monkeypatch):
+    """Codex c4276204979: re-checking every mark for every review made this
+    quadratic (about n squared comparisons, x4 per doubling of n). Linear work
+    roughly doubles; the absolute bound only rules out a quadratic count."""
+    small, large = _comparisons(monkeypatch, 400), _comparisons(monkeypatch, 800)
+    assert large < 20 * 800, large
+    assert large < 3 * small, (small, large)
+
+
+def _ancestors_from(commits):
+    parents = {c["sha"]: c["parents"] or [] for c in commits}
+
+    def ancestors(sha):
+        seen, stack = set(), list(parents.get(sha, []))
+        while stack:
+            node = stack.pop()
+            if node in seen or node not in parents:
+                continue
+            seen.add(node)
+            stack.extend(parents.get(node, []))
+        return seen
+
+    return ancestors
+
+
+def test_late_equals_a_brute_force_recomputation_from_the_output():
+    """`late` read back from the output's own marks and commit graph: a review is
+    late iff some strict descendant of its head was marked strictly before it."""
+    rng = random.Random(20261016)
+    times = [BEFORE, T1, T2, T3, T4]
+    # A line, and a history with a side branch merged back in (H3 branches off
+    # H1, H4 merges H2 and H3), so ancestry through a second parent is covered.
+    graphs = [_dag(*COMMITS), _dag(*COMMITS, extra={H3: [H1], H4: [H2, H3]})]
+    seen_late = 0
+    for i in range(800):
+        reviews, comments = _random_corpus(rng, times)
+        got = _ev(reviews=reviews, comments=comments, commits=graphs[i % 2])
+        if got["status"] != "ok":
+            continue
+        ancestors = _ancestors_from(got["commits"])
+        marks = [
+            (m["head"], datetime.fromisoformat(m["at"]))
+            for m in got["marks"]
+            if m["at"] is not None
+        ]
+        for f in got["findings"]:
+            at = datetime.fromisoformat(f["submitted_at"])
+            want = any(m_at < at and f["head"] in ancestors(m_head) for m_head, m_at in marks)
+            assert f["late"] == want, (f, got["marks"])
+            seen_late += want
+    assert seen_late
+
+
+def test_only_a_strict_descendant_marked_strictly_before_makes_a_review_late():
+    commits = _dag(H1, H2, H3)
+
+    def late(*marks):
+        reviews = [_rv(RABBIT, sha, when=at, body="Looks good.") for sha, at in marks]
+        reviews.append(_rv(DEVIN, H1, _devin("🟡"), when=T2))
+        return [f["late"] for f in _ev(head=H3, commits=commits, reviews=reviews)["findings"]]
+
+    assert late((H2, T1), (H3, T3)) == [True]  # one descendant was marked before it
+    assert late((H3, T3)) == [False]  # the only descendant mark came after it
+    assert late((H1, T1)) == [False]  # a mark on its own head never counts
+
+
+@pytest.mark.parametrize("timed_source", ["primary review", "clean comment", "identity template"])
+def test_a_legacy_round_with_any_untimed_evidence_has_no_opening_time(timed_source):
+    """Codex c4276204998: a pending review may be the head's earliest evidence,
+    so a minimum over the timed evidence alone would be a made-up boundary."""
+    template = "external report head={head}"
+    pending = {**_rv(CODEX, H1, state="PENDING", body="x"), "submitted_at": None}
+    reviews, comments = [pending, _rv(DEVIN, H1, _devin("🟡"), when=T1)], []
+    if timed_source == "primary review":
+        reviews.append(_rv(CODEX, H1, when=BEFORE, body="x"))
+    elif timed_source == "clean comment":
+        comments.append(_clean(H1[:10], when=BEFORE))
+    else:
+        comments.append(
+            _cm(f"external report head={H1}", login="someone", kind="User", when=BEFORE)
+        )
+    got = _ev(
+        head=H2, commits=_dag(H1, H2), reviews=reviews, comments=comments, templates=(template,)
+    )
+    assert got["status"] == "ok", got
+    assert [(r["head"], r["opened_at"]) for r in got["rounds"]] == [(H1, None)]
+
+
+def test_an_untimed_legacy_comment_also_leaves_the_opening_time_unknown():
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(_rv(CODEX, H1, when=BEFORE, body="x"),),
+        comments=(_clean(H1[:10], when=None),),
+    )
+    assert got["status"] == "ok", got
+    assert [(r["head"], r["opened_at"]) for r in got["rounds"]] == [(H1, None)]
+
+
+def test_untimed_legacy_evidence_changes_nothing_but_the_opening_time():
+    pending = {**_rv(CODEX, H1, state="PENDING", body="x"), "submitted_at": None}
+    base = [_rv(CODEX, H1, when=BEFORE, body="x"), _rv(DEVIN, H1, _devin("🟡"), when=T1)]
+    without = _ev(head=H2, commits=_dag(H1, H2), reviews=base)
+    with_pending = _ev(head=H2, commits=_dag(H1, H2), reviews=[pending, *base])
+    assert without["rounds"][0]["opened_at"] == _z(BEFORE)
+    assert with_pending["rounds"][0]["opened_at"] is None
+
+    def without_opened_at(result):
+        return {
+            **result,
+            "rounds": [{k: v for k, v in r.items() if k != "opened_at"} for r in result["rounds"]],
+        }
+
+    assert without_opened_at(with_pending) == without_opened_at(without)
