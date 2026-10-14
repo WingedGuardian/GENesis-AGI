@@ -6,11 +6,13 @@ stored CLI words (``ssh``), MCP short names and prose beside real tool names.
 This runs every live row's ``tool_trigger`` through ``normalize_tool_trigger``:
 
 - the cleaned tool list is written back (``NULL`` when every value drops);
-- a CLI command mapped to ``Bash`` also writes ``trigger_spec`` with its
-  command pattern and ``repeat: every`` when ``Bash`` is the row's only tool,
-  the row did not name ``Bash`` itself and has no spec (a spec gates every
-  tool on the row). The patterns are provisional: the advisor that reads them
-  sets the match contract, so apply only after it ships.
+- a CLI word becomes ``Bash`` only together with ``trigger_spec`` (its command
+  pattern, ``repeat: every``), which needs Bash to be the row's one tool, no
+  spec already there and a spec the validator accepts; otherwise the word is
+  kept as written, inert as before. The patterns are provisional: the advisor
+  that reads them sets the match contract, so apply only after it ships;
+- the trigger cache is rebuilt only from this install's database, or into the
+  cache ``GENESIS_PROCEDURE_TRIGGERS`` names;
 - lesson rows are never touched (they are authored, and validated on write).
 
 Dry-run by default; ``--apply`` writes and then regenerates the trigger cache.
@@ -18,6 +20,8 @@ Apply it only once the advisor matches on ``patterns`` (the trigger-spec
 advisor ticket): until then a CLI word mapped to ``Bash`` would match any
 Bash call its tags match, on a row that reaches the cache.
 Idempotent: a repaired row normalizes to itself, so a re-run changes nothing.
+The counts classify each row once (unchanged, cleaned, cli_mapped, all_dropped);
+``cli_kept`` and ``spec_refused`` are cross-cuts that can overlap them.
 Run it after the schema migration that adds ``trigger_spec`` and ``lesson``,
 from the main checkout (the regenerated cache lands under the checkout it runs
 from, unless ``GENESIS_PROCEDURE_TRIGGERS`` points elsewhere).
@@ -31,6 +35,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -38,7 +43,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 
-async def backfill(db, *, apply: bool) -> Counter:
+async def backfill(db, *, apply: bool, regenerate_cache: bool = True) -> Counter:
     """Classify (and with ``apply``, repair) every live row; return the counts."""
     from genesis.learning.procedural.lesson_shape import validate_trigger_spec
     from genesis.learning.procedural.tool_names import normalize_tool_trigger
@@ -53,26 +58,40 @@ async def backfill(db, *, apply: bool) -> Counter:
             value = json.loads(raw)
         except (ValueError, RecursionError):
             value = raw  # a bare string is one value
-        tools, patterns, dropped = normalize_tool_trigger(value)
-        counts["values_seen"] += len(value) if isinstance(value, list) else 1
+        items = value if isinstance(value, list) else [value]
+        counts["values_seen"] += len(items)
+        # Judge each value alone. A CLI word becomes Bash only together with
+        # its stored pattern; when the pattern cannot be stored (other tools on
+        # the row, including a Bash the row names itself, plain or annotated; a
+        # spec already there; or the validator refuses it), the word stays as written:
+        # inert as before, and recoverable once the advisor can scope it.
+        cli_items: list[str] = []
+        kept_items: list = []
+        patterns: list[str] = []
+        for item in items:
+            _, item_patterns, _ = normalize_tool_trigger([item])
+            if item_patterns:
+                cli_items.append(str(item).strip())
+                patterns += [x for x in item_patterns if x not in patterns]
+            else:
+                kept_items.append(item)
+        tools, _, dropped = normalize_tool_trigger(kept_items)
         counts["values_dropped"] += len(dropped)
         update: dict[str, str | None] = {}
-        if tools != value or not tools:  # a stored [] is a trigger to the promoter
-            update["tool_trigger"] = json.dumps(tools) if tools else None
-        # A spec applies to every tool on the row, so it is written only when
-        # Bash is the row's one tool: a pattern on [Read, Bash] would stop Read
-        # surfacing. A spec the validator refuses (over the cap) is not written.
-        # A row that names Bash itself asked for every Bash call: never narrow it.
-        named_bash = any(
-            str(v).strip() == "Bash" for v in (value if isinstance(value, list) else [value])
-        )
-        if patterns and spec is None and tools == ["Bash"] and not named_bash:
-            new_spec = {"patterns": patterns, "repeat": "every"}
+        new_spec = None
+        if cli_items and spec is None and not tools:
             try:
-                validate_trigger_spec(new_spec)
-                update["trigger_spec"] = json.dumps(new_spec)
+                new_spec = validate_trigger_spec({"patterns": patterns, "repeat": "every"})
             except ValueError:
                 counts["spec_refused"] += 1
+        if new_spec is not None:
+            tools = ["Bash"]
+            update["trigger_spec"] = json.dumps(new_spec)
+        elif cli_items:
+            tools += [c for c in dict.fromkeys(cli_items) if c not in tools]
+            counts["cli_kept"] += 1
+        if tools != value or not tools:  # a stored [] is a trigger to the promoter
+            update["tool_trigger"] = json.dumps(tools) if tools else None
         if not update:
             counts["unchanged"] += 1
             continue
@@ -92,16 +111,21 @@ async def backfill(db, *, apply: bool) -> Counter:
                 counts["skipped_changed"] += 1
     if apply:
         await db.commit()
+    if apply and regenerate_cache:
         from genesis.learning.procedural.trigger_cache import regenerate
 
         counts["cache_entries"] = await regenerate(db)
     return counts
 
 
-async def _main(db_path: Path, apply: bool) -> int:
+async def _main(db_path: Path, apply: bool, *, own_db: bool = False) -> int:
     import aiosqlite
 
-    async with aiosqlite.connect(str(db_path)) as db:
+    if not Path(db_path).is_file():  # never create a database at a mistyped path
+        print(f"No database at {db_path}")
+        return 2
+    db = await aiosqlite.connect(f"file:{Path(db_path).resolve()}?mode=rw", uri=True)
+    try:
         db.row_factory = aiosqlite.Row  # the cache regeneration reads rows by name
         columns = {r[1] for r in await db.execute_fetchall("PRAGMA table_info(procedural_memory)")}
         if "lesson" not in columns:
@@ -109,7 +133,16 @@ async def _main(db_path: Path, apply: bool) -> int:
                 "procedural_memory has no lesson column: run after the schema migration (server start)."
             )
             return 1
-        counts = await backfill(db, apply=apply)
+        # The cache file is the running install's: rebuild it only from the
+        # install's own database, or into an explicitly redirected cache.
+        redirected = bool(os.environ.get("GENESIS_PROCEDURE_TRIGGERS"))
+        counts = await backfill(db, apply=apply, regenerate_cache=own_db or redirected)
+        if apply and not (own_db or redirected):
+            print(
+                "Cache not regenerated: --db is not this install's database and GENESIS_PROCEDURE_TRIGGERS is unset."
+            )
+    finally:
+        await db.close()
     print(("APPLIED" if apply else "DRY-RUN") + ":", json.dumps(dict(counts), sort_keys=True))
     return 0
 
@@ -123,4 +156,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     from genesis.env import genesis_db_path
 
-    sys.exit(asyncio.run(_main(args.db or genesis_db_path(), args.apply)))
+    # Only the install's own database (no --db, no GENESIS_DB_PATH override) may
+    # rebuild the install's cache.
+    own_db = args.db is None and not os.environ.get("GENESIS_DB_PATH")
+    sys.exit(asyncio.run(_main(args.db or genesis_db_path(), args.apply, own_db=own_db)))

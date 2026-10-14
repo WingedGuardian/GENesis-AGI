@@ -61,7 +61,7 @@ async def test_dry_run_counts_every_class_and_writes_nothing(db):
         counts["cleaned"],
         counts["cli_mapped"],
         counts["all_dropped"],
-    ) == (1, 2, 2, 2)  # [] counts as all_dropped
+    ) == (2, 1, 2, 2)  # [] is all_dropped; spec_kept keeps its word
     assert counts["values_seen"] == 9
     assert counts["values_dropped"] == 3
 
@@ -89,7 +89,7 @@ async def test_apply_repairs_each_class_and_a_rerun_changes_nothing(db):
     assert rerun["unchanged"] == 5  # every repaired row except the all-dropped one, now unread
 
 
-async def test_the_entry_point_applies_and_regenerates_on_a_plain_connection(tmp_path):
+async def test_the_entry_point_applies_and_regenerates_on_a_plain_connection(tmp_path, monkeypatch):
     import aiosqlite
 
     from genesis.db.schema import create_all_tables
@@ -98,6 +98,7 @@ async def test_the_entry_point_applies_and_regenerates_on_a_plain_connection(tmp
     async with aiosqlite.connect(str(path)) as db:
         await create_all_tables(db)
         await _seed(db)
+    monkeypatch.setenv("GENESIS_PROCEDURE_TRIGGERS", str(trigger_cache.get_cache_path()))
     assert await backfill_module._main(path, apply=True) == 0
     assert trigger_cache.get_json_cache_path().exists()
 
@@ -165,6 +166,7 @@ async def test_a_spec_is_written_only_for_a_bash_only_row_and_only_when_valid(db
     for pid, trigger in (
         ("mixed", '["Read", "ssh"]'),
         ("named_bash", '["Bash", "SSH"]'),
+        ("annotated_bash", '["Bash (running tests)", "ssh"]'),
         (
             "too_many",
             '["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git add"]',
@@ -177,10 +179,32 @@ async def test_a_spec_is_written_only_for_a_bash_only_row_and_only_when_valid(db
         )
     counts = await backfill_module.backfill(db, apply=True)
     stored = await _stored(db)
-    assert json.loads(stored["mixed"][0]) == ["Read", "Bash"]
+    assert json.loads(stored["mixed"][0]) == ["Read", "ssh"]  # kept as written, not widened
     assert stored["mixed"][1] is None  # a pattern would stop Read surfacing
-    assert json.loads(stored["too_many"][0]) == ["Bash"]
+    assert len(json.loads(stored["too_many"][0])) == 9  # kept as written, not widened
     assert stored["too_many"][1] is None  # nine patterns: over the validator's cap
     assert counts["spec_refused"] == 1
-    assert json.loads(stored["named_bash"][0]) == ["Bash"]
+    assert json.loads(stored["named_bash"][0]) == ["Bash", "SSH"]
+    assert json.loads(stored["annotated_bash"][0]) == ["Bash", "ssh"]
+    assert stored["annotated_bash"][1] is None  # annotated Bash is still Bash named
     assert stored["named_bash"][1] is None  # it named Bash: every Bash call, not only ssh
+
+
+async def test_an_alternate_database_does_not_rebuild_the_install_cache(tmp_path, monkeypatch):
+    import aiosqlite
+
+    from genesis.db.schema import create_all_tables
+
+    monkeypatch.delenv("GENESIS_PROCEDURE_TRIGGERS", raising=False)
+    path = tmp_path / "copy.db"
+    async with aiosqlite.connect(str(path)) as db:
+        await create_all_tables(db)
+        await _seed(db)
+    assert await backfill_module._main(path, apply=True) == 0
+    assert not trigger_cache.get_json_cache_path().exists()
+
+
+async def test_a_mistyped_database_path_is_refused_not_created(tmp_path):
+    path = tmp_path / "missing.db"
+    assert await backfill_module._main(path, apply=False) == 2
+    assert not path.exists()
