@@ -30,6 +30,14 @@ from genesis.learning.procedural.tool_names import BUILTIN_TOOLS, normalize_tool
         # A real tool name in front of added prose is recovered.
         (["Read (codebase inspection)", "Edit{file_path: x}"], ["Read", "Edit"], [], []),
         (["Tool:browser_navigate"], ["mcp__genesis-health__browser_navigate"], [], []),
+        (
+            ["mcp__genesis-health__browser_navigate (navigation)"],
+            ["mcp__genesis-health__browser_navigate"],
+            [],
+            [],
+        ),
+        (["mcp__genesis-health__nope (x)"], [], [], ["mcp__genesis-health__nope (x)"]),
+        (["ssh (to the host)"], ["Bash"], [tool_names._CLI_PATTERNS["ssh"]], []),
         (["Python (scripts)", "review gate"], [], [], ["Python (scripts)", "review gate"]),
         (["Python", "Git", "review gate", "Grep"], ["Grep"], [], ["Python", "Git", "review gate"]),
         # Built-ins match exactly: the CLI word `grep` is not the Grep tool.
@@ -177,6 +185,11 @@ async def test_an_explicit_teach_can_clear_a_trigger_and_an_extraction_cannot(db
         ("gh", "ls gh-pages", False),
         ("git push", "git push origin HEAD", True),
         ("git push", "echo git push", False),
+        ("ssh", "ssh-agent -s", False),
+        ("ssh", "/usr/bin/ssh-keygen -t ed25519", False),
+        ("pytest", "pytest-cov --help", False),
+        ("gh", "gh-pages build", False),
+        ("ssh", "x=`ssh host`", True),
     ],
 )
 def test_a_cli_pattern_matches_the_command_not_a_mention(phrase, command, fires):

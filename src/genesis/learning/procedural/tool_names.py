@@ -64,12 +64,13 @@ _CLI_PREFIX = (
     r"(?:[\w.~-]*/)*(?:python3?\s+-m\s+)?"
 )
 _CLI_PATTERNS = {
-    phrase: _CLI_PREFIX + r"\s+".join(map(re.escape, phrase.split())) + r"\b"
+    # The command must END there too, so ssh-agent and pytest-cov are not ssh/pytest.
+    phrase: _CLI_PREFIX + r"\s+".join(map(re.escape, phrase.split())) + r"(?=$|[\s;&|)`])"
     for phrase in _CLI_COMMANDS
 }
 # A real tool name in front of prose an LLM added: `Bash (running tests)`,
 # `Edit{file_path: ...}`, `Tool:ego_proposal_resolve`.
-_TOOL_PREFIX = re.compile(r"(?:Tool:\s*)?(\w+)\s*(?:[(:{].*)?")  # one line only
+_TOOL_PREFIX = re.compile(r"(?:Tool:\s*)?([\w-]+)\s*(?:[(:{].*)?")  # one line only
 
 # Genesis MCP servers and the modules that register their tools.
 _MCP_MODULES = {
@@ -186,10 +187,16 @@ def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:
             pattern = _CLI_PATTERNS[value.lower()]
             if pattern not in patterns:
                 patterns.append(pattern)
-        elif (m := _TOOL_PREFIX.fullmatch(value)) and (
-            m.group(1) in BUILTIN_TOOLS or m.group(1) in short
-        ):
-            tool = m.group(1) if m.group(1) in BUILTIN_TOOLS else short[m.group(1)]
+        elif (m := _TOOL_PREFIX.fullmatch(value)) and m.group(1) != value:
+            # The name alone, judged by every rule above (a full MCP name is
+            # validated, a CLI word gets its pattern); it holds no prose, so
+            # this recurses at most once.
+            inner, inner_patterns, _ = normalize_tool_trigger([m.group(1)])
+            if not inner:
+                dropped.append(value)
+                continue
+            tool = inner[0]
+            patterns.extend(p for p in inner_patterns if p not in patterns)
         else:
             dropped.append(value)
             continue

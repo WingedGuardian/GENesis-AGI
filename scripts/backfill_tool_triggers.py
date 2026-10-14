@@ -11,6 +11,9 @@ This runs every live row's ``tool_trigger`` through ``normalize_tool_trigger``:
 - lesson rows are never touched (they are authored, and validated on write).
 
 Dry-run by default; ``--apply`` writes and then regenerates the trigger cache.
+Apply it only once the advisor matches on ``patterns`` (the trigger-spec
+advisor ticket): until then a CLI word mapped to ``Bash`` would match any
+Bash call its tags match, on a row that reaches the cache.
 Idempotent: a repaired row normalizes to itself, so a re-run changes nothing.
 Run it after the schema migration that adds ``trigger_spec`` and ``lesson``,
 from the main checkout (the regenerated cache lands under the checkout it runs
@@ -50,7 +53,7 @@ async def backfill(db, *, apply: bool) -> Counter:
         counts["values_seen"] += len(value) if isinstance(value, list) else 1
         counts["values_dropped"] += len(dropped)
         update: dict[str, str | None] = {}
-        if tools != value:
+        if tools != value or not tools:  # a stored [] is a trigger to the promoter
             update["tool_trigger"] = json.dumps(tools) if tools else None
         if patterns and spec is None:
             update["trigger_spec"] = json.dumps({"patterns": patterns, "repeat": "every"})
@@ -65,8 +68,9 @@ async def backfill(db, *, apply: bool) -> Counter:
             # Only if the row still holds what was read: a refine that landed in
             # between is kept, and counted.
             cursor = await db.execute(
-                f"UPDATE procedural_memory SET {sets} WHERE id = ? AND tool_trigger IS ?",  # noqa: S608 (fixed column names)
-                (*update.values(), row_id, raw),
+                f"UPDATE procedural_memory SET {sets} WHERE id = ? AND tool_trigger IS ? "  # noqa: S608 (fixed column names)
+                "AND trigger_spec IS ? AND lesson IS NULL AND deprecated = 0",
+                (*update.values(), row_id, raw, spec),
             )
             if cursor.rowcount == 0:
                 counts["skipped_changed"] += 1

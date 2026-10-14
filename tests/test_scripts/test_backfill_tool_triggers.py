@@ -25,6 +25,7 @@ _ROWS = {
     "bare_string": ["pytest", None, None],
     "spec_kept": ['["gh"]', '{"patterns": ["own"], "repeat": "session"}', None],
     "lesson": ['["ssh"]', None, '{"origin": "owner"}'],
+    "empty": ["[]", None, None],
 }
 
 
@@ -53,14 +54,14 @@ async def test_dry_run_counts_every_class_and_writes_nothing(db):
     before = await _stored(db)
     counts = await backfill_module.backfill(db, apply=False)
     assert await _stored(db) == before
-    assert counts["rows_scanned"] == 6  # the lesson row is never read
+    assert counts["rows_scanned"] == 7  # the lesson row is never read
     # spec_kept writes no spec, so it counts as cleaned, not cli_mapped.
     assert (
         counts["unchanged"],
         counts["cleaned"],
         counts["cli_mapped"],
         counts["all_dropped"],
-    ) == (1, 2, 2, 1)
+    ) == (1, 2, 2, 2)  # [] counts as all_dropped
     assert counts["values_seen"] == 10
     assert counts["values_dropped"] == 3
 
@@ -132,3 +133,29 @@ async def test_a_row_changed_after_the_read_is_kept(db):
     counts = await backfill_module.backfill(_RefineAfterRead(db), apply=True)
     assert counts["skipped_changed"] == 1
     assert (await _stored(db))["cleaned"][0] == '["Edit"]'
+
+
+async def test_a_stored_empty_list_becomes_null(db):
+    await _seed(db)
+    await backfill_module.backfill(db, apply=True)
+    assert (await _stored(db))["empty"] == (None, None)
+
+
+class _SpecAfterRead(_RefineAfterRead):
+    async def execute_fetchall(self, sql, *args):
+        rows = await self._db.execute_fetchall(sql, *args)
+        await self._db.execute(
+            'UPDATE procedural_memory SET trigger_spec = \'{"patterns": ["x"], "repeat": "every"}\' '
+            "WHERE id = 'cli_mapped'"
+        )
+        await self._db.execute("UPDATE procedural_memory SET lesson = '{}' WHERE id = 'cleaned'")
+        return rows
+
+
+async def test_a_spec_or_lesson_set_after_the_read_is_kept(db):
+    await _seed(db)
+    counts = await backfill_module.backfill(_SpecAfterRead(db), apply=True)
+    stored = await _stored(db)
+    assert json.loads(stored["cli_mapped"][1])["patterns"] == ["x"]
+    assert stored["cleaned"][0] == '["Read (code review)", "review gate"]'
+    assert counts["skipped_changed"] == 2
