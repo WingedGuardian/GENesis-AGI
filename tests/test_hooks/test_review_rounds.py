@@ -988,7 +988,14 @@ def test_a_finding_on_an_ancestor_after_a_descendant_was_reviewed_opens_no_round
     assert late["status"] == "ok" and late["count"] == 0
     assert late["rounds"] == [] and late["open_keys"] == []
     assert late["findings"] == [
-        {"head": H1, "submitted_at": _z(T3), "login": DEVIN, "keys": ["c70"], "round_head": None}
+        {
+            "head": H1,
+            "submitted_at": _z(T3),
+            "login": DEVIN,
+            "keys": ["c70"],
+            "round_head": None,
+            "late": True,
+        }
     ]
     # Without the commit graph nothing is known to be late: the old count.
     assert _ev(head=H2, reviews=reviews, commits=(H1, H2))["count"] == 1
@@ -1366,3 +1373,251 @@ def test_an_edit_time_before_the_comment_never_back_dates_its_mark():
     clean = {**_clean(H2[:10], when=T3), "updated_at": T1}
     got = _ev(head=H2, commits=_dag(H1, H2), comments=(clean,))
     assert [m["at"] for m in got["marks"]] == [_z(T3)]
+
+
+# -- the producer states its own decisions: `late` per finding, `opened_at` per round
+# (issue #3301; the rework of #3324). A reader must never re-derive either: a late
+# review on a head that already is a round IS listed in that round's ``reviews``, so
+# list membership cannot tell an opening review from a late one.
+
+
+def test_a_late_review_on_a_head_that_already_is_a_round_is_flagged_late():
+    """#3324 round 2: the first review on H1 opens its round; after a descendant
+    was reviewed, a second review on H1 is late, yet it still joins H1's round."""
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(
+            _keyed(_rv(CODEX, H1, P2, when=T1), 1, [10]),
+            _rv(RABBIT, H2, when=T2, body="Looks good."),
+            _keyed(_rv(DEVIN, H1, _devin("🟡"), when=T3), 2, [20]),
+        ),
+    )
+    assert [(f["keys"], f["late"]) for f in got["findings"]] == [(["c10"], False), (["c20"], True)]
+    assert got["count"] == 1 and [s["id"] for s in got["rounds"][0]["reviews"]] == [1, 2]
+    assert got["rounds"][0]["opened_at"] == _z(T1)
+    assert all("late" not in s for s in got["rounds"][0]["reviews"])
+
+
+def test_a_late_review_of_an_ancestor_is_late_and_joins_the_older_round():
+    got = _ev(
+        head=H3,
+        commits=_dag(H1, H2, H3),
+        reviews=(
+            _rv(CODEX, H1, P2, when=T1),
+            _rv(CODEX, H3, when=T2, body="Looks good."),
+            _rv(DEVIN, H2, _devin("🟡"), when=T3),
+        ),
+    )
+    assert [(f["head"], f["round_head"], f["late"]) for f in got["findings"]] == [
+        (H1, H1, False),
+        (H2, H1, True),
+    ]
+
+
+def test_a_late_codex_findings_comment_is_flagged_late():
+    body = f"### 💡 Codex Review\n\n{P2}\n\nhttps://github.com/o/r/blob/{H1}/x.py#L1"
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(_rv(CODEX, H2, when=T2, body="Looks good."),),
+        comments=(_cm(body, when=T3),),
+    )
+    assert [(f["head"], f["round_head"], f["late"]) for f in got["findings"]] == [(H1, None, True)]
+
+
+def test_a_review_on_a_force_pushed_head_is_never_late():
+    gone = "f" * 40
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(
+            _rv(CODEX, H2, when=T1, body="Looks good."),
+            _rv(DEVIN, gone, _devin("🟡"), when=T2),
+        ),
+    )
+    assert [f["late"] for f in got["findings"]] == [False]
+    assert got["rounds"][0]["opened_at"] == _z(T2)
+
+
+def test_a_descendant_marked_at_the_same_instant_leaves_the_review_on_time():
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(
+            _rv(CODEX, H2, when=T2, body="Looks good."),
+            _rv(DEVIN, H1, _devin("🟡"), when=T2),
+        ),
+    )
+    assert [f["late"] for f in got["findings"]] == [False]
+
+
+def test_late_keys_never_enter_the_open_rounds_keys():
+    """The current head has no descendant in the PR, so a review on it is never
+    late: whatever is late belongs to an earlier round."""
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(
+            _keyed(_rv(CODEX, H1, P2, when=T1), 1, [10]),
+            _keyed(_rv(CODEX, H2, P2, when=T2), 2, [20]),
+            _keyed(_rv(DEVIN, H1, _devin("🟡"), when=T3), 3, [30]),
+        ),
+    )
+    assert got["round_state"] == "open" and got["open_keys"] == ["c20"]
+    late = [k for f in got["findings"] if f["late"] for k in f["keys"]]
+    assert late == ["c30"] and not set(late) & set(got["open_keys"])
+
+
+def test_opened_at_of_a_round_is_its_opening_reviews_time():
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(_rv(DEVIN, H1, _devin("🟡"), when=T2), _rv(CODEX, H1, P2, when=T1)),
+    )
+    assert [(r["head"], r["opened_at"]) for r in got["rounds"]] == [(H1, _z(T1))]
+
+
+@pytest.mark.parametrize(
+    "legacy_evidence",
+    ["primary review", "clean comment", "identity template"],
+)
+def test_a_legacy_round_opens_at_its_old_rule_evidence_not_at_a_later_finding(legacy_evidence):
+    """The three ways the old rule counted a head, each before the cutover."""
+    template = "external report head={head}"
+    reviews = [_rv(DEVIN, H1, _devin("🟡"), when=T1)]
+    comments = []
+    if legacy_evidence == "primary review":
+        reviews.append(_rv(CODEX, H1, when=BEFORE, body="x"))
+    elif legacy_evidence == "clean comment":
+        comments.append(_clean(H1[:10], when=BEFORE))
+    else:
+        comments.append(
+            _cm(f"external report head={H1}", login="someone", kind="User", when=BEFORE)
+        )
+    got = _ev(
+        head=H2, commits=_dag(H1, H2), reviews=reviews, comments=comments, templates=(template,)
+    )
+    assert got["status"] == "ok", got
+    assert [(r["head"], r["opened_at"]) for r in got["rounds"]] == [(H1, _z(BEFORE))]
+
+
+@pytest.mark.parametrize("earliest_first", [True, False])
+def test_a_legacy_round_opens_at_its_earliest_legacy_evidence(earliest_first):
+    """Reviews are read before comments, so both orders of the earlier and the
+    later evidence are exercised: neither the first nor the last one seen wins."""
+    earlier = "2025-12-01T00:00:00Z"
+    review_when, comment_when = (earlier, BEFORE) if earliest_first else (BEFORE, earlier)
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(_rv(CODEX, H1, when=review_when, body="x"),),
+        comments=(_clean(H1[:10], when=comment_when),),
+    )
+    assert got["rounds"][0]["opened_at"] == _z(earlier)
+
+
+def test_a_primary_reply_wrapper_before_the_cutover_is_legacy_evidence():
+    """The old rule counted every primary review, including the empty record
+    GitHub makes for a reply in a thread, so its time can open a legacy round
+    even though it marks nothing."""
+    wrapper = {**_rv(CODEX, H1, when=BEFORE), "top_level": [], "body": ""}
+    got = _ev(head=H2, commits=_dag(H1, H2), reviews=(wrapper,))
+    assert [(r["head"], r["legacy"], r["opened_at"]) for r in got["rounds"]] == [
+        (H1, True, _z(BEFORE))
+    ]
+    assert got["marks"] == []
+
+
+def test_a_non_primary_review_before_the_cutover_makes_no_legacy_opening():
+    """#3324 round 2 (c4273455013): only the primary's pre-cutover evidence made
+    a head a legacy round, so a Devin review before the cutover is just a mark."""
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(
+            _rv(DEVIN, H1, when=BEFORE, body="No issues found."),
+            _rv(DEVIN, H1, _devin("🟡"), when=T1),
+        ),
+    )
+    assert [(r["head"], r["legacy"], r["opened_at"]) for r in got["rounds"]] == [
+        (H1, False, _z(T1))
+    ]
+
+
+def test_a_legacy_round_known_only_from_a_pending_review_has_no_opening_time():
+    """A pending review carries no time. The old rule placed it before the
+    cutover, so a later finding's time would be a wrong opening: unknown."""
+    pending = {**_rv(CODEX, H1, state="PENDING", body="x"), "submitted_at": None}
+    got = _ev(
+        head=H2,
+        commits=_dag(H1, H2),
+        reviews=(pending, _rv(DEVIN, H1, _devin("🟡"), when=T1)),
+    )
+    assert got["status"] == "ok", got
+    assert [(r["head"], r["opened_at"]) for r in got["rounds"]] == [(H1, None)]
+    assert [f["late"] for f in got["findings"]] == [False]
+
+
+def _legacy_by_input(reviews, comments):
+    """Heads the old rule counted, read from the INPUT (as in the cutover test
+    above), never from ``rounds[].legacy``, which means legacy-and-not-found."""
+    heads = {r["commit_id"] for r in reviews if r["login"] == CODEX and r["submitted_at"] == BEFORE}
+    heads |= {
+        next(h for h in COMMITS if h.startswith(c["body"].rsplit("`", 2)[1]))
+        for c in comments
+        if c["created_at"] == BEFORE
+    }
+    return heads
+
+
+def test_a_head_is_a_round_exactly_when_it_is_legacy_or_one_review_on_it_was_on_time():
+    """The producer's two new fields against its own round decision, as a property
+    over random evidence WITH a commit graph (bare SHAs know no ancestry, so
+    nothing could be late and the property would hold vacuously)."""
+    rng = random.Random(20261014)
+    times = [BEFORE, T1, T2, T3, T4]
+    seen_late = 0
+    for _ in range(400):
+        reviews, comments = _random_corpus(rng, times)
+        got = _ev(reviews=reviews, comments=comments, commits=_dag(*COMMITS))
+        if got["status"] != "ok":
+            continue
+        legacy = _legacy_by_input(reviews, comments)
+        rounds = {r["head"]: r for r in got["rounds"]}
+        by_head: dict[str, list] = {}
+        for f in got["findings"]:
+            by_head.setdefault(f["head"], []).append(f)
+        for head in set(rounds) | set(by_head):
+            on_time = any(not f["late"] for f in by_head.get(head, []))
+            assert (head in rounds) == (head in legacy or on_time), (head, got)
+            # Once a review on a head is late, every later one is late too.
+            flags = [
+                f["late"] for f in sorted(by_head.get(head, []), key=lambda f: f["submitted_at"])
+            ]
+            assert flags == sorted(flags), (head, flags)
+        for head, r in rounds.items():
+            if head in legacy:
+                assert r["opened_at"] == _z(BEFORE), r
+            else:
+                assert r["opened_at"] == min(f["submitted_at"] for f in by_head[head]), r
+        seen_late += sum(f["late"] for f in got["findings"])
+    assert seen_late  # the corpus does exercise late reviews
+
+
+def test_late_and_opened_at_never_depend_on_review_ids():
+    rng = random.Random(20261015)
+    for _ in range(200):
+        reviews, comments = _random_corpus(rng, [BEFORE, T1, T2, T3])
+        keyed = [
+            dict(r, id=1000 + i, top_level_ids=list(range(len(r["top_level"]))))
+            for i, r in enumerate(reviews)
+        ]
+        plain = _ev(reviews=reviews, comments=comments, commits=_dag(*COMMITS))
+        withids = _ev(reviews=keyed, comments=comments, commits=_dag(*COMMITS))
+        assert [f["late"] for f in plain.get("findings", [])] == [
+            f["late"] for f in withids.get("findings", [])
+        ]
+        assert [r["opened_at"] for r in plain.get("rounds", [])] == [
+            r["opened_at"] for r in withids.get("rounds", [])
+        ]

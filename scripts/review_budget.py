@@ -425,7 +425,11 @@ def evaluate_evidence(
     review that lands on a head after one of that head's descendants was marked
     is a LATE review of an earlier round. It opens no round, and is listed in
     ``findings`` with the round it belongs to (``round_head``), for the round
-    reflection to owe (issue #3301; nothing owes them yet). Ancestry comes from each commit's ``parents`` when the caller
+    reflection to owe (issue #3301; nothing owes them yet). Each ``findings``
+    entry carries the decision itself as ``late``, and each ``rounds`` entry
+    carries ``opened_at``, so a reader never re-derives either. Membership in
+    ``rounds[].reviews`` does NOT mean "not late": a late review on a head that
+    already is a round is listed there too. Ancestry comes from each commit's ``parents`` when the caller
     passes ``commit_heads`` entries as ``{"sha", "parents"}``; a bare SHA knows
     no ancestry, so it never makes a review late.
 
@@ -510,13 +514,18 @@ def evaluate_evidence(
         return _unknown("malformed_round_cutover", current_head=head)
 
     legacy: set[str] = set()  # the old rule's heads, before cutover
+    # When each legacy head was first counted by the old rule: the earliest TIMED
+    # pre-cutover evidence (a pending review has no time and records none).
+    legacy_times: dict[str, tuple[datetime, object]] = {}
     confirmed: set[str] = set()  # heads the primary (or the identity) reviewed
     found: dict[str, dict[str, Any]] = {}  # round head -> what landed there
 
-    def confirm(sha: str, before: bool) -> None:
+    def confirm(sha: str, before: bool, when: datetime | None = None, raw: object = None) -> None:
         confirmed.add(sha)
         if before:
             legacy.add(sha)
+            if when is not None and (sha not in legacy_times or when < legacy_times[sha][0]):
+                legacy_times[sha] = (when, raw)
 
     def add_round(
         sha: str, login: str, findings: int, source: Mapping[str, Any] | None = None
@@ -583,7 +592,7 @@ def evaluate_evidence(
             return _unknown("malformed_review_head", current_head=head)
         before = when is None or when < cut
         if primary:
-            confirm(sha, before)
+            confirm(sha, before, when, item.get("submitted_at"))
         elif when is None:
             # Only a test seam omits the time; a non-primary review cannot be
             # placed on either side of the cutover, and dropping it undercounts.
@@ -670,7 +679,7 @@ def evaluate_evidence(
                     continue  # confirms only, as for a clean comment below
                 if error:
                     return _unknown(error, current_head=head)
-                confirm(resolved or "", before)
+                confirm(resolved or "", before, when, item.get("created_at"))
                 # Matched on TEXT, so whoever posted it is not the reviewer: the
                 # configured identity is, named by its position in the config.
                 report(resolved or "", f"identity:{index}")
@@ -695,7 +704,7 @@ def evaluate_evidence(
                 continue
             if error:
                 return _unknown(error, current_head=head)
-            confirm(resolved or "", before)
+            confirm(resolved or "", before, when, item.get("created_at"))
             report(resolved or "", login)
             mark(resolved or "", marked, marked_raw)
             continue
@@ -734,22 +743,30 @@ def evaluate_evidence(
     # (force-pushed away) has no known descendants, so it opens a round as it
     # always did. A head the old rule already counted (``legacy``) is a round,
     # so a late review of it joins it.
+    #
+    # Each review's own verdict is kept as ``late``, from the SAME predicate, so
+    # a reader never re-derives it: a later review on a head that already opened
+    # a round is late too, and still joins that round. Marks only accumulate, so
+    # once one review on a head is late every later one is.
+    def marked_after(sha: str, when: datetime | None) -> bool:
+        """Was a strict descendant of ``sha`` marked strictly before ``when``?"""
+        return when is not None and any(
+            m_when is not None and m_when < when and sha in ancestors(m_sha)
+            for m_sha, m_when, _ in marks
+        )
+
     opened: dict[str, bool] = {sha: True for sha in legacy}
+    first_event: dict[str, dict[str, Any]] = {}  # each head's earliest finding review
     timed = sorted(
         range(len(events)),
         key=lambda i: (events[i]["when"] is None, events[i]["when"] or cut, i),
     )
     for i in timed:
-        sha, when = events[i]["sha"], events[i]["when"]
-        if sha in opened:
-            continue
-        opened[sha] = not (
-            when is not None
-            and any(
-                m_when is not None and m_when < when and sha in ancestors(m_sha)
-                for m_sha, m_when, _ in marks
-            )
-        )
+        event = events[i]
+        event["late"] = marked_after(event["sha"], event["when"])
+        first_event.setdefault(event["sha"], event)
+        if event["sha"] not in opened:
+            opened[event["sha"]] = not event["late"]
     for event in events:  # input order, so each round lists its reviews as before
         if opened[event["sha"]]:
             add_round(event["sha"], event["login"], event["findings"], event["source"])
@@ -774,6 +791,19 @@ def evaluate_evidence(
     count = len(heads)
     current_reviewed = head in confirmed
     confirmation_requested = head in confirmation_heads
+
+    def opened_at(sha: str) -> object:
+        """When round ``sha`` opened: for a head the old rule counted, its
+        earliest timed pre-cutover evidence (None when it had none, such as a
+        pending review); otherwise its opening finding review. A legacy head
+        never takes a later post-cutover review's time, which would misplace it
+        in the order of rounds."""
+        if sha in legacy:
+            stamp = legacy_times.get(sha)
+            return _iso(*stamp) if stamp else None
+        event = first_event[sha]
+        return _iso(event["when"], event["source"]["submitted_at"])
+
     # A head force-pushed out of the PR sorts before every live commit.
     rounds = [
         {
@@ -782,6 +812,7 @@ def evaluate_evidence(
             "findings": found[sha]["findings"] if sha in found else None,
             "reviewers": found[sha]["reviewers"] if sha in found else [],
             "reviews": found[sha]["reviews"] if sha in found else [],
+            "opened_at": opened_at(sha),
         }
         for sha in sorted(round_heads, key=lambda s: (order.get(s, -1), s))
     ]
@@ -878,7 +909,9 @@ def evaluate_evidence(
     # newest round head it descends from, else None. None means either no
     # earlier round, or no single newest one (the two sides of a merge both
     # opened rounds); a reader must never take it as owed by nobody.
-    # ``late_state`` says whether
+    # ``late`` is the review's own verdict from the round rule above; a review
+    # on the current head is never late (the head has no descendant in the PR),
+    # so late keys never enter ``open_keys``. ``late_state`` says whether
     # every finding OUTSIDE the open round could be keyed; it is kept apart from
     # ``reflection_keys`` so an unkeyable finding there cannot make a known open
     # round unknown. Times here are normalised ISO-8601 (``+00:00``), so a
@@ -909,6 +942,7 @@ def evaluate_evidence(
                 "login": event["login"],
                 "keys": keys,
                 "round_head": round_of(event["sha"]),
+                "late": event["late"],
             }
         )
 
