@@ -29,8 +29,8 @@ An entry matches the tool's input on any of:
   regex syntax runs as a regex under the same timeout.
 
 A lesson whose ``repeat`` is ``session`` fires once per context window and
-agent: again after a compaction, since the earlier advice left the context with
-it. The fires are recorded in ``~/.genesis/sessions/<id>/advisor_fires.jsonl``.
+agent: again after a compaction (not after a resume), since the earlier advice
+left the context with it. The fires are recorded in ``~/.genesis/sessions/<id>/advisor_fires.jsonl``.
 A call without a usable session id is never deduplicated.
 """
 
@@ -228,7 +228,15 @@ class _Matcher:
             return False  # one bad or slow pattern is skipped, never fatal
 
     def hits(self, entry: dict) -> bool:
-        commands = entry.get("commands") or []
+        if time.monotonic() > self.deadline:
+            return False  # the budget is spent: no further parsing or matching
+        commands = entry.get("commands", [])
+        # Cache entries written before lessons had only `context_patterns`.
+        patterns = entry.get("patterns", entry.get("context_patterns", []))
+        for value in (commands, patterns):
+            # A string would iterate as single characters and match nearly anything.
+            if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+                raise ValueError("commands and patterns must be lists of text")
         if commands and self.command is not None:
             firsts = {c.split()[0] for c in commands}
             # Parse only when a phrase's first word appears at all (the parser
@@ -237,8 +245,6 @@ class _Matcher:
                 _command_hit(c, seg, self.sp) for seg in self.segments() for c in commands
             ):
                 return True
-        # Cache entries written before lessons had only `context_patterns`.
-        patterns = entry.get("patterns", entry.get("context_patterns", []))
         earned = entry.get("kind", "earned") != "lesson"
         for pattern in patterns:
             if time.monotonic() > self.deadline:
@@ -265,27 +271,69 @@ def _fire_log(data: dict) -> tuple[Path | None, str]:
 
 
 def _window_start(session_dir: Path) -> float:
-    """When this context window began, or 0.0 when unknown.
+    """When the current context window began, or 0.0 when unknown.
 
-    The SessionStart hook (genesis_session_context.py) rewrites the session's
-    ``context-<part>.md`` mirrors at every start, resume and compaction, and
-    nothing else writes them. A fire older than the newest mirror happened in
-    an earlier window, whose context the agent no longer has.
+    A fire older than this happened before a compaction, so the agent no
+    longer has that advice.
+    - Foreground: the PreCompact hook (genesis_precompact.py) appends to
+      ``waypoints.jsonl`` at each compaction that writes the charter, and
+      nothing else writes it. A resume does not touch it, since a resumed
+      conversation keeps its context.
+    - Dispatched (GENESIS_CC_SESSION=1): the PreCompact hook skips them, but
+      the SessionStart hook still rewrites their ``context-*.md`` mirrors at
+      every start and compaction, and they are never resumed.
     """
+    if os.environ.get("GENESIS_CC_SESSION") == "1":
+        paths = list(session_dir.glob("context-*.md"))
+    else:
+        paths = [session_dir / "waypoints.jsonl"]
+    times = []
+    for path in paths:
+        try:
+            times.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    return max(times, default=0.0)
+
+
+def _open_log(log: Path | None) -> object:
+    """The fire log, open and exclusively locked, or None.
+
+    Parallel tool calls run the hook in separate processes; holding the lock
+    from the read to the append makes check-and-record one step, so a lesson
+    is shown once even when two matching calls start together.
+    """
+    if log is None:
+        return None
     try:
-        return max((p.stat().st_mtime for p in session_dir.glob("context-*.md")), default=0.0)
-    except OSError:
-        return 0.0
+        import fcntl
+
+        log.parent.mkdir(parents=True, exist_ok=True)
+        # errors="replace": one bad byte must not turn dedup off for the session.
+        handle = open(log, "a+", encoding="utf-8", errors="replace")  # noqa: SIM115 - held across emit
+        for _ in range(20):  # about 1 s; the guarded section takes milliseconds
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except BlockingIOError:
+                time.sleep(0.05)
+        handle.close()  # a stalled holder: show the lesson rather than wait
+        _skipped("fire log", TimeoutError("lock busy"))
+        return None
+    except Exception as exc:  # no log: the lesson is shown, never suppressed
+        _skipped("fire log", exc)
+        return None
 
 
-def _already_fired(log: Path, agent: str) -> set[str]:
+def _already_fired(handle: object, session_dir: Path, agent: str) -> set[str]:
     """Lessons already shown to this agent in the current context window."""
     fired = set()
     try:
-        lines = log.read_text(encoding="utf-8").splitlines()
-    except OSError:
+        handle.seek(0)
+        lines = handle.read().splitlines()
+    except (OSError, ValueError):
         return fired
-    start = _window_start(log.parent)
+    start = _window_start(session_dir)
     for line in lines:
         try:
             record = json.loads(line)
@@ -310,6 +358,32 @@ def _advice(trigger: dict) -> str:
     if steps:
         parts.append(f"Steps:\n{steps}")
     return "\n".join(parts)
+
+
+# The hook output budget is 9,800 characters of JSON (hook_output.DEFAULT_BUDGET);
+# this leaves room for the envelope, so the blocks chosen are never trimmed.
+_BLOCKS_BUDGET = 9_000
+
+
+def _fit(shown: list[tuple[dict, str]]) -> list[tuple[dict, str]]:
+    """The leading advice blocks that fit whole in the output (always the first).
+
+    A lesson cut off by trimming would be recorded as shown and then suppressed,
+    so a block that does not fit is left for a later call instead.
+    """
+    kept, size = [], 0
+    for trigger, text in shown:
+        cost = len(json.dumps(text)) + 4  # escaped text plus the separator
+        if kept and size + cost > _BLOCKS_BUDGET:
+            break
+        kept.append((trigger, text))  # the first block is always shown
+        size += cost
+    return kept
+
+
+def _whole(text: str) -> bool:
+    """Whether a block is shown in full (a lone oversized one is trimmed)."""
+    return len(json.dumps(text)) + 4 <= _BLOCKS_BUDGET
 
 
 def _skipped(what: str, exc: Exception) -> None:
@@ -381,45 +455,48 @@ def main() -> int:
         if t.get("repeat") == "session" and isinstance(t.get("procedure_id"), str)
     }
     log, agent = _fire_log(data) if once else (None, "main")
-    if log is not None:
-        fired = _already_fired(log, agent)
-        matched = [t for t in matched if id(t) not in once or t["procedure_id"] not in fired]
-        if not matched:
+    handle = _open_log(log)
+    try:
+        if handle is not None:
+            fired = _already_fired(handle, log.parent, agent)
+            matched = [t for t in matched if id(t) not in once or t["procedure_id"] not in fired]
+        # Lessons first: if the output is too long, earned advice waits, not a lesson.
+        matched.sort(key=lambda t: t.get("kind") != "lesson")
+        shown = []
+        for trigger in matched:
+            try:
+                shown.append((trigger, _advice(trigger)))
+            except Exception as exc:
+                _skipped("cache entry", exc)
+        shown = _fit(shown)
+        if not shown:
             return 0
-    # Lessons first: if the output is trimmed to fit, earned advice loses out,
-    # not a lesson that would then be recorded as shown.
-    matched.sort(key=lambda t: t.get("kind") != "lesson")
-    shown = []
-    for trigger in matched:
-        try:
-            shown.append((trigger, _advice(trigger)))
-        except Exception as exc:
-            _skipped("cache entry", exc)
-    if not shown:
-        return 0
-    matched = [trigger for trigger, _ in shown]
-    _emit([text for _, text in shown])
-    if log is not None:
-        try:
-            # No excerpt of the input: a command can carry a credential.
-            lines = "".join(
-                json.dumps(
-                    {
-                        "ts": time.time(),
-                        "procedure_id": t["procedure_id"],
-                        "agent": agent,
-                        "tool": tool_name,
-                    }
+        matched = [trigger for trigger, _ in shown]
+        _emit([text for _, text in shown])
+        if handle is not None:
+            try:
+                # No excerpt of the input: a command can carry a credential.
+                handle.write(
+                    "".join(
+                        json.dumps(
+                            {
+                                "ts": time.time(),
+                                "procedure_id": t["procedure_id"],
+                                "agent": agent,
+                                "tool": tool_name,
+                            }
+                        )
+                        + "\n"
+                        for t, text in shown
+                        if id(t) in once and _whole(text)
+                    )
                 )
-                + "\n"
-                for t in matched
-                if id(t) in once
-            )
-            log.parent.mkdir(parents=True, exist_ok=True)
-            with open(log, "a", encoding="utf-8") as f:
-                f.write(lines)  # one write per call
-        except Exception as exc:  # the advice is out; a lost record only repeats it
-            print(f"procedure_advisor: fire log skipped: {exc}", file=sys.stderr)
+                handle.flush()
+            except Exception as exc:  # the advice is out; a lost record only repeats it
+                _skipped("fire record", exc)
+    finally:
+        if handle is not None:
+            handle.close()  # releases the lock
     # Honest funnel signal: count advisory surfacing (NOT an invocation — does
     # not feed promotion). After the advisory is already delivered.
     _record_procedures_surfaced([t.get("procedure_id") for t in matched if t.get("procedure_id")])

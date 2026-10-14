@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -91,8 +92,11 @@ def test_a_session_lesson_fires_again_after_a_compaction(env):
     assert "task_l1" in env("Bash", {"command": "deploy"})
     assert env("Bash", {"command": "deploy"}) == ""
     # SessionStart rewrites the context mirrors when the window is compacted.
-    mirror = env.sessions / "sess-1" / "context-identity-core.md"
-    mirror.write_text("new window")  # written after the first fire
+    # A resume rewrites the SessionStart mirrors but keeps the context.
+    (env.sessions / "sess-1" / "context-identity-core.md").write_text("resumed")
+    assert env("Bash", {"command": "deploy"}) == ""
+    # The PreCompact hook appends a waypoint at every compaction.
+    (env.sessions / "sess-1" / "waypoints.jsonl").write_text('{"trigger": "auto"}\n')
     assert "task_l1" in env("Bash", {"command": "deploy"})  # a new window
     assert env("Bash", {"command": "deploy"}) == ""  # and once in it
 
@@ -262,3 +266,79 @@ def test_a_call_with_no_command_word_never_imports_the_parser(env, tmp_path):
         env={**os.environ, "GENESIS_PROCEDURE_TRIGGERS": str(tmp_path / "procedure_triggers.yaml")},
     )
     assert result.stdout.strip().splitlines()[-1] == "False", result.stderr
+
+
+def test_a_scalar_pattern_list_is_skipped_not_split_into_letters(env):
+    env.write(_entry("bad", repeat="every", patterns="deploy"),
+              _entry("cmd", repeat="every", commands="git push"))
+    assert env("Bash", {"command": "echo hello world"}) == ""
+
+
+def test_only_whole_blocks_that_fit_are_shown_and_recorded(env):
+    long_steps = ["x" * 900] * 3  # about 2.8 KB a block: three fit, five do not
+    env.write(*[_entry(f"l{i}", patterns=["deploy"], steps=long_steps) for i in range(5)])
+    first = env("Bash", {"command": "deploy"})
+    shown = {f"task_l{i}" for i in range(5) if f"task_l{i} " in first}
+    assert 0 < len(shown) < 5 and "[truncated" not in first
+    second = env("Bash", {"command": "deploy"})  # the rest were never recorded
+    assert {f"task_l{i}" for i in range(5) if f"task_l{i} " in second} == {
+        f"task_l{i}" for i in range(5)
+    } - shown
+
+
+def test_the_fire_check_waits_for_a_concurrent_claim(env):
+    """Check and record are one step under the log's lock (parallel tool calls)."""
+    import fcntl
+
+    env.write(_entry("l1", patterns=["deploy"]))
+    log = env.sessions / "sess-1" / "advisor_fires.jsonl"
+    log.parent.mkdir(parents=True)
+    payload = json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": "deploy"}, "session_id": "sess-1"}
+    )
+    run_env = {
+        **os.environ,
+        "GENESIS_PROCEDURE_TRIGGERS": str(env.sessions.parent / "procedure_triggers.yaml"),
+        "GENESIS_SESSIONS_DIR": str(env.sessions),
+        "GENESIS_DB_PATH": str(env.sessions.parent / "absent.db"),
+    }
+    with open(log, "a") as other_call:
+        fcntl.flock(other_call.fileno(), fcntl.LOCK_EX)
+        proc = subprocess.Popen(
+            [sys.executable, str(_SCRIPT)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, env=run_env,
+        )
+        proc.stdin.write(payload)
+        proc.stdin.close()
+        time.sleep(0.4)  # the hook is now waiting on the lock (it waits about 1 s)
+        other_call.write(json.dumps({"ts": time.time(), "procedure_id": "l1", "agent": "main"}) + "\n")
+        other_call.flush()
+    assert proc.stdout.read() == ""  # it saw the other call's claim
+    assert proc.wait(timeout=30) == 0
+
+
+def test_an_expired_deadline_stops_command_matching(monkeypatch):
+    advisor = _load()
+    monkeypatch.setattr(advisor, "_DEADLINE_S", -1.0)
+    assert not advisor._Matcher("git push", "git push").hits(_entry("x", commands=["git push"]))
+
+
+def test_a_dispatched_session_uses_the_start_mirrors_for_its_window(env, monkeypatch):
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    env.write(_entry("l1", patterns=["deploy"]))
+    assert "task_l1" in env("Bash", {"command": "deploy"})
+    assert env("Bash", {"command": "deploy"}) == ""
+    (env.sessions / "sess-1" / "context-charter.md").write_text("compacted")
+    assert "task_l1" in env("Bash", {"command": "deploy"})
+
+
+def test_one_oversized_lesson_is_shown_but_not_recorded(env):
+    env.write(_entry("big", patterns=["deploy"], steps=["y" * 9500]))
+    assert "task_big" in env("Bash", {"command": "deploy"})  # never dropped entirely
+    assert "task_big" in env("Bash", {"command": "deploy"})  # trimmed, so not recorded
+
+
+def test_an_empty_pattern_rejects_the_entry():
+    advisor = _load()
+    with pytest.raises(ValueError):
+        advisor._Matcher("anything", None).hits(_entry("x", patterns=[""]))
