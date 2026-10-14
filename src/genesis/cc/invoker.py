@@ -49,9 +49,11 @@ from genesis.cc.types import (
 from genesis.observability.spans import SpanKind, start_span
 from genesis.util.inflight import inflight
 from genesis.util.proc_kill import (
+    confirm_process_exit,
     kill_process_group,
     process_group_alive,
     reap_bounded,
+    spawn_owned,
 )
 
 logger = logging.getLogger(__name__)
@@ -1601,6 +1603,10 @@ async def _emit_invocation_failed_event(
     runtime/bus is absent and never raises — observability must not mask the
     real error the caller is about to receive.
     """
+    from genesis.util.execution_privacy import private_execution_active
+
+    if private_execution_active():
+        return  # Managed receipts expose classified failures, not raw provider data.
     is_limit = isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
     key: tuple[str, str | None, str] | None = None
     prev_state: list[float] | None = None
@@ -2489,8 +2495,9 @@ class CCInvoker:
         # stitch this session's tool spans under the dispatching operation's
         # trace (cross-process). Absent when no span is active → hook no-ops.
         from genesis.observability.spans import current_trace_context
+        from genesis.util.execution_privacy import private_execution_active
 
-        _tc = current_trace_context()
+        _tc = None if private_execution_active() else current_trace_context()
         if _tc:
             env["GENESIS_TRACE_ID"], env["GENESIS_PARENT_SPAN_ID"] = _tc
         else:
@@ -3289,7 +3296,8 @@ class CCInvoker:
 
         try:
             scope_args = await _get_scope_args()
-            proc = await asyncio.create_subprocess_exec(
+            create = spawn_owned if invocation.confirm_cleanup else asyncio.create_subprocess_exec
+            proc = await create(
                 *scope_args,
                 *args,
                 stdin=asyncio.subprocess.PIPE,
@@ -3339,8 +3347,14 @@ class CCInvoker:
                 await proc.stdin.drain()
                 proc.stdin.close()
         except BaseException:
-            self._unregister_proc(reg_key)
-            kill_process_group(proc)
+            if not invocation.confirm_cleanup:
+                self._unregister_proc(reg_key)
+                kill_process_group(proc)
+            else:
+                try:
+                    await confirm_process_exit(proc)
+                finally:
+                    self._unregister_proc(reg_key)
             raise
 
         result_data: dict | None = None
@@ -3587,7 +3601,11 @@ class CCInvoker:
             kill_process_group(proc)
             raise
         finally:
-            self._unregister_proc(reg_key)
+            try:
+                if invocation.confirm_cleanup:
+                    await confirm_process_exit(proc)
+            finally:
+                self._unregister_proc(reg_key)
 
         # Bounded reap: proc.terminate() on the result path is a GRACEFUL stop
         # the child can ignore (wedged node flush / MCP teardown) — an
@@ -3867,6 +3885,7 @@ class CCInvoker:
             await self._notify_status_change(None)
         output = CCOutput(
             session_id="",
+            result_received=False,
             text="".join(collected_text),
             model_used=str(invocation.model),
             cost_usd=0.0,

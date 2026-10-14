@@ -1,0 +1,731 @@
+"""Native managed receipts: persisted ownership before hooks and effects."""
+
+import asyncio
+import json
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from genesis.cc.direct_session import DirectSessionRequest, DirectSessionRunner
+from genesis.cc.managed_session import prepared_metadata, reconcile_orphans
+from genesis.cc.session_manager import SessionManager
+from genesis.cc.types import CCInvocation, CCOutput
+from genesis.db.crud import cc_sessions
+
+
+def output(**kwargs):
+    defaults = dict(
+        session_id="cc",
+        text="answer",
+        model_used="sonnet",
+        cost_usd=0.0,
+        input_tokens=1,
+        output_tokens=1,
+        duration_ms=1,
+        exit_code=0,
+    )
+    defaults.update(kwargs)
+    return CCOutput(**defaults)
+
+
+@pytest.fixture
+def native(db, tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    invoker = SimpleNamespace(run_streaming=AsyncMock(return_value=output()))
+    manager = SessionManager(db=db)
+    runtime = SimpleNamespace(
+        _db=db,
+        _autonomy_manager=SimpleNamespace(
+            effective_level=AsyncMock(return_value=3),
+            get_state=AsyncMock(return_value=None),
+        ),
+    )
+    runner = DirectSessionRunner(
+        invoker=invoker,
+        session_manager=manager,
+        runtime=runtime,
+        config_builder=AsyncMock(),
+    )
+    runner._build_invocation = lambda req, sid: CCInvocation(prompt=req.prompt)
+    return runner, manager, invoker
+
+
+def request(**kwargs):
+    return DirectSessionRequest(
+        prompt="a synthetic conversation",
+        source_tag="agent_api",
+        caller_context="agent_api:synthetic",
+        notify=False,
+        managed=True,
+        **kwargs,
+    )
+
+
+async def prepare(db, req, sid="receipt", **changes):
+    now = datetime.now(UTC).isoformat()
+    meta = prepared_metadata(req)
+    meta.update(changes)
+    await cc_sessions.create(
+        db,
+        id=sid,
+        session_type="background_task",
+        model=str(req.model),
+        effort=str(req.effort),
+        source_tag=req.source_tag,
+        channel="agent",
+        origin_class="external_untrusted",
+        metadata=json.dumps(meta),
+        started_at=now,
+        last_activity_at=now,
+    )
+    return sid
+
+
+async def settled(runner, sid):
+    task = runner._active[sid]
+    await asyncio.wait_for(asyncio.shield(task), 5)
+    await asyncio.sleep(0)
+
+
+async def reached(event):
+    await asyncio.wait_for(event.wait(), 5)
+
+
+async def test_adopt_registers_before_start_hook_and_keeps_receipt(db, native):
+    runner, manager, invoker = native
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hook(sid, kind, source):
+        assert runner.is_active(sid)
+        assert source == "agent_api"
+        entered.set()
+        await release.wait()
+
+    manager.add_on_start(hook)
+    req = request()
+    sid = await prepare(db, req)
+    assert await runner.adopt(sid, req) == sid
+    await reached(entered)
+    invoker.run_streaming.assert_not_awaited()
+    with pytest.raises(ValueError):
+        await runner.adopt(sid, req)
+    release.set()
+    await settled(runner, sid)
+    row = await cc_sessions.get_by_id(db, sid)
+    meta = json.loads(row["metadata"])
+    assert row["status"] == "completed"
+    assert meta["native_state"] == "succeeded"
+    assert meta["result_committed"] is True
+    assert invoker.run_streaming.await_count == 1
+
+
+async def test_cancel_before_first_step_has_no_effects(db, native):
+    runner, manager, invoker = native
+    hook = AsyncMock()
+    manager.add_on_start(hook)
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    assert runner.cancel(sid)
+    await settled(runner, sid)
+    invoker.run_streaming.assert_not_awaited()
+    hook.assert_not_awaited()
+    assert (
+        json.loads((await cc_sessions.get_by_id(db, sid))["metadata"])["native_state"]
+        == "cancelled"
+    )
+    assert not runner.cancel(sid)
+
+
+async def test_cancel_holds_capacity_until_cleanup_confirmed(db, native):
+    runner, _, invoker = native
+    entered, draining, drained = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def execute(*args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            draining.set()
+            await drained.wait()
+
+    invoker.run_streaming.side_effect = execute
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await reached(entered)
+    assert runner.cancel(sid)
+    await reached(draining)
+    assert runner.is_active(sid)
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "active"
+    runner.cancel(sid)  # repeated cancellation cannot abandon cleanup
+    await asyncio.sleep(0)
+    assert runner.is_active(sid)
+    drained.set()
+    await settled(runner, sid)
+    assert not runner.is_active(sid)
+
+
+async def test_expired_receipt_does_not_start(db, native):
+    runner, _, invoker = native
+    req = request()
+    sid = await prepare(db, req, deadline_at=(datetime.now(UTC) - timedelta(seconds=1)).isoformat())
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    invoker.run_streaming.assert_not_awaited()
+    assert (
+        json.loads((await cc_sessions.get_by_id(db, sid))["metadata"])["error"]
+        == "deadline_exceeded"
+    )
+
+
+async def test_model_error_is_failed_and_full_output_is_private(db, native):
+    from pathlib import Path
+
+    runner, _, invoker = native
+    text = "é" * 25000
+    invoker.run_streaming.return_value = output(
+        text=text,
+        is_error=True,
+        error_message="private detail",
+        cost_usd=0.1,
+    )
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    row = await cc_sessions.get_by_id(db, sid)
+    meta = json.loads(row["metadata"])
+    assert row["status"] == "failed"
+    assert row["cost_usd"] == 0.1
+    assert meta["native_state"] == "failed"
+    assert meta["error"] == "execution_failed"
+    assert len(meta["output_text"]) == 20000
+    path = Path(meta["result_path"])
+    assert path.read_text(encoding="utf-8") == text
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+async def test_live_receipt_survives_stale_reaper_then_orphan_fails(db, native):
+    runner, manager, invoker = native
+    entered = asyncio.Event()
+
+    async def execute(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    invoker.run_streaming.side_effect = execute
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await reached(entered)
+    await cc_sessions.update_activity(db, sid, last_activity_at="2000-01-01T00:00:00+00:00")
+    assert await manager.cleanup_stale() == 0
+    await runner.shutdown()
+    # A committed receipt left across a runtime death is never replayed.
+    orphan = await prepare(db, req, sid="orphan")
+    assert await reconcile_orphans(db) == 1
+    meta = json.loads((await cc_sessions.get_by_id(db, orphan))["metadata"])
+    assert meta["native_state"] == "failed"
+    assert meta["error"] == "outcome_unknown"
+    assert not await cc_sessions.delete(db, orphan)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"profile": "full"},
+        {"tool_exceptions": ("Bash",)},
+        {"timeout_s": 7201},
+        {"timeout_s": True},
+        {"timeout_s": 0},
+    ],
+)
+def test_managed_request_rejects_authority_or_bound_overrides(kwargs):
+    with pytest.raises(ValueError):
+        request(**kwargs)
+
+
+async def test_adoption_construction_failure_settles_only_valid_receipt(db, native, monkeypatch):
+    runner, _, invoker = native
+    req = request()
+    sid = await prepare(db, req)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("synthetic scheduling failure")
+
+    monkeypatch.setattr("genesis.cc.direct_session.tracked_task", fail)
+    with pytest.raises(RuntimeError):
+        await runner.adopt(sid, req)
+    row = await cc_sessions.get_by_id(db, sid)
+    assert row["status"] == "failed"
+    assert json.loads(row["metadata"])["error"] == "not_started"
+    assert not runner.is_active(sid)
+    invoker.run_streaming.assert_not_awaited()
+    with pytest.raises(ValueError):
+        await runner.adopt(sid, req)
+
+
+@pytest.mark.parametrize(
+    "alteration",
+    [
+        {"managed_fingerprint": "mismatch"},
+        {"native_state": "running"},
+    ],
+)
+async def test_rejected_adoption_does_not_change_receipt(db, native, alteration):
+    runner, _, invoker = native
+    req = request()
+    sid = await prepare(db, req, **alteration)
+    before = await cc_sessions.get_by_id(db, sid)
+    with pytest.raises(ValueError):
+        await runner.adopt(sid, req)
+    assert await cc_sessions.get_by_id(db, sid) == before
+    invoker.run_streaming.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [
+        output(result_received=False, text="partial", exit_code=7),
+        output(bg_truncated=True, text="partial"),
+    ],
+)
+async def test_incomplete_output_never_claims_success(db, native, returned):
+    runner, _, invoker = native
+    invoker.run_streaming.return_value = returned
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    row = await cc_sessions.get_by_id(db, sid)
+    assert row["status"] == "failed"
+    assert json.loads(row["metadata"])["result_partial"] is True
+
+
+async def test_deadline_includes_start_hook_wait(db, native):
+    runner, manager, invoker = native
+    entered = asyncio.Event()
+
+    async def hook(*args):
+        entered.set()
+        await asyncio.Event().wait()
+
+    manager.add_on_start(hook)
+    req = request(timeout_s=1)
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await reached(entered)
+    await settled(runner, sid)
+    invoker.run_streaming.assert_not_awaited()
+    assert (
+        json.loads((await cc_sessions.get_by_id(db, sid))["metadata"])["error"]
+        == "deadline_exceeded"
+    )
+
+
+async def test_managed_checks_effective_level_and_existing_circuit_breaker(db, native):
+    runner, _, invoker = native
+    mgr = runner._rt._autonomy_manager
+    mgr.get_state.return_value = SimpleNamespace(
+        total_successes=0,
+        total_corrections=20,
+        current_level=3,
+    )
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    invoker.run_streaming.assert_not_awaited()
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "failed"
+    mgr.get_state.return_value = None
+    mgr.effective_level.return_value = 1
+    req = request(profile="interact")
+    sid = await prepare(db, req, sid="insufficient")
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    invoker.run_streaming.assert_not_awaited()
+
+
+async def test_spawn_cannot_bypass_prepared_mode(native):
+    runner, _, invoker = native
+    with pytest.raises(ValueError):
+        await runner.spawn(request())
+    invoker.run_streaming.assert_not_awaited()
+
+
+async def test_private_diagnostics_are_task_local_and_child_traces_are_disabled(
+    tmp_path, caplog, monkeypatch
+):
+    import logging
+
+    from genesis.cc.invoker import CCInvoker
+    from genesis.util.execution_privacy import private_execution
+
+    monkeypatch.setattr(
+        "genesis.observability.spans.current_trace_context", lambda: ("trace", "span")
+    )
+    invoker = CCInvoker(claude_path="/usr/bin/claude")
+    logger = logging.getLogger("genesis.cc.invoker")
+    caplog.set_level(logging.WARNING, logger=logger.name)
+
+    async def ordinary():
+        logger.warning("ordinary diagnostic")
+        return invoker._build_env(CCInvocation(prompt="ordinary"))
+
+    task = asyncio.create_task(ordinary())
+    with private_execution():
+        logger.warning("synthetic private diagnostic")
+        env = invoker._build_env(CCInvocation(prompt="private"))
+        assert "GENESIS_TRACE_ID" not in env
+        assert "GENESIS_PARENT_SPAN_ID" not in env
+        ordinary_env = await task
+    assert ordinary_env["GENESIS_TRACE_ID"] == "trace"
+    markers = {"ordinary diagnostic", "synthetic private diagnostic"}
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == logger.name and r.getMessage() in markers
+    ] == ["ordinary diagnostic"]
+
+
+async def test_strong_drain_refusal_and_repeated_cancel_retain_ownership(monkeypatch):
+    from unittest.mock import Mock
+
+    from genesis.util.proc_kill import confirm_process_exit
+
+    gone = False
+    proc = SimpleNamespace(pid=99999, returncode=None, kill=Mock(side_effect=PermissionError))
+
+    def probe(pid, sig):
+        if gone:
+            raise ProcessLookupError
+        raise PermissionError
+
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", probe)
+    task = asyncio.create_task(confirm_process_exit(proc))
+    await asyncio.sleep(0.11)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0.11)
+    assert not task.done()
+    gone = True
+    proc.returncode = -9
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
+
+
+async def test_cancel_during_creation_owns_handle_and_drains_before_return(monkeypatch):
+    from genesis.util.proc_kill import spawn_owned
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    launches = []
+    proc = SimpleNamespace(pid=99999, returncode=-9)
+
+    async def create(*args, **kwargs):
+        launches.append(asyncio.current_task())
+        entered.set()
+        await release.wait()
+        return proc
+
+    confirm = AsyncMock()
+    monkeypatch.setattr("genesis.util.proc_kill.asyncio.create_subprocess_exec", create)
+    monkeypatch.setattr("genesis.util.proc_kill.confirm_process_exit", confirm)
+    task = asyncio.create_task(spawn_owned("synthetic-cli"))
+    await reached(entered)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert launches[0].cancelling() == 0
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    confirm.assert_awaited_once_with(proc)
+
+
+@pytest.mark.parametrize("failure", [OSError, FileNotFoundError])
+async def test_creation_without_handle_is_explicitly_uncertain(monkeypatch, failure):
+    from genesis.util.proc_kill import ProcessCleanupUncertain, spawn_owned
+
+    create = AsyncMock(side_effect=failure("synthetic transport setup failure"))
+    monkeypatch.setattr("genesis.util.proc_kill.asyncio.create_subprocess_exec", create)
+    with pytest.raises(ProcessCleanupUncertain, match="creation is unconfirmed"):
+        await spawn_owned("synthetic-cli")
+    create.assert_awaited_once()
+
+
+async def test_uncertain_creation_keeps_registered_receipt_through_cancellation(
+    db, native, monkeypatch
+):
+    from genesis.util.proc_kill import ProcessCleanupUncertain
+
+    runner, _, invoker = native
+    invoker.run_streaming.side_effect = ProcessCleanupUncertain("synthetic uncertainty")
+    paused, teardown = asyncio.Event(), asyncio.Event()
+    original_sleep = asyncio.sleep
+
+    class TestTeardown(BaseException):
+        """Only the test harness can end the deliberately unbounded hold."""
+
+    async def pause(seconds):
+        if seconds != 1:
+            return await original_sleep(seconds)
+        paused.set()
+        await teardown.wait()
+        raise TestTeardown
+
+    monkeypatch.setattr("genesis.cc.managed_session.asyncio.sleep", pause)
+    sid = await prepare(db, request())
+    await runner.adopt(sid, request())
+    task = runner._active[sid]
+    await reached(paused)
+    try:
+        for _ in range(2):
+            task.cancel()
+            await original_sleep(0)
+        assert runner.is_active(sid)
+        assert not task.done()
+        row = await cc_sessions.get_by_id(db, sid)
+        assert row["status"] == "active"
+        assert json.loads(row["metadata"])["cleanup_unconfirmed"] is True
+        invoker.run_streaming.assert_awaited_once()
+    finally:
+        # Harness-only teardown; this is not a production recovery API or proof
+        # of a confirmed terminal outcome after an ambiguous startup failure.
+        teardown.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_prepared_insert_can_rollback_without_committing(db):
+    now = datetime.now(UTC).isoformat()
+    await cc_sessions.create(
+        db,
+        id="uncommitted",
+        session_type="background_task",
+        model="sonnet",
+        started_at=now,
+        last_activity_at=now,
+        commit=False,
+    )
+    await db.rollback()
+    assert await cc_sessions.get_by_id(db, "uncommitted") is None
+
+
+async def test_publication_failure_is_explicit_and_never_claims_full_result(
+    db, native, monkeypatch
+):
+    runner, _, invoker = native
+
+    def fail(*args, **kwargs):
+        raise OSError("synthetic publication failure")
+
+    monkeypatch.setattr("genesis.cc.managed_session.atomic_write_text", fail)
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    row = await cc_sessions.get_by_id(db, sid)
+    meta = json.loads(row["metadata"])
+    assert row["status"] == "failed"
+    assert meta["error"] == "result_unavailable"
+    assert meta["result_committed"] is False
+    assert meta["result_path"] is None
+    assert invoker.run_streaming.await_count == 1
+
+
+async def test_persistence_failure_retains_capacity_and_retry_does_not_double_cost(
+    db, native, monkeypatch
+):
+    import sqlite3
+
+    runner, manager, invoker = native
+    invoker.run_streaming.return_value = output(cost_usd=0.2)
+    original_complete = manager.complete
+    failed, release = asyncio.Event(), asyncio.Event()
+    attempts = 0
+
+    async def flaky_complete(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            failed.set()
+            raise sqlite3.OperationalError("synthetic temporary database failure")
+        await release.wait()
+        await original_complete(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "complete", flaky_complete)
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await reached(failed)
+    assert runner.is_active(sid)
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "active"
+    release.set()
+    await settled(runner, sid)
+    row = await cc_sessions.get_by_id(db, sid)
+    assert row["status"] == "completed"
+    assert row["cost_usd"] == 0.2
+    assert attempts == 2
+    assert invoker.run_streaming.await_count == 1
+
+
+async def test_real_invoker_exception_contract_is_classified_without_raw_error(db, native):
+    from genesis.cc.exceptions import CCProcessError
+
+    runner, _, invoker = native
+    invoker.run_streaming.side_effect = CCProcessError("synthetic provider diagnostic")
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    meta = json.loads((await cc_sessions.get_by_id(db, sid))["metadata"])
+    assert meta["native_state"] == "failed"
+    assert meta["error"] == "execution_failed"
+    assert "synthetic provider diagnostic" not in json.dumps(meta)
+
+
+async def test_stdin_failure_still_drains_when_both_kill_methods_refuse(
+    db, native, monkeypatch, caplog
+):
+    from genesis.cc.invoker import CCInvoker
+
+    runner, _, _ = native
+    invoker = CCInvoker(claude_path="synthetic-cli")
+    probing, gone = asyncio.Event(), asyncio.Event()
+    proc = SimpleNamespace(pid=99999, returncode=None)
+
+    def refuse(*args):
+        raise PermissionError("synthetic private kill refusal")
+
+    def probe(pid, sig):
+        if sig == 0:
+            probing.set()
+            if gone.is_set():
+                proc.returncode = -9
+                raise ProcessLookupError
+        refuse()
+
+    def broken_write(data):
+        raise BrokenPipeError("synthetic private stdin failure")
+
+    proc.kill = refuse
+    proc.stdin = SimpleNamespace(write=broken_write)
+    monkeypatch.setattr("genesis.util.proc_kill.os.killpg", probe)
+    monkeypatch.setattr("genesis.cc.invoker.set_oom_score_adj", lambda *args: None)
+    monkeypatch.setattr("genesis.cc.invoker._get_scope_args", AsyncMock(return_value=[]))
+    monkeypatch.setattr("genesis.cc.invoker.spawn_owned", AsyncMock(return_value=proc))
+    monkeypatch.setattr(invoker, "_network_preflight", AsyncMock())
+    monkeypatch.setattr(invoker, "_cc_version", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        invoker,
+        "_build_args",
+        lambda *args, **kwargs: ["synthetic-cli", "-p", "--output-format", "json"],
+    )
+    runner._invoker = invoker
+    sid = await prepare(db, request())
+    await runner.adopt(sid, request())
+    await asyncio.wait_for(probing.wait(), 2)
+    try:
+        assert runner.is_active(sid)
+        assert proc.returncode is None
+        assert (await cc_sessions.get_by_id(db, sid))["status"] == "active"
+        assert "synthetic private kill refusal" not in caplog.text
+        assert "synthetic private stdin failure" not in caplog.text
+    finally:
+        gone.set()
+        await settled(runner, sid)
+    meta = json.loads((await cc_sessions.get_by_id(db, sid))["metadata"])
+    assert meta["native_state"] == "failed"
+    assert meta["error"] == "execution_failed"
+
+
+@pytest.mark.parametrize("behavior", ["result", "eof", "cancel"])
+@pytest.mark.parametrize("scoped", [False, True], ids=["process-group", "user-scope"])
+async def test_native_subprocess_lifecycle_and_provenance(
+    db, native, tmp_path, monkeypatch, behavior, caplog, scoped
+):
+    """Real OS process, native invoker and SQLite; scripted CLI, no provider spend."""
+    import logging
+    import os
+    import sys
+
+    from genesis.cc.invoker import CCInvoker, _get_scope_args
+    from genesis.util.proc_kill import spawn_owned
+
+    script = tmp_path / "synthetic_cli.py"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys, time\n"
+        "sys.stdin.read()\n"
+        "print('synthetic private stderr', file=sys.stderr, flush=True)\n"
+        + (
+            "print(json.dumps({'type':'result','subtype':'success','is_error':False,"
+            "'session_id':'synthetic-cc','result':json.dumps({'origin':os.environ.get('GENESIS_SESSION_ORIGIN'),"
+            "'supervised':os.environ.get('GENESIS_SESSION_SUPERVISED'),"
+            "'traced':bool(os.environ.get('GENESIS_TRACE_ID'))})}), flush=True)\n"
+            "time.sleep(30)\n"
+            if behavior == "result"
+            else "print(json.dumps({'type':'assistant','message':{'content':[{'type':'text',"
+            "'text':'synthetic partial response'}]}}), flush=True)\n"
+            + ("sys.exit(7)\n" if behavior == "eof" else "time.sleep(30)\n")
+        ),
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    runner, _, _ = native
+    invoker = CCInvoker(claude_path=sys.executable)
+    monkeypatch.setattr(
+        invoker,
+        "_build_args",
+        lambda *args, **kwargs: [str(script), "-p", "--output-format", "json"],
+    )
+    prefix = await _get_scope_args() if scoped else []
+    if scoped and not prefix:
+        pytest.skip("Native user scope is unavailable on this test host")
+    monkeypatch.setattr("genesis.cc.invoker._get_scope_args", AsyncMock(return_value=prefix))
+    launch = AsyncMock(wraps=spawn_owned)
+    monkeypatch.setattr("genesis.cc.invoker.spawn_owned", launch)
+    monkeypatch.setattr(invoker, "_network_preflight", AsyncMock())
+    monkeypatch.setattr(invoker, "_cc_version", AsyncMock(return_value=None))
+    runner._invoker = invoker
+    spawned = asyncio.Event()
+    pids = []
+
+    async def on_spawn(pid):
+        pids.append(pid)
+        spawned.set()
+
+    runner._build_invocation = lambda req, sid: CCInvocation(
+        prompt=req.prompt,
+        working_dir=str(tmp_path),
+        on_spawn=on_spawn,
+    )
+    caplog.set_level(logging.INFO)
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    if behavior == "cancel":
+        await asyncio.wait_for(spawned.wait(), 2)
+        assert runner.cancel(sid)
+    await settled(runner, sid)
+    meta = json.loads((await cc_sessions.get_by_id(db, sid))["metadata"])
+    expected = {"result": "succeeded", "eof": "failed", "cancel": "cancelled"}
+    assert meta["native_state"] == expected[behavior]
+    if behavior == "result":
+        assert json.loads(meta["output_text"]) == {
+            "origin": "external_untrusted",
+            "supervised": None,
+            "traced": False,
+        }
+    elif behavior == "eof":
+        assert meta["result_partial"] is True
+    assert len(pids) == 1
+    assert launch.await_count == 1
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pids[0], 0)
+    assert "synthetic private stderr" not in caplog.text

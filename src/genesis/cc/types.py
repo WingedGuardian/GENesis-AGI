@@ -445,6 +445,8 @@ class CCInvocation:
     # content there (visible in the enforce ledger + auto-demote), never
     # toward injecting into an unsupervised session.
     supervised: bool = False
+    # Managed native receipts may release capacity only after the group exits.
+    confirm_cleanup: bool = False
     # Applied LAST in CCInvoker._build_env, after every computed key — the
     # per-invocation escape hatch for env the invoker doesn't model (e.g. the
     # eval bench's CLAUDE_CONFIG_DIR cleanroom). Overrides win over inherited
@@ -556,6 +558,9 @@ class CCOutput:
     # that survives a model switch. A caller that SUMS `cost_usd` across turns
     # must record the difference, via `cc_sessions.record_turn_cost`.
     cost_is_cumulative: bool = False
+    # False for a streaming EOF fallback without a structured terminal result.
+    # Ordinary callers retain their legacy interpretation of that fallback.
+    result_received: bool = True
 
     # How many over-limit stream-json lines the reader DROPPED on this run.
     # Nonzero means the event stream this output was built from is INCOMPLETE:

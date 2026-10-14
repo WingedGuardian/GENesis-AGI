@@ -1,0 +1,242 @@
+"""Prepared native receipts, without a second execution queue or task store."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import json
+import logging
+import shutil
+import time
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from genesis.db.crud import cc_sessions
+from genesis.util.atomic import atomic_write_text
+from genesis.util.execution_privacy import private_execution
+from genesis.util.proc_kill import ProcessCleanupUncertain
+
+logger = logging.getLogger(__name__)
+
+
+def fingerprint(request) -> str:
+    return hashlib.sha256(json.dumps(asdict(request), sort_keys=True).encode()).hexdigest()
+
+
+def prepared_metadata(request) -> dict:
+    """Metadata for the caller's atomic cc_sessions.create(commit=False)."""
+    if not request.managed:
+        raise ValueError("A managed request is required")
+    return {
+        "managed_fingerprint": fingerprint(request),
+        "native_state": "pending",
+        "profile": request.profile,
+        "caller_context": request.caller_context,
+        "deadline_at": (datetime.now(UTC) + timedelta(seconds=request.timeout_s)).isoformat(),
+        "result_committed": False,
+    }
+
+
+def metadata(row) -> dict:
+    try:
+        value = json.loads(row.get("metadata") or "{}")
+        return value if isinstance(value, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+async def update_state(db, sid: str, state: str, **fields) -> None:
+    row = await cc_sessions.get_by_id(db, sid)
+    if row is None:
+        raise ValueError("Prepared receipt is unavailable")
+    meta = metadata(row)
+    meta.update(native_state=state, **fields)
+    await db.execute("UPDATE cc_sessions SET metadata=? WHERE id=?", (json.dumps(meta), sid))
+    await db.commit()
+
+
+async def reconcile_orphans(db) -> int:
+    """Boot-only reconciliation, before exposing a newly created runner.
+
+    A prior process may have executed effects. Never replay its receipt or
+    report confirmed cancellation merely because the new registry is empty.
+    """
+    rows = await db.execute(
+        "SELECT * FROM cc_sessions WHERE source_tag='agent_api' AND status='active'",
+    )
+    orphaned = await rows.fetchall()
+    for row in orphaned:
+        await update_state(db, row["id"], "failed", error="outcome_unknown")
+        await cc_sessions.update_status(db, row["id"], status="failed")
+    return len(orphaned)
+
+
+async def run_managed(runner, request, sid: str, cancel: asyncio.Event):
+    """Strongly own execution and finalization until effects are drained.
+
+    Cancellation is a signal, never abandonment of the supervisor. If result
+    persistence fails, keep capacity reserved until persistence succeeds.
+    """
+    from genesis.cc.direct_session import DirectSessionResult
+
+    db = runner._session_manager._db
+    worker = None
+    state, error = "failed", "execution_failed"
+    result = DirectSessionResult(session_id=sid)
+    with private_execution():
+        try:
+            row = await cc_sessions.get_by_id(db, sid)
+            deadline = datetime.fromisoformat(metadata(row)["deadline_at"])
+            remaining = (deadline - datetime.now(UTC)).total_seconds()
+            if cancel.is_set():
+                state, error = "cancelled", "cancelled"
+            elif remaining <= 0:
+                error = "deadline_exceeded"
+            else:
+                worker = asyncio.create_task(_execute(runner, request, sid))
+                signal = asyncio.create_task(cancel.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        (worker, signal),
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if worker in done:
+                        result = worker.result()
+                        state = "succeeded" if result.success else "failed"
+                        error = None if result.success else "execution_failed"
+                    else:
+                        state = "cancelled" if cancel.is_set() else "failed"
+                        error = "cancelled" if cancel.is_set() else "deadline_exceeded"
+                        worker.cancel()
+                        await update_state(db, sid, "cancelling", error=error)
+                finally:
+                    signal.cancel()
+                    await asyncio.gather(signal, return_exceptions=True)
+        except asyncio.CancelledError:
+            state, error = "cancelled", "cancelled"
+            if worker is not None:
+                worker.cancel()
+        except Exception:
+            # Never propagate private provider/hook details to tracked_task.
+            state, error = "failed", "execution_failed"
+        finally:
+            if worker is not None:
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                # Retrieve all exceptions without printing them.
+                if not worker.cancelled() and worker.exception() is None:
+                    result = worker.result()
+            result.success = state == "succeeded"
+            result.error = error
+            # Cancellation cannot interrupt the receipt/artifact commit.
+            finalizer = asyncio.create_task(_finalize(runner, request, result, state))
+            while not finalizer.done():
+                try:
+                    await asyncio.shield(finalizer)
+                except asyncio.CancelledError:
+                    continue
+            finalizer.result()
+    return result
+
+
+async def _execute(runner, request, sid):
+    from genesis.cc.direct_session import DirectSessionResult, _bg_session_root, _set_obs_session
+
+    _set_obs_session(sid)
+    await runner._check_background(request)
+    await runner._session_manager.start_prepared(sid)
+    await update_state(runner._session_manager._db, sid, "running")
+    start = time.monotonic()
+    telemetry = []
+
+    async def on_event(event):
+        if event.event_type == "tool_use" and event.tool_name:
+            telemetry.append({"name": event.tool_name})
+
+    error = "execution_failed"
+    try:
+        output = await runner._invoke(request, sid, on_event)
+        result = runner._result(sid, output, telemetry, time.monotonic() - start)
+        result.success = result.success and output.result_received and not output.bg_truncated
+        return result
+    except ProcessCleanupUncertain:
+        # No safe process identity remains. Hold the existing receipt until
+        # runtime teardown; an owner restart reconciles it as outcome_unknown.
+        # Even repeated cancellation cannot turn uncertainty into confirmation.
+        while True:
+            try:
+                # Persistence refusal also cannot establish cleanup.
+                with contextlib.suppress(Exception):
+                    await update_state(
+                        runner._session_manager._db,
+                        sid,
+                        "cancelling",
+                        error="cleanup_unconfirmed",
+                        cleanup_unconfirmed=True,
+                    )
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                continue
+    except asyncio.CancelledError:
+        error = "cancelled"
+    except Exception:
+        pass  # Classified below; never park/replay or propagate private details.
+    finally:
+        shutil.rmtree(_bg_session_root(sid), ignore_errors=True)
+    return DirectSessionResult(
+        session_id=sid,
+        error=error,
+        tools_called=telemetry,
+        duration_s=round(time.monotonic() - start, 1),
+    )
+
+
+async def _finalize(runner, request, result, state):
+    path = Path.home() / ".genesis" / "output" / f"bg-session-{result.session_id}.md"
+    committed = False
+    try:
+        atomic_write_text(path, result.output_text, encoding="utf-8")
+        committed = True
+    except Exception:
+        state, result.success, result.error = "failed", False, "result_unavailable"
+    while True:
+        try:
+            await runner._store_result(
+                result.session_id,
+                request,
+                result,
+                extra_metadata={
+                    "native_state": state,
+                    "result_committed": committed,
+                    "result_path": str(path) if committed else None,
+                    "stream_lines_dropped": result.stream_lines_dropped,
+                    "result_partial": result.partial,
+                },
+            )
+            # Absolute fresh-turn values: retries of finalization do not add cost twice.
+            await runner._session_manager._db.execute(
+                "UPDATE cc_sessions SET cost_usd=?, input_tokens=?, output_tokens=? WHERE id=?",
+                (result.cost_usd, result.input_tokens, result.output_tokens, result.session_id),
+            )
+            await runner._session_manager._db.commit()
+            if result.success:
+                await runner._session_manager.complete(
+                    result.session_id,
+                    cost_usd=result.cost_usd,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                )
+            else:
+                await runner._session_manager.fail(result.session_id, reason=result.error)
+            return
+        except Exception:
+            logger.warning("Managed receipt persistence unavailable; capacity retained")
+            await asyncio.sleep(1)

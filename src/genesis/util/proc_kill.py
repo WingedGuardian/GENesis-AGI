@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_REAP_TIMEOUT_S = 30.0
 
 
+class ProcessCleanupUncertain(RuntimeError):
+    """Managed supervisor must retain ownership; process exit is unconfirmed."""
+
+
 def kill_process_group(proc, sig: signal.Signals = signal.SIGKILL) -> None:
     """Signal the process group led by ``proc`` (Popen or asyncio Process).
 
@@ -99,3 +103,73 @@ async def reap_bounded(proc, timeout_s: float | None = None) -> None:
         timeout_s = DEFAULT_REAP_TIMEOUT_S
     with contextlib.suppress(Exception):
         await asyncio.wait_for(proc.wait(), timeout=timeout_s)
+
+
+async def confirm_process_exit(proc) -> None:
+    """Opt-in strong drain: refusals are unknown, never proof of group exit.
+
+    A managed receipt holds capacity while this waits. Shield the cleanup task
+    against repeated cancellation; deliver cancellation after confirmation.
+    """
+
+    async def drain():
+        with contextlib.suppress(OSError):
+            kill_process_group(proc)
+        while True:
+            gone = False
+            pgid = getattr(proc, "pid", None)
+            if isinstance(pgid, int) and pgid > 1:
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    gone = True
+                except OSError:
+                    pass  # Includes PermissionError: liveness remains unknown.
+            if gone and proc.returncode is not None:
+                return
+            await asyncio.sleep(0.1)
+
+    cleanup = asyncio.create_task(drain())
+    interrupted = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            interrupted = True
+        except Exception:
+            break  # Classify below; never infer exit from a failed drain.
+    if cleanup.cancelled() or cleanup.exception() is not None:
+        raise ProcessCleanupUncertain("Process cleanup is unconfirmed") from None
+    cleanup.result()
+    if interrupted:
+        raise asyncio.CancelledError
+
+
+async def spawn_owned(*args, **kwargs):
+    """Retain a managed subprocess launch until its process handle is known.
+
+    Cancelling CPython's creation coroutine kills only the transport's leader.
+    Shield it, then drain the group before delivering the caller's cancel.
+    """
+    launch = asyncio.create_task(asyncio.create_subprocess_exec(*args, **kwargs))
+    interrupted = False
+    try:
+        while not launch.done():
+            try:
+                await asyncio.shield(launch)
+            except asyncio.CancelledError:
+                interrupted = True
+        if launch.cancelled():
+            raise ProcessCleanupUncertain("Process creation is unconfirmed")
+        proc = launch.result()
+    except Exception:
+        # CPython may raise while connecting pipes AFTER Popen starts a child;
+        # its transport closes only the leader. No handle means no proof that
+        # startup descendants exited, including when the caller was cancelled.
+        # Transfer uncertainty to the registered managed supervisor, never to
+        # ordinary/nonstreaming callers (they do not use this opt-in helper).
+        raise ProcessCleanupUncertain("Process creation is unconfirmed") from None
+    if interrupted:
+        await confirm_process_exit(proc)
+        raise asyncio.CancelledError
+    return proc
