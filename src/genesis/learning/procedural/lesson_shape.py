@@ -33,16 +33,35 @@ _SPEC_KEYS = frozenset({"patterns", "repeat"})
 _LESSON_KEYS = frozenset({"authored_via", "authored_in", "origin", "reviewed", "authored_at"})
 _TRUSTED_ORIGINS = (ORIGIN_OWNER, ORIGIN_FIRST_PARTY)
 
+
+def _sql_set(values) -> str:
+    return ", ".join(f"'{v}'" for v in sorted(values))
+
+
 # is_live_lesson as a SQL condition, for queries that read procedural_memory
-# directly. A row without a lesson passes. CASE keeps json_each/json_extract away
-# from a malformed value (it would fail the whole query); such a row is held, and
-# so is one with a duplicated key, which SQLite and Python would read differently.
+# directly. A row without a lesson passes. Anything else must be a complete
+# record (exactly the five keys, once each, the enums and types valid) before
+# its origin and review state are read; any other value is held. CASE keeps
+# json_each/json_extract away from a malformed value, which would fail the query,
+# and COALESCE keeps a JSON null from turning a NOT IN into NULL (not held).
+_KEYS = _sql_set(_LESSON_KEYS)
+# Built from module constants only, so the S608 string-SQL warning does not apply.
 LIVE_LESSON_SQL = (
-    "CASE WHEN lesson IS NULL THEN 1 WHEN NOT json_valid(lesson) THEN 0 "
-    "WHEN (SELECT COUNT(*) - COUNT(DISTINCT key) FROM json_each(lesson)) != 0 THEN 0 "
-    "ELSE COALESCE("
-    f"json_extract(lesson, '$.origin') IN ('{ORIGIN_OWNER}', '{ORIGIN_FIRST_PARTY}') "
-    "OR json_type(lesson, '$.reviewed') = 'true', 0) END"
+    "CASE WHEN lesson IS NULL THEN 1 WHEN NOT json_valid(lesson) THEN 0 "  # noqa: S608
+    "WHEN json_type(lesson) != 'object' THEN 0 "
+    "WHEN (SELECT COUNT(DISTINCT key) FROM json_each(lesson) WHERE key IN (" + _KEYS + ")) != 5 "
+    "OR (SELECT COUNT(*) FROM json_each(lesson)) != 5 THEN 0 "
+    "WHEN json_type(lesson, '$.reviewed') NOT IN ('true', 'false') "
+    "OR json_type(lesson, '$.authored_at') != 'text' "
+    "OR COALESCE(json_extract(lesson, '$.authored_via'), '') NOT IN ("
+    + _sql_set(AUTHORED_VIA)
+    + ") "
+    "OR COALESCE(json_extract(lesson, '$.authored_in'), '') NOT IN (" + _sql_set(AUTHORED_IN) + ") "
+    "OR COALESCE(json_extract(lesson, '$.origin'), '') NOT IN ("
+    + _sql_set(ORIGIN_CLASSES)
+    + ") THEN 0 "
+    "ELSE json_extract(lesson, '$.origin') IN (" + _sql_set(_TRUSTED_ORIGINS) + ") "
+    "OR json_type(lesson, '$.reviewed') = 'true' END"
 )
 
 
@@ -120,15 +139,25 @@ def is_live_lesson(raw: object) -> bool:
     """Whether a stored ``lesson`` value may reach a session.
 
     A lesson from outside (``external_untrusted``) is held until the owner has
-    reviewed it. Fail-closed: a value that is not a JSON object, or that names
-    no trusted origin and has no ``reviewed: true``, is held. Mirrored by
-    ``LIVE_LESSON_SQL``.
+    reviewed it. Fail-closed: a value that is not a complete lesson record
+    (exactly its five keys, valid enums and types; ``authored_at`` need only be
+    a string here), or that names no trusted origin and has no ``reviewed:
+    true``, is held. Mirrored by ``LIVE_LESSON_SQL``.
     """
     if isinstance(raw, str):
         try:
             raw = json.loads(raw, object_pairs_hook=_no_duplicate_keys, parse_constant=_no_constant)
         except ValueError:
             return False
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or set(raw) != _LESSON_KEYS:
         return False
-    return raw.get("origin") in _TRUSTED_ORIGINS or raw.get("reviewed") is True
+    if not isinstance(raw["reviewed"], bool) or not isinstance(raw["authored_at"], str):
+        return False
+    for field, allowed in (
+        ("authored_via", AUTHORED_VIA),
+        ("authored_in", AUTHORED_IN),
+        ("origin", ORIGIN_CLASSES),
+    ):
+        if not isinstance(raw[field], str) or raw[field] not in allowed:
+            return False
+    return raw["origin"] in _TRUSTED_ORIGINS or raw["reviewed"]

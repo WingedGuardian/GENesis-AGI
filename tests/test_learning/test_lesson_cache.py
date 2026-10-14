@@ -74,21 +74,37 @@ def _entries(cache_path) -> dict[str, dict]:
         ('{"origin": "owner", "origin": "external_untrusted"}', False),
         ('{"origin": "external_untrusted", "reviewed": true, "reviewed": false}', False),
         ('{"origin": "external_untrusted", "reviewed": NaN}', False),
+        # Only a complete record is read for its origin and review state.
+        ({"origin": "owner"}, False),
+        ({"origin": "external_untrusted", "reviewed": True}, False),
+        ({**_lesson("owner"), "extra": 1}, False),
+        ({**_lesson("external_untrusted", reviewed=True), "origin": None}, False),
+        ({**_lesson("owner"), "authored_via": None}, False),
+        ({**_lesson("owner"), "authored_in": "elsewhere"}, False),
+        ({**_lesson("owner"), "reviewed": "yes"}, False),
+        ({**_lesson("owner"), "authored_at": 5}, False),
+        ({**_lesson("owner"), "origin": 1}, False),
     ],
 )
 async def test_python_and_sql_agree_on_liveness(db, raw, live):
     stored = raw if raw is None or isinstance(raw, str) else json.dumps(raw)
     if raw is not None:
         assert is_live_lesson(stored) is live
-    rows = await db.execute_fetchall(f"SELECT ({LIVE_LESSON_SQL}) FROM (SELECT ? AS lesson)", (stored,))
+    rows = await db.execute_fetchall(
+        f"SELECT ({LIVE_LESSON_SQL}) FROM (SELECT ? AS lesson)", (stored,)
+    )
     assert bool(rows[0][0]) is (True if live is None else live)
 
 
 async def test_cache_holds_live_lessons_and_leaves_held_ones_out(db, cache_path):
     await _row(db, "held", tier="ADVISORY", lesson=_lesson("external_untrusted"))
     await _row(db, "reviewed", lesson=_lesson("external_untrusted", reviewed=True))
-    await _row(db, "owned", lesson=_lesson("owner"), trigger_spec={"patterns": ["ssh"], "repeat": "every"})
-    await _row(db, "earned", tier="CORE", trigger_spec={"patterns": [r"git\s+push"], "repeat": "session"})
+    await _row(
+        db, "owned", lesson=_lesson("owner"), trigger_spec={"patterns": ["ssh"], "repeat": "every"}
+    )
+    await _row(
+        db, "earned", tier="CORE", trigger_spec={"patterns": [r"git\s+push"], "repeat": "session"}
+    )
     await trigger_cache.regenerate(db)
     entries = _entries(cache_path)
 
@@ -156,14 +172,18 @@ async def test_one_malformed_row_does_not_stop_the_cache(db, cache_path):
     await _row(db, "good", lesson=_lesson("owner"))
     await _row(db, "bad", lesson=_lesson("owner"))
     await _row(db, "bad_earned", tier="CORE")
-    await db.execute("UPDATE procedural_memory SET tool_trigger = 'Bash' WHERE id IN ('bad', 'bad_earned')")
+    await db.execute(
+        "UPDATE procedural_memory SET tool_trigger = 'Bash' WHERE id IN ('bad', 'bad_earned')"
+    )
     assert await trigger_cache.regenerate(db) == 1
     assert set(_entries(cache_path)) == {"good"}
 
 
 async def test_the_live_recheck_drops_a_lesson_held_since_the_cache_was_built(db, monkeypatch):
     monkeypatch.setattr(proactive, "_procedure_cache", None)
-    await _row(db, "lesson", tier="CORE", lesson=_lesson("external_untrusted", reviewed=True), embed=True)
+    await _row(
+        db, "lesson", tier="CORE", lesson=_lesson("external_untrusted", reviewed=True), embed=True
+    )
     query = [1.0] + [0.0] * 1023
     assert (await proactive._surface_procedure(db, query)) is not None
     held = json.dumps(_lesson("external_untrusted"))
