@@ -12,6 +12,8 @@
 #   _git_dir             its git directory (the reflog is <that>/logs/HEAD)
 #   _SERVING_COMMIT_PY   the source of scripts/lib/serving_commit.py, read at
 #                        the caller's start so a merge cannot swap it mid-run
+#   _server_outside_unit succeeds (setting _OUTSIDE_PID) when a server runs
+#                        outside the unit; defined by deploy_code_only.sh
 #
 # The files under scripts/ the server itself consumes, in two kinds, each with
 # the call site that consumes it. tests/test_scripts/
@@ -332,8 +334,14 @@ _status_main() {
     echo "serving: ${SERVING:-unknown ($SERVING_WHY)}"
     # For scripts/deploy_candidates: with nothing running Genesis's code (the
     # server, and the bridge that runs the full stack while the server is down),
-    # readiness judges the code the next start runs instead.
-    echo "server-state: $(_unit_active_state genesis-server) $(_unit_active_state genesis-bridge)"
+    # readiness judges the code the next start runs instead. A server outside the
+    # unit (update.sh's degraded fallback) runs while both units read stopped: it
+    # adds a third word, and a line of any other length never reads as stopped.
+    local outside=""
+    if _server_outside_unit; then
+        outside=" outside:$_OUTSIDE_PID"
+    fi
+    echo "server-state: $(_unit_active_state genesis-server) $(_unit_active_state genesis-bridge)$outside"
     echo "head: $(_git_ro rev-parse HEAD)"
     echo "mainpid: $(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || echo unknown)"
     inv="$(systemctl --user show genesis-server -p InvocationID --value 2>/dev/null || true)"

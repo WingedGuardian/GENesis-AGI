@@ -33,6 +33,7 @@ SCRIPTS = REPO / "scripts"
 UPDATE = SCRIPTS / "update.sh"
 CHECKER = SCRIPTS / "lib" / "managed_units.py"
 LIVE_PY = SCRIPTS / "lib" / "live_checkout.py"
+PEER_RESTORE = REPO / "src" / "genesis" / "db" / "crud" / "peer_restore.py"
 TAG = "pre-update-test"
 LIBS = "".join(
     f'. "{SCRIPTS / "lib" / name}"\n'
@@ -106,6 +107,16 @@ def _out(r: subprocess.CompletedProcess) -> str:
     return r.stdout + r.stderr
 
 
+def _snapshot_defs() -> str:
+    """The database snapshot as update.sh defines it, on a scratch database
+    ($HOME/live.db, absent unless a test makes it), with the authority check's
+    source read the way update.sh reads it at its start."""
+    return (
+        'DB_FILE="$HOME/live.db"\nDB_SNAPSHOT_TAKEN=0\n'
+        f'_PEER_RESTORE_PY="$(cat "{PEER_RESTORE}")"\n' + _block("db-snapshot")
+    )
+
+
 def _result(r: subprocess.CompletedProcess) -> dict[str, str]:
     m = re.search(r"^RESULT (.*)$", r.stdout, re.MULTILINE)
     assert m, _out(r)
@@ -163,10 +174,12 @@ def _rebuild_script(w, old_base: str, mu_src: str | None = None, pre: str = "") 
         + _function("_clear_deploy_state")
         + _function("_on_signal_prestop")
         + _block("live-prestop")
+        + _snapshot_defs()
+        + _block("live-marker")
         + pre
         + _block("live-rebuild")
         + 'echo "RESULT OWN=$UPDATE_OWN_HEAD DEPLOY=$DEPLOY_HEAD NEW=$NEW_COMMIT PID=$$ '
-        'MARKER=$(cat "$DEPLOY_MARKER_FILE" 2>/dev/null || echo none)"\n'
+        'MARKER=$(cat "$DEPLOY_MARKER_FILE" 2>/dev/null || echo none) SNAP=$DB_SNAPSHOT_TAKEN"\n'
     )
 
 
@@ -352,6 +365,8 @@ def _plain_script(root: Path, stub: Path) -> str:
         + _function("_clear_deploy_state")
         + _function("_on_signal_prestop")
         + _block("live-prestop")
+        + _snapshot_defs()
+        + _block("live-marker")
         + _block("live-rebuild")
         + 'echo "RESULT OWN=$UPDATE_OWN_HEAD"\n'
     )
@@ -409,12 +424,13 @@ def test_u5_order_tag_preflight_snapshot_rebuild_stop():
     block = _block("live-rebuild")
     lock = block.index("GENESIS_CHECKOUT_LOCK_FD")
     clear = block.index('checkout -q HEAD -- "$_eph"')
-    marker = block.index("_acquire_deploy_marker")
-    exit_trap = block.index("trap '_live_prestop_exit;")
-    sig = block.index("trap '_on_signal_prestop TERM' TERM")
     engine = block.index('"$SCRIPT_DIR/deploy_candidates.py" rebuild')
     recheck = block.index('--upto "$_live_tip" --also "$ROLLBACK_TAG"')
-    assert lock < clear < marker < exit_trap < engine and sig < engine < recheck
+    assert lock < clear < engine < recheck
+    # The marker, its EXIT trap and the signal traps are armed before the rebuild.
+    marker = text.index("# BEGIN live-marker")
+    assert text.index("trap '_on_signal_prestop TERM' TERM") < marker < snap < rebuild
+    assert "_acquire_deploy_marker" not in block and "trap " not in block
     # The checker that runs on `live` is the old base's, read from git.
     assert 'git -C "$GENESIS_ROOT" show "$_LIVE_BASE:scripts/lib/managed_units.py"' in _block(
         "managed-units-preflight"
@@ -974,7 +990,9 @@ def test_the_moved_message_names_the_run_to_repeat(plain_live, post_merge):
     assert ("re-run scripts/update.sh --post-merge" in r.stdout) is (post_merge == "true")
 
 
-def test_a_marker_refusal_names_the_edits_it_already_cleared(plain_live):
+def test_a_marker_refusal_comes_before_any_edit_is_cleared(plain_live):
+    """The marker is taken before the rebuild block, so a refusal over it leaves
+    the excused local edits where they are and changes nothing."""
     root, home, stub, env, log = plain_live
     (root / "AGENTS.md").write_text("v1\n")
     _git(root, "add", "AGENTS.md")
@@ -982,10 +1000,224 @@ def test_a_marker_refusal_names_the_edits_it_already_cleared(plain_live):
     _git(root, "tag", "-f", TAG)
     (root / "AGENTS.md").write_text("local edit\n")
     # A live foreign holder: this test's own process.
-    (home / ".genesis" / "update_in_progress.pid").write_text(f"{os.getpid()}\n")
+    marker = home / ".genesis" / "update_in_progress.pid"
+    marker.write_text(f"{os.getpid()}\n")
     r = _bash(_plain_script(root, stub), env)
     assert r.returncode == 1, _out(r)
-    assert "holds the deploy marker" in r.stdout
-    assert "Nothing was changed" not in r.stdout
-    assert "AGENTS.md" in r.stdout and "/live" in r.stdout and "Cleared" in r.stdout, r.stdout
+    assert "holds the deploy marker" in r.stdout and "Nothing was changed" in r.stdout
+    assert (root / "AGENTS.md").read_text() == "local edit\n"
     assert not log.exists(), "the engine ran without the deploy marker"
+    assert _git(root, "tag", "-l", TAG) == ""
+    assert marker.read_text() == f"{os.getpid()}\n", "a refused run took the holder's marker"
+
+
+# ── F5: the deploy marker, in both modes ────────────────────────────────────
+
+
+def _marker_script(root: Path, on_live: str, post_merge: str, after: str = "") -> str:
+    return (
+        f'GENESIS_ROOT="{root}"\nON_LIVE={on_live}\nPOST_MERGE={post_merge}\n'
+        f"ORIGINAL_BRANCH=live\nROLLBACK_TAG={TAG}\n"
+        'VALIDATED_HEAD="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"\n_SELF_COPY="$HOME/self-copy"\n'
+        "_guardian_resume() { :; }\n_flush_deploy_summary() { :; }\n"
+        + _block("live-prestop")
+        + _block("live-marker")
+        + 'echo "RESULT PID=$$ MARKER=$(cat "$DEPLOY_MARKER_FILE" 2>/dev/null || echo none)"\n'
+        + after
+    )
+
+
+@pytest.mark.parametrize("post_merge", ["true", "false"])
+def test_f5_live_takes_the_marker_before_the_stop_in_both_modes(plain_live, post_merge):
+    """--post-merge skips the rebuild, yet it holds the server stopped until the
+    bootstrap state row: the marker must cover it too, and go on exit."""
+    root, home, stub, env, log = plain_live
+    # The stop and the activation: the EXIT trap still releases the marker.
+    r = _bash(_marker_script(root, "1", post_merge, "_LIVE_STOPPED=1\nexit 0\n"), env)
+    assert r.returncode == 0, _out(r)
+    res = _result(r)
+    assert res["MARKER"] == res["PID"], "live ran toward the stop without the deploy marker"
+    marker = home / ".genesis" / "update_in_progress.pid"
+    assert not marker.exists(), "the deploy marker outlived the run"
+
+
+def test_f5_main_never_takes_the_marker(plain_live):
+    root, home, stub, env, log = plain_live
+    r = _bash(_marker_script(root, "0", "true"), env)
+    assert r.returncode == 0, _out(r)
+    assert _result(r)["MARKER"] == "none"
+
+
+def test_f5_the_marker_is_taken_for_every_live_run_before_the_stop():
+    text = _text()
+    block = _block("live-marker")
+    # Gated on `live` alone: never on POST_MERGE, which only decides the tag.
+    assert '\nif [ "${ON_LIVE:-0}" = 1 ]; then\n    _marker_rc=0\n' in "\n" + block
+    assert "_acquire_deploy_marker" in block and "trap '_live_prestop_exit;" in block
+    marker = text.index("# BEGIN live-marker")
+    assert text.index('_write_state "fetching"') < marker
+    assert marker < text.index('echo "--- Stopping services for update ---"')
+    assert marker < text.index("# BEGIN live-rebuild")
+    assert "_acquire_deploy_marker" not in _block("live-rebuild")
+
+
+# ── F1: the database snapshot, retaken after the rebuild ────────────────────
+
+
+def test_f1_live_retakes_the_snapshot_after_the_rebuild_before_the_stop():
+    text = _text()
+    block = _block("live-rebuild")
+    recheck = block.index('--upto "$_live_tip" --also "$ROLLBACK_TAG"')
+    engine = block.index('"$SCRIPT_DIR/deploy_candidates.py" rebuild')
+    snap = block.index("_take_db_snapshot")
+    assert engine < recheck < snap
+    assert "_live_abandon 1" in block[snap:]
+    # The first snapshot still runs early, where a failure has moved nothing.
+    assert text.index("_take_db_snapshot || exit 1") < text.index("# BEGIN live-rebuild")
+    # The authority check is the copy read at the start, run isolated.
+    snapshot = _block("db-snapshot")
+    assert 'python3 -I -S -c "$_PEER_RESTORE_PY"' in snapshot
+    assert "-m genesis" not in snapshot
+    assert '_PEER_RESTORE_PY="$(cat ' in text[: text.index("# BEGIN live-prestop")]
+
+
+def _db_rows(path: Path) -> list[str]:
+    con = sqlite3.connect(path)
+    try:
+        return [r[0] for r in con.execute("SELECT v FROM t ORDER BY rowid")]
+    finally:
+        con.close()
+
+
+def test_f1_a_write_during_the_rebuild_is_in_the_snapshot(dc, dc_ready, capsys):
+    """The server keeps writing while the engine rebuilds; the snapshot a
+    rollback would restore must hold those writes."""
+    w = dc_ready
+    old_base = _live_world(dc, w, capsys)
+    db = w.home / "live.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE t (v TEXT)")
+    con.execute("INSERT INTO t VALUES ('before')")
+    con.commit()
+    con.close()
+    # The engine reads the serving commit through this stub mid-rebuild: it
+    # stands in for the server writing in that window.
+    stub = w.root / "scripts" / "deploy_code_only.sh"
+    stub.write_text(
+        "#!/bin/bash\n"
+        f'python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); '
+        f'c.execute(\\"INSERT INTO t VALUES (\'during\')\\"); c.commit()" "{db}"\n'
+        f'echo "serving: {w.rev("HEAD")}"\necho "server-state: active inactive"\n'
+    )
+    w.advance_main({"c.txt": "c\n"})
+    # The early snapshot, as update.sh takes it before the rebuild.
+    r = _bash(_rebuild_script(w, old_base, pre="_take_db_snapshot\n"), _env(w.home))
+    assert r.returncode == 0, _out(r)
+    assert _result(r)["SNAP"] == "1"
+    assert "during" in _db_rows(db), "the stub never wrote; nothing was tested"
+    for name in ("live.db.pre-update", "live.db.pre-update.peer-restore"):
+        assert "during" in _db_rows(w.home / name), f"{name} predates the rebuild"
+
+
+def test_f1_a_failed_refresh_after_the_move_says_live_moved(dc, dc_ready, capsys):
+    w = dc_ready
+    old_base = _live_world(dc, w, capsys)
+    old_tip = w.rev("HEAD")
+    con = sqlite3.connect(w.home / "live.db")
+    con.execute("CREATE TABLE t (v TEXT)")
+    con.commit()
+    con.close()
+    w.advance_main({"c.txt": "c\n"})
+    refuse = "_PEER_RESTORE_PY='import sys; sys.exit(1)'\n"
+    r = _bash(_rebuild_script(w, old_base, pre=refuse), _env(w.home))
+    assert r.returncode == 1, _out(r)
+    assert "RESTORE AUTHORITY CHECK FAILED" in r.stderr
+    assert "live moved to" in r.stdout and "RESULT" not in r.stdout
+    assert w.rev("refs/heads/live") != old_tip and _tag(w) == old_tip
+    assert not _marker(w).exists()
+    assert _no_state(w)
+
+
+# ── F3: tier-2 against the activated tip ───────────────────────────────────
+
+
+def _tier2(w, tmp_path: Path) -> int:
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True, exist_ok=True)
+    if not (venv / "python").exists():
+        (venv / "python").symlink_to(sys.executable)
+    script = (
+        f'GENESIS_ROOT="{w.root}"\nSCRIPT_DIR="$GENESIS_ROOT/scripts"\n'
+        f'VENV_DIR="{tmp_path / "venv"}"\nON_LIVE=1\n'
+        + _function("_metadata_python")
+        + _block("tier2-baseline-check")
+        + "if _tier2_pending_since_baseline; then echo PENDING; else echo CLEAN; fi\n"
+    )
+    r = _bash(script, _env(w.home))
+    assert r.returncode == 0, _out(r)
+    return "PENDING" in r.stdout
+
+
+def _tier2_world(dc, w, capsys) -> tuple[str, str]:
+    """`live` with a candidate touching pyproject.toml; the history's last success
+    is the base, as update.sh records it on `live`. Returns (base, tip)."""
+    base = _live_world(dc, w, capsys, files={"pyproject.toml": "[project]\nname = 'x'\n"})
+    (w.root / "data").mkdir()
+    con = sqlite3.connect(w.root / "data" / "genesis.db")
+    con.execute(
+        "CREATE TABLE update_history (id TEXT, new_commit TEXT, status TEXT, completed_at TEXT)"
+    )
+    con.execute(
+        "INSERT INTO update_history VALUES ('x', ?, 'success', '2026-10-13T00:00:00+00:00')",
+        (base[:9],),
+    )
+    con.commit()
+    con.close()
+    return base, w.rev("HEAD")
+
+
+def test_f3_an_activated_tip_is_not_pending_again(dc, dc_ready, capsys, tmp_path):
+    w = dc_ready
+    _base, tip = _tier2_world(dc, w, capsys)
+    w.git(w.root, "update-ref", "refs/genesis/live-activated", tip)
+    assert not _tier2(w, tmp_path), "a candidate's tier-2 change reads pending forever"
+
+
+def test_f3_with_no_activated_tip_it_falls_back_to_the_base(dc, dc_ready, capsys, tmp_path):
+    w = dc_ready
+    _tier2_world(dc, w, capsys)
+    assert _tier2(w, tmp_path)
+
+
+def test_f3_a_foreign_activated_ref_falls_back_to_the_base(dc, dc_ready, capsys, tmp_path):
+    """A ref that is not a rebuild's tip (here the candidate's own commit) is not
+    trusted, even though it holds the same tier-2 files as HEAD."""
+    w = dc_ready
+    _tier2_world(dc, w, capsys)
+    w.git(w.root, "update-ref", "refs/genesis/live-activated", w.rev("refs/heads/feat/a"))
+    assert _tier2(w, tmp_path)
+
+
+@pytest.mark.parametrize("on_live", ["1", "0"])
+def test_f3_the_success_path_records_the_activated_tip_on_live(plain_live, on_live):
+    root, home, stub, env, log = plain_live
+    head = _git(root, "rev-parse", "HEAD")
+    script = f'GENESIS_ROOT="{root}"\nON_LIVE={on_live}\nUPDATE_OWN_HEAD="{head}"\n' + _block(
+        "live-activated-record"
+    )
+    r = _bash(script, env)
+    assert r.returncode == 0, _out(r)
+    got = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "-q", "--verify", "refs/genesis/live-activated"],
+        capture_output=True,
+        text=True,
+        env=_env(home),
+    ).stdout.strip()
+    assert got == (head if on_live == "1" else "")
+
+
+def test_f3_the_record_follows_the_success_row():
+    text = _text()
+    success = text.index('_record_update_history "success" "" "$_p6_degraded"')
+    record = text.index("# BEGIN live-activated-record")
+    assert success < record < text.index('_write_state "done"', success)

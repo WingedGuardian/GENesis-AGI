@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -204,6 +205,14 @@ exit 0
 """
 
 
+def _outside_unit_check(scripts: Path) -> str:
+    """deploy_code_only.sh's real `_server_outside_unit`, which `_status_main`
+    calls (deploy_code_only.sh defines it before it calls `_status_main`)."""
+    text = (scripts / "deploy_code_only.sh").read_text()
+    start = text.index("_server_outside_unit() {")
+    return text[start : text.index("\n}\n", start) + 3]
+
+
 def _status(tmp_path, server: str, bridge: str):
     """Run deploy_status.sh's real `_status_main` with a fake systemctl first on
     PATH; returns (stdout, returncode)."""
@@ -231,7 +240,7 @@ def _status(tmp_path, server: str, bridge: str):
     script = (
         f'GENESIS_ROOT="{root}"\n_git_dir="{root}/.git"\n'
         f'_SERVING_COMMIT_PY="$(cat "{scripts}/lib/serving_commit.py")"\n'
-        f'. "{scripts}/lib/deploy_status.sh"\n_status_main ""\n'
+        f'. "{scripts}/lib/deploy_status.sh"\n' + _outside_unit_check(scripts) + '_status_main ""\n'
     )
     p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=120)
     return p.stdout, p.returncode
@@ -261,3 +270,22 @@ def test_the_status_line_the_engine_reads_is_produced(dc, tmp_path, server, brid
     commit, why = dc.core.parse_serving(out, rc)
     assert commit is None
     assert (why == dc.core.SERVER_DOWN) is down, (why, out)
+
+
+def test_a_server_outside_the_units_is_not_down(dc, tmp_path):
+    """update.sh's degraded fallback runs `genesis serve` with no unit: both units
+    read stopped while Genesis's code runs. The server's process lock names it."""
+    server = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(600)", "genesis serve"]
+    )
+    try:
+        (tmp_path / ".genesis").mkdir()
+        (tmp_path / ".genesis" / "genesis-server.lock").write_text(str(server.pid))
+        out, rc = _status(tmp_path, "inactive", "inactive")
+    finally:
+        server.kill()
+        server.wait()
+    assert f"server-state: inactive inactive outside:{server.pid}\n" in out, out
+    commit, why = dc.core.parse_serving(out, rc)
+    assert commit is None
+    assert why != dc.core.SERVER_DOWN, out

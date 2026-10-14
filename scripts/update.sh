@@ -190,6 +190,9 @@ MANIFEST_DELTA_PY="$(cat "$SCRIPT_DIR/lib/manifest_delta.py")"
 # The `live` verdict (genesis_live_checkout, deploy_checkout.sh, runs this copy),
 # read now for the same reason: every ask this run makes uses the copy it started with.
 _LIVE_CHECKOUT_PY="$(cat "$SCRIPT_DIR/lib/live_checkout.py")"
+# The DB snapshot's authority check (stdlib only), read now for the same reason: on
+# `live` the snapshot is retaken after the rebuild moved the checkout.
+_PEER_RESTORE_PY="$(cat "$GENESIS_ROOT/src/genesis/db/crud/peer_restore.py")"
 # The deployable-checkout assertion, DEPLOY_BRANCH, and the tracked-dirty query,
 # shared with deploy_code_only.sh so the two deploy paths cannot disagree.
 # shellcheck source=lib/deploy_checkout.sh
@@ -1427,6 +1430,32 @@ fi
 trap '_on_signal_prestop INT' INT
 trap '_on_signal_prestop TERM' TERM
 
+# BEGIN live-marker (extracted by tests/test_scripts/test_update_live.py)
+# On `live` the deploy marker is the in-progress signal in place of "fetching", in
+# both modes: the rebuild moves the checkout before the stop, and --post-merge,
+# which skips the rebuild, still holds the server stopped until bootstrap's state
+# row. The watchdog defers on the marker, so nothing restarts the server in either
+# window. _live_prestop_exit, on EXIT, releases it on every way out.
+if [ "${ON_LIVE:-0}" = 1 ]; then
+    _marker_rc=0
+    _acquire_deploy_marker || _marker_rc=$?
+    if [ "$_marker_rc" -ne 0 ]; then
+        if [ "$_marker_rc" -eq 2 ]; then
+            echo "ERROR: cannot write the deploy marker $DEPLOY_MARKER_FILE."
+        else
+            echo "ERROR: a live deploy (pid $DEPLOY_MARKER_HOLDER) holds the deploy marker $DEPLOY_MARKER_FILE."
+        fi
+        echo "       Nothing was changed."
+        # --post-merge never deletes the tag: it is the earlier run's.
+        if [[ "$POST_MERGE" == "false" ]]; then
+            git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" >/dev/null 2>&1 || true
+        fi
+        exit 1
+    fi
+    trap '_live_prestop_exit; _guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
+fi
+# END live-marker
+
 # ── Service stop/start helpers ───────────────────────────
 # Works with both systemd and bare-process environments.
 _stop_genesis_server() {
@@ -1538,7 +1567,16 @@ MIGRATIONS_RAN=0  # set to 1 once the migration runner is invoked; gates the
 DB_SNAPSHOT_TAKEN=0  # set to 1 only when THIS run's `.backup` succeeds; the
                   # restore trusts this, not mere file existence, so a stale
                   # snapshot from a prior run is never restored as if current.
-if [ -f "$DB_FILE" ]; then
+# BEGIN db-snapshot (extracted by tests/test_scripts/test_update_live.py)
+# Returns 1, having said why, when no current snapshot could be taken; each caller
+# decides how to leave. On `live` it runs a second time, as the last step before
+# the stop (the end of the live-rebuild block), so the snapshot a rollback restores
+# is not older than the rebuild. The authority check runs the copy of
+# peer_restore.py this run read at its start, never the checkout's, which the
+# rebuild may have replaced.
+_take_db_snapshot() {
+    DB_SNAPSHOT_TAKEN=0
+    [ -f "$DB_FILE" ] || return 0
     echo "--- Snapshotting database ---"
     sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
     # Use the online-backup API, not `cp`: this snapshot runs while the server
@@ -1556,15 +1594,14 @@ if [ -f "$DB_FILE" ]; then
             rm -f "$DB_FILE.pre-update.peer-restore" "$DB_FILE.pre-update.peer-restore-wal" \
                 "$DB_FILE.pre-update.peer-restore-shm" "$DB_FILE.pre-update.peer-restore-journal"
             if ! cp "$DB_FILE.pre-update" "$DB_FILE.pre-update.peer-restore" \
-                || ! PYTHONPATH="$GENESIS_ROOT/src" python3 -m genesis.db.crud.peer_restore \
-                    "$DB_FILE.pre-update.peer-restore"; then
+                || ! python3 -I -S -c "$_PEER_RESTORE_PY" "$DB_FILE.pre-update.peer-restore"; then
                 echo "  DATABASE RESTORE AUTHORITY CHECK FAILED — UPDATE ABORTED" >&2
-                exit 1
+                return 1
             fi
             DB_SNAPSHOT_TAKEN=1
         else
             echo "  DATABASE SNAPSHOT FAILED VERIFICATION — UPDATE ABORTED" >&2
-            exit 1
+            return 1
         fi
     else
         # Leave any stale $DB_FILE.pre-update on disk untouched — DB_SNAPSHOT_TAKEN
@@ -1572,9 +1609,12 @@ if [ -f "$DB_FILE" ]; then
         # loudly if this run then migrates). Removing it would erase a prior valid
         # snapshot for no gain.
         echo "  DATABASE SNAPSHOT FAILED — UPDATE ABORTED" >&2
-        exit 1
+        return 1
     fi
-fi
+}
+# END db-snapshot
+# The first snapshot: a failure here exits with nothing moved and nothing stopped.
+_take_db_snapshot || exit 1
 
 # The staged-path guard again, as the last step before the stop: the backups and
 # the database snapshot above can take minutes.
@@ -1629,22 +1669,8 @@ if [[ "$POST_MERGE" == "false" ]] && [ "${ON_LIVE:-0}" = 1 ]; then
         echo "  (backed up and cleared local edits to $_eph before the rebuild: $EPHEMERAL_BACKUP_ROOT/live/$_eph)"
         _live_cleared+=" $_eph"
     done <<< "$_live_status"
-    # The watchdog defers on the marker, so nothing restarts the server mid-move.
-    _marker_rc=0
-    _acquire_deploy_marker || _marker_rc=$?
-    if [ "$_marker_rc" -ne 0 ]; then
-        if [ "$_marker_rc" -eq 2 ]; then
-            echo "ERROR: cannot write the deploy marker $DEPLOY_MARKER_FILE."
-        else
-            echo "ERROR: a live deploy (pid $DEPLOY_MARKER_HOLDER) holds the deploy marker $DEPLOY_MARKER_FILE."
-        fi
-        _live_nothing_moved
-        git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" >/dev/null 2>&1 || true
-        exit 1
-    fi
-    trap '_live_prestop_exit; _guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
-    trap '_on_signal_prestop INT' INT
-    trap '_on_signal_prestop TERM' TERM
+    # This run holds the deploy marker since live-marker, so the watchdog restarts
+    # nothing mid-move.
     echo "--- Rebuilding live ---"
     _eng_rc=0
     DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" DEPLOY_CANDIDATES_EPHEMERAL_RE="$EPHEMERAL_DIRTY_RE" python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" rebuild || _eng_rc=$?
@@ -1696,6 +1722,12 @@ if [[ "$POST_MERGE" == "false" ]] && [ "${ON_LIVE:-0}" = 1 ]; then
             printf '%s\n' "$_mu_out" | sed 's/^/  /'
         fi
         _live_abandon "$([ "$_mu_rc" -eq 4 ] && echo 4 || echo 1)" "" "after fixing the units"
+    fi
+    # The database snapshot again, as the last step before the stop: the rebuild
+    # above can take minutes after the first one, and a rollback restores the
+    # snapshot, which would drop anything the server wrote in between.
+    if ! _take_db_snapshot; then
+        _live_abandon 1 "the database snapshot could not be refreshed; the server was not stopped"
     fi
 fi
 # END live-rebuild
@@ -2725,15 +2757,27 @@ except Exception:
     sys.exit(1)
 PYEOF
 }
+# On `live` the recorded baseline is the reviewed base, which never holds the
+# candidates on top of it, so a candidate touching a tier-2 path would read as
+# pending on every run. The success path records the activated tip instead
+# (refs/genesis/live-activated); it is used only while it is still a rebuild's
+# tip. Any doubt about it falls back to the base, which fails toward activation.
 _tier2_pending_since_baseline() {
-    local _baseline="" _rc=0
+    local _baseline="" _rc=0 _activated=""
+    local -a _tier2=(scripts/systemd scripts/bootstrap.sh scripts/update.sh
+        scripts/lib/cc_version.sh scripts/hooks pyproject.toml)
+    if [ "${ON_LIVE:-0}" = 1 ] \
+        && _activated="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'refs/genesis/live-activated^{commit}' 2>/dev/null)" \
+        && [ -n "$_activated" ] \
+        && python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" live-shaped "$_activated" >/dev/null 2>&1; then
+        ! git -C "$GENESIS_ROOT" diff --quiet "$_activated" HEAD -- "${_tier2[@]}" 2>/dev/null
+        return
+    fi
     _baseline="$(_success_baseline)" || _rc=$?
     [ "$_rc" -eq 0 ] || return 0
     [ -n "$_baseline" ] || return 1
     git -C "$GENESIS_ROOT" cat-file -e "${_baseline}^{commit}" 2>/dev/null || return 1
-    ! git -C "$GENESIS_ROOT" diff --quiet "$_baseline" HEAD -- \
-        scripts/systemd scripts/bootstrap.sh scripts/update.sh \
-        scripts/lib/cc_version.sh scripts/hooks pyproject.toml 2>/dev/null
+    ! git -C "$GENESIS_ROOT" diff --quiet "$_baseline" HEAD -- "${_tier2[@]}" 2>/dev/null
 }
 # END tier2-baseline-check
 
@@ -3519,6 +3563,14 @@ if [ -n "${DEGRADED:-}" ]; then
     _p6_degraded="${_p6_degraded:+$_p6_degraded,}$DEGRADED"
 fi
 _record_update_history "success" "" "$_p6_degraded"
+# BEGIN live-activated-record (extracted by tests/test_scripts/test_update_live.py)
+# On `live` the history records the reviewed base, but what was activated is the
+# tip, candidates included: the tier-2 check compares against this ref.
+if [ "${ON_LIVE:-0}" = 1 ]; then
+    git -C "$GENESIS_ROOT" update-ref refs/genesis/live-activated "$UPDATE_OWN_HEAD" 2>/dev/null \
+        || echo "  WARNING: could not record the activated live tip; the next run re-checks against the base."
+fi
+# END live-activated-record
 
 _write_state "done"
 
