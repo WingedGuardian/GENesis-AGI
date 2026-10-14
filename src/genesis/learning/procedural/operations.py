@@ -12,7 +12,13 @@ import aiosqlite
 
 from genesis.db.crud import procedural
 from genesis.learning.procedural.embedding import cosine_similarity, unpack_embedding
+from genesis.learning.procedural.lesson_shape import (
+    is_live_lesson,
+    validate_lesson,
+    validate_trigger_spec,
+)
 from genesis.learning.procedural.tool_names import normalize_tool_trigger
+from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +68,8 @@ class StoreResult:
     # decision (None when no embedding was available to compare). Observability +
     # test assertions; does not affect the stored row.
     matched_similarity: float | None = None
+    # For a lesson write: whether the trigger cache was rebuilt (None otherwise).
+    cache_rebuilt: bool | None = None
 
 
 async def store_procedure(
@@ -82,6 +90,8 @@ async def store_procedure(
     principle_embedding: bytes | None = None,
     extraction_context: str | None = None,
     first_mover: int = 0,
+    trigger_spec: dict | None = None,
+    lesson: dict | None = None,
 ) -> str:
     """Create a new procedure and return its ID.
 
@@ -129,6 +139,8 @@ async def store_procedure(
         principle_embedding=principle_embedding,
         extraction_context=extraction_context,
         first_mover=first_mover,
+        trigger_spec=trigger_spec,
+        lesson=lesson,
     )
     return proc_id
 
@@ -179,6 +191,9 @@ async def store_procedure_checked(
     confidence: float = 2 / 3,
     source: dict | None = None,
     principle_embedding: bytes | None = None,
+    trigger_spec: dict | None = None,
+    lesson: dict | None = None,
+    caller_origin: str | None = None,
 ) -> StoreResult:
     """Store a procedure with conflict detection.
 
@@ -194,8 +209,36 @@ async def store_procedure_checked(
       CREATE a new row. This is the fix for the serial-overwrite data loss:
       distinct lessons sharing a slug coexist instead of destroying each other.
     - High context_tag overlap with a different task_type → warn but still create.
+
+    A LESSON (``lesson`` and ``trigger_spec`` given) is authored, not earned:
+    the normalizer's command patterns join the author's, both records are
+    validated (``ValueError`` refuses the call), its tier comes from its
+    origin (live ADVISORY, held LIBRARY) and the trigger cache is rebuilt.
+    A lesson call refines only a lesson and a plain call only an earned row, so
+    neither kind is ever rewritten as the other. A caller of
+    ``external_untrusted`` origin never refines a lesson: it creates a held
+    sibling. A trusted lesson refine of a held lesson replaces its content and
+    record, so it makes it live.
     """
     trigger, patterns, dropped = normalize_tool_trigger(tool_trigger)
+    if lesson is not None:
+        if not trigger:
+            raise ValueError("a lesson needs at least one tool name in tool_trigger")
+        spec = dict(trigger_spec or {})
+        authored = list(spec.get("patterns") or [])
+        spec["patterns"] = authored + [p for p in patterns if p not in authored]
+        try:
+            trigger_spec = validate_trigger_spec(spec)
+        except ValueError as exc:
+            derived = len(spec["patterns"]) - len(authored)
+            if derived:
+                raise ValueError(
+                    f"{exc} (counting {derived} pattern(s) derived from shell commands in tool_trigger)"
+                ) from exc
+            raise
+        lesson = validate_lesson(lesson)
+        activation_tier = "ADVISORY" if is_live_lesson(lesson) else "LIBRARY"
+        patterns = []  # stored in the spec, so not a warning
     trigger_warnings = (
         [f"tool_trigger values dropped as not tool names: {dropped}"] if dropped else []
     )
@@ -204,6 +247,11 @@ async def store_procedure_checked(
         # its tags match, not only on the command it named.
         trigger_warnings.append(f"shell commands stored as Bash; patterns not kept: {patterns}")
     candidates = await procedural.list_by_task_type(db, task_type)
+    # A lesson refines only a lesson, a plain teach only an earned row.
+    candidates = [c for c in candidates if (c.get("lesson") is None) == (lesson is None)]
+    if caller_origin == ORIGIN_EXTERNAL_UNTRUSTED:
+        # Never let outside text rewrite a lesson; it becomes a sibling instead.
+        candidates = [c for c in candidates if c.get("lesson") is None]
     matched, best_sim = _best_same_procedure_match(candidates, principle_embedding)
 
     if matched is not None:
@@ -247,6 +295,11 @@ async def store_procedure_checked(
         # through took a live CORE row out of the trigger cache.
         if trigger:
             update_fields["tool_trigger"] = trigger
+            stored = json.loads(matched["tool_trigger"]) if matched.get("tool_trigger") else None
+            if lesson is None and trigger != stored:
+                # An earned row's spec was written for its old trigger: drop it
+                # rather than gate new tools with a pattern meant for others.
+                update_fields["trigger_spec"] = None
         elif tool_trigger == [] and draft == 0:
             # An explicit teach that passes an empty list means "no trigger".
             # Auto-extraction (draft=1) emitting [] keeps the stored one: an
@@ -270,7 +323,10 @@ async def store_procedure_checked(
             # threshold; never demote a row the promoter already advanced.
             if matched.get("activation_tier") == "DORMANT":
                 update_fields["activation_tier"] = activation_tier
+        if lesson is not None:
+            update_fields.update(trigger_spec=trigger_spec, lesson=lesson, activation_tier=activation_tier)
         await procedural.update(db, matched["id"], **update_fields)
+        rebuilt = await _regenerate_cache(db) if lesson is not None else None
         logger.info(
             "Refined procedure %s (v%d, cosine=%.3f): %s",
             matched["id"], new_version, best_sim, task_type,
@@ -280,6 +336,7 @@ async def store_procedure_checked(
             action="updated",
             warnings=trigger_warnings,
             matched_similarity=best_sim,
+            cache_rebuilt=rebuilt,
         )
 
     # No same-procedure match → this is a DISTINCT lesson (or we had no embedding
@@ -310,7 +367,10 @@ async def store_procedure_checked(
         confidence=confidence,
         source=source,
         principle_embedding=principle_embedding,
+        trigger_spec=trigger_spec,
+        lesson=lesson,
     )
+    rebuilt = await _regenerate_cache(db) if lesson is not None else None
 
     if warnings:
         logger.info("Procedure %s created with %d warnings", proc_id, len(warnings))
@@ -321,7 +381,20 @@ async def store_procedure_checked(
         warnings=warnings,
         conflicting_ids=conflicting_ids,
         matched_similarity=best_sim or None,
+        cache_rebuilt=rebuilt,
     )
+
+
+async def _regenerate_cache(db: aiosqlite.Connection) -> bool:
+    """Rebuild the trigger cache after a lesson write; a failure is logged and returned."""
+    from genesis.learning.procedural.trigger_cache import regenerate
+
+    try:
+        await regenerate(db)
+        return True
+    except Exception:
+        logger.error("Trigger cache regeneration after a lesson write failed", exc_info=True)
+        return False
 
 
 async def record_success(db: aiosqlite.Connection, procedure_id: str) -> bool:

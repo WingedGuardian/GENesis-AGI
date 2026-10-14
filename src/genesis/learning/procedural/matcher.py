@@ -7,7 +7,13 @@ import json
 import aiosqlite
 
 from genesis.db.crud import procedural
+from genesis.learning.procedural.lesson_shape import is_live_lesson
 from genesis.learning.types import ProcedureMatch
+
+
+def _held(row: dict) -> bool:
+    """A lesson nobody may be shown yet: external origin, not reviewed."""
+    return row.get("lesson") is not None and not is_live_lesson(row["lesson"])
 
 
 def _row_to_match(row: dict) -> ProcedureMatch:
@@ -52,7 +58,7 @@ async def find_best_match(
     best_row = None
 
     for row in rows:
-        if row.get("deprecated") or row.get("quarantined"):
+        if row.get("deprecated") or row.get("quarantined") or _held(row):
             continue
         row_tags = set(json.loads(row["context_tags"]) if isinstance(row["context_tags"], str) else row["context_tags"])
         union = query_tags | row_tags
@@ -88,7 +94,7 @@ async def find_relevant(
     scored: list[tuple[float, dict]] = []
 
     for row in rows:
-        if row["confidence"] < min_confidence:
+        if row["confidence"] < min_confidence or _held(row):
             continue
         row_tags = set(json.loads(row["context_tags"]) if isinstance(row["context_tags"], str) else row["context_tags"])
         union = query_tags | row_tags
