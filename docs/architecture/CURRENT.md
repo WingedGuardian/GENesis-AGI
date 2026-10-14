@@ -1511,7 +1511,12 @@ verified: 637f7f7bb679 2026-10-05
   `scripts/browser.py` copies too when it can import Genesis (else it says so and
   launches without a copy). The Chromium fallback and that CLI run
   through patchright when installed. `scripts/disk_hygiene.sh` keeps
-  the newest copy per profile, and the newest per version for 90 days.
+  the newest copy per profile, and the newest per version for 90 days. Once
+  the paired Camoufox engine has been in use 14 days, it also removes older
+  engine versions and the pre-0.5 root engine (`scripts/prune_browser_engines.py`
+  decides; none while an override or `camoufox set` choice is in effect or access
+  times are not kept, never an engine a running browser uses, the one the browser
+  profile last ran, or one launched in 14 days, never camoufox 0.5's own files).
   Every install gets the `browser` extra (pinned camoufox 0.5.7+, playwright and
   patchright on one minor): bootstrap.sh and install.sh install it after the core
   packages, never fatally (`venv_setup.sh` `install_browser_extra`, checked by
