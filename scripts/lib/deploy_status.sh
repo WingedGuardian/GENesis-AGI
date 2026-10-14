@@ -317,12 +317,23 @@ _bracket() {
     BRACKET="b1-$(printf '%s\n' "$SERVING" "$mainpid" "$inv" "$overrides" "$fresh" | sha256sum | cut -c1-24)"
 }
 
+# ActiveState of one user unit, or "unknown" when systemd does not say.
+_unit_active_state() {
+    local s
+    s="$(systemctl --user show "$1" -p ActiveState --value 2>/dev/null || true)"
+    printf '%s' "${s:-unknown}"
+}
+
 # `status [--verify <token>]`. Prints the fields a human reads and the bracket;
 # with --verify, exits 0 when the token still holds and 1 when it does not.
 _status_main() {
     local verify="$1" inv
     _read_serving
     echo "serving: ${SERVING:-unknown ($SERVING_WHY)}"
+    # For scripts/deploy_candidates: with nothing running Genesis's code (the
+    # server, and the bridge that runs the full stack while the server is down),
+    # readiness judges the code the next start runs instead.
+    echo "server-state: $(_unit_active_state genesis-server) $(_unit_active_state genesis-bridge)"
     echo "head: $(_git_ro rev-parse HEAD)"
     echo "mainpid: $(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || echo unknown)"
     inv="$(systemctl --user show genesis-server -p InvocationID --value 2>/dev/null || true)"

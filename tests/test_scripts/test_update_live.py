@@ -1,0 +1,991 @@
+"""update.sh on `live`: rebuild through the engine instead of merging (#2978 C1b, #2526).
+
+Every test runs SHIPPED blocks of scripts/update.sh (extracted between their
+``# BEGIN``/``# END`` markers, never copied) against scratch repositories with
+HOME pointed at a scratch directory. The rebuild tests drive the REAL engine,
+copied into a scratch checkout (tests/test_scripts/_deploy_candidates_world.py);
+its serving-commit read goes to a stub ``scripts/deploy_code_only.sh`` there.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+import pytest
+
+from tests.test_scripts.test_bootstrap_guards import (
+    _assert_recovery_refused,
+    _recover,
+    _recovery_commit_file,
+    _recovery_git,
+    _recovery_repo,
+)
+
+REPO = Path(__file__).resolve().parents[2]
+SCRIPTS = REPO / "scripts"
+UPDATE = SCRIPTS / "update.sh"
+CHECKER = SCRIPTS / "lib" / "managed_units.py"
+LIVE_PY = SCRIPTS / "lib" / "live_checkout.py"
+TAG = "pre-update-test"
+LIBS = "".join(
+    f'. "{SCRIPTS / "lib" / name}"\n'
+    for name in ("deploy_marker.sh", "deploy_checkout.sh", "checkout_lock.sh", "deploy_recovery.sh")
+)
+_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@example.invalid",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    "GIT_CONFIG_NOSYSTEM": "1",
+}
+
+
+def _text() -> str:
+    return UPDATE.read_text()
+
+
+def _block(marker: str) -> str:
+    m = re.search(
+        rf"# BEGIN {re.escape(marker)}[^\n]*\n(.*?)# END {re.escape(marker)}", _text(), re.DOTALL
+    )
+    assert m, f"missing {marker} block"
+    return m.group(1)
+
+
+def _function(name: str) -> str:
+    m = re.search(rf"^{re.escape(name)}\(\) \{{\n.*?^\}}\n", _text(), re.DOTALL | re.MULTILINE)
+    assert m, f"missing {name}()"
+    return m.group(0)
+
+
+def _env(home: Path, **extra: str) -> dict[str, str]:
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("GIT_", "GENESIS_", "DEPLOY_CANDIDATES_", "CLAUDECODE"))
+    }
+    env.update(_GIT_ENV)
+    env["HOME"] = str(home)
+    env.update(extra)
+    return env
+
+
+def _bash(script: str, env: dict[str, str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", "set -Eeuo pipefail\n" + LIBS + script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_env(repo),
+    ).stdout.strip()
+
+
+def _assign(var: str, text: str) -> str:
+    """A bash assignment of ``text`` verbatim (a quoted heredoc: no escapes)."""
+    return f"{var}=\"$(cat <<'__TEXT__'\n{text}__TEXT__\n)\"\n"
+
+
+def _out(r: subprocess.CompletedProcess) -> str:
+    return r.stdout + r.stderr
+
+
+def _result(r: subprocess.CompletedProcess) -> dict[str, str]:
+    m = re.search(r"^RESULT (.*)$", r.stdout, re.MULTILINE)
+    assert m, _out(r)
+    return dict(kv.split("=", 1) for kv in m.group(1).split())
+
+
+# ── the rebuild, against the real engine ────────────────────────────────────
+
+
+def _serving_stub(w, lines: str) -> None:
+    stub = w.root / "scripts" / "deploy_code_only.sh"
+    stub.write_text(
+        "#!/bin/bash\n" + "".join(f"echo {json.dumps(ln)}\n" for ln in lines.splitlines())
+    )
+
+
+def _live_world(dc, w, capsys, files: dict | None = None) -> str:
+    """`live` = origin/main + feat/a, rebuilt in-process; then the engine is
+    installed into the checkout for update.sh to run, ready against the old base.
+    Returns the old base."""
+    w.candidate("feat/a", files or {"src/a.py": "a = 1\n"})
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "live"
+    old_base = w.rev("refs/remotes/origin/main")
+    w.install_engine()
+    gate = w.root / "scripts" / "deploy_candidates_gate.py"
+    gate.write_text(gate.read_text() + f'\nREQUIRED_MERGED = (("scratch base", "{old_base}"),)\n')
+    _serving_stub(w, f"serving: {w.rev('HEAD')}\nserver-state: active inactive")
+    w.git(w.root, "tag", TAG)
+    return old_base
+
+
+def _rebuild_script(w, old_base: str, mu_src: str | None = None, pre: str = "") -> str:
+    mu = f'_mu_src="$(cat "{CHECKER}")"\n' if mu_src is None else _assign("_mu_src", mu_src)
+    return (
+        f'GENESIS_ROOT="{w.root}"\nSCRIPT_DIR="$GENESIS_ROOT/scripts"\n'
+        f"POST_MERGE=false\nON_LIVE=1\nORIGINAL_BRANCH=live\nROLLBACK_TAG={TAG}\n"
+        'VALIDATED_HEAD="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"\n'
+        'UPDATE_OWN_HEAD="$VALIDATED_HEAD"\n'
+        f'_LIVE_BASE="{old_base}"\nDEPLOY_HEAD="$_LIVE_BASE"\nNEW_COMMIT=""\nNEW_TAG=""\n'
+        'GENESIS_TAKE_TEMPLATES=""\nREFUSED_FILE="$HOME/.genesis/update_refused.json"\n'
+        'STATE_FILE="$HOME/.genesis/update_state.json"\n_SELF_COPY="$HOME/self-copy"\n'
+        "WERE_RUNNING=()\n"
+        "_guardian_resume() { :; }\n_flush_deploy_summary() { :; }\n"
+        'mkdir -p "$HOME/.genesis/locks"\n'
+        'exec {_UPDATE_LOCK_FD}>"$HOME/.genesis/locks/update.lock"\nflock -n "$_UPDATE_LOCK_FD"\n'
+        + mu
+        + "".join(
+            re.search(
+                rf"{name}\(\) \{{\n.*?\n\}}\n", _block("managed-units-preflight"), re.DOTALL
+            ).group(0)
+            for name in ("_mu_record_refusal", "_mu_remedy")
+        )
+        + _function("_clear_deploy_state")
+        + _function("_on_signal_prestop")
+        + _block("live-prestop")
+        + pre
+        + _block("live-rebuild")
+        + 'echo "RESULT OWN=$UPDATE_OWN_HEAD DEPLOY=$DEPLOY_HEAD NEW=$NEW_COMMIT PID=$$ '
+        'MARKER=$(cat "$DEPLOY_MARKER_FILE" 2>/dev/null || echo none)"\n'
+    )
+
+
+def _no_state(w) -> bool:
+    return not (w.home / ".genesis" / "update_state.json").exists()
+
+
+def _marker(w) -> Path:
+    return w.home / ".genesis" / "update_in_progress.pid"
+
+
+def _tag(w) -> str | None:
+    r = w.git(w.root, "rev-parse", "-q", "--verify", f"refs/tags/{TAG}", check=False)
+    return r.stdout.strip() or None
+
+
+def test_u1_update_on_live_rebuilds_onto_new_main(dc, dc_ready, capsys):
+    """#2526: update.sh on `live` puts the candidate back on top of the NEW main,
+    with only rebuild merges above origin/main; it records the base, keeps the
+    tip as its own head, and holds the deploy marker into the stop."""
+    w = dc_ready
+    old_base = _live_world(dc, w, capsys)
+    old_tip = w.rev("HEAD")
+    feat = w.rev("refs/heads/feat/a")
+    new_main = w.advance_main({"c.txt": "c\n"})
+    r = _bash(_rebuild_script(w, old_base), _env(w.home))
+    assert r.returncode == 0, _out(r)
+    tip = w.rev("refs/heads/live")
+    assert w.rev("HEAD") == tip != old_tip
+    assert w.rev("refs/remotes/origin/main") == new_main
+    above = set(w.git(w.root, "rev-list", tip, "--not", new_main).stdout.split())
+    merge = w.git(w.root, "rev-list", "--first-parent", "-1", tip).stdout.strip()
+    assert above == {merge, *w.git(w.root, "rev-list", feat, "--not", old_base).stdout.split()}
+    assert w.git(w.root, "rev-parse", f"{merge}^1", f"{merge}^2").stdout.split() == [new_main, feat]
+    res = _result(r)
+    assert res["OWN"] == tip
+    assert res["DEPLOY"] == new_main
+    assert res["NEW"] == w.git(w.root, "rev-parse", "--short", new_main).stdout.strip()
+    assert res["MARKER"] == res["PID"], "the deploy marker is not held into the stop"
+    assert _no_state(w), "the rebuild wrote an update state before the stop"
+    assert _tag(w) == old_tip
+
+
+def test_u1_server_down_still_rebuilds(dc, dc_ready, capsys):
+    """Nothing runs (both units definitely stopped): readiness judges the
+    checkout, and the rebuild goes ahead."""
+    w = dc_ready
+    old_base = _live_world(dc, w, capsys)
+    _serving_stub(
+        w,
+        "serving: unknown (genesis-server is not running (inactive))\nserver-state: inactive inactive",
+    )
+    w.advance_main({"c.txt": "c\n"})
+    r = _bash(_rebuild_script(w, old_base), _env(w.home))
+    assert r.returncode == 0, _out(r)
+    assert _result(r)["OWN"] == w.rev("refs/heads/live")
+
+
+def test_u1_server_starting_still_refuses(dc, dc_ready, capsys):
+    """Control for the test above: a unit in any other state is not "down"."""
+    w = dc_ready
+    old_base = _live_world(dc, w, capsys)
+    old_tip = w.rev("HEAD")
+    _serving_stub(
+        w,
+        "serving: unknown (genesis-server is not running (activating))\nserver-state: activating inactive",
+    )
+    w.advance_main({"c.txt": "c\n"})
+    r = _bash(_rebuild_script(w, old_base), _env(w.home))
+    assert r.returncode == 1, _out(r)
+    assert w.rev("HEAD") == old_tip
+
+
+def test_u2_a_readiness_refusal_changes_nothing(dc, dc_ready, capsys):
+    w = dc_ready
+    old_base = _live_world(dc, w, capsys)
+    old_tip = w.rev("HEAD")
+    new_main = w.advance_main({"c.txt": "c\n"})
+    # A required fix the running server's base lacks.
+    w.git(w.root, "fetch", "-q", "origin")
+    gate = w.root / "scripts" / "deploy_candidates_gate.py"
+    gate.write_text(gate.read_text() + f'\nREQUIRED_MERGED = (("newer fix", "{new_main}"),)\n')
+    r = _bash(_rebuild_script(w, old_base), _env(w.home))
+    assert r.returncode == 1, _out(r)
+    assert "not ready" in _out(r) and "live was not moved" in r.stdout
+    assert w.rev("HEAD") == old_tip
+    assert w.git(w.root, "status", "--porcelain", "--untracked-files=no").stdout == ""
+    assert _tag(w) is None, "an unmoved refusal left the rollback tag"
+    assert not _marker(w).exists(), "the deploy marker was not released"
+    assert _no_state(w)
+
+
+def test_u4_dirty_excused_files_are_backed_up_and_cleared(dc, dc_ready, capsys):
+    """AGENTS.md changes upstream and is dirty here: without the clear the
+    switch refuses over it. USER.md, excused but not in the merge's clear list,
+    is cleared too."""
+    w = dc_ready
+    user_md = "src/genesis/identity/USER.md"
+    w.advance_main({"AGENTS.md": "v1\n", user_md: "template\n"})
+    old_base = _live_world(dc, w, capsys)
+    w.advance_main({"AGENTS.md": "v2\n"})
+    (w.root / "AGENTS.md").write_text("local edit\n")
+    (w.root / user_md).write_text("filled in\n")
+    r = _bash(_rebuild_script(w, old_base), _env(w.home))
+    assert r.returncode == 0, _out(r)
+    assert (w.root / "AGENTS.md").read_text() == "v2\n"
+    saved = list((w.home / ".genesis" / "premerge-backups").glob("*/live/AGENTS.md/current"))
+    assert len(saved) == 1 and saved[0].read_text() == "local edit\n"
+    saved = list((w.home / ".genesis" / "premerge-backups").glob(f"*/live/{user_md}/current"))
+    assert len(saved) == 1 and saved[0].read_text() == "filled in\n"
+
+
+def test_u6_post_move_unit_refusal_keeps_the_tag_and_says_what_moved(dc, dc_ready, capsys):
+    w = dc_ready
+    old_base = _live_world(dc, w, capsys)
+    old_tip = w.rev("HEAD")
+    w.advance_main({"c.txt": "c\n"})
+    refuse = 'import sys\nprint("REFUSED: demo.service (edited by hand)")\nsys.exit(4)\n'
+    r = _bash(_rebuild_script(w, old_base, mu_src=refuse), _env(w.home))
+    assert r.returncode == 4, _out(r)
+    tip = w.rev("refs/heads/live")
+    assert tip != old_tip and _tag(w) == old_tip
+    assert "live moved to" in r.stdout and "after fixing the units" in r.stdout
+    record = json.loads((w.home / ".genesis" / "update_refused.json").read_text())
+    assert record["units"] == ["demo.service"] and record["deploy_head"] == tip
+    assert "--take-template" in r.stdout and "override.conf" in r.stdout, r.stdout
+    assert not _marker(w).exists()
+    assert _no_state(w)
+
+
+# ── the rebuild, against a stub engine ──────────────────────────────────────
+
+_STUB_ENGINE = """\
+import os, subprocess, sys
+with open(os.environ["STUB_LOG"], "a") as fh:
+    fh.write(" ".join(sys.argv[1:]) + " lockfd=" + os.environ.get("DEPLOY_CANDIDATES_LOCK_FD", "-")
+             + " re=" + ("yes" if os.environ.get("DEPLOY_CANDIDATES_EPHEMERAL_RE") else "no") + "\\n")
+mode = os.environ.get("STUB_MODE", "")
+root = os.environ["STUB_ROOT"]
+if sys.argv[1] == "rebuild":
+    if mode == "move-fail":
+        subprocess.run(["git", "-C", root, "-c", "core.hooksPath=/dev/null", "commit", "-q",
+                        "--allow-empty", "-m", "moved"], check=True)
+    sys.exit(1 if mode in ("move-fail", "fail") else 0)
+if sys.argv[1] == "live-shaped":
+    print(os.environ["STUB_BASE"])
+sys.exit(0)
+"""
+
+
+@pytest.fixture
+def plain_live(tmp_path: Path):
+    """A checkout on `live` with the rollback tag at HEAD, and a stub engine."""
+    root, home, stub = tmp_path / "root", tmp_path / "home", tmp_path / "stub"
+    (home / ".genesis").mkdir(parents=True)
+    stub.mkdir()
+    (stub / "deploy_candidates.py").write_text(_STUB_ENGINE)
+    subprocess.run(["git", "init", "-q", "-b", "live", str(root)], check=True, env=_env(home))
+    (root / "f.txt").write_text("1\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "base")
+    _git(root, "tag", TAG)
+    env = _env(
+        home,
+        STUB_LOG=str(tmp_path / "engine.log"),
+        STUB_ROOT=str(root),
+        STUB_BASE=_git(root, "rev-parse", "HEAD"),
+    )
+    return root, home, stub, env, tmp_path / "engine.log"
+
+
+def _plain_script(root: Path, stub: Path) -> str:
+    return (
+        f'GENESIS_ROOT="{root}"\nSCRIPT_DIR="{stub}"\n'
+        f"POST_MERGE=false\nON_LIVE=1\nORIGINAL_BRANCH=live\nROLLBACK_TAG={TAG}\n"
+        'VALIDATED_HEAD="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"\nUPDATE_OWN_HEAD="$VALIDATED_HEAD"\n'
+        '_LIVE_BASE="$VALIDATED_HEAD"\nDEPLOY_HEAD="$_LIVE_BASE"\n_mu_src="import sys"\n'
+        'GENESIS_TAKE_TEMPLATES=""\nREFUSED_FILE="$HOME/.genesis/update_refused.json"\n'
+        'STATE_FILE="$HOME/.genesis/update_state.json"\n_SELF_COPY="$HOME/self-copy"\nWERE_RUNNING=()\n'
+        "_guardian_resume() { :; }\n_flush_deploy_summary() { :; }\n"
+        'mkdir -p "$HOME/.genesis/locks"\n'
+        'exec {_UPDATE_LOCK_FD}>"$HOME/.genesis/locks/update.lock"\nflock -n "$_UPDATE_LOCK_FD"\n'
+        + _function("_clear_deploy_state")
+        + _function("_on_signal_prestop")
+        + _block("live-prestop")
+        + _block("live-rebuild")
+        + 'echo "RESULT OWN=$UPDATE_OWN_HEAD"\n'
+    )
+
+
+def test_u3_a_move_then_failure_keeps_the_tag_and_writes_no_state(plain_live):
+    root, home, stub, env, log = plain_live
+    old = _git(root, "rev-parse", "HEAD")
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "move-fail"})
+    assert r.returncode == 1, _out(r)
+    assert _git(root, "rev-parse", "HEAD") != old
+    assert _git(root, "rev-parse", TAG) == old, "a moved run lost the name of the old tip"
+    assert "live moved to" in r.stdout and "re-run scripts/update.sh" in r.stdout
+    assert r.stdout.count("live moved to") == 1, r.stdout
+    assert not (home / ".genesis" / "update_state.json").exists()
+    assert not (home / ".genesis" / "update_in_progress.pid").exists()
+
+
+def test_u3_control_an_unmoved_failure_deletes_the_tag(plain_live):
+    root, home, stub, env, log = plain_live
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "fail"})
+    assert r.returncode == 1, _out(r)
+    assert "live was not moved" in r.stdout and "live moved to" not in r.stdout
+    assert _git(root, "tag", "-l", TAG) == ""
+
+
+def test_the_engine_gets_the_update_lock_and_the_excuse_list(plain_live):
+    root, home, stub, env, log = plain_live
+    r = _bash(_plain_script(root, stub), env)
+    assert r.returncode == 0, _out(r)
+    first = log.read_text().splitlines()[0]
+    assert (
+        first.startswith("rebuild lockfd=") and "lockfd=-" not in first and first.endswith("re=yes")
+    )
+
+
+def test_u5_a_held_checkout_lock_refuses_before_the_engine(plain_live):
+    root, home, stub, env, log = plain_live
+    r = _bash("exec {GENESIS_CHECKOUT_LOCK_FD}>/dev/null\n" + _plain_script(root, stub), env)
+    assert r.returncode == 1, _out(r)
+    assert "genesis-checkout.lock" in r.stdout
+    assert not log.exists(), "the engine ran while this run held the checkout lock"
+    assert _git(root, "tag", "-l", TAG) == ""
+
+
+def test_u5_order_tag_preflight_snapshot_rebuild_stop():
+    text = _text()
+    tag = text.index('git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"')
+    pre = text.index("# BEGIN managed-units-preflight")
+    snap = text.index("--- Snapshotting database ---")
+    staged = text.index("# BEGIN staged-excused-prestop")
+    rebuild = text.index("# BEGIN live-rebuild")
+    stop = text.index('echo "--- Stopping services for update ---"')
+    assert tag < pre < snap < staged < rebuild < stop
+    block = _block("live-rebuild")
+    lock = block.index("GENESIS_CHECKOUT_LOCK_FD")
+    clear = block.index('checkout -q HEAD -- "$_eph"')
+    marker = block.index("_acquire_deploy_marker")
+    exit_trap = block.index("trap '_live_prestop_exit;")
+    sig = block.index("trap '_on_signal_prestop TERM' TERM")
+    engine = block.index('"$SCRIPT_DIR/deploy_candidates.py" rebuild')
+    recheck = block.index('--upto "$_live_tip" --also "$ROLLBACK_TAG"')
+    assert lock < clear < marker < exit_trap < engine and sig < engine < recheck
+    # The checker that runs on `live` is the old base's, read from git.
+    assert 'git -C "$GENESIS_ROOT" show "$_LIVE_BASE:scripts/lib/managed_units.py"' in _block(
+        "managed-units-preflight"
+    )
+    # The first state on `live` is written after the stop.
+    assert '\nif [ "${ON_LIVE:-0}" != 1 ]; then\n_write_state "fetching"\nfi\n' in text
+
+
+# ── branch admission ────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def checkout(tmp_path: Path):
+    root, home = tmp_path / "root", tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True, env=_env(home))
+    (root / "f.txt").write_text("1\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "base")
+    return root, home
+
+
+def _manifest(home: Path, repo: str | None, raw: str | None = None) -> None:
+    path = home / ".genesis" / "deploy_manifest.json"
+    path.write_text(
+        raw if raw is not None else json.dumps({"version": 3, "repo": repo, "candidates": []})
+    )
+
+
+_SENTINEL_PY = "import pathlib, sys\npathlib.Path(sys.argv[1], 'PREDICATE_RAN').touch()\nprint('other')\nsys.exit(1)\n"
+
+
+def _admit(root: Path, home: Path, *, predicate: str | None = None, **env: str):
+    py = (
+        f'_LIVE_CHECKOUT_PY="$(cat "{LIVE_PY}")"\n'
+        if predicate is None
+        else _assign("_LIVE_CHECKOUT_PY", predicate)
+    )
+    return _bash(
+        f'GENESIS_ROOT="{root}"\n' + py + _block("branch-admission") + 'echo "ON_LIVE=$ON_LIVE"\n',
+        _env(home, **env),
+    )
+
+
+def test_u7_main_is_admitted_and_never_asks_the_manifest(checkout):
+    root, home = checkout
+    r = _admit(root, home, predicate=_SENTINEL_PY)
+    assert r.returncode == 0 and "ON_LIVE=0" in r.stdout, _out(r)
+    assert "WARNING" not in r.stdout
+    assert not (root / "PREDICATE_RAN").exists()
+
+
+def test_u7_override_admits_a_named_branch_without_the_manifest(checkout):
+    root, home = checkout
+    _git(root, "checkout", "-qb", "feature")
+    r = _admit(root, home, predicate=_SENTINEL_PY, GENESIS_ALLOW_NON_DEPLOY_BRANCH="1")
+    assert (
+        r.returncode == 0
+        and "ON_LIVE=0" in r.stdout
+        and "WARNING: updating branch 'feature'" in r.stdout
+    )
+    assert not (root / "PREDICATE_RAN").exists()
+
+
+@pytest.mark.parametrize("override", ["", "1"], ids=["plain", "override"])
+def test_u7_live_bound_to_this_repository_is_admitted(checkout, override):
+    root, home = checkout
+    _git(root, "checkout", "-qb", "live")
+    _manifest(home, os.path.realpath(root / ".git"))
+    r = _admit(root, home, GENESIS_ALLOW_NON_DEPLOY_BRANCH=override)
+    assert r.returncode == 0 and "ON_LIVE=1" in r.stdout, _out(r)
+    assert "WARNING" not in r.stdout
+
+
+@pytest.mark.parametrize("override", ["", "1"], ids=["plain", "override"])
+def test_u7_live_built_for_another_repository_keeps_the_branch_refusal(
+    checkout, tmp_path, override
+):
+    root, home = checkout
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", str(other)], check=True, env=_env(home))
+    _git(root, "checkout", "-qb", "live")
+    _manifest(home, os.path.realpath(other / ".git"))
+    r = _admit(root, home, GENESIS_ALLOW_NON_DEPLOY_BRANCH=override)
+    assert r.returncode == 1 and "is on 'live', not main" in r.stdout, _out(r)
+    assert "ON_LIVE" not in r.stdout
+
+
+def test_u7_live_with_an_unreadable_manifest_refuses(checkout):
+    root, home = checkout
+    _git(root, "checkout", "-qb", "live")
+    _manifest(home, None, raw="{not json")
+    r = _admit(root, home)
+    assert r.returncode == 1 and "cannot tell whether" in r.stdout, _out(r)
+
+
+def test_u7_an_inherited_on_live_is_ignored(checkout):
+    root, home = checkout
+    r = _admit(root, home, ON_LIVE="1", _LIVE_BASE="deadbeef")
+    assert r.returncode == 0 and "ON_LIVE=0" in r.stdout, _out(r)
+
+
+def test_u7_the_verdict_is_asked_again_under_the_lock(checkout):
+    root, home = checkout
+    _git(root, "checkout", "-qb", "live")
+    script = (
+        f'GENESIS_ROOT="{root}"\n_LIVE_CHECKOUT_PY="$(cat "{LIVE_PY}")"\nON_LIVE=1\n'
+        + _block("live-lock-recheck")
+        + "echo PASSED\n"
+    )
+    _manifest(home, os.path.realpath(root / ".git"))
+    assert "PASSED" in _bash(script, _env(home)).stdout
+    (home / ".genesis" / "deploy_manifest.json").unlink()
+    r = _bash(script, _env(home))
+    assert r.returncode == 1 and "no longer on the live branch" in r.stdout, _out(r)
+
+
+def test_u7_the_predicate_is_read_before_the_branch_check():
+    text = _text()
+    assert text.index('_LIVE_CHECKOUT_PY="$(cat "$SCRIPT_DIR/lib/live_checkout.py")"') < text.index(
+        "# BEGIN branch-admission"
+    )
+    flock = text.index('if ! flock -n "$_UPDATE_LOCK_FD"; then')
+    assert flock < text.index("# BEGIN live-lock-recheck") < text.index("Genesis Update")
+
+
+# ── the remote ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("on_live", "post_merge", "remote", "refused"),
+    [
+        ("1", "false", "upstream", True),
+        ("1", "false", "origin", False),
+        ("1", "true", "", False),
+        ("0", "false", "upstream", False),
+    ],
+    ids=["live-other-remote", "live-origin", "live-post-merge", "main-other-remote"],
+)
+def test_u8_live_refuses_any_remote_but_origin(tmp_path, on_live, post_merge, remote, refused):
+    script = (
+        f"ON_LIVE={on_live}\nPOST_MERGE={post_merge}\nUPDATE_REMOTE={remote}\n"
+        + _block("live-remote")
+        + "echo PASSED\n"
+    )
+    r = _bash(script, _env(tmp_path))
+    assert (r.returncode == 1 and "PASSED" not in r.stdout) is refused, _out(r)
+
+
+# ── nothing new ─────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def history(tmp_path: Path):
+    """A checkout with base <- tip, the rollback tag at the tip, and an
+    update_history table."""
+    root = tmp_path / "root"
+    subprocess.run(["git", "init", "-q", "-b", "live", str(root)], check=True, env=_env(tmp_path))
+    (root / "f.txt").write_text("1\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "base")
+    base = _git(root, "rev-parse", "HEAD")
+    _git(root, "commit", "-q", "--allow-empty", "-m", "candidate merge")
+    tip = _git(root, "rev-parse", "HEAD")
+    _git(root, "tag", TAG)
+    (root / "data").mkdir()
+    con = sqlite3.connect(root / "data" / "genesis.db")
+    con.execute(
+        "CREATE TABLE update_history (id TEXT, new_commit TEXT, status TEXT, completed_at TEXT)"
+    )
+    con.commit()
+    con.close()
+    return root, base, tip
+
+
+def _success_row(root: Path, new_commit: str) -> None:
+    con = sqlite3.connect(root / "data" / "genesis.db")
+    con.execute(
+        "INSERT INTO update_history VALUES ('x', ?, 'success', '2026-10-13T00:00:00+00:00')",
+        (new_commit,),
+    )
+    con.commit()
+    con.close()
+
+
+def _nothing_new(tmp_path: Path, root: Path, **vars_: str) -> bool:
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True, exist_ok=True)
+    if not (venv / "python").exists():
+        (venv / "python").symlink_to(sys.executable)
+    script = (
+        f'GENESIS_ROOT="{root}"\nVENV_DIR="{tmp_path / "venv"}"\nROLLBACK_TAG={TAG}\n'
+        + "".join(f'{k}="{v}"\n' for k, v in vars_.items())
+        + _function("_metadata_python")
+        + _block("tier2-baseline-check")
+        + _block("nothing-new")
+        + "if _nothing_new; then echo NOTHING-NEW; else echo SOMETHING-NEW; fi\n"
+    )
+    r = _bash(script, _env(tmp_path))
+    assert r.returncode == 0, _out(r)
+    return "NOTHING-NEW" in r.stdout
+
+
+@pytest.mark.parametrize(("old", "new", "nothing"), [("abc", "abc", True), ("abc", "def", False)])
+def test_u9_off_live_it_is_the_commit_comparison(tmp_path, history, old, new, nothing):
+    root, base, tip = history
+    assert _nothing_new(tmp_path, root, OLD_COMMIT=old, NEW_COMMIT=new) is nothing
+
+
+def test_u9_on_live_unmoved_and_recorded_is_nothing_new(tmp_path, history):
+    root, base, tip = history
+    _success_row(root, base[:9])
+    assert _nothing_new(
+        tmp_path,
+        root,
+        ON_LIVE="1",
+        UPDATE_OWN_HEAD=tip,
+        DEPLOY_HEAD=base,
+        OLD_COMMIT="a",
+        NEW_COMMIT="a",
+    )
+
+
+def test_u9_on_live_a_moved_tip_is_something_new(tmp_path, history):
+    root, base, tip = history
+    _success_row(root, base[:9])
+    _git(root, "commit", "-q", "--allow-empty", "-m", "rebuilt")
+    moved = _git(root, "rev-parse", "HEAD")
+    assert not _nothing_new(
+        tmp_path,
+        root,
+        ON_LIVE="1",
+        UPDATE_OWN_HEAD=moved,
+        DEPLOY_HEAD=base,
+        OLD_COMMIT="a",
+        NEW_COMMIT="a",
+    )
+
+
+@pytest.mark.parametrize("recorded", ["tip", "unresolvable", "none"])
+def test_u9_on_live_an_unrecorded_base_is_something_new(tmp_path, history, recorded):
+    """A moved-then-refused run left `live` on a base no success row names: the
+    rerun must activate and record it, not read "Already up to date"."""
+    root, base, tip = history
+    if recorded == "tip":
+        _success_row(root, tip[:9])
+    elif recorded == "unresolvable":
+        _success_row(root, "0" * 9)
+    assert not _nothing_new(
+        tmp_path,
+        root,
+        ON_LIVE="1",
+        UPDATE_OWN_HEAD=tip,
+        DEPLOY_HEAD=base,
+        OLD_COMMIT="a",
+        NEW_COMMIT="a",
+    )
+
+
+def test_u9_the_take_branch_stays_first():
+    text = _text()
+    first = text.index('if _nothing_new && [ -n "$GENESIS_TAKE_TEMPLATES" ]; then')
+    assert (
+        first
+        < text.index("elif _nothing_new && _tier2_pending_since_baseline; then")
+        < text.index("elif _nothing_new; then")
+    )
+    assert '[[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]' in _block("nothing-new")
+
+
+# ── NEW_COMMIT is the base at both recompute sites ──────────────────────────
+
+_SITE = re.compile(
+    r'NEW_TAG=\$\(git -C "\$GENESIS_ROOT" describe --tags --match \'v\*\' --abbrev=0 2>/dev/null \|\| echo "untagged"\)\n'
+    r'NEW_COMMIT=\$\(git -C "\$GENESIS_ROOT" rev-parse --short HEAD\)\n'
+    r'(?:if \[ "\$\{ON_LIVE:-0\}" = 1 \]; then\n    _live_new_commit\nfi\n)?'
+)
+
+
+def test_u10_new_commit_is_the_base_at_both_sites(tmp_path, history):
+    root, base, tip = history
+    _git(root, "tag", "v1.0", base)
+    _git(root, "tag", "v9.9", tip)
+    sites = [m.group(0) for m in _SITE.finditer(_text())]
+    assert len(sites) == 2, sites
+    for site in sites:
+        script = (
+            f'GENESIS_ROOT="{root}"\nON_LIVE=1\nDEPLOY_HEAD="{base}"\n'
+            + _block("live-prestop")
+            + site
+            + 'echo "NEW=$NEW_COMMIT TAG=$NEW_TAG"\n'
+        )
+        r = _bash(script, _env(tmp_path))
+        assert r.returncode == 0, _out(r)
+        assert f"NEW={_git(root, 'rev-parse', '--short', base)} TAG=v1.0" in r.stdout, site
+
+
+# ── rollback: restore-hooks ─────────────────────────────────────────────────
+
+
+def _rollback_reset(root: Path, home: Path, stub: Path, own_head: str, on_live: str) -> str:
+    return (
+        "exec {GENESIS_CHECKOUT_LOCK_FD}>/dev/null\n"
+        'mkdir -p "$HOME/.genesis/locks"\nexec {_UPDATE_LOCK_FD}>"$HOME/.genesis/locks/update.lock"\n'
+        f'GENESIS_ROOT="{root}"\nSCRIPT_DIR="{stub}"\nORIGINAL_BRANCH=live\nROLLBACK_TAG={TAG}\n'
+        f'UPDATE_OWN_HEAD="{own_head}"\nON_LIVE={on_live}\nMERGE_ATTEMPTED=0\n'
+        "guard() {\n"
+        + _block("rollback-code-guard")
+        + '    echo "ACTION=$code_action OK=$checkout_ok"\n}\nguard\n'
+    )
+
+
+@pytest.mark.parametrize("on_live", ["1", "0"])
+def test_u11_a_live_rollback_restores_the_hooks(plain_live, on_live):
+    root, home, stub, env, log = plain_live
+    _git(root, "commit", "-q", "--allow-empty", "-m", "the rebuilt tip")
+    tip = _git(root, "rev-parse", "HEAD")
+    r = _bash(_rollback_reset(root, home, stub, tip, on_live), env)
+    assert r.returncode == 0, _out(r)
+    assert "ACTION=reset OK=true" in r.stdout
+    assert _git(root, "rev-parse", "HEAD") == _git(root, "rev-parse", TAG)
+    if on_live == "1":
+        line = log.read_text().strip()
+        assert line.startswith(f"restore-hooks {tip} {TAG} lockfd=") and line.endswith("re=yes"), (
+            line
+        )
+        assert "lockfd=-" not in line
+    else:
+        assert not log.exists()
+
+
+def test_u11_a_failed_restore_only_warns(plain_live):
+    root, home, stub, env, log = plain_live
+    (stub / "deploy_candidates.py").write_text("import sys\nsys.exit(1)\n")
+    _git(root, "commit", "-q", "--allow-empty", "-m", "the rebuilt tip")
+    tip = _git(root, "rev-parse", "HEAD")
+    r = _bash(_rollback_reset(root, home, stub, tip, "1"), env)
+    assert (
+        "ACTION=reset OK=true" in r.stdout
+        and "WARNING: could not restore the git hooks" in r.stdout
+    )
+
+
+# ── the live prestop handler ────────────────────────────────────────────────
+
+
+def _prestop(root: Path, on_live: str, before: str = "") -> str:
+    return (
+        f'GENESIS_ROOT="{root}"\nPOST_MERGE=false\nON_LIVE={on_live}\nORIGINAL_BRANCH=live\n'
+        f'ROLLBACK_TAG={TAG}\nSTATE_FILE="$HOME/.genesis/update_state.json"\nWERE_RUNNING=()\n'
+        'VALIDATED_HEAD="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"\n'
+        + _function("_clear_deploy_state")
+        + _function("_on_signal_prestop")
+        + _block("live-prestop")
+        + "_acquire_deploy_marker\n"
+        + before
+        + "_on_signal_prestop TERM\n"
+    )
+
+
+def _other_runs_state(home: Path) -> Path:
+    state = home / ".genesis" / "update_state.json"
+    state.write_text(json.dumps({"phase": "merging", "pid": 999999}))
+    return state
+
+
+def test_u12_unmoved_keeps_the_other_runs_state_and_deletes_the_tag(plain_live):
+    root, home, stub, env, log = plain_live
+    state = _other_runs_state(home)
+    r = _bash(_prestop(root, "1"), env)
+    assert r.returncode == 1, _out(r)
+    assert state.exists(), "the live prestop handler deleted another run's state"
+    assert not (home / ".genesis" / "update_in_progress.pid").exists()
+    assert _git(root, "tag", "-l", TAG) == ""
+    assert "live was not moved" in r.stdout
+
+
+@pytest.mark.parametrize("how", ["moved", "index-lock"])
+def test_u12_a_move_or_a_half_done_git_keeps_the_tag(plain_live, how):
+    root, home, stub, env, log = plain_live
+    state = _other_runs_state(home)
+    before = (
+        'git -C "$GENESIS_ROOT" commit -q --allow-empty -m moved\n'
+        if how == "moved"
+        else ': > "$GENESIS_ROOT/.git/index.lock"\n'
+    )
+    r = _bash(_prestop(root, "1", before), env)
+    assert r.returncode == 1, _out(r)
+    assert state.exists()
+    assert _git(root, "tag", "-l", TAG) == TAG
+    if how == "moved":
+        assert "live moved to" in r.stdout and "re-run scripts/update.sh" in r.stdout
+    else:
+        # HEAD never moved: what is on disk may be a half-written switch, and
+        # re-running is not the next step.
+        assert "half-written tree" in r.stdout and "git status" in r.stdout, r.stdout
+        assert "live moved to" not in r.stdout and "re-run" not in r.stdout
+    assert not (home / ".genesis" / "update_in_progress.pid").exists()
+
+
+def test_u12_control_off_live_clears_the_state(plain_live):
+    root, home, stub, env, log = plain_live
+    state = _other_runs_state(home)
+    r = _bash(_prestop(root, "0"), env)
+    assert r.returncode == 1, _out(r)
+    assert not state.exists()
+
+
+# ── staged-excused prestop ──────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(("on_live", "rc"), [("1", 0), ("0", 127)])
+def test_u13_the_staged_guard_is_not_called_on_live(tmp_path, on_live, rc):
+    """The guard is defined inside the fetch block, which `live` skips."""
+    r = _bash(
+        f"POST_MERGE=false\nON_LIVE={on_live}\n" + _block("staged-excused-prestop"), _env(tmp_path)
+    )
+    assert r.returncode == rc, _out(r)
+
+
+# ── the guardian source ─────────────────────────────────────────────────────
+
+_SSH_STUB = """#!/bin/bash
+cmd="${@: -1}"
+echo "$cmd" >> "$STUB_SSH_LOG"
+case "$cmd" in
+    version) echo '{"deployed_commit": "unknown"}' ;;
+    redeploy*) cat > "$STUB_ARCHIVE" ;;
+esac
+exit 0
+"""
+
+
+@pytest.mark.parametrize("on_live", ["1", "0"])
+def test_u14_the_guardian_gets_the_base_on_live(tmp_path, on_live):
+    home, root, bin_ = tmp_path / "home", tmp_path / "root", tmp_path / "bin"
+    (home / ".genesis").mkdir(parents=True)
+    bin_.mkdir()
+    (bin_ / "ssh").write_text(_SSH_STUB)
+    (bin_ / "ssh").chmod(0o755)
+    key = home / "key"
+    key.write_text("k\n")
+    (home / ".genesis" / "guardian_remote.yaml").write_text(
+        f'host_ip: "192.0.2.7"\nssh_key: "{key}"\n'
+    )
+    venv = tmp_path / "venv" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").symlink_to(sys.executable)
+    subprocess.run(["git", "init", "-q", "-b", "live", str(root)], check=True, env=_env(home))
+    # Every path the archive names must exist, or `git archive` refuses.
+    for path in (
+        "scripts/x.sh",
+        "pyproject.toml",
+        "config/guardian-claude.md",
+        "config/genesis-guardian.service",
+        "config/genesis-guardian.timer",
+        "config/genesis-guardian-watchman.service",
+        "config/genesis-guardian-watchman.timer",
+    ):
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text("x\n")
+    base = _recovery_like_commit(root, "src/genesis/util/base.py")
+    tip = _recovery_like_commit(root, "src/genesis/util/candidate.py")
+    archive = tmp_path / "archive.tar"
+    log = tmp_path / "ssh.log"
+    script = (
+        f'GENESIS_ROOT="{root}"\nVENV_DIR="{tmp_path / "venv"}"\nSCRIPT_DIR="{tmp_path / "noscripts"}"\n'
+        f'ON_LIVE={on_live}\nDEPLOY_HEAD="{base}"\nOLD_COMMIT="{base[:9]}"\n'
+        + _function("_guardian_redeploy_reason")
+        + _function("_sync_deploy_targets")
+        + "_sync_deploy_targets\n"
+    )
+    env = _env(home, STUB_SSH_LOG=str(log), STUB_ARCHIVE=str(archive))
+    env["PATH"] = f"{bin_}{os.pathsep}{env['PATH']}"
+    r = _bash(script, env)
+    assert r.returncode == 0, _out(r)
+    want = base if on_live == "1" else tip
+    sent = [ln for ln in log.read_text().splitlines() if ln.startswith("redeploy ")]
+    assert sent and sent[0].split()[1] == _git(root, "rev-parse", "--short", want), _out(r)
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+    assert "src/genesis/util/base.py" in names
+    assert ("src/genesis/util/candidate.py" in names) is (on_live == "0"), names
+
+
+def _recovery_like_commit(root: Path, path: str) -> str:
+    p = root / path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f"# {path}\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", path)
+    return _git(root, "rev-parse", "HEAD")
+
+
+# ── bootstrap crash recovery ────────────────────────────────────────────────
+
+
+def test_b1_bootstrap_does_not_roll_live_back(tmp_path):
+    root, _common, rollback = _recovery_repo(tmp_path)
+    _recovery_git(root, "checkout", "-qb", "live")
+    merged = _recovery_commit_file(root, "changed.txt", "rebuilt\n", "the rebuilt tip")
+    proc, state_path = _recover(tmp_path, root, original_branch="live", own_head=merged)
+    _assert_recovery_refused(proc, state_path)
+    assert "the update ran on live" in proc.stdout + proc.stderr
+    assert _recovery_git(root, "rev-parse", "HEAD") == merged
+
+
+# ── what a refusal says after the rebuild began ─────────────────────────────
+
+
+def _stop_abort_branch() -> str:
+    """The stop's abort branch: genesis-server could not be stopped."""
+    text = _text()
+    start = text.index("    if ! _ensure_server_down; then\n")
+    end = text.index("\n    fi\n", start) + len("\n    fi\n")
+    return text[start:end]
+
+
+@pytest.mark.parametrize(("on_live", "post_merge"), [("1", "false"), ("1", "true"), ("0", "false")])
+def test_sf1_a_failed_stop_on_live_says_where_live_is(plain_live, on_live, post_merge):
+    """The EXIT trap is quiet once the stop began, so the abort branch itself
+    names the rebuilt tip and the old one."""
+    root, home, stub, env, log = plain_live
+    _git(root, "commit", "-q", "--allow-empty", "-m", "the rebuilt tip")
+    short = _git(root, "rev-parse", "--short", "HEAD")
+    script = (
+        f'GENESIS_ROOT="{root}"\nON_LIVE={on_live}\nPOST_MERGE={post_merge}\n'
+        f"ORIGINAL_BRANCH=live\nROLLBACK_TAG={TAG}\n"
+        + _block("live-prestop")
+        + "_LIVE_STOPPED=1\n_ensure_server_down() { return 1; }\n"
+        + _stop_abort_branch()
+    )
+    r = _bash(script, env)
+    assert r.returncode == 1, _out(r)
+    if on_live == "0":
+        assert "live is at" not in r.stdout
+        return
+    assert f"live is at {short}" in r.stdout and f"tag {TAG}" in r.stdout, r.stdout
+    assert "without activation" in r.stdout
+    if post_merge == "true":
+        assert "re-run scripts/update.sh --post-merge." in r.stdout
+    else:
+        assert "re-run scripts/update.sh." in r.stdout and "--post-merge" not in r.stdout
+
+
+@pytest.mark.parametrize("post_merge", ["false", "true"])
+def test_the_moved_message_names_the_run_to_repeat(plain_live, post_merge):
+    root, home, stub, env, log = plain_live
+    _git(root, "commit", "-q", "--allow-empty", "-m", "the rebuilt tip")
+    script = (
+        f'GENESIS_ROOT="{root}"\nPOST_MERGE={post_merge}\nORIGINAL_BRANCH=live\n'
+        f"ROLLBACK_TAG={TAG}\n" + _block("live-prestop") + "_live_moved_message\n"
+    )
+    r = _bash(script, env)
+    assert r.returncode == 0, _out(r)
+    assert "live moved to" in r.stdout
+    assert ("re-run scripts/update.sh --post-merge" in r.stdout) is (post_merge == "true")
+
+
+def test_a_marker_refusal_names_the_edits_it_already_cleared(plain_live):
+    root, home, stub, env, log = plain_live
+    (root / "AGENTS.md").write_text("v1\n")
+    _git(root, "add", "AGENTS.md")
+    _git(root, "commit", "-qm", "agents")
+    _git(root, "tag", "-f", TAG)
+    (root / "AGENTS.md").write_text("local edit\n")
+    # A live foreign holder: this test's own process.
+    (home / ".genesis" / "update_in_progress.pid").write_text(f"{os.getpid()}\n")
+    r = _bash(_plain_script(root, stub), env)
+    assert r.returncode == 1, _out(r)
+    assert "holds the deploy marker" in r.stdout
+    assert "Nothing was changed" not in r.stdout
+    assert "AGENTS.md" in r.stdout and "/live" in r.stdout and "Cleared" in r.stdout, r.stdout
+    assert not log.exists(), "the engine ran without the deploy marker"

@@ -1,0 +1,263 @@
+"""The engine pieces update.sh uses on `live` (#2978 C1b, #2526).
+
+- With nothing running Genesis's code (genesis-server and genesis-bridge both in
+  a definite stopped state), readiness judges the code the next start runs,
+  HEAD, instead of refusing for want of a serving commit.
+- `restore-hooks <before> <after>`: update.sh's rollback moves the checkout back
+  itself; this puts back the git hooks the move left behind.
+- `live-shaped <commit>`: is the commit what a rebuild makes, and on which base.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+PRE_COMMIT = "scripts/hooks/pre-commit"
+BASE_HOOK = "#!/bin/sh\n# pre-commit\nexit 0\n"
+
+
+def _installed(w, name: str = "pre-commit") -> str:
+    return (w.root / ".git" / "hooks" / name).read_text()
+
+
+# ── server down ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("states", "down"),
+    [
+        ("inactive inactive", True),
+        ("failed inactive", True),
+        ("inactive failed", True),
+        ("inactive active", False),  # the bridge runs the full stack
+        ("activating inactive", False),
+        ("deactivating inactive", False),
+        ("unknown inactive", False),
+        ("inactive", False),
+        (None, False),
+    ],
+)
+def test_only_two_definitely_stopped_units_read_as_down(dc, states, down):
+    stdout = "serving: unknown (genesis-server is not running (inactive))\n"
+    if states is not None:
+        stdout += f"server-state: {states}\n"
+    commit, why = dc.core.parse_serving(stdout, 0)
+    assert commit is None
+    assert (why == dc.core.SERVER_DOWN) is down
+
+
+def test_a_serving_commit_wins_over_the_state_line(dc):
+    sha = "a" * 40
+    commit, _why = dc.core.parse_serving(f"serving: {sha}\nserver-state: inactive inactive\n", 0)
+    assert commit == sha
+
+
+def test_with_the_server_down_readiness_judges_the_checkout(dc, dc_ready, capsys):
+    w = dc_ready
+    w.serving = lambda root: (None, dc.core.SERVER_DOWN)
+    w.candidate("feat/a", {"src/a.py": "a = 1\n"})
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+
+
+def test_with_the_server_down_a_checkout_too_old_still_refuses(dc, dc_ready, monkeypatch, capsys):
+    w = dc_ready
+    w.candidate("feat/a", {"src/a.py": "a = 1\n"})
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
+    required = w.advance_main({"src/required.py": "r = 1\n"})
+    w.git(w.root, "fetch", "-q", "origin")
+    monkeypatch.setattr(dc.gate, "REQUIRED_MERGED", (("scratch required", required),))
+    w.serving = lambda root: (None, dc.core.SERVER_DOWN)
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 1
+    assert "the checkout's base" in capsys.readouterr().err
+
+
+def test_a_server_state_that_is_not_definitely_down_still_refuses(dc, dc_ready, capsys):
+    w = dc_ready
+    w.candidate("feat/a", {"src/a.py": "a = 1\n"})
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
+    w.serving = lambda root: (None, "genesis-server is not running (activating)")
+    capsys.readouterr()
+    assert w.run(dc, "rebuild") == 1
+    assert "a candidate needs a running server" in capsys.readouterr().err
+
+
+# ── restore-hooks ────────────────────────────────────────────────────────
+
+
+def _hook_live(w, dc, capsys) -> tuple[str, str]:
+    """A rebuild installing an approved hook. Returns (checkout before, tip)."""
+    before = w.rev("HEAD", w.root)
+    w.candidate("feat/h", {PRE_COMMIT: "#!/bin/sh\n# approved\nexit 0\n"})
+    assert w.add(dc, "feat/h", "--approve-hooks", "owner, in chat") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert _installed(w) != BASE_HOOK
+    return before, w.rev("HEAD", w.root)
+
+
+def _roll_back(w, to: str) -> None:
+    """What update.sh's rollback does on `live`: move the branch back itself."""
+    w.git(w.root, "-c", "core.hooksPath=/dev/null", "switch", "-q", "-C", "live", to)
+
+
+def test_restore_hooks_puts_back_what_the_rollback_left_installed(dc, dc_ready, capsys):
+    w = dc_ready
+    before, tip = _hook_live(w, dc, capsys)
+    _roll_back(w, before)
+    assert _installed(w) != BASE_HOOK, "the rollback alone restored the hook; nothing to test"
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 0, capsys.readouterr()
+    assert _installed(w) == BASE_HOOK
+
+
+def test_restore_hooks_runs_while_the_update_is_unfinished(dc, dc_ready, capsys):
+    """It is called from update.sh's rollback, while update_state.json records
+    the update: none of the move refusals may apply."""
+    w = dc_ready
+    before, tip = _hook_live(w, dc, capsys)
+    _roll_back(w, before)
+    (w.home / ".genesis" / "update_state.json").write_text(json.dumps({"phase": "merging"}))
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 0, capsys.readouterr()
+    assert _installed(w) == BASE_HOOK
+
+
+def test_restore_hooks_refuses_when_the_checkout_is_elsewhere(dc, dc_ready, capsys):
+    w = dc_ready
+    before, tip = _hook_live(w, dc, capsys)
+    capsys.readouterr()
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 1
+    assert "not where the rollback put it" in capsys.readouterr().err
+    assert _installed(w) != BASE_HOOK, "a refused restore changed a hook"
+
+
+def test_restore_hooks_needs_update_lock(dc, dc_ready, capsys):
+    w = dc_ready
+    before, tip = _hook_live(w, dc, capsys)
+    _roll_back(w, before)
+    capsys.readouterr()
+    assert w.run(dc, "restore-hooks", tip, before, lock=False) == 1
+    assert "update.lock" in capsys.readouterr().err
+
+
+# ── live-shaped ──────────────────────────────────────────────────────────
+
+
+def _shaped(w, dc, capsys, commit: str) -> tuple[int, str]:
+    capsys.readouterr()
+    rc = w.run(dc, "live-shaped", commit)
+    return rc, capsys.readouterr().out.strip()
+
+
+def test_a_rebuilt_tip_names_the_base_it_was_built_on(dc, dc_ready, capsys):
+    w = dc_ready
+    w.candidate("feat/a", {"src/a.py": "a = 1\n"})
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    base = w.rev("refs/remotes/origin/main", w.root)
+    assert _shaped(w, dc, capsys, "refs/heads/live") == (0, base)
+    # main moves on after the rebuild: the tip still names its own base.
+    w.advance_main({"src/later.py": "l = 1\n"})
+    w.git(w.root, "fetch", "-q", "origin")
+    assert _shaped(w, dc, capsys, "refs/heads/live") == (0, base)
+
+
+def test_a_tip_with_no_candidates_is_its_own_base(dc, dc_ready, capsys):
+    w = dc_ready
+    base = w.rev("refs/remotes/origin/main", w.root)
+    assert _shaped(w, dc, capsys, base) == (0, base)
+
+
+def test_a_hand_commit_on_live_is_not_shaped(dc, dc_ready, capsys):
+    w = dc_ready
+    w.candidate("feat/a", {"src/a.py": "a = 1\n"})
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    w.git(
+        w.root, "-c", "core.hooksPath=/dev/null", "commit", "-q", "--allow-empty", "-m", "by hand"
+    )
+    capsys.readouterr()
+    assert w.run(dc, "live-shaped", "HEAD") == 1
+    assert "not a rebuild's tip" in capsys.readouterr().err
+
+
+# ── the producer of the server-state line ────────────────────────────────
+
+_FAKE_SYSTEMCTL = """#!/bin/bash
+# Answers `systemctl --user show <unit> -p ActiveState --value` from FAKE_<UNIT>;
+# "none" prints nothing and fails, as an unreachable user manager does. Every
+# other query prints nothing.
+if [ "$2" = show ] && [ "$4" = -p ] && [ "$5" = ActiveState ]; then
+    case "$3" in
+        genesis-server|genesis-server.service) v="$FAKE_SERVER" ;;
+        genesis-bridge|genesis-bridge.service) v="$FAKE_BRIDGE" ;;
+        *) v=none ;;
+    esac
+    [ "$v" = none ] && exit 1
+    echo "$v"
+fi
+exit 0
+"""
+
+
+def _status(tmp_path, server: str, bridge: str):
+    """Run deploy_status.sh's real `_status_main` with a fake systemctl first on
+    PATH; returns (stdout, returncode)."""
+    scripts = Path(__file__).resolve().parents[2] / "scripts"
+    root, bin_ = tmp_path / "root", tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "systemctl").write_text(_FAKE_SYSTEMCTL)
+    (bin_ / "systemctl").chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(
+        HOME=str(tmp_path),
+        PATH=f"{bin_}{os.pathsep}{env['PATH']}",
+        FAKE_SERVER=server,
+        FAKE_BRIDGE=bridge,
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_AUTHOR_NAME="t",
+        GIT_AUTHOR_EMAIL="t@example.invalid",
+        GIT_COMMITTER_NAME="t",
+        GIT_COMMITTER_EMAIL="t@example.invalid",
+    )
+    subprocess.run(["git", "init", "-q", str(root)], check=True, env=env)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "-q", "--allow-empty", "-m", "c"], check=True, env=env
+    )
+    script = (
+        f'GENESIS_ROOT="{root}"\n_git_dir="{root}/.git"\n'
+        f'_SERVING_COMMIT_PY="$(cat "{scripts}/lib/serving_commit.py")"\n'
+        f'. "{scripts}/lib/deploy_status.sh"\n_status_main ""\n'
+    )
+    p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=120)
+    return p.stdout, p.returncode
+
+
+@pytest.mark.parametrize(
+    ("server", "bridge", "line", "down"),
+    [
+        ("inactive", "inactive", "inactive inactive", True),
+        ("failed", "inactive", "failed inactive", True),
+        ("inactive", "active", "inactive active", False),
+        ("none", "inactive", "unknown inactive", False),
+        ("inactive", "none", "inactive unknown", False),
+    ],
+    ids=[
+        "both-stopped",
+        "server-failed",
+        "bridge-active",
+        "server-unreadable",
+        "bridge-unreadable",
+    ],
+)
+def test_the_status_line_the_engine_reads_is_produced(dc, tmp_path, server, bridge, line, down):
+    """deploy_status.sh's real output, fed to the engine's real parser."""
+    out, rc = _status(tmp_path, server, bridge)
+    assert f"server-state: {line}\n" in out, out
+    commit, why = dc.core.parse_serving(out, rc)
+    assert commit is None
+    assert (why == dc.core.SERVER_DOWN) is down, (why, out)
