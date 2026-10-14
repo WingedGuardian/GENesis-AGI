@@ -66,6 +66,11 @@ def _budget(**over):
         ],
         "expected_reviewers": [],
         "reviewers_reported": [],
+        "commits": [
+            {"sha": "a" * 40, "parents": []},
+            {"sha": "e" * 40, "parents": []},
+            {"sha": "f" * 40, "parents": ["a" * 40]},
+        ],
     }
     budget.update(over)
     return budget
@@ -105,10 +110,22 @@ def test_findings_from_the_cutover_on_are_owed_after_the_round_completes():
     # Those reviews have all landed: a finished round's evidence is final,
     # whether or not anything is owed, and unknown is never settled.
     assert state["settled"] is True
-    assert rr.owed_state(_budget(), ["c1", "c9"], now=T0, cutover=CUT)["settled"] is True
+    done = rr.owed_state(_budget(), [], now=T0, cutover=CUT, late_covered=["c1", "c9"])
+    assert done["owed"] == [] and done["settled"] is True
     unknown = rr.owed_state(_budget(), [], now=T0, cutover="soon")
     assert unknown["owed"] is None and unknown["settled"] is False
-    assert rr.owed_state(_budget(), ["c9"], now=T0, cutover=CUT)["owed"] == ["c1"]
+    assert rr.owed_state(_budget(), [], now=T0, cutover=CUT, late_covered=["c9"])["owed"] == ["c1"]
+
+
+def test_open_round_coverage_never_clears_a_late_key():
+    """Codex c4266451771: a reflection judged under the OPEN round that also
+    names an older round's late key must not clear it; only a credit made
+    under that key's own round does."""
+    budget = _budget(round_state="open", open_keys=["c2"])
+    state = rr.owed_state(budget, ["c2", "c9"], now=T0, cutover=CUT)
+    assert state["owed"] == ["c1", "c9"]
+    state = rr.owed_state(budget, ["c2"], now=T0, cutover=CUT, late_covered=["c9"])
+    assert state["owed"] == ["c1"]
 
 
 def test_findings_before_the_cutover_are_not_owed():
@@ -164,18 +181,49 @@ def test_rounds_are_numbered_by_when_they_opened_not_by_list_order():
     assert rr.round_context(budget, "c" * 40, later) is None
 
 
-def test_a_legacy_round_comes_first_and_starts_at_its_earliest_finding():
-    a, legacy = "a" * 40, "e" * 40
+def test_legacy_rounds_are_ordered_by_their_marks_never_by_sha():
+    """Codex c4266451765: legacy rounds carry no review times. Their order
+    comes from when their heads were reviewed (``marks``); the SHA order here
+    is the opposite one."""
+    a, b, new = "a" * 40, "b" * 40, "0" * 40
     budget = _budget(
         rounds=[
-            {"head": a, "reviews": [{"submitted_at": _iso(0)}]},
-            {"head": legacy, "reviews": []},
+            {"head": a, "reviews": []},
+            {"head": b, "reviews": []},
+            {"head": new, "reviews": [{"submitted_at": _iso(30)}]},
         ],
-        findings=[{"head": legacy, "submitted_at": _iso(20), "keys": ["c4"], "round_head": legacy}],
+        marks=[
+            {"head": a, "at": _iso(20)},
+            {"head": b, "at": _iso(10)},
+            {"head": b, "at": _iso(50)},
+        ],
     )
     later = T0 + timedelta(hours=1)
-    assert rr.round_context(budget, legacy, later) == rr.RoundContext(1, _iso(20), ())
-    assert rr.round_context(budget, a, later) == rr.RoundContext(2, _iso(0), (legacy,))
+    assert rr.round_context(budget, b, later) == rr.RoundContext(1, _iso(10), ())
+    assert rr.round_context(budget, a, later) == rr.RoundContext(2, _iso(20), (b,))
+    assert rr.round_context(budget, new, later) == rr.RoundContext(3, _iso(30), (b, a))
+
+
+def test_a_round_with_no_known_time_makes_late_debt_unknown():
+    legacy = "e" * 40
+    budget = _budget(
+        rounds=[{"head": legacy, "reviews": []}],
+        findings=[{"head": legacy, "submitted_at": _iso(20), "keys": ["c4"], "round_head": legacy}],
+    )
+    assert rr.round_context(budget, legacy, T0 + timedelta(hours=1)) is None
+    assert rr.owed_state(budget, [], now=T0, cutover=CUT)["owed"] is None
+    # No cutover: nothing reads the order, so nothing changes.
+    assert rr.owed_state(budget, [], now=T0)["owed"] == []
+
+
+def test_a_key_with_no_placeable_round_makes_owed_unknown():
+    """A late review with no round head whose ancestry is unknown could never
+    be answered: owed is unknown, not a key owed for ever."""
+    budget = _budget(
+        commits=[{"sha": "d" * 40, "parents": None}],
+        findings=[{"head": "d" * 40, "submitted_at": _iso(5), "keys": ["c7"], "round_head": None}],
+    )
+    assert rr.owed_state(budget, [], now=T0, cutover=CUT)["owed"] is None
 
 
 # -- coverage, in a real repository ------------------------------------------------
@@ -322,37 +370,6 @@ def test_a_reflection_off_the_current_line_credits_nothing(pr, tmp_path):
     budget["commits"].append({"sha": other, "parents": [head]})
     _reflect(path, tmp_path, _block(["c9"], fix), T0 + timedelta(minutes=120))
     assert _credit(path, budget) == set()
-
-
-def test_a_force_pushed_heads_review_needs_a_reflection_before_any_later_fix(pr, tmp_path):
-    path, base, head, fix = pr
-    gone = "7" * 40
-    budget = _pr_budget(base, head, fix, findings=[_finding("c9", gone, 90, None)])
-    budget["rounds"] = [{"head": gone, "reviews": [{"submitted_at": _iso(-30)}]}]
-    budget["findings"][0]["round_head"] = gone
-    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=120))
-    assert _credit(path, budget) == set()
-    _reflect(path, tmp_path, _block(["c9"], fix), T0 + timedelta(minutes=121))
-    assert _credit(path, budget) == {"c9"}
-
-
-def test_a_force_pushed_heads_review_is_answered_anywhere_in_the_current_history(pr, tmp_path):
-    """A review of a head that left the graph can be answered by a valid
-    reflection at any commit in the current history, so it stays answered
-    after later pushes (the reflection itself is one)."""
-    path, base, head, _ = pr
-    _git(path, "checkout", "-q", "-b", "side", head)
-    gone = "7" * 40
-    reflection = _reflect(path, tmp_path, _block(["c9"], head), T0 - timedelta(minutes=5))
-    fix = _change(path, "w\n", T0 + timedelta(minutes=60))
-    budget = _pr_budget(base, head, fix, findings=[_finding("c9", gone, -8, gone)])
-    budget["rounds"] = [{"head": gone, "reviews": [{"submitted_at": _iso(-30)}]}]
-    budget["commits"] = [
-        {"sha": head, "parents": [base]},
-        {"sha": reflection, "parents": [head]},
-        {"sha": fix, "parents": [reflection]},
-    ]
-    assert _credit(path, budget) == {"c9"}
 
 
 def test_a_reflection_with_content_or_after_a_further_fix_credits_nothing(pr, tmp_path):
@@ -563,3 +580,159 @@ def test_status_owes_late_keys_only_from_a_cutover(pr, tmp_path, monkeypatch):
     monkeypatch.setattr(rr, "REFLECTION_CUTOVER_ISO", None)
     monkeypatch.chdir(path)
     assert rr.main(["status", "--cutover", CUT]) == 0
+
+
+# -- round-1 class (PR #3324): every input bound to the key's own round --------
+
+
+def test_round_zero_owes_no_acceptance_and_no_evidence_window(pr, tmp_path):
+    """Codex c4266451775: round 0 owes the grammar only. A reflection without
+    the PR's acceptance Scope line, citing an audit written before the late
+    review, still answers it."""
+    path, base, head, fix = pr
+    budget = _pr_budget(base, head, fix, findings=[_finding("c9", head, 90, None)], gate=True)
+    budget["rounds"] = []
+    audit = tmp_path / "old-audit.txt"
+    audit.write_text("an audit from an earlier round\n")
+    stamp = (T0 - timedelta(days=1)).timestamp()
+    os.utime(audit, (stamp, stamp))
+    text = _block(["c9"], fix, extra=[f"Audit-evidence: {audit} class-audit"])
+    _reflect(path, tmp_path, text, T0 + timedelta(minutes=120))
+    late = rr.late_findings(budget, CUT)
+    credited = rr.covered_late_keys(
+        str(path), budget, late, gate_lane=True, acceptance=["the cache survives a restart"]
+    )
+    assert credited == {"c9"}
+
+
+def test_a_side_branchs_old_commit_is_not_a_fix_on_the_line(pr, tmp_path):
+    """Codex c4266451758: a merged side branch's own commits are not fixes to
+    the reviewed head; the merge that brings them in is."""
+    path, base, head, fix = pr
+    _git(path, "checkout", "-q", "-b", "side", base)
+    (path / "g.txt").write_text("side\n")
+    _git(path, "add", "g.txt")
+    _git(path, "commit", "-q", "-m", "side work", when=T0 - timedelta(minutes=60))
+    _git(path, "checkout", "-q", "-b", "line", head)
+    _git(
+        path, "merge", "-q", "--no-ff", "-m", "merge side", "side", when=T0 + timedelta(minutes=40)
+    )
+    merged = _git(path, "rev-parse", "HEAD")
+    assert rr._fix_times(str(path), head, merged) == [T0 + timedelta(minutes=40)]
+    # An opening review at +10 came before the merge: not owed after the fact.
+    reader = rr.fix_time_reader(str(path), merged)
+    assert reader(head) == T0 + timedelta(minutes=40)
+
+
+def test_status_never_lets_the_open_rounds_coverage_clear_a_late_key(pr, monkeypatch):
+    path, base, head, fix = pr
+    budget = _pr_budget(base, head, fix, findings=[_finding("c9", head, 90, None)])
+    budget.update(round_state="open", open_keys=["c2"], body="")
+    monkeypatch.setattr(rr, "pr_identity", lambda cwd: ("o/r", 1))
+    import review_budget
+
+    monkeypatch.setattr(review_budget, "evaluate_pr", lambda repo, number: budget)
+    monkeypatch.setattr(rr, "covered_keys", lambda *a, **k: {"c2", "c9"})
+    monkeypatch.setattr(rr, "covered_late_keys", lambda *a, **k: set())
+    assert rr.status(str(path), now=T0, cutover=CUT)["owed"] == ["c9"]
+
+
+def test_a_review_of_a_head_outside_the_graph_is_never_credited(pr, tmp_path):
+    """Owner ruling 2026-10-14: a force-push drops late debt. Even handed such
+    a key directly, crediting never places it."""
+    path, base, head, fix = pr
+    gone = "7" * 40
+    budget = _pr_budget(base, head, fix, findings=[_finding("c9", gone, 90, head)])
+    _reflect(path, tmp_path, _block(["c9"], fix), T0 + timedelta(minutes=120))
+    late = [{**budget["findings"][0], "key": "c9", "at": T0 + timedelta(minutes=90)}]
+    assert rr.covered_late_keys(str(path), budget, late, gate_lane=False, acceptance=None) == set()
+
+
+def test_an_unknown_round_order_makes_debt_unknown_never_a_crash():
+    """A timeless round and a late key with no round head: placing the key
+    needs the order, which is unknown, so owed is unknown (it raised before)."""
+    budget = _budget(
+        rounds=[{"head": "e" * 40, "reviews": []}],
+        findings=[{"head": "f" * 40, "submitted_at": _iso(5), "keys": ["c7"], "round_head": None}],
+    )
+    assert rr.late_findings(budget, CUT) is None
+    assert rr.owed_state(budget, [], now=T0, cutover=CUT)["owed"] is None
+
+
+def test_a_legacy_head_reviewed_again_after_the_cutover_keeps_its_opening():
+    """A legacy head marked before the round-rule cutover that also drew a
+    later review opened at its first mark, so a round opened in between is
+    numbered after it."""
+    import review_budget
+
+    cut = datetime.fromisoformat(review_budget.ROUND_RULE_CUTOVER_ISO)
+    old, mid, legacy = cut - timedelta(days=1), cut + timedelta(hours=1), "e" * 40
+    budget = _budget(
+        rounds=[
+            {"head": "a" * 40, "reviews": [{"submitted_at": mid.isoformat()}]},
+            {"head": legacy, "reviews": [{"submitted_at": (mid + timedelta(hours=2)).isoformat()}]},
+        ],
+        marks=[{"head": legacy, "at": old.isoformat()}],
+    )
+    later = mid + timedelta(days=1)
+    assert rr.round_context(budget, legacy, later) == rr.RoundContext(1, old.isoformat(), ())
+    assert rr.round_context(budget, "a" * 40, later).round_number == 2
+
+
+def test_no_review_of_a_head_outside_the_graph_is_owed():
+    """Owner ruling 2026-10-14: a force-push drops late debt, whether the
+    review opened a round or not."""
+    gone = "7" * 40
+    budget = _budget(
+        findings=[{"head": gone, "submitted_at": _iso(5), "keys": ["c7"], "round_head": "a" * 40}]
+    )
+    assert rr.owed_state(budget, [], now=T0, cutover=CUT)["owed"] == []
+
+
+def test_round_zero_still_refuses_an_escalating_reflection(pr, tmp_path):
+    path, base, head, fix = pr
+    budget = _pr_budget(base, head, fix, findings=[_finding("c9", head, 90, None)])
+    budget["rounds"] = []
+    escalating = _block(["c9"], fix).replace("Escalate: no", "Escalate: yes")
+    _reflect(path, tmp_path, escalating, T0 + timedelta(minutes=120))
+    assert _credit(path, budget) == set()
+
+
+def test_a_reflection_made_later_never_withdraws_an_earlier_credit(pr, tmp_path):
+    """Class labels of earlier rounds count only from reflections made before
+    the one being judged: a round-1 reflection committed AFTER the late answer
+    cannot turn its class into a recurring one and withdraw the credit."""
+    path, base, head, fix = pr
+    second = _change(path, "z2\n", T0 + timedelta(minutes=100))
+    budget = _pr_budget(base, head, fix, findings=[_finding("c9", fix, 110, fix)], current=second)
+    budget["rounds"] = [
+        {"head": head, "reviews": [{"submitted_at": _iso(0)}]},
+        {"head": fix, "reviews": [{"submitted_at": _iso(70)}]},
+    ]
+    budget["commits"].append({"sha": second, "parents": [fix]})
+    premise = tmp_path / "premise.txt"
+    premise.write_text(
+        "Design-premise: SOUND-BUT-INFERIOR\n"
+        "Expected before checking: it holds\n"
+        "P1 TRUE — a\n"
+        "P2 FALSE — b\n"
+    )
+    stamp = (T0 + timedelta(minutes=115)).timestamp()
+    os.utime(premise, (stamp, stamp))
+    answer = (
+        _block(
+            ["c9"],
+            second,
+            extra=[
+                "Premise-check: P1 TRUE the store already dedups by key",
+                "Premise-check: P2 FALSE replies are never top level",
+                f"Premise-evidence: {premise} SOUND-BUT-INFERIOR",
+            ],
+        )
+        .replace("Premise: LEAD", "Premise: SOUND-BUT-INFERIOR")
+        .replace("Decision: close-class", "Decision: fix-instances")
+    )
+    _reflect(path, tmp_path, answer, T0 + timedelta(minutes=120))
+    assert _credit(path, budget) == {"c9"}
+    _reflect(path, tmp_path, _block(["c1"], head), T0 + timedelta(minutes=130))
+    assert _credit(path, budget) == {"c9"}

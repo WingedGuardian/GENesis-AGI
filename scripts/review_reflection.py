@@ -1023,43 +1023,51 @@ def _descends(ancestors: Any, sha: str, base: str) -> bool:
     return found is not None and base in found
 
 
-def _round_order(budget: Mapping[str, Any]) -> list[tuple[str, datetime | None]]:
-    """Round heads in the order they OPENED, with each opening time: the
-    earliest review that opened it. Never the ``rounds`` list order, which is
-    by commit date (#3302). Rounds with no known time (legacy) come first."""
+def _round_order(budget: Mapping[str, Any]) -> list[tuple[str, datetime]] | None:
+    """Round heads in the order they OPENED, each with its opening time: the
+    earliest review that opened it, or the earliest review of its head
+    before ``review_budget.ROUND_RULE_CUTOVER_ISO`` (``marks``: that is what
+    made it a legacy round). Never the ``rounds`` list order, which is by commit date
+    (#3302), and never a guess: a round with no known time makes the whole
+    order unknown (None). Ties break by head."""
+    import review_budget  # noqa: PLC0415
+
+    cutover = _parse_when(review_budget.ROUND_RULE_CUTOVER_ISO)
+    legacy_marks: dict[str, list[datetime]] = {}
+    for mark in budget.get("marks") or []:
+        when = _parse_when(mark.get("at")) if isinstance(mark, Mapping) else None
+        # A mark before the round-rule cutover is what made a head a legacy
+        # round; its earliest one is when that round opened, even when the
+        # head also drew a post-cutover review later.
+        if when is not None and cutover is not None and when < cutover:
+            legacy_marks.setdefault(str(mark.get("head")), []).append(when)
     order = []
     for entry in budget.get("rounds") or []:
+        head = str(entry.get("head"))
         times = [
             when
             for review in entry.get("reviews") or []
             if (when := _parse_when(review.get("submitted_at"))) is not None
-        ]
-        order.append((str(entry.get("head")), min(times) if times else None))
-    floor = datetime.min.replace(tzinfo=UTC)
-    return sorted(order, key=lambda item: (item[1] is not None, item[1] or floor, item[0]))
+        ] + legacy_marks.get(head, [])
+        if not times:
+            return None
+        order.append((head, min(times)))
+    return sorted(order, key=lambda item: (item[1], item[0]))
 
 
 def round_context(budget: Mapping[str, Any], round_head: str, at: datetime) -> RoundContext | None:
     """Round ``round_head``'s context as of ``at``: its number among the rounds
     opened by then, its start, and the heads of the rounds before it. None when
-    it is not a round head, or it had not opened by ``at``. A round with no
-    known opening time (legacy) starts at its earliest listed finding, or is
-    unknown, which refuses any evidence it would need."""
-    opened = [(head, when) for head, when in _round_order(budget) if when is None or when <= at]
-    heads = [head for head, _ in opened]
+    it is not a round head, it had not opened by ``at``, or the rounds' order
+    is unknown."""
+    order = _round_order(budget)
+    if order is None:
+        return None
+    heads = [head for head, when in order if when <= at]
     if round_head not in heads:
         return None
     index = heads.index(round_head)
-    started = opened[index][1]
-    if started is None:
-        times = [
-            when
-            for item in budget.get("findings") or []
-            if item.get("round_head") == round_head
-            and (when := _parse_when(item.get("submitted_at"))) is not None
-        ]
-        started = min(times) if times else None
-    return RoundContext(index + 1, started.isoformat() if started else None, tuple(heads[:index]))
+    return RoundContext(index + 1, order[index][1].isoformat(), tuple(heads[:index]))
 
 
 def late_findings(
@@ -1103,10 +1111,11 @@ def late_findings(
         keys = item.get("keys") or []
         if any(not isinstance(key, str) for key in keys):
             return None
+        head = str(item.get("head"))
+        if head not in in_graph:
+            # A force-push dropped it (owner ruling 2026-10-14).
+            continue
         if keys and set(keys) <= opening:
-            head = str(item.get("head"))
-            if head not in in_graph:
-                continue
             if fix_time is None:
                 return None
             fixed = fix_time(head)
@@ -1115,6 +1124,13 @@ def late_findings(
         for key in keys:
             if key not in own and key not in found:
                 found[key] = {**item, "key": key, "at": when}
+    # Every owed key must have a round to be answered under. One that cannot
+    # be placed (unknown round order, unknown ancestry) makes owed unknown,
+    # never a key no reflection could ever clear.
+    _, ancestors = _ancestry(budget)
+    latest = datetime.max.replace(tzinfo=UTC)
+    if any(_contexts(budget, item, latest, ancestors) is None for item in found.values()):
+        return None
     return list(found.values())
 
 
@@ -1131,8 +1147,10 @@ def _contexts(
     found = ancestors(str(item.get("head")))
     if found is None:
         return None
-    heads = {head for head, _ in _round_order(budget)}
-    older = {head for head in heads if head in found}
+    order = _round_order(budget)
+    if order is None:
+        return None
+    older = {head for head, _ in order if head in found}
     if not older:
         return [RoundContext(0, item["at"].isoformat(), ())]
     # The newest by ancestry: no other candidate descends from it. Two
@@ -1148,12 +1166,21 @@ def _contexts(
 
 
 def _fix_times(cwd: str, base: str, head: str) -> list[datetime]:
-    """The author time of every fix after ``base`` on the way to ``head``: each
-    commit that is a merge or changes the tree (an empty reflection commit is
-    no fix). The AUTHOR time, the earlier of the two: amending a fix rewrites
-    only its committer time (owner ruling 2026-10-13). Raises ``Refused`` when
+    """The author time of every fix on the LINE from ``base`` to ``head``
+    (``--ancestry-path``: descendants of ``base`` that ``head`` reaches, so a
+    side branch's own commits drop out and the merge that brought it in
+    stays): each commit that is a merge or changes the tree (an empty
+    reflection commit is no fix). The owe rule (earliest fix to the current
+    head) and the credit rule (latest fix to the reflection's head) read the
+    same line, so a key owed is answerable until the next fix lands. A fix
+    committed while a key is owed leaves it owed for good: the commit gate
+    that sets the cutover must stop that commit (stated for that PR). The
+    AUTHOR time, the earlier of the two: amending a fix rewrites only its
+    committer time (owner ruling 2026-10-13). Raises ``Refused`` when
     git cannot say."""
-    code, out, _ = _run(["git", "-C", cwd, "log", "--format=%H %T %P|%at", f"{base}..{head}"])
+    code, out, _ = _run(
+        ["git", "-C", cwd, "log", "--ancestry-path", "--format=%H %T %P|%at", f"{base}..{head}"]
+    )
     if code != 0:
         raise Refused(f"git log {base[:12]}..{head[:12]} failed")
     times = []
@@ -1199,16 +1226,22 @@ def covered_late_keys(
 
     - R is an empty commit made before any fix to N (``before_any_fix``);
     - N is the current head or in its history, and N is H or descends from it
-      (from the budget's commit graph; unknown ancestry never credits). A key
-      whose head left the graph (rebased or force-pushed away) can be answered
-      at any commit in the current history;
+      (from the budget's commit graph; unknown ancestry never credits). A head
+      that left the graph (a force-push of the PR branch) is never owed here
+      (owner ruling 2026-10-14: a force-push drops late debt; the default
+      branch itself refuses force-pushes by ruleset);
     - S is no later than T: an answer cannot predate its finding;
     - when N is not H, S is after the LATEST fix on the way from H to N (author
       time). A review that arrived before a fix was owed before it, and a
       reflection made after that fix is a rationalisation, not a reflection;
     - ``check`` passes R under k's own round's context (every candidate round
       when k's round is ambiguous): that round's number, its earlier rounds'
-      classes, and evidence written from that round's start to T.
+      classes, the PR's acceptance points, and evidence written from that
+      round's start to T. Round 0 (a late review with no earlier round) owes
+      the grammar only: no acceptance points, no evidence window.
+
+    Returns only keys from ``late``; the open round's coverage is never mixed
+    in (``owed_state`` keeps the two apart).
 
     ``deadline`` is a ``time.monotonic()`` bound; past it the check refuses.
     Raises ``Refused`` when git cannot be read: unknown, never nothing owed."""
@@ -1217,7 +1250,7 @@ def covered_late_keys(
     current = budget.get("current_head")
     in_graph, ancestors = _ancestry(budget)
     log = _log_reflections(cwd)
-    labels: dict[tuple[str, ...], list[str]] = {}
+    labels: dict[tuple[tuple[str, ...], datetime], list[str]] = {}
     checked: dict[tuple[str, RoundContext], bool] = {}
     fix_times: dict[tuple[str, str], datetime | None] = {}
     covered: set[str] = set()
@@ -1237,11 +1270,11 @@ def covered_late_keys(
             if key in covered or key not in parsed.keys:
                 continue
             reviewed = str(item.get("head"))
-            if reviewed in in_graph and not _descends(ancestors, head, reviewed):
+            if reviewed not in in_graph or not _descends(ancestors, head, reviewed):
                 continue
             if item["at"] > made_at + _COMMIT_CLOCK_SLACK:
                 continue
-            if head != reviewed and reviewed in in_graph:
+            if head != reviewed:
                 if (reviewed, head) not in fix_times:
                     found = _fix_times(cwd, reviewed, head)
                     fix_times[(reviewed, head)] = max(found) if found else None
@@ -1253,15 +1286,20 @@ def covered_late_keys(
                 continue
             passed = True
             for context in contexts:
+                if (sha, context) not in checked and context.round_number == 0:
+                    checked[(sha, context)] = parsed.ok and not parsed.escalate
                 if (sha, context) not in checked:
-                    if context.prior_heads not in labels:
-                        labels[context.prior_heads] = _class_labels(log, context.prior_heads)
+                    if (context.prior_heads, made_at) not in labels:
+                        earlier = [row for row in log if row[3] is not None and row[3] <= made_at]
+                        labels[(context.prior_heads, made_at)] = _class_labels(
+                            earlier, context.prior_heads
+                        )
                     checked[(sha, context)] = check(
                         body,
                         head=head,
                         round_number=context.round_number,
                         gate_lane=gate_lane,
-                        previous_classes=labels[context.prior_heads],
+                        previous_classes=labels[(context.prior_heads, made_at)],
                         acceptance=acceptance,
                         round_started=context.round_started,
                         made_at=made_at,
@@ -1280,12 +1318,15 @@ def owed_state(
     now: datetime,
     cutover: str | None = None,
     fix_time: Any = None,
+    late_covered: Iterable[str] = (),
 ) -> dict[str, Any]:
-    """What is owed, from a ``review_budget`` result: the open round's keys,
-    plus the late keys from ``cutover`` on (``late_findings``), less
-    ``covered``. With ``cutover`` None that is exactly the open round, and
-    pure; a ``fix_time`` reader (``fix_time_reader``) reads local git and may
-    raise ``Refused``."""
+    """What is owed, from a ``review_budget`` result: the open round's keys
+    less ``covered`` (``covered_keys``), plus the late keys from ``cutover`` on
+    (``late_findings``) less ``late_covered`` (``covered_late_keys``). The two
+    are subtracted apart, so a reflection judged under the open round never
+    clears a late key, which only its own round's context can. With
+    ``cutover`` None that is exactly the open round, and pure; a ``fix_time``
+    reader (``fix_time_reader``) reads local git and may raise ``Refused``."""
     state: dict[str, Any] = {
         "status": budget.get("status"),
         "round": budget.get("count"),
@@ -1310,9 +1351,10 @@ def owed_state(
     if budget.get("status") != "ok":
         return state
     done = set(covered)
+    late_done = set(late_covered)
     late = late_findings(budget, cutover, fix_time)
     state["late_keys"] = None if late is None else [item["key"] for item in late]
-    late_owed = None if late is None else [k for k in state["late_keys"] if k not in done]
+    late_owed = None if late is None else [k for k in state["late_keys"] if k not in late_done]
     if budget.get("round_state") != "open":
         state["owed"] = late_owed
         # A finished round's reviews have all landed: once late findings are
@@ -1380,6 +1422,7 @@ def status(
     if is_open or late:
         acceptance = _acceptance(budget, repo, number)
         covered: set[str] = set()
+        late_covered: set[str] = set()
         if is_open:
             covered = covered_keys(
                 cwd,
@@ -1391,11 +1434,16 @@ def status(
                 round_started=state["round_started"],
             )
         if late:
-            covered |= covered_late_keys(
+            late_covered = covered_late_keys(
                 cwd, budget, late, gate_lane=state["gate_lane"], acceptance=acceptance
             )
         state = owed_state(
-            budget, covered, now=now or datetime.now(UTC), cutover=cutover, fix_time=fix_time
+            budget,
+            covered,
+            now=now or datetime.now(UTC),
+            cutover=cutover,
+            fix_time=fix_time,
+            late_covered=late_covered,
         )
     state.update({"repo": repo, "pr": number, "errors": budget.get("errors", [])})
     return state
