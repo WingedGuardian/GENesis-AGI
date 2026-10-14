@@ -59,6 +59,13 @@ import sys
 import unicodedata
 
 
+def _gone(exc: OSError) -> bool:
+    """True when the error means the process (or the descriptor) is gone. Any
+    other failure (EACCES, say) means it could not be inspected: never "gone"
+    (review finding)."""
+    return exc.errno in (errno.ENOENT, errno.ESRCH)
+
+
 def _safe(raw: bytes) -> str:
     # A renderer may break a line at, or reorder text around, any of these: a
     # process-chosen name must never be able to start a line of its own or
@@ -99,7 +106,7 @@ def _fallback(dfd: int) -> tuple[str, str, str, str] | None:
                 ppid = value.decode() if value.isdigit() else "?"
                 break
     except OSError as exc:
-        if exc.errno == errno.ESRCH:
+        if exc.errno == errno.ESRCH:  # through the handle: only ESRCH means exited
             return None
     return ("?", "?", comm, ppid)
 
@@ -110,7 +117,7 @@ def _stat_fields(dfd: int) -> tuple[str, str, str, str] | None:
     try:
         raw = _read("stat", dfd)
     except OSError as exc:
-        if exc.errno == errno.ESRCH:
+        if exc.errno == errno.ESRCH:  # exited; anything else falls back
             return None
         return _fallback(dfd)
     head, sep, tail = raw.rpartition(b")")
@@ -135,8 +142,10 @@ def _threads(dfd: int) -> str:
 def _chain_one(root: str, pid: str, want: str) -> str:
     try:
         dfd = os.open(f"{root}/{pid}", os.O_RDONLY | os.O_DIRECTORY)
-    except OSError:
-        return f"{pid}\tgone\t-\t-\t-\t-\t-\t-"
+    except OSError as exc:
+        if _gone(exc):
+            return f"{pid}\tgone\t-\t-\t-\t-\t-\t-"
+        return f"{pid}\tunknown\t-\t-\t-\t-\t-\t-"
     try:
         ident = _stat_fields(dfd)
         if ident is None or (want != "-" and ident[0] != want):
@@ -228,28 +237,44 @@ def holders(root: str, lines: list[str]) -> list[str]:
         by_pid.setdefault(pid, []).append((key, fd))
     out = []
     for pid, cands in by_pid.items():
+        # A holder that cannot be inspected (EACCES, say) is still a holder
+        # the walk found: it is printed with an unknown identity ("?"), so the
+        # file stays watched and nothing is acted on without its start time
+        # (review finding). Only a disappearance drops it.
+        unknown = "\t".join(("?",) * 5)
         try:
             dfd = os.open(f"{root}/{pid}", os.O_RDONLY | os.O_DIRECTORY)
-        except OSError:
-            continue  # gone, or never there
+        except OSError as exc:
+            if not _gone(exc):
+                for key in dict.fromkeys(k for k, _ in cands):
+                    out.append(f"{key}\t{pid}\t{unknown}")
+            continue
         try:
             held = []
+            unread = []
             for key, fd in cands:
                 try:
                     st = os.stat(f"fd/{fd}", dir_fd=dfd)
                     if f"{st.st_dev}:{st.st_ino}" == key and _writer(dfd, fd) and key not in held:
                         held.append(key)
-                except OSError:
+                except OSError as exc:
+                    if not _gone(exc) and key not in unread:
+                        unread.append(key)
                     continue  # descriptor closed, or the process exited
-            if not held:
-                continue
-            ident = _stat_fields(dfd)
-            if ident is None:
-                continue
-            start, state, comm, ppid = ident
-            pid_p, pcomm = _parent(root, dfd, ppid)
-            for key in held:
-                out.append("\t".join((key, pid, start, state, comm, pid_p, pcomm)))
+            if held:
+                ident = _stat_fields(dfd)
+                if ident is None:
+                    continue  # exited: nothing it held is held
+                start, state, comm, ppid = ident
+                pid_p, pcomm = _parent(root, dfd, ppid)
+                for key in held:
+                    out.append("\t".join((key, pid, start, state, comm, pid_p, pcomm)))
+            # The unknown rows come LAST: the watchgod keeps one identity per
+            # pid, the last row it reads, so a pid with any file it could not
+            # read stays unknown and is never acted on (review finding).
+            for key in unread:
+                if key not in held:
+                    out.append(f"{key}\t{pid}\t{unknown}")
         finally:
             os.close(dfd)
     return out

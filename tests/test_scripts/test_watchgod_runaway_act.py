@@ -460,6 +460,45 @@ def test_a_stop_that_is_not_confirmed_stays_pending_and_is_promoted_later(box):
     assert [r[6] for r in _frozen(box)] == ["paused", "paused"]
 
 
+def test_every_process_between_the_root_and_a_holder_is_paused(box):
+    """claude -> bash (root) -> supervisor -> worker (holds the file): the
+    supervisor holds nothing but could restart the worker, so it is paused
+    and recorded too, parents first (review finding)."""
+    f = _task_output(box)
+    _proc(box, 100, "claude", 1, starttime=500)
+    _proc(box, 200, "bash", 100, starttime=2000)
+    _proc(box, 250, "supervisor", 200, starttime=2005)
+    _proc(box, 300, "worker", 250, f, starttime=2010)
+    _respond(box, f)
+    assert _kills(box) == ["kill -STOP 200", "kill -STOP 250", "kill -STOP 300"]
+    assert sorted((r[0], r[1], r[2]) for r in _frozen(box)) == [
+        ("200", "2000", "bash"),
+        ("250", "2005", "supervisor"),
+        ("300", "2010", "worker"),
+    ]
+
+
+def test_slow_confirmations_never_leave_a_later_holder_unsignalled(box):
+    """Stops that never confirm each spend up to a second; every process is
+    recorded and signalled before any confirmation is waited for, so the
+    bounded deadline can never leave a later holder running (review finding).
+    With no stop confirmed, the detection page never says "paused"."""
+    f = _task_output(box)
+    _proc(box, 100, "claude", 1, starttime=500)
+    _proc(box, 200, "bash", 100, f, starttime=2000)
+    holders = [210 + i for i in range(7)]
+    for i, pid in enumerate(holders):
+        _proc(box, pid, f"w{i}", 200, f, starttime=2100 + i)
+    nostop = 'kill() { echo "kill $*" >> "$WG_KILLS"; return 0; }'
+    out = _respond(box, f, between=nostop)
+    assert sorted(_kills(box)) == sorted(f"kill -STOP {p}" for p in [200, *holders])
+    assert sorted(r[0] for r in _frozen(box)) == sorted(str(p) for p in [200, *holders])
+    assert "ACTED=unconfirmed" in out.stdout
+    detect = [p for p in _pages(box) if p["title"].startswith("Runaway file on")]
+    assert detect and "paused the command" not in detect[0]["body"]
+    assert "no stop is confirmed yet" in detect[0]["body"]
+
+
 # ── reminders ─────────────────────────────────────────────────────
 
 
@@ -598,7 +637,8 @@ def test_a_traced_holder_is_not_called_paused_on_t(box):
     assert [r[6] for r in _frozen(box)] == ["pending-t"]
     # A second process (fresh state) that sees the file grow again: it acts.
     out = _respond(box, f, between=nostop, grow_mb=80)
-    assert "ACTED=paused" in out.stdout, "the second response did act"
+    # It acted: signalled again, and honest that the stop is not confirmed.
+    assert "ACTED=unconfirmed" in out.stdout, "the second response did act"
     assert [r[6] for r in _frozen(box)] == ["pending-t"], "still t: never promoted"
 
 
@@ -759,7 +799,7 @@ def test_a_thaw_between_the_owed_check_and_the_lock_pauses_nothing(box):
         + "_THAWED=0\n"
         + "wg_records_lock() {\n"
         + "  if (( ! _THAWED )); then _THAWED=1\n"
-        + "    : > \"$(wg_records_file)\"\n"
+        + '    : > "$(wg_records_file)"\n'
         + f"    sed -i 's/^State:.*/State:\\tS (x)/' '{proc}/200/status' '{proc}/201/status'\n"
         + f"    sed -i 's/) T /) S /' '{proc}/200/stat' '{proc}/201/stat'\n"
         + "  fi\n"

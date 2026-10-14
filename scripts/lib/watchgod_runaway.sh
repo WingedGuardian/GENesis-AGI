@@ -523,6 +523,8 @@ wg_runaway_check() {
         fi
         if [[ "$_RW_ACTED" == paused ]]; then
             body+=$'\n'"The guardian paused the command writing it (its action page says how to resume or end it); the file could not be emptied yet."
+        elif [[ "$_RW_ACTED" == unconfirmed ]]; then
+            body+=$'\n'"The guardian sent SIGSTOP to the command writing it, but no stop is confirmed yet (its action page says how to resume or end it). Make sure the writer stops before the filesystem fills."
         elif [[ -n "$_RW_ACTED" ]]; then
             body+=$'\n'"The guardian did not pause it (${_RW_ACTED}). Stop the writer, or empty the file, before the filesystem fills."
         else

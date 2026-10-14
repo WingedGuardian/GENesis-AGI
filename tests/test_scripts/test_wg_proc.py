@@ -18,6 +18,7 @@ What these pin:
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import os
 import subprocess
@@ -279,6 +280,61 @@ def test_every_candidate_of_one_pid_is_read_through_one_handle(fake, monkeypatch
     fields = [r.split("\t") for r in rows]
     assert [f[0] for f in fields] == [_key(target), _key(other)], "each file once, in order"
     assert fields[0][1:] == fields[1][1:], "both rows describe the same process"
+
+
+@pytest.mark.parametrize("err", [errno.EACCES, errno.EPERM])
+def test_a_process_that_cannot_be_inspected_is_unknown_never_gone(fake, monkeypatch, err):
+    """Only a disappearance (ENOENT, ESRCH) means gone. Any other failure to
+    open /proc/<pid> reads as unknown in a chain (so the response vetoes) and
+    as an unknown identity for a holder (so the file stays watched) (review
+    finding)."""
+    proc, target = fake
+    _fake(proc, 4200, target, comm=b"dd")
+    real_open = os.open
+
+    def deny(path, *a, **kw):
+        if str(path) == f"{proc}/4200":
+            raise OSError(err, os.strerror(err))
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(wg.os, "open", deny)
+    assert wg.chain(str(proc), ["4200 -"])[0].split("\t")[1] == "unknown"
+    assert wg.holders(str(proc), [f"{_key(target)} 4200 1"]) == [
+        "\t".join([_key(target), "4200", "?", "?", "?", "?", "?"])
+    ]
+
+
+def test_a_pid_with_an_unreadable_file_ends_with_an_unknown_identity(fake, monkeypatch):
+    """One process holds a readable file and one whose descriptor cannot be
+    read: the unknown row is printed LAST, so the watchgod (one identity per
+    pid, the last row wins) never acts on it with the readable file's start
+    time (review finding)."""
+    proc, target = fake
+    other = target.parent / "other"
+    other.touch()
+    _fake(proc, 4300, target, comm=b"dd")
+    (proc / "4300" / "fd" / "2").symlink_to(other)
+    (proc / "4300" / "fdinfo" / "2").write_text("pos:\t0\nflags:\t0102001\n")
+    real_stat = os.stat
+
+    def stale(path, *a, **kw):
+        if str(path) == "fd/2":
+            raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(wg.os, "stat", stale)
+    rows = [
+        r.split("\t")
+        for r in wg.holders(str(proc), [f"{_key(target)} 4300 1", f"{_key(other)} 4300 2"])
+    ]
+    assert [r[0] for r in rows] == [_key(target), _key(other)]
+    assert rows[0][2] == "777" and rows[-1][2:] == ["?"] * 5, "the last row for the pid is unknown"
+
+
+def test_a_process_that_is_gone_is_gone(fake):
+    proc, _target = fake
+    assert wg.chain(str(proc), ["4299 -"])[0].split("\t")[1] == "gone"
+    assert wg.holders(str(proc), ["1:2 4299 1"]) == []
 
 
 def test_malformed_candidates_are_skipped(fake):
