@@ -26,6 +26,8 @@ def _lesson(origin: str = "owner", reviewed: bool = False) -> dict:
 
 
 async def _row(db, pid: str, *, tier="DORMANT", lesson=None, trigger_spec=None, embed=False) -> str:
+    if lesson is not None and trigger_spec is None:  # every lesson writer stores a spec
+        trigger_spec = {"patterns": ["tag-" + pid], "repeat": "session"}
     return await procedural.create(
         db,
         id=pid,
@@ -238,7 +240,8 @@ async def test_a_field_the_advisor_cannot_read_leaves_only_that_row_out(
     await trigger_cache.regenerate(db)
     entries = _entries(cache_path)
     assert "good" in entries
-    assert "bad_lesson" not in entries
+    # A lesson never reads its tags, so only a bad tag list leaves it in.
+    assert ("bad_lesson" in entries) is (column == "context_tags")
     # An earned row's bad trigger_spec falls back to its tags (as before); every
     # other bad field leaves it out.
     assert ("bad_earned" in entries) is (column == "trigger_spec")
@@ -249,3 +252,46 @@ def test_an_overflowing_quantifier_is_refused_by_the_validator():
 
     with pytest.raises(ValueError):
         validate_trigger_spec({"patterns": ["a{999999999999999999999}"], "repeat": "every"})
+
+
+async def test_a_lesson_without_a_spec_matches_nothing(db, cache_path):
+    await _row(db, "bare", lesson=_lesson("owner"))
+    await db.execute("UPDATE procedural_memory SET trigger_spec = NULL WHERE id = 'bare'")
+    await db.commit()
+    await trigger_cache.regenerate(db)
+    assert "bare" not in _entries(cache_path)  # never falls back to its tags
+
+
+async def test_the_cache_carries_commands(db, cache_path):
+    spec = {"patterns": [], "commands": ["git push"], "repeat": "session"}
+    await _row(db, "cli", lesson=_lesson("owner"), trigger_spec=spec)
+    await _row(db, "earned", tier="CORE", trigger_spec={**spec, "repeat": "every"})
+    await trigger_cache.regenerate(db)
+    entries = _entries(cache_path)
+    assert entries["cli"]["commands"] == ["git push"]
+    assert entries["cli"]["patterns"] == []
+    assert entries["earned"]["commands"] == ["git push"]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"patterns": [], "commands": ["rm"], "repeat": "every"},  # not a known command phrase
+        {"patterns": [], "commands": [], "repeat": "every"},
+        {"patterns": [], "commands": "git push", "repeat": "every"},
+        {"patterns": [], "repeat": "every"},  # neither patterns nor commands
+        {"patterns": ["x"], "commands": ["git push"] * 9, "repeat": "every"},
+    ],
+)
+def test_the_validator_refuses_bad_commands(spec):
+    from genesis.learning.procedural.lesson_shape import validate_trigger_spec
+
+    with pytest.raises(ValueError):
+        validate_trigger_spec(spec)
+
+
+def test_the_validator_accepts_commands_alone():
+    from genesis.learning.procedural.lesson_shape import validate_trigger_spec
+
+    spec = {"patterns": [], "commands": ["git push", "pytest"], "repeat": "session"}
+    assert validate_trigger_spec(spec) == spec

@@ -113,7 +113,7 @@ def _require_reader_types(entry: dict) -> dict:
     """
     if not entry["tool"] or not _str_list(entry["tool"]):
         raise ValueError("tool_trigger is not a list of tool names")
-    for key in ("patterns", "context_patterns"):
+    for key in ("patterns", "context_patterns", "commands"):
         if key in entry and not _str_list(entry[key]):
             raise ValueError(f"{key} is not a list of strings")
     if not _str_list(entry["steps"]):
@@ -132,9 +132,13 @@ def _lesson_entry(row: dict) -> dict | None:
     if not tools:
         return None
     spec = _trigger_spec(row)
+    if not spec:  # a lesson fires only on what its author wrote, never on tags
+        return None
     entry = _entry(row, tools, "lesson")
-    entry["patterns"] = spec["patterns"] if spec else _json(row["context_tags"])
-    entry["repeat"] = spec["repeat"] if spec else "session"
+    entry["patterns"] = spec["patterns"]
+    entry["repeat"] = spec["repeat"]
+    if "commands" in spec:
+        entry["commands"] = spec["commands"]
     if _json(row["lesson"]).get("reviewed") is not True:
         entry["label"] = "unreviewed"
     return _require_reader_types(entry)
@@ -154,6 +158,8 @@ def _earned_entry(row: dict) -> dict | None:
     entry = _entry(row, tools, "earned")
     entry["context_patterns"] = context_patterns
     entry["patterns"] = spec["patterns"] if spec else context_patterns
+    if spec and "commands" in spec:
+        entry["commands"] = spec["commands"]
     entry["repeat"] = "every"
     return _require_reader_types(entry)
 
