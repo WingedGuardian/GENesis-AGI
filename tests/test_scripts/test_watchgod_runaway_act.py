@@ -177,7 +177,11 @@ def _kills(box) -> list[str]:
 
 def _frozen(box) -> list[list[str]]:
     f = box["home"] / ".genesis" / "watchgod" / "frozen"
-    return [line.split("\t") for line in f.read_text().splitlines()] if f.exists() else []
+    # Split on "\n" only, as the watchgod's bash readers do: str.splitlines()
+    # also breaks at U+2028 and other separators a path may hold.
+    if not f.exists():
+        return []
+    return [line.split("\t") for line in f.read_text().split("\n") if line]
 
 
 def _log(box) -> str:
@@ -448,6 +452,27 @@ def test_a_pause_left_in_place_is_reminded_without_raw_pids(box):
         and "scripts/watchgod kill 201" in rem[0]["body"]
     )
     _no_raw_kill(box)
+
+
+def test_a_task_output_name_cannot_forge_or_disguise_page_lines(box):
+    """A task output's path is shown in the action page, the detection page,
+    the reminder and the log; a Unicode line separator or bidi control in it
+    is shown as "?" there, like a process name. The pause record keeps the
+    real path, and the file is still acted on."""
+    f = _task_output(box, rel="claude-1000/-pr\u2028oj/se\u202ess-1/tasks/b\u2029x.output")
+    _session(box, f)
+    out = _respond(box, f)
+    assert "ACTED=paused" in out.stdout
+    assert [r[5] for r in _frozen(box)] == [str(f), str(f)], "the record keeps the real path"
+    _run(box, f"_rw_repage {int(time.time()) + 7 * 3600}")
+    pages = _pages(box)
+    assert {p["title"].split(" ")[0] for p in pages} >= {"Paused", "Runaway", "Still"}
+    for text in [x for p in pages for x in (p["title"], p["body"])] + [_log(box)]:
+        for ch in ("\u2028", "\u2029", "\u202e"):
+            assert ch not in text, text
+    act = next(p for p in pages if p["title"].startswith("Paused"))
+    assert "-pr?oj/se?ss-1/tasks/b?x.output" in act["body"]
+    assert "Claude Code session: se?ss-1" in act["body"]
 
 
 def test_a_record_of_another_boot_is_not_reminded(box):

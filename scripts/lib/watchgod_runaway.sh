@@ -245,12 +245,28 @@ _rw_domain_for() {
     printf '%s\n' "${best:-$fallback}"
 }
 
+_rw_show() {
+    # $1 made safe for a page or a log line: a file name is chosen by whoever
+    # created the file, and a newline, a Unicode line separator or a bidi
+    # control in it could forge or disguise page lines (review finding). The
+    # same sanitiser as the process names; printable ASCII only without it.
+    local out
+    if out="$(printf '%s' "$1" | timeout -k 1 5 python3 -I -S "$_RW_PROC_PY" - safe 2>/dev/null)" \
+            && [[ -n "$out" ]]; then
+        printf '%s' "$out"
+    else
+        printf '%s' "$1" | LC_ALL=C tr -c '[:print:]' '?'
+    fi
+}
+
 _rw_holders() {
     # One line per distinct holder: "pid comm (parent ppid: comm)". Never the
     # command line: arguments can carry credentials, and the page leaves the
     # machine (review finding, P1).
     # Names come from the identity read through the holder's own /proc handle
-    # (_RW_IDENT); without one, from comm with control bytes removed.
+    # (_RW_IDENT); without one, from comm with everything but printable
+    # ASCII replaced (any locale: a multibyte line separator or bidi control
+    # must not reach the page either).
     local proc="${DG_PROC:-/proc}" pid comm ppid pcomm
     for pid in "$@"; do
         if [[ -n "${_RW_IDENT[$pid]:-}" ]]; then
@@ -260,7 +276,8 @@ _rw_holders() {
             ppid="$(awk '/^PPid:/ { print $2; exit }' "$proc/$pid/status" 2>/dev/null)" || ppid=""
             pcomm="?"
             [[ "$ppid" =~ ^[0-9]+$ ]] && pcomm="$(cat "$proc/$ppid/comm" 2>/dev/null)" || true
-            comm="${comm//[[:cntrl:]]/?}"; pcomm="${pcomm//[[:cntrl:]]/?}"
+            comm="$(printf '%s' "$comm" | LC_ALL=C tr -c '[:print:]' '?')"
+            pcomm="$(printf '%s' "$pcomm" | LC_ALL=C tr -c '[:print:]' '?')"
         fi
         printf '  pid %s %s (parent %s: %s)\n' "$pid" "${comm:-?}" "${ppid:-?}" "${pcomm:-?}"
     done
@@ -414,9 +431,11 @@ _rw_respond() {
     # dev:inode, $3 path, $4 size MB, rest: holder pids (identity in
     # _RW_IDENT). Sets _RW_PAUSED_NOW=1 when it paused something this poll and
     # _RW_ACTED to a one-line summary for the detection page.
-    local gen="$1" key="$2" path="$3" size_mb="$4"
+    local gen="$1" key="$2" path="$3" size_mb="$4" spath
     shift 4
     _RW_PAUSED_NOW=0; _RW_ACTED=""
+    # Shown copies only (pages, log lines); the record keeps the real path.
+    spath="$(_rw_show "$path")"
     local pid st ident status comm state threads depth root anc veto="" in="" r
     local -A st_of=() comm_of=() depth_of=() roots=()
     # Identity of every holder, as read at discovery.
@@ -489,7 +508,7 @@ _rw_respond() {
         fi
     fi
     if [[ -n "$veto" ]]; then
-        _wg_warn_once "rw_veto_${gen}_${veto}" "runaway ${path}: not paused: ${veto}"
+        _wg_warn_once "rw_veto_${gen}_${veto}" "runaway ${spath}: not paused: ${veto}"
         _RW_ACTED="not paused: ${veto}"
         return 0
     fi
@@ -501,7 +520,7 @@ _rw_respond() {
     # still-running parent before the parent's turn.
     order="$(for pid in "${!depth_of[@]}"; do printf '%s %s\n' "${depth_of[$pid]}" "$pid"; done | sort -n)"
     if ! wg_records_lock lk "$DG_RUNAWAY_LOCK_WAIT_S"; then
-        _wg_warn_once "rw_lock_${gen}" "runaway ${path}: not paused this poll: the pause records' lock could not be taken (an operator command holds it, or the state directory is not writable); retried every poll"
+        _wg_warn_once "rw_lock_${gen}" "runaway ${spath}: not paused this poll: the pause records' lock could not be taken (an operator command holds it, or the state directory is not writable); retried every poll"
         _RW_ACTED="not paused this poll: the pause records' lock could not be taken (an operator command holds it, or the state directory is not writable)"
         return 0
     fi
@@ -539,7 +558,7 @@ _rw_respond() {
         if (( rc != 0 )); then
             # Nothing was sent: the record would name a stop that never happened.
             wg_record_drop "$pid" "$st" {lk}>&- \
-                || log WARN "runaway ${path}: the record of pid ${pid} names a stop that was never sent and could not be removed"
+                || log WARN "runaway ${spath}: the record of pid ${pid} names a stop that was never sent and could not be removed"
             (( rc == 1 )) || refused+=" ${pid}"
             continue
         fi
@@ -556,7 +575,7 @@ _rw_respond() {
 
     local all="${paused}${unconfirmed}"
     if [[ -z "$all" ]]; then
-        log WARN "runaway ${path}: no writer could be paused (pid${refused:- none})"
+        log WARN "runaway ${spath}: no writer could be paused (pid${refused:- none})"
         _RW_ACTED="no writer could be paused"
         return 0
     fi
@@ -565,7 +584,8 @@ _rw_respond() {
     _RW_PAUSED_NOW=1
     local sid body title p
     sid="$(_rw_session_of "${path% (deleted)}")"
-    body="${path} (${size_mb} MB) is growing fast in ${CC_TMP_DIR}."$'\n'
+    [[ -n "$sid" ]] && sid="$(_rw_show "$sid")"
+    body="${spath} (${size_mb} MB) is growing fast in ${CC_TMP_DIR}."$'\n'
     [[ -n "$paused" ]] && body+="Paused (SIGSTOP, not killed): pid${paused}."$'\n'
     [[ -n "$unconfirmed" ]] && body+="SIGSTOP sent but NOT yet confirmed: pid${unconfirmed}. Recorded as pending; thaw resumes it and also cancels a stop that has not landed."$'\n'
     [[ -n "$refused" ]] && body+="Could not pause: pid${refused}."$'\n'
@@ -579,7 +599,7 @@ _rw_respond() {
     for p in $all; do body+=" scripts/watchgod kill ${p};"; done
     title="Paused a runaway Claude Code task"
     [[ -n "$paused" ]] || title="Sent SIGSTOP to a runaway Claude Code task, NOT yet confirmed"
-    log WARN "runaway ${path}: paused${paused:- none}; unconfirmed${unconfirmed:- none}; refused${refused:- none}"
+    log WARN "runaway ${spath}: paused${paused:- none}; unconfirmed${unconfirmed:- none}; refused${refused:- none}"
     _rw_page_act "watchgod:runaway-act:${key}:$(date +%s)" "$title" "$body"
     return 0
 }
@@ -642,7 +662,7 @@ _rw_repage() {
         fi
         k=$(( (now - t) / period ))
         (( k >= 1 && k > ${_RW_REMINDED[$g]:-0} )) || continue
-        list+="  pid ${pid} (${comm}) paused since ${ts}${note}, writing ${path}"$'\n'
+        list+="  pid ${pid} (${comm}) paused since ${ts}${note}, writing $(_rw_show "$path")"$'\n'
         pids+=" ${pid}"
         due+=" ${g}=${k}"
         n=$(( n + 1 ))
@@ -868,16 +888,21 @@ wg_runaway_check() {
         if (( grew )) && [[ "${RW_TIER[$dkey]:-}" == orange || "${RW_TIER[$dkey]:-}" == red ]] \
                 && _rw_task_output "$path"; then
             if (( ! WATCHGOD_ACT )); then
-                _wg_warn_once "rw_obs_${gen}" "OBSERVE: would pause the command writing ${path} (pid ${holders[*]})"
+                _wg_warn_once "rw_obs_${gen}" "OBSERVE: would pause the command writing $(_rw_show "$path") (pid ${holders[*]})"
             elif (( ! walk_ok )); then
-                log WARN "runaway ${path}: not paused this poll: the /proc walk did not complete"
+                log WARN "runaway $(_rw_show "$path"): not paused this poll: the /proc walk did not complete"
             else
                 _rw_respond "$gen" "$key" "$path" "$size_mb" "${holders[@]}"
             fi
         fi
         [[ " ${_RW_PAGED[$gen]:-} " == *" mode${pg} "* ]] && continue
+        # The raw path stays the key for the domain and the session; only
+        # what is shown goes through the sanitiser.
+        local spath
+        spath="$(_rw_show "$path")"
         sid="$(_rw_session_of "${path% (deleted)}")"
-        body="${path}: ${size_mb} MB in use, held open for writing. Why flagged: ${why}."$'\n'"Writers:"$'\n'"$(_rw_holders "${holders[@]:0:DG_RUNAWAY_MAX_HOLDERS}")"
+        [[ -n "$sid" ]] && sid="$(_rw_show "$sid")"
+        body="${spath}: ${size_mb} MB in use, held open for writing. Why flagged: ${why}."$'\n'"Writers:"$'\n'"$(_rw_holders "${holders[@]:0:DG_RUNAWAY_MAX_HOLDERS}")"
         (( ${#holders[@]} > DG_RUNAWAY_MAX_HOLDERS )) && body+=$'\n'"  +$(( ${#holders[@]} - DG_RUNAWAY_MAX_HOLDERS )) more"
         [[ -n "$sid" ]] && body+=$'\n'"Claude Code session: ${sid}"
         local pkey="watchgod:runaway:${gen}" again=""
@@ -894,13 +919,13 @@ wg_runaway_check() {
         else
             body+=$'\n'"The guardian has not acted on it. Stop the writer, or empty the file, before the filesystem fills."
         fi
-        if _wg_page critical "Runaway file on ${dpath}: ${path##*/}${again}" "$body" \
-                "$pkey" "CRITICAL — runaway ${path} (${size_mb} MB)${again}"; then
+        if _wg_page critical "Runaway file on ${dpath}: ${spath##*/}${again}" "$body" \
+                "$pkey" "CRITICAL — runaway ${spath} (${size_mb} MB)${again}"; then
             _RW_PAGED[$gen]="${_RW_PAGED[$gen]:-} mode${pg}"
             # Only this mode's debt: the other mode still owes its own page
             # (review finding).
             unset "_RW_DUE[$gen$pg]"
-            log WARN "runaway file ${path} (${size_mb} MB; ${why}); writers: ${holders[*]}"
+            log WARN "runaway file ${spath} (${size_mb} MB; ${why}); writers: ${holders[*]}"
         else
             _RW_DUE[$gen$pg]="${why% (found at an earlier poll*}"
         fi
