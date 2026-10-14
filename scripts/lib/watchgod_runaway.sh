@@ -220,12 +220,28 @@ _rw_domain_for() {
     printf '%s\n' "${best:-$fallback}"
 }
 
+_rw_show() {
+    # $1 made safe for a page or a log line: a file name is chosen by whoever
+    # created the file, and a newline, a Unicode line separator or a bidi
+    # control in it could forge or disguise page lines (review finding). The
+    # same sanitiser as the process names; printable ASCII only without it.
+    local out
+    if out="$(printf '%s' "$1" | timeout -k 1 5 python3 -I -S "$_RW_PROC_PY" - safe 2>/dev/null)" \
+            && [[ -n "$out" ]]; then
+        printf '%s' "$out"
+    else
+        printf '%s' "$1" | LC_ALL=C tr -c '[:print:]' '?'
+    fi
+}
+
 _rw_holders() {
     # One line per distinct holder: "pid comm (parent ppid: comm)". Never the
     # command line: arguments can carry credentials, and the page leaves the
     # machine (review finding, P1).
     # Names come from the identity read through the holder's own /proc handle
-    # (_RW_IDENT); without one, from comm with control bytes removed.
+    # (_RW_IDENT); without one, from comm with everything but printable
+    # ASCII replaced (any locale: a multibyte line separator or bidi control
+    # must not reach the page either).
     local proc="${DG_PROC:-/proc}" pid comm ppid pcomm
     for pid in "$@"; do
         if [[ -n "${_RW_IDENT[$pid]:-}" ]]; then
@@ -235,7 +251,8 @@ _rw_holders() {
             ppid="$(awk '/^PPid:/ { print $2; exit }' "$proc/$pid/status" 2>/dev/null)" || ppid=""
             pcomm="?"
             [[ "$ppid" =~ ^[0-9]+$ ]] && pcomm="$(cat "$proc/$ppid/comm" 2>/dev/null)" || true
-            comm="${comm//[[:cntrl:]]/?}"; pcomm="${pcomm//[[:cntrl:]]/?}"
+            comm="$(printf '%s' "$comm" | LC_ALL=C tr -c '[:print:]' '?')"
+            pcomm="$(printf '%s' "$pcomm" | LC_ALL=C tr -c '[:print:]' '?')"
         fi
         printf '  pid %s %s (parent %s: %s)\n' "$pid" "${comm:-?}" "${ppid:-?}" "${pcomm:-?}"
     done
@@ -455,8 +472,13 @@ wg_runaway_check() {
         [[ -n "$why" ]] || continue
         (( opened )) && continue
         [[ " ${_RW_PAGED[$gen]:-} " == *" mode${pg} "* ]] && continue
+        # The raw path stays the key for the domain and the session; only
+        # what is shown goes through the sanitiser.
+        local spath
+        spath="$(_rw_show "$path")"
         sid="$(_rw_session_of "${path% (deleted)}")"
-        body="${path}: ${size_mb} MB in use, held open for writing. Why flagged: ${why}."$'\n'"Writers:"$'\n'"$(_rw_holders "${holders[@]:0:DG_RUNAWAY_MAX_HOLDERS}")"
+        [[ -n "$sid" ]] && sid="$(_rw_show "$sid")"
+        body="${spath}: ${size_mb} MB in use, held open for writing. Why flagged: ${why}."$'\n'"Writers:"$'\n'"$(_rw_holders "${holders[@]:0:DG_RUNAWAY_MAX_HOLDERS}")"
         (( ${#holders[@]} > DG_RUNAWAY_MAX_HOLDERS )) && body+=$'\n'"  +$(( ${#holders[@]} - DG_RUNAWAY_MAX_HOLDERS )) more"
         [[ -n "$sid" ]] && body+=$'\n'"Claude Code session: ${sid}"
         local pkey="watchgod:runaway:${gen}" again=""
@@ -467,13 +489,13 @@ wg_runaway_check() {
             body+=$'\n'"It shrank after an earlier page (at ${since}) and is over the threshold again."
         fi
         body+=$'\n'"The guardian has not acted on it. Stop the writer, or empty the file, before the filesystem fills."
-        if _wg_page critical "Runaway file on ${dpath}: ${path##*/}${again}" "$body" \
-                "$pkey" "CRITICAL — runaway ${path} (${size_mb} MB)${again}"; then
+        if _wg_page critical "Runaway file on ${dpath}: ${spath##*/}${again}" "$body" \
+                "$pkey" "CRITICAL — runaway ${spath} (${size_mb} MB)${again}"; then
             _RW_PAGED[$gen]="${_RW_PAGED[$gen]:-} mode${pg}"
             # Only this mode's debt: the other mode still owes its own page
             # (review finding).
             unset "_RW_DUE[$gen$pg]"
-            log WARN "runaway file ${path} (${size_mb} MB; ${why}); writers: ${holders[*]}"
+            log WARN "runaway file ${spath} (${size_mb} MB; ${why}); writers: ${holders[*]}"
         else
             _RW_DUE[$gen$pg]="${why% (found at an earlier poll*}"
         fi

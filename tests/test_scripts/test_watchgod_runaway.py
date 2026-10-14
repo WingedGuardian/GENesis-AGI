@@ -1455,3 +1455,35 @@ def test_detection_survives_an_identity_read_that_fails(box, tmp_path):
     assert "pid 4242 evil?name" in pages[0]["body"]
     log = (box["home"] / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
     assert "identity read failed (status 1" in log, "a failed read is never silent"
+
+
+def test_a_file_name_cannot_forge_page_lines(box):
+    """The runaway file's own name is chosen by whoever created it: a newline,
+    a line separator or a bidi control in it reaches the page as "?", like a
+    process name (review finding). The real name still keys the domain."""
+    name = "evil\nWriters:\n  pid 1 sshd\u2028x\u202egol.txt"
+    f = _file(box, name, 60)
+    _holder(box, 4242, f, comm="grep")
+    _check(box, _domain(box, 200))
+    pages = _pages(box)
+    assert len(pages) == 1, "still detected: the raw name keys the domain"
+    page = pages[0]
+    for text in (page["title"], page["body"]):
+        assert "\n  pid 1 sshd" not in text
+        assert "\u2028" not in text and "\u202e" not in text
+    assert "evil?Writers:?  pid 1 sshd?x?gol.txt" in page["body"]
+    assert page["body"].count("\nWriters:\n") == 1
+
+
+def test_without_the_identity_read_names_keep_printable_ascii_only(box, tmp_path):
+    """The fallback (no identity read) cannot rely on the locale to know a
+    multibyte line separator or bidi control: it keeps printable ASCII and
+    replaces every other byte (review finding)."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 4242, f, comm="evil\u2028FAKE: all clear", ppid=1)
+    stub = tmp_path / "fail.py"
+    stub.write_text("import sys; sys.exit(1)\n")
+    _run(box, f"_RW_PROC_PY='{stub}'; wg_runaway_check '{_domain(box, 200)}'")
+    body = _pages(box)[0]["body"]
+    assert "pid 4242 evil???FAKE: all clear" in body
+    assert "\u2028" not in body
