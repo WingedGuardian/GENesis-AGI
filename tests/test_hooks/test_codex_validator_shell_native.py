@@ -55,8 +55,8 @@ def fixture_runtime(root, evidence, case):
         original = source / relative
         target = runtime / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        # One read: the copy and its recorded hash come from the same bytes, even
-        # if the supplied runtime is edited while the matrix runs.
+        # One read: the copy and its recorded hash come from the same bytes. Each
+        # case copies afresh, so compare receipts' source_hashes across a matrix.
         data = original.read_bytes()
         target.write_bytes(data)
         target.chmod(original.stat().st_mode & 0o777)
@@ -151,13 +151,19 @@ def completed_commands(events):
     return commands
 
 
-def run_native_case(tmp_path, native_binaries, client, case, build_item, prepare):
-    """Run one native session; build_item(runtime, workspace, request) and prepare(request) shape it."""
+def run_native_case(tmp_path, native_binaries, client, param, build_item, prepare):
+    """Run one native session; build_item(runtime, workspace, request) and prepare(request) shape it.
+
+    The receipt keeps the full parameter (code_* included) and names the transport,
+    so a retained receipt shows which route was qualified.
+    """
     binaries, versions = native_binaries
-    evidence = {"versions": versions, "client": client, "case": case}
+    unified = param.startswith("code_")
+    evidence = {"versions": versions, "client": client, "case": param,
+                "transport": "functions.exec" if unified else "direct"}
     previous = os.umask(0o077)
     try:
-        runtime = fixture_runtime(tmp_path, evidence, case)
+        runtime = fixture_runtime(tmp_path, evidence, param.removeprefix("code_"))
         workspace = tmp_path / "workspace"
         request = workspace / "requests" / (TOKEN + ".json")
         item = build_item(runtime, workspace, request)
@@ -197,6 +203,7 @@ REFUSED_BODIES = {
                                   "code_probe", "code_update_request"])
 def test_native_request_boundary(tmp_path, native_binaries, client, case):
     # code_* cases send the base case's action through the unified functions.exec route.
+    param = case
     unified = case.startswith("code_")
     case = case.removeprefix("code_")
 
@@ -210,7 +217,7 @@ def test_native_request_boundary(tmp_path, native_binaries, client, case):
         if case == "public_request":
             request.chmod(0o644)
 
-    requests, hooks, events, workspace, request = run_native_case(tmp_path, native_binaries, client, case, build, prepare)
+    requests, hooks, events, workspace, request = run_native_case(tmp_path, native_binaries, client, param, build, prepare)
     assert len(requests) == (1 if case == "noop" else 2)
     assert len(hooks) == (0 if case == "noop" else 1), hooks
     if hooks:
@@ -278,6 +285,7 @@ HOOK_REFUSALS = {
 @pytest.mark.parametrize("client", ["cli", "app"])
 @pytest.mark.parametrize("case", [*HOOK_REFUSALS, "code_patch_protected_target"])
 def test_native_hook_refusal(tmp_path, native_binaries, client, case):
+    param = case
     unified = case.startswith("code_")
     case = case.removeprefix("code_")
     build_item, prepare = HOOK_REFUSALS[case]
@@ -286,7 +294,7 @@ def test_native_hook_refusal(tmp_path, native_binaries, client, case):
         item = build_item(runtime, workspace, request)
         return unified_item(item) if unified else item
 
-    requests, hooks, events, workspace, request = run_native_case(tmp_path, native_binaries, client, case, build, prepare)
+    requests, hooks, events, workspace, request = run_native_case(tmp_path, native_binaries, client, param, build, prepare)
     assert len(requests) == 2
     assert len(hooks) == 1, hooks
     assert hooks[0]["payload"]["hook_event_name"] == "PreToolUse"
