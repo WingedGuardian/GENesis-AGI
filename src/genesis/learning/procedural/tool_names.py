@@ -7,7 +7,13 @@ short names (``browser_navigate``) and prose (``review gate``) beside real names
 :func:`normalize_tool_trigger` keeps the real names, repairs the two classes that
 mean a real tool, and drops the rest. It is pure and deterministic.
 
-The built-in set is seeded from the lists the CC session builders already keep.
+The built-in set is seeded from the lists the CC session builders already keep,
+plus the built-ins sessions were seen calling (Claude Code 2.1.280). It is a
+snapshot: the authoritative inventory is the ``tools`` list of a session's init
+event, which nothing persists, and a missing name costs only a dropped trigger.
+MCP names on the Genesis servers are checked against what those servers
+declare; any other server (user-scoped, plugin, connector) is install-local,
+so its names are only shape-checked.
 ``experimentation.cc_router`` holds a third list and is deliberately NOT imported
 (it loads the provider stack); a test pins it as a subset instead.
 """
@@ -32,7 +38,8 @@ BUILTIN_TOOLS = frozenset({
     "NotebookRead", "ExitPlanMode", "EnterPlanMode", "AskUserQuestion", "ToolSearch",
     "LSP", "CronList", "TaskGet", "TaskList", "TaskOutput", "BashOutput", "KillShell",
     "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool", "ListAgents",
-    "Artifact", "ArtifactComments", "ArtifactData", "SendFeedback", "EndConversation",
+    "Artifact", "ArtifactComments", "ArtifactData", "ArtifactCheck", "SendFeedback",
+    "EndConversation", "SendUserFile", "ReadNotifications", "StructuredOutput",
 })
 # fmt: on
 
@@ -58,9 +65,13 @@ _MCP_MODULES = {
     "genesis-memory": "genesis.mcp.memory",
     "genesis-outreach": "genesis.mcp.outreach_mcp",
     "genesis-recon": "genesis.mcp.recon_mcp",
+    "discord-bot": "genesis.mcp.discord_bot_mcp",
 }
-
-_GENESIS_PREFIXES = tuple(f"mcp__{server}__" for server in _MCP_MODULES)
+# Modules that declare tools the standalone MCP server never imports, so a
+# session can never call them (tests/test_mcp/test_docket_worker_suppressed.py
+# keeps the same list). A test pins the scan to exactly what each server
+# registers, so a new module like these fails there.
+_NOT_SERVED = frozenset({"genesis.mcp.health.user_job_tools"})
 
 TOOL_TRIGGER_GUIDANCE = (
     "Use only these tool names: "
@@ -76,7 +87,7 @@ def _mcp_short_names() -> dict[str, str]:
 
 
 def _genesis_mcp_names() -> frozenset[str]:
-    """Every full ``mcp__genesis-*__<tool>`` name the Genesis servers declare."""
+    """Every full ``mcp__<server>__<tool>`` name the Genesis servers declare."""
     return frozenset(name for names in _mcp_owners().values() for name in names)
 
 
@@ -84,13 +95,12 @@ def _genesis_mcp_names() -> frozenset[str]:
 def _mcp_owners() -> dict[str, list[str]]:
     """Each Genesis MCP tool's short name -> its full name(s).
 
-    Read from the servers' source rather than by importing them: importing all
-    four takes seconds and registers every tool in the importing process. Every
+    Read from the servers' source rather than by importing them: importing them
+    takes seconds and registers every tool in the importing process. Every
     tool is declared with a bare ``@mcp.tool()``, so the function name is the
-    tool name; a test pins every registered name to its entry here. The scan
-    also finds tools a module registers only when the runtime starts, which is
-    still their real full name. A file that cannot be read maps nothing, so its
-    short names are dropped rather than guessed.
+    tool name; a test pins the result to exactly what each server registers.
+    Modules in ``_NOT_SERVED`` are skipped. A file that cannot be read maps
+    nothing, so its short names are dropped rather than guessed.
     """
     root = Path(__file__).resolve().parents[2]
     owners: dict[str, list[str]] = {}
@@ -98,6 +108,8 @@ def _mcp_owners() -> dict[str, list[str]]:
         base = root.joinpath(*module.split(".")[1:])
         files = sorted(base.glob("*.py")) if base.is_dir() else [base.with_suffix(".py")]
         for path in files:
+            if f"{module}.{path.stem}" in _NOT_SERVED:
+                continue
             try:
                 tree = ast.parse(path.read_text())
             except (OSError, SyntaxError):
@@ -126,6 +138,10 @@ def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:
         return [], [], []
     if isinstance(values, str):
         values = [values]
+    elif not isinstance(values, list | tuple):
+        # A number, bool or mapping from an LLM is not a trigger list; drop it
+        # rather than iterate it (or raise) and abort the caller's batch.
+        return [], [], [str(values)]
     short = _mcp_short_names()
     # A full name on a Genesis server must be one that server declares, so a
     # hallucinated tool is dropped; other servers can only be shape-checked.
@@ -140,9 +156,16 @@ def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:
         if value in BUILTIN_TOOLS:
             tool = value
         elif _MCP_NAME.fullmatch(value):
-            if genesis_names and value.startswith(_GENESIS_PREFIXES) and value not in genesis_names:
-                dropped.append(value)
-                continue
+            server, name = value[5:].split("__", 1)
+            canon = server.lower().replace("_", "-")
+            if genesis_names and (canon in _MCP_MODULES or canon.startswith("genesis-")):
+                # A Genesis server, however it was spelled (the template owns the
+                # genesis- prefix): keep only a tool one declares, under its real name.
+                canonical = f"mcp__{canon}__{name}"
+                if canonical not in genesis_names:
+                    dropped.append(value)
+                    continue
+                value = canonical
             tool = value
         elif value in short:
             tool = short[value]

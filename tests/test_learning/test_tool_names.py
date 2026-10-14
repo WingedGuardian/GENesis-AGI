@@ -1,6 +1,8 @@
 """The tool-name normalizer applied to every stored tool_trigger."""
 
 import json
+import subprocess
+import sys
 
 import pytest
 
@@ -29,6 +31,19 @@ from genesis.learning.procedural.tool_names import BUILTIN_TOOLS, normalize_tool
         # Built-ins match exactly: the CLI word `grep` is not the Grep tool.
         (["grep"], [], [], ["grep"]),
         (["ListAgents", "Artifact"], ["ListAgents", "Artifact"], [], []),
+        (["SendUserFile"], ["SendUserFile"], [], []),
+        # A Genesis server name spelled another way is repaired, or dropped.
+        (["mcp__genesis_health__health_status"], ["mcp__genesis-health__health_status"], [], []),
+        (["mcp__Genesis-Health__nope"], [], [], ["mcp__Genesis-Health__nope"]),
+        (["mcp__genesis-healthx__foo"], [], [], ["mcp__genesis-healthx__foo"]),
+        # Other servers are install-local, so only their shape is checked.
+        (["mcp__made_up_server__x"], ["mcp__made_up_server__x"], [], []),
+        (["fetch_messages"], ["mcp__discord-bot__fetch_messages"], [], []),
+        (["user_job_list"], [], [], ["user_job_list"]),
+        (["mcp__genesis-health__user_job_list"], [], [], ["mcp__genesis-health__user_job_list"]),
+        (3, [], [], ["3"]),
+        (True, [], [], ["True"]),
+        ({"tool": "Bash"}, [], [], ["{'tool': 'Bash'}"]),
         # A Genesis server's full name must be one it declares.
         (["mcp__genesis-health__not_a_tool"], [], [], ["mcp__genesis-health__not_a_tool"]),
         (["mcp__genesis-health__health_status"], ["mcp__genesis-health__health_status"], [], []),
@@ -52,18 +67,22 @@ def test_the_builtin_set_covers_the_three_existing_lists():
 def test_the_mcp_short_names_match_the_registered_tools():
     """The map is read from source without importing the servers; this pins it
     to what each server really registers, so drift fails here."""
-    from genesis.cc.session_config import _registered_mcp_tool_names
-
+    # A fresh interpreter: an import elsewhere in the test run (the runtime
+    # imports user_job_tools) would add tools to these same server objects.
+    probe = (
+        "import json; from genesis.cc.session_config import _registered_mcp_tool_names as r; "
+        f"print(json.dumps({{s: r(m) for s, m in {tool_names._MCP_MODULES!r}.items()}}))"
+    )
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
     registered = {}
-    for server, module in tool_names._MCP_MODULES.items():
-        for name in _registered_mcp_tool_names(module):
+    for server, names in json.loads(out.stdout.strip().splitlines()[-1]).items():
+        for name in names:
             registered.setdefault(name, []).append(f"mcp__{server}__{name}")
     unique = {short: full[0] for short, full in registered.items() if len(full) == 1}
-    mapped = tool_names._mcp_short_names()
-    # Every registered tool maps to its real full name. The map may hold more:
-    # a few modules register their tools when the runtime starts (user_job_tools),
-    # which a plain import of the server does not do.
-    assert {short: mapped.get(short) for short in unique} == unique
+    # Exactly the served tools: a module the server never imports would add
+    # names no session can call.
+    assert tool_names._mcp_short_names() == unique
+    assert tool_names._genesis_mcp_names() == {n for full in registered.values() for n in full}
 
 
 def test_the_prompt_guidance_names_the_tools_without_braces():
@@ -123,7 +142,9 @@ async def test_an_explicit_teach_can_clear_a_trigger_and_an_extraction_cannot(db
     from genesis.learning.procedural.embedding import pack_embedding
 
     blob = pack_embedding([1.0] + [0.0] * 1023)
-    first = await store_procedure_checked(db, tool_trigger=["Bash"], principle_embedding=blob, **_ROW)
+    first = await store_procedure_checked(
+        db, tool_trigger=["Bash"], principle_embedding=blob, **_ROW
+    )
     # An auto-extraction's empty list keeps the trigger.
     await store_procedure_checked(db, tool_trigger=[], principle_embedding=blob, draft=1, **_ROW)
     row = await procedural.get_by_id(db, first.procedure_id)

@@ -102,9 +102,14 @@ async def store_procedure(
     """
     proc_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
-    tool_trigger, _patterns, dropped = normalize_tool_trigger(tool_trigger)
-    if dropped:
-        logger.info("Procedure %s: dropped non-tool trigger values %s", task_type, dropped)
+    tool_trigger, patterns, dropped = normalize_tool_trigger(tool_trigger)
+    if dropped or patterns:
+        logger.info(
+            "Procedure %s: dropped non-tool trigger values %s; command patterns not kept %s",
+            task_type,
+            dropped,
+            patterns,
+        )
     await procedural.create(
         db,
         id=proc_id,
