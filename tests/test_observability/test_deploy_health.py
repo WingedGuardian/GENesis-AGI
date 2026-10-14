@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import signal
 import subprocess
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -22,14 +25,20 @@ import pytest
 
 from genesis.observability.snapshots.deploy_health import (
     GUARDIAN_HOST_PATHS,
+    MAIN_CHECKOUT_PATHS_SHOWN,
     collect_git_facts,
     collect_host_gateway,
+    collect_main_checkout_dirty,
     collect_missing_units,
     collect_tier2_pending,
     derive_findings,
     last_success_update,
     resolve_commit,
 )
+
+# importlib, not a plain import: snapshots/__init__.py re-exports the function
+# under the submodule's own name, so `import … as` would bind the function.
+dh_module = importlib.import_module("genesis.observability.snapshots.deploy_health")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -503,3 +512,536 @@ def test_tier2_pending_is_not_fooled_by_a_shadowing_branch(linear_repo):
     # Resolved against the object store, `first..HEAD` carries the change.
     # Resolved as a refname it becomes `HEAD..HEAD`, which is empty.
     assert collect_tier2_pending(repo, first[:8]) == ["pyproject.toml"]
+
+
+# ── main_checkout: tracked edits in the deploy checkout ──────────────
+#
+# The collector runs the deploy scripts' OWN predicate (scripts/lib/
+# deploy_checkout.sh) through bash, so there is one definition of "a dirty
+# deploy root". Every test below runs that real bash against a scratch git
+# repository carrying copies of the real libs, never a mocked subprocess:
+# the defects worth pinning live in the bash call (a wrong arity, a failed
+# source read as clean), and a fake would return what the test believed.
+
+_REAL_LIBS = Path(__file__).resolve().parents[2] / "scripts" / "lib"
+_PROBE_LIBS = ("deploy_marker.sh", "deploy_checkout.sh")
+
+
+@pytest.fixture
+def no_deploy(monkeypatch):
+    """The collector skips while a deploy is in progress; pin that to False so
+    a real deploy on the machine running the suite cannot change a verdict."""
+    from genesis import env
+
+    monkeypatch.setattr(env, "update_in_progress", lambda: False)
+
+
+def _with_libs(root: Path) -> None:
+    (root / "scripts" / "lib").mkdir(parents=True)
+    for name in _PROBE_LIBS:
+        (root / "scripts" / "lib" / name).write_text((_REAL_LIBS / name).read_text())
+
+
+@pytest.fixture
+def deploy_root(tmp_path, no_deploy):
+    """A primary checkout holding the real deploy libs, a tracked AGENTS.md (an
+    ephemeral path) and a tracked a.txt, all committed: clean."""
+    r = tmp_path / "deploy"
+    _with_libs(r)
+    (r / "AGENTS.md").write_text("stats\n")
+    (r / "a.txt").write_text("a\n")
+    _git(r, "init", "-q", "-b", "main")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "init")
+    return r
+
+
+def test_main_checkout_clean(deploy_root):
+    assert collect_main_checkout_dirty(deploy_root) == {
+        "status": "clean",
+        "count": 0,
+        "paths": [],
+        "paths_omitted": 0,
+    }
+
+
+def test_main_checkout_tracked_edit_is_dirty(deploy_root):
+    (deploy_root / "a.txt").write_text("edited in place\n")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "dirty"
+    assert got["count"] == 1
+    assert got["paths"] == ["a.txt"]
+
+
+def test_main_checkout_ephemeral_only_is_clean(deploy_root):
+    """AGENTS.md is on the deploy scripts' ephemeral allowlist: a deploy does
+    not refuse on it, so neither does this finding."""
+    (deploy_root / "AGENTS.md").write_text("rewritten stats\n")
+    # Guard-the-guard: git really sees the edit.
+    assert _git(deploy_root, "status", "--porcelain").strip() == "M AGENTS.md"
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "clean"
+
+
+def test_main_checkout_untracked_only_is_clean(deploy_root):
+    (deploy_root / "stray.log").write_text("x\n")
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "clean"
+
+
+def test_main_checkout_sees_a_hidden_assume_unchanged_edit(deploy_root):
+    """git status hides an edit behind assume-unchanged; the deploy predicate
+    does not, and a deploy refuses on it, so the finding must fire."""
+    _git(deploy_root, "update-index", "--assume-unchanged", "a.txt")
+    (deploy_root / "a.txt").write_text("hidden edit\n")
+    assert _git(deploy_root, "status", "--porcelain") == ""  # really hidden
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "dirty"
+    assert got["paths"] == ["a.txt"]
+    # The probe's scratch index is removed after a completed run.
+    assert not list((deploy_root / ".git").glob("genesis-hidden-index.*"))
+
+
+def test_main_checkout_linked_worktree_is_not_the_deploy_root(deploy_root, tmp_path):
+    """A dev worktree running the code is not the deploy checkout: no finding,
+    even when it is dirty. The worktree sits OUTSIDE any .claude/worktrees
+    path, so git's own git-dir comparison is what decides."""
+    wt = tmp_path / "elsewhere" / "wt"
+    _git(deploy_root, "worktree", "add", "-q", "-b", "dev", str(wt))
+    (wt / "a.txt").write_text("dev edit\n")
+    assert collect_main_checkout_dirty(wt)["status"] == "not_deploy_root"
+    # Control: the same edit in the primary checkout IS dirty, so the verdict
+    # above came from the worktree test, not from a probe that sees nothing.
+    (deploy_root / "a.txt").write_text("dev edit\n")
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "dirty"
+
+
+@pytest.mark.parametrize("missing", _PROBE_LIBS)
+def test_main_checkout_missing_lib_is_unknown(deploy_root, missing):
+    """A lib that cannot be sourced must never read as clean (it would resolve
+    a standing alert) or as not-the-deploy-root."""
+    (deploy_root / "a.txt").write_text("edited\n")
+    (deploy_root / "scripts" / "lib" / missing).unlink()
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "unknown"
+    assert got["reason"]
+
+
+def test_main_checkout_non_repo_is_unknown(tmp_path, no_deploy):
+    """git cannot answer at all: unknown, never clean and never 'not ours'."""
+    r = tmp_path / "plain"
+    _with_libs(r)
+    assert collect_main_checkout_dirty(r)["status"] == "unknown"
+
+
+def _pid_gone(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return True
+    return stat.rsplit(") ", 1)[1].split(" ", 1)[0] == "Z"
+
+
+def test_main_checkout_timeout_is_unknown_and_leaves_no_process(deploy_root, tmp_path, monkeypatch):
+    """A wedged git: the probe times out, reports unknown, and kills the whole
+    process group, so no git grandchild outlives it."""
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    pidfile = tmp_path / "git.pids"
+    (shim / "git").write_text('#!/bin/sh\necho $$ >> "$GIT_SHIM_PIDS"\nexec sleep 300\n')
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    monkeypatch.setenv("GIT_SHIM_PIDS", str(pidfile))
+    started = time.monotonic()
+    got = collect_main_checkout_dirty(deploy_root, timeout=1.0)
+    # Returns promptly: a surviving grandchild holding the pipes would make it
+    # wait on the shim's 300 s sleep (60 s is a loose bound, not a benchmark).
+    assert time.monotonic() - started < 60
+    assert got["status"] == "unknown"
+    assert "timed out" in got["reason"]
+    pids = [int(p) for p in pidfile.read_text().split()]
+    assert pids, "precondition: the shim git really ran"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not all(_pid_gone(p) for p in pids):
+        time.sleep(0.05)
+    leftover = [p for p in pids if not _pid_gone(p)]
+    for p in leftover:  # never leak a sleeper past the test, whatever happens
+        os.kill(p, signal.SIGKILL)
+    assert not leftover, f"git grandchildren survived the timeout: {leftover}"
+
+
+def test_main_checkout_timeout_removes_its_scratch_index(deploy_root, tmp_path, monkeypatch):
+    """git wedges AFTER the hidden-edit pass has copied the index: the timeout
+    kills the probe before the lib's own rm runs, so the collector removes the
+    probe's scratch index itself. Every periodic run would otherwise leave
+    another full index copy in .git. A scratch index belonging to another
+    process (a concurrent deploy's) is left alone."""
+    import shutil
+
+    real_git = shutil.which("git")
+    _git(deploy_root, "update-index", "--assume-unchanged", "a.txt")
+    (deploy_root / "a.txt").write_text("hidden edit\n")
+    other = deploy_root / ".git" / "genesis-hidden-index.1.AbCdEf"
+    other.write_text("another process's scratch index\n")
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    # Only the scratch-index steps set GIT_INDEX_FILE; everything else is real git.
+    (shim / "git").write_text(
+        f'#!/bin/sh\n[ -n "$GIT_INDEX_FILE" ] && exec sleep 300\nexec "{real_git}" "$@"\n'
+    )
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    got = collect_main_checkout_dirty(deploy_root, timeout=3.0)
+    assert got["status"] == "unknown"
+    assert "timed out" in got["reason"]
+    assert list((deploy_root / ".git").glob("genesis-hidden-index.*")) == [other]
+
+
+def test_main_checkout_a_failed_flag_listing_is_unknown_not_clean(
+    deploy_root, tmp_path, monkeypatch
+):
+    """The hidden-edit pass pipes `git ls-files -v -z` into xargs. Without pipefail
+    a failed listing reads as success, the flags stay set, the hidden edit is
+    missed and the checkout reports clean, which would resolve a standing alert.
+    The probe runs the lib under pipefail, as the deploy scripts do."""
+    import shutil
+
+    real_git = shutil.which("git")
+    _git(deploy_root, "update-index", "--assume-unchanged", "a.txt")
+    (deploy_root / "a.txt").write_text("hidden edit\n")
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "git").write_text(
+        "#!/bin/sh\n"
+        'case " $* " in *" ls-files -v -z "*) exit 128 ;; esac\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "unknown"
+
+
+def test_main_checkout_a_deploy_that_starts_during_the_probe_is_deploying(deploy_root, monkeypatch):
+    """deploy_code_only.sh pull keeps the server up, so a deploy can begin after
+    the up-front check and merge under the probe: that reading is not the
+    checkout's own, and it must not be reported (or alerted) as dirty."""
+    from genesis import env
+
+    (deploy_root / "a.txt").write_text("mid-merge state\n")
+    answers = iter([False, True])
+    monkeypatch.setattr(env, "update_in_progress", lambda: next(answers))
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "deploying"
+
+
+def test_kill_probe_group_reap_is_bounded(monkeypatch):
+    """SIGKILL stays pending while the probe is in uninterruptible I/O, so the
+    reap after it must be bounded: an unbounded wait() would strand the snapshot
+    worker during the very failure the timeout contains."""
+    # The package __init__ shadows the submodule with its same-named function.
+    dh = importlib.import_module("genesis.observability.snapshots.deploy_health")
+
+    signals = []
+    monkeypatch.setattr(dh.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+
+    class Stuck:
+        pid = 2_147_483_000  # never signalled for real: killpg is patched above
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired("probe", timeout)
+
+        def wait(self, timeout=None):
+            if timeout is None:
+                raise AssertionError("unbounded wait() on a probe that may never exit")
+            raise subprocess.TimeoutExpired("probe", timeout)
+
+    dh._kill_probe_group(Stuck())
+    assert signals == [(Stuck.pid, signal.SIGKILL)]
+
+
+def test_main_checkout_a_failed_worktree_read_is_unknown_not_another_root(
+    deploy_root, tmp_path, monkeypatch
+):
+    """genesis_is_primary_checkout swallows a failed `rev-parse --is-inside-work-tree`
+    as "not a primary checkout", and not_deploy_root resolves a standing dirty
+    alert like clean. The probe reads it itself first, so a failure is unknown."""
+    import shutil
+
+    real_git = shutil.which("git")
+    (deploy_root / "a.txt").write_text("edited\n")
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "git").write_text(
+        "#!/bin/sh\n"
+        'case " $* " in *" --is-inside-work-tree "*) exit 128 ;; esac\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "unknown"
+
+
+def test_main_checkout_an_empty_ephemeral_pattern_is_unknown_not_clean(deploy_root):
+    """`grep -vE ""` drops every line, so an empty EPHEMERAL_DIRTY_RE (renamed or
+    blanked in the marker lib) would read every checkout as clean."""
+    lib = deploy_root / "scripts" / "lib" / "deploy_marker.sh"
+    lib.write_text(lib.read_text() + "\nEPHEMERAL_DIRTY_RE=\n")
+    (deploy_root / "a.txt").write_text("edited\n")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "unknown", got
+
+
+def test_main_checkout_a_probe_killed_from_outside_leaves_no_scratch_index(
+    deploy_root, tmp_path, monkeypatch
+):
+    """A signal from outside the timeout (an OOM kill, say) ends the probe mid
+    hidden-edit pass with rc < 0, before the lib's rm: the collector removes that
+    probe's scratch index then too."""
+    import shutil
+
+    real_git = shutil.which("git")
+    _git(deploy_root, "update-index", "--assume-unchanged", "a.txt")
+    (deploy_root / "a.txt").write_text("hidden edit\n")
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    # The scratch-index steps set GIT_INDEX_FILE: kill the probe's whole group there.
+    (shim / "git").write_text(
+        f'#!/bin/sh\n[ -n "$GIT_INDEX_FILE" ] && kill -KILL 0\nexec "{real_git}" "$@"\n'
+    )
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    got = collect_main_checkout_dirty(deploy_root, timeout=30.0)
+    assert got["status"] == "unknown"
+    assert not list((deploy_root / ".git").glob("genesis-hidden-index.*"))
+
+
+def test_main_checkout_a_deploy_during_a_timed_out_probe_is_deploying(
+    deploy_root, tmp_path, monkeypatch
+):
+    """The timeout path re-checks the deploy marker too: a probe that ran out of
+    time while a deploy began reports deploying, not unreadable."""
+    from genesis import env
+
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "git").write_text("#!/bin/sh\nexec sleep 300\n")
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    answers = iter([False, True])
+    monkeypatch.setattr(env, "update_in_progress", lambda: next(answers))
+    assert collect_main_checkout_dirty(deploy_root, timeout=1.0)["status"] == "deploying"
+
+
+def test_main_checkout_does_not_rewrite_the_index(deploy_root):
+    """GIT_OPTIONAL_LOCKS=0: a stat-stale index must NOT be refreshed and
+    written back by the probe, which would take index.lock under a concurrent
+    deploy's merge."""
+    st = (deploy_root / "a.txt").stat()
+    os.utime(deploy_root / "a.txt", ns=(st.st_atime_ns, st.st_mtime_ns - 10**10))
+    index = deploy_root / ".git" / "index"
+    before = (index.stat().st_ino, index.stat().st_mtime_ns)
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "clean"
+    assert (index.stat().st_ino, index.stat().st_mtime_ns) == before
+
+
+def test_main_checkout_index_lock_held_is_still_read(deploy_root):
+    """Another process holds index.lock (a deploy mid-merge): the probe reads
+    the status anyway and leaves the lock alone."""
+    lock = deploy_root / ".git" / "index.lock"
+    lock.write_text("")
+    (deploy_root / "a.txt").write_text("edited\n")
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "dirty"
+    assert lock.exists()
+
+
+def test_main_checkout_skipped_during_a_deploy(deploy_root, monkeypatch):
+    from genesis import env
+
+    (deploy_root / "a.txt").write_text("edited\n")
+    monkeypatch.setattr(env, "update_in_progress", lambda: True)
+    assert collect_main_checkout_dirty(deploy_root)["status"] == "deploying"
+
+
+def test_main_checkout_bounds_the_display_list_but_counts_exactly(deploy_root):
+    n = MAIN_CHECKOUT_PATHS_SHOWN + 3
+    for i in range(n):
+        (deploy_root / f"f{i:02d}.txt").write_text("x\n")
+    _git(deploy_root, "add", "-A")
+    _git(deploy_root, "commit", "-qm", "more")
+    for i in range(n):
+        (deploy_root / f"f{i:02d}.txt").write_text("edited\n")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["count"] == n
+    assert len(got["paths"]) == MAIN_CHECKOUT_PATHS_SHOWN
+    assert got["paths_omitted"] == 3
+
+
+# Names git quotes in porcelain output under its default core.quotePath:
+# non-ASCII bytes as octal escapes, and a space, quote, backslash or control
+# character wherever it appears (measured, git 2.43).
+_UNUSUAL_NAMES = (
+    "café.md",
+    "sp ace.md",
+    'quo"te.md',
+    "back\\slash.md",
+    "tab\there.md",
+    "new\nline.md",
+)
+
+
+def _commit_and_edit(root: Path, names) -> None:
+    for name in names:
+        (root / name).write_text("v1\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "unusual names")
+    for name in names:
+        (root / name).write_text("v2\n")
+
+
+def test_main_checkout_names_quoted_paths_as_the_files_they_are(deploy_root):
+    """A name git quotes is reported as the file an operator can find, not as
+    git's escaped form ("caf\\303\\251.md")."""
+    _commit_and_edit(deploy_root, _UNUSUAL_NAMES)
+    # Guard-the-guard: git really quotes these in the porcelain it prints.
+    assert '"caf\\303\\251.md"' in _git(deploy_root, "status", "--porcelain")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "dirty"
+    assert sorted(got["paths"]) == sorted(_UNUSUAL_NAMES)
+    assert got["count"] == len(_UNUSUAL_NAMES)
+
+
+def test_main_checkout_names_a_hidden_edit_to_a_quoted_path(deploy_root):
+    """The assume-unchanged pass reads diff-files --name-status, which quotes a
+    non-ASCII or control-character name but NOT a space (measured, git 2.43)."""
+    _commit_and_edit(deploy_root, ["café.md"])
+    _git(deploy_root, "checkout", "--", "café.md")
+    _git(deploy_root, "update-index", "--assume-unchanged", "café.md")
+    (deploy_root / "café.md").write_text("hidden edit\n")
+    assert _git(deploy_root, "status", "--porcelain") == ""  # really hidden
+    assert collect_main_checkout_dirty(deploy_root)["paths"] == ["café.md"]
+
+
+def test_main_checkout_one_file_quoted_in_one_pass_and_not_the_other(deploy_root):
+    """A staged edit to "sp ace.md" arrives quoted from git status and the hidden
+    edit unquoted from diff-files: still one file."""
+    _commit_and_edit(deploy_root, ["sp ace.md"])
+    _git(deploy_root, "add", "sp ace.md")
+    _git(deploy_root, "update-index", "--assume-unchanged", "sp ace.md")
+    (deploy_root / "sp ace.md").write_text("v2\nthen edited\n")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["paths"] == ["sp ace.md"]
+    assert got["count"] == 1
+
+
+def test_main_checkout_a_non_utf8_name_does_not_raise(deploy_root, monkeypatch):
+    """core.quotePath=false makes git print a name's raw bytes, and a POSIX name
+    need not be valid UTF-8. The collector must report the edit, with the bad
+    byte shown escaped, and never raise: a raise here took the whole deploy-health
+    snapshot down to "error", unrelated findings with it. LC_ALL=C makes the
+    predicate's grep pass the line through (under a UTF-8 locale it drops it,
+    which is the shared predicate's own defect and is tracked separately)."""
+    name = b"lat\xe9.md"
+    (deploy_root / os.fsdecode(name)).write_bytes(b"v1\n")
+    _git(deploy_root, "add", "-A")
+    _git(deploy_root, "commit", "-qm", "latin-1 name")
+    _git(deploy_root, "config", "core.quotePath", "false")
+    (deploy_root / os.fsdecode(name)).write_bytes(b"v2\n")
+    monkeypatch.setenv("LC_ALL", "C")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "dirty"
+    assert got["paths"] == ["lat\\xe9.md"]
+
+
+def test_main_checkout_counts_a_file_once_when_staged_and_hidden(deploy_root):
+    """A staged edit shows in git status and a further worktree edit behind
+    assume-unchanged shows in the hidden pass: two status records, one file."""
+    (deploy_root / "a.txt").write_text("staged\n")
+    _git(deploy_root, "add", "a.txt")
+    _git(deploy_root, "update-index", "--assume-unchanged", "a.txt")
+    (deploy_root / "a.txt").write_text("staged\nthen edited\n")
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "dirty"
+    assert got["count"] == 1
+    assert got["paths"] == ["a.txt"]
+
+
+def test_main_checkout_a_failed_read_still_kills_the_probe(deploy_root, tmp_path, monkeypatch):
+    """A read that fails for any reason other than the timeout also kills the
+    probe's group before the failure propagates, so no git grandchild outlives
+    it; the collector then reports unknown rather than raising."""
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    pidfile = tmp_path / "git.pids"
+    (shim / "git").write_text('#!/bin/sh\necho $$ >> "$GIT_SHIM_PIDS"\nexec sleep 300\n')
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+    monkeypatch.setenv("GIT_SHIM_PIDS", str(pidfile))
+    real_popen = subprocess.Popen
+
+    class FailingRead(real_popen):
+        failed = False
+
+        def communicate(self, input=None, timeout=None):
+            if not FailingRead.failed:
+                FailingRead.failed = True
+                deadline = time.monotonic() + 10  # let the shim git start first
+                while time.monotonic() < deadline and not pidfile.exists():
+                    time.sleep(0.05)
+                raise RuntimeError("read failed")
+            return super().communicate(input=input, timeout=timeout)
+
+    monkeypatch.setattr(dh_module.subprocess, "Popen", FailingRead)
+    got = collect_main_checkout_dirty(deploy_root, timeout=60.0)
+    assert got["status"] == "unknown"
+    assert got["reason"] == "collector failed: RuntimeError"
+    pids = [int(p) for p in pidfile.read_text().split()]
+    assert pids, "precondition: the shim git really ran"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not all(_pid_gone(p) for p in pids):
+        time.sleep(0.05)
+    leftover = [p for p in pids if not _pid_gone(p)]
+    for p in leftover:  # never leak a sleeper past the test, whatever happens
+        os.kill(p, signal.SIGKILL)
+    assert not leftover, f"git grandchildren survived the failed read: {leftover}"
+
+
+def test_main_checkout_collector_failure_is_unknown_not_raised(deploy_root, monkeypatch):
+    """Like every other collector here, an unexpected failure degrades to its
+    own unknown instead of escaping into deploy_health(), whose catch-all would
+    drop every unrelated finding on the tick."""
+
+    def broken(repo, timeout):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(dh_module, "_collect_main_checkout_dirty", broken)
+    got = collect_main_checkout_dirty(deploy_root)
+    assert got["status"] == "unknown"
+    assert got["reason"] == "collector failed: RuntimeError"
+
+
+@pytest.mark.parametrize(
+    ("quoted", "raw"),
+    [
+        (b"plain.txt", b"plain.txt"),
+        (b'"caf\\303\\251.md"', "café.md".encode()),
+        (b'"a\\tb\\nc\\"d\\\\e"', b'a\tb\nc"d\\e'),
+        # Escapes git never emits are kept literally rather than raising.
+        (b'"bad\\q\\9z"', b"bad\\q\\9z"),
+        (b'"trailing\\"', b"trailing\\"),
+    ],
+)
+def test_git_unquote(quoted, raw):
+    assert dh_module._git_unquote(quoted) == raw
+
+
+def test_derive_findings_main_checkout_keys():
+    common = dict(
+        missing_units=[], tier2_pending=None, host_gateway={"status": "ok"}, commits_behind=0
+    )
+    # Default: every existing caller's output is unchanged.
+    assert derive_findings(**common) == []
+    assert derive_findings(**common, main_checkout={"status": "dirty", "count": 3}) == [
+        "main_checkout_dirty:3"
+    ]
+    assert derive_findings(**common, main_checkout={"status": "unknown"}) == [
+        "main_checkout_unreadable"
+    ]
+    for quiet in ("clean", "not_deploy_root", "deploying"):
+        assert derive_findings(**common, main_checkout={"status": quiet}) == []

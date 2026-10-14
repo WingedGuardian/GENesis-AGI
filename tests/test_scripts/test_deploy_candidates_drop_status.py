@@ -301,6 +301,7 @@ def test_adopt_is_not_a_command(dc, dc_ready, capsys):
         ({"scripts/deploy_code_only.sh": "x\n"}, "keeps the wipers"),
         ({"scripts/lib/guardian_pause.sh": "x\n"}, "keeps the wipers"),
         ({"scripts/lib/deploy_checkout.sh": "x\n"}, "keeps the wipers"),
+        ({"scripts/lib/deploy_recovery.sh": "x\n"}, "keeps the wipers"),
         ({"src/genesis/dashboard/routes/updates.py": "x\n"}, "keeps the wipers"),
         ({"scripts/deploy_candidates_gate.py": "x\n"}, "keeps the wipers"),
         ({"scripts/lib/deploy_live.sh": "x\n"}, "keeps the wipers"),
@@ -386,6 +387,7 @@ _CONTAINER_LOCAL_UNITS = {
     "scripts/code_intel_runner.sh": "container-side code index only",
     "scripts/disk_hygiene.sh": "container-side file retention only",
     "scripts/graph_project_runner.sh": "container-side graph projection only",
+    "scripts/install_browser_stack.sh": "container-side: installs into this user's caches; never escalates in the unit (NoNewPrivileges)",
     "scripts/star_milestone_check.py": "container-side: one GitHub star-count read + an observation; no deploy/host/guard surface",
     "scripts/tmp_watchgod.sh": "container-side disk guard only",
 }
@@ -396,7 +398,8 @@ def test_every_systemd_unit_target_is_classified(dc):
     for unit in (SCRIPTS / "systemd").glob("*.template"):
         for line in unit.read_text().splitlines():
             if line.startswith("ExecStart="):
-                targets.update(re.findall(r"__REPO_DIR__/(\S+)", line))
+                # A quoted ExecStart path ends at its closing quote.
+                targets.update(re.findall(r'__REPO_DIR__/([^\s"]+)', line))
     assert targets, "no ExecStart target found: the enumeration is broken"
     for target in sorted(targets):
         refused = dc.gate.path_refusal(target) is not None

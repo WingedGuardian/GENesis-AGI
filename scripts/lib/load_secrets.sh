@@ -24,11 +24,13 @@
 
 load_secrets_file() {
     local file="$1" line key value
+    # Explicit ASCII syntax does not change the caller's locale or shadow an
+    # accepted LC_ALL record. A file locale assignment cannot alter later parsing.
     [ -f "$file" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         # Trim surrounding whitespace.
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
+        line="${line#"${line%%[!$' \t\r\v\f']*}"}"
+        line="${line%"${line##*[!$' \t\r\v\f']}"}"
         case "$line" in
             '' | '#'*) continue ;;
         esac
@@ -63,7 +65,7 @@ load_secrets_file() {
                 # sed keeps leftmost-match semantics: 'x #a #b' → 'x',
                 # exactly what shell comment parsing gave under source.
                 value="$(printf '%s' "$value" \
-                    | sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//')"
+                    | LC_ALL=C sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//')"
                 ;;
         esac
         export "$key=$value"

@@ -1,0 +1,14 @@
+[Unit]
+Description=Genesis browser stack — daily retry of the engine and Chromium install
+
+# The retry path: a failed download, a run skipped for low disk, and an update
+# that installed new browser packages without starting the unit. A run with
+# nothing to do exits in seconds.
+[Timer]
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+AccuracySec=1h
+RandomizedDelaySec=1800
+
+[Install]
+WantedBy=timers.target

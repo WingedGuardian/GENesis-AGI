@@ -356,6 +356,21 @@ class TestTagCooccurrenceIndex:
         # Genuine content tags still expand.
         assert "recovery" in expansions or "delete_guard" in expansions
 
+    def test_skips_session_note_tag(self):
+        """``session_note`` is stamped on every session-observer note, so it
+        co-occurs with nearly everything and would be offered as an expansion for
+        almost any query. It is excluded like the structural prefixes, in any case."""
+        index = TagCooccurrenceIndex()
+        tag_lists = [
+            ["qdrant", "session_note", "recovery"],
+            ["qdrant", "Session_Note", "delete_guard"],
+            ["qdrant", "session_note", "recovery"],
+        ]
+        index.build(tag_lists, memory_count=10)
+        expansions = index.expand(["qdrant"], max_expansions=10)
+        assert "session_note" not in expansions
+        assert "recovery" in expansions
+
     def test_max_expansions_limit(self):
         index = TagCooccurrenceIndex()
         # Create many co-occurring tags

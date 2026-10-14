@@ -1,0 +1,14 @@
+[Unit]
+Description=Genesis VNC Server (x11vnc)
+After=genesis-xvfb.service
+Requires=genesis-xvfb.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:99
+ExecStart=/usr/bin/x11vnc -display :99 -forever -shared -rfbauth %h/.genesis/vnc_passwd -rfbport 5999 -xdamage -threads
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
