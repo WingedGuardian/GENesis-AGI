@@ -232,6 +232,40 @@ def _lesson_from_file(path: Path) -> dict:
     }
 
 
+# The seed writes only what the file owns. Usage history (success and failure
+# counts, confidence, version, workarounds, invocations) belongs to the runtime
+# and stays in the database: a first seed starts at the explicit-teach values,
+# and a re-seed never reads or rewrites those columns. A new principle drops the
+# vector of the old text in the same statement, so the backfill re-embeds it.
+_SHIPPED_UPSERT = """INSERT INTO procedural_memory
+    (id, task_type, principle, steps, tools_used, context_tags, draft, created_at,
+     activation_tier, tool_trigger, success_count, confidence, trigger_spec, lesson)
+    VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'ADVISORY', ?, 1, 2.0 / 3, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      task_type = excluded.task_type, principle = excluded.principle,
+      principle_embedding = CASE WHEN procedural_memory.principle IS excluded.principle
+        THEN procedural_memory.principle_embedding END,
+      steps = excluded.steps, tools_used = excluded.tools_used,
+      context_tags = excluded.context_tags, draft = 0, activation_tier = 'ADVISORY',
+      tool_trigger = excluded.tool_trigger, trigger_spec = excluded.trigger_spec,
+      lesson = excluded.lesson"""
+
+
+def _first_seeded(prior: dict | None) -> str | None:
+    """The row's ``authored_at`` when it is a readable timestamp, else None.
+
+    An unreadable stored record is repaired from the file, never fatal, and a
+    value that is not an ISO timestamp is replaced: copying it forward would
+    leave the lesson held on every later seed.
+    """
+    try:
+        value = json.loads(prior["lesson"])["authored_at"] if prior else None
+        datetime.fromisoformat(value)
+    except (ValueError, TypeError, KeyError, RecursionError):
+        return None
+    return value
+
+
 async def seed_shipped_lessons(db: aiosqlite.Connection, directory: Path = LESSONS_DIR) -> list[str]:
     """Upsert every valid lesson file, deprecate removed ones; return the errors."""
     from genesis.db.crud import procedural
@@ -240,7 +274,8 @@ async def seed_shipped_lessons(db: aiosqlite.Connection, directory: Path = LESSO
     if not directory.is_dir():
         return [f"{directory} is missing; shipped lessons left as they are"]
     files = sorted(directory.glob("*.yaml"))
-    errors: list[str] = [f"{p.name}: use the .yaml extension" for p in sorted(directory.glob("*.yml"))]
+    misnamed = sorted(directory.glob("*.yml"))
+    errors: list[str] = [f"{p.name}: use the .yaml extension" for p in misnamed]
     now = datetime.now(UTC).isoformat()
     for path in files:
         try:
@@ -249,40 +284,30 @@ async def seed_shipped_lessons(db: aiosqlite.Connection, directory: Path = LESSO
             errors.append(f"{path.name}: {exc}")
             continue
         prior = await procedural.get_by_id(db, lesson["id"])
-        prior_lesson = json.loads(prior["lesson"]) if prior and prior.get("lesson") else {}
-        await procedural.upsert(
-            db,
-            id=lesson["id"],
-            task_type=lesson["task_type"],
-            principle=lesson["principle"],
-            steps=lesson["steps"],
-            tools_used=lesson["tool_trigger"],
-            context_tags=lesson["context_tags"],
-            created_at=now,
-            draft=0,
-            activation_tier="ADVISORY",
-            tool_trigger=lesson["tool_trigger"],
-            # A first seed starts at the explicit-teach values; a re-seed keeps the
-            # usage history the row has gathered since.
-            success_count=prior["success_count"] if prior else 1,
-            confidence=prior["confidence"] if prior else 2 / 3,
-            version=prior["version"] if prior else 1,
-            trigger_spec=lesson["trigger_spec"],
-            lesson={
-                "authored_via": "shipped",
-                "authored_in": "foreground",
-                "origin": ORIGIN_FIRST_PARTY,
-                "reviewed": True,
-                # Kept from the first seed, so a re-run changes nothing.
-                "authored_at": prior_lesson.get("authored_at", now),
-            },
+        record = {
+            "authored_via": "shipped",
+            "authored_in": "foreground",
+            "origin": ORIGIN_FIRST_PARTY,
+            "reviewed": True,
+            # Kept from the first seed, so a re-run changes nothing.
+            "authored_at": _first_seeded(prior) or now,
+        }
+        await db.execute(
+            _SHIPPED_UPSERT,
+            (
+                lesson["id"], lesson["task_type"], lesson["principle"], json.dumps(lesson["steps"]),
+                json.dumps(lesson["tool_trigger"]), json.dumps(lesson["context_tags"]), now,
+                json.dumps(lesson["tool_trigger"]), json.dumps(lesson["trigger_spec"]),
+                json.dumps(record),
+            ),
         )
+        await db.commit()
         if prior and prior["deprecated"] and prior.get("deprecated_reason") == _RETIRED:
             # Only a row this seed retired comes back; an owner's deprecation stands.
             await procedural.update(db, lesson["id"], deprecated=0, deprecated_reason=None)
     # A shipped lesson whose file is gone is deprecated; one whose file is merely
-    # invalid keeps its earlier row.
-    present = {_lesson_id(path) for path in files}
+    # invalid (including one renamed to .yml) keeps its earlier row.
+    present = {_lesson_id(path) for path in files + misnamed}
     for row in await db.execute_fetchall(
         "SELECT id, lesson FROM procedural_memory WHERE lesson IS NOT NULL AND deprecated = 0"
     ):

@@ -172,3 +172,42 @@ async def test_the_last_line_names_every_skipped_file(tmp_path, monkeypatch, cap
     await seed.main(tmp_path / "genesis.db")
     last = capsys.readouterr().out.strip().splitlines()[-1]
     assert "a.yaml" in last and "b.yaml" in last
+
+
+async def test_a_rename_to_yml_keeps_the_lesson(db, lessons):
+    await seed.seed_shipped_lessons(db, lessons)
+    (lessons / "deploy_detach.yaml").rename(lessons / "deploy_detach.yml")
+    errors = await seed.seed_shipped_lessons(db, lessons)
+    assert errors == ["deploy_detach.yml: use the .yaml extension"]
+    (row,) = (await _rows(db)).values()
+    assert row["deprecated"] == 0  # reported, not retired
+
+
+async def test_unreadable_stored_values_are_repaired_and_workarounds_kept(db, lessons):
+    await seed.seed_shipped_lessons(db, lessons)
+    (row_id,) = await _rows(db)
+    await db.execute(
+        "UPDATE procedural_memory SET lesson = '{not json', attempted_workarounds = ? WHERE id = ?",
+        (json.dumps(["retry with setsid"]), row_id),
+    )
+    await db.commit()
+    assert await seed.seed_shipped_lessons(db, lessons) == []
+    row = (await _rows(db))[row_id]
+    assert json.loads(row["lesson"])["authored_via"] == "shipped"
+    assert json.loads(row["attempted_workarounds"]) == ["retry with setsid"]
+
+
+@pytest.mark.parametrize("stored", [None, 5, ["x"], "not a date"])
+async def test_an_unreadable_authored_at_is_replaced_so_the_lesson_stays_live(db, lessons, stored):
+    from genesis.learning.procedural.lesson_shape import is_live_lesson
+
+    await seed.seed_shipped_lessons(db, lessons)
+    (row_id,) = await _rows(db)
+    record = json.loads((await _rows(db))[row_id]["lesson"])
+    await db.execute(
+        "UPDATE procedural_memory SET lesson = ? WHERE id = ?",
+        (json.dumps({**record, "authored_at": stored}), row_id),
+    )
+    await db.commit()
+    await seed.seed_shipped_lessons(db, lessons)
+    assert is_live_lesson((await _rows(db))[row_id]["lesson"])
