@@ -77,6 +77,8 @@ identities. They block settlement, including when appended after an earlier
 receipt. Missing identity is not silently replaced by requested routing.
 
 Any unresolved campaign incident pauses both new completions and answer replay.
+Processing and cleanup failures with empty or whitespace-only messages retain
+their exception type as the durable error; nonblank redacted messages are kept.
 After GET settlement and explicit acknowledgement of a retained local failure,
 an eligible retained answer can replay without reading a credential or sending another
 completion. An acknowledged undispatched reservation continues the same attempt

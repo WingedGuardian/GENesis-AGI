@@ -843,7 +843,10 @@ class PinnedRouter:
     def stop_processing(self, case_id, error):
         self.failure = LocalFailure(safe_text(str(error)))
         if case_id in self.served:
-            self.campaign.fail(self.served[case_id], str(self.failure))
+            message = str(self.failure)
+            self.campaign.fail(
+                self.served[case_id], message if message.strip() else type(error).__name__
+            )
 
     def request(self, messages):
         body = self.params[route(self.contract)]
@@ -935,7 +938,8 @@ class PinnedRouter:
     def _failure(self, attempt, error):
         self.failure = LocalFailure(safe_text(str(error)))
         try:
-            self.campaign.fail(attempt, str(self.failure) or type(error).__name__)
+            message = str(self.failure)
+            self.campaign.fail(attempt, message if message.strip() else type(error).__name__)
         except BaseException as append_error:
             # Preserve the original cancellation/call/cleanup exception. Journal
             # poisoning still prevents all subsequent reads and egress.

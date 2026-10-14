@@ -296,6 +296,46 @@ async def test_answer_observed_before_a_late_failure_is_kept(env, monkeypatch, c
     assert len(server.requests) == 1
 
 
+@pytest.mark.parametrize("failure_path", ["processing", "cleanup"])
+@pytest.mark.parametrize(
+    ("error", "retained"),
+    [
+        (AssertionError(), "AssertionError"),
+        (asyncio.CancelledError(), "CancelledError"),
+        (RuntimeError(" \t\n"), "RuntimeError"),
+        (ValueError("synthetic downstream failure"), "synthetic downstream failure"),
+        (ValueError("synthetic-only-key"), "[REDACTED]"),
+    ],
+)
+async def test_served_failure_survives_reopen_without_resending(
+    env, monkeypatch, failure_path, error, retained
+):
+    data, server = bundle(env), Gateway()
+    with data.campaign:
+        target = router(data, server)
+        answer = await ask(target, data.messages)
+        if failure_path == "processing":
+            target.stop_processing("case-1", error)
+        else:
+            target._failure("case-1", error)
+        assert data.campaign.lines[-1]["error"] == retained
+        assert data.campaign.attempt("case-1")["failed"]
+        assert "failure:case-1" in data.campaign.state.blockers
+
+    key_reads = server.key_reads
+    monkeypatch.delenv(pinned.KEY_ENV)
+    with data.campaign:
+        offline = router(data, server, dispatch=False)
+        with pytest.raises(pinned.LocalFailure, match="stopped"):
+            await ask(offline, data.messages)
+        with pytest.raises(pinned.LocalFailure, match="stopped"):
+            await ask(offline, data.messages, "case-2")
+        data.campaign.acknowledge("failure:case-1", "synthetic processing failure reviewed")
+        assert (await ask(offline, data.messages)).content == answer.content
+    assert len(server.requests) == 1
+    assert server.key_reads == key_reads
+
+
 async def test_client_retry_after_a_dropped_connection_never_sends_twice(env):
     data, server = bundle(env), Gateway()
     completions = []
