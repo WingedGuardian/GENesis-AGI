@@ -147,7 +147,7 @@ def is_live_lesson(raw: object) -> bool:
     if isinstance(raw, str):
         try:
             raw = json.loads(raw, object_pairs_hook=_no_duplicate_keys, parse_constant=_no_constant)
-        except ValueError:
+        except (ValueError, RecursionError):  # too-deep JSON raises the latter
             return False
     if not isinstance(raw, dict) or set(raw) != _LESSON_KEYS:
         return False

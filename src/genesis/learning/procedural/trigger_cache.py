@@ -119,7 +119,7 @@ def _earned_entry(row: dict) -> dict | None:
     context_patterns = _json(row["context_tags"])
     try:
         spec = _trigger_spec(row)
-    except ValueError:
+    except (ValueError, RecursionError):
         logger.warning("Procedure %s has a malformed trigger_spec; using its tags", row["id"])
         spec = None
     entry = _entry(row, tools, "earned")
@@ -147,7 +147,10 @@ async def regenerate(db: object) -> int:
             continue
         try:
             entry = _lesson_entry(row)
-        except ValueError:  # malformed JSON or trigger_spec: fail closed, row only
+        except (
+            ValueError,
+            RecursionError,
+        ):  # malformed or too-deep JSON or trigger_spec: fail closed, row only
             logger.warning("Lesson %s has a malformed field; left out", row["id"], exc_info=True)
             continue
         if entry:
@@ -164,7 +167,7 @@ async def regenerate(db: object) -> int:
             continue
         try:
             entry = _earned_entry(row)
-        except ValueError:  # one bad row must not keep every other row out
+        except (ValueError, RecursionError):  # one bad row must not keep every other row out
             logger.warning("Procedure %s has a malformed field; left out", row["id"], exc_info=True)
             continue
         if entry:

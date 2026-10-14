@@ -189,3 +189,19 @@ async def test_the_live_recheck_drops_a_lesson_held_since_the_cache_was_built(db
     held = json.dumps(_lesson("external_untrusted"))
     await db.execute("UPDATE procedural_memory SET lesson = ? WHERE id = 'lesson'", (held,))
     assert (await proactive._surface_procedure(db, query)) is None
+
+
+async def test_too_deep_json_is_held_and_does_not_stop_the_cache(db, cache_path):
+    deep = "[" * 100_000 + "]" * 100_000  # json.loads raises RecursionError, not ValueError
+    assert is_live_lesson(deep) is False
+    await _row(db, "good", lesson=_lesson("owner"))
+    await _row(db, "deep_lesson", lesson=_lesson("owner"))
+    await _row(db, "deep_earned", tier="CORE")
+    await db.execute(
+        "UPDATE procedural_memory SET tool_trigger = ? WHERE id = 'deep_lesson'", (deep,)
+    )
+    await db.execute(
+        "UPDATE procedural_memory SET context_tags = ? WHERE id = 'deep_earned'", (deep,)
+    )
+    assert await trigger_cache.regenerate(db) == 1
+    assert set(_entries(cache_path)) == {"good"}
