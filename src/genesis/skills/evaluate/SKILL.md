@@ -26,9 +26,49 @@ to Genesis. Produce a structured evaluation with clear recommendations.
    fetch every supplied URL and individually address each source; do not stop
    because the first source seems sufficient. If a concept, research current
    state.
-2. **Map to Genesis** — Identify which Genesis components or design decisions
+2. **Search for alternatives and in-flight work** — When the target is a tool,
+   product, library or capability (not only an idea in an article), it is one
+   candidate, not the field. Before scoring it, search for what else already
+   does the job, and log each search in the output's `**Searched:**` line. The
+   routes depend on where you run: a **foreground** session has Bash and every
+   MCP server; a **research** background session has `recon_github_search` /
+   `recon_github_read` and `web_fetch`, but no Bash; an **inbox evaluation**
+   has only the health and memory servers (`web_search`, `web_fetch`). A search
+   you have no route for is logged as "not run: no route in this context" and
+   named in `next_step`, never logged as zero results.
+   - **Genesis's own queue.** Open PRs and issues on the public Genesis repo
+     that touch the same area. Foreground: `gh pr list --state open --search
+     "<terms>" --limit 1000`, same for `gh issue list`. Research background:
+     `recon_github_search(kind="issues", repository=<public repo>)` finds
+     issues only; open PRs have no background route. A draft PR or an issue may
+     already own the capability, or the target may replace one.
+   - **Existing implementations.** Public repositories (`gh search repos`,
+     `recon_github_search`) and exact code (`searchGitHub` / grep.app,
+     foreground only).
+   - **Claude Code mods and plugins**, whenever the capability runs inside a
+     Claude Code session: a hook or guard, status line, prompt or context
+     injection, tool interception, notifications, an in-terminal pane, session
+     awareness. From CC 2.1.287 plugins can carry mods (JS/TS function hooks
+     with UI, tool, agent and model calls); a public catalogue scans over three
+     thousand. Foreground: the `mod-finder` plugin's `search_mods` tool if
+     installed (it filters by access, e.g. `without: ["network"]`), otherwise
+     grep the catalogue it reads,
+     `https://raw.githubusercontent.com/karanb192/awesome-claude-code-mods/main/catalogue.md`.
+     Any context with `web_fetch`: Anthropic's directory,
+     `https://raw.githubusercontent.com/anthropics/claude-plugins-official/main/.claude-plugin/marketplace.json`.
+     The community catalogue has no background route yet (#3321).
+     Check each candidate's validated CC version against the pin in
+     `docs/reference/cc-compatibility.md`: below 2.1.287 a mod needs the
+     early-access flag, so it is ADOPT-pending-pin-bump. Mods are unsandboxed:
+     record each candidate's access footprint, and never propose a mod as the
+     only enforcement for a guard, because a mod that denies a tool call ran
+     before the classic `PreToolUse` hooks and suppressed them when measured
+     (#2260).
+   A negative result is "not found in <sources searched>", never "nothing
+   exists".
+3. **Map to Genesis** — Identify which Genesis components or design decisions
    the target intersects (routing, memory, perception, surplus, etc.).
-3. **Assess fit** — Score along these axes:
+4. **Assess fit** — Score along these axes:
    - **Capability gap**: Does this solve something Genesis lacks?
    - **Replacement risk**: Could this obsolete a Genesis component?
    - **Integration cost**: How much work to adopt or adapt?
@@ -41,7 +81,7 @@ to Genesis. Produce a structured evaluation with clear recommendations.
      produce the Overlap Comparison table (see Output Format below) instead
      of prose claims like "we already have this." Required whenever rigor gap
      is not "N/A — no Genesis equivalent."
-4. **Recommend** — One of: ADOPT, WATCH, IGNORE, ADAPT (take the idea, not the tool).
+5. **Recommend** — One of: ADOPT, WATCH, IGNORE, ADAPT (take the idea, not the tool).
    **Disposition posture:** Genesis's scope is everything digital — default toward
    ADOPT/ADAPT and acting now. "No current use case", "out of our wheelhouse", and
    "not obviously valuable" are NOT valid grounds for WATCH/IGNORE. A weaker
@@ -51,7 +91,7 @@ to Genesis. Produce a structured evaluation with clear recommendations.
    (stealing patterns/rigor without adopting the code) is common and valuable, but
    it is not a polite default for "I don't want to act" — reach for ADOPT when the
    thing itself fits.
-5. **Write output** — Structured evaluation in the format below.
+6. **Write output** — Structured evaluation in the format below.
 
 ## Decision Protocol: Reuse Before Rebuild
 
@@ -74,7 +114,20 @@ services. The disposition labels are the final roll-up, not the analysis.
    pattern; only then a new Genesis implementation for the irreducible delta.
    Language or runtime mismatch changes integration cost; it is not by itself a
    veto. For commodity tooling, prefer a bounded trial of a mature external
-   implementation before rebuilding it.
+   implementation before rebuilding it. For anything that runs inside a Claude
+   Code session, an existing mod or plugin is the first rung.
+   **Implementing an ADAPT verdict starts with reverse-engineering the
+   reference, not a blank file** (this is build-time work, not part of the
+   evaluation itself). Read the candidate's source end to end: the mechanism,
+   its edge cases, its tests, and which failures it already handles. Then
+   carry that over and change only the delta Genesis needs: a port of a proven
+   implementation inherits its debugging, while a rebuild from the idea
+   repeats it. Record the reference's license first. Copy code only when the
+   license allows redistribution in Genesis's public repo; otherwise carry the
+   mechanism over from your reading, not the text. When the reference is a
+   closed binary and the install has a reverse-engineering toolchain, use it
+   in a foreground session only: autonomous and background evaluation never
+   runs it.
 5. **Compare complete lifecycle cost.** External adoption includes integration,
    operations, lock-in, privacy, and compatibility risk. Internal construction
    includes design, implementation, testing, security review, battle-hardening,
@@ -105,6 +158,8 @@ architectural implications. Lead with what matters most. This is a TLDR — if
 a scoring axis is unremarkable, skip it here.}
 
 **Scores:** Capability gap: {low|medium|high} · Replacement risk: {low|medium|high} · Integration cost: {low|medium|high} · Lock-in risk: {low|medium|high}
+
+**Searched:** {one entry per search from workflow step 2: source, "terms", result count; or "not run: no route in this context". Omit the line only when the target is an idea, not a tool or capability.}
 
 **Action items:**
 - {concrete next step if any}
