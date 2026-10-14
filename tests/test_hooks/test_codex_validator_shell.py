@@ -167,6 +167,18 @@ def test_malformed_invocation_does_not_echo_arguments(tmp_path):
     assert result.stderr == b"Validator request refused\n"
 
 
+@pytest.mark.parametrize("extra", [["-h"], ["--help"], ["--work", "{ws}", "--req", "{req}"]])
+def test_runner_cli_matches_the_sealed_contract(files, tmp_path, extra):
+    """No help output and no abbreviated options: only the exact sealed argv is served."""
+    workspace, request, _, _ = files
+    args = [a.format(ws=workspace, req=request) for a in extra]
+    result = subprocess.run([sys.executable, "-I", str(ROOT / "scripts/codex_validator_request.py"), *args],
+                            cwd=tmp_path, capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert result.stderr == b"Validator request refused\n"
+
+
 @pytest.mark.parametrize("change", ["replace", "grow"])
 def test_runner_validates_actual_opened_file(modules, files, monkeypatch, change):
     _, runner = modules
@@ -238,3 +250,24 @@ def test_real_guard_wrapper_allows_exact_invocation(files, tmp_path):
     assert result.returncode == 0
     assert result.stdout == b""
     assert result.stderr == b""
+    # Evaluating the action wrote no bytecode beside the copied hooks.
+    assert not list((runtime / "scripts/hooks").rglob("__pycache__"))
+
+
+def test_probe_writes_no_bytecode_into_the_runtime(files, tmp_path):
+    """-I alone still writes __pycache__; the probe must leave the runtime as it was."""
+    workspace, request, runtime, _ = files
+    for relative in ("scripts/hooks/codex_validator_shell.py", "scripts/hooks/codex_validator_patch.py",
+                     "scripts/hooks/shell_parse.py", "src/genesis/__init__.py",
+                     "src/genesis/eval/__init__.py", "src/genesis/eval/qualification/__init__.py",
+                     "src/genesis/eval/qualification/evidence.py"):
+        target = runtime / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, target)
+    result = subprocess.run([str(runtime / ".venv/bin/python"), "-I",
+                             str(runtime / "scripts/codex_validator_request.py"),
+                             "--workspace-root", str(workspace), "--request", str(request)],
+                            cwd=tmp_path, capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {**PROBE, "ok": True}
+    assert not list(runtime.rglob("__pycache__"))

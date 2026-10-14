@@ -15,6 +15,10 @@ import os
 import sys
 from pathlib import Path
 
+# -I does not stop bytecode writes. Set before the runtime's own imports so they
+# create no __pycache__; the venv's startup .pth modules rely on install-time
+# compilation, since the sealed argv is fixed.
+sys.dont_write_bytecode = True
 RUNTIME_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(RUNTIME_ROOT / "src"))
 sys.path.insert(0, str(RUNTIME_ROOT / "scripts" / "hooks"))
@@ -47,7 +51,7 @@ def read_request(workspace: Path, supplied: str) -> object:
 
 
 def execute(request: object) -> dict:
-    """Closed schema and operation set; probe safety proves no future mutation."""
+    """Closed schema and operation set; the probe's safety says nothing about future operations."""
     if (not isinstance(request, dict) or set(request) != {"version", "operation"}
             or type(request["version"]) is not int or request["version"] != 1
             or request["operation"] != "protocol_probe"):
@@ -56,7 +60,7 @@ def execute(request: object) -> dict:
 
 
 def main() -> int:
-    parser = RequestParser()
+    parser = RequestParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--workspace-root", required=True)
     parser.add_argument("--request", required=True)
     try:

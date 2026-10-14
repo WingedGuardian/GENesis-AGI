@@ -6,7 +6,8 @@ rc=0
 decision=
 # An unresolvable hook directory falls through to the final explained denial.
 if hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd); then
-    decision=$(python3 "$hook_dir/codex_validator_guard.py" "$@") || rc=$?
+    # -B: evaluating an action must not write bytecode into the runtime checkout.
+    decision=$(python3 -B "$hook_dir/codex_validator_guard.py" "$@") || rc=$?
 else
     rc=2
 fi
