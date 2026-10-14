@@ -1468,19 +1468,20 @@ class TestSubcommandBypass:
     exit — which for `setup-token` is a long-lived credential. The capture is
     already scrubbed and fails closed, so this is defence in depth.
 
-    The split is by LIFETIME, not by "is it listed under Commands:". Three of
+    The split is by LIFETIME, not by "is it listed under Commands:". Four of
     claude's subcommands are exactly what the slot exists for, and bypassing
     them would hand an SSH drop the failure this launcher prevents.
     """
 
     # Ephemeral: prints and exits. These bypass.
     EPHEMERAL = [
-        "auth", "auto-mode", "doctor", "import", "install", "mcp", "plugin",
-        "plugins", "project", "setup-token", "update", "upgrade",
+        "auth", "auto-mode", "doctor", "import", "install", "kill", "logs",
+        "mcp", "plugin", "plugins", "project", "respawn", "rm", "setup-token",
+        "stop", "update", "upgrade",
     ]
     # Long-lived: a daemon, the interactive agent view, and a minutes-long
     # cloud review. These KEEP the slot, as a recorded decision.
-    KEEPS_A_SLOT = ["agents", "gateway", "ultrareview"]
+    KEEPS_A_SLOT = ["agents", "attach", "gateway", "ultrareview"]
 
     @staticmethod
     def _door_list(name: str) -> set[str]:

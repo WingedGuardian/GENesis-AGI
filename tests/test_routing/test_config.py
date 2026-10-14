@@ -229,16 +229,12 @@ def test_load_full_yaml(monkeypatch):
     assert cfg.call_sites["5_deep_reflection"].default_paid is True
     assert cfg.call_sites["36_code_auditor"].never_pays is False
     assert cfg.call_sites["37_infrastructure_monitor"].default_paid is True
-    # judge: LLM-as-judge eval primitive — paid V4-pro (the calibrated judge model)
-    # first, then NIM v4-flash, then paid v4-flash for resilience; paid-by-default.
-    # (Reordered 2026-08-19: NIM now serves flash, not the calibrated pro, so the
-    # calibrated openrouter-deepseek-v4 leads to keep the eval baseline stable.)
-    # 2026-10-07: the never-answering NIM rung became deepseek-flash, the same
-    # V4.1 Flash on DeepSeek's own API.
+    # Owner-selected interim order: Flash direct, Flash gateway, then Pro.
+    # This preference is not evidence of equivalent grading quality.
     assert cfg.call_sites["judge"].chain == [
-        "openrouter-deepseek-v4",
         "deepseek-flash",
         "openrouter-deepseek-flash",
+        "openrouter-deepseek-v4",
     ]
     assert cfg.call_sites["judge"].default_paid is True
     assert cfg.call_sites["judge"].dispatch == "api"

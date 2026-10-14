@@ -47,6 +47,10 @@
 #  15. Retention prune of the work board's local stores → scripts/prune_board.py
 #      (closed open-questions + their edges >90d, board events >180d; unverified
 #      questions and promotion pointers are never pruned)
+#  15b. Browser-profile copies (genesis.browser.profile_backup) → prune_browser_backups
+#      (scripts/prune_browser_backups.py decides: the newest copy per profile
+#      always stays, the newest per version for 90 days, older ones go after 14
+#      days, an unfinished *.tmp after a day)
 #  16. Copytruncate rotation of the shared MCP logs in ~/tmp (>10MB, 2 kept)
 #      → rotate_log (mcp_health.log, turnstile_debug.log; the first is held open
 #      by every session's MCP server, so both are copied and truncated, never
@@ -290,6 +294,53 @@ prune_guard_corpus() {
         \( -name 'guard-corpus.jsonl' -o -name 'guard-corpus.jsonl.*.tmp' \) \
         -mtime +45 -delete 2>/dev/null \
         || echo "guard-corpus prune exited $?"
+}
+
+prune_backup_runs() {
+    # prune_backup_runs <dir> <label> <days>: remove the per-run directories under
+    # a Genesis-owned backup dir once older than <days> (each is written once, so
+    # its mtime is its age), through remove_tree_one_fs, which spares a tree that
+    # is or holds a mount. A <dir> that is a symlink is refused: it points at a
+    # directory Genesis does not own, and every old directory there would go.
+    local dir="$1" label="$2" days="$3" root mounts run
+    if [ -L "$dir" ]; then
+        echo "$label prune SKIPPED: $dir is a symlink; pruning would delete at its target"
+        return 0
+    fi
+    root="$(cd -P -- "$dir" 2>/dev/null && pwd -P)" || return 0
+    if ! mounts="$(mount_targets "$root")"; then
+        echo "$label prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+        return 0
+    fi
+    while IFS= read -r -d '' run; do
+        remove_tree_one_fs "$run" "$mounts" 1 || echo "$label prune failed or spared $run"
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -mtime +"$days" -print0 2>/dev/null)
+}
+
+prune_browser_backups() {
+    # genesis.browser.profile_backup copies a browser profile aside before a
+    # different engine first opens it (<profile>.pre-v<version>-<UTC time>, a
+    # few hundred MB with caches left out). scripts/prune_browser_backups.py
+    # decides what goes (per profile: the newest copy always stays; the newest
+    # copy of each version for 90 days, since going back to that version needs
+    # it; older copies after 14 days; an unfinished *.tmp after a day). This
+    # function only deletes what it names, each one a direct child of the
+    # canonical root, through remove_tree_one_fs like every other recursive
+    # deleter here.
+    local base="${1:-$HOME/.genesis}" canon mounts dir
+    if [ ! -x "${VENV_PY:-}" ] || [ ! -f "$SCRIPT_DIR/prune_browser_backups.py" ]; then
+        echo "browser backup prune SKIPPED: no python interpreter or no prune_browser_backups.py"
+        return 0
+    fi
+    canon="$(cd -P -- "$base" 2>/dev/null && pwd -P)" || return 0
+    if ! mounts="$(mount_targets "$canon")"; then
+        echo "browser backup prune SKIPPED in $canon: the mount table is unreadable"
+        return 0
+    fi
+    while IFS= read -r -d '' dir; do
+        [ "${dir%/*}" = "$canon" ] || { echo "browser backup prune refused $dir: not in $canon"; continue; }
+        remove_tree_one_fs "$dir" "$mounts" 1 || echo "browser backup prune failed or spared $dir"
+    done < <("$VENV_PY" "$SCRIPT_DIR/prune_browser_backups.py" "$canon")
 }
 
 # rotate_log FILE [MAX_BYTES] [KEEP] — copytruncate rotation for a log that
@@ -546,22 +597,18 @@ main() {
             || echo "reconcile ghost-export prune exited $?"
     fi
 
-    echo "--- update.sh ephemeral-file backup retention prune (>45d) ---"
-    # update.sh saves local edits to the tracked ephemeral files it discards before
-    # its merge (AGENTS.md, config/procedure_triggers.yaml) under one directory per
-    # run. Written once and never touched again, so a directory's mtime is its age.
-    # Same guarded removal as every other recursive deleter (remove_tree_one_fs,
-    # which spares a tree that is or holds a mount), over the CANONICAL root.
-    if ! _pmb_root="$(cd -P -- "$HOME/.genesis/premerge-backups" 2>/dev/null && pwd -P)"; then
-        :
-    elif ! _pmb_mounts="$(mount_targets "$_pmb_root")"; then
-        echo "premerge-backups prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
-    else
-        while IFS= read -r -d '' _pmb_dir; do
-            remove_tree_one_fs "$_pmb_dir" "$_pmb_mounts" 1 \
-                || echo "premerge-backups prune failed or spared $_pmb_dir"
-        done < <(find "$_pmb_root" -mindepth 1 -maxdepth 1 -type d -mtime +45 -print0 2>/dev/null)
-    fi
+    echo "--- ephemeral-file backup retention prune (>45d) ---"
+    # update.sh and deploy_code_only.sh save local edits to the tracked ephemeral
+    # files they discard before their merge (AGENTS.md, config/procedure_triggers.yaml)
+    # under one directory per run. Written once and never touched again, so a
+    # directory's mtime is its age.
+    prune_backup_runs "$HOME/.genesis/premerge-backups" premerge-backups 45
+
+    echo "--- replaced systemd unit backup retention prune (>90d) ---"
+    # update.sh --take-template / bootstrap's GENESIS_TAKE_TEMPLATES save a hand-edited
+    # unit here, one directory per run, before installing its template
+    # (lib/managed_units.sh). Written once, so a directory's mtime is its age.
+    prune_backup_runs "$HOME/.genesis/deploy-backups" deploy-backups 90
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
     # The two store knobs, read BY NAME out of secrets.env.
@@ -607,6 +654,9 @@ main() {
 
     echo "--- guard replay corpus retention prune (>45d) ---"
     prune_guard_corpus "$HOME/.genesis/output"
+
+    echo "--- browser profile copies (newest kept; per version 90d; older 14d; unfinished 1d) ---"
+    prune_browser_backups "$HOME/.genesis"
 
     echo "--- MCP log rotation (>10MB, copytruncate, 2 kept) ---"
     # 10 MB: about nine days of mcp_health.log at the measured rate, small

@@ -28,11 +28,16 @@ _RUNTIME_RELOAD_SCRIPTS=(
 _RUNTIME_FRESH_SCRIPTS=(
     scripts/disk_reclaim.py               # run by autonomy/remediation.py
     scripts/lib/live_checkout.py          # run by dashboard/routes/updates.py before an update
+    scripts/lib/managed_units.py          # run by dashboard/routes/updates.py for the update status card
     scripts/hooks/bash_allowlist_guard.sh # run through .claude/hooks/genesis-hook by cc/invoker.py
     scripts/hooks/bash_allowlist_lib.sh   # sourced by bash_allowlist_guard.sh on every run
+    scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot
+    scripts/lib/deploy_checkout.sh        # sourced by the same probe (its dirty-tree predicate)
     scripts/hooks/main_checkout_guard.py  # registered by cc/invoker.py for dispatched sessions
     scripts/hooks/hook_input.py           # imported by main_checkout_guard.py on every run
     scripts/hooks/hook_output.py          # imported by main_checkout_guard.py to emit a note
+    scripts/lib/disk_guardian.sh          # sourced by util/disk_headroom.py on every free-space check
+    scripts/tmp_watchgod.sh               # sourced by util/disk_headroom.py for the watchdog's tiers
     # Not under scripts/, but the same kind: cc/invoker.py runs the allowlist
     # guard through this launcher in the server, and reads its exit code.
     .claude/hooks/genesis-hook

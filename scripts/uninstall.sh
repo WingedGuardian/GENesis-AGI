@@ -56,7 +56,7 @@ CONTAINER_NAME="genesis"
 GENESIS_PERSISTENT_TIMERS="genesis-cc-settings-align.timer genesis-cc-align.timer \
 genesis-disk-hygiene.timer genesis-watchdog.timer genesis-graph-project.timer \
 genesis-code-intel.timer genesis-backup.timer genesis-cc-tmp-align.timer \
-genesis-star-milestone.timer"
+genesis-star-milestone.timer genesis-browser-stack.timer"
 # The ROOT timers scripts/lib/network_resilience.sh installs under
 # /etc/systemd/system, with their scripts and /run files. Both removal paths
 # (direct and via incus) run this one command, so they cannot drift apart. The
@@ -538,6 +538,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-graph-project.timer genesis-graph-project.service \
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-star-milestone.timer genesis-star-milestone.service \
+                    genesis-browser-stack.timer genesis-browser-stack.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
@@ -644,6 +645,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-graph-project.timer genesis-graph-project.service 2>/dev/null || true;
                 systemctl --user stop genesis-code-intel.timer genesis-code-intel.service 2>/dev/null || true;
                 systemctl --user stop genesis-star-milestone.timer genesis-star-milestone.service 2>/dev/null || true;
+                systemctl --user stop genesis-browser-stack.timer genesis-browser-stack.service 2>/dev/null || true;
                 systemctl --user stop genesis-serena-claude-code.service genesis-serena-codex.service 2>/dev/null || true;
                 systemctl --user stop genesis-backup.timer genesis-backup.service 2>/dev/null || true;
                 systemctl --user stop genesis-server.service genesis-bridge.service \
@@ -656,6 +658,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-graph-project.timer genesis-graph-project.service \
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-star-milestone.timer genesis-star-milestone.service \
+                    genesis-browser-stack.timer genesis-browser-stack.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \

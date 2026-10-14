@@ -500,7 +500,7 @@ class TestBaseWiring:
         await _seed(db)
         engine = _engine(db)
         seen = self._spy(monkeypatch, self._BASE)
-        monkeypatch.setattr(worktree_mgr, "verify_worktree", AsyncMock(return_value=False))
+        monkeypatch.setattr(worktree_mgr, "is_registered_worktree", AsyncMock(return_value=False))
         await engine._set_output("t-sg1", "worktree_path", str(tmp_path / "gone"))
         task = await task_states.get_by_id(db, "t-sg1")
         assert await engine._recover_worktree("t-sg1", task) is True
