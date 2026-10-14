@@ -86,7 +86,7 @@ def validate_trigger_spec(spec: object) -> dict:
     """Return *spec* if it is a valid trigger_spec, else raise ValueError."""
     spec = _exact_keys(spec, _SPEC_KEYS, "trigger_spec", frozenset({"commands"}))
     commands = spec.get("commands")
-    if commands is not None:
+    if "commands" in spec:  # present means a list; null is refused, not ignored
         # Matched on the parsed command, never as text: a shell phrase the
         # normalizer knows (`git push`, `pytest`), checked here so the advisor
         # can trust what it splits.

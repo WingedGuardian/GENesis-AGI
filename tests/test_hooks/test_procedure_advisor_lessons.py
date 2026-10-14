@@ -181,6 +181,7 @@ def test_only_the_first_8_kb_is_matched(env):
         {"commands": "git push"}, {"commands": [""]}, {"commands": [5]}, {"patterns": None},
         {"patterns": [5]}, {"tool": 5}, {"task_type": None}, {"confidence": "high"},
         {"procedure_id": ["x"]},
+        {"procedure_id": ["x"], "repeat": "session"},  # reaches the fire-once filter
     ],
 )
 def test_a_malformed_entry_is_skipped_and_the_others_still_fire(env, bad):

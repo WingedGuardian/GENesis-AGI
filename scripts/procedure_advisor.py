@@ -375,7 +375,11 @@ def main() -> int:
     if not matched:
         return 0  # No match — silent pass-through
 
-    once = {id(t) for t in matched if t.get("repeat") == "session" and t.get("procedure_id")}
+    once = {
+        id(t)
+        for t in matched
+        if t.get("repeat") == "session" and isinstance(t.get("procedure_id"), str)
+    }
     log, agent = _fire_log(data) if once else (None, "main")
     if log is not None:
         fired = _already_fired(log, agent)

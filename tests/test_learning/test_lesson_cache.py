@@ -279,6 +279,7 @@ async def test_the_cache_carries_commands(db, cache_path):
         {"patterns": [], "commands": ["rm"], "repeat": "every"},  # not a known command phrase
         {"patterns": [], "commands": [], "repeat": "every"},
         {"patterns": [], "commands": "git push", "repeat": "every"},
+        {"patterns": ["x"], "commands": None, "repeat": "every"},  # null is not "absent"
         {"patterns": [], "repeat": "every"},  # neither patterns nor commands
         {"patterns": ["x"], "commands": ["git push"] * 9, "repeat": "every"},
     ],
