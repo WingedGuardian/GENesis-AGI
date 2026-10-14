@@ -20,7 +20,7 @@ _SPEC.loader.exec_module(backfill_module)
 _ROWS = {
     "unchanged": ['["Bash", "Read"]', None, None],
     "cleaned": ['["Read (code review)", "review gate"]', None, None],
-    "cli_mapped": ['["ssh", "Bash"]', None, None],
+    "cli_mapped": ['["ssh"]', None, None],
     "all_dropped": ['["Python", "review gate"]', None, None],
     "bare_string": ["pytest", None, None],
     "spec_kept": ['["gh"]', '{"patterns": ["own"], "repeat": "session"}', None],
@@ -62,7 +62,7 @@ async def test_dry_run_counts_every_class_and_writes_nothing(db):
         counts["cli_mapped"],
         counts["all_dropped"],
     ) == (1, 2, 2, 2)  # [] counts as all_dropped
-    assert counts["values_seen"] == 10
+    assert counts["values_seen"] == 9
     assert counts["values_dropped"] == 3
 
 
@@ -159,3 +159,28 @@ async def test_a_spec_or_lesson_set_after_the_read_is_kept(db):
     assert json.loads(stored["cli_mapped"][1])["patterns"] == ["x"]
     assert stored["cleaned"][0] == '["Read (code review)", "review gate"]'
     assert counts["skipped_changed"] == 2
+
+
+async def test_a_spec_is_written_only_for_a_bash_only_row_and_only_when_valid(db):
+    for pid, trigger in (
+        ("mixed", '["Read", "ssh"]'),
+        ("named_bash", '["Bash", "SSH"]'),
+        (
+            "too_many",
+            '["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git add"]',
+        ),
+    ):
+        await db.execute(
+            "INSERT INTO procedural_memory (id, task_type, principle, steps, tools_used, context_tags, "
+            "created_at, tool_trigger) VALUES (?, ?, 'p', '[]', '[]', '[]', 'now', ?)",
+            (pid, pid, trigger),
+        )
+    counts = await backfill_module.backfill(db, apply=True)
+    stored = await _stored(db)
+    assert json.loads(stored["mixed"][0]) == ["Read", "Bash"]
+    assert stored["mixed"][1] is None  # a pattern would stop Read surfacing
+    assert json.loads(stored["too_many"][0]) == ["Bash"]
+    assert stored["too_many"][1] is None  # nine patterns: over the validator's cap
+    assert counts["spec_refused"] == 1
+    assert json.loads(stored["named_bash"][0]) == ["Bash"]
+    assert stored["named_bash"][1] is None  # it named Bash: every Bash call, not only ssh

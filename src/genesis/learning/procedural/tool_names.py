@@ -55,17 +55,21 @@ _CLI_COMMANDS = (
     "git push", "git commit", "git add", "git worktree add",
 )
 # fmt: on
-# Anchored to command position (start, or after ; & | ( ` or a newline), past any
-# wrappers (sudo, env, timeout N, VAR=x, ...), a path and `python -m`, so
-# `.venv/bin/ruff` and `timeout 30 ssh` match while `~/.ssh/known_hosts`,
-# `gh-pages` and `grep pytest` do not.
+# Anchored to command position (start, or after ; & | ( ` or a newline, then any
+# blanks), past wrappers and their flags (sudo -E, time -p, env, timeout N,
+# command, VAR=x, ...), a path and `python -m`, so `.venv/bin/ruff` and
+# `timeout 30 ssh` match while `~/.ssh/known_hosts`, `gh-pages` and
+# `grep pytest` do not. A heuristic for an advisory nudge: a wrapper it does not
+# know costs one missed nudge, never a wrong one.
+# Blanks are [ \t], never \s: with \s every newline would be an anchor that
+# re-scans every newline after it (8 KB of newlines took 9 s per pattern).
 _CLI_PREFIX = (
-    r"(?:^|[;&|(`\n]\s*)(?:(?:sudo|env|time|nohup|xargs|timeout\s+\S+|\w+=\S*)\s+)*"
-    r"(?:[\w.~-]*/)*(?:python3?\s+-m\s+)?"
+    r"(?:^|[;&|(`\n])[ \t]*(?:(?:(?:sudo|env|time|nohup|xargs|command)(?:[ \t]+-\S+)*"
+    r"|timeout[ \t]+\S+|\w+=\S*)[ \t]+)*(?:[\w.~-]*/)*(?:python3?[ \t]+-m[ \t]+)?"
 )
 _CLI_PATTERNS = {
     # The command must END there too, so ssh-agent and pytest-cov are not ssh/pytest.
-    phrase: _CLI_PREFIX + r"\s+".join(map(re.escape, phrase.split())) + r"(?=$|[\s;&|)`])"
+    phrase: _CLI_PREFIX + r"[ \t]+".join(map(re.escape, phrase.split())) + r"(?=$|[\s;&|)`])"
     for phrase in _CLI_COMMANDS
 }
 # A real tool name in front of prose an LLM added: `Bash (running tests)`,
@@ -139,6 +143,15 @@ def _mcp_owners() -> dict[str, list[str]]:
     return owners
 
 
+def _annotated_cli(value: str) -> str | None:
+    """The longest CLI phrase ``value`` starts with, when prose follows it."""
+    lower = value.lower()
+    for phrase in sorted(_CLI_PATTERNS, key=len, reverse=True):
+        if lower.startswith(phrase) and re.match(r"\s*[(:{]", lower[len(phrase) :]):
+            return phrase
+    return None
+
+
 def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:
     """``(tools, patterns, dropped)`` for a raw tool_trigger value.
 
@@ -187,6 +200,10 @@ def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:
             pattern = _CLI_PATTERNS[value.lower()]
             if pattern not in patterns:
                 patterns.append(pattern)
+        elif cli := _annotated_cli(value):
+            tool = "Bash"
+            if _CLI_PATTERNS[cli] not in patterns:
+                patterns.append(_CLI_PATTERNS[cli])
         elif (m := _TOOL_PREFIX.fullmatch(value)) and m.group(1) != value:
             # The name alone, judged by every rule above (a full MCP name is
             # validated, a CLI word gets its pattern); it holds no prose, so

@@ -7,7 +7,10 @@ This runs every live row's ``tool_trigger`` through ``normalize_tool_trigger``:
 
 - the cleaned tool list is written back (``NULL`` when every value drops);
 - a CLI command mapped to ``Bash`` also writes ``trigger_spec`` with its
-  command pattern and ``repeat: every``, unless the row already has a spec;
+  command pattern and ``repeat: every`` when ``Bash`` is the row's only tool,
+  the row did not name ``Bash`` itself and has no spec (a spec gates every
+  tool on the row). The patterns are provisional: the advisor that reads them
+  sets the match contract, so apply only after it ships.
 - lesson rows are never touched (they are authored, and validated on write).
 
 Dry-run by default; ``--apply`` writes and then regenerates the trigger cache.
@@ -37,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 async def backfill(db, *, apply: bool) -> Counter:
     """Classify (and with ``apply``, repair) every live row; return the counts."""
+    from genesis.learning.procedural.lesson_shape import validate_trigger_spec
     from genesis.learning.procedural.tool_names import normalize_tool_trigger
 
     rows = await db.execute_fetchall(
@@ -55,8 +59,20 @@ async def backfill(db, *, apply: bool) -> Counter:
         update: dict[str, str | None] = {}
         if tools != value or not tools:  # a stored [] is a trigger to the promoter
             update["tool_trigger"] = json.dumps(tools) if tools else None
-        if patterns and spec is None:
-            update["trigger_spec"] = json.dumps({"patterns": patterns, "repeat": "every"})
+        # A spec applies to every tool on the row, so it is written only when
+        # Bash is the row's one tool: a pattern on [Read, Bash] would stop Read
+        # surfacing. A spec the validator refuses (over the cap) is not written.
+        # A row that names Bash itself asked for every Bash call: never narrow it.
+        named_bash = any(
+            str(v).strip() == "Bash" for v in (value if isinstance(value, list) else [value])
+        )
+        if patterns and spec is None and tools == ["Bash"] and not named_bash:
+            new_spec = {"patterns": patterns, "repeat": "every"}
+            try:
+                validate_trigger_spec(new_spec)
+                update["trigger_spec"] = json.dumps(new_spec)
+            except ValueError:
+                counts["spec_refused"] += 1
         if not update:
             counts["unchanged"] += 1
             continue

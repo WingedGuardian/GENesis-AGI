@@ -38,6 +38,8 @@ from genesis.learning.procedural.tool_names import BUILTIN_TOOLS, normalize_tool
         ),
         (["mcp__genesis-health__nope (x)"], [], [], ["mcp__genesis-health__nope (x)"]),
         (["ssh (to the host)"], ["Bash"], [tool_names._CLI_PATTERNS["ssh"]], []),
+        (["git push (publish branch)"], ["Bash"], [tool_names._CLI_PATTERNS["git push"]], []),
+        (["gh pr create: open it"], ["Bash"], [tool_names._CLI_PATTERNS["gh pr create"]], []),
         (["Python (scripts)", "review gate"], [], [], ["Python (scripts)", "review gate"]),
         (["Python", "Git", "review gate", "Grep"], ["Grep"], [], ["Python", "Git", "review gate"]),
         # Built-ins match exactly: the CLI word `grep` is not the Grep tool.
@@ -190,9 +192,33 @@ async def test_an_explicit_teach_can_clear_a_trigger_and_an_extraction_cannot(db
         ("pytest", "pytest-cov --help", False),
         ("gh", "gh-pages build", False),
         ("ssh", "x=`ssh host`", True),
+        ("ssh", "  ssh host", True),
+        ("ssh", "time -p ssh host", True),
+        ("ssh", "command ssh host", True),
+        ("ssh", "sudo -E ssh host", True),
     ],
 )
 def test_a_cli_pattern_matches_the_command_not_a_mention(phrase, command, fires):
     import re
 
     assert bool(re.search(tool_names._CLI_PATTERNS[phrase], command)) is fires
+
+
+def test_a_cli_pattern_stays_linear_on_many_newlines():
+    import re
+    import time
+
+    worst = 0.0
+    for text in ("\n" * 8192, " \n" * 4096, "\n\t" * 4096 + "x"):
+        for pattern in tool_names._CLI_PATTERNS.values():
+            start = time.perf_counter()
+            re.search(pattern, text)
+            worst = max(worst, time.perf_counter() - start)
+    assert worst < 0.5, worst
+
+
+def test_every_cli_pattern_is_a_spec_the_validator_accepts():
+    from genesis.learning.procedural.lesson_shape import validate_trigger_spec
+
+    for pattern in tool_names._CLI_PATTERNS.values():
+        validate_trigger_spec({"patterns": [pattern], "repeat": "every"})
