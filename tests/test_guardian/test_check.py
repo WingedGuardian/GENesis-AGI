@@ -1019,6 +1019,8 @@ class TestTwoGateApproval:
 
         recovery_engine.execute.assert_awaited_once()
         assert channel.poll_for_keyword.await_count == 2  # one reply per gate
+        all_sent = " ".join(str(c.args[0]) for c in channel.send_text.await_args_list)
+        assert "explicitly reauthorizes" not in all_sent
         # _execute_recovery_with_approval delegates flag-clearing to the recovery
         # engine (which clears only on VERIFIED recovery). On APPROVE it must NOT
         # clear the flag itself — recovery_engine is mocked here, so it stays set.
@@ -1073,6 +1075,11 @@ class TestTwoGateApproval:
         all_sent = " ".join(str(c.args[0]) for c in channel.send_text.await_args_list)
         assert "SNAPSHOT_ROLLBACK" in all_sent
         assert "REVERT_CODE" not in all_sent
+        assert "APPROVE explicitly reauthorizes those saved peers" in all_sent
+        gate2 = next(
+            c.args[0] for c in channel.send_text.await_args_list if "Proposed:" in c.args[0]
+        )
+        assert gate2.index("saved peer permissions") < gate2.index("APPROVE to execute")
 
     @pytest.mark.asyncio
     async def test_revert_preserved_when_git_healthy(

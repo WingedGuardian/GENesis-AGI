@@ -9,7 +9,9 @@ retires nothing, a premise-wrong PR gets `needs-architecture-session` and stays
 OPEN, and retiring belongs to the session taking up the revival. A superseded PR
 gets a comment naming its successor; since 2026-10-04 the closing session may
 retire it when the owner authorized the supersession, the successor is open or
-merged, and a per-file check shows it superseded in every part.
+merged, and a per-file check shows it superseded in every part. Since 2026-10-06
+a rework's builder may too, under the same conditions (Devin excepted: the
+closing session retires a Devin rework's old PR).
 
 **Nothing enforces or surfaces it.** MEASURED against `origin/main`: no hook
 mentions PR closure at all except one line in the push guard, and that one is a
@@ -308,13 +310,22 @@ def _closes_a_pr(argv: list[str]) -> str | None:
 #: Both notes read this one constant, so they cannot drift apart.
 _SUPERSEDED_EXCEPTION = (
     "A superseded PR gets a comment naming its successor and stays open, with "
-    "one exception that only the CLOSING session may use (not a build or "
-    "reviewer session): it may retire the PR when the owner's authorization of "
-    "the supersession is on record, the successor PR is open or merged, and every "
-    "file of the old PR was checked against the successor and current main and "
-    "found covered (naming the file:line that now does it) or moot (saying why). "
-    "That per-file mapping goes in the closing comment; one part neither covered "
-    "nor moot keeps the PR open."
+    "one exception that only two sessions may use: the CLOSING session, or the "
+    "BUILDER of a rework that replaces this PR (its `Replaces: #N` names it). "
+    "Never a reviewer session, and never Devin, even as a rework's builder: the "
+    "closing session retires the PR a Devin rework replaces. Either may retire "
+    "the PR only when all three hold: (1) the owner's authorization of the "
+    "supersession is on record; for a rework, a `## Rework spec` comment on this "
+    "PR posted by a maintainer (author association OWNER, MEMBER or "
+    "COLLABORATOR; a spec from a non-maintainer, including a non-maintainer "
+    "author of this PR, is not authorization); (2) the successor PR is open or "
+    "merged (for a split rework, the LAST replacement has opened and every "
+    "replacement is open or merged); (3) every file of the old PR was checked "
+    "against the successor and current main and found covered (naming the "
+    "file:line that now does it) or moot (saying why). That per-file mapping "
+    "goes in the closing comment, and a retired PR keeps its labels. If one "
+    "part is neither covered nor moot, the PR stays open with a comment naming "
+    "that part."
 )
 
 
@@ -348,15 +359,21 @@ def _advisory(reasons: list[str], closes: int) -> str:
         f"NOTE: {lead}\n"
         "STANDING RULE (genesis-development, 'Never RETIRE a PR you are not the "
         "one reviving'): a reviewer session retires nothing. A PR that is wrong "
-        "at the premise gets the `needs-architecture-session` label carrying the "
-        "evidence, and STAYS OPEN — retiring belongs to the session that takes "
-        f"up its revival. {_SUPERSEDED_EXCEPTION} If you believe any other PR "
+        "at the premise gets the `needs-architecture-session` label and a comment "
+        "carrying the evidence, and STAYS OPEN — retiring belongs to the session "
+        "that takes up its revival, and a rework's builder retires only under the "
+        f"superseded-PR conditions below. {_SUPERSEDED_EXCEPTION} If you believe "
+        "any other PR "
         "should be retired and nobody is picking it up, that is a question for "
         "the user.\n"
-        "So: if you are the reviving session, the user asked for this close by "
-        "name, or you are the closing session and every superseded-PR condition "
-        "above holds with its evidence, proceed. Otherwise say what you are "
-        "about to close and why, and let them answer.\n"
+        "So: if you are Devin and this PR is one your rework replaces, do not "
+        "close it; the closing session does. Otherwise proceed only if one of "
+        "these holds: (a) the user asked for this close by name; (b) you are the "
+        "closing session, or the builder of a rework that replaces this PR, and "
+        "all three conditions above hold with their evidence; (c) you are "
+        "reviving this PR with no rework replacing it, and your comment names "
+        "the successor and justifies the retirement. In any other case, say "
+        "what you are about to close and why, and let the user answer.\n"
         f"{_LIMIT}"
     )
 
@@ -375,7 +392,8 @@ def _unreadable_note(blind) -> str:
     return (
         f"NOTE: this command {blind.cause}, so I could not check whether it closes a "
         "pull request; it mentions a close. If it does: closing a PR is the user's "
-        "decision unless you are the session reviving it (genesis-development, "
+        "decision unless you are reviving it with no rework replacing it, or the "
+        "superseded-PR exception below applies to you (genesis-development, "
         f"'Never RETIRE a PR you are not the one reviving'). {_SUPERSEDED_EXCEPTION} "
         f"For the specific check: {blind.hint}."
     )

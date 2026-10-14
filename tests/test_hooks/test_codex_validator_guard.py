@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import shutil
+import site
 import subprocess
 import sys
 from pathlib import Path
@@ -78,8 +79,11 @@ def test_dispatch_uses_shared_role_floor_for_every_server_and_refuses_foreign_to
 
 def invoke(tmp_path, data, *, runtime=ROOT, workspace=None):
     workspace = workspace or tmp_path
+    # HOME is isolated, but the interpreter's user site stays where the test
+    # runner found it: a user-site install would otherwise lose fastmcp and the
+    # allow path would fail closed for an environmental reason.
     env = {"PATH": str(Path(sys.executable).parent) + os.pathsep + os.defpath,
-           "HOME": str(tmp_path)}
+           "HOME": str(tmp_path), "PYTHONUSERBASE": site.getuserbase()}
     return subprocess.run(
         ["/bin/bash", str(HOOKS / "codex-validator-guard"),
          "--runtime-root", str(runtime), "--workspace-root", str(workspace)],
@@ -99,16 +103,30 @@ def test_outer_native_allow_is_empty_stdout_and_denials_do_not_echo_input(tmp_pa
     assert b"synthetic-sensitive" not in denied.stderr
 
 
-@pytest.mark.parametrize("data", [b"not-json", b"{}", b'{"tool_name":"Bash","tool_name":"x"}',
-                                  b'{"hook_event_name":"PreToolUse","tool_name":"mcp__genesis_validator_health__health_status","tool_input":{"key":1,"key":2}}',
-                                  b'{"hook_event_name":"PreToolUse","tool_name":"mcp__genesis_validator_health__health_status","tool_input":{"value":NaN}}',
-                                  b'{"hook_event_name":"PreToolUse","tool_name":"mcp__genesis_validator_health__health_status","tool_input":{"value":1e999}}',
-                                  b"x" * (1024 * 1024 + 1)])
-def test_outer_bad_payload_never_allows(tmp_path, data):
+DECODE_FAILED = b"BLOCKED: Validator action evaluation failed"
+
+
+# Each malformed payload is otherwise a valid allowed action, so only the named
+# defect can produce the pinned denial (a decoder that kept the last duplicate
+# key would allow the duplicate-key payloads).
+@pytest.mark.parametrize(("data", "reason"), [
+    (b"not-json", DECODE_FAILED),
+    (b"{}", b"BLOCKED: Unsupported validator hook event"),
+    (b'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_name":"mcp__genesis_validator_health__health_status","tool_input":{}}',
+     DECODE_FAILED),
+    (b'{"hook_event_name":"PreToolUse","tool_name":"mcp__genesis_validator_health__health_status","tool_input":{"key":1,"key":2}}',
+     DECODE_FAILED),
+    (b'{"hook_event_name":"PreToolUse","tool_name":"mcp__genesis_validator_health__health_status","tool_input":{"value":NaN}}',
+     DECODE_FAILED),
+    (b'{"hook_event_name":"PreToolUse","tool_name":"mcp__genesis_validator_health__health_status","tool_input":{"value":1e999}}',
+     DECODE_FAILED),
+    (b"x" * (1024 * 1024 + 1), b"BLOCKED: Validator payload exceeds its size limit"),
+])
+def test_outer_bad_payload_never_allows(tmp_path, data, reason):
     result = invoke(tmp_path, data)
     assert result.returncode == 2
     assert result.stdout == b""
-    assert b"BLOCKED" in result.stderr
+    assert result.stderr.splitlines() == [reason]
 
 
 @pytest.mark.parametrize("context", ["wrong-runtime", "relative-runtime", "missing-workspace",
@@ -125,6 +143,12 @@ def test_payload_cannot_repair_invalid_launch_context(tmp_path, context):
     )).encode(), runtime=runtime, workspace=workspace)
     assert result.returncode == 2
     assert result.stdout == b""
+    reason = {"wrong-runtime": b"Validator runtime does not match its hook",
+              "relative-runtime": b"Validator runtime does not match its hook",
+              "missing-workspace": b"Missing dedicated validator workspace",
+              "runtime-workspace": b"Validator workspace must be disjoint from the runtime checkout",
+              "workspace-ancestor": b"Validator workspace must be disjoint from the runtime checkout"}[context]
+    assert result.stderr.splitlines() == [b"BLOCKED: " + reason]
 
 
 @pytest.mark.parametrize("program", ["print('unexpected')", "print('allow'); raise SystemExit(2)",
