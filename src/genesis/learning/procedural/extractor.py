@@ -38,6 +38,7 @@ from genesis.learning.procedural.embedding import (
     unpack_embedding,
 )
 from genesis.learning.procedural.operations import store_procedure
+from genesis.learning.procedural.tool_names import TOOL_TRIGGER_GUIDANCE
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -356,7 +357,8 @@ Return a JSON object with these fields:
 - "steps": array of step strings (imperative, specific, actionable)
 - "tools_used": array of tool names involved (e.g., ["Bash", "WebFetch"])
 - "context_tags": array of tags for matching (e.g., ["youtube", "ssl", "video"])
-- "tool_trigger": array of CC tool names that should trigger this procedure, or null
+- "tool_trigger": array of CC tool names that should trigger this procedure, or null.
+  """ + TOOL_TRIGGER_GUIDANCE + """
 - "reusability_score": float 0.0-1.0 (how likely is this to help future tasks?)
 
 Return ONLY the JSON object, no markdown fences or explanation.
