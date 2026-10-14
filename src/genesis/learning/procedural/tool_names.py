@@ -31,7 +31,8 @@ BUILTIN_TOOLS = frozenset({
     "Read", "Glob", "Grep", "LS", "MultiEdit", "WebFetch", "WebSearch", "TodoWrite",
     "NotebookRead", "ExitPlanMode", "EnterPlanMode", "AskUserQuestion", "ToolSearch",
     "LSP", "CronList", "TaskGet", "TaskList", "TaskOutput", "BashOutput", "KillShell",
-    "ListMcpResourcesTool", "ReadMcpResourceTool",
+    "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool", "ListAgents",
+    "Artifact", "ArtifactComments", "ArtifactData", "SendFeedback", "EndConversation",
 })
 # fmt: on
 
@@ -59,6 +60,8 @@ _MCP_MODULES = {
     "genesis-recon": "genesis.mcp.recon_mcp",
 }
 
+_GENESIS_PREFIXES = tuple(f"mcp__{server}__" for server in _MCP_MODULES)
+
 TOOL_TRIGGER_GUIDANCE = (
     "Use only these tool names: "
     + ", ".join(sorted(BUILTIN_TOOLS))
@@ -67,9 +70,19 @@ TOOL_TRIGGER_GUIDANCE = (
 )
 
 
-@functools.cache
 def _mcp_short_names() -> dict[str, str]:
-    """Short MCP tool name -> full name, for names exactly one Genesis server has.
+    """Short MCP tool name -> full name, for names exactly one Genesis server has."""
+    return {short: full[0] for short, full in _mcp_owners().items() if len(full) == 1}
+
+
+def _genesis_mcp_names() -> frozenset[str]:
+    """Every full ``mcp__genesis-*__<tool>`` name the Genesis servers declare."""
+    return frozenset(name for names in _mcp_owners().values() for name in names)
+
+
+@functools.cache
+def _mcp_owners() -> dict[str, list[str]]:
+    """Each Genesis MCP tool's short name -> its full name(s).
 
     Read from the servers' source rather than by importing them: importing all
     four takes seconds and registers every tool in the importing process. Every
@@ -98,7 +111,7 @@ def _mcp_short_names() -> dict[str, str]:
                     for d in node.decorator_list
                 ):
                     owners.setdefault(node.name, []).append(f"mcp__{server}__{node.name}")
-    return {short: full[0] for short, full in owners.items() if len(full) == 1}
+    return owners
 
 
 def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:
@@ -114,12 +127,22 @@ def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:
     if isinstance(values, str):
         values = [values]
     short = _mcp_short_names()
+    # A full name on a Genesis server must be one that server declares, so a
+    # hallucinated tool is dropped; other servers can only be shape-checked.
+    # An empty scan (unreadable source) validates nothing rather than
+    # dropping every Genesis name.
+    genesis_names = _genesis_mcp_names()
     tools: list[str] = []
     patterns: list[str] = []
     dropped: list[str] = []
     for raw in values:
         value = str(raw).strip()
-        if value in BUILTIN_TOOLS or _MCP_NAME.fullmatch(value):
+        if value in BUILTIN_TOOLS:
+            tool = value
+        elif _MCP_NAME.fullmatch(value):
+            if genesis_names and value.startswith(_GENESIS_PREFIXES) and value not in genesis_names:
+                dropped.append(value)
+                continue
             tool = value
         elif value in short:
             tool = short[value]

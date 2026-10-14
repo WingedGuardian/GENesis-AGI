@@ -242,6 +242,11 @@ async def store_procedure_checked(
         # through took a live CORE row out of the trigger cache.
         if trigger:
             update_fields["tool_trigger"] = trigger
+        elif tool_trigger == [] and draft == 0:
+            # An explicit teach that passes an empty list means "no trigger".
+            # Auto-extraction (draft=1) emitting [] keeps the stored one: an
+            # LLM's empty list is how the CORE-row wipe happened.
+            update_fields["tool_trigger"] = None
         # An explicit teach (draft=0) refining a matched auto-extracted row
         # (draft=1) promotes it. Recall gates on `confidence`/`success_count`,
         # NOT `draft` (matcher.find_best_match returns None at score<=0;

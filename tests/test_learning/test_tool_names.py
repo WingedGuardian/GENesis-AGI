@@ -28,6 +28,10 @@ from genesis.learning.procedural.tool_names import BUILTIN_TOOLS, normalize_tool
         (["Python", "Git", "review gate", "Grep"], ["Grep"], [], ["Python", "Git", "review gate"]),
         # Built-ins match exactly: the CLI word `grep` is not the Grep tool.
         (["grep"], [], [], ["grep"]),
+        (["ListAgents", "Artifact"], ["ListAgents", "Artifact"], [], []),
+        # A Genesis server's full name must be one it declares.
+        (["mcp__genesis-health__not_a_tool"], [], [], ["mcp__genesis-health__not_a_tool"]),
+        (["mcp__genesis-health__health_status"], ["mcp__genesis-health__health_status"], [], []),
     ],
 )
 def test_each_mapping_class(values, tools, patterns, dropped):
@@ -112,3 +116,19 @@ async def test_a_refine_without_a_usable_trigger_keeps_the_stored_one(db, incomi
     assert second.action == "updated" and second.procedure_id == first.procedure_id
     row = await procedural.get_by_id(db, first.procedure_id)
     assert json.loads(row["tool_trigger"]) == ["Bash"]
+
+
+async def test_an_explicit_teach_can_clear_a_trigger_and_an_extraction_cannot(db):
+    from genesis.db.crud import procedural
+    from genesis.learning.procedural.embedding import pack_embedding
+
+    blob = pack_embedding([1.0] + [0.0] * 1023)
+    first = await store_procedure_checked(db, tool_trigger=["Bash"], principle_embedding=blob, **_ROW)
+    # An auto-extraction's empty list keeps the trigger.
+    await store_procedure_checked(db, tool_trigger=[], principle_embedding=blob, draft=1, **_ROW)
+    row = await procedural.get_by_id(db, first.procedure_id)
+    assert json.loads(row["tool_trigger"]) == ["Bash"]
+    # An explicit teach's empty list clears it.
+    await store_procedure_checked(db, tool_trigger=[], principle_embedding=blob, **_ROW)
+    row = await procedural.get_by_id(db, first.procedure_id)
+    assert row["tool_trigger"] is None
