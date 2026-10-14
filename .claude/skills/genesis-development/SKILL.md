@@ -2988,7 +2988,11 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   cannot read, and any top-level comment from a reviewer with no known format, DOES
   count. Humans, workflow bots and CodeQL never open a round. A clean review, a Codex
   clean comment and the configured identity template CONFIRM a head; they never add a
-  round. Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
+  round. A round advances only on the newest reviewed head (owner ruling, 2026-10-12):
+  every review MARKS the head it reviewed, clean ones too, and a finding review that
+  lands on a head after one of that head's descendants was marked is a LATE review. It
+  opens no round; `review_budget`'s `findings` list keeps it with the round it belongs
+  to, for the round reflection to owe (#3301; until that lands nothing owes them). Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
   keeps the old rule (every head Codex reviewed, clean included), so no PR's count
   moved at the cutover. The rule lives in `review_findings.is_finding` and
   `review_budget.evaluate_evidence`; read those, not this paragraph, for an edge case.

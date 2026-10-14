@@ -701,7 +701,9 @@ jobs:
         # The collected-count floor that shared this line until #2743, and its
         # ledger of hand counts, are in this file's git history.
         # Hook-output property tests (#3187): four strict xfails, ceiling 124 -> 128.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 128
+        # Codex budget native tests (test_codex_budget_native.py): 28 opt-in cases
+        # skipped unless GENESIS_CODEX_NATIVE_TESTS=1, ceiling 128 -> 156.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 156
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job

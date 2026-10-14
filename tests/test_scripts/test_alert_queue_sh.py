@@ -171,6 +171,109 @@ def test_bytes_that_are_not_utf8_still_queue(tmp_path):
     assert e["dedupe_key"] == "k:\ufffd"
 
 
+# --- only a deliverable entry suppresses a same-key write (#3025) ------------
+# The shell's dedupe scan mirrors genesis.guardian.alert.queue.v1_entry_problem
+# (it runs isolated and cannot import it). A same-key file the drainer would
+# quarantine is not a delivery; skipping the write on its account loses the page.
+
+
+def _v1(**overrides) -> dict:
+    entry = {
+        "schema": 1, "ts": 1000.0, "severity": "warning", "source": "s",
+        "title": "t", "body": "b", "dedupe_key": "k", "meta": {},
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _drop(**keys) -> str:
+    return json.dumps({k: v for k, v in _v1().items() if k not in keys})
+
+
+_PARITY_CORPUS = [
+    ("valid", json.dumps(_v1())),
+    ("valid-int-ts", json.dumps(_v1(ts=1000))),
+    ("valid-body-only", json.dumps(_v1(title=""))),
+    ("valid-meta-null", json.dumps(_v1(meta=None))),
+    ("valid-meta-absent", _drop(meta=1)),
+    ("valid-other-key", json.dumps(_v1(dedupe_key="other"))),
+    ("ts-string", json.dumps(_v1(ts="soon"))),
+    ("ts-null", json.dumps(_v1(ts=None))),
+    ("ts-bool", json.dumps(_v1(ts=True))),
+    ("ts-nan", json.dumps(_v1()).replace('"ts": 1000.0', '"ts": NaN')),
+    ("ts-infinity", json.dumps(_v1()).replace('"ts": 1000.0', '"ts": Infinity')),
+    ("ts-missing", _drop(ts=1)),
+    ("schema-2", json.dumps(_v1(schema=2))),
+    ("schema-true", json.dumps(_v1(schema=True))),
+    ("schema-missing", _drop(schema=1)),
+    ("title-int", json.dumps(_v1(title=5))),
+    ("severity-int", json.dumps(_v1(severity=3))),
+    ("both-empty", json.dumps(_v1(title="", body=""))),
+    ("dedupe-key-int", json.dumps(_v1(dedupe_key=7))),
+    ("meta-list", json.dumps(_v1(meta=[1]))),
+    ("meta-cause-int", json.dumps(_v1(meta={"likely_cause": 1}))),
+    ("not-an-object", json.dumps([1])),
+    ("bad-json", "{nope"),
+    ("ts-huge-int", json.dumps(_v1()).replace('"ts": 1000.0', '"ts": 1' + "0" * 400)),
+    ("deeply-nested", "[" * 200000 + "]" * 200000),
+]
+
+
+def _generated_corpus():
+    # Generated from the Python check's own tuples, so a field dropped from
+    # EITHER copy fails parity.
+    from genesis.guardian.alert.queue import _HOST_META_KEYS, _TEXT_FIELDS
+
+    out = [(f"gen-{f}-int", json.dumps(_v1(**{f: 5}))) for f in _TEXT_FIELDS]
+    out += [(f"gen-meta-{f}-int", json.dumps(_v1(meta={f: 5}))) for f in _HOST_META_KEYS]
+    return out
+
+
+def test_shell_dedupe_matches_python_predicate_on_one_corpus(tmp_path):
+    from genesis.guardian.alert.queue import v1_entry_problem
+
+    mismatches = []
+    for name, raw in _PARITY_CORPUS + _generated_corpus():
+        root = tmp_path / name
+        root.mkdir()
+        (root / "queued.json").write_text(raw)
+        r = _run_bash(
+            'queue_alert warning s "t" "b" "k"', {"GENESIS_ALERT_QUEUE_ROOT": str(root)}
+        )
+        assert r.returncode == 0, r.stderr
+        written = len(list(root.glob("*.json"))) == 2
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, RecursionError):
+            parsed = None
+        suppress = (
+            parsed is not None
+            and v1_entry_problem(parsed) is None
+            and parsed.get("dedupe_key") == "k"
+        )
+        if written == suppress:
+            mismatches.append(name)
+    assert mismatches == []
+
+
+def test_invalid_same_key_entry_does_not_suppress_the_shell_write(tmp_path):
+    root = tmp_path / "queue"
+    root.mkdir()
+    (root / "queued.json").write_text(json.dumps(_v1(ts=None)))
+    r = _run_bash('queue_alert warning s "t" "b" "k"', {"GENESIS_ALERT_QUEUE_ROOT": str(root)})
+    assert r.returncode == 0, r.stderr
+    assert len(list(root.glob("*.json"))) == 2
+
+
+def test_valid_same_key_entry_still_suppresses_the_shell_write(tmp_path):
+    root = tmp_path / "queue"
+    root.mkdir()
+    (root / "queued.json").write_text(json.dumps(_v1()))
+    r = _run_bash('queue_alert warning s "t" "b" "k"', {"GENESIS_ALERT_QUEUE_ROOT": str(root)})
+    assert r.returncode == 0, r.stderr
+    assert len(list(root.glob("*.json"))) == 1
+
+
 # --- alert_stable_key: a dedupe key that ignores per-run lines (R3) ---------
 
 _FAILURE = (

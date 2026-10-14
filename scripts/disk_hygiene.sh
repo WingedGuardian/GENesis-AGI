@@ -51,6 +51,10 @@
 #      (scripts/prune_browser_backups.py decides: the newest copy per profile
 #      always stays, the newest per version for 90 days, older ones go after 14
 #      days, an unfinished *.tmp after a day)
+#  15c. Camoufox engines nothing runs → prune_browser_engines
+#      (scripts/prune_browser_engines.py decides: once the engine the installed
+#      camoufox pairs with has been in use 14 days, older version directories and
+#      the pre-0.5 root engine go, never one a running browser uses)
 #  16. Copytruncate rotation of the shared MCP logs in ~/tmp (>10MB, 2 kept)
 #      → rotate_log (mcp_health.log, turnstile_debug.log; the first is held open
 #      by every session's MCP server, so both are copied and truncated, never
@@ -343,6 +347,142 @@ prune_browser_backups() {
     done < <("$VENV_PY" "$SCRIPT_DIR/prune_browser_backups.py" "$canon")
 }
 
+_runs_from() {
+    # 0 when a process this user can see executes a binary under $1
+    # (/proc/<pid>/exe), other than one under $2 when given. An exe link this user
+    # may not read is skipped: MEASURED, every live Camoufox and Chromium process
+    # shows its own (the ones that hide it are systemd, gpg-agent, tmux), and the
+    # decider's own liveness input treats an unreadable process as running.
+    local exe
+    for exe in /proc/[0-9]*/exe; do
+        exe="$(readlink -- "$exe" 2>/dev/null)" || continue
+        if [ -n "${2:-}" ]; then
+            case "$exe" in "$2"/*) continue ;; esac
+        fi
+        case "$exe" in "$1"|"$1"/*) return 0 ;; esac
+    done
+    return 1
+}
+
+prune_browser_engines() {
+    # camoufox 0.5 keeps every engine version it ever fetched under
+    # <cache>/browsers/<repo>/<version> (about 2.4 GB each, MEASURED) and never
+    # deletes one, and a cache upgraded from camoufox 0.4 still holds the 0.4
+    # engine in its root. scripts/prune_browser_engines.py decides what goes (its
+    # header lists when nothing does). This function only deletes what it names,
+    # in the order printed, through remove_tree_one_fs:
+    #   - <root>/browsers/<repo>/<version>: renamed into <root>/browsers/.retiring/
+    #     first, so a run killed midway leaves it where the next run finds it
+    #     (camoufox's own listing skips dot directories);
+    #   - <root>/browsers/.retiring/<name>: what such a run left;
+    #   - a direct child of <root> that is not one of camoufox 0.5's own names.
+    # Anything else, a `.`/`..` component or a symlinked parent is refused. The
+    # provisioner's lock is held throughout, so no fetch runs underneath. Each
+    # path is re-checked just before it goes: a version or leftover against a
+    # browser running from it, a root entry against one running anywhere in the
+    # root outside browsers/ (the pre-0.5 engine runs from <root>/camoufox-bin,
+    # not from the file being removed). A version holding a mount is never moved,
+    # since the move would carry the mount out of the snapshot's sight. Once a
+    # root entry stays, the rest of the root stays too: the decider prints the
+    # marker it finds the root by (precomplete, else version.json) last, so the
+    # next run retries.
+    local base="${1:-${XDG_CACHE_HOME:-$HOME/.cache}/camoufox}" canon mounts path parent kind repo
+    local root_stuck=0 retiring
+    local lock_dir="${GENESIS_HOME:-$HOME/.genesis}/locks"
+    if [ ! -x "${VENV_PY:-}" ] || [ ! -f "$SCRIPT_DIR/prune_browser_engines.py" ]; then
+        echo "browser engine prune SKIPPED: no python interpreter or no prune_browser_engines.py"
+        return 0
+    fi
+    canon="$(cd -P -- "$base" 2>/dev/null && pwd -P)" || return 0
+    # The script reads "a browser runs from it" off the process table; a table
+    # this process cannot see would read as nothing running.
+    if ! liveness_visible; then
+        echo "browser engine prune SKIPPED: no other process is visible in /proc, so no engine can be proven unused"
+        return 0
+    fi
+    if ! mounts="$(mount_targets "$canon")"; then
+        echo "browser engine prune SKIPPED in $canon: the mount table is unreadable"
+        return 0
+    fi
+    mkdir -p "$lock_dir" 2>/dev/null || true
+    (
+        if ! command -v flock >/dev/null 2>&1 || ! flock -n 9; then
+            echo "browser engine prune SKIPPED: the browser stack lock is held or unavailable"
+            exit 0
+        fi
+        while IFS= read -r -d '' path; do
+            parent="${path%/*}"
+            case "$path/" in
+                */./*|*/../*|*//*) kind="" ;;
+                *)
+                    repo="${parent##*/}"
+                    if [ "${parent%/*}" = "$canon/browsers" ] && [ "${repo#.}" = "$repo" ]; then
+                        kind=version
+                    elif [ "$parent" = "$canon/browsers/.retiring" ]; then
+                        kind=leftover
+                    elif [ "$parent" = "$canon" ]; then
+                        case "${path##*/}" in
+                            browsers|config.json|repo_cache.json|.0.5_FLAG|addons|geoip|fontconfig) kind="" ;;
+                            *) kind=root ;;
+                        esac
+                    else
+                        kind=""
+                    fi
+                    ;;
+            esac
+            if [ -z "$kind" ] || [ "$(cd -P -- "$parent" 2>/dev/null && pwd -P)" != "$parent" ]; then
+                echo "browser engine prune refused $path: not an engine path in $canon"
+                continue
+            fi
+            if [ "$kind" = root ] && [ "$root_stuck" = 1 ]; then
+                echo "browser engine prune spared $path: an earlier entry of the pre-0.5 engine stayed"
+                continue
+            fi
+            if { [ "$kind" = root ] && _runs_from "$canon" "$canon/browsers"; } \
+                || { [ "$kind" != root ] && _runs_from "$path"; }; then
+                # Launched since the decision: re-checked here, just before the move.
+                echo "browser engine prune spared $path: a running process executes from it"
+                [ "$kind" = root ] && root_stuck=1
+                continue
+            fi
+            if [ "$kind" = version ] && tree_holds_mount "$path" "$mounts" 1; then
+                # A mount above the version (at browsers/ or its repo) counts too:
+                # such an install keeps every version, and says so each run.
+                echo "browser engine prune spared $path: it holds a mount"
+                continue
+            fi
+            if [ "$kind" = version ]; then
+                retiring="$canon/browsers/.retiring"
+                mkdir -p "$retiring" 2>/dev/null
+                # A link would carry the engine out of the cache, and a mount
+                # would turn the rename into a 2.4 GB copy.
+                if [ "$(cd -P -- "$retiring" 2>/dev/null && pwd -P)" != "$retiring" ] \
+                    || tree_holds_mount "$retiring" "$mounts" 1; then
+                    echo "browser engine prune refused $path: $retiring is not a plain directory in $canon"
+                    continue
+                fi
+                mv -T -- "$path" "$retiring/${parent##*/}.${path##*/}.$$" \
+                    || { echo "browser engine prune could not set aside $path"; continue; }
+                echo "browser engine prune set aside $path"
+                path="$retiring/${parent##*/}.${path##*/}.$$"
+                # Checked again past the rename: camoufox can no longer list or
+                # launch it, so a browser seen now started before the move. It
+                # stays in .retiring for the next run, which keeps it while used.
+                if _runs_from "$path"; then
+                    echo "browser engine prune spared $path: a running process executes from it"
+                    continue
+                fi
+            fi
+            if remove_tree_one_fs "$path" "$mounts" 1; then
+                echo "browser engine prune removed $path"
+            else
+                echo "browser engine prune failed or spared $path"
+                [ "$kind" = root ] && root_stuck=1
+            fi
+        done < <("$VENV_PY" "$SCRIPT_DIR/prune_browser_engines.py" "$canon")
+    ) 9>"$lock_dir/browser-stack.lock"
+}
+
 # rotate_log FILE [MAX_BYTES] [KEEP] — copytruncate rotation for a log that
 # long-lived processes hold open. The genesis-health MCP server of EVERY session
 # appends to ~/tmp/mcp_health.log through a logging.FileHandler opened once at
@@ -411,6 +551,54 @@ rotate_log() {
     else
         echo "rotate of $f failed (moving the copy to $f.1); it is kept at $tmp"
     fi
+}
+
+# Settings read BY NAME out of secrets.env: the hook audit store knobs, and the
+# browser engine cache and override (prune_camoufox_engines_step).
+#
+# The writers see them because genesis-server loads that file; this unit does
+# not, so without this the trim resolved the DEFAULT directories on an install
+# that had configured custom ones — the real store growing with no retention
+# while the timer reported success on an empty default (Codex P2, PR #1609).
+#
+# Two variables rather than `EnvironmentFile=` on the unit, for two reasons.
+# MEASURED on systemd 255: an EnvironmentFile overrides `Environment=`
+# regardless of directive order, so loading secrets.env would silently replace
+# the unit's deliberately-pinned gh/git PATH on any install whose secrets.env
+# sets PATH. And this oneshot runs `rm -rf` and `find -delete`; it has no
+# business holding provider keys or the backup passphrase.
+#
+# No `eval` and no `source`: both execute file content, and this file is the
+# one place on the box that holds every credential.
+_load_store_knob() {
+    local key="$1"
+    local file="${2:-$REPO_DIR/secrets.env}"
+    local line=""
+    local val
+    [ -f "$file" ] || return 0
+    # Last assignment wins, which is how systemd reads these files too.
+    line="$(grep -aE "^${key}=" "$file" | tail -1)" || line=""
+    [ -n "$line" ] || return 0
+    val="${line#*=}"
+    case "$val" in
+        \"*\") val="${val#\"}"; val="${val%\"}" ;;
+        \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    [ -n "$val" ] && export "$key=$val"
+    return 0
+}
+
+# The Camoufox cache the browser tools use can come from secrets.env, which this
+# unit does not load: the provisioner installs where XDG_CACHE_HOME there points.
+# It is read by name from the file the runtime reads (genesis.env.secrets_path:
+# SECRETS_PATH with a leading ~ expanded, else the checkout's), in a subshell so it
+# reaches no later step. The engine override the decider reads itself.
+prune_camoufox_engines_step() {
+    (
+        secrets="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
+        _load_store_knob XDG_CACHE_HOME "${secrets/#\~/$HOME}"
+        prune_browser_engines "${XDG_CACHE_HOME:-$HOME/.cache}/camoufox"
+    )
 }
 
 main() {
@@ -611,38 +799,7 @@ main() {
     prune_backup_runs "$HOME/.genesis/deploy-backups" deploy-backups 90
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
-    # The two store knobs, read BY NAME out of secrets.env.
-    #
-    # The writers see them because genesis-server loads that file; this unit does
-    # not, so without this the trim resolved the DEFAULT directories on an install
-    # that had configured custom ones — the real store growing with no retention
-    # while the timer reported success on an empty default (Codex P2, PR #1609).
-    #
-    # Two variables rather than `EnvironmentFile=` on the unit, for two reasons.
-    # MEASURED on systemd 255: an EnvironmentFile overrides `Environment=`
-    # regardless of directive order, so loading secrets.env would silently replace
-    # the unit's deliberately-pinned gh/git PATH on any install whose secrets.env
-    # sets PATH. And this oneshot runs `rm -rf` and `find -delete`; it has no
-    # business holding provider keys or the backup passphrase.
-    #
-    # No `eval` and no `source`: both execute file content, and this file is the
-    # one place on the box that holds every credential.
-    _load_store_knob() {
-        local key="$1"
-        local line=""
-        local val
-        [ -f "$REPO_DIR/secrets.env" ] || return 0
-        # Last assignment wins, which is how systemd reads these files too.
-        line="$(grep -aE "^${key}=" "$REPO_DIR/secrets.env" | tail -1)" || line=""
-        [ -n "$line" ] || return 0
-        val="${line#*=}"
-        case "$val" in
-            \"*\") val="${val#\"}"; val="${val%\"}" ;;
-            \'*\') val="${val#\'}"; val="${val%\'}" ;;
-        esac
-        [ -n "$val" ] && export "$key=$val"
-        return 0
-    }
+    # The two store knobs, read BY NAME out of secrets.env (`_load_store_knob`).
     _load_store_knob GENESIS_MERGE_OVERRIDE_DIR
     _load_store_knob GENESIS_DISCARD_SNAPSHOT_DIR
     # One file per hook flush, so the oldest whole files are deleted past the byte
@@ -657,6 +814,9 @@ main() {
 
     echo "--- browser profile copies (newest kept; per version 90d; older 14d; unfinished 1d) ---"
     prune_browser_backups "$HOME/.genesis"
+
+    echo "--- Camoufox engines nothing runs (only once the paired one is 14d old) ---"
+    prune_camoufox_engines_step
 
     echo "--- MCP log rotation (>10MB, copytruncate, 2 kept) ---"
     # 10 MB: about nine days of mcp_health.log at the measured rate, small
