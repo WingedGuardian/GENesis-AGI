@@ -3,7 +3,13 @@
 # Genesis — shared venv/package-install helpers.
 # Sourced by install.sh and bootstrap.sh; not executable on its own.
 
-# editable_install_guarded <repo_dir> <venv_path>
+# editable_install_guarded <repo_dir> <venv_path> [extras]
+#
+# [extras] is an optional comma-separated extras list (e.g. "browser"); the
+# install target becomes "<repo_dir>[extras]". Same guard, same contract. The
+# import check below proves only the core package: callers verify an extra's own
+# packages themselves (pip's status is masked, and a failed resolution leaves the
+# previous packages importable).
 #
 # Installs the Genesis package into <venv_path> in editable mode, refusing
 # to run when <repo_dir> is a linked git worktree: an editable install is
@@ -19,6 +25,11 @@
 editable_install_guarded() {
     local repo_dir="$1"
     local venv_path="$2"
+    local extras="${3:-}"
+    local target="$repo_dir"
+    if [ -n "$extras" ]; then
+        target="${repo_dir}[${extras}]"
+    fi
 
     # Canonical worktree detection: --git-common-dir differs from --git-dir
     # in a linked worktree. Checked against repo_dir explicitly (git -C), not
@@ -55,10 +66,50 @@ editable_install_guarded() {
         return 1
     fi
 
-    "$venv_path/bin/pip" install -e "$repo_dir" --quiet 2>&1 | tail -1 || true
+    "$venv_path/bin/pip" install -e "$target" --quiet 2>&1 | tail -1 || true
     # Validate pip actually installed Genesis (|| true above masks pip failures)
     if "$venv_path/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then
         return 0
     fi
     return 2
+}
+
+# install_browser_extra <repo_dir> <venv_path>
+#
+# The `browser` extra (camoufox, playwright, patchright), installed AFTER the core
+# packages and as its own call, never in place of them: a browser package that
+# fails to resolve fails the whole pip run, and folded into the core call it would
+# leave the core packages stale behind the masked pip status. Callers treat a
+# failure as non-fatal. The engine and Chromium these packages pin are downloaded
+# later, by scripts/install_browser_stack.sh.
+#
+# Returns 0 when the browser packages are installed as the extra intends, 1
+# otherwise (each problem printed); also 1 when the guard refused the install.
+install_browser_extra() {
+    local repo_dir="$1"
+    local venv_path="$2"
+    # Before pip: once camoufox 0.5 is installed, a manual `camoufox fetch` deletes a
+    # cache holding a pre-0.5 engine unless the cache carries .0.5_FLAG (the
+    # browser-stack unit marks it itself). Best effort: a fresh install has no cache.
+    "$venv_path/bin/python" -m genesis.browser.provision mark-legacy 2>/dev/null || true
+    # Under the browser-stack unit's own lock: pip replacing camoufox, playwright or
+    # patchright while a provisioning run uses them can mix pins mid-install. Waits
+    # up to GENESIS_BROWSER_STACK_WAIT_S (default 7200, the project's step floor).
+    local lock_dir="${GENESIS_HOME:-$HOME/.genesis}/locks"
+    local wait_s="${GENESIS_BROWSER_STACK_WAIT_S:-7200}"
+    if mkdir -p "$lock_dir" 2>/dev/null && command -v flock >/dev/null 2>&1; then
+        if ! (
+            flock -w "$wait_s" 9 || {
+                echo "browser-stack: a provisioning run still holds its lock after ${wait_s}s; browser packages not changed" >&2
+                exit 75
+            }
+            editable_install_guarded "$repo_dir" "$venv_path" browser
+        ) 9>"$lock_dir/browser-stack.lock"; then
+            return 1
+        fi
+    else
+        editable_install_guarded "$repo_dir" "$venv_path" browser || return 1
+    fi
+    # The checkout's ranges, not the installed metadata a failed pip left behind.
+    "$venv_path/bin/python" -m genesis.browser.provision check-packages --pyproject "$repo_dir/pyproject.toml"
 }

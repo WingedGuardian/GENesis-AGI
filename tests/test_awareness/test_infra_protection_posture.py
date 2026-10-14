@@ -197,6 +197,28 @@ def test_healthy_profile_no_defects():
     assert _infra_missing_protections(_profile()) == []
 
 
+@pytest.mark.parametrize(
+    "knob",
+    ["false", "0", "no", "off", "FALSE", "Off", " no ", "0B"],
+)
+def test_incus_false_swap_words_are_detected(knob):
+    assert "container_swap_knob_off" in _infra_missing_protections(_profile(knob=knob))
+
+
+@pytest.mark.parametrize(
+    "knob",
+    ["true", "1", "yes", "on", "4294967296", "4GiB", "", None],
+)
+def test_swap_on_and_unset_values_are_healthy(knob):
+    assert "container_swap_knob_off" not in _infra_missing_protections(_profile(knob=knob))
+
+
+def test_absent_swap_knob_is_healthy():
+    profile = _profile()
+    del profile["sections"]["host_virt"]["facts"]["container_limits"]["limits.memory.swap"]
+    assert "container_swap_knob_off" not in _infra_missing_protections(profile)
+
+
 def test_cc_tmp_shared_fs_detected_in_lxc():
     # cc-tmp NOT isolated on an lxc container → the nag fires.
     assert "cc_tmp_shared_fs" in _infra_missing_protections(
@@ -899,4 +921,3 @@ def test_tailscale_watchdog_rule_silent_otherwise(tailscaled, state):
     assert "tailscale_watchdog_absent" not in _infra_missing_protections(
         _profile(tailscaled=tailscaled, ts_watchdog=state)
     )
-

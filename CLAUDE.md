@@ -80,6 +80,10 @@ that the FalkorDB store reads — the staleness BOUND, since that store's
 `invalidate()` is a no-op and nothing else refreshes it; a clean no-op on
 installs with no graph engine, so it is enabled everywhere; see
 `scripts/graph_project_runner.sh`),
+`genesis-browser-stack.timer` (daily retry of `genesis-browser-stack.service`,
+the oneshot bootstrap starts after installing the browser packages: the
+Camoufox engine and Chromium they pin, and their system libraries; see
+`scripts/install_browser_stack.sh`),
 `genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
