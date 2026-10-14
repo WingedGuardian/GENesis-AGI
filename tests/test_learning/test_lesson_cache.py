@@ -74,6 +74,10 @@ def _entries(cache_path) -> dict[str, dict]:
         ('{"origin": "owner", "origin": "external_untrusted"}', False),
         ('{"origin": "external_untrusted", "reviewed": true, "reviewed": false}', False),
         ('{"origin": "external_untrusted", "reviewed": NaN}', False),
+        # SQLite's JSON functions stop reading at a NUL; Python rejects the tail.
+        (json.dumps(_lesson("owner")) + "\x00junk", False),
+        # A BLOB: SQLite's JSON functions would read it, Python never does.
+        (json.dumps(_lesson("owner")).encode(), False),
         # Only a complete record is read for its origin and review state.
         ({"origin": "owner"}, False),
         ({"origin": "external_untrusted", "reviewed": True}, False),
@@ -87,7 +91,7 @@ def _entries(cache_path) -> dict[str, dict]:
     ],
 )
 async def test_python_and_sql_agree_on_liveness(db, raw, live):
-    stored = raw if raw is None or isinstance(raw, str) else json.dumps(raw)
+    stored = raw if raw is None or isinstance(raw, str | bytes) else json.dumps(raw)
     if raw is not None:
         assert is_live_lesson(stored) is live
     rows = await db.execute_fetchall(
@@ -205,3 +209,43 @@ async def test_too_deep_json_is_held_and_does_not_stop_the_cache(db, cache_path)
     )
     assert await trigger_cache.regenerate(db) == 1
     assert set(_entries(cache_path)) == {"good"}
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("tool_trigger", "1"),
+        ("tool_trigger", "true"),
+        ("tool_trigger", '{"Bash": 1}'),
+        ("tool_trigger", "[1, 2]"),
+        ("steps", '"one step"'),
+        ("context_tags", "[1]"),
+        ("steps", "[" * 500 + "]" * 500),  # nested: would break the YAML writer
+        ("steps", "[1]"),
+        ("task_type", b"bytes"),  # binary: would break the JSON writer
+        ("principle", b"bytes"),  # binary principle (an integer would be stored as text)
+        ("trigger_spec", '{"patterns": ["a{999999999999999999999}"], "repeat": "every"}'),
+    ],
+)
+async def test_a_field_the_advisor_cannot_read_leaves_only_that_row_out(
+    db, cache_path, column, value
+):
+    await _row(db, "good", lesson=_lesson("owner"))
+    await _row(db, "bad_lesson", lesson=_lesson("owner"))
+    await _row(db, "bad_earned", tier="CORE")
+    for pid in ("bad_lesson", "bad_earned"):
+        await db.execute(f"UPDATE procedural_memory SET {column} = ? WHERE id = ?", (value, pid))
+    await trigger_cache.regenerate(db)
+    entries = _entries(cache_path)
+    assert "good" in entries
+    assert "bad_lesson" not in entries
+    # An earned row's bad trigger_spec falls back to its tags (as before); every
+    # other bad field leaves it out.
+    assert ("bad_earned" in entries) is (column == "trigger_spec")
+
+
+def test_an_overflowing_quantifier_is_refused_by_the_validator():
+    from genesis.learning.procedural.lesson_shape import validate_trigger_spec
+
+    with pytest.raises(ValueError):
+        validate_trigger_spec({"patterns": ["a{999999999999999999999}"], "repeat": "every"})

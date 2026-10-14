@@ -39,7 +39,8 @@ def _sql_set(values) -> str:
 
 
 # is_live_lesson as a SQL condition, for queries that read procedural_memory
-# directly. A row without a lesson passes. Anything else must be a complete
+# directly. A row without a lesson passes. Anything else must be TEXT (SQLite's
+# JSON functions also accept a BLOB, which Python never decodes) and a complete
 # record (exactly the five keys, once each, the enums and types valid) before
 # its origin and review state are read; any other value is held. CASE keeps
 # json_each/json_extract away from a malformed value, which would fail the query,
@@ -47,7 +48,9 @@ def _sql_set(values) -> str:
 _KEYS = _sql_set(_LESSON_KEYS)
 # Built from module constants only, so the S608 string-SQL warning does not apply.
 LIVE_LESSON_SQL = (
-    "CASE WHEN lesson IS NULL THEN 1 WHEN NOT json_valid(lesson) THEN 0 "  # noqa: S608
+    "CASE WHEN lesson IS NULL THEN 1 WHEN typeof(lesson) != 'text' THEN 0 "  # noqa: S608
+    "WHEN instr(lesson, char(0)) > 0 THEN 0 "  # SQLite's JSON stops at a NUL; Python does not
+    "WHEN NOT json_valid(lesson) THEN 0 "
     "WHEN json_type(lesson) != 'object' THEN 0 "
     "WHEN (SELECT COUNT(DISTINCT key) FROM json_each(lesson) WHERE key IN (" + _KEYS + ")) != 5 "
     "OR (SELECT COUNT(*) FROM json_each(lesson)) != 5 THEN 0 "
@@ -94,7 +97,7 @@ def validate_trigger_spec(spec: object) -> dict:
             )
         try:
             compiled = re.compile(pattern)
-        except re.error as exc:
+        except (re.error, OverflowError, RecursionError) as exc:
             raise ValueError(f"trigger_spec pattern {pattern!r} does not compile: {exc}") from exc
         if compiled.search("") is not None:
             raise ValueError(f"trigger_spec pattern {pattern!r} matches every input")

@@ -98,6 +98,35 @@ def _entry(row: dict, tools: list, kind: str) -> dict:
     }
 
 
+def _str_list(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _require_reader_types(entry: dict) -> dict:
+    """Raise ValueError unless every field the advisor reads has the type it uses.
+
+    The advisor runs `tool_name in tool`, iterates the pattern lists, joins
+    `steps` and formats `confidence` as a percentage, on every tool call: one
+    entry of the wrong type would raise there instead of being left out here.
+    With these checks every value is text, a number or a list of text, so the
+    YAML and JSON writers cannot fail on a nested or binary value either.
+    """
+    if not entry["tool"] or not _str_list(entry["tool"]):
+        raise ValueError("tool_trigger is not a list of tool names")
+    for key in ("patterns", "context_patterns"):
+        if key in entry and not _str_list(entry[key]):
+            raise ValueError(f"{key} is not a list of strings")
+    if not _str_list(entry["steps"]):
+        raise ValueError("steps is not a list of strings")
+    for key in ("procedure_id", "task_type", "principle"):
+        if not isinstance(entry[key], str):
+            raise ValueError(f"{key} is not text")
+    confidence = entry["confidence"]
+    if isinstance(confidence, bool) or not isinstance(confidence, int | float):
+        raise ValueError("confidence is not a number")
+    return entry
+
+
 def _lesson_entry(row: dict) -> dict | None:
     tools = _json(row["tool_trigger"]) if row.get("tool_trigger") else None
     if not tools:
@@ -108,7 +137,7 @@ def _lesson_entry(row: dict) -> dict | None:
     entry["repeat"] = spec["repeat"] if spec else "session"
     if _json(row["lesson"]).get("reviewed") is not True:
         entry["label"] = "unreviewed"
-    return entry
+    return _require_reader_types(entry)
 
 
 def _earned_entry(row: dict) -> dict | None:
@@ -126,7 +155,7 @@ def _earned_entry(row: dict) -> dict | None:
     entry["context_patterns"] = context_patterns
     entry["patterns"] = spec["patterns"] if spec else context_patterns
     entry["repeat"] = "every"
-    return entry
+    return _require_reader_types(entry)
 
 
 async def regenerate(db: object) -> int:
@@ -147,10 +176,7 @@ async def regenerate(db: object) -> int:
             continue
         try:
             entry = _lesson_entry(row)
-        except (
-            ValueError,
-            RecursionError,
-        ):  # malformed or too-deep JSON or trigger_spec: fail closed, row only
+        except Exception:  # any malformed field: fail closed, this row only
             logger.warning("Lesson %s has a malformed field; left out", row["id"], exc_info=True)
             continue
         if entry:
@@ -167,7 +193,7 @@ async def regenerate(db: object) -> int:
             continue
         try:
             entry = _earned_entry(row)
-        except (ValueError, RecursionError):  # one bad row must not keep every other row out
+        except Exception:  # one bad row must not keep every other row out
             logger.warning("Procedure %s has a malformed field; left out", row["id"], exc_info=True)
             continue
         if entry:
