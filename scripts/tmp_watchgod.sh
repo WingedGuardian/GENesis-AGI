@@ -32,7 +32,10 @@
 # RUNAWAY FILES, at every tier (scripts/lib/watchgod_runaway.sh): a file held
 # open for writing that alone is a large share of its filesystem, or that grew
 # a large share in one poll, is paged CRITICAL with its path and the processes
-# holding it. Fast growth switches to the fast poll. Detection only.
+# holding it. Fast growth switches to the fast poll. One response, in act mode:
+# a Claude Code task output growing fast while its domain is ORANGE or RED has
+# its command PAUSED (SIGSTOP; recorded for `scripts/watchgod thaw|kill`). The
+# file is not emptied.
 #
 # OBSERVE mode (WATCHGOD_ACT=0) changes nothing on disk but still sends every
 # page, titled as observe-mode.
@@ -93,9 +96,19 @@ source "$_SCRIPT_DIR/lib/disk_guardian.sh"
 # Liveness (open fds + cwds) for the cc-tmp retention sweep.
 # shellcheck source=scripts/lib/tmp_liveness.sh
 source "$_SCRIPT_DIR/lib/tmp_liveness.sh"
-# Runaway-file detection: names a file filling a disk, and who is writing it.
+# Process identity and generation-bound signals, and the pause records
+# (shared with scripts/watchgod status|thaw|kill).
+# shellcheck source=scripts/lib/watchgod_signal.sh
+source "$_SCRIPT_DIR/lib/watchgod_signal.sh"
+# shellcheck source=scripts/lib/watchgod_records.sh
+source "$_SCRIPT_DIR/lib/watchgod_records.sh"
+# Runaway-file detection: names a file filling a disk, and who is writing it;
+# pauses the command when it is a Claude Code task output.
 # shellcheck source=scripts/lib/watchgod_runaway.sh
 source "$_SCRIPT_DIR/lib/watchgod_runaway.sh"
+# This poll's tier of each watched domain, by domain key (the runaway response
+# acts only on an ORANGE or RED one).
+declare -gA RW_TIER=()
 
 LOCAL_CONF_FILE="$HOME/.genesis/config/watchgod.local.conf"
 FAST_POLL_INTERVAL=5
@@ -789,6 +802,7 @@ check_disks() {
 
     # Pass 2: tier and act, once per domain.
     local rw_domains=""
+    RW_TIER=()
     for key in "${order[@]}"; do
         p="${path_of[$key]}"
         read -r free total quota unalloc meta fstype used_raw <<< "${meas_of[$key]}"
@@ -805,6 +819,7 @@ check_disks() {
         handle_fs "$p" "$key" "$tier" "$free" "$total" "$eta" "$writers" "$fstype"
         # Canonical root: /proc names a held file by its resolved path.
         rw_domains+="${key} ${key%%[qm]*} ${total} $(wg_canon "$p")"$'\n'
+        RW_TIER[$key]="$tier"
 
         [[ -n "$DISK_JSON" ]] && DISK_JSON+=", "
         DISK_JSON+="$(_wg_json_str "$p"): {\"tier\": \"$tier\", \"floor_tier\": \"$floor\", \"free_mb\": $free, \"total_mb\": $total, \"used_pct\": $(( total > 0 ? used * 100 / total : 0 )), \"eta_min\": $([[ "$eta" == - ]] && echo null || echo "$eta"), \"rate_mb_per_min\": $rate, \"quota\": $([[ $quota == 1 ]] && echo true || echo false), \"unalloc_mb\": $([[ "$unalloc" == - ]] && echo null || echo "$unalloc"), \"meta_pct\": $([[ "$meta" == - ]] && echo null || echo "$meta"), \"fstype\": $(_wg_json_str "$fstype")}"

@@ -253,3 +253,98 @@ def test_usage_error_exits_2():
         [sys.executable, "-I", "-S", str(_PY), "/proc"], capture_output=True, timeout=60
     )
     assert r.returncode == 2
+
+
+# ── chain: the ancestry, each link bound ──────────────────────────
+
+
+def _cfake(
+    proc: Path, pid: int, comm: bytes, ppid: int, st: int, state: str = "S", threads: int = 1
+) -> None:
+    d = proc / str(pid)
+    d.mkdir(parents=True, exist_ok=True)
+    rest = [state, str(ppid)] + ["0"] * 15 + [str(threads), "0", str(st)] + ["0"] * 10
+    (d / "stat").write_bytes(f"{pid} (".encode() + comm + b") " + " ".join(rest).encode() + b"\n")
+
+
+def _chain(root: Path, stdin: str) -> list[list[str]]:
+    return [r.split("\t") for r in wg.chain(str(root), stdin.splitlines())]
+
+
+def test_chain_finds_the_claude_ancestor_and_the_command_root(tmp_path):
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    _cfake(tmp_path, 200, b"bash", 100, 2000)
+    _cfake(tmp_path, 201, b"grep", 200, 2010, threads=3)
+    assert _chain(tmp_path, "201 2010") == [
+        ["201", "ok", "grep", "S", "3", "2", "200:2000", "201:2010,200:2000"]
+    ]
+    assert _chain(tmp_path, "200 -")[0][1:2] + _chain(tmp_path, "200 -")[0][5:7] == [
+        "ok",
+        "1",
+        "200:2000",
+    ]
+
+
+def test_chain_says_claude_for_the_session_itself_and_nocc_without_one(tmp_path):
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    _cfake(tmp_path, 300, b"python", 1, 3000)
+    assert _chain(tmp_path, "100 500")[0][1] == "claude"
+    assert _chain(tmp_path, "300 3000")[0][1] == "nocc"
+
+
+def test_chain_says_gone_for_another_start_time_or_no_process(tmp_path):
+    _cfake(tmp_path, 200, b"bash", 100, 2000)
+    assert _chain(tmp_path, "200 9999")[0][1] == "gone", (
+        "a reused pid is not the process asked about"
+    )
+    assert _chain(tmp_path, "4242 1")[0][1] == "gone"
+
+
+def test_chain_says_unknown_when_a_parent_changes_while_read(tmp_path, monkeypatch):
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    _cfake(tmp_path, 200, b"bash", 100, 2000)
+    real = wg._stat_fields
+    calls = []
+
+    def reparented(dfd):
+        calls.append(dfd)
+        start, state, comm, ppid = real(dfd)
+        # The child's re-read after its parent was read: reparented to init.
+        return (
+            (start, state, comm, "1")
+            if comm == "bash" and len(calls) > 2
+            else (start, state, comm, ppid)
+        )
+
+    monkeypatch.setattr(wg, "_stat_fields", reparented)
+    assert _chain(tmp_path, "200 2000")[0][1] == "unknown"
+
+
+def test_chain_says_unknown_when_a_start_time_cannot_be_read(tmp_path):
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    d = tmp_path / "200"
+    d.mkdir()
+    (d / "comm").write_bytes(b"bash\n")
+    (d / "status").write_bytes(b"Name:\tbash\nPPid:\t100\n")
+    assert _chain(tmp_path, "200 -")[0][1] == "unknown"
+
+
+def test_chain_skips_malformed_lines(tmp_path):
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    assert _chain(tmp_path, "x 1\n100\n100 5a\n") == []
+
+
+def test_chain_says_gone_when_the_process_itself_exits_mid_walk(tmp_path, monkeypatch):
+    """Its own re-read after the parent was read finds it gone: gone, not
+    unknown (unknown would veto the whole response)."""
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    _cfake(tmp_path, 200, b"bash", 100, 2000)
+    real = wg._stat_fields
+    calls = []
+
+    def exits(dfd):
+        calls.append(dfd)
+        return None if len(calls) == 3 else real(dfd)
+
+    monkeypatch.setattr(wg, "_stat_fields", exits)
+    assert _chain(tmp_path, "200 2000")[0][1] == "gone"
