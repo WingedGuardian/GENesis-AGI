@@ -1346,7 +1346,9 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         target="$SYSTEMD_USER_DIR/$svc_name"
         case "$svc_name" in
             genesis-cbm-query.service | genesis-cbm-query-clients.slice)
-                if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+                # Links reach the shared writer's keep/named-take policy below;
+                # it never writes through them. Other nonregular paths refuse.
+                if [[ ! -L "$target" && -e "$target" && ! -f "$target" ]]; then
                     echo "  ERROR: refusing nonregular managed Codebase unit: $target" >&2
                     exit 1
                 fi ;;
