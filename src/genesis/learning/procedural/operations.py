@@ -13,6 +13,7 @@ import aiosqlite
 from genesis.db.crud import procedural
 from genesis.learning.procedural.embedding import cosine_similarity, unpack_embedding
 from genesis.learning.procedural.lesson_shape import (
+    HELD_REASON,
     is_live_lesson,
     validate_lesson,
     validate_trigger_spec,
@@ -92,6 +93,7 @@ async def store_procedure(
     first_mover: int = 0,
     trigger_spec: dict | None = None,
     lesson: dict | None = None,
+    deprecated_reason: str | None = None,
 ) -> str:
     """Create a new procedure and return its ID.
 
@@ -141,6 +143,7 @@ async def store_procedure(
         first_mover=first_mover,
         trigger_spec=trigger_spec,
         lesson=lesson,
+        deprecated_reason=deprecated_reason,
     )
     return proc_id
 
@@ -217,10 +220,12 @@ async def store_procedure_checked(
     A lesson call refines only a lesson and a plain call only an earned row, so
     neither kind is ever rewritten as the other. A caller of
     ``external_untrusted`` origin never refines a lesson: it creates a held
-    sibling. A trusted lesson refine of a held lesson replaces its content and
-    record, so it makes it live.
+    sibling, written deprecated with ``HELD_REASON`` so no reader sees it until
+    the owner reviews it. A trusted author of the same lesson therefore creates
+    a live lesson of its own rather than refining the held one.
     """
     trigger, patterns, dropped = normalize_tool_trigger(tool_trigger)
+    held = False
     if lesson is not None:
         if not trigger:
             raise ValueError("a lesson needs at least one tool name in tool_trigger")
@@ -237,7 +242,8 @@ async def store_procedure_checked(
                 ) from exc
             raise
         lesson = validate_lesson(lesson)
-        activation_tier = "ADVISORY" if is_live_lesson(lesson) else "LIBRARY"
+        held = not is_live_lesson(lesson)
+        activation_tier = "LIBRARY" if held else "ADVISORY"
         patterns = []  # stored in the spec, so not a warning
     trigger_warnings = (
         [f"tool_trigger values dropped as not tool names: {dropped}"] if dropped else []
@@ -251,8 +257,10 @@ async def store_procedure_checked(
     candidates = await procedural.list_by_task_type(
         db, task_type, lessons=lesson is not None, limit=None
     )
-    if caller_origin == ORIGIN_EXTERNAL_UNTRUSTED:
+    if held or caller_origin == ORIGIN_EXTERNAL_UNTRUSTED:
         # Never let outside text rewrite a lesson; it becomes a sibling instead.
+        # `held` is checked too, so a held record can never update a live row
+        # whatever the caller passed as its origin.
         candidates = [c for c in candidates if c.get("lesson") is None]
     matched, best_sim = _best_same_procedure_match(candidates, principle_embedding)
 
@@ -374,8 +382,11 @@ async def store_procedure_checked(
         principle_embedding=principle_embedding,
         trigger_spec=trigger_spec,
         lesson=lesson,
+        # A held lesson is written out of every reader's sight until reviewed,
+        # and it cannot change the trigger cache, so the cache is left alone.
+        deprecated_reason=HELD_REASON if held else None,
     )
-    rebuilt = await _regenerate_cache(db) if lesson is not None else None
+    rebuilt = await _regenerate_cache(db) if lesson is not None and not held else None
 
     if warnings:
         logger.info("Procedure %s created with %d warnings", proc_id, len(warnings))

@@ -24,6 +24,9 @@ from datetime import datetime
 from genesis.memory.provenance import ORIGIN_CLASSES, ORIGIN_FIRST_PARTY, ORIGIN_OWNER
 
 MAX_PATTERNS = 8
+# A held lesson is written deprecated with this reason, so every reader that
+# skips deprecated rows skips it; the owner's review removes it.
+HELD_REASON = "held: awaiting review"
 MAX_PATTERN_CHARS = 200
 REPEAT_MODES = frozenset({"session", "every"})
 AUTHORED_VIA = frozenset({"mcp", "shipped"})

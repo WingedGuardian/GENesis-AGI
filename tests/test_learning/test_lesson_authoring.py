@@ -96,7 +96,13 @@ async def test_an_external_lesson_is_held_and_not_cached(env, monkeypatch):
     row = await _only_row(db)
     assert row["activation_tier"] == "LIBRARY"
     assert "HELD" in response
+    await trigger_cache.regenerate(db)  # the held write itself leaves the cache alone
     assert row["id"] not in _cached(cache)
+    # Written out of every reader's sight until reviewed (owner ruling).
+    from genesis.learning.procedural.lesson_shape import HELD_REASON
+
+    assert (row["deprecated"], row["deprecated_reason"]) == (1, HELD_REASON)
+    assert await procedural.list_active(db) == []
     # Held from recall too (owner ruling): neither matcher path returns it.
     assert await matcher.find_best_match(db, "deploy", ["deploy"]) is None
     assert await matcher.find_relevant(db, ["deploy"], min_confidence=0.0) == []
@@ -114,6 +120,7 @@ async def test_an_external_refine_of_a_live_lesson_makes_a_held_sibling(env, mon
     sibling = next(r for pid, r in rows.items() if pid != original["id"])
     assert json.loads(sibling["lesson"])["origin"] == "external_untrusted"
     assert sibling["activation_tier"] == "LIBRARY"
+    assert sibling["deprecated"] == 1  # held: out of every reader's sight
 
 
 async def test_a_trusted_refine_with_lesson_parameters_rewrites_the_spec(env):
@@ -380,3 +387,38 @@ async def test_lessons_never_crowd_earned_rows_out_of_the_promoter_or_the_cache(
     await db.commit()
     await promoter.promote_and_demote(db)
     assert (await procedural.get_by_id(db, "earned"))["quarantined"] == 1  # it was evaluated
+
+
+async def test_a_held_write_leaves_the_cache_alone(env, monkeypatch):
+    from genesis.learning.procedural import operations
+
+    db, store, _ = env
+    calls = []
+
+    async def counted(db_):
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(operations, "_regenerate_cache", counted)
+    monkeypatch.setenv("GENESIS_SESSION_ORIGIN", "external_untrusted")
+    await store(**_ARGS, trigger_patterns=[r"update\.sh"])
+    assert calls == []
+    monkeypatch.delenv("GENESIS_SESSION_ORIGIN")
+    await store(**{**_ARGS, "task_type": "other"}, trigger_patterns=[r"update\.sh"])
+    assert calls == [1]  # a live lesson still rebuilds it
+
+
+async def test_a_held_record_never_updates_a_live_row_whatever_the_caller_says(env):
+    db, store, _ = env
+    await store(**_ARGS, trigger_patterns=[r"update\\.sh"])
+    (live,) = [dict(r) for r in await db.execute_fetchall("SELECT * FROM procedural_memory")]
+    held = {**_HELD}
+    result = await store_procedure_checked(
+        db, task_type="deploy", principle=live["principle"], steps=["s"], tools_used=["Bash"],
+        context_tags=["deploy"], tool_trigger=["Bash"], principle_embedding=_VEC,
+        trigger_spec={"patterns": ["x"], "repeat": "every"}, lesson=held,
+    )  # no caller_origin passed
+    assert result.action == "created"
+    row = dict((await db.execute_fetchall(
+        "SELECT lesson, deprecated FROM procedural_memory WHERE id = ?", (live["id"],)))[0])
+    assert json.loads(row["lesson"])["origin"] != "external_untrusted" and row["deprecated"] == 0

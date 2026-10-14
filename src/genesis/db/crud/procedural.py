@@ -57,15 +57,19 @@ async def create(
     first_mover: int = 0,
     trigger_spec: dict | None = None,
     lesson: dict | None = None,
+    deprecated_reason: str | None = None,
 ) -> str:
+    """Insert a row. A ``deprecated_reason`` writes it deprecated in the same
+    statement, so no reader ever sees it live in between."""
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, scenario, steps, tools_used,
             context_tags, draft, attempted_workarounds, version, created_at,
             activation_tier, tool_trigger, success_count, confidence,
             source, promotion_history, principle_embedding,
-            extraction_context, first_mover, trigger_spec, lesson)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            extraction_context, first_mover, trigger_spec, lesson,
+            deprecated, deprecated_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, person_id, task_type, principle, scenario,
          json.dumps(steps), json.dumps(tools_used),
          json.dumps(context_tags), draft,
@@ -74,7 +78,8 @@ async def create(
          json.dumps(tool_trigger) if tool_trigger else None,
          success_count, confidence, source, promotion_history,
          principle_embedding, extraction_context, first_mover,
-         _json_or_none(trigger_spec), _json_or_none(lesson)),
+         _json_or_none(trigger_spec), _json_or_none(lesson),
+         1 if deprecated_reason else 0, deprecated_reason),
     )
     await db.commit()
     return id
