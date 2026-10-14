@@ -705,7 +705,9 @@ jobs:
         # skipped unless GENESIS_CODEX_NATIVE_TESTS=1, ceiling 128 -> 156.
         # Native validator-shell qualification (test_codex_validator_shell_native.py):
         # 42 opt-in cases skipped unless GENESIS_CODEX_NATIVE_TESTS=1, ceiling 156 -> 198.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 198
+        # Native validator-guard checks (test_codex_validator_guard.py): 18 opt-in
+        # cases skipped unless GENESIS_CODEX_NATIVE_TESTS=1, ceiling 198 -> 216.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 216
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job
