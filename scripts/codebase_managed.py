@@ -314,14 +314,7 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
     except (OSError, ValueError) as error:
         result["settings_error"] = str(error)
     try:
-        systemd_spec = importlib.util.spec_from_file_location(
-            "_genesis_util_systemd",
-            Path(__file__).resolve().parent.parent / "src/genesis/util/systemd.py",
-        )
-        if systemd_spec is None or systemd_spec.loader is None:
-            raise ImportError("could not load systemd utilities")
-        systemd = importlib.util.module_from_spec(systemd_spec)
-        systemd_spec.loader.exec_module(systemd)
+        manager_env = systemctl_env()
         output = subprocess.check_output(
             [
                 "/usr/bin/systemctl",
@@ -342,12 +335,30 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
             text=True,
             timeout=30,
             stderr=subprocess.PIPE,
-            env=systemd.systemctl_env(),
+            env=manager_env,
         )
         result["service"] = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     except (ImportError, OSError, SyntaxError, subprocess.SubprocessError) as error:
         result["manager_error"] = str(error)
     return result
+
+
+def systemctl_env() -> dict[str, str]:
+    """The user-manager environment from src/genesis/util/systemd.py.
+
+    Loaded by path because this script runs isolated (-I). Without it a service
+    started with no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS cannot reach the
+    user manager, and every systemctl --user call fails.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_genesis_util_systemd",
+        Path(__file__).resolve().parent.parent / "src/genesis/util/systemd.py",
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load systemd utilities")
+    systemd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(systemd)
+    return systemd.systemctl_env()
 
 
 def show(unit: str, *properties: str, timeout: float = 30) -> dict[str, str]:
@@ -362,6 +373,7 @@ def show(unit: str, *properties: str, timeout: float = 30) -> dict[str, str]:
         text=True,
         timeout=timeout,
         stderr=subprocess.PIPE,
+        env=systemctl_env(),
     )
     value = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     if any(name not in value for name in properties):
