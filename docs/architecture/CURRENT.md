@@ -3650,6 +3650,14 @@ verified: 4ab8bf71c 2026-10-10
   floor; other tool bodies cannot be entered through those MCP processes.
   External health initialization skips the LLM router, dispatch queue setup,
   and campaign wiring. Profiles constrain tools, not an operator's host access.
+  The separately launched validator can admit one canonical invocation of
+  `scripts/codex_validator_request.py` through its native shell hook. Its
+  bounded, private UUID request files use strict JSON and a closed operation
+  schema; only `protocol_probe` exists. Request creation and retirement use
+  the admitted workspace patch path. Serving probes, verification recording
+  and publication operations remain GROUNDWORK, and this boundary has no
+  activation wiring in the ordinary project configuration. Its dedicated
+  launcher must establish private workspace modes and umask before activation.
   In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
   the main checkout, which owns the live database and secrets. This gives Codex
   on-demand access without registering its transcript,
