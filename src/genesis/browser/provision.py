@@ -228,11 +228,18 @@ def _pin_capable() -> bool:
 
 
 def _explicit_choice() -> bool | None:
-    """Whether the user picked a build with ``camoufox set``; None when unreadable."""
+    """Whether the user picked a build with ``camoufox set``; None when unreadable.
+
+    The config is parsed here: camoufox's ``load_config()`` turns a malformed file
+    (an interrupted write) into ``{}``, which would read as no choice at all. A
+    symlink whose target is gone counts as unreadable too."""
     try:
         from camoufox import browser_pin, multiversion
 
-        return browser_pin.is_explicit_choice(multiversion.load_config())
+        path = Path(multiversion.CONFIG_FILE)
+        present = path.exists() or path.is_symlink()
+        config = json.loads(path.read_bytes()) if present else {}
+        return bool(browser_pin.is_explicit_choice(config))
     except Exception:  # noqa: BLE001 - unknown, and the caller treats it as a choice
         return None
 

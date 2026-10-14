@@ -107,7 +107,7 @@ def test_a_version_is_set_aside_before_it_is_deleted(tmp_path):
 def test_a_leftover_is_removed(tmp_path):
     root = tmp_path / "camoufox"
     _tree(root)
-    left = root / "browsers" / ".retiring" / "official.146-aa.123"
+    left = root / "browsers" / ".retiring" / "official.146-aa.40417"
     (left / "sub").mkdir(parents=True)
     r = _prune(root, _stub(tmp_path, [left]))
     assert r.returncode == 0 and not left.exists()
@@ -289,3 +289,36 @@ def test_a_browser_launched_during_the_move_keeps_the_set_aside_engine(tmp_path)
     retiring = list((root / "browsers" / ".retiring").iterdir())
     assert len(retiring) == 1 and retiring[0].is_dir(), r.stdout
     assert "spared" in r.stdout
+
+
+def test_the_step_prunes_the_cache_secrets_env_names(tmp_path):
+    """The provisioner installs where secrets.env's XDG_CACHE_HOME points, and this
+    unit does not load that file: the step reads it by name, for its own run only."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cache = tmp_path / "elsewhere"
+    (repo / "secrets.env").write_text(
+        f'XDG_CACHE_HOME="{cache}"\nCAMOUFOX_EXECUTABLE_PATH=/opt/cf/camoufox-bin\nAPI_KEY=nope\n'
+    )
+    script = (
+        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nunset XDG_CACHE_HOME CAMOUFOX_EXECUTABLE_PATH\n"
+        'prune_browser_engines() { echo "root=$1 xdg=$XDG_CACHE_HOME ov=$CAMOUFOX_EXECUTABLE_PATH key=${API_KEY-}"; }\n'
+        "prune_camoufox_engines_step\n"
+        'echo "after=${XDG_CACHE_HOME-unset}"'
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+    assert r.returncode == 0, r.stderr
+    assert f"root={cache}/camoufox xdg={cache} ov=/opt/cf/camoufox-bin key=" in r.stdout
+    assert "after=unset" in r.stdout  # nothing leaks into the steps after it
+
+
+def test_the_step_defaults_to_the_home_cache(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    script = (
+        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nHOME='{tmp_path}'\nunset XDG_CACHE_HOME\n"
+        'prune_browser_engines() { echo "root=$1"; }\n'
+        "prune_camoufox_engines_step"
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+    assert f"root={tmp_path}/.cache/camoufox" in r.stdout, r.stdout + r.stderr

@@ -232,15 +232,6 @@ def _paired_at() -> float | None:
         return None
 
 
-def _explicit_choice() -> bool | None:
-    try:
-        from camoufox import browser_pin, multiversion
-
-        return bool(browser_pin.is_explicit_choice(multiversion.load_config()))
-    except Exception:  # noqa: BLE001 - unknown counts as a choice
-        return None
-
-
 def _inputs() -> tuple[engine.EngineStatus, list[Path], list[Path] | None, dict]:
     status = engine.resolve_camoufox_engine()
     try:
@@ -252,7 +243,7 @@ def _inputs() -> tuple[engine.EngineStatus, list[Path], list[Path] | None, dict]
         installed = []
     gates = {
         "override": bool(os.environ.get("CAMOUFOX_EXECUTABLE_PATH", "").strip()),
-        "explicit_choice": _explicit_choice(),
+        "explicit_choice": provision._explicit_choice(),
         "paired_at": _paired_at(),
     }
     return status, installed, provision.live_camoufox_exes(), gates

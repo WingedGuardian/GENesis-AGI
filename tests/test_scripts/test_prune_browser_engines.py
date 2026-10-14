@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from genesis.browser import engine
+from genesis.browser import engine, provision
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "prune_browser_engines.py"
 DAY = 86400
@@ -345,7 +345,7 @@ def test_what_an_interrupted_run_left_retiring_is_finished(prune, tmp_path):
     """camoufox's listing skips dot directories, so only this finds them again."""
     root = tmp_path / "camoufox"
     pinned = _version(root, "156.0.1-beta.36-bb", age_days=30)
-    left = root / "browsers" / ".retiring" / "official.146.0.1-beta.25-aa.123"
+    left = root / "browsers" / ".retiring" / "official.146.0.1-beta.25-aa.40417"
     left.mkdir(parents=True)
     busy = root / "browsers" / ".retiring" / "official.145.0-beta.1-cc.456"
     busy.mkdir()
@@ -358,7 +358,7 @@ def test_a_leftover_launched_recently_stays(prune, tmp_path):
     from .retiring; once it exits, only its launch time says it was in use."""
     root = tmp_path / "camoufox"
     pinned = _version(root, "156.0.1-beta.36-bb", age_days=30)
-    left = root / "browsers" / ".retiring" / "official.146.0.1-beta.25-aa.123"
+    left = root / "browsers" / ".retiring" / "official.146.0.1-beta.25-aa.40417"
     left.mkdir(parents=True)
     (left / "camoufox-bin").write_bytes(b"\x7fELF")
     _recent(left / "camoufox-bin")
@@ -414,3 +414,65 @@ def test_with_a_manifest_version_json_goes_first_and_the_manifest_last(prune, tm
     doomed, _ = _plan(prune, root, _ready(pinned), [pinned])
     names = [p.name for p in doomed if p.parent == root]
     assert names[0] == "version.json" and names[-1] == "precomplete"
+
+
+def _fake_camoufox(monkeypatch, config_file: Path) -> None:
+    """camoufox 0.5.8's own shapes: load_config() turns a decode error into {}
+    (multiversion.py), and a choice is a channel or a pinned build (browser_pin.py)."""
+    import types
+
+    multiversion = types.ModuleType("camoufox.multiversion")
+    multiversion.CONFIG_FILE = config_file
+    multiversion.load_config = lambda: {}
+    browser_pin = types.ModuleType("camoufox.browser_pin")
+    browser_pin.is_explicit_choice = lambda c: bool(c.get("channel") or c.get("pinned"))
+    package = types.ModuleType("camoufox")
+    package.multiversion = multiversion
+    package.browser_pin = browser_pin
+    monkeypatch.setitem(sys.modules, "camoufox", package)
+    monkeypatch.setitem(sys.modules, "camoufox.multiversion", multiversion)
+    monkeypatch.setitem(sys.modules, "camoufox.browser_pin", browser_pin)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (b'{"pinned": ', None),  # an interrupted write
+        (b"[1]", None),  # JSON, but not camoufox's shape
+        (b"\xff\xfe", None),
+        (b"{}", False),
+        (b'{"channel": "official/beta"}', True),
+        (b'{"pinned": "official/156.0.1-beta.36"}', True),
+    ],
+)
+def test_an_unreadable_camoufox_config_counts_as_unknown(tmp_path, monkeypatch, content, expected):
+    """Unknown keeps every engine; camoufox's own loader would read a corrupt file
+    as no choice at all."""
+    config = tmp_path / "config.json"
+    config.write_bytes(content)
+    _fake_camoufox(monkeypatch, config)
+    assert provision._explicit_choice() is expected
+
+
+def test_a_dangling_camoufox_config_link_counts_as_unknown(tmp_path, monkeypatch):
+    config = tmp_path / "config.json"
+    config.symlink_to(tmp_path / "gone")
+    _fake_camoufox(monkeypatch, config)
+    assert provision._explicit_choice() is None
+
+
+def test_the_decider_takes_the_provisioners_reading(prune, monkeypatch):
+    """One reader for both: the provisioner refuses a fetch on the same answer."""
+    monkeypatch.setattr(prune.provision, "_explicit_choice", lambda: None)
+    monkeypatch.setattr(
+        prune.engine,
+        "resolve_camoufox_engine",
+        lambda: engine.EngineStatus(engine.NOT_INSTALLED, "x"),
+    )
+    monkeypatch.setattr(prune.provision, "live_camoufox_exes", lambda: [])
+    assert prune._inputs()[3]["explicit_choice"] is None
+
+
+def test_no_camoufox_config_is_no_choice(tmp_path, monkeypatch):
+    _fake_camoufox(monkeypatch, tmp_path / "config.json")
+    assert provision._explicit_choice() is False

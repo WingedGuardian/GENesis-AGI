@@ -532,6 +532,53 @@ rotate_log() {
     fi
 }
 
+# Settings read BY NAME out of secrets.env: the hook audit store knobs, and the
+# browser engine cache and override (prune_camoufox_engines_step).
+#
+# The writers see them because genesis-server loads that file; this unit does
+# not, so without this the trim resolved the DEFAULT directories on an install
+# that had configured custom ones — the real store growing with no retention
+# while the timer reported success on an empty default (Codex P2, PR #1609).
+#
+# Two variables rather than `EnvironmentFile=` on the unit, for two reasons.
+# MEASURED on systemd 255: an EnvironmentFile overrides `Environment=`
+# regardless of directive order, so loading secrets.env would silently replace
+# the unit's deliberately-pinned gh/git PATH on any install whose secrets.env
+# sets PATH. And this oneshot runs `rm -rf` and `find -delete`; it has no
+# business holding provider keys or the backup passphrase.
+#
+# No `eval` and no `source`: both execute file content, and this file is the
+# one place on the box that holds every credential.
+_load_store_knob() {
+    local key="$1"
+    local line=""
+    local val
+    [ -f "$REPO_DIR/secrets.env" ] || return 0
+    # Last assignment wins, which is how systemd reads these files too.
+    line="$(grep -aE "^${key}=" "$REPO_DIR/secrets.env" | tail -1)" || line=""
+    [ -n "$line" ] || return 0
+    val="${line#*=}"
+    case "$val" in
+        \"*\") val="${val#\"}"; val="${val%\"}" ;;
+        \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    [ -n "$val" ] && export "$key=$val"
+    return 0
+}
+
+# The Camoufox cache the browser tools use, and their engine override, can both
+# come from secrets.env, which this unit does not load: the provisioner installs
+# where XDG_CACHE_HOME there points, and the decider keeps every engine while an
+# override is set. Both are read by name, in a subshell so neither reaches the
+# steps after this one.
+prune_camoufox_engines_step() {
+    (
+        _load_store_knob CAMOUFOX_EXECUTABLE_PATH
+        _load_store_knob XDG_CACHE_HOME
+        prune_browser_engines "${XDG_CACHE_HOME:-$HOME/.cache}/camoufox"
+    )
+}
+
 main() {
     local disk_reclaim_rc=0
     if [ -z "$VENV_PY" ]; then
@@ -735,38 +782,7 @@ main() {
     fi
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
-    # The two store knobs, read BY NAME out of secrets.env.
-    #
-    # The writers see them because genesis-server loads that file; this unit does
-    # not, so without this the trim resolved the DEFAULT directories on an install
-    # that had configured custom ones — the real store growing with no retention
-    # while the timer reported success on an empty default (Codex P2, PR #1609).
-    #
-    # Two variables rather than `EnvironmentFile=` on the unit, for two reasons.
-    # MEASURED on systemd 255: an EnvironmentFile overrides `Environment=`
-    # regardless of directive order, so loading secrets.env would silently replace
-    # the unit's deliberately-pinned gh/git PATH on any install whose secrets.env
-    # sets PATH. And this oneshot runs `rm -rf` and `find -delete`; it has no
-    # business holding provider keys or the backup passphrase.
-    #
-    # No `eval` and no `source`: both execute file content, and this file is the
-    # one place on the box that holds every credential.
-    _load_store_knob() {
-        local key="$1"
-        local line=""
-        local val
-        [ -f "$REPO_DIR/secrets.env" ] || return 0
-        # Last assignment wins, which is how systemd reads these files too.
-        line="$(grep -aE "^${key}=" "$REPO_DIR/secrets.env" | tail -1)" || line=""
-        [ -n "$line" ] || return 0
-        val="${line#*=}"
-        case "$val" in
-            \"*\") val="${val#\"}"; val="${val%\"}" ;;
-            \'*\') val="${val#\'}"; val="${val%\'}" ;;
-        esac
-        [ -n "$val" ] && export "$key=$val"
-        return 0
-    }
+    # The two store knobs, read BY NAME out of secrets.env (`_load_store_knob`).
     _load_store_knob GENESIS_MERGE_OVERRIDE_DIR
     _load_store_knob GENESIS_DISCARD_SNAPSHOT_DIR
     # One file per hook flush, so the oldest whole files are deleted past the byte
@@ -783,10 +799,7 @@ main() {
     prune_browser_backups "$HOME/.genesis"
 
     echo "--- Camoufox engines nothing runs (only once the paired one is 14d old) ---"
-    # The browser tools may run with an operator's engine override from secrets.env,
-    # which this unit does not load; the decider keeps every engine while it is set.
-    _load_store_knob CAMOUFOX_EXECUTABLE_PATH
-    prune_browser_engines "${XDG_CACHE_HOME:-$HOME/.cache}/camoufox"
+    prune_camoufox_engines_step
 
     echo "--- MCP log rotation (>10MB, copytruncate, 2 kept) ---"
     # 10 MB: about nine days of mcp_health.log at the measured rate, small
