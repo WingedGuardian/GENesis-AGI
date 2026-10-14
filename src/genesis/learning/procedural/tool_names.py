@@ -55,9 +55,21 @@ _CLI_COMMANDS = (
     "git push", "git commit", "git add", "git worktree add",
 )
 # fmt: on
+# Anchored to command position (start, or after ; & | ( ` or a newline), past any
+# wrappers (sudo, env, timeout N, VAR=x, ...), a path and `python -m`, so
+# `.venv/bin/ruff` and `timeout 30 ssh` match while `~/.ssh/known_hosts`,
+# `gh-pages` and `grep pytest` do not.
+_CLI_PREFIX = (
+    r"(?:^|[;&|(`\n]\s*)(?:(?:sudo|env|time|nohup|xargs|timeout\s+\S+|\w+=\S*)\s+)*"
+    r"(?:[\w.~-]*/)*(?:python3?\s+-m\s+)?"
+)
 _CLI_PATTERNS = {
-    phrase: r"\b" + r"\s+".join(map(re.escape, phrase.split())) + r"\b" for phrase in _CLI_COMMANDS
+    phrase: _CLI_PREFIX + r"\s+".join(map(re.escape, phrase.split())) + r"\b"
+    for phrase in _CLI_COMMANDS
 }
+# A real tool name in front of prose an LLM added: `Bash (running tests)`,
+# `Edit{file_path: ...}`, `Tool:ego_proposal_resolve`.
+_TOOL_PREFIX = re.compile(r"(?:Tool:\s*)?(\w+)\s*(?:[(:{].*)?")  # one line only
 
 # Genesis MCP servers and the modules that register their tools.
 _MCP_MODULES = {
@@ -174,6 +186,10 @@ def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:
             pattern = _CLI_PATTERNS[value.lower()]
             if pattern not in patterns:
                 patterns.append(pattern)
+        elif (m := _TOOL_PREFIX.fullmatch(value)) and (
+            m.group(1) in BUILTIN_TOOLS or m.group(1) in short
+        ):
+            tool = m.group(1) if m.group(1) in BUILTIN_TOOLS else short[m.group(1)]
         else:
             dropped.append(value)
             continue

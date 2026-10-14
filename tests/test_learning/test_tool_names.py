@@ -24,9 +24,13 @@ from genesis.learning.procedural.tool_names import BUILTIN_TOOLS, normalize_tool
             [],
         ),
         (["browser_navigate"], ["mcp__genesis-health__browser_navigate"], [], []),
-        (["ssh", "SSH"], ["Bash"], [r"\bssh\b"], []),
-        (["git push"], ["Bash"], [r"\bgit\s+push\b"], []),
-        (["Bash", "pytest"], ["Bash"], [r"\bpytest\b"], []),
+        (["ssh", "SSH"], ["Bash"], [tool_names._CLI_PATTERNS["ssh"]], []),
+        (["git push"], ["Bash"], [tool_names._CLI_PATTERNS["git push"]], []),
+        (["Bash", "pytest"], ["Bash"], [tool_names._CLI_PATTERNS["pytest"]], []),
+        # A real tool name in front of added prose is recovered.
+        (["Read (codebase inspection)", "Edit{file_path: x}"], ["Read", "Edit"], [], []),
+        (["Tool:browser_navigate"], ["mcp__genesis-health__browser_navigate"], [], []),
+        (["Python (scripts)", "review gate"], [], [], ["Python (scripts)", "review gate"]),
         (["Python", "Git", "review gate", "Grep"], ["Grep"], [], ["Python", "Git", "review gate"]),
         # Built-ins match exactly: the CLI word `grep` is not the Grep tool.
         (["grep"], [], [], ["grep"]),
@@ -153,3 +157,29 @@ async def test_an_explicit_teach_can_clear_a_trigger_and_an_extraction_cannot(db
     await store_procedure_checked(db, tool_trigger=[], principle_embedding=blob, **_ROW)
     row = await procedural.get_by_id(db, first.procedure_id)
     assert row["tool_trigger"] is None
+
+
+@pytest.mark.parametrize(
+    ("phrase", "command", "fires"),
+    [
+        ("ssh", "ssh host", True),
+        ("ssh", "cd x && ssh host", True),
+        ("ssh", "timeout 30 ssh host", True),
+        ("ssh", "cat ~/.ssh/known_hosts", False),
+        ("ssh", "echo run ssh", False),
+        ("pytest", "python -m pytest tests/x.py", True),
+        ("pytest", "GENESIS_PYTEST_LOCK=0 .venv/bin/python -m pytest -q", True),
+        ("pytest", "grep pytest setup.cfg", False),
+        ("pytest", "cat pytest.ini", False),
+        ("ruff", "~/genesis/.venv/bin/ruff check .", True),
+        ("ruff", "x=$(ruff check .)", True),
+        ("gh", "echo a; gh pr list", True),
+        ("gh", "ls gh-pages", False),
+        ("git push", "git push origin HEAD", True),
+        ("git push", "echo git push", False),
+    ],
+)
+def test_a_cli_pattern_matches_the_command_not_a_mention(phrase, command, fires):
+    import re
+
+    assert bool(re.search(tool_names._CLI_PATTERNS[phrase], command)) is fires
