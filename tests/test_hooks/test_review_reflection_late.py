@@ -102,8 +102,12 @@ def test_nothing_late_is_owed_until_a_cutover_is_set():
 def test_findings_from_the_cutover_on_are_owed_after_the_round_completes():
     state = rr.owed_state(_budget(), [], now=T0, cutover=CUT)
     assert state["owed"] == ["c1", "c9"]
-    # Those reviews have all landed: a finished round has no settle window.
+    # Those reviews have all landed: a finished round's evidence is final,
+    # whether or not anything is owed, and unknown is never settled.
     assert state["settled"] is True
+    assert rr.owed_state(_budget(), ["c1", "c9"], now=T0, cutover=CUT)["settled"] is True
+    unknown = rr.owed_state(_budget(), [], now=T0, cutover="soon")
+    assert unknown["owed"] is None and unknown["settled"] is False
     assert rr.owed_state(_budget(), ["c9"], now=T0, cutover=CUT)["owed"] == ["c1"]
 
 
@@ -557,4 +561,5 @@ def test_status_owes_late_keys_only_from_a_cutover(pr, tmp_path, monkeypatch):
     _reflect(path, tmp_path, _block(["c9"], fix), T0 + timedelta(minutes=120))
     assert rr.status(str(path), now=T0)["owed"] == []
     monkeypatch.setattr(rr, "REFLECTION_CUTOVER_ISO", None)
+    monkeypatch.chdir(path)
     assert rr.main(["status", "--cutover", CUT]) == 0

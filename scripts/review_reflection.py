@@ -1201,11 +1201,11 @@ def covered_late_keys(
     - N is the current head or in its history, and N is H or descends from it
       (from the budget's commit graph; unknown ancestry never credits). A key
       whose head left the graph (rebased or force-pushed away) can be answered
-      only at the current head;
+      at any commit in the current history;
     - S is no later than T: an answer cannot predate its finding;
-    - when N is not H, S is after the first fix on the way from H to N. A
-      review that arrived before the fix was owed before it, and a reflection
-      made after the fix is a rationalisation, not a reflection;
+    - when N is not H, S is after the LATEST fix on the way from H to N (author
+      time). A review that arrived before a fix was owed before it, and a
+      reflection made after that fix is a rationalisation, not a reflection;
     - ``check`` passes R under k's own round's context (every candidate round
       when k's round is ambiguous): that round's number, its earlier rounds'
       classes, and evidence written from that round's start to T.
@@ -1283,7 +1283,9 @@ def owed_state(
 ) -> dict[str, Any]:
     """What is owed, from a ``review_budget`` result: the open round's keys,
     plus the late keys from ``cutover`` on (``late_findings``), less
-    ``covered``. With ``cutover`` None that is exactly the open round. Pure."""
+    ``covered``. With ``cutover`` None that is exactly the open round, and
+    pure; a ``fix_time`` reader (``fix_time_reader``) reads local git and may
+    raise ``Refused``."""
     state: dict[str, Any] = {
         "status": budget.get("status"),
         "round": budget.get("count"),
@@ -1313,9 +1315,10 @@ def owed_state(
     late_owed = None if late is None else [k for k in state["late_keys"] if k not in done]
     if budget.get("round_state") != "open":
         state["owed"] = late_owed
-        # Only a finished round's late reviews are owed here; they have all
-        # landed, and the settle window belongs to an open round.
-        state["settled"] = bool(late_owed)
+        # A finished round's reviews have all landed: once late findings are
+        # read (a cutover is set) and known, its evidence is final, owed or
+        # not. With no cutover this is main's answer, False.
+        state["settled"] = cutover is not None and late_owed is not None
         return state
     if state["reflection_keys"] == "ok" and late_owed is not None:
         state["owed"] = [k for k in state["open_keys"] if k not in done] + late_owed
