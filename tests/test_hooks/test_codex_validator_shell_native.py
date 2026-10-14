@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import shlex
-import shutil
 import sys
 from pathlib import Path
 
@@ -56,10 +55,12 @@ def fixture_runtime(root, evidence, case):
         original = source / relative
         target = runtime / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(original, target)
+        # One read: the copy and its recorded hash come from the same bytes, even
+        # if the supplied runtime is edited while the matrix runs.
+        data = original.read_bytes()
+        target.write_bytes(data)
         target.chmod(original.stat().st_mode & 0o777)
-        evidence["source_hashes"][relative] = hashlib.sha256(original.read_bytes()).hexdigest()
-        assert target.read_bytes() == original.read_bytes()
+        evidence["source_hashes"][relative] = hashlib.sha256(data).hexdigest()
     interpreter = runtime / ".venv/bin/python"
     interpreter.parent.mkdir(parents=True)
     # A trusted private fixture interpreter, never an editable install.
@@ -102,14 +103,28 @@ def native_item(case, runtime, workspace, request):
             body = f"*** Update File: {request}\n@@\n-{json.dumps(PROBE)}\n+{json.dumps(PROBE, sort_keys=True)}"
         else:
             body = f"*** Delete File: {request}"
-        patch = "*** Begin Patch\n" + body + "\n*** End Patch"
-        return {"type": "custom_tool_call", "id": "ct_fixture", "call_id": "call_fixture",
-                "name": "apply_patch", "input": patch}
-    command = shlex.join([str(runtime / ".venv/bin/python"), "-I",
-                          str(runtime / "scripts/codex_validator_request.py"),
-                          "--workspace-root", str(workspace), "--request", str(request)])
+        return patch_item(body)
+    command = sealed_command(runtime, workspace, request)
     if case in {"excluded_shell", "removed_gate"}:
-        command = "printf fixture > shell-receipt.txt"
+        command = SINK_COMMAND
+    return shell_item(command)
+
+
+SINK_COMMAND = "printf fixture > shell-receipt.txt"
+
+
+def sealed_command(runtime, workspace, request):
+    return shlex.join([str(runtime / ".venv/bin/python"), "-I",
+                       str(runtime / "scripts/codex_validator_request.py"),
+                       "--workspace-root", str(workspace), "--request", str(request)])
+
+
+def patch_item(body):
+    return {"type": "custom_tool_call", "id": "ct_fixture", "call_id": "call_fixture",
+            "name": "apply_patch", "input": "*** Begin Patch\n" + body + "\n*** End Patch"}
+
+
+def shell_item(command):
     return {"type": "function_call", "id": "fc_fixture", "call_id": "call_fixture",
             "name": "exec_command", "arguments": json.dumps({"cmd": command})}
 
@@ -136,31 +151,21 @@ def completed_commands(events):
     return commands
 
 
-@pytest.mark.parametrize("client", ["cli", "app"])
-@pytest.mark.parametrize("case", ["probe", "unknown_request", "excluded_shell", "removed_gate", "noop", "create_request", "update_request", "delete_request", "public_request",
-                                  "code_probe", "code_update_request"])
-def test_native_request_boundary(tmp_path, native_binaries, client, case):
+def run_native_case(tmp_path, native_binaries, client, case, build_item, prepare):
+    """Run one native session; build_item(runtime, workspace, request) and prepare(request) shape it."""
     binaries, versions = native_binaries
     evidence = {"versions": versions, "client": client, "case": case}
-    # code_* cases send the base case's action through the unified functions.exec route.
-    unified = case.startswith("code_")
-    case = case.removeprefix("code_")
     previous = os.umask(0o077)
     try:
         runtime = fixture_runtime(tmp_path, evidence, case)
         workspace = tmp_path / "workspace"
         request = workspace / "requests" / (TOKEN + ".json")
-        item = native_item(case, runtime, workspace, request)
-        if unified:
-            item = unified_item(item)
+        item = build_item(runtime, workspace, request)
         with fixture_provider(item) as (url, requests):
             evidence["requests"] = requests
             env = configure(tmp_path, url, "allow")
             request.parent.mkdir(mode=0o700)
-            if case != "create_request":
-                request.write_text(json.dumps(PROBE if case != "unknown_request" else {"version": 1, "operation": "shell", "command": "private marker"}))
-            if case == "public_request":
-                request.chmod(0o644)
+            prepare(request)
             instrument_hook(tmp_path, runtime)
             evidence["trust"] = trust_fixture_hook(binaries["app"], tmp_path, env)
             events, stderr = run_native(binaries[client], client, tmp_path, env, evidence)
@@ -170,9 +175,43 @@ def test_native_request_boundary(tmp_path, native_binaries, client, case):
         receipt = tmp_path / "native-evidence.json"
         receipt.write_text(json.dumps(evidence, indent=2))
         receipt.chmod(0o600)
-    assert len(requests) == (1 if case == "noop" else 2)
     hooks_path = tmp_path / "hooks.jsonl"
     hooks = [json.loads(line) for line in hooks_path.read_text().splitlines()] if hooks_path.exists() else []
+    return requests, hooks, events, workspace, request
+
+
+# Request bodies the request script must refuse inside an admitted command. A
+# nonfinite number is not here: the schema already rejects any non-integer
+# version, so that case would pass even with a permissive decoder.
+REFUSED_BODIES = {
+    "unknown_request": json.dumps({"version": 1, "operation": "shell", "command": "private marker"}),
+    "duplicate_key_request": '{"version": 1, "operation": "shell", "operation": "protocol_probe"}',
+    "empty_request": "",
+    "non_object_request": json.dumps([PROBE]),
+}
+
+
+@pytest.mark.parametrize("client", ["cli", "app"])
+@pytest.mark.parametrize("case", ["probe", "unknown_request", "excluded_shell", "removed_gate", "noop", "create_request", "update_request", "delete_request", "public_request",
+                                  "duplicate_key_request", "empty_request", "non_object_request",
+                                  "code_probe", "code_update_request"])
+def test_native_request_boundary(tmp_path, native_binaries, client, case):
+    # code_* cases send the base case's action through the unified functions.exec route.
+    unified = case.startswith("code_")
+    case = case.removeprefix("code_")
+
+    def build(runtime, workspace, request):
+        item = native_item(case, runtime, workspace, request)
+        return unified_item(item) if unified else item
+
+    def prepare(request):
+        if case != "create_request":
+            request.write_text(REFUSED_BODIES.get(case, json.dumps(PROBE)))
+        if case == "public_request":
+            request.chmod(0o644)
+
+    requests, hooks, events, workspace, request = run_native_case(tmp_path, native_binaries, client, case, build, prepare)
+    assert len(requests) == (1 if case == "noop" else 2)
     assert len(hooks) == (0 if case == "noop" else 1), hooks
     if hooks:
         assert hooks[0]["payload"]["hook_event_name"] == "PreToolUse"
@@ -185,7 +224,8 @@ def test_native_request_boundary(tmp_path, native_binaries, client, case):
         assert sink.read_text() == "fixture"
     if case == "probe":
         assert any(code == 0 and json.dumps({**PROBE, "ok": True}, sort_keys=True) in output for code, output in completed_commands(events)), events
-    if case == "unknown_request":
+    if case in REFUSED_BODIES:
+        assert request.read_text() == REFUSED_BODIES[case]
         assert any(code == 2 and "Validator request refused" in output for code, output in completed_commands(events)), events
     if case in {"create_request", "update_request"}:
         assert json.loads(request.read_text()) == PROBE
@@ -196,4 +236,73 @@ def test_native_request_boundary(tmp_path, native_binaries, client, case):
         assert request.read_text().rstrip("\n") == expected
         assert request.stat().st_mode & 0o777 == 0o600
     assert request.exists() == (case != "delete_request")
+    assert not list((tmp_path / "codex" / ".tmp").glob("plugins-clone-*"))
+
+
+def _protected(workspace):
+    return workspace / "AGENTS.md"
+
+
+def _write_probe(path):
+    path.write_text(json.dumps(PROBE))
+
+
+def _symlink_request(request):
+    outside = request.parents[2] / "outside.json"
+    _write_probe(outside)
+    request.symlink_to(outside)
+
+
+def _hardlink_request(request):
+    _write_probe(request)
+    os.link(request, request.parents[2] / "alias.json")
+
+
+# name -> (item builder, request preparation). Every case must be refused at the
+# hook (exit 2) and leave the workspace exactly as prepared.
+HOOK_REFUSALS = {
+    "patch_protected_target": (
+        lambda rt, ws, rq: patch_item(f"*** Add File: {_protected(ws)}\n+fixture"), lambda rq: None),
+    "patch_mixed_targets": (
+        lambda rt, ws, rq: patch_item(f"*** Add File: {rq}\n+{json.dumps(PROBE)}\n*** Add File: {_protected(ws)}\n+fixture"),
+        lambda rq: None),
+    "compound_sink_after": (
+        lambda rt, ws, rq: shell_item(f"{sealed_command(rt, ws, rq)}; {SINK_COMMAND}"), _write_probe),
+    "compound_sink_before": (
+        lambda rt, ws, rq: shell_item(f"{SINK_COMMAND}; {sealed_command(rt, ws, rq)}"), _write_probe),
+    "symlink_request": (lambda rt, ws, rq: shell_item(sealed_command(rt, ws, rq)), _symlink_request),
+    "hardlink_request": (lambda rt, ws, rq: shell_item(sealed_command(rt, ws, rq)), _hardlink_request),
+}
+
+
+@pytest.mark.parametrize("client", ["cli", "app"])
+@pytest.mark.parametrize("case", [*HOOK_REFUSALS, "code_patch_protected_target"])
+def test_native_hook_refusal(tmp_path, native_binaries, client, case):
+    unified = case.startswith("code_")
+    case = case.removeprefix("code_")
+    build_item, prepare = HOOK_REFUSALS[case]
+
+    def build(runtime, workspace, request):
+        item = build_item(runtime, workspace, request)
+        return unified_item(item) if unified else item
+
+    requests, hooks, events, workspace, request = run_native_case(tmp_path, native_binaries, client, case, build, prepare)
+    assert len(requests) == 2
+    assert len(hooks) == 1, hooks
+    assert hooks[0]["payload"]["hook_event_name"] == "PreToolUse"
+    assert hooks[0]["payload"]["tool_name"] == ("apply_patch" if case.startswith("patch_") else "Bash")
+    assert hooks[0]["exit"] == 2
+    assert hooks[0]["stdout"] == ""
+    assert "Validator action evaluation failed" in hooks[0]["stderr"]
+    # Nothing ran: no completed command, no sink, no protected file.
+    assert completed_commands(events) == [], events
+    assert not (workspace / "shell-receipt.txt").exists()
+    assert not _protected(workspace).exists()
+    if case.startswith("patch_"):
+        assert not request.exists()
+    elif case == "symlink_request":
+        assert request.is_symlink() and request.read_text() == json.dumps(PROBE)
+    else:
+        assert not request.is_symlink() and request.read_text() == json.dumps(PROBE)
+        assert request.stat().st_nlink == (2 if case == "hardlink_request" else 1)
     assert not list((tmp_path / "codex" / ".tmp").glob("plugins-clone-*"))
