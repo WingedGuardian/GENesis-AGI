@@ -246,9 +246,9 @@ async def store_procedure_checked(
         # The command pattern is not stored yet, so the row fires on any Bash call
         # its tags match, not only on the command it named.
         trigger_warnings.append(f"shell commands stored as Bash; patterns not kept: {patterns}")
-    candidates = await procedural.list_by_task_type(db, task_type)
-    # A lesson refines only a lesson, a plain teach only an earned row.
-    candidates = [c for c in candidates if (c.get("lesson") is None) == (lesson is None)]
+    # A lesson refines only a lesson, a plain teach only an earned row; the kind
+    # is chosen in SQL so rows of the other kind cannot fill the limit.
+    candidates = await procedural.list_by_task_type(db, task_type, lessons=lesson is not None)
     if caller_origin == ORIGIN_EXTERNAL_UNTRUSTED:
         # Never let outside text rewrite a lesson; it becomes a sibling instead.
         candidates = [c for c in candidates if c.get("lesson") is None]

@@ -7,13 +7,7 @@ import json
 import aiosqlite
 
 from genesis.db.crud import procedural
-from genesis.learning.procedural.lesson_shape import is_live_lesson
 from genesis.learning.types import ProcedureMatch
-
-
-def _held(row: dict) -> bool:
-    """A lesson nobody may be shown yet: external origin, not reviewed."""
-    return row.get("lesson") is not None and not is_live_lesson(row["lesson"])
 
 
 def _row_to_match(row: dict) -> ProcedureMatch:
@@ -49,7 +43,8 @@ async def find_best_match(
     overlap = len(intersection) / len(union) of context_tags (Jaccard).
     Returns None if no non-deprecated procedures match.
     """
-    rows = await procedural.list_by_task_type(db, task_type)
+    # Held lessons are left out in SQL, so they cannot fill the limit.
+    rows = await procedural.list_by_task_type(db, task_type, live_only=True)
     if not rows:
         return None
 
@@ -58,7 +53,7 @@ async def find_best_match(
     best_row = None
 
     for row in rows:
-        if row.get("deprecated") or row.get("quarantined") or _held(row):
+        if row.get("deprecated") or row.get("quarantined"):
             continue
         row_tags = set(json.loads(row["context_tags"]) if isinstance(row["context_tags"], str) else row["context_tags"])
         union = query_tags | row_tags
@@ -86,7 +81,7 @@ async def find_relevant(
     Broader than find_best_match — searches all active procedures, not just one
     task_type. Used by SessionStart injection and procedure_recall MCP tool.
     """
-    rows = await procedural.list_active(db, limit=200)
+    rows = await procedural.list_active(db, limit=200, live_only=True)
     if not rows:
         return []
 
@@ -94,7 +89,7 @@ async def find_relevant(
     scored: list[tuple[float, dict]] = []
 
     for row in rows:
-        if row["confidence"] < min_confidence or _held(row):
+        if row["confidence"] < min_confidence:
             continue
         row_tags = set(json.loads(row["context_tags"]) if isinstance(row["context_tags"], str) else row["context_tags"])
         union = query_tags | row_tags

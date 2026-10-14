@@ -12,6 +12,15 @@ def _json_or_none(value: dict | None) -> str | None:
     return None if value is None else json.dumps(value)
 
 
+def _live_clause(live_only: bool) -> str:
+    """SQL that leaves out held lessons (external origin, not reviewed)."""
+    if not live_only:
+        return ""
+    from genesis.learning.procedural.lesson_shape import LIVE_LESSON_SQL
+
+    return f" AND ({LIVE_LESSON_SQL})"
+
+
 async def create(
     db: aiosqlite.Connection,
     *,
@@ -197,6 +206,8 @@ async def list_by_task_type(
     *,
     person_id: str | None = None,
     limit: int = 50,
+    live_only: bool = False,
+    lessons: bool | None = None,
 ) -> list[dict]:
     # Exclude deprecated/quarantined rows: the dominant caller is the procedure
     # novelty/dedup gate, which must NOT let a deprecated procedure suppress a new
@@ -210,6 +221,9 @@ async def list_by_task_type(
     if person_id is not None:
         sql += " AND person_id = ?"
         params.append(person_id)
+    sql += _live_clause(live_only)
+    if lessons is not None:  # only lessons, or only rows without one
+        sql += " AND lesson IS NOT NULL" if lessons else " AND lesson IS NULL"
     sql += " ORDER BY confidence DESC LIMIT ?"
     params.append(limit)
     cursor = await db.execute(sql, params)
@@ -327,13 +341,18 @@ async def list_active(
     *,
     person_id: str | None = None,
     limit: int = 100,
+    live_only: bool = False,
 ) -> list[dict]:
-    """List non-deprecated, non-quarantined procedures."""
+    """List non-deprecated, non-quarantined procedures.
+
+    ``live_only`` leaves out held lessons in SQL, before the limit applies.
+    """
     sql = "SELECT * FROM procedural_memory WHERE deprecated = 0 AND quarantined = 0"
     params: list = []
     if person_id is not None:
         sql += " AND person_id = ?"
         params.append(person_id)
+    sql += _live_clause(live_only)
     sql += " ORDER BY confidence DESC LIMIT ?"
     params.append(limit)
     cursor = await db.execute(sql, params)

@@ -226,3 +226,57 @@ async def test_the_pattern_cap_refusal_names_the_derived_patterns(env):
     )
     assert response.startswith("Refused:")
     assert "derived from shell commands" in response
+
+
+async def test_held_lessons_never_crowd_live_rows_out_of_recall(env):
+    db, _, _ = env
+    held = json.dumps({
+        "authored_via": "mcp", "authored_in": "dispatched", "origin": "external_untrusted",
+        "reviewed": False, "authored_at": "2026-10-14T00:00:00Z",
+    })
+    common = {"principle": "p", "steps": ["s"], "tools_used": ["Bash"], "context_tags": ["deploy"],
+              "created_at": "2026-10-14T00:00:00Z"}
+    for i in range(201):  # past both limits: 50 by task type, 200 across types
+        await procedural.create(db, id=f"held-{i}", task_type="deploy", confidence=0.99, **common)
+        await db.execute("UPDATE procedural_memory SET lesson = ? WHERE id = ?", (held, f"held-{i}"))
+    await procedural.create(db, id="live", task_type="deploy", confidence=0.5, **common)
+    await db.commit()
+    assert (await matcher.find_best_match(db, "deploy", ["deploy"])).procedure_id == "live"
+    assert [m.procedure_id for m in await matcher.find_relevant(db, ["deploy"], min_confidence=0.0)] == ["live"]
+
+
+async def test_a_regenerate_waits_for_the_cache_lock(env):
+    import asyncio
+    import fcntl
+
+    db, _, cache = env
+    with open(cache.with_suffix(".lock"), "a") as other_writer:
+        fcntl.flock(other_writer.fileno(), fcntl.LOCK_EX)
+        task = asyncio.create_task(trigger_cache.regenerate(db))
+        await asyncio.sleep(0.2)
+        assert not task.done()  # held off while another writer holds the lock
+        fcntl.flock(other_writer.fileno(), fcntl.LOCK_UN)
+        await asyncio.wait_for(task, 5)
+    # Two writers in one event loop finish without deadlocking the loop.
+    await asyncio.wait_for(asyncio.gather(trigger_cache.regenerate(db), trigger_cache.regenerate(db)), 5)
+    assert cache.with_suffix(".json").exists()
+
+
+async def test_lessons_never_crowd_an_earned_row_out_of_a_refine(env):
+    db, store, _ = env
+    await store(**_ARGS)  # the earned row a later plain teach should refine
+    (earned,) = [dict(r) for r in await db.execute_fetchall("SELECT * FROM procedural_memory")]
+    lesson = json.dumps({
+        "authored_via": "mcp", "authored_in": "foreground", "origin": "first_party",
+        "reviewed": False, "authored_at": "2026-10-14T00:00:00Z",
+    })
+    for i in range(51):  # past list_by_task_type's limit of 50
+        await procedural.create(
+            db, id=f"lesson-{i}", task_type="deploy", principle="p", steps=["s"], tools_used=["Bash"],
+            context_tags=["deploy"], created_at="2026-10-14T00:00:00Z", confidence=0.99,
+        )
+        await db.execute("UPDATE procedural_memory SET lesson = ? WHERE id = ?", (lesson, f"lesson-{i}"))
+    await db.commit()
+    await store(**_ARGS)
+    rows = await db.execute_fetchall("SELECT id FROM procedural_memory WHERE lesson IS NULL")
+    assert [r["id"] for r in rows] == [earned["id"]]  # refined in place, no duplicate
