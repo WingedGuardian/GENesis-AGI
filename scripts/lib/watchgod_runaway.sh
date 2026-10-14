@@ -483,7 +483,12 @@ wg_runaway_check() {
         # Emptied this poll: the action page says everything, and the episode
         # it closed must not page "again" for the size it no longer has. Its
         # baseline is the empty file, not the size before the truncate.
-        if (( _RW_EMPTIED )); then size_now[$gen]=0; continue; fi
+        if (( _RW_EMPTIED )); then
+            # shellcheck disable=SC2034  # read by handle_fs in tmp_watchgod.sh
+            RUNAWAY_RELIEVED[$dkey]=1
+            size_now[$gen]=0
+            continue
+        fi
         [[ -n "$why" ]] || continue
         (( opened )) && continue
         [[ " ${_RW_PAGED[$gen]:-} " == *" mode${pg} "* ]] && continue

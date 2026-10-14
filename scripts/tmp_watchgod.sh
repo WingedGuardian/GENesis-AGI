@@ -25,7 +25,10 @@
 #           spared); on cc-tmp's, run the retention sweep at 2 days. Page a
 #           WARNING.
 #   RED     release the reserve file, start genesis-disk-hygiene-pressure@
-#           last-resort, page EMERGENCY with attribution.
+#           last-resort, page EMERGENCY with attribution. On cc-tmp's own
+#           volume, release its small reserve (CC_RESERVE_NAME) instead, a
+#           poll later when the runaway response has just emptied a file
+#           there (that RED was measured before the emptying freed the space).
 # Reclaim levers only run for the filesystem they can actually relieve; the
 # others page with attribution.
 #
@@ -320,44 +323,9 @@ log_attribution() {
     ) </dev/null >/dev/null 2>&1 &
 }
 
-# ── Reserve file ─────────────────────────────────────────────
-RESERVE_FILE="$DG_STATE_DIR/reserve"
-
-reserve_ensure() {
-    # Create the reserve on the $HOME filesystem when it is healthy. $1 free
-    # MB, $2 total MB. Never takes the filesystem below its ORANGE floor.
-    local free="$1" total="$2" size orange_floor
-    [[ -f "$RESERVE_FILE" ]] && return 0
-    size=$(( total / 100 ))
-    (( size > RESERVE_MAX_MB )) && size=$RESERVE_MAX_MB
-    (( size >= 64 )) || return 0
-    orange_floor=$(( total * DG_ORANGE_PCT / 100 ))
-    (( free - size > orange_floor )) || return 0
-    if (( WATCHGOD_ACT == 0 )); then
-        _wg_warn_once reserve_obs "OBSERVE: would create a ${size} MB reserve file at ${RESERVE_FILE}"
-        return 0
-    fi
-    mkdir -p "$DG_STATE_DIR" 2>/dev/null || true
-    if fallocate -l "${size}M" "$RESERVE_FILE" 2>/dev/null; then
-        log INFO "reserve file created: ${size} MB at ${RESERVE_FILE} (released at RED)"
-    else
-        rm -f "$RESERVE_FILE" 2>/dev/null || true
-        _wg_warn_once reserve_fail "reserve file could not be preallocated (fallocate unsupported here?) — RED has no reserve to release"
-    fi
-    return 0
-}
-
-reserve_release() {
-    [[ -f "$RESERVE_FILE" ]] || { echo "none held"; return 0; }
-    local sz
-    sz=$(( $(stat -c %s -- "$RESERVE_FILE" 2>/dev/null || echo 0) / 1048576 ))
-    if (( WATCHGOD_ACT == 0 )); then
-        echo "OBSERVE: would release ${sz} MB"
-        return 0
-    fi
-    rm -f -- "$RESERVE_FILE" && echo "released ${sz} MB (a snapshot may still pin its blocks; the next poll measures what was actually freed)"
-    return 0
-}
+# ── Reserve files ────────────────────────────────────────────
+# shellcheck source=scripts/lib/watchgod_reserve.sh
+source "$_SCRIPT_DIR/lib/watchgod_reserve.sh"
 
 # ── Action stamps and pages ──────────────────────────────────
 # Two rules every stamp, marker and page in this daemon follows (review
@@ -490,7 +458,7 @@ _cc_sweep_units() {
     while IFS= read -r -d '' c; do
         name="${c##*/}"
         case "$name" in
-            cc-socks|"cc-socks-$uid"|"cc-daemon-$uid") continue ;;
+            cc-socks|"cc-socks-$uid"|"cc-daemon-$uid"|"$CC_RESERVE_NAME") continue ;;
         esac
         if [[ "$name" =~ ^claude-[0-9]+$ && -d "$c" ]]; then
             find "$c" -mindepth 2 -maxdepth 2 -print0 2>/dev/null
@@ -673,6 +641,7 @@ handle_fs() {
         fi
         episode_clear "$dev"
         (( is_home )) && reserve_ensure "$free" "$total"
+        (( is_cc && ! is_home )) && cc_reserve_ensure "$free" "$total"
         return 0
     fi
 
@@ -703,8 +672,16 @@ handle_fs() {
     if [[ "$tier" == red ]]; then
         rel="not applicable (reserve lives on the \$HOME filesystem)"
         if (( is_home )); then
-            rel="$(reserve_release)"
+            rel="$(reserve_release)" || true
             start_pressure_unit last-resort
+        elif (( is_cc )); then
+            # Spend the last reserve only on a RED measured after the runaway
+            # response: this poll's RED was read before it emptied a file here.
+            if [[ -n "${RUNAWAY_RELIEVED[$dev]:-}" ]]; then
+                rel="cc-tmp reserve held: a runaway output was emptied this poll; released next poll if still RED"
+            else
+                rel="cc-tmp reserve $(cc_reserve_release)" || true
+            fi
         fi
         if ! episode_seen "$dev" "red$pg"; then
             body="${summary}. Reserve: ${rel}."$'\n'"${writers_block}"
@@ -804,8 +781,13 @@ check_disks() {
         done
     fi
 
-    # Pass 2: tier and act, once per domain.
+    # Pass 2: tier every domain and run its levers, except cc-tmp's own
+    # domain: its levers run after pass 3 (the runaway response), so its RED
+    # sees whether the response just relieved it. Every other domain's levers
+    # run first, so no fault in the response can cost them their poll (review
+    # finding: under set -u an unbound variable there kills the daemon).
     local rw_domains=""
+    local -A tier_of=() free_of=() total_of=() eta_of=() fstype_of=()
     RW_TIER=()
     for key in "${order[@]}"; do
         p="${path_of[$key]}"
@@ -813,14 +795,18 @@ check_disks() {
         used=$(( total - free ))
         [[ "$used_raw" =~ ^[0-9]+$ ]] || used_raw=$used
         binding=fs; (( quota )) && binding=quota
-        rate="$(dg_rate_update "$key" "$used_raw" "$now" "$binding")"
+        rate="$(dg_rate_update "$key" "$used_raw" "$now" "$binding" "$(_wg_reserve_mb "$key")")"
         eta="$(dg_eta_min "$free" "$rate")"
         floor="$(dg_floor_tier "$free" "$total" "$unalloc" "$meta")"
         etat="$(dg_eta_tier "$eta")"
         tier="$(dg_tier "$floor" "$etat")"
         [[ "$tier" == orange || "$tier" == red || "$etat" != green ]] && fast=1
 
-        handle_fs "$p" "$key" "$tier" "$free" "$total" "$eta" "$writers" "$fstype"
+        tier_of[$key]="$tier"; free_of[$key]="$free"; total_of[$key]="$total"
+        eta_of[$key]="$eta"; fstype_of[$key]="$fstype"
+        if [[ -z "$CC_KEY" || "$key" != "$CC_KEY" || "$key" == "$HOME_KEY" ]]; then
+            handle_fs "$p" "$key" "$tier" "$free" "$total" "$eta" "$writers" "$fstype"
+        fi
         # Canonical root: /proc names a held file by its resolved path.
         rw_domains+="${key} ${key%%[qm]*} ${total} $(wg_canon "$p")"$'\n'
         RW_TIER[$key]="$tier"
@@ -851,12 +837,21 @@ check_disks() {
         if [[ -n "$tmp_key" && "$key" == "$tmp_key" ]]; then SYS_COMPAT="$floor $free $total $fstype"; fi
     done
 
-    # Name the file filling a disk, and who is writing it, on every domain.
-    # A failure here must never cost the tiers above their poll.
+    # Pass 3: name the file filling a disk and who is writing it, on every
+    # domain, and answer a runaway Claude Code task output in cc-tmp. A failure
+    # here must never cost the tiers their poll.
+    RUNAWAY_RELIEVED=()
     if [[ -n "$rw_domains" ]]; then
         # The || keeps errexit off inside the check; it logs its own failures.
         wg_runaway_check "$rw_domains" || true
         (( RUNAWAY_FAST )) && fast=1
+    fi
+
+    # Pass 4: cc-tmp's own domain's levers and pages.
+    key="$CC_KEY"
+    if [[ -n "$key" && "$key" != "$HOME_KEY" && -n "${tier_of[$key]:-}" ]]; then
+        handle_fs "${path_of[$key]}" "$key" "${tier_of[$key]}" "${free_of[$key]}" "${total_of[$key]}" \
+            "${eta_of[$key]}" "$writers" "${fstype_of[$key]}"
     fi
 
     NEXT_POLL=$POLL_INTERVAL

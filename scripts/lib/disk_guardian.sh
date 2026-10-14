@@ -260,22 +260,32 @@ dg_rate_update() {
     # reset on every change, and near a quota's crossover — where reservations
     # swing by gigabytes and the closer wall alternates poll to poll — it never
     # built a rate at all, silencing the time-to-full tiers (review finding).
-    local key="$1" used="$2" now="$3" binding="${4:-fs}" f prev_t prev_u prev_r prev_b rate
+    #
+    # $5: MB held by the guardian's own reserve files in this domain. A
+    # sample's growth has the CHANGE in them since the previous sample taken
+    # out (spec; review finding: a new reserve fed a false time-to-full).
+    # A sample written before this field existed counts as no change, so a
+    # deploy causes no step. Known limit: a quota's usage (qgroup) can trail
+    # a reserve's creation or release by tens of seconds, so one fast poll
+    # may still see part of it.
+    local key="$1" used="$2" now="$3" binding="${4:-fs}" reserve="${5:-0}" f prev_t prev_u prev_r prev_b prev_res rate
+    [[ "$reserve" =~ ^[0-9]+$ ]] || reserve=0
     f="$DG_STATE_DIR/rate_${key}_${binding}"
     rate=0
-    if read -r prev_t prev_u prev_r prev_b 2>/dev/null < "$f" \
+    if read -r prev_t prev_u prev_r prev_b prev_res 2>/dev/null < "$f" \
             && [[ "$prev_t" =~ ^[0-9]+$ && "$prev_u" =~ ^[0-9]+$ && "$prev_r" =~ ^-?[0-9]+$ ]] \
             && [[ "${prev_b:-fs}" == "$binding" ]] \
             && (( now > prev_t )); then
         local dt=$(( now - prev_t )) inst
         # A gap of more than an hour (daemon stopped) says nothing about now.
         if (( dt <= 3600 )); then
-            inst=$(( (used - prev_u) * 60 / dt ))
+            [[ "${prev_res:-}" =~ ^[0-9]+$ ]] || prev_res=$reserve
+            inst=$(( ((used - prev_u) - (reserve - prev_res)) * 60 / dt ))
             rate=$(( (3 * inst + 7 * prev_r) / 10 ))
         fi
     fi
     mkdir -p "$DG_STATE_DIR" 2>/dev/null || true
-    { printf '%s %s %s %s\n' "$now" "$used" "$rate" "$binding" > "$f.tmp" \
+    { printf '%s %s %s %s %s\n' "$now" "$used" "$rate" "$binding" "$reserve" > "$f.tmp" \
         && mv -f "$f.tmp" "$f"; } 2>/dev/null || true
     printf '%s' "$rate"
 }
