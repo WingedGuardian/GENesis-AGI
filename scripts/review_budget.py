@@ -909,9 +909,11 @@ def evaluate_evidence(
     # newest round head it descends from, else None. None means either no
     # earlier round, or no single newest one (the two sides of a merge both
     # opened rounds); a reader must never take it as owed by nobody.
-    # ``late`` is the review's own verdict from the round rule above; a review
-    # on the current head is never late (the head has no descendant in the PR),
-    # so late keys never enter ``open_keys``. ``late_state`` says whether
+    # ``late`` is the review's own verdict from the round rule above. When
+    # ``current_head`` is the PR's tip, as ``evaluate_pr`` always passes it, a
+    # review on it is never late (the tip has no descendant in the PR), so late
+    # keys never enter ``open_keys``; a caller passing an older head gets no such
+    # guarantee. ``late_state`` says whether
     # every finding OUTSIDE the open round could be keyed; it is kept apart from
     # ``reflection_keys`` so an unkeyable finding there cannot make a known open
     # round unknown. Times here are normalised ISO-8601 (``+00:00``), so a
