@@ -124,7 +124,23 @@ async def _main(db_path: Path, apply: bool, *, own_db: bool = False) -> int:
     if not Path(db_path).is_file():  # never create a database at a mistyped path
         print(f"No database at {db_path}")
         return 2
-    db = await aiosqlite.connect(f"file:{Path(db_path).resolve()}?mode=rw", uri=True)
+    # Admission fence (fail-closed): never write to a quarantined or restoring database.
+    hooks = str(Path(__file__).resolve().parent / "hooks")
+    if hooks not in sys.path:
+        sys.path.insert(0, hooks)
+    try:
+        from db_admission_check import database_is_fenced
+
+        fenced = database_is_fenced(db_path)
+    except Exception:
+        fenced = True
+    if fenced:
+        print(
+            f"{db_path} is fenced (quarantined, restoring, or the fence is unreadable); not opened"
+        )
+        return 3
+    # as_uri() escapes ? and # in the path; mode=rw never creates a database.
+    db = await aiosqlite.connect(Path(db_path).resolve().as_uri() + "?mode=rw", uri=True)
     try:
         db.row_factory = aiosqlite.Row  # the cache regeneration reads rows by name
         columns = {r[1] for r in await db.execute_fetchall("PRAGMA table_info(procedural_memory)")}

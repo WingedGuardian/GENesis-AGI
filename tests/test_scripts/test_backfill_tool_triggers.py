@@ -208,3 +208,34 @@ async def test_a_mistyped_database_path_is_refused_not_created(tmp_path):
     path = tmp_path / "missing.db"
     assert await backfill_module._main(path, apply=False) == 2
     assert not path.exists()
+
+
+async def test_a_path_with_uri_characters_opens_that_file(tmp_path, monkeypatch):
+    import aiosqlite
+
+    from genesis.db.schema import create_all_tables
+
+    monkeypatch.setenv("GENESIS_PROCEDURE_TRIGGERS", str(trigger_cache.get_cache_path()))
+    path = tmp_path / "copy?old#1.db"
+    async with aiosqlite.connect(str(path)) as db:
+        await create_all_tables(db)
+        await _seed(db)
+    assert await backfill_module._main(path, apply=True) == 0
+    assert not (tmp_path / "copy").exists()  # the prefix was never created
+    async with aiosqlite.connect(str(path)) as db:
+        rows = await db.execute_fetchall(
+            "SELECT tool_trigger FROM procedural_memory WHERE id = 'cleaned'"
+        )
+    assert rows[0][0] == '["Read"]'
+
+
+async def test_a_fenced_database_is_not_opened(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    fence = types.ModuleType("db_admission_check")
+    fence.database_is_fenced = lambda _path: True
+    monkeypatch.setitem(sys.modules, "db_admission_check", fence)
+    path = tmp_path / "fenced.db"
+    path.write_bytes(b"")
+    assert await backfill_module._main(path, apply=True) == 3
