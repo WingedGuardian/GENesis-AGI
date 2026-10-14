@@ -551,11 +551,12 @@ rotate_log() {
 # one place on the box that holds every credential.
 _load_store_knob() {
     local key="$1"
+    local file="${2:-$REPO_DIR/secrets.env}"
     local line=""
     local val
-    [ -f "$REPO_DIR/secrets.env" ] || return 0
+    [ -f "$file" ] || return 0
     # Last assignment wins, which is how systemd reads these files too.
-    line="$(grep -aE "^${key}=" "$REPO_DIR/secrets.env" | tail -1)" || line=""
+    line="$(grep -aE "^${key}=" "$file" | tail -1)" || line=""
     [ -n "$line" ] || return 0
     val="${line#*=}"
     case "$val" in
@@ -566,15 +567,15 @@ _load_store_knob() {
     return 0
 }
 
-# The Camoufox cache the browser tools use, and their engine override, can both
-# come from secrets.env, which this unit does not load: the provisioner installs
-# where XDG_CACHE_HOME there points, and the decider keeps every engine while an
-# override is set. Both are read by name, in a subshell so neither reaches the
-# steps after this one.
+# The Camoufox cache the browser tools use can come from secrets.env, which this
+# unit does not load: the provisioner installs where XDG_CACHE_HOME there points.
+# It is read by name from the file the runtime reads (genesis.env.secrets_path:
+# SECRETS_PATH with a leading ~ expanded, else the checkout's), in a subshell so it
+# reaches no later step. The engine override the decider reads itself.
 prune_camoufox_engines_step() {
     (
-        _load_store_knob CAMOUFOX_EXECUTABLE_PATH
-        _load_store_knob XDG_CACHE_HOME
+        secrets="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
+        _load_store_knob XDG_CACHE_HOME "${secrets/#\~/$HOME}"
         prune_browser_engines "${XDG_CACHE_HOME:-$HOME/.cache}/camoufox"
     )
 }

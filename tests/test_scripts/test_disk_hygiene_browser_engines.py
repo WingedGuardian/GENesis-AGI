@@ -302,13 +302,13 @@ def test_the_step_prunes_the_cache_secrets_env_names(tmp_path):
     )
     script = (
         f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nunset XDG_CACHE_HOME CAMOUFOX_EXECUTABLE_PATH\n"
-        'prune_browser_engines() { echo "root=$1 xdg=$XDG_CACHE_HOME ov=$CAMOUFOX_EXECUTABLE_PATH key=${API_KEY-}"; }\n'
+        'prune_browser_engines() { echo "root=$1 xdg=$XDG_CACHE_HOME ov=${CAMOUFOX_EXECUTABLE_PATH-} key=${API_KEY-}"; }\n'
         "prune_camoufox_engines_step\n"
         'echo "after=${XDG_CACHE_HOME-unset}"'
     )
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
     assert r.returncode == 0, r.stderr
-    assert f"root={cache}/camoufox xdg={cache} ov=/opt/cf/camoufox-bin key=" in r.stdout
+    assert f"root={cache}/camoufox xdg={cache} ov= key=" in r.stdout
     assert "after=unset" in r.stdout  # nothing leaks into the steps after it
 
 
@@ -322,3 +322,51 @@ def test_the_step_defaults_to_the_home_cache(tmp_path):
     )
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
     assert f"root={tmp_path}/.cache/camoufox" in r.stdout, r.stdout + r.stderr
+
+
+def test_the_step_reads_the_secrets_file_secrets_path_names(tmp_path):
+    """SECRETS_PATH relocates secrets.env for the runtime and the provisioner; an
+    override set there must reach the decider too, or its engine looks unused."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "secrets.env").write_text("CAMOUFOX_EXECUTABLE_PATH=/wrong\n")
+    elsewhere = tmp_path / "conf" / "secrets.env"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text(f"XDG_CACHE_HOME={tmp_path / 'c'}\nCAMOUFOX_EXECUTABLE_PATH=/opt/cf/bin\n")
+    script = (
+        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nexport SECRETS_PATH='{elsewhere}'\n"
+        "unset XDG_CACHE_HOME CAMOUFOX_EXECUTABLE_PATH\n"
+        'prune_browser_engines() { echo "root=$1"; }\n'
+        "prune_camoufox_engines_step"
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+    assert f"root={tmp_path / 'c'}/camoufox" in r.stdout, r.stdout + r.stderr
+
+
+def test_a_secrets_path_under_home_is_expanded(tmp_path):
+    (tmp_path / "conf").mkdir()
+    (tmp_path / "conf" / "secrets.env").write_text(f"XDG_CACHE_HOME={tmp_path / 'c'}\n")
+    script = (
+        f"source '{_HYGIENE}'\nREPO_DIR='{tmp_path}'\nHOME='{tmp_path}'\n"
+        "export SECRETS_PATH='~/conf/secrets.env'\nunset XDG_CACHE_HOME\n"
+        'prune_browser_engines() { echo "root=$1"; }\n'
+        "prune_camoufox_engines_step"
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+    assert f"root={tmp_path / 'c'}/camoufox" in r.stdout, r.stdout + r.stderr
+
+
+def test_the_store_knobs_still_come_from_the_checkout(tmp_path):
+    """SECRETS_PATH is honoured for the browser settings only: the hook-audit
+    stores' writers read their directories from the checkout's secrets.env."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "secrets.env").write_text("GENESIS_MERGE_OVERRIDE_DIR=/from/repo\n")
+    elsewhere = tmp_path / "elsewhere.env"
+    elsewhere.write_text("GENESIS_MERGE_OVERRIDE_DIR=/from/elsewhere\n")
+    script = (
+        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nexport SECRETS_PATH='{elsewhere}'\n"
+        '_load_store_knob GENESIS_MERGE_OVERRIDE_DIR\necho "dir=$GENESIS_MERGE_OVERRIDE_DIR"'
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+    assert "dir=/from/repo" in r.stdout, r.stdout + r.stderr

@@ -36,7 +36,7 @@ from pathlib import Path
 from fastmcp import Context
 
 from genesis.browser import chromium, engine, packages, profile_backup
-from genesis.browser.types import BrowserLayer
+from genesis.browser.types import CAMOUFOX_PROFILE_DIR, BrowserLayer
 from genesis.mcp.health import mcp
 from genesis.security.card_shapes import contains_card_number
 
@@ -108,7 +108,7 @@ _ts_log = _TsLog()
 # Prevents concurrent browser init/cleanup races across tool calls.
 _browser_lock = asyncio.Lock()
 
-_PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
+_PROFILE_DIR = CAMOUFOX_PROFILE_DIR
 _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
 # Module-level browser state — persists across tool calls within a session.

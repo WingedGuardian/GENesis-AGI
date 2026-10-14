@@ -8,7 +8,8 @@ script only decides. scripts/disk_hygiene.sh deletes what it prints, through its
 mount-aware deleter, so a decision bug cannot reach past the names printed here.
 
 Nothing is printed while any of these holds:
-- ``CAMOUFOX_EXECUTABLE_PATH`` names an engine (the operator's choice), or the user
+- ``CAMOUFOX_EXECUTABLE_PATH`` names an engine (the operator's choice, in this
+  environment or the runtime's secrets file), or the user
   picked a build with ``camoufox set`` (or that config is unreadable);
 - the engine the installed camoufox pairs with does not resolve ready from
   ``browsers/``;
@@ -16,8 +17,13 @@ Nothing is printed while any of these holds:
   the camoufox package's install. Until then the older builds are the way back;
 - the running browsers cannot be read.
 
-Otherwise it prints, never an engine a running browser uses or one launched in the
-last 14 days (its binary's access time):
+It also keeps everything while the cache's filesystem keeps no access times, or
+the browser profile's record of its last engine cannot be read.
+
+Otherwise it prints, never an engine a running browser uses, the one the browser
+profile last ran (its compatibility.ini, which Firefox writes on every launch, so an
+override this process cannot see is covered), or one launched in the last 14 days
+(its binary's access time):
 - what an interrupted run left in ``browsers/.retiring/`` (the shell renames a
   version directory there before deleting it, so a run killed midway is finished
   by the next one; camoufox's listing skips dot directories);
@@ -34,6 +40,7 @@ usage: prune_browser_engines.py <camoufox cache root, canonical>
 
 from __future__ import annotations
 
+import configparser
 import os
 import re
 import sys
@@ -42,6 +49,7 @@ from importlib import metadata
 from pathlib import Path
 
 from genesis.browser import engine, provision
+from genesis.browser.types import CAMOUFOX_PROFILE_DIR
 
 GRACE_DAYS = 14
 RETIRING = ".retiring"
@@ -99,6 +107,14 @@ _MANIFEST_LINE = re.compile(r'\s*(?:remove|rmdir)\s+"([^"]+)"')
 _DAY = 86400
 
 
+class _Unknown:
+    def __repr__(self) -> str:
+        return "UNKNOWN"
+
+
+UNKNOWN = _Unknown()  # an input that exists but cannot be read: keep every engine
+
+
 def _legacy_names(root: Path) -> set[str]:
     names = set(_MANIFEST_NAMES | _CAMOUFOX_NAMES)
     try:
@@ -141,6 +157,8 @@ def plan(
     override: bool = False,
     explicit_choice: bool | None = False,
     paired_at: float | None = None,
+    last_used: Path | _Unknown | None = None,
+    atime_kept: bool = True,
 ) -> tuple[list[Path], list[str]]:
     """The paths to delete, in order, and why anything was kept."""
     if override:
@@ -161,11 +179,32 @@ def plan(
         return [], [f"kept every engine: the pairing with {pinned} is under {GRACE_DAYS} days old"]
     if exes is None:
         return [], ["kept every engine: the running browsers could not be read"]
+    if not atime_kept:
+        return [], [f"kept every engine: {root} keeps no access times, so no launch shows"]
+    if isinstance(last_used, _Unknown):
+        return [], ["kept every engine: the browser profile's record of its engine is unreadable"]
 
     doomed: list[Path] = []
     notes: list[str] = []
+    # The engine directory the browser profile last ran (Firefox writes it on every
+    # launch, whatever chose the engine): an override this process cannot see too.
+    last = Path(last_used).resolve() if last_used is not None else None
+    if last is not None and not _under(last, root):
+        notes.append(f"the browser profile last ran an engine outside {root}: {last}")
+
+    def last_ran(directory: Path) -> bool:
+        if last is None:
+            return False
+        if directory.parent.name == RETIRING:  # <repo>.<version>.<pid>
+            return last.parent.parent == browsers and directory.name.startswith(
+                f"{last.parent.name}.{last.name}."
+            )
+        return _under(last, directory)
 
     def in_use(directory: Path, binary: Path) -> bool:
+        if last_ran(directory):
+            notes.append(f"kept {directory}: the browser profile last ran it")
+            return True
         if any(_under(exe, directory) for exe in exes):
             notes.append(f"kept {directory}: a running browser uses it")
             return True
@@ -202,6 +241,8 @@ def plan(
         root_exes = [exe for exe in exes if _under(exe, root) and not _under(exe, browsers)]
         if root_exes:
             notes.append(f"kept the pre-0.5 engine in {root}: a running browser uses it")
+        elif last == root:
+            notes.append(f"kept the pre-0.5 engine in {root}: the browser profile last ran it")
         elif _launched_recently(root / engine.LAUNCH_FILE, now):
             notes.append(
                 f"kept the pre-0.5 engine in {root}: launched in the last {GRACE_DAYS} days"
@@ -232,7 +273,53 @@ def _paired_at() -> float | None:
         return None
 
 
-def _inputs() -> tuple[engine.EngineStatus, list[Path], list[Path] | None, dict]:
+def _last_used(profile: Path) -> Path | _Unknown | None:
+    """The engine directory that last opened ``profile`` (Firefox's own
+    compatibility.ini ``LastPlatformDir``); None when it was never opened, UNKNOWN
+    when the record is there but cannot be read."""
+    path = profile / "compatibility.ini"
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        if not (path.exists() or path.is_symlink()):
+            return None
+        if not parser.read(path, encoding="utf-8"):
+            return UNKNOWN
+        value = parser.get("Compatibility", "LastPlatformDir").strip()
+    except (configparser.Error, UnicodeDecodeError, OSError):
+        return UNKNOWN
+    return Path(value) if value else UNKNOWN
+
+
+def _override_set() -> bool:
+    """Whether an engine override is in effect: in this environment, or in the
+    secrets file the runtime loads, read with the runtime's own parser. A secrets
+    file that cannot be read counts as one."""
+    if os.environ.get("CAMOUFOX_EXECUTABLE_PATH", "").strip():
+        return True
+    try:
+        from dotenv import dotenv_values
+
+        from genesis.env import secrets_path
+
+        path = secrets_path()
+        if not path.exists():
+            return False
+        value = dotenv_values(path).get("CAMOUFOX_EXECUTABLE_PATH") or ""
+    except Exception:  # noqa: BLE001 - unknown counts as an override
+        return True
+    return bool(value.strip())
+
+
+def _atime_kept(root: Path) -> bool:
+    """Whether ``root``'s filesystem records access times (the recent-launch
+    signal); a noatime mount, or one that cannot be asked, does not."""
+    try:
+        return not os.statvfs(root).f_flag & os.ST_NOATIME
+    except OSError:
+        return False
+
+
+def _inputs(root: Path) -> tuple[engine.EngineStatus, list[Path], list[Path] | None, dict]:
     status = engine.resolve_camoufox_engine()
     try:
         from camoufox import multiversion
@@ -242,9 +329,11 @@ def _inputs() -> tuple[engine.EngineStatus, list[Path], list[Path] | None, dict]
         print(f"browser engine prune: camoufox's listing failed: {exc!r}", file=sys.stderr)
         installed = []
     gates = {
-        "override": bool(os.environ.get("CAMOUFOX_EXECUTABLE_PATH", "").strip()),
+        "override": _override_set(),
         "explicit_choice": provision._explicit_choice(),
         "paired_at": _paired_at(),
+        "last_used": _last_used(CAMOUFOX_PROFILE_DIR),
+        "atime_kept": _atime_kept(root),
     }
     return status, installed, provision.live_camoufox_exes(), gates
 
@@ -259,7 +348,7 @@ def main(argv: list[str]) -> int:
             f"browser engine prune: {root} is not camoufox's cache; nothing done", file=sys.stderr
         )
         return 0
-    status, installed, exes, gates = _inputs()
+    status, installed, exes, gates = _inputs(root)
     doomed, notes = plan(root, status, installed, exes, time.time(), **gates)
     for note in notes:
         print(f"browser engine prune: {note}", file=sys.stderr)
