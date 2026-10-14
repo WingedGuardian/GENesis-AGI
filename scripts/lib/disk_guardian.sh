@@ -380,15 +380,20 @@ dg_io_snapshot() {
             [[ "$k" == write_bytes: ]] && { wb="$v"; break; }
         done 2>/dev/null < "$p/io" || continue
         [[ "$wb" =~ ^[0-9]+$ ]] || continue
+        # The WHOLE record: comm may hold a newline, and a first-line read would
+        # stop inside it and drop the writer from the list (review finding).
         rest=""
-        read -r rest 2>/dev/null < "$p/stat" || [[ -n "$rest" ]] || continue
+        IFS= read -r -d '' rest 2>/dev/null < "$p/stat" || [[ -n "$rest" ]] || continue
         rest="${rest##*) }"
         # rest starts at field 3 (state); starttime is field 22 → word 20 here.
         read -r -a _dg_f <<< "$rest"
         st="${_dg_f[19]:-}"
         [[ "$st" =~ ^[0-9]+$ ]] || continue
+        # The whole name, for the same reason as stat above.
         comm="?"
-        read -r comm 2>/dev/null < "$p/comm" || true
+        IFS= read -r -d '' comm 2>/dev/null < "$p/comm" || true
+        comm="${comm%$'\n'}"
+        [[ -n "$comm" ]] || comm="?"
         # comm is process-chosen (prctl PR_SET_NAME) and may hold tabs or
         # newlines; those would split the space-separated snapshot, so every
         # whitespace byte becomes "_".

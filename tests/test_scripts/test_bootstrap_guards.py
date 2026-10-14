@@ -649,68 +649,6 @@ def test_normal_setup_does_not_install_upgrade_or_probe_raw_codebase():
         assert "codebase-memory-mcp --version" not in code
 
 
-def _cbm_outcome_block(script: Path) -> str:
-    """The caller's whole outcome path: the source, the CALL, and the `case`.
-
-    Anchored on the source line rather than on `case`, because the wire between
-    them — `genesis_cbm_install || _cbm_rc=$?` — is the part most easily broken.
-    A slice that starts at `case` and injects `_cbm_rc` itself leaves that
-    assignment outside everything it executes.
-    """
-    lines = script.read_text().splitlines()
-    # Anchored on the kill-switch guard's `if [ -z "$_cbm_disable" ]` — the
-    # if/elif/else encloses the source line, the call wire and the `case`, so
-    # slicing from any inner line leaves an orphaned `fi`; `_cbm_disable` is
-    # pre-set by the caller to a nonexistent path so the else branch runs.
-    start = next(i for i, ln in enumerate(lines) if ln.strip() == 'if [ -z "$_cbm_disable" ]; then')
-    end = next(i for i, ln in enumerate(lines) if i > start and ln.strip() == "esac")
-    end = next(i for i, ln in enumerate(lines) if i > end and ln.strip() == "fi")
-    return "\n".join(lines[start : end + 1]) + "\n"
-
-
-def test_b9_callers_render_a_digest_mismatch_distinctly(tmp_path):
-    """rc 3 exists so a wrong pin cannot hide inside a network-failure message.
-
-    That only holds if the CALLERS say something different for it, and if the
-    return actually reaches them. Both are exercised together: the real source
-    line, the real call and the real `case` are run against a stub library that
-    returns the code under test, so the `|| _cbm_rc=$?` wire is inside the
-    harness rather than bypassed by injecting `_cbm_rc` directly. MEASURED with
-    that wire replaced by `|| true`: install.sh rendered a pin/digest mismatch
-    as `+ codebase-memory-mcp installed/upgraded`.
-    """
-    for script in (BOOTSTRAP, INSTALL):
-        block = _cbm_outcome_block(script)
-        stub_root = tmp_path / script.stem
-        (stub_root / "lib").mkdir(parents=True)
-        (stub_root / "lib" / "cbm_installer.sh").write_text(
-            'genesis_cbm_install() { return "${FAKE_CBM_RC}"; }\n'
-        )
-        rendered = {}
-        for rc in ("0", "1", "2", "3"):
-            proc = subprocess.run(
-                [
-                    "/bin/bash",
-                    "-c",
-                    f'set -euo pipefail\nSCRIPT_DIR="{stub_root}"\n'
-                    f'_cbm_disable="{stub_root}/no-sentinel-present"\n{block}',
-                ],
-                capture_output=True,
-                text=True,
-                env={"PATH": "/usr/bin:/bin", "FAKE_CBM_RC": rc},
-            )
-            assert proc.returncode == 0, proc.stderr
-            rendered[rc] = proc.stdout.strip()
-        assert "digest" in rendered["3"].lower(), (
-            f"{script.name}: a digest mismatch is not named — {rendered['3']!r}"
-        )
-        for other in ("0", "1", "2"):
-            assert rendered["3"] != rendered[other], (
-                f"{script.name}: a wrong pin renders identically to outcome {other} "
-                f"— {rendered['3']!r}"
-            )
-
-
 # ── CDPATH: `cd` SEARCHES it, and echoes what it resolves ────────────
 #
 # With CDPATH exported and a RELATIVE entrypoint, `cd` searches CDPATH for the

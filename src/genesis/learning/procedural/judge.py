@@ -23,6 +23,7 @@ from genesis.learning.procedural.embedding import (
     _fail_open_timestamps,
     get_embedding_provider,
 )
+from genesis.learning.procedural.tool_names import TOOL_TRIGGER_GUIDANCE
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -132,6 +133,7 @@ def _build_multi_struggle_prompt(spine_text: str, score: float) -> str:
         + "\n\n"
         "## Struggle Score: " + f"{score:.2f}" + "\n\n"
         "Return ONLY this JSON in backticks (the list may be empty):\n\n" + _MULTI_SCHEMA_EXAMPLE
+        + "\n\ntool_trigger: " + TOOL_TRIGGER_GUIDANCE + "\n"
     )
 
 

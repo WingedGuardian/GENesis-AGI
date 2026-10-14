@@ -75,6 +75,8 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(updates, "_ESCALATION_FILE", escalation)
     monkeypatch.setattr(updates, "_PID_FILE", tmp_path / "update.pid")
     monkeypatch.setattr(updates, "update_in_progress", lambda: False)
+    # Never the install's real ~/.genesis/update_state.json.
+    monkeypatch.setattr(updates, "_STATE_FILE", home / ".genesis" / "update_state.json")
     return {"home": home, "root": root}
 
 

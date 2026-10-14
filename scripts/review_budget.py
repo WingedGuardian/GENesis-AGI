@@ -268,8 +268,17 @@ def _unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
         "body_changed": False,
         "reviewers_reported": [],
         "expected_reviewers": [],
+        "commits": [],
+        "marks": [],
+        "findings": [],
+        "late_state": "unknown",
         "errors": [e for e in errors if e],
     }
+
+
+def _iso(when: datetime | None, raw: object) -> object:
+    """``when`` as ISO-8601, or ``raw`` unchanged when it carried no time."""
+    return when.isoformat() if when is not None else raw
 
 
 def _full_sha(value: object) -> str | None:
@@ -411,6 +420,15 @@ def evaluate_evidence(
     the configured identity template CONFIRM a head (``current_head_reviewed``)
     and never add a round.
 
+    A round advances only on the newest reviewed head (owner ruling
+    2026-10-12). Every review MARKS the head it reviewed, clean or not; a finding
+    review that lands on a head after one of that head's descendants was marked
+    is a LATE review of an earlier round. It opens no round, and is listed in
+    ``findings`` with the round it belongs to (``round_head``), for the round
+    reflection to owe (issue #3301; nothing owes them yet). Ancestry comes from each commit's ``parents`` when the caller
+    passes ``commit_heads`` entries as ``{"sha", "parents"}``; a bare SHA knows
+    no ancestry, so it never makes a review late.
+
     Evidence before ``cutover`` (default ``ROUND_RULE_CUTOVER_ISO``) keeps the
     old rule: every head the PRIMARY reviewed, clean included. Items carrying no
     timestamp are treated as before it. The count is the union of the two, so at
@@ -425,15 +443,56 @@ def evaluate_evidence(
         return _unknown("malformed_current_head", current_head=str(current_head or ""))
 
     commits: list[str] = []
+    # Each commit's parents, where the caller supplied them (the GraphQL read
+    # does; a bare SHA, as test seams pass, carries none). Ancestry is read only
+    # from this graph, never from list order: GitHub lists a PR's commits by
+    # date, not by parent (MEASURED on #3203: 6 of 22 neighbours are not parent
+    # and child).
+    parents_of: dict[str, tuple[str, ...]] = {}
     for raw in commit_heads:
+        parents: tuple[str, ...] | None = None
+        if isinstance(raw, Mapping):
+            raw_parents = raw.get("parents")
+            raw = raw.get("sha")
+            if raw_parents is not None:
+                if not isinstance(raw_parents, list):
+                    return _unknown("malformed_pr_commit", current_head=head)
+                parsed = [_full_sha(p) for p in raw_parents]
+                if any(p is None for p in parsed):
+                    return _unknown("malformed_pr_commit", current_head=head)
+                parents = tuple(p for p in parsed if p is not None)
         full = _full_sha(raw)
         if full is None:
             return _unknown("malformed_pr_commit", current_head=head)
         if full not in commits:
             commits.append(full)
+        if parents is not None:
+            parents_of[full] = parents
     if head not in commits:
         return _unknown("current_head_missing_from_commits", current_head=head)
     order = {sha: index for index, sha in enumerate(commits)}
+
+    ancestors_memo: dict[str, frozenset[str]] = {}
+
+    def ancestors(sha: str) -> frozenset[str]:
+        """Every PR commit reachable through ``sha``'s parents, itself excluded.
+
+        A commit with no parent record (a force-pushed head, or a bare seam SHA)
+        has none known, so it can be no head's ancestor and suppresses nothing:
+        a missing edge only ever makes the count larger, never smaller.
+        """
+        if sha in ancestors_memo:
+            return ancestors_memo[sha]
+        seen: set[str] = set()
+        stack = list(parents_of.get(sha, ()))
+        while stack:
+            node = stack.pop()
+            if node in seen or node not in order:
+                continue  # the base branch's commits are not the PR's
+            seen.add(node)
+            stack.extend(parents_of.get(node, ()))
+        ancestors_memo[sha] = frozenset(seen)
+        return ancestors_memo[sha]
 
     identities: list[re.Pattern[str]] = []
     for template in external_identity_templates:
@@ -477,6 +536,20 @@ def evaluate_evidence(
     def report(sha: str, login: str) -> None:
         reported.setdefault(sha, set()).add(login)
 
+    # MARKS: every head some reviewer looked at, and when, clean reviews
+    # included (owner ruling 2026-10-12: any review marks a head). They decide
+    # whether a finding review opens a round: once a head has been reviewed, a
+    # review that then lands on one of its ANCESTORS is a late review of an
+    # earlier round, never a new round.
+    marks: list[tuple[str, datetime | None, object]] = []
+
+    def mark(sha: str, when: datetime | None, raw: object) -> None:
+        marks.append((sha, when, raw))
+
+    # Every post-cutover finding review, in arrival order of the input. Which of
+    # them open a round is decided below, once every mark is known.
+    events: list[dict[str, Any]] = []
+
     surface_only = review_findings.surface_only_logins()
     for item in reviews:
         if not isinstance(item, Mapping):
@@ -517,6 +590,22 @@ def evaluate_evidence(
             return _unknown("review_time_missing", current_head=head)
         if item.get("state") != "PENDING":
             report(sha, login)
+            raw_tops, raw_body = item.get("top_level"), item.get("body")
+            # A review record with no body and no top-level comment is the
+            # wrapper GitHub makes for a reply inside a thread: nobody reviewed
+            # the head it names, so it marks nothing.
+            # A row with no comment list at all reads the same way: marking less
+            # can only make the count larger. Only a COMMENTED review (or one
+            # whose state is missing or unknown) can be a wrapper: an approval,
+            # a change request or a dismissed review with no text is still a
+            # review of the head.
+            reply_only = (
+                item.get("state") not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+                and (raw_tops is None or (isinstance(raw_tops, list) and not raw_tops))
+                and (raw_body is None or (isinstance(raw_body, str) and not raw_body.strip()))
+            )
+            if not reply_only:
+                mark(sha, when, item.get("submitted_at"))
         if before:
             continue
         top_level = item.get("top_level")
@@ -533,11 +622,14 @@ def evaluate_evidence(
         in_body = review_findings.body_finding_count(login, body)
         findings = len(flagged) + in_body
         if findings:
-            add_round(
-                sha,
-                login,
-                findings,
-                _round_source(item, login, flagged, in_body),
+            events.append(
+                {
+                    "sha": sha,
+                    "when": when,
+                    "login": login,
+                    "findings": findings,
+                    "source": _round_source(item, login, flagged, in_body),
+                }
             )
         elif not top_level and review_findings.declares_findings(login, body):
             # Its body says it posted findings and no top-level comment
@@ -557,6 +649,15 @@ def evaluate_evidence(
         ok, when = _parse_time(item.get("created_at"))
         if not ok:
             return _unknown("malformed_comment_time", current_head=head)
+        # A comment can be edited. Its MARK takes the edit time and everything
+        # else its creation time: a later mark makes fewer reviews late, an
+        # earlier event time makes fewer late too, so each side raises the count.
+        marked_raw = item.get("updated_at") or item.get("created_at")
+        ok, marked = _parse_time(marked_raw)
+        if not ok:
+            return _unknown("malformed_comment_time", current_head=head)
+        if marked is None or (when is not None and marked < when):
+            marked = when  # never earlier than the comment itself
         before = when is None or when < cut
         # The confirmation marker and the identity template are matched on TEXT,
         # not on who wrote it, so a deleted author's comment still counts for both.
@@ -573,6 +674,10 @@ def evaluate_evidence(
                 # Matched on TEXT, so whoever posted it is not the reviewer: the
                 # configured identity is, named by its position in the config.
                 report(resolved or "", f"identity:{index}")
+                # No MARK: the template is matched on text from any author, so
+                # anyone could post it. A mark can make a review late and lower
+                # the count, which a confirmation never could; leaving it out can
+                # only make the count larger.
         if login is None or author_type is None:
             continue  # deleted author: never the primary
         if not isinstance(login, str) or not isinstance(author_type, str):
@@ -592,27 +697,62 @@ def evaluate_evidence(
                 return _unknown(error, current_head=head)
             confirm(resolved or "", before)
             report(resolved or "", login)
+            mark(resolved or "", marked, marked_raw)
             continue
         is_findings, sha = review_findings.codex_comment_finding_head(body)
         if is_findings and sha is not None:
             report(sha, login)  # a report on either side of the cutover, like a review
+            mark(sha, marked, marked_raw)
         if is_findings and not before:
             if sha is None:
                 return _unknown("codex_findings_comment_unbound", current_head=head)
             confirm(sha, False)
             comment_id = item.get("id")
-            add_round(
-                sha,
-                login,
-                1,
+            events.append(
                 {
-                    "id": None,
+                    "sha": sha,
+                    "when": when,
                     "login": login,
-                    "submitted_at": item.get("created_at"),
-                    # A findings comment has no review object; its own id keys it.
-                    "finding_keys": [f"i{comment_id}" if _is_id(comment_id) else None],
-                },
+                    "findings": 1,
+                    "source": {
+                        "id": None,
+                        "login": login,
+                        "submitted_at": item.get("created_at"),
+                        # A findings comment has no review object; its own id keys it.
+                        "finding_keys": [f"i{comment_id}" if _is_id(comment_id) else None],
+                    },
+                }
             )
+
+    # Which finding reviews open a round (owner ruling 2026-10-12). A review on
+    # head X opens one iff X has no round yet and no head that is a strict
+    # DESCENDANT of X had been reviewed (marked, clean or not) strictly before
+    # it arrived. Otherwise it is a late review of an earlier round: it joins X's
+    # round when X has one, and opens nothing. Decided in arrival order, so the
+    # first finding review on a head decides it (marks only accumulate, so a
+    # later one could only be suppressed too). A head outside the commit graph
+    # (force-pushed away) has no known descendants, so it opens a round as it
+    # always did. A head the old rule already counted (``legacy``) is a round,
+    # so a late review of it joins it.
+    opened: dict[str, bool] = {sha: True for sha in legacy}
+    timed = sorted(
+        range(len(events)),
+        key=lambda i: (events[i]["when"] is None, events[i]["when"] or cut, i),
+    )
+    for i in timed:
+        sha, when = events[i]["sha"], events[i]["when"]
+        if sha in opened:
+            continue
+        opened[sha] = not (
+            when is not None
+            and any(
+                m_when is not None and m_when < when and sha in ancestors(m_sha)
+                for m_sha, m_when, _ in marks
+            )
+        )
+    for event in events:  # input order, so each round lists its reviews as before
+        if opened[event["sha"]]:
+            add_round(event["sha"], event["login"], event["findings"], event["source"])
 
     paths: list[str] = []
     for item in changed_files:
@@ -706,9 +846,9 @@ def evaluate_evidence(
     # What a round reflection must answer for, read by review_reflection.status
     # (and by the commit gate once it enforces reflections; until then they are
     # reported, never enforced). The newest round only, and only while it is
-    # open. NOT attached (a later PR owes them separately): a review
-    # submitted on an earlier head after the fix was pushed stays on that head,
-    # so it is never owed here.
+    # open. A LATE review (one that opened no round, above) never lands here: it
+    # is listed in ``findings`` with the round it belongs to. Nothing owes
+    # those keys yet; the round reflection reader will (issue #3301).
     seen: dict[str, None] = {}  # ordered and linear, however many keys arrive
     keys_known = True
     if round_state == "open":
@@ -733,6 +873,45 @@ def evaluate_evidence(
     # that never will.
     expected = sorted({login for sha, who in reported.items() if sha != head for login in who})
 
+    # Every post-cutover finding review and the round it belongs to: its own
+    # head's round, else (a late review of a head that never opened one) the
+    # newest round head it descends from, else None. None means either no
+    # earlier round, or no single newest one (the two sides of a merge both
+    # opened rounds); a reader must never take it as owed by nobody.
+    # ``late_state`` says whether
+    # every finding OUTSIDE the open round could be keyed; it is kept apart from
+    # ``reflection_keys`` so an unkeyable finding there cannot make a known open
+    # round unknown. Times here are normalised ISO-8601 (``+00:00``), so a
+    # reader never compares GitHub's ``Z`` form with Python's as strings.
+    def round_of(sha: str) -> str | None:
+        if sha in round_heads:
+            return sha
+        older = {r for r in ancestors(sha) if r in round_heads}
+        # The newest by ANCESTRY: the one round head every other candidate is an
+        # ancestor of. Two incomparable candidates (the two sides of a merge) have
+        # no newest, and list order (by date) cannot pick one: None, never a guess.
+        newest = [r for r in older if older - {r} <= ancestors(r)]
+        return newest[0] if len(newest) == 1 else None
+
+    open_head = rounds[-1]["head"] if round_state == "open" else None
+    findings_out: list[dict[str, Any]] = []
+    late_known = True
+    for event in events:
+        keys = list(event["source"]["finding_keys"])
+        # The open round's own keys are already judged by ``reflection_keys``.
+        in_open_round = event["sha"] == open_head and opened[event["sha"]]
+        if not in_open_round and any(k is None for k in keys):
+            late_known = False
+        findings_out.append(
+            {
+                "head": event["sha"],
+                "submitted_at": _iso(event["when"], event["source"]["submitted_at"]),
+                "login": event["login"],
+                "keys": keys,
+                "round_head": round_of(event["sha"]),
+            }
+        )
+
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
@@ -756,6 +935,15 @@ def evaluate_evidence(
         "reflection_keys": "ok" if keys_known else "unknown",
         "reviewers_reported": sorted(reported.get(head, set())),
         "expected_reviewers": expected,
+        # ``parents`` is None where the caller gave no ancestry, so a reader can
+        # tell "unknown" from a root commit (``[]``).
+        "commits": [
+            {"sha": sha, "parents": list(parents_of[sha]) if sha in parents_of else None}
+            for sha in commits
+        ],
+        "marks": [{"head": sha, "at": _iso(when, raw)} for sha, when, raw in marks],
+        "findings": findings_out,
+        "late_state": "ok" if late_known else "unknown",
         "errors": [],
     }
 
@@ -909,7 +1097,7 @@ _GRAPHQL_CONNECTIONS = {
     ),
     "comments": (
         "comments(first: 100, after: $after_comments) { pageInfo { hasNextPage endCursor } "
-        "nodes { fullDatabaseId body createdAt author { login __typename } } }"
+        "nodes { fullDatabaseId body createdAt updatedAt author { login __typename } } }"
     ),
     "files": (
         "files(first: 100, after: $after_files) { pageInfo { hasNextPage endCursor } "
@@ -917,7 +1105,7 @@ _GRAPHQL_CONNECTIONS = {
     ),
     "commits": (
         "commits(first: 100, after: $after_commits) { pageInfo { hasNextPage endCursor } "
-        "nodes { commit { oid } } }"
+        "nodes { commit { oid parents(first: 100) { totalCount nodes { oid } } } } }"
     ),
 }
 
@@ -1035,6 +1223,7 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
                     "type": kind,
                     "body": node.get("body"),
                     "created_at": node.get("createdAt"),
+                    "updated_at": node.get("updatedAt"),
                 }
             )
         elif name == "files":
@@ -1048,7 +1237,22 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
             commit = node.get("commit")
             if not isinstance(commit, dict):
                 raise ValueError(name)
-            rows.append({"sha": commit.get("oid")})
+            # Every parent is read. A missing edge would not only leave a late
+            # review counted (the safe side) but could make round_of's "one newest
+            # round ancestor" falsely unique, so a parent list that did not come
+            # back complete makes the whole read unknown.
+            parents = commit.get("parents")
+            if not isinstance(parents, dict) or not isinstance(parents.get("nodes"), list):
+                raise ValueError(name)
+            total = parents.get("totalCount")
+            if not isinstance(total, int) or total != len(parents["nodes"]):
+                raise ValueError(name)
+            oids = []
+            for parent in parents["nodes"]:
+                if not isinstance(parent, dict) or not isinstance(parent.get("oid"), str):
+                    raise ValueError(name)
+                oids.append(parent["oid"])
+            rows.append({"sha": commit.get("oid"), "parents": oids})
     return rows, path_changed
 
 
@@ -1081,6 +1285,9 @@ def _review_digest(rows: Sequence[Mapping[str, object]], rf: Any) -> list[tuple[
                 tuple(named and isinstance(b, str) and rf.is_finding(login, b) for b in tops),
                 rf.body_finding_count(login, body) if named else 0,
                 rf.declares_findings(login, body) if named else False,
+                # Whether the review MARKS its head: an empty review with no
+                # comment is a reply wrapper, which marks nothing.
+                bool(body.strip()),
             )
         )
     return digest
@@ -1366,7 +1573,9 @@ def _evaluate_pr_inner(
     final_head = os.environ.get("_TEST_REVIEW_BUDGET_HEAD_AFTER")
     if final_head is None and os.environ.get("_TEST_REVIEW_BUDGET_HEAD") is not None:
         final_head = test_head
-    mutable = [item for item in ("reviews", "comments") if item in needed]
+    # The commit graph is re-read too: it decides which reviews are late, and the
+    # PR's commit list can change (a base branch moving) while its head does not.
+    mutable = [item for item in ("reviews", "comments", "commits") if item in needed]
     second: dict[str, Any] | None = None
     if final_head is None or mutable:
         second, error = snapshot(mutable)
@@ -1391,12 +1600,15 @@ def _evaluate_pr_inner(
         if not same:
             return _unknown("evidence_changed_during_evaluation", current_head=final_head)
 
-    commit_heads: list[str] = []
+    commit_heads: list[str | dict[str, Any]] = []
     for item in fetched["commits"]:
         sha = item.get("sha")
         if not isinstance(sha, str):
             return _unknown("commits_malformed", current_head=test_head)
-        commit_heads.append(sha)
+        # A seam row may omit parents; the evaluator then knows no ancestry.
+        commit_heads.append(
+            {"sha": sha, "parents": item["parents"]} if item.get("parents") is not None else sha
+        )
 
     result = evaluate_evidence(
         current_head=test_head,

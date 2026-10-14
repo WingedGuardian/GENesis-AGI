@@ -374,8 +374,11 @@ def test_source_refusal_does_not_claim_retained_staging(
             source.mkdir()
         elif kind == "fifo":
             os.mkfifo(source)
-    with pytest.raises((OSError, ValueError)):
+    with pytest.raises((OSError, ValueError)) as raised:
         managed.configure(args, settings)
+    if kind == "wrong-pin":
+        # A digest mismatch is named distinctly, never folded into a generic failure.
+        assert "unsupported managed executable" in str(raised.value)
     assert "Incomplete staging retained" not in capsys.readouterr().err
     assert not state.exists() and not settings.exists()
 

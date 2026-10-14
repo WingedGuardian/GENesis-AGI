@@ -97,6 +97,10 @@ EXEMPT: dict[tuple[str, str], str] = {
     ("util/pytest_lock.py", "scripts/pytest_lock_wait.py"): (
         "named in the advice a blocked pytest prints; never executed"
     ),
+    ("browser/engine.py", "scripts/install_browser_stack.sh"): (
+        "named in the operator step an unready engine reports; an operator or the "
+        "browser-stack unit runs it, never the server"
+    ),
     ("surplus/jobs/gitnexus.py", "scripts/lib"): (
         "put on sys.path to import index_marker; every bare import of a scripts/ "
         "module is checked on its own below"
@@ -494,6 +498,7 @@ _RELOAD = ("scripts/lib/index_marker.py", "scripts/hooks/worktree_claim.py")
 _FRESH = (
     "scripts/disk_reclaim.py",
     "scripts/lib/live_checkout.py",
+    "scripts/lib/managed_units.py",
     "scripts/hooks/bash_allowlist_guard.sh",
     "scripts/hooks/bash_allowlist_lib.sh",
     "scripts/lib/deploy_marker.sh",

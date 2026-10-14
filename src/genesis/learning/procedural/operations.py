@@ -12,6 +12,7 @@ import aiosqlite
 
 from genesis.db.crud import procedural
 from genesis.learning.procedural.embedding import cosine_similarity, unpack_embedding
+from genesis.learning.procedural.tool_names import normalize_tool_trigger
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,14 @@ async def store_procedure(
     """
     proc_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
+    tool_trigger, patterns, dropped = normalize_tool_trigger(tool_trigger)
+    if dropped or patterns:
+        logger.info(
+            "Procedure %s: dropped non-tool trigger values %s; command patterns not kept %s",
+            task_type,
+            dropped,
+            patterns,
+        )
     await procedural.create(
         db,
         id=proc_id,
@@ -112,7 +121,7 @@ async def store_procedure(
         context_tags=context_tags,
         created_at=now,
         activation_tier=activation_tier,
-        tool_trigger=tool_trigger,
+        tool_trigger=tool_trigger or None,
         draft=draft,
         success_count=success_count,
         confidence=confidence,
@@ -186,6 +195,14 @@ async def store_procedure_checked(
       distinct lessons sharing a slug coexist instead of destroying each other.
     - High context_tag overlap with a different task_type → warn but still create.
     """
+    trigger, patterns, dropped = normalize_tool_trigger(tool_trigger)
+    trigger_warnings = (
+        [f"tool_trigger values dropped as not tool names: {dropped}"] if dropped else []
+    )
+    if patterns:
+        # The command pattern is not stored yet, so the row fires on any Bash call
+        # its tags match, not only on the command it named.
+        trigger_warnings.append(f"shell commands stored as Bash; patterns not kept: {patterns}")
     candidates = await procedural.list_by_task_type(db, task_type)
     matched, best_sim = _best_same_procedure_match(candidates, principle_embedding)
 
@@ -216,7 +233,6 @@ async def store_procedure_checked(
             steps=steps,
             tools_used=tools_used,
             context_tags=context_tags,
-            tool_trigger=tool_trigger,
             version=new_version,
             source=json.dumps(source) if source else matched.get("source"),
         )
@@ -227,6 +243,15 @@ async def store_procedure_checked(
         # proactive surfacing trust a vector describing the PREVIOUS text.
         if principle_embedding is not None:
             update_fields["principle_embedding"] = principle_embedding
+        # A refine with no usable trigger keeps the stored one. Writing None
+        # through took a live CORE row out of the trigger cache.
+        if trigger:
+            update_fields["tool_trigger"] = trigger
+        elif tool_trigger == [] and draft == 0:
+            # An explicit teach that passes an empty list means "no trigger".
+            # Auto-extraction (draft=1) emitting [] keeps the stored one: an
+            # LLM's empty list is how the CORE-row wipe happened.
+            update_fields["tool_trigger"] = None
         # An explicit teach (draft=0) refining a matched auto-extracted row
         # (draft=1) promotes it. Recall gates on `confidence`/`success_count`,
         # NOT `draft` (matcher.find_best_match returns None at score<=0;
@@ -253,13 +278,14 @@ async def store_procedure_checked(
         return StoreResult(
             procedure_id=matched["id"],
             action="updated",
+            warnings=trigger_warnings,
             matched_similarity=best_sim,
         )
 
     # No same-procedure match → this is a DISTINCT lesson (or we had no embedding
     # to prove sameness). Check for high context_tag overlap with different
     # task_types (informational warning only).
-    warnings: list[str] = []
+    warnings: list[str] = list(trigger_warnings)
     conflicting_ids: list[str] = []
     overlapping = await procedural.find_by_context_overlap(db, context_tags)
     for row in overlapping:
@@ -278,7 +304,7 @@ async def store_procedure_checked(
         tools_used=tools_used,
         context_tags=context_tags,
         activation_tier=activation_tier,
-        tool_trigger=tool_trigger,
+        tool_trigger=trigger,
         draft=draft,
         success_count=success_count,
         confidence=confidence,
@@ -287,7 +313,7 @@ async def store_procedure_checked(
     )
 
     if warnings:
-        logger.info("Procedure %s created with %d overlap warnings", proc_id, len(warnings))
+        logger.info("Procedure %s created with %d warnings", proc_id, len(warnings))
 
     return StoreResult(
         procedure_id=proc_id,
