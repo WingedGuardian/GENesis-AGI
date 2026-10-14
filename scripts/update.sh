@@ -286,7 +286,7 @@ _on_signal_prestop() {
 _LIVE_MOVED_SAID=0
 _LIVE_STOPPED=0
 _live_moved_message() {
-    [ "$_LIVE_MOVED_SAID" = 1 ] && return 0
+    [ "${_LIVE_MOVED_SAID:-0}" = 1 ] && return 0
     _LIVE_MOVED_SAID=1
     local now rerun="scripts/update.sh"
     [[ "${POST_MERGE:-false}" == "true" ]] && rerun="scripts/update.sh --post-merge"
@@ -295,7 +295,7 @@ _live_moved_message() {
         # HEAD did not move, yet the tree is not clean or a git command is half
         # done: what is on disk may be a partly written switch.
         echo "  live is still at tag ${ROLLBACK_TAG:-?} ($now), but the checkout holds a half-written tree (tracked changes or .git/index.lock): run git status in $GENESIS_ROOT and settle it before anything else."
-    elif [ "$_LIVE_STOPPED" = 1 ]; then
+    elif [ "${_LIVE_STOPPED:-0}" = 1 ]; then
         echo "  live moved to $now; the services were restarted on it without activation; re-run $rerun${1:+ $1}. The old tip is tag ${ROLLBACK_TAG:-?}."
     else
         echo "  live moved to $now; the server still runs the old code; re-run $rerun${1:+ $1} (or scripts/deploy_code_only.sh restart to run it without activation). The old tip is tag ${ROLLBACK_TAG:-?}."
@@ -351,7 +351,7 @@ _live_abandon() {
 # described yet (a `set -e` exit, an unexpected path) is described.
 _live_prestop_exit() {
     _release_deploy_marker
-    [ "$_LIVE_STOPPED" = 1 ] && return 0
+    [ "${_LIVE_STOPPED:-0}" = 1 ] && return 0
     local now
     now="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null || true)"
     [ "$now" = "${VALIDATED_HEAD:-}" ] || _live_moved_message
@@ -406,7 +406,7 @@ if ! genesis_deploy_branch_ok "$GENESIS_ROOT" --allow-override; then
             ;;
     esac
 fi
-if [ "$ON_LIVE" = 1 ]; then
+if [ "${ON_LIVE:-0}" = 1 ]; then
     echo "  On live: the deploy manifest's candidates are rebuilt onto origin/$DEPLOY_BRANCH instead of a merge."
 elif [ "$_branch" != "$DEPLOY_BRANCH" ]; then
     echo "  WARNING: updating branch '$_branch', not $DEPLOY_BRANCH (GENESIS_ALLOW_NON_DEPLOY_BRANCH=1)."
@@ -459,7 +459,7 @@ fi
 # BEGIN live-lock-recheck (extracted by tests/test_scripts/test_update_live.py)
 # `live` is decided again under update.lock: the engine and its manifest writers
 # take the same lock, so the verdict this run acts on cannot change under it.
-if [ "$ON_LIVE" = 1 ]; then
+if [ "${ON_LIVE:-0}" = 1 ]; then
     _live_rc=0
     genesis_live_checkout "$GENESIS_ROOT" || _live_rc=$?
     if [ "$_live_rc" -ne 0 ]; then
@@ -557,7 +557,7 @@ fi
 # BEGIN live-remote (extracted by tests/test_scripts/test_update_live.py)
 # On `live` the engine fetches origin's main itself, so a run resolved to any other
 # remote would deploy a source it did not choose. --post-merge resolves none.
-if [ "$ON_LIVE" = 1 ] && [[ "$POST_MERGE" == "false" ]] && [ "${UPDATE_REMOTE:-}" != origin ]; then
+if [ "${ON_LIVE:-0}" = 1 ] && [[ "$POST_MERGE" == "false" ]] && [ "${UPDATE_REMOTE:-}" != origin ]; then
     echo "ERROR: on live the rebuild builds on origin/$DEPLOY_BRANCH, but this update's remote is '${UPDATE_REMOTE:-}'."
     echo "       Nothing was changed."
     exit 1
@@ -591,9 +591,9 @@ NEW_COMMIT="$OLD_COMMIT"
 # top. What this run records, compares and sends to the host guardian is that
 # base, never the tip; UPDATE_OWN_HEAD stays the tip. A commit made on `live` by
 # hand is not a rebuild's tip, and refuses here, before any backup or tag.
-if [ "$ON_LIVE" = 1 ]; then
+if [ "${ON_LIVE:-0}" = 1 ]; then
     if ! _LIVE_BASE="$(python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" live-shaped HEAD)" \
-        || [ -z "$_LIVE_BASE" ]; then
+        || [ -z "${_LIVE_BASE:-}" ]; then
         echo "ERROR: live is not what a rebuild makes (see above); update.sh rebuilds only a rebuild's tip."
         echo "       Move any commit made on live to a branch, then run scripts/deploy_candidates rebuild. Nothing was changed."
         exit 1
@@ -1620,7 +1620,7 @@ if [[ "$POST_MERGE" == "false" ]] && [ "${ON_LIVE:-0}" = 1 ]; then
         [ -n "$_line" ] && [[ "$_line" != '??'* ]] && [[ "$_line" =~ $EPHEMERAL_DIRTY_RE ]] || continue
         _eph="${_line:3}"
         if ! _ephemeral_backup "$_eph" "$EPHEMERAL_BACKUP_ROOT/live" \
-            || ! git -C "$GENESIS_ROOT" checkout -q HEAD -- "$_eph"; then
+            || ! genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout -q HEAD -- "$_eph"; then
             echo "  Could not back up and clear local edits to $_eph — server NOT stopped."
             _live_nothing_moved
             git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" >/dev/null 2>&1 || true
