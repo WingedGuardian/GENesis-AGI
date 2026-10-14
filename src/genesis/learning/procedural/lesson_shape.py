@@ -65,7 +65,7 @@ def validate_trigger_spec(spec: object) -> dict:
             raise ValueError(f"trigger_spec pattern {pattern!r} does not compile: {exc}") from exc
         if compiled.search("") is not None:
             raise ValueError(f"trigger_spec pattern {pattern!r} matches every input")
-    if spec["repeat"] not in REPEAT_MODES:
+    if not isinstance(spec["repeat"], str) or spec["repeat"] not in REPEAT_MODES:
         raise ValueError(f"trigger_spec.repeat must be one of {sorted(REPEAT_MODES)}")
     return spec
 
@@ -78,7 +78,7 @@ def validate_lesson(lesson: object) -> dict:
         ("authored_in", AUTHORED_IN),
         ("origin", ORIGIN_CLASSES),
     ):
-        if lesson[field] not in allowed:
+        if not isinstance(lesson[field], str) or lesson[field] not in allowed:
             raise ValueError(f"lesson.{field} must be one of {sorted(allowed)}")
     if not isinstance(lesson["reviewed"], bool):
         raise ValueError("lesson.reviewed must be true or false")
