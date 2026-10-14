@@ -352,3 +352,17 @@ def test_there_is_at_least_one_persistent_timer_to_check():
         f"found {len(_persistent_timers())} Persistent=true timer template(s) — "
         "the detection is probably broken, making the uninstall check vacuous"
     )
+
+
+def test_every_vnc_template_token_is_substituted_by_setup_vnc():
+    """scripts/systemd/vnc/ is rendered by setup-vnc.sh alone (bootstrap's loop
+    globs only the top level), so it gets its own renderer check. The floor
+    proves the extraction read setup-vnc.sh at all."""
+    templates = sorted((TEMPLATE_DIR / "vnc").glob("*.template"))
+    assert len(templates) == 3, f"expected the three VNC unit templates, found {templates}"
+    known = _substituted_tokens("setup-vnc.sh")
+    assert "__BRAIN_IMG__" in known, f"setup-vnc.sh extraction found {sorted(known)}"
+    offenders = [
+        f"{t.name}: {token}" for t in templates for token in sorted(_tokens_used(t) - known)
+    ]
+    assert not offenders, "VNC template tokens setup-vnc.sh never substitutes:\n  " + "\n  ".join(offenders)

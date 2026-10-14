@@ -12,9 +12,23 @@
 #   - update_history table written on success + failure
 #   - Writes failure context for CC-assisted recovery
 #
-# Usage: ./scripts/update.sh [--post-merge]
+# Usage: ./scripts/update.sh [--post-merge] [--take-template <unit>]... [--take-templates]
 #   --post-merge  Skip fetch/merge (code already merged by CC conflict resolution);
 #                 run only bootstrap, migrations, health check, and service restart.
+#   --take-template <unit>  A systemd unit edited by hand makes the update REFUSE,
+#                 before anything stops (exit 4). This replaces that one unit with
+#                 its template instead, after saving the old file under
+#                 ~/.genesis/deploy-backups/. Repeatable. --take-templates: all.
+#                 A symlinked unit (a mask) is replaced only when named.
+#                 Local changes that should survive updates belong in a drop-in,
+#                 ~/.config/systemd/user/<unit>.d/*.conf, which updates never touch.
+#                 --post-merge never refuses: the merge already happened, so it
+#                 keeps an edited unit (bootstrap does) and names it at the end.
+#
+# Exit codes: 0 updated (or nothing to do); 1 failed (rolled back where it got that
+# far); 2 merge conflicts; 4 refused, nothing stopped: hand-edited units are named,
+# and ~/.genesis/update_refused.json records the refusal for the dashboard's
+# supervised update, which never escalates past it.
 
 set -Eeuo pipefail  # -E: the ERR trap is inherited by functions AND subshells
                     # (see _on_err's BASH_SUBSHELL guard for the subshell case)
@@ -68,7 +82,25 @@ fi
 # below names "$_SELF_COPY" instead, and it is readonly so no later code can
 # re-point it.
 readonly _SELF_COPY="${BASH_SOURCE[0]}"
-trap 'rm -f "$_SELF_COPY" 2>/dev/null' EXIT
+# What bootstrap changed outside the checkout (GENESIS_DEPLOY_SUMMARY, created
+# just before it runs) is printed on EVERY exit after that, not only on
+# success: a rollback restores the code but leaves units and /etc files as
+# bootstrap wrote them, so a failed run is exactly when the list matters. The
+# success path flushes it first with its own heading; this finds nothing then.
+# The traps remove the self-copy first, so a dead stdout cannot leak it.
+# A GENESIS_DEPLOY_SUMMARY inherited from the caller names the caller's file, not
+# one this run created: forget it, so no exit path prints or deletes it.
+unset GENESIS_DEPLOY_SUMMARY
+_flush_deploy_summary() {
+    local heading="${1:-Changed outside the checkout before this run stopped (not undone):}"
+    if [ -n "${GENESIS_DEPLOY_SUMMARY:-}" ] && [ -s "$GENESIS_DEPLOY_SUMMARY" ]; then
+        echo "  $heading"
+        sed 's/^/    /' "$GENESIS_DEPLOY_SUMMARY" 2>/dev/null || true
+    fi
+    rm -f "${GENESIS_DEPLOY_SUMMARY:-}" 2>/dev/null || true
+    GENESIS_DEPLOY_SUMMARY=""
+}
+trap 'rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
 # The copy handshake is spent. Nothing this run starts (bootstrap, a nohup'd
 # server, a later dashboard update) may inherit it.
 unset GENESIS_UPDATE_FROM_TEMP GENESIS_UPDATE_SELF_COPY
@@ -81,9 +113,41 @@ export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNT
 
 # ── Flag parsing ─────────────────────────────────────────
 POST_MERGE=false
-for _arg in "$@"; do
-    [[ "$_arg" == "--post-merge" ]] && POST_MERGE=true
+# Only the flags below name units to take; a value inherited from the
+# environment is ignored, so a take is always visible on the command line.
+GENESIS_TAKE_TEMPLATES=""
+_args=("$@")
+_i=0
+while [ "$_i" -lt "${#_args[@]}" ]; do
+    case "${_args[$_i]}" in
+        --post-merge) POST_MERGE=true ;;
+        --take-templates|--take-template)
+            # A supervised update session (the dashboard's tiers carry
+            # GENESIS_UPDATE_TIER=1) may never take a template: whether a hand
+            # edit goes is the user's decision, enforced here, not only in its prompt.
+            if [ "${GENESIS_UPDATE_TIER:-}" = "1" ]; then
+                echo "ERROR: ${_args[$_i]} is refused in a supervised update session; the user decides whether a hand-edited unit is replaced." >&2
+                exit 1
+            fi
+            ;;&
+        --take-templates) GENESIS_TAKE_TEMPLATES="*" ;;
+        --take-template)
+            _i=$((_i + 1))
+            if [ "$_i" -ge "${#_args[@]}" ] || [ -z "${_args[$_i]}" ] || [[ "${_args[$_i]}" == -* ]]; then
+                echo "ERROR: --take-template needs a unit name (e.g. genesis-server.service)." >&2
+                exit 1
+            fi
+            GENESIS_TAKE_TEMPLATES="${GENESIS_TAKE_TEMPLATES:+$GENESIS_TAKE_TEMPLATES }${_args[$_i]}"
+            ;;
+        *)
+            echo "ERROR: unknown argument '${_args[$_i]}'. Usage: scripts/update.sh [--post-merge] [--take-template <unit>]... [--take-templates]" >&2
+            exit 1
+            ;;
+    esac
+    _i=$((_i + 1))
 done
+# Read by bootstrap.sh and setup-vnc.sh (lib/managed_units.sh).
+export GENESIS_TAKE_TEMPLATES
 
 GENESIS_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)}"
 # The last piece of the copy handshake, spent now that GENESIS_ROOT is set.
@@ -1032,6 +1096,82 @@ if [[ "$POST_MERGE" == "false" ]]; then
     # END staged-excused-divergence
 fi
 
+# ── Hand-edited systemd units: refuse BEFORE anything stops ──────────
+# bootstrap.sh re-renders every unit under ~/.config/systemd/user from its
+# template. A unit edited in place (instead of through a <unit>.d/*.conf drop-in)
+# would be kept by bootstrap rather than overwritten, so the update would land
+# with that unit silently NOT updated. Refuse here instead, while the server is
+# still up and nothing has changed, and name each unit and the fix.
+# The checker that RUNS is this checkout's own copy: nothing from the fetched
+# tree executes before the merge and the gates that follow it. The incoming
+# commit is data only (`--upto`: its templates are the ones judged).
+# --post-merge skips it: the merge it finishes already happened, so refusing
+# would only strand merged code. bootstrap keeps an edited unit and names it in
+# the summary printed at the end.
+# The verdict is also written to REFUSED_FILE, the one thing the dashboard's
+# supervised update reads to decide that a refusal is not a tier's to fix.
+# BEGIN managed-units-preflight (extracted by tests/test_scripts/test_update_managed_units.py)
+REFUSED_FILE="$HOME/.genesis/update_refused.json"
+if [[ "$POST_MERGE" != "true" ]]; then
+_mu_rev="${DEPLOY_HEAD:-HEAD}"
+_mu_src="$(cat "$GENESIS_ROOT/scripts/lib/managed_units.py" 2>/dev/null)" || _mu_src=""
+_mu_rc=0
+if [ -n "$_mu_src" ]; then
+    _mu_out="$(python3 -I -S -c "$_mu_src" check --repo "$GENESIS_ROOT" \
+        --unit-dir "$HOME/.config/systemd/user" --upto "$_mu_rev" --also HEAD \
+        --accept-legacy --take "$GENESIS_TAKE_TEMPLATES" 2>&1)" || _mu_rc=$?
+else
+    _mu_out="scripts/lib/managed_units.py is missing from this checkout"
+    _mu_rc=2
+fi
+# No exception for "nothing to merge": a run with nothing new can still activate
+# template changes a code-only deploy pulled in (the tier-2 check further down),
+# so an edited unit refuses on every run.
+# The record always says what THIS preflight found: an older one goes first.
+rm -f "$REFUSED_FILE" 2>/dev/null || true
+if [ "$_mu_rc" -ne 0 ]; then
+    if [ "$_mu_rc" -eq 4 ]; then
+        echo "REFUSED: these systemd units were edited by hand, and this update would leave them"
+        echo "behind (bootstrap keeps an edited unit rather than overwrite it):"
+        printf '%s\n' "$_mu_out" | grep REFUSED || true
+        echo "Nothing was stopped or changed. For each unit, either:"
+        echo "  - move the change into ~/.config/systemd/user/<unit>.d/override.conf (a drop-in;"
+        echo "    updates never touch drop-ins), restore the unit, and run update.sh again; or"
+        echo "  - run update.sh --take-template <unit> (or --take-templates) to install the"
+        echo "    template, keeping the old file under ~/.genesis/deploy-backups/."
+    else
+        echo "ERROR: could not check the installed systemd units for hand edits (exit $_mu_rc):"
+        printf '%s\n' "$_mu_out" | sed 's/^/  /'
+        echo "Nothing was stopped or changed."
+    fi
+    # This run has written no state yet (that is below), so the state file on
+    # disk, if any, is an earlier run's: it is left as it is.
+    git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+    if [ "$_mu_rc" -eq 4 ]; then
+        mkdir -p "$(dirname "$REFUSED_FILE")"
+        printf '%s\n' "$_mu_out" | python3 -I -S -c '
+import json, os, sys
+units = [line.split("REFUSED:", 1)[1].split()[0] for line in sys.stdin if "REFUSED:" in line]
+tmp = sys.argv[1] + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump({"deploy_head": sys.argv[2], "units": units, "pid": int(sys.argv[3])}, fh)
+os.replace(tmp, sys.argv[1])
+' "$REFUSED_FILE" "$_mu_rev" "$$" 2>/dev/null || echo "WARNING: could not record the refusal in $REFUSED_FILE"
+        exit 4
+    fi
+    exit 1
+fi
+fi
+# END managed-units-preflight
+
+# What this run changes outside the checkout (units written or kept, timers,
+# templates taken, Claude Code pins realigned, shadow copies removed) is recorded
+# here from now on and printed at the end, on every path: bootstrap's own output
+# is cut to `tail -10`, and the no-change path realigns pins without bootstrap.
+mkdir -p "$HOME/tmp"
+GENESIS_DEPLOY_SUMMARY="$(mktemp -p "$HOME/tmp" update-summary.XXXXXX)" || GENESIS_DEPLOY_SUMMARY=""
+export GENESIS_DEPLOY_SUMMARY
+
 # ── Back up locally edited ephemeral files BEFORE anything stops ──────
 # The clean-tree gate above EXCUSES these tracked paths when they are dirty, and
 # the merge step later DISCARDS their local edits when the incoming range changes
@@ -1281,7 +1421,7 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     # deploy). It is armed BEFORE the pause, so no signal can land between an
     # accepted pause and its resume; _guardian_resume no-ops until a pause is
     # accepted.
-    trap '_guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null' EXIT
+    trap '_guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
     _guardian_pause
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
@@ -2245,7 +2385,12 @@ PYEOF
 }
 # END tier2-baseline-check
 
-if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]] && _tier2_pending_since_baseline; then
+if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]] && [ -n "$GENESIS_TAKE_TEMPLATES" ]; then
+    # Only bootstrap installs a taken template, so a take must not stop at
+    # "Already up to date" with the edited unit still installed.
+    echo "  No new commits, but --take-template was given — running full activation"
+    echo "  (bootstrap + migrations + restart) so the template is installed."
+elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]] && _tier2_pending_since_baseline; then
     echo "  No new commits, but update.sh-only paths changed since the last recorded"
     echo "  update — running full activation (bootstrap + migrations + restart)."
 elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
@@ -2293,6 +2438,7 @@ elif [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     # pins): a pin bump pulled MANUALLY before this run, or an earlier failed
     # sync, must not leave drift in place just because the merge was a no-op.
     _sync_deploy_targets
+    _flush_deploy_summary "Changed outside the checkout:"
     # Clear stale recovery signals. If genesis-server was up when THIS run
     # started (present in WERE_RUNNING), any prior update failure was already
     # resolved — the server recovered. Leaving last_update_failure.json (and the
@@ -3010,5 +3156,6 @@ _clear_deploy_state
 
 # ── Done ──────────────────────────────────────────────────
 echo "  ──────────────────────────────────────"
+_flush_deploy_summary "Changed outside the checkout:"
 echo "  Updated: $OLD_TAG ($OLD_COMMIT) → $NEW_TAG ($NEW_COMMIT)"
 echo ""
