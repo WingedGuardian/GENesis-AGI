@@ -34,8 +34,9 @@
 # a large share in one poll, is paged CRITICAL with its path and the processes
 # holding it. Fast growth switches to the fast poll. One response, in act mode:
 # a Claude Code task output growing fast while its domain is ORANGE or RED has
-# its command PAUSED (SIGSTOP; recorded for `scripts/watchgod thaw|kill`). The
-# file is not emptied.
+# its command PAUSED (SIGSTOP; recorded for `scripts/watchgod thaw|kill`), then
+# the file EMPTIED once no writer is left running (its last MB kept in
+# ~/tmp/watchgod-truncated where there is room).
 #
 # OBSERVE mode (WATCHGOD_ACT=0) changes nothing on disk but still sends every
 # page, titled as observe-mode.
@@ -106,6 +107,9 @@ source "$_SCRIPT_DIR/lib/watchgod_records.sh"
 # pauses the command when it is a Claude Code task output.
 # shellcheck source=scripts/lib/watchgod_runaway.sh
 source "$_SCRIPT_DIR/lib/watchgod_runaway.sh"
+# The response itself: pause the command, empty its output.
+# shellcheck source=scripts/lib/watchgod_act.sh
+source "$_SCRIPT_DIR/lib/watchgod_act.sh"
 # This poll's tier of each watched domain, by domain key (the runaway response
 # acts only on an ORANGE or RED one).
 declare -gA RW_TIER=()

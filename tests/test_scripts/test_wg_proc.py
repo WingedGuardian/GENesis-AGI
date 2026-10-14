@@ -53,6 +53,22 @@ def _key(path: Path) -> str:
     return f"{st.st_dev}:{st.st_ino}"
 
 
+def _fd_of(pid: int, target: Path) -> str | None:
+    """The fd number at which pid holds target, or None. Descriptors come and
+    go while the interpreter starts: one can vanish between list and read."""
+    try:
+        names = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return None
+    for n in names:
+        try:
+            if os.readlink(f"/proc/{pid}/fd/{n}") == str(target):
+                return n
+        except OSError:
+            continue
+    return None
+
+
 @pytest.fixture
 def writer(tmp_path):
     """A real process holding tmp_path/out open for writing on fd 3."""
@@ -67,16 +83,11 @@ def writer(tmp_path):
         ],
     )
     deadline = time.time() + 10
-    while time.time() < deadline and not any(
-        os.path.realpath(f"/proc/{p.pid}/fd/{n}") == str(target)
-        for n in os.listdir(f"/proc/{p.pid}/fd")
-    ):
+    fd = _fd_of(p.pid, target)
+    while fd is None and time.time() < deadline:
         time.sleep(0.05)
-    fd = next(
-        n
-        for n in os.listdir(f"/proc/{p.pid}/fd")
-        if os.path.realpath(f"/proc/{p.pid}/fd/{n}") == str(target)
-    )
+        fd = _fd_of(p.pid, target)
+    assert fd is not None, "fixture precondition: the writer opened the file"
     yield p, target, fd
     if p.poll() is None:
         p.kill()

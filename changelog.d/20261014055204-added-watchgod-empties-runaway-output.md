@@ -1,0 +1,1 @@
+- After pausing a runaway Claude Code task, the disk guardian now also empties its output file once no writer of it is left running, which frees the space at once. The last 1 MB is kept, owner-only, in `~/tmp/watchgod-truncated` when the home disk has room. A refill is detected and handled again.

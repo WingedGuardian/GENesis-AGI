@@ -11,7 +11,8 @@ narrowness from every side:
   * a pid reused at any step is never signalled;
   * a lock held by an operator command means nothing is paused;
   * no page or reminder carries a raw `kill <pid>`;
-  * the file is NOT emptied (that comes later);
+  * the file is emptied only once no writer is left running, through a
+    paused writer's own descriptor, its last MB kept where there is room;
   * against REAL processes: the writer is really stopped, the stand-in session
     is not, and `scripts/watchgod thaw` resumes it.
 
@@ -140,6 +141,7 @@ def _respond(
     box,
     f: Path,
     tier: str = "red",
+    home_tier: str = "green",
     act: int = 1,
     grow_mb: int = 40,
     between: str = "",
@@ -147,11 +149,13 @@ def _respond(
 ) -> subprocess.CompletedProcess:
     """Two polls: the second sees the file grow by grow_mb (10% of 400 per poll)."""
     cc_key = f"{os.stat(box['cc']).st_dev}m9"
+    home_key = f"{os.stat(box['home'] / 'tmp').st_dev}m8"
     doms = _domains(box)
     return _run(
         box,
         f"""
         RW_TIER[{cc_key}]={tier}
+        RW_TIER[{home_key}]={home_tier}
         {before}
         wg_runaway_check '{doms}'
         _RW_PREV_T=$(( _RW_PREV_T - 30 ))
@@ -211,24 +215,44 @@ def test_a_growing_task_output_is_paused_parents_first_and_recorded(box, tier):
     )
     assert [r[:3] for r in _frozen(box)] == [["200", "2000", "bash"], ["201", "2010", "grep"]]
     assert [r[6] for r in _frozen(box)] == ["paused", "paused"]
-    assert f.stat().st_size >= 60 * _MB, "C1 never empties the file"
-    assert "ACTED=paused" in out.stdout
-    act = [p for p in _pages(box) if p["title"].startswith("Paused a runaway Claude Code task")]
+    assert f.stat().st_size == 0, "no writer left running: emptied"
+    assert "ACTED=emptied" in out.stdout
+    act = [
+        p
+        for p in _pages(box)
+        if p["title"] == "Paused a runaway Claude Code task and emptied its output"
+    ]
     assert len(act) == 1
     body = act[0]["body"]
     assert "scripts/watchgod thaw 200" in body and "scripts/watchgod kill 201" in body
     assert "session itself was NOT paused" in body and "Claude Code session: sess-1" in body
-    assert "was NOT emptied" in body
+    assert "was emptied (last 1 MB kept in" in body
     _no_raw_kill(box)
 
 
-def test_the_detection_page_says_it_paused_never_that_it_did_not_act(box):
+def test_an_emptied_file_sends_no_detection_page_for_the_episode_it_closed(box):
+    """The action page says everything; the episode the truncate closed must
+    not page "again" for a size the file no longer has."""
     f = _task_output(box)
     _session(box, f)
     _respond(box, f)
+    assert not [p for p in _pages(box) if p["title"].startswith("Runaway file on")]
+
+
+def test_a_paused_but_not_emptied_file_says_so_and_never_that_it_did_not_act(box):
+    f = _task_output(box)
+    _session(box, f)
+    refuse = """
+    eval "_orig_sig() $(declare -f wg_signal_gen | tail -n +2)"
+    wg_signal_gen() { [[ "$2" == 201 ]] && return 2; _orig_sig "$@"; }
+    """
+    _respond(box, f, between=refuse)
+    assert f.stat().st_size >= 60 * _MB, "a writer was not stopped: never emptied"
+    act = [p for p in _pages(box) if p["title"].startswith("Paused")]
+    assert act[0]["title"] == "Paused a runaway Claude Code task; its output could NOT be emptied"
+    assert "not every writer is confirmed stopped" in act[0]["body"]
     detect = [p for p in _pages(box) if p["title"].startswith("Runaway file on")]
-    assert len(detect) == 1
-    assert "paused the command writing it" in detect[0]["body"]
+    assert "could not be emptied yet" in detect[0]["body"]
     assert "has not acted" not in detect[0]["body"]
 
 
@@ -518,6 +542,7 @@ echo "ACTED=$_RW_ACTED"
         assert f"{bash_pid}\t" in frozen, r.stdout + r.stderr
         state = Path(f"/proc/{bash_pid}/status").read_text()
         assert "State:\tT" in state, "the command's shell is really stopped"
+        assert out.stat().st_size == 0, "and its output emptied"
         assert "State:\tT" not in Path(f"/proc/{session.pid}/status").read_text(), (
             "the session is not"
         )
@@ -587,3 +612,247 @@ def test_a_refused_signal_leaves_no_record(box):
     assert [r[0] for r in _frozen(box)] == ["200"]
     act = [p for p in _pages(box) if p["title"].startswith("Paused")]
     assert "Could not pause: pid 201" in act[0]["body"]
+
+
+# ── emptying (C2) ─────────────────────────────────────────────────
+
+
+def test_no_tail_is_kept_on_a_disk_in_trouble_but_the_file_is_still_emptied(box):
+    f = _task_output(box)
+    _session(box, f)
+    _respond(box, f, home_tier="red")
+    assert f.stat().st_size == 0
+    assert not (box["home"] / "tmp" / "watchgod-truncated").exists()
+    act = [p for p in _pages(box) if p["title"].startswith("Paused")]
+    assert (
+        "was emptied (no tail kept: the disk holding ~/tmp has no room to spare)" in act[0]["body"]
+    )
+
+
+def test_the_tail_is_private(box):
+    f = _task_output(box)
+    _session(box, f)
+    _respond(box, f)
+    d = box["home"] / "tmp" / "watchgod-truncated"
+    tails = list(d.glob("b1.output.*.tail"))
+    assert len(tails) == 1 and tails[0].stat().st_size == _MB
+    assert oct(d.stat().st_mode & 0o777) == "0o700"
+    assert oct(tails[0].stat().st_mode & 0o777) == "0o600"
+
+
+def test_a_writer_forked_after_the_pause_keeps_the_file_from_being_emptied(box):
+    """A child that inherited the descriptor after the walk is a running writer:
+    the re-walk finds it and nothing is emptied."""
+    f = _task_output(box)
+    _session(box, f)
+    fork = f"""
+    eval "_orig_sig() $(declare -f wg_signal_gen | tail -n +2)"
+    wg_signal_gen() {{
+        local rc=0; _orig_sig "$@" || rc=$?
+        if [[ "$2" == 201 ]]; then
+            mkdir -p '{box["proc"]}/202/fd' '{box["proc"]}/202/fdinfo'
+            ln -sf '{f}' '{box["proc"]}/202/fd/1'
+            printf 'pos:\t0\nflags:\t0102001\n' > '{box["proc"]}/202/fdinfo/1'
+            printf 'Name:\tgrep\nState:\tS (x)\nPPid:\t201\nThreads:\t1\n' > '{box["proc"]}/202/status'
+            printf '202 (grep) S 201 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 2020 0\n' > '{box["proc"]}/202/stat'
+        fi
+        return $rc
+    }}
+    """
+    _respond(box, f, between=fork)
+    assert f.stat().st_size >= 60 * _MB
+    act = [p for p in _pages(box) if p["title"].startswith("Paused")]
+    assert (
+        "still running (or stopped by something else, which can resume it): pid 202"
+        in act[0]["body"]
+    )
+
+
+def test_a_paused_pid_reused_before_the_recheck_keeps_the_file(box):
+    """The re-walk compares start times too: the process now at a paused pid is
+    another one, a running writer."""
+    f = _task_output(box)
+    _session(box, f)
+    reuse = f"""
+    eval "_orig_unp() $(declare -f _rw_unpaused_holders | tail -n +2)"
+    _rw_unpaused_holders() {{
+        sed -i 's/ 2010 / 9999 /' '{box["proc"]}/201/stat'
+        # Still stopped, but another process: only the start time tells.
+        _orig_unp "$@"
+    }}
+    """
+    _respond(box, f, between=reuse)
+    assert f.stat().st_size >= 60 * _MB
+    act = [p for p in _pages(box) if p["title"].startswith("Paused")]
+    assert (
+        "still running (or stopped by something else, which can resume it): pid 201"
+        in act[0]["body"]
+    )
+
+
+def test_a_file_whose_writers_are_all_paused_is_emptied_without_new_growth(box):
+    """A pause that could not empty on its poll (or one from before emptying
+    existed): the emptying is still owed, size alone is enough."""
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    _proc(box, 200, "bash", 100, f, starttime=2000, state="T")
+    _proc(box, 201, "grep", 200, f, starttime=2010, state="T")
+    put = (
+        "wg_records_lock lk; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
+        f"wg_record_put 200 2000 bash \"$ts\" {os.stat(f).st_dev}:{os.stat(f).st_ino} '{f}' paused\n"
+        f"wg_record_put 201 2010 grep \"$ts\" {os.stat(f).st_dev}:{os.stat(f).st_ino} '{f}' paused\n"
+        'wg_records_unlock "$lk"'
+    )
+    _respond(box, f, grow_mb=0, before=put)
+    # Emptied on the first poll (the helper's growth step then re-extends it
+    # to 60 MB, still far below the 150 MB it was).
+    assert f.stat().st_size < 150 * _MB
+    assert _kills(box) == [], "nothing new to pause"
+    act = [p for p in _pages(box) if p["title"].startswith("Emptied")]
+    assert (
+        act
+        and act[0]["title"]
+        == "Emptied a runaway Claude Code task output (its writers were already paused)"
+    )
+
+
+def test_a_thawed_writer_is_not_paused_again_for_the_size_it_left(box):
+    """No record (thawed) and no growth: size alone never acts."""
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    _respond(box, f, grow_mb=0)
+    assert _kills(box) == [] and f.stat().st_size >= 150 * _MB
+
+
+def test_emptying_opens_a_new_episode(box):
+    """After a confirmed truncate the episode is over: the generation carries
+    an episode start, so a refill pages and is acted on again."""
+    f = _task_output(box)
+    _session(box, f)
+    out = _respond(box, f, before="", between="")
+    assert f.stat().st_size == 0 and "ACTED=emptied" in out.stdout
+    r = _run(
+        box,
+        f"""
+        RW_TIER[{os.stat(box["cc"]).st_dev}m9]=red
+        RW_TIER[{os.stat(box["home"] / "tmp").st_dev}m8]=green
+        python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_WRONLY); os.posix_fallocate(fd, 0, 60*1048576)' '{f}'
+        sed -i 's/^State:.*/State:\tS (x)/' '{box["proc"]}/200/status' '{box["proc"]}/201/status'
+        wg_runaway_check '{_domains(box)}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 ))
+        python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_WRONLY); os.posix_fallocate(fd, 0, 100*1048576)' '{f}'
+        wg_runaway_check '{_domains(box)}'
+        for g in "${{!_RW_EP[@]}}"; do echo "EP=$g"; done
+    """,
+    )
+    assert "EP=" in r.stdout, r.stdout + r.stderr
+    assert f.stat().st_size == 0, "the refill was acted on again"
+
+
+def _paused_records(box, f: Path) -> str:
+    return (
+        "wg_records_lock lk; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
+        f"wg_record_put 200 2000 bash \"$ts\" {os.stat(f).st_dev}:{os.stat(f).st_ino} '{f}' paused\n"
+        f"wg_record_put 201 2010 grep \"$ts\" {os.stat(f).st_dev}:{os.stat(f).st_ino} '{f}' paused\n"
+        'wg_records_unlock "$lk"'
+    )
+
+
+def test_a_paused_record_whose_process_runs_again_is_not_emptied_on_size(box):
+    """Resumed outside thaw (the record is still there, the process runs):
+    size alone does not act."""
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    _respond(box, f, grow_mb=0, before=_paused_records(box, f))
+    assert _kills(box) == [] and f.stat().st_size >= 150 * _MB
+
+
+def test_a_foreign_stop_is_not_emptied_on_size(box):
+    """Stopped by something else (no record of ours): size alone does not act."""
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    _proc(box, 200, "bash", 100, f, starttime=2000, state="T")
+    _proc(box, 201, "grep", 200, f, starttime=2010, state="T")
+    _respond(box, f, grow_mb=0)
+    assert _kills(box) == [] and f.stat().st_size >= 150 * _MB
+    assert "no writer could be paused" not in _log(box), "the response never ran"
+
+
+def test_an_uninspectable_process_appearing_after_the_pause_keeps_the_file(box):
+    f = _task_output(box)
+    _session(box, f)
+    blind = f"""
+    eval "_orig_sig() $(declare -f wg_signal_gen | tail -n +2)"
+    wg_signal_gen() {{
+        local rc=0; _orig_sig "$@" || rc=$?
+        if [[ "$2" == 201 ]]; then
+            mkdir -p '{box["proc"]}/203/fd'
+            printf 'Name:\\tsudo\\nState:\\tS (x)\\nPPid:\\t201\\nThreads:\\t1\\n' > '{box["proc"]}/203/status'
+            printf '203 (sudo) S 201 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 2030 0\\n' > '{box["proc"]}/203/stat'
+            chmod 000 '{box["proc"]}/203/fd'
+        fi
+        return $rc
+    }}
+    """
+    try:
+        _respond(box, f, between=blind)
+    finally:
+        d = box["proc"] / "203" / "fd"
+        if d.exists():
+            d.chmod(0o700)
+    if os.geteuid() == 0:
+        pytest.skip("root lists a 0o000 dir")
+    assert f.stat().st_size >= 60 * _MB
+    act = [p for p in _pages(box) if p["title"].startswith("Paused")]
+    assert "cannot be inspected" in act[0]["body"]
+
+
+def test_a_truncate_that_leaves_the_file_is_not_called_emptied(box):
+    f = _task_output(box)
+    _session(box, f)
+    # truncate runs under timeout (an executable), so the stub is a program on PATH.
+    shim = box["tmp"] / "shim"
+    shim.mkdir()
+    (shim / "truncate").write_text("#!/bin/sh\nexit 0\n")
+    (shim / "truncate").chmod(0o755)
+    _respond(box, f, between=f'PATH="{shim}:$PATH"')
+    assert f.stat().st_size >= 60 * _MB
+    act = [p for p in _pages(box) if p["title"].startswith("Paused")]
+    assert act[0]["title"] == "Paused a runaway Claude Code task; its output could NOT be emptied"
+    assert "the truncate failed" in act[0]["body"]
+
+
+def test_an_owed_emptying_is_retried_below_the_size_threshold(box):
+    """A file paused for growth at 15% of its domain whose emptying could not
+    happen on its poll is emptied on a later one, though it no longer grows and
+    is under the size threshold (review finding: it was never retried)."""
+    f = _task_output(box, mb=60)
+    _session(box, f)
+    _proc(box, 200, "bash", 100, f, starttime=2000, state="T")
+    _proc(box, 201, "grep", 200, f, starttime=2010, state="T")
+    key = f"{os.stat(f).st_dev}:{os.stat(f).st_ino}"
+    put = (
+        "wg_records_lock lk; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
+        f"wg_record_put 200 2000 bash \"$ts\" {key} '{f}' paused\n"
+        f"wg_record_put 201 2010 grep \"$ts\" {key} '{f}' paused\n"
+        'wg_records_unlock "$lk"'
+    )
+    _respond(box, f, grow_mb=0, before=put)
+    assert [p for p in _pages(box) if p["title"].startswith("Emptied")], _log(box)
+
+
+def test_a_paused_record_for_another_file_does_not_empty_this_one(box):
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    _proc(box, 200, "bash", 100, f, starttime=2000, state="T")
+    _proc(box, 201, "grep", 200, f, starttime=2010, state="T")
+    put = (
+        "wg_records_lock lk; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
+        f"wg_record_put 200 2000 bash \"$ts\" 1:1 '{f}' paused\n"
+        f"wg_record_put 201 2010 grep \"$ts\" 1:1 '{f}' paused\n"
+        'wg_records_unlock "$lk"'
+    )
+    _respond(box, f, grow_mb=0, before=put)
+    assert f.stat().st_size >= 150 * _MB and not [
+        p for p in _pages(box) if p["title"].startswith("Emptied")
+    ]
