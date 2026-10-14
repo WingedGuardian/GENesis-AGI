@@ -54,9 +54,15 @@ that the line covers the point.
 
 ``covered_keys`` is THE coverage check: the commit gate (a later change) calls
 it, and it applies every local rule, so a reflection committed by hand is held
-to exactly the standard a tool-made one is.
+to exactly the standard a tool-made one is. Late findings (reviews that opened
+no round) are owed from ``REFLECTION_CUTOVER_ISO`` on and credited by
+``covered_late_keys``, each under its own round's context; the cutover is unset
+until the commit gate enforces reflections, so until then nothing more is owed.
+A reflection that cites evidence answers one round: evidence must be written
+inside its round's window, so answer each round in its own reflection.
 
-CLI: ``status`` (what the open round owes, whether it has settled) and
+CLI: ``status`` (what the open round owes, whether it has settled; ``--cutover``
+reports what late findings would owe, enforcing nothing) and
 ``validate`` (a file, offline). Exit 1 means the reflection is invalid; exit
 2 means the check could not be made.
 """
@@ -516,11 +522,21 @@ def previous_class_labels(cwd: str, prior_heads: Sequence[str]) -> list[str]:
     other head is ignored, so a stray or mistyped one cannot stand in for the
     previous round. Drafts never count: an invalid or escalating reflection
     was never accepted as its round's answer."""
+    if not prior_heads:
+        return []
+    return _class_labels(_log_reflections(cwd), prior_heads)
+
+
+def _class_labels(
+    log: Sequence[tuple[str, str, str, datetime | None]], prior_heads: Sequence[str]
+) -> list[str]:
+    """``previous_class_labels`` over a log already read, so several rounds
+    judged in one call read the history once."""
     wanted = set(prior_heads)
     classes: list[str] = []
     if not wanted:
         return classes
-    for _, kind, body, _ in _log_reflections(cwd):
+    for _, kind, body, _ in log:
         parsed = parse(body)
         if kind == "empty" and parsed.ok and not parsed.escalate and parsed.head in wanted:
             classes.extend(c for c in parsed.classes if c not in classes)
@@ -615,22 +631,32 @@ def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
     for i, line in enumerate(lines):
         marked = _PREMISE_MARKED_VERDICT_RE.fullmatch(line)
         if marked and _PREMISE_VERDICT_TOKEN_RE.search(marked.group(1)):
-            return None, {}, (
-                f"line {i + 1} gives a 'Design-premise:' verdict in a heading or list item; "
-                "write it as a plain column-0 line, or indent or >-quote it if it is not yours"
+            return (
+                None,
+                {},
+                (
+                    f"line {i + 1} gives a 'Design-premise:' verdict in a heading or list item; "
+                    "write it as a plain column-0 line, or indent or >-quote it if it is not yours"
+                ),
             )
         if not _PREMISE_VERDICT_PREFIX_RE.match(line):
             continue
         head = _PREMISE_VERDICT_LINE_RE.fullmatch(line)
         if head is None:
-            return None, {}, (
-                f"line {i + 1} starts like a 'Design-premise:' line but is not "
-                "'Design-premise: SOUND|SOUND-BUT-INFERIOR|BROKEN[ — <qualifier>]' (plain text)"
+            return (
+                None,
+                {},
+                (
+                    f"line {i + 1} starts like a 'Design-premise:' line but is not "
+                    "'Design-premise: SOUND|SOUND-BUT-INFERIOR|BROKEN[ — <qualifier>]' (plain text)"
+                ),
             )
         verdicts.add(head.group(1))
         if len(verdicts) > 1:
-            return None, {}, "it names more than one 'Design-premise:' verdict: " + ", ".join(
-                sorted(verdicts)
+            return (
+                None,
+                {},
+                "it names more than one 'Design-premise:' verdict: " + ", ".join(sorted(verdicts)),
             )
         run: dict[str, str] = {}
         j = i + 1
@@ -649,21 +675,29 @@ def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
             j < len(lines) and lines[j].strip() and not _PREMISE_VERDICT_PREFIX_RE.match(lines[j])
         ):
             if not _PREMISE_TRAILER_RE.fullmatch(lines[j]):
-                return None, {}, (
-                    f"line {j + 1} is inside the premise block that starts at line {i + 1} but "
-                    "is not one of its lines: a claim "
-                    "'P<n> TRUE|FALSE|UNPROVEN — <claim>' (one line, not wrapped), the "
-                    "Expected line directly under the verdict, Effect:, Better shape:, "
-                    "PR-shape:, Persisted-state: or a code fence. Leave a blank line before any other text"
+                return (
+                    None,
+                    {},
+                    (
+                        f"line {j + 1} is inside the premise block that starts at line {i + 1} but "
+                        "is not one of its lines: a claim "
+                        "'P<n> TRUE|FALSE|UNPROVEN — <claim>' (one line, not wrapped), the "
+                        "Expected line directly under the verdict, Effect:, Better shape:, "
+                        "PR-shape:, Persisted-state: or a code fence. Leave a blank line before any other text"
+                    ),
                 )
             j += 1
         has_expected = has_expected or (expected_here and bool(run))
         if first is None:
             first = run or None
         elif any(first.get(number) != said for number, said in run.items()):
-            return None, {}, (
-                f"line {i + 1}: a repeated 'Design-premise:' block must restate the "
-                "first block's claims, never add or change one"
+            return (
+                None,
+                {},
+                (
+                    f"line {i + 1}: a repeated 'Design-premise:' block must restate the "
+                    "first block's claims, never add or change one"
+                ),
             )
     claims = first or {}
     if not verdicts or len(claims) < 2:
@@ -675,9 +709,13 @@ def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
             "'P<n> TRUE|FALSE|UNPROVEN' claim lines directly under it",
         )
     if not has_expected:
-        return None, {}, (
-            "the block needs its 'Expected before checking: <one line>' line directly "
-            "under the 'Design-premise:' line (.claude/docs/premise-check.md)"
+        return (
+            None,
+            {},
+            (
+                "the block needs its 'Expected before checking: <one line>' line directly "
+                "under the 'Design-premise:' line (.claude/docs/premise-check.md)"
+            ),
         )
     return next(iter(verdicts)), claims, None
 
@@ -775,9 +813,8 @@ def evidence_problem(
             for number, said in sorted(reflection.premise_claims.items()):
                 found = claims.get(number)
                 if found != said:
-                    return (
-                        f"Premise-check P{number} says {said}, but {label} "
-                        + (f"says {found}" if found else "has no claim P" + number)
+                    return f"Premise-check P{number} says {said}, but {label} " + (
+                        f"says {found}" if found else "has no claim P" + number
                     )
     started = _parse_when(round_started)
     if started is None:
@@ -915,10 +952,338 @@ def covered_keys(
     return covered
 
 
+# -- late findings -------------------------------------------------------------
+#
+# A late review (one that lands on a commit after one of its descendants was
+# already reviewed) opens no round, so its keys are not in ``open_keys``;
+# ``review_budget`` lists it in ``findings`` with the round it belongs to
+# (``round_head``). Its keys are owed from the reflection cutover on (owner
+# ruling a222b408), and each is credited only under ITS OWN round's context,
+# so a reflection on a later head cannot clear an earlier round's keys
+# without that round's evidence. The open round is never judged here:
+# ``covered_keys`` keeps it exactly as before.
+
+#: When late findings start being owed. None until the commit gate enforces
+#: reflections (B1b-1b sets it at its own merge), so no debt appears before
+#: anything enforces it (owner ruling 50cc9dec); with None, owed is exactly
+#: the open round's.
+REFLECTION_CUTOVER_ISO: str | None = None
+
+
+@dataclass(frozen=True)
+class RoundContext:
+    """What a round owes, as of a time. ``round_number`` 0 is a late review
+    with no earlier round: nothing more than the grammar is owed (owner,
+    2026-10-12: a late-only answer owes no new audit or premise check)."""
+
+    round_number: int
+    round_started: str | None
+    prior_heads: tuple[str, ...]
+
+
+def _ancestry(budget: Mapping[str, Any]) -> tuple[set[str], Any]:
+    """The PR's commits and ``ancestors(sha)``: the strict ancestors inside the
+    PR, or None when they are unknown (a commit outside the graph, or one whose
+    parents were not read). Unknown ancestry never credits a key."""
+    parents: dict[str, list[str] | None] = {}
+    for row in budget.get("commits") or []:
+        if isinstance(row, Mapping) and isinstance(row.get("sha"), str):
+            given = row.get("parents")
+            parents[row["sha"]] = list(given) if isinstance(given, list) else None
+    memo: dict[str, frozenset[str] | None] = {}
+
+    def ancestors(sha: str) -> frozenset[str] | None:
+        if sha in memo:
+            return memo[sha]
+        if sha not in parents:
+            return None
+        seen: set[str] = set()
+        stack = [sha]
+        while stack:
+            given = parents[stack.pop()]
+            if given is None:
+                memo[sha] = None
+                return None
+            for parent in given:
+                # A parent outside the PR is the base: the walk stops there.
+                if parent in parents and parent not in seen:
+                    seen.add(parent)
+                    stack.append(parent)
+        memo[sha] = frozenset(seen)
+        return memo[sha]
+
+    return set(parents), ancestors
+
+
+def _descends(ancestors: Any, sha: str, base: str) -> bool:
+    """Whether ``sha`` is ``base`` or a known descendant of it."""
+    if sha == base:
+        return True
+    found = ancestors(sha)
+    return found is not None and base in found
+
+
+def _round_order(budget: Mapping[str, Any]) -> list[tuple[str, datetime | None]]:
+    """Round heads in the order they OPENED, with each opening time: the
+    earliest review that opened it. Never the ``rounds`` list order, which is
+    by commit date (#3302). Rounds with no known time (legacy) come first."""
+    order = []
+    for entry in budget.get("rounds") or []:
+        times = [
+            when
+            for review in entry.get("reviews") or []
+            if (when := _parse_when(review.get("submitted_at"))) is not None
+        ]
+        order.append((str(entry.get("head")), min(times) if times else None))
+    floor = datetime.min.replace(tzinfo=UTC)
+    return sorted(order, key=lambda item: (item[1] is not None, item[1] or floor, item[0]))
+
+
+def round_context(budget: Mapping[str, Any], round_head: str, at: datetime) -> RoundContext | None:
+    """Round ``round_head``'s context as of ``at``: its number among the rounds
+    opened by then, its start, and the heads of the rounds before it. None when
+    it is not a round head, or it had not opened by ``at``. A round with no
+    known opening time (legacy) starts at its earliest listed finding, or is
+    unknown, which refuses any evidence it would need."""
+    opened = [(head, when) for head, when in _round_order(budget) if when is None or when <= at]
+    heads = [head for head, _ in opened]
+    if round_head not in heads:
+        return None
+    index = heads.index(round_head)
+    started = opened[index][1]
+    if started is None:
+        times = [
+            when
+            for item in budget.get("findings") or []
+            if item.get("round_head") == round_head
+            and (when := _parse_when(item.get("submitted_at"))) is not None
+        ]
+        started = min(times) if times else None
+    return RoundContext(index + 1, started.isoformat() if started else None, tuple(heads[:index]))
+
+
+def late_findings(
+    budget: Mapping[str, Any], cutover: str | None, fix_time: Any = None
+) -> list[dict[str, Any]] | None:
+    """The finding keys owed besides the open round, one entry per key, from
+    reviews submitted at or after ``cutover``. ``[]`` when ``cutover`` is None.
+
+    A review that opened its round was the open round's to answer while it was
+    open, and the open-round check enforced it then; it is owed here only when
+    it arrived AFTER a fix to its head existed (owner ruling 2026-10-13: the
+    after-fix review). ``fix_time(head)`` gives that fix's author time, or None
+    when nothing has been fixed since the head. A late review (one that opened
+    no round) was never the open round's, so it is always owed. A review of a
+    head outside the commit graph that opened its round cannot be placed
+    against a fix and is not owed (stated residual).
+
+    None (unknown) when such a review has an unreadable time or a key that
+    could not be derived, or a fix time is needed and ``fix_time`` is None. A
+    review before the cutover never makes it unknown."""
+    if cutover is None:
+        return []
+    start = _parse_when(cutover)
+    if start is None:
+        return None
+    own = set(budget.get("open_keys") or []) if budget.get("round_state") == "open" else set()
+    opening = {
+        key
+        for entry in budget.get("rounds") or []
+        for review in entry.get("reviews") or []
+        for key in review.get("finding_keys") or []
+    }
+    in_graph = {row.get("sha") for row in budget.get("commits") or [] if isinstance(row, Mapping)}
+    found: dict[str, dict[str, Any]] = {}
+    for item in budget.get("findings") or []:
+        when = _parse_when(item.get("submitted_at"))
+        if when is None:
+            return None
+        if when < start:
+            continue
+        keys = item.get("keys") or []
+        if any(not isinstance(key, str) for key in keys):
+            return None
+        if keys and set(keys) <= opening:
+            head = str(item.get("head"))
+            if head not in in_graph:
+                continue
+            if fix_time is None:
+                return None
+            fixed = fix_time(head)
+            if fixed is None or when <= fixed:
+                continue
+        for key in keys:
+            if key not in own and key not in found:
+                found[key] = {**item, "key": key, "at": when}
+    return list(found.values())
+
+
+def _contexts(
+    budget: Mapping[str, Any], item: Mapping[str, Any], at: datetime, ancestors: Any
+) -> list[RoundContext] | None:
+    """Every context a late key must be answered under. Its own round when it
+    has one. With none (``round_head`` null): round 0 when no earlier round is
+    its ancestor, else every candidate round (the two sides of a merge), all of
+    which must pass. None when its round cannot be placed."""
+    if item.get("round_head"):
+        context = round_context(budget, str(item["round_head"]), at)
+        return [context] if context else None
+    found = ancestors(str(item.get("head")))
+    if found is None:
+        return None
+    heads = {head for head, _ in _round_order(budget)}
+    older = {head for head in heads if head in found}
+    if not older:
+        return [RoundContext(0, item["at"].isoformat(), ())]
+    # The newest by ancestry: no other candidate descends from it. Two
+    # incomparable ones (the two sides of a merge) must both pass; a candidate
+    # with unknown ancestry places nothing.
+    if any(ancestors(head) is None for head in older):
+        return None
+    newest = [
+        head for head in older if not any(head in ancestors(other) for other in older - {head})
+    ]
+    contexts = [round_context(budget, head, at) for head in sorted(newest)]
+    return None if any(c is None for c in contexts) else contexts  # type: ignore[return-value]
+
+
+def _fix_times(cwd: str, base: str, head: str) -> list[datetime]:
+    """The author time of every fix after ``base`` on the way to ``head``: each
+    commit that is a merge or changes the tree (an empty reflection commit is
+    no fix). The AUTHOR time, the earlier of the two: amending a fix rewrites
+    only its committer time (owner ruling 2026-10-13). Raises ``Refused`` when
+    git cannot say."""
+    code, out, _ = _run(["git", "-C", cwd, "log", "--format=%H %T %P|%at", f"{base}..{head}"])
+    if code != 0:
+        raise Refused(f"git log {base[:12]}..{head[:12]} failed")
+    times = []
+    for row in out.split("\n"):
+        if not row.strip():
+            continue
+        names, _, stamp = row.partition("|")
+        _, tree, *parents = names.split()
+        if len(parents) == 1 and tree == _git(cwd, "rev-parse", f"{parents[0]}^{{tree}}").strip():
+            continue
+        if not stamp.strip().isdigit():
+            raise Refused(f"a fix after {base[:12]} has no readable author time")
+        times.append(datetime.fromtimestamp(int(stamp), UTC))
+    return times
+
+
+def fix_time_reader(cwd: str, current: str) -> Any:
+    """``fix_time`` for ``late_findings``: the earliest fix after a head on the
+    way to ``current``, read from local git once per head."""
+    memo: dict[str, datetime | None] = {}
+
+    def fix_time(head: str) -> datetime | None:
+        if head not in memo:
+            times = _fix_times(cwd, head, current)
+            memo[head] = min(times) if times else None
+        return memo[head]
+
+    return fix_time
+
+
+def covered_late_keys(
+    cwd: str,
+    budget: Mapping[str, Any],
+    late: Sequence[Mapping[str, Any]],
+    *,
+    gate_lane: bool,
+    acceptance: Sequence[str] | None,
+    deadline: float | None = None,
+) -> set[str]:
+    """Late keys answered by committed reflections. A reflection R naming head
+    N, committed at T, credits late key k (reviewed on head H at time S) only
+    when ALL hold:
+
+    - R is an empty commit made before any fix to N (``before_any_fix``);
+    - N is the current head or in its history, and N is H or descends from it
+      (from the budget's commit graph; unknown ancestry never credits). A key
+      whose head left the graph (rebased or force-pushed away) can be answered
+      only at the current head;
+    - S is no later than T: an answer cannot predate its finding;
+    - when N is not H, S is after the first fix on the way from H to N. A
+      review that arrived before the fix was owed before it, and a reflection
+      made after the fix is a rationalisation, not a reflection;
+    - ``check`` passes R under k's own round's context (every candidate round
+      when k's round is ambiguous): that round's number, its earlier rounds'
+      classes, and evidence written from that round's start to T.
+
+    ``deadline`` is a ``time.monotonic()`` bound; past it the check refuses.
+    Raises ``Refused`` when git cannot be read: unknown, never nothing owed."""
+    import time  # noqa: PLC0415
+
+    current = budget.get("current_head")
+    in_graph, ancestors = _ancestry(budget)
+    log = _log_reflections(cwd)
+    labels: dict[tuple[str, ...], list[str]] = {}
+    checked: dict[tuple[str, RoundContext], bool] = {}
+    fix_times: dict[tuple[str, str], datetime | None] = {}
+    covered: set[str] = set()
+    for sha, kind, body, made_at in log:
+        if deadline is not None and time.monotonic() > deadline:
+            raise Refused("the late-findings check ran out of time")
+        parsed = parse(body)
+        head = parsed.head
+        if kind != "empty" or made_at is None or not head:
+            continue
+        if not (head == current or _descends(ancestors, str(current), head)):
+            continue
+        if not before_any_fix(cwd, head, sha):
+            continue
+        for item in late:
+            key = item["key"]
+            if key in covered or key not in parsed.keys:
+                continue
+            reviewed = str(item.get("head"))
+            if reviewed in in_graph and not _descends(ancestors, head, reviewed):
+                continue
+            if item["at"] > made_at + _COMMIT_CLOCK_SLACK:
+                continue
+            if head != reviewed and reviewed in in_graph:
+                if (reviewed, head) not in fix_times:
+                    found = _fix_times(cwd, reviewed, head)
+                    fix_times[(reviewed, head)] = max(found) if found else None
+                fixed = fix_times[(reviewed, head)]
+                if fixed is not None and item["at"] <= fixed:
+                    continue
+            contexts = _contexts(budget, item, made_at, ancestors)
+            if not contexts:
+                continue
+            passed = True
+            for context in contexts:
+                if (sha, context) not in checked:
+                    if context.prior_heads not in labels:
+                        labels[context.prior_heads] = _class_labels(log, context.prior_heads)
+                    checked[(sha, context)] = check(
+                        body,
+                        head=head,
+                        round_number=context.round_number,
+                        gate_lane=gate_lane,
+                        previous_classes=labels[context.prior_heads],
+                        acceptance=acceptance,
+                        round_started=context.round_started,
+                        made_at=made_at,
+                        cwd=cwd,
+                    ).ok
+                passed = passed and checked[(sha, context)]
+            if passed:
+                covered.add(key)
+    return covered
+
+
 def owed_state(
-    budget: Mapping[str, Any], covered: Iterable[str], *, now: datetime
+    budget: Mapping[str, Any],
+    covered: Iterable[str],
+    *,
+    now: datetime,
+    cutover: str | None = None,
+    fix_time: Any = None,
 ) -> dict[str, Any]:
-    """What the open round owes, from a ``review_budget`` result. Pure."""
+    """What is owed, from a ``review_budget`` result: the open round's keys,
+    plus the late keys from ``cutover`` on (``late_findings``), less
+    ``covered``. With ``cutover`` None that is exactly the open round. Pure."""
     state: dict[str, Any] = {
         "status": budget.get("status"),
         "round": budget.get("count"),
@@ -934,18 +1299,26 @@ def owed_state(
         "round_started": None,
         "settled": False,
         "settle_until": None,
+        "cutover": cutover,
+        "late_keys": [],
     }
     rounds = budget.get("rounds") or []
     if budget.get("status") == "ok" and rounds:
         state["round_head"] = rounds[-1].get("head")
     if budget.get("status") != "ok":
         return state
+    done = set(covered)
+    late = late_findings(budget, cutover, fix_time)
+    state["late_keys"] = None if late is None else [item["key"] for item in late]
+    late_owed = None if late is None else [k for k in state["late_keys"] if k not in done]
     if budget.get("round_state") != "open":
-        state["owed"] = []
+        state["owed"] = late_owed
+        # Only a finished round's late reviews are owed here; they have all
+        # landed, and the settle window belongs to an open round.
+        state["settled"] = bool(late_owed)
         return state
-    if state["reflection_keys"] == "ok":
-        done = set(covered)
-        state["owed"] = [k for k in state["open_keys"] if k not in done]
+    if state["reflection_keys"] == "ok" and late_owed is not None:
+        state["owed"] = [k for k in state["open_keys"] if k not in done] + late_owed
     times = [
         when
         for source in (rounds[-1].get("reviews") or [] if rounds else [])
@@ -961,38 +1334,66 @@ def owed_state(
     return state
 
 
-def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
+def _acceptance(budget: Mapping[str, Any], repo: str, number: int) -> list[str] | None:
+    """The PR's acceptance points, from the body the budget read carried."""
+    if budget.get("body_changed"):
+        raise Refused(
+            "the PR body changed between the two reads, so its acceptance "
+            "points are not known: run status again"
+        )
+    # The body comes with the budget read. Only a budget that carries no
+    # body at all (an older review_budget) is answered by asking again; a
+    # carried body of None (two reads that disagreed) never is.
+    if "body" in budget:
+        body = budget.get("body")
+        if not isinstance(body, str):
+            raise Refused("the PR body could not be read, so its acceptance is unknown")
+    else:
+        body = _pr_meta(repo, number).get("body") or ""
+    return acceptance_points(body)
+
+
+_MODULE_CUTOVER = object()
+
+
+def status(
+    cwd: str, *, now: datetime | None = None, cutover: Any = _MODULE_CUTOVER
+) -> dict[str, Any]:
+    """What is owed now. ``cutover`` defaults to ``REFLECTION_CUTOVER_ISO`` as
+    it stands at the call; any other value is a report only: it shows what
+    late findings would owe, and enforces nothing."""
     import review_budget  # noqa: PLC0415
 
+    if cutover is _MODULE_CUTOVER:
+        cutover = REFLECTION_CUTOVER_ISO
     repo, number = pr_identity(cwd)
     budget = review_budget.evaluate_pr(repo, number)
-    state = owed_state(budget, (), now=now or datetime.now(UTC))
-    if state["status"] == "ok" and state["round_state"] == "open":
-        if budget.get("body_changed"):
-            raise Refused(
-                "the PR body changed between the two reads, so its acceptance "
-                "points are not known: run status again"
+    fix_time = None
+    if cutover is not None and budget.get("status") == "ok":
+        fix_time = fix_time_reader(cwd, str(budget.get("current_head")))
+    state = owed_state(budget, (), now=now or datetime.now(UTC), cutover=cutover, fix_time=fix_time)
+    is_open = state["status"] == "ok" and state["round_state"] == "open"
+    late = late_findings(budget, cutover, fix_time) if state["status"] == "ok" else []
+    if is_open or late:
+        acceptance = _acceptance(budget, repo, number)
+        covered: set[str] = set()
+        if is_open:
+            covered = covered_keys(
+                cwd,
+                str(state["head"]),
+                round_number=int(state["round"] or 0),
+                gate_lane=state["gate_lane"],
+                prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
+                acceptance=acceptance,
+                round_started=state["round_started"],
             )
-        # The body comes with the budget read. Only a budget that carries no
-        # body at all (an older review_budget) is answered by asking again; a
-        # carried body of None (two reads that disagreed) never is.
-        if "body" in budget:
-            body = budget.get("body")
-            if not isinstance(body, str):
-                raise Refused("the PR body could not be read, so its acceptance is unknown")
-        else:
-            body = _pr_meta(repo, number).get("body") or ""
-        covered = covered_keys(
-            cwd,
-            str(state["head"]),
-            round_number=int(state["round"] or 0),
-            gate_lane=state["gate_lane"],
-            prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
-            acceptance=acceptance_points(body),
-            round_started=state["round_started"],
+        if late:
+            covered |= covered_late_keys(
+                cwd, budget, late, gate_lane=state["gate_lane"], acceptance=acceptance
+            )
+        state = owed_state(
+            budget, covered, now=now or datetime.now(UTC), cutover=cutover, fix_time=fix_time
         )
-        if state["reflection_keys"] == "ok":
-            state["owed"] = [k for k in state["open_keys"] if k not in covered]
     state.update({"repo": repo, "pr": number, "errors": budget.get("errors", [])})
     return state
 
@@ -1003,7 +1404,12 @@ def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("status", help="what the open round owes")
+    status_cmd = sub.add_parser("status", help="what the open round owes")
+    status_cmd.add_argument(
+        "--cutover",
+        default=None,
+        help="report what late findings from this ISO time on would owe (enforces nothing)",
+    )
     validate = sub.add_parser("validate", help="check a file against the grammar, offline")
     validate.add_argument("file", type=Path)
     validate.add_argument("--round", type=int, default=None)
@@ -1011,7 +1417,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "status":
-            print(json.dumps(status(os.getcwd()), indent=2))
+            report = (
+                status(os.getcwd(), cutover=args.cutover) if args.cutover else status(os.getcwd())
+            )
+            print(json.dumps(report, indent=2, default=str))
             return 0
         text = args.file.read_bytes().decode("utf-8")
         parsed = parse(text, round_number=args.round, gate_lane=args.gate)

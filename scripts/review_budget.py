@@ -425,7 +425,7 @@ def evaluate_evidence(
     review that lands on a head after one of that head's descendants was marked
     is a LATE review of an earlier round. It opens no round, and is listed in
     ``findings`` with the round it belongs to (``round_head``), for the round
-    reflection to owe (issue #3301; nothing owes them yet). Ancestry comes from each commit's ``parents`` when the caller
+    reflection to owe (``review_reflection.late_findings``, from its cutover on). Ancestry comes from each commit's ``parents`` when the caller
     passes ``commit_heads`` entries as ``{"sha", "parents"}``; a bare SHA knows
     no ancestry, so it never makes a review late.
 
@@ -848,7 +848,7 @@ def evaluate_evidence(
     # reported, never enforced). The newest round only, and only while it is
     # open. A LATE review (one that opened no round, above) never lands here: it
     # is listed in ``findings`` with the round it belongs to. Nothing owes
-    # those keys yet; the round reflection reader will (issue #3301).
+    # those keys here; ``review_reflection.late_findings`` owes them from its cutover.
     seen: dict[str, None] = {}  # ordered and linear, however many keys arrive
     keys_known = True
     if round_state == "open":
