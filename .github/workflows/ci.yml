@@ -703,7 +703,13 @@ jobs:
         # Hook-output property tests (#3187): four strict xfails, ceiling 124 -> 128.
         # Codex budget native tests (test_codex_budget_native.py): 28 opt-in cases
         # skipped unless GENESIS_CODEX_NATIVE_TESTS=1, ceiling 128 -> 156.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 156
+        # Native validator-shell qualification (test_codex_validator_shell_native.py):
+        # 42 opt-in cases skipped unless GENESIS_CODEX_NATIVE_TESTS=1, ceiling 156 -> 198.
+        # Native validator-guard checks (test_codex_validator_guard.py): 18 opt-in
+        # cases skipped unless GENESIS_CODEX_NATIVE_TESTS=1, ceiling 198 -> 216.
+        # Native validator-patch checks (test_codex_validator_patch.py): 128 opt-in
+        # cases skipped unless GENESIS_CODEX_NATIVE_TESTS=1, ceiling 216 -> 344.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 344
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job

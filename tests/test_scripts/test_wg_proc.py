@@ -7,7 +7,10 @@ What these pin:
     not holders;
   * a read through a handle whose process has exited reports "gone", never the
     pid's next owner (the property the handle exists for);
-  * names are made safe for a page (control bytes, non-UTF-8 -> "?");
+  * names are made safe for a page (control bytes, non-UTF-8, Unicode
+    line/paragraph separators, bidi and zero-width format characters -> "?");
+  * every candidate of one pid is read through ONE handle, so a pid reused
+    between two of its candidates cannot lend the first file its identity;
   * an unreadable stat record falls back to comm/status through the same
     handle, with the start time "?" (cannot tell), never guessed;
   * a parent that changed while it was read is not named.
@@ -15,6 +18,7 @@ What these pin:
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import os
 import subprocess
@@ -207,6 +211,11 @@ def fake(tmp_path):
         (b"c1\xc2\x85x", "c1?x"),
         (b"bad\xffutf8", "bad?utf8"),
         (b"caf\xc3\xa9 (x) y", "café (x) y"),
+        (b"ls\xe2\x80\xa8FAKE", "ls?FAKE"),  # U+2028 line separator
+        (b"ls\xe2\x80\xa9FAKE", "ls?FAKE"),  # U+2029 paragraph separator
+        (b"ls\xe2\x80\xaegpj", "ls?gpj"),  # U+202E right-to-left override
+        (b"cl\xe2\x80\x8baude", "cl?aude"),  # U+200B zero-width space
+        (b"x\xe2\x81\xa6y", "x?y"),  # U+2066 left-to-right isolate
     ],
 )
 def test_names_are_made_safe_for_a_page(fake, raw, shown):
@@ -243,6 +252,89 @@ def test_a_parent_that_changed_while_read_is_not_named(fake, monkeypatch):
     monkeypatch.setattr(wg, "_stat_fields", flaky)
     rows = wg.holders(str(proc), [f"{_key(target)} 4102 1"])
     assert rows and rows[0].split("\t")[5:] == ["?", "?"]
+
+
+def test_every_candidate_of_one_pid_is_read_through_one_handle(fake, monkeypatch):
+    """One process holding two files: /proc/<pid> is opened once for both, so
+    both rows describe the same process (review finding: per-candidate opens
+    let a pid reused in between lend the first file the new owner's identity)."""
+    proc, target = fake
+    other = target.parent / "other"
+    other.touch()
+    _fake(proc, 4105, target, comm=b"dd")
+    (proc / "4105" / "fd" / "2").symlink_to(other)
+    (proc / "4105" / "fdinfo" / "2").write_text("pos:\t0\nflags:\t0102001\n")
+    real_open = os.open
+    opened = []
+
+    def counting(path, *a, **kw):
+        if str(path) == f"{proc}/4105":
+            opened.append(path)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(wg.os, "open", counting)
+    rows = wg.holders(
+        str(proc), [f"{_key(target)} 4105 1", f"{_key(other)} 4105 2", f"{_key(target)} 4105 1"]
+    )
+    assert len(opened) == 1, "one handle per pid"
+    fields = [r.split("\t") for r in rows]
+    assert [f[0] for f in fields] == [_key(target), _key(other)], "each file once, in order"
+    assert fields[0][1:] == fields[1][1:], "both rows describe the same process"
+
+
+@pytest.mark.parametrize("err", [errno.EACCES, errno.EPERM])
+def test_a_process_that_cannot_be_inspected_is_unknown_never_gone(fake, monkeypatch, err):
+    """Only a disappearance (ENOENT, ESRCH) means gone. Any other failure to
+    open /proc/<pid> reads as unknown in a chain (so the response vetoes) and
+    as an unknown identity for a holder (so the file stays watched) (review
+    finding)."""
+    proc, target = fake
+    _fake(proc, 4200, target, comm=b"dd")
+    real_open = os.open
+
+    def deny(path, *a, **kw):
+        if str(path) == f"{proc}/4200":
+            raise OSError(err, os.strerror(err))
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(wg.os, "open", deny)
+    assert wg.chain(str(proc), ["4200 -"])[0].split("\t")[1] == "unknown"
+    assert wg.holders(str(proc), [f"{_key(target)} 4200 1"]) == [
+        "\t".join([_key(target), "4200", "?", "?", "?", "?", "?"])
+    ]
+
+
+def test_a_pid_with_an_unreadable_file_ends_with_an_unknown_identity(fake, monkeypatch):
+    """One process holds a readable file and one whose descriptor cannot be
+    read: the unknown row is printed LAST, so the watchgod (one identity per
+    pid, the last row wins) never acts on it with the readable file's start
+    time (review finding)."""
+    proc, target = fake
+    other = target.parent / "other"
+    other.touch()
+    _fake(proc, 4300, target, comm=b"dd")
+    (proc / "4300" / "fd" / "2").symlink_to(other)
+    (proc / "4300" / "fdinfo" / "2").write_text("pos:\t0\nflags:\t0102001\n")
+    real_stat = os.stat
+
+    def stale(path, *a, **kw):
+        if str(path) == "fd/2":
+            raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(wg.os, "stat", stale)
+    rows = [
+        r.split("\t")
+        for r in wg.holders(str(proc), [f"{_key(target)} 4300 1", f"{_key(other)} 4300 2"])
+    ]
+    assert [r[0] for r in rows] == [_key(target), _key(other)]
+    assert rows[0][2] == "777" and rows[-1][2:] == ["?"] * 5, "the last row for the pid is unknown"
+
+
+def test_a_process_that_is_gone_is_gone(fake):
+    proc, _target = fake
+    assert wg.chain(str(proc), ["4299 -"])[0].split("\t")[1] == "gone"
+    assert wg.holders(str(proc), ["1:2 4299 1"]) == []
 
 
 def test_malformed_candidates_are_skipped(fake):

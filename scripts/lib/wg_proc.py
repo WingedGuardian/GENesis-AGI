@@ -1,7 +1,10 @@
 """Process identity for the watchgod, read through one handle per process.
 
-Run as `python3 -I -S wg_proc.py <proc root> holders|chain`, stdlib only, like the
+Run as `python3 -I -S wg_proc.py <proc root> holders|chain`, stdlib only, like
+the
 rest of the watchgod's python: it must work when the venv does not.
+`python3 -I -S wg_proc.py - safe` prints its stdin made safe for a page (see
+below), for text that is not a process name: a file path, a session id.
 
 Why a handle: a pid alone names whichever process holds the number when it is
 read. Reading /proc/<pid>/fd/N and then /proc/<pid>/stat by path can see two
@@ -17,12 +20,15 @@ whose descriptor still leads to that file and is open for writing, print
 
     <dev:ino> TAB pid TAB starttime TAB state TAB comm TAB ppid TAB pcomm
 
-comm and pcomm are made safe for a page: every control byte (C0, DEL, C1) and
-every byte that is not UTF-8 becomes "?". A field that cannot be read while
+comm and pcomm are made safe for a page: every byte that is not UTF-8, and
+every character Unicode files as a control, format, surrogate, private-use or
+unassigned character (category C*: C0, DEL, C1, bidi overrides, zero-width
+characters) or as a line or paragraph separator (U+2028, U+2029), becomes "?". A field that cannot be read while
 the process is still there is "?" (cannot tell): never a guess. A candidate
 that no longer holds the file, or whose process has exited, is left out.
-The parent is named only if the holder still has the same parent after the
-parent was read; otherwise both parent fields are "?". A parent that cannot
+All candidates of one pid are read through ONE handle, so every row printed
+for a pid describes the same process. The parent is named only if the holder
+still has the same parent after the parent was read; otherwise both parent fields are "?". A parent that cannot
 be opened keeps the holder's own ppid, with its name "?".
 
 chain: stdin has one process per line, "<pid> <starttime>" ("-" for the
@@ -50,14 +56,25 @@ from __future__ import annotations
 import errno
 import os
 import sys
+import unicodedata
+
+
+def _gone(exc: OSError) -> bool:
+    """True when the error means the process (or the descriptor) is gone. Any
+    other failure (EACCES, say) means it could not be inspected: never "gone"
+    (review finding)."""
+    return exc.errno in (errno.ENOENT, errno.ESRCH)
 
 
 def _safe(raw: bytes) -> str:
+    # A renderer may break a line at, or reorder text around, any of these: a
+    # process-chosen name must never be able to start a line of its own or
+    # disguise what follows it (review findings).
     text = raw.decode("utf-8", errors="replace")
     out = []
     for ch in text:
-        code = ord(ch)
-        if code < 0x20 or 0x7F <= code <= 0x9F or ch == "\ufffd":
+        cat = unicodedata.category(ch)
+        if cat[0] == "C" or cat in ("Zl", "Zp") or ch == "\ufffd":
             out.append("?")
         else:
             out.append(ch)
@@ -89,7 +106,7 @@ def _fallback(dfd: int) -> tuple[str, str, str, str] | None:
                 ppid = value.decode() if value.isdigit() else "?"
                 break
     except OSError as exc:
-        if exc.errno == errno.ESRCH:
+        if exc.errno == errno.ESRCH:  # through the handle: only ESRCH means exited
             return None
     return ("?", "?", comm, ppid)
 
@@ -100,7 +117,7 @@ def _stat_fields(dfd: int) -> tuple[str, str, str, str] | None:
     try:
         raw = _read("stat", dfd)
     except OSError as exc:
-        if exc.errno == errno.ESRCH:
+        if exc.errno == errno.ESRCH:  # exited; anything else falls back
             return None
         return _fallback(dfd)
     head, sep, tail = raw.rpartition(b")")
@@ -125,8 +142,10 @@ def _threads(dfd: int) -> str:
 def _chain_one(root: str, pid: str, want: str) -> str:
     try:
         dfd = os.open(f"{root}/{pid}", os.O_RDONLY | os.O_DIRECTORY)
-    except OSError:
-        return f"{pid}\tgone\t-\t-\t-\t-\t-\t-"
+    except OSError as exc:
+        if _gone(exc):
+            return f"{pid}\tgone\t-\t-\t-\t-\t-\t-"
+        return f"{pid}\tunknown\t-\t-\t-\t-\t-\t-"
     try:
         ident = _stat_fields(dfd)
         if ident is None or (want != "-" and ident[0] != want):
@@ -206,38 +225,68 @@ def _parent(root: str, dfd: int, ppid: str) -> tuple[str, str]:
 
 
 def holders(root: str, lines: list[str]) -> list[str]:
-    out = []
+    # Grouped by pid, in first-seen order: one handle per pid, so a pid reused
+    # between two of its candidates can never lend its identity to the first
+    # one's file (review finding).
+    by_pid: dict[str, list[tuple[str, str]]] = {}
     for line in lines:
         parts = line.split()
         if len(parts) != 3 or not (parts[1].isdigit() and parts[2].isdigit()):
             continue
         key, pid, fd = parts
+        by_pid.setdefault(pid, []).append((key, fd))
+    out = []
+    for pid, cands in by_pid.items():
+        # A holder that cannot be inspected (EACCES, say) is still a holder
+        # the walk found: it is printed with an unknown identity ("?"), so the
+        # file stays watched and nothing is acted on without its start time
+        # (review finding). Only a disappearance drops it.
+        unknown = "\t".join(("?",) * 5)
         try:
             dfd = os.open(f"{root}/{pid}", os.O_RDONLY | os.O_DIRECTORY)
-        except OSError:
-            continue  # gone, or never there
+        except OSError as exc:
+            if not _gone(exc):
+                for key in dict.fromkeys(k for k, _ in cands):
+                    out.append(f"{key}\t{pid}\t{unknown}")
+            continue
         try:
-            try:
-                st = os.stat(f"fd/{fd}", dir_fd=dfd)
-                if f"{st.st_dev}:{st.st_ino}" != key or not _writer(dfd, fd):
-                    continue
-            except OSError:
-                continue  # descriptor closed, or the process exited
-            ident = _stat_fields(dfd)
-            if ident is None:
-                continue
-            start, state, comm, ppid = ident
-            pid_p, pcomm = _parent(root, dfd, ppid)
-            out.append("\t".join((key, pid, start, state, comm, pid_p, pcomm)))
+            held = []
+            unread = []
+            for key, fd in cands:
+                try:
+                    st = os.stat(f"fd/{fd}", dir_fd=dfd)
+                    if f"{st.st_dev}:{st.st_ino}" == key and _writer(dfd, fd) and key not in held:
+                        held.append(key)
+                except OSError as exc:
+                    if not _gone(exc) and key not in unread:
+                        unread.append(key)
+                    continue  # descriptor closed, or the process exited
+            if held:
+                ident = _stat_fields(dfd)
+                if ident is None:
+                    continue  # exited: nothing it held is held
+                start, state, comm, ppid = ident
+                pid_p, pcomm = _parent(root, dfd, ppid)
+                for key in held:
+                    out.append("\t".join((key, pid, start, state, comm, pid_p, pcomm)))
+            # The unknown rows come LAST: the watchgod keeps one identity per
+            # pid, the last row it reads, so a pid with any file it could not
+            # read stays unknown and is never acted on (review finding).
+            for key in unread:
+                if key not in held:
+                    out.append(f"{key}\t{pid}\t{unknown}")
         finally:
             os.close(dfd)
     return out
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[2] == "safe":
+        sys.stdout.write(_safe(sys.stdin.buffer.read()) + "\n")
+        return 0
     verbs = {"holders": holders, "chain": chain}
     if len(argv) != 3 or argv[2] not in verbs:
-        print("usage: wg_proc.py <proc root> holders|chain", file=sys.stderr)
+        print("usage: wg_proc.py <proc root> holders|chain|safe", file=sys.stderr)
         return 2
     lines = sys.stdin.read().splitlines()
     for row in verbs[argv[2]](argv[1], lines):

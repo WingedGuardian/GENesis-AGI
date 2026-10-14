@@ -27,6 +27,10 @@ _RW_PAUSED_NOW=0
 _RW_ACTED=""
 # 1 when _rw_respond emptied the file it was called for, this poll.
 _RW_EMPTIED=0
+# 1 when the caller acts only because the emptying is owed (every writer is
+# one this guardian paused), not because the file grew this poll:
+# _rw_respond re-checks that under the records lock (review finding).
+_RW_OWED=0
 # The last MB of an emptied output, for whoever investigates: owner-only, in an
 # owner-only directory (the output can carry a credential).
 DG_RUNAWAY_TAIL_DIR="$HOME/tmp/watchgod-truncated"
@@ -43,9 +47,10 @@ DG_RUNAWAY_TAIL_DIR="$HOME/tmp/watchgod-truncated"
 # file is held by the command's own shell and its children, never by the
 # `claude` process (MEASURED: fd 1 and 2 belong to the task's bash, parent
 # claude). Every holder must descend from a claude process and not be one, or
-# nothing is done. What is paused is the command's ROOT (the ancestor whose
-# parent is that claude) and every holder, parents first: a root that closed
-# its own descriptor could otherwise start the writer again.
+# nothing is done. What is paused is every holder and every process between
+# it and the command's ROOT (the ancestor whose parent is that claude),
+# parents first: a root that closed its own descriptor, or a supervisor in
+# between, could otherwise start the writer again.
 #
 # Identity: every process is the pair (pid, start time) read through one
 # handle on its /proc entry (wg_proc.py: holders at discovery, chain for the
@@ -61,7 +66,8 @@ DG_RUNAWAY_TAIL_DIR="$HOME/tmp/watchgod-truncated"
 # re-walk, the tail copy and the truncate, so thaw cannot resume a writer
 # between the check and the truncate. That hold is bounded by the timeouts
 # inside it (the re-walk and the uninspectable-process walk, 10 s each; the
-# tail copy 10 s; the truncate 5 s), about 35 s at worst; an operator's thaw
+# tail copy 10 s; the truncate 5 s; confirming the stops 5 s), about 40 s at
+# worst plus one record and one signal per process paused; an operator's thaw
 # waits for it (security review: the 1 s is the wait, not the hold). No child
 # started under the lock inherits its descriptor ({lk}>&-): a child stuck in
 # uninterruptible sleep would otherwise hold it, and thaw waits on it.
@@ -195,7 +201,9 @@ _rw_blind_veto() {
 _rw_all_paused() {
     # 0 when every holder pid in $2.. is a process this guardian paused while
     # it wrote THIS file ($1, dev:inode): its identity (as read at discovery)
-    # has a "paused" record for this file, and it is stopped. Only such a file
+    # has a "paused" record for this file, and it is stopped (T, or t: a
+    # recorded holder's own stop can show as t, as the pause itself and the
+    # re-walk accept; review finding). Only such a file
     # is emptied without new growth: a writer someone thawed has no record any
     # more, so it is never paused again on size alone.
     local key="$1" pid st recs
@@ -207,7 +215,7 @@ _rw_all_paused() {
         [[ "$st" =~ ^[0-9]+$ ]] || return 1
         awk -F'\t' -v p="$pid" -v s="$st" -v k="$key" \
             '$1 == p && $2 == s && $5 == k && $7 == "paused" { f = 1 } END { exit !f }' <<< "$recs" || return 1
-        [[ "$(_rw_state "$pid")" == T ]] || return 1
+        [[ "$(_rw_state "$pid")" == [Tt] ]] || return 1
     done
     return 0
 }
@@ -306,7 +314,7 @@ _rw_empty() {
             dest="$(umask 077; mktemp --suffix=.tail "$DG_RUNAWAY_TAIL_DIR/${path##*/}.$(date +%s).XXXXXXXX" 2>/dev/null)" || dest=""
         fi
         if [[ -n "$dest" ]] && timeout -k 2 10 tail -c 1048576 -- "$own" > "$dest" 2>/dev/null; then
-            _RW_EMPTY_NOTE="last 1 MB kept in ${dest}"
+            _RW_EMPTY_NOTE="last 1 MB kept in $(_rw_show "$dest")"
         else
             [[ -n "$dest" ]] && rm -f -- "$dest" 2>/dev/null
             _RW_EMPTY_NOTE="the tail could not be kept"
@@ -329,11 +337,14 @@ _rw_respond() {
     # _RW_PAUSED_NOW=1 when it paused something this poll, _RW_EMPTIED=1 when
     # it emptied the file, and _RW_ACTED to a one-line summary for the
     # detection page.
-    local gen="$1" key="$2" path="$3" size_mb="$4" domains="$5"
+    local gen="$1" key="$2" path="$3" size_mb="$4" domains="$5" spath
+    # Shown copies only (pages, log lines); the record keeps the real path.
+    spath="$(_rw_show "$path")"
     shift 5
     _RW_PAUSED_NOW=0; _RW_ACTED=""; _RW_EMPTIED=0
-    local pid st ident status comm state threads depth root anc veto="" in="" r
-    local -A st_of=() comm_of=() depth_of=() roots=()
+    local pid st ident status comm state threads depth root anc veto="" in="" r i
+    local -a links
+    local -A st_of=() comm_of=() depth_of=() roots=() tree=() tree_pid=()
     # Identity of every holder, as read at discovery.
     for pid in "$@"; do
         ident="${_RW_IDENT[$pid]:-}"
@@ -348,7 +359,22 @@ _rw_respond() {
         for pid in "${!st_of[@]}"; do
             IFS=$'\t' read -r _ status comm state threads depth root anc <<< "${_RW_CH[$pid]:-$pid	unknown}"
             case "$status" in
-                ok) depth_of[$pid]="$depth"; comm_of[$pid]="$comm"; roots[$root]=1 ;;
+                ok)
+                    depth_of[$pid]="$depth"; comm_of[$pid]="$comm"; roots[$root]=1
+                    # Every ancestor up to the root ("pid:start", nearest
+                    # first; the last is the root, depth 1): paused too.
+                    IFS=, read -r -a links <<< "$anc"
+                    for (( i = 1; i < ${#links[@]}; i++ )); do
+                        # One pid seen with two start times: one of them is a
+                        # reused pid, and the walk cannot tell which (review
+                        # finding). Nothing is acted on.
+                        if [[ -n "${tree_pid[${links[$i]%%:*}]:-}" && "${tree_pid[${links[$i]%%:*}]}" != "${links[$i]}" ]]; then
+                            veto="pid ${links[$i]%%:*} changed while its command was read"; break 2
+                        fi
+                        tree_pid[${links[$i]%%:*}]="${links[$i]}"
+                        tree[${links[$i]}]=$(( depth - i ))
+                    done
+                    ;;
                 gone) unset "st_of[$pid]" ;;   # exited since the walk: not a holder
                 claude) veto="pid ${pid} is the Claude Code session itself"; break ;;
                 nocc) veto="pid ${pid} holds it and is not a command of a Claude Code session"; break ;;
@@ -357,18 +383,22 @@ _rw_respond() {
         done
     fi
     (( ${#st_of[@]} )) || veto="${veto:-its writers exited}"
-    # The command roots: paused too, even when they hold no descriptor.
-    if [[ -z "$veto" ]]; then
+    # The command root and every process between it and a holder: paused
+    # too, even when they hold no descriptor. A SIGSTOP stops one process, so
+    # one left running (a supervisor, say) could restart the writer or reopen
+    # the output (review finding). Each is read again, bound to the start
+    # time and depth its descendant's walk saw.
+    if [[ -z "$veto" && ${#tree[@]} -gt 0 ]]; then
         in=""
-        for r in "${!roots[@]}"; do in+="${r%%:*} ${r#*:}"$'\n'; done
+        for r in "${!tree[@]}"; do in+="${r%%:*} ${r#*:}"$'\n'; done
         if ! _rw_chain <<< "$in"; then
             veto="its command's ancestry could not be read"
         else
-            for r in "${!roots[@]}"; do
+            for r in "${!tree[@]}"; do
                 pid="${r%%:*}"
                 IFS=$'\t' read -r _ status comm _ _ depth _ _ <<< "${_RW_CH[$pid]:-$pid	unknown}"
-                [[ "$status" == ok && "$depth" == 1 ]] || { veto="its command (pid ${pid}) changed while it was read"; break; }
-                st_of[$pid]="${r#*:}"; comm_of[$pid]="$comm"; depth_of[$pid]=1
+                [[ "$status" == ok && "$depth" == "${tree[$r]}" ]] || { veto="its command (pid ${pid}) changed while it was read"; break; }
+                st_of[$pid]="${r#*:}"; comm_of[$pid]="$comm"; depth_of[$pid]="${tree[$r]}"
             done
         fi
     fi
@@ -379,23 +409,47 @@ _rw_respond() {
         veto="$(_rw_blind_veto "${!roots[*]}")" || veto=""
     fi
     if [[ -n "$veto" ]]; then
-        _wg_warn_once "rw_veto_${gen}_${veto}" "runaway ${path}: not paused: ${veto}"
+        _wg_warn_once "rw_veto_${gen}_${veto}" "runaway ${spath}: not paused: ${veto}"
         _RW_ACTED="not paused: ${veto}"
         return 0
     fi
 
-    local ts rstate pend rc paused="" newly="" unconfirmed="" refused="" prestopped="" order lk=""
+    local ts rstate pend rc paused="" newly="" unconfirmed="" refused="" prestopped="" order lk="" now_s
     # Before the lock: nothing forked while it is held may inherit it.
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf -v now_s '%(%s)T' -1
     # Parents first: a child stopped first can be reaped and replaced by its
     # still-running parent before the parent's turn.
     order="$(for pid in "${!depth_of[@]}"; do printf '%s %s\n' "${depth_of[$pid]}" "$pid"; done | sort -n)"
     if ! wg_records_lock lk "$DG_RUNAWAY_LOCK_WAIT_S"; then
-        _wg_warn_once "rw_lock_${gen}" "runaway ${path}: not paused this poll: the pause records' lock could not be taken (an operator command holds it, or the state directory is not writable); retried every poll"
+        _wg_warn_once "rw_lock_${gen}" "runaway ${spath}: not paused this poll: the pause records' lock could not be taken (an operator command holds it, or the state directory is not writable); retried every poll"
         _RW_ACTED="not paused this poll: the pause records' lock could not be taken (an operator command holds it, or the state directory is not writable)"
         return 0
     fi
-    local deadline=$(( SECONDS + 5 )) tflag
+    # Acting only because the emptying was owed: that was decided before the
+    # lock, and an operator's thaw may have resumed the writers since. Decide
+    # it again now that thaw cannot run, for every process this would stop:
+    # the holders, and their ancestors up to the command root, which need not
+    # hold the file (review findings). Anything resumed means no growth and
+    # nothing owed.
+    if (( _RW_OWED )); then
+        local resumed=""
+        _rw_all_paused "$key" "$@" {lk}>&- || resumed=1
+        for r in "${!tree[@]}"; do
+            [[ "$(wg_record_state "${r%%:*}" "${r#*:}" {lk}>&- || true)" == paused ]] || resumed=1
+        done
+        if [[ -n "$resumed" ]]; then
+            wg_records_unlock "$lk"
+            _RW_ACTED="not acted: a process in its command is no longer one this guardian paused (resumed, or never recorded)"
+            log INFO "runaway ${spath}: owed emptying not done: a process in its command is no longer one this guardian paused (resumed by thaw, or never recorded)"
+            return 0
+        fi
+    fi
+    # Every eligible process is recorded and signalled first; the bounded
+    # deadline applies only to confirming the stops, so slow confirmations
+    # never leave a later process unsignalled (review finding).
+    local deadline tflag sent=""
+    local -A tflag_of=() rstate_of=()
     while read -r depth pid; do
         [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || continue
         st="${st_of[$pid]}"
@@ -419,7 +473,6 @@ _rw_respond() {
             fi
             continue
         fi
-        if (( SECONDS >= deadline )); then refused+=" ${pid}"; continue; fi
         pend=pending; [[ "$state" == t ]] && pend=pending-t
         # The record first: no record, no signal.
         if ! wg_record_put "$pid" "$st" "${comm_of[$pid]:-?}" "$ts" "$key" "${path% (deleted)}" "$pend" {lk}>&-; then
@@ -429,19 +482,25 @@ _rw_respond() {
         if (( rc != 0 )); then
             # Nothing was sent: the record would name a stop that never happened.
             wg_record_drop "$pid" "$st" {lk}>&- \
-                || log WARN "runaway ${path}: the record of pid ${pid} names a stop that was never sent and could not be removed"
+                || log WARN "runaway ${spath}: the record of pid ${pid} names a stop that was never sent and could not be removed"
             (( rc == 1 )) || refused+=" ${pid}"
             continue
         fi
-        tflag=""; [[ "$state" == t ]] && tflag=T
-        if _rw_stopped "$pid" "$st" "$tflag" {lk}>&-; then
+        tflag_of[$pid]=""; [[ "$state" == t ]] && tflag_of[$pid]=T
+        rstate_of[$pid]="$rstate"
+        sent+=" ${pid}"
+    done <<< "$order"
+    deadline=$(( SECONDS + 5 ))
+    for pid in $sent; do
+        st="${st_of[$pid]}"; tflag="${tflag_of[$pid]}"
+        if (( SECONDS < deadline )) && _rw_stopped "$pid" "$st" "$tflag" {lk}>&-; then
             wg_record_promote "$pid" "$st" {lk}>&- || true
             paused+=" ${pid}"; newly+=" ${pid}"
         else
             unconfirmed+=" ${pid}"
-            [[ "$rstate" == pending* ]] || newly+=" ${pid}"
+            [[ "${rstate_of[$pid]}" == pending* ]] || newly+=" ${pid}"
         fi
-    done <<< "$order"
+    done
 
     # Empty the file only when NO writer is left running: every process here
     # confirmed stopped, and a fresh walk (start times as well as the file's
@@ -468,7 +527,7 @@ _rw_respond() {
             _RW_EMPTIED=1
             # The episode is over: a refill pages (and is acted on) again,
             # however long it takes.
-            _rw_episode_open "$gen" "$(date +%s)"
+            _rw_episode_open "$gen" "$now_s"
         else
             why_not="$_RW_EMPTY_NOTE"
         fi
@@ -477,21 +536,23 @@ _rw_respond() {
 
     local all="${paused}${unconfirmed}"
     if [[ -z "$all" ]]; then
-        log WARN "runaway ${path}: no writer could be paused (pid${refused:- none})"
+        log WARN "runaway ${spath}: no writer could be paused (pid${refused:- none})"
         _RW_ACTED="no writer could be paused"
         return 0
     fi
     _RW_ACTED="paused"
+    [[ -n "$paused" ]] || _RW_ACTED="unconfirmed"
     (( _RW_EMPTIED )) && _RW_ACTED="emptied"
     if [[ -z "$newly" ]] && (( ! _RW_EMPTIED )); then
         # Nothing new this poll: the reminders cover the pause.
-        _wg_warn_once "rw_notempty_${gen}" "runaway ${path}: writers stay paused; the file could not be emptied${why_not:+ (${why_not})}"
+        _wg_warn_once "rw_notempty_${gen}" "runaway ${spath}: writers stay paused; the file could not be emptied${why_not:+ (${why_not})}"
         return 0
     fi
     [[ -n "$newly" ]] && _RW_PAUSED_NOW=1
     local sid body title p
     sid="$(_rw_session_of "${path% (deleted)}")"
-    body="${path} (${size_mb} MB) was filling ${CC_TMP_DIR}."$'\n'
+    [[ -n "$sid" ]] && sid="$(_rw_show "$sid")"
+    body="${spath} (${size_mb} MB) was filling ${CC_TMP_DIR}."$'\n'
     [[ -n "$paused" ]] && body+="Paused (SIGSTOP, not killed): pid${paused}."$'\n'
     [[ -n "$unconfirmed" ]] && body+="SIGSTOP sent but NOT yet confirmed: pid${unconfirmed}. Recorded as pending; thaw resumes it and also cancels a stop that has not landed."$'\n'
     [[ -n "$refused" ]] && body+="Could not pause: pid${refused}."$'\n'
@@ -518,7 +579,7 @@ _rw_respond() {
     else
         title="Sent SIGSTOP to a runaway Claude Code task, NOT yet confirmed; its output could NOT be emptied"
     fi
-    log WARN "runaway ${path}: paused${paused:- none}; unconfirmed${unconfirmed:- none}; refused${refused:- none}; emptied=${_RW_EMPTIED}${why_not:+ (${why_not})}"
+    log WARN "runaway ${spath}: paused${paused:- none}; unconfirmed${unconfirmed:- none}; refused${refused:- none}; emptied=${_RW_EMPTIED}${why_not:+ (${why_not})}"
     _rw_page_act "watchgod:runaway-act:${key}:$(date +%s)" "$title" "$body"
     return 0
 }
@@ -581,7 +642,7 @@ _rw_repage() {
         fi
         k=$(( (now - t) / period ))
         (( k >= 1 && k > ${_RW_REMINDED[$g]:-0} )) || continue
-        list+="  pid ${pid} (${comm}) paused since ${ts}${note}, writing ${path}"$'\n'
+        list+="  pid ${pid} (${comm}) paused since ${ts}${note}, writing $(_rw_show "$path")"$'\n'
         pids+=" ${pid}"
         due+=" ${g}=${k}"
         n=$(( n + 1 ))

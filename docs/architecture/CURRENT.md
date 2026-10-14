@@ -1511,7 +1511,12 @@ verified: 637f7f7bb679 2026-10-05
   `scripts/browser.py` copies too when it can import Genesis (else it says so and
   launches without a copy). The Chromium fallback and that CLI run
   through patchright when installed. `scripts/disk_hygiene.sh` keeps
-  the newest copy per profile, and the newest per version for 90 days.
+  the newest copy per profile, and the newest per version for 90 days. Once
+  the paired Camoufox engine has been in use 14 days, it also removes older
+  engine versions and the pre-0.5 root engine (`scripts/prune_browser_engines.py`
+  decides; none while an override or `camoufox set` choice is in effect or access
+  times are not kept, never an engine a running browser uses, the one the browser
+  profile last ran, or one launched in 14 days, never camoufox 0.5's own files).
   Every install gets the `browser` extra (pinned camoufox 0.5.7+, playwright and
   patchright on one minor): bootstrap.sh and install.sh install it after the core
   packages, never fatally (`venv_setup.sh` `install_browser_extra`, checked by
@@ -3556,6 +3561,30 @@ verified: ba9dd8a37 2026-10-09
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
   `secrets_path()` is repo-relative unless SECRETS_PATH set.
+- **Managed systemd user units** (deploy scripts, no `src/genesis` module):
+  `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
+  renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through
+  `scripts/lib/managed_units.sh`. Every render ends with a
+  `# genesis-managed v1 sha256=` stamp of its own body
+  (`scripts/lib/managed_units.py` holds the grammar), so a later run tells
+  Genesis's output from a hand edit: an edited unit is KEPT and named, never
+  overwritten. A plain `update.sh` run checks every unit BEFORE it stops
+  anything and exits 4 naming the edited ones; `--post-merge` does not refuse
+  (its merge already happened), and bootstrap keeps and names the unit
+  instead (`--take-template <unit>` installs the template and
+  backs the old file up under `~/.genesis/deploy-backups/`, pruned at 90 days by
+  `disk_hygiene.sh`); a unit from before stamps is accepted when it matches a
+  version of its template in git history. Local unit changes belong in a
+  drop-in (`<unit>.d/*.conf`), which nothing here touches. Timers listed in
+  `~/.genesis/config/disabled_timers` are not re-enabled (`systemctl mask`
+  cannot work on a unit in `~/.config/systemd/user`). The dashboard's update
+  card shows edited units (stamp check only). A refusal is recorded in
+  `~/.genesis/update_refused.json` (units, commit judged), which every other
+  preflight verdict removes; the supervised update's orchestrator removes it
+  before tier 1 and never escalates while it stands. `update.sh` prints what bootstrap changed
+  outside the checkout at the end of every run, a failed one included. A
+  symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
+  `--take-templates`.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.
@@ -3621,6 +3650,14 @@ verified: 4ab8bf71c 2026-10-10
   floor; other tool bodies cannot be entered through those MCP processes.
   External health initialization skips the LLM router, dispatch queue setup,
   and campaign wiring. Profiles constrain tools, not an operator's host access.
+  The separately launched validator can admit one canonical invocation of
+  `scripts/codex_validator_request.py` through its native shell hook. Its
+  bounded, private UUID request files use strict JSON and a closed operation
+  schema; only `protocol_probe` exists. Request creation and retirement use
+  the admitted workspace patch path. Serving probes, verification recording
+  and publication operations remain GROUNDWORK, and this boundary has no
+  activation wiring in the ordinary project configuration. Its dedicated
+  launcher must establish private workspace modes and umask before activation.
   In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
   the main checkout, which owns the live database and secrets. This gives Codex
   on-demand access without registering its transcript,

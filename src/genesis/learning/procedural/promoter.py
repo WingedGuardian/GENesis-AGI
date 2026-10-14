@@ -105,7 +105,10 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
 
     Returns summary: {"promotions": N, "demotions": N, "quarantined": N}.
     """
-    rows = await procedural.list_active(db)
+    # Earned rows and lessons are listed apart, so lessons (all at the same
+    # authored confidence) never push earned rows out of the earned window.
+    # Every lesson is checked for quarantine; none is ever promoted.
+    rows = await procedural.list_active(db, lessons=False) + await procedural.list_lessons(db)
     promotions = 0
     demotions = 0
     quarantined = 0
@@ -129,6 +132,11 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
             await procedural.quarantine(db, proc_id)
             quarantined += 1
             logger.info("Quarantined procedure %s (conf=%.2f)", row["task_type"], row["confidence"])
+            continue
+
+        # A lesson is authored, not earned: metrics never move its tier.
+        # The quarantine check above still applies to it.
+        if row.get("lesson") is not None:
             continue
 
         # Draft clearing: a draft graduates to validated once it has >=1 real

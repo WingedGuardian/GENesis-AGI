@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from genesis.learning.procedural.lesson_shape import LIVE_LESSON_SQL
 from genesis.memory import graph_expansion
 from genesis.memory.intent import classify_intent, classify_stance
 from genesis.util.loop_diag import default_executor_pending
@@ -422,9 +423,11 @@ async def _rebuild_procedure_cache(db: Any) -> _ProcedureCache | None:
     now = time.monotonic()
     try:
         rows = await db.execute_fetchall(
-            "SELECT id, task_type, principle, principle_embedding, activation_tier "
+            # LIVE_LESSON_SQL is a constant, not input.
+            "SELECT id, task_type, principle, principle_embedding, activation_tier "  # noqa: S608
             "FROM procedural_memory "
             "WHERE deprecated = 0 AND quarantined = 0 "
+            f"AND ({LIVE_LESSON_SQL}) "
             "AND principle_embedding IS NOT NULL "
             "ORDER BY confidence DESC LIMIT 1000"
         )
@@ -540,8 +543,8 @@ async def _surface_procedure(db: Any, vector: list[float]) -> dict | None:
     # vector. An unusable live embedding fails closed (surface nothing).
     try:
         live = await db.execute_fetchall(
-            "SELECT principle, activation_tier, principle_embedding FROM procedural_memory "
-            "WHERE id = ? AND deprecated = 0 AND quarantined = 0 LIMIT 1",
+            "SELECT principle, activation_tier, principle_embedding FROM procedural_memory "  # noqa: S608
+            f"WHERE id = ? AND deprecated = 0 AND quarantined = 0 AND ({LIVE_LESSON_SQL}) LIMIT 1",
             (proc_id,),
         )
     except Exception:
