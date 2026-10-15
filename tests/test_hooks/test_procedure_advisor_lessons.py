@@ -205,7 +205,7 @@ def test_an_earned_tag_with_regex_syntax_is_bounded_too(env):
 
 def test_the_fire_log_keeps_a_scrubbed_excerpt_only(env):
     env.write(_entry("l1", patterns=["deploy"]), _entry("l2", tool="Write", patterns=["KEY"]))
-    env("Bash", {"command": "deploy --token ghp_" + "a" * 36 + " done"})
+    env("Bash", {"command": "deploy ghp_" + "a" * 36 + " done"})  # a bare token: scrubbed
     env("Write", {"file_path": "/srv/app/secrets.env", "content": "KEY=value"})
     records = [
         json.loads(line)
@@ -397,9 +397,16 @@ def test_session_start_stamps_only_a_compaction(tmp_path):
 
 def test_a_credential_flag_value_is_redacted_from_the_excerpt():
     advisor = _load()
-    for command in ("docker login -u admin -p S3cretPass123", "tool --password S3cret", "x --api-key=abc123"):
-        excerpt = advisor._excerpt("Bash", {"command": command}, command)
-        assert "S3cret" not in excerpt and "abc123" not in excerpt and "[REDACTED]" in excerpt
+    for command in (
+        "docker login -u admin -p S3cretPass123",
+        "tool --password S3cret",
+        "x --api-key=abc123",
+        "deploy --password 'correct horse battery staple'",
+        'deploy --password "violet orange"',
+        "mysql -pS3cret db",
+    ):
+        assert advisor._excerpt("Bash", {"command": command}, command) is None  # withheld whole
+    assert advisor._excerpt("Bash", {"command": "ls -la"}, "ls -la") == "ls -la"
 
 
 def test_the_waypoint_also_starts_a_window(env):

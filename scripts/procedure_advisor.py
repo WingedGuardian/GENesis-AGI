@@ -58,8 +58,12 @@ _PATTERN_TIMEOUT_S = 0.05
 # The hook's own timeout is 10 s (.claude/settings.json); stopping matching at
 # 2 s leaves the rest for output and the surfaced-count write.
 _DEADLINE_S = 2.0
-_FLAG_VALUE = re.compile(
-    r"((?:^|\s)(?:-p|-P|--?[\w-]*(?:pass|pwd|token|secret|key|auth)[\w-]*)[ =])\S+", re.IGNORECASE
+# A credential-like flag anywhere in the text (`-p S3cret`, `-pS3cret`,
+# `--token 'a b'`): its value can take any shell shape, so the excerpt is
+# withheld rather than redacted piece by piece.
+_CREDENTIAL_FLAG = re.compile(
+    r"(?:^|[\s'\"])(?:-[pP]|--?[\w-]*(?:pass|pwd|token|secret|key|auth)[\w-]*)(?:[\s=:'\"]|\S|$)",
+    re.IGNORECASE,
 )
 _REGEX_SYNTAX = re.compile(r"[.^$*+?{}\[\]\\|()]")
 
@@ -420,8 +424,10 @@ def _excerpt(tool_name: str, tool_input: object, text: str) -> str | None:
             if isinstance(path, str) and is_secret_path(path):
                 return None
         # The scrubber knows labelled and shaped secrets; a value after a
-        # credential-like flag (`-p S3cret`, `--token abc`) has neither shape.
-        return _FLAG_VALUE.sub(r"\1[REDACTED]", scrub(text))[:200]
+        # credential-like flag has neither shape, so such text keeps nothing.
+        if _CREDENTIAL_FLAG.search(text):
+            return None
+        return scrub(text)[:200]
     except Exception:
         return None
 
