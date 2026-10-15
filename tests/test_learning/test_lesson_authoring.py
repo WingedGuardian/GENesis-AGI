@@ -140,7 +140,7 @@ async def test_a_trusted_refine_with_lesson_parameters_rewrites_the_spec(env):
         ({"trigger_patterns": ["("]}, "compile"),
         ({"trigger_patterns": ["x"], "repeat": "sometimes"}, "repeat"),
         ({"trigger_patterns": ["x"], "tool_trigger": ["not a tool"]}, "tool"),
-        ({"trigger_patterns": [f"p{i}" for i in range(8)], "tool_trigger": ["ssh"]}, "8"),
+        ({"trigger_patterns": ["x"], "tool_trigger": ["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git push"]}, "8"),
     ],
 )
 async def test_an_invalid_lesson_is_refused_and_nothing_is_stored(env, override, reason):
@@ -205,12 +205,12 @@ async def test_a_plain_teach_never_lands_in_a_lesson(env):
 async def test_an_unchanged_trigger_keeps_its_spec(env):
     db, _, _ = env
     first = await store_procedure_checked(
-        db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["ssh"]}
+        db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["Edit"]}
     )
-    spec = {"patterns": ["ssh"], "repeat": "every"}
+    spec = {"patterns": ["x"], "repeat": "every"}
     await procedural.update(db, first.procedure_id, trigger_spec=spec)
     await store_procedure_checked(
-        db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["ssh"]}
+        db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["Edit"]}
     )
     row = await _only_row(db)
     assert json.loads(row["trigger_spec"]) == spec
@@ -227,13 +227,26 @@ async def test_a_failed_cache_rebuild_is_reported(env, monkeypatch):
     assert "rebuild failed" in response
 
 
+async def test_a_failed_cache_rebuild_after_an_earned_refine_is_reported(env, monkeypatch):
+    db, store, _ = env
+    await store(**{**_ARGS, "tool_trigger": ["ssh"]})
+    row = await _only_row(db)
+    await procedural.update(db, row["id"], activation_tier="ADVISORY")  # cached
+
+    async def broken(_db):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(trigger_cache, "regenerate", broken)
+    response = await store(**{**_ARGS, "tool_trigger": ["git push"]})
+    assert response.startswith("Updated existing procedure")
+    assert "rebuild failed" in response
+
+
 async def test_the_pattern_cap_refusal_names_the_derived_patterns(env):
     db, store, _ = env
-    response = await store(
-        **{**_ARGS, "tool_trigger": ["ssh"]}, trigger_patterns=[f"p{i}" for i in range(8)]
-    )
+    response = await store(**{**_ARGS, "tool_trigger": ["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git push"]}, trigger_patterns=["x"])
     assert response.startswith("Refused:")
-    assert "derived from shell commands" in response
+    assert "derived from tool_trigger" in response
 
 
 async def test_held_lessons_never_crowd_live_rows_out_of_recall(env):
@@ -408,6 +421,36 @@ async def test_a_held_write_leaves_the_cache_alone(env, monkeypatch):
     assert calls == [1]  # a live lesson still rebuilds it
 
 
+async def test_any_refine_of_a_cached_earned_row_rebuilds_the_cache(env, monkeypatch):
+    from genesis.learning.procedural import operations
+
+    db, store, _ = env
+    await store(**{**_ARGS, "tool_trigger": ["Edit"]})
+    row = await _only_row(db)
+    await procedural.update(db, row["id"], activation_tier="CORE")
+    calls = []
+
+    async def counted(db_):
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(operations, "_regenerate_cache", counted)
+    # Same trigger, new tags: the tags are the cached row's patterns.
+    await store(**{**_ARGS, "tool_trigger": None, "context_tags": ["rollout"]})
+    assert calls == [1]
+
+
+async def test_command_words_naming_no_tool_never_replace_a_stored_trigger(env):
+    db, store, _ = env
+    await store(**{**_ARGS, "tool_trigger": ["Edit"]})
+    nine = ["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git add"]
+    response = await store(**{**_ARGS, "tool_trigger": nine})
+    row = await _only_row(db)
+    assert json.loads(row["tool_trigger"]) == ["Edit"]
+    assert row["trigger_spec"] is None
+    assert "stored trigger kept" in response
+
+
 async def test_a_held_record_never_updates_a_live_row_whatever_the_caller_says(env):
     db, store, _ = env
     await store(**_ARGS, trigger_patterns=[r"update\\.sh"])
@@ -422,3 +465,68 @@ async def test_a_held_record_never_updates_a_live_row_whatever_the_caller_says(e
     row = dict((await db.execute_fetchall(
         "SELECT lesson, deprecated FROM procedural_memory WHERE id = ?", (live["id"],)))[0])
     assert json.loads(row["lesson"])["origin"] != "external_untrusted" and row["deprecated"] == 0
+
+
+async def test_a_command_word_becomes_a_command_spec_on_every_write(env):
+    db, store, cache = env
+    await store(**{**_ARGS, "tool_trigger": ["ssh"]})  # a plain teach: an earned row
+    row = await _only_row(db)
+    assert json.loads(row["trigger_spec"]) == {"patterns": [], "commands": ["ssh"], "repeat": "every"}
+    await store(**{**_ARGS, "tool_trigger": ["git push"]})  # a refine naming a new command
+    row = await _only_row(db)
+    assert json.loads(row["trigger_spec"])["commands"] == ["git push"]
+
+
+async def test_a_lesson_merges_derived_commands_with_its_own(env):
+    db, store, cache = env
+    await store(**{**_ARGS, "tool_trigger": ["ssh"]}, trigger_patterns=[r"update\.sh"])
+    spec = json.loads((await _only_row(db))["trigger_spec"])
+    assert spec["patterns"] == [r"update\.sh"] and spec["commands"] == ["ssh"]
+
+
+async def test_commands_narrow_only_a_bash_only_row_and_bash_widens_it_again(env):
+    db, store, _ = env
+    result = await store_procedure_checked(
+        db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["ssh", "Edit"]}
+    )
+    row = await _only_row(db)
+    assert row["trigger_spec"] is None  # Edit keeps firing on its tags
+    assert json.loads(row["tool_trigger"]) == ["Edit", "ssh"]  # the word kept as written, no Bash
+    assert any("kept as written" in w for w in result.warnings)
+    await store_procedure_checked(db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["ssh"]})
+    assert json.loads((await _only_row(db))["trigger_spec"])["commands"] == ["ssh"]
+    await store_procedure_checked(db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["Bash"]})
+    assert (await _only_row(db))["trigger_spec"] is None  # every Bash call again
+
+
+async def test_an_extracted_row_gets_its_commands_spec():
+    from genesis.db.schema import create_all_tables
+    from genesis.learning.procedural.operations import store_procedure
+
+    async with aiosqlite.connect(":memory:") as db:
+        db.row_factory = aiosqlite.Row
+        await create_all_tables(db)
+        pid = await store_procedure(
+            db, task_type="t", principle="p", steps=["s"], tools_used=[], context_tags=["x"],
+            tool_trigger=["git push"],
+        )
+        row = await procedural.get_by_id(db, pid)
+        assert json.loads(row["trigger_spec"]) == {"patterns": [], "commands": ["git push"], "repeat": "every"}
+
+
+async def test_a_cached_earned_row_reaches_the_advisor_on_refine(env, monkeypatch):
+    from genesis.learning.procedural import operations
+
+    db, _, _ = env
+    await store_procedure_checked(db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["ssh"]})
+    await db.execute("UPDATE procedural_memory SET activation_tier = 'ADVISORY'")
+    await db.commit()
+    calls = []
+
+    async def counted(db_):
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(operations, "_regenerate_cache", counted)
+    await store_procedure_checked(db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["git push"]})
+    assert calls == [1]

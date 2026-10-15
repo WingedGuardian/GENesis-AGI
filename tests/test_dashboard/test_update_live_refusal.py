@@ -132,6 +132,9 @@ def test_on_live_the_route_refuses_and_names_the_rebuild(client, world, starters
     r = client.post(route, json={})
     assert r.status_code == 409
     body = r.get_json()["error"]
+    # update.sh is the way to update `live` (it rebuilds, then activates); the
+    # rebuild and restart pair is the no-activation alternative.
+    assert "scripts/update.sh" in body
     assert "scripts/deploy_candidates rebuild" in body
     assert "scripts/deploy_code_only.sh restart" in body
     assert starters == [], "a refused route started work"

@@ -26,6 +26,7 @@ from pathlib import Path
 from deploy_candidates_core import (  # noqa: E402
     BASE_BRANCH,
     HEX40,
+    SERVER_DOWN,
     TRAILER_LINE,
     Refusal,
     Repo,
@@ -64,8 +65,10 @@ SCHEMA_FILES = ("src/genesis/db/schema/_migrations.py", "src/genesis/db/schema/_
 # What reaches the HOST: the guardian's own files from update.sh's GUARDIAN_PATHS.
 # The rest of that list is runtime code the container runs too (GUARDIAN_SHARED_
 # RUNTIME); refusing it would refuse most PRs. update.sh, which redeploys the
-# guardian, refuses to run on `live` and is itself refused below. A test pins
-# that every GUARDIAN_PATHS entry is in exactly one of the two.
+# guardian, does so on `live` from the reviewed base `live` sits on, never from
+# the tip (its _sync_deploy_targets reads $_GUARDIAN_SRC), so a candidate's shared
+# runtime code never reaches the host; update.sh itself is refused below. A test
+# pins that every GUARDIAN_PATHS entry is in exactly one of the two.
 GUARDIAN_OWN_PREFIXES = ("src/genesis/guardian/", "config/genesis-guardian")
 GUARDIAN_OWN_FILES = (
     "config/guardian-claude.md",
@@ -201,12 +204,23 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
     if too_old:
         fails.append(too_old)
     serving, why = repo.serving()
-    if not serving:
+    judged = "the server's base"
+    subject = "the serving commit"
+    if not serving and why == SERVER_DOWN:
+        # Nothing runs Genesis's code, so what acts on `live` next is the code
+        # the next start runs: the checkout's. (A server already down when
+        # update.sh or a bare rebuild runs on `live`.)
+        serving = repo.resolve("HEAD")
+        judged = "the checkout's base (the server is down; the next start runs it)"
+        subject = "the checkout's commit"
+        if not serving:
+            fails.append("the server is down and HEAD does not resolve")
+    elif not serving:
         fails.append(f"the serving commit is unknown ({why}); a candidate needs a running server")
-    else:
+    if serving:
         mb = repo.merge_base(serving, base)
         if not mb:
-            fails.append(f"the serving commit {serving[:12]} shares no history with origin/main")
+            fails.append(f"{subject} {serving[:12]} shares no history with origin/main")
         else:
             for label, sha in REQUIRED_MERGED:
                 have = repo.resolve(sha) if HEX40.match(sha) else None
@@ -214,11 +228,11 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
                     fails.append(f"{label}: {sha[:12]} is not in this repository (fetch origin)")
                 elif not repo.is_ancestor(have, mb):
                     fails.append(
-                        f"{label}: {have[:12]} is not in the server's base {mb[:12]} (deploy it first)"
+                        f"{label}: {have[:12]} is not in {judged} {mb[:12]} (deploy it first)"
                     )
             if repo.blob_at(mb, PR_C_MARKER) is None:
                 fails.append(
-                    f"PR C (the wipers rebuild `live`) is not in the server's base {mb[:12]}: "
+                    f"PR C (the wipers rebuild `live`) is not in {judged} {mb[:12]}: "
                     f"{PR_C_MARKER} does not exist there (it has not merged, or is not deployed)"
                 )
     text = repo.show("HEAD", SYNC_HOOKS)

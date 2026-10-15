@@ -117,7 +117,7 @@ _MULTI_SEGMENTATION = (
 
 _MULTI_SCHEMA_EXAMPLE = """\
 ```json
-{"procedures": [{"task_type": "kebab-slug", "scenario": "When <trigger>", "principle": "<specific problem solved, one line>", "steps": ["<concrete step with the REAL command/path/flag>"], "tools_used": ["..."], "context_tags": ["..."], "tool_trigger": ["Bash"], "is_subprocedure_of": "<parent task_type or null>"}]}
+{"procedures": [{"task_type": "kebab-slug", "scenario": "When <trigger>", "principle": "<specific problem solved, one line>", "steps": ["<concrete step with the REAL command/path/flag>"], "tools_used": ["..."], "context_tags": ["..."], "tool_trigger": ["<a tool name, or one shell command such as git push>"], "is_subprocedure_of": "<parent task_type or null>"}]}
 ```"""
 
 
