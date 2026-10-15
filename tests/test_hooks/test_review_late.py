@@ -726,6 +726,188 @@ def test_a_side_branchs_old_commit_is_not_a_fix_on_the_line(pr, tmp_path):
     assert rl.fix_time_reader(str(path), merged)(head) == T0 + timedelta(minutes=40)
 
 
+# -- the PR line, read without merge parent order (Codex c4278817060, c4278817070) --
+
+
+def test_a_side_fix_forked_from_the_head_counts_from_its_own_commit(pr, tmp_path):
+    """c4278817060, accepted as a fail-closed residual: a fix on a branch
+    forked from H counts from its own commit, before the merge brings it to
+    the PR, because no reading of merge parent order is safe (a pull reverses
+    it). A review between the two is owed early, and stays answerable."""
+    path, base, head, _ = pr
+    _git(path, "checkout", "-q", "-b", "side", head)
+    (path / "g.txt").write_text("side fix\n")
+    _git(path, "add", "g.txt")
+    _git(path, "commit", "-q", "-m", "side fix", when=T0 + timedelta(minutes=30))
+    _git(path, "checkout", "-q", "-b", "line", head)
+    _git(
+        path, "merge", "-q", "--no-ff", "-m", "merge side", "side", when=T0 + timedelta(minutes=100)
+    )
+    merged = _git(path, "rev-parse", "HEAD")
+    assert rl._fix_times(str(path), head, merged) == [
+        T0 + timedelta(minutes=30),
+        T0 + timedelta(minutes=100),
+    ]
+    budget = _late_budget(path, base, merged, [_rv(head, _at(0), 1), _rv(head, _at(50), 9)])
+    late = rl.late_findings(budget, CUT, rl.fix_time_reader(str(path), merged))
+    assert [i["key"] for i in late] == ["c9"]
+
+
+def test_a_pull_merge_from_a_stale_branch_never_hides_a_pushed_fix(pr, tmp_path):
+    """The fix-code audit's case: F is pushed, c9 lands on H after it, then a
+    stale branch at H commits and pulls F in, putting F on the merge's second
+    parent. The earliest fix is still F, so c9 stays owed."""
+    path, base, head, fix = pr
+    _git(path, "checkout", "-q", "-b", "stale", head)
+    (path / "g.txt").write_text("stale work\n")
+    _git(path, "add", "g.txt")
+    _git(path, "commit", "-q", "-m", "stale work", when=T0 + timedelta(minutes=120))
+    _git(path, "merge", "-q", "--no-ff", "-m", "pull", "feat/x", when=T0 + timedelta(minutes=130))
+    merged = _git(path, "rev-parse", "HEAD")
+    assert rl.fix_time_reader(str(path), merged)(head) == T0 + timedelta(minutes=60)
+    budget = _late_budget(path, base, merged, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])
+    late = rl.late_findings(budget, CUT, rl.fix_time_reader(str(path), merged))
+    assert [i["key"] for i in late] == ["c9"]
+
+
+def _fork_reflection(path, tmp_path, head):
+    """A reflection naming H, made on a fork of H after the fix F existed."""
+    _git(path, "checkout", "-q", "-b", "fork", head)
+    sha = _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=120))
+    return sha
+
+
+def test_a_reflection_on_a_fork_never_credits(pr, tmp_path):
+    """c4278817070: the head a reflection names is on the line, but the
+    reflection commit is not; a rationalisation made after the fix, on a
+    fork, credits nothing."""
+    path, base, head, fix = pr
+    budget = _late_budget(path, base, fix, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])
+    _fork_reflection(path, tmp_path, head)
+    assert _credit(path, budget) == set()
+
+
+def test_a_fork_reflection_merged_in_still_never_credits(pr, tmp_path):
+    """Merged in as a second parent, the fork's reflection becomes an ancestor
+    of the tip, which an ancestor-either-way check would accept; the fix F
+    still does not descend from it, so it credits nothing."""
+    path, base, head, fix = pr
+    _fork_reflection(path, tmp_path, head)
+    _git(path, "checkout", "-q", "feat/x")
+    _git(
+        path, "merge", "-q", "--no-ff", "-m", "merge fork", "fork", when=T0 + timedelta(minutes=130)
+    )
+    merged = _git(path, "rev-parse", "HEAD")
+    budget = _late_budget(path, base, merged, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])
+    late = rl.late_findings(budget, CUT, rl.fix_time_reader(str(path), merged))
+    assert [i["key"] for i in late] == ["c9"]
+    assert rl.covered_late_keys(str(path), budget, late, gate_lane=False, acceptance=None) == set()
+
+
+def test_a_fork_reflection_that_pulls_the_fix_in_still_never_credits(pr, tmp_path):
+    """The other orientation: the fork merges the PR branch into itself, so
+    the reflection is on the merge's FIRST parent; F still does not descend
+    from it, so it credits nothing."""
+    path, base, head, fix = pr
+    _fork_reflection(path, tmp_path, head)
+    _git(path, "merge", "-q", "--no-ff", "-m", "pull", "feat/x", when=T0 + timedelta(minutes=130))
+    merged = _git(path, "rev-parse", "HEAD")
+    budget = _late_budget(path, base, merged, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])
+    late = rl.late_findings(budget, CUT, rl.fix_time_reader(str(path), merged))
+    assert [i["key"] for i in late] == ["c9"]
+    assert rl.covered_late_keys(str(path), budget, late, gate_lane=False, acceptance=None) == set()
+
+
+def test_a_reflection_the_tip_never_reached_never_credits(pr, tmp_path):
+    """With no fix after H, every fix trivially descends from any reflection;
+    a reflection on a fork the PR tip does not contain (and is not ahead of)
+    still credits nothing: it is not on the PR at all."""
+    path, base, head, _ = pr
+    _git(path, "reset", "-q", "--hard", head)
+    empty = _reflect(path, tmp_path, "wip\n", T0 + timedelta(minutes=2))
+    budget = _late_budget(path, base, empty, [_rv(empty, _at(3)), _rv(head, _at(5), 9)])
+    assert budget["findings"][0]["late"] is True
+    _git(path, "checkout", "-q", "-b", "fork", head)
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=8))
+    assert _credit(path, budget) == set()
+
+
+def test_a_fix_reordered_after_the_reflection_still_counts_before_it(pr, tmp_path):
+    """The re-audit's case: the fix F (authored +60) is reordered after a
+    reflection R (+120) by a rebase and force-pushed. F now descends from R,
+    but it was authored first, and the owe rule dates it there."""
+    path, base, head, _ = pr
+    budget_reviews = [_rv(head, _at(0), 1), _rv(head, _at(90), 9)]
+    _git(path, "checkout", "-q", "-b", "reordered", head)
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=120))
+    # The fix keeps its author time (+60); only the committer time moves.
+    stamp = (T0 + timedelta(minutes=125)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+    subprocess.run(
+        ["git", "-C", str(path), "cherry-pick", "feat/x"],
+        check=True,
+        capture_output=True,
+        env={**os.environ, "GIT_COMMITTER_DATE": stamp},
+    )
+    tip = _git(path, "rev-parse", "HEAD")
+    assert rl.fix_time_reader(str(path), tip)(head) == T0 + timedelta(minutes=60)
+    budget = _late_budget(path, base, tip, budget_reviews)
+    assert _credit(path, budget) == set()
+
+
+def test_a_fork_reflection_before_a_sibling_fix_is_refused(pr, tmp_path):
+    """Stated residual, failing closed: R is made on a fork of H before any
+    fix exists, a fix F then lands on the PR line, and the fork is merged.
+    F was authored after R but does not descend from it, so R is refused;
+    by time alone it would credit."""
+    path, base, head, _ = pr
+    _git(path, "reset", "-q", "--hard", head)
+    empty = _reflect(path, tmp_path, "wip\n", T0 + timedelta(minutes=2))
+    _git(path, "checkout", "-q", "-b", "fork", head)
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=8))
+    _git(path, "checkout", "-q", "feat/x")
+    _change(path, "f\n", T0 + timedelta(minutes=20))
+    _git(
+        path, "merge", "-q", "--no-ff", "-m", "merge fork", "fork", when=T0 + timedelta(minutes=30)
+    )
+    tip = _git(path, "rev-parse", "HEAD")
+    budget = _late_budget(path, base, tip, [_rv(empty, _at(3)), _rv(head, _at(5), 9)])
+    assert budget["findings"][0]["late"] is True
+    assert _credit(path, budget) == set()
+
+
+def test_each_reflection_is_judged_by_its_own_heads_fixes(pr, tmp_path):
+    """Pins the memo key: R2 (naming the merge M) has only the later fix K
+    after its head, while R1 (a fork reflection naming H) has every fix. If
+    R1 were judged by R2's set it would credit c9."""
+    path, base, head, fix = pr
+    second = _change(path, "z2\n", T0 + timedelta(minutes=100))
+    _fork_reflection(path, tmp_path, head)
+    _git(path, "checkout", "-q", "feat/x")
+    _git(
+        path, "merge", "-q", "--no-ff", "-m", "merge fork", "fork", when=T0 + timedelta(minutes=110)
+    )
+    merged = _git(path, "rev-parse", "HEAD")
+    _reflect(path, tmp_path, _block(["c7"], merged), T0 + timedelta(minutes=115))
+    tip = _change(path, "z3\n", T0 + timedelta(minutes=120))
+    assert second != tip
+    budget = _late_budget(path, base, tip, [_rv(head, _at(0), 1), _rv(head, _at(80), 9)])
+    assert _credit(path, budget) == set()
+
+
+def test_a_pushed_reflection_on_the_line_credits(pr, tmp_path):
+    """The control: a reflection on the PR line before the fix, already
+    pushed (the tip descends from it), credits its late key."""
+    path, base, head, _ = pr
+    _git(path, "reset", "-q", "--hard", head)
+    empty = _reflect(path, tmp_path, "wip\n", T0 + timedelta(minutes=2))
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=8))
+    fix = _change(path, "z\n", T0 + timedelta(minutes=60))
+    reviews = [_rv(empty, _at(3)), _rv(head, _at(5), 9)]
+    budget = _late_budget(path, base, fix, reviews)
+    assert budget["findings"][0]["late"] is True
+    assert _credit(path, budget) == {"c9"}
+
+
 # -- earlier rounds' classes, by ancestry (Codex c4273454993) ----------------------
 
 

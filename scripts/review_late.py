@@ -270,29 +270,29 @@ def late_owed(
     return keys, [key for key in keys if key not in done]
 
 
-def _fix_times(cwd: str, base: str, head: str) -> list[datetime]:
-    """The author time of every fix on the LINE from ``base`` to ``head``
-    (``--ancestry-path``: descendants of ``base`` that ``head`` reaches, so a
-    side branch's own commits drop out and the merge that brought it in
-    stays): each commit that is a merge or changes the tree (an empty
-    reflection commit is no fix). The owe rule (earliest fix to the current
-    head) and the credit rule (latest fix to the reflection's head) read the
-    same line, so a key owed is answerable until the next fix lands. A fix
-    committed while a key is owed leaves it owed for good: the commit gate
-    that sets the cutover must stop that commit. The AUTHOR time, the earlier
-    of the two: amending a fix rewrites only its committer time (owner ruling
-    2026-10-13). Raises ``Refused`` when git cannot say."""
+def _fixes(cwd: str, base: str, head: str) -> dict[str, datetime]:
+    """Every fix after ``base`` on the way to ``head``, with its author time:
+    each descendant of ``base`` that ``head`` reaches (``--ancestry-path``)
+    and that is a merge or changes the tree (an empty reflection commit is no
+    fix). A branch forked from ``base`` and merged later counts from its own
+    commits on, before the merge brings it to the PR: local git records no
+    push order, and a merge's parent order is the merger's choice (a pull from
+    a stale worktree reverses it), so no reading of one line is safe. Reading
+    every path can only owe early and credit less, never the reverse. The
+    AUTHOR time, the earlier of the two: amending a fix rewrites only its
+    committer time (owner ruling 2026-10-13). Raises ``Refused`` when git
+    cannot say."""
     code, out, _ = rr._run(
         ["git", "-C", cwd, "log", "--ancestry-path", "--format=%H %T %P|%at", f"{base}..{head}"]
     )
     if code != 0:
         raise rr.Refused(f"git log {base[:12]}..{head[:12]} failed")
-    times = []
+    found: dict[str, datetime] = {}
     for row in out.split("\n"):
         if not row.strip():
             continue
         names, _, stamp = row.partition("|")
-        _, tree, *parents = names.split()
+        sha, tree, *parents = names.split()
         if (
             len(parents) == 1
             and tree == rr._git(cwd, "rev-parse", f"{parents[0]}^{{tree}}").strip()
@@ -301,10 +301,19 @@ def _fix_times(cwd: str, base: str, head: str) -> list[datetime]:
         if not stamp.strip().isdigit():
             raise rr.Refused(f"a fix after {base[:12]} has no readable author time")
         try:
-            times.append(datetime.fromtimestamp(int(stamp), UTC))
+            found[sha] = datetime.fromtimestamp(int(stamp), UTC)
         except (ValueError, OverflowError, OSError) as exc:
             raise rr.Refused(f"a fix after {base[:12]} has an unusable author time") from exc
-    return times
+    return found
+
+
+def _fix_times(cwd: str, base: str, head: str) -> list[datetime]:
+    """The author times of ``_fixes``. The owe rule (earliest fix to the
+    current head) and the credit rule (latest fix to the reflection's head)
+    read the same set, so a key owed is answerable until the next fix lands.
+    A fix committed while a key is owed leaves it owed for good: the commit
+    gate that sets the cutover must stop that commit."""
+    return sorted(_fixes(cwd, base, head).values())
 
 
 def fix_time_reader(cwd: str, current: str) -> Callable[[str], datetime | None]:
@@ -328,6 +337,15 @@ def _is_ancestor(cwd: str, sha: str, of: str) -> bool:
     if code in (0, 1):
         return code == 0
     raise rr.Refused(f"git merge-base --is-ancestor {sha[:12]} {of[:12]} failed")
+
+
+def _descendants(cwd: str, sha: str, current: str) -> set[str]:
+    """Every commit after ``sha`` that ``current`` reaches through it
+    (``rev-list --ancestry-path``). Raises ``Refused`` when git cannot say."""
+    code, out, _ = rr._run(["git", "-C", cwd, "rev-list", "--ancestry-path", f"{sha}..{current}"])
+    if code != 0:
+        raise rr.Refused(f"git rev-list {sha[:12]}..{current[:12]} failed")
+    return set(out.split())
 
 
 def _prior_labels(
@@ -365,6 +383,16 @@ def covered_late_keys(
     - R is an empty commit made before any fix to N (``before_any_fix``);
     - N is the current head or in its history, and N is H or descends from it
       (from the budget's commit graph; unknown ancestry never credits);
+    - R came before every fix that reached the current head: each fix after
+      N on the way to the tip descends from R and was authored no earlier
+      than R (or R is ahead of the tip locally). This never reads a merge's
+      parent order, so a reflection made on a fork of N after a fix credits
+      nothing, whichever way the fork was merged, and a fix reordered after R
+      by a rebase still counts as before it. Stated residuals, both failing
+      closed because local git records no push order: a reflection already
+      pushed and then put on a merge's second parent by a pull from a stale
+      worktree is refused, and so is a reflection made before any fix when a
+      side branch forked from N carries a fix merged in after it;
     - S is no later than T: an answer cannot predate its finding;
     - when N is not H, S is after the LATEST fix on the way from H to N (author
       time). A review that arrived before a fix was owed before it, and a
@@ -385,6 +413,7 @@ def covered_late_keys(
     labels: dict[tuple[tuple[str, ...], str], list[str]] = {}
     checked: dict[tuple[str, RoundContext], bool] = {}
     fix_times: dict[tuple[str, str], datetime | None] = {}
+    fix_sets: dict[str, dict[str, datetime]] = {}
     covered: set[str] = set()
     for sha, kind, body, made_at in log:
         if deadline is not None and time.monotonic() > deadline:
@@ -397,6 +426,18 @@ def covered_late_keys(
             continue
         if not rr.before_any_fix(cwd, head, sha):
             continue
+        if not _is_ancestor(cwd, str(current), sha):
+            if not _is_ancestor(cwd, sha, str(current)):
+                continue
+            if head not in fix_sets:
+                fix_sets[head] = _fixes(cwd, head, str(current))
+            if not set(fix_sets[head]) <= _descendants(cwd, sha, str(current)):
+                continue
+            # By time as well as by graph: a fix authored before R and then
+            # reordered after it (a rebase or cherry-pick, force-pushed)
+            # descends from R yet is the fix the owe rule dates.
+            if any(when < made_at for when in fix_sets[head].values()):
+                continue
         for item in late:
             key = item["key"]
             if key in covered or key not in parsed.keys:
