@@ -836,6 +836,35 @@ def test_status_owes_late_keys_only_from_a_cutover(pr, tmp_path, monkeypatch, ca
     assert '"late_keys": [\n    "c9"\n  ]' in capsys.readouterr().out
 
 
+def test_status_reads_no_pr_body_for_a_round_zero_only_debt(pr, tmp_path, monkeypatch):
+    """Round 0 owes no acceptance check, so a body that changed between the
+    budget's two reads never makes a round-0-only debt unknown; a debt under
+    a real round still refuses."""
+    path, base, head, fix = pr
+    budget = _round_zero(path, base, head, fix)
+    _status_env(monkeypatch, budget)
+    budget["body_changed"] = True
+    assert rr.status(str(path), now=T0, cutover=CUT)["owed"] == ["c9"]
+    other = _late_budget(path, base, fix, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])
+    _status_env(monkeypatch, other)
+    other["body_changed"] = True
+    with pytest.raises(rr.Refused):
+        rr.status(str(path), now=T0, cutover=CUT)
+
+
+def test_an_unusable_author_time_refuses(pr, tmp_path):
+    path, base, head, fix = pr
+    (path / "f.txt").write_text("far\n")
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-q", "-am", "far"],
+        check=True,
+        env={**os.environ, "GIT_AUTHOR_DATE": "@99999999999999 +0000"},
+    )
+    far = _git(path, "rev-parse", "HEAD")
+    with pytest.raises(rr.Refused):
+        rl._fix_times(str(path), head, far)
+
+
 def test_status_never_lets_the_open_rounds_coverage_clear_a_late_key(pr, monkeypatch):
     path, base, head, fix = pr
     reviews = [_rv(head, _at(0), 1), _rv(head, _at(90), 9), _rv(fix, _at(95), 2)]

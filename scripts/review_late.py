@@ -300,7 +300,10 @@ def _fix_times(cwd: str, base: str, head: str) -> list[datetime]:
             continue
         if not stamp.strip().isdigit():
             raise rr.Refused(f"a fix after {base[:12]} has no readable author time")
-        times.append(datetime.fromtimestamp(int(stamp), UTC))
+        try:
+            times.append(datetime.fromtimestamp(int(stamp), UTC))
+        except (ValueError, OverflowError, OSError) as exc:
+            raise rr.Refused(f"a fix after {base[:12]} has an unusable author time") from exc
     return times
 
 
@@ -439,6 +442,18 @@ def covered_late_keys(
     return covered
 
 
+def _needs_acceptance(budget: Mapping[str, Any], late: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether any late key is answered under a round above 0, the only
+    contexts whose ``check`` reads the acceptance points."""
+    _, ancestors = _ancestry(budget)
+    latest = datetime.max.replace(tzinfo=UTC)
+    return any(
+        context.round_number > 0
+        for item in late
+        for context in (_contexts(budget, item, latest, ancestors) or [])
+    )
+
+
 def late_status(
     cwd: str,
     budget: Mapping[str, Any],
@@ -461,7 +476,12 @@ def late_status(
     late = late_findings(budget, cutover, fix_time) if ok else []
     if not (is_open or late):
         return state
-    acceptance = rr._acceptance(budget, repo, number)
+    # Only the open round and late keys judged under a real round read the
+    # PR's acceptance points; round 0 owes the grammar alone, so a PR body that
+    # cannot be read never makes a round-0-only debt unknown.
+    acceptance = (
+        rr._acceptance(budget, repo, number) if is_open or _needs_acceptance(budget, late) else None
+    )
     covered = rr._open_covered(cwd, budget, state, acceptance) if is_open else set()
     late_covered = (
         covered_late_keys(
