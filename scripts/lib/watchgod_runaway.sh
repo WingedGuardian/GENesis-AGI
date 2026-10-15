@@ -462,7 +462,9 @@ wg_runaway_check() {
                 && (( ${_RW_PREV[$gen]} / 1048576 * 100 >= DG_RUNAWAY_PCT * dtotal )); then
             size_armed=0
         fi
+        local over=0
         if (( size_armed && size_mb * 100 >= DG_RUNAWAY_PCT * dtotal )); then
+            over=1
             why="it alone uses $(( size_mb * 100 / dtotal ))% of ${dpath} (threshold ${DG_RUNAWAY_PCT}%)"
         fi
         grew=0
@@ -485,12 +487,17 @@ wg_runaway_check() {
         # paused (its emptying is still owed, whatever its size: review
         # finding, a paused file under the size threshold was never retried).
         # Never on size alone otherwise: a writer someone thawed would be
-        # paused again for the size it left behind. Never on a reason carried
+        # paused again for the size it left behind. The one size exception: a
+        # file over the size threshold within the episode this guardian's own
+        # emptying opened, whose size was all written after it (review
+        # finding: a missed writer refilling slowly). Never on a reason carried
         # from an earlier poll, and never on the poll that opened an episode.
         _RW_ACTED=""; _RW_PAUSED_NOW=0; _RW_EMPTIED=0; _RW_OWED=0
         if (( ! opened )) && [[ "${RW_TIER[$dkey]:-}" == orange || "${RW_TIER[$dkey]:-}" == red ]] \
                 && _rw_task_output "$path" \
-                && { (( grew )) || { _rw_all_paused "$key" "${holders[@]}" && _RW_OWED=1; }; }; then
+                && { (( grew )) \
+                     || { (( over )) && [[ -n "${_RW_EP[$gen]:-}" && "${_RW_EMPTIED_EP[$gen]:-}" == "${_RW_EP[$gen]}" ]]; } \
+                     || { _rw_all_paused "$key" "${holders[@]}" && _RW_OWED=1; }; }; then
             if (( ! WATCHGOD_ACT )); then
                 _wg_warn_once "rw_obs_${gen}" "OBSERVE: would pause the command writing $(_rw_show "$path") (pid ${holders[*]})"
             elif (( ! walk_ok )); then
@@ -560,6 +567,7 @@ wg_runaway_check() {
                   "_RW_LINKS[$gen]" "_RW_DUE[$gen]" "_RW_DUE[${gen}_observe]"
             # Its tail markers too (watchgod_act.sh; one per episode).
             for k in "${!_RW_TAILED[@]}"; do [[ "$k" == "$gen:"* ]] && unset "_RW_TAILED[$k]"; done
+            unset "_RW_EMPTIED_EP[$gen]"
         done
     fi
 
