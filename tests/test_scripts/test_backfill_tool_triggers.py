@@ -523,3 +523,26 @@ async def test_a_blob_trigger_is_reported_not_fatal(db, capsys):
     counts = await backfill_module.backfill(db, apply=False)
     assert counts["all_dropped"] == 1
     assert '"id": "blob"' in capsys.readouterr().out
+
+
+def test_a_closed_stdout_keeps_the_exit_code(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    read_end, write_end = os.pipe()
+    os.close(read_end)  # the reader is gone before the first line
+    root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "src"), os.environ.get("PYTHONPATH", "")])}
+    try:
+        done = subprocess.run(
+            [sys.executable, str(root / "scripts" / "backfill_tool_triggers.py"), "--db", str(tmp_path / "missing.db")],
+            stdout=write_end,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=120,
+        )
+    finally:
+        os.close(write_end)
+    assert done.returncode == 2, done.stderr.decode()  # "No database", not a traceback or 120
+    assert b"Traceback" not in done.stderr

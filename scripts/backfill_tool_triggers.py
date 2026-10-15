@@ -43,6 +43,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import sqlite3
 import sys
 from collections import Counter
@@ -151,7 +152,7 @@ async def _main(db_path: Path, apply: bool, *, rebuild_cache: bool = False) -> i
     import aiosqlite
 
     if not Path(db_path).is_file():  # never create a database at a mistyped path
-        print(f"No database at {db_path}")
+        _say(f"No database at {db_path}")
         return 2
     # Admission fence (fail-closed): never write to a quarantined or restoring database.
     hooks = str(Path(__file__).resolve().parent / "hooks")
@@ -164,7 +165,7 @@ async def _main(db_path: Path, apply: bool, *, rebuild_cache: bool = False) -> i
     except Exception:
         fenced = True
     if fenced:
-        print(
+        _say(
             f"{db_path} is fenced (quarantined, restoring, or the fence is unreadable); not opened"
         )
         return 3
@@ -175,23 +176,23 @@ async def _main(db_path: Path, apply: bool, *, rebuild_cache: bool = False) -> i
         try:  # admission is checked again before and after the open
             db = await connect_aiosqlite_rw(db_path, existing_only=True)
         except DatabaseIntegrityError as exc:  # the admission refusal
-            print(f"{db_path} is fenced; not opened for writing: {exc}")
+            _say(f"{db_path} is fenced; not opened for writing: {exc}")
             return 3
         except Exception as exc:
-            print(f"{db_path} not opened for writing: {exc}")
+            _say(f"{db_path} not opened for writing: {exc}")
             return 2
     else:  # a dry run never writes: an encoded read-only URI (as_uri escapes ? and #)
         try:
             db = await aiosqlite.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
         except (sqlite3.Error, OSError) as exc:
-            print(f"{db_path} not opened: {exc}")
+            _say(f"{db_path} not opened: {exc}")
             return 2
     try:
         db.row_factory = aiosqlite.Row  # the cache regeneration reads rows by name
         columns = {r[1] for r in await db.execute_fetchall("PRAGMA table_info(procedural_memory)")}
         missing = sorted({"id", "tool_trigger", "trigger_spec", "lesson", "deprecated"} - columns)
         if missing:
-            print(
+            _say(
                 f"procedural_memory lacks {', '.join(missing)}: run after the schema migration "
                 "(server start)."
             )
@@ -216,7 +217,7 @@ async def _main(db_path: Path, apply: bool, *, rebuild_cache: bool = False) -> i
             )
     except sqlite3.Error as exc:  # not a database, unreadable, or locked past the busy timeout
         # Raised before the commit, so an apply wrote nothing (close rolls it back).
-        print(f"{db_path}: database unreadable or busy, nothing written: {exc}")
+        _say(f"{db_path}: database unreadable or busy, nothing written: {exc}")
         return 2
     finally:
         try:
@@ -241,8 +242,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     from genesis.env import genesis_db_path
 
-    sys.exit(
-        asyncio.run(
-            _main(args.db or genesis_db_path(), args.apply, rebuild_cache=args.rebuild_cache)
-        )
+    code = asyncio.run(
+        _main(args.db or genesis_db_path(), args.apply, rebuild_cache=args.rebuild_cache)
     )
+    try:  # a reader that closed the pipe must not turn the exit code into 120
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):  # drop what is left; the run's result stands
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    sys.exit(code)
