@@ -29,7 +29,12 @@ def flag_dir(tmp_path: Path) -> Path:
 class TestSessionContextHook:
     def test_outputs_nothing_when_flag_absent(self, tmp_path: Path) -> None:
         """No flag file → no output."""
-        env = {"HOME": str(tmp_path), "PATH": "/usr/bin"}
+        env = {
+            "HOME": str(tmp_path),
+            "GENESIS_DB_PATH": str(tmp_path / "no-genesis.db"),
+            "SECRETS_PATH": str(tmp_path / "no-secrets.env"),
+            "PATH": "/usr/bin",
+        }
         result = subprocess.run(
             [_PYTHON, str(_CONTEXT_SCRIPT)],
             capture_output=True,
@@ -47,6 +52,8 @@ class TestSessionContextHook:
         """GENESIS_CC_SESSION=1 → skips identity/cognitive but outputs capabilities."""
         env = {
             "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
+            "SECRETS_PATH": str(flag_dir.parent / "no-secrets.env"),
             "PATH": "/usr/bin",
             "GENESIS_CC_SESSION": "1",
         }
@@ -73,7 +80,12 @@ class TestSessionContextHook:
         fixes). `all` is the manual/test path that keeps this test's original
         whole-injection meaning.
         """
-        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
+        env = {
+            "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
+            "SECRETS_PATH": str(flag_dir.parent / "no-secrets.env"),
+            "PATH": "/usr/bin",
+        }
         result = subprocess.run(
             [_PYTHON, str(_CONTEXT_SCRIPT), "--part", "all"],
             capture_output=True,
@@ -94,7 +106,12 @@ class TestSessionContextHook:
         The hook now echoes the directive into the high-salience top block — if
         that echo is dropped, the header silently stops appearing again.
         """
-        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
+        env = {
+            "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
+            "SECRETS_PATH": str(flag_dir.parent / "no-secrets.env"),
+            "PATH": "/usr/bin",
+        }
         result = subprocess.run(
             [_PYTHON, str(_CONTEXT_SCRIPT)],
             capture_output=True,
@@ -110,7 +127,12 @@ class TestSessionContextHook:
 
     def test_writes_session_start_file(self, flag_dir: Path) -> None:
         """Hook should write session start timestamp for urgent-alerts hook."""
-        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
+        env = {
+            "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
+            "SECRETS_PATH": str(flag_dir.parent / "no-secrets.env"),
+            "PATH": "/usr/bin",
+        }
         subprocess.run(
             [_PYTHON, str(_CONTEXT_SCRIPT)],
             capture_output=True,
@@ -131,7 +153,12 @@ class TestSessionContextHook:
         Foreground sessions use the essential_knowledge path and degrade
         silently by design — missing EK is advisory, not an error.
         """
-        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
+        env = {
+            "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
+            "SECRETS_PATH": str(flag_dir.parent / "no-secrets.env"),
+            "PATH": "/usr/bin",
+        }
         result = subprocess.run(
             [_PYTHON, str(_CONTEXT_SCRIPT)],
             capture_output=True,
@@ -152,6 +179,8 @@ class TestSessionContextHook:
         """
         env = {
             "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
+            "SECRETS_PATH": str(flag_dir.parent / "no-secrets.env"),
             "PATH": "/usr/bin",
             "GENESIS_CC_SESSION": "1",
         }
@@ -288,7 +317,12 @@ class TestStatusHeaderStdinModel:
 
     def test_resume_without_model_recovers_from_cache(self, flag_dir: Path) -> None:
         """startup writes the cache; a later resume (model omitted) reads it back."""
-        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
+        env = {
+            "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
+            "SECRETS_PATH": str(flag_dir.parent / "no-secrets.env"),
+            "PATH": "/usr/bin",
+        }
         sid = "resume-sess-1"
         subprocess.run(
             [_PYTHON, str(_CONTEXT_SCRIPT)],
@@ -311,7 +345,12 @@ class TestStatusHeaderStdinModel:
 
     def test_hook_model_field_drives_header(self, flag_dir: Path) -> None:
         """A `model` in stdin JSON produces an exact, authoritative header."""
-        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
+        env = {
+            "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
+            "SECRETS_PATH": str(flag_dir.parent / "no-secrets.env"),
+            "PATH": "/usr/bin",
+        }
         result = subprocess.run(
             [_PYTHON, str(_CONTEXT_SCRIPT)],
             input='{"model": "claude-opus-4-8", "source": "compact"}',
@@ -325,7 +364,12 @@ class TestStatusHeaderStdinModel:
 
     def test_no_stdin_keeps_env_derivation_header(self, flag_dir: Path) -> None:
         """Backward compat: no stdin/model → legacy `[<model> / high]` directive."""
-        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
+        env = {
+            "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
+            "SECRETS_PATH": str(flag_dir.parent / "no-secrets.env"),
+            "PATH": "/usr/bin",
+        }
         result = subprocess.run(
             [_PYTHON, str(_CONTEXT_SCRIPT)],
             capture_output=True,
@@ -355,6 +399,7 @@ class TestOnboardingInjection:
         secrets.write_text(secrets_body)
         env = {
             "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
             "PATH": "/usr/bin",
             "PYTHONPATH": self._SRC,
             "SECRETS_PATH": str(secrets),
@@ -411,7 +456,12 @@ class TestOnboardingInjection:
 class TestUrgentAlertsHook:
     def test_outputs_nothing_when_flag_absent(self, tmp_path: Path) -> None:
         """No flag file → no output."""
-        env = {"HOME": str(tmp_path), "PATH": "/usr/bin"}
+        env = {
+            "HOME": str(tmp_path),
+            "GENESIS_DB_PATH": str(tmp_path / "no-genesis.db"),
+            "SECRETS_PATH": str(tmp_path / "no-secrets.env"),
+            "PATH": "/usr/bin",
+        }
         result = subprocess.run(
             [_PYTHON, str(_ALERTS_SCRIPT)],
             capture_output=True,
@@ -426,6 +476,8 @@ class TestUrgentAlertsHook:
         """GENESIS_CC_SESSION=1 → no output."""
         env = {
             "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
+            "SECRETS_PATH": str(flag_dir.parent / "no-secrets.env"),
             "PATH": "/usr/bin",
             "GENESIS_CC_SESSION": "1",
         }
@@ -441,7 +493,12 @@ class TestUrgentAlertsHook:
 
     def test_outputs_nothing_when_no_alerts(self, flag_dir: Path) -> None:
         """Flag present, no DB → no alerts (graceful)."""
-        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
+        env = {
+            "HOME": str(flag_dir.parent),
+            "GENESIS_DB_PATH": str(flag_dir.parent / "no-genesis.db"),
+            "SECRETS_PATH": str(flag_dir.parent / "no-secrets.env"),
+            "PATH": "/usr/bin",
+        }
         result = subprocess.run(
             [_PYTHON, str(_ALERTS_SCRIPT)],
             capture_output=True,
