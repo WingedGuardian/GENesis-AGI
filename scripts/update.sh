@@ -262,12 +262,33 @@ _on_signal_prestop() {
     # if the interrupt already took it down — either way it ends up running. The
     # bridge uses `start`, a no-op when still running. No rollback is needed
     # here: nothing has been merged yet.
-    local _svc
+    local _svc _seen=" "
     for _svc in "${WERE_RUNNING[@]:-}"; do
         [ -n "$_svc" ] || continue
+        _seen+="$_svc "
         if [ "$_svc" = "genesis-server" ]; then
             _start_genesis_server 2>/dev/null \
                 || systemctl --user restart genesis-server.service 2>/dev/null || true
+        else
+            systemctl --user start "$_svc.service" 2>/dev/null || true
+        fi
+    done
+    # On `live` an interrupt can land in the rebuild, before WERE_RUNNING is read
+    # and before anything was stopped. What ran when the marker was taken
+    # (_LIVE_WERE_RUNNING) is only STARTED, and only if it is down now: a server
+    # still running keeps running (never bounced onto a moved tree), and one that
+    # died meanwhile comes back on the checkout as it stands, which the moved
+    # message then says.
+    for _svc in "${_LIVE_WERE_RUNNING[@]:-}"; do
+        [ -n "$_svc" ] || continue
+        [[ "$_seen" == *" $_svc "* ]] && continue
+        _seen+="$_svc "
+        if [ "$_svc" = "genesis-server" ]; then
+            if ! systemctl --user is-active --quiet genesis-server.service 2>/dev/null \
+                && ! pgrep -f "python -m genesis serve" >/dev/null 2>&1; then
+                _start_genesis_server 2>/dev/null || true
+                _LIVE_STOPPED=1
+            fi
         else
             systemctl --user start "$_svc.service" 2>/dev/null || true
         fi
@@ -389,6 +410,7 @@ fi
 # Never inherited: only the verdict below sets them.
 ON_LIVE=0
 _LIVE_BASE=""
+_LIVE_WERE_RUNNING=()
 if ! genesis_deploy_branch_ok "$GENESIS_ROOT" --allow-override; then
     _live_rc=1
     if [ "$_branch" = live ]; then
@@ -601,6 +623,14 @@ if [ "${ON_LIVE:-0}" = 1 ]; then
         echo "       Move any commit made on live to a branch, then run scripts/deploy_candidates rebuild. Nothing was changed."
         exit 1
     fi
+    # The snapshot's authority check comes from the reviewed base, as the managed
+    # units checker does: on `live` the checkout holds candidates, and a candidate's
+    # peer_restore.py must never be what clears the rollback snapshot.
+    if ! _PEER_RESTORE_PY="$(git -C "$GENESIS_ROOT" show "$_LIVE_BASE:src/genesis/db/crud/peer_restore.py" 2>/dev/null)" \
+        || [ -z "$_PEER_RESTORE_PY" ]; then
+        echo "ERROR: src/genesis/db/crud/peer_restore.py cannot be read from the base live was rebuilt on (${_LIVE_BASE:0:12}). Nothing was changed."
+        exit 1
+    fi
     DEPLOY_HEAD="$_LIVE_BASE"
     OLD_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$_LIVE_BASE" 2>/dev/null || echo "untagged")
     OLD_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short "$_LIVE_BASE")
@@ -628,8 +658,19 @@ if [ -x "$GENESIS_ROOT/scripts/backup.sh" ]; then
 
     _backup_gate=""
     _backup_gate_rc=0
-    _backup_gate=$(python3 "$GENESIS_ROOT/scripts/lib/backup_status_gate.py" \
-        "${GENESIS_HOME:-$HOME/.genesis}/backup_status.json" "$_backup_run_id") || _backup_gate_rc=$?
+    # On `live` the checkout holds candidates; the gate that decides abort or
+    # continue comes from the reviewed base (an unreadable base copy fails closed
+    # through the gate's error branch).
+    if [ "${ON_LIVE:-0}" = 1 ]; then
+        _gate_src="$(git -C "$GENESIS_ROOT" show "$_LIVE_BASE:scripts/lib/backup_status_gate.py" 2>/dev/null)" || _gate_src=""
+        # An empty program exits 0: an empty or unreadable base copy aborts instead.
+        [ -n "$_gate_src" ] || _gate_src='raise SystemExit(3)'
+        _backup_gate=$(python3 -I -S -c "$_gate_src" \
+            "${GENESIS_HOME:-$HOME/.genesis}/backup_status.json" "$_backup_run_id") || _backup_gate_rc=$?
+    else
+        _backup_gate=$(python3 "$GENESIS_ROOT/scripts/lib/backup_status_gate.py" \
+            "${GENESIS_HOME:-$HOME/.genesis}/backup_status.json" "$_backup_run_id") || _backup_gate_rc=$?
+    fi
     case "$_backup_gate_rc" in
         0)
             if [ "$_backup_rc" -eq 0 ]; then
@@ -1437,6 +1478,16 @@ trap '_on_signal_prestop TERM' TERM
 # row. The watchdog defers on the marker, so nothing restarts the server in either
 # window. _live_prestop_exit, on EXIT, releases it on every way out.
 if [ "${ON_LIVE:-0}" = 1 ]; then
+    # What runs now, before the marker holds the watchdog off: a service that
+    # dies during the rebuild is still restarted (merged into WERE_RUNNING at
+    # the stop), never read as stopped by the operator.
+    if systemctl --user is-active --quiet genesis-server.service 2>/dev/null || \
+       pgrep -f "python -m genesis serve" >/dev/null 2>&1; then
+        _LIVE_WERE_RUNNING+=("genesis-server")
+    fi
+    if systemctl --user is-active --quiet genesis-bridge.service 2>/dev/null; then
+        _LIVE_WERE_RUNNING+=("genesis-bridge")
+    fi
     _marker_rc=0
     _acquire_deploy_marker || _marker_rc=$?
     if [ "$_marker_rc" -ne 0 ]; then
@@ -1594,6 +1645,7 @@ _take_db_snapshot() {
             rm -f "$DB_FILE.pre-update.peer-restore" "$DB_FILE.pre-update.peer-restore-wal" \
                 "$DB_FILE.pre-update.peer-restore-shm" "$DB_FILE.pre-update.peer-restore-journal"
             if ! cp "$DB_FILE.pre-update" "$DB_FILE.pre-update.peer-restore" \
+                || [ -z "${_PEER_RESTORE_PY:-}" ] \
                 || ! python3 -I -S -c "$_PEER_RESTORE_PY" "$DB_FILE.pre-update.peer-restore"; then
                 echo "  DATABASE RESTORE AUTHORITY CHECK FAILED — UPDATE ABORTED" >&2
                 return 1
@@ -1765,6 +1817,11 @@ for svc in genesis-bridge; do
     if systemctl --user is-active --quiet "$svc.service" 2>/dev/null; then
         WERE_RUNNING+=("$svc")
     fi
+done
+# On `live`, also what ran before the rebuild (sampled at the marker).
+for svc in "${_LIVE_WERE_RUNNING[@]:-}"; do
+    [ -n "$svc" ] || continue
+    [[ " ${WERE_RUNNING[*]} " == *" $svc "* ]] || WERE_RUNNING+=("$svc")
 done
 
 # Now stop them. From here a SIG* runs _on_signal_prestop, which restarts

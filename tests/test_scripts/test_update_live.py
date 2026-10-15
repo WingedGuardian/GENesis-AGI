@@ -1052,7 +1052,9 @@ def test_f5_the_marker_is_taken_for_every_live_run_before_the_stop():
     text = _text()
     block = _block("live-marker")
     # Gated on `live` alone: never on POST_MERGE, which only decides the tag.
-    assert '\nif [ "${ON_LIVE:-0}" = 1 ]; then\n    _marker_rc=0\n' in "\n" + block
+    gate = block.index('\nif [ "${ON_LIVE:-0}" = 1 ]; then\n')
+    assert "POST_MERGE" not in block[: block.index("_acquire_deploy_marker")]
+    assert gate < block.index("_acquire_deploy_marker")
     assert "_acquire_deploy_marker" in block and "trap '_live_prestop_exit;" in block
     marker = text.index("# BEGIN live-marker")
     assert text.index('_write_state "fetching"') < marker
@@ -1221,3 +1223,278 @@ def test_f3_the_record_follows_the_success_row():
     success = text.index('_record_update_history "success" "" "$_p6_degraded"')
     record = text.index("# BEGIN live-activated-record")
     assert success < record < text.index('_write_state "done"', success)
+
+
+# ── R3-A: what ran before the rebuild is restarted after it ────────────────
+
+_FAKE_SERVICES = """#!/bin/bash
+# systemctl / pgrep stand-in: "running" iff $FAKE_STATE_FILE holds the unit's name.
+state="$(cat "$FAKE_STATE_FILE" 2>/dev/null || true)"
+case "$(basename "$0")" in
+    systemctl) unit="${@: -1}"; unit="${unit%.service}" ;;
+    pgrep) unit=genesis-server ;;
+esac
+[[ " $state " == *" $unit "* ]]
+"""
+
+
+def _stop_detection() -> str:
+    """update.sh's detection of what runs, just before the stop."""
+    text = _text()
+    start = text.index("\nWERE_RUNNING=()\n") + 1
+    return text[start : text.index("# Now stop them.", start)]
+
+
+def _services_env(tmp_path: Path, home: Path) -> tuple[dict[str, str], Path]:
+    bin_ = tmp_path / "fakebin"
+    bin_.mkdir(exist_ok=True)
+    for name in ("systemctl", "pgrep"):
+        (bin_ / name).write_text(_FAKE_SERVICES)
+        (bin_ / name).chmod(0o755)
+    state = tmp_path / "services"
+    env = _env(home, FAKE_STATE_FILE=str(state))
+    env["PATH"] = f"{bin_}{os.pathsep}{env['PATH']}"
+    return env, state
+
+
+def _were_running(plain_live, tmp_path, on_live: str, at_marker: str, at_stop: str) -> list[str]:
+    """Run live-marker with services `at_marker` running, then the stop's
+    detection with `at_stop` running; returns WERE_RUNNING."""
+    root, home, stub, _env_unused, log = plain_live
+    env, state = _services_env(tmp_path, home)
+    script = (
+        # Set where branch-admission sets it, never inherited.
+        f'_LIVE_WERE_RUNNING=()\necho "{at_marker}" > "{state}"\n'
+        + _marker_script(root, on_live, "false")
+        + f'echo "{at_stop}" > "{state}"\n'
+        + _stop_detection()
+        + 'echo "WERE=${WERE_RUNNING[*]:-}"\n'
+    )
+    r = _bash(script, env)
+    assert r.returncode == 0, _out(r)
+    m = re.search(r"^WERE=(.*)$", r.stdout, re.MULTILINE)
+    assert m, _out(r)
+    return m.group(1).split()
+
+
+def test_r3a_a_server_that_died_during_the_rebuild_is_still_restarted(plain_live, tmp_path):
+    assert _were_running(plain_live, tmp_path, "1", "genesis-server", "") == ["genesis-server"]
+
+
+def test_r3a_a_server_still_running_is_listed_once(plain_live, tmp_path):
+    assert _were_running(plain_live, tmp_path, "1", "genesis-server", "genesis-server") == [
+        "genesis-server"
+    ]
+
+
+def test_r3a_main_reads_only_the_stop(plain_live, tmp_path):
+    """Off `live` nothing is sampled at the marker: the stop alone decides."""
+    assert _were_running(plain_live, tmp_path, "0", "genesis-server", "") == []
+    assert _were_running(plain_live, tmp_path, "0", "", "genesis-bridge") == ["genesis-bridge"]
+
+
+def test_r3a_the_sample_precedes_the_marker():
+    block = _block("live-marker")
+    sample = block.index('_LIVE_WERE_RUNNING+=("genesis-server")')
+    assert sample < block.index("_acquire_deploy_marker")
+    assert '_LIVE_WERE_RUNNING+=("genesis-bridge")' in block[: sample + 400]
+    # Never inherited: set where the other `live` variables are.
+    assert "\n_LIVE_WERE_RUNNING=()\n" in _block("branch-admission")
+
+
+# ── R3-B: the restore authority check comes from the reviewed base ─────────
+
+_PEER_PATH = "src/genesis/db/crud/peer_restore.py"
+
+
+def _live_shape(plain_live, base_holds: str | None, tip_holds: str):
+    """`live` = a base (holding ``base_holds`` as peer_restore.py, or no such
+    file) with a candidate commit on top that writes ``tip_holds`` there."""
+    root, home, stub, env, log = plain_live
+    if base_holds is not None:
+        (root / _PEER_PATH).parent.mkdir(parents=True, exist_ok=True)
+        (root / _PEER_PATH).write_text(base_holds)
+        _git(root, "add", "-A")
+        _git(root, "commit", "-qm", "base")
+    base = _git(root, "rev-parse", "HEAD")
+    (root / _PEER_PATH).parent.mkdir(parents=True, exist_ok=True)
+    (root / _PEER_PATH).write_text(tip_holds)
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "candidate")
+    script = (
+        f'GENESIS_ROOT="{root}"\nSCRIPT_DIR="{stub}"\nON_LIVE=1\n'
+        f'_PEER_RESTORE_PY="$(cat "$GENESIS_ROOT/{_PEER_PATH}")"\n'
+        'OLD_TAG=""\nOLD_COMMIT=""\nNEW_TAG=""\nNEW_COMMIT=""\nDEPLOY_HEAD=""\n'
+        + _block("live-shape")
+        + 'printf "PEER=%s\\n" "$_PEER_RESTORE_PY"\n'
+    )
+    return _bash(script, {**env, "STUB_BASE": base})
+
+
+def test_r3b_the_check_is_the_base_copy_not_the_candidate(plain_live):
+    r = _live_shape(plain_live, "print('base')", "print('candidate')")
+    assert r.returncode == 0, _out(r)
+    assert "PEER=print('base')\n" in r.stdout, r.stdout
+
+
+def test_r3b_a_base_without_the_check_refuses(plain_live):
+    r = _live_shape(plain_live, None, "print('candidate')")
+    assert r.returncode == 1, _out(r)
+    assert "cannot be read from the base live was rebuilt on" in r.stdout
+    assert "Nothing was changed." in r.stdout and "PEER=" not in r.stdout
+
+
+def test_r3b_an_empty_check_fails_the_snapshot_closed(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    con = sqlite3.connect(home / "live.db")
+    con.execute("CREATE TABLE t (v TEXT)")
+    con.commit()
+    con.close()
+    script = (
+        _snapshot_defs()
+        + '_PEER_RESTORE_PY=""\n'
+        + 'if _take_db_snapshot; then echo "SNAP=ok $DB_SNAPSHOT_TAKEN"; '
+        + 'else echo "SNAP=refused $DB_SNAPSHOT_TAKEN"; fi\n'
+    )
+    r = _bash(script, _env(home))
+    assert r.returncode == 0, _out(r)
+    assert "SNAP=refused 0" in r.stdout, _out(r)
+    assert "RESTORE AUTHORITY CHECK FAILED" in r.stderr
+
+
+# ── R3-A: an interrupt during the rebuild restores what ran at the marker ────
+
+# systemctl: `is-active` answers from FAKE_SERVER_ACTIVE (1 = active) and is not
+# recorded; every other call is recorded. pgrep: finds a bare server iff FAKE_PGREP=1.
+_RECORDING_SYSTEMCTL = """#!/bin/bash
+for a in "$@"; do
+    if [ "$a" = is-active ]; then [ "${FAKE_SERVER_ACTIVE:-0}" = 1 ]; exit; fi
+done
+echo "systemctl $*" >> "$CALLS"
+exit 0
+"""
+_FAKE_PGREP = '#!/bin/bash\n[ "${FAKE_PGREP:-0}" = 1 ]\n'
+
+
+def _prestop_restarts(
+    tmp_path: Path, were: str, live_were: str, active: bool = False, bare: bool = False
+) -> tuple[list[str], str]:
+    """Run the real _on_signal_prestop with `WERE_RUNNING=(were)` and
+    `_LIVE_WERE_RUNNING=(live_were)`. Returns the service calls it made (a
+    `_start_genesis_server` call is a RESTART, recorded as such) and the
+    `_LIVE_STOPPED` value it left for the moved-message."""
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    for name, body in (("systemctl", _RECORDING_SYSTEMCTL), ("pgrep", _FAKE_PGREP)):
+        (bin_ / name).write_text(body)
+        (bin_ / name).chmod(0o755)
+    calls = tmp_path / "calls"
+    env = _env(
+        tmp_path,
+        CALLS=str(calls),
+        FAKE_SERVER_ACTIVE="1" if active else "0",
+        FAKE_PGREP="1" if bare else "0",
+    )
+    env["PATH"] = f"{bin_}{os.pathsep}{env['PATH']}"
+    script = (
+        f"WERE_RUNNING=({were})\n_LIVE_WERE_RUNNING=({live_were})\nON_LIVE=1\n"
+        '_start_genesis_server() { echo "restart-server" >> "$CALLS"; }\n'
+        '_live_abandon() { echo "LIVE_STOPPED=${_LIVE_STOPPED:-0}"; }\n'
+        "_clear_deploy_state() { :; }\n"
+        + _function("_on_signal_prestop")
+        + "_on_signal_prestop TERM\n"
+    )
+    r = _bash(script, env)
+    assert r.returncode == 1, _out(r)
+    m = re.search(r"^LIVE_STOPPED=(\S*)$", r.stdout, re.MULTILINE)
+    assert m, _out(r)
+    return (calls.read_text().splitlines() if calls.exists() else []), m.group(1)
+
+
+def test_r3a_an_interrupt_brings_back_a_server_that_died_during_the_rebuild(tmp_path):
+    """The rebuild runs before WERE_RUNNING is read: what the marker sampled and
+    is down now comes back, each once, and the moved-message says so."""
+    got, stopped = _prestop_restarts(tmp_path, "", "genesis-server genesis-bridge")
+    assert got == ["restart-server", "systemctl --user start genesis-bridge.service"], got
+    assert stopped == "1"
+
+
+def test_r3a_an_interrupt_never_bounces_a_running_server(tmp_path):
+    """A server still running when the rebuild is interrupted gets no call: a
+    restart would put it on the moved tree without activation."""
+    got, stopped = _prestop_restarts(tmp_path, "", "genesis-server genesis-bridge", active=True)
+    assert got == ["systemctl --user start genesis-bridge.service"], got
+    assert stopped == "0"
+
+
+def test_r3a_an_interrupt_leaves_a_bare_server_alone(tmp_path):
+    """Not active per systemd, but a bare `genesis serve` runs: still running."""
+    got, stopped = _prestop_restarts(tmp_path, "", "genesis-server", bare=True)
+    assert got == [], got
+    assert stopped == "0"
+
+
+def test_r3a_an_interrupt_restarts_a_service_listed_twice_once(tmp_path):
+    got, _stopped = _prestop_restarts(tmp_path, "genesis-server", "genesis-server")
+    assert got == ["restart-server"], got
+
+
+# ── R3-B: on `live` the backup gate is the reviewed base's ─────────────────
+
+_PASS_GATE = 'print("ok")\nraise SystemExit(0)\n'
+
+
+def _backup_region() -> str:
+    text = _text()
+    start = text.index("# ── Pre-update backup")
+    return text[start : text.index("# ── Dirty-tree guard", start)]
+
+
+def _gate_run(plain_live, on_live: str, base_gate: str | None) -> subprocess.CompletedProcess:
+    """`live` whose base holds ``base_gate`` as backup_status_gate.py (or none),
+    with a candidate on top whose copy always passes. No backup status file
+    exists, so the real gate aborts and the candidate's passes."""
+    root, home, stub, env, log = plain_live
+    gate_path = root / "scripts" / "lib" / "backup_status_gate.py"
+    gate_path.parent.mkdir(parents=True, exist_ok=True)
+    if base_gate is not None:
+        gate_path.write_text(base_gate)
+        _git(root, "add", "-A")
+        _git(root, "commit", "-qm", "base gate")
+    base = _git(root, "rev-parse", "HEAD")
+    gate_path.write_text(_PASS_GATE)
+    backup = root / "scripts" / "backup.sh"
+    backup.write_text("#!/bin/bash\nexit 0\n")
+    backup.chmod(0o755)
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "candidate: a gate that always passes")
+    script = (
+        f'GENESIS_ROOT="{root}"\nON_LIVE={on_live}\n_LIVE_BASE="{base}"\n'
+        + _backup_region()
+        + 'echo "GATE-PASSED degraded=${PRE_UPDATE_DEGRADED}"\n'
+    )
+    return _bash(script, env)
+
+
+def test_r3b_on_live_the_base_gate_decides(plain_live):
+    real = (SCRIPTS / "lib" / "backup_status_gate.py").read_text()
+    r = _gate_run(plain_live, "1", real)
+    assert r.returncode == 1, _out(r)
+    assert "DATABASE BACKUP NOT VERIFIED" in r.stderr
+    assert "abort_db:status_missing_or_invalid" in r.stderr
+    assert "GATE-PASSED" not in r.stdout
+
+
+def test_r3b_on_live_a_base_without_the_gate_aborts(plain_live):
+    r = _gate_run(plain_live, "1", None)
+    assert r.returncode == 1, _out(r)
+    assert "DATABASE BACKUP NOT VERIFIED" in r.stderr and "GATE-PASSED" not in r.stdout
+
+
+def test_r3b_off_live_the_checkout_gate_still_decides(plain_live):
+    """Control: main runs the checkout's own copy, as before."""
+    real = (SCRIPTS / "lib" / "backup_status_gate.py").read_text()
+    r = _gate_run(plain_live, "0", real)
+    assert r.returncode == 0, _out(r)
+    assert "GATE-PASSED" in r.stdout

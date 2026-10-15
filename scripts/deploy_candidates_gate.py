@@ -208,8 +208,8 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
     subject = "the serving commit"
     if not serving and why == SERVER_DOWN:
         # Nothing runs Genesis's code, so what acts on `live` next is the code
-        # the next start runs: the checkout's. (update.sh on `live` rebuilds
-        # with the server down and then starts it.)
+        # the next start runs: the checkout's. (A server already down when
+        # update.sh or a bare rebuild runs on `live`.)
         serving = repo.resolve("HEAD")
         judged = "the checkout's base (the server is down; the next start runs it)"
         subject = "the checkout's commit"
