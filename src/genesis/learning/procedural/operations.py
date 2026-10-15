@@ -148,6 +148,15 @@ async def store_procedure(
     return proc_id
 
 
+def _stored_lesson(row: dict) -> dict:
+    """A row's lesson record as a dict, or {} when absent or unreadable."""
+    try:
+        value = json.loads(row.get("lesson") or "null")
+    except (TypeError, ValueError, RecursionError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def commands_spec(tools: list[str], commands: list[str]) -> tuple[dict | None, list[str], list[str]]:
     """``(spec, stored_tools, warnings)`` for an earned row named by shell commands.
 
@@ -282,6 +291,19 @@ async def store_procedure_checked(
         # whatever the caller passed as its origin.
         candidates = [c for c in candidates if c.get("lesson") is None]
     matched, best_sim = _best_same_procedure_match(candidates, principle_embedding)
+
+    if matched is not None and lesson is not None:
+        prior = _stored_lesson(matched)
+        if prior.get("authored_via") == "shipped":
+            # The repository file is the source of truth; the next seed would
+            # silently revert an edit made here.
+            raise ValueError(
+                f"lesson {matched['id']} ships with the repository; edit its file in config/lessons/"
+            )
+        if prior.get("reviewed") is True and not held and lesson.get("authored_in") == "foreground":
+            # The owner's review survives an edit made in the foreground; a
+            # dispatched session's rewrite goes back to unreviewed.
+            lesson = {**lesson, "reviewed": True}
 
     if matched is not None:
         # Auto-extracted should never overwrite an explicit-teach of the SAME

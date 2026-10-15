@@ -378,10 +378,21 @@ unclassified row never expires.
 Spawning, tracking, and recovering Claude Code sessions — Genesis's hands for
 any task bigger than an LLM call.
 
+Machine connectors can adopt a prepared `cc_sessions` receipt through the same
+native runner (`cc/managed_session.py`, `DirectSessionRunner.adopt`), rather than
+adding another execution queue. This opt-in mode registers before start hooks,
+uses the existing background breaker plus a fail-closed effective ceiling,
+keeps external unattended provenance, and supervises cancellation/deadline
+cleanup. Structured terminal state and private full artifacts distinguish model
+failure/partial output from legacy completion. Receipt retention and boot orphan
+reconciliation prevent automatic replay; live registered work is excluded from
+the stale reaper. It is a native primitive, not an enabled peer transport. See
+`docs/reference/native-managed-sessions.md`.
+
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 6aae986bb 2026-10-04
+verified: 6ef113ecd 2026-10-14
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
@@ -3605,6 +3616,24 @@ verified: ba9dd8a37 2026-10-09
   outside the checkout at the end of every run, a failed one included. A
   symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
   `--take-templates`.
+- **The restart guard, `~/.genesis/update_state.json`** (deploy scripts and the
+  dashboard update routes, #3139): `update.sh` writes it at each phase; an
+  update that merged code and never activated it, or that stopped on merge
+  conflicts, leaves it behind. Whether it still guards is ONE rule,
+  `scripts/lib/update_state_guard.py` (stdlib; `safe` / `guards` /
+  `conflict_pending`, plus the remedy text): a "done" state, a plain run's
+  "fetching" at its rollback tag, and a "merging" at the tag with no merge
+  residue and no recorded conflict guard nothing; anything unreadable guards.
+  `deploy_code_only.sh` and the live engine refuse to restart or move the
+  checkout while it guards; a plain `update.sh` exits 5 (before tagging or
+  writing anything), and the dashboard's `/apply` answers 409 on both paths;
+  `--post-merge` is the run that finishes it. Only the run that wrote the file
+  deletes it on its exits (never a `--post-merge`, never a run that had not
+  written yet), a rollback that left merged code keeps it, and bootstrap's
+  crash recovery keeps a pending conflict. The dashboard's progress poll is
+  read-only: it reports the verdict and offers Dismiss, the one retirement by
+  hand. The merge-residue check is shared with bootstrap
+  (`genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`).
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.
