@@ -129,7 +129,8 @@ async def _cross_type_duplicate(
     try:
         from genesis.db.crud.procedural import list_active
 
-        active = await list_active(db, limit=500)
+        # Held lessons are untrusted text: kept out of the novelty prompt.
+        active = await list_active(db, limit=500, live_only=True)
     except Exception:
         logger.warning(
             "Cross-type dedup: list_active failed; treating as novel",
@@ -267,7 +268,8 @@ async def _principle_is_novel(
     try:
         from genesis.db.crud.procedural import list_by_task_type
 
-        existing = await list_by_task_type(db, task_type)
+        # A held lesson must not make a trusted extraction look like a duplicate.
+        existing = await list_by_task_type(db, task_type, live_only=True)
     except Exception:
         logger.warning(
             "Procedure novelty lookup failed; allowing storage",

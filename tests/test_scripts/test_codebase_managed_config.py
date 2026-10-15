@@ -374,8 +374,11 @@ def test_source_refusal_does_not_claim_retained_staging(
             source.mkdir()
         elif kind == "fifo":
             os.mkfifo(source)
-    with pytest.raises((OSError, ValueError)):
+    with pytest.raises((OSError, ValueError)) as raised:
         managed.configure(args, settings)
+    if kind == "wrong-pin":
+        # A digest mismatch is named distinctly, never folded into a generic failure.
+        assert "unsupported managed executable" in str(raised.value)
     assert "Incomplete staging retained" not in capsys.readouterr().err
     assert not state.exists() and not settings.exists()
 
@@ -510,6 +513,9 @@ def test_native_configure_cli_e2e(native_root, long_runtime):
     shutil.copy2(SCRIPT, repo / "scripts/codebase_managed.py")
     shutil.copy2(
         ROOT / "scripts/lib/code_intel_cbm_worker.py", repo / "scripts/lib/code_intel_cbm_worker.py"
+    )
+    shutil.copy2(
+        ROOT / "scripts/lib/code_intel_cbm_admission.py", repo / "scripts/lib/code_intel_cbm_admission.py"
     )
     git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     subprocess.run(["git", "init", "--quiet", str(repo)], check=True, env=git_env)
