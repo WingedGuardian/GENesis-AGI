@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from genesis.cc.direct_session import DirectSessionRequest, DirectSessionRunner
-from genesis.cc.managed_session import prepared_metadata, reconcile_orphans
+from genesis.cc.managed_session import _HOLD_PARK_S, prepared_metadata, reconcile_orphans
 from genesis.cc.session_manager import SessionManager
 from genesis.cc.types import CCInvocation, CCOutput
 from genesis.db.crud import cc_sessions
@@ -475,7 +475,7 @@ async def test_uncertain_creation_keeps_registered_receipt_through_cancellation(
         """Only the test harness can end the deliberately unbounded hold."""
 
     async def pause(seconds):
-        if seconds != 1:
+        if seconds != _HOLD_PARK_S:
             return await original_sleep(seconds)
         paused.set()
         await teardown.wait()
@@ -799,7 +799,7 @@ async def test_uncertain_cleanup_keeps_its_runner_slot(db, native, monkeypatch):
         """Only the test harness can end the deliberately unbounded hold."""
 
     async def pause(seconds):
-        if seconds != 1:
+        if seconds != _HOLD_PARK_S:
             return await original_sleep(seconds)
         paused.set()
         await teardown.wait()
@@ -891,3 +891,102 @@ async def test_orphan_with_committed_outcome_is_finished_not_overwritten(
     assert meta["native_state"] == native_state
     assert meta["result_committed"] is True
     assert "error" not in meta
+
+
+async def test_successful_managed_run_lets_the_child_flush_before_the_group_kill(
+    db, native, tmp_path, monkeypatch
+):
+    """After a clean result the child is only asked to stop. Its SIGTERM handler
+    must get to run (flush) before the confirming group kill."""
+    import sys
+
+    from genesis.cc.invoker import CCInvoker
+
+    flushed = tmp_path / "flushed"
+    script = tmp_path / "synthetic_cli.py"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import json, signal, sys, time\n"
+        "def stop(*_):\n"
+        "    time.sleep(0.3)\n"
+        f"    open({str(flushed)!r}, 'w').write('ok')\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type':'result','subtype':'success','is_error':False,"
+        "'session_id':'synthetic-cc','result':'done'}), flush=True)\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    runner, _, _ = native
+    invoker = CCInvoker(claude_path=sys.executable)
+    monkeypatch.setattr(
+        invoker, "_build_args", lambda *a, **k: [str(script), "-p", "--output-format", "json"]
+    )
+    monkeypatch.setattr("genesis.cc.invoker._get_scope_args", AsyncMock(return_value=[]))
+    monkeypatch.setattr(invoker, "_network_preflight", AsyncMock())
+    monkeypatch.setattr(invoker, "_cc_version", AsyncMock(return_value=None))
+    runner._invoker = invoker
+    runner._build_invocation = lambda req, sid: CCInvocation(
+        prompt=req.prompt, working_dir=str(tmp_path)
+    )
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    meta = json.loads((await cc_sessions.get_by_id(db, sid))["metadata"])
+    assert meta["native_state"] == "succeeded"
+    assert flushed.read_text() == "ok"
+
+
+async def test_held_uncertain_state_is_written_once(db, native, monkeypatch):
+    from genesis.cc import managed_session
+    from genesis.util.proc_kill import ProcessCleanupUncertain
+
+    runner, _, invoker = native
+    invoker.run_streaming.side_effect = ProcessCleanupUncertain("synthetic uncertainty")
+    writes = []
+    original_update = managed_session.update_state
+
+    async def counting_update(db_, sid_, state, **fields):
+        if fields.get("cleanup_unconfirmed"):
+            writes.append(state)
+            if len(writes) == 1:
+                raise RuntimeError("synthetic transient write failure")
+        return await original_update(db_, sid_, state, **fields)
+
+    monkeypatch.setattr(managed_session, "update_state", counting_update)
+    parked, teardown = asyncio.Event(), asyncio.Event()
+    original_sleep = asyncio.sleep
+    retry_sleeps = []
+
+    class TestTeardown(BaseException):
+        """Only the test harness can end the deliberately unbounded hold."""
+
+    async def pause(seconds):
+        if seconds == _HOLD_PARK_S:
+            parked.set()
+            await teardown.wait()
+            raise TestTeardown
+        if seconds >= 1:
+            retry_sleeps.append(seconds)
+            if len(retry_sleeps) > 5:
+                raise TestTeardown  # still rewriting: fail instead of spinning
+            return await original_sleep(0)
+        return await original_sleep(seconds)
+
+    monkeypatch.setattr("genesis.cc.managed_session.asyncio.sleep", pause)
+    sid = await prepare(db, request())
+    await runner.adopt(sid, request())
+    task = runner._active[sid]
+    await reached(parked)
+    try:
+        # One failed write, one successful write, then no further writes.
+        assert writes == ["cancelling", "cancelling"]
+        assert retry_sleeps == [1.0]
+        row = await cc_sessions.get_by_id(db, sid)
+        assert json.loads(row["metadata"])["cleanup_unconfirmed"] is True
+    finally:
+        teardown.set()
+        await asyncio.gather(task, return_exceptions=True)

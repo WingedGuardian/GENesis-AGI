@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 # its complete()/fail() call would have set.
 _COMMITTED_STATUS = {"succeeded": "completed", "failed": "failed", "cancelled": "failed"}
 
+# How long a held uncertain receipt sleeps between (write-free) wakeups.
+_HOLD_PARK_S = 3600.0
+
 
 def fingerprint(request) -> str:
     return hashlib.sha256(json.dumps(asdict(request), sort_keys=True).encode()).hexdigest()
@@ -60,20 +63,29 @@ async def hold_uncertain(db, sid: str) -> None:
 
     The caller keeps everything it holds (receipt, runner slot) until runtime
     teardown; an owner restart reconciles the receipt as outcome_unknown. Even
-    repeated cancellation cannot turn uncertainty into confirmation.
+    repeated cancellation cannot turn uncertainty into confirmation. The state
+    is written until one write succeeds, then held without further writes.
     """
+    delay = 1.0
+    recorded = False
     while True:
         try:
-            # Persistence refusal also cannot establish cleanup.
-            with contextlib.suppress(Exception):
-                await update_state(
-                    db,
-                    sid,
-                    "cancelling",
-                    error="cleanup_unconfirmed",
-                    cleanup_unconfirmed=True,
-                )
-            await asyncio.sleep(1)
+            if not recorded:
+                # Persistence refusal also cannot establish cleanup: retry.
+                with contextlib.suppress(Exception):
+                    await update_state(
+                        db,
+                        sid,
+                        "cancelling",
+                        error="cleanup_unconfirmed",
+                        cleanup_unconfirmed=True,
+                    )
+                    recorded = True
+            if recorded:
+                await asyncio.sleep(_HOLD_PARK_S)
+            else:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
         except asyncio.CancelledError:
             continue
 
