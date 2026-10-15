@@ -100,8 +100,7 @@ async def test_the_entry_point_applies_and_regenerates_on_a_plain_connection(tmp
     async with aiosqlite.connect(str(path)) as db:
         await create_all_tables(db)
         await _seed(db)
-    monkeypatch.setenv("GENESIS_PROCEDURE_TRIGGERS", str(trigger_cache.get_cache_path()))
-    assert await backfill_module._main(path, apply=True) == 0
+    assert await backfill_module._main(path, apply=True, rebuild_cache=True) == 0
     assert trigger_cache.get_json_cache_path().exists()
 
 
@@ -264,12 +263,11 @@ async def test_a_failed_cache_rebuild_after_the_commit_exits_4(tmp_path, monkeyp
         raise OSError("disk full")
 
     monkeypatch.setattr(trigger_cache, "regenerate", broken)
-    monkeypatch.setenv("GENESIS_PROCEDURE_TRIGGERS", str(trigger_cache.get_cache_path()))
     path = tmp_path / "t.db"
     async with aiosqlite.connect(str(path)) as conn:
         await create_all_tables(conn)
         await _seed(conn)
-    assert await backfill_module._main(path, apply=True) == 4
+    assert await backfill_module._main(path, apply=True, rebuild_cache=True) == 4
     assert "Repairs committed" in capsys.readouterr().out
     async with aiosqlite.connect(str(path)) as conn:
         rows = await conn.execute_fetchall(
@@ -303,12 +301,11 @@ async def test_a_path_with_uri_characters_opens_that_file(tmp_path, monkeypatch)
 
     from genesis.db.schema import create_all_tables
 
-    monkeypatch.setenv("GENESIS_PROCEDURE_TRIGGERS", str(trigger_cache.get_cache_path()))
     path = tmp_path / "copy?old#1.db"
     async with aiosqlite.connect(str(path)) as db:
         await create_all_tables(db)
         await _seed(db)
-    assert await backfill_module._main(path, apply=True) == 0
+    assert await backfill_module._main(path, apply=True, rebuild_cache=True) == 0
     assert not (tmp_path / "copy").exists()  # the prefix was never created
     async with aiosqlite.connect(str(path)) as db:
         rows = await db.execute_fetchall(
@@ -450,3 +447,79 @@ async def test_a_database_locked_through_the_apply_exits_2_and_writes_nothing(
             "SELECT tool_trigger FROM procedural_memory WHERE id = 'cleaned'"
         )
     assert rows[0][0] == '["Read (code review)", "review gate"]'
+
+
+async def test_the_live_database_rebuilds_the_cache_however_its_path_is_given(tmp_path, monkeypatch):
+    monkeypatch.delenv("GENESIS_PROCEDURE_TRIGGERS", raising=False)
+    checkout = tmp_path / "checkout"
+    (checkout / "data").mkdir(parents=True)
+    live = await _migrated(checkout / "data")  # <checkout>/data/genesis.db
+    monkeypatch.setattr(backfill_module, "_checkout", lambda: checkout)
+    # An explicit --db naming the live file, through a path that is not literal.
+    assert await backfill_module._main(checkout / "data" / ".." / "data" / "genesis.db", apply=True) == 0
+    assert live.exists() and trigger_cache.get_json_cache_path().exists()
+
+
+async def test_rebuild_cache_rebuilds_from_a_database_elsewhere(tmp_path, monkeypatch):
+    monkeypatch.delenv("GENESIS_PROCEDURE_TRIGGERS", raising=False)
+    path = await _migrated(tmp_path)
+    assert await backfill_module._main(path, apply=True, rebuild_cache=True) == 0
+    assert trigger_cache.get_json_cache_path().exists()
+
+
+async def test_a_partly_migrated_database_is_refused_as_unmigrated(tmp_path, capsys):
+    import aiosqlite
+
+    path = tmp_path / "partial.db"
+    async with aiosqlite.connect(str(path)) as db:
+        await db.execute(
+            "CREATE TABLE procedural_memory (id TEXT, tool_trigger TEXT, lesson TEXT, deprecated INTEGER)"
+        )
+    assert await backfill_module._main(path, apply=False) == 1
+    assert "lacks trigger_spec" in capsys.readouterr().out
+
+
+class _CommitFails(_RefineAfterRead):
+    async def execute_fetchall(self, sql, *args):
+        return await self._db.execute_fetchall(sql, *args)
+
+    async def commit(self):
+        import sqlite3
+
+        raise sqlite3.OperationalError("database or disk is full")
+
+
+async def test_applied_rows_are_printed_only_after_the_commit_lands(db, capsys):
+    import sqlite3
+
+    await _seed(db)
+    with pytest.raises(sqlite3.OperationalError):
+        await backfill_module.backfill(_CommitFails(db), apply=True, regenerate_cache=False)
+    assert '{"id"' not in capsys.readouterr().out  # nothing advertised as applied
+
+
+async def test_a_closed_output_never_skips_the_cache_rebuild(tmp_path, monkeypatch):
+    import builtins
+
+    real = builtins.print
+
+    def closed_pipe(*args, **kwargs):
+        if args and str(args[0]).startswith('{"id"'):
+            raise BrokenPipeError
+        real(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", closed_pipe)
+    path = await _migrated(tmp_path)
+    assert await backfill_module._main(path, apply=True, rebuild_cache=True) == 0
+    assert trigger_cache.get_json_cache_path().exists()
+
+
+async def test_a_blob_trigger_is_reported_not_fatal(db, capsys):
+    await db.execute(
+        "INSERT INTO procedural_memory (id, task_type, principle, steps, tools_used, context_tags, "
+        "created_at, tool_trigger) VALUES ('blob', 'b', 'p', '[]', '[]', '[]', 'now', ?)",
+        (b"\xff\xfe",),
+    )
+    counts = await backfill_module.backfill(db, apply=False)
+    assert counts["all_dropped"] == 1
+    assert '"id": "blob"' in capsys.readouterr().out
