@@ -69,8 +69,8 @@ def _lesson_from_file(path: Path) -> dict:
         value = data.get(key, [])
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ValueError(f"{key} must be a list of text")
-    tools, cli_patterns, dropped = normalize_tool_trigger(data["tool_trigger"])
-    if dropped or cli_patterns or not tools or tools != data["tool_trigger"]:
+    tools, commands, dropped = normalize_tool_trigger(data["tool_trigger"])
+    if dropped or commands or not tools or tools != data["tool_trigger"]:
         # A shipped file names tools exactly; a shell command is Bash plus a pattern
         # the author writes, never one derived silently from a command word, and an
         # MCP tool is its full name, never a short name resolved from today's servers.
