@@ -368,3 +368,100 @@ def test_a_guarding_state_is_never_removed_before_a_move(dc, dc_ready):
     with pytest.raises(dc.Refusal):
         dc.Engine(w.root, w.env)._move_preflight(need_manifest=False)
     assert state.exists()
+
+
+# ── the caller's own "merging" row (#3370) ──────────────────────────────────
+
+
+def _own_row(w, **over) -> Path:
+    """update.sh's own row as it stands when it runs the rebuild after the stop:
+    "merging", a plain run, its own pid (this process's parent here, as update.sh
+    is the engine's parent there), the rollback tag at HEAD."""
+    w.git(w.root, "tag", "-f", "pre")
+    row = {
+        "phase": "merging",
+        "rollback_tag": "pre",
+        "deploy_head": w.rev("HEAD", w.root),
+        "pid": os.getppid(),
+        "post_merge": False,
+        **over,
+    }
+    state = w.home / ".genesis" / "update_state.json"
+    state.write_text(json.dumps(row))
+    return state
+
+
+def _rebuild_with_a_candidate(w, dc, capsys, **env: str) -> int:
+    w.candidate("feat/a", {"src/a.py": "a = 1\n"})
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
+    return w.run(dc, "rebuild", extra_env=env)
+
+
+def test_the_callers_own_row_is_kept_through_the_rebuild(dc, dc_ready, capsys):
+    """A row the shared rule calls harmless is retired before a move, unless it
+    is the caller's own: update.sh's restart guard must survive the move it
+    guards."""
+    w = dc_ready
+    state = _own_row(w)
+    before = state.read_bytes()
+    rc = _rebuild_with_a_candidate(w, dc, capsys, DEPLOY_CANDIDATES_OWN_STATE_PID=str(os.getppid()))
+    assert rc == 0, capsys.readouterr()
+    assert w.live_merges(), "the rebuild did not move"
+    assert state.read_bytes() == before, "the engine retired its caller's restart guard"
+
+
+def test_the_callers_own_guarding_row_does_not_refuse(dc, dc_ready, capsys):
+    """Its row would GUARD (HEAD is off its rollback tag): still the caller's."""
+    w = dc_ready
+    w.advance_main({"m.txt": "m\n"})
+    w.git(w.root, "pull", "-q", "--ff-only", "origin", "main")
+    state = _own_row(w)
+    w.git(w.root, "tag", "-f", "pre", "HEAD~1")
+    rc = _rebuild_with_a_candidate(w, dc, capsys, DEPLOY_CANDIDATES_OWN_STATE_PID=str(os.getppid()))
+    assert rc == 0, capsys.readouterr()
+    assert state.exists() and w.live_merges()
+
+
+@pytest.mark.parametrize(
+    ("named", "over"),
+    [
+        (None, {}),
+        ("other", {"pid": "other"}),
+        ("ppid", {"pid": "other"}),
+        ("ppid", {"phase": "fetching"}),
+        ("ppid", {"post_merge": True}),
+    ],
+    ids=["not-named", "not-the-parent", "another-pid", "not-merging", "post-merge"],
+)
+def test_any_other_row_is_judged_by_the_shared_rule(dc, dc_ready, capsys, named, over):
+    """Controls: the exception needs every part. Off its tag, each of these rows
+    guards, so the rebuild refuses and the row stays. "other" is a pid that is
+    not this process's parent (whatever the parent is: a test sandbox may run
+    pytest as pid 1's child)."""
+    other, ppid = os.getppid() + 1, os.getppid()
+    w = dc_ready
+    w.advance_main({"m.txt": "m\n"})
+    w.git(w.root, "pull", "-q", "--ff-only", "origin", "main")
+    state = _own_row(w, **{k: other if v == "other" else v for k, v in over.items()})
+    w.git(w.root, "tag", "-f", "pre", "HEAD~1")
+    env = (
+        {}
+        if named is None
+        else {"DEPLOY_CANDIDATES_OWN_STATE_PID": str(ppid if named == "ppid" else other)}
+    )
+    rc = _rebuild_with_a_candidate(w, dc, capsys, **env)
+    assert rc == 1
+    assert "update_state.json" in capsys.readouterr().err
+    assert state.exists() and not w.live_merges()
+
+
+def test_the_exception_needs_the_handed_over_update_lock(dc, dc_ready):
+    """Without update.lock (status reads refusals unlocked) the same row, named,
+    still reads as an unfinished update."""
+    w = dc_ready
+    w.advance_main({"m.txt": "m\n"})
+    w.git(w.root, "pull", "-q", "--ff-only", "origin", "main")
+    _own_row(w)
+    w.git(w.root, "tag", "-f", "pre", "HEAD~1")
+    eng = dc.Engine(w.root, {**w.env, "DEPLOY_CANDIDATES_OWN_STATE_PID": str(os.getppid())})
+    assert [r for r in eng._move_refusals() if "update_state.json" in r]

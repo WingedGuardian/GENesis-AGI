@@ -3600,7 +3600,9 @@ verified: ba9dd8a37 2026-10-09
   (`scripts/lib/managed_units.py` holds the grammar), so a later run tells
   Genesis's output from a hand edit: an edited unit is KEPT and named, never
   overwritten. A plain `update.sh` run checks every unit BEFORE it stops
-  anything and exits 4 naming the edited ones; `--post-merge` does not refuse
+  anything and exits 4 naming the edited ones (on `live`, a unit only the
+  rebuilt tip brings is judged after the move, so that exit 4 follows the stop
+  and a rollback onto the old tip); `--post-merge` does not refuse
   (its merge already happened), and bootstrap keeps and names the unit
   instead (`--take-template <unit>` installs the template and
   backs the old file up under `~/.genesis/deploy-backups/`, pruned at 90 days by
@@ -3633,7 +3635,26 @@ verified: ba9dd8a37 2026-10-09
   crash recovery keeps a pending conflict. The dashboard's progress poll is
   read-only: it reports the verdict and offers Dismiss, the one retirement by
   hand. The merge-residue check is shared with bootstrap
-  (`genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`).
+  (`genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`). One exception
+  in the engine: the "merging" row of the `update.sh` that is running the
+  rebuild (its pid named in `DEPLOY_CANDIDATES_OWN_STATE_PID`, equal to the
+  engine's parent, update.lock handed over, a plain run) is neither refused nor
+  retired.
+- **`update.sh` on `live`** (#2978, #3370): the merge's place, after the stop,
+  is taken by the deploy-candidates engine's rebuild (`scripts/deploy_candidates.py
+  rebuild`, the `live-engine` block). Everything else is main's path: one DB
+  snapshot and one sample of the running services before the stop, the same
+  "fetching"/"merging" rows, the armed rollback trap. Readiness judges the
+  checkout the stopped server will start from (both units definitely stopped).
+  update.lock is handed to the engine; `update.sh` holds genesis-checkout.lock
+  only while it clears the excused local edits, never across the rebuild (the
+  engine's move takes that lock itself). A refusal, failure or interrupt of the
+  rebuild runs the normal rollback: a moved checkout is adopted only when it is
+  a rebuild's tip (`live-shaped`), moved back to the rollback tag with its git
+  hooks restored (`restore-hooks`), and the services restart on the old tip.
+  The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
+  `--post-merge` on `live` never runs the engine. What is recorded and sent to
+  the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.
