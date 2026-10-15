@@ -175,23 +175,14 @@ def test_installers_enforce_the_pinned_tools_node_floor():
         assert '"$major" -gt 24' in text, relative
 
 
-def test_installers_do_not_run_cbm_installer_while_kill_switch_is_active():
-    """Neither install path may reach the installer while the kill switch is set.
-
-    The fetch moved to scripts/lib/cbm_installer.sh — one site for the pin, its
-    digest and the install — so the ordering is now checked against the CALL,
-    and the callers are additionally held to not growing a second copy of the
-    fetch. The shared script also refuses on its own when run directly, so the
-    guarantee does not rest on every future caller remembering to check.
-    """
+def test_installers_never_run_legacy_cbm_installer():
+    """Explicit managed staging owns acquisition; ordinary setup never fetches CBM."""
     for relative in ("scripts/install.sh", "scripts/bootstrap.sh"):
         text = (REPO_ROOT / relative).read_text()
-        # The sentinel is the resolved shared-site path (cbm_disable_file.sh),
-        # honouring CODEBASE_MEMORY_MCP_DISABLE_FILE — never a hard-coded
-        # $HOME literal that would ignore the override.
-        sentinel = '[ -e "$_cbm_disable" ]'
-        assert text.index(sentinel) < text.index("genesis_cbm_install"), relative
-        assert 'lib/cbm_disable_file.sh' in text, relative
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        assert "genesis_cbm_install" not in code, relative
+        assert "cbm_installer.sh" not in code, relative
+        assert "codebase-memory-mcp --version" not in code, relative
         assert "raw.githubusercontent.com/DeusData/codebase-memory-mcp/" not in text, relative
     # The shared script's OWN kill switch is exercised, not grepped, by
     # test_bootstrap_guards.py::test_b9_direct_run_honours_the_kill_switch — a

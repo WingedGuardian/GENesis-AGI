@@ -74,10 +74,11 @@ def _live_refusal() -> tuple[dict, int] | None:
     """The 409 to answer when the checkout is on `live`, or None to proceed.
 
     `live` is the integration branch scripts/deploy_candidates rebuilds from the
-    deploy manifest. update.sh and the Tier 2/3 sessions it hands off to work on
+    deploy manifest. The Tier 2/3 sessions these routes hand off to work on
     `main` (a Tier session checks main out and merges), which would move the
-    checkout off `live`, so these routes refuse there and name the two commands
-    that move and restart it. A verdict that cannot be read refuses too, and the
+    checkout off `live`, so these routes refuse there and name the commands that
+    update it: scripts/update.sh, which rebuilds `live` and activates it, or a
+    rebuild and a restart without activation. A verdict that cannot be read refuses too, and the
     printed word must agree with the exit code: python itself exits 1 on a
     SyntaxError or an uncaught exception, which must never read as "other". The
     script is run afresh, never imported, so the copy that answers is the one on
@@ -120,9 +121,11 @@ def _live_refusal() -> tuple[dict, int] | None:
     if verdict == (0, "live"):
         return {
             "error": (
-                "This install runs the live integration branch, and an update would "
-                "move the checkout off it. Run scripts/deploy_candidates rebuild, then "
-                "scripts/deploy_code_only.sh restart."
+                "This install runs the live integration branch, and an update from here "
+                "would move the checkout off it. Update it from a shell with "
+                "scripts/update.sh (it rebuilds live, then activates it), or run "
+                "scripts/deploy_candidates rebuild, then scripts/deploy_code_only.sh "
+                "restart, to restart without activation."
             )
         }, 409
     return {
@@ -406,7 +409,8 @@ def update_apply():
             return _apply_supervised(_PID_FILE)
     # The direct path runs update.sh, which takes update.lock itself (`flock -n`)
     # and refuses while anyone holds it, so it starts only after the lock is
-    # released. update.sh then refuses `live` on its own branch rule.
+    # released. A checkout put on `live` after the refusal above is rebuilt, not
+    # merged into: update.sh decides `live` again under its lock.
     return _apply_direct(_PID_FILE)
 
 

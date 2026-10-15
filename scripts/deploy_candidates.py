@@ -701,6 +701,51 @@ class Engine(Repo):
                 "keep that code out."
             )
 
+    def cmd_restore_hooks(self, before: str, after: str) -> int:
+        """update.sh's rollback on `live` moves the checkout back to its rollback
+        tag itself (genesis_rollback_checkout), which restores no git hook. Put
+        back each installed hook that is exactly the moved-from version, then
+        sync, as a rebuild does after its own move. It runs while
+        update_state.json records the unfinished update, so it takes none of the
+        move refusals; it changes installed hooks only."""
+        self.require_update_lock()
+        self.require_main_checkout()
+        moved_from, moved_to = self.resolve(before), self.resolve(after)
+        if not moved_from or not moved_to:
+            raise Refusal(
+                f"{before if not moved_from else after} does not resolve; nothing changed."
+            )
+        head = self.resolve("HEAD")
+        if head != moved_to:
+            raise Refusal(
+                f"HEAD is {(head or 'unresolvable')[:12]}, not {moved_to[:12]}: the checkout is not "
+                "where the rollback put it; nothing changed."
+            )
+        plan.restore_moved_hooks(self, moved_from, moved_to)
+        plan.sync_git_hooks(self)
+        return 0
+
+    def cmd_live_shaped(self, commit: str) -> int:
+        """Whether ``commit`` is what a rebuild makes: a commit on origin/main's
+        history with only rebuild merges of candidates on top. Prints the commit
+        those merges sit on (the base `live` was built on) and exits 0; exits 1
+        naming why not. Reads git only: no lock, no manifest, no state."""
+        tip = self.resolve(commit)
+        main_ref = self.resolve(BASE_REF)
+        if not tip or not main_ref:
+            raise Refusal(f"{commit if not tip else BASE_REF} does not resolve.")
+        foreign = self.foreign_commits(main_ref, at=tip)
+        if foreign:
+            raise Refusal(
+                f"{commit} is not a rebuild's tip: {foreign[0][:12]} is neither a rebuild merge "
+                "nor a candidate's commit."
+            )
+        base, _merged = self.live_chain(main_ref, at=tip)
+        if not base or not self.is_ancestor(base, main_ref):
+            raise Refusal(f"{commit} does not sit on origin/main's history.")
+        out(base)
+        return 0
+
     def cmd_rebuild(self) -> int:
         self.require_update_lock()
         data, branch = self._move_preflight(need_manifest=True)
@@ -1042,6 +1087,13 @@ def _parser() -> argparse.ArgumentParser:
     ls.add_argument("--json", action="store_true")
     sub.add_parser("status")
     sub.add_parser("rebuild")
+    # For update.sh on `live`: its rollback's hook restore, and the shape check
+    # it runs before anything moves.
+    r = sub.add_parser("restore-hooks")
+    r.add_argument("before")
+    r.add_argument("after")
+    s = sub.add_parser("live-shaped")
+    s.add_argument("commit")
     return p
 
 
@@ -1083,6 +1135,10 @@ def main(
             return engine.cmd_drop(args.branch, args.no_rebuild)
         if args.cmd == "rebuild":
             return engine.cmd_rebuild()
+        if args.cmd == "restore-hooks":
+            return engine.cmd_restore_hooks(args.before, args.after)
+        if args.cmd == "live-shaped":
+            return engine.cmd_live_shaped(args.commit)
     except Unknown as exc:
         _err(
             f"ERROR: {exc}\nThis could not be established, so nothing changed; retry once it can be."

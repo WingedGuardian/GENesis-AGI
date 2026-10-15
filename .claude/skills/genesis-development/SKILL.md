@@ -2992,7 +2992,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   every review MARKS the head it reviewed, clean ones too, and a finding review that
   lands on a head after one of that head's descendants was marked is a LATE review. It
   opens no round; `review_budget`'s `findings` list keeps it with the round it belongs
-  to, for the round reflection to owe (#3301; until that lands nothing owes them). Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
+  to, for the round reflection to owe (#3301; until that lands nothing owes them).
+  Each entry says whether it was late (`late`) and each round when it opened
+  (`opened_at`, None when unknown); read those, never membership in `rounds[].reviews`, which also lists
+  late reviews of a head that already is a round. Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
   keeps the old rule (every head Codex reviewed, clean included), so no PR's count
   moved at the cutover. The rule lives in `review_findings.is_finding` and
   `review_budget.evaluate_evidence`; read those, not this paragraph, for an edge case.
