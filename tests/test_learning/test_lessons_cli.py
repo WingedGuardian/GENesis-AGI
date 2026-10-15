@@ -75,6 +75,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr("genesis.env.genesis_db_path", lambda: db)
     monkeypatch.setenv("GENESIS_PROCEDURE_TRIGGERS", str(cache))
     monkeypatch.setenv("GENESIS_SESSIONS_DIR", str(sessions))
+    for marker in ("GENESIS_CC_SESSION", "GENESIS_SESSION_SUPERVISED", "GENESIS_SESSION_ORIGIN"):
+        monkeypatch.delenv(marker, raising=False)  # an attended terminal unless a test says so
     from genesis.learning.procedural import trigger_cache
 
     monkeypatch.setattr(trigger_cache, "_CACHE_PATH", cache)
@@ -336,6 +338,25 @@ def test_a_deprecation_reason_is_escaped_when_shown(env, capsys):
     assert env("list") == 0
     out = capsys.readouterr().out
     assert "\x1b" not in out and "noisy\\x1b[2Jcleared" in out
+
+
+@pytest.mark.parametrize(
+    ("markers", "code"),
+    [
+        ({"GENESIS_CC_SESSION": "1"}, 1),  # dispatched, unsupervised
+        ({"GENESIS_SESSION_ORIGIN": "external_untrusted"}, 1),
+        ({"GENESIS_CC_SESSION": "1", "GENESIS_SESSION_SUPERVISED": "1"}, 0),  # owner-attended
+        ({"GENESIS_SESSION_ORIGIN": "first_party"}, 0),
+    ],
+)
+def test_only_an_attended_session_may_approve(env, monkeypatch, capsys, markers, code):
+    env.build({"id": "held", **_HELD, "embedding": _VEC})
+    for name, value in markers.items():
+        monkeypatch.setenv(name, value)
+    assert env("review", "held") == code
+    assert env.row("held")["deprecated"] == (0 if code == 0 else 1)
+    if code:
+        assert "cannot approve a lesson" in capsys.readouterr().out
 
 
 def test_deprecate_takes_a_lesson_out_of_service(env):
