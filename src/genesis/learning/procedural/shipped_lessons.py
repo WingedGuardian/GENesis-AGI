@@ -23,6 +23,8 @@ from pathlib import Path
 import aiosqlite
 import yaml
 
+from genesis.learning.procedural.lesson_shape import SHIPPED_RETIRED_REASON
+
 logger = logging.getLogger(__name__)
 
 # The seed's namespace for deterministic ids (scripts/seed_procedures.py uses it
@@ -33,7 +35,7 @@ SEED_NAMESPACE = uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
 LESSONS_DIR = Path(__file__).resolve().parents[4] / "config" / "lessons"
 _LESSON_KEYS = {"task_type", "principle", "steps", "tool_trigger", "patterns", "repeat"}
 # Written only by this seed, so a row it retired is told apart from one the owner deprecated.
-_RETIRED = "shipped lesson file removed"
+_RETIRED = SHIPPED_RETIRED_REASON
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
