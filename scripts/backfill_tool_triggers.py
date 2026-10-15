@@ -18,7 +18,8 @@ This runs every live row's ``tool_trigger`` through ``normalize_tool_trigger``:
 
 Dry-run by default (the database is opened read-only); ``--apply`` writes
 through the guarded read-write connection and then regenerates the trigger
-cache. A fenced (quarantined) database is never opened: exit 3.
+cache. A fenced (quarantined) database is never opened: exit 3. A missing,
+unreadable or busy database exits 2 with nothing written.
 Idempotent: a repaired row normalizes to itself, so a re-run changes nothing.
 Every row it would change (dry-run) or did change (``--apply``) is printed
 first, one JSON line each with its old value, its new columns and the values
@@ -41,6 +42,7 @@ import argparse
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 from collections import Counter
 from pathlib import Path
@@ -154,7 +156,11 @@ async def _main(db_path: Path, apply: bool, *, own_db: bool = False) -> int:
             print(f"{db_path} not opened for writing: {exc}")
             return 2
     else:  # a dry run never writes: an encoded read-only URI (as_uri escapes ? and #)
-        db = await aiosqlite.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            db = await aiosqlite.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+        except (sqlite3.Error, OSError) as exc:
+            print(f"{db_path} not opened: {exc}")
+            return 2
     try:
         db.row_factory = aiosqlite.Row  # the cache regeneration reads rows by name
         columns = {r[1] for r in await db.execute_fetchall("PRAGMA table_info(procedural_memory)")}
@@ -171,6 +177,10 @@ async def _main(db_path: Path, apply: bool, *, own_db: bool = False) -> int:
             print(
                 "Cache not regenerated: --db is not this install's database and GENESIS_PROCEDURE_TRIGGERS is unset."
             )
+    except sqlite3.Error as exc:  # not a database, unreadable, or locked past the busy timeout
+        # Raised before the commit, so an apply wrote nothing (close rolls it back).
+        print(f"{db_path}: database unreadable or busy, nothing written: {exc}")
+        return 2
     finally:
         await db.close()
     print(("APPLIED" if apply else "DRY-RUN") + ":", json.dumps(dict(counts), sort_keys=True))

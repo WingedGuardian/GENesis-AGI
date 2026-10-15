@@ -409,3 +409,44 @@ async def test_an_apply_the_guarded_open_refuses_exits_3(tmp_path, monkeypatch):
         await create_all_tables(conn)
         await _seed(conn)
     assert await backfill_module._main(path, apply=True) == 3
+
+
+@pytest.mark.parametrize("apply", [False, True])
+async def test_a_file_that_is_not_a_database_exits_2(tmp_path, monkeypatch, capsys, apply):
+    import sys
+    import types
+
+    fence = types.ModuleType("db_admission_check")
+    fence.database_is_fenced = lambda _path: False
+    monkeypatch.setitem(sys.modules, "db_admission_check", fence)
+    monkeypatch.setattr("genesis.db.admission.assert_admitted", lambda _path: None)
+    path = tmp_path / "genesis.db"
+    path.write_bytes(b"not a database " * 512)
+    assert await backfill_module._main(path, apply=apply) == 2
+    out = capsys.readouterr().out
+    assert "not opened" in out or "unreadable or busy" in out
+
+
+async def test_a_database_locked_through_the_apply_exits_2_and_writes_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    import sqlite3
+
+    import aiosqlite
+
+    monkeypatch.setenv("GENESIS_DB_BUSY_TIMEOUT_MS", "100")
+
+    path = await _migrated(tmp_path)
+    holder = sqlite3.connect(path, timeout=0)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        assert await backfill_module._main(path, apply=True) == 2
+    finally:
+        holder.rollback()
+        holder.close()
+    assert "nothing written" in capsys.readouterr().out
+    async with aiosqlite.connect(str(path)) as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT tool_trigger FROM procedural_memory WHERE id = 'cleaned'"
+        )
+    assert rows[0][0] == '["Read (code review)", "review gate"]'
