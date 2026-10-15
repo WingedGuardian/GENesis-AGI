@@ -11,8 +11,10 @@ narrowness from every side:
   * a pid reused at any step is never signalled;
   * a lock held by an operator command means nothing is paused;
   * no page or reminder carries a raw `kill <pid>`;
-  * the file is emptied only once no writer is left running, through a
-    paused writer's own descriptor, its last MB kept where there is room;
+  * the file is emptied once every writer paused here is confirmed stopped
+    and nothing in the command was stopped by something else, through a
+    paused writer's own descriptor, its last MB kept (once per episode) where
+    there is room; a writer it never saw only refills it;
   * against REAL processes: the writer is really stopped, the stand-in session
     is not, and `scripts/watchgod thaw` resumes it.
 
@@ -219,7 +221,7 @@ def test_a_growing_task_output_is_paused_parents_first_and_recorded(box, tier):
     )
     assert [r[:3] for r in _frozen(box)] == [["200", "2000", "bash"], ["201", "2010", "grep"]]
     assert [r[6] for r in _frozen(box)] == ["paused", "paused"]
-    assert f.stat().st_size == 0, "no writer left running: emptied"
+    assert f.stat().st_size == 0, "every writer paused: emptied"
     assert "ACTED=emptied" in out.stdout
     act = [
         p
@@ -706,56 +708,6 @@ def test_the_tail_is_private(box):
     assert oct(tails[0].stat().st_mode & 0o777) == "0o600"
 
 
-def test_a_writer_forked_after_the_pause_keeps_the_file_from_being_emptied(box):
-    """A child that inherited the descriptor after the walk is a running writer:
-    the re-walk finds it and nothing is emptied."""
-    f = _task_output(box)
-    _session(box, f)
-    fork = f"""
-    eval "_orig_sig() $(declare -f wg_signal_gen | tail -n +2)"
-    wg_signal_gen() {{
-        local rc=0; _orig_sig "$@" || rc=$?
-        if [[ "$2" == 201 ]]; then
-            mkdir -p '{box["proc"]}/202/fd' '{box["proc"]}/202/fdinfo'
-            ln -sf '{f}' '{box["proc"]}/202/fd/1'
-            printf 'pos:\t0\nflags:\t0102001\n' > '{box["proc"]}/202/fdinfo/1'
-            printf 'Name:\tgrep\nState:\tS (x)\nPPid:\t201\nThreads:\t1\n' > '{box["proc"]}/202/status'
-            printf '202 (grep) S 201 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 2020 0\n' > '{box["proc"]}/202/stat'
-        fi
-        return $rc
-    }}
-    """
-    _respond(box, f, between=fork)
-    assert f.stat().st_size >= 60 * _MB
-    act = [p for p in _pages(box) if p["title"].startswith("Paused")]
-    assert (
-        "still running (or stopped by something else, which can resume it): pid 202"
-        in act[0]["body"]
-    )
-
-
-def test_a_paused_pid_reused_before_the_recheck_keeps_the_file(box):
-    """The re-walk compares start times too: the process now at a paused pid is
-    another one, a running writer."""
-    f = _task_output(box)
-    _session(box, f)
-    reuse = f"""
-    eval "_orig_unp() $(declare -f _rw_unpaused_holders | tail -n +2)"
-    _rw_unpaused_holders() {{
-        sed -i 's/ 2010 / 9999 /' '{box["proc"]}/201/stat'
-        # Still stopped, but another process: only the start time tells.
-        _orig_unp "$@"
-    }}
-    """
-    _respond(box, f, between=reuse)
-    assert f.stat().st_size >= 60 * _MB
-    act = [p for p in _pages(box) if p["title"].startswith("Paused")]
-    assert (
-        "still running (or stopped by something else, which can resume it): pid 201"
-        in act[0]["body"]
-    )
-
-
 def test_a_file_whose_writers_are_all_paused_is_emptied_without_new_growth(box):
     """A pause that could not empty on its poll (or one from before emptying
     existed): the emptying is still owed, size alone is enough."""
@@ -907,33 +859,132 @@ def test_a_foreign_stop_is_not_emptied_on_size(box):
     assert "no writer could be paused" not in _log(box), "the response never ran"
 
 
-def test_an_uninspectable_process_appearing_after_the_pause_keeps_the_file(box):
+def test_a_writer_the_walk_never_saw_does_not_stop_the_emptying(box):
+    """No proof is attempted that no other process writes the file: a task
+    output is opened O_APPEND, so a writer missed here only refills it, and
+    that refill is detected and paused again (premise check). A holder that
+    appears after the pause therefore does not block the emptying."""
     f = _task_output(box)
     _session(box, f)
-    blind = f"""
+    fork = f"""
     eval "_orig_sig() $(declare -f wg_signal_gen | tail -n +2)"
     wg_signal_gen() {{
         local rc=0; _orig_sig "$@" || rc=$?
         if [[ "$2" == 201 ]]; then
-            mkdir -p '{box["proc"]}/203/fd'
-            printf 'Name:\\tsudo\\nState:\\tS (x)\\nPPid:\\t201\\nThreads:\\t1\\n' > '{box["proc"]}/203/status'
-            printf '203 (sudo) S 201 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 2030 0\\n' > '{box["proc"]}/203/stat'
-            chmod 000 '{box["proc"]}/203/fd'
+            mkdir -p '{box["proc"]}/202/fd' '{box["proc"]}/202/fdinfo'
+            ln -sf '{f}' '{box["proc"]}/202/fd/1'
+            printf 'pos:\t0\nflags:\t0102001\n' > '{box["proc"]}/202/fdinfo/1'
+            printf 'Name:\tgrep\nState:\tS (x)\nPPid:\t201\nThreads:\t1\n' > '{box["proc"]}/202/status'
+            printf '202 (grep) S 201 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 2020 0\n' > '{box["proc"]}/202/stat'
         fi
         return $rc
     }}
     """
+    out = _respond(box, f, between=fork)
+    assert "ACTED=emptied" in out.stdout
+    assert f.stat().st_size == 0
+
+
+def test_an_o_append_writer_missed_by_the_emptying_only_refills_it(tmp_path):
+    """The premise the emptying rests on, on a real file: truncating under a
+    running O_APPEND writer (the flags of every live task output) frees the
+    space, and the writer goes on from the new end; nothing is corrupted."""
+    f = tmp_path / "out"
+    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        _respond(box, f, between=blind)
+        os.write(fd, b"x" * (4 * _MB))
+        os.truncate(f, 0)
+        os.write(fd, b"y" * 1000)
+        st = os.stat(f)
+        assert st.st_size == 1000, "an O_APPEND writer writes from the new end"
+        assert st.st_blocks * 512 < _MB, "the space was freed"
     finally:
-        d = box["proc"] / "203" / "fd"
-        if d.exists():
-            d.chmod(0o700)
-    if os.geteuid() == 0:
-        pytest.skip("root lists a 0o000 dir")
+        os.close(fd)
+
+
+def test_a_process_stopped_by_something_else_keeps_the_file(box):
+    """Something other than this guardian stopped a process of the command: it
+    may resume it, so the file is not emptied (review finding)."""
+    f = _task_output(box)
+    _proc(box, 100, "claude", 1, starttime=500)
+    _proc(box, 200, "bash", 100, f, starttime=2000, state="T")
+    _proc(box, 201, "grep", 200, f, starttime=2010)
+    _respond(box, f)
     assert f.stat().st_size >= 60 * _MB
     act = [p for p in _pages(box) if p["title"].startswith("Paused")]
-    assert "cannot be inspected" in act[0]["body"]
+    assert "stopped by something else, which can resume it" in act[0]["body"]
+
+
+def test_an_ancestor_stopped_by_something_else_keeps_the_file(box):
+    """A process of the command that holds nothing (the root here) but was
+    stopped by something else may be resumed by it and restart the writer:
+    the file is not emptied (review finding)."""
+    f = _task_output(box)
+    _proc(box, 100, "claude", 1, starttime=500)
+    _proc(box, 200, "bash", 100, starttime=2000, state="T")
+    _proc(box, 201, "grep", 200, f, starttime=2010)
+    _respond(box, f)
+    assert f.stat().st_size >= 60 * _MB
+    act = [p for p in _pages(box) if p["title"].startswith("Paused")]
+    assert "pid 200 in its command was stopped by something else" in act[0]["body"]
+
+
+def test_a_failing_truncate_keeps_one_tail_per_episode(box):
+    """A truncate that keeps failing is retried every poll; the 1 MB tail is
+    kept once per episode, never once per poll (review finding)."""
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    _proc(box, 200, "bash", 100, f, starttime=2000, state="T")
+    _proc(box, 201, "grep", 200, f, starttime=2010, state="T")
+    shim = box["tmp"] / "shim"
+    shim.mkdir()
+    calls = box["tmp"] / "truncate-calls"
+    (shim / "truncate").write_text(f"#!/bin/sh\necho x >> '{calls}'\nexit 0\n")
+    (shim / "truncate").chmod(0o755)
+    _respond(box, f, grow_mb=0, before=_paused_records(box, f) + f'\nPATH="{shim}:$PATH"')
+    assert len(calls.read_text().split()) >= 2, "the emptying was retried on the next poll"
+    tails = list((box["home"] / "tmp" / "watchgod-truncated").glob("*.tail"))
+    assert len(tails) == 1, tails
+
+
+def test_the_records_lock_is_free_while_the_file_is_emptied(box):
+    """The tail copy and the truncate run after the records lock is released,
+    so a stalled filesystem there can never hold up an operator's thaw
+    (review finding)."""
+    f = _task_output(box)
+    _session(box, f)
+    lock = box["home"] / ".genesis" / "watchgod" / "frozen.lock"
+    seen = box["tmp"] / "lock-during-truncate"
+    shim = box["tmp"] / "shim"
+    shim.mkdir()
+    (shim / "truncate").write_text(
+        "#!/bin/sh\n"
+        f"if flock -n '{lock}' true; then echo free > '{seen}'; else echo held > '{seen}'; fi\n"
+        'exec /usr/bin/truncate "$@"\n'
+    )
+    (shim / "truncate").chmod(0o755)
+    out = _respond(box, f, between=f'PATH="{shim}:$PATH"')
+    assert "ACTED=emptied" in out.stdout
+    assert seen.read_text().strip() == "free"
+
+
+def test_a_stalled_tail_copy_never_hangs_the_poll(box):
+    """Every step of the tail copy runs in one child under one bound: a copy
+    that hangs is cut off, the file is still emptied, and the page says the
+    tail could not be kept (review finding)."""
+    f = _task_output(box)
+    _session(box, f)
+    shim = box["tmp"] / "shim"
+    shim.mkdir()
+    # mktemp: the step the old code ran with no bound at all.
+    (shim / "mktemp").write_text("#!/bin/sh\nsleep 120\n")
+    (shim / "mktemp").chmod(0o755)
+    start = time.monotonic()
+    out = _respond(box, f, between=f'PATH="{shim}:$PATH"')
+    assert time.monotonic() - start < 60
+    assert "ACTED=emptied" in out.stdout and f.stat().st_size == 0
+    act = [p for p in _pages(box) if p["title"].startswith("Paused")]
+    assert "the tail could not be kept" in act[0]["body"]
 
 
 def test_a_truncate_that_leaves_the_file_is_not_called_emptied(box):

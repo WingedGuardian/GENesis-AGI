@@ -35,8 +35,9 @@
 # holding it. Fast growth switches to the fast poll. One response, in act mode:
 # a Claude Code task output growing fast while its domain is ORANGE or RED has
 # its command PAUSED (SIGSTOP; recorded for `scripts/watchgod thaw|kill`), then
-# the file EMPTIED once no writer is left running (its last MB kept in
-# ~/tmp/watchgod-truncated where there is room).
+# the file EMPTIED once every writer it paused is confirmed stopped (its last
+# MB kept in ~/tmp/watchgod-truncated where there is room; a writer it missed
+# only refills the file, and is paused again).
 #
 # OBSERVE mode (WATCHGOD_ACT=0) changes nothing on disk but still sends every
 # page, titled as observe-mode.
