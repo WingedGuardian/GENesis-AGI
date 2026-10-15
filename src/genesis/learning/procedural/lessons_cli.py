@@ -91,7 +91,7 @@ def _state(row: dict) -> str:
         return "quarantined"
     if row["deprecated"]:
         reason = row.get("deprecated_reason") or ""
-        return "held" if reason == HELD_REASON else f"deprecated ({reason})"
+        return "held" if reason == HELD_REASON else f"deprecated ({_safe(reason)})"
     return "live" if is_live_lesson(row["lesson"]) else "malformed record"
 
 
@@ -331,15 +331,26 @@ async def _review(args) -> int:
                 if not args.force:
                     return REFUSED
             unusable = [r["id"] for r in live if r not in comparable]
-            if unusable:
+            # The hourly backfill embeds only a missing (NULL) vector; nothing
+            # repairs a malformed one, so the advice differs.
+            missing = [
+                r["id"] for r in live if r not in comparable and not r.get("principle_embedding")
+            ]
+            broken = [r["id"] for r in live if r not in comparable and r.get("principle_embedding")]
+            if missing:
                 print(
-                    f"{verdict}: twin check incomplete (no usable embedding on "
-                    + ", ".join(unusable)
-                    + "; the hourly backfill re-embeds live rows); retry later, or re-run "
-                    "with --force"
+                    f"{verdict}: twin check incomplete (no embedding yet on "
+                    + ", ".join(missing)
+                    + "; the hourly backfill adds it); retry after it runs, or re-run with --force"
                 )
-                if not args.force:
-                    return REFUSED
+            if broken:
+                print(
+                    f"{verdict}: twin check incomplete (a malformed embedding on "
+                    + ", ".join(broken)
+                    + ", which nothing repairs); deprecate that lesson, or re-run with --force"
+                )
+            if unusable and not args.force:
+                return REFUSED
         # One compare-and-set write: it applies only while the row is still held.
         cursor = await db.execute(
             "UPDATE procedural_memory SET deprecated = 0, deprecated_reason = NULL, "
@@ -383,7 +394,7 @@ async def _deprecate(args) -> int:
             print(f"no lesson with id {args.id}")
             return NOT_FOUND
         await procedural.update(db, args.id, deprecated=1, deprecated_reason=reason)
-        print(f"deprecated: {args.id} ({reason})")
+        print(f"deprecated: {args.id} ({_safe(reason)})")
         return await _rebuild(db, args.rebuild_cache)
     finally:
         await db.close()

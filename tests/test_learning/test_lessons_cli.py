@@ -235,7 +235,12 @@ def test_an_embedding_a_cosine_cannot_compare_blocks_the_twin_check(env, capsys,
         {"id": "held", **_HELD, "embedding": bad if where == "held" else _VEC},
     )
     assert env("review", "held") == 1
-    assert f"no usable embedding on {where}" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    if where == "held":
+        assert "no usable embedding on held" in out
+    else:  # a malformed vector is never re-embedded: retrying would not help
+        assert "malformed embedding on live, which nothing repairs" in out
+        assert "retry" not in out
     assert env.row("held")["deprecated"] == 1
     assert env("review", "held", "--force") == 0
 
@@ -314,6 +319,23 @@ def test_a_locked_database_exits_busy_not_refused(env, capsys):
         holder.close()
     assert "database busy or unreadable" in capsys.readouterr().err
     assert env.row("held")["deprecated"] == 1
+
+
+def test_a_missing_sibling_embedding_says_to_retry(env, capsys):
+    env.build(
+        {"id": "noemb", "lesson": _lesson(), "embedding": None},
+        {"id": "held", **_HELD, "embedding": _VEC},
+    )
+    assert env("review", "held") == 1
+    assert "no embedding yet on noemb; the hourly backfill adds it" in capsys.readouterr().out
+
+
+def test_a_deprecation_reason_is_escaped_when_shown(env, capsys):
+    env.build({"id": "live", "lesson": _lesson()})
+    assert env("deprecate", "live", "--reason", "noisy\x1b[2Jcleared") == 0
+    assert env("list") == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "noisy\\x1b[2Jcleared" in out
 
 
 def test_deprecate_takes_a_lesson_out_of_service(env):
