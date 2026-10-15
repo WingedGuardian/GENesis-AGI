@@ -211,3 +211,16 @@ async def test_an_unreadable_authored_at_is_replaced_so_the_lesson_stays_live(db
     await db.commit()
     await seed.seed_shipped_lessons(db, lessons)
     assert is_live_lesson((await _rows(db))[row_id]["lesson"])
+
+
+def test_the_agent_tool_guidance_lesson_matches_what_the_hook_did():
+    """The shipped lesson replaces the retired agent_tool_guidance hook: it
+    fires on a research prompt for Agent and Task, and not on other work."""
+    import re
+
+    lesson = seed._lesson_from_file(seed.LESSONS_DIR / "agent-tool-guidance.yaml")
+    assert set(lesson["tool_trigger"]) == {"Agent", "Task"}
+    (pattern,) = lesson["trigger_spec"]["patterns"]
+    assert re.search(pattern, "Research the codebase ARCHITECTURE of the memory module")
+    assert not re.search(pattern, "write a short poem about autumn")
+    assert lesson["trigger_spec"]["repeat"] == "session"
