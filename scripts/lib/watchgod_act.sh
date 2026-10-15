@@ -34,9 +34,18 @@ _RW_OWED=0
 # The last MB of an emptied output, for whoever investigates: owner-only, in an
 # owner-only directory (the output can carry a credential). At most one per
 # file episode: a truncate that keeps failing never adds a copy per poll
-# (review finding). _RW_TAILED["gen:episode"] marks the episodes copied.
+# (review finding). _RW_TAILED["gen:episode"] is "kept" or "failed" for an
+# episode whose copy was attempted: a failed copy is never reported as kept.
 DG_RUNAWAY_TAIL_DIR="$HOME/tmp/watchgod-truncated"
 declare -gA _RW_TAILED=()
+# Per generation: the episode start that this guardian's own emptying opened.
+# A refill past the size threshold within that episode is space written AFTER
+# the emptying (never a size someone left behind), so it is acted on like
+# growth: a writer the emptying missed and that refills slowly is paused again
+# too (review finding). Each emptying opens a new episode, so each refill cycle
+# may keep its own tail: bounded by real refills of that size, and only while
+# ~/tmp's disk has room.
+declare -gA _RW_EMPTIED_EP=()
 
 # ── The response: pause the command ─────────────────────────
 # Only ONE kind of file is ever acted on: a Claude Code Bash command's
@@ -217,7 +226,9 @@ _rw_all_paused() {
     # recorded holder's own stop can show as t, as the pause itself and the
     # re-walk accept; review finding). Only such a file
     # is emptied without new growth: a writer someone thawed has no record any
-    # more, so it is never paused again on size alone.
+    # more, so it is never paused again on size alone (the one exception: a
+    # refill past the size threshold within the episode this guardian's own
+    # emptying opened; see _RW_EMPTIED_EP).
     local key="$1" pid st recs
     shift
     (( $# )) || return 1
@@ -293,18 +304,21 @@ _rw_empty() {
     ep="${gen}:${_RW_EP[$gen]:-0}"
     tdom="$(_rw_domain_for "$(timeout -k 1 2 stat -L -c %d -- "$HOME/tmp" 2>/dev/null)" "$(wg_canon "$HOME/tmp")" "$domains")"
     tkey="${tdom%% *}"
-    if [[ -n "${_RW_TAILED[$ep]:-}" ]]; then
+    if [[ "${_RW_TAILED[$ep]:-}" == kept ]]; then
         _RW_EMPTY_NOTE="its tail was already kept in this episode"
+    elif [[ "${_RW_TAILED[$ep]:-}" == failed ]]; then
+        _RW_EMPTY_NOTE="no tail kept: the copy failed earlier in this episode, and is not retried"
     elif [[ -z "$tkey" || ( "${RW_TIER[$tkey]:-}" != green && "${RW_TIER[$tkey]:-}" != yellow ) ]]; then
         _RW_EMPTY_NOTE="no tail kept: the disk holding ~/tmp has no room to spare"
     else
-        _RW_TAILED[$ep]=1
+        _RW_TAILED[$ep]=failed
         # One child, one bound, for the directory, the new file, the copy and
         # its cleanup (review finding: a stalled ~/tmp must never hang the
         # poll). A copy cut short by the bound may be left partial: at most
         # one per episode, in the owner-only directory.
         if dest="$(timeout -k 2 15 bash -c "$(declare -f _rw_private_dir _rw_keep_tail)"'; _rw_keep_tail "$@"' \
                        _ "$DG_RUNAWAY_TAIL_DIR" "${path##*/}.$(date +%s)" "$own" 2>/dev/null)" && [[ -n "$dest" ]]; then
+            _RW_TAILED[$ep]=kept
             _RW_EMPTY_NOTE="last 1 MB kept in $(_rw_show "$dest")"
         else
             _RW_EMPTY_NOTE="the tail could not be kept"
@@ -426,8 +440,11 @@ _rw_respond() {
     if (( _RW_OWED )); then
         local resumed=""
         _rw_all_paused "$key" "$@" {lk}>&- || resumed=1
+        # An ancestor's record survives a direct SIGCONT (only thaw drops it):
+        # it must also still be stopped, as the holders must (review finding).
         for r in "${!tree[@]}"; do
             [[ "$(wg_record_state "${r%%:*}" "${r#*:}" {lk}>&- || true)" == paused ]] || resumed=1
+            [[ "$(_rw_state "${r%%:*}" {lk}>&-)" == [Tt] ]] || resumed=1
         done
         if [[ -n "$resumed" ]]; then
             wg_records_unlock "$lk"
@@ -521,6 +538,7 @@ _rw_respond() {
             # The episode is over: a refill pages (and is acted on) again,
             # however long it takes.
             _rw_episode_open "$gen" "$now_s"
+            _RW_EMPTIED_EP[$gen]="$now_s"
         else
             why_not="$_RW_EMPTY_NOTE"
         fi
@@ -558,7 +576,9 @@ _rw_respond() {
     [[ -n "$sid" ]] && body+="Claude Code session: ${sid}"$'\n'
     body+="Resume:"
     for p in $all; do body+=" scripts/watchgod thaw ${p};"; done
-    body+=" or scripts/watchgod thaw all. A resumed command that is still growing fast while the disk is in trouble is paused again. End it instead:"
+    body+=" or scripts/watchgod thaw all. A resumed command that is still growing fast while the disk is in trouble is paused again"
+    (( _RW_EMPTIED )) && body+=", as is one that refills this output past ${DG_RUNAWAY_PCT}% of the disk after this emptying"
+    body+=". End it instead:"
     for p in $all; do body+=" scripts/watchgod kill ${p};"; done
     if (( _RW_EMPTIED )) && [[ -z "$newly" ]]; then
         title="Emptied a runaway Claude Code task output (its writers were already paused)"

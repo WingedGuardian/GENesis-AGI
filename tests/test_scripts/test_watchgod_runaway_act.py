@@ -929,6 +929,110 @@ def test_an_ancestor_stopped_by_something_else_keeps_the_file(box):
     assert "pid 200 in its command was stopped by something else" in act[0]["body"]
 
 
+def test_an_ancestor_resumed_outside_thaw_is_not_stopped_again_on_size(box):
+    """A direct SIGCONT leaves an ancestor's "paused" record in place: the
+    owed emptying checks its state too, so a running root is never stopped
+    again, nor the file emptied, without new growth (review finding)."""
+    f = _task_output(box, mb=150)
+    _proc(box, 100, "claude", 1, starttime=500)
+    _proc(box, 200, "bash", 100, starttime=2000)  # the root: running again
+    _proc(box, 201, "grep", 200, f, starttime=2010, state="T")
+    put = (
+        "wg_records_lock lk; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n"
+        f"wg_record_put 200 2000 bash \"$ts\" {os.stat(f).st_dev}:{os.stat(f).st_ino} '{f}' paused\n"
+        f"wg_record_put 201 2010 grep \"$ts\" {os.stat(f).st_dev}:{os.stat(f).st_ino} '{f}' paused\n"
+        'wg_records_unlock "$lk"'
+    )
+    _respond(box, f, grow_mb=0, before=put)
+    assert _kills(box) == [], "the running root is not stopped again on size"
+    assert f.stat().st_size >= 150 * _MB, "nor is the file emptied"
+
+
+def test_a_slow_refill_after_an_emptying_is_paused_again(box):
+    """A writer the emptying missed, refilling slowly: within the episode this
+    guardian's own emptying opened, crossing the size threshold is acted on
+    like growth, though it never grows fast (review finding)."""
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    cc_key = f"{os.stat(box['cc']).st_dev}m9"
+    r = _run(
+        box,
+        f"""
+        RW_TIER[{cc_key}]=red
+        _RW_EMPTIED_EP[$(stat -c %d:%i:%W '{f}')]=1000
+        _RW_EP[$(stat -c %d:%i:%W '{f}')]=1000
+        wg_runaway_check '{_domains(box)}'
+        echo "ACTED=$_RW_ACTED"
+        """,
+    )
+    assert "ACTED=emptied" in r.stdout or "ACTED=paused" in r.stdout, r.stdout + r.stderr
+    assert "kill -STOP 200" in _kills(box)
+
+
+def test_a_slow_refill_after_a_real_emptying_and_a_thaw_is_paused_again(box):
+    """End to end: the guardian empties the file, the operator thaws the
+    command, and it refills slowly past the size threshold: it is paused
+    again, because that size was all written after the emptying."""
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    _proc(box, 200, "bash", 100, f, starttime=2000, state="T")
+    _proc(box, 201, "grep", 200, f, starttime=2010, state="T")
+    cc_key = f"{os.stat(box['cc']).st_dev}m9"
+    doms = _domains(box)
+    proc = box["proc"]
+    r = _run(
+        box,
+        f"""
+        RW_TIER[{cc_key}]=red
+        {_paused_records(box, f)}
+        wg_runaway_check '{doms}'
+        echo "A1=$_RW_ACTED"
+        : > "$(wg_records_file)"
+        sed -i 's/^State:.*/State:\tS (x)/' '{proc}/200/status' '{proc}/201/status'
+        sed -i 's/) T /) S /' '{proc}/200/stat' '{proc}/201/stat'
+        for g in "${{!_RW_PREV_AT[@]}}"; do _RW_PREV_AT[$g]=$(( _RW_PREV_AT[$g] - 100000 )); done
+        _RW_PREV_T=$(( _RW_PREV_T - 100000 ))
+        python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_WRONLY); os.posix_fallocate(fd, 0, 150*1048576)' '{f}'
+        wg_runaway_check '{doms}'
+        echo "A2=$_RW_ACTED"
+        """,
+    )
+    assert "A1=emptied" in r.stdout, r.stdout + r.stderr
+    assert "kill -STOP 200" in _kills(box) and "kill -STOP 201" in _kills(box), r.stdout
+    assert "A2=emptied" in r.stdout
+
+
+def test_a_slow_size_alone_outside_an_emptied_episode_is_never_acted_on(box):
+    """The control: the same size with no emptying of ours behind it (e.g. a
+    writer someone thawed) is paged, never paused."""
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    cc_key = f"{os.stat(box['cc']).st_dev}m9"
+    _run(box, f"RW_TIER[{cc_key}]=red\nwg_runaway_check '{_domains(box)}'")
+    assert _kills(box) == []
+
+
+def test_a_failed_tail_copy_is_never_reported_as_kept(box):
+    """The copy fails and so does the truncate; on the retry the page must not
+    claim a tail exists (review finding)."""
+    f = _task_output(box, mb=150)
+    _session(box, f)
+    _proc(box, 200, "bash", 100, f, starttime=2000, state="T")
+    _proc(box, 201, "grep", 200, f, starttime=2010, state="T")
+    shim = box["tmp"] / "shim"
+    shim.mkdir()
+    for name in ("mktemp", "truncate"):
+        (shim / name).write_text("#!/bin/sh\nexit 1\n")
+        (shim / name).chmod(0o755)
+    # The retry's note is deduplicated in the log: read it from the shell.
+    trap = "trap 'echo \"NOTE=$_RW_EMPTY_NOTE\"' EXIT"
+    out = _respond(
+        box, f, grow_mb=0, before=_paused_records(box, f) + f'\nPATH="{shim}:$PATH"\n{trap}'
+    )
+    assert "copy failed earlier in this episode" in out.stdout, out.stdout
+    assert "already kept" not in out.stdout
+
+
 def test_a_failing_truncate_keeps_one_tail_per_episode(box):
     """A truncate that keeps failing is retried every poll; the 1 MB tail is
     kept once per episode, never once per poll (review finding)."""
