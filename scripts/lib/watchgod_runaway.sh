@@ -19,8 +19,9 @@
 # (the growth test, live this poll), while its domain is ORANGE or RED and the
 # guardian is in act mode. Then it pauses that command (SIGSTOP: never the
 # session, never a kill), records the pause for `scripts/watchgod thaw|kill`,
-# and once no writer is left running, empties the file (keeping its last MB
-# where there is room). Nothing else is stopped or changed.
+# and once every writer it paused is confirmed stopped, empties the file
+# (keeping its last MB where there is room; a writer it missed only refills
+# it, and is paused again). Nothing else is stopped or changed.
 #
 # One poll costs one size-filtered walk of /proc/*/fd. A file is followed only
 # when it is held open FOR WRITING by a process this uid can see and has at
@@ -562,6 +563,8 @@ wg_runaway_check() {
             (( now - ${_RW_LAST[$gen]} > ttl )) || continue
             unset "_RW_LAST[$gen]" "_RW_PAGED[$gen]" "_RW_EP[$gen]" "_RW_PREV[$gen]" "_RW_PREV_AT[$gen]" \
                   "_RW_LINKS[$gen]" "_RW_DUE[$gen]" "_RW_DUE[${gen}_observe]"
+            # Its tail markers too (watchgod_act.sh; one per episode).
+            for k in "${!_RW_TAILED[@]}"; do [[ "$k" == "$gen:"* ]] && unset "_RW_TAILED[$k]"; done
         done
     fi
 

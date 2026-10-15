@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # The runaway response for tmp_watchgod.sh: pause the command writing a
-# runaway Claude Code task output, then empty the file once no writer of it
-# is left running. Detection, and the decision to call this, live in
+# runaway Claude Code task output, then empty the file once every writer it
+# paused is confirmed stopped. Detection, and the decision to call this, live in
 # scripts/lib/watchgod_runaway.sh (wg_runaway_check); this file only acts.
 # Sourced after watchgod_signal.sh, watchgod_records.sh and
 # watchgod_runaway.sh. Pure functions; nothing runs at source time.
@@ -32,8 +32,11 @@ _RW_EMPTIED=0
 # _rw_respond re-checks that under the records lock (review finding).
 _RW_OWED=0
 # The last MB of an emptied output, for whoever investigates: owner-only, in an
-# owner-only directory (the output can carry a credential).
+# owner-only directory (the output can carry a credential). At most one per
+# file episode: a truncate that keeps failing never adds a copy per poll
+# (review finding). _RW_TAILED["gen:episode"] marks the episodes copied.
 DG_RUNAWAY_TAIL_DIR="$HOME/tmp/watchgod-truncated"
+declare -gA _RW_TAILED=()
 
 # ── The response: pause the command ─────────────────────────
 # Only ONE kind of file is ever acted on: a Claude Code Bash command's
@@ -62,15 +65,24 @@ DG_RUNAWAY_TAIL_DIR="$HOME/tmp/watchgod-truncated"
 # stop is seen. A record that cannot be written means no signal (review
 # finding: on a full disk the record is what fails). The lock is waited for at
 # most DG_RUNAWAY_LOCK_WAIT_S; when an operator's thaw or kill holds it, nothing
-# is paused this poll. Once taken it is HELD from the first record through the
-# re-walk, the tail copy and the truncate, so thaw cannot resume a writer
-# between the check and the truncate. That hold is bounded by the timeouts
-# inside it (the re-walk and the uninspectable-process walk, 10 s each; the
-# tail copy 10 s; the truncate 5 s; confirming the stops 5 s), about 40 s at
-# worst plus one record and one signal per process paused; an operator's thaw
-# waits for it (security review: the 1 s is the wait, not the hold). No child
-# started under the lock inherits its descriptor ({lk}>&-): a child stuck in
-# uninterruptible sleep would otherwise hold it, and thaw waits on it.
+# is paused this poll. Once taken it is HELD from the first record until the
+# output file is opened through a paused holder: one record and one signal per
+# process, confirming the stops (5 s), and opening the file (bounded stats,
+# then one open that is not: the stat just before it reached the same file
+# within its bound). The tail copy and the truncate run AFTER it is released, so neither
+# can hold up an operator's thaw (review finding). No child started under the
+# lock inherits its descriptor ({lk}>&-): a child stuck in uninterruptible
+# sleep would otherwise hold it, and thaw waits on it.
+#
+# Emptying: once every process paused here is confirmed stopped, and nothing
+# in the command was stopped by something else (which could resume it), the
+# file is truncated through a paused holder's own descriptor. No proof is
+# attempted that no other process writes it: a task output is opened
+# O_APPEND (MEASURED: every live task-output descriptor, flags 0506001), so a
+# writer missed here writes on from the new end, and that refill is detected
+# and paused again. An independent premise check found the proof bought no
+# safety and drew most of the review findings; it was removed. A thaw that
+# lands between the unlock and the truncate is the same case: a refill.
 
 _rw_task_output() {
     # 0 when $1 is exactly a Claude Code task output under cc-tmp.
@@ -235,94 +247,73 @@ _rw_private_dir() {
     return 0
 }
 
-_rw_unpaused_holders() {
-    # After the pause: every process that NOW holds $1 (dev:inode) open for
-    # writing and is not one of the processes paused here ($2: "pid:start"
-    # space-separated) in a stopped state, one pid per line. A holder at a pid
-    # we paused but with another start time is a different process: running.
-    # A forked child inherits the descriptor, and something else may have
-    # opened the file since the walk: emptying it under a running writer lets
-    # it refill at once. Prints "#incomplete" when the walk, or a re-check,
-    # did not complete: then nothing can be confirmed.
-    local key="$1" ours=" ${2:-} " k s pid fd _d rc="" id st state src
-    local -A seen=()
-    while read -r k s pid fd _d; do
-        if [[ "$k" == "#rc" ]]; then rc="$s"; continue; fi
-        [[ "$k" == "$key" && -n "$pid" && -z "${seen[$pid]:-}" ]] || continue
-        # Still on this file through that descriptor? stat -L touches the
-        # file's filesystem, so it is bounded.
-        src=0
-        id="$(timeout -k 1 2 stat -L -c %d:%i -- "${DG_PROC:-/proc}/$pid/fd/$fd" 2>/dev/null)" || src=$?
-        case $src in
-            0) ;;
-            124|137) echo "#incomplete"; return 0 ;;
-            # Gone (closed, or its process exited): not a holder. Still there
-            # but not stat-able: a holder that cannot be checked.
-            *) [[ -L "${DG_PROC:-/proc}/$pid/fd/$fd" ]] && { echo "#incomplete"; return 0; }
-               continue ;;
-        esac
-        [[ "$id" == "$key" ]] || continue
-        seen[$pid]=1
-        st="$(wg_starttime "$pid" 2>/dev/null)" || { [[ -e "${DG_PROC:-/proc}/$pid" ]] && { echo "#incomplete"; return 0; }; continue; }
-        state="$(_rw_state "$pid")"
-        [[ "$ours" == *" ${pid}:${st} "* && ( "$state" == T || "$state" == t ) ]] && continue
-        [[ -z "$state" ]] && continue   # exited
-        printf '%s\n' "$pid"
-    done < <(_rw_scan)
-    [[ "$rc" =~ ^[01]$ ]] || echo "#incomplete"
+_rw_find_paused_fd() {
+    # The /proc descriptor link through which one of the paused processes $3
+    # ("pid:start" space-separated) still holds the file $2 (path) whose
+    # identity is $1 (dev:inode). A stopped process cannot close or reuse a
+    # descriptor; the start time rules out a recycled pid. Prints nothing when
+    # none still leads to it. readlink never touches the file's filesystem;
+    # only a link that names this file is stat'ed, and under a timeout.
+    local key="$1" path="$2" p ffd
+    for p in $3; do
+        wg_same_gen "${p%%:*}" "${p#*:}" || continue
+        for ffd in "${DG_PROC:-/proc}/${p%%:*}"/fd/*; do
+            [[ "$(readlink -- "$ffd" 2>/dev/null)" == "$path" ]] || continue
+            [[ "$(timeout -k 1 2 stat -L -c %d:%i -- "$ffd" 2>/dev/null)" == "$key" ]] && { printf '%s' "$ffd"; return 0; }
+        done
+    done
     return 0
 }
 
-_rw_empty() {
-    # Empty the task output $3 (dev:inode $2) through a descriptor of one of
-    # the processes paused here ($4: "pid:start" space-separated), keeping its
-    # last MB where there is room. $1: the domains, to judge the room. Sets
-    # _RW_EMPTY_NOTE; succeeds only when the file was confirmed empty. Called
-    # under the records lock, with the lock's descriptor closed for it.
-    local domains="$1" key="$2" path="$3" ours="$4" p ffd flink="" ofd="" own="" tdom tkey dest=""
-    _RW_EMPTY_NOTE="no tail kept"
-    # Reach the file through a PAUSED holder (a stopped process cannot close
-    # or reuse a descriptor), open it on a descriptor of our own, and act only
-    # if that descriptor is still the file the walk saw: a /proc fd link of a
-    # pid that exited and was recycled would name some other file.
-    for p in $ours; do
-        wg_same_gen "${p%%:*}" "${p#*:}" || continue
-        for ffd in "${DG_PROC:-/proc}/${p%%:*}"/fd/*; do
-            # readlink never touches the target's filesystem; only a link that
-            # names this file is stat'ed, and under a timeout.
-            [[ "$(readlink -- "$ffd" 2>/dev/null)" == "$path" ]] || continue
-            [[ "$(timeout -k 1 2 stat -L -c %d:%i -- "$ffd" 2>/dev/null)" == "$key" ]] && { flink="$ffd"; break 2; }
-        done
-    done
-    [[ -n "$flink" ]] || { _RW_EMPTY_NOTE="no paused writer still leads to it"; return 1; }
-    { exec {ofd}>>"$flink"; } 2>/dev/null || { _RW_EMPTY_NOTE="it could not be opened"; return 1; }
-    own="/proc/$BASHPID/fd/$ofd"
-    if [[ "$(timeout -k 1 2 stat -L -c %d:%i -- "$own" 2>/dev/null)" != "$key" ]]; then
-        exec {ofd}>&-
-        _RW_EMPTY_NOTE="the file changed while it was opened"
+_rw_keep_tail() {
+    # Run in a child under a timeout (every step may touch ~/tmp's
+    # filesystem, which can stall): copy the last MB of $3 (our descriptor
+    # of the output, as a /proc path) to a new owner-only file named after $2
+    # in directory $1; print its path. A copy that fails is removed.
+    local d
+    _rw_private_dir "$1" || return 1
+    d="$(umask 077; mktemp --suffix=.tail "$1/$2.XXXXXXXX")" || return 1
+    if tail -c 1048576 -- "$3" > "$d"; then
+        printf '%s' "$d"
+    else
+        rm -f -- "$d"
         return 1
     fi
-    # The tail only where there is room: the copy must never gate the
-    # emptying, and never fill a second disk. mktemp creates the copy 0600
-    # and exclusively under a name no other tail can take.
+}
+
+_rw_empty() {
+    # Empty the task output $3 of generation $2, open on our descriptor $4
+    # (opened through a paused holder and checked by the caller), keeping its
+    # last MB where there is room, once per episode. $1: the domains, to judge
+    # the room. Closes $4. Sets _RW_EMPTY_NOTE; succeeds only when the file
+    # was confirmed empty. Runs WITHOUT the records lock.
+    local domains="$1" gen="$2" path="$3" ofd="$4" own tdom tkey dest ep
+    own="/proc/$BASHPID/fd/$ofd"
+    _RW_EMPTY_NOTE="no tail kept"
+    ep="${gen}:${_RW_EP[$gen]:-0}"
     tdom="$(_rw_domain_for "$(timeout -k 1 2 stat -L -c %d -- "$HOME/tmp" 2>/dev/null)" "$(wg_canon "$HOME/tmp")" "$domains")"
     tkey="${tdom%% *}"
-    if [[ -z "$tkey" || ( "${RW_TIER[$tkey]:-}" != green && "${RW_TIER[$tkey]:-}" != yellow ) ]]; then
+    if [[ -n "${_RW_TAILED[$ep]:-}" ]]; then
+        _RW_EMPTY_NOTE="its tail was already kept in this episode"
+    elif [[ -z "$tkey" || ( "${RW_TIER[$tkey]:-}" != green && "${RW_TIER[$tkey]:-}" != yellow ) ]]; then
         _RW_EMPTY_NOTE="no tail kept: the disk holding ~/tmp has no room to spare"
     else
-        if _rw_private_dir "$DG_RUNAWAY_TAIL_DIR"; then
-            dest="$(umask 077; mktemp --suffix=.tail "$DG_RUNAWAY_TAIL_DIR/${path##*/}.$(date +%s).XXXXXXXX" 2>/dev/null)" || dest=""
-        fi
-        if [[ -n "$dest" ]] && timeout -k 2 10 tail -c 1048576 -- "$own" > "$dest" 2>/dev/null; then
+        _RW_TAILED[$ep]=1
+        # One child, one bound, for the directory, the new file, the copy and
+        # its cleanup (review finding: a stalled ~/tmp must never hang the
+        # poll). A copy cut short by the bound may be left partial: at most
+        # one per episode, in the owner-only directory.
+        if dest="$(timeout -k 2 15 bash -c "$(declare -f _rw_private_dir _rw_keep_tail)"'; _rw_keep_tail "$@"' \
+                       _ "$DG_RUNAWAY_TAIL_DIR" "${path##*/}.$(date +%s)" "$own" 2>/dev/null)" && [[ -n "$dest" ]]; then
             _RW_EMPTY_NOTE="last 1 MB kept in $(_rw_show "$dest")"
         else
-            [[ -n "$dest" ]] && rm -f -- "$dest" 2>/dev/null
             _RW_EMPTY_NOTE="the tail could not be kept"
         fi
     fi
     if timeout -k 1 5 truncate -s 0 -- "$own" 2>/dev/null \
             && [[ "$(timeout -k 1 2 stat -L -c %s -- "$own" 2>/dev/null)" == 0 ]]; then
         exec {ofd}>&-
+        unset "_RW_TAILED[$ep]"
         return 0
     fi
     exec {ofd}>&-
@@ -331,8 +322,8 @@ _rw_empty() {
 }
 
 _rw_respond() {
-    # Pause the command writing a runaway task output, then empty it once no
-    # writer is left running. $1 generation, $2 dev:inode, $3 path, $4 size
+    # Pause the command writing a runaway task output, then empty it once
+    # every writer it paused is confirmed stopped. $1 generation, $2 dev:inode, $3 path, $4 size
     # MB, $5 the domains, rest: holder pids (identity in _RW_IDENT). Sets
     # _RW_PAUSED_NOW=1 when it paused something this poll, _RW_EMPTIED=1 when
     # it emptied the file, and _RW_ACTED to a one-line summary for the
@@ -502,28 +493,30 @@ _rw_respond() {
         fi
     done
 
-    # Empty the file only when NO writer is left running: every process here
-    # confirmed stopped, and a fresh walk (start times as well as the file's
-    # identity) finds no other running holder and no uninspectable process in
-    # the command. Still under the lock, so thaw cannot resume a writer
-    # between the check and the truncate.
-    local why_not="" running="" ours="" q
+    # Empty the file once every process paused here is confirmed stopped and
+    # nothing in the command was stopped by something else, which could
+    # resume it (review finding). See the header for why no other proof is
+    # attempted. The file is opened here, under the lock, through a paused
+    # holder, on a descriptor of our own that must still be the file the walk
+    # saw; the copy and the truncate run after the unlock.
+    local why_not="" ours="" q flink="" ofd=""
     [[ -n "$unconfirmed$refused" ]] && why_not="not every writer is confirmed stopped"
     [[ -n "$paused" ]] || why_not="no writer was confirmed paused"
+    [[ -n "$prestopped" ]] && why_not="${why_not}${why_not:+; }pid${prestopped} in its command was stopped by something else, which can resume it"
     if [[ -z "$why_not" ]]; then
         for q in $paused; do ours+=" ${q}:${st_of[$q]}"; done
-        while read -r q; do
-            [[ -n "$q" ]] || continue
-            if [[ "$q" == "#incomplete" ]]; then why_not="the check for running writers did not complete"; continue; fi
-            running+=" ${q}"
-        done < <(_rw_unpaused_holders "$key" "${ours# }" {lk}>&-)
-        [[ -n "$running" ]] && why_not="${why_not}${why_not:+; }still running (or stopped by something else, which can resume it): pid${running}"
+        flink="$(_rw_find_paused_fd "$key" "$path" "${ours# }" {lk}>&-)"
+        if [[ -z "$flink" ]]; then
+            why_not="no paused writer still leads to it"
+        elif ! { exec {ofd}>>"$flink"; } 2>/dev/null; then
+            ofd=""; why_not="it could not be opened"
+        elif [[ "$(timeout -k 1 2 stat -L -c %d:%i -- "/proc/$BASHPID/fd/$ofd" {lk}>&- 2>/dev/null)" != "$key" ]]; then
+            exec {ofd}>&-; ofd=""; why_not="the file changed while it was opened"
+        fi
     fi
+    wg_records_unlock "$lk"
     if [[ -z "$why_not" ]]; then
-        q="$(_rw_blind_veto "${!roots[*]}" {lk}>&-)" && why_not="$q"
-    fi
-    if [[ -z "$why_not" ]]; then
-        if _rw_empty "$domains" "$key" "$path" "${ours# }" {lk}>&-; then
+        if _rw_empty "$domains" "$gen" "$path" "$ofd"; then
             _RW_EMPTIED=1
             # The episode is over: a refill pages (and is acted on) again,
             # however long it takes.
@@ -532,7 +525,6 @@ _rw_respond() {
             why_not="$_RW_EMPTY_NOTE"
         fi
     fi
-    wg_records_unlock "$lk"
 
     local all="${paused}${unconfirmed}"
     if [[ -z "$all" ]]; then
