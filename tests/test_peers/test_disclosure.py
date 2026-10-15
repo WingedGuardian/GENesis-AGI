@@ -37,6 +37,34 @@ def test_plain_safe_and_embedded_json_are_supported(value):
     assert json_strings_safe(value)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        'see "\\/home\\/synthetic\\/notes"',  # quoted JSON string token in prose
+        "see \\\\/home\\\\/synthetic\\\\/notes",  # escaped twice
+        "host 10\\u002e0\\u002e0\\u002e1 answered",  # bare escapes in prose
+        {"API\\u005fKEY": "syntheticvalue1"},  # escaped mapping key
+    ],
+)
+def test_escaped_disclosures_in_prose_are_withheld(value):
+    assert not json_strings_safe(value)
+
+
+def test_ordinary_escapes_in_prose_stay_disclosable():
+    assert json_strings_safe('line one\\nline two \\"quoted\\" caf\\u00e9')
+    assert json_strings_safe("C:\\Users\\Public\\notes")
+    # Decoding can leave a truncated JSON fragment; that is prose, not refusal.
+    assert json_strings_safe(
+        'The log showed {\\"event\\": \\"start\\", \\"n\\": 1 and then stopped.'
+    )
+    assert json_strings_safe('match \\d+\\.\\d+ then [\\"a\\" or')
+
+
+def test_escaped_json_object_in_prose_is_still_parsed():
+    secret = "".join(["synthetic", "credential"])
+    assert not json_strings_safe('logged {\\"password\\": \\"' + secret + '\\"} today')
+
+
 def test_nested_decoded_compound_keys_malformed_cycles_and_work():
     assert not json_strings_safe({json.dumps({"safe": "key"}): "value"})
     assert not json_strings_safe('prose {"pass\\u0077ord":"unfinished')

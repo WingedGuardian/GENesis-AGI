@@ -1,5 +1,6 @@
 """Peer JSON disclosure checks, including serialized JSON within string values."""
 
+import itertools
 import json
 import re
 
@@ -9,6 +10,19 @@ _MAX_JSON_BYTES = 2 * 1024 * 1024
 _MAX_SCAN_WORK = 32 * _MAX_JSON_BYTES
 _MAX_NESTING = 1024
 _CONTAINER = re.compile(r'[\{\[]\s*(?=["\{\[\]\}\d-]|true\b|false\b|null\b)')
+_ESCAPE = re.compile(r'\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))')
+_SIMPLE_ESCAPES = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
+class _Unescaped(str):
+    """Escape-decoded text: scanned as a leaf, never parsed as JSON."""
+
+
+def _unescape(text):
+    """Text with its JSON escapes decoded, wherever they appear in prose."""
+    return _ESCAPE.sub(
+        lambda m: chr(int(m[1], 16)) if m[1] else _SIMPLE_ESCAPES.get(m[2], m[2]), text
+    )
 
 
 class _JSONPairs(list):
@@ -31,6 +45,11 @@ class _WorkBudget:
 
 def json_strings_safe(value):
     """Refuse unsafe original or decoded JSON; fail closed on invalid or excessive work.
+
+    Scope: accident hygiene for same-owner peers, at least as strict as the
+    outbound scan on other egress. It is not a confidentiality boundary: a
+    session a peer can steer can encode or paraphrase anything it can read, so
+    what a peer may learn is bounded by the session profile's capabilities.
 
     Serialized disclosures are limited to 2 MiB; larger results are withheld.
     Aggregate scanning is bounded to 32 times that limit; unusually nested or
@@ -74,6 +93,9 @@ def _key_names(key, budget):
     while isinstance(key, str):
         budget.charge(len(key))
         yield key
+        unescaped = _unescape(key)
+        if unescaped != key:
+            yield from _key_names(unescaped, budget)
         key = _decode(key, budget)
         if isinstance(key, (dict, list)):
             raise ValueError("Compound peer JSON mapping keys are unsupported")
@@ -116,10 +138,23 @@ def _json_nodes(value, budget, decode):
 
 def _descendants(item, keys, budget, decode):
     if isinstance(item, str):
-        decoded = _decode(item, budget) if decode else None
-        if decoded is not None:
-            return iter(((decoded, keys),))
-        return _embedded(item, keys, budget) if decode else None
+        if not decode:
+            return None
+        if isinstance(item, _Unescaped):
+            # Decoding can truncate quoted JSON; a fragment here is prose.
+            children = _embedded(item, keys, budget, strict=False)
+        else:
+            decoded = _decode(item, budget)
+            children = (
+                iter(((decoded, keys),)) if decoded is not None else _embedded(item, keys, budget)
+            )
+        # Hygiene, not a boundary: JSON escapes in prose ("\/home") are also
+        # scanned decoded. Each pass shortens the text, so this ends.
+        budget.charge(len(item))
+        unescaped = _unescape(item)
+        if unescaped != item:
+            return itertools.chain(children, ((_Unescaped(unescaped), keys),))
+        return children
     if isinstance(item, (dict, _JSONPairs)):
         pairs = item.items() if isinstance(item, dict) else item
         return _members(pairs, keys, budget, decode)
@@ -128,12 +163,14 @@ def _descendants(item, keys, budget, decode):
     return None
 
 
-def _embedded(text, keys, budget):
+def _embedded(text, keys, budget, *, strict=True):
     """Inspect JSON containers within prose/code fences using the stdlib parser.
 
     Plausible but malformed JSON is withheld rather than allowing escaped
-    credentials to escape the scalar checks. Ordinary non-JSON brackets remain
-    prose. Cursor and aggregate work bounds prevent repeated suffix decoding.
+    credentials to escape the scalar checks (``strict``); escape-decoded text
+    is already scanned whole, so there a fragment is prose. Ordinary non-JSON
+    brackets remain prose. Cursor and aggregate work bounds prevent repeated
+    suffix decoding.
     """
     decoder = json.JSONDecoder(object_pairs_hook=_JSONPairs)
     cursor = 0
@@ -142,7 +179,10 @@ def _embedded(text, keys, budget):
         try:
             value, cursor = decoder.raw_decode(text, match.start())
         except json.JSONDecodeError:
-            raise ValueError("Malformed embedded peer JSON") from None
+            if strict:
+                raise ValueError("Malformed embedded peer JSON") from None
+            cursor = match.end()
+            continue
         yield value, keys
 
 

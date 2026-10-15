@@ -16,13 +16,15 @@ from genesis.cc.types import CCModel, EffortLevel
 
 
 def validate_version(header: str | None) -> None:
-    # The pinned SDK defaults a missing header to0.3 and accepts the major.
+    # A missing header means 0.3. The spec (3.6.2) requires matching Major.Minor
+    # and ignoring only the patch; the pinned SDK checks the major alone.
     # Avoid its logging decorator: the supplied header may contain private text.
     try:
-        major = Version(header or "0.3").major
+        version = Version(header or "0.3")
     except InvalidVersion:
         raise VersionNotSupportedError("A2A version is not supported") from None
-    if major != 1:
+    plain = version.epoch == 0 and str(version) == version.base_version
+    if not plain or (version.release + (0, 0))[:2] != (1, 0):
         raise VersionNotSupportedError("A2A version is not supported")
 
 
