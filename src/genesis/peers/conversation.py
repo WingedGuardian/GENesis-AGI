@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
 import json
 import os
@@ -104,7 +103,16 @@ class ConversationService:
             raise ConversationRefusal("not_ready", 503)
 
     async def send(self, identity, incoming):
+        runner = self.runner
+        if runner.closing:
+            raise ConversationRefusal("not_ready", 503)
         task = asyncio.create_task(self._receive(identity, incoming))
+        try:
+            # The runner's shutdown drains these before it cancels sessions.
+            runner.register_admission(task)
+        except RuntimeError:
+            task.cancel()
+            raise ConversationRefusal("not_ready", 503) from None
         self._admissions.add(task)
         task.add_done_callback(self._admissions.discard)
         sid = receipt_id(identity, incoming)
@@ -145,9 +153,14 @@ class ConversationService:
                 row = await self._existing(db, sid, digest, identity)
                 if row is not None:
                     return row
-                # Avoid identity/retrieval work for an already full reservation.
-                # The transaction repeats this check authoritatively below.
-                await self._reserve(db, identity, incoming.message.get("contextId", ""))
+                # Avoid identity/retrieval work for an already full reservation,
+                # or for a continuation anchor that is malformed or not owned.
+                # The transaction repeats both checks authoritatively below.
+                supplied = incoming.message.get("contextId")
+                if supplied:
+                    uuid_id(supplied)
+                    await self._owned_context(db, identity, supplied)
+                await self._reserve(db, identity, supplied or "")
             options = incoming.options
             from genesis.autonomy.types import AutonomyCategory
 
@@ -232,14 +245,18 @@ class ConversationService:
                 if not runner.is_active(sid):
                     # Keep the admission owner and SQL reservation through a
                     # transient persistence failure. Never replay the receipt.
+                    # Never replay the receipt. If shutdown has begun, or this
+                    # task is cancelled, stop retrying: the row stays active and
+                    # boot reconciliation records it as outcome_unknown.
                     while True:
                         try:
                             await update_state(self.runtime._db, sid, "failed", error="not_started")
                             await cc_sessions.update_status(self.runtime._db, sid, status="failed")
                             break
-                        except (Exception, asyncio.CancelledError):
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await asyncio.sleep(0.1)
+                        except Exception:
+                            if runner.closing:
+                                break
+                            await asyncio.sleep(0.1)
             return await cc_sessions.get_by_id(self.runtime._db, sid)
 
     async def _reserve(self, db, identity, context_id):
@@ -262,6 +279,16 @@ class ConversationService:
             raise ConversationRefusal("state_conflict", 409)
         if len(own) >= 2 or len(rows) >= 2:
             raise ConversationRefusal("rate_limited", 429)
+
+    async def _owned_context(self, db, identity, context_id):
+        row = await (
+            await db.execute(
+                f"SELECT 1 FROM cc_sessions WHERE {OWNED} AND json_extract(metadata,'$.context_id')=? LIMIT 1",  # noqa: S608 — compiled owner clause, values bound
+                (identity.peer["peer_id"], identity.peer["epoch"], context_id),
+            )
+        ).fetchone()
+        if row is None:
+            raise ConversationRefusal("not_found", 404)
 
     async def _history(self, db, identity, context_id, supplied):
         rows = await (
@@ -370,27 +397,64 @@ class ConversationService:
                 raise ConversationRefusal("cancellation_pending", 503) from None
         return await self.get(identity, sid)
 
-    async def approvals(self, identity, sid=None):
+    _PENDING_FOR_PEER = (
+        "FROM approval_requests JOIN cc_sessions "
+        "ON cc_sessions.id=json_extract(CASE WHEN json_valid(context) THEN context ELSE '{}' END,'$.agent_session_id') "
+        "WHERE approval_requests.status='pending' AND cc_sessions.source_tag='agent_api' "
+        "AND json_extract(cc_sessions.metadata,'$.peer_id')=? "
+        "AND json_extract(cc_sessions.metadata,'$.peer_epoch')=? "
+    )
+
+    async def has_pending_approval(self, identity, sid):
+        """Bounded existence check for one task projection; no description scan."""
+        async with self.registry.connection() as db:
+            await self._same_database(db)
+            await db.execute("BEGIN")
+            await authorize(db, identity)
+            row = await (
+                await db.execute(
+                    "SELECT 1 " + self._PENDING_FOR_PEER + "AND cc_sessions.id=? LIMIT 1",
+                    (identity.peer["peer_id"], identity.peer["epoch"], sid),
+                )
+            ).fetchone()
+        return row is not None
+
+    async def approvals(self, identity, size=20, token=None):
+        """One page of this peer's pending owner actions, oldest first."""
         from genesis.peers.disclosure_scan import json_strings_safe
 
         async with self.registry.connection() as db:
             await self._same_database(db)
             await db.execute("BEGIN")
             await authorize(db, identity)
+            owner = (identity.peer["peer_id"], identity.peer["epoch"])
+            after = ""
+            values = list(owner)
+            if token:
+                anchor = await (
+                    await db.execute(
+                        "SELECT approval_requests.created_at, approval_requests.id "
+                        + self._PENDING_FOR_PEER
+                        + "AND approval_requests.id=?",
+                        (*owner, token),
+                    )
+                ).fetchone()
+                if anchor is None:
+                    raise ConversationRefusal("validation_error", 400)
+                after = "AND (approval_requests.created_at, approval_requests.id) > (?, ?) "
+                values += [anchor[0], anchor[1]]
             rows = await (
                 await db.execute(
-                    "SELECT approval_requests.* FROM approval_requests JOIN cc_sessions "
-                    "ON cc_sessions.id=json_extract(CASE WHEN json_valid(context) THEN context ELSE '{}' END,'$.agent_session_id') "
-                    "WHERE approval_requests.status='pending' AND cc_sessions.source_tag='agent_api' "
-                    "AND json_extract(cc_sessions.metadata,'$.peer_id')=? "
-                    "AND json_extract(cc_sessions.metadata,'$.peer_epoch')=? "
-                    "AND (? IS NULL OR cc_sessions.id=?) ORDER BY approval_requests.created_at",
-                    (identity.peer["peer_id"], identity.peer["epoch"], sid, sid),
+                    "SELECT approval_requests.* "
+                    + self._PENDING_FOR_PEER
+                    + after
+                    + "ORDER BY approval_requests.created_at, approval_requests.id LIMIT ?",
+                    (*values, size + 1),
                 )
             ).fetchall()
         now = datetime.now(UTC)
         result = []
-        for row in rows:
+        for row in rows[:size]:
             payload = {
                 "approvalId": row["id"],
                 "actionType": row["action_type"],
@@ -407,4 +471,4 @@ class ConversationService:
                     actionType="owner_action", description="Owner action pending; details withheld"
                 )
             result.append(payload)
-        return result
+        return result, (rows[size - 1]["id"] if len(rows) > size else "")

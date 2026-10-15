@@ -176,7 +176,7 @@ def _install_gate(state):
 
 async def _view(service, row):
     g.peer_task_id = row["id"]
-    return project(row, await service.approvals(g.peer_identity, row["id"]))
+    return project(row, await service.has_pending_approval(g.peer_identity, row["id"]))
 
 
 @agent_api_bp.route(ROOT + "/message:send", methods=["POST"])
@@ -249,7 +249,15 @@ async def get_result(task_id):
 @agent_api_bp.route(ROOT + "/approvals")
 @_handled
 async def approvals():
-    return jsonify(approvals=await _service().approvals(g.peer_identity))
+    if set(request.args) - {"pageSize", "pageToken"} or any(
+        len(v) > 1 for _, v in request.args.lists()
+    ):
+        raise InvalidParamsError("Unsupported list options")
+    size = _integer("pageSize", 20, 1, 100)
+    page, token = await _service().approvals(
+        g.peer_identity, size, request.args.get("pageToken")
+    )
+    return jsonify(approvals=page, nextPageToken=token, pageSize=size)
 
 
 @agent_api_bp.route(ROOT + "/.well-known/agent-card.json")
