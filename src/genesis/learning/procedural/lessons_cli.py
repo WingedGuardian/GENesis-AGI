@@ -13,7 +13,12 @@
   is the rejection. A shipped lesson stays deprecated across seeds.
 
 Exit codes: 0 done, 1 refused, 2 not found (or no database) or bad arguments, 3
-the database is fenced (quarantined), 4 written but the trigger cache was not rebuilt.
+the database is fenced (quarantined), 4 written but the trigger cache was not rebuilt,
+5 the database was busy (locked) or unreadable when queried.
+
+What the owner approves is shown first: ``list --held`` and ``review`` print each
+lesson's principle, steps and trigger, with control characters escaped, because
+a held lesson's text is untrusted.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ import sys
 import time
 from pathlib import Path
 
-DONE, REFUSED, NOT_FOUND, FENCED, CACHE_STALE = 0, 1, 2, 3, 4
+DONE, REFUSED, NOT_FOUND, FENCED, CACHE_STALE, BUSY = 0, 1, 2, 3, 4, 5
 
 
 class _Fenced(Exception):
@@ -121,7 +126,7 @@ async def _list(args) -> int:
         rows = await procedural.list_lessons(db, include_quarantined=True, include_deprecated=True)
         earned = await db.execute_fetchall(
             "SELECT activation_tier, COUNT(*) FROM procedural_memory WHERE lesson IS NULL "
-            "AND deprecated = 0 AND quarantined = 0 AND activation_tier IN ('CORE', 'ADVISORY') GROUP BY 1"
+            "AND deprecated = 0 AND quarantined = 0 GROUP BY 1 ORDER BY 1"
         )
     finally:
         await db.close()
@@ -129,16 +134,48 @@ async def _list(args) -> int:
     for row in shown:
         rec = _record(row)
         print(
-            f"{row['id']}  {_state(row):<16} {row['task_type']}  "
-            f"via={rec.get('authored_via', '?')}/{rec.get('authored_in', '?')} "
-            f"origin={rec.get('origin', '?')} reviewed={rec.get('reviewed', '?')} "
+            f"{row['id']}  {_state(row):<16} {_safe(row['task_type'])}  "
+            f"via={_safe(rec.get('authored_via', '?'))}/{_safe(rec.get('authored_in', '?'))} "
+            f"origin={_safe(rec.get('origin', '?'))} reviewed={_safe(rec.get('reviewed', '?'))} "
             f"tier={row['activation_tier']} surfaced={row['surfaced_count']}"
         )
+        if args.held:
+            print("\n".join(_payload(row)))
     print(
-        f"{len(shown)} lesson(s); earned rows (not lessons): "
+        f"{len(shown)} lesson(s); earned rows (not lessons) by tier: "
         + (", ".join(f"{tier} {n}" for tier, n in earned) or "none")
     )
     return DONE
+
+
+def _safe(value) -> str:
+    """Text with control characters escaped, so stored text cannot rewrite the terminal."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in str(value))
+
+
+def _loaded(text):
+    try:
+        return json.loads(text) if text else None
+    except (ValueError, TypeError, RecursionError):
+        return text
+
+
+def _payload(row: dict) -> list[str]:
+    """What the advisor would deliver for this lesson, one escaped line each."""
+    spec = _loaded(row.get("trigger_spec"))
+    steps = _loaded(row.get("steps"))
+    lines = [f"    principle: {_safe(row.get('principle'))}"]
+    for n, step in enumerate(steps if isinstance(steps, list) else [steps], 1):
+        lines.append(f"    step {n}: {_safe(step)}")
+    lines.append(f"    tools: {_safe(_loaded(row.get('tool_trigger')))}")
+    if isinstance(spec, dict):
+        lines.append(
+            f"    patterns: {_safe(spec.get('patterns'))}  commands: {_safe(spec.get('commands'))}"
+            f"  repeat: {_safe(spec.get('repeat'))}"
+        )
+    else:
+        lines.append(f"    trigger_spec: {_safe(spec)}")
+    return lines
 
 
 def _fires(root: Path, days: float) -> list[dict]:
@@ -193,11 +230,12 @@ async def _sample(args) -> int:
     )
     for fire in fires:
         row = rows.get(fire.get("procedure_id"))
-        lesson = f"{row['task_type']}: {row['principle']}" if row else "(row gone)"
+        lesson = f"{_safe(row['task_type'])}: {_safe(row['principle'])}" if row else "(row gone)"
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(fire["ts"])))
         print(
-            f"\n{when}  session {fire['session'][:8]}  agent {fire.get('agent', '?')}  "
-            f"tool {fire.get('tool', '?')}\n  lesson: {lesson}\n  input:  {fire.get('excerpt') or '(no excerpt)'}"
+            f"\n{when}  session {_safe(fire['session'][:8])}  agent {_safe(fire.get('agent', '?'))}  "
+            f"tool {_safe(fire.get('tool', '?'))}\n  lesson: {lesson}\n"
+            f"  input:  {_safe(fire.get('excerpt') or '(no excerpt)')}"
         )
     return DONE
 
@@ -212,6 +250,14 @@ def _cacheable(row: dict) -> bool:
         return False
 
 
+def _comparable(blob) -> bool:
+    """True for an embedding a cosine can compare: the right bytes, finite, not all zero."""
+    from genesis.learning.procedural.embedding import unpack_embedding
+
+    vec = unpack_embedding(blob)
+    return vec is not None and all(math.isfinite(x) for x in vec) and any(vec)
+
+
 async def _review(args) -> int:
     from genesis.db.crud import procedural
     from genesis.learning.procedural.lesson_shape import HELD_REASON, is_live_lesson
@@ -219,14 +265,24 @@ async def _review(args) -> int:
 
     db = await _connect(write=True)
     try:
+        # Hold the write lock for the whole review: what is checked here (the
+        # row, its live twins) is what gets approved, and no writer can change
+        # either in between.
+        await db.execute("BEGIN IMMEDIATE")
         row = await procedural.get_by_id(db, args.id)
         if row is None or row.get("lesson") is None:
             print(f"no lesson with id {args.id}")
             return NOT_FOUND
         state = _state(row)
         if state in ("live", "held") and not _cacheable(row):
-            print(f"refused: {args.id} has a trigger the advisor cannot read; fix or deprecate it")
+            print(
+                f"refused: {args.id} has a field the advisor cannot read (its record, trigger, "
+                "steps or principle); fix or deprecate it"
+            )
             return REFUSED
+        if state in ("live", "held"):
+            print(f"approving {args.id} ({_safe(row['task_type'])}):")
+            print("\n".join(_payload(row)))
         if state == "live":
             cursor = await db.execute(
                 "UPDATE procedural_memory SET lesson = json_set(lesson, '$.reviewed', json('true')) "
@@ -236,20 +292,13 @@ async def _review(args) -> int:
             )
             if cursor.rowcount != 1:
                 await db.rollback()
-                print(f"refused: {args.id} changed while reviewing")
+                print(f"refused: {args.id}'s lesson record is not valid JSON to SQLite")
                 return REFUSED
             await db.commit()
-            print(f"reviewed: {args.id} (already live; the unreviewed label is cleared)")
+            print(f"reviewed: {args.id} (already live; now marked reviewed)")
             return await _rebuild(db, args.rebuild_cache)
         if state != "held":
             print(f"refused: {args.id} is {state}; only a lesson held for review can be revived")
-            return REFUSED
-        # Hold the write lock from the twin check to the revival: a live twin
-        # another writer commits meanwhile is then seen, never missed.
-        await db.execute("BEGIN IMMEDIATE")
-        row = await procedural.get_by_id(db, args.id)
-        if row is None or _state(row) != "held":
-            print(f"refused: {args.id} changed while reviewing")
             return REFUSED
         live = await procedural.list_by_task_type(
             db, row["task_type"], lessons=True, limit=None, live_only=True
@@ -260,21 +309,37 @@ async def _review(args) -> int:
         )
         if siblings:
             print("other held lessons for this task: " + ", ".join(r[0] for r in siblings))
-        if not args.force:
-            from genesis.learning.procedural.embedding import unpack_embedding
-
-            if unpack_embedding(row.get("principle_embedding")) is None:
-                print(
-                    "refused: twin check unavailable (no embedding); re-run with --force to revive anyway"
-                )
+        # --force waives only what it names: the twin check still runs over
+        # every comparable row, and a twin it finds is always reported.
+        verdict = "warning" if args.force else "refused"
+        if not _comparable(row.get("principle_embedding")):
+            print(
+                f"{verdict}: twin check unavailable (no usable embedding on {args.id}; only "
+                "live rows are re-embedded, so it stays that way); re-run with --force to "
+                "revive anyway"
+            )
+            if not args.force:
                 return REFUSED
-            twin, sim = _best_same_procedure_match(live, row["principle_embedding"])
+        else:
+            comparable = [r for r in live if _comparable(r.get("principle_embedding"))]
+            twin, sim = _best_same_procedure_match(comparable, row["principle_embedding"])
             if twin is not None:
                 print(
-                    f"refused: live lesson {twin['id']} already teaches this (similarity {sim:.2f}); "
-                    "deprecate this one, or re-run with --force"
+                    f"{verdict}: live lesson {twin['id']} already teaches this (similarity "
+                    f"{sim:.2f}); deprecate this one, or re-run with --force"
                 )
-                return REFUSED
+                if not args.force:
+                    return REFUSED
+            unusable = [r["id"] for r in live if r not in comparable]
+            if unusable:
+                print(
+                    f"{verdict}: twin check incomplete (no usable embedding on "
+                    + ", ".join(unusable)
+                    + "; the hourly backfill re-embeds live rows); retry later, or re-run "
+                    "with --force"
+                )
+                if not args.force:
+                    return REFUSED
         # One compare-and-set write: it applies only while the row is still held.
         cursor = await db.execute(
             "UPDATE procedural_memory SET deprecated = 0, deprecated_reason = NULL, "
@@ -285,9 +350,7 @@ async def _review(args) -> int:
         )
         if cursor.rowcount != 1:
             await db.rollback()
-            print(
-                f"refused: {args.id} changed while reviewing; it is now {_state(await procedural.get_by_id(db, args.id))}"
-            )
+            print(f"refused: {args.id}'s lesson record is not valid JSON to SQLite; it stays held")
             return REFUSED
         after = await procedural.get_by_id(db, args.id)
         if not is_live_lesson(after["lesson"]) or not _cacheable(after):
@@ -336,6 +399,9 @@ def _run(handler):
         except _NoDatabase as exc:
             print(f"no database: {exc}", file=sys.stderr)
             return NOT_FOUND
+        except sqlite3.Error as exc:  # locked past the busy timeout, or not a Genesis database
+            print(f"database busy or unreadable: {exc}", file=sys.stderr)
+            return BUSY
 
     return run
 
