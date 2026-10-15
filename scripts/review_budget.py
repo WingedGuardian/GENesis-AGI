@@ -112,6 +112,7 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_budget.py",
         "scripts/review_findings.py",
         "scripts/review_reflection.py",
+        "scripts/review_late.py",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
         "scripts/lib/gate_menu.py",
@@ -425,7 +426,7 @@ def evaluate_evidence(
     review that lands on a head after one of that head's descendants was marked
     is a LATE review of an earlier round. It opens no round, and is listed in
     ``findings`` with the round it belongs to (``round_head``), for the round
-    reflection to owe (issue #3301; nothing owes them yet). Each ``findings``
+    reflection to owe (``review_late``, from its cutover on). Each ``findings``
     entry carries the decision itself as ``late``, and each ``rounds`` entry
     carries ``opened_at``, so a reader never re-derives either. Membership in
     ``rounds[].reviews`` does NOT mean "not late": a late review on a head that
@@ -898,8 +899,8 @@ def evaluate_evidence(
     # (and by the commit gate once it enforces reflections; until then they are
     # reported, never enforced). The newest round only, and only while it is
     # open. A LATE review (one that opened no round, above) never lands here: it
-    # is listed in ``findings`` with the round it belongs to. Nothing owes
-    # those keys yet; the round reflection reader will (issue #3301).
+    # is listed in ``findings`` with the round it belongs to, and ``review_late``
+    # owes those keys from its cutover on.
     seen: dict[str, None] = {}  # ordered and linear, however many keys arrive
     keys_known = True
     if round_state == "open":
