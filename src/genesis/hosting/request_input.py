@@ -23,6 +23,7 @@ def _body_endpoint(environ):
     return environ["REQUEST_METHOD"] == "POST" and (
         path == _ROOT + "/message:send"
         or (path.startswith(_ROOT + "/tasks/") and path.endswith(":cancel"))
+        or (path.startswith(_ROOT + "/outbox/") and path.endswith(":ack"))
     )
 
 

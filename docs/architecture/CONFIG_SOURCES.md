@@ -11,6 +11,7 @@ right and this page is stale.
 | Per-install identity (timezone, GitHub, local-inference URLs, a few flags) | `~/.genesis/config/genesis.yaml` | `genesis.env` helpers |
 | Subsystem policy (levers, modes, knobs) | `config/<name>.yaml` + a `<name>.local.yaml` overlay | per-domain config modules |
 | Peer mode, identities, grants, legacy allowance field and service URL | `genesis.db` peer tables | local `genesis peers` CLI / `genesis.peers.registry` |
+| Peer messages awaiting collection and ACK anchors | `genesis.db` `peer_outbox` | governed agent channel / authenticated peer polling; normal SQLite backup, no automatic purge |
 | Model routing | `config/model_routing.yaml` + `config/model_routing.local.yaml` | `genesis.routing.config` |
 | Paths, tuning, kill switches | process environment only | `genesis.env`, per-domain modules |
 | Prompts and persona | `src/genesis/identity/*.md` | identity loader, CC prompt assembly |

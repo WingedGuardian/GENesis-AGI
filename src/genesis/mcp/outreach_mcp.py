@@ -61,6 +61,42 @@ def init_outreach_mcp(*, pipeline, engagement, config, db, activity_tracker=None
 
 
 @mcp.tool()
+async def agent_send(
+    peer_id: str, message: str, context_id: str | None = None, message_id: str | None = None,
+) -> str:
+    """Send a conversation message to an explicitly enrolled same-owner peer.
+
+    Returns queued_for_governance, queued_for_collection on retained retries,
+    or refusal. The existing scheduler applies governance. Collection is not
+    peer execution. Pass a
+    stable message_id on retries. An omitted context_id starts an owned context;
+    a supplied one must belong to this enrollment or match that message_id's
+    server-issued retry context.
+    """
+    from genesis.peers.conversation import ConversationRefusal
+    from genesis.peers.outbox import Outbox, registry_for_db
+
+    if _db is None:
+        return json.dumps({"code": "not_ready", "status": "refused"})
+    try:
+        envelope, existing = await Outbox(await registry_for_db(_db)).prepare(
+            peer_id, message, context_id, message_id,
+        )
+        receipt = {"message_id": envelope.message_id, "context_id": envelope.context_id}
+        if existing:
+            return json.dumps({"status": "queued_for_collection", **receipt,
+                               "acknowledged": bool(existing["acknowledged_at"])})
+        pending_id, state = await Outbox(await registry_for_db(_db)).enqueue(envelope)
+        return json.dumps({"status": state, **receipt,
+                           **({"pending_id": pending_id} if pending_id else {})})
+    except (ConversationRefusal, ValueError):
+        return json.dumps({"code": "outbound_refused", "status": "refused"})
+    except Exception:
+        logger.warning("Peer send unavailable")
+        return json.dumps({"code": "not_ready", "status": "refused"})
+
+
+@mcp.tool()
 async def outreach_send(
     message: str,
     category: str,

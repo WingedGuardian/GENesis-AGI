@@ -737,6 +737,7 @@ class OutreachPipeline:
                 delivery_recipient, formatted.text,
                 message_thread_id=thread_id,
                 reply_markup=reply_markup,
+                **({"peer_envelope": request.peer_envelope} if channel == "agent" else {}),
             )
             # Secondary DM copy for "both" mode (no buttons — primary only)
             if (routing == "both" and delivery_recipient != recipient
@@ -1087,6 +1088,7 @@ class OutreachPipeline:
                     # surface instead of the exact origin thread it promised.
                     "target_chat_id": request.target_chat_id,
                     "target_thread_id": request.target_thread_id,
+                    "peer_envelope": request.peer_envelope.encode() if request.peer_envelope else None,
                 }),
                 reason=reason,
                 # "ttl" (not "drain"): expire_by_policy honors staleness_ttl_s

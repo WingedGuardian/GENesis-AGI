@@ -779,7 +779,12 @@ class OutreachScheduler:
                         # the LLM drafter must never re-word a stored message.
                         verbatim=True,
                     )
-                    if row.get("urgency") == "high":
+                    if channel == "agent":
+                        from genesis.peers.outbox import PeerEnvelope
+
+                        # Typed identity, never message-prefix dedup or urgent bypass.
+                        req = PeerEnvelope.decode(row["message"]).request(defer_retry=False)
+                    if row.get("urgency") == "high" and channel != "agent":
                         result = await self._pipeline.submit_urgent(req)
                     else:
                         result = await self._pipeline.submit(req)

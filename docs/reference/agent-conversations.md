@@ -1,5 +1,10 @@
 # Same-owner agent conversations
 
+Genesis-originated messages use the [pull outbox](agent-outbox.md). A reply
+supplies the outgoing message's contextId and metadata.inReplyTo. The first
+distinct reply is reserved atomically with its native task; an exact retry
+reuses that task, and later conversation turns omit inReplyTo.
+
 This is an asynchronous A2A 1.0 HTTP+JSON interface, using SDK 1.2.2 models on
 the existing Flask/runtime loop. Genesis reasons independently with its identity,
 current cognitive state, available prior-experience retrieval and permitted native

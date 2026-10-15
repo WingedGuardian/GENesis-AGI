@@ -167,6 +167,7 @@ async def test_no_unexpected_tables(db):
         "peer_settings",
         "peers",
         "peer_grants",
+        "peer_outbox",
         "job_run_events",
         "alert_events",  # WS-2 sensor fabric (M9/M10)
         "memory_consistency_reports",

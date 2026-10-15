@@ -24,6 +24,8 @@ async def enqueue(
     thread_id: str | None = None,
     validated_recipient: str | None = None,
     labeled_surplus: bool = False,
+    pending_id: str | None = None,
+    commit: bool = True,
 ) -> str:
     """Queue a message for bridge delivery. Returns the pending ID.
 
@@ -39,7 +41,7 @@ async def enqueue(
     """
     from datetime import UTC, datetime
 
-    pending_id = str(uuid.uuid4())
+    pending_id = pending_id or str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
     await db.execute(
         """INSERT INTO pending_outreach
@@ -59,7 +61,8 @@ async def enqueue(
             1 if labeled_surplus else 0,
         ),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return pending_id
 
 

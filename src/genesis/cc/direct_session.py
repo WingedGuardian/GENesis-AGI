@@ -200,6 +200,7 @@ _UNIVERSAL_DISALLOW = [
 ]
 
 _NO_OUTREACH_SEND = [
+    "mcp__genesis-outreach__agent_send",
     "mcp__genesis-outreach__outreach_send",
     "mcp__genesis-outreach__outreach_send_and_wait",
 ]
@@ -260,6 +261,7 @@ _NO_WEB_TOOLS = [
 # untrusted-inbound perimeter until it is named here. Add new tools to this list
 # as part of adding them, not afterwards.
 _NO_OUTREACH_EXTRAS = [
+    "mcp__genesis-outreach__agent_send",
     "mcp__genesis-outreach__outreach_send_and_wait",
     "mcp__genesis-outreach__outreach_poll",
     "mcp__genesis-outreach__outreach_digest",

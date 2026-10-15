@@ -7,6 +7,18 @@ Schema is derived from docs/architecture/genesis-v3-autonomous-behavior-design.m
 # ─── Table DDL ────────────────────────────────────────────────────────────────
 
 TABLES = {
+    'peer_outbox': """
+CREATE TABLE IF NOT EXISTS peer_outbox (
+    peer_id TEXT NOT NULL REFERENCES peers(peer_id),
+    epoch TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    acknowledged_at TEXT,
+    PRIMARY KEY(peer_id,epoch,message_id)
+)
+    """,
     'peer_settings': """
 CREATE TABLE IF NOT EXISTS peer_settings (
     id INTEGER PRIMARY KEY CHECK(id=1),

@@ -963,7 +963,7 @@ row (`GovernanceGate._is_duplicate`). Inside the signal type's window
 signal type, category and `content_hash` (SHA-256 of the first 200 characters of
 `context`, topic ignored). The content-hash match is skipped for the signal types
 whose topic is the message identity (`_TOPIC_IS_IDENTITY`: `queued_alert`,
-`morning_report`, `career_outreach_nudged`) and for any empty or whitespace-only
+`morning_report`, `career_outreach_nudged`, `peer_message`) and for any empty or whitespace-only
 context. Before that exemption, at least 3 of a live install's 84 recorded
 morning-report job runs (mid-July to October) delivered nothing this way: the
 next day's report finished drafting a few seconds sooner, fell inside the 24 h
@@ -974,10 +974,16 @@ gives a repeated failure one dedupe key with `alert_stable_key`
 (`scripts/lib/alert_queue.sh`), which leaves the per-run
 `Time:`/`Duration:`/`SQLite lines:` lines out of the hash.
 
+Peer messages use their peer/epoch/message identity as the topic. Every
+`agent_send` first reserves the existing pending queue; the adapter checks its
+immutable payload and canceled/dequeued state before committing a new outbox
+message. Collection ACKs and peer traffic are excluded from human engagement
+judgments, without changing outbound governance or granting authority.
+
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: d6edbcc6 2026-09-11
+verified: 0164dd1f0 2026-10-14
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -1407,7 +1413,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 8952d558f 2026-10-14
+verified: 0164dd1f0 2026-10-14
 ```
 
 - **peers/**: explicit owner-managed registry and scoped authentication for
@@ -1423,6 +1429,14 @@ verified: 8952d558f 2026-10-14
   owner mutation shortcuts. Disabled by default; deployment/enrollment and
   connector-only ingress verification are separate prerequisites. No new listener
   or peer execution queue. See `docs/reference/agent-conversations.md`.
+  `peers/outbox.py` retains addressed A2A messages for collection, with scoped
+  idempotent ACKs and atomic first-reply correlation in the native receipt.
+  `channels/agent_adapter.py` queues locally through ordinary outreach governance;
+  `agent_send` is denied to observe/restricted mail profiles and available to
+  permitted interact turns. Pending/deferred delivery preserves typed message
+  identity. ACKs confer no owner engagement or approval. This is a pull channel,
+  not an HTTP sender or new listener; the separately operated peer client must
+  durably deduplicate before ACK/execution. See `docs/reference/agent-outbox.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is
