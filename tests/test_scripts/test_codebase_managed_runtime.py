@@ -23,6 +23,24 @@ def test_only_persistent_enablement_authorizes_runtime(runtime, monkeypatch, sta
         runtime.require_enabled({"sentinel": "/unused"})
 
 
+def test_manager_calls_seed_the_user_manager_environment(runtime, monkeypatch):
+    """A systemd-started service may lack XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS;
+    without them `systemctl --user` cannot reach the manager and startup fails."""
+    for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        monkeypatch.delenv(name, raising=False)
+    seen = {}
+
+    def check_output(argv, **kwargs):
+        seen.update(argv=argv, env=kwargs.get("env"))
+        return "UnitFileState=enabled\n"
+
+    monkeypatch.setattr(runtime.show.__globals__["subprocess"], "check_output", check_output)
+    assert runtime.show("genesis-cbm-query.service", "UnitFileState") == {"UnitFileState": "enabled"}
+    assert seen["argv"][:3] == ["/usr/bin/systemctl", "--user", "show"]
+    assert seen["env"]["XDG_RUNTIME_DIR"].startswith("/run/user/")
+    assert seen["env"]["DBUS_SESSION_BUS_ADDRESS"].startswith("unix:path=/run/user/")
+
+
 def test_persistent_enablement_still_refuses_sentinel(runtime, tmp_path, monkeypatch):
     monkeypatch.setitem(
         runtime.require_enabled.__globals__, "show", lambda *a, **kw: {"UnitFileState": "enabled"}
