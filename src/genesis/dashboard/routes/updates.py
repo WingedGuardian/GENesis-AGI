@@ -567,8 +567,9 @@ If MERGE CONFLICTS:
    - Run: bash {update_script} --post-merge 2>&1
      (--post-merge skips fetch/merge, runs only bootstrap + health)
    - --post-merge keeps a systemd unit that was edited by hand and names it at
-     the end ("kept <unit>: edited by hand"). Never modify, delete, replace or
-     re-stamp those unit files, and never pass --take-template or
+     the end ("kept <unit>: edited by hand"); any update keeps an /etc file
+     Genesis manages the same way ("kept-etc <path>: ..."). Never modify,
+     delete, replace or re-stamp those files, and never pass --take-template or
      --take-templates: whether the hand edit goes is the user's decision. List
      them in your summary.
 
@@ -618,9 +619,10 @@ IMPORTANT: The main working tree is CLEAN. Work on a temporary branch.
 9. Run: bash {update_script} --post-merge 2>&1
 
 --post-merge keeps a systemd unit that was edited by hand and names it at the
-end ("kept <unit>: edited by hand"). Never modify, delete, replace or re-stamp
-those unit files, and never pass --take-template or --take-templates: whether
-the hand edit goes is the user's decision. List them in your report.
+end ("kept <unit>: edited by hand"), and an /etc file Genesis manages the same
+way ("kept-etc <path>: ..."). Never modify, delete, replace or re-stamp those
+files, and never pass --take-template or --take-templates: whether the hand
+edit goes is the user's decision. List them in your report.
 
 Write a resolution report to {summary_file} explaining each decision.
 Use conventional commit format for any fixes (fix: ...).\

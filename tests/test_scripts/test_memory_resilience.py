@@ -10,6 +10,7 @@ invariant check (vantage-aware: container vs bare/VM).
 
 from __future__ import annotations
 
+import hashlib
 import re
 import subprocess
 from pathlib import Path
@@ -42,6 +43,12 @@ exit "${DETECT_VIRT_RC:-0}"
 _SWAPON_STUB = """#!/bin/bash
 printf '%s' "${SWAPON_OUT-}"
 """
+
+
+def _stamped(body: str) -> str:
+    """What scripts/lib/managed_units.py stamp writes for <body>."""
+    body = body.rstrip("\n") + "\n"
+    return body + f"# genesis-managed v1 sha256={hashlib.sha256(body.encode()).hexdigest()}\n"
 
 
 def _stage(tmp_path: Path) -> dict:
@@ -103,12 +110,13 @@ def test_fresh_apply_writes_dropins_and_reloads(tmp_path):
     assert "policy applied" in result.stdout
 
     files = _dropins(env)
-    assert (
-        files["user_slice"].read_text()
-        == "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%\n"
+    assert files["user_slice"].read_text() == _stamped(
+        "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%\n"
     )
-    assert files["user_service"].read_text() == "[Service]\nManagedOOMMemoryPressure=kill\n"
-    assert files["oomd_conf"].read_text() == (
+    assert files["user_service"].read_text() == _stamped(
+        "[Service]\nManagedOOMMemoryPressure=kill\n"
+    )
+    assert files["oomd_conf"].read_text() == _stamped(
         "[OOM]\nSwapUsedLimit=90%\nDefaultMemoryPressureLimit=60%\n"
         "DefaultMemoryPressureDurationSec=20s\n"
     )
@@ -332,7 +340,7 @@ def test_pid_budget_apply_writes_percentage_dropin_and_reloads(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "PID ceiling raised" in result.stdout
     # A PERCENTAGE (self-calibrating), never an absolute count — the whole point.
-    assert _tasksmax_dropin(env).read_text() == "[Slice]\nTasksMax=60%\n"
+    assert _tasksmax_dropin(env).read_text() == _stamped("[Slice]\nTasksMax=60%\n")
     assert "daemon-reload" in Path(env["SYSTEMCTL_LOG"]).read_text()
 
 
@@ -374,3 +382,116 @@ def test_pid_budget_dropin_wins_over_systemd_default():
 def test_bootstrap_and_update_wire_pid_budget_apply():
     assert "pid_budget_apply" in BOOTSTRAP.read_text()
     assert "pid_budget_apply" in (REPO_ROOT / "scripts" / "update.sh").read_text()
+
+
+# ── Hand edits are kept, not overwritten (scripts/lib/managed_etc.sh) ────────
+
+
+_SLICE = "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%\n"
+
+
+def test_a_drop_in_edited_by_hand_is_kept_and_named(tmp_path):
+    env = _stage(tmp_path)
+    files = _dropins(env)
+    files["user_slice"].parent.mkdir(parents=True)
+    edited = "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=80%\n"
+    files["user_slice"].write_text(edited)
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    assert files["user_slice"].read_text() == edited
+    assert "was edited by hand" in result.stdout and str(files["user_slice"]) in result.stdout
+    assert "a drop-in edited by hand was kept" in result.stdout
+    # The other two still land, and they changed, so oomd restarts for them.
+    assert files["oomd_conf"].read_text().startswith("[OOM]")
+    assert "restart systemd-oomd" in Path(env["SYSTEMCTL_LOG"]).read_text()
+
+
+def test_an_unstamped_genesis_drop_in_is_stamped_without_restarting_oomd(tmp_path):
+    """Every install from before stamps holds the bare content. Adding the stamp
+    changes only a comment: reload, but never restart the OOM killer for it."""
+    env = _stage(tmp_path)
+    bare = {
+        "user_slice": _SLICE,
+        "user_service": "[Service]\nManagedOOMMemoryPressure=kill\n",
+        "oomd_conf": "[OOM]\nSwapUsedLimit=90%\nDefaultMemoryPressureLimit=60%\n"
+        "DefaultMemoryPressureDurationSec=20s\n",
+    }
+    for key, path in _dropins(env).items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(bare[key])
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    for key, path in _dropins(env).items():
+        assert path.read_text() == _stamped(bare[key])
+    calls = Path(env["SYSTEMCTL_LOG"]).read_text()
+    assert "daemon-reload" in calls
+    assert "restart systemd-oomd" not in calls
+
+
+def test_a_drop_in_with_an_older_genesis_stamp_is_rewritten(tmp_path):
+    env = _stage(tmp_path)
+    path = _dropins(env)["user_slice"]
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        _stamped("[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=55%\n")
+    )
+    _run(env)
+    assert path.read_text() == _stamped(_SLICE)
+
+
+def test_a_taken_drop_in_is_backed_up_then_written(tmp_path):
+    env = _stage(tmp_path)
+    path = _dropins(env)["user_slice"]
+    path.parent.mkdir(parents=True)
+    path.write_text("[Slice]\nMine=1\n")
+    backups = tmp_path / "backups"
+    env["GENESIS_TAKE_TEMPLATES"] = str(path)
+    env["GENESIS_MU_BACKUP_DIR"] = str(backups)
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    assert path.read_text() == _stamped(_SLICE)
+    saved = backups / str(path).lstrip("/")
+    assert saved.read_text() == "[Slice]\nMine=1\n"
+    assert saved.stat().st_mode & 0o777 == 0o600
+
+
+def test_a_bare_star_takes_units_only_never_etc_files(tmp_path):
+    env = _stage(tmp_path)
+    path = _dropins(env)["user_slice"]
+    path.parent.mkdir(parents=True)
+    path.write_text("[Slice]\nMine=1\n")
+    env["GENESIS_TAKE_TEMPLATES"] = "*"
+    _run(env)
+    assert path.read_text() == "[Slice]\nMine=1\n"
+    env["GENESIS_TAKE_TEMPLATES"] = "etc:*"
+    env["GENESIS_MU_BACKUP_DIR"] = str(tmp_path / "b")
+    _run(env)
+    assert path.read_text() == _stamped(_SLICE)
+
+
+def test_a_symlinked_drop_in_is_kept(tmp_path):
+    env = _stage(tmp_path)
+    path = _dropins(env)["user_slice"]
+    path.parent.mkdir(parents=True)
+    target = tmp_path / "elsewhere.conf"
+    target.write_text("[Slice]\nMine=1\n")
+    path.symlink_to(target)
+    result = _run(env)
+    assert result.returncode == 0
+    assert path.is_symlink() and target.read_text() == "[Slice]\nMine=1\n"
+    assert "is a symlink (a masked unit?)" in result.stdout
+    assert "NOT fully applied" in result.stdout  # a masked drop-in means the policy is off
+
+
+def test_the_run_summary_names_a_kept_file_without_counting_it_as_a_unit(tmp_path):
+    env = _stage(tmp_path)
+    path = _dropins(env)["user_slice"]
+    path.parent.mkdir(parents=True)
+    path.write_text("[Slice]\nMine=1\n")
+    summary = tmp_path / "summary.txt"
+    env["GENESIS_DEPLOY_SUMMARY"] = str(summary)
+    env["GENESIS_ETC_SUMMARY_OK"] = "1"
+    _run(env)
+    lines = summary.read_text().splitlines()
+    assert any(line.startswith(f"kept-etc {path}: edited by hand") for line in lines)
+    assert not any(line.startswith("kept ") for line in lines)  # bootstrap's unit count

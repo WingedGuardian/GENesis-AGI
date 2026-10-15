@@ -18,12 +18,16 @@
 #   --take-template <unit>  A systemd unit edited by hand makes the update REFUSE,
 #                 before anything stops (exit 4). This replaces that one unit with
 #                 its template instead, after saving the old file under
-#                 ~/.genesis/deploy-backups/. Repeatable. --take-templates: all.
+#                 ~/.genesis/deploy-backups/. Repeatable. --take-templates: all units.
 #                 A symlinked unit (a mask) is replaced only when named.
 #                 Local changes that should survive updates belong in a drop-in,
 #                 ~/.config/systemd/user/<unit>.d/*.conf, which updates never touch.
 #                 --post-merge never refuses: the merge already happened, so it
 #                 keeps an edited unit (bootstrap does) and names it at the end.
+#                 The same flag takes an /etc file Genesis manages (journald,
+#                 sshd, memory and network resilience) that was edited by hand and
+#                 so is kept rather than updated: pass its full path, or etc:* for
+#                 all of them. --take-templates never covers those.
 #
 # On `live` (the integration branch scripts/deploy_candidates builds from the
 # deploy manifest, admitted only when scripts/lib/live_checkout.py says so), the
@@ -147,7 +151,7 @@ while [ "$_i" -lt "${#_args[@]}" ]; do
         --take-template)
             _i=$((_i + 1))
             if [ "$_i" -ge "${#_args[@]}" ] || [ -z "${_args[$_i]}" ] || [[ "${_args[$_i]}" == -* ]]; then
-                echo "ERROR: --take-template needs a unit name (e.g. genesis-server.service)." >&2
+                echo "ERROR: --take-template needs a unit name (e.g. genesis-server.service) or an /etc path." >&2
                 exit 1
             fi
             GENESIS_TAKE_TEMPLATES="${GENESIS_TAKE_TEMPLATES:+$GENESIS_TAKE_TEMPLATES }${_args[$_i]}"
