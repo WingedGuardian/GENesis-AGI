@@ -969,6 +969,8 @@ class DirectSessionRunner:
         # and drains them before cancelling sessions, while the DB is open.
         self._admissions: set[asyncio.Task] = set()
         self._closing = False
+        # Managed sessions whose runner slot is held through finalization.
+        self._managed_slots: set[str] = set()
         self._protected_paths: object | None = None
         self._auditor: object | None = None
 
@@ -1241,27 +1243,43 @@ class DirectSessionRunner:
 
     async def _invoke(self, request, session_id, on_event) -> CCOutput:
         """Shared profile configuration, runner slot and native invocation."""
-        async with self._semaphore:
-            invocation = self._build_invocation(request, session_id)
-            if request.managed:
-                invocation = replace(
-                    invocation,
-                    confirm_cleanup=True,
-                    origin="external_untrusted",
-                    supervised=False,
-                )
-            if invocation.claude_code_tmpdir:
-                Path(invocation.claude_code_tmpdir).mkdir(parents=True, exist_ok=True)
-            try:
-                return await self._invoker.run_streaming(invocation, on_event=on_event)
-            except ProcessCleanupUncertain:
-                if not request.managed:
-                    raise
-                from genesis.cc.managed_session import hold_uncertain
+        if not request.managed:
+            async with self._semaphore:
+                return await self._invoke_in_slot(request, session_id, on_event)
+        # A managed run keeps its slot until its receipt is finalized, not just
+        # until the subprocess exits: run_managed releases it through
+        # release_managed_slot() once finalization has committed.
+        await self._semaphore.acquire()
+        self._managed_slots.add(session_id)
+        return await self._invoke_in_slot(request, session_id, on_event)
 
-                # A child may still be running: keep this runner slot with it.
-                await hold_uncertain(self._session_manager.db, session_id)
-                raise  # unreachable: hold_uncertain never returns
+    def release_managed_slot(self, session_id: str) -> None:
+        """Free the slot a managed run took, once its receipt is persisted."""
+        if session_id in self._managed_slots:
+            self._managed_slots.discard(session_id)
+            self._semaphore.release()
+
+    async def _invoke_in_slot(self, request, session_id, on_event) -> CCOutput:
+        invocation = self._build_invocation(request, session_id)
+        if request.managed:
+            invocation = replace(
+                invocation,
+                confirm_cleanup=True,
+                origin="external_untrusted",
+                supervised=False,
+            )
+        if invocation.claude_code_tmpdir:
+            Path(invocation.claude_code_tmpdir).mkdir(parents=True, exist_ok=True)
+        try:
+            return await self._invoker.run_streaming(invocation, on_event=on_event)
+        except ProcessCleanupUncertain:
+            if not request.managed:
+                raise
+            from genesis.cc.managed_session import hold_uncertain
+
+            # A child may still be running: keep this runner slot with it.
+            await hold_uncertain(self._session_manager.db, session_id)
+            raise  # unreachable: hold_uncertain never returns
 
     @staticmethod
     def _result(session_id, output: CCOutput, telemetry, elapsed) -> DirectSessionResult:
