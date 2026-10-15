@@ -446,7 +446,8 @@ async def test_commands_narrow_only_a_bash_only_row_and_bash_widens_it_again(env
     )
     row = await _only_row(db)
     assert row["trigger_spec"] is None  # Edit keeps firing on its tags
-    assert any("not stored" in w for w in result.warnings)
+    assert json.loads(row["tool_trigger"]) == ["Edit", "ssh"]  # the word kept as written, no Bash
+    assert any("kept as written" in w for w in result.warnings)
     await store_procedure_checked(db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["ssh"]})
     assert json.loads((await _only_row(db))["trigger_spec"])["commands"] == ["ssh"]
     await store_procedure_checked(db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["Bash"]})
@@ -466,3 +467,21 @@ async def test_an_extracted_row_gets_its_commands_spec():
         )
         row = await procedural.get_by_id(db, pid)
         assert json.loads(row["trigger_spec"]) == {"patterns": [], "commands": ["git push"], "repeat": "every"}
+
+
+async def test_a_cached_earned_row_reaches_the_advisor_on_refine(env, monkeypatch):
+    from genesis.learning.procedural import operations
+
+    db, _, _ = env
+    await store_procedure_checked(db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["ssh"]})
+    await db.execute("UPDATE procedural_memory SET activation_tier = 'ADVISORY'")
+    await db.commit()
+    calls = []
+
+    async def counted(db_):
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(operations, "_regenerate_cache", counted)
+    await store_procedure_checked(db, principle_embedding=_VEC, **{**_ARGS, "tool_trigger": ["git push"]})
+    assert calls == [1]

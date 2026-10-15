@@ -118,7 +118,7 @@ async def store_procedure(
     if dropped:
         logger.info("Procedure %s: dropped non-tool trigger values %s", task_type, dropped)
     if commands and trigger_spec is None:
-        trigger_spec, spec_warnings = _commands_spec(tool_trigger, commands)
+        trigger_spec, tool_trigger, spec_warnings = commands_spec(tool_trigger, commands)
         if spec_warnings:
             logger.info("Procedure %s: %s", task_type, "; ".join(spec_warnings))
     await procedural.create(
@@ -147,23 +147,23 @@ async def store_procedure(
     return proc_id
 
 
-def _commands_spec(tools: list[str], commands: list[str]) -> tuple[dict | None, list[str]]:
-    """The spec of an earned row named by shell commands, and any warning.
+def commands_spec(tools: list[str], commands: list[str]) -> tuple[dict | None, list[str], list[str]]:
+    """``(spec, stored_tools, warnings)`` for an earned row named by shell commands.
 
-    It fires on those commands only, never on any Bash call its tags match. An
-    earned spec replaces the row's tags for every tool, so it is written only
-    when Bash is the row's one tool; a row naming other tools keeps its tags.
+    The one rule every writer and the trigger backfill apply. A spec makes the
+    row fire on those commands only, never on any Bash call its tags match. It
+    replaces the row's tags for every tool, so it is written only when Bash is
+    the row's one tool and the commands fit the validator's cap. Otherwise the
+    command words are stored as written, inert (they name no tool), so the
+    row's other tools keep their tags and no Bash is widened.
     """
-    if tools != ["Bash"]:
-        return None, [f"shell commands not stored (the row names other tools too): {commands}"]
     from genesis.learning.procedural.lesson_shape import MAX_PATTERNS
 
-    warnings = []
-    if len(commands) > MAX_PATTERNS:
-        warnings.append(f"only the first {MAX_PATTERNS} shell commands are stored: {commands}")
-        commands = commands[:MAX_PATTERNS]
-    spec = validate_trigger_spec({"patterns": [], "commands": commands, "repeat": "every"})
-    return spec, warnings
+    if tools == ["Bash"] and len(commands) <= MAX_PATTERNS:
+        spec = validate_trigger_spec({"patterns": [], "commands": commands, "repeat": "every"})
+        return spec, tools, []
+    stored = [t for t in tools if t != "Bash"] + [c for c in commands if c not in tools]
+    return None, stored, [f"shell commands kept as written, not stored as a command spec: {commands}"]
 
 
 def _best_same_procedure_match(
@@ -266,7 +266,7 @@ async def store_procedure_checked(
     spec_warnings: list[str] = []
     if lesson is None and commands:
         # An earned row named by shell commands fires on those commands only.
-        trigger_spec, spec_warnings = _commands_spec(trigger, commands)
+        trigger_spec, trigger, spec_warnings = commands_spec(trigger, commands)
     trigger_warnings = (
         [f"tool_trigger values dropped as not tool names: {dropped}"] if dropped else []
     ) + spec_warnings
@@ -360,7 +360,12 @@ async def store_procedure_checked(
         if lesson is not None:
             update_fields.update(trigger_spec=trigger_spec, lesson=lesson, activation_tier=activation_tier)
         await procedural.update(db, matched["id"], **update_fields)
-        rebuilt = await _regenerate_cache(db) if lesson is not None else None
+        # A lesson, or a cached earned row whose trigger or spec changed, must
+        # reach the advisor now, not at the promoter's next tier change.
+        earned_cached = matched.get("activation_tier") in ("CORE", "ADVISORY") and (
+            "trigger_spec" in update_fields or "tool_trigger" in update_fields
+        )
+        rebuilt = await _regenerate_cache(db) if lesson is not None or earned_cached else None
         logger.info(
             "Refined procedure %s (v%d, cosine=%.3f): %s",
             matched["id"], new_version, best_sim, task_type,

@@ -108,12 +108,14 @@ _ROW = dict(
 )
 
 
-async def test_store_procedure_stores_only_tool_names(db):
+async def test_store_procedure_drops_prose_and_keeps_a_mixed_command_word_inert(db):
     from genesis.db.crud import procedural
 
     pid = await store_procedure(db, tool_trigger=["ssh", "Python", "Read"], **_ROW)
     row = await procedural.get_by_id(db, pid)
-    assert json.loads(row["tool_trigger"]) == ["Bash", "Read"]
+    # Read keeps its tags; ssh stays as written (inert), never a widened Bash.
+    assert json.loads(row["tool_trigger"]) == ["Read", "ssh"]
+    assert row["trigger_spec"] is None
 
 
 async def test_a_judge_shaped_store_reports_what_it_dropped(db):
