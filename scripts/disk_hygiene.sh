@@ -822,8 +822,12 @@ main() {
     # 10 MB: about nine days of mcp_health.log at the measured rate, small
     # enough to read whole, and with 2 copies the three files stay near 30 MB
     # instead of growing without bound.
-    rotate_log "$HOME/tmp/mcp_health.log" 10000000 2
-    rotate_log "$HOME/tmp/turnstile_debug.log" 10000000 2
+    # The same directory the module writes to: GENESIS_MCP_LOG_DIR when this
+    # unit's environment sets it (genesis/mcp/health/browser.py), else ~/tmp.
+    local mcp_log_dir="${GENESIS_MCP_LOG_DIR:-$HOME/tmp}"
+    mcp_log_dir="${mcp_log_dir/#\~/$HOME}"
+    rotate_log "$mcp_log_dir/mcp_health.log" 10000000 2
+    rotate_log "$mcp_log_dir/turnstile_debug.log" 10000000 2
 
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"

@@ -86,8 +86,9 @@ def test_a_missing_log_or_a_symlink_is_a_noop(tmp_path):
 
 def test_main_rotates_both_shared_logs():
     src = _HYGIENE.read_text()
-    assert 'rotate_log "$HOME/tmp/mcp_health.log"' in src
-    assert 'rotate_log "$HOME/tmp/turnstile_debug.log"' in src
+    assert 'mcp_log_dir="${GENESIS_MCP_LOG_DIR:-$HOME/tmp}"' in src
+    assert 'rotate_log "$mcp_log_dir/mcp_health.log"' in src
+    assert 'rotate_log "$mcp_log_dir/turnstile_debug.log"' in src
 
 
 def test_a_planted_symlink_at_the_temp_name_is_never_written_through(tmp_path):
