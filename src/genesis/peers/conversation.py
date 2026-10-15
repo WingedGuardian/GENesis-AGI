@@ -308,6 +308,15 @@ class ConversationService:
             )
         ).fetchone()
         if row is None:
+            # A context Genesis opened with an outbox message is owned too,
+            # the same rule _history applies.
+            row = await (
+                await db.execute(
+                    "SELECT 1 FROM peer_outbox WHERE peer_id=? AND epoch=? AND context_id=? LIMIT 1",
+                    (identity.peer["peer_id"], identity.peer["epoch"], context_id),
+                )
+            ).fetchone()
+        if row is None:
             raise ConversationRefusal("not_found", 404)
 
     async def _history(self, db, identity, context_id, supplied):
