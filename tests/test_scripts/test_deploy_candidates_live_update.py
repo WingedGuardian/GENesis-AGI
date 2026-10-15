@@ -289,3 +289,82 @@ def test_a_server_outside_the_units_is_not_down(dc, tmp_path):
     commit, why = dc.core.parse_serving(out, rc)
     assert commit is None
     assert why != dc.core.SERVER_DOWN, out
+
+
+# ── update_state.json: the restart-guard rule (#3139) ───────────────────────
+
+
+def _engine_state(w, dc, content, *, conflict: bool = False) -> list[str]:
+    head = w.rev("HEAD", w.root)
+    w.git(w.root, "tag", "-f", "pre")
+    if isinstance(content, dict) and content.get("deploy_head") == "HEAD":
+        content = {**content, "deploy_head": head}
+    state = w.home / ".genesis" / "update_state.json"
+    state.write_text(content if isinstance(content, str) else json.dumps(content))
+    if conflict:
+        (w.home / ".genesis" / "update_conflicts.json").write_text(
+            json.dumps({"deploy_head": head})
+        )
+    return [r for r in dc.Engine(w.root, w.env)._move_refusals() if "update_state.json" in r]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"phase": "done"},
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": False},
+        {"phase": "merging", "rollback_tag": "pre", "deploy_head": "HEAD"},
+    ],
+    ids=["done", "fetching-nothing-merged", "merging-killed-before-merge"],
+)
+def test_a_state_that_guards_nothing_does_not_refuse_a_move(dc, dc_ready, content):
+    """The shared rule: a run that stopped before merging anything left nothing
+    for a rebuild to protect."""
+    assert _engine_state(dc_ready, dc, content) == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"phase": "bootstrap", "rollback_tag": "pre"},
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": True},
+        "[1, 2]",
+        "{not json",
+    ],
+    ids=["bootstrap", "post-merge", "array", "malformed"],
+)
+def test_a_guarding_state_refuses_with_the_shared_remedy(dc, dc_ready, content):
+    [reason] = _engine_state(dc_ready, dc, content)
+    assert "scripts/update.sh --post-merge" in reason and "Dismiss" in reason
+
+
+def test_a_pending_conflict_refuses_with_the_conflict_remedy(dc, dc_ready):
+    content = {"phase": "merging", "rollback_tag": "pre", "deploy_head": "HEAD"}
+    [reason] = _engine_state(dc_ready, dc, content, conflict=True)
+    assert "merge conflicts" in reason and "Resolve" in reason
+
+
+def test_a_harmless_leftover_is_removed_before_a_move_and_kept_by_status(dc, dc_ready):
+    """SF-C: rebuild and drop pass _move_preflight under update.lock, then move
+    HEAD off the leftover's rollback tag; status only reports."""
+    w = dc_ready
+    content = {
+        "phase": "fetching",
+        "rollback_tag": "pre",
+        "deploy_head": "HEAD",
+        "post_merge": False,
+    }
+    assert _engine_state(w, dc, content) == []
+    state = w.home / ".genesis" / "update_state.json"
+    assert state.exists(), "status (_move_refusals) only reports"
+    dc.Engine(w.root, w.env)._move_preflight(need_manifest=False)
+    assert not state.exists()
+
+
+def test_a_guarding_state_is_never_removed_before_a_move(dc, dc_ready):
+    w = dc_ready
+    _engine_state(w, dc, {"phase": "bootstrap", "rollback_tag": "pre"})
+    state = w.home / ".genesis" / "update_state.json"
+    with pytest.raises(dc.Refusal):
+        dc.Engine(w.root, w.env)._move_preflight(need_manifest=False)
+    assert state.exists()

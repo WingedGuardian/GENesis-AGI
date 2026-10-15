@@ -171,6 +171,7 @@ def _rebuild_script(w, old_base: str, mu_src: str | None = None, pre: str = "") 
             ).group(0)
             for name in ("_mu_record_refusal", "_mu_remedy")
         )
+        + _function("_clear_deploy_marker")
         + _function("_clear_deploy_state")
         + _function("_on_signal_prestop")
         + _block("live-prestop")
@@ -362,6 +363,7 @@ def _plain_script(root: Path, stub: Path) -> str:
         "_guardian_resume() { :; }\n_flush_deploy_summary() { :; }\n"
         'mkdir -p "$HOME/.genesis/locks"\n'
         'exec {_UPDATE_LOCK_FD}>"$HOME/.genesis/locks/update.lock"\nflock -n "$_UPDATE_LOCK_FD"\n'
+        + _function("_clear_deploy_marker")
         + _function("_clear_deploy_state")
         + _function("_on_signal_prestop")
         + _block("live-prestop")
@@ -777,11 +779,13 @@ def test_u11_a_failed_restore_only_warns(plain_live):
 # ── the live prestop handler ────────────────────────────────────────────────
 
 
-def _prestop(root: Path, on_live: str, before: str = "") -> str:
+def _prestop(root: Path, on_live: str, before: str = "", *, written: bool = False) -> str:
     return (
         f'GENESIS_ROOT="{root}"\nPOST_MERGE=false\nON_LIVE={on_live}\nORIGINAL_BRANCH=live\n'
         f'ROLLBACK_TAG={TAG}\nSTATE_FILE="$HOME/.genesis/update_state.json"\nWERE_RUNNING=()\n'
         'VALIDATED_HEAD="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"\n'
+        + ("_STATE_WRITTEN=1\n" if written else "")
+        + _function("_clear_deploy_marker")
         + _function("_clear_deploy_state")
         + _function("_on_signal_prestop")
         + _block("live-prestop")
@@ -832,11 +836,23 @@ def test_u12_a_move_or_a_half_done_git_keeps_the_tag(plain_live, how):
 
 
 def test_u12_control_off_live_clears_the_state(plain_live):
+    """Off `live` the handler is armed after this run wrote its own "fetching"
+    state, and that file goes."""
+    root, home, stub, env, log = plain_live
+    state = _other_runs_state(home)
+    r = _bash(_prestop(root, "0", written=True), env)
+    assert r.returncode == 1, _out(r)
+    assert not state.exists()
+
+
+def test_u12_off_live_a_state_this_run_never_wrote_stays(plain_live):
+    """#3139 (N1): an exit before this run's first write never deletes another
+    run's state file."""
     root, home, stub, env, log = plain_live
     state = _other_runs_state(home)
     r = _bash(_prestop(root, "0"), env)
     assert r.returncode == 1, _out(r)
-    assert not state.exists()
+    assert state.exists()
 
 
 # ── staged-excused prestop ──────────────────────────────────────────────────

@@ -244,7 +244,60 @@ class Engine(Repo):
         reasons = self._move_refusals()
         if reasons:
             raise Refusal(reasons[0])
+        self._retire_harmless_update_state()
         return data, self.current_branch()
+
+    def _update_state_refusal(self) -> str | None:
+        """Why update_state.json forbids moving the checkout, or None.
+
+        The rule is scripts/lib/update_state_guard.py, the one update.sh,
+        deploy_code_only.sh, bootstrap and the dashboard apply (#3139), loaded from
+        this directory by path (the engine imports nothing by name from the tree it
+        judges). A state that guards nothing (a finished run, one that stopped
+        before merging anything) does not refuse; one that cannot be judged does."""
+        path = str(self.update_state)
+        if not os.path.lexists(path):
+            return None
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_genesis_update_state_guard",
+                os.path.join(_SCRIPT_DIR, "lib", "update_state_guard.py"),
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError("update_state_guard.py cannot be loaded")
+            guard = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(guard)
+            verdict, reason = guard.verdict(path, str(self.root))
+            if verdict == guard.SAFE:
+                return None
+            return guard.message(path, verdict, reason)
+        except Exception as exc:  # noqa: BLE001 - any failure to decide refuses
+            return (
+                f"{path} could not be checked ({exc}); it is kept. Finish that update with "
+                "scripts/update.sh --post-merge, or Dismiss it on the dashboard's update card."
+            )
+
+    def _retire_harmless_update_state(self) -> None:
+        """Remove an update_state.json that guards nothing, before a move.
+
+        Called under update.lock once every refusal has passed, so the file is a
+        leftover the shared rule calls safe (it sits at its rollback tag). The move
+        is about to take HEAD off that tag, after which the same file would read as
+        guarding merged code it never merged: keeping it would turn a harmless
+        leftover into a false restart guard. A file the rule cannot clear again
+        here is left alone; a file it clears but this cannot remove refuses."""
+        path = str(self.update_state)
+        if not os.path.lexists(path) or self._update_state_refusal() is not None:
+            return
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise Refusal(
+                f"{path} guards nothing but could not be removed before the move ({exc}); "
+                "remove it, then run this again."
+            ) from exc
 
     def _move_refusals(self) -> list[str]:
         """Every reason the checkout must not move now, in the order rebuild and
@@ -252,15 +305,9 @@ class Engine(Repo):
         and status reports them all, so status never predicts a rebuild that
         would refuse."""
         reasons: list[str] = []
-        if self.update_state.exists():
-            try:
-                phase = json.loads(self.update_state.read_text()).get("phase")
-            except (OSError, ValueError, AttributeError):
-                phase = None
-            if phase != "done":
-                reasons.append(
-                    f"{self.update_state} records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
-                )
+        state_refusal = self._update_state_refusal()
+        if state_refusal:
+            reasons.append(state_refusal)
         branch = self.current_branch()
         if branch not in (LIVE_BRANCH, BASE_BRANCH):
             reasons.append(
