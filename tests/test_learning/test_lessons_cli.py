@@ -182,6 +182,41 @@ def test_review_refuses_a_twin_or_an_unchecked_row_unless_forced(env, capsys):
     assert env("review", "nope") == 2
 
 
+def test_review_holds_the_write_lock_through_the_twin_check(env, monkeypatch):
+    import sqlite3
+
+    from genesis.db.crud import procedural
+
+    env.build({"id": "held", **_HELD, "embedding": _VEC})
+    real = procedural.list_by_task_type
+    blocked = []
+
+    async def twin_check_with_a_racing_writer(db, *args, **kwargs):
+        # Another writer tries to commit a live twin while the check reads.
+        async with aiosqlite.connect(env.db, timeout=0) as other:
+            try:
+                await other.execute(
+                    "UPDATE procedural_memory SET principle = 'raced' WHERE id = 'held'"
+                )
+                await other.commit()
+            except sqlite3.OperationalError as exc:
+                blocked.append(str(exc))
+        return await real(db, *args, **kwargs)
+
+    monkeypatch.setattr(procedural, "list_by_task_type", twin_check_with_a_racing_writer)
+    assert env("review", "held") == 0
+    assert blocked and "locked" in blocked[0]
+
+
+def test_a_twin_refusal_leaves_the_database_writable(env):
+    env.build(
+        {"id": "live", "lesson": _lesson(), "embedding": _VEC},
+        {"id": "held", **_HELD, "embedding": _VEC},
+    )
+    assert env("review", "held") == 1  # the twin refusal returns inside the lock
+    assert env("deprecate", "live", "--reason", "owner: superseded") == 0
+
+
 def test_deprecate_takes_a_lesson_out_of_service(env):
     env.build({"id": "live", "lesson": _lesson()})
     assert env("review", "live") == 0 and "live" in env.cached()
@@ -297,12 +332,18 @@ def test_sample_skips_foreign_records(env, capsys):
     log = env.sessions / "sess-x" / "advisor_fires.jsonl"
     log.parent.mkdir(parents=True)
     now = time.time()
-    log.write_text("\n".join(json.dumps(r) for r in (
-        {"ts": "soon", "procedure_id": "live"},
-        {"ts": 1e300, "procedure_id": "live"},
-        {"ts": now, "procedure_id": ["live"]},
-        {"ts": now, "procedure_id": "live"},
-    )) + "\n")
+    log.write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in (
+                {"ts": "soon", "procedure_id": "live"},
+                {"ts": 1e300, "procedure_id": "live"},
+                {"ts": now, "procedure_id": ["live"]},
+                {"ts": now, "procedure_id": "live"},
+            )
+        )
+        + "\n"
+    )
     assert env("sample") == 0
     assert capsys.readouterr().out.startswith("1 fire(s)")
 
@@ -319,8 +360,10 @@ def test_review_refuses_rows_it_cannot_check_or_cache(env):
 
 
 def test_a_malformed_sibling_is_no_twin(env):
-    env.build({"id": "odd", "lesson": json.dumps({"origin": "x"}), "embedding": _VEC},
-              {"id": "held", **_HELD, "embedding": _VEC})
+    env.build(
+        {"id": "odd", "lesson": json.dumps({"origin": "x"}), "embedding": _VEC},
+        {"id": "held", **_HELD, "embedding": _VEC},
+    )
     assert env("review", "held") == 0
 
 

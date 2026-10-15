@@ -244,6 +244,13 @@ async def _review(args) -> int:
         if state != "held":
             print(f"refused: {args.id} is {state}; only a lesson held for review can be revived")
             return REFUSED
+        # Hold the write lock from the twin check to the revival: a live twin
+        # another writer commits meanwhile is then seen, never missed.
+        await db.execute("BEGIN IMMEDIATE")
+        row = await procedural.get_by_id(db, args.id)
+        if row is None or _state(row) != "held":
+            print(f"refused: {args.id} changed while reviewing")
+            return REFUSED
         live = await procedural.list_by_task_type(
             db, row["task_type"], lessons=True, limit=None, live_only=True
         )
@@ -291,6 +298,8 @@ async def _review(args) -> int:
         print(f"reviewed: {args.id} is live")
         return await _rebuild(db, args.rebuild_cache)
     finally:
+        if db.in_transaction:  # a refusal under the lock releases it
+            await db.rollback()
         await db.close()
 
 
@@ -360,10 +369,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     rp.add_argument(
         "--force", action="store_true", help="Revive despite a live twin or no embedding"
     )
-    rp.add_argument("--rebuild-cache", action="store_true", help="Rebuild the cache from a relocated database")
+    rp.add_argument(
+        "--rebuild-cache", action="store_true", help="Rebuild the cache from a relocated database"
+    )
     rp.set_defaults(func=_run(_review))
     dp = sub.add_parser("deprecate", help="Take a lesson out of service (rejects a held one)")
     dp.add_argument("id")
     dp.add_argument("--reason", required=True)
-    dp.add_argument("--rebuild-cache", action="store_true", help="Rebuild the cache from a relocated database")
+    dp.add_argument(
+        "--rebuild-cache", action="store_true", help="Rebuild the cache from a relocated database"
+    )
     dp.set_defaults(func=_run(_deprecate))
