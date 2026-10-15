@@ -27,6 +27,9 @@ MAX_PATTERNS = 8
 # A held lesson is written deprecated with this reason, so every reader that
 # skips deprecated rows skips it; the owner's review removes it.
 HELD_REASON = "held: awaiting review"
+# Written by scripts/seed_procedures.py when a shipped lesson's file is removed;
+# only the seed revives a row with this reason.
+SHIPPED_RETIRED_REASON = "shipped lesson file removed"
 MAX_PATTERN_CHARS = 200
 REPEAT_MODES = frozenset({"session", "every"})
 AUTHORED_VIA = frozenset({"mcp", "shipped"})

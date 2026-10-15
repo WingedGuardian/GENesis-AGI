@@ -422,3 +422,40 @@ async def test_a_held_record_never_updates_a_live_row_whatever_the_caller_says(e
     row = dict((await db.execute_fetchall(
         "SELECT lesson, deprecated FROM procedural_memory WHERE id = ?", (live["id"],)))[0])
     assert json.loads(row["lesson"])["origin"] != "external_untrusted" and row["deprecated"] == 0
+
+
+async def test_a_shipped_lesson_is_edited_in_its_file_not_through_the_tool(env):
+    db, store, _ = env
+    await store(**_ARGS, trigger_patterns=[r"update\.sh"])
+    (row,) = [dict(r) for r in await db.execute_fetchall("SELECT * FROM procedural_memory")]
+    shipped = {**json.loads(row["lesson"]), "authored_via": "shipped", "reviewed": True}
+    await db.execute("UPDATE procedural_memory SET lesson = ? WHERE id = ?", (json.dumps(shipped), row["id"]))
+    await db.commit()
+    response = await store(**_ARGS, trigger_patterns=[r"other\.sh"])
+    assert response.startswith("Refused") and "config/lessons" in response
+
+
+async def test_a_reviewed_lesson_stays_reviewed_when_its_author_refines_it(env):
+    db, store, _ = env
+    await store(**_ARGS, trigger_patterns=[r"update\.sh"])
+    (row,) = [dict(r) for r in await db.execute_fetchall("SELECT * FROM procedural_memory")]
+    reviewed = {**json.loads(row["lesson"]), "reviewed": True}
+    await db.execute("UPDATE procedural_memory SET lesson = ? WHERE id = ?", (json.dumps(reviewed), row["id"]))
+    await db.commit()
+    await store(**_ARGS, trigger_patterns=[r"other\.sh"])
+    (after,) = [dict(r) for r in await db.execute_fetchall("SELECT * FROM procedural_memory")]
+    assert json.loads(after["lesson"])["reviewed"] is True
+    assert json.loads(after["trigger_spec"])["patterns"] == [r"other\.sh"]
+
+
+async def test_a_dispatched_refine_of_a_reviewed_lesson_is_unreviewed_again(env, monkeypatch):
+    db, store, _ = env
+    await store(**_ARGS, trigger_patterns=[r"update\\.sh"])
+    (row,) = [dict(r) for r in await db.execute_fetchall("SELECT * FROM procedural_memory")]
+    reviewed = {**json.loads(row["lesson"]), "reviewed": True}
+    await db.execute("UPDATE procedural_memory SET lesson = ? WHERE id = ?", (json.dumps(reviewed), row["id"]))
+    await db.commit()
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")  # a dispatched session
+    await store(**_ARGS, trigger_patterns=[r"other\\.sh"])
+    (after,) = [dict(r) for r in await db.execute_fetchall("SELECT * FROM procedural_memory")]
+    assert json.loads(after["lesson"])["reviewed"] is False
