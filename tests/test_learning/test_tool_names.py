@@ -7,6 +7,7 @@ import sys
 import pytest
 
 from genesis.learning.procedural import tool_names
+from genesis.learning.procedural.lesson_shape import MAX_PATTERNS
 from genesis.learning.procedural.operations import store_procedure, store_procedure_checked
 from genesis.learning.procedural.tool_names import BUILTIN_TOOLS, normalize_tool_trigger
 
@@ -97,6 +98,8 @@ def test_the_prompt_guidance_names_the_tools_without_braces():
     text = tool_names.TOOL_TRIGGER_GUIDANCE
     assert "Bash" in text and "mcp__<server>__<tool>" in text and "git push" in text
     assert "{" not in text and "}" not in text  # the extractor prompt is a str.format template
+    # operations.commands_spec stores a command spec only for a commands-only trigger.
+    assert "only as the whole trigger" in text and f"at most {MAX_PATTERNS} " in text
 
 
 _ROW = dict(
@@ -126,7 +129,11 @@ async def test_a_judge_shaped_store_reports_what_it_dropped(db):
     assert json.loads(row["tool_trigger"]) == ["Bash"]
     assert any("review gate" in w for w in result.warnings)
     # The mapped command is stored, so the row fires on ssh, not any Bash call.
-    assert json.loads(row["trigger_spec"]) == {"patterns": [], "commands": ["ssh"], "repeat": "every"}
+    assert json.loads(row["trigger_spec"]) == {
+        "patterns": [],
+        "commands": ["ssh"],
+        "repeat": "every",
+    }
 
 
 @pytest.mark.parametrize("incoming", [None, ["Python", "fail-open"]])

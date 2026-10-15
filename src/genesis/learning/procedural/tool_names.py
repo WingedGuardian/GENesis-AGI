@@ -28,6 +28,7 @@ from pathlib import Path
 
 from genesis.cc.session_config import _REFLECTION_DENY_BUILTINS
 from genesis.cc.types import SPAWN_TOOL_NAMES
+from genesis.learning.procedural.lesson_shape import MAX_PATTERNS
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +80,10 @@ TOOL_TRIGGER_GUIDANCE = (
     + ", or an MCP tool written in full as mcp__<server>__<tool>. For a specific shell"
     " command, write the command itself, one of: "
     + ", ".join(_CLI_COMMANDS)
-    + " (it is stored as Bash, firing on that command only); write Bash for any shell"
-    " call. Anything else is discarded."
+    + " (stored as Bash, it fires on that command only). Commands work only as the whole"
+    f" trigger, at most {MAX_PATTERNS} of them: listed beside any other tool name they never"
+    " fire, so write Bash there instead. Write Bash for any shell call. Anything else is"
+    " discarded."
 )
 
 

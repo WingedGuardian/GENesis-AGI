@@ -80,6 +80,11 @@ async def procedure_store(
     origin is external, in which case it is held until the owner reviews it;
     the response says which.
 
+    Without patterns, a shell command in ``tool_trigger`` (``ssh``, ``git push``)
+    makes the procedure fire on that command only, when commands are the whole
+    trigger (at most 8). Beside another tool name they are stored inert, and
+    the response warns.
+
     An MCP `procedure_store` call represents an *explicit teach* — the caller
     is asserting the procedure works. We seed it as already-confirmed
     (draft=0) with one Laplace-equivalent success (success_count=1,
