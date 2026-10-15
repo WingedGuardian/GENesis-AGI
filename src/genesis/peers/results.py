@@ -50,7 +50,7 @@ def full_result(row):
     return text
 
 
-def project(row, approvals=()):
+def project(row, pending_approvals=False):
     from genesis.peers.conversation import head
 
     meta = metadata(row)
@@ -65,12 +65,12 @@ def project(row, approvals=()):
         status.timestamp.CopyFrom(ts)
     view = {
         "nativeState": state,
-        "pendingOwnerActions": bool(approvals),
+        "pendingOwnerActions": bool(pending_approvals),
         "cleanupUnconfirmed": bool(meta.get("cleanup_unconfirmed")),
         "resultCommitted": bool(meta.get("result_committed")),
         "resultPartial": bool(meta.get("result_partial")),
     }
-    if approvals and row["status"] == "active":
+    if pending_approvals and row["status"] == "active":
         status.state = TaskState.TASK_STATE_AUTH_REQUIRED
     if row["status"] != "active":
         text = meta.get("output_text") or ""

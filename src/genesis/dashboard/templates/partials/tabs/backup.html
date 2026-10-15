@@ -123,9 +123,11 @@
                                 style="background:#ff9800; color:#fff; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
                           Resolve with Opus</button>
                       </template>
-                      <button @click="$store.genesisDashboard.applyUpdate()"
-                              style="background:var(--color-surface-elevated); color:var(--color-text); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
-                        Retry</button>
+                      <template x-if="!$store.genesisDashboard.updateProgress?.guards">
+                        <button @click="$store.genesisDashboard.applyUpdate()"
+                                style="background:var(--color-surface-elevated); color:var(--color-text); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                          Retry</button>
+                      </template>
                       <button @click="$store.genesisDashboard.dismissUpdate()"
                               style="background:transparent; color:var(--color-text-secondary); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
                         Dismiss</button>
@@ -134,7 +136,9 @@
                   <div style="font-size:0.8rem; color:var(--color-text-secondary);"
                        x-text="$store.genesisDashboard.updateProgress?.conflicts
                          ? 'The update has merge conflicts that could not be resolved automatically. Opus can analyze both sides and find the best resolution.'
-                         : 'The last update attempt did not complete successfully. You can retry or dismiss this notice.'"></div>
+                         : $store.genesisDashboard.updateProgress?.guards
+                           ? 'An earlier update merged code it has not activated, or its record cannot be read. Finish it with scripts/update.sh --post-merge, or Dismiss its record (code-only deploys will then restart onto the checkout as it stands).'
+                           : 'The last update attempt did not complete successfully. You can retry or dismiss this notice.'"></div>
                   <template x-if="$store.genesisDashboard.updateProgress?.summary">
                     <div style="margin-top:0.5rem; padding:0.5rem; border-radius:4px; background:rgba(255,152,0,0.05); font-size:0.8rem; font-family:monospace; color:var(--color-text-secondary);"
                          x-text="$store.genesisDashboard.updateProgress.summary"></div>

@@ -368,7 +368,8 @@ def test_the_merge_assertion_sits_between_the_merge_and_the_new_head_record():
     text = UPDATE.read_text()
     merge = text.index('merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit')
     check = text.index('merge-base --is-ancestor "$DEPLOY_HEAD" HEAD', merge)
-    new_tag = text.index("NEW_TAG=$(git -C")
+    # Column 0: the recompute after the merge, not the `live` helper that sets it.
+    new_tag = text.index("\nNEW_TAG=$(git -C")
     assert merge < check < new_tag
 
 

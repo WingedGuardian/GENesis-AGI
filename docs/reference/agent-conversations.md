@@ -97,9 +97,13 @@ Send returns the A2A `SendMessageResponse` task. Persist its task/context IDs.
 Reuse `messageId` and identical parsed request semantics for retry: one receipt,
 one adoption. Changing that message's content/options conflicts. Context IDs are
 server-issued UUIDs bound to peer/epoch; continue with that `contextId` and a new
-message ID. Overlapping turns in one context conflict. At most two outstanding
-agent turns are admitted globally and per peer; excess returns 429 without work.
-Capacity stays reserved through cancellation and uncertain cleanup.
+message ID. A malformed or unowned `contextId` is refused (400/404) before any
+identity or memory work. Overlapping turns in one context conflict. At most two
+outstanding agent turns are admitted globally and per peer; excess returns 429
+without work. Capacity stays reserved through cancellation and uncertain cleanup.
+Once the runtime starts shutting down, new sends return 503 and in-flight
+admissions are drained or cancelled before sessions stop; an admission cut off
+there is recorded as outcome unknown after restart, never replayed.
 
 Each fresh native turn gets at most eight previous prompt/reply heads, each at
 most 4 KiB UTF-8, with an overall 64 KiB prior-context cap and visible omissions.
@@ -107,7 +111,9 @@ This is a bounded recap, not CC transcript resume or lossless shared memory.
 Full previous artifacts remain separately retrievable while retained.
 
 Lists default to 20 tasks, maximum 100; use `pageSize`, `pageToken` and optional
-`contextId`. A next-page token is the last owned receipt ID. Task history can be
+`contextId`. A next-page token is the last owned receipt ID. `GET /approvals`
+pages the same way (`pageSize`, `pageToken`, oldest first; the token is the last
+approval ID), and each task carries `pendingOwnerActions` from a bounded check. Task history can be
 requested with `historyLength`; this binding returns no history (a permitted
 maximum of zero), with the reply head in `status.message`. Unsupported list
 filters are explicitly refused; no silently ignored filter. Terminal reply

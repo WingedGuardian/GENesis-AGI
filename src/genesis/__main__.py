@@ -57,6 +57,8 @@ def main() -> None:
     from genesis.session_awareness import peer_address_cli
     peer_address_cli.add_parser(sub)
 
+    from genesis.peers import cli as peers_cli
+    peers_cli.add_parser(sub)
     # Encrypted card vault: genesis vault init/add/list/retire/status
     from genesis.payments import cli as vault_cli
     vault_cli.add_parser(sub)

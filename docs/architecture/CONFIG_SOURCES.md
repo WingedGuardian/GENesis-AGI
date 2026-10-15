@@ -271,3 +271,18 @@ names, so an overlay of a read-only file is editable (#2446).
    session via the server's env; it has its own file (`src/genesis/guardian/credential_bridge.py`).
 9. **The raw config-file editor edits tracked files.** Prefer `settings_update`, which
    writes an overlay that survives `git pull`.
+
+## Peer front door
+
+`genesis peers configure` explicitly selects disabled, fallback or SAM mode and
+persists the owner-configured HTTPS service URL. SAM pins the local realm; each
+relationship pins a remote node and optionally its delegated principal. Registry
+changes take effect on the next request. Tokens use `genesis.env.bearer_token`
+against the server environment; no endpoint loads `secrets.env` or credential
+files. A cleared value refuses access; file edits require the approved restart
+path. Backend and peer values must differ from other surface credentials,
+the dashboard password and the app's loaded active/fallback session-signing
+keys. Request checks use loaded signing authority without reading its file;
+boot diagnostics receive the actual app explicitly.
+Authenticated health is available in the registry foundation; the Agent Card
+returns `503 not_ready` until the task transport is installed.

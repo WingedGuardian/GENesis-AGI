@@ -610,6 +610,28 @@ class StreamEvent:
             if isinstance(b, dict) and b.get("type") in StreamEvent._RECOGNIZED_BLOCKS
         )
 
+    def tool_uses(self) -> list[tuple[str, object]]:
+        """Every ``(name, input)`` tool_use this event carries.
+
+        ``from_raw`` stops at the first recognized block, so a line shaped
+        ``text + tool_use`` parses as "text". Telemetry that is persisted as an
+        inventory reads the raw content array through this instead. An event
+        built without a raw ``assistant`` line falls back to its parsed fields.
+        """
+        raw = self.raw or {}
+        if raw.get("type") == "assistant":
+            blocks = raw.get("message", {}).get("content", [])
+            if not isinstance(blocks, list):
+                return []
+            return [
+                (b["name"], b.get("input"))
+                for b in blocks
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name")
+            ]
+        if self.event_type == "tool_use" and self.tool_name:
+            return [(self.tool_name, self.tool_input)]
+        return []
+
     @classmethod
     def from_raw(cls, raw: dict) -> StreamEvent:
         etype = raw.get("type", "")

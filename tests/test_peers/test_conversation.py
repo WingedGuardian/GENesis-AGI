@@ -765,3 +765,96 @@ async def test_bearer_fail_closed_body_and_owner_resolution(bridge, monkeypatch)
                 headers=headers,
             )
         ).status_code == 503
+
+
+async def test_approvals_page_and_task_projection_is_a_bounded_check(bridge):
+    from genesis.db.crud import approval_requests
+
+    identity = bridge.identities["alpha"]
+    row = await settle(bridge, await bridge.service.send(identity, incoming()))
+    for n in range(5):
+        await approval_requests.create(
+            bridge.db,
+            id=f"synthetic-approval-{n}",
+            action_type="email_send",
+            action_class="irreversible",
+            description=f"Synthetic held action {n}",
+            context=json.dumps({"agent_session_id": row["id"]}),
+            created_at=f"2026-01-01T00:00:0{n}",
+        )
+    first, token = await bridge.service.approvals(identity, 2)
+    second, token2 = await bridge.service.approvals(identity, 2, token)
+    third, token3 = await bridge.service.approvals(identity, 2, token2)
+    ids = [a["approvalId"] for a in first + second + third]
+    assert ids == [f"synthetic-approval-{n}" for n in range(5)]
+    assert token and token2 and token3 == ""
+    assert await bridge.service.has_pending_approval(identity, row["id"]) is True
+    other = bridge.identities["beta"]
+    assert await bridge.service.has_pending_approval(other, row["id"]) is False
+    with pytest.raises(ConversationRefusal):
+        await bridge.service.approvals(other, 2, token)  # foreign anchor
+
+
+@pytest.mark.parametrize("context", ["not-a-uuid", "unowned"])
+async def test_bad_continuation_anchor_is_refused_before_identity_work(
+    bridge, monkeypatch, context
+):
+    assembled = AsyncMock()
+    monkeypatch.setattr(
+        "genesis.peers.conversation.SystemPromptAssembler",
+        lambda: SimpleNamespace(assemble=assembled),
+    )
+    payload = message(context=str(uuid4()) if context == "unowned" else context)
+    with pytest.raises(ConversationRefusal) as refused:
+        await bridge.service.send(bridge.identities["alpha"], incoming(payload))
+    assert refused.value.status == (404 if context == "unowned" else 400)
+    assembled.assert_not_awaited()
+    bridge.invoker.run_streaming.assert_not_awaited()
+
+
+async def test_shutdown_drains_admissions_and_refuses_new_ones(bridge, monkeypatch):
+    identity = bridge.identities["alpha"]
+    entered, release = asyncio.Event(), asyncio.Event()
+    real = SystemPromptAssembler
+
+    class SlowAssembler:
+        async def assemble(self, **kwargs):
+            entered.set()
+            await release.wait()
+            return "Synthetic identity"
+
+    monkeypatch.setattr("genesis.peers.conversation.SystemPromptAssembler", SlowAssembler)
+    send = asyncio.create_task(bridge.service.send(identity, incoming()))
+    await asyncio.wait_for(entered.wait(), 3)
+    stop = asyncio.create_task(bridge.runner.shutdown(grace_s=0.2))
+    await asyncio.sleep(0.05)
+    with pytest.raises(ConversationRefusal) as late:
+        await bridge.service.send(identity, incoming())
+    assert late.value.status == 503
+    await asyncio.wait_for(stop, 3)
+    assert send.done()
+    # The cut-off admission never adopted: no native effect ran.
+    bridge.invoker.run_streaming.assert_not_awaited()
+    assert not bridge.runner._active
+    assert real is SystemPromptAssembler
+
+
+async def test_not_started_persistence_stops_retrying_once_closing(bridge, monkeypatch):
+    from genesis.peers import conversation
+
+    identity = bridge.identities["alpha"]
+
+    async def refuse(*args, **kwargs):
+        raise ValueError("Prepared receipt cannot be adopted")
+
+    attempts = []
+
+    async def failing_update(*args, **kwargs):
+        attempts.append(1)
+        bridge.runner._closing = True
+        raise RuntimeError("synthetic closed database")
+
+    monkeypatch.setattr(bridge.runner, "adopt", refuse)
+    monkeypatch.setattr(conversation, "update_state", failing_update)
+    await asyncio.wait_for(bridge.service.send(identity, incoming()), 3)
+    assert attempts == [1]

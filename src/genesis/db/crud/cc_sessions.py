@@ -539,6 +539,23 @@ async def merge_metadata(
     return cursor.rowcount > 0
 
 
+async def set_turn_totals(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    cost_usd: float,
+    input_tokens: int,
+    output_tokens: int,
+) -> bool:
+    """Write absolute totals, so a retried finalization never counts twice."""
+    cursor = await db.execute(
+        "UPDATE cc_sessions SET cost_usd = ?, input_tokens = ?, output_tokens = ? WHERE id = ?",
+        (cost_usd, input_tokens, output_tokens, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def update_model_effort(
     db: aiosqlite.Connection,
     id: str,

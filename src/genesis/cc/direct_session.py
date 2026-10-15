@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import shutil
 import time
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -46,6 +48,7 @@ from genesis.cc.types import (
 )
 from genesis.observability.session_context import set_session_id as _set_obs_session
 from genesis.util.inflight import close_unit, open_unit, within
+from genesis.util.proc_kill import ProcessCleanupUncertain
 from genesis.util.tasks import tracked_task
 
 if TYPE_CHECKING:
@@ -107,7 +110,13 @@ _BG_CC_TMP_ROOT = Path.home() / "tmp" / "bg-cc-sessions"
 
 
 def _bg_session_root(session_id: str) -> Path:
-    """Per-session root dir for a background CC session's isolated sandbox."""
+    """Per-session root dir for a background CC session's isolated sandbox.
+
+    Callers remove this tree recursively, so the id must be one plain path
+    component; anything else is refused rather than resolved.
+    """
+    if not session_id or session_id in {".", ".."} or Path(session_id).name != session_id:
+        raise ValueError("Session id is not a single path component")
     return _BG_CC_TMP_ROOT / session_id
 
 
@@ -958,6 +967,10 @@ class DirectSessionRunner:
         self._semaphore = asyncio.Semaphore(self._MAX_CONCURRENT)
         self._active: dict[str, asyncio.Task] = {}
         self._managed_cancel: dict[str, asyncio.Event] = {}
+        # Admissions that may still adopt a receipt. shutdown() closes the gate
+        # and drains them before cancelling sessions, while the DB is open.
+        self._admissions: set[asyncio.Task] = set()
+        self._closing = False
         self._protected_paths: object | None = None
         self._auditor: object | None = None
 
@@ -1084,6 +1097,17 @@ class DirectSessionRunner:
     def is_active(self, session_id: str) -> bool:
         return session_id in self._active
 
+    def register_admission(self, task: asyncio.Task) -> None:
+        """Track a task that may adopt a receipt; refused once shutdown began."""
+        if self._closing:
+            raise RuntimeError("Direct-session runner is shutting down")
+        self._admissions.add(task)
+        task.add_done_callback(self._admissions.discard)
+
+    @property
+    def closing(self) -> bool:
+        return self._closing
+
     def cancel(self, session_id: str) -> bool:
         """Signal a managed session; repeated signals never interrupt its drain."""
         signal = self._managed_cancel.get(session_id)
@@ -1097,12 +1121,23 @@ class DirectSessionRunner:
         from genesis.cc.managed_session import fingerprint, metadata
         from genesis.db.crud import cc_sessions
 
-        row = await cc_sessions.get_by_id(self._session_manager._db, session_id)
+        # The receipt id names files and directories (sandbox, artifact), so
+        # only a canonical UUID is adoptable, whoever created the row.
+        try:
+            canonical = str(uuid.UUID(session_id)) == session_id
+        except (ValueError, TypeError, AttributeError):
+            canonical = False
+        if not canonical or self._closing:
+            raise ValueError("Prepared receipt cannot be adopted")
+        # Verify and run one private snapshot: a caller mutating its own
+        # request (e.g. the skills list) after adoption cannot change what runs.
+        request = copy.deepcopy(request)
+        row = await cc_sessions.get_by_id(self._session_manager.db, session_id)
         if (
             not request.managed
             or row is None
             or session_id in self._active
-            or getattr(self._rt, "_db", None) is not self._session_manager._db
+            or getattr(self._rt, "_db", None) is not self._session_manager.db
             or row["source_tag"] != "agent_api"
             or row["status"] != "active"
             or row["session_type"] != "background_task"
@@ -1123,12 +1158,12 @@ class DirectSessionRunner:
             from genesis.cc.managed_session import update_state
 
             await update_state(
-                self._session_manager._db,
+                self._session_manager.db,
                 session_id,
                 "failed",
                 error="not_started",
             )
-            await cc_sessions.update_status(self._session_manager._db, session_id, status="failed")
+            await cc_sessions.update_status(self._session_manager.db, session_id, status="failed")
             raise
         self._active[session_id] = task
         self._managed_cancel[session_id] = signal
@@ -1175,6 +1210,17 @@ class DirectSessionRunner:
 
         Returns the number of tasks that were still in flight.
         """
+        # Close the admission gate first: an admission racing shutdown either
+        # finishes (its adopt is refused while closing) or is cancelled here,
+        # never adopting after the cancellation pass below.
+        self._closing = True
+        admissions = [t for t in self._admissions if not t.done()]
+        if admissions:
+            _, pending = await asyncio.wait(admissions, timeout=grace_s)
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.wait(pending, timeout=grace_s)
         tasks = [t for t in self._active.values() if not t.done()]
         for t in tasks:
             sid = next((sid for sid, active in self._active.items() if active is t), None)
@@ -1208,7 +1254,16 @@ class DirectSessionRunner:
                 )
             if invocation.claude_code_tmpdir:
                 Path(invocation.claude_code_tmpdir).mkdir(parents=True, exist_ok=True)
-            return await self._invoker.run_streaming(invocation, on_event=on_event)
+            try:
+                return await self._invoker.run_streaming(invocation, on_event=on_event)
+            except ProcessCleanupUncertain:
+                if not request.managed:
+                    raise
+                from genesis.cc.managed_session import hold_uncertain
+
+                # A child may still be running: keep this runner slot with it.
+                await hold_uncertain(self._session_manager.db, session_id)
+                raise  # unreachable: hold_uncertain never returns
 
     @staticmethod
     def _result(session_id, output: CCOutput, telemetry, elapsed) -> DirectSessionResult:
@@ -1242,11 +1297,11 @@ class DirectSessionRunner:
         start = time.monotonic()
 
         async def on_event(event: StreamEvent) -> None:
-            if event.event_type == "tool_use" and event.tool_name:
+            for name, tool_input in event.tool_uses():
                 telemetry.append(
                     {
-                        "name": event.tool_name,
-                        "input_preview": (str(event.tool_input)[:200] if event.tool_input else ""),
+                        "name": name,
+                        "input_preview": (str(tool_input)[:200] if tool_input else ""),
                     }
                 )
 

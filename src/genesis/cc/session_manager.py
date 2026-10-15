@@ -38,6 +38,11 @@ class SessionManager:
         self._on_end_hooks: list[OnSessionEnd] = []
         self._live_background: Callable[[str], bool] = lambda _sid: False
 
+    @property
+    def db(self):
+        """The connection this manager writes cc_sessions rows through."""
+        return self._db
+
     def set_background_liveness(self, probe: Callable[[str], bool]) -> None:
         self._live_background = probe
 
