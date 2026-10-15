@@ -495,6 +495,13 @@ def build_learning_collectors(rt: GenesisRuntime) -> list:
 
 async def init(rt: GenesisRuntime) -> None:
     """Initialize learning pipeline, triage, calibration, harvest, and all scheduled jobs."""
+    if rt._db is not None:
+        # First, and needing only the database: shipped lessons reach the
+        # advisor on every deploy path, whatever the rest of this step does.
+        from genesis.learning.procedural.shipped_lessons import seed_at_start
+        from genesis.util.tasks import tracked_task
+
+        tracked_task(seed_at_start(rt._db), name="shipped_lesson_seed")
     if rt._db is None or rt._router is None:
         logger.warning(
             "Learning skipped — missing prerequisites (db=%s, router=%s)",
