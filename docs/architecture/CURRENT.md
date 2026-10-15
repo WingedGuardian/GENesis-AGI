@@ -1406,10 +1406,23 @@ Every surface a human (or host process) talks to Genesis through.
 
 ```yaml subsystem-map
 entry: channels-interfaces
-modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 637f7f7bb679 2026-10-05
+modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
+verified: 8952d558f 2026-10-14
 ```
 
+- **peers/**: explicit owner-managed registry and scoped authentication for
+  same-owner asynchronous A2A conversations on the existing Flask/runtime loop.
+  `peers/conversation.py` atomically persists native receipts, binds contexts and
+  retries to relationship epochs, and admits at most two outstanding peer turns
+  globally and per peer, without a daily submission quota. Fresh native turns
+  use Genesis identity/cognition, available memory enrichment, observe/interact
+  tools, external unattended provenance and the native background ceiling.
+  Result heads and full artifacts have bounded disclosure checks. Approval
+  attribution survives notification updates; the API lists pending owner actions
+  and never resolves them. Presented peer/backend bearers are refused before
+  owner mutation shortcuts. Disabled by default; deployment/enrollment and
+  connector-only ingress verification are separate prerequisites. No new listener
+  or peer execution queue. See `docs/reference/agent-conversations.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is

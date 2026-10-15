@@ -61,6 +61,9 @@ def main() -> None:
     from genesis.payments import cli as vault_cli
     vault_cli.add_parser(sub)
 
+    from genesis.peers import cli as peers_cli
+    peers_cli.add_parser(sub)
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -74,7 +77,7 @@ def main() -> None:
         with ProcessLock("genesis-server"):
             asyncio.run(_serve(args))
     elif args.command in (
-        "contribute", "eval", "restore", "handoffs", "session-address", "vault",
+        "contribute", "eval", "restore", "handoffs", "session-address", "vault", "peers",
     ):
         sys.exit(args.func(args))
     else:
