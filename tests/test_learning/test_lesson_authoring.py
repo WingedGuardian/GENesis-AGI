@@ -227,6 +227,21 @@ async def test_a_failed_cache_rebuild_is_reported(env, monkeypatch):
     assert "rebuild failed" in response
 
 
+async def test_a_failed_cache_rebuild_after_an_earned_refine_is_reported(env, monkeypatch):
+    db, store, _ = env
+    await store(**{**_ARGS, "tool_trigger": ["ssh"]})
+    row = await _only_row(db)
+    await procedural.update(db, row["id"], activation_tier="ADVISORY")  # cached
+
+    async def broken(_db):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(trigger_cache, "regenerate", broken)
+    response = await store(**{**_ARGS, "tool_trigger": ["git push"]})
+    assert response.startswith("Updated existing procedure")
+    assert "rebuild failed" in response
+
+
 async def test_the_pattern_cap_refusal_names_the_derived_patterns(env):
     db, store, _ = env
     response = await store(**{**_ARGS, "tool_trigger": ["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git push"]}, trigger_patterns=["x"])
@@ -404,6 +419,36 @@ async def test_a_held_write_leaves_the_cache_alone(env, monkeypatch):
     monkeypatch.delenv("GENESIS_SESSION_ORIGIN")
     await store(**{**_ARGS, "task_type": "other"}, trigger_patterns=[r"update\.sh"])
     assert calls == [1]  # a live lesson still rebuilds it
+
+
+async def test_any_refine_of_a_cached_earned_row_rebuilds_the_cache(env, monkeypatch):
+    from genesis.learning.procedural import operations
+
+    db, store, _ = env
+    await store(**{**_ARGS, "tool_trigger": ["Edit"]})
+    row = await _only_row(db)
+    await procedural.update(db, row["id"], activation_tier="CORE")
+    calls = []
+
+    async def counted(db_):
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(operations, "_regenerate_cache", counted)
+    # Same trigger, new tags: the tags are the cached row's patterns.
+    await store(**{**_ARGS, "tool_trigger": None, "context_tags": ["rollout"]})
+    assert calls == [1]
+
+
+async def test_command_words_naming_no_tool_never_replace_a_stored_trigger(env):
+    db, store, _ = env
+    await store(**{**_ARGS, "tool_trigger": ["Edit"]})
+    nine = ["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git add"]
+    response = await store(**{**_ARGS, "tool_trigger": nine})
+    row = await _only_row(db)
+    assert json.loads(row["tool_trigger"]) == ["Edit"]
+    assert row["trigger_spec"] is None
+    assert "stored trigger kept" in response
 
 
 async def test_a_held_record_never_updates_a_live_row_whatever_the_caller_says(env):

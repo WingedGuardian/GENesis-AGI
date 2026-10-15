@@ -347,6 +347,7 @@ async def main(db_path: Path) -> None:
                  context_tags = excluded.context_tags,
                  activation_tier = excluded.activation_tier,
                  tool_trigger = excluded.tool_trigger,
+                 trigger_spec = NULL,
                  draft = excluded.draft""",
             (
                 proc_id,

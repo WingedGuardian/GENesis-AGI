@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import json
 import logging
 import re
 from pathlib import Path
@@ -139,6 +140,25 @@ def _annotated_cli(value: str) -> str | None:
         if lower.startswith(phrase) and re.match(r"\s*[(:{]", lower[len(phrase) :]):
             return phrase
     return None
+
+
+def names_a_tool(stored) -> bool:
+    """True when a stored ``tool_trigger`` (JSON text or a list) holds a tool name.
+
+    Command words kept as written name no tool, so a row holding only those has
+    no trigger the advisor can match, and must not count as having one.
+    """
+    if isinstance(stored, str):
+        try:
+            stored = json.loads(stored)
+        except (ValueError, RecursionError):
+            return False
+    # Only a list, as the trigger cache reads it (a bare string is refused there).
+    if not isinstance(stored, list | tuple):
+        return False
+    return any(
+        isinstance(v, str) and (v in BUILTIN_TOOLS or _MCP_NAME.fullmatch(v)) for v in stored
+    )
 
 
 def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:

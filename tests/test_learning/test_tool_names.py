@@ -94,6 +94,24 @@ def test_the_mcp_short_names_match_the_registered_tools():
     assert tool_names._genesis_mcp_names() == {n for full in registered.values() for n in full}
 
 
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ('["Bash"]', True),
+        ('["mcp__genesis-health__health_status"]', True),
+        (["Read", "ssh"], True),
+        ('["ssh", "git push"]', False),
+        ("[]", False),
+        (None, False),
+        ('"Bash"', False),  # not a list: the trigger cache refuses it too
+        ("not json", False),
+        ("[1, null]", False),
+    ],
+)
+def test_names_a_tool_counts_only_real_tool_names(stored, expected):
+    assert tool_names.names_a_tool(stored) is expected
+
+
 def test_the_prompt_guidance_names_the_tools_without_braces():
     text = tool_names.TOOL_TRIGGER_GUIDANCE
     assert "Bash" in text and "mcp__<server>__<tool>" in text and "git push" in text

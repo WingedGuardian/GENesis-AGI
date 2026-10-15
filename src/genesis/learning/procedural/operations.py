@@ -18,7 +18,7 @@ from genesis.learning.procedural.lesson_shape import (
     validate_lesson,
     validate_trigger_spec,
 )
-from genesis.learning.procedural.tool_names import normalize_tool_trigger
+from genesis.learning.procedural.tool_names import names_a_tool, normalize_tool_trigger
 from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,8 @@ class StoreResult:
     # decision (None when no embedding was available to compare). Observability +
     # test assertions; does not affect the stored row.
     matched_similarity: float | None = None
-    # For a lesson write: whether the trigger cache was rebuilt (None otherwise).
+    # For a lesson write or a refine of a cached earned row: whether the trigger
+    # cache was rebuilt (None when no rebuild was needed).
     cache_rebuilt: bool | None = None
 
 
@@ -232,7 +233,7 @@ async def store_procedure_checked(
     - High context_tag overlap with a different task_type → warn but still create.
 
     A LESSON (``lesson`` and ``trigger_spec`` given) is authored, not earned:
-    the normalizer's command patterns join the author's, both records are
+    the normalizer's command phrases join the author's commands, both records are
     validated (``ValueError`` refuses the call), its tier comes from its
     origin (live ADVISORY, held LIBRARY) and the trigger cache is rebuilt.
     A lesson call refines only a lesson and a plain call only an earned row, so
@@ -320,8 +321,9 @@ async def store_procedure_checked(
         if principle_embedding is not None:
             update_fields["principle_embedding"] = principle_embedding
         # A refine with no usable trigger keeps the stored one. Writing None
-        # through took a live CORE row out of the trigger cache.
-        if trigger:
+        # through took a live CORE row out of the trigger cache, and command
+        # words kept as written name no tool, so they never replace one.
+        if names_a_tool(trigger):
             update_fields["tool_trigger"] = trigger
             try:
                 stored = json.loads(matched["tool_trigger"]) if matched.get("tool_trigger") else None
@@ -334,6 +336,10 @@ async def store_procedure_checked(
                 # teach names Bash itself (every Bash call): drop the spec rather
                 # than gate the row with commands it no longer names.
                 update_fields["trigger_spec"] = None
+        elif trigger:
+            trigger_warnings.append(
+                f"stored trigger kept: {trigger} names no tool the advisor can match"
+            )
         elif tool_trigger == [] and draft == 0:
             # An explicit teach that passes an empty list means "no trigger".
             # Auto-extraction (draft=1) emitting [] keeps the stored one: an
@@ -360,11 +366,10 @@ async def store_procedure_checked(
         if lesson is not None:
             update_fields.update(trigger_spec=trigger_spec, lesson=lesson, activation_tier=activation_tier)
         await procedural.update(db, matched["id"], **update_fields)
-        # A lesson, or a cached earned row whose trigger or spec changed, must
-        # reach the advisor now, not at the promoter's next tier change.
-        earned_cached = matched.get("activation_tier") in ("CORE", "ADVISORY") and (
-            "trigger_spec" in update_fields or "tool_trigger" in update_fields
-        )
+        # A lesson, or any refine of a cached earned row (its principle, steps
+        # and tags are cached too; tags are its patterns), must reach the
+        # advisor now, not at the promoter's next tier change.
+        earned_cached = lesson is None and matched.get("activation_tier") in ("CORE", "ADVISORY")
         rebuilt = await _regenerate_cache(db) if lesson is not None or earned_cached else None
         logger.info(
             "Refined procedure %s (v%d, cosine=%.3f): %s",
@@ -428,14 +433,14 @@ async def store_procedure_checked(
 
 
 async def _regenerate_cache(db: aiosqlite.Connection) -> bool:
-    """Rebuild the trigger cache after a lesson write; a failure is logged and returned."""
+    """Rebuild the trigger cache after a write it carries; a failure is logged and returned."""
     from genesis.learning.procedural.trigger_cache import regenerate
 
     try:
         await regenerate(db)
         return True
     except Exception:
-        logger.error("Trigger cache regeneration after a lesson write failed", exc_info=True)
+        logger.error("Trigger cache regeneration after a procedure write failed", exc_info=True)
         return False
 
 
