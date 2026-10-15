@@ -14,8 +14,8 @@ here is marked `shipped` and `reviewed`, so it is live on every install.
 | `principle` | yes | The advice itself, one or two sentences. |
 | `steps` | yes | A list of concrete steps (may be empty). |
 | `tool_trigger` | yes | The tools the lesson watches, by their exact Claude Code names (`Bash`, `Edit`, `mcp__<server>__<tool>`). A shell command such as `ssh` is written as `Bash`, with a pattern. |
-| `patterns` | yes | Regular expressions matched against the tool's input; any one matching is enough. At most 8, each at most 200 characters, each must compile and must not match empty input. |
-| `repeat` | yes | `session` (shown once per session) or `every` (shown on every match). |
+| `patterns` | yes | Regular expressions matched against the tool's input (case-sensitive; start a pattern with `(?i)` to ignore case); any one matching is enough. At most 8, each at most 200 characters, each must compile and must not match empty input. |
+| `repeat` | yes | `session` (shown once per context window and agent, so again after a compaction) or `every` (shown on every match). |
 | `context_tags` | no | Topic tags used by recall. |
 
 Unknown fields make the file invalid.

@@ -15,13 +15,13 @@ import tempfile
 from pathlib import Path
 
 
-def atomic_write_text(path: Path | str, content: str) -> None:
+def atomic_write_text(path: Path | str, content: str, *, encoding: str | None = None) -> None:
     """Atomically write ``content`` to ``path`` (temp file in the same dir + rename)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())

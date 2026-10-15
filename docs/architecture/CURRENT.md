@@ -378,10 +378,21 @@ unclassified row never expires.
 Spawning, tracking, and recovering Claude Code sessions — Genesis's hands for
 any task bigger than an LLM call.
 
+Machine connectors can adopt a prepared `cc_sessions` receipt through the same
+native runner (`cc/managed_session.py`, `DirectSessionRunner.adopt`), rather than
+adding another execution queue. This opt-in mode registers before start hooks,
+uses the existing background breaker plus a fail-closed effective ceiling,
+keeps external unattended provenance, and supervises cancellation/deadline
+cleanup. Structured terminal state and private full artifacts distinguish model
+failure/partial output from legacy completion. Receipt retention and boot orphan
+reconciliation prevent automatic replay; live registered work is excluded from
+the stale reaper. It is a native primitive, not an enabled peer transport. See
+`docs/reference/native-managed-sessions.md`.
+
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 6aae986bb 2026-10-04
+verified: 6ef113ecd 2026-10-14
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
@@ -1395,10 +1406,22 @@ Every surface a human (or host process) talks to Genesis through.
 
 ```yaml subsystem-map
 entry: channels-interfaces
-modules: [channels, dashboard, mcp, hosting, browser, mail]
+modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
 verified: cfbb876243f2 2026-10-07
 ```
 
+- **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
+  pinned node/realm/principal and scoped credentials. Disabled by default; no
+  implicit capability grants. Enrollment requires no daily task budget; the
+  deprecated allowance field remains only for database compatibility. Local
+  `genesis peers` CLI writes relationships; `/v1/agent/a2a/health` authenticates
+  through the existing runtime loop. The Agent Card returns `503 not_ready`
+  until an installed task transport can fulfill its advertised interface.
+  Revocation disables access immediately; only active peer credentials contribute
+  to fallback readiness, while inactive credentials still participate in scope
+  collision checks. Scope checks also reject equality with loaded active/fallback
+  Flask signing keys, without request-time credential-file reads.
+  See `docs/reference/peer-registry.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is
@@ -1470,7 +1493,12 @@ verified: cfbb876243f2 2026-10-07
   a PATH provider. Staging does not activate it; MCP registration and indexing
   retain their existing routes until their integration concerns land. See
   `docs/reference/codebase-managed.md`.
-- **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
+- **hosting/**: the OUTER layer that calls the runtime. Standalone's scoped peer
+  request-input handler provides a trusted 256 KiB body reader with a five-second
+  absolute deadline on peer send/cancel POST paths. It bounds framing and refusal
+  cleanup while preserving the configured listener and ordinary-route/WebSocket
+  policies; it does not activate the peer API. See
+  [peer request input](../reference/peer-request-input.md). `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at
   `/v1/desk/chat/completions` — `dashboard/routes/desk_api.py`, an
@@ -3588,6 +3616,24 @@ verified: ba9dd8a37 2026-10-09
   outside the checkout at the end of every run, a failed one included. A
   symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
   `--take-templates`.
+- **The restart guard, `~/.genesis/update_state.json`** (deploy scripts and the
+  dashboard update routes, #3139): `update.sh` writes it at each phase; an
+  update that merged code and never activated it, or that stopped on merge
+  conflicts, leaves it behind. Whether it still guards is ONE rule,
+  `scripts/lib/update_state_guard.py` (stdlib; `safe` / `guards` /
+  `conflict_pending`, plus the remedy text): a "done" state, a plain run's
+  "fetching" at its rollback tag, and a "merging" at the tag with no merge
+  residue and no recorded conflict guard nothing; anything unreadable guards.
+  `deploy_code_only.sh` and the live engine refuse to restart or move the
+  checkout while it guards; a plain `update.sh` exits 5 (before tagging or
+  writing anything), and the dashboard's `/apply` answers 409 on both paths;
+  `--post-merge` is the run that finishes it. Only the run that wrote the file
+  deletes it on its exits (never a `--post-merge`, never a run that had not
+  written yet), a rollback that left merged code keeps it, and bootstrap's
+  crash recovery keeps a pending conflict. The dashboard's progress poll is
+  read-only: it reports the verdict and offers Dismiss, the one retirement by
+  hand. The merge-residue check is shared with bootstrap
+  (`genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`).
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.

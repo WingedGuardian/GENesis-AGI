@@ -28,6 +28,7 @@ async def create(
     thread_id: str | None = None,
     origin_class: str | None = None,
     chat_id: str | None = None,
+    commit: bool = True,
 ) -> str:
     await db.execute(
         """INSERT INTO cc_sessions
@@ -53,7 +54,8 @@ async def create(
             chat_id,
         ),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return id
 
 
@@ -537,6 +539,23 @@ async def merge_metadata(
     return cursor.rowcount > 0
 
 
+async def set_turn_totals(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    cost_usd: float,
+    input_tokens: int,
+    output_tokens: int,
+) -> bool:
+    """Write absolute totals, so a retried finalization never counts twice."""
+    cursor = await db.execute(
+        "UPDATE cc_sessions SET cost_usd = ?, input_tokens = ?, output_tokens = ? WHERE id = ?",
+        (cost_usd, input_tokens, output_tokens, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def update_model_effort(
     db: aiosqlite.Connection,
     id: str,
@@ -769,7 +788,11 @@ async def record_turn_cost(
 
 
 async def delete(db: aiosqlite.Connection, id: str) -> bool:
-    cursor = await db.execute("DELETE FROM cc_sessions WHERE id = ?", (id,))
+    # Agent receipts are retained retry/correlation anchors, not disposable jobs.
+    cursor = await db.execute(
+        "DELETE FROM cc_sessions WHERE id = ? AND COALESCE(source_tag, '') != 'agent_api'",
+        (id,),
+    )
     await db.commit()
     return cursor.rowcount > 0
 
