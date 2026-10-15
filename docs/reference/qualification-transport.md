@@ -24,16 +24,23 @@ enable that SDK printer; an empty or unset value is required. Offline retained
 answer replay does not use the SDK and remains available. The dedicated key must differ from all visible
 production OpenRouter credentials and match the frozen fingerprint. Each new
 completion reads its finite nonreset limit, remaining credit and usage; explicit
-`limit_reset: null` is required. Remaining credit, the least of the key's own
-`limit_remaining` and every returned `effective_budget`/`budgets` entry's
-`remaining_usd`, must cover the outstanding scheduled maxima; a malformed
-budget entry refuses. A current key snapshot cannot prove exclusive key use,
+`limit_reset: null` is required. Available credit is the least of reported
+`limit_remaining`, exact `limit - usage`, every returned budget's `remaining_usd`
+and its exact `limit_usd - spend_usd` when those constraints are supplied.
+All arithmetic uses retained lexical decimals. A partial/malformed budget pair
+refuses; a lower reported remainder remains binding. This conservative envelope
+does not assume atomic or exactly equal snapshots. It must cover the outstanding
+scheduled maxima. A current key snapshot cannot prove exclusive key use,
 in-flight overshoot, billable reasoning/framing or fees. `max_price` filters
 rates; it is not a per-request dollar cap. The later runner must still require complete admission and concrete owner
 approval of the frozen operating parameters and allowance. An approved operating
 allowance with disclosed overrun risk does not establish a hard invoice ceiling.
 
-Reservation and dispatch are durable before the delegate runs. Every SDK
+Local HTTP client construction precedes reservation/dispatch. Failed setup
+therefore leaves no durable dispatch, and an initialized client is closed even
+when reservation or dispatch publication fails. Ambiguous historical dispatches
+remain unresolved and are never resent. Reservation and dispatch are durable
+before the delegate runs. Every SDK
 replacement client shares the same exact-wire and second-request refusal guard.
 The serialized HTTP hook enables documented routing metadata and explicitly
 disables OpenRouter response caching. Each qualified answer needs one selected
@@ -63,7 +70,11 @@ strings. This is an evidence-processing limit, not a claimed provider precision.
 Locally constructed evidence field names stay unchanged when a credential value
 matches a schema name. Usage records and the four association fields retain
 their schema, as do the selected identity/cache headers. Arbitrary nested values and extra association key material remain
-redacted. Valid raw response/billing JSON preserves its fixed public schema key
+redacted. Association metadata is normalized through the existing finite-JSON
+serializer before redaction and before GET; tuples become arrays, while unsupported
+or cyclic inputs refuse. Existing retained records require no migration. Logging
+message, cached exception, traceback and stack formatting failures use a fixed
+redacted diagnostic rather than interrupting a request. Valid raw response/billing JSON preserves its fixed public schema key
 tokens while redacting values and unknown keys without reserializing numbers.
 Optional pipeline and attempt-history keys remain available to refusal checks.
 Retained raw bodies use that same boundary again; diagnostic text does not

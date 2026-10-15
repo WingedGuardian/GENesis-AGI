@@ -161,6 +161,10 @@ def safe_evidence(value: dict) -> dict:
 
 def safe_association(value):
     """Keep association schema names; redact all extra operator-supplied keys."""
+    try:
+        value = load_json(canonical(value))
+    except (ValueError, TypeError, RecursionError, OverflowError):
+        raise LocalFailure("association must be finite serializable JSON") from None
     if not isinstance(value, dict):
         return _safe_value(value)
     return {
@@ -472,13 +476,22 @@ def private_logs():
 
     def redacted(*args, **kwargs):
         record = original(*args, **kwargs)
-        record.msg = safe_text(record.getMessage())
-        record.args = ()
-        if record.exc_info:
-            record.exc_text = safe_text("".join(traceback.format_exception(*record.exc_info)))
-            record.exc_info = None
-        if record.stack_info:
-            record.stack_info = safe_text(record.stack_info)
+        try:
+            record.msg = safe_text(record.getMessage())
+            if record.exc_info:
+                record.exc_text = safe_text("".join(traceback.format_exception(*record.exc_info)))
+            elif record.exc_text:
+                record.exc_text = safe_text(record.exc_text)
+            if record.stack_info:
+                record.stack_info = safe_text(record.stack_info)
+        except BaseException:
+            # Formatting is diagnostic only, including hostile __str__/repr.
+            # Do not retain any partially rendered or unsanitized fallback.
+            record.msg = "[REDACTED: unformattable log record]"
+            record.exc_text = None
+            record.stack_info = None
+        finally:
+            record.args, record.exc_info = (), None
         return record
 
     # LiteLLM otherwise PRINTS a help banner and the raw provider error to stdout,
@@ -570,6 +583,12 @@ def _budget_paths(raw: bytes) -> tuple[tuple, ...]:
         if not isinstance(budgets, list) or not all(isinstance(item, dict) for item in budgets):
             raise LocalFailure("budgets is not a list of budget objects")
         paths.extend(("data", "budgets", index, "remaining_usd") for index in range(len(budgets)))
+    for path in tuple(paths):
+        budget = _at(data, path[1:-1])
+        if "limit_usd" in budget or "spend_usd" in budget:
+            # A partial pair is malformed; financial_json rejects its missing
+            # partner instead of silently ignoring a supplied constraint.
+            paths.extend(path[:-1] + (name,) for name in ("limit_usd", "spend_usd"))
     return tuple(paths)
 
 
@@ -604,9 +623,24 @@ async def key_status(key: str, transport=None, *, required="0") -> dict:
             )
             # limit/limit_remaining describe only the key's own limit; a member,
             # workspace or guardrail budget can block requests first.
-            available = min(
-                [remaining, *(Decimal(_at(data, path[1:])) for path in budgets)]
-            )
+            budget_headroom = [
+                {
+                    "limit_usd": _at(data, path[1:]),
+                    "spend_usd": _at(data, path[1:-1] + ("spend_usd",)),
+                }
+                for path in budgets if path[-1] == "limit_usd"
+            ]
+            for budget in budget_headroom:
+                budget["available"] = format(total([
+                    Decimal(budget["limit_usd"]), Decimal(budget["spend_usd"]).copy_negate(),
+                ]), "f")
+            # Snapshots need not be exactly equal or atomic. Never admit more
+            # than any reported or independently derived headroom supports.
+            available = min([
+                remaining, total([limit, usage.copy_negate()]),
+                *(Decimal(_at(data, path[1:])) for path in budgets if path[-1] == "remaining_usd"),
+                *(Decimal(item["available"]) for item in budget_headroom),
+            ])
             if (
                 available <= 0
                 or available < Decimal(required)
@@ -626,6 +660,8 @@ async def key_status(key: str, transport=None, *, required="0") -> dict:
     if "budgets" in data:
         info["budgets_remaining_usd"] = [item["remaining_usd"] for item in data["budgets"]]
     info["available"] = format(available, "f")
+    if budget_headroom:
+        info["budget_headroom"] = budget_headroom
     return info
 
 
@@ -687,6 +723,8 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None):
                 "receipt-only recovery needs independently verified attempt association"
             )
         generation = association["generation_id"]
+    # Validate the serializer's whole input domain before doing any GET work.
+    association_evidence = safe_association(association)
     key = dedicated_key()
     if hashlib.sha256(key.encode()).hexdigest() != spec.get("credential_fingerprint"):
         raise LocalFailure("reconciliation credential differs from frozen identity")
@@ -703,7 +741,7 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None):
         "request_hash": spec["request_hash"],
         "http_status": response.status_code,
         "raw_body": safe_body(response.content),
-        "association": safe_association(association),
+        "association": association_evidence,
         "provider_identity_evidence": identity,
     }
     try:
@@ -1019,17 +1057,6 @@ class PinnedRouter:
             raise LocalFailure("dedicated credential differs from frozen identity")
         info = await key_status(secret, self.transport, required=str(self.required))
         row = self.campaign.attempt(attempt)
-        if row.get("reserved_at") is None:
-            self.campaign.reserve(attempt)
-        self.campaign.append(
-            "dispatch",
-            attempt=attempt,
-            request_hash=row["spec"]["request_hash"],
-            key_status=info,
-            credential_fingerprint=self.fingerprint,
-        )
-        self.required = total([self.required, Decimal(row["spec"]["max_charge"]).copy_negate()])
-
         def record(observation):
             spec = row["spec"]
             observed = {
@@ -1046,14 +1073,27 @@ class PinnedRouter:
             ):
                 raise LocalFailure("provider observation is not verified pinned-model evidence")
 
-        handler = ObservedHTTPHandler(expected, secret, record, transport=self.transport)
         body = self.params[route(self.contract)]
         flat = {k: v for k, v in body.items() if k != "reasoning"}
         extra = {
             "provider": expected["provider"],
             **({"reasoning": body["reasoning"]} if "reasoning" in body else {}),
         }
+        # Local client setup must succeed before an irreversible dispatch event.
+        handler = ObservedHTTPHandler(expected, secret, record, transport=self.transport)
+        dispatched = False
         try:
+            if row.get("reserved_at") is None:
+                self.campaign.reserve(attempt)
+            self.campaign.append(
+                "dispatch",
+                attempt=attempt,
+                request_hash=row["spec"]["request_hash"],
+                key_status=info,
+                credential_fingerprint=self.fingerprint,
+            )
+            dispatched = True
+            self.required = total([self.required, Decimal(row["spec"]["max_charge"]).copy_negate()])
             try:
                 with private_logs(), scoped_credential(secret):
                     result = await LiteLLMDelegate(self.config).call(
@@ -1087,7 +1127,8 @@ class PinnedRouter:
             try:
                 await handler.close()
             except BaseException as cleanup:
-                self._failure(attempt, cleanup)
+                if dispatched:
+                    self._failure(attempt, cleanup)
                 if active is None or not isinstance(cleanup, Exception):
                     raise
         try:

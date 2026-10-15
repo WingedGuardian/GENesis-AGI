@@ -473,6 +473,15 @@ async def test_key_status_accepts_absent_or_sufficient_budgets(budgets, evidence
     data = {"limit": 1, "limit_remaining": 1, "usage": 0, "limit_reset": None, **budgets}
     transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"data": data}))
     info = await key_status("synthetic-only-key", transport, required="0.2")
+    budget_rows = [
+        item for item in [budgets.get("effective_budget"), *budgets.get("budgets", [])]
+        if item is not None
+    ]
+    if budget_rows:
+        evidence["budget_headroom"] = [
+            {"limit_usd": "50", "spend_usd": "32.5", "available": "17.5"}
+            for _ in budget_rows
+        ]
     assert info == {
         "limit": "1", "limit_remaining": "1", "limit_reset": None, "usage": "0", **evidence,
     }
@@ -668,7 +677,7 @@ async def _check_receipt_only_recovery(
                 "request_hash": spec["request_hash"],
                 "generation_id": "gen-0",
                 "evidence": "synthetic verified recovery record",
-                extra: {extra: extra},
+                extra: {extra: (extra, {extra: (extra,)})},
             },
         )
         association = campaign.lines[-1]["receipt"]["association"]
@@ -676,7 +685,9 @@ async def _check_receipt_only_recovery(
         assert association["request_hash"] == spec["request_hash"]
         assert association["generation_id"] == "gen-0"
         assert association["evidence"] == "synthetic verified recovery record"
-        assert association["[REDACTED]"] == {"[REDACTED]": "[REDACTED]"}
+        assert association["[REDACTED]"] == {
+            "[REDACTED]": ["[REDACTED]", {"[REDACTED]": ["[REDACTED]"]}]
+        }
         assert extra not in (campaign.directory / "answers.jsonl").read_text()
         assert campaign.state.settled == Decimal("0.0001")
         assert campaign.state.blockers == {"answer:case-0"}

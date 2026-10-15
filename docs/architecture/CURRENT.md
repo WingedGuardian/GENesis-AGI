@@ -2655,7 +2655,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 9a95483a8 2026-10-09
+verified: a95ae76ce923 2026-10-15
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2826,6 +2826,10 @@ verified: 9a95483a8 2026-10-09
   Frozen schedule/provider
   mapping and dedicated nonreset credentials are required; any journal incident
   pauses new requests and replay until verified recovery. These checks do not
+  admit more than reported or exact limit-minus-spend headroom supports. Local
+  client setup precedes durable dispatch; recovery metadata uses the shared JSON
+  authority before redaction, and diagnostic formatting cannot interrupt calls.
+  These checks do not
   establish provider spend bounds or owner approval. The isolated runner remains
   a later replacement. This verification refresh covers the qualification slice;
   other learning/evaluation entries retain their previous verification scope.
