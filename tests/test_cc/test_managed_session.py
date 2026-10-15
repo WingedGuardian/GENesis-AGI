@@ -940,7 +940,7 @@ async def test_successful_managed_run_lets_the_child_flush_before_the_group_kill
     assert flushed.read_text() == "ok"
 
 
-async def test_held_uncertain_state_is_written_once(db, native, monkeypatch):
+async def test_held_uncertain_state_is_written_once(db, native, monkeypatch, caplog):
     from genesis.cc import managed_session
     from genesis.util.proc_kill import ProcessCleanupUncertain
 
@@ -985,8 +985,174 @@ async def test_held_uncertain_state_is_written_once(db, native, monkeypatch):
         # One failed write, one successful write, then no further writes.
         assert writes == ["cancelling", "cancelling"]
         assert retry_sleeps == [1.0]
+        holds = [
+            r for r in caplog.records
+            if r.name == "genesis.cc.managed_session" and "cleanup unconfirmed" in r.getMessage()
+        ]
+        assert len(holds) == 1 and holds[0].levelname == "WARNING"
         row = await cc_sessions.get_by_id(db, sid)
         assert json.loads(row["metadata"])["cleanup_unconfirmed"] is True
     finally:
         teardown.set()
         await asyncio.gather(task, return_exceptions=True)
+@pytest.mark.parametrize("failure", ["missing", "not_executable", "bad_cwd"])
+async def test_a_popen_launch_failure_is_ordinary_not_uncertain(tmp_path, failure):
+    """Popen reaps any child it forked before raising, so nothing is left to own
+    and no runner slot should be held for it (#3369)."""
+    import sys
+
+    from genesis.util.proc_kill import ProcessCleanupUncertain, spawn_owned
+
+    argv, kwargs = [sys.executable, "-c", "pass"], {}
+    if failure == "missing":
+        argv = [str(tmp_path / "no-such-cli")]
+    elif failure == "not_executable":
+        script = tmp_path / "plain.txt"
+        script.write_text("not a program")
+        argv = [str(script)]
+    else:
+        kwargs["cwd"] = str(tmp_path / "no-such-dir")
+    with pytest.raises(OSError) as raised:
+        await spawn_owned(*argv, start_new_session=True, **kwargs)
+    assert not isinstance(raised.value, ProcessCleanupUncertain)
+
+
+async def test_unconfirmable_group_becomes_uncertain_after_the_bound(monkeypatch):
+    """A group whose absence cannot be observed is reported, not watched forever."""
+    import os
+
+    from genesis.util import proc_kill
+    from genesis.util.proc_kill import ProcessCleanupUncertain, confirm_process_exit
+
+    def refuse(pgid, sig):
+        raise PermissionError("synthetic: liveness unknown")
+
+    monkeypatch.setattr(proc_kill.os, "killpg", refuse)
+    proc = SimpleNamespace(pid=os.getpid() + 100000, returncode=None, kill=lambda: None)
+    with pytest.raises(ProcessCleanupUncertain):
+        await asyncio.wait_for(confirm_process_exit(proc, confirm_timeout_s=0.3), 5)
+
+
+async def test_slot_is_held_until_finalization_commits(db, native, monkeypatch):
+    import sqlite3
+
+    runner, manager, invoker = native
+    free = runner._semaphore._value
+    original_complete = manager.complete
+    failed, release = asyncio.Event(), asyncio.Event()
+    attempts = 0
+
+    async def flaky_complete(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            failed.set()
+            raise sqlite3.OperationalError("synthetic temporary database failure")
+        await release.wait()
+        await original_complete(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "complete", flaky_complete)
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await reached(failed)
+    # The subprocess has exited, but the receipt is not persisted yet.
+    assert invoker.run_streaming.await_count == 1
+    assert runner._semaphore._value == free - 1
+    release.set()
+    await settled(runner, sid)
+    assert runner._semaphore._value == free
+
+
+async def test_committed_orphan_recovers_its_usage_totals(db):
+    req = request()
+    sid = await prepare(
+        db,
+        req,
+        native_state="succeeded",
+        result_committed=True,
+        usage={"cost_usd": 0.25, "input_tokens": 7, "output_tokens": 11},
+    )
+    assert await reconcile_orphans(db) == 1
+    row = await cc_sessions.get_by_id(db, sid)
+    assert row["status"] == "completed"
+    assert (row["cost_usd"], row["input_tokens"], row["output_tokens"]) == (0.25, 7, 11)
+
+
+async def test_cancel_keeps_a_recorded_cleanup_uncertainty(db, native, monkeypatch):
+    from genesis.util.proc_kill import ProcessCleanupUncertain
+
+    runner, _, invoker = native
+    invoker.run_streaming.side_effect = ProcessCleanupUncertain("synthetic uncertainty")
+    parked, teardown = asyncio.Event(), asyncio.Event()
+    original_sleep = asyncio.sleep
+
+    class TestTeardown(BaseException):
+        """Only the test harness can end the deliberately unbounded hold."""
+
+    async def pause(seconds):
+        if seconds == _HOLD_PARK_S:
+            parked.set()
+            await teardown.wait()
+            raise TestTeardown
+        return await original_sleep(seconds)
+
+    monkeypatch.setattr("genesis.cc.managed_session.asyncio.sleep", pause)
+    sid = await prepare(db, request())
+    await runner.adopt(sid, request())
+    task = runner._active[sid]
+    await reached(parked)
+    try:
+        assert runner.cancel(sid)
+        for _ in range(20):
+            await original_sleep(0.01)
+        meta = json.loads((await cc_sessions.get_by_id(db, sid))["metadata"])
+        assert meta["error"] == "cleanup_unconfirmed"
+        assert meta["cleanup_unconfirmed"] is True
+    finally:
+        teardown.set()
+        await asyncio.gather(task, return_exceptions=True)
+async def test_a_launch_failure_frees_the_slot_and_fails_the_receipt(db, native):
+    """Runner level: an ordinary launch error fails the receipt and keeps no slot."""
+    runner, _, invoker = native
+    invoker.run_streaming.side_effect = FileNotFoundError(2, "synthetic", "no-such-cli")
+    free = runner._semaphore._value
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    row = await cc_sessions.get_by_id(db, sid)
+    meta = json.loads(row["metadata"])
+    assert row["status"] == "failed"
+    assert meta["native_state"] == "failed"
+    assert not meta.get("cleanup_unconfirmed")
+    assert runner._semaphore._value == free
+
+
+async def test_usage_is_written_with_the_terminal_state(db, native, monkeypatch):
+    """The usage totals ride in the terminal metadata, before set_turn_totals."""
+    runner, _, invoker = native
+    invoker.run_streaming.return_value = output(cost_usd=0.3, input_tokens=5, output_tokens=9)
+    failed, release = asyncio.Event(), asyncio.Event()
+    original = cc_sessions.set_turn_totals
+    calls = 0
+
+    async def flaky_totals(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            failed.set()
+            await release.wait()
+            raise RuntimeError("synthetic: died before totals")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(cc_sessions, "set_turn_totals", flaky_totals)
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await reached(failed)
+    meta = json.loads((await cc_sessions.get_by_id(db, sid))["metadata"])
+    assert meta["native_state"] == "succeeded"
+    assert meta["usage"] == {"cost_usd": 0.3, "input_tokens": 5, "output_tokens": 9}
+    release.set()
+    await settled(runner, sid)

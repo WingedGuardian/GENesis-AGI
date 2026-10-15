@@ -81,6 +81,13 @@ async def hold_uncertain(db, sid: str) -> None:
                         cleanup_unconfirmed=True,
                     )
                     recorded = True
+                    # This module's logger is outside the private-execution
+                    # filter, so the hold is visible; the line carries no content.
+                    logger.warning(
+                        "Managed receipt %s held: process cleanup unconfirmed; "
+                        "its runner slot is kept until restart",
+                        sid,
+                    )
             if recorded:
                 await asyncio.sleep(_HOLD_PARK_S)
             else:
@@ -105,8 +112,19 @@ async def reconcile_orphans(db) -> int:
         if row.get("source_tag") == "agent_api" and "managed_fingerprint" in metadata(row)
     ]
     for row in orphaned:
-        finished = _COMMITTED_STATUS.get(metadata(row).get("native_state"))
+        meta = metadata(row)
+        finished = _COMMITTED_STATUS.get(meta.get("native_state"))
         if finished is not None:
+            usage = meta.get("usage")
+            if isinstance(usage, dict):
+                with contextlib.suppress(TypeError, ValueError, OverflowError):
+                    await cc_sessions.set_turn_totals(
+                        db,
+                        row["id"],
+                        cost_usd=float(usage.get("cost_usd") or 0.0),
+                        input_tokens=int(usage.get("input_tokens") or 0),
+                        output_tokens=int(usage.get("output_tokens") or 0),
+                    )
             await cc_sessions.update_status(db, row["id"], status=finished)
             continue
         await update_state(db, row["id"], "failed", error="outcome_unknown")
@@ -152,7 +170,11 @@ async def run_managed(runner, request, sid: str, cancel: asyncio.Event):
                         state = "cancelled" if cancel.is_set() else "failed"
                         error = "cancelled" if cancel.is_set() else "deadline_exceeded"
                         worker.cancel()
-                        await update_state(db, sid, "cancelling", error=error)
+                        current = metadata(await cc_sessions.get_by_id(db, sid) or {})
+                        if not current.get("cleanup_unconfirmed"):
+                            # A held uncertain receipt keeps its classification:
+                            # cancelling it does not make its child go away.
+                            await update_state(db, sid, "cancelling", error=error)
                 finally:
                     signal.cancel()
                     await asyncio.gather(signal, return_exceptions=True)
@@ -185,6 +207,9 @@ async def run_managed(runner, request, sid: str, cancel: asyncio.Event):
                 except asyncio.CancelledError:
                     continue
             finalizer.result()
+            # Capacity is held until the receipt is persisted, not merely
+            # until the subprocess exits.
+            runner.release_managed_slot(sid)
     return result
 
 
@@ -242,6 +267,13 @@ async def _finalize(runner, request, result, state):
                     "result_path": str(path) if committed else None,
                     "stream_lines_dropped": result.stream_lines_dropped,
                     "result_partial": result.partial,
+                    # Written with the terminal state, so a restart before
+                    # set_turn_totals below can still restore them.
+                    "usage": {
+                        "cost_usd": result.cost_usd,
+                        "input_tokens": result.input_tokens,
+                        "output_tokens": result.output_tokens,
+                    },
                 },
             )
             # Absolute fresh-turn values: retries of finalization do not add cost twice.
