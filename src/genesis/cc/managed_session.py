@@ -19,6 +19,10 @@ from genesis.util.execution_privacy import private_execution
 
 logger = logging.getLogger(__name__)
 
+# Terminal native states, written only by _finalize, mapped to the row status
+# its complete()/fail() call would have set.
+_COMMITTED_STATUS = {"succeeded": "completed", "failed": "failed", "cancelled": "failed"}
+
 
 def fingerprint(request) -> str:
     return hashlib.sha256(json.dumps(asdict(request), sort_keys=True).encode()).hexdigest()
@@ -80,6 +84,8 @@ async def reconcile_orphans(db) -> int:
     A prior process may have executed effects. Never replay its receipt or
     report confirmed cancellation merely because the new registry is empty.
     Only prepared receipts (rows carrying a managed fingerprint) are touched.
+    A receipt whose finalization already committed its terminal outcome lost
+    only the status write, so it is finished with that outcome, not overwritten.
     """
     orphaned = [
         row
@@ -87,6 +93,10 @@ async def reconcile_orphans(db) -> int:
         if row.get("source_tag") == "agent_api" and "managed_fingerprint" in metadata(row)
     ]
     for row in orphaned:
+        finished = _COMMITTED_STATUS.get(metadata(row).get("native_state"))
+        if finished is not None:
+            await cc_sessions.update_status(db, row["id"], status=finished)
+            continue
         await update_state(db, row["id"], "failed", error="outcome_unknown")
         await cc_sessions.update_status(db, row["id"], status="failed")
     return len(orphaned)
@@ -177,8 +187,8 @@ async def _execute(runner, request, sid):
     telemetry = []
 
     async def on_event(event):
-        if event.event_type == "tool_use" and event.tool_name:
-            telemetry.append({"name": event.tool_name})
+        for name, _input in event.tool_uses():
+            telemetry.append({"name": name})
 
     error = "execution_failed"
     try:

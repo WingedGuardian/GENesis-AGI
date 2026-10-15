@@ -1269,11 +1269,11 @@ class DirectSessionRunner:
         start = time.monotonic()
 
         async def on_event(event: StreamEvent) -> None:
-            if event.event_type == "tool_use" and event.tool_name:
+            for name, tool_input in event.tool_uses():
                 telemetry.append(
                     {
-                        "name": event.tool_name,
-                        "input_preview": (str(event.tool_input)[:200] if event.tool_input else ""),
+                        "name": name,
+                        "input_preview": (str(tool_input)[:200] if tool_input else ""),
                     }
                 )
 

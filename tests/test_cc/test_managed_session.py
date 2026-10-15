@@ -839,3 +839,55 @@ async def test_orphan_reconciliation_ignores_unprepared_agent_rows(db):
     row = await cc_sessions.get_by_id(db, sid)
     assert row["status"] == "active"
     assert "native_state" not in json.loads(row["metadata"])
+
+
+async def test_managed_telemetry_counts_every_tool_block_on_a_line(db, native):
+    from genesis.cc.types import StreamEvent
+
+    runner, _, invoker = native
+    raw = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "thinking", "thinking": "plan"},
+                {"type": "tool_use", "name": "Read", "input": {}},
+                {"type": "tool_use", "name": "Grep", "input": {}},
+            ]
+        },
+    }
+
+    async def execute(invocation, on_event=None):
+        await on_event(StreamEvent.from_raw(raw))
+        return output()
+
+    invoker.run_streaming.side_effect = execute
+    req = request()
+    sid = await prepare(db, req)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    meta = json.loads((await cc_sessions.get_by_id(db, sid))["metadata"])
+    assert meta["tools_summary"] == {"Read": 1, "Grep": 1}
+
+
+@pytest.mark.parametrize(
+    ("native_state", "status"),
+    [("succeeded", "completed"), ("failed", "failed"), ("cancelled", "failed")],
+)
+async def test_orphan_with_committed_outcome_is_finished_not_overwritten(
+    db, native_state, status
+):
+    req = request()
+    sid = await prepare(
+        db,
+        req,
+        native_state=native_state,
+        result_committed=True,
+        result_path="/synthetic/result.md",
+    )
+    assert await reconcile_orphans(db) == 1
+    row = await cc_sessions.get_by_id(db, sid)
+    meta = json.loads(row["metadata"])
+    assert row["status"] == status
+    assert meta["native_state"] == native_state
+    assert meta["result_committed"] is True
+    assert "error" not in meta
