@@ -945,6 +945,24 @@ treats `start == end` as off, matching `ego/cadence.py`), so nothing delays an
 owner-facing send by default. The salience thresholds and the shared daily cap
 are the other timing/volume controls on that path.
 
+Governance can also DROP an owner-facing send as a duplicate, writing no history
+row (`GovernanceGate._is_duplicate`). Inside the signal type's window
+(`_DEDUP_WINDOWS`, default 24 h; 0 turns dedup off), a delivered row with the same
+`(signal_type, topic, category)` suppresses it, and so does one with the same
+signal type, category and `content_hash` (SHA-256 of the first 200 characters of
+`context`, topic ignored). The content-hash match is skipped for the signal types
+whose topic is the message identity (`_TOPIC_IS_IDENTITY`: `queued_alert`,
+`morning_report`, `career_outreach_nudged`) and for any empty or whitespace-only
+context. Before that exemption, at least 3 of a live install's 84 recorded
+morning-report job runs (mid-July to October) delivered nothing this way: the
+next day's report finished drafting a few seconds sooner, fell inside the 24 h
+window, and opened with the same 200 characters. For a queued alert the topic is
+`alert:<dedupe_key>`, or `alert:<source>` when the producer passed no key, so a
+keyless producer's distinct alerts still collide on the topic check. `backup.sh`
+gives a repeated failure one dedupe key with `alert_stable_key`
+(`scripts/lib/alert_queue.sh`), which leaves the per-run
+`Time:`/`Duration:`/`SQLite lines:` lines out of the hash.
+
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
@@ -1378,7 +1396,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: a73bc16 2026-10-10
+verified: cfbb876243f2 2026-10-07
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
@@ -1458,9 +1476,12 @@ verified: a73bc16 2026-10-10
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
   live runtime (stale-but-functional).
-  External Codebase has explicit pinned configuration staging/diagnostics in
-  `scripts/codebase_managed.py`; staging does not activate it or alter the
-  existing indexing route. See `docs/reference/codebase-managed.md`.
+  External Codebase has pinned configuration staging/diagnostics and bounded
+  native query unit entry points in `scripts/codebase_managed.py`. Install and
+  bootstrap render disabled query/client-slice templates without auto-upgrading
+  a PATH provider. Staging does not activate it; MCP registration and indexing
+  retain their existing routes until their integration concerns land. See
+  `docs/reference/codebase-managed.md`.
 - **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at
@@ -1502,10 +1523,22 @@ verified: a73bc16 2026-10-10
   copy's own burst would raise it), though a disk already ORANGE
   still gets one; never stops the launch, though a launch waits up to 10 minutes
   for another session's copy of the same profile).
-  `scripts/browser.py` launches without a copy. `scripts/disk_hygiene.sh` keeps
-  the newest copy per profile, and the newest per version for 90 days.
-  `provision.py` (run by `scripts/install_browser_stack.sh`,
-  unit `genesis-browser-stack.service`) installs what the tools launch: the
+  `scripts/browser.py` copies too when it can import Genesis (else it says so and
+  launches without a copy). The Chromium fallback and that CLI run
+  through patchright when installed. `scripts/disk_hygiene.sh` keeps
+  the newest copy per profile, and the newest per version for 90 days. Once
+  the paired Camoufox engine has been in use 14 days, it also removes older
+  engine versions and the pre-0.5 root engine (`scripts/prune_browser_engines.py`
+  decides; none while an override or `camoufox set` choice is in effect or access
+  times are not kept, never an engine a running browser uses, the one the browser
+  profile last ran, or one launched in 14 days, never camoufox 0.5's own files).
+  Every install gets the `browser` extra (pinned camoufox 0.5.7+, playwright and
+  patchright on one minor): bootstrap.sh and install.sh install it after the core
+  packages, never fatally (`venv_setup.sh` `install_browser_extra`, checked by
+  `provision.py check-packages`). `provision.py` (run by
+  `scripts/install_browser_stack.sh`: unit `genesis-browser-stack.service`, which
+  bootstrap starts without waiting and its daily timer retries; inline in
+  install.sh) installs what the tools launch: the
   engine the camoufox package pairs with (only from camoufox 0.5.7: 0.4's fetch
   empties the cache and 0.5.3-0.5.6 have no pin), the Chromium the fallback
   launches (`chromium.py`: patchright's when installed, else playwright's; where
@@ -1515,7 +1548,13 @@ verified: a73bc16 2026-10-10
   `sudo -n`, else the command is printed). Free space is checked on every
   destination with the disk guardian's effective figure (`util/disk_headroom.py`);
   every step's timeout comes off one run budget inside the unit's limit. One
-  outcome line; a re-run is a no-op. The automation TOOLS live in
+  outcome line; a re-run is a no-op. The Chromium launches refuse with the
+  operator step while their build is not installed: the MCP fallback judges it at
+  the executable its started driver names, the CLI where the package's dry-run says
+  the headless shell lives. The `browser_automation` capability is probed when
+  genesis-server starts, so after an update that pins a new engine it reads
+  degraded until the next restart after the unit finishes (documented, not
+  refreshed). The automation TOOLS live in
   `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
   TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
   1 h idle reclaim of one layer never touches another (TinyFish included:
@@ -3138,11 +3177,25 @@ config resolution, and hygiene utilities.
 ```yaml subsystem-map
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
-          restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
-          _config_overlay.py]
+          restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
+          env.py, _config_overlay.py]
 verified: ba9dd8a37 2026-10-09
 ```
 
+- **payments/**: the encrypted card vault, virtual cards only.
+  `python -m genesis vault init|add|list|retire|status` (`payments/cli.py`);
+  `vault_store.py` keeps `~/.genesis/payment_vault/` (0700, files 0600): an age
+  X25519 identity sealed under the owner's passphrase (zxcvbn score 4), its
+  public key, and `cards.db`, whose card details exist only as age blobs
+  encrypted to that key, each carrying its own `card_ref` and merchant scope;
+  cards.db also records the sealed key's sha256 and public key, checked (with no
+  passphrase) before any add, so a damaged or swapped key is refused; the public
+  key is checked again on the connection that writes the card, so a swapped
+  database takes nothing. `add` needs no passphrase and requires a merchant
+  scope or `--single-use`; init/add/retire need a TTY that can hide input (every
+  answer is hidden) and refuse inside a coding agent's session, Claude Code or
+  Codex (accident guard). Needs the `payments` extra. No runtime
+  caller yet: nothing decrypts a card, and the directory is not backed up.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;
@@ -3523,6 +3576,30 @@ verified: ba9dd8a37 2026-10-09
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
   `secrets_path()` is repo-relative unless SECRETS_PATH set.
+- **Managed systemd user units** (deploy scripts, no `src/genesis` module):
+  `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
+  renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through
+  `scripts/lib/managed_units.sh`. Every render ends with a
+  `# genesis-managed v1 sha256=` stamp of its own body
+  (`scripts/lib/managed_units.py` holds the grammar), so a later run tells
+  Genesis's output from a hand edit: an edited unit is KEPT and named, never
+  overwritten. A plain `update.sh` run checks every unit BEFORE it stops
+  anything and exits 4 naming the edited ones; `--post-merge` does not refuse
+  (its merge already happened), and bootstrap keeps and names the unit
+  instead (`--take-template <unit>` installs the template and
+  backs the old file up under `~/.genesis/deploy-backups/`, pruned at 90 days by
+  `disk_hygiene.sh`); a unit from before stamps is accepted when it matches a
+  version of its template in git history. Local unit changes belong in a
+  drop-in (`<unit>.d/*.conf`), which nothing here touches. Timers listed in
+  `~/.genesis/config/disabled_timers` are not re-enabled (`systemctl mask`
+  cannot work on a unit in `~/.config/systemd/user`). The dashboard's update
+  card shows edited units (stamp check only). A refusal is recorded in
+  `~/.genesis/update_refused.json` (units, commit judged), which every other
+  preflight verdict removes; the supervised update's orchestrator removes it
+  before tier 1 and never escalates while it stands. `update.sh` prints what bootstrap changed
+  outside the checkout at the end of every run, a failed one included. A
+  symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
+  `--take-templates`.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.
@@ -3583,6 +3660,19 @@ verified: 4ab8bf71c 2026-10-10
   recall tools. The launcher also selects `--external-client`; memory initialization
   then disables processing of Claude's pending plan-bookmark file. Ordinary
   Genesis memory initialization keeps that processing enabled by default.
+  The standalone server enforces the `external` or `validator` tool profile
+  during discovery and direct calls. Both currently admit the same health/recall
+  floor; other tool bodies cannot be entered through those MCP processes.
+  External health initialization skips the LLM router, dispatch queue setup,
+  and campaign wiring. Profiles constrain tools, not an operator's host access.
+  The separately launched validator can admit one canonical invocation of
+  `scripts/codex_validator_request.py` through its native shell hook. Its
+  bounded, private UUID request files use strict JSON and a closed operation
+  schema; only `protocol_probe` exists. Request creation and retirement use
+  the admitted workspace patch path. Serving probes, verification recording
+  and publication operations remain GROUNDWORK, and this boundary has no
+  activation wiring in the ordinary project configuration. Its dedicated
+  launcher must establish private workspace modes and umask before activation.
   In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
   the main checkout, which owns the live database and secrets. This gives Codex
   on-demand access without registering its transcript,

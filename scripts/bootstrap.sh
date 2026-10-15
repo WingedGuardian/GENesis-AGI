@@ -255,6 +255,41 @@ except Exception as e:
 fi
 # END crash-recovery
 
+# --- Managed units: a run summary, and (run by hand) a refusal before any change ---
+# update.sh hands us its summary file; run by hand we keep our own and print it at
+# the end. A plain update.sh run has already refused a hand-edited unit before
+# stopping the server (update.sh --post-merge does not: its merge already
+# happened), so the check below is for a run by hand: it refuses here, after crash
+# recovery (which never touches units) and before anything else changes. Under
+# update.sh the render loop never overwrites an edited unit: it keeps and names it.
+if [ -z "${GENESIS_DEPLOY_SUMMARY:-}" ]; then
+    mkdir -p "$HOME/tmp"
+    GENESIS_DEPLOY_SUMMARY="$(mktemp -p "$HOME/tmp" bootstrap-summary.XXXXXX)"
+    _bootstrap_owns_summary=1
+fi
+export GENESIS_DEPLOY_SUMMARY
+if [ -z "${GENESIS_BOOTSTRAP_ALLOW_LIVE:-}" ]; then
+    _mu_rc=0
+    _mu_out="$(python3 -I -S "$SCRIPT_DIR/lib/managed_units.py" check --repo "$GENESIS_ROOT" \
+        --unit-dir "$HOME/.config/systemd/user" --upto HEAD --accept-legacy \
+        --take "${GENESIS_TAKE_TEMPLATES:-}")" || _mu_rc=$?
+    if [ "$_mu_rc" -eq 4 ]; then
+        echo "REFUSED: these systemd units were edited by hand and would be overwritten:"
+        printf '%s\n' "$_mu_out" | grep REFUSED || true
+        echo "Nothing was changed. Move each change into ~/.config/systemd/user/<unit>.d/*.conf"
+        echo "(a drop-in, which updates never touch), or replace it with the template, keeping"
+        echo "a backup:  GENESIS_TAKE_TEMPLATES='<unit> ...' scripts/bootstrap.sh"
+        # Only a summary file bootstrap created itself; a caller's is not ours.
+        if [ "${_bootstrap_owns_summary:-0}" = "1" ]; then
+            rm -f "$GENESIS_DEPLOY_SUMMARY"
+        fi
+        exit 4
+    elif [ "$_mu_rc" -ne 0 ]; then
+        echo "  WARNING: could not check the installed units for hand edits; any unit that"
+        echo "  differs from its template will be kept rather than overwritten."
+    fi
+fi
+
 # --- Prerequisites ---
 echo "--- Checking and installing prerequisites ---"
 
@@ -326,14 +361,14 @@ elif [[ "$PKG_MGR" == "dnf" || "$PKG_MGR" == "yum" ]]; then
     sudo "$PKG_MGR" check-update -q 2>/dev/null; true
 fi
 
-# Python 3.12+ required
+# Python 3.12-3.14 required (upper bound mirrors pyproject's requires-python)
 if command -v python3.12 &>/dev/null; then
     echo "  Python: $(python3.12 --version)"
-elif command -v python3 &>/dev/null && python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
+elif command -v python3 &>/dev/null && python3 -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
     echo "  Python: $(python3 --version)"
 else
     _found_ver=$(python3 --version 2>/dev/null || echo "not found")
-    echo "  Python 3.12+ required (found: $_found_ver) — run install.sh to install it"
+    echo "  Python 3.12-3.14 required (found: $_found_ver) — run install.sh to install it"
     echo "  Or install manually and re-run bootstrap."
     exit 1
 fi
@@ -524,11 +559,6 @@ echo
 echo "--- Installing code intelligence tools ---"
 
 # codebase-memory-mcp (code graph — 66 languages)
-# Always re-runs the upstream installer: it is idempotent and pulls the latest
-# release, so existing installs are upgraded in place.
-# --skip-config: the installer's own agent-config step registers the RAW binary
-# in ~/.claude/.mcp.json, bypassing our 2G-capped launcher. We register the
-# capped wrapper below via _register_mcp, so the installer must NOT self-register.
 # The kill-switch path resolves through the ONE shared site — an override via
 # CODEBASE_MEMORY_MCP_DISABLE_FILE is honoured here the same way the launcher
 # and indexer honour it, and an UNRESOLVABLE path refuses rather than falling
@@ -539,33 +569,7 @@ if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
     . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
     _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
 fi
-if [ -z "$_cbm_disable" ]; then
-    echo "  WARNING: codebase-memory-mcp kill-switch path unresolvable — refusing install (fail closed)"
-elif [ -e "$_cbm_disable" ]; then
-    echo "  codebase-memory-mcp: install/upgrade skipped (machine kill switch active: $_cbm_disable)"
-else
-    echo "  codebase-memory-mcp: installing/upgrading..."
-    # The pin, the digest and the install itself live in ONE place, shared with
-    # install.sh, so the commit and its digest cannot drift apart.
-    # shellcheck source=lib/cbm_installer.sh
-    . "$SCRIPT_DIR/lib/cbm_installer.sh"
-    _cbm_rc=0
-    genesis_cbm_install || _cbm_rc=$?
-    case "$_cbm_rc" in
-        0) ;;
-        1) echo "  WARNING: codebase-memory-mcp installer download failed (non-critical)" ;;
-        3) echo "  ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
-        4) echo "  WARNING: codebase-memory-mcp install refused — machine kill switch active" ;;
-        *) echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)" ;;
-    esac
-fi
-if [ -z "$_cbm_disable" ]; then
-    echo "  codebase-memory-mcp status probe skipped (kill-switch path unresolvable)"
-elif [ -e "$_cbm_disable" ]; then
-    echo "  codebase-memory-mcp status probe skipped (machine kill switch active)"
-elif command -v codebase-memory-mcp &>/dev/null; then
-    echo "  codebase-memory-mcp: $(codebase-memory-mcp --version 2>/dev/null || echo 'installed')"
-fi
+echo "  Codebase: explicit pinned setup required; see docs/reference/codebase-managed.md"
 
 # GitNexus (blast radius, impact analysis, execution flows)
 # Exact, shared pin — GitNexus index storage formats can change between
@@ -754,6 +758,13 @@ elif [ "$_ei_rc" -ne 0 ]; then
     echo "  Re-run: $VENV_DIR/bin/pip install -e $GENESIS_ROOT --verbose"
     exit 1
 fi
+# The browser packages, after the core and never fatal: a browser package that
+# cannot install leaves the browser tools refusing with the repair step, not a
+# half-configured machine. The engine and Chromium download later, in
+# genesis-browser-stack.service, started below once the units are rendered.
+echo "  Syncing browser packages..."
+install_browser_extra "$GENESIS_ROOT" "$VENV_DIR" \
+    || echo "  WARNING: browser packages incomplete (non-fatal; the browser tools say what to repair)"
 echo
 
 # --- Skill-security trusted baseline ---
@@ -1297,6 +1308,13 @@ SERVICES_UPDATED=0
 
 if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     mkdir -p "$SYSTEMD_USER_DIR"
+    # shellcheck source=lib/managed_units.sh
+    . "$SCRIPT_DIR/lib/managed_units.sh"
+    GENESIS_MU_PREV="$(genesis_mu_prev_from_state)"
+    mkdir -p "$HOME/tmp"
+    _mu_dir="$(mktemp -d -p "$HOME/tmp" bootstrap-units.XXXXXX)"
+    _mu_render="$_mu_dir/render"
+    genesis_mu_precheck "$SYSTEMD_USER_DIR" "$_mu_dir"
     # Detect Claude Code binary directory for systemd PATH injection
     # Resolve the Claude Code binary dir. `dirname ""` collapses to "." and
     # exits 0 when claude isn't on PATH yet, so split the pipeline and resolve
@@ -1326,6 +1344,13 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        case "$svc_name" in
+            genesis-cbm-query.service | genesis-cbm-query-clients.slice)
+                if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+                    echo "  ERROR: refusing nonregular managed Codebase unit: $target" >&2
+                    exit 1
+                fi ;;
+        esac
         # The graph engine's unit only advances to a module that is verified on
         # disk. Provisioning above returns 0 when it skips or fails, so without
         # this a failed or unpinned provision would point a working unit at a
@@ -1350,6 +1375,10 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         # fail outright, and a failing render aborts bootstrap — the UPDATE
         # path — under set -e.
         _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+        _systemd_exec_esc() { printf '%s' "$1" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g'; }
+        _home_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$HOME")")
+        _repo_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$GENESIS_ROOT")")
+        _venv_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$GENESIS_ROOT/.venv")")
         _home_esc=$(_sed_repl_esc "$HOME")
         _venv_esc=$(_sed_repl_esc "$GENESIS_ROOT/.venv")
         _repo_esc=$(_sed_repl_esc "$GENESIS_ROOT")
@@ -1369,29 +1398,23 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         # anyway because no module was installed.
         _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
         _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
-        rendered=$(sed -e "s|__HOME__|$_home_esc|g" \
-                       -e "s|__VENV__|$_venv_esc|g" \
-                       -e "s|__REPO_DIR__|$_repo_esc|g" \
-                       -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
-                       -e "s|__AZ_ROOT__|$_az_root_esc|g" \
-                       -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
-                       -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
-                       "$template")
-        if [[ -f "$target" ]]; then
-            current=$(cat "$target")
-            if [[ "$rendered" != "$current" ]]; then
-                echo "$rendered" > "$target"
-                echo "  Updated: $svc_name"
-                SERVICES_UPDATED=1
-            else
-                echo "  OK: $svc_name (unchanged)"
-            fi
-        else
-            echo "$rendered" > "$target"
-            echo "  Created: $svc_name"
-            SERVICES_UPDATED=1
-        fi
+        sed -e "s|__HOME__|$_home_esc|g" \
+            -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
+            -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
+            -e "s|__VENV_EXEC__|$_venv_exec_esc|g" \
+            -e "s|__VENV__|$_venv_esc|g" \
+            -e "s|__REPO_DIR__|$_repo_esc|g" \
+            -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
+            -e "s|__AZ_ROOT__|$_az_root_esc|g" \
+            -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
+            -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
+            "$template" > "$_mu_render"
+        # Written only when the installed unit is Genesis's own render; a unit
+        # edited by hand is kept and named (lib/managed_units.sh).
+        genesis_install_managed_unit "scripts/systemd/$svc_name.template" "$_mu_render" "$target"
     done
+    rm -rf "$_mu_dir"
+    if [[ "$GENESIS_MU_CHANGED" = "1" ]]; then SERVICES_UPDATED=1; fi
     # Always reload before enabling — cheap + idempotent, and covers a prior run
     # that wrote a unit then crashed before reloading (files unchanged this run,
     # but systemd's in-memory view stale). B3.
@@ -1426,6 +1449,14 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         case "$timer_name" in
             genesis-backup.timer) continue ;;  # deliberate setup step — see note below
         esac
+        # A timer the operator switched off stays off: `systemctl disable` alone
+        # is undone here on the next update, and `mask` cannot work on a unit that
+        # lives in ~/.config/systemd/user (systemctl(1), "mask").
+        if genesis_timer_opted_out "$timer_name"; then
+            echo "  - $timer_name not enabled (listed in $GENESIS_DISABLED_TIMERS)"
+            genesis_mu_summary "skipped $timer_name: listed in $GENESIS_DISABLED_TIMERS"
+            continue
+        fi
         if [ -f "$SYSTEMD_USER_DIR/$timer_name" ]; then
             systemctl --user enable --now "$timer_name" 2>/dev/null && \
                 echo "  + $timer_name enabled + started" || true
@@ -1440,6 +1471,19 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     if [ -f "$SYSTEMD_USER_DIR/genesis-cc-tmp-align.service" ]; then
         systemctl --user enable genesis-cc-tmp-align.service 2>/dev/null && \
             echo "  + genesis-cc-tmp-align.service enabled (cold-start cc-tmp apply)" || true
+    fi
+
+    # The browser stack's downloads (the Camoufox engine and Chromium the packages
+    # above pin, about 1.5 GB the first time) run in their own oneshot, started
+    # without waiting: never inside bootstrap, nor update.sh's stop window when it
+    # runs bootstrap. A run with nothing to do exits in seconds; the daily timer
+    # enabled above retries a failure.
+    if [ -f "$SYSTEMD_USER_DIR/genesis-browser-stack.service" ]; then
+        if systemctl --user start --no-block genesis-browser-stack.service 2>/dev/null; then
+            echo "  + genesis-browser-stack.service started (journalctl --user -u genesis-browser-stack)"
+        else
+            echo "  WARNING: could not start genesis-browser-stack.service (run scripts/install_browser_stack.sh)"
+        fi
     fi
 else
     echo "  Template directory $SYSTEMD_TEMPLATE_DIR not found — skipping"
@@ -1574,6 +1618,21 @@ if [[ -z "$MISSING_CRITICAL" && -z "$MISSING_HELPFUL" ]]; then
     echo "  All recommended plugins installed."
 fi
 echo
+
+# Last, so they survive update.sh's `| tail -10` of this output. The kept count
+# comes from the summary, not GENESIS_MU_KEPT: setup-vnc.sh keeps its units in a
+# child process whose counter never reaches this shell.
+_mu_kept_count="$(grep -c '^kept ' "$GENESIS_DEPLOY_SUMMARY" 2>/dev/null || true)"
+if [[ "${_bootstrap_owns_summary:-0}" = "1" ]]; then
+    if [[ -s "$GENESIS_DEPLOY_SUMMARY" ]]; then
+        echo "--- What this run changed outside the checkout ---"
+        sed 's/^/  /' "$GENESIS_DEPLOY_SUMMARY"
+    fi
+    rm -f "$GENESIS_DEPLOY_SUMMARY"
+fi
+if [[ "${_mu_kept_count:-0}" -gt 0 ]]; then
+    echo "  ${_mu_kept_count} systemd unit(s) KEPT, not overwritten: edited by hand or not a regular file."
+fi
 
 # setup-complete written only now that all bootstrap work has finished (B1) — the
 # marker gates the fresh-install onboarding prompt + ego cadence, so an interrupted

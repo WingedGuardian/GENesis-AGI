@@ -443,7 +443,7 @@ def test_a_python_too_old_for_the_pyproject_is_not_sent_to_a_reinstall(station):
     )
     r = _run(station)
     assert r.returncode == 1
-    assert "needs a newer Python" in r.stderr, r.stderr
+    assert "needs a Python version (its requires-python)" in r.stderr, r.stderr
     assert "update.sh" not in r.stderr, "a reinstall into this venv cannot fix it"
     assert _git(station["root"], "rev-parse", "HEAD") == head
 

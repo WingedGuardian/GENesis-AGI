@@ -346,6 +346,7 @@ class TestWebFetchAutoChain:
                 "status_code": 200,
                 "truncated": False,
                 "error": None,
+                "client": "scrapling",
             })()
             with patch("genesis.mcp.health.web_tools._get_fetcher") as mock_fetcher:
                 mock_fetcher.return_value.fetch = AsyncMock(return_value=mock_result)

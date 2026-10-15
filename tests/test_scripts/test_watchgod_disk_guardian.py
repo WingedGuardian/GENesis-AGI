@@ -21,6 +21,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -741,6 +742,27 @@ def test_a_process_name_with_a_tab_cannot_split_the_snapshot(box):
         mine = [ln for ln in out if ln.split(" ")[0] == str(proc.pid)]
         assert mine, "fixture precondition: the renamed process is in the snapshot"
         assert mine[0].split(" ")[3] == "dl_fake" and len(mine[0].split(" ")) == 4
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_process_name_with_a_newline_stays_in_the_snapshot(box):
+    """A newline in comm: a first-line read of stat stopped inside the name and
+    dropped the writer from the snapshot (review finding)."""
+    # One write: bash's printf splits at the newline, and each write replaces
+    # the whole name.
+    code = ("import os, time; fd = os.open('/proc/self/comm', os.O_WRONLY); os.write(fd, b'dl\\nfake'); "
+            "print('ready', flush=True); time.sleep(60)")
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
+    assert proc.stdout.readline().strip() == "ready"
+    try:
+        assert Path(f"/proc/{proc.pid}/comm").read_text() == "dl\nfake\n", "fixture precondition: renamed"
+        start = Path(f"/proc/{proc.pid}/stat").read_bytes().rpartition(b")")[2].split()[19].decode()
+        out = _run(box, "dg_io_snapshot").stdout.splitlines()
+        mine = [ln for ln in out if ln.split(" ")[0] == str(proc.pid)]
+        assert mine, "the renamed process is in the snapshot"
+        assert mine[0].split(" ")[1] == start and mine[0].split(" ")[3] == "dl_fake"
     finally:
         proc.kill()
         proc.wait()

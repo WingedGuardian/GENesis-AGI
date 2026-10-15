@@ -12,6 +12,7 @@ def test_orchestrator_template_compiles():
     code = _ORCHESTRATOR_TEMPLATE.format(
         summary_file="/tmp/test_summary.txt",
         escalation_file="/tmp/test_escalation.txt",
+        refused_file="/tmp/test_refused.json",
         pid_file="/tmp/test_pid",
         genesis_root="/tmp/test_genesis",
         tier1_prompt="test tier 1 prompt",

@@ -36,8 +36,10 @@ GUARDIAN_LIB = REPO_ROOT / "scripts" / "lib" / "guardian_pause.sh"
 # Exact strings (real statements, not comment prose).
 # The self-copy is named through the startup binding, never a late-bound
 # ${BASH_SOURCE[0]} (test_update_self_copy_trap.py has the reason).
-SELF_DELETE = "trap 'rm -f \"$_SELF_COPY\" 2>/dev/null' EXIT"
-EXIT_REARM = "trap '_guardian_resume; rm -f \"$_SELF_COPY\" 2>/dev/null' EXIT"
+SELF_DELETE = "trap 'rm -f \"$_SELF_COPY\" 2>/dev/null; _flush_deploy_summary' EXIT"
+EXIT_REARM = (
+    "trap '_guardian_resume; rm -f \"$_SELF_COPY\" 2>/dev/null; _flush_deploy_summary' EXIT"
+)
 STOP_CALL = "\n    _stop_genesis_server\n"
 PAUSE_CALL = "_guardian_pause"
 

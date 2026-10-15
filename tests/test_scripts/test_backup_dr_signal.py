@@ -214,3 +214,36 @@ def test_complete_marker_failure_is_offsite_failure(backup_env):
     assert status["tier2_status"] == "partial", status
     assert status["offsite_confirmed"] is False, status
     assert "replication" in tg.lower() or "off-site" in tg.lower(), tg
+
+
+def test_failed_send_queues_with_a_key_that_ignores_per_run_lines(backup_env, monkeypatch):
+    """When the Telegram send fails, backup.sh queues the alert under
+    alert_stable_key (scripts/lib/alert_queue.sh): the per-run Time/Duration/
+    SQLite lines are left out, so the next identical failure keeps the same key
+    and the outreach dedup delivers it once per window."""
+    import hashlib
+
+    _make_stub(
+        backup_env["bind"] / "curl",
+        "#!/usr/bin/env bash\n"
+        'for a in "$@"; do case "$a" in *api.telegram.org*) exit 1 ;; esac; done\n'
+        'for a in "$@"; do [ "$a" = "-w" ] && { printf "404"; exit 0; }; done\n'
+        "exit 1\n",
+    )
+    queue = backup_env["tmp"] / "alert-queue"
+    monkeypatch.setenv("GENESIS_ALERT_QUEUE_ROOT", str(queue))
+    _run(backup_env, nas=False, remove_db=True)
+
+    entries = [json.loads(p.read_text()) for p in sorted(queue.glob("*.json"))]
+    assert len(entries) == 1, entries
+    body, key = entries[0]["body"], entries[0]["dedupe_key"]
+    assert "Backup failed" in body and "\nTime: " in body  # the per-run line is there
+
+    lib = _BACKUP.parent / "lib" / "alert_queue.sh"
+    expected = subprocess.run(
+        ["bash", "-c", f'source "{lib}"; alert_stable_key backup "$MSG"'],
+        env={**os.environ, "MSG": body}, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert key == expected
+    # Control: the previous key hashed the whole message, Time line included.
+    assert key != "backup:" + hashlib.md5(body.encode()).hexdigest()[:12]

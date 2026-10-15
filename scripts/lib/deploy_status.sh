@@ -28,6 +28,7 @@ _RUNTIME_RELOAD_SCRIPTS=(
 _RUNTIME_FRESH_SCRIPTS=(
     scripts/disk_reclaim.py               # run by autonomy/remediation.py
     scripts/lib/live_checkout.py          # run by dashboard/routes/updates.py before an update
+    scripts/lib/managed_units.py          # run by dashboard/routes/updates.py for the update status card
     scripts/hooks/bash_allowlist_guard.sh # run through .claude/hooks/genesis-hook by cc/invoker.py
     scripts/hooks/bash_allowlist_lib.sh   # sourced by bash_allowlist_guard.sh on every run
     scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot
