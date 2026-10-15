@@ -508,35 +508,45 @@ async def merge_metadata(
     db: aiosqlite.Connection,
     id: str,
     patch: dict,
+    *,
+    unless_true: str | None = None,
 ) -> bool:
-    """Shallow read-merge-write a patch into the session's JSON ``metadata``.
+    """Shallow-merge a patch into the session's JSON ``metadata``.
 
     Used to persist roster endpoint context (model-diversification) without a
     migration. Tolerates absent/corrupt existing metadata (treats as ``{}``).
-    Returns True if the row exists and was updated.
+    The write is a compare-and-swap on the value read, retried when another
+    writer changed the row in between, so a concurrent merge to the same row is
+    never lost. With ``unless_true``, the merge is skipped when that key is
+    already truthy in the stored metadata. Returns True if the row exists and
+    was updated.
     """
-    cursor = await db.execute(
-        "SELECT metadata FROM cc_sessions WHERE id = ?",
-        (id,),
-    )
-    row = await cursor.fetchone()
-    if row is None:
-        return False
-    existing: dict = {}
-    if row[0]:
-        try:
-            loaded = json.loads(row[0])
-            if isinstance(loaded, dict):
-                existing = loaded
-        except (json.JSONDecodeError, TypeError):
-            existing = {}
-    existing.update(patch)
-    cursor = await db.execute(
-        "UPDATE cc_sessions SET metadata = ? WHERE id = ?",
-        (json.dumps(existing), id),
-    )
-    await db.commit()
-    return cursor.rowcount > 0
+    while True:
+        cursor = await db.execute(
+            "SELECT metadata FROM cc_sessions WHERE id = ?",
+            (id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return False
+        existing: dict = {}
+        if row[0]:
+            try:
+                loaded = json.loads(row[0])
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (json.JSONDecodeError, TypeError):
+                existing = {}
+        if unless_true is not None and existing.get(unless_true):
+            return False
+        existing.update(patch)
+        cursor = await db.execute(
+            "UPDATE cc_sessions SET metadata = ? WHERE id = ? AND metadata IS ?",
+            (json.dumps(existing), id, row[0]),
+        )
+        await db.commit()
+        if cursor.rowcount > 0:
+            return True
 
 
 async def set_turn_totals(

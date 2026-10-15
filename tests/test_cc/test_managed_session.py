@@ -735,7 +735,14 @@ async def test_native_subprocess_lifecycle_and_provenance(
 
 @pytest.mark.parametrize(
     "sid",
-    ["../../.genesis", "a/b", "receipt", str(uuid.uuid4()).upper(), "{" + str(uuid.uuid4()) + "}"],
+    # Fixed literals: a random id would rename the test on every collection.
+    [
+        "../../.genesis",
+        "a/b",
+        "receipt",
+        "5F0C6E1A-3B7D-4C2E-9A1F-8D4B2C6E0A13",
+        "{5f0c6e1a-3b7d-4c2e-9a1f-8d4b2c6e0a13}",
+    ],
 )
 async def test_only_canonical_uuid_receipts_are_adoptable(db, native, tmp_path, sid):
     runner, _, invoker = native
@@ -1015,6 +1022,68 @@ async def test_a_popen_launch_failure_is_ordinary_not_uncertain(tmp_path, failur
     with pytest.raises(OSError) as raised:
         await spawn_owned(*argv, start_new_session=True, **kwargs)
     assert not isinstance(raised.value, ProcessCleanupUncertain)
+
+
+async def test_a_failure_after_the_fork_stays_uncertain():
+    """An error-pipe read failing after the fork leaves an unreaped child."""
+    import os
+    import subprocess
+    import sys
+
+    from genesis.util.proc_kill import ProcessCleanupUncertain, spawn_owned
+
+    forked, real_read = [], os.read
+
+    def failing_read(fd, n):
+        caller = sys._getframe(1)
+        if caller.f_code.co_name == "_execute_child" and not forked:
+            forked.append(caller.f_locals["self"].pid)
+            raise InterruptedError("synthetic: error-pipe read interrupted")
+        return real_read(fd, n)
+
+    try:
+        with pytest.MonkeyPatch.context() as mp, pytest.raises(ProcessCleanupUncertain):
+            mp.setattr(subprocess.os, "read", failing_read)
+            await spawn_owned(sys.executable, "-c", "pass", start_new_session=True)
+    finally:
+        for pid in forked:
+            os.waitpid(pid, 0)
+    assert forked and forked[0] is not None
+
+
+async def test_a_stdio_pipe_failure_before_the_fork_is_ordinary():
+    """fd exhaustion while Popen makes its stdio pipes creates no child."""
+    import errno
+    import os
+    import subprocess
+    import sys
+
+    from genesis.util.proc_kill import ProcessCleanupUncertain, spawn_owned
+
+    real_pipe = os.pipe
+
+    def exhausted_pipe(*args):
+        if sys._getframe(1).f_code.co_name == "_get_handles":
+            raise OSError(errno.EMFILE, "synthetic: too many open files")
+        return real_pipe(*args)
+
+    with pytest.MonkeyPatch.context() as mp, pytest.raises(OSError) as raised:
+        mp.setattr(subprocess.os, "pipe", exhausted_pipe)
+        await spawn_owned(
+            sys.executable, "-c", "pass", stdout=subprocess.PIPE, start_new_session=True
+        )
+    assert raised.value.errno == errno.EMFILE
+    assert not isinstance(raised.value, ProcessCleanupUncertain)
+
+
+async def test_a_cancel_during_an_ordinary_launch_failure_stays_a_cancel(tmp_path):
+    from genesis.util.proc_kill import spawn_owned
+
+    task = asyncio.create_task(spawn_owned(str(tmp_path / "no-such-cli"), start_new_session=True))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 async def test_unconfirmable_group_becomes_uncertain_after_the_bound(monkeypatch):

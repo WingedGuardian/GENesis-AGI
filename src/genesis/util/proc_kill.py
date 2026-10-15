@@ -26,6 +26,7 @@ import contextlib
 import logging
 import os
 import signal
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -172,18 +173,26 @@ async def confirm_process_exit(
 
 
 def _raised_by_popen(exc: BaseException) -> bool:
-    """True when ``exc`` came out of ``subprocess.Popen._execute_child``.
+    """True when ``exc`` left ``subprocess.Popen`` construction with no child.
 
-    That path raises only after it has waited for any child it forked (exec
-    failure, fork failure), so no process from this launch survives it.
+    Judged from the Popen object being constructed, not from where it raised:
+    either no child was created (``pid`` is still None: a stdio pipe, error
+    pipe, fork or posix_spawn failure) or CPython reaped it (``returncode``
+    set: an exec failure reported through the error pipe). Any other raise,
+    such as an error-pipe read failing after the fork, leaves a child that may
+    still be running. Relies on CPython 3.12's Popen internals; if they change,
+    the check fails toward uncertain. One double fault (a fork that succeeds,
+    then a non-OSError before ``pid`` is assigned, then an OSError closing the
+    error pipe) would read as no child; it is not handled.
     """
     if not isinstance(exc, OSError):
         return False
     tb = exc.__traceback__
     while tb is not None:
-        code = tb.tb_frame.f_code
-        if code.co_name == "_execute_child" and code.co_filename.endswith("subprocess.py"):
-            return True
+        frame = tb.tb_frame
+        popen = frame.f_locals.get("self")
+        if frame.f_code.co_name == "__init__" and isinstance(popen, subprocess.Popen):
+            return popen.pid is None or popen.returncode is not None
         tb = tb.tb_next
     return False
 
@@ -207,9 +216,12 @@ async def spawn_owned(*args, **kwargs):
         proc = launch.result()
     except Exception as exc:
         if _raised_by_popen(exc):
-            # Popen itself failed (exec error, fork failure): CPython reaped
-            # any child it forked before raising, so nothing is left to own.
-            # An ordinary failure, not an uncertain one.
+            # Popen failed with no child left (never forked, or exec failed
+            # and CPython reaped it), so nothing is left to own. An ordinary
+            # failure, not an uncertain one. A cancel received meanwhile
+            # still ends the caller as cancelled.
+            if interrupted:
+                raise asyncio.CancelledError from exc
             raise
         # CPython may raise while connecting pipes AFTER Popen starts a child;
         # its transport closes only the leader. No handle means no proof that

@@ -170,11 +170,20 @@ async def run_managed(runner, request, sid: str, cancel: asyncio.Event):
                         state = "cancelled" if cancel.is_set() else "failed"
                         error = "cancelled" if cancel.is_set() else "deadline_exceeded"
                         worker.cancel()
-                        current = metadata(await cc_sessions.get_by_id(db, sid) or {})
-                        if not current.get("cleanup_unconfirmed"):
-                            # A held uncertain receipt keeps its classification:
-                            # cancelling it does not make its child go away.
-                            await update_state(db, sid, "cancelling", error=error)
+                        # A held uncertain receipt keeps its classification:
+                        # cancelling it does not make its child go away. The
+                        # check and the write are one statement, so a hold
+                        # recorded concurrently is never overwritten.
+                        if (
+                            not await cc_sessions.merge_metadata(
+                                db,
+                                sid,
+                                {"native_state": "cancelling", "error": error},
+                                unless_true="cleanup_unconfirmed",
+                            )
+                            and await cc_sessions.get_by_id(db, sid) is None
+                        ):
+                            raise ValueError("Prepared receipt is unavailable")
                 finally:
                     signal.cancel()
                     await asyncio.gather(signal, return_exceptions=True)
