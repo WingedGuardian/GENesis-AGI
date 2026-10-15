@@ -65,6 +65,8 @@ async def _connect(write: bool):
             db = await aiosqlite.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     except sqlite3.OperationalError as exc:
         raise _NoDatabase(f"{path}: {exc}") from exc
+    except sqlite3.DatabaseError as exc:  # the guarded open's own admission refusal
+        raise _Fenced(str(exc)) from exc
     db.row_factory = aiosqlite.Row
     return db
 
@@ -167,7 +169,7 @@ def _fires(root: Path, days: float) -> list[dict]:
                 if not isinstance(record.get("procedure_id"), str):
                     continue
                 records.append({**record, "ts": ts, "session": entry.name})
-            except (ValueError, KeyError, TypeError, AttributeError):
+            except (ValueError, KeyError, TypeError, AttributeError, OverflowError, RecursionError):
                 continue
     return records
 
@@ -200,6 +202,16 @@ async def _sample(args) -> int:
     return DONE
 
 
+def _cacheable(row: dict) -> bool:
+    """Whether the advisor's cache would carry this lesson as it stands."""
+    from genesis.learning.procedural.trigger_cache import _lesson_entry
+
+    try:
+        return _lesson_entry(row) is not None
+    except Exception:
+        return False
+
+
 async def _review(args) -> int:
     from genesis.db.crud import procedural
     from genesis.learning.procedural.lesson_shape import HELD_REASON, is_live_lesson
@@ -212,6 +224,9 @@ async def _review(args) -> int:
             print(f"no lesson with id {args.id}")
             return NOT_FOUND
         state = _state(row)
+        if state in ("live", "held") and not _cacheable(row):
+            print(f"refused: {args.id} has a trigger the advisor cannot read; fix or deprecate it")
+            return REFUSED
         if state == "live":
             cursor = await db.execute(
                 "UPDATE procedural_memory SET lesson = json_set(lesson, '$.reviewed', json('true')) "
@@ -229,7 +244,9 @@ async def _review(args) -> int:
         if state != "held":
             print(f"refused: {args.id} is {state}; only a lesson held for review can be revived")
             return REFUSED
-        live = await procedural.list_by_task_type(db, row["task_type"], lessons=True, limit=None)
+        live = await procedural.list_by_task_type(
+            db, row["task_type"], lessons=True, limit=None, live_only=True
+        )
         siblings = await db.execute_fetchall(
             "SELECT id FROM procedural_memory WHERE task_type = ? AND deprecated_reason = ? AND id != ?",
             (row["task_type"], HELD_REASON, args.id),
@@ -237,7 +254,9 @@ async def _review(args) -> int:
         if siblings:
             print("other held lessons for this task: " + ", ".join(r[0] for r in siblings))
         if not args.force:
-            if row.get("principle_embedding") is None:
+            from genesis.learning.procedural.embedding import unpack_embedding
+
+            if unpack_embedding(row.get("principle_embedding")) is None:
                 print(
                     "refused: twin check unavailable (no embedding); re-run with --force to revive anyway"
                 )
@@ -264,7 +283,7 @@ async def _review(args) -> int:
             )
             return REFUSED
         after = await procedural.get_by_id(db, args.id)
-        if not is_live_lesson(after["lesson"]):
+        if not is_live_lesson(after["lesson"]) or not _cacheable(after):
             await db.rollback()
             print(f"refused: {args.id} has a malformed lesson record; it stays held")
             return REFUSED
@@ -312,6 +331,13 @@ def _run(handler):
     return run
 
 
+def _window(value: str) -> float:
+    days = float(value)
+    if not (math.isfinite(days) and days > 0):
+        raise argparse.ArgumentTypeError("must be a positive number of days")
+    return days
+
+
 def _positive(value: str) -> int:
     number = int(value)
     if number < 1:
@@ -327,7 +353,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     lp.set_defaults(func=_run(_list))
     sp = sub.add_parser("sample", help="Recent fire-once lesson fires, to rate relevance")
     sp.add_argument("--n", type=_positive, default=20)
-    sp.add_argument("--days", type=float, default=14.0)
+    sp.add_argument("--days", type=_window, default=14.0)
     sp.set_defaults(func=_run(_sample))
     rp = sub.add_parser("review", help="Approve a lesson (revives a held one)")
     rp.add_argument("id")

@@ -106,7 +106,7 @@ def env(tmp_path, monkeypatch):
 
         return asyncio.run(read())
 
-    run.build, run.cached, run.row, run.sessions = build, cached, row, sessions
+    run.build, run.cached, run.row, run.sessions, run.db = build, cached, row, sessions, db
     return run
 
 
@@ -305,3 +305,40 @@ def test_sample_skips_foreign_records(env, capsys):
     )) + "\n")
     assert env("sample") == 0
     assert capsys.readouterr().out.startswith("1 fire(s)")
+
+
+def test_review_refuses_rows_it_cannot_check_or_cache(env):
+    env.build(
+        {"id": "bad_vec", **_HELD, "embedding": b"not a vector"},
+        {"id": "no_tools", **_HELD},
+    )
+    assert env("review", "bad_vec") == 1  # unpackable embedding: no twin check without --force
+    asyncio.run(_set(env, "no_tools", "tool_trigger", "[]"))
+    assert env("review", "no_tools", "--force") == 1  # it would be live but never cached
+    assert env.row("no_tools")["deprecated"] == 1
+
+
+def test_a_malformed_sibling_is_no_twin(env):
+    env.build({"id": "odd", "lesson": json.dumps({"origin": "x"}), "embedding": _VEC},
+              {"id": "held", **_HELD, "embedding": _VEC})
+    assert env("review", "held") == 0
+
+
+@pytest.mark.parametrize("days", ["-1", "nan", "inf", "0"])
+def test_sample_rejects_a_bad_window(env, days):
+    with pytest.raises(SystemExit):
+        env("sample", "--days", days)
+
+
+def test_sample_survives_a_huge_integer_ts(env, capsys):
+    env.build({"id": "live", "lesson": _lesson()})
+    log = env.sessions / "s" / "advisor_fires.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text('{"ts": ' + "9" * 400 + ', "procedure_id": "live"}\n')
+    assert env("sample") == 0
+
+
+async def _set(env, pid, column, value):
+    async with aiosqlite.connect(env.db) as conn:
+        await conn.execute(f"UPDATE procedural_memory SET {column} = ? WHERE id = ?", (value, pid))
+        await conn.commit()
