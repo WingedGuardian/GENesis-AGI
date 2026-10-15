@@ -82,8 +82,8 @@ async def procedure_store(
 
     Without patterns, a shell command in ``tool_trigger`` (``ssh``, ``git push``)
     makes the procedure fire on that command only, when commands are the whole
-    trigger (at most 8). Beside another tool name they are stored inert, and
-    the response warns.
+    trigger (at most 8). Beside another tool name, or more than 8, they are
+    stored inert (naming no tool), and the response warns.
 
     An MCP `procedure_store` call represents an *explicit teach* — the caller
     is asserting the procedure works. We seed it as already-confirmed
@@ -196,6 +196,11 @@ async def procedure_store(
                 "\n\nLesson is HELD: this session's origin is external, so it stays out of "
                 "every session until the owner reviews it."
             )
+    elif result.cache_rebuilt is False:
+        response += (
+            "\n\nThe procedure is stored, but the trigger cache rebuild failed, so the "
+            "advisor keeps its old trigger until the cache is next rebuilt."
+        )
     if result.warnings:
         response += "\n\nWarnings:\n" + "\n".join(f"- {w}" for w in result.warnings)
     return response
