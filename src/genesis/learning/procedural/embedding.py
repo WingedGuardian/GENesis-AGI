@@ -78,8 +78,8 @@ def unpack_embedding(blob: bytes | None) -> list[float] | None:
     """Inverse of pack_embedding. Returns None on any failure (bad length,
     corrupted bytes, NULL) so the hook can skip the row instead of crashing.
     """
-    if not blob or len(blob) != EMBEDDING_DIM * 4:
-        return None
+    if not isinstance(blob, bytes | bytearray | memoryview) or len(blob) != EMBEDDING_DIM * 4:
+        return None  # NULL, TEXT (a str of the right length unpacks as a TypeError), bad length
     try:
         return list(struct.unpack(f"<{EMBEDDING_DIM}f", blob))
     except struct.error:

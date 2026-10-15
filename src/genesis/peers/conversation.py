@@ -449,13 +449,14 @@ class ConversationService:
                 raise ConversationRefusal("cancellation_pending", 503) from None
         return await self.get(identity, sid)
 
-    _PENDING_FOR_PEER = (
+    _APPROVALS_FOR_PEER = (
         "FROM approval_requests JOIN cc_sessions "
         "ON cc_sessions.id=json_extract(CASE WHEN json_valid(context) THEN context ELSE '{}' END,'$.agent_session_id') "
-        "WHERE approval_requests.status='pending' AND cc_sessions.source_tag='agent_api' "
+        "WHERE cc_sessions.source_tag='agent_api' "
         "AND json_extract(cc_sessions.metadata,'$.peer_id')=? "
         "AND json_extract(cc_sessions.metadata,'$.peer_epoch')=? "
     )
+    _PENDING_FOR_PEER = _APPROVALS_FOR_PEER + "AND approval_requests.status='pending' "
 
     async def has_pending_approval(self, identity, sid):
         """Bounded existence check for one task projection; no description scan."""
@@ -483,10 +484,12 @@ class ConversationService:
             after = ""
             values = list(owner)
             if token:
+                # The anchor may have been resolved since the previous page; any
+                # approval this peer owns still marks the position.
                 anchor = await (
                     await db.execute(
                         "SELECT approval_requests.created_at, approval_requests.id "
-                        + self._PENDING_FOR_PEER
+                        + self._APPROVALS_FOR_PEER
                         + "AND approval_requests.id=?",
                         (*owner, token),
                     )

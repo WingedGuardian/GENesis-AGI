@@ -701,6 +701,34 @@ def test_async_version_alias_and_head_boundaries():
     assert "omitted" in head("\u20ac" * 6000)
 
 
+@pytest.mark.parametrize(
+    ("header", "supported"),
+    [
+        ("1.0", True),
+        ("1", True),
+        ("1.0.3", True),  # patch versions do not affect compatibility
+        ("1.1", False),
+        ("2.0", False),
+        ("0.3", False),
+        (None, False),  # a missing header means 0.3
+        ("1.0rc1", False),
+        ("1.0+local", False),
+        ("1!1.0", False),
+        ("not a version", False),
+    ],
+)
+def test_only_a2a_1_0_is_served(header, supported):
+    from a2a.utils.errors import VersionNotSupportedError
+
+    from genesis.peers.protocol import validate_version
+
+    if supported:
+        validate_version(header)
+    else:
+        with pytest.raises(VersionNotSupportedError):
+            validate_version(header)
+
+
 async def test_read_pagination_owned_contexts(bridge):
     for _ in range(3):
         await settle(bridge, await bridge.service.send(bridge.identities["alpha"], incoming()))
@@ -793,6 +821,12 @@ async def test_approvals_page_and_task_projection_is_a_bounded_check(bridge):
     assert await bridge.service.has_pending_approval(other, row["id"]) is False
     with pytest.raises(ConversationRefusal):
         await bridge.service.approvals(other, 2, token)  # foreign anchor
+    # The owner resolving the anchor between pages does not invalidate the cursor.
+    assert await approval_requests.resolve(
+        bridge.db, token, status="approved", resolved_at="2026-01-01T00:01:00"
+    )
+    after, _ = await bridge.service.approvals(identity, 2, token)
+    assert [a["approvalId"] for a in after] == [a["approvalId"] for a in second]
 
 
 @pytest.mark.parametrize("context", ["not-a-uuid", "unowned"])

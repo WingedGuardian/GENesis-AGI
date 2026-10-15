@@ -175,8 +175,7 @@ SEED_PROCEDURES = [
 ]
 
 
-async def main(db_path: Path) -> None:
-    db = await aiosqlite.connect(str(db_path))
+async def _seed_all(db: aiosqlite.Connection) -> tuple[int, list[str]]:
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA foreign_keys=ON")
@@ -229,7 +228,17 @@ async def main(db_path: Path) -> None:
     n_triggers = await regenerate(db)
     print(f"\nRegenerated trigger cache: {n_triggers} CORE/ADVISORY triggers")
 
-    await db.close()
+    return seeded, lesson_errors
+
+
+async def main(db_path: Path) -> None:
+    db = await aiosqlite.connect(str(db_path))
+    try:
+        seeded, lesson_errors = await _seed_all(db)
+    finally:
+        # Always closed: an open aiosqlite connection's thread keeps the process
+        # alive after an error, so bootstrap would wait out its whole timeout.
+        await db.close()
     print(f"Seeded {seeded} procedures into {db_path}")
     # Last, so a caller keeping only the tail (bootstrap keeps two lines) still sees it.
     for error in lesson_errors:
