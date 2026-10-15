@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import logging
 import os
@@ -36,6 +37,11 @@ _DB_PATH = _GENESIS_ROOT / "data" / "genesis.db"
 _FAILURE_FILE = _HOME / ".genesis" / "last_update_failure.json"
 _LIVE_CHECKOUT_SCRIPT = _GENESIS_ROOT / "scripts" / "lib" / "live_checkout.py"
 _MANAGED_UNITS_SCRIPT = _GENESIS_ROOT / "scripts" / "lib" / "managed_units.py"
+# The restart-guard rule update.sh, deploy_code_only.sh, bootstrap and the live
+# engine share (#3139), from the tree this module ships in.
+_STATE_GUARD_SCRIPT = (
+    Path(__file__).resolve().parents[4] / "scripts" / "lib" / "update_state_guard.py"
+)
 _UNIT_DIR = _HOME / ".config" / "systemd" / "user"
 
 
@@ -74,10 +80,11 @@ def _live_refusal() -> tuple[dict, int] | None:
     """The 409 to answer when the checkout is on `live`, or None to proceed.
 
     `live` is the integration branch scripts/deploy_candidates rebuilds from the
-    deploy manifest. update.sh and the Tier 2/3 sessions it hands off to work on
+    deploy manifest. The Tier 2/3 sessions these routes hand off to work on
     `main` (a Tier session checks main out and merges), which would move the
-    checkout off `live`, so these routes refuse there and name the two commands
-    that move and restart it. A verdict that cannot be read refuses too, and the
+    checkout off `live`, so these routes refuse there and name the commands that
+    update it: scripts/update.sh, which rebuilds `live` and activates it, or a
+    rebuild and a restart without activation. A verdict that cannot be read refuses too, and the
     printed word must agree with the exit code: python itself exits 1 on a
     SyntaxError or an uncaught exception, which must never read as "other". The
     script is run afresh, never imported, so the copy that answers is the one on
@@ -120,9 +127,11 @@ def _live_refusal() -> tuple[dict, int] | None:
     if verdict == (0, "live"):
         return {
             "error": (
-                "This install runs the live integration branch, and an update would "
-                "move the checkout off it. Run scripts/deploy_candidates rebuild, then "
-                "scripts/deploy_code_only.sh restart."
+                "This install runs the live integration branch, and an update from here "
+                "would move the checkout off it. Update it from a shell with "
+                "scripts/update.sh (it rebuilds live, then activates it), or run "
+                "scripts/deploy_candidates rebuild, then scripts/deploy_code_only.sh "
+                "restart, to restart without activation."
             )
         }, 409
     return {
@@ -401,12 +410,20 @@ def update_apply():
         refusal = _live_refusal()
         if refusal is not None:
             return jsonify(refusal[0]), refusal[1]
+        # An earlier update's state that still guards merged code (or a pending
+        # merge conflict) refuses both paths: the supervised start would delete
+        # it, and the direct path's update.sh refuses it into update_direct.log,
+        # where nobody reads it (#3139).
+        guarded = _state_guard_refusal()
+        if guarded is not None:
+            return jsonify({"error": guarded}), 409
         if supervised:
             # Writes the orchestrator's pid as the marker before the lock goes.
             return _apply_supervised(_PID_FILE)
     # The direct path runs update.sh, which takes update.lock itself (`flock -n`)
     # and refuses while anyone holds it, so it starts only after the lock is
-    # released. update.sh then refuses `live` on its own branch rule.
+    # released. A checkout put on `live` after the refusal above is rebuilt, not
+    # merged into: update.sh decides `live` again under its lock.
     return _apply_direct(_PID_FILE)
 
 
@@ -511,6 +528,8 @@ You are supervising a Genesis update. Your role is WATCH AND ESCALATE.
    - Read the error output. If it's a simple retry (network timeout,
      temp file issue, pip cache), retry ONCE.
    - If retry succeeds, continue from step 2.
+   - If the retry exits 4 or 5, follow step 6 or step 7 for that exit instead:
+     write the "refused:" summary and stop; do not escalate.
    - If retry fails or the error is not trivially retryable:
      Write to {escalation_file}: "tier2_needed"
      Write error context to {summary_file}
@@ -521,6 +540,14 @@ You are supervising a Genesis update. Your role is WATCH AND ESCALATE.
    were edited by hand. Never modify, delete, replace or re-stamp those unit files,
    and never pass --take-template or --take-templates: whether the hand edit goes is
    the user's decision. Write to {summary_file}: "refused: <the units it names>".
+   Do not write {escalation_file}. Done.
+
+7. If exit 5 (refused, an earlier update unfinished):
+   Exit 5 means update.sh REFUSED, before changing anything, because an earlier
+   update's ~/.genesis/update_state.json still guards code it merged and never
+   activated, or merge conflicts it is waiting on. That file is the restart guard:
+   never delete or edit ~/.genesis/update_state.json, and never run --post-merge
+   yourself. Write to {summary_file}: "refused: <the message update.sh printed>".
    Do not write {escalation_file}. Done.
 
 You are a security guard, not an engineer. Press buttons, report status,
@@ -575,17 +602,26 @@ and never pass --take-template or --take-templates: whether the hand edit goes i
 the user's decision. Write to {summary_file}: "refused: <the units it names>".
 Do not write {escalation_file}. Done.
 
+If update.sh EXITS 5:
+Exit 5 means update.sh REFUSED, before changing anything, because an earlier
+update's ~/.genesis/update_state.json still guards code it merged and never
+activated, or merge conflicts it is waiting on. It is the restart guard: never
+delete or edit ~/.genesis/update_state.json to get past it. Write to
+{summary_file}: "refused: <the message update.sh printed>". Do not write
+"tier3_needed" or anything else to {escalation_file}. Stop. Done.
+
 If SCRIPT ERROR:
 1. Diagnose the root cause from the error output
 2. If fixable (missing dep, config mismatch, import error): fix and retry.
    Never set or change the git config key genesis.updateRemote: choosing the
-   update source is the operator's decision.
+   update source is the operator's decision. Never delete or edit
+   ~/.genesis/update_state.json: it is the restart guard.
 3. If not fixable: write report to {summary_file}, write "tier3_needed"
    to {escalation_file}, done
 
 Commit any fixes with conventional format (fix: ...).
-Write final outcome to {summary_file}, unless update.sh exited 4: then the summary
-stays exactly "refused: <the units it names>".
+Write final outcome to {summary_file}, unless update.sh exited 4 or 5: then the
+summary stays exactly "refused: ..." as written above.
 Log every action taken for user review.\
 """
 
@@ -617,6 +653,9 @@ IMPORTANT: The main working tree is CLEAN. Work on a temporary branch.
 end ("kept <unit>: edited by hand"). Never modify, delete, replace or re-stamp
 those unit files, and never pass --take-template or --take-templates: whether
 the hand edit goes is the user's decision. List them in your report.
+
+Never delete or edit ~/.genesis/update_state.json to get past an update.sh
+refusal: it is the restart guard (and the record --post-merge finishes).
 
 Write a resolution report to {summary_file} explaining each decision.
 Use conventional commit format for any fixes (fix: ...).\
@@ -656,6 +695,50 @@ def _update_lock_unopenable(exc: UpdateLockError):
     return jsonify({"error": f"Cannot open update.lock ({exc}); nothing was started."}), 500
 
 
+def _load_state_guard():
+    """scripts/lib/update_state_guard.py, loaded from disk on each call (like
+    live_checkout.py), so the copy that answers is the one update.sh would run."""
+    spec = importlib.util.spec_from_file_location(
+        "genesis_update_state_guard", _STATE_GUARD_SCRIPT
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_STATE_GUARD_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _state_guard_verdict() -> tuple[str, str, str | None]:
+    """The restart-guard verdict on update_state.json: (verdict, reason, remedy).
+
+    ``verdict`` is "safe", "guards" or "conflict_pending"; ``remedy`` is the
+    message every refusing caller prints, None when safe. A guard that cannot be
+    evaluated keeps an existing file (doubt keeps the guard)."""
+    try:
+        guard = _load_state_guard()
+        verdict, reason = guard.verdict(
+            str(_STATE_FILE), str(_GENESIS_ROOT), str(_CONFLICT_FILE)
+        )
+        if verdict == guard.SAFE:
+            return verdict, reason, None
+        return verdict, reason, guard.message(str(_STATE_FILE), verdict, reason)
+    except Exception:  # noqa: BLE001 - any failure to decide must keep the guard
+        logger.warning("update_state guard could not be evaluated", exc_info=True)
+        if not (_STATE_FILE.exists() or _STATE_FILE.is_symlink()):
+            return "safe", "there is no state file", None
+        return (
+            "guards",
+            "it could not be checked",
+            f"{_STATE_FILE} could not be checked, so it is kept. Finish that update "
+            "with scripts/update.sh --post-merge, or Dismiss it on the update card.",
+        )
+
+
+def _state_guard_refusal() -> str | None:
+    """The 409 message when update_state.json still guards, else None."""
+    return _state_guard_verdict()[2]
+
+
 def _apply_supervised(pid_file: Path) -> tuple:
     """Spawn a three-tier CC update pipeline as a detached subprocess.
 
@@ -670,7 +753,8 @@ def _apply_supervised(pid_file: Path) -> tuple:
     """
     _GENESIS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Clean up ALL state files from prior runs
+    # Clean up ALL state files from prior runs. update_apply reached here only
+    # after the restart guard said update_state.json guards nothing (#3139).
     for f in (_SUMMARY_FILE, _ESCALATION_FILE, _CONFLICT_FILE, _STATE_FILE):
         f.unlink(missing_ok=True)
 
@@ -910,7 +994,7 @@ def refused():
         return False
 
 if refused():
-    log.info("update.sh refused over hand-edited units; not escalating")
+    log.info("update.sh refused (hand-edited units, or an earlier update unfinished); not escalating")
     ESCALATION.unlink(missing_ok=True)
 
 # ── Check escalation ──
@@ -930,7 +1014,7 @@ if ESCALATION.is_file() and "tier2_needed" in ESCALATION.read_text():
 
     # Check if Tier 3 needed
     if refused():
-        log.info("update.sh refused over hand-edited units; not escalating")
+        log.info("update.sh refused (hand-edited units, or an earlier update unfinished); not escalating")
         ESCALATION.unlink(missing_ok=True)
     if ESCALATION.is_file() and "tier3_needed" in ESCALATION.read_text():
         log.info("Tier 2 escalated -> Tier 3 (user-initiated Opus)")
@@ -965,6 +1049,9 @@ def update_dismiss():
 @blueprint.route("/api/genesis/updates/resolve", methods=["POST"])
 def update_resolve():
     """User-initiated Tier 3 (Opus) conflict resolution."""
+    # No restart-guard check here, unlike /apply: the state this route exists
+    # for is a pending conflict, which the guard refuses by design; Tier 3 runs
+    # update.sh --post-merge, which applies the guard itself under its own lock.
     # Accept resolve when tier3 was explicitly requested OR when tier2 died
     # leaving conflicts behind (failed state with conflict files present)
     has_escalation = _ESCALATION_FILE.is_file()
@@ -1029,8 +1116,16 @@ def update_progress():
     Returns phase-aware status so the frontend can show appropriate UX:
     - in_progress: update process is alive
     - failed: update finished but with errors/conflicts (not success)
-    - stale: state file exists but process is dead and phase != done
+    - stale: state file exists but process is dead and phase != done (a file
+      that cannot be read, or names no phase, counts: Dismiss must be offered)
     - phase: current update phase from update_state.json
+    - guards / guard / state_unreadable: whether that file still stands between a
+      restart and code an update merged and never activated (or a pending merge
+      conflict), per scripts/lib/update_state_guard.py
+
+    It never deletes update_state.json: deploy_code_only.sh and the live engine
+    read it as the restart guard, and retiring it is the job of update.sh, the
+    user's Dismiss, or bootstrap's crash recovery (#3139).
     """
     summary = None
     if _SUMMARY_FILE.is_file():
@@ -1047,13 +1142,17 @@ def update_progress():
         with contextlib.suppress(json.JSONDecodeError, OSError):
             conflicts = json.loads(_CONFLICT_FILE.read_text())
 
-    # Read update phase from state file
+    # Read update phase from state file. Anything but a JSON object is reported as
+    # unreadable, never raised (a JSON array used to answer 500 here).
     phase = None
     state_data = None
-    if _STATE_FILE.is_file():
-        with contextlib.suppress(json.JSONDecodeError, OSError):
+    state_exists = _STATE_FILE.exists() or _STATE_FILE.is_symlink()
+    if state_exists:
+        with contextlib.suppress(ValueError, OSError):
             state_data = json.loads(_STATE_FILE.read_text())
-            phase = state_data.get("phase")
+        if isinstance(state_data, dict) and isinstance(state_data.get("phase"), str):
+            phase = state_data["phase"]
+    state_unreadable = state_exists and not isinstance(state_data, dict)
 
     # Is an update process still running? Canonical liveness check (marker AND
     # state file) so a CLI `update.sh` run counts too -- which also keeps the
@@ -1071,7 +1170,8 @@ def update_progress():
     )
 
     stale = False
-    if not in_progress and state_data is not None and phase not in (None, "done"):
+    guard = None
+    if not in_progress and state_exists and phase != "done":
         # Only declare stale if state file is older than 60s
         import time
         try:
@@ -1079,13 +1179,9 @@ def update_progress():
             stale = age > 60
         except OSError:
             stale = True
-
-        # Clean up stale state file — no process is running and the file
-        # is just noise at this point (its purpose is crash recovery).
-        if stale:
-            with contextlib.suppress(OSError):
-                _STATE_FILE.unlink()
-
+        # Whether it still guards merged code: the card says so and hides Retry.
+        # Asked only when a file exists and no update is running.
+        guard = _state_guard_verdict()[0]
 
     return jsonify({
         "in_progress": in_progress,
@@ -1095,4 +1191,7 @@ def update_progress():
         "phase": phase,
         "failed": failed,
         "stale": stale,
+        "guards": guard not in (None, "safe"),
+        "guard": guard,
+        "state_unreadable": state_unreadable,
     })

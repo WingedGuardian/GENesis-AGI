@@ -266,7 +266,10 @@ async def list_by_tier(
 
 
 async def list_lessons(
-    db: aiosqlite.Connection, *, include_quarantined: bool = False
+    db: aiosqlite.Connection,
+    *,
+    include_quarantined: bool = False,
+    include_deprecated: bool = False,
 ) -> list[dict]:
     """Every non-deprecated row that carries a lesson record.
 
@@ -276,8 +279,10 @@ async def list_lessons(
     listing leaves them out, unless a caller that manages them asks.
     """
     quarantine = "" if include_quarantined else " AND quarantined = 0"
+    deprecated = "" if include_deprecated else " AND deprecated = 0"
     cursor = await db.execute(
-        "SELECT * FROM procedural_memory WHERE lesson IS NOT NULL AND deprecated = 0"
+        "SELECT * FROM procedural_memory WHERE lesson IS NOT NULL"
+        + deprecated
         + quarantine
         + " ORDER BY created_at"
     )
