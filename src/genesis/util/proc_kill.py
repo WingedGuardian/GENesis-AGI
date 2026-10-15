@@ -105,14 +105,25 @@ async def reap_bounded(proc, timeout_s: float | None = None) -> None:
         await asyncio.wait_for(proc.wait(), timeout=timeout_s)
 
 
-async def confirm_process_exit(proc) -> None:
+async def confirm_process_exit(
+    proc, *, graceful: bool = False, escalation_grace_s: float = 0.0
+) -> None:
     """Opt-in strong drain: refusals are unknown, never proof of group exit.
 
     A managed receipt holds capacity while this waits. Shield the cleanup task
     against repeated cancellation; deliver cancellation after confirmation.
+
+    ``graceful`` is for a child already asked to stop (SIGTERM after its
+    result): it first gets the ordinary bounded reap, and a surviving group
+    gets ``escalation_grace_s`` to flush, before the group kill and the
+    confirmation that follows it.
     """
 
     async def drain():
+        if graceful:
+            await reap_bounded(proc)
+            if process_group_alive(proc):
+                await asyncio.sleep(escalation_grace_s)
         with contextlib.suppress(OSError):
             kill_process_group(proc)
         while True:

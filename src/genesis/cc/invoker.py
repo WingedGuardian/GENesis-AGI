@@ -3603,7 +3603,14 @@ class CCInvoker:
         finally:
             try:
                 if invocation.confirm_cleanup:
-                    await confirm_process_exit(proc)
+                    # After a clean result the child was only asked to stop:
+                    # give it the same reap and flush grace an ordinary run
+                    # gets below, then confirm the group is gone.
+                    await confirm_process_exit(
+                        proc,
+                        graceful=terminated_after_result,
+                        escalation_grace_s=_ESCALATION_GRACE_S,
+                    )
             finally:
                 self._unregister_proc(reg_key)
 
