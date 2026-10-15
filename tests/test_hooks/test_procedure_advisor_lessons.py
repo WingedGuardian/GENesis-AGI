@@ -96,7 +96,7 @@ def test_a_session_lesson_fires_again_after_a_compaction(env):
     (env.sessions / "sess-1" / "context-identity-core.md").write_text("resumed")
     assert env("Bash", {"command": "deploy"}) == ""
     # The PreCompact hook appends a waypoint at every compaction.
-    (env.sessions / "sess-1" / "waypoints.jsonl").write_text('{"trigger": "auto"}\n')
+    (env.sessions / "sess-1" / "compacted.stamp").touch()  # SessionStart, source=compact
     assert "task_l1" in env("Bash", {"command": "deploy"})  # a new window
     assert env("Bash", {"command": "deploy"}) == ""  # and once in it
 
@@ -186,12 +186,16 @@ def test_only_the_first_8_kb_is_matched(env):
         {"patterns": [5]}, {"tool": 5}, {"task_type": None}, {"confidence": "high"},
         {"procedure_id": ["x"]},
         {"procedure_id": ["x"], "repeat": "session"},  # reaches the fire-once filter
+        {"steps": "one step"},
+        {"steps": [1]},
+        {"confidence": True},
     ],
 )
 def test_a_malformed_entry_is_skipped_and_the_others_still_fire(env, bad):
     env.write({**_entry("bad", repeat="every", patterns=["git"]), **bad},
               _entry("good", repeat="every", patterns=["git"]))
-    assert "task_good" in env("Bash", {"command": "git push"})
+    out = env("Bash", {"command": "git push"})
+    assert "task_good" in out and "task_bad" not in out
 
 
 def test_an_earned_tag_with_regex_syntax_is_bounded_too(env):
@@ -199,12 +203,37 @@ def test_an_earned_tag_with_regex_syntax_is_bounded_too(env):
     assert "task_e" in env("Bash", {"command": "a" * 40 + "b deploy"})
 
 
-def test_the_fire_log_holds_no_input_text(env):
-    env.write(_entry("l1", patterns=["deploy"]))
-    env("Bash", {"command": "deploy --token sk-secret-value"})
-    log = (env.sessions / "sess-1" / "advisor_fires.jsonl").read_text()
-    assert "sk-secret" not in log and "deploy" not in log
+def test_the_fire_log_keeps_a_scrubbed_excerpt_only(env):
+    env.write(_entry("l1", patterns=["deploy"]), _entry("l2", tool="Write", patterns=["KEY"]))
+    env("Bash", {"command": "deploy --token ghp_" + "a" * 36 + " done"})
+    env("Write", {"file_path": "/srv/app/secrets.env", "content": "KEY=value"})
+    records = [
+        json.loads(line)
+        for line in (env.sessions / "sess-1" / "advisor_fires.jsonl").read_text().splitlines()
+    ]
+    bash, write = records
+    assert "ghp_" not in bash["excerpt"] and "[REDACTED]" in bash["excerpt"]
+    assert "excerpt" not in write or write["excerpt"] is None  # a secret path keeps nothing
 
+
+def test_a_command_touching_a_secret_file_keeps_no_excerpt(env):
+    env.write(_entry("l1", patterns=["cat"]))
+    env("Bash", {"command": "cat secrets.env"})
+    (record,) = [
+        json.loads(line)
+        for line in (env.sessions / "sess-1" / "advisor_fires.jsonl").read_text().splitlines()
+    ]
+    assert record.get("excerpt") is None
+
+
+def test_an_empty_step_is_allowed(env):
+    env.write(_entry("l1", repeat="every", patterns=["deploy"], steps=["", "a step"]))
+    assert "task_l1" in env("Bash", {"command": "deploy"})
+
+
+def test_a_multi_pass_cut_keeps_its_note(env):
+    env.write(_entry("big", repeat="every", patterns=["deploy"], steps=["\u00e9" * 6000]))
+    assert "[advice truncated]" in env("Bash", {"command": "deploy"})
 
 def test_lesson_patterns_are_case_sensitive_and_earned_ones_are_not(env):
     env.write(
@@ -323,22 +352,44 @@ def test_an_expired_deadline_stops_command_matching(monkeypatch):
     assert not advisor._Matcher("git push", "git push").hits(_entry("x", commands=["git push"]))
 
 
-def test_a_dispatched_session_uses_the_start_mirrors_for_its_window(env, monkeypatch):
+def test_a_dispatched_session_resets_on_the_compaction_stamp_only(env, monkeypatch):
     monkeypatch.setenv("GENESIS_CC_SESSION", "1")
     env.write(_entry("l1", patterns=["deploy"]))
     assert "task_l1" in env("Bash", {"command": "deploy"})
+    (env.sessions / "sess-1" / "context-charter.md").write_text("resumed")  # a resume
     assert env("Bash", {"command": "deploy"}) == ""
-    (env.sessions / "sess-1" / "context-charter.md").write_text("compacted")
+    (env.sessions / "sess-1" / "compacted.stamp").touch()
     assert "task_l1" in env("Bash", {"command": "deploy"})
 
 
-def test_one_oversized_lesson_is_shown_but_not_recorded(env):
-    env.write(_entry("big", patterns=["deploy"], steps=["y" * 9500]))
-    assert "task_big" in env("Bash", {"command": "deploy"})  # never dropped entirely
-    assert "task_big" in env("Bash", {"command": "deploy"})  # trimmed, so not recorded
+def test_an_oversized_lesson_is_cut_recorded_and_later_advice_moves_on(env):
+    env.write(
+        _entry("big", patterns=["deploy"], steps=["y" * 9500]),
+        # A cut block costs at least ~8,100 of the 9,000 budget, so this cannot join it.
+        _entry("next", patterns=["deploy"], steps=["z" * 1200]),
+    )
+    first = env("Bash", {"command": "deploy"})
+    assert "task_big" in first and "[advice truncated]" in first and "task_next" not in first
+    second = env("Bash", {"command": "deploy"})
+    assert "task_next" in second and "task_big" not in second
 
 
 def test_an_empty_pattern_rejects_the_entry():
     advisor = _load()
     with pytest.raises(ValueError):
         advisor._Matcher("anything", None).hits(_entry("x", patterns=[""]))
+
+
+def test_session_start_stamps_only_a_compaction(tmp_path):
+    """genesis_session_context.py touches compacted.stamp on source=compact only,
+    before its own enable flag is checked (the flag is absent here)."""
+    script = Path(__file__).resolve().parents[2] / "scripts" / "genesis_session_context.py"
+    stamp = tmp_path / ".genesis" / "sessions" / "sess-9" / "compacted.stamp"
+    for source, exists in (("resume", False), ("compact", True)):
+        subprocess.run(
+            [sys.executable, str(script), "--part", "charter"],
+            input=json.dumps({"session_id": "sess-9", "source": source}),
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, "HOME": str(tmp_path)},
+        )
+        assert stamp.exists() is exists

@@ -30,8 +30,10 @@ An entry matches the tool's input on any of:
 
 A lesson whose ``repeat`` is ``session`` fires once per context window and
 agent: again after a compaction (not after a resume), since the earlier advice
-left the context with it. The fires are recorded in ``~/.genesis/sessions/<id>/advisor_fires.jsonl``.
-A call without a usable session id is never deduplicated.
+left the context with it. The fires are recorded in
+``~/.genesis/sessions/<id>/advisor_fires.jsonl`` with a short, secret-scrubbed
+excerpt of the input (for ``genesis lessons sample``). A call without a usable
+session id is never deduplicated.
 """
 
 from __future__ import annotations
@@ -234,9 +236,18 @@ class _Matcher:
         # Cache entries written before lessons had only `context_patterns`.
         patterns = entry.get("patterns", entry.get("context_patterns", []))
         for value in (commands, patterns):
-            # A string would iterate as single characters and match nearly anything.
+            # A string would iterate as single characters and match nearly
+            # anything, and an empty pattern matches every input.
             if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
-                raise ValueError("commands and patterns must be lists of text")
+                raise ValueError("commands and patterns must be lists of non-empty text")
+        steps = entry.get("steps", [])
+        if not isinstance(steps, list) or not all(isinstance(v, str) for v in steps):
+            raise ValueError("steps must be a list of text")
+        confidence = entry.get("confidence")
+        if not all(isinstance(entry.get(k), str) for k in ("procedure_id", "task_type")) or (
+            isinstance(confidence, bool) or not isinstance(confidence, int | float)
+        ):
+            raise ValueError("procedure_id, task_type and confidence are malformed")
         if commands and self.command is not None:
             firsts = {c.split()[0] for c in commands}
             # Parse only when a phrase's first word appears at all (the parser
@@ -271,29 +282,18 @@ def _fire_log(data: dict) -> tuple[Path | None, str]:
 
 
 def _window_start(session_dir: Path) -> float:
-    """When the current context window began, or 0.0 when unknown.
+    """When the current context window began (the last compaction), or 0.0.
 
-    A fire older than this happened before a compaction, so the agent no
-    longer has that advice.
-    - Foreground: the PreCompact hook (genesis_precompact.py) appends to
-      ``waypoints.jsonl`` at each compaction that writes the charter, and
-      nothing else writes it. A resume does not touch it, since a resumed
-      conversation keeps its context.
-    - Dispatched (GENESIS_CC_SESSION=1): the PreCompact hook skips them, but
-      the SessionStart hook still rewrites their ``context-*.md`` mirrors at
-      every start and compaction, and they are never resumed.
+    The SessionStart hook (genesis_session_context.py) touches
+    ``compacted.stamp`` when its source is ``compact``, before any other step,
+    for foreground and dispatched sessions alike; a resume keeps its context
+    and does not touch it. A fire older than the stamp happened before the
+    compaction, so the agent no longer has that advice.
     """
-    if os.environ.get("GENESIS_CC_SESSION") == "1":
-        paths = list(session_dir.glob("context-*.md"))
-    else:
-        paths = [session_dir / "waypoints.jsonl"]
-    times = []
-    for path in paths:
-        try:
-            times.append(path.stat().st_mtime)
-        except OSError:
-            continue
-    return max(times, default=0.0)
+    try:
+        return (session_dir / "compacted.stamp").stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def _open_log(log: Path | None) -> object:
@@ -310,7 +310,9 @@ def _open_log(log: Path | None) -> object:
 
         log.parent.mkdir(parents=True, exist_ok=True)
         # errors="replace": one bad byte must not turn dedup off for the session.
-        handle = open(log, "a+", encoding="utf-8", errors="replace")  # noqa: SIM115 - held across emit
+        # 0600, like the session transcripts: the excerpts are scrubbed, not empty.
+        fd = os.open(log, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+        handle = os.fdopen(fd, "a+", encoding="utf-8", errors="replace")
         for _ in range(20):  # about 1 s; the guarded section takes milliseconds
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -365,25 +367,52 @@ def _advice(trigger: dict) -> str:
 _BLOCKS_BUDGET = 9_000
 
 
-def _fit(shown: list[tuple[dict, str]]) -> list[tuple[dict, str]]:
-    """The leading advice blocks that fit whole in the output (always the first).
+def _cost(text: str) -> int:
+    return len(json.dumps(text)) + 4  # escaped text plus the separator
 
-    A lesson cut off by trimming would be recorded as shown and then suppressed,
-    so a block that does not fit is left for a later call instead.
+
+def _fit(shown: list[tuple[dict, str]]) -> list[tuple[dict, str]]:
+    """The leading advice blocks that fit whole in the output.
+
+    A lesson cut off by the output cap would be recorded as shown and then
+    suppressed, so a block that does not fit waits for a later call. A first
+    block too large on its own is cut here to fit, and so is recorded, rather
+    than shown trimmed forever ahead of every later block.
     """
     kept, size = [], 0
     for trigger, text in shown:
-        cost = len(json.dumps(text)) + 4  # escaped text plus the separator
-        if kept and size + cost > _BLOCKS_BUDGET:
+        note = "\n[advice truncated]"
+        if not kept and _cost(text) > _BLOCKS_BUDGET:
+            while _cost(text + note) > _BLOCKS_BUDGET:
+                text = text[: int(len(text) * 0.9)]
+            text += note
+        elif size + _cost(text) > _BLOCKS_BUDGET:
             break
-        kept.append((trigger, text))  # the first block is always shown
-        size += cost
+        kept.append((trigger, text))
+        size += _cost(text)
     return kept
 
 
-def _whole(text: str) -> bool:
-    """Whether a block is shown in full (a lone oversized one is trimmed)."""
-    return len(json.dumps(text)) + 4 <= _BLOCKS_BUDGET
+def _excerpt(tool_name: str, tool_input: object, text: str) -> str | None:
+    """The first 200 characters of the matched input, secrets scrubbed, or None.
+
+    Scrubbed before it is cut, so a token split at the cut still matches the
+    scrubber. Nothing is kept for a command or a path that touches a secret
+    file, or when the scrubber cannot be loaded.
+    """
+    try:
+        _hooks_on_path()
+        from secret_scrub import command_touches_secret, is_secret_path, scrub
+
+        if isinstance(tool_input, dict):
+            command, path = tool_input.get("command"), tool_input.get("file_path")
+            if isinstance(command, str) and command_touches_secret(command):
+                return None
+            if isinstance(path, str) and is_secret_path(path):
+                return None
+        return scrub(text)[:200]
+    except Exception:
+        return None
 
 
 def _skipped(what: str, exc: Exception) -> None:
@@ -475,7 +504,7 @@ def main() -> int:
         _emit([text for _, text in shown])
         if handle is not None:
             try:
-                # No excerpt of the input: a command can carry a credential.
+                excerpt = _excerpt(tool_name, tool_input, matcher.text)
                 handle.write(
                     "".join(
                         json.dumps(
@@ -484,11 +513,12 @@ def main() -> int:
                                 "procedure_id": t["procedure_id"],
                                 "agent": agent,
                                 "tool": tool_name,
+                                "excerpt": excerpt,
                             }
                         )
                         + "\n"
-                        for t, text in shown
-                        if id(t) in once and _whole(text)
+                        for t, _ in shown
+                        if id(t) in once
                     )
                 )
                 handle.flush()
