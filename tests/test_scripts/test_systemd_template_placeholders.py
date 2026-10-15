@@ -33,7 +33,9 @@ next token nobody thought of, which is the only kind that has ever shipped.
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -209,6 +211,32 @@ def test_the_two_renderers_agree_on_their_substitution_sets():
     )
 
 
+def test_hosted_install_inventory_covers_slice_templates(tmp_path):
+    source = (REPO / ".github/workflows/install-test.yml").read_text()
+    start = source.index('          _unrendered=""')
+    terminal = '          echo "  $_tpl_count shipped unit template(s), all rendered"'
+    end = source.index(terminal, start) + len(terminal)
+    block = "set -euo pipefail\n" + source[start:end]
+    templates = tmp_path / "scripts/systemd"
+    units = tmp_path / ".config/systemd/user"
+    templates.mkdir(parents=True)
+    units.mkdir(parents=True)
+    name = "genesis-cbm-query-clients.slice"
+    (templates / (name + ".template")).write_text("[Slice]\nMemoryMax=2G\n")
+    rendered = units / name
+    rendered.write_text("[Slice]\nMemoryMax=2G\n")
+    env = dict(os.environ, HOME=str(tmp_path))
+    result = subprocess.run(
+        ["bash", "-c", block], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 0 and "1 shipped unit" in result.stdout, result.stdout
+    rendered.unlink()
+    result = subprocess.run(
+        ["bash", "-c", block], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+    assert result.returncode != 0 and name in result.stdout
+
+
 def test_the_graph_projection_units_use_only_shared_tokens():
     """This PR's own units, pinned deliberately.
 
@@ -352,3 +380,17 @@ def test_there_is_at_least_one_persistent_timer_to_check():
         f"found {len(_persistent_timers())} Persistent=true timer template(s) — "
         "the detection is probably broken, making the uninstall check vacuous"
     )
+
+
+def test_every_vnc_template_token_is_substituted_by_setup_vnc():
+    """scripts/systemd/vnc/ is rendered by setup-vnc.sh alone (bootstrap's loop
+    globs only the top level), so it gets its own renderer check. The floor
+    proves the extraction read setup-vnc.sh at all."""
+    templates = sorted((TEMPLATE_DIR / "vnc").glob("*.template"))
+    assert len(templates) == 3, f"expected the three VNC unit templates, found {templates}"
+    known = _substituted_tokens("setup-vnc.sh")
+    assert "__BRAIN_IMG__" in known, f"setup-vnc.sh extraction found {sorted(known)}"
+    offenders = [
+        f"{t.name}: {token}" for t in templates for token in sorted(_tokens_used(t) - known)
+    ]
+    assert not offenders, "VNC template tokens setup-vnc.sh never substitutes:\n  " + "\n  ".join(offenders)

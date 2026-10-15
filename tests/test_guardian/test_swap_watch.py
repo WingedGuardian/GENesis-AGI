@@ -130,6 +130,8 @@ async def test_unset_knob_is_set_and_info_alerted(tmp_path):
         await swap_watch.check_container_swap_and_alert(cfg, d)
     assert _set_calls_for_key(sp, "limits.memory.swap") == [{"limits.memory.swap": "true"}]
     assert _sent_severities(d) == [AlertSeverity.INFO]
+    # Without a ceiling, unset under a hard limit starts at swap.max=0: a repair.
+    assert _titles(d) == ["Guardian set container swap"]
 
 
 @pytest.mark.asyncio
@@ -415,6 +417,57 @@ async def test_off_removes_a_native_ceiling_and_heals_the_live_zero(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_off_ceiling_removal_is_ceiling_only_when_swap_was_on(tmp_path):
+    """Lifting a ceiling with swap on: the key write to true makes Incus zero the
+    cgroup, and reopening that self-caused 0 is part of the ceiling change, not a
+    swap-off repair."""
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=swap_watch.SWAP_CEILING_OFF)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "2147483648", "")})
+    live = _IncusLive("2147483648")
+
+    async def activate(_container):
+        live.value = "max"
+        return True
+
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "_incus_config_set", AsyncMock(side_effect=live.config_set)),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(side_effect=live.read)),
+        patch.object(swap_watch, "activate_swap_max", AsyncMock(side_effect=activate)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert "memory.swap.max: 0 → max" in body
+    assert "D-state" not in body
+
+
+@pytest.mark.asyncio
+async def test_off_ceiling_removal_with_swap_already_off_is_a_repair(tmp_path):
+    """The cgroup read 0 before the key write: swap really was off, so reopening
+    it is a repair as well as the ceiling removal."""
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=swap_watch.SWAP_CEILING_OFF)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "2147483648", "")})
+    live = _IncusLive("0")
+
+    async def activate(_container):
+        live.value = "max"
+        return True
+
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "_incus_config_set", AsyncMock(side_effect=live.config_set)),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(side_effect=live.read)),
+        patch.object(swap_watch, "activate_swap_max", AsyncMock(side_effect=activate)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian set container swap"]
+    assert "D-state" in _sent_bodies(d)[0]
+
+
+@pytest.mark.asyncio
 async def test_off_lifts_a_fallback_cgroup_cap(tmp_path):
     """`off` with the key already true and a finite live cap (the fallback
     path's): the cap is lifted to max, the key is not touched."""
@@ -530,6 +583,27 @@ _TARGET = 10 * 1024 * 1024 * 1024  # 10 GiB, already page-aligned
 _TARGET_S = str(_TARGET)
 
 
+class _IncusLive:
+    """The live cgroup as Incus drives it under a hard memory limit (module
+    docstring): a BOOLEAN limits.memory.swap write resets memory.swap.max to 0,
+    a byte value applies that value, and the guardian's own cgroup writes stick."""
+
+    def __init__(self, value):
+        self.value = value
+
+    async def config_set(self, _container, pairs):
+        v = pairs.get("limits.memory.swap", "")
+        self.value = v if v.isdigit() else "0"
+        return True, ""
+
+    async def read(self, _container):
+        return self.value
+
+    async def write(self, _container, value):
+        self.value = value
+        return True
+
+
 def _patch_target(monkeypatch, target=_TARGET):
     monkeypatch.setattr(swap_watch, "_compute_swap_ceiling_target", lambda config: target)
 
@@ -550,6 +624,304 @@ async def test_native_path_asserts_the_key(tmp_path, monkeypatch):
         await swap_watch.check_container_swap_and_alert(cfg, d)
     assert sp.sets == [{"limits.memory.swap": _TARGET_S}]
     assert _sent_severities(d) == [AlertSeverity.INFO]
+
+
+@pytest.mark.asyncio
+async def test_new_native_ceiling_has_ceiling_alert_copy(tmp_path, monkeypatch):
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "true", ""),
+        "limits.memory": (0, "8GiB", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert "now 50% of host swap" in body
+    assert "swap_reconcile_enabled" not in body
+    assert "D-state" not in body
+
+
+@pytest.mark.asyncio
+async def test_changed_native_ceiling_has_ceiling_alert_copy(tmp_path, monkeypatch):
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "8589934592", ""),
+        "limits.memory": (0, "8GiB", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert "now 50% of host swap" in body
+    assert "swap_reconcile_enabled" not in body
+    assert "D-state" not in body
+
+
+@pytest.mark.asyncio
+async def test_unset_key_native_ceiling_is_ceiling_only(tmp_path, monkeypatch):
+    """Unset is Incus's default true; whether swap was off is decided from the
+    live value before the write, here already the target, so writing the first
+    native ceiling is a ceiling change, not a swap-off repair."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "", ""),
+        "limits.memory": (0, "8GiB", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert sp.sets == [{"limits.memory.swap": _TARGET_S}]
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert "D-state" not in body
+    assert "swap_reconcile_enabled" not in body
+
+
+@pytest.mark.asyncio
+async def test_unset_key_fallback_ceiling_is_ceiling_only(tmp_path, monkeypatch):
+    """Fallback path (no hard memory limit): the unset key is written to true and
+    the ceiling goes on the live cgroup; neither is a swap-off repair."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "", ""),
+        "limits.memory": (0, "", ""),
+    })
+    # Before the key write the cgroup is open; the boolean write makes Incus
+    # reset it to 0, which is what the step-2 read then sees.
+    live = _IncusLive("max")
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "_incus_config_set", AsyncMock(side_effect=live.config_set)),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(side_effect=live.read)),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(side_effect=live.write)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert f"memory.swap.max: 0 → {_TARGET_S} bytes (live)" in body
+    assert "D-state" not in body
+    assert "swap_reconcile_enabled" not in body
+    assert "This follows swap_ceiling_pct" in body
+
+
+@pytest.mark.asyncio
+async def test_false_key_fallback_is_a_repair_even_with_live_open(tmp_path, monkeypatch):
+    """A stored false value is swap-off at the next start, whatever the live
+    cgroup reads now."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "false", ""),
+        "limits.memory": (0, "", ""),
+    })
+    live = _IncusLive("max")
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "_incus_config_set", AsyncMock(side_effect=live.config_set)),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(side_effect=live.read)),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(side_effect=live.write)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian set container swap"]
+
+
+@pytest.mark.asyncio
+async def test_unset_key_fallback_live_zero_before_write_is_a_repair(tmp_path, monkeypatch):
+    """Swap was off before the tick and the cgroup cannot be read afterwards: the
+    pre-write read alone carries the repair."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "", ""),
+        "limits.memory": (0, "", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(side_effect=["0", None])),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    titles = _titles(d)
+    assert "Guardian set container swap" in titles
+    assert "D-state" in _sent_bodies(d)[titles.index("Guardian set container swap")]
+
+
+@pytest.mark.asyncio
+async def test_unset_key_fallback_self_caused_zero_without_pre_read_is_ceiling(
+    tmp_path, monkeypatch
+):
+    """The pre-write read failed and the cgroup reads 0 after the boolean write:
+    that 0 may be the one Incus just wrote, so it is not reported as a repair."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "", ""),
+        "limits.memory": (0, "", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(side_effect=[None, "0"])),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+
+
+@pytest.mark.asyncio
+async def test_unset_key_fallback_with_unreadable_cgroup_still_explains(tmp_path, monkeypatch):
+    """No live signal at all: the key write still serves the fallback ceiling,
+    so the alert carries the ceiling paragraph rather than none."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "", ""),
+        "limits.memory": (0, "", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=None)),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    titles = _titles(d)
+    assert "Guardian updated container swap ceiling" in titles
+    info_body = _sent_bodies(d)[titles.index("Guardian updated container swap ceiling")]
+    assert "This follows swap_ceiling_pct" in info_body
+
+
+@pytest.mark.asyncio
+async def test_unset_key_native_with_live_zero_is_a_repair(tmp_path, monkeypatch):
+    """Swap really was off before the tick (live 0 after a start under a hard
+    limit); Incus applies the byte key live, so step 2 reads the target. The
+    pre-write read is what reports the repair."""
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "", ""),
+        "limits.memory": (0, "8GiB", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(side_effect=["0", _TARGET_S])),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian set container swap"]
+    body = _sent_bodies(d)[0]
+    assert "D-state" in body
+    assert "This follows swap_ceiling_pct" in body
+
+
+@pytest.mark.asyncio
+async def test_native_ceiling_removal_has_only_ceiling_alert_copy(tmp_path):
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=swap_watch.SWAP_CEILING_OFF)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "2147483648", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert "swap_ceiling_pct: off" in body
+    assert "Without this" not in body
+    assert "D-state" not in body
+
+
+@pytest.mark.asyncio
+async def test_live_only_ceiling_removal_has_only_ceiling_alert_copy(tmp_path):
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=swap_watch.SWAP_CEILING_OFF)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "true", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="2147483648")),
+        patch.object(swap_watch, "write_swap_max", AsyncMock(return_value=True)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian updated container swap ceiling"]
+    body = _sent_bodies(d)[0]
+    assert "swap_ceiling_pct: off" in body
+    assert "Without this" not in body
+    assert "D-state" not in body
+
+
+@pytest.mark.asyncio
+async def test_plain_swap_off_repair_has_only_repair_alert_copy(tmp_path):
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "false", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="max")),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian set container swap"]
+    body = _sent_bodies(d)[0]
+    assert "Without this, a memory spike wedges the box into D-state" in body
+    assert "swap_reconcile_enabled: false" in body
+    assert "This follows swap_ceiling_pct" not in body
+
+
+@pytest.mark.asyncio
+async def test_live_zero_repair_has_only_repair_alert_copy(tmp_path):
+    cfg = _Cfg(tmp_path)
+    d = _dispatcher()
+    sp = _subproc(get_responses={"limits.memory.swap": (0, "true", "")})
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value="0")),
+        patch.object(swap_watch, "activate_swap_max", AsyncMock(return_value=True)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian set container swap"]
+    body = _sent_bodies(d)[0]
+    assert "Without this, a memory spike wedges the box into D-state" in body
+    assert "swap_reconcile_enabled: false" in body
+    assert "This follows swap_ceiling_pct" not in body
+
+
+@pytest.mark.asyncio
+async def test_false_key_with_ceiling_has_mixed_repair_and_ceiling_copy(tmp_path, monkeypatch):
+    _patch_target(monkeypatch)
+    cfg = _Cfg(tmp_path, swap_ceiling_pct=50)
+    d = _dispatcher()
+    sp = _subproc(get_responses={
+        "limits.memory.swap": (0, "false", ""),
+        "limits.memory": (0, "8GiB", ""),
+    })
+    with (
+        patch.object(swap_watch, "_run_subprocess", sp),
+        patch.object(swap_watch, "read_swap_max", AsyncMock(return_value=_TARGET_S)),
+    ):
+        await swap_watch.check_container_swap_and_alert(cfg, d)
+    assert _titles(d) == ["Guardian set container swap"]
+    body = _sent_bodies(d)[0]
+    assert "swap_reconcile_enabled: false" in body
+    assert "Without this, a memory spike wedges the box into D-state" in body
+    assert "This follows swap_ceiling_pct in the guardian config (now 50% of host swap)" in body
 
 
 @pytest.mark.asyncio
@@ -1283,7 +1655,7 @@ async def test_write_swap_max_accepts_bare_zero():
 
 
 # ---------------------------------------------------------------------------
-# _is_swap_on / _is_parseable_incus_size matrix — unchanged from #3069.
+# is_swap_on / _is_parseable_incus_size matrix — unchanged from #3069.
 # ---------------------------------------------------------------------------
 
 
@@ -1321,4 +1693,4 @@ async def test_write_swap_max_accepts_bare_zero():
     ],
 )
 def test_is_swap_on_matrix(raw, expected):
-    assert swap_watch._is_swap_on(raw) is expected
+    assert swap_watch.is_swap_on(raw) is expected

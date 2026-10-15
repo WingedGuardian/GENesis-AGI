@@ -39,6 +39,8 @@ from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 
+from genesis.env import repo_root
+
 logger = logging.getLogger(__name__)
 
 READY = "ready"
@@ -99,11 +101,16 @@ class _UnreadableMetadata(Exception):
 
 def _dist_version(name: str) -> str | None:
     try:
-        return metadata.version(name)
+        version = metadata.version(name)
     except metadata.PackageNotFoundError:
         return None
     except Exception as exc:  # noqa: BLE001 - any other failure is a damaged install
         raise _UnreadableMetadata(name, exc) from exc
+    if not version:
+        # A dist-info with no Version (a half-removed install) answers None on
+        # Python 3.12: damaged, not absent.
+        raise _UnreadableMetadata(name, ValueError("its metadata has no Version"))
+    return version
 
 
 def _dist_files(name: str) -> list[str] | None:
@@ -135,29 +142,31 @@ def _q(path: object) -> str:
     return shlex.quote(str(path))
 
 
-def _operator_step(*, legacy: bool = False, remove_first: bool = False) -> str:
-    """What to tell the user. Run by an operator with no browser open, never from a
-    session: every session's MCP server shares the engine cache and the venv.
-    ``legacy``: the installed camoufox is < 0.5, whose fetch empties the whole cache
-    before installing (pkgman ``cleanup()``). ``remove_first``: 0.4's fetch does
-    nothing when the root already holds the latest release (``is_updated_needed``),
-    and both its fetch and remove crash on an unreadable version.json (the updater
-    catches only FileNotFoundError). Without version.json, fetch reinstalls."""
+def stack_step() -> str:
+    """The repair for an engine camoufox 0.5.7+ pins: the provisioning script, which
+    marks a pre-0.5 root engine first, finishes a killed install's chmod, removes a
+    corrupt pinned directory and fetches it once (genesis.browser.provision)."""
+    return f"{_TELL}`{_q(repo_root() / 'scripts' / 'install_browser_stack.sh')}`"
+
+
+def _operator_step(*, remove_first: bool = False) -> str:
+    """What to tell the user about an engine camoufox < 0.5 uses, which the
+    provisioning script never fetches: 0.4's fetch empties the whole cache before
+    installing (pkgman ``cleanup()``). Run by an operator with no browser open, never
+    from a session: every session's MCP server shares the engine cache and the venv.
+    ``remove_first``: 0.4's fetch does nothing when the root already holds the latest
+    release (``is_updated_needed``), and both its fetch and remove crash on an
+    unreadable version.json (the updater catches only FileNotFoundError). Without
+    version.json, fetch reinstalls."""
     root = camoufox_install_dir()
     flag = ""
-    if legacy:
-        if (root / "browsers").exists():
-            flag = (
-                f"note that camoufox 0.4's fetch deletes everything in {_q(root)} first, "
-                "including the newer engines under browsers/; then "
-            )
-        if remove_first:
-            flag += f"`rm -f {_q(root / 'version.json')}`, then "
-    elif (root / "version.json").exists() and not (root / COMPAT_FLAG).exists():
+    if (root / "browsers").exists():
         flag = (
-            f"`touch {_q(root / COMPAT_FLAG)}` (without it camoufox 0.5's fetch deletes the "
-            "pre-0.5 engine there), then "
+            f"note that camoufox 0.4's fetch deletes everything in {_q(root)} first, "
+            "including the newer engines under browsers/; then "
         )
+    if remove_first:
+        flag += f"`rm -f {_q(root / 'version.json')}`, then "
     # The engine download is a temp file in TMPDIR; a session's TMPDIR is a small
     # quota, and a TMPDIR that does not exist falls back to /tmp, often a small
     # tmpfs. The interpreter is this one, the venv camoufox is installed in.
@@ -170,11 +179,11 @@ def _repair_step(binary: Path, problem: str, kind: str) -> str:
     fetch skips a directory that has version.json, so fetching again never fixes it."""
     if kind == "override":
         return f"tell the user; operator step: fix or unset CAMOUFOX_EXECUTABLE_PATH ({binary})"
+    if kind == "versioned":
+        return stack_step()
     if "not executable" in problem:
         return f"{_TELL}`chmod -R 755 {_q(binary.parent)}`"
-    if kind == "versioned":
-        return f"{_TELL}remove `{_q(binary.parent)}`, then {_operator_step().removeprefix(_TELL)}"
-    return _operator_step(legacy=True, remove_first=True)  # pre-0.5: the root engine
+    return _operator_step(remove_first=True)  # pre-0.5: the root engine
 
 
 def _properties_problem(binary: Path) -> str | None:
@@ -336,7 +345,7 @@ def _legacy_engine(version: str) -> EngineStatus:
     if not binary.exists() and not (binary.parent / "version.json").exists():
         return EngineStatus(
             NOT_INSTALLED,
-            f"no Camoufox engine at {binary.parent}; {_operator_step(legacy=True)}",
+            f"no Camoufox engine at {binary.parent}; {_operator_step()}",
         )
     label = f"Camoufox (camoufox {version})"
     status = _check(binary, label, "legacy")
@@ -352,7 +361,7 @@ def _legacy_engine(version: str) -> EngineStatus:
         return EngineStatus(
             INVALID,
             f"{label}: version.json beside {binary} is unreadable ({exc!r}); "
-            f"{_operator_step(legacy=True, remove_first=True)}",
+            f"{_operator_step(remove_first=True)}",
             binary,
         )
     if not supported:
@@ -360,7 +369,7 @@ def _legacy_engine(version: str) -> EngineStatus:
             INVALID,
             f"{label}: the engine at {binary.parent} is outside the versions camoufox "
             f"{version} supports, and launching it would delete the cache and download "
-            f"another; {_operator_step(legacy=True)}",
+            f"another; {_operator_step()}",
             binary,
         )
     return status
@@ -499,8 +508,21 @@ def _pinned_engine(version: str) -> EngineStatus:
         )
     return EngineStatus(
         NOT_INSTALLED,
-        f"{label}, the engine camoufox {version} pairs with, is not installed; {_operator_step()}",
+        f"{label}, the engine camoufox {version} pairs with, is not installed; {stack_step()}",
     )
+
+
+def predates_pin(version: str) -> bool:
+    """Whether the installed camoufox ``version`` is older than the browser pin
+    (0.5.7): its installed files carry no ``camoufox/browser_pin.py``, or, for an
+    installer that wrote no file list, its release number is below 0.5.7."""
+    files = _dist_files("camoufox")
+    if files is not None:
+        return "camoufox/browser_pin.py" not in files
+    match = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", version)
+    if not match:
+        return True
+    return (int(match[1]), int(match[2]), int(match[3] or 0)) < (0, 5, 7)
 
 
 def resolve_camoufox_engine() -> EngineStatus:
@@ -543,13 +565,7 @@ def _resolve() -> EngineStatus:
         return _legacy_engine(version)
     # 0.5.7 brought both the browser pin and CAMOUFOX_EXECUTABLE_PATH; 0.5.3-0.5.6
     # have neither, so they are refused before the override is read.
-    files = _dist_files("camoufox")
-    if files is not None:
-        predates_pin = "camoufox/browser_pin.py" not in files
-    else:  # an installer that wrote no RECORD: the release number decides
-        patch = re.match(r"\d+\.\d+\.(\d+)", version)
-        predates_pin = (int(match[1]), int(match[2]), int(patch[1]) if patch else 0) < (0, 5, 7)
-    if predates_pin:
+    if predates_pin(version):
         return EngineStatus(
             INVALID,
             f"camoufox {version} predates the browser pin (0.5.7); "
