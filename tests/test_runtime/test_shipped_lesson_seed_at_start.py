@@ -105,3 +105,31 @@ def test_the_seed_script_and_the_server_share_one_implementation_and_its_ids():
     namespace = uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
     assert shipped_lessons._lesson_id(Path("x.yaml")) == str(uuid.uuid5(namespace, "lesson:x"))
     assert seed._id("t") == str(uuid.uuid5(namespace, "t"))
+
+
+class _JobRT:
+    _router = None
+
+    def __init__(self, db):
+        self._db = db
+        self.jobs = []
+
+    def record_job_success(self, name):
+        self.jobs.append((name, "ok"))
+
+    def record_job_failure(self, name, *, exc=None, **_kw):
+        self.jobs.append((name, type(exc).__name__))
+
+
+async def test_a_start_records_the_seed_in_job_health(db, monkeypatch):
+    rt = _JobRT(db)
+    await learning._seed_shipped_lessons(rt)
+    assert rt.jobs == [("shipped_lesson_seed", "ok")]
+
+    async def broken(_db):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(shipped_lessons, "seed_shipped_lessons", broken)
+    rt.jobs.clear()
+    await learning._seed_shipped_lessons(rt)  # never raises out of the task
+    assert rt.jobs == [("shipped_lesson_seed", "OSError")]
