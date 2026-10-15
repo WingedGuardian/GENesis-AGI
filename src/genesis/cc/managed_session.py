@@ -16,7 +16,6 @@ from pathlib import Path
 from genesis.db.crud import cc_sessions
 from genesis.util.atomic import atomic_write_text
 from genesis.util.execution_privacy import private_execution
-from genesis.util.proc_kill import ProcessCleanupUncertain
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +47,31 @@ def metadata(row) -> dict:
 
 
 async def update_state(db, sid: str, state: str, **fields) -> None:
-    row = await cc_sessions.get_by_id(db, sid)
-    if row is None:
+    if not await cc_sessions.merge_metadata(db, sid, {"native_state": state, **fields}):
         raise ValueError("Prepared receipt is unavailable")
-    meta = metadata(row)
-    meta.update(native_state=state, **fields)
-    await db.execute("UPDATE cc_sessions SET metadata=? WHERE id=?", (json.dumps(meta), sid))
-    await db.commit()
+
+
+async def hold_uncertain(db, sid: str) -> None:
+    """Never return: no safe process identity remains after uncertain cleanup.
+
+    The caller keeps everything it holds (receipt, runner slot) until runtime
+    teardown; an owner restart reconciles the receipt as outcome_unknown. Even
+    repeated cancellation cannot turn uncertainty into confirmation.
+    """
+    while True:
+        try:
+            # Persistence refusal also cannot establish cleanup.
+            with contextlib.suppress(Exception):
+                await update_state(
+                    db,
+                    sid,
+                    "cancelling",
+                    error="cleanup_unconfirmed",
+                    cleanup_unconfirmed=True,
+                )
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            continue
 
 
 async def reconcile_orphans(db) -> int:
@@ -62,11 +79,13 @@ async def reconcile_orphans(db) -> int:
 
     A prior process may have executed effects. Never replay its receipt or
     report confirmed cancellation merely because the new registry is empty.
+    Only prepared receipts (rows carrying a managed fingerprint) are touched.
     """
-    rows = await db.execute(
-        "SELECT * FROM cc_sessions WHERE source_tag='agent_api' AND status='active'",
-    )
-    orphaned = await rows.fetchall()
+    orphaned = [
+        row
+        for row in await cc_sessions.query_active(db)
+        if row.get("source_tag") == "agent_api" and "managed_fingerprint" in metadata(row)
+    ]
     for row in orphaned:
         await update_state(db, row["id"], "failed", error="outcome_unknown")
         await cc_sessions.update_status(db, row["id"], status="failed")
@@ -81,7 +100,7 @@ async def run_managed(runner, request, sid: str, cancel: asyncio.Event):
     """
     from genesis.cc.direct_session import DirectSessionResult
 
-    db = runner._session_manager._db
+    db = runner._session_manager.db
     worker = None
     state, error = "failed", "execution_failed"
     result = DirectSessionResult(session_id=sid)
@@ -153,7 +172,7 @@ async def _execute(runner, request, sid):
     _set_obs_session(sid)
     await runner._check_background(request)
     await runner._session_manager.start_prepared(sid)
-    await update_state(runner._session_manager._db, sid, "running")
+    await update_state(runner._session_manager.db, sid, "running")
     start = time.monotonic()
     telemetry = []
 
@@ -167,24 +186,6 @@ async def _execute(runner, request, sid):
         result = runner._result(sid, output, telemetry, time.monotonic() - start)
         result.success = result.success and output.result_received and not output.bg_truncated
         return result
-    except ProcessCleanupUncertain:
-        # No safe process identity remains. Hold the existing receipt until
-        # runtime teardown; an owner restart reconciles it as outcome_unknown.
-        # Even repeated cancellation cannot turn uncertainty into confirmation.
-        while True:
-            try:
-                # Persistence refusal also cannot establish cleanup.
-                with contextlib.suppress(Exception):
-                    await update_state(
-                        runner._session_manager._db,
-                        sid,
-                        "cancelling",
-                        error="cleanup_unconfirmed",
-                        cleanup_unconfirmed=True,
-                    )
-                await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                continue
     except asyncio.CancelledError:
         error = "cancelled"
     except Exception:
@@ -222,11 +223,13 @@ async def _finalize(runner, request, result, state):
                 },
             )
             # Absolute fresh-turn values: retries of finalization do not add cost twice.
-            await runner._session_manager._db.execute(
-                "UPDATE cc_sessions SET cost_usd=?, input_tokens=?, output_tokens=? WHERE id=?",
-                (result.cost_usd, result.input_tokens, result.output_tokens, result.session_id),
+            await cc_sessions.set_turn_totals(
+                runner._session_manager.db,
+                result.session_id,
+                cost_usd=result.cost_usd,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
             )
-            await runner._session_manager._db.commit()
             if result.success:
                 await runner._session_manager.complete(
                     result.session_id,
