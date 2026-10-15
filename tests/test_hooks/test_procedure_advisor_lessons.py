@@ -393,3 +393,17 @@ def test_session_start_stamps_only_a_compaction(tmp_path):
             env={**os.environ, "HOME": str(tmp_path)},
         )
         assert stamp.exists() is exists
+
+
+def test_a_credential_flag_value_is_redacted_from_the_excerpt():
+    advisor = _load()
+    for command in ("docker login -u admin -p S3cretPass123", "tool --password S3cret", "x --api-key=abc123"):
+        excerpt = advisor._excerpt("Bash", {"command": command}, command)
+        assert "S3cret" not in excerpt and "abc123" not in excerpt and "[REDACTED]" in excerpt
+
+
+def test_the_waypoint_also_starts_a_window(env):
+    env.write(_entry("l1", patterns=["deploy"]))
+    assert "task_l1" in env("Bash", {"command": "deploy"})
+    (env.sessions / "sess-1" / "waypoints.jsonl").write_text("{}\n")  # no stamp yet
+    assert "task_l1" in env("Bash", {"command": "deploy"})

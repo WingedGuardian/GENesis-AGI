@@ -58,6 +58,9 @@ _PATTERN_TIMEOUT_S = 0.05
 # The hook's own timeout is 10 s (.claude/settings.json); stopping matching at
 # 2 s leaves the rest for output and the surfaced-count write.
 _DEADLINE_S = 2.0
+_FLAG_VALUE = re.compile(
+    r"((?:^|\s)(?:-p|-P|--?[\w-]*(?:pass|pwd|token|secret|key|auth)[\w-]*)[ =])\S+", re.IGNORECASE
+)
 _REGEX_SYNTAX = re.compile(r"[.^$*+?{}\[\]\\|()]")
 
 
@@ -290,10 +293,15 @@ def _window_start(session_dir: Path) -> float:
     and does not touch it. A fire older than the stamp happened before the
     compaction, so the agent no longer has that advice.
     """
-    try:
-        return (session_dir / "compacted.stamp").stat().st_mtime
-    except OSError:
-        return 0.0
+    times = []
+    # The PreCompact waypoint (foreground only) also marks a compaction: it
+    # covers a session that started before the stamp's writer was deployed.
+    for name in ("compacted.stamp", "waypoints.jsonl"):
+        try:
+            times.append((session_dir / name).stat().st_mtime)
+        except OSError:
+            continue
+    return max(times, default=0.0)
 
 
 def _open_log(log: Path | None) -> object:
@@ -312,6 +320,7 @@ def _open_log(log: Path | None) -> object:
         # errors="replace": one bad byte must not turn dedup off for the session.
         # 0600, like the session transcripts: the excerpts are scrubbed, not empty.
         fd = os.open(log, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, 0o600)  # also a log created before this mode was set
         handle = os.fdopen(fd, "a+", encoding="utf-8", errors="replace")
         for _ in range(20):  # about 1 s; the guarded section takes milliseconds
             try:
@@ -410,7 +419,9 @@ def _excerpt(tool_name: str, tool_input: object, text: str) -> str | None:
                 return None
             if isinstance(path, str) and is_secret_path(path):
                 return None
-        return scrub(text)[:200]
+        # The scrubber knows labelled and shaped secrets; a value after a
+        # credential-like flag (`-p S3cret`, `--token abc`) has neither shape.
+        return _FLAG_VALUE.sub(r"\1[REDACTED]", scrub(text))[:200]
     except Exception:
         return None
 
