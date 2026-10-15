@@ -24,9 +24,17 @@ from genesis.learning.procedural.tool_names import BUILTIN_TOOLS, normalize_tool
             [],
         ),
         (["browser_navigate"], ["mcp__genesis-health__browser_navigate"], [], []),
-        (["ssh", "SSH"], ["Bash"], [r"\bssh\b"], []),
-        (["git push"], ["Bash"], [r"\bgit\s+push\b"], []),
-        (["Bash", "pytest"], ["Bash"], [r"\bpytest\b"], []),
+        (["ssh", "SSH"], ["Bash"], ["ssh"], []),
+        (["git push"], ["Bash"], ["git push"], []),
+        (["Bash", "pytest"], ["Bash"], [], []),  # an explicit Bash is never narrowed
+        (["git push (to origin)"], ["Bash"], ["git push"], []),
+        (["Bash (running tests)"], ["Bash"], [], []),
+        (["Edit{file_path: x}"], ["Edit"], [], []),
+        (["Tool:ego_proposal_resolve"], ["mcp__genesis-health__ego_proposal_resolve"], [], []),
+        (["ssh-agent", "pytest-cov"], [], [], ["ssh-agent", "pytest-cov"]),
+        (["Python (scripts)"], [], [], ["Python (scripts)"]),
+        (["Bash (x)", "ssh"], ["Bash"], [], []),  # an explicit Bash, annotated
+        (["gh pr create (to main)"], ["Bash"], ["gh pr create"], []),  # the longest phrase
         (["Python", "Git", "review gate", "Grep"], ["Grep"], [], ["Python", "Git", "review gate"]),
         # Built-ins match exactly: the CLI word `grep` is not the Grep tool.
         (["grep"], [], [], ["grep"]),
@@ -87,7 +95,7 @@ def test_the_mcp_short_names_match_the_registered_tools():
 
 def test_the_prompt_guidance_names_the_tools_without_braces():
     text = tool_names.TOOL_TRIGGER_GUIDANCE
-    assert "Bash" in text and "mcp__<server>__<tool>" in text
+    assert "Bash" in text and "mcp__<server>__<tool>" in text and "git push" in text
     assert "{" not in text and "}" not in text  # the extractor prompt is a str.format template
 
 
@@ -115,9 +123,8 @@ async def test_a_judge_shaped_store_reports_what_it_dropped(db):
     row = await procedural.get_by_id(db, result.procedure_id)
     assert json.loads(row["tool_trigger"]) == ["Bash"]
     assert any("review gate" in w for w in result.warnings)
-    # The mapped command is reported too: until its pattern is stored, the row
-    # fires on any Bash call its tags match.
-    assert any("ssh" in w and "Bash" in w for w in result.warnings)
+    # The mapped command is stored, so the row fires on ssh, not any Bash call.
+    assert json.loads(row["trigger_spec"]) == {"patterns": [], "commands": ["ssh"], "repeat": "every"}
 
 
 @pytest.mark.parametrize("incoming", [None, ["Python", "fail-open"]])

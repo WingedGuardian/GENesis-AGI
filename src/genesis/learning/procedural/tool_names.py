@@ -45,9 +45,9 @@ BUILTIN_TOOLS = frozenset({
 
 _MCP_NAME = re.compile(r"mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+")
 
-# Shell commands an LLM names as if they were tools. Each becomes Bash plus a
-# pattern on the command, which the trigger_spec tickets store; until then the
-# pattern is only reported. Matched case-insensitively (`SSH`, `Pytest`), after
+# Shell commands an LLM names as if they were tools. Each becomes Bash plus the
+# phrase itself, stored as trigger_spec.commands, which the advisor matches on
+# the command as shell_parse reads it. Matched case-insensitively (`SSH`, `Pytest`), after
 # the exact built-in check, so the Grep tool never reads as the CLI `grep`.
 # fmt: off
 _CLI_COMMANDS = (
@@ -55,9 +55,9 @@ _CLI_COMMANDS = (
     "git push", "git commit", "git add", "git worktree add",
 )
 # fmt: on
-_CLI_PATTERNS = {
-    phrase: r"\b" + r"\s+".join(map(re.escape, phrase.split())) + r"\b" for phrase in _CLI_COMMANDS
-}
+# A real tool name in front of prose an LLM added: `Bash (running tests)`,
+# `Edit{file_path: ...}`, `Tool:ego_proposal_resolve`.
+_TOOL_PREFIX = re.compile(r"(?:Tool:\s*)?([\w-]+)\s*(?:[(:{].*)?")  # one line only
 
 # Genesis MCP servers and the modules that register their tools.
 _MCP_MODULES = {
@@ -76,8 +76,11 @@ _NOT_SERVED = frozenset({"genesis.mcp.health.user_job_tools"})
 TOOL_TRIGGER_GUIDANCE = (
     "Use only these tool names: "
     + ", ".join(sorted(BUILTIN_TOOLS))
-    + ", or an MCP tool written in full as mcp__<server>__<tool>. For a shell command"
-    " such as ssh or git push, use Bash. Anything else is discarded."
+    + ", or an MCP tool written in full as mcp__<server>__<tool>. For a specific shell"
+    " command, write the command itself, one of: "
+    + ", ".join(_CLI_COMMANDS)
+    + " (it is stored as Bash, firing on that command only); write Bash for any shell"
+    " call. Anything else is discarded."
 )
 
 
@@ -126,13 +129,25 @@ def _mcp_owners() -> dict[str, list[str]]:
     return owners
 
 
+def _annotated_cli(value: str) -> str | None:
+    """The longest CLI phrase ``value`` starts with, when prose follows it."""
+    lower = value.lower()
+    for phrase in sorted(_CLI_COMMANDS, key=len, reverse=True):
+        if lower.startswith(phrase) and re.match(r"\s*[(:{]", lower[len(phrase) :]):
+            return phrase
+    return None
+
+
 def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:
-    """``(tools, patterns, dropped)`` for a raw tool_trigger value.
+    """``(tools, commands, dropped)`` for a raw tool_trigger value.
 
     ``tools`` holds built-in names and full ``mcp__<server>__<tool>`` names, in
     first-seen order without repeats; a unique MCP short name becomes its full
-    name, and a known shell command becomes ``Bash`` with a word-boundary
-    ``pattern``. Everything else is returned in ``dropped``.
+    name, and a known shell command (alone or with prose after it, such as
+    ``ssh (to the host)``) becomes ``Bash`` plus its phrase in ``commands``. A
+    real tool name followed by prose (``Bash (running tests)``) keeps the name.
+    An explicitly named ``Bash`` means every Bash call, so it is never narrowed:
+    ``commands`` is then empty. Everything else is returned in ``dropped``.
     """
     if values is None:
         return [], [], []
@@ -149,8 +164,9 @@ def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:
     # dropping every Genesis name.
     genesis_names = _genesis_mcp_names()
     tools: list[str] = []
-    patterns: list[str] = []
+    commands: list[str] = []
     dropped: list[str] = []
+    explicit_bash = False
     for raw in values:
         value = str(raw).strip()
         if value in BUILTIN_TOOLS:
@@ -169,14 +185,25 @@ def normalize_tool_trigger(values) -> tuple[list[str], list[str], list[str]]:
             tool = value
         elif value in short:
             tool = short[value]
-        elif value.lower() in _CLI_PATTERNS:
+        elif (cli := value.lower()) in _CLI_COMMANDS or (cli := _annotated_cli(value)):
             tool = "Bash"
-            pattern = _CLI_PATTERNS[value.lower()]
-            if pattern not in patterns:
-                patterns.append(pattern)
+            if cli not in commands:
+                commands.append(cli)
+        elif (m := _TOOL_PREFIX.fullmatch(value)) and m.group(1) != value:
+            # The name alone, judged by every rule above (a full MCP name is
+            # validated, a CLI word gets its command); it holds no prose, so
+            # this recurses at most once.
+            inner, inner_commands, _ = normalize_tool_trigger([m.group(1)])
+            if not inner:
+                dropped.append(value)
+                continue
+            tool = inner[0]
+            commands.extend(c for c in inner_commands if c not in commands)
+            explicit_bash |= tool == "Bash" and not inner_commands
         else:
             dropped.append(value)
             continue
+        explicit_bash |= value == "Bash"
         if tool not in tools:
             tools.append(tool)
-    return tools, patterns, dropped
+    return tools, [] if explicit_bash else commands, dropped

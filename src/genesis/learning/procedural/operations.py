@@ -114,14 +114,13 @@ async def store_procedure(
     """
     proc_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
-    tool_trigger, patterns, dropped = normalize_tool_trigger(tool_trigger)
-    if dropped or patterns:
-        logger.info(
-            "Procedure %s: dropped non-tool trigger values %s; command patterns not kept %s",
-            task_type,
-            dropped,
-            patterns,
-        )
+    tool_trigger, commands, dropped = normalize_tool_trigger(tool_trigger)
+    if dropped:
+        logger.info("Procedure %s: dropped non-tool trigger values %s", task_type, dropped)
+    if commands and trigger_spec is None:
+        trigger_spec, spec_warnings = _commands_spec(tool_trigger, commands)
+        if spec_warnings:
+            logger.info("Procedure %s: %s", task_type, "; ".join(spec_warnings))
     await procedural.create(
         db,
         id=proc_id,
@@ -146,6 +145,25 @@ async def store_procedure(
         deprecated_reason=deprecated_reason,
     )
     return proc_id
+
+
+def _commands_spec(tools: list[str], commands: list[str]) -> tuple[dict | None, list[str]]:
+    """The spec of an earned row named by shell commands, and any warning.
+
+    It fires on those commands only, never on any Bash call its tags match. An
+    earned spec replaces the row's tags for every tool, so it is written only
+    when Bash is the row's one tool; a row naming other tools keeps its tags.
+    """
+    if tools != ["Bash"]:
+        return None, [f"shell commands not stored (the row names other tools too): {commands}"]
+    from genesis.learning.procedural.lesson_shape import MAX_PATTERNS
+
+    warnings = []
+    if len(commands) > MAX_PATTERNS:
+        warnings.append(f"only the first {MAX_PATTERNS} shell commands are stored: {commands}")
+        commands = commands[:MAX_PATTERNS]
+    spec = validate_trigger_spec({"patterns": [], "commands": commands, "repeat": "every"})
+    return spec, warnings
 
 
 def _best_same_procedure_match(
@@ -224,34 +242,34 @@ async def store_procedure_checked(
     the owner reviews it. A trusted author of the same lesson therefore creates
     a live lesson of its own rather than refining the held one.
     """
-    trigger, patterns, dropped = normalize_tool_trigger(tool_trigger)
+    trigger, commands, dropped = normalize_tool_trigger(tool_trigger)
     held = False
     if lesson is not None:
         if not trigger:
             raise ValueError("a lesson needs at least one tool name in tool_trigger")
         spec = dict(trigger_spec or {})
-        authored = list(spec.get("patterns") or [])
-        spec["patterns"] = authored + [p for p in patterns if p not in authored]
+        authored = list(spec.get("commands") or [])
+        if commands or authored:
+            spec["commands"] = authored + [c for c in commands if c not in authored]
         try:
             trigger_spec = validate_trigger_spec(spec)
         except ValueError as exc:
-            derived = len(spec["patterns"]) - len(authored)
-            if derived:
+            derived = len(spec.get("commands") or []) - len(authored)
+            if derived and "commands" in str(exc):
                 raise ValueError(
-                    f"{exc} (counting {derived} pattern(s) derived from shell commands in tool_trigger)"
+                    f"{exc} (counting {derived} command(s) derived from tool_trigger)"
                 ) from exc
             raise
         lesson = validate_lesson(lesson)
         held = not is_live_lesson(lesson)
         activation_tier = "LIBRARY" if held else "ADVISORY"
-        patterns = []  # stored in the spec, so not a warning
+    spec_warnings: list[str] = []
+    if lesson is None and commands:
+        # An earned row named by shell commands fires on those commands only.
+        trigger_spec, spec_warnings = _commands_spec(trigger, commands)
     trigger_warnings = (
         [f"tool_trigger values dropped as not tool names: {dropped}"] if dropped else []
-    )
-    if patterns:
-        # The command pattern is not stored yet, so the row fires on any Bash call
-        # its tags match, not only on the command it named.
-        trigger_warnings.append(f"shell commands stored as Bash; patterns not kept: {patterns}")
+    ) + spec_warnings
     # A lesson refines only a lesson, a plain teach only an earned row; the kind
     # is chosen in SQL so rows of the other kind cannot fill the limit.
     candidates = await procedural.list_by_task_type(
@@ -309,9 +327,12 @@ async def store_procedure_checked(
                 stored = json.loads(matched["tool_trigger"]) if matched.get("tool_trigger") else None
             except (ValueError, TypeError, RecursionError):
                 stored = None  # unreadable: the new trigger replaces it, as a change
-            if lesson is None and trigger != stored:
-                # An earned row's spec was written for its old trigger: drop it
-                # rather than gate new tools with a pattern meant for others.
+            if lesson is None and trigger_spec is not None:
+                update_fields["trigger_spec"] = trigger_spec  # the commands it now names
+            elif lesson is None and (trigger != stored or "Bash" in trigger):
+                # An earned row's spec was written for its old trigger, or the
+                # teach names Bash itself (every Bash call): drop the spec rather
+                # than gate the row with commands it no longer names.
                 update_fields["trigger_spec"] = None
         elif tool_trigger == [] and draft == 0:
             # An explicit teach that passes an empty list means "no trigger".
