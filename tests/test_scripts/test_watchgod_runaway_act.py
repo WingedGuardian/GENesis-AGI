@@ -1180,6 +1180,62 @@ handle_fs '{box["cc"]}' '{cc_dev}' red 10 2048 - '' btrfs""",
     assert "reserve held" in body
 
 
+def test_no_reserve_is_claimed_held_when_there_is_none(box):
+    """A runaway emptying at cc-tmp RED with no reserve file: the page says
+    none is held, never that one is held (review finding)."""
+    cc_dev = os.stat(box["cc"]).st_dev
+    assert not (box["cc"] / ".watchgod-reserve").exists()
+    _run(
+        box,
+        f"""CC_KEY='{cc_dev}'; HOME_KEY=none; RUNAWAY_RELIEVED[{cc_dev}]=1
+handle_fs '{box["cc"]}' '{cc_dev}' red 10 2048 - '' btrfs""",
+    )
+    body = [p for p in _pages(box) if "RED" in p["title"]][0]["body"]
+    assert "reserve held" not in body
+    assert "none held" in body
+
+
+def test_a_reserve_is_discounted_in_every_domain_that_measures_it(box):
+    """cc-tmp's reserve counts in every domain whose measurement includes its
+    blocks: the same filesystem for a filesystem-wide measurement, the same
+    subvolume for a quota; never in a domain on another filesystem (review
+    finding: it was counted only in its owning domain)."""
+    reserve = box["cc"] / ".watchgod-reserve"
+    with open(reserve, "wb") as fh:
+        os.posix_fallocate(fh.fileno(), 0, 16 * _MB)
+    home = box["home"]
+    r = _run(
+        box,
+        f"""echo "FS=$(_wg_reserve_mb '{home}' fs)"
+echo "Q=$(_wg_reserve_mb '{home}' quota)"
+echo "OTHER=$(_wg_reserve_mb /proc fs)"
+echo "OTHERQ=$(_wg_reserve_mb /proc quota)"
+""",
+    )
+    assert "FS=16" in r.stdout, r.stdout
+    assert "Q=16" in r.stdout, "same device: the same subvolume"
+    assert "OTHER=0" in r.stdout and "OTHERQ=0" in r.stdout, r.stdout
+
+
+def test_a_project_quota_domain_on_a_shared_device_does_not_count_the_reserve(box):
+    """A filesystem-wide domain counts a reserve only when its statvfs is the
+    same filesystem: a project-quota volume shares the root's device but
+    reports only itself (a different raw size), so the root's reserve is not
+    its own (review finding)."""
+    reserve = box["cc"] / ".watchgod-reserve"
+    with open(reserve, "wb") as fh:
+        os.posix_fallocate(fh.fileno(), 0, 16 * _MB)
+    home = box["home"]
+    # Same device and filesystem id; only the raw statvfs sizes differ.
+    r = _run(
+        box,
+        f"""dg_raw_sizes_mb() {{ echo "100000 2048"; }}
+echo "FS=$(_wg_reserve_mb '{home}' fs)"
+""",
+    )
+    assert "FS=0" in r.stdout, r.stdout
+
+
 def test_a_cc_reserve_that_cannot_be_removed_is_reported_not_released(box):
     cc_dev = os.stat(box["cc"]).st_dev
     reserve = box["cc"] / ".watchgod-reserve"

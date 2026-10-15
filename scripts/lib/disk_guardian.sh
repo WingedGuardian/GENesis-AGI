@@ -261,7 +261,8 @@ dg_rate_update() {
     # swing by gigabytes and the closer wall alternates poll to poll — it never
     # built a rate at all, silencing the time-to-full tiers (review finding).
     #
-    # $5: MB held by the guardian's own reserve files in this domain. A
+    # $5: MB held by the guardian's own reserve files that this domain's
+    # measurement includes (_wg_reserve_mb). A
     # sample's growth has the CHANGE in them since the previous sample taken
     # out (spec; review finding: a new reserve fed a false time-to-full).
     # A sample written before this field existed counts as no change, so a

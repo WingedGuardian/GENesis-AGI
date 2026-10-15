@@ -678,7 +678,10 @@ handle_fs() {
         elif (( is_cc )); then
             # Spend the last reserve only on a RED measured after the runaway
             # response: this poll's RED was read before it emptied a file here.
-            if [[ -n "${RUNAWAY_RELIEVED[$dev]:-}" ]]; then
+            # Held only when there is a reserve to hold (review finding: a
+            # RED with none made the first emergency page claim one).
+            if [[ -n "${RUNAWAY_RELIEVED[$dev]:-}" && -f "$CC_TMP_DIR/$CC_RESERVE_NAME" \
+                    && ! -L "$CC_TMP_DIR/$CC_RESERVE_NAME" ]]; then
                 rel="cc-tmp reserve held: a runaway output was emptied this poll; released next poll if still RED"
             else
                 rel="cc-tmp reserve $(cc_reserve_release)" || true
@@ -796,7 +799,7 @@ check_disks() {
         used=$(( total - free ))
         [[ "$used_raw" =~ ^[0-9]+$ ]] || used_raw=$used
         binding=fs; (( quota )) && binding=quota
-        rate="$(dg_rate_update "$key" "$used_raw" "$now" "$binding" "$(_wg_reserve_mb "$key")")"
+        rate="$(dg_rate_update "$key" "$used_raw" "$now" "$binding" "$(_wg_reserve_mb "$p" "$binding")")"
         eta="$(dg_eta_min "$free" "$rate")"
         floor="$(dg_floor_tier "$free" "$total" "$unalloc" "$meta")"
         etat="$(dg_eta_tier "$eta")"

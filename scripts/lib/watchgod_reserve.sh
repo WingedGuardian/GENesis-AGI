@@ -113,19 +113,45 @@ cc_reserve_release() {
     return 1
 }
 
-_wg_reserve_mb() {
-    # MB allocated to the reserve files that live in domain $1: $HOME's on its
-    # domain, cc-tmp's on cc-tmp's own. The growth rate discounts a change in
-    # them, so creating or releasing a reserve does not read as the disk
-    # filling or emptying (review finding: it fed a false time-to-full).
-    local key="$1" f mb=0 b
-    for f in "$RESERVE_FILE" "$CC_TMP_DIR/$CC_RESERVE_NAME"; do
-        if [[ "$f" == "$RESERVE_FILE" ]]; then
-            [[ "$key" == "${HOME_KEY:-}" ]] || continue
-        else
-            [[ "$key" == "${CC_KEY:-}" && "$key" != "${HOME_KEY:-}" ]] || continue
+_wg_fs_id() {
+    # The filesystem a statvfs of $1 measures: a btrfs filesystem by its UUID
+    # (every subvolume of one pool reports the same pool), anything else by
+    # its device number.
+    local mline fstype source uuid
+    if mline="$(dg_mount_line "$1")"; then
+        IFS=$'\t' read -r _ fstype source _ <<< "$mline"
+        if [[ "$fstype" == btrfs ]] && uuid="$(dg_btrfs_uuid "$source")"; then
+            printf 'btrfs:%s' "$uuid"
+            return 0
         fi
-        [[ -L "$f" ]] && continue
+    fi
+    printf 'dev:%s' "$(stat -c %d -- "$1" 2>/dev/null)"
+}
+
+_wg_reserve_mb() {
+    # MB allocated to the guardian's reserve files ($HOME's and cc-tmp's) that
+    # the measurement of the domain at path $1 includes; $2 is how it is
+    # measured: "quota" counts its own subvolume (same device number), "fs"
+    # its whole filesystem (same filesystem). The growth rate discounts a
+    # change in them, so creating or releasing a reserve does not read as the
+    # disk filling or emptying in ANY domain that sees it (review findings: a
+    # false time-to-full; a reserve counted only in its owning domain).
+    local path="$1" binding="${2:-fs}" f mb=0 b want=""
+    for f in "$RESERVE_FILE" "$CC_TMP_DIR/$CC_RESERVE_NAME"; do
+        [[ -f "$f" && ! -L "$f" ]] || continue
+        if [[ "$binding" == quota ]]; then
+            [[ "$(stat -c %d -- "$f" 2>/dev/null)" == "$(stat -c %d -- "$path" 2>/dev/null)" ]] || continue
+        else
+            [[ -n "$want" ]] || want="$(_wg_fs_id "$path")"
+            [[ "$(_wg_fs_id "$f")" == "$want" ]] || continue
+            # The same filesystem as statvfs sees it: a project-quota volume
+            # shares its device with the root filesystem but statvfs-reports
+            # only itself, so it must not count the root's reserve (review
+            # finding; the same rule that keys such a domain apart).
+            local sa sb
+            read -r sa sb < <(dg_raw_sizes_mb "${f%/*}" "$path")
+            dg_same_size "$sa" "$sb" || continue
+        fi
         b="$(stat -c %b -- "$f" 2>/dev/null)" || continue
         [[ "$b" =~ ^[0-9]+$ ]] && mb=$(( mb + b * 512 / 1048576 ))
     done
