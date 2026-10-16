@@ -1,4 +1,5 @@
 """Operating allocation controls; synthetic consent never authorizes real spending."""
+import asyncio
 import copy
 import hashlib
 import json
@@ -9,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from genesis.eval.qualification import execution, pinned, run
+from genesis.eval.qualification import evidence, execution, pinned, run
 from genesis.eval.qualification.accounting import Journal, currency
 from genesis.eval.qualification.evidence import Incomplete, digest
 from tests.test_eval.qualification_transport_fixtures import bundle
@@ -74,6 +75,67 @@ def select_flash(plan):
     plan.value["stop_semantics"] = execution.SINGLE_STOP
     plan.consent.update(scope="2250_requests", plan_hash=digest(plan.value))
     return plan
+
+
+@pytest.mark.parametrize("when", ["qualify", "final_input"])
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("append_fails", [False, True])
+async def test_execute_preserves_original_failure_and_uncertain_journal(
+    plan, monkeypatch, when, cancel, append_fails,
+):
+    # Actual execution, private files and Journal; inject only the initiating
+    # failure at its two outer boundaries and the real evidence fsync failure.
+    select_flash(plan)
+    (plan.tmp / ".genesis").mkdir(mode=0o700)
+    monkeypatch.setattr(execution.Path, "home", lambda: plan.tmp)
+    for name, value in (("plan", plan.value), ("consent", plan.consent)):
+        item = write_input(plan.tmp / name, value)
+        item.close()
+    original = asyncio.CancelledError("synthetic cancellation") if cancel else RuntimeError("synthetic failure")
+    actual_sync, actual_check = evidence.os.fsync, execution.Input.check
+    seen = {}
+
+    def sync(fd):
+        if append_fails and seen.get("armed"):
+            raise OSError("PRIVATE SYNC DETAIL")
+        return actual_sync(fd)
+
+    def check(self, *, final=False):
+        if final and when == "final_input":
+            raise original
+        return actual_check(self, final=final)
+
+    async def qualify(alias, cases, params, journal, scratch, *, operating, **kwargs):
+        attempt = operating.manifests[alias]["attempts"][0]["id"]
+        journal.reserve(attempt)
+        journal.dispatch(attempt)
+        operating.last = journal, attempt
+        seen.update(journal=journal, operating=operating,
+                    prior=(journal.directory / "answers.jsonl").read_bytes(), armed=True)
+        if when == "qualify":
+            raise original
+        return {"status": "pass"}, []
+
+    monkeypatch.setattr(evidence.os, "fsync", sync)
+    monkeypatch.setattr(execution.Input, "check", check)
+    monkeypatch.setattr(run, "qualify", qualify)
+    with pytest.raises(type(original)) as caught:
+        await execution.execute([], plan.checked, {execution.ALIASES[1]: plan.tmp / "flash"}, plan.tmp,
+                                plan_path=plan.tmp / "plan", approval_path=plan.tmp / "consent", options={})
+    assert caught.value is original and seen["operating"].stopped
+    journal = seen["journal"]
+    assert (journal.directory / "answers.jsonl").read_bytes().startswith(seen["prior"])
+    if append_fails:
+        assert journal._poisoned
+        with pytest.raises(Incomplete, match="uncertain"):
+            _ = journal.state
+        notes = original.__notes__
+        assert any("OSError" in note for note in notes)
+        assert not any("PRIVATE SYNC DETAIL" in note for note in notes)
+    else:
+        assert journal.state.blockers and journal.state.reserved == currency("0.001")
+    with pytest.raises(Incomplete):
+        journal.ready()
 
 
 def test_plan_binds_every_coordinate_and_allocation(plan):
@@ -185,7 +247,8 @@ async def test_exact_final_key_observation_stops_both_before_reservation(plan, c
         with Journal(plan.tmp / "mimo", control.manifests[execution.ALIASES[0]]) as a, \
                 Journal(plan.tmp / "flash", control.manifests[execution.ALIASES[1]]) as b:
             control.attach(dict(zip(execution.ALIASES, (a, b), strict=True)))
-            info = {"limit": "5", "usage": "0", "limit_remaining": "5", "limit_reset": None}
+            info = {"limit": "5", "usage": "0", "limit_remaining": "5", "limit_reset": None,
+                    "available": "5"}
             adapter = SimpleNamespace(fingerprint=plan.value["credential_fingerprint"])
             await control.admission_hook(adapter, "a-0-1", info)
             key, value = {"limit": ("limit", "6"), "usage": ("usage", "0.01"),
@@ -214,6 +277,72 @@ def test_shared_cost_counter_ignores_rounding_and_duplicate_generations():
     row["spec"]["generation_namespace"] = "independent-gateway"
     control.update("flash", "different-attempt", row)
     assert control.observed == currency("0.246913578")
+
+
+@pytest.mark.parametrize("available,pending,refused", [
+    ("2.50", "4.50", True), ("2.50", "2.25", False), ("2.50", "2.50", False),
+    ("5", "5.01", True), (None, "2.25", True),
+])
+def test_whole_population_requires_validated_available_headroom(available, pending, refused):
+    control = execution.Operating.__new__(execution.Operating)
+    control.plan = {"expected_limit": "5", "baseline_usage": "0"}
+    control.observed, control.pending = currency("0"), currency(pending)
+    info = {"limit": "5", "usage": "0", "limit_remaining": "5", "limit_reset": None}
+    if available is not None:
+        info["available"] = available
+    if refused:
+        with pytest.raises(Incomplete):
+            control.predicate(info)
+    else:
+        control.predicate(info)
+
+
+@pytest.mark.parametrize("budget", ["effective_budget", "budgets"])
+async def test_pair_member_headroom_refuses_before_any_reservation_or_post(plan, monkeypatch, budget):
+    import httpx
+
+    from tests.test_eval.qualification_transport_fixtures import Gateway, ask
+
+    monkeypatch.setenv(pinned.KEY_ENV, "synthetic-only-key")
+    secrets = plan.tmp / "secrets.env"
+    secrets.write_text("")
+    monkeypatch.setenv("SECRETS_PATH", str(secrets))
+    for name in pinned.PRODUCTION_KEY_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+    class LimitedGateway(Gateway):
+        def __call__(self, request):
+            if request.url.path.endswith("/key"):
+                self.key_reads += 1
+                member = {"remaining_usd": 2.5}
+                return httpx.Response(200, json={"data": {
+                    "limit": 5, "usage": 0, "limit_remaining": 5, "limit_reset": None,
+                    budget: [member] if budget == "budgets" else member,
+                }})
+            return super().__call__(request)
+
+    gateway = LimitedGateway()
+    left = write_input(plan.tmp / "plan.json", plan.value)
+    right = write_input(plan.tmp / "consent.json", plan.consent)
+    try:
+        control = execution.Operating(left, right, plan.checked)
+        with ExitStack() as stack:
+            journals = {a: stack.enter_context(Journal(plan.tmp / a, control.manifests[a]))
+                        for a in control.aliases}
+            control.attach(journals)
+            alias = control.aliases[0]
+            adapter = control.router(journals[alias], alias=alias,
+                                     params=plan.checked["parameters"][alias], dispatch=True,
+                                     transport=gateway.transport)
+            contract, rows = next(iter(plan.checked["plan"].items()))
+            adapter.bind(contract, 1, case_id="case-0")
+            with pytest.raises(Incomplete, match="operating_key_discrepancy"):
+                await ask(adapter, rows["case-0"]["messages"], "case-0")
+            assert control.stopped and gateway.key_reads == 1 and not gateway.requests
+            assert all([line["kind"] for line in j.lines] == ["manifest"] for j in journals.values())
+    finally:
+        left.close()
+        right.close()
 
 
 @pytest.mark.parametrize("namespace", ["synthetic", "independent-gateway"])

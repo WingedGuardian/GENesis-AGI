@@ -15,6 +15,8 @@ import re
 import sys
 import traceback
 from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from decimal import Decimal, DecimalException
 from pathlib import Path
 
@@ -26,7 +28,7 @@ from genesis.routing.config import load_config_from_string
 from genesis.routing.litellm_delegate import LiteLLMDelegate
 from genesis.routing.types import RoutingResult
 
-from .accounting import total
+from .accounting import currency, total
 from .corpus import route, versions
 from .evidence import Incomplete, canonical, digest, load_json
 
@@ -39,53 +41,226 @@ ROUTE_KEYS = {"temperature", "max_tokens", "top_p", "seed", "reasoning"}
 # Processing bound, not billing precision: never round evidence to fit it.
 # Refusal retains raw evidence and the attempt's funded maximum liability.
 MAX_CURRENCY_CHARS = 4096
+# The binding limit is the delegate's whole-call wall clock (asyncio.wait_for).
+# Every HTTPX client gets the same value, which HTTPX applies per phase
+# (connect/read/write/pool), so it never cuts a response off before the wall
+# clock does. A response slower than the wall clock leaves a dispatched
+# attempt for the existing GET-only recovery path; it is never resent.
+COMPLETION_TIMEOUT_S = 120
 
 
 class LocalFailure(Incomplete):
     """Harness failure, not a candidate verdict."""
 
 
-def _literal_text(value: str) -> str:
-    """Redact environment credentials, including overlapping prefixes."""
-    secrets = {
+_SCOPED_SECRETS = ContextVar("qualification_redaction_secrets", default=frozenset())
+
+
+def _redaction_values() -> frozenset[str]:
+    """Retain known credentials while their SDK aliases are temporarily hidden."""
+    return _SCOPED_SECRETS.get() | {
         value
         for name, value in os.environ.items()
         if value
         and (name == KEY_ENV or len(value) >= 8)
         and any(word in name.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
     }
-    for secret in sorted(secrets, key=len, reverse=True):
+
+
+def _literal_text(value: str) -> str:
+    """Redact known credentials, including overlapping prefixes."""
+    for secret in sorted(_redaction_values(), key=len, reverse=True):
         value = value.replace(secret, "[REDACTED]")
     return value
 
 
-def safe_text(value: str) -> str:
-    """Redact literal and JSON-escaped credentials in arbitrary diagnostic text."""
-    def redact(match):
-        token = match.group()
-        try:
-            decoded = json.loads(token)
-        except ValueError:
-            return _literal_text(token)
-        redacted = _literal_text(decoded)
-        return json.dumps(redacted) if redacted != decoded else token
-
-    return _literal_text(re.sub(r'"(?:[^"\\]|\\.)*"', redact, value))
+# Local processing bounds, not provider limits or billing precision.
+MAX_EVIDENCE_BYTES = 1024 * 1024
+MAX_EVIDENCE_DEPTH = 64
+OPAQUE_EVIDENCE = "[REDACTED: unsafe evidence]"
+_JSON_PARTS = re.compile(r'["{}\[\]]')
 
 
-def safe_evidence(value):
+def _json_parts(value):
+    """Scan delimiters once; the stdlib consumes disjoint JSON string spans."""
+    end = 0
+    for match in _JSON_PARTS.finditer(value):
+        if match.start() < end:
+            continue
+        decoded, end = None, match.end()
+        if match.group() == '"':
+            decoded, end = json.decoder.scanstring(value, end)
+        yield match, end, decoded
+
+
+def external_json(value):
+    """Bound external parsing; the existing loader still decides JSON validity."""
+    try:
+        if len(value) > MAX_EVIDENCE_BYTES:
+            raise ValueError
+        text = value.decode("utf-8") if isinstance(value, bytes) else value
+        if len(text.encode("utf-8")) > MAX_EVIDENCE_BYTES:
+            raise ValueError
+        depth = 0
+        for match, _, _ in _json_parts(text):
+            token = match.group()
+            depth += (token in ("{", "[")) - (token in ("}", "]"))
+            if depth > MAX_EVIDENCE_DEPTH:
+                raise ValueError
+        return load_json(text)
+    except (ValueError, UnicodeError, TypeError, RecursionError):
+        raise LocalFailure("invalid or excessive external JSON") from None
+
+
+_WIRE_FIELDS = frozenset({
+    "id", "model", "object", "created", "choices", "index", "message", "role",
+    "content", "finish_reason", "usage", "prompt_tokens", "completion_tokens",
+    "total_tokens", "cost", "openrouter_metadata", "requested", "strategy",
+    "attempt", "is_byok", "endpoints", "total", "available", "provider", "selected",
+    "data", "total_cost", "provider_name", "upstream_id", "error", "code",
+    "pipeline", "attempts", "status",
+})
+_KEY_COLON = re.compile(r"\s*:")
+
+
+def safe_text(value: str, *, schema_keys: frozenset[str] = frozenset(), _depth=0) -> str:
+    """Redact literal and JSON-escaped credentials in arbitrary diagnostic text.
+
+    A JSON object/array is redacted only inside its string tokens, so a numeric
+    lexeme that happens to contain a credential's digits stays valid JSON.
+    Other text also gets a final literal pass over everything.
+    """
+    if len(value) > MAX_EVIDENCE_BYTES or _depth > MAX_EVIDENCE_DEPTH:
+        return OPAQUE_EVIDENCE
+    try:
+        return _redacted_text(value, schema_keys, _depth)
+    except (ValueError, RecursionError):
+        return OPAQUE_EVIDENCE
+
+
+def _redacted_text(value, schema_keys, depth):
+    """Certify string spans without reserializing numeric wire lexemes."""
+    try:
+        document = isinstance(external_json(value), (dict, list))
+    except LocalFailure:
+        document = False
+    pieces, end = [], 0
+    for match, token_end, decoded in _json_parts(value):
+        if decoded is None:
+            continue
+        prefix, token = value[end:match.start()], value[match.start():token_end]
+        if "\\" in prefix:
+            return OPAQUE_EVIDENCE
+        trusted = document and decoded in schema_keys and _KEY_COLON.match(value, token_end)
+        # Decoded values remain untrusted text, including another JSON layer.
+        # The final literal pass keeps numeric text inside values untrusted.
+        redacted = decoded if trusted else _literal_text(safe_text(decoded, _depth=depth + 1))
+        pieces.extend((prefix, json.dumps(redacted) if redacted != decoded else token))
+        end = token_end
+    if "\\" in value[end:]:
+        return OPAQUE_EVIDENCE
+    strings = "".join((*pieces, value[end:]))
+    return strings if document else _literal_text(strings)
+
+
+def exception_name(error: BaseException) -> str:
+    """An exception's name is diagnostic data, not a trusted schema key."""
+    try:
+        name = safe_text(type(error).__name__)
+        return name if name.strip() else "[REDACTED]"
+    except BaseException:
+        return "[REDACTED]"
+
+
+def failure_message(error: BaseException) -> str:
+    """Diagnostic formatting must not prevent durable failure recording.
+
+    Catch only while rendering; the call/cleanup caller retains responsibility
+    for propagating the original exception, including cancellation.
+    """
+    try:
+        message = safe_text(str(error))
+    except BaseException:
+        message = ""
+    return message if message.strip() else exception_name(error)
+
+
+def _safe_value(value, depth=0):
+    """Redact untrusted values, including arbitrary nested dictionary keys."""
+    if depth > 2 * MAX_EVIDENCE_DEPTH:
+        raise LocalFailure("evidence nesting exceeds the processing bound")
     if isinstance(value, str):
         return safe_text(value)
     if isinstance(value, dict):
-        return {safe_text(key): safe_evidence(item) for key, item in value.items()}
+        return {safe_text(key): _safe_value(item, depth + 1) for key, item in value.items()}
     if isinstance(value, list):
-        return [safe_evidence(item) for item in value]
+        return [_safe_value(item, depth + 1) for item in value]
     return value
+
+
+def safe_evidence(value: dict, depth=0) -> dict:
+    """Redact a locally constructed evidence record without renaming its schema.
+
+    Usage, selected response headers and already-sanitized association are
+    nested schema records.
+    Their field values, and other arbitrary structured values, stay untrusted.
+    """
+    if depth > 2 * MAX_EVIDENCE_DEPTH:
+        raise LocalFailure("evidence nesting exceeds the processing bound")
+    result = {}
+    for key, item in value.items():
+        if key == "raw_body" and isinstance(item, str):
+            result[key] = safe_text(item, schema_keys=_WIRE_FIELDS)
+        elif key in ("usage", "association", "response_headers") and isinstance(item, dict):
+            result[key] = safe_evidence(item, depth + 1)
+        else:
+            result[key] = _safe_value(item, depth + 1)
+    return result
+
+
+def safe_association(value):
+    """Keep association schema names; redact all extra operator-supplied keys."""
+    try:
+        value = external_json(canonical(value))
+    except (ValueError, TypeError, RecursionError, OverflowError):
+        raise LocalFailure("association must be finite serializable JSON") from None
+    if not isinstance(value, dict):
+        return _safe_value(value)
+    return {
+        key if key in ("attempt", "request_hash", "generation_id", "evidence")
+        else safe_text(key): _safe_value(item)
+        for key, item in value.items()
+    }
+
+
+def safe_money_evidence(value: dict, money: dict[tuple, str]) -> dict:
+    """Redact evidence, keeping validated money fields out of the literal pass.
+
+    ``money`` maps a path to an amount that already passed ``financial_json``.
+    A bare decimal string is not a JSON document, so the generic redactor would
+    rewrite a credential's digits inside it and Journal could never settle it.
+    An amount is re-inserted only when it is still a pure decimal string.
+    """
+    result = safe_evidence(value)
+    for path, amount in money.items():
+        try:
+            currency(amount)
+        except Incomplete:
+            continue  # Not proven pure money: keep the redacted form.
+        target = result
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = amount
+    return result
 
 
 def safe_body(data: bytes) -> str:
     """Redact decoded JSON strings while leaving numeric lexemes untouched."""
-    return safe_text(data.decode("utf-8", errors="replace"))
+    try:
+        external_json(data)
+        return safe_text(data.decode("utf-8"), schema_keys=_WIRE_FIELDS)
+    except LocalFailure:
+        return OPAQUE_EVIDENCE
 
 
 def fixed_currency(value: Decimal) -> str:
@@ -108,7 +283,7 @@ def financial_json(raw: bytes, paths: tuple[tuple[str, ...], ...]) -> dict:
     Its floats are never used to calculate or normalize a financial field.
     """
     try:
-        result = load_json(raw)
+        result = external_json(raw)
         exact = json.loads(raw, parse_float=Decimal, parse_int=Decimal)
         if not isinstance(result, dict):
             raise LocalFailure("provider JSON must be an object")
@@ -119,7 +294,7 @@ def financial_json(raw: bytes, paths: tuple[tuple[str, ...], ...]) -> dict:
             target[path[-1]] = fixed_currency(source[path[-1]])
         return result
     except (ValueError, UnicodeError, KeyError, TypeError, DecimalException) as exc:
-        raise LocalFailure("invalid financial evidence: " + safe_text(str(exc))) from None
+        raise LocalFailure("invalid financial evidence: " + failure_message(exc)) from None
 
 
 class DeferredCloseStream(httpx.AsyncByteStream):
@@ -144,7 +319,7 @@ def _selected_routes(raw):
 def _route_facts(observation):
     """Derive identity from retained bytes; no acknowledgement changes these facts."""
     try:
-        raw = load_json(observation["raw_body"])
+        raw = external_json(observation["raw_body"])
         if not isinstance(raw, dict):
             raise LocalFailure("routing response is not an object")
     except (KeyError, ValueError, UnicodeError, TypeError) as exc:
@@ -249,17 +424,20 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
     returns. No outer SDK success or cancellable cleanup substitutes for it.
     """
 
-    def __init__(self, expected: dict, key: str, record, *, transport=None):
+    def __init__(self, expected: dict, key: str, record, *, transport=None, timeout=COMPLETION_TIMEOUT_S):
         self.expected, self.key, self.record = load_json(canonical(expected)), key, record
         self.posts = 0
         self.observed = None
         self.error = None
         self._transport = transport
-        super().__init__()
+        super().__init__(timeout=timeout)
 
-    def create_client(self, **_kwargs):
+    def create_client(self, *, timeout=None, **_kwargs):
+        # Every client (initial and AsyncHTTPHandler's replacement after a dropped
+        # connection) keeps the delegate's ceiling, never HTTPX's 5-second default.
         return httpx.AsyncClient(
             transport=self._transport,
+            timeout=self.timeout if timeout is None else timeout,
             follow_redirects=False,
             event_hooks={"request": [self.before], "response": [self.after]},
         )
@@ -305,17 +483,19 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
             except BaseException as exc:
                 if failure is None:
                     raise
-                failure.add_note("response stream cleanup also failed: " + type(exc).__name__)
+                failure.add_note("response stream cleanup also failed: " + exception_name(exc))
 
     def record_response(self, response: httpx.Response, data: bytes):
         raw_body = safe_body(data)
+        money = {}
         try:
             raw = financial_json(data, (("usage", "cost"),))
+            money[("usage", "cost")] = raw["usage"]["cost"]
         except LocalFailure as exc:
-            self.error = str(exc)
+            self.error = failure_message(exc)
             # Preserve valid identity/content even when cost is absent or invalid.
             try:
-                raw = load_json(data)
+                raw = external_json(data)
             except (ValueError, UnicodeError):
                 raw = {}
         raw = raw if isinstance(raw, dict) else {}
@@ -331,7 +511,7 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
             self.error = self.error or "provider response has no usable answer"
         identity = _response_identity(raw, response.headers)
         self.error = self.error or identity["error"]
-        self.observed = safe_evidence(
+        self.observed = safe_money_evidence(
             {
                 "http_status": response.status_code,
                 "raw_body": raw_body,
@@ -345,7 +525,8 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
                 },
                 "content": content if isinstance(content, str) else None,
                 "error": self.error,
-            }
+            },
+            money,
         )
         # Synchronous durable append: auth/SDK/close may raise after this returns.
         self.record(self.observed)
@@ -353,18 +534,36 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
 
 @contextmanager
 def private_logs():
-    """Redact SDK and delegate log records and silence LiteLLM's stdout; restore both."""
+    """Redact log records and suppress normal SDK verbosity; restore both."""
     original = logging.getLogRecordFactory()
+    # Log calls can originate on SDK threads without the caller's context.
+    secrets = _redaction_values()
 
     def redacted(*args, **kwargs):
+        token = _SCOPED_SECRETS.set(_redaction_values() | secrets)
+        try:
+            return render(*args, **kwargs)
+        finally:
+            _SCOPED_SECRETS.reset(token)
+
+    def render(*args, **kwargs):
         record = original(*args, **kwargs)
-        record.msg = safe_text(record.getMessage())
-        record.args = ()
-        if record.exc_info:
-            record.exc_text = safe_text("".join(traceback.format_exception(*record.exc_info)))
-            record.exc_info = None
-        if record.stack_info:
-            record.stack_info = safe_text(record.stack_info)
+        try:
+            record.msg = safe_text(record.getMessage())
+            if record.exc_info:
+                record.exc_text = safe_text("".join(traceback.format_exception(*record.exc_info)))
+            elif record.exc_text:
+                record.exc_text = safe_text(record.exc_text)
+            if record.stack_info:
+                record.stack_info = safe_text(record.stack_info)
+        except BaseException:
+            # Formatting is diagnostic only, including hostile __str__/repr.
+            # Do not retain any partially rendered or unsanitized fallback.
+            record.msg = "[REDACTED: unformattable log record]"
+            record.exc_text = None
+            record.stack_info = None
+        finally:
+            record.args, record.exc_info = (), None
         return record
 
     # LiteLLM otherwise PRINTS a help banner and the raw provider error to stdout,
@@ -383,6 +582,9 @@ def private_logs():
 
 
 def check_callback_isolation():
+    # The SDK tests string truthiness, so even "0" enables unredacted stdout.
+    if os.environ.get("LITELLM_PRINT_STANDARD_LOGGING_PAYLOAD"):
+        raise LocalFailure("LiteLLM payload printing is active; use a fresh CLI process")
     names = (
         "callbacks",
         "input_callback",
@@ -418,9 +620,12 @@ def production_credentials() -> set[str]:
 @contextmanager
 def scoped_credential(key: str):
     """The delegate reads its key from the environment; lend it the dedicated one."""
-    saved = {name: os.environ.pop(name, None) for name in PRODUCTION_KEY_NAMES}
-    os.environ["OPENROUTER_API_KEY"] = key
+    saved = {name: os.environ.get(name) for name in PRODUCTION_KEY_NAMES}
+    token = _SCOPED_SECRETS.set(_redaction_values())
     try:
+        for name in PRODUCTION_KEY_NAMES:
+            os.environ.pop(name, None)
+        os.environ["OPENROUTER_API_KEY"] = key
         yield
     finally:
         for name, value in saved.items():
@@ -428,6 +633,45 @@ def scoped_credential(key: str):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+        _SCOPED_SECRETS.reset(token)
+
+
+def _budget_paths(raw: bytes) -> tuple[tuple, ...]:
+    """Every returned budget remainder, which must parse as nonnegative money.
+
+    OpenRouter's GET /key documents ``budgets`` (KeyBudget list) and
+    ``effective_budget`` (KeyBudget or null), each with ``remaining_usd``.
+    Absent fields add nothing; any present, malformed one refuses.
+    """
+    try:
+        data = external_json(raw)["data"]
+    except (ValueError, UnicodeError, KeyError, TypeError):
+        return ()  # financial_json reports the malformed envelope itself
+    if not isinstance(data, dict):
+        return ()
+    paths = []
+    if data.get("effective_budget") is not None:
+        if not isinstance(data["effective_budget"], dict):
+            raise LocalFailure("effective_budget is not a budget object")
+        paths.append(("data", "effective_budget", "remaining_usd"))
+    if "budgets" in data:
+        budgets = data["budgets"]
+        if not isinstance(budgets, list) or not all(isinstance(item, dict) for item in budgets):
+            raise LocalFailure("budgets is not a list of budget objects")
+        paths.extend(("data", "budgets", index, "remaining_usd") for index in range(len(budgets)))
+    for path in tuple(paths):
+        budget = _at(data, path[1:-1])
+        if "limit_usd" in budget or "spend_usd" in budget:
+            # A partial pair is malformed; financial_json rejects its missing
+            # partner instead of silently ignoring a supplied constraint.
+            paths.extend(path[:-1] + (name,) for name in ("limit_usd", "spend_usd"))
+    return tuple(paths)
+
+
+def _at(data, path):
+    for key in path:
+        data = data[key]
+    return data
 
 
 async def key_status(key: str, transport=None, *, required="0") -> dict:
@@ -440,9 +684,10 @@ async def key_status(key: str, transport=None, *, required="0") -> dict:
                 )
             if response.status_code != 200:
                 raise LocalFailure("could not read the dedicated key's limit")
+            budgets = _budget_paths(response.content)
             parsed = financial_json(
                 response.content,
-                tuple(("data", name) for name in ("limit", "limit_remaining", "usage")),
+                (("data", "limit"), ("data", "limit_remaining"), ("data", "usage"), *budgets),
             )
             if "error" in parsed:
                 raise LocalFailure("dedicated key lookup returned an error envelope")
@@ -452,9 +697,29 @@ async def key_status(key: str, transport=None, *, required="0") -> dict:
             limit, remaining, usage = (
                 Decimal(data[name]) for name in ("limit", "limit_remaining", "usage")
             )
+            # limit/limit_remaining describe only the key's own limit; a member,
+            # workspace or guardrail budget can block requests first.
+            budget_headroom = [
+                {
+                    "limit_usd": _at(data, path[1:]),
+                    "spend_usd": _at(data, path[1:-1] + ("spend_usd",)),
+                }
+                for path in budgets if path[-1] == "limit_usd"
+            ]
+            for budget in budget_headroom:
+                budget["available"] = format(total([
+                    Decimal(budget["limit_usd"]), Decimal(budget["spend_usd"]).copy_negate(),
+                ]), "f")
+            # Snapshots need not be exactly equal or atomic. Never admit more
+            # than any reported or independently derived headroom supports.
+            available = min([
+                remaining, total([limit, usage.copy_negate()]),
+                *(Decimal(_at(data, path[1:])) for path in budgets if path[-1] == "remaining_usd"),
+                *(Decimal(item["available"]) for item in budget_headroom),
+            ])
             if (
-                remaining <= 0
-                or remaining < Decimal(required)
+                available <= 0
+                or available < Decimal(required)
                 or remaining > limit
                 or usage > limit
             ):
@@ -462,8 +727,18 @@ async def key_status(key: str, transport=None, *, required="0") -> dict:
                     "dedicated key has insufficient or contradictory credit evidence"
                 )
         except (httpx.HTTPError, ValueError, KeyError, TypeError, DecimalException) as exc:
-            raise LocalFailure(safe_text(str(exc))) from None
-    return {name: data[name] for name in ("limit", "limit_remaining", "limit_reset", "usage")}
+            raise LocalFailure(failure_message(exc)) from None
+    info = {name: data[name] for name in ("limit", "limit_remaining", "limit_reset", "usage")}
+    # The budget remainders that decided dispatch, as returned (null stays null).
+    if "effective_budget" in data:
+        effective = data["effective_budget"]
+        info["effective_budget_remaining_usd"] = None if effective is None else effective["remaining_usd"]
+    if "budgets" in data:
+        info["budgets_remaining_usd"] = [item["remaining_usd"] for item in data["budgets"]]
+    info["available"] = format(available, "f")
+    if budget_headroom:
+        info["budget_headroom"] = budget_headroom
+    return info
 
 
 def dedicated_key() -> str:
@@ -524,6 +799,8 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None):
                 "receipt-only recovery needs independently verified attempt association"
             )
         generation = association["generation_id"]
+    # Validate the serializer's whole input domain before doing any GET work.
+    association_evidence = safe_association(association)
     key = dedicated_key()
     if hashlib.sha256(key.encode()).hexdigest() != spec.get("credential_fingerprint"):
         raise LocalFailure("reconciliation credential differs from frozen identity")
@@ -540,7 +817,7 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None):
         "request_hash": spec["request_hash"],
         "http_status": response.status_code,
         "raw_body": safe_body(response.content),
-        "association": safe_evidence(association),
+        "association": association_evidence,
         "provider_identity_evidence": identity,
     }
     try:
@@ -568,11 +845,12 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None):
                 raise LocalFailure("retained routing identity contradicts billing settlement")
         evidence.update(model=data["model"], upstream=spec["upstream"], charge=data["total_cost"])
     except (ValueError, KeyError, TypeError) as exc:
-        evidence["error"] = safe_text(str(exc))
+        evidence["error"] = failure_message(exc)
         # Invalid evidence is still durable; Journal refuses settlement.
         journal.settle(attempt, safe_evidence(evidence))
         raise LocalFailure(evidence["error"]) from None
-    journal.settle(attempt, safe_evidence(evidence))
+    # charge was set last inside the try, only after financial_json validated it.
+    journal.settle(attempt, safe_money_evidence(evidence, {("charge",): evidence["charge"]}))
     return evidence
 
 
@@ -761,9 +1039,10 @@ class PinnedRouter:
         self.calls, self.local, self.served = [], {}, {}
 
     def stop_processing(self, case_id, error):
-        self.failure = LocalFailure(safe_text(str(error)))
+        message = failure_message(error)
+        self.failure = LocalFailure(message)
         if case_id in self.served:
-            self.campaign.fail(self.served[case_id], str(self.failure))
+            self.campaign.fail(self.served[case_id], message)
 
     def request(self, messages):
         return request_body(self.cfg.model_id, self.params, self.contract, messages)
@@ -816,8 +1095,8 @@ class PinnedRouter:
             ):
                 raise LocalFailure("retained response is not verified evidence of the pinned model")
         except Exception as exc:
-            failure = exc if isinstance(exc, LocalFailure) else LocalFailure(safe_text(str(exc)))
-            self.local[case_id or "<unmatched>"] = str(failure)
+            failure = exc if isinstance(exc, LocalFailure) else LocalFailure(failure_message(exc))
+            self.local[case_id or "<unmatched>"] = failure_message(failure)
             self.failure = failure
             if failure is exc:
                 raise
@@ -836,13 +1115,14 @@ class PinnedRouter:
         )
 
     def _failure(self, attempt, error):
-        self.failure = LocalFailure(safe_text(str(error)))
+        message = failure_message(error)
+        self.failure = LocalFailure(message)
         try:
-            self.campaign.fail(attempt, str(self.failure) or type(error).__name__)
+            self.campaign.fail(attempt, message)
         except BaseException as append_error:
             # Preserve the original cancellation/call/cleanup exception. Journal
             # poisoning still prevents all subsequent reads and egress.
-            error.add_note("failure evidence append failed: " + type(append_error).__name__)
+            error.add_note("failure evidence append failed: " + exception_name(append_error))
 
     async def _send(self, attempt, expected):
         secret = dedicated_key()
@@ -850,21 +1130,10 @@ class PinnedRouter:
             raise LocalFailure("dedicated credential differs from frozen identity")
         info = await key_status(secret, self.transport, required=str(self.required))
         if self.dispatch_admission is not None:
-            # Validate the very observation used for this dispatch, before any
-            # reservation. The hook cannot rewrite the retained key evidence.
-            await self.dispatch_admission(self, attempt, dict(info))
+            # Check the exact validated observation before owning a client or
+            # reserving/dispatching. Nested metadata remains detached evidence.
+            await self.dispatch_admission(self, attempt, deepcopy(info))
         row = self.campaign.attempt(attempt)
-        if row.get("reserved_at") is None:
-            self.campaign.reserve(attempt)
-        self.campaign.append(
-            "dispatch",
-            attempt=attempt,
-            request_hash=row["spec"]["request_hash"],
-            key_status=info,
-            credential_fingerprint=self.fingerprint,
-        )
-        self.required = total([self.required, Decimal(row["spec"]["max_charge"]).copy_negate()])
-
         def record(observation):
             spec = row["spec"]
             observed = {
@@ -881,14 +1150,27 @@ class PinnedRouter:
             ):
                 raise LocalFailure("provider observation is not verified pinned-model evidence")
 
-        handler = ObservedHTTPHandler(expected, secret, record, transport=self.transport)
         body = self.params[route(self.contract)]
         flat = {k: v for k, v in body.items() if k != "reasoning"}
         extra = {
             "provider": expected["provider"],
             **({"reasoning": body["reasoning"]} if "reasoning" in body else {}),
         }
+        # Local client setup must succeed before an irreversible dispatch event.
+        handler = ObservedHTTPHandler(expected, secret, record, transport=self.transport)
+        dispatched = False
         try:
+            if row.get("reserved_at") is None:
+                self.campaign.reserve(attempt)
+            self.campaign.append(
+                "dispatch",
+                attempt=attempt,
+                request_hash=row["spec"]["request_hash"],
+                key_status=info,
+                credential_fingerprint=self.fingerprint,
+            )
+            dispatched = True
+            self.required = total([self.required, Decimal(row["spec"]["max_charge"]).copy_negate()])
             try:
                 with private_logs(), scoped_credential(secret):
                     result = await LiteLLMDelegate(self.config).call(
@@ -901,6 +1183,7 @@ class PinnedRouter:
                         success_callback=[],
                         failure_callback=[],
                         caching=False,
+                        timeout=COMPLETION_TIMEOUT_S,
                         extra_body=extra,
                         **flat,
                     )
@@ -921,7 +1204,8 @@ class PinnedRouter:
             try:
                 await handler.close()
             except BaseException as cleanup:
-                self._failure(attempt, cleanup)
+                if dispatched:
+                    self._failure(attempt, cleanup)
                 if active is None or not isinstance(cleanup, Exception):
                     raise
         try:

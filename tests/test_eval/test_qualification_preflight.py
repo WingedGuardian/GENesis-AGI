@@ -2,9 +2,14 @@
 
 import asyncio
 import copy
+import functools
 import hashlib
+import json
 import tracemalloc
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -15,14 +20,14 @@ from tests.test_eval.qualification_fixtures import novelty_case
 from tests.test_eval.qualification_preflight_fixtures import admitted, params
 
 
-async def replay(tmp_path, case=None):
+async def replay(tmp_path, case=None, content='{"redundant_with":null}'):
     case = case or novelty_case("probe", None)
     async with contracts.Sandbox(tmp_path) as sandbox:
         probe = contracts.Probe()
-        await contracts.novelty(case, probe, sandbox)
-        mapping = contracts.candidate_mapping(case, probe.calls[0][0], probe.candidate_ids)
+        rendered = await contracts.novelty(case, probe, sandbox)
+        mapping = contracts.candidate_mapping(case, probe.calls[0][0], rendered["candidate_ids"])
         return await storage.replay(case, probe.calls[0][0], mapping,
-                                    '{"redundant_with":null}', sandbox, "synthetic", "model")
+                                    content, sandbox, "synthetic", "model")
 
 
 @pytest.mark.parametrize("field", ["principle", "steps", "version", "confidence", "source",
@@ -48,7 +53,7 @@ async def test_mutating_any_original_column_is_detected(tmp_path, monkeypatch, f
     "person_id", "scenario", "tools_used", "context_tags", "failure_count", "failure_modes",
     "last_used", "last_validated", "deprecated_reason", "superseded_by", "invocation_count",
     "attempted_workarounds", "version", "tool_trigger", "promotion_history", "surfaced_count",
-    "extraction_context", "first_mover",
+    "extraction_context", "first_mover", "trigger_spec", "lesson",
 ])
 async def test_every_new_row_semantic_column_is_verified(tmp_path, monkeypatch, path, field):
     create = contracts.procedural.create
@@ -67,11 +72,39 @@ async def test_every_new_row_semantic_column_is_verified(tmp_path, monkeypatch, 
         await replay(tmp_path)
 
 
-async def test_judge_input_metadata_and_extractor_fixture_metadata_stay_distinct(tmp_path):
+@pytest.mark.parametrize("trigger,expected,spec", [
+    (["SyntheticTrigger"], None, None),
+    (["Bash"], ["Bash"], None),
+    (["Bash (running tests)"], ["Bash"], None),
+    (["Read", "Read", "SyntheticTrigger"], ["Read"], None),
+    (["ssh"], ["Bash"], {"patterns": [], "commands": ["ssh"], "repeat": "every"}),
+    (["ssh", "Bash"], ["Bash"], None),
+    (["Read", "ssh"], ["Read", "ssh"], None),
+    (["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git push"],
+     ["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git push"], None),
+])
+async def test_judge_input_metadata_and_extractor_fixture_metadata_stay_distinct(
+    tmp_path, monkeypatch, trigger, expected, spec,
+):
     case = novelty_case("metadata", None)
     case["new"].update(tools_used="SyntheticTool", context_tags="SyntheticTag",
-                       tool_trigger=["SyntheticTrigger"], scenario="Synthetic scenario")
+                       tool_trigger=trigger, scenario="Synthetic scenario")
+    original, inserted = storage.rows, []
+
+    async def observe(db):
+        result = await original(db)
+        inserted.extend(row for key, row in result.items()
+                        if key not in {"candidate-a", "candidate-b"})
+        return result
+
+    monkeypatch.setattr(storage, "rows", observe)
     assert all(r["stored"] for r in (await replay(tmp_path, case)).values())
+    assert len(inserted) == 8  # writer plus independent committed reader in each mode
+    for index, row in enumerate(inserted):
+        judge_path = index // 2 % 2 == 0
+        assert json.loads(row["tool_trigger"] or "null") == (expected if judge_path else None)
+        assert json.loads(row["trigger_spec"] or "null") == (spec if judge_path else None)
+        assert row["lesson"] is None
 
 
 @pytest.mark.parametrize("flag", ["deprecated", "quarantined"])
@@ -113,10 +146,11 @@ async def test_cancellation_closes_database_and_restores_globals(tmp_path, monke
     cooldown = dict(embedding._fail_open_timestamps)
     validator, classifier = validation_gate.validate_extraction, scoping.is_behavioral_directive
 
+    @asynccontextmanager
     async def opening(sandbox, case):
-        db = await database(sandbox, case)
-        handles.append(db)
-        return db
+        async with database(sandbox, case) as db:
+            handles.append(db)
+            yield db
 
     async def cancelled(router, call_site_id, messages, **kwargs):
         nonlocal calls
@@ -148,9 +182,9 @@ async def test_saved_answer_cannot_bind_another_rendered_question(tmp_path, chan
     case = novelty_case("question", None)
     async with contracts.Sandbox(tmp_path) as sandbox:
         probe = contracts.Probe()
-        await contracts.novelty(case, probe, sandbox)
+        rendered = await contracts.novelty(case, probe, sandbox)
         messages = copy.deepcopy(probe.calls[0][0])
-        mapping = contracts.candidate_mapping(case, messages, probe.candidate_ids)
+        mapping = contracts.candidate_mapping(case, messages, rendered["candidate_ids"])
         if change == "prefix":
             messages[0]["content"] = "Changed question\n" + messages[0]["content"]
         elif change == "candidate_order":
@@ -257,7 +291,7 @@ def test_composite_sources_check_every_nested_arm_and_git_baseline(tmp_path, mis
     path.write_text("historical bytes")
     sha = preflight.file_hash(path)
     source = {"query_source": {"path": str(path), "sha256": sha}, "baselines": [
-        {"path": "historical/repo/path", "commit": "historical-commit",
+        {"path": "historical/repo/path", "commit": "a" * 40,
          "sha256": "0" * 64 if missing else sha}
     ]}
     cases = {"test": [{"source": source}]}
@@ -266,3 +300,339 @@ def test_composite_sources_check_every_nested_arm_and_git_baseline(tmp_path, mis
             preflight.source_evidence(cases, {str(path): sha})
     else:
         assert preflight.source_evidence(cases, {str(path): sha}) == {str(path): sha}
+
+
+@pytest.mark.parametrize("commit", [None, "", " ", False, {}, [], 42, "not-a-commit", "a" * 39])
+@pytest.mark.parametrize("hash_key", ["sha256", "before_sha256", "after_sha256"])
+def test_malformed_git_source_cannot_relax_path_binding(tmp_path, commit, hash_key):
+    path = tmp_path / "export"
+    path.write_text("historical bytes")
+    sha = preflight.file_hash(path)
+    case = {"source": {"path": "wrong", "commit": commit, hash_key: sha}}
+    with pytest.raises(Incomplete):
+        preflight.source_evidence({"test": [case]}, {str(path): sha})
+
+
+@pytest.mark.parametrize("path", [None, "", ".", "/absolute", "../outside", "nul\x00path"])
+def test_historical_source_requires_repository_path(tmp_path, path):
+    export = tmp_path / "export"
+    export.write_text("historical bytes")
+    sha = preflight.file_hash(export)
+    case = {"source": {"path": path, "commit": "a" * 40, "before_sha256": sha}}
+    with pytest.raises(Incomplete):
+        preflight.source_evidence({"test": [case]}, {str(export): sha})
+
+
+@pytest.mark.parametrize("length", [40, 64])
+@pytest.mark.parametrize("paired", [False, True])
+def test_valid_git_exports_retain_both_byte_arms(tmp_path, length, paired):
+    exports = [tmp_path / "before", tmp_path / "after"]
+    for index, path in enumerate(exports):
+        path.write_text(f"historical bytes {index}")
+    sources = {str(path): preflight.file_hash(path) for path in exports}
+    node = {"commit": "a" * length, "path": "historical/repo/path"}
+    if paired:
+        node.update(parent="b" * length, before_sha256=sources[str(exports[0])],
+                    after_sha256=sources[str(exports[1])])
+    else:
+        node["sha256"] = sources[str(exports[0])]
+    assert preflight.source_evidence({"test": [{"source": node}]}, sources) == sources
+
+
+@pytest.mark.parametrize("key", ["sha256", "snapshot_sha256", "before_sha256", "after_sha256"])
+def test_missing_commit_retains_ordinary_path_binding(tmp_path, key):
+    export = tmp_path / "export"
+    export.write_text("bytes")
+    sha = preflight.file_hash(export)
+    path_key = "path" if key == "sha256" else key.removesuffix("_sha256")
+    with pytest.raises(Incomplete, match="source path"):
+        preflight.source_evidence({"test": [{"source": {path_key: "wrong", key: sha}}]},
+                                  {str(export): sha})
+
+
+@pytest.mark.parametrize("git_hashes", ["none", "single", "paired"])
+@pytest.mark.parametrize("other", ["snapshot", "transcript", "before_snapshot"])
+def test_git_exception_never_waives_other_source_paths(tmp_path, git_hashes, other):
+    export = tmp_path / "export"
+    export.write_text("historical bytes")
+    sha = preflight.file_hash(export)
+    node = {"commit": "a" * 40, "path": "historical/path",
+            other: "wrong", other + "_sha256": sha}
+    if git_hashes == "single":
+        node["sha256"] = sha
+    elif git_hashes == "paired":
+        node.update(parent="b" * 40, before_sha256=sha, after_sha256=sha)
+    with pytest.raises(Incomplete, match="source path"):
+        preflight.source_evidence({"test": [{"source": node}]}, {str(export): sha})
+
+
+@pytest.mark.parametrize("missing", ["before_sha256", "after_sha256", "parent"])
+def test_paired_git_export_requires_both_arms_and_parent(tmp_path, missing):
+    export = tmp_path / "export"
+    export.write_text("historical bytes")
+    sha = preflight.file_hash(export)
+    node = {"commit": "a" * 40, "path": "historical/path", "parent": "b" * 40,
+            "before_sha256": sha, "after_sha256": sha}
+    node.pop(missing)
+    with pytest.raises(Incomplete, match="historical"):
+        preflight.source_evidence({"test": [{"source": node}]}, {str(export): sha})
+
+
+@pytest.mark.parametrize("parent", [None, "", " ", False, {}, [], 42, "not-an-id", "a" * 39])
+def test_paired_git_export_requires_full_parent_identifier(tmp_path, parent):
+    export = tmp_path / "export"
+    export.write_text("historical bytes")
+    sha = preflight.file_hash(export)
+    node = {"commit": "a" * 40, "path": "historical/path", "parent": parent,
+            "before_sha256": sha, "after_sha256": sha}
+    with pytest.raises(Incomplete, match="historical"):
+        preflight.source_evidence({"test": [{"source": node}]}, {str(export): sha})
+
+
+@pytest.mark.parametrize("mode", [1, 2, 3, 4])
+@pytest.mark.parametrize("suppress", [False, True])
+async def test_uncommitted_store_effects_are_refused(tmp_path, monkeypatch, mode, suppress):
+    from genesis.learning.procedural import judge
+
+    calls = 0
+
+    def wrap(original):
+        async def store(db, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == mode:
+                monkeypatch.setattr(db, "commit", AsyncMock())
+            result = await original(db, *args, **kwargs)
+            if calls == mode and suppress:
+                await db.execute("UPDATE procedural_memory SET success_count=success_count")
+            return result
+        return store
+
+    monkeypatch.setattr(judge, "_store_judged_procedure", wrap(judge._store_judged_procedure))
+    monkeypatch.setattr(extractor, "extract_procedure", wrap(extractor.extract_procedure))
+    if suppress:
+        monkeypatch.setitem(extractor._NOVELTY_VALIDATED_MODELS, "synthetic", "model")
+    content = '{"redundant_with":1}' if suppress else '{"redundant_with":null}'
+    with pytest.raises(Incomplete):
+        await replay(tmp_path, content=content)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("field", ["tools_used", "context_tags"])
+@pytest.mark.parametrize("value", [None, {}, {"bad": "shape"}, 0, False, [None], [["Bash"]], ["Bash", 1]])
+async def test_invalid_metadata_refused_before_database(tmp_path, monkeypatch, field, value):
+    case = novelty_case("bad-metadata", None)
+    case["new"][field] = value
+
+    def never(*args, **kwargs):
+        raise AssertionError("invalid metadata reached database")
+
+    monkeypatch.setattr(contracts.Sandbox, "database", never)
+    with pytest.raises(Incomplete, match="metadata"):
+        await preflight.prepare({corpus.NOVELTY: [case]}, tmp_path)
+
+
+@pytest.mark.parametrize("value", ["", "Bash", [], ["Bash"], ["", "Bash"]])
+@pytest.mark.parametrize("field", ["tools_used", "context_tags"])
+async def test_supported_metadata_shapes_are_preserved(tmp_path, field, value):
+    case = novelty_case("metadata-shape", None)
+    case["new"][field] = value
+    assert all(row["stored"] for row in (await replay(tmp_path, case)).values())
+
+
+@pytest.mark.parametrize("module_name", ["_migrations", "_tables"])
+async def test_schema_sources_bound_and_rechecked(tmp_path, monkeypatch, module_name):
+    from genesis.db.schema import _migrations, _tables
+
+    module = {"_migrations": _migrations, "_tables": _tables}[module_name]
+    cases, options = admitted(tmp_path)
+    original = preflight.file_hash
+    changed = False
+
+    def file_hash(path):
+        return "0" * 64 if changed and str(path) == module.__file__ else original(path)
+
+    async def prepare(*args, **kwargs):
+        nonlocal changed
+        changed = True
+        return {}
+
+    monkeypatch.setattr(preflight, "file_hash", file_hash)
+    monkeypatch.setattr(preflight, "prepare", prepare)
+    with pytest.raises(Incomplete, match="source or contract changed"):
+        await preflight.check(cases, tmp_path, **options)
+
+
+async def test_complete_check_binds_actual_normalizer_registry_inputs(tmp_path, monkeypatch):
+    from genesis.cc import session_config, types
+    from genesis.learning.procedural import tool_names
+
+    attempted, read_text = set(), Path.read_text
+
+    def observe(path, *args, **kwargs):
+        attempted.add(path)
+        return read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as observer:
+        observer.setattr(Path, "read_text", observe)
+        tool_names._mcp_owners.__wrapped__()
+    attempted.update(Path(m.__file__) for m in (session_config, types))
+    cases, options = admitted(tmp_path)
+    monkeypatch.setattr(preflight, "prepare", AsyncMock(return_value={}))
+    result = await preflight.check(cases, tmp_path, **options)
+    root = Path(preflight.__file__).resolve().parents[4]
+    for path in attempted:
+        assert result["production_sources"][str(path.relative_to(root))] == preflight.file_hash(path)
+
+
+@pytest.fixture
+def registry_files(monkeypatch):
+    """Virtual registry additions exercise public admission without editing the checkout."""
+    from genesis.learning.procedural import tool_names
+
+    health = Path(tool_names.__file__).resolve().parents[2] / "mcp" / "health"
+    files = {"_qualification_registry_fixture.py": ""}
+    assert not (health / next(iter(files))).exists()
+    glob, iterdir, read_text, file_hash = Path.glob, Path.iterdir, Path.read_text, preflight.file_hash
+
+    def children():
+        return {health / name.split("/", 1)[0] for name in files}
+
+    def glob_sources(path, pattern, **kwargs):
+        yield from glob(path, pattern, **kwargs)
+        if path == health:
+            yield from (child for child in children() if child.match(pattern))
+
+    def iter_sources(path):
+        yield from iterdir(path)
+        if path == health:
+            yield from children()
+
+    def source_text(path, *args, **kwargs):
+        if path.parent == health and path.name in files:
+            return files[path.name]
+        return read_text(path, *args, **kwargs)
+
+    def source_hash(path):
+        path = Path(path)
+        if path.parent == health and path.name in files:
+            return hashlib.sha256(files[path.name].encode()).hexdigest()
+        return file_hash(path)
+
+    monkeypatch.setattr(Path, "glob", glob_sources)
+    monkeypatch.setattr(Path, "iterdir", iter_sources)
+    monkeypatch.setattr(Path, "read_text", source_text)
+    monkeypatch.setattr(preflight, "file_hash", source_hash)
+    # Isolate the test cache without clearing the production cache.
+    cache = functools.cache(tool_names._mcp_owners.__wrapped__)
+    monkeypatch.setattr(tool_names, "_mcp_owners", cache)
+    return files, cache
+
+
+@pytest.mark.parametrize("change", ["add", "remove", "modify", "literal", "hidden"])
+async def test_complete_check_rechecks_registry_population(tmp_path, monkeypatch, registry_files, change):
+    files, _cache = registry_files
+    cases, options = admitted(tmp_path)
+
+    async def prepare(*args, **kwargs):
+        if change == "remove":
+            files.clear()
+        elif change == "modify":
+            files[next(iter(files))] = '"changed supporting bytes"'
+        else:
+            files[{"add": "_new_registry_fixture.py", "literal": ".py", "hidden": ".hidden.py"}[change]] = ""
+        return {}
+
+    monkeypatch.setattr(preflight, "prepare", prepare)
+    with pytest.raises(Incomplete, match="source or contract changed"):
+        await preflight.check(cases, tmp_path, **options)
+
+
+@pytest.mark.parametrize("when", ["before", "during"])
+async def test_complete_check_refuses_stale_registry_cache(tmp_path, monkeypatch, registry_files, when):
+    files, cache = registry_files
+    name = next(iter(files))
+    files[name] = "@mcp.tool()\ndef qualification_registry_probe(): pass\n"
+    cache()
+    cases, options = admitted(tmp_path)
+
+    def change():
+        files[name] = "@mcp.tool()\ndef changed_registry_probe(): pass\n"
+
+    async def prepare(*args, **kwargs):
+        assert when == "during", "stale initial registry reached rendering"
+        change()
+        return {}
+
+    if when == "before":
+        change()
+    monkeypatch.setattr(preflight, "prepare", prepare)
+    with pytest.raises(Incomplete, match="registry"):
+        await preflight.check(cases, tmp_path, **options)
+
+
+@pytest.mark.parametrize("ignored", ["user_job_tools.py", "nested/fixture.py"])
+async def test_complete_check_retains_registry_exclusions_and_matching_cache(
+    tmp_path, monkeypatch, registry_files, ignored,
+):
+    files, cache = registry_files
+    cached = cache()
+    cases, options = admitted(tmp_path)
+
+    async def prepare(*args, **kwargs):
+        files[ignored] = "@mcp.tool()\ndef excluded_registry_probe(): pass\n"
+        return {}
+
+    monkeypatch.setattr(preflight, "prepare", prepare)
+    for _ in range(2):
+        assert (await preflight.check(cases, tmp_path, **options))["complete"]
+        assert cache() is cached
+
+
+@pytest.mark.parametrize("module_name", ["session_config", "types"])
+async def test_complete_check_rechecks_builtin_registry_sources(tmp_path, monkeypatch, module_name):
+    from genesis.cc import session_config, types
+
+    module = {"session_config": session_config, "types": types}[module_name]
+    cases, options = admitted(tmp_path)
+    original, changed = preflight.file_hash, False
+
+    def file_hash(path):
+        return "0" * 64 if changed and str(path) == module.__file__ else original(path)
+
+    async def prepare(*args, **kwargs):
+        nonlocal changed
+        changed = True
+        return {}
+
+    monkeypatch.setattr(preflight, "file_hash", file_hash)
+    monkeypatch.setattr(preflight, "prepare", prepare)
+    with pytest.raises(Incomplete, match="source or contract changed"):
+        await preflight.check(cases, tmp_path, **options)
+
+
+@pytest.mark.parametrize("unreadable", ["directory", "file"])
+async def test_complete_check_requires_readable_registry_inputs(
+    tmp_path, monkeypatch, registry_files, unreadable,
+):
+    from genesis.learning.procedural import tool_names
+
+    health = Path(tool_names.__file__).resolve().parents[2] / "mcp" / "health"
+    iterate, hash_source = Path.iterdir, preflight.file_hash
+
+    def iterdir(path):
+        if path == health:
+            raise PermissionError("synthetic unreadable registry directory")
+        return iterate(path)
+
+    def file_hash(path):
+        if Path(path) == health / "_qualification_registry_fixture.py":
+            raise PermissionError("synthetic unreadable registry source")
+        return hash_source(path)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir if unreadable == "directory" else iterate)
+    monkeypatch.setattr(preflight, "file_hash", file_hash if unreadable == "file" else hash_source)
+    cases, options = admitted(tmp_path)
+    monkeypatch.setattr(preflight, "prepare", AsyncMock(return_value={}))
+    with pytest.raises(PermissionError):
+        await preflight.check(cases, tmp_path, **options)

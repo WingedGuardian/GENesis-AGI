@@ -1,5 +1,6 @@
 """Subset runner instruments; no complete, historical or financial admission claim."""
 
+import asyncio
 import hashlib
 import json
 import socket
@@ -45,7 +46,8 @@ async def instrument(tmp_path, cases, *, policy=None, alias="openrouter-mimo"):
     checked = {
         "corpus_hash": digest(cases), "policy_hash": "a" * 64, "approval_hash": "b" * 64,
         "versions": corpus.versions(), "rubrics": [], "reference_sources": sources,
-        "production_sources": {}, "plan": plan,
+        "production_sources": preflight.production_source_inventory(preflight.production_modules()),
+        "plan": plan,
         "models": {alias: pinned.resolve(alias).model_id}, "parameters": {alias: configured},
     }
     identity = {
@@ -84,6 +86,15 @@ def make_router(data, campaign, dispatch):
                                dispatch=dispatch, transport=data.gateway.transport)
 
 
+async def finish_acquisition_logging():
+    """Drain setup's actual SDK work before running CLI on a different loop."""
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    with pinned.private_logs():
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=10)
+        await GLOBAL_LOGGING_WORKER.stop()
+
+
 class LabelGateway(Gateway):
     """Actual wire transport with deterministic reference answers; no quality claim."""
 
@@ -119,6 +130,9 @@ def report_cli(data, monkeypatch, *extra):
         return {**data.checked, "corpus_hash": digest(cases), "plan": plan,
                 "models": {a: pinned.resolve(a).model_id for a in candidates}, "parameters": candidates}
 
+    # This declared subset shim replaces admission, not the production module
+    # population. Keep the real inventory/cache checks and their module input.
+    current.__module__ = preflight.__name__
     monkeypatch.setattr(preflight, "check", current)
     # This subset fixture measures CLI plumbing, never complete admission.
     monkeypatch.setattr(corpus, "coverage", lambda *_args, **_kwargs: [])

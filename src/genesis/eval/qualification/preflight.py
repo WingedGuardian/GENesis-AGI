@@ -3,15 +3,18 @@
 Run in a dedicated serial qualification process: disposable replay temporarily
 patches production globals. The runner must recompute ``check`` from current
 files before credentials; a saved or caller-supplied plan is not authority.
+Start a fresh interpreter after checkout changes; unchanged checkouts support
+repeated checks without invalidating the normalizer's cache.
 """
 
 import hashlib
 import inspect
+import re
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
-from genesis.eval.qualification import contracts, corpus, references
+from genesis.eval.qualification import contracts, corpus, references, storage
 from genesis.eval.qualification.evidence import Incomplete, canonical, digest, load_json
 from genesis.eval.qualification.pinned import ROUTE_KEYS, resolve, routing, validate_params
 from genesis.eval.rubrics import list_rubrics
@@ -44,7 +47,7 @@ async def prepare(cases, temp_root, *, reference_policy=None):
             for case in rows:
                 capture = Capture()
                 if name == corpus.NOVELTY:
-                    await contracts.novelty(case, capture, sandbox)
+                    rendered = await contracts.novelty(case, capture, sandbox)
                 elif name == corpus.RELEVANCE:
                     await contracts.relevance(case, capture)
                 else:
@@ -64,7 +67,7 @@ async def prepare(cases, temp_root, *, reference_policy=None):
                     "call_parameters": capture.parameters[0],
                 }
                 if name == corpus.NOVELTY:
-                    mapping = contracts.candidate_mapping(case, messages, capture.candidate_ids)
+                    mapping = contracts.candidate_mapping(case, messages, rendered["candidate_ids"])
                     target = case["expected_target"]
                     content = canonical({
                         "redundant_with": mapping.index(target) + 1 if target else None
@@ -101,6 +104,18 @@ def file_hash(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def production_source_inventory(modules):
+    """Bind explicit modules and actual registry inputs, refusing stale MCP data."""
+    paths = {Path(module.__file__) for module in modules}
+    paths.update(path for _, path in storage.tool_names._mcp_source_files(strict=True))
+    root = Path(__file__).resolve().parents[4]
+    sources = {str(path.relative_to(root)): file_hash(path) for path in sorted(paths)}
+    owners = storage.tool_names._mcp_owners
+    if owners() != owners.__wrapped__():
+        raise Incomplete("tool registry cache differs from current source declarations")
+    return sources
+
+
 def source_nodes(value):
     """Composite references retain both arms and historical baseline evidence."""
     if isinstance(value, dict):
@@ -110,6 +125,23 @@ def source_nodes(value):
     elif isinstance(value, list):
         for child in value:
             yield from source_nodes(child)
+
+
+def historical_source(node):
+    """Validate exported Git identity syntax; this does not prove ancestry."""
+    identities, path = [node["commit"]], node.get("path")
+    if "before_sha256" in node or "after_sha256" in node:
+        if not {"before_sha256", "after_sha256", "parent"} <= node.keys():
+            raise Incomplete("incomplete historical reference source pair")
+        identities.append(node["parent"])
+    for identity in identities:
+        if (not isinstance(identity, str)
+            or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", identity) is None):
+            raise Incomplete("invalid historical reference source identifier")
+    if (not isinstance(path, str) or not path or "\x00" in path
+        or not references.scalar_text(path) or not Path(path).parts
+        or Path(path).is_absolute() or ".." in Path(path).parts):
+        raise Incomplete("invalid historical reference source identity")
 
 
 def source_evidence(cases, source_files):
@@ -136,22 +168,38 @@ def source_evidence(cases, source_files):
                 if any(v not in verified.values() for v in hashes.values()):
                     raise Incomplete("reference source hash is not in the frozen source files")
                 for key, value in hashes.items():
+                    if "commit" in node and key in ("sha256", "before_sha256", "after_sha256"):
+                        historical_source(node)
+                        continue
                     path = node.get("path" if key == "sha256" else key.removesuffix("_sha256"))
                     # Git baselines name a historical repository-relative path;
                     # their exported immutable bytes are identified by SHA-256.
-                    if path is not None and "commit" not in node and verified.get(path) != value:
+                    if path is not None and verified.get(path) != value:
                         raise Incomplete("reference source path differs from its frozen identity")
             if not count:
                 raise Incomplete("reference source evidence has no frozen byte identity")
     return verified
 
 
+def production_modules():
+    """The direct production population shared by admission and final scoring."""
+    from genesis.cc import session_config
+    from genesis.cc import types as cc_types
+    from genesis.db.schema import _tables, create_all_tables
+    from genesis.learning.procedural import extractor, judge, operations, scoping, validation_gate
+
+    return [contracts, corpus, references, storage, extractor, judge, operations, scoping,
+            validation_gate, inspect.getmodule(LLMJudgeScorer),
+            inspect.getmodule(contracts.J9EvalBatchExecutor), inspect.getmodule(check),
+            inspect.getmodule(resolve), inspect.getmodule(contracts.pack_embedding),
+            inspect.getmodule(contracts.connect_aiosqlite_rw), contracts.procedural, storage.tool_names,
+            inspect.getmodule(operations.validate_trigger_spec), inspect.getmodule(create_all_tables), _tables,
+            session_config, cc_types]
+
+
 async def check(cases, temp_root, *, reference_policy, current_policy,
                 reference_approval, candidates, source_files, config=None):
     """Complete CURRENT offline evidence; conveys no consent, budget or quality."""
-    from genesis.eval.qualification import storage
-    from genesis.learning.procedural import extractor, judge, operations, scoping, validation_gate
-
     cases, policy, current, approval, candidates, sources = load_json(canonical([
         cases, reference_policy, current_policy, reference_approval, candidates, source_files
     ]))
@@ -179,16 +227,8 @@ async def check(cases, temp_root, *, reference_policy, current_policy,
         # Reject malformed/implicit routing settings before expensive rendering.
         parameters(alias, configured, {}, config=config)
     verified_sources = source_evidence(cases, sources)
-    modules = [contracts, corpus, references, storage, extractor, judge, operations, scoping,
-               validation_gate, inspect.getmodule(LLMJudgeScorer),
-               inspect.getmodule(contracts.J9EvalBatchExecutor), inspect.getmodule(check),
-               inspect.getmodule(resolve), inspect.getmodule(contracts.pack_embedding),
-               inspect.getmodule(contracts.connect_aiosqlite_rw), contracts.procedural]
-    production_sources = {
-        str(Path(module.__file__).relative_to(Path(__file__).resolve().parents[4])):
-            file_hash(module.__file__)
-        for module in modules
-    }
+    modules = production_modules()
+    production_sources = production_source_inventory(modules)
     plan = await prepare(cases, temp_root, reference_policy=policy)
     frozen_params = {
         alias: parameters(alias, params, plan, config=config)
@@ -196,9 +236,7 @@ async def check(cases, temp_root, *, reference_policy, current_policy,
     }
     if (source_evidence(cases, sources) != verified_sources or corpus.versions() != versions
         or [asdict(r) for r in list_rubrics()] != rubric_definitions
-        or any(file_hash(module.__file__) !=
-               production_sources[str(Path(module.__file__).relative_to(Path(__file__).resolve().parents[4]))]
-               for module in modules)):
+        or production_source_inventory(modules) != production_sources):
         raise Incomplete("source or contract changed during offline preflight")
     return {
         "complete": True, "corpus_hash": digest(cases), "policy_hash": digest(policy),

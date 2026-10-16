@@ -113,9 +113,11 @@ _genesis_hidden_dirty_lines() {
     listing="$(git -C "$root" ls-files -v)" || return 2
     grep -E '^([a-z]|S) ' <<<"$listing" >/dev/null || return 0
     # The scratch index sits beside the real one: same filesystem, and no
-    # dependence on a writable TMPDIR.
+    # dependence on a writable TMPDIR. Its name carries this shell's pid, so a
+    # caller that kills the shell before the rm below can remove exactly this
+    # shell's copy (deploy_health.py's probe does, on a timeout).
     idx="$(git -C "$root" rev-parse --path-format=absolute --git-path index)" || return 2
-    tmp="$(mktemp "${idx%/*}/genesis-hidden-index.XXXXXX")" || return 2
+    tmp="$(mktemp "${idx%/*}/genesis-hidden-index.$$.XXXXXX")" || return 2
     if cp "$idx" "$tmp" \
         && _genesis_flagged_paths "$root" '[a-z]' \
             | GIT_INDEX_FILE="$tmp" xargs -0 -r git -C "$root" update-index --no-assume-unchanged -- \
@@ -221,6 +223,31 @@ genesis_range_collisions() {
     done < <(git -C "$root" diff -z --no-renames --name-only --diff-filter=d "$from...$to" 2>/dev/null)
     printf '%s' "$collisions"
     [ -z "$collisions" ]
+}
+
+# What an update killed in its "merging" phase may have left in <root> while HEAD
+# still sits at its rollback commit <rb_commit>: a fast-forward killed mid-write
+# leaves HEAD unmoved and the files half new. Prints one line per sign of that, and
+# nothing when there is none; never fails (a step it cannot read prints a line
+# saying so). Every tracked path counts, the ephemeral allowlist included: the
+# merge writes those too. git status cannot see a file whose index entry is
+# flagged skip-worktree or assume-unchanged, so the hidden-edit scan runs as
+# well. A fast-forward killed after writing only the files the range ADDS leaves
+# them untracked, which status cannot show; update.sh's pre-stop scan refuses a
+# range that lands on an existing untracked path, so one present now appeared
+# during the run (<deploy_head> empty: not checked). Shared by bootstrap.sh's
+# crash recovery and scripts/lib/update_state_guard.py, so the two agree.
+genesis_merge_residue() {
+    local root="$1" rb_commit="$2" deploy_head="$3" dirty="" hidden="" new="" rc=0
+    dirty="$(git -C "$root" status --porcelain --untracked-files=no --no-renames 2>/dev/null)" \
+        || dirty="(status unreadable)"
+    hidden="$(_genesis_hidden_dirty_lines "$root" 2>/dev/null)" \
+        || hidden="(flagged-entry status unreadable)"
+    if [ -n "$deploy_head" ]; then
+        new="$(genesis_range_collisions "$root" "$rb_commit" "$deploy_head" 2>/dev/null)" || rc=$?
+        [ "$rc" -ne 2 ] || new="(the update's incoming range cannot be listed)"
+    fi
+    printf '%s\n%s\n%s\n' "$dirty" "$hidden" "$new" | grep -v '^$' || true
 }
 
 # Is <root> still on <branch> at exactly <head> (a full commit id)? Another

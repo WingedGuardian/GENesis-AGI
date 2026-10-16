@@ -58,6 +58,7 @@ if [ -f "$_SCRIPT_DIR/lib/alert_queue.sh" ]; then
     source "$_SCRIPT_DIR/lib/alert_queue.sh"
 else
     queue_alert() { :; }
+    alert_stable_key() { printf '%s:\n' "${1:-alert}"; }
 fi
 
 # ── Mutual exclusion (SF5): backup↔restore share one whole-run lock ──
@@ -256,10 +257,11 @@ _send_telegram() {
         -d "{\"chat_id\":\"${TELEGRAM_FORUM_CHAT_ID}\",\"text\":$(printf '%s' "$1" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"parse_mode\":\"Markdown\"}" \
         > /dev/null 2>&1 || {
         # Send failed (network/token) — don't lose the alert. Content-derived
-        # dedupe key so distinct backup alerts stay separate but identical
-        # repeats collapse to one queued entry.
+        # dedupe key, minus the per-run Time/Duration/SQLite lines, so distinct
+        # backup alerts stay separate while a repeated identical failure keeps
+        # one key and is delivered once per outreach dedup window.
         local _dkey
-        _dkey="backup:$(printf '%s' "$1" | md5sum 2>/dev/null | cut -c1-12)"
+        _dkey="$(alert_stable_key backup "$1")"
         log "WARNING: Telegram alert failed to send — queued for retry"
         queue_alert emergency "backup" "Backup alert (Telegram send failed)" "$1" "$_dkey"
     }
@@ -284,22 +286,20 @@ log "big-temp dir: $GENESIS_BIG_TMP"
 # to a private repo is not acceptable).
 _BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
 _ENCRYPT_READY=false
+if [ -f "$SECRETS_FILE" ] && ! backup_passphrase_file_valid "$SECRETS_FILE"; then
+    die "Backup secrets file is unreadable or contains NUL"
+fi
 if [ -n "$_BACKUP_PASSPHRASE" ]; then
+    backup_passphrase_valid "$_BACKUP_PASSPHRASE" || die "Backup passphrase must be a single line without a terminator"
     _ENCRYPT_READY=true
 fi
-
-# encrypt_stdin <output_path> — read plaintext from stdin, write <output_path>.
-encrypt_stdin() {
-    local out="$1"
-    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
-        --symmetric --cipher-algo AES256 -o "$out" 2>/dev/null
-}
 
 # encrypt_file <src> <dst> — encrypt file contents to <dst> (e.g. *.gpg).
 encrypt_file() {
     local src="$1"
     local dst="$2"
-    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
+    backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
+    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --no-symkey-cache --passphrase-fd 0 \
         --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
 }
 
@@ -318,11 +318,12 @@ _git_net() { timeout -k 10 "$_GIT_NET_TIMEOUT" git "$@"; }
 # misses broken UNIQUE indexes and other logical inconsistencies.
 _roundtrip_ok() {
     local _pass="$1" _art="$2" _errf="${3:-/dev/null}" _gpg_rc _sqlite_rc _ic _fk _schema
+    backup_passphrase_valid "$_pass" || return 1
     _VERIFY_DB=$(mktemp -p "$GENESIS_BIG_TMP")
     rm -f "$_VERIFY_DB"
     _SQL_VERIFY_TMP=$(mktemp -p "$GENESIS_BIG_TMP")
-    printf '%s' "$_pass" | gpg --batch --passphrase-fd 0 -d "$_art" \
-        >"$_SQL_VERIFY_TMP" 2>"$_errf"
+    printf '%s' "$_pass" | python3 \
+        "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup "$_art" "$_SQL_VERIFY_TMP" 2>"$_errf"
     _gpg_rc=${PIPESTATUS[1]}
     if [ "$_gpg_rc" -eq 0 ]; then
         sqlite3 "$_VERIFY_DB" ".bail on" ".read $_SQL_VERIFY_TMP" 2>>"$_errf"

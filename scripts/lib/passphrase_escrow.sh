@@ -32,6 +32,7 @@ passphrase_escrow_lookup() {
         "$HOME/.local/state/genesis-guardian/shared/guardian/backup_passphrase.env" \
         "$HOME/.local/state/genesis-guardian/creds-archive/backup_passphrase.env"; do
         [ -n "$_escrow" ] && [ -f "$_escrow" ] || continue
+        backup_passphrase_file_valid "$_escrow" || continue
         _val="$(sed -n 's/^\(export \)\{0,1\}GENESIS_BACKUP_PASSPHRASE=//p' "$_escrow" | head -n1)"
         if [ -n "$_val" ]; then
             ESCROW_PASSPHRASE="$_val"
@@ -40,4 +41,18 @@ passphrase_escrow_lookup() {
         fi
     done
     return 0
+}
+
+# GPG --passphrase-fd consumes only the first line. Bash/env strings cannot
+# represent NUL; byte-oriented callers separately reject NUL. Empty means
+# absent and remains each caller's existing policy; never trim other bytes.
+backup_passphrase_valid() {
+    [[ "$1" != *$'\n'* ]]
+}
+
+# Read the raw file before Bash or command substitution can discard NUL bytes.
+backup_passphrase_file_valid() {
+    local discarded
+    [[ -f "$1" && -r "$1" ]] || return 1
+    ! IFS= read -r -d '' discarded < "$1"
 }

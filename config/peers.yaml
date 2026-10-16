@@ -1,0 +1,21 @@
+# Peer installs — read by `python -m genesis handoffs peers|sessions|send`
+# (this file + ~/.genesis/config/peers.local.yaml, deep-merged).
+#
+# A peer is another Genesis install this one can deliver a handoff to. A
+# delivery is session-to-session CONTEXT, untrusted on arrival; it is not the
+# pipeline for findings (issues and follow-ups remain that). See
+# docs/reference/peer-handoff.md.
+#
+# Ships EMPTY. Name real peers only in your local overlay, keyed by name:
+#
+#   peers:
+#     other-install:
+#       ssh_host: user@host        # anything `ssh` accepts (an ssh_config alias works)
+#       ssh_key: ~/.ssh/id_peer    # optional; ssh's own defaults otherwise
+#       container: genesis         # optional: run inside this incus container...
+#       remote_user: someone       # ...as this user (required with container)
+#       root: /path/to/genesis     # ABSOLUTE path of the peer's checkout (holds .venv/)
+#
+# A mapping, not a list: the overlay merge replaces lists wholesale but merges
+# mappings key by key.
+peers: {}

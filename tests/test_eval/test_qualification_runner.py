@@ -1,16 +1,25 @@
 """Runner binding, retained-answer scoring, privacy and read-only failure boundaries."""
 
+import asyncio
 import copy
+import json
 import os
 
 import pytest
 
 from genesis.eval.qualification import __main__ as cli
-from genesis.eval.qualification import pinned, run
+from genesis.eval.qualification import pinned, preflight, run
 from genesis.eval.qualification.accounting import Journal
 from genesis.eval.qualification.evidence import Incomplete
-from tests.test_eval.qualification_runner_fixtures import make_router, runner_data  # noqa: F401
+from tests.test_eval.qualification_runner_fixtures import (
+    LabelGateway,
+    finish_acquisition_logging,
+    make_router,
+    report_cli,
+    runner_data,  # noqa: F401
+)
 from tests.test_eval.qualification_transport_fixtures import Gateway
+from tests.test_eval.test_qualification_preflight import registry_files  # noqa: F401
 
 
 async def test_current_full_coordinate_population_matches_wire_constructor(data):
@@ -116,6 +125,103 @@ async def test_report_ephemeral_failure_changes_no_history(data):
     with pytest.raises(Incomplete, match="campaign_incomplete"):
         view.ready()
     assert before == {p.name: p.read_bytes() for p in data.path.iterdir()}
+
+
+@pytest.mark.parametrize("module", ["run.py", "__main__.py", "execution.py", "accounting.py", "evidence.py"])
+@pytest.mark.parametrize("when", ["before", "after"])
+async def test_report_binds_every_direct_runner_source(data, monkeypatch, capsys, module, when):
+    # Actual identity and report boundaries; subset admission is explicit here.
+    data.gateway = LabelGateway(data)
+    with Journal(data.path, data.manifest) as campaign:
+        await run.score(data.cases, make_router(data, campaign, True), data.temp)
+    before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_mode)
+              for p in data.path.iterdir()}
+    original_hash, original_score = preflight.file_hash, run.score
+    changed = when == "before"
+
+    def file_hash(path):
+        if changed and path == run.Path(run.__file__).with_name(module):
+            return "0" * 64
+        return original_hash(path)
+
+    async def score_then_change(*args, **kwargs):
+        nonlocal changed
+        assert when == "after", "changed source reached scoring"
+        result = await original_score(*args, **kwargs)
+        assert all(row["agreed"] for reps in result[0].values()
+                   for rows in reps.values() for row in rows.values())
+        changed = True
+        return result
+
+    monkeypatch.setattr(preflight, "file_hash", file_hash)
+    monkeypatch.setattr(run, "score", score_then_change)
+    monkeypatch.delenv(pinned.KEY_ENV)
+    reads = data.gateway.key_reads, data.gateway.receipt_reads
+    await finish_acquisition_logging()
+    capsys.readouterr()  # Separate acquisition setup output from the actual CLI.
+    assert await asyncio.to_thread(report_cli, data, monkeypatch) == 2
+    report = json.loads(capsys.readouterr().out)
+    reason = "campaign_incompatible" if when == "before" else "admission_changed"
+    assert all(rep["unscored"] == 2 and rep["unscored_reasons"] == [reason]
+               for value in report["contracts"].values() for rep in value["repetitions"])
+    assert len(data.gateway.requests) == 6
+    assert reads == (data.gateway.key_reads, data.gateway.receipt_reads)
+    assert before == {p.name: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_mode)
+                      for p in data.path.iterdir()}
+
+
+@pytest.mark.parametrize("change", ["add", "remove", "modify", "literal", "hidden",
+                                 "stale_cache", "unchanged", "excluded", "nested"])
+@pytest.mark.usefixtures("registry_files")
+async def test_report_final_boundary_rebuilds_registry_inventory(
+    request, data, monkeypatch, capsys, change,
+):
+    # Subset CLI plumbing; actual retained-answer scoring and inventory run.
+    # Complete corpus admission is covered separately, not asserted here.
+    files, cache = request.getfixturevalue("registry_files")
+    cached = cache()
+    data.gateway = LabelGateway(data)
+    with Journal(data.path, data.manifest) as campaign:
+        await run.score(data.cases, make_router(data, campaign, True), data.temp)
+    assert len(data.gateway.requests) == 6
+    requests, key_reads = len(data.gateway.requests), data.gateway.key_reads
+    before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_mode)
+              for p in data.path.iterdir()}
+    actual_score = run.score
+
+    async def score_then_change(*args, **kwargs):
+        scored = await actual_score(*args, **kwargs)
+        assert all(row["agreed"] for reps in scored[0].values()
+                   for rows in reps.values() for row in rows.values())
+        if change == "remove":
+            files.clear()
+        elif change == "modify":
+            files[next(iter(files))] = '"changed supporting bytes"'
+        elif change == "stale_cache":
+            files[next(iter(files))] = "@mcp.tool()\ndef changed_runner_probe(): pass\n"
+        elif change != "unchanged":
+            files[{
+                "add": "_runner_registry_fixture.py", "literal": ".py", "hidden": ".hidden.py",
+                "excluded": "user_job_tools.py", "nested": "nested/fixture.py",
+            }[change]] = ""
+        return scored
+
+    monkeypatch.setattr(run, "score", score_then_change)
+    monkeypatch.delenv(pinned.KEY_ENV)
+    await finish_acquisition_logging()
+    capsys.readouterr()  # Only the following CLI invocation must be one JSON result.
+    assert await asyncio.to_thread(report_cli, data, monkeypatch) == 2
+    report = json.loads(capsys.readouterr().out)
+    repetitions = [rep for value in report["contracts"].values() for rep in value["repetitions"]]
+    if change in {"unchanged", "excluded", "nested"}:
+        assert all(rep["correct"] == 2 and rep["unscored"] == 0 for rep in repetitions)
+    else:
+        assert all(rep["unscored"] == 2 and rep["unscored_reasons"] == ["admission_changed"]
+                   for rep in repetitions)
+    assert cache() is cached  # Refusal must never repair the stale cache.
+    assert len(data.gateway.requests) == requests and data.gateway.key_reads == key_reads
+    assert before == {p.name: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_mode)
+                      for p in data.path.iterdir()}
 
 
 def test_public_financial_boundary_has_no_declared_proof_bypass():

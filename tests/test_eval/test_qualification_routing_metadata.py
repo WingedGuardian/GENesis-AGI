@@ -84,7 +84,7 @@ SPEC = {
         "derived_provider",
     ],
 )
-def test_metadata_ineligibility_cannot_be_credited(change):
+def test_metadata_ineligibility_cannot_be_credited(change, monkeypatch):
     obs = observation()
     raw = json.loads(obs["raw_body"])
     meta = raw["openrouter_metadata"]
@@ -174,6 +174,23 @@ def test_metadata_ineligibility_cannot_be_credited(change):
     obs["raw_body"] = json.dumps(raw)
     with pytest.raises(pinned.LocalFailure):
         pinned.verify_routing(obs, SPEC)
+    # Redaction must never erase the evidence that made this response ineligible.
+    fields = pinned._WIRE_FIELDS | {
+        "raw_body", "response_provider", "generation_id", "response_headers",
+        "x-generation-id", "x-openrouter-cache-status",
+        # Independent verifier contract: deleting a production schema entry
+        # cannot delete its negative collision test.
+        "id", "model", "openrouter_metadata", "requested", "strategy", "attempt",
+        "is_byok", "endpoints", "available", "selected", "provider",
+        "pipeline", "attempts", "status",
+    }
+    for field in sorted(fields):
+        monkeypatch.setenv(pinned.KEY_ENV, field)
+        retained = pinned.safe_evidence({
+            **obs, "raw_body": pinned.safe_body(obs["raw_body"].encode()),
+        })
+        with pytest.raises(pinned.LocalFailure):
+            pinned.verify_routing(retained, SPEC)
 
 
 def test_unselected_candidates_and_additive_fields_do_not_invent_retries():

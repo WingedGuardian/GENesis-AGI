@@ -21,6 +21,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from genesis.cc import roster
+from genesis.cc.checkout_lock import CheckoutAdmission, admit_launch
 from genesis.cc.child_env import pin_dispatched_env
 from genesis.cc.exceptions import (
     CCError,
@@ -48,9 +49,11 @@ from genesis.cc.types import (
 from genesis.observability.spans import SpanKind, start_span
 from genesis.util.inflight import inflight
 from genesis.util.proc_kill import (
+    confirm_process_exit,
     kill_process_group,
     process_group_alive,
     reap_bounded,
+    spawn_owned,
 )
 
 logger = logging.getLogger(__name__)
@@ -1600,6 +1603,10 @@ async def _emit_invocation_failed_event(
     runtime/bus is absent and never raises — observability must not mask the
     real error the caller is about to receive.
     """
+    from genesis.util.execution_privacy import private_execution_active
+
+    if private_execution_active():
+        return  # Managed receipts expose classified failures, not raw provider data.
     is_limit = isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
     key: tuple[str, str | None, str] | None = None
     prev_state: list[float] | None = None
@@ -2488,8 +2495,9 @@ class CCInvoker:
         # stitch this session's tool spans under the dispatching operation's
         # trace (cross-process). Absent when no span is active → hook no-ops.
         from genesis.observability.spans import current_trace_context
+        from genesis.util.execution_privacy import private_execution_active
 
-        _tc = current_trace_context()
+        _tc = None if private_execution_active() else current_trace_context()
         if _tc:
             env["GENESIS_TRACE_ID"], env["GENESIS_PARENT_SPAN_ID"] = _tc
         else:
@@ -2886,23 +2894,40 @@ class CCInvoker:
         untouched and emits nothing. Roster routing is resolved HERE (it never
         raises) so the failure event names the routed model, not only the
         requested tier.
-        """
-        invocation, roster_model = roster.apply_active(invocation)
-        try:
-            # Registered for the whole call: a restart now would cancel it
-            # (genesis.util.inflight; a no-op inside a caller's open unit).
-            with inflight("claude", _inflight_label(invocation)):
-                return await self._run_traced(invocation, roster_model)
-        except CCError as exc:
-            await _emit_invocation_failed_event(
-                exc,
-                invocation,
-                streaming=False,
-                roster_model=roster_model,
-            )
-            raise
 
-    async def _run_traced(self, invocation: CCInvocation, roster_model: str) -> CCOutput:
+        Checkout admission is taken before the roster read: that read and the
+        network preflight read checkout files too, so a checkout mutation must
+        not start between them and the spawn. The launch is registered in flight
+        before it waits, so a deploy's session scan sees it (the label does not
+        depend on roster routing, which never changes ``model``). The spawn path
+        releases admission once the subprocess exists; the ``finally`` covers
+        every path that never spawns.
+        """
+        # Registered for the whole call: a restart now would cancel it
+        # (genesis.util.inflight; a no-op inside a caller's open unit).
+        with inflight("claude", _inflight_label(invocation)):
+            admission = await admit_launch()
+            try:
+                invocation, roster_model = roster.apply_active(invocation)
+                try:
+                    return await self._run_traced(invocation, roster_model, admission)
+                except CCError as exc:
+                    await _emit_invocation_failed_event(
+                        exc,
+                        invocation,
+                        streaming=False,
+                        roster_model=roster_model,
+                    )
+                    raise
+            finally:
+                admission.release()
+
+    async def _run_traced(
+        self,
+        invocation: CCInvocation,
+        roster_model: str,
+        admission: CheckoutAdmission | None = None,
+    ) -> CCOutput:
         """Run an already-roster-routed CC session (traced).
 
         Opens a ``cc.session`` span spanning the whole subprocess lifetime so
@@ -2923,7 +2948,7 @@ class CCInvoker:
             },
         ) as span:
             output = replace(
-                await self._run_inner(invocation),
+                await self._run_inner(invocation, admission),
                 roster_model=roster_model,
             )
             with contextlib.suppress(Exception):
@@ -2977,7 +3002,19 @@ class CCInvoker:
             logger.debug("login fallback check failed", exc_info=True)
         return env
 
-    async def _run_inner(self, invocation: CCInvocation) -> CCOutput:
+    async def _run_inner(
+        self, invocation: CCInvocation, admission: CheckoutAdmission | None = None
+    ) -> CCOutput:
+        if admission is None:
+            admission = await admit_launch()
+        try:
+            return await self._run_inner_with_admission(invocation, admission)
+        finally:
+            admission.release()
+
+    async def _run_inner_with_admission(
+        self, invocation: CCInvocation, admission: CheckoutAdmission
+    ) -> CCOutput:
         # Off the event loop: the pins may prepare the gh seal (filesystem
         # work behind a blocking lock) for a Bash-restricted profile.
         pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
@@ -3020,6 +3057,7 @@ class CCInvoker:
                 # kill paths can killpg the whole claude tree.
                 start_new_session=True,
             )
+            admission.release()
             reg_key = invocation.session_key or f"pid:{proc.pid}"
             self._register_proc(reg_key, proc)
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
@@ -3148,25 +3186,35 @@ class CCInvoker:
         invocation: CCInvocation,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
     ) -> CCOutput:
-        """Run CC with stream-json output; emit-then-reraise on CCError (see run())."""
-        invocation, roster_model = roster.apply_active(invocation)
-        try:
-            with inflight("claude", _inflight_label(invocation)):
-                return await self._run_streaming_traced(invocation, roster_model, on_event)
-        except CCError as exc:
-            await _emit_invocation_failed_event(
-                exc,
-                invocation,
-                streaming=True,
-                roster_model=roster_model,
-            )
-            raise
+        """Run CC with stream-json output; emit-then-reraise on CCError (see run()).
+
+        In flight first, then checkout admission, then the roster read, as in run().
+        """
+        with inflight("claude", _inflight_label(invocation)):
+            admission = await admit_launch()
+            try:
+                invocation, roster_model = roster.apply_active(invocation)
+                try:
+                    return await self._run_streaming_traced(
+                        invocation, roster_model, on_event, admission
+                    )
+                except CCError as exc:
+                    await _emit_invocation_failed_event(
+                        exc,
+                        invocation,
+                        streaming=True,
+                        roster_model=roster_model,
+                    )
+                    raise
+            finally:
+                admission.release()
 
     async def _run_streaming_traced(
         self,
         invocation: CCInvocation,
         roster_model: str,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+        admission: CheckoutAdmission | None = None,
     ) -> CCOutput:
         """Run an already-roster-routed stream-json session (traced — see _run_traced)."""
         await self._network_preflight(invocation)
@@ -3181,7 +3229,7 @@ class CCInvoker:
             },
         ) as span:
             output = replace(
-                await self._run_streaming_inner(invocation, on_event),
+                await self._run_streaming_inner(invocation, on_event, admission),
                 roster_model=roster_model,
             )
             with contextlib.suppress(Exception):
@@ -3197,8 +3245,22 @@ class CCInvoker:
         self,
         invocation: CCInvocation,
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
+        admission: CheckoutAdmission | None = None,
     ) -> CCOutput:
         """Run CC with stream-json output, calling on_event for each line."""
+        if admission is None:
+            admission = await admit_launch()
+        try:
+            return await self._run_streaming_inner_with_admission(invocation, on_event, admission)
+        finally:
+            admission.release()
+
+    async def _run_streaming_inner_with_admission(
+        self,
+        invocation: CCInvocation,
+        on_event: Callable[[StreamEvent], Awaitable[None]] | None,
+        admission: CheckoutAdmission,
+    ) -> CCOutput:
         # Off the event loop: the pins may prepare the gh seal (filesystem
         # work behind a blocking lock) for a Bash-restricted profile.
         pins = await asyncio.to_thread(_settings_env_pins, tuple(invocation.bash_allowlist))
@@ -3234,7 +3296,8 @@ class CCInvoker:
 
         try:
             scope_args = await _get_scope_args()
-            proc = await asyncio.create_subprocess_exec(
+            create = spawn_owned if invocation.confirm_cleanup else asyncio.create_subprocess_exec
+            proc = await create(
                 *scope_args,
                 *args,
                 stdin=asyncio.subprocess.PIPE,
@@ -3248,6 +3311,7 @@ class CCInvoker:
                 # kill paths can killpg the whole claude tree.
                 start_new_session=True,
             )
+            admission.release()
         except FileNotFoundError:
             logger.error(
                 "Claude CLI not found at %r. Ensure @anthropic-ai/claude-code "
@@ -3283,8 +3347,14 @@ class CCInvoker:
                 await proc.stdin.drain()
                 proc.stdin.close()
         except BaseException:
-            self._unregister_proc(reg_key)
-            kill_process_group(proc)
+            if not invocation.confirm_cleanup:
+                self._unregister_proc(reg_key)
+                kill_process_group(proc)
+            else:
+                try:
+                    await confirm_process_exit(proc)
+                finally:
+                    self._unregister_proc(reg_key)
             raise
 
         result_data: dict | None = None
@@ -3531,7 +3601,18 @@ class CCInvoker:
             kill_process_group(proc)
             raise
         finally:
-            self._unregister_proc(reg_key)
+            try:
+                if invocation.confirm_cleanup:
+                    # After a clean result the child was only asked to stop:
+                    # give it the same reap and flush grace an ordinary run
+                    # gets below, then confirm the group is gone.
+                    await confirm_process_exit(
+                        proc,
+                        graceful=terminated_after_result,
+                        escalation_grace_s=_ESCALATION_GRACE_S,
+                    )
+            finally:
+                self._unregister_proc(reg_key)
 
         # Bounded reap: proc.terminate() on the result path is a GRACEFUL stop
         # the child can ignore (wedged node flush / MCP teardown) — an
@@ -3811,6 +3892,7 @@ class CCInvoker:
             await self._notify_status_change(None)
         output = CCOutput(
             session_id="",
+            result_received=False,
             text="".join(collected_text),
             model_used=str(invocation.model),
             cost_usd=0.0,

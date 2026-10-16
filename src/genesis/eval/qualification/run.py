@@ -54,7 +54,7 @@ def admission_identity(checked):
     }
     shared["runner_sources"] = {
         name: preflight.file_hash(Path(__file__).with_name(name))
-        for name in ("run.py", "__main__.py", "execution.py")
+        for name in ("run.py", "__main__.py", "execution.py", "accounting.py", "evidence.py")
     }
     return deepcopy(shared)
 
@@ -199,7 +199,7 @@ async def _case(name, case, router, sandbox):
     if name == corpus.NOVELTY:
         from genesis.eval.qualification.storage import replay
 
-        mapping = contracts.candidate_mapping(case, messages, router.candidate_ids)
+        mapping = contracts.candidate_mapping(case, messages, result["candidate_ids"])
         result["storage"] = await replay(
             case, messages, mapping, content, sandbox, router.alias, router.cfg.model_id
         )
@@ -325,10 +325,9 @@ async def qualify(alias, cases, params, campaign, temp_root, *, reference_policy
     else:
         records, clamped = await score(cases, router, temp_root)
     try:
-        root = Path(__file__).resolve().parents[4]
         if (preflight.source_evidence(cases, source_files) != checked["reference_sources"]
-            or any(preflight.file_hash(root / name) != expected
-                   for name, expected in checked["production_sources"].items())
+            or preflight.production_source_inventory(preflight.production_modules())
+               != checked["production_sources"]
             or admission_identity(checked) != admission):
             raise Incomplete("admission_changed")
     except (ValueError, OSError):

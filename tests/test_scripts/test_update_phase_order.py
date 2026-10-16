@@ -74,6 +74,28 @@ def test_fetch_before_stop_before_trap_before_merge(text):
     )
 
 
+def test_checkout_lock_covers_premerge_clears_and_merge(text):
+    call = _idx(text, "_checkout_unmoved_or_roll_back\n# END checkout-unmoved")
+    acquire = text.index('if ! genesis_checkout_lock "$GENESIS_ROOT"; then', call)
+    clear = text.index('checkout HEAD -- "$SETTINGS_LOCAL"', acquire)
+    verify = _idx(
+        text,
+        'if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD',
+    )
+    release = text.index("genesis_checkout_unlock", verify)
+    new_tag = text.index("NEW_TAG=", verify)
+    assert acquire < clear < verify < release < new_tag
+
+
+def test_rollback_takes_checkout_lock_after_stopping_bridge_and_unlocks_before_restart(text):
+    stop = _idx(text, "systemctl --user stop genesis-bridge")
+    skip = text.index('if [ "${_CHECKOUT_LOCK_BUSY:-0}" != "1" ]; then', stop)
+    acquire = text.index('genesis_checkout_lock "$GENESIS_ROOT"', stop)
+    release = text.index("genesis_checkout_unlock", acquire)
+    restart = text.index('if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then', acquire)
+    assert stop < skip < acquire < release < restart
+
+
 def test_rollback_tag_created_before_trap(text):
     assert _idx(text, ROLLBACK_TAG) < _idx(text, TRAP)
 
@@ -96,7 +118,8 @@ def test_pre_stop_fetch_is_post_merge_gated(text):
     f = _idx(text, FETCH)
     # The nearest gate opener before the fetch, with no column-0 `fi` closing it
     # in between: the fetch sits INSIDE that block, however long the comments.
-    gate = text.rfind('if [[ "$POST_MERGE" == "false" ]]; then', 0, f)
+    # (On `live` the same gate also skips it: `&& [ "${ON_LIVE:-0}" != 1 ]`.)
+    gate = text.rfind('if [[ "$POST_MERGE" == "false" ]]', 0, f)
     assert gate != -1, "pre-stop fetch must be POST_MERGE-gated"
     assert "\nfi\n" not in text[gate:f], "the POST_MERGE gate closes before the fetch"
 

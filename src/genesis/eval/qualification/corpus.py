@@ -95,6 +95,10 @@ def validate(contract: str, cases: list[dict], *, reference_policy=None):
         raise Incomplete("unknown reference contract")
     if any(not isinstance(c, dict) for c in cases):
         raise Incomplete("reference case must be an object")
+    # Every string a case or the policy carries can reach SQLite or a judge request,
+    # whichever contract reads it, so check them all once here rather than per field.
+    if not references.all_scalar(cases) or not references.all_scalar(reference_policy):
+        raise Incomplete(f"{contract}: text holds a lone surrogate (not Unicode scalar values)")
     if reference_policy is not None:
         references.validate_policy(reference_policy, versions())
         references.admit(
@@ -159,6 +163,16 @@ def _rubric_question(contract, case):
     return render_rubric_prompt(rubric, case["actual"], case.get("expected", ""), config)
 
 
+def validate_metadata(row):
+    """Match the judge's string normalization, refusing non-string arrays."""
+    for key in ("tools_used", "context_tags"):
+        value = row.get(key, [])
+        values = [value] if isinstance(value, str) else value
+        if (not isinstance(values, list)
+            or any(not isinstance(v, str) or not references.scalar_text(v) for v in values)):
+            raise Incomplete(f"invalid procedure metadata: {key}")
+
+
 def validate_novelty(case: dict):
     if "expected_target" not in case:
         raise Incomplete("novelty requires an explicit target or null reference")
@@ -171,13 +185,22 @@ def validate_novelty(case: dict):
             raise Incomplete("procedure must be a JSON object")
         for key in ("task_type", "principle"):
             value = row.get(key)
-            if not isinstance(value, str) or not value.strip() or "\n" in value or "\r" in value:
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or "\n" in value
+                or "\r" in value
+                or not references.scalar_text(value)
+            ):
                 raise Incomplete("invalid procedure text")
         steps = row.get("steps")
         if (
             not isinstance(steps, list)
             or not steps
-            or any(not isinstance(s, str) or not s.strip() for s in steps)
+            or any(
+                not isinstance(s, str) or not s.strip() or not references.scalar_text(s)
+                for s in steps
+            )
             or any(
                 re.search(r"(?:^|[\r\n])  \[\d+\] task_type:", s)
                 for s in steps
@@ -188,6 +211,7 @@ def validate_novelty(case: dict):
         for flag in ("deprecated", "quarantined"):
             if flag in row and type(row[flag]) is not bool:
                 raise Incomplete(f"procedure {flag} must be a boolean")
+        validate_metadata(row)
         vector = row.get("embedding")
         if (
             not isinstance(vector, list)
@@ -204,7 +228,12 @@ def validate_novelty(case: dict):
             raise Incomplete("same principle must have a consistent deterministic embedding")
         embeddings[row["principle"]] = vector_key
     for row in existing:
-        if not isinstance(row.get("id"), str) or not row["id"] or row["id"] in ids:
+        if (
+            not isinstance(row.get("id"), str)
+            or not row["id"]
+            or not references.scalar_text(row["id"])
+            or row["id"] in ids
+        ):
             raise Incomplete("invalid procedure id")
         ids.add(row["id"])
     target = case["expected_target"]

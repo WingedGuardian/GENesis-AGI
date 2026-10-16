@@ -27,6 +27,10 @@ from pathlib import Path
 
 from genesis.autonomy.executor.types import StepResult, StepType
 from genesis.util.proc_kill import kill_process_group, reap_bounded
+from genesis.util.streams import (
+    DEFAULT_STREAM_LIMIT as _MAX_STREAM_BYTES,  # noqa: F401 -- legacy constant
+)
+from genesis.util.streams import read_limited as _read_limited
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +65,6 @@ _INTERPRETER_PREFIXES = frozenset({
     "eval",
 })
 
-# Maximum bytes to read from each output stream (stdout/stderr).
-# Prevents memory exhaustion from commands like ``yes`` or verbose tests.
-_MAX_STREAM_BYTES = 2 * 1024 * 1024  # 2 MiB
-
 # Hard timeout for deterministic subprocesses (seconds).
 # This is a last-resort safety net for subprocesses that hang forever
 # (git waiting for credentials, test with infinite loop, etc.).
@@ -98,36 +98,6 @@ def validate_command(command: str) -> str | None:
         )
 
     return None
-
-
-# ---------------------------------------------------------------------------
-# Output-limited stream reader
-# ---------------------------------------------------------------------------
-
-
-async def _read_limited(
-    stream: asyncio.StreamReader,
-    limit: int = _MAX_STREAM_BYTES,
-) -> tuple[bytes, int]:
-    """Retain up to *limit* bytes while counting and draining the full stream."""
-    chunks: list[bytes] = []
-    retained_size = 0
-    total_size = 0
-    while True:
-        chunk = await stream.read(8192)
-        if not chunk:
-            break
-        total_size += len(chunk)
-        remaining = limit - retained_size
-        if remaining <= 0:
-            continue
-        if len(chunk) > remaining:
-            chunks.append(chunk[:remaining])
-            retained_size = limit
-        else:
-            chunks.append(chunk)
-            retained_size += len(chunk)
-    return b"".join(chunks), total_size
 
 
 # ---------------------------------------------------------------------------

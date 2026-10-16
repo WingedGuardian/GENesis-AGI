@@ -63,6 +63,8 @@ gate-surface:
           - 'scripts/lib/gate_menu.py'
           - 'scripts/review_budget.py'
           - 'scripts/review_findings.py'
+          - 'scripts/review_reflection.py'
+          - 'scripts/review_late.py'
           - 'src/genesis/session_awareness/external_review.py'
           - 'src/genesis/session_awareness/external_review_config.py'
           - 'scripts/hooks/main_checkout_guard.py'

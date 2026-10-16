@@ -202,9 +202,14 @@ class Operating:
             journal, attempt = self.last
             # Fixed reason and validated numeric key observations, never credentials
             # or arbitrary transport exception text. Existing Journal is the ledger.
-            journal.append("failure", attempt=attempt,
-                           error="operating_comparison_stopped:" + type(error).__name__,
-                           **({"key_status": info} if info is not None else {}))
+            try:
+                journal.append("failure", attempt=attempt,
+                               error="operating_comparison_stopped:" + type(error).__name__,
+                               **({"key_status": info} if info is not None else {}))
+            except BaseException as append_error:
+                # Journal poison still refuses reads and new acquisition. Keep
+                # the initiating error, including cancellation, authoritative.
+                error.add_note("operating failure evidence append failed: " + type(append_error).__name__)
 
     def predicate(self, info):
         if (info.get("limit_reset", "missing") is not None
@@ -213,7 +218,8 @@ class Operating:
                     currency(self.plan["baseline_usage"]), self.observed
                 ])
                 or currency(info["limit_remaining"]) <= 0
-                or currency(info["limit_remaining"]) < self.pending):
+                or currency(info["limit_remaining"]) < self.pending
+                or currency(info.get("available")) < self.pending):
             raise Incomplete("operating_key_discrepancy")
 
     async def admission_hook(self, adapter, _attempt, info):

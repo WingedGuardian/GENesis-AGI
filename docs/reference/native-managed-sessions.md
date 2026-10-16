@@ -1,0 +1,72 @@
+# Prepared native background sessions
+
+Machine connectors can use `DirectSessionRunner.adopt` to run an already
+persisted `cc_sessions` receipt through the existing native invoker and profiles.
+This is an execution primitive, not an enabled network connector. Ordinary
+`spawn` callers retain their existing defaults and delivery/parking behavior.
+
+Construct a server-owned `DirectSessionRequest(managed=True, notify=False,
+source_tag="agent_api", caller_context="agent_api:<receipt>")`. Only `observe`
+and `interact` profiles are supported in this mode; tool exceptions and origin
+delivery are refused. `timeout_s` must be an integer from 1 through 7200 seconds.
+The normal background autonomy circuit breaker still applies. Effective
+background authority must permit observation (L1) or interaction (L3); missing
+authority fails closed. The child has external provenance and is unattended.
+
+Use `managed_session.prepared_metadata(request)` and the canonical
+`cc_sessions.create(..., commit=False)` inside the connector's private atomic
+admission transaction. The row must have `session_type="background_task"`,
+`channel="agent"`, and `origin_class="external_untrusted"`. Persist identity,
+idempotency and caller attribution in that same transaction. The connector
+must prove that its private admission connection and the runtime use the same
+database. Commit before calling `adopt`; never enqueue that receipt for replay.
+
+`adopt` verifies the receipt fingerprint and registers it before awaited start
+hooks. It refuses foreign, changed, terminal and already-adopted rows. A valid
+receipt whose task cannot be constructed becomes failed with `not_started`.
+Exact client retries are the connector's responsibility: return the saved
+receipt without calling `adopt` again. Ordinary receipt deletion refuses
+`source_tag="agent_api"`, retaining the retry anchor.
+
+The supervisor owns the entire wait for start hooks, a runner slot and execution.
+The deadline starts when receipt metadata is prepared. `cancel(id)` signals the
+supervisor and is safe to repeat. Cancellation before its first step starts no
+hooks or subprocess. Subprocess cancellation retains registration until the
+leader has exited and its process group is confirmed absent. An OS refusal is
+unknown, not confirmation. A stuck drain or failed receipt persistence holds
+capacity; it must not be mistaken for a completed cancellation. Runtime shutdown
+signals managed supervisors within its existing bounded shutdown grace.
+
+Creation errors without a process handle are also unconfirmed: pipe setup can
+fail after the OS child starts. They set `cleanup_unconfirmed=true` and retain
+the active receipt, including through repeated cancellation. This mode does
+not infer safe pre-exec failure from an exception class. An owner-authorized
+service restart ends the supervisor and boot reconciliation records
+`outcome_unknown`; it does not confirm cleanup of separately scoped children.
+Actual child teardown requires scope/runtime or operator evidence. There is no
+automatic replay or recovery endpoint.
+
+Private invocations withhold raw execution/callback diagnostics and error span
+text. Child tool tracing is disabled for this mode because the ordinary trace
+hook records argument and path previews. Concurrent ordinary sessions retain
+their diagnostics. Owner notification and approval paths are not disabled.
+
+Results preserve the existing `output_text` head (20,000 characters), tool
+counts, transcript reference and error fields in metadata. Full text is
+atomically published as UTF-8 with private file permissions at the existing
+`~/.genesis/output/bg-session-<id>.md` convention independently of Telegram.
+`native_state` distinguishes `pending`, `running`, `cancelling`, `succeeded`,
+`failed` and `cancelled`. Consumers must check both terminal row status and
+structured state; a legacy `completed` row alone is not a success receipt.
+`result_committed` and `result_path` distinguish available full output from
+publication failure. Missing CLI result or truncated background work cannot be
+reported as managed success; `result_partial` and `stream_lines_dropped` report
+partial output or incomplete telemetry. Provider errors are classified without
+persisting their diagnostic text. Managed work never enters automatic parking.
+
+At native runner initialization, remaining active agent receipts from the old
+runtime become failed with `outcome_unknown`, before the new runner is exposed.
+They are never replayed. A live registered receipt is excluded from the stale
+background reaper. Retained receipts survive normal restart, not deliberate
+database deletion or rollback. Existing output-file retention is independent:
+a connector must verify the artifact exists before promising a full result.

@@ -96,10 +96,17 @@ def _harness(text: str, scenario: str) -> str:
     on_err = _extract_func(text, "_on_err")
     on_signal = _extract_func(text, "_on_signal")
     on_prestop = _extract_func(text, "_on_signal_prestop")
-    on_clear = _extract_func(text, "_clear_deploy_state")
+    on_clear = (
+        _extract_func(text, "_clear_deploy_marker")
+        + "\n"
+        + _extract_func(text, "_clear_deploy_state")
+    )
     return f"""#!/bin/bash
 set -Eeuo pipefail
 STATE_FILE="$STATE_FILE"
+# The state file is this run's own (a plain run that wrote it): #3139.
+_STATE_WRITTEN=1
+POST_MERGE=false
 _do_rollback() {{ echo "depth=$BASH_SUBSHELL reason=$1" >> "$RB_LOG"; }}
 # Stub the service-restart calls the real _on_signal_prestop makes, so the test
 # records intent without touching real systemd.

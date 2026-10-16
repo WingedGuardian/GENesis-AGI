@@ -138,64 +138,6 @@ def approval(cases, guidance):
     }
 
 
-async def test_current_guidance_and_approval_stop_before_router_or_network(tmp_path, monkeypatch):
-    cases, options = admitted(tmp_path)
-
-    def refuse(*_args, **_kwargs):
-        pytest.fail("admission failure must precede router or key")
-
-    monkeypatch.setattr(pinned, "PinnedRouter", refuse)
-    monkeypatch.setattr(pinned, "dedicated_key", refuse)
-    for current, approved in [(None, options["reference_approval"]),
-                              ({**options["reference_policy"], "guidance": "changed"}, options["reference_approval"]),
-                              (options["reference_policy"], None)]:
-        with pytest.raises(Incomplete):
-            await run.qualify("openrouter-mimo", cases, params(), tmp_path / "missing-campaign", tmp_path,
-                              reference_policy=options["reference_policy"], current_reference_policy=current,
-                              reference_approval=approved, source_files=options["source_files"], dispatch=True)
-    assert not (tmp_path / "missing-campaign").exists()
-
-
-async def test_conflicting_legacy_label_fields_stop_before_router(tmp_path, monkeypatch):
-    cases, options = admitted(tmp_path)
-    cases[next(iter(cases))][0]["reference_passed"] = True
-    monkeypatch.setattr(pinned, "PinnedRouter", lambda *_a, **_k: pytest.fail("router constructed"))
-    with pytest.raises(Incomplete, match="conflicting reference label"):
-        await run.qualify("openrouter-mimo", cases, params(), tmp_path / "missing-campaign", tmp_path,
-                          reference_policy=options["reference_policy"],
-                          current_reference_policy=options["current_policy"],
-                          reference_approval=options["reference_approval"], source_files=options["source_files"],
-                          dispatch=True)
-    assert not (tmp_path / "missing-campaign").exists()
-
-
-async def test_mixed_rubrics_and_j9_mock_http_preserve_actual_labels(data):
-    guidance, cases = mixed()
-    current = await instrument(data.temp, cases, policy=guidance)
-    current.gateway = LabelGateway(current)
-    with Journal(current.path, current.manifest) as campaign:
-        records, _ = await run.score(current.cases, make_router(current, campaign, True), current.temp)
-    assert len(current.gateway.requests) == 42
-    assert all(row["agreed"] for reps in records.values() for rows in reps.values() for row in rows.values())
-    assert references.summary(cases, guidance)["sources"] == {"human": 7, references.FRONTIER: 7}
-    rerun, _ = await run.score(current.cases, make_router(current, run.ReadView(current.path), False), current.temp)
-    assert rerun == records and len(current.gateway.requests) == 42
-
-
-def test_review_cli_offline_and_has_no_dispatch_side_effect(tmp_path, monkeypatch, capsys):
-    guidance, cases = mixed()
-    spec = {"reference_policy": guidance,
-            "cases": [{**case, "contract": name} for name, rows in cases.items() for case in rows]}
-    for case in spec["cases"]:
-        receipt(case["contract"], case, guidance)
-    path = tmp_path / "review.json"
-    path.write_text(json.dumps(spec))
-    monkeypatch.setattr(pinned, "dedicated_key", lambda: pytest.fail("offline key read"))
-    assert main(["review-references", "--spec", str(path)]) == 0
-    assert json.loads(capsys.readouterr().out)["counts"] == {"admitted": 14}
-    assert not (tmp_path / "campaign").exists()
-
-
 @pytest.mark.parametrize("same_contract", [False, True])
 def test_review_identity_is_scoped_to_contract(same_contract):
     guidance, cases = mixed()
@@ -712,3 +654,61 @@ def test_novelty_mixed_source_requires_real_target_and_keeps_history():
     receipt(corpus.NOVELTY, case, guidance)
     with pytest.raises(Incomplete, match="invalid novelty reference target"):
         corpus.validate(corpus.NOVELTY, cases, reference_policy=guidance)
+
+
+async def test_current_guidance_and_approval_stop_before_router_or_network(tmp_path, monkeypatch):
+    cases, options = admitted(tmp_path)
+
+    def refuse(*_args, **_kwargs):
+        pytest.fail("admission failure must precede router or key")
+
+    monkeypatch.setattr(pinned, "PinnedRouter", refuse)
+    monkeypatch.setattr(pinned, "dedicated_key", refuse)
+    for current, approved in [(None, options["reference_approval"]),
+                              ({**options["reference_policy"], "guidance": "changed"}, options["reference_approval"]),
+                              (options["reference_policy"], None)]:
+        with pytest.raises(Incomplete):
+            await run.qualify("openrouter-mimo", cases, params(), tmp_path / "missing-campaign", tmp_path,
+                              reference_policy=options["reference_policy"], current_reference_policy=current,
+                              reference_approval=approved, source_files=options["source_files"], dispatch=True)
+    assert not (tmp_path / "missing-campaign").exists()
+
+
+async def test_conflicting_legacy_label_fields_stop_before_router(tmp_path, monkeypatch):
+    cases, options = admitted(tmp_path)
+    cases[next(iter(cases))][0]["reference_passed"] = True
+    monkeypatch.setattr(pinned, "PinnedRouter", lambda *_a, **_k: pytest.fail("router constructed"))
+    with pytest.raises(Incomplete, match="conflicting reference label"):
+        await run.qualify("openrouter-mimo", cases, params(), tmp_path / "missing-campaign", tmp_path,
+                          reference_policy=options["reference_policy"],
+                          current_reference_policy=options["current_policy"],
+                          reference_approval=options["reference_approval"], source_files=options["source_files"],
+                          dispatch=True)
+    assert not (tmp_path / "missing-campaign").exists()
+
+
+async def test_mixed_rubrics_and_j9_mock_http_preserve_actual_labels(data):
+    guidance, cases = mixed()
+    current = await instrument(data.temp, cases, policy=guidance)
+    current.gateway = LabelGateway(current)
+    with Journal(current.path, current.manifest) as campaign:
+        records, _ = await run.score(current.cases, make_router(current, campaign, True), current.temp)
+    assert len(current.gateway.requests) == 42
+    assert all(row["agreed"] for reps in records.values() for rows in reps.values() for row in rows.values())
+    assert references.summary(cases, guidance)["sources"] == {"human": 7, references.FRONTIER: 7}
+    rerun, _ = await run.score(current.cases, make_router(current, run.ReadView(current.path), False), current.temp)
+    assert rerun == records and len(current.gateway.requests) == 42
+
+
+def test_review_cli_offline_and_has_no_dispatch_side_effect(tmp_path, monkeypatch, capsys):
+    guidance, cases = mixed()
+    spec = {"reference_policy": guidance,
+            "cases": [{**case, "contract": name} for name, rows in cases.items() for case in rows]}
+    for case in spec["cases"]:
+        receipt(case["contract"], case, guidance)
+    path = tmp_path / "review.json"
+    path.write_text(json.dumps(spec))
+    monkeypatch.setattr(pinned, "dedicated_key", lambda: pytest.fail("offline key read"))
+    assert main(["review-references", "--spec", str(path)]) == 0
+    assert json.loads(capsys.readouterr().out)["counts"] == {"admitted": 14}
+    assert not (tmp_path / "campaign").exists()

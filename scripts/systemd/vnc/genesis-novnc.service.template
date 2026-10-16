@@ -1,0 +1,13 @@
+[Unit]
+Description=Genesis noVNC (browser-based VNC client)
+After=genesis-vnc.service
+Requires=genesis-vnc.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/websockify --web=/usr/share/novnc/ 6080 localhost:5999
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

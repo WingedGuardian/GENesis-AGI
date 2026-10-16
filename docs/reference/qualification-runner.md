@@ -29,10 +29,16 @@ The frozen manifest must match all current contract/version/case/repetition/
 prompt coordinates, canonical wire bodies, model, explicit parameters,
 credential fingerprint, upstream namespace and receipt-provider mapping.
 Corpus, reference policy, approval, source bytes and declared production/runner
-module fingerprints also bind the report. A changed binding invalidates current
-scoring; observed historical counters remain separate. Source bytes and module
-fingerprints are checked again after scoring. These checks are scoped integrity
+module fingerprints, including financial accounting and durable evidence, also
+bind the report. A changed binding invalidates current
+scoring; observed historical counters remain separate. Source bytes, the complete
+declared module population and MCP registry/cache coherence are checked again
+after scoring. These are admission and completion checks: detected drift
+invalidates qualification but does not promise to prevent every intervening
+request. These checks are scoped integrity
 checks, not authentication of declared actors or a full transitive attestation.
+Detached reports do not take operating-plan or spending-approval inputs and do
+not independently authenticate current external consent for the frozen campaign.
 
 Add `--against <second-alias> --against-campaign <second-private-directory>`
 for paired reporting. Each model has its own campaign. Pairing requires the same
@@ -75,8 +81,9 @@ agent must never fabricate that record from design approval or a test fixture.
 A private kernel comparison lock, shared by credential fingerprint across both
 population sizes and all campaign directories, precedes journal writers and credential reads. The final pre-dispatch
 key observation must match the approved nonreset limit and baseline plus exact
-consistent receipt costs from the selected campaigns; remaining credit must cover all
-undispatched allocations. One inference is in flight globally. Settlement and a
+consistent receipt costs from the selected campaigns; both key credit and validated
+effective/member budget headroom must cover all undispatched allocations across
+the entire selected population. One inference is in flight globally. Settlement and a
 fresh key observation precede the next request. Uncertainty or processing failure
 stops new acquisition in the entire selected population and retains an existing journal incident
 when there is a dispatched attempt. Pre-dispatch refusal invents no reservation,
