@@ -2151,7 +2151,8 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             severity     TEXT NOT NULL,               -- CRITICAL / WARNING / ... (computed)
             message      TEXT NOT NULL,
             created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-            resolved_at  TEXT                         -- NULL = still open
+            resolved_at  TEXT,                        -- NULL = still open
+            resolution_reason TEXT                   -- healthy / disabled; legacy NULL
         )
     """,
     # ── WS-2 Cognitive Ledger (P1a) ──────────────────────────────────────
