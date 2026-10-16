@@ -512,6 +512,11 @@ class OutreachPipeline:
         gate_cleared: bool = False,
         best_effort: bool = False,
     ) -> OutreachResult:
+        if channel == "agent" and request.peer_envelope is None:
+            return OutreachResult(
+                outreach_id=outreach_id, status=OutreachStatus.REJECTED,
+                channel=channel, message_content="", error="agent channel requires a peer envelope",
+            )
         adapter = self._channels.get(channel)
         recipient = (
             request.validated_recipient

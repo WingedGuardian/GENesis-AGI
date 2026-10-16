@@ -146,6 +146,8 @@ async def outreach_send(
     # front would store "discord" in pending_outreach and lose which channel was
     # asked for — the exact bug this change exists to remove, reintroduced one
     # code path over. MEASURED: a first version of this fix did precisely that.
+    if channel == "agent":
+        return json.dumps({"status": "refused", "code": "use_agent_send"})
     from genesis.outreach.types import DISCORD_CHANNELS
 
     discord_channel: str | None = channel if channel in DISCORD_CHANNELS else None
@@ -772,6 +774,8 @@ async def outreach_send_and_wait(
     pass a smaller timeout_seconds explicitly if the caller genuinely can't
     block.
     """
+    if channel == "agent":
+        return json.dumps({"status": "refused", "code": "use_agent_send"})
     if not _pipeline:
         # No in-process pipeline (standalone MCP subprocess) → bridge to the
         # genesis-server, which owns the live pipeline + Telegram reply-waiter.

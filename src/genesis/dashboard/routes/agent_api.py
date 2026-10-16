@@ -69,7 +69,7 @@ def _runtime():
     return current_app.config.get("GENESIS_PEER_RUNTIME") or GenesisRuntime.peek()
 
 
-def _service():
+def _service(*, require_runner=True):
     runtime = _runtime()
     if runtime is None or runtime._db is None:
         raise ConversationRefusal("not_ready", 503)
@@ -77,7 +77,8 @@ def _service():
     if service is None or service.runtime is not runtime:
         service = ConversationService(_registry(), runtime)
         current_app.config["GENESIS_CONVERSATION_SERVICE"] = service
-    _ = service.runner
+    if require_runner:
+        _ = service.runner
     return service
 
 
@@ -255,9 +256,7 @@ async def approvals():
     ):
         raise InvalidParamsError("Unsupported list options")
     size = _integer("pageSize", 20, 1, 100)
-    page, token = await _service().approvals(
-        g.peer_identity, size, request.args.get("pageToken")
-    )
+    page, token = await _service().approvals(g.peer_identity, size, request.args.get("pageToken"))
     return jsonify(approvals=page, nextPageToken=token, pageSize=size)
 
 
@@ -319,7 +318,7 @@ def unavailable_path(path):
 async def _outbox():
     from genesis.peers.outbox import Outbox
 
-    service = _service()
+    service = _service(require_runner=False)
     async with service.registry.connection() as db:
         await service._same_database(db)
     return Outbox(service.registry)

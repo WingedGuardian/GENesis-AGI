@@ -396,6 +396,7 @@ PROFILES: dict[str, list[str]] = {
     # autonomous cold-marketing caller. Every other profile denies it above/below.
     "campaign": (
         _UNIVERSAL_DISALLOW
+        + ["mcp__genesis-outreach__agent_send"]
         + _NO_BROWSER_INTERACTION
         + _NO_OUTREACH_QUEUE_CONTROL
         + _NO_OPEN_QUESTION_READS

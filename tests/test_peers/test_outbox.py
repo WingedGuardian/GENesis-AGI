@@ -380,6 +380,7 @@ async def test_registered_send_tool_and_native_profile_boundary():
     tool = "mcp__genesis-outreach__agent_send"
     assert tool in PROFILES["observe"]
     assert tool in PROFILES["mail"]
+    assert tool in PROFILES["campaign"]
     assert tool not in PROFILES["interact"]
 
 
@@ -426,3 +427,84 @@ async def test_machine_collection_does_not_grade_human_engagement_or_throttle_di
         salience_score=1,
     )
     assert (await p._governance.check(digest)).verdict.value == "allow"
+
+
+async def test_collection_and_ack_survive_missing_runner(http_bridge):
+    b, app, base, owner = http_bridge
+    env, _ = await Outbox(b.registry).prepare("alpha", "A retained question")
+    await Outbox(b.registry).put(env)
+    async with sdk_client(base) as (client, transport):
+        b.runtime._direct_session_runner = None
+        response = await client.get(base + ROOT + "/outbox")
+        assert response.status_code == 200
+        assert response.json()["messages"][0]["message"]["messageId"] == env.message_id
+        response = await client.post(base + ROOT + f"/outbox/{env.message_id}:ack", json={})
+        assert response.status_code == 200
+    assert (await Outbox(b.registry).poll(b.identities["alpha"]))[0] == []
+
+
+@pytest.mark.parametrize("live", [False, True])
+async def test_generic_agent_channel_refused_without_queueing(bridge, monkeypatch, live):
+    from genesis.mcp import outreach_mcp
+
+    p = pipeline(bridge)
+    monkeypatch.setattr(outreach_mcp, "_db", bridge.db)
+    monkeypatch.setattr(outreach_mcp, "_pipeline", p if live else None)
+    monkeypatch.setattr(
+        outreach_mcp, "_server_rpc", AsyncMock(side_effect=AssertionError("No server RPC allowed"))
+    )
+    if live:
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+        from genesis.resilience.deferred_work import DeferredWorkQueue
+
+        p._deferred_queue = DeferredWorkQueue(bridge.db)
+        untyped = OutreachRequest(
+            category=OutreachCategory.NOTIFICATION,
+            topic="Untyped",
+            context="Untyped text",
+            salience_score=1,
+            channel="agent",
+            verbatim=True,
+        )
+        assert (await p.submit_urgent(untyped)).status.value == "rejected"
+    result = json.loads(
+        await outreach_mcp.outreach_send.fn("Untyped text", "notification", "agent")
+    )
+    assert result["status"] == "refused"
+    waiting = json.loads(
+        await outreach_mcp.outreach_send_and_wait.fn(
+            "Untyped text", "notification", "agent", timeout_seconds=1
+        )
+    )
+    assert waiting["status"] == "refused"
+    outreach_mcp._server_rpc.assert_not_awaited()
+    assert (await (await bridge.db.execute("SELECT count(*) FROM pending_outreach")).fetchone())[
+        0
+    ] == 0
+    assert (await (await bridge.db.execute("SELECT count(*) FROM deferred_work_queue")).fetchone())[
+        0
+    ] == 0
+
+
+async def test_dedup_after_retained_delivery_closes_pending_row(bridge, monkeypatch):
+    from genesis.mcp import outreach_mcp
+
+    p = pipeline(bridge)
+    monkeypatch.setattr(outreach_mcp, "_db", bridge.db)
+    monkeypatch.setattr(outreach_mcp, "_pipeline", None)
+    answer = json.loads(await outreach_mcp.agent_send.fn("alpha", "A retained question"))
+    scheduler = OutreachScheduler(p, AsyncMock(), AsyncMock(), p._config, bridge.db)
+    scheduler._record_job_result = AsyncMock()
+    real_mark = scheduler._mark_row_delivered
+    scheduler._mark_row_delivered = AsyncMock(side_effect=OSError("Synthetic interruption"))
+    await scheduler._drain_pending_job()
+    assert len((await Outbox(bridge.registry).poll(bridge.identities["alpha"]))[0]) == 1
+    scheduler._mark_row_delivered = real_mark
+    await scheduler._drain_pending_job()
+    row = await (
+        await bridge.db.execute(
+            "SELECT delivered_at FROM pending_outreach WHERE id=?", (answer["pending_id"],)
+        )
+    ).fetchone()
+    assert row[0] is not None
+    assert len((await Outbox(bridge.registry).poll(bridge.identities["alpha"]))[0]) == 1
