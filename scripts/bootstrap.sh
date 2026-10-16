@@ -767,10 +767,13 @@ install_browser_extra "$GENESIS_ROOT" "$VENV_DIR" \
 echo
 
 # --- Skill-security trusted baseline ---
-# Bless the currently-installed skills so the scheduled scan files findings only
-# for NEW/untrusted skills (a raw scan flags ~every capable skill as CRITICAL).
+# Bless the skills installed the FIRST time bootstrap runs, so the scheduled
+# scan files findings only for NEW/untrusted skills (a raw scan flags ~every
+# capable skill as CRITICAL). --if-missing: bootstrap runs on every update, and
+# re-seeding here would silently bless every skill added since the last one.
+# Trusting a new skill is a deliberate act: add its name to the allowlist.
 echo "--- Seeding skill-security trusted allowlist ---"
-"$VENV_DIR/bin/python" -m genesis.security.skill_scan --seed-trusted 2>&1 | tail -1 || true
+"$VENV_DIR/bin/python" -m genesis.security.skill_scan --seed-trusted --if-missing 2>&1 | tail -1 || true
 echo
 
 # --- Baseline procedures ---
