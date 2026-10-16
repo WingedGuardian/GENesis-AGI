@@ -209,6 +209,8 @@ class Engine(Repo):
     def __init__(self, root, env, gh=None, serving=None):
         super().__init__(root, env, gh=gh, serving=serving)
         self.store = manifest.ManifestStore(self.home, self.common_dir)
+        # Set by require_update_lock once this run holds update.lock exclusive.
+        self._update_lock_held = False
 
     # ── locks and preflight ──────────────────────────────────────────────
     def require_update_lock(self) -> None:
@@ -231,6 +233,7 @@ class Engine(Repo):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             raise Refusal(f"update.lock is held by another process; {hint}.") from exc
+        self._update_lock_held = True
 
     def _move_preflight(self, need_manifest: bool) -> tuple[dict | None, str]:
         """Every refusal before a checkout move, in order. Returns the manifest
@@ -256,7 +259,7 @@ class Engine(Repo):
         judges). A state that guards nothing (a finished run, one that stopped
         before merging anything) does not refuse; one that cannot be judged does."""
         path = str(self.update_state)
-        if not os.path.lexists(path):
+        if not os.path.lexists(path) or self._own_update_state():
             return None
         try:
             spec = importlib.util.spec_from_file_location(
@@ -277,6 +280,33 @@ class Engine(Repo):
                 "scripts/update.sh --post-merge, or Dismiss it on the dashboard's update card."
             )
 
+    def _own_update_state(self) -> bool:
+        """Is update_state.json the in-flight row of the update.sh running this rebuild?
+
+        On `live`, update.sh writes its "merging" row after the stop, then runs the
+        rebuild in its merge slot, handing over update.lock and naming its own pid
+        in DEPLOY_CANDIDATES_OWN_STATE_PID. That row is the caller's restart guard
+        for the move about to happen: neither a refusal nor a leftover to retire.
+        It counts as the caller's only when this run holds update.lock through the
+        handed-over fd, the named pid is this process's parent, and the file records
+        that pid, phase "merging", from a plain run. Anything else is judged by the
+        shared rule."""
+        named = self.env.get("DEPLOY_CANDIDATES_OWN_STATE_PID", "")
+        if not (self._update_lock_held and named.isdigit() and int(named) == os.getppid()):
+            return False
+        try:
+            with open(self.update_state, encoding="utf-8") as fh:
+                state = json.load(fh)
+        except (OSError, ValueError, RecursionError):
+            return False
+        return (
+            isinstance(state, dict)
+            and state.get("phase") == "merging"
+            and state.get("post_merge") is False
+            and type(state.get("pid")) is int
+            and state["pid"] == int(named)
+        )
+
     def _retire_harmless_update_state(self) -> None:
         """Remove an update_state.json that guards nothing, before a move.
 
@@ -287,7 +317,11 @@ class Engine(Repo):
         leftover into a false restart guard. A file the rule cannot clear again
         here is left alone; a file it clears but this cannot remove refuses."""
         path = str(self.update_state)
-        if not os.path.lexists(path) or self._update_state_refusal() is not None:
+        if (
+            not os.path.lexists(path)
+            or self._own_update_state()
+            or self._update_state_refusal() is not None
+        ):
             return
         try:
             os.unlink(path)

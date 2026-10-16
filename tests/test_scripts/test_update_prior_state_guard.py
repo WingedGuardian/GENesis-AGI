@@ -175,7 +175,7 @@ def test_the_guard_runs_under_the_lock_before_any_tag_or_state_write():
     assert guard > text.index('if ! flock -n "$_UPDATE_LOCK_FD"; then')
     assert guard < text.index('ROLLBACK_TAG="pre-update-')
     assert guard < text.index('\n_write_state "fetching"')
-    assert guard < text.index("# BEGIN live-marker")
+    assert guard < text.index("# BEGIN live-engine")
 
 
 # ── what an exit deletes ───────────────────────────────────────────────────────
@@ -238,14 +238,15 @@ def test_write_state_records_which_kind_of_run_wrote_it(world):
         ('_write_state "fetching"\n', False, False, False),
         ('_write_state "fetching"\n_write_state "merging"\n', False, False, True),
         ('_write_state "fetching"\n', True, False, True),
-        ('_write_state "fetching"\n', False, True, True),
+        ('_write_state "fetching"\n', False, True, False),
         ("", False, False, True),
     ],
     ids=["own-fetching", "own-merging", "post-merge", "on-live", "never-written"],
 )
 def test_the_exit_trap_drops_only_its_own_prestop_state(world, steps, post_merge, on_live, kept):
     """SF3: the exits after the "fetching" write (a failed DB snapshot, a server
-    that will not stop) left it behind, and the poll no longer deletes it."""
+    that will not stop) left it behind, and the poll no longer deletes it. On
+    `live` too (#3370): it writes the same pre-stop row as main."""
     if not steps:
         _other_runs_state(world)
     r = _cleanup_harness(
@@ -258,7 +259,7 @@ def test_the_exit_trap_drops_only_its_own_prestop_state(world, steps, post_merge
 def test_every_exit_trap_after_the_fetching_write_drops_it():
     """Both EXIT traps a plain run can hold between "fetching" and "merging"."""
     traps = re.findall(r"^\s*trap '([^']*)' EXIT$", _text(), re.MULTILINE)
-    plain = [t for t in traps if "_live_prestop_exit" not in t and "TEMP_COPY" not in t]
+    plain = [t for t in traps if "TEMP_COPY" not in t]
     assert len(plain) == 2, traps
     assert all("_drop_own_prestop_state" in t for t in plain), plain
 

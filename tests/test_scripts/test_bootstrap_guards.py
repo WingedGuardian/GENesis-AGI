@@ -1202,4 +1202,7 @@ def test_update_records_its_own_head_the_moment_it_adopts_the_merge():
     record = code.index('_write_state "merging"', adopt)
     between = code[adopt:record]
     assert "\nfi" not in between, "the state write must sit inside the adoption branch"
-    assert code.count('_write_state "merging"') == 2
+    # On `live` (#3370) the rebuilt tip is adopted the same way, in the merge's place.
+    live = code.index('UPDATE_OWN_HEAD="$_live_tip"')
+    assert "\nfi" not in code[live : code.index('_write_state "merging"', live)]
+    assert code.count('_write_state "merging"') == 3
