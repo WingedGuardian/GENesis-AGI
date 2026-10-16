@@ -74,17 +74,27 @@ class WebFetcher:
             )
         return self._client
 
-    async def fetch(self, url: str, *, max_chars: int | None = None) -> FetchResult:
+    async def fetch(
+        self,
+        url: str,
+        *,
+        max_chars: int | None = None,
+        client: str | None = None,
+    ) -> FetchResult:
         """Fetch a URL and return cleaned text. Never raises."""
         limit = max_chars or self._max_chars
+        actual_client = "scrapling" if _HAS_SCRAPLING and client != "httpx" else "httpx"
 
-        if _HAS_SCRAPLING:
+        if actual_client == "scrapling":
             body, status_code, content_type, error = await self._fetch_scrapling(url)
         else:
             body, status_code, content_type, error = await self._fetch_httpx(url)
 
         if error:
-            return FetchResult(url=url, text="", status_code=status_code, error=error)
+            return FetchResult(
+                url=url, text="", status_code=status_code, error=error,
+                client=actual_client,
+            )
 
         is_html = (
             "text/html" in content_type
@@ -102,7 +112,7 @@ class WebFetcher:
         else:
             return FetchResult(
                 url=url, text="", status_code=status_code,
-                error=f"Unsupported content type: {content_type}",
+                error=f"Unsupported content type: {content_type}", client=actual_client,
             )
 
         truncated = len(text) > limit
@@ -114,7 +124,7 @@ class WebFetcher:
 
         return FetchResult(
             url=url, text=text, title=title,
-            status_code=status_code, truncated=truncated,
+            status_code=status_code, truncated=truncated, client=actual_client,
         )
 
     async def _fetch_scrapling(self, url: str) -> tuple[str, int, str, str | None]:

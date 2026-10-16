@@ -102,6 +102,55 @@ def _shell(path: Path) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.mark.parametrize("phase", ["stdin", "begin", "body", "end", "rename"])
+@pytest.mark.parametrize("context", ["guarded", "direct"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_shell_io_failures_preserve_destination(tmp_path, phase, context, existing):
+    path = tmp_path / "CLAUDE.md"
+    original = f"head\n{B}\nold\n{E}\nPersonal Notes\nmine\n".encode()
+    if existing:
+        path.write_bytes(original)
+    script = r'''
+set -euo pipefail
+source "$1"
+phase=$3
+mv() { if [[ "$phase" == rename ]]; then return 1; fi; command mv "$@"; }
+cat() {
+    if [[ "$phase" == stdin && $# == 0 ]]; then
+        builtin printf PART
+        return 1
+    fi
+    command cat "$@"
+}
+printf() {
+    if [[ "$phase" == begin && "${2-}" == '<!-- begin:x -->' ||
+          "$phase" == body && "$1" == '%s' && "${2-}" == $'BODY\n' ||
+          "$phase" == end && "${2-}" == '<!-- end:x -->' ]]; then
+        builtin printf PART
+        return 1
+    fi
+    builtin printf "$@"
+}
+if [[ "$4" == guarded ]]; then
+    if write_sentinel_block "$2" x <<< BODY; then exit 0; else exit $?; fi
+else
+    write_sentinel_block "$2" x <<< BODY
+fi
+'''
+    result = subprocess.run(
+        ["bash", "-c", script, "_", str(LIB), str(path), phase, context],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 1, result.stderr
+    if phase != "rename":
+        assert "left unchanged" in result.stderr
+    if existing:
+        assert path.read_bytes() == original
+    else:
+        assert not path.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == (["CLAUDE.md"] if existing else [])
+
+
 @pytest.mark.parametrize(("case", "text", "verdict", "kept"), CASES, ids=[c[0] for c in CASES])
 def test_the_shell_writer(tmp_path, case, text, verdict, kept):
     path = tmp_path / "CLAUDE.md"

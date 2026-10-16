@@ -84,7 +84,10 @@ build_network_identity_block() {
 write_sentinel_block() {
     local file="$1" name="$2" body dir tmp rc
     # Read all of stdin first: a refusal must not SIGPIPE the producer.
-    body=$(cat; printf x)
+    body=$(cat && printf x) || {
+        echo "CLAUDE.md block '$name' left unchanged: could not read block content" >&2
+        return 1
+    }
     body=${body%x}
     if [ -n "$body" ] && [ "${body: -1}" != $'\n' ]; then
         body+=$'\n'
@@ -132,13 +135,20 @@ write_sentinel_block() {
         return 1
     fi
     rm -f "$tmp.err"
-    {
-        printf '%s\n' "<!-- begin:${name} -->"
-        printf '%s' "$body"
+    if ! {
+        printf '%s\n' "<!-- begin:${name} -->" &&
+        printf '%s' "$body" &&
         printf '%s\n' "<!-- end:${name} -->"
-    } >> "$tmp"
+    } >> "$tmp"; then
+        echo "CLAUDE.md block '$name' left unchanged: could not write block content" >&2
+        rm -f "$tmp"
+        return 1
+    fi
     if [ -e "$file" ]; then
         chmod --reference="$file" "$tmp" 2>/dev/null || true
     fi
-    mv -f "$tmp" "$file"
+    if ! mv -f "$tmp" "$file"; then
+        rm -f "$tmp"
+        return 1
+    fi
 }
