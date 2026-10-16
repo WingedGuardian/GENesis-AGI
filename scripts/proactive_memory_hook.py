@@ -66,6 +66,7 @@ from hook_output import (  # noqa: E402
     DEFAULT_BUDGET,
     HOOK_STDOUT_CAP,
     BoundedStdout,
+    clip_final_notice,
     clip_to_cost,
     utf16_len,
 )
@@ -2102,10 +2103,7 @@ def _hard_stop_notice() -> str | None:
     # The timer holds STDOUT_LOCK while this runs, so written_units() counts
     # every unit that reached the stream; the writer's own counter can lag a
     # write by the length of one print().
-    room = HOOK_STDOUT_CAP - written_units() - 3
-    if room <= 0:
-        return None
-    return clip_to_cost(_out_of_time_notice(_PROCESS_AGE), room)
+    return clip_final_notice(_out_of_time_notice(_PROCESS_AGE), emitted_units=written_units())
 
 
 async def _run(prompt: str, session_id: str = "", *, process_age_s: float = 0.0) -> None:
