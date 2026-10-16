@@ -790,6 +790,7 @@ def main(argv: list[str] | None = None) -> None:
         # memory server makes most traversals, so a secrets.env setting that never
         # reached it would leave the documented switch inert where it matters.
         "GENESIS_GRAPH_TELEMETRY_DISABLED",
+        "GENESIS_MCP_ENV_RECORDER",  # File-only opt-out must precede installation.
     }
     import os
 

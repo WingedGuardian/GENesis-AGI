@@ -1,9 +1,38 @@
+import os
 from types import SimpleNamespace
+
+import pytest
 
 import genesis.env
 import genesis.routing.config
 import scripts.genesis_mcp_server as server
 from genesis.routing.litellm_delegate import api_key_env_names
+
+
+@pytest.mark.parametrize("kind", sorted(server._VALID_SERVERS))
+@pytest.mark.parametrize("file_value,inherited", [(None, None), ("0", None), (None, "0"), ("1", "0"), ("0", "1")])
+def test_recorder_control_is_loaded_before_installation(monkeypatch, tmp_path, kind, file_value, inherited):
+    from genesis.observability import mcp_env_reads
+
+    mcp_env_reads.uninstall()
+    monkeypatch.delenv("GENESIS_MCP_ENV_RECORDER", raising=False)
+    if inherited is not None:
+        monkeypatch.setenv("GENESIS_MCP_ENV_RECORDER", inherited)
+    secret = tmp_path / "secrets.env"
+    secret.write_text("" if file_value is None else f"GENESIS_MCP_ENV_RECORDER={file_value}\n")
+    monkeypatch.setenv("SECRETS_PATH", str(secret))
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(tmp_path))
+    monkeypatch.setattr(server, "_standalone_routing_env_names", lambda kind: frozenset())
+    monkeypatch.setattr(server, "is_genesis_enabled", lambda: False)
+    monkeypatch.setattr(server, "_run_disabled_stub", lambda kwargs: None)
+    expected = inherited if inherited is not None else file_value
+    try:
+        server.main(["--server", kind])
+        assert (mcp_env_reads._original_environ_class is not None) == (expected != "0")
+        assert os.environ.get("GENESIS_MCP_ENV_RECORDER") == expected
+    finally:
+        mcp_env_reads.uninstall()
 
 
 def test_server_declaration_maps_cover_exactly_the_valid_servers(monkeypatch, tmp_path) -> None:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -80,6 +82,110 @@ def _read_with_get(key: str) -> str | None:
     return os.environ.get(key)
 
 
+def _record_lines(path: Path) -> list[str]:
+    return [line for line in path.read_text().split("\n") if line]
+
+
+@pytest.mark.parametrize("prefix", [b"", b'{"ts":', b'{"old":1}', b'{"old":1}\n'])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("fault", ["short", "exception"])
+@pytest.mark.parametrize("cut", ["zero", "one", "middle", "last"])
+def test_interrupted_appends_preserve_retry_evidence(
+    recorder, tmp_path, monkeypatch, prefix, restart, fault, cut
+):
+    key = "MCP_ENV_READ_INTERRUPTED"
+    monkeypatch.setenv(key, "synthetic-value")
+    log = tmp_path / "mcp_env_reads.jsonl"
+    log.write_bytes(prefix)
+
+    def install():
+        recorder.install("memory", declared=frozenset(), declared_prefixes=(),
+                         secret_keys=frozenset({key}), log_path=log)
+
+    install()
+    original_write = os.write
+    attempts = 0
+
+    def interrupt(fd, data):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            count = {"zero": 0, "one": 1, "middle": len(data) // 2, "last": len(data) - 1}[cut]
+            original_write(fd, data[:count])
+            if fault == "exception":
+                raise OSError("injected interrupted append")
+            return count
+        return original_write(fd, data)
+
+    monkeypatch.setattr(os, "write", interrupt)
+    assert _read_with_get(key) == "synthetic-value"
+    assert attempts == 1
+    assert not any(item[1] == key for item in recorder._seen_keys)
+    if restart:
+        install()
+    assert _read_with_get(key) == "synthetic-value"
+    assert _read_with_get(key) == "synthetic-value"
+    assert attempts == 2
+    records = []
+    for line in log.read_text().split("\n"):
+        with contextlib.suppress(ValueError):
+            records.append(json.loads(line))
+    assert any(entry.get("key") == key for entry in records)
+    assert any(item[1] == key for item in recorder._seen_keys)
+
+
+def test_two_children_append_independently_parseable_frames(recorder, tmp_path):
+    probe = r'''
+import importlib.util, os, pathlib, sys, time
+spec = importlib.util.spec_from_file_location("isolated_recorder", sys.argv[1])
+r = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(r)
+root, server = pathlib.Path(sys.argv[2]), sys.argv[3]
+keys = frozenset(f"RECORDER_CHILD_{i}" for i in range(20))
+os.environ.update({key: "synthetic-value" for key in keys})
+r.install(server, declared=frozenset(), declared_prefixes=(), secret_keys=keys,
+          log_path=root / "log")
+(root / server).touch()
+deadline = time.monotonic() + 15
+while not (root / "go").exists():
+    assert time.monotonic() < deadline
+    time.sleep(0.01)
+for key in sorted(keys):
+    assert os.environ[key] == "synthetic-value"
+r.uninstall()
+'''
+    (tmp_path / "log").write_bytes(b'{"broken":')
+    children = []
+    try:
+        for name in ("one", "two"):
+            children.append(subprocess.Popen(
+                [sys.executable, "-c", probe, recorder.__file__, str(tmp_path), name],
+                env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ))
+        deadline = time.monotonic() + 10
+        while not all((tmp_path / name).exists() for name in ("one", "two")):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        (tmp_path / "go").touch()
+        for child in children:
+            _, errors = child.communicate(timeout=15)
+            assert child.returncode == 0, errors
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+    lines = _record_lines(tmp_path / "log")
+    assert lines[0] == '{"broken":'
+    entries = [json.loads(line) for line in lines[1:]]
+    assert len(entries) == 40
+    assert {(entry["server"], entry["key"]) for entry in entries} == {
+        (name, f"RECORDER_CHILD_{i}") for name in ("one", "two") for i in range(20)
+    }
+    assert "synthetic-value" not in (tmp_path / "log").read_text()
+
+
 def test_preload_reads_a_bounded_snapshot_without_splitting_unicode(recorder, tmp_path, monkeypatch):
     log = tmp_path / "log"
     entry = {"server": "memory", "key": "KEY\u0085NAME", "caller": "module:caller"}
@@ -141,7 +247,7 @@ def test_undeclared_secret_reads_are_logged_once_per_supported_accessor(
         else:
             assert os.environ[key] == value
 
-    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    records = [json.loads(line) for line in _record_lines(log_path)]
     assert [record["key"] for record in records] == [key]
 
 
@@ -157,7 +263,7 @@ def test_secret_reads_are_deduplicated_per_caller(
     assert _read_with_get(key) == value
     assert _read_with_index(key) == value
 
-    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    records = [json.loads(line) for line in _record_lines(log_path)]
     assert [record["caller"] for record in records] == [
         f"{__name__}:_read_with_get",
         f"{__name__}:_read_with_index",
@@ -176,7 +282,7 @@ def test_bulk_copy_does_not_suppress_later_direct_read(
     assert _copy_environment()[key] == value
     assert _read_with_get(key) == value
 
-    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    records = [json.loads(line) for line in _record_lines(log_path)]
     assert [record["caller"] for record in records] == [
         f"{__name__}:_copy_environment",
         f"{__name__}:_read_with_get",
@@ -236,7 +342,7 @@ def test_missing_keys_keep_existing_getenv_and_indexing_behavior(recorder, tmp_p
     assert os.getenv(missing_key) is None
     with pytest.raises(KeyError):
         os.environ[missing_key]
-    assert len(log_path.read_text().splitlines()) == 1
+    assert len(_record_lines(log_path)) == 1
 
 
 def test_unwritable_log_path_does_not_break_lookup(
@@ -281,7 +387,7 @@ def test_failed_write_is_retried_by_same_caller(
     assert _read_with_get(key) == value
     assert _read_with_get(key) == value
 
-    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    records = [json.loads(line) for line in _record_lines(log_path)]
     assert attempts == 2
     assert [record["key"] for record in records] == [key]
     assert records[0]["caller"] == f"{__name__}:_read_with_get"
@@ -341,7 +447,7 @@ def test_preexisting_triples_are_deduplicated_per_server(
         log_path=log_path,
     )
     assert _read_with_get(key) == value
-    assert len(log_path.read_text().splitlines()) == 1
+    assert len(_record_lines(log_path)) == 1
 
     recorder.install(
         "health",
@@ -351,7 +457,7 @@ def test_preexisting_triples_are_deduplicated_per_server(
         log_path=log_path,
     )
     assert _read_with_get(key) == value
-    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    records = [json.loads(line) for line in _record_lines(log_path)]
     assert [(record["server"], record["key"], record["caller"]) for record in records] == [
         ("memory", key, caller),
         ("health", key, caller),
@@ -375,7 +481,7 @@ def test_malformed_preexisting_lines_are_ignored(
     )
 
     assert _read_with_get(key) == value
-    lines = log_path.read_text().splitlines()
+    lines = _record_lines(log_path)
     assert lines[0] == "{malformed json}"
     assert json.loads(lines[1])["key"] == key
 
@@ -438,9 +544,9 @@ def test_reinstall_resets_seen_state_for_new_server_and_log_path(
     assert _read_with_get(key) == value
 
     expected_caller = f"{__name__}:_read_with_get"
-    first = json.loads(first_path.read_text().splitlines()[0])
-    second = json.loads(second_path.read_text().splitlines()[0])
-    third = json.loads(third_path.read_text().splitlines()[0])
+    first = json.loads(_record_lines(first_path)[0])
+    second = json.loads(_record_lines(second_path)[0])
+    third = json.loads(_record_lines(third_path)[0])
     assert [
         (record["server"], record["key"], record["caller"]) for record in (first, second, third)
     ] == [
@@ -482,12 +588,12 @@ def test_recording_guard_prevents_reentrant_duplicate_reads(
     value = "reentrant-value"
     monkeypatch.setenv(key, value)
     log_path = _install(recorder, tmp_path, secret_keys=frozenset({key}))
-    original_fdopen = os.fdopen
+    original_write = os.write
 
-    def reentrant_fdopen(fd, *args, **kwargs):
+    def reentrant_write(fd, data):
         assert os.getenv(key) == value
-        return original_fdopen(fd, *args, **kwargs)
+        return original_write(fd, data)
 
-    monkeypatch.setattr(os, "fdopen", reentrant_fdopen)
+    monkeypatch.setattr(os, "write", reentrant_write)
     assert os.getenv(key) == value
-    assert len(log_path.read_text().splitlines()) == 1
+    assert len(_record_lines(log_path)) == 1

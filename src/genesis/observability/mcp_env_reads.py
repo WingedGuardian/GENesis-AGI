@@ -44,7 +44,8 @@ def _load_seen_keys(log_path: Path) -> set[tuple[str, str, str]]:
         with os.fdopen(_open_regular_log(log_path, os.O_RDONLY), "rb") as stream:
             # Only inspect the bounded snapshot the append threshold can cover.
             snapshot = stream.read(_MAX_LOG_BYTES).decode("utf-8", errors="replace")
-            for line in snapshot.split("\n"):
+            # A final unterminated fragment may be a short write, not a record.
+            for line in snapshot.split("\n")[:-1]:
                 try:
                     entry = json.loads(line)
                 except (TypeError, ValueError):
@@ -117,9 +118,12 @@ def install(
                     os.fchmod(fd, 0o600)
                 if os.fstat(fd).st_size >= _MAX_LOG_BYTES:
                     return
-                with os.fdopen(fd, "a", encoding="utf-8") as stream:
-                    fd = None
-                    stream.write(json.dumps(entry) + "\n")
+                # The leading separator isolates any interrupted prior tail.
+                # One append syscall keeps complete frames together across children;
+                # blank separator lines are ignored by the preload reader.
+                frame = ("\n" + json.dumps(entry) + "\n").encode("utf-8")
+                if os.write(fd, frame) != len(frame):
+                    return
             finally:
                 if fd is not None:
                     os.close(fd)
