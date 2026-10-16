@@ -605,7 +605,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
 
         # Remove systemd unit files
         SYSTEMD_DIR="$HOME/.config/systemd/user"
-        for f in "$SYSTEMD_DIR"/genesis-*.service "$SYSTEMD_DIR"/genesis-*.timer "$SYSTEMD_DIR/qdrant.service"; do
+        for f in "$SYSTEMD_DIR"/genesis-*.service "$SYSTEMD_DIR"/genesis-*.timer "$SYSTEMD_DIR/genesis-workload.slice" "$SYSTEMD_DIR/qdrant.service"; do
             { [ -e "$f" ] || [ -L "$f" ]; } && safe_remove "$f" "systemd/$(basename "$f")"
         done
         systemctl --user daemon-reload 2>/dev/null || true

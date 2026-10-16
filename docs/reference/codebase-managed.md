@@ -55,6 +55,15 @@ Resolved paths must satisfy the same validation as the published settings:
 newline and carriage-return characters introduced by symlink ancestors are
 refused before staging. The final settings filename remains unresolved.
 
+The pinned provider rewrites literal backslashes as path separators on Linux.
+Repository and cache paths containing backslashes, including their resolved
+physical identities, therefore refuse before staging or native execution. This
+prevents native configuration writes from selecting a different cache directory.
+A configure argument's symlink alias may contain a backslash if it resolves to a
+supported physical main/state path. Binary, interpreter, runtime, sentinel and
+settings paths retain their existing literal-path handling; this restriction
+applies to provider-consumed repository/cache identities.
+
 No service is enabled, no unit is rendered and no sentinel is removed.
 Configuration uses schema 2: paths and build identity, with no mutable `enabled`
 flag. Native systemd enablement will own operational state when lifecycle
@@ -132,6 +141,10 @@ Diagnostic settings include only known scalar metadata; unknown fields and
 deeply nested invalid values cannot prevent reporting manager state.
 An incompatible build populates `settings_error` while retaining its metadata
 and independently reporting systemd status.
+Unsupported repository/cache identities and symlink-resolution failures also
+populate `settings_error` without suppressing metadata or the systemd check.
+Structural settings reads remain available for retained-state diagnosis; no
+incompatible cache is repaired or deleted automatically.
 
 Existing settings and state are never refreshed in place. Schema 1 and other
 builds remain diagnosable, but are not valid schema-2 execution configurations.

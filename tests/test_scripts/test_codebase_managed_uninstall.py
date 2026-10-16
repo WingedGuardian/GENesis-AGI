@@ -238,7 +238,16 @@ def test_retained_diagnostics_tolerate_each_symlink_loop(guard, tmp_path, monkey
     assert sum("Preserved configured" in line for line in output.splitlines()) == 3
 
 
-@pytest.mark.parametrize("kind,expected", [("native", True), ("heap", True), ("wrapper", True), ("private-launch", True), ("query", False), ("foreign-cwd", False), ("foreign-path", False), ("unrelated", False), ("foreign-wrapper", False)])
+@pytest.mark.parametrize("kind,expected", [
+    ("native", True), ("heap", True), ("wrapper", True), ("private-launch", True),
+    ("renamed", True), ("renamed-target", True), ("renamed-alias", True),
+    ("renamed-relative", True), ("atom-executable", True), ("multiple-analyze", True),
+    ("program-only", False),
+    ("renamed-foreign-cwd", False), ("renamed-foreign-target", False),
+    ("python-renamed", True), ("ambiguous-analyze", True), ("substring", False),
+    ("query", False), ("foreign-cwd", False), ("foreign-path", False),
+    ("unrelated", False), ("foreign-wrapper", False),
+])
 def test_existing_fallback_writer_population(guard, transaction, tmp_path, kind, expected):
     repo = transaction / "genesis"
     other = tmp_path / "other"
@@ -261,7 +270,33 @@ def test_existing_fallback_writer_population(guard, transaction, tmp_path, kind,
     elif kind == "foreign-path":
         argv.append(str(other))
     elif kind == "unrelated":
-        argv[1] = "/opt/another/dist/cli/index.js"
+        argv = ["node", "/opt/another/dist/cli/index.js", "status"]
+    elif kind.startswith("renamed") or kind in ("python-renamed", "substring"):
+        argv = ["python3" if kind == "python-renamed" else "node", "/opt/gn", "analyze"]
+        if kind == "renamed-target":
+            argv.append(str(repo))
+            cwd = other
+        elif kind == "renamed-relative":
+            argv.append(".")
+        elif kind == "renamed-alias":
+            alias = other / "checkout-link"
+            alias.symlink_to(repo, target_is_directory=True)
+            argv.append(str(alias))
+            cwd = other
+        elif kind == "renamed-foreign-cwd":
+            cwd = other
+        elif kind == "renamed-foreign-target":
+            argv.append(str(other))
+        elif kind == "substring":
+            argv[-1] = "preanalyze"
+    elif kind == "ambiguous-analyze":
+        argv = ["rg", "analyze"]  # Possible writer: argv cannot prove its implementation.
+    elif kind == "atom-executable":
+        argv = ["analyze", "analyze"]
+    elif kind == "multiple-analyze":
+        argv = ["node", "--title", "analyze", "/opt/gn", "analyze"]
+    elif kind == "program-only":
+        argv = ["analyze"]
     (process / "cmdline").write_bytes(b"\0".join(os.fsencode(arg) for arg in argv) + b"\0")
     (process / "stat").write_text("123 (worker) " + " ".join(["S"] + ["0"] * 18 + ["10"]))
     (process / "cwd").symlink_to(cwd, target_is_directory=True)
@@ -580,11 +615,12 @@ def test_fixture_refuses_final_directory_aliases(owned_install, command):
         assert (home / ".bashrc.tmp").read_text() == "owned"
 
 
-def test_owned_process_observation_refuses_actual_cleanup(owned_install):
+@pytest.mark.parametrize("index", ["/opt/gitnexus/dist/cli/index.js", "/opt/gn"])
+def test_owned_process_observation_refuses_actual_cleanup(owned_install, index):
     home, scripts, env = owned_install
     process = home / "test-proc/123"
     process.mkdir()
-    (process / "cmdline").write_bytes(b"node\0/opt/gitnexus/dist/cli/index.js\0analyze\0")
+    (process / "cmdline").write_bytes(f"node\0{index}\0analyze\0".encode())
     (process / "stat").write_text("123 (worker) " + " ".join(["S"] + ["0"] * 18 + ["10"]))
     (process / "cwd").symlink_to(home / "genesis", target_is_directory=True)
     result = subprocess.run(["/bin/bash", str(scripts / "uninstall.sh"), "--genesis-only", "--non-interactive"], env=env, capture_output=True, text=True, timeout=10)
@@ -973,7 +1009,7 @@ def test_cleanup_unlinks_known_units_without_removing_foreign_target(owned_insta
     target.parent.mkdir()
     if target_exists:
         target.write_text("foreign unit")
-    links = [home / ".config/systemd/user" / name for name in ("genesis-old.service", "genesis-old.timer", "qdrant.service")]
+    links = [home / ".config/systemd/user" / name for name in ("genesis-old.service", "genesis-old.timer", "genesis-workload.slice", "qdrant.service")]
     for link in links:
         link.symlink_to(target)
     result = subprocess.run(["/bin/bash", str(scripts / "uninstall.sh"), "--genesis-only", "--non-interactive"], env=env, capture_output=True, text=True, timeout=20)
@@ -987,3 +1023,18 @@ def test_retained_diagnostics_do_not_require_file_digest(guard, monkeypatch, tmp
     monkeypatch.setitem(guard.report_retained_state.__globals__, "read_settings", lambda *a, **kw: {key: str(tmp_path / key) for key in ("binary", "cache", "runtime")})
     guard.report_retained_state()
     assert capsys.readouterr().out.count("Preserved configured") == 3
+
+
+def test_cleanup_removes_installed_slices_and_keeps_unrelated_slices(owned_install):
+    home, scripts, env = owned_install
+    directory = home / ".config/systemd/user"
+    installed = {path.name.removesuffix(".template") for path in ROOT.glob("scripts/systemd/*.slice.template")}
+    assert "genesis-workload.slice" in installed
+    for name in installed:
+        (directory / name).write_text("owned installed slice")
+    foreign = directory / "genesis-foreign.slice"
+    foreign.write_text("unrelated slice")
+    result = subprocess.run(["/bin/bash", str(scripts / "uninstall.sh"), "--genesis-only", "--non-interactive"], env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not any((directory / name).exists() for name in installed)
+    assert foreign.read_text() == "unrelated slice"

@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager, suppress
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
@@ -184,12 +184,16 @@ def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
         candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
         if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
             return True
-    # The private OOM launcher contains both wrapper and native argv. Its fixed
-    # flag is not a repository argument; native classification must still run.
-    if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):
-        tail = argv[argv.index("analyze") + 1 :]
+    # GITNEXUS_BIN permits arbitrary executable names. Exact analyze arguments
+    # targeting main are possible writers, including after the wrapper exits.
+    # Skip argv[0]; an executable itself can be named analyze.
+    for index, arg in enumerate(argv[1:], 1):
+        if arg != "analyze":
+            continue
+        tail = argv[index + 1 :]
         target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
-        return target.resolve() == main
+        if target.resolve() == main:
+            return True
     return False
 
 
@@ -208,7 +212,7 @@ def observed_index_writers(proc: Path = Path("/proc")) -> list[int]:
             started = process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19]
             argv = [os.fsdecode(arg) for arg in process.joinpath("cmdline").read_bytes().split(b"\0") if arg]
             wrapper = any(Path(arg).name == "code_intel_index.sh" for arg in argv)
-            native = "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv)
+            native = "analyze" in argv[1:]
             if not (wrapper or native):
                 continue
             cwd = process.joinpath("cwd").resolve(strict=True)
@@ -229,7 +233,7 @@ def observed_index_writers(proc: Path = Path("/proc")) -> list[int]:
 def require_no_batch() -> None:
     writers = observed_index_writers()
     if writers:
-        raise ValueError(f"uninstall refuses observed index writers: {writers}")
+        raise ValueError(f"uninstall refuses possible index writers: {writers}")
     result = subprocess.run(
         [
             "/usr/bin/systemctl",
@@ -396,7 +400,23 @@ def sentinel_armed(raw: str) -> bool:
     return True
 
 
+def validate_provider_paths(config: dict) -> None:
+    """The pinned POSIX provider folds backslashes before native storage use."""
+    for key in ("main", "cache"):
+        path = absolute(config[key])
+        physical = path.resolve()
+        # Python 3.13+ non-strict resolve leaves symlink loops unresolved.
+        # Let the kernel reject loops in both the literal and resolved paths;
+        # missing staging directories remain supported.
+        for candidate in (path, physical):
+            with suppress(FileNotFoundError):
+                candidate.stat()
+        if "\\" in str(path) or "\\" in str(physical):
+            raise ValueError(f"pinned provider does not support backslash in {key} paths")
+
+
 def native_env(config: dict) -> dict[str, str]:
+    validate_provider_paths(config)
     env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
     env.update(
         CBM_CACHE_DIR=config["cache"],
@@ -507,6 +527,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         sentinel=str(absolute(args.sentinel)),
     )
     validate_settings(config)
+    validate_provider_paths(config)
     with lifecycle_lock():
         if any(os.path.lexists(p) for p in (path, absolute(args.state), state)):
             raise ValueError("existing settings/state preserved; choose a fresh staging state")
@@ -567,7 +588,8 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
                 if key in ("version", "build", "enabled", *PATH_KEYS)
             }
             validate_settings(value)
-    except (OSError, ValueError) as error:
+            validate_provider_paths(value)
+    except (OSError, ValueError, RuntimeError) as error:
         result["settings_error"] = str(error)
     try:
         manager_env = systemctl_env()
