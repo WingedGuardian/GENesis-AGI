@@ -269,6 +269,12 @@ class TestContentionMessage:
             "not-a-pid\n0\npytest x",
             "4242",  # torn: pid only, no age or command yet
             "4242\nnot-a-timestamp\npytest x",  # torn: unparseable age
+            "²\n0\npytest x",
+            "١\n0\npytest x",
+            "4242\n-inf\npytest x",
+            "4242\n0\npytest x\ntest_x\n-inf\n",
+            "4242\n0\npytest x\ntest_x\ninf\n",
+            "4242\n0\npytest x\ntest_x\nnan\n",
         ],
     )
     def test_partial_or_corrupt_holder_record_still_blocks(
@@ -730,7 +736,8 @@ class TestConftestWiring:
         path = tmp_path / "pytest.lock"
         holder(path)
 
-        result = self._run(mode, path)
+        # Introspection must bypass contention, independent of suite size.
+        result = self._run([*mode, str(Path(__file__).resolve())], path)
         out = result.stdout + result.stderr
 
         assert result.returncode == 0, f"{mode} was refused: {out[:400]}"
@@ -970,6 +977,17 @@ class TestStallReport:
         assert not inner.acquired
         inner.note("tests/inner.py::test_z")
         assert path.read_text() == "4242\n0\nouter run\n"
+
+    def test_an_oversized_label_declares_truncation(self, tmp_path):
+        path = tmp_path / "pytest.lock"
+        lock = acquire(lock_path=path)
+        try:
+            lock.note("tests/x.py::test_value[" + "x" * 600 + "]")
+            label = path.read_text().split("\n")[3]
+        finally:
+            lock.release()
+        assert len(label) <= 500
+        assert label.endswith("[truncated]")
 
     def test_the_wait_cli_copy_describes_a_record_identically(self, monkeypatch):
         """``scripts/pytest_lock_wait.py`` carries a copy (it runs without

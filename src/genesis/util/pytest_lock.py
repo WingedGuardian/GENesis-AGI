@@ -228,6 +228,8 @@ def default_lock_path() -> Path | None:
 
 
 def _format_age(seconds: float) -> str:
+    if not math.isfinite(seconds):
+        return "unknown"
     seconds = max(0, int(seconds))
     if seconds < 60:
         return f"{seconds}s"
@@ -251,7 +253,7 @@ def _read_holder(path: Path) -> str:
         return "another pytest run (holder details unavailable)"
     lines = raw.split("\n")
     pid = lines[0].strip() if lines else ""
-    if not pid.isdigit():
+    if not (pid.isascii() and pid.isdigit()):
         return "another pytest run (holder details unavailable)"
     detail = f"pid {pid}"
     if len(lines) > 1:
@@ -298,6 +300,8 @@ def describe_current(lines: list[str], pid: int) -> str:
     try:
         age = time.time() - float(lines[4])
     except (TypeError, ValueError):
+        return f"\n  current: {label}"
+    if not math.isfinite(age):
         return f"\n  current: {label}"
     out = f"\n  current: {label} (running {_format_age(age)})"
     note = lines[5].strip() if len(lines) > 5 else ""
@@ -414,7 +418,9 @@ def _write_holder_record(
         text = f"{os.getpid()}\n{started}\n{argv}\n"
         if current is not None:
             label, since, note = current
-            label = label[:500].replace("\n", " ")
+            label = label.replace("\n", " ")
+            if len(label) > 500:
+                label = label[:488] + " [truncated]"
             text += f"{label}\n{since}\n{note.replace(chr(10), ' ')}\n"
         record = text.encode(errors="replace")
         os.pwrite(fd, record, 0)

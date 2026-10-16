@@ -37,6 +37,31 @@ _spec = importlib.util.spec_from_file_location("pytest_lock_wait", _SCRIPT)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "²\n0\npytest x",
+        "١\n0\npytest x",
+        "4242\n-inf\npytest x",
+        "4242\n0\npytest x\ntest_x\n-inf\n",
+        "4242\n0\npytest x\ntest_x\ninf\n",
+        "4242\n0\npytest x\ntest_x\nnan\n",
+    ],
+)
+def test_malformed_metadata_does_not_break_a_waiter(lock_file, lock_holder, record):
+    lock_holder(lock_file, record=record)
+    active, description = _mod.pytest_is_active()
+    assert active
+    assert description
+
+
+def test_a_marker_in_the_test_name_is_not_a_stall_report():
+    fresh = "  pid 4242 (running 2m)\n  current: test_x[LIKELY HUNG] (running 2s)"
+    assert _mod._stall_key(fresh) is None
+    stalled = fresh + "\n  LIKELY HUNG: one step has run 11m; wait channel unknown."
+    assert _mod._stall_key(stalled) == ("pid 4242", "current: test_x[LIKELY HUNG]")
+
 argv_is_pytest = _mod.argv_is_pytest
 scan_pytest_processes = _mod.scan_pytest_processes
 parse_wait_arg = _mod.parse_wait_arg

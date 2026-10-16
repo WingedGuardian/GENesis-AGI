@@ -201,6 +201,8 @@ def scan_pytest_processes() -> list[tuple[int, str, float]]:
 
 
 def _format_age(seconds: float) -> str:
+    if not (float("-inf") < seconds < float("inf")):
+        return "unknown"
     seconds = max(0, int(seconds))
     if seconds < 60:
         return f"{seconds}s"
@@ -215,7 +217,7 @@ def _lock_holder_description() -> str:
     except OSError:
         return "  (holder details unavailable)"
     pid = lines[0].strip() if lines else ""
-    if not pid.isdigit():
+    if not (pid.isascii() and pid.isdigit()):
         return "  (holder details unavailable)"
     detail = f"  pid {pid}"
     if len(lines) > 1:
@@ -252,7 +254,7 @@ def _stall_key(detail: str) -> tuple[str, ...] | None:
     The pid line and the ``current:`` label, without their running ages, so a
     hang is reported once however long it lasts and again if a different step
     hangs."""
-    if "LIKELY HUNG" not in detail:
+    if not any(ln.startswith("  LIKELY HUNG:") for ln in detail.split("\n")):
         return None
     lines = [ln.strip() for ln in detail.split("\n") if ln.strip()]
     pid = lines[0].split(" (", 1)[0] if lines else ""
@@ -270,6 +272,8 @@ def describe_current(lines: list[str], pid: int) -> str:
     try:
         age = time.time() - float(lines[4])
     except (TypeError, ValueError):
+        return f"\n  current: {label}"
+    if not (float("-inf") < age < float("inf")):
         return f"\n  current: {label}"
     out = f"\n  current: {label} (running {_format_age(age)})"
     note = lines[5].strip() if len(lines) > 5 else ""
