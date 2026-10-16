@@ -1,0 +1,1 @@
+- Guardian's code-revert recovery now stops when its `git stash` fails or does not finish, and says so, instead of reverting anyway and reporting a misleading revert failure.

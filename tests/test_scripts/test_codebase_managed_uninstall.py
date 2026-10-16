@@ -17,6 +17,45 @@ from tests.test_scripts.test_codebase_managed_config import ROOT, managed
 guard = managed
 
 
+def test_batch_observation_seeds_the_user_manager_environment(guard, monkeypatch):
+    for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        monkeypatch.delenv(name, raising=False)
+    seen = {}
+
+    def run(argv, **kwargs):
+        seen.update(argv=argv, env=kwargs["env"])
+        return SimpleNamespace(stdout="")
+
+    g = guard.require_no_batch.__globals__
+    monkeypatch.setitem(g, "observed_index_writers", lambda: [])
+    monkeypatch.setattr(g["subprocess"], "run", run)
+    guard.require_no_batch()
+    assert seen["argv"][:3] == ["/usr/bin/systemctl", "--user", "list-units"]
+    assert seen["env"]["XDG_RUNTIME_DIR"].startswith("/run/user/")
+    assert seen["env"]["DBUS_SESSION_BUS_ADDRESS"].startswith("unix:path=/run/user/")
+
+
+def test_retirement_seeds_the_user_manager_environment(guard, monkeypatch):
+    for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs["env"]))
+        return SimpleNamespace(returncode=0, stderr="")
+
+    g = guard.retire_managed.__globals__
+    monkeypatch.setattr(g["subprocess"], "run", run)
+    monkeypatch.setitem(g, "require_quiescent", lambda unit: None)
+    monkeypatch.setitem(g, "show", lambda *args: {"UnitFileState": "disabled", "LoadState": "loaded"})
+    guard.retire_managed()
+    assert [argv[2:] for argv, _env in calls] == [
+        ["disable", guard.BACKEND], ["stop", guard.BACKEND], ["stop", guard.SLICE]
+    ]
+    assert all(env["XDG_RUNTIME_DIR"].startswith("/run/user/") for _argv, env in calls)
+    assert all(env["DBUS_SESSION_BUS_ADDRESS"].startswith("unix:path=/run/user/") for _argv, env in calls)
+
+
 @pytest.mark.parametrize("layout", ["default", "empty", "external", "data", "repo", "qdrant", "nested", "default-alias", "locks-alias", "external-alias"])
 def test_namespace_layout_before_mutation(guard, transaction, monkeypatch, layout):
     home = transaction
@@ -448,6 +487,9 @@ os.execv("/usr/bin/rm",["rm",*sys.argv[1:]])
         "/usr/local/bin/qdrant", str(home / "system-bin/qdrant")))
     for name in ("code_intel_cbm_worker.py", "code_intel_cbm_admission.py"):
         shutil.copy2(ROOT / "scripts/lib" / name, scripts / "lib" / name)
+    utility = repo / "src/genesis/util/systemd.py"
+    utility.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "src/genesis/util/systemd.py", utility)
     for name in (
         ".genesis/config",
         "data",

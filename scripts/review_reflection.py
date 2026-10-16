@@ -40,17 +40,30 @@ most 1 MiB, written after the round started and before the reflection was
 committed; a relative path is read from the repository the check runs in.
 Cite a copy that nothing else rewrites (``<pr>-round<N>-<kind>.txt``), never
 the review gate's per-worktree evidence file, which the next review replaces.
-A premise-evidence file must carry the ``Design-premise:`` block of
-``.claude/docs/premise-check.md``: the verdict line and at least two ``P<n>``
-claim lines. Each of the PR's acceptance points must appear within one Scope
-line that starts ``covered:``; that is a substring floor for an honest
-session, not proof that the line covers the point.
+A premise-evidence file must carry the canonical ``Design-premise:`` block of
+``.claude/docs/premise-check.md``: the verdict line at column 0, the
+``Expected before checking:`` line directly under it, at least two distinct
+``P<n> <verdict>`` claim lines in an unbroken run, verdict first, and then
+only ``Effect:``, ``Better shape:``, ``PR-shape:``, ``Persisted-state:`` or
+code-fence lines until a blank line or the next ``Design-premise:`` line (the
+block's paragraph is closed). At least one block that has claims must carry
+the Expected line. Each of
+the PR's acceptance points must appear within one Scope line that starts
+``covered:``; that is a substring floor for an honest session, not proof
+that the line covers the point.
 
 ``covered_keys`` is THE coverage check: the commit gate (a later change) calls
 it, and it applies every local rule, so a reflection committed by hand is held
 to exactly the standard a tool-made one is.
 
-CLI: ``status`` (what the open round owes, whether it has settled) and
+Late findings (reviews that opened no round, and round-opening reviews that
+arrived after a fix to their head) are owed from ``REFLECTION_CUTOVER_ISO`` on,
+each credited only under its own round's context; ``review_late`` holds that
+reader and is imported only when a cutover is set. The cutover is None until the
+commit gate enforces reflections, so until then nothing more is owed.
+
+CLI: ``status`` (what the open round owes, whether it has settled; ``--cutover``
+reports what late findings from that time on would owe, enforcing nothing) and
 ``validate`` (a file, offline). Exit 1 means the reflection is invalid; exit
 2 means the check could not be made.
 """
@@ -76,6 +89,11 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 SETTLE = timedelta(minutes=30)
+#: When late findings start being owed (``review_late``). None until the commit
+#: gate enforces reflections, which sets it at its own merge, so no debt appears
+#: before anything enforces it (owner ruling 50cc9dec). With None, what is owed
+#: is exactly the open round's, and ``review_late`` is never imported.
+REFLECTION_CUTOVER_ISO: str | None = None
 MIN_BLOCK_CHARS = 300
 LOG_DEPTH = 1000
 #: A template placeholder; it can never match a field, so it is refused anyway,
@@ -510,11 +528,21 @@ def previous_class_labels(cwd: str, prior_heads: Sequence[str]) -> list[str]:
     other head is ignored, so a stray or mistyped one cannot stand in for the
     previous round. Drafts never count: an invalid or escalating reflection
     was never accepted as its round's answer."""
+    if not prior_heads:
+        return []
+    return _class_labels(_log_reflections(cwd), prior_heads)
+
+
+def _class_labels(
+    log: Sequence[tuple[str, str, str, datetime | None]], prior_heads: Sequence[str]
+) -> list[str]:
+    """``previous_class_labels`` over reflection rows already read
+    (``_log_reflections``' shape), so a caller can choose which rows count."""
     wanted = set(prior_heads)
     classes: list[str] = []
     if not wanted:
         return classes
-    for _, kind, body, _ in _log_reflections(cwd):
+    for _, kind, body, _ in log:
         parsed = parse(body)
         if kind == "empty" and parsed.ok and not parsed.escalate and parsed.head in wanted:
             classes.extend(c for c in parsed.classes if c not in classes)
@@ -543,51 +571,135 @@ _COMMIT_CLOCK_SLACK = timedelta(seconds=1)
 #: path is a hang (a device) or memory exhaustion on the hook path.
 EVIDENCE_MAX_BYTES = 1024 * 1024
 
-#: The premise-check block of .claude/docs/premise-check.md: the verdict line,
-#: then claim lines ``P<n> <claim> — TRUE|FALSE|UNPROVEN ...``.
-#: A leading bullet, table cell or bold marker is allowed: the block is often
-#: rendered inside a review. This is a floor that rejects a hand summary, not a
-#: parser of the claims' meaning.
-_BLOCK_LEAD = r"^\s*(?:[-*|]\s*)?(?:\*\*)?"
-_PREMISE_VERDICT_RE = re.compile(
-    _BLOCK_LEAD
-    + r"Design-premise:(?:\*\*)?\s*(SOUND-BUT-INFERIOR|SOUND|BROKEN)(?![\w-]|[ \t]*[/|][ \t]*(?:SOUND|BROKEN))",
-    re.MULTILINE,
+#: The premise-check block of .claude/docs/premise-check.md ("The output"):
+#: a ``Design-premise:`` line at column 0, then the required ``Expected before
+#: checking:`` line, then the claim lines ``P<n> TRUE|FALSE|UNPROVEN — <claim>``,
+#: verdict FIRST (a short parenthesised qualifier may follow it). A claim's
+#: verdict sits in a fixed slot, so no word in the claim's own text can be read
+#: as it (#3120: the free-text reader misbound them). Each line is matched whole
+#: after trailing whitespace is dropped. A line that opens like a verdict line
+#: but does not match it is refused by its line number, and so is any line in
+#: the block's paragraph that is not one of the block's lines (#3127, #3238).
+_PREMISE_VERDICT_LINE_RE = re.compile(
+    r"Design-premise:[ \t]+(SOUND-BUT-INFERIOR|SOUND|BROKEN)"
+    r"(?:[ \t]+[—–-][ \t]+\S.*)?"
 )
-#: A claim's verdict is the word in its SLOT, on the claim's own line: the first
-#: TRUE, FALSE or UNPROVEN right after an em or en dash or a hyphen with spaces
-#: on both sides (optionally bold), or one that fills a whole table cell. A
-#: verdict word inside the claim's own text is not in a slot, so it is never
-#: read as the verdict.
-_PREMISE_CLAIM_RE = re.compile(
-    _BLOCK_LEAD
-    + r"P([1-9][0-9]?)\b.*?(?:(?:\u2014|\u2013|[ \t]-[ \t])[ \t]*(?:\*\*)?(TRUE|FALSE|UNPROVEN)\b"
-    + r"|\|[ \t]*(?:\*\*)?(TRUE|FALSE|UNPROVEN)(?:\*\*)?[ \t]*(?:\||$))",
-    re.MULTILINE,
+#: Any column-0 line that opens like a verdict line, in any case, bold or
+#: spacing: it must be a verdict line exactly. An indented or ``>``-quoted one
+#: stays prose, which is how the doc says to quote an example.
+_PREMISE_VERDICT_PREFIX_RE = re.compile(
+    r"[*_]*design[-\u2010\u2011 ]premise[*_]*[ \t]*:", re.IGNORECASE
+)
+#: A heading or list item labelled as the verdict (``## Design-premise: BROKEN``,
+#: ``- Design-premise: SOUND (80%)``) is not a sanctioned quote, so it would
+#: otherwise contradict the block unseen. It is refused when the text after
+#: its colon carries an UPPERCASE verdict token, the grammar's own spelling; a
+#: lowercase question or description ("what would make this sound?") and a bare
+#: section heading stay prose. ``>`` is not a marker here: it is the doc's quote.
+_PREMISE_MARKED_VERDICT_RE = re.compile(
+    r"(?:#{1,6}|[-*+|]|[0-9]+[.)])[ \t]+[*_]*(?i:design[-\u2010\u2011 ]premise)[*_]*[ \t]*:(.*)"
+)
+_PREMISE_VERDICT_TOKEN_RE = re.compile(r"\b(?:SOUND|BROKEN)\b")
+_PREMISE_EXPECTED_LINE_RE = re.compile(r"Expected before checking:[ \t]+\S.*")
+_PREMISE_CLAIM_LINE_RE = re.compile(
+    r"[ \t]*P([1-9][0-9]?) (TRUE|FALSE|UNPROVEN)(?: \([^)\n]*\))?[ \t]+[\u2014\u2013-][ \t]+\S.*"
+)
+#: After the claims, the block paragraph (up to the next blank line or verdict
+#: line) may hold only the doc's trailer lines (and ``Persisted-state:``, which
+#: the architect agent emits right after them) and a code fence. Every other
+#: line in it is refused by its line number: the paragraph is closed, so no
+#: near-miss spelling of a claim or Expected line can be dropped as prose (#3238).
+_PREMISE_TRAILER_RE = re.compile(
+    r"(?:Effect|Better shape|PR-shape|Persisted-state):[ \t]+\S.*|(?:```|~~~)\S*"
 )
 
 
 def premise_block(text: str) -> tuple[str | None, dict[str, str], str | None]:
     """``(verdict, {claim number: verdict}, problem)`` from a premise-check
-    output. The block must name exactly one verdict, however many times it
-    repeats it, and at least two distinct claims; a claim given two different
-    verdicts is a problem, never the first one read."""
-    verdicts = {m.group(1) for m in _PREMISE_VERDICT_RE.finditer(text)}
-    claims: dict[str, str] = {}
-    for m in _PREMISE_CLAIM_RE.finditer(text):
-        said = m.group(2) or m.group(3)
-        if claims.setdefault(m.group(1), said) != said:
-            return None, {}, f"claim P{m.group(1)} carries two different verdicts"
-    if len(verdicts) > 1:
-        return None, {}, "it names more than one 'Design-premise:' verdict: " + ", ".join(
-            sorted(verdicts)
-        )
+    output in the canonical block. Every column-0 line that opens like
+    ``Design-premise:`` must be a verdict line, and they must all agree; a
+    heading or list item labelled as the verdict that carries an uppercase
+    verdict token is refused. The block paragraph runs from a verdict line to
+    the next blank line or verdict line and is CLOSED: it holds the verdict
+    line, the ``Expected before checking:`` line directly under it,
+    the unbroken run of claim lines, then only ``Effect:``, ``Better shape:``,
+    ``PR-shape:``, ``Persisted-state:`` and code-fence lines. Any other line in it is refused by its
+    line number. The claims are those of the first block that has any; a later
+    block may repeat any of them with the same verdict (claim text is not
+    compared), never add one or change a verdict. At least one block with
+    claims must carry the Expected line (a restating summary need not), and at least two distinct claims are required. Lines are
+    split on newlines only, as the reflection itself is. Outside a block
+    paragraph, text is prose and is not checked."""
+    lines = [line.rstrip() for line in text.split("\n")]
+    verdicts: set[str] = set()
+    first: dict[str, str] | None = None
+    has_expected = False
+    for i, line in enumerate(lines):
+        marked = _PREMISE_MARKED_VERDICT_RE.fullmatch(line)
+        if marked and _PREMISE_VERDICT_TOKEN_RE.search(marked.group(1)):
+            return None, {}, (
+                f"line {i + 1} gives a 'Design-premise:' verdict in a heading or list item; "
+                "write it as a plain column-0 line, or indent or >-quote it if it is not yours"
+            )
+        if not _PREMISE_VERDICT_PREFIX_RE.match(line):
+            continue
+        head = _PREMISE_VERDICT_LINE_RE.fullmatch(line)
+        if head is None:
+            return None, {}, (
+                f"line {i + 1} starts like a 'Design-premise:' line but is not "
+                "'Design-premise: SOUND|SOUND-BUT-INFERIOR|BROKEN[ — <qualifier>]' (plain text)"
+            )
+        verdicts.add(head.group(1))
+        if len(verdicts) > 1:
+            return None, {}, "it names more than one 'Design-premise:' verdict: " + ", ".join(
+                sorted(verdicts)
+            )
+        run: dict[str, str] = {}
+        j = i + 1
+        expected_here = j < len(lines) and bool(_PREMISE_EXPECTED_LINE_RE.fullmatch(lines[j]))
+        if expected_here:
+            j += 1
+        while j < len(lines):
+            claim = _PREMISE_CLAIM_LINE_RE.fullmatch(lines[j])
+            if claim is None:
+                break
+            number, said = claim.group(1), claim.group(2)
+            if run.setdefault(number, said) != said:
+                return None, {}, f"line {j + 1}: claim P{number} carries two different verdicts"
+            j += 1
+        while (
+            j < len(lines) and lines[j].strip() and not _PREMISE_VERDICT_PREFIX_RE.match(lines[j])
+        ):
+            if not _PREMISE_TRAILER_RE.fullmatch(lines[j]):
+                return None, {}, (
+                    f"line {j + 1} is inside the premise block that starts at line {i + 1} but "
+                    "is not one of its lines: a claim "
+                    "'P<n> TRUE|FALSE|UNPROVEN — <claim>' (one line, not wrapped), the "
+                    "Expected line directly under the verdict, Effect:, Better shape:, "
+                    "PR-shape:, Persisted-state: or a code fence. Leave a blank line before any other text"
+                )
+            j += 1
+        has_expected = has_expected or (expected_here and bool(run))
+        if first is None:
+            first = run or None
+        elif any(first.get(number) != said for number, said in run.items()):
+            return None, {}, (
+                f"line {i + 1}: a repeated 'Design-premise:' block must restate the "
+                "first block's claims, never add or change one"
+            )
+    claims = first or {}
     if not verdicts or len(claims) < 2:
         return (
             None,
             {},
-            "it needs the 'Design-premise:' verdict line and at least two "
-            "'P<n> ... TRUE|FALSE|UNPROVEN' claim lines (.claude/docs/premise-check.md)",
+            "it needs the canonical block of .claude/docs/premise-check.md: a "
+            "'Design-premise: <verdict>' line at column 0 with at least two "
+            "'P<n> TRUE|FALSE|UNPROVEN' claim lines directly under it",
+        )
+    if not has_expected:
+        return None, {}, (
+            "the block needs its 'Expected before checking: <one line>' line directly "
+            "under the 'Design-premise:' line (.claude/docs/premise-check.md)"
         )
     return next(iter(verdicts)), claims, None
 
@@ -826,9 +938,21 @@ def covered_keys(
 
 
 def owed_state(
-    budget: Mapping[str, Any], covered: Iterable[str], *, now: datetime
+    budget: Mapping[str, Any],
+    covered: Iterable[str],
+    *,
+    now: datetime,
+    cutover: str | None = None,
+    fix_time: Any = None,
+    late_covered: Iterable[str] = (),
 ) -> dict[str, Any]:
-    """What the open round owes, from a ``review_budget`` result. Pure."""
+    """What is owed, from a ``review_budget`` result: the open round's keys less
+    ``covered`` (``covered_keys``). With ``cutover`` None that is all, and pure.
+    With a cutover, the late keys from it on (``review_late.late_owed``) less
+    ``late_covered`` are owed too. The two are subtracted apart, so a
+    reflection judged under the open round never clears a late key, which only
+    its own round's context can. ``fix_time`` (``review_late.fix_time_reader``)
+    reads local git and may raise ``Refused``."""
     state: dict[str, Any] = {
         "status": budget.get("status"),
         "round": budget.get("count"),
@@ -844,18 +968,33 @@ def owed_state(
         "round_started": None,
         "settled": False,
         "settle_until": None,
+        "cutover": cutover,
+        # None (unknown) until a cutover's late findings have been read.
+        "late_keys": [] if cutover is None else None,
     }
     rounds = budget.get("rounds") or []
     if budget.get("status") == "ok" and rounds:
         state["round_head"] = rounds[-1].get("head")
     if budget.get("status") != "ok":
         return state
+    late_owed: list[str] | None = []
+    if cutover is not None:
+        import review_late  # noqa: PLC0415
+
+        state["late_keys"], late_owed = review_late.late_owed(
+            budget, late_covered, cutover=cutover, fix_time=fix_time
+        )
     if budget.get("round_state") != "open":
-        state["owed"] = []
+        state["owed"] = late_owed
+        if cutover is not None:
+            # No settle window applies to late reviews: each is owed as it
+            # lands. So with no round open, the state is settled once the late
+            # debt is known, owed or not. With no cutover this is main's False.
+            state["settled"] = late_owed is not None
         return state
-    if state["reflection_keys"] == "ok":
+    if state["reflection_keys"] == "ok" and late_owed is not None:
         done = set(covered)
-        state["owed"] = [k for k in state["open_keys"] if k not in done]
+        state["owed"] = [k for k in state["open_keys"] if k not in done] + late_owed
     times = [
         when
         for source in (rounds[-1].get("reviews") or [] if rounds else [])
@@ -871,36 +1010,66 @@ def owed_state(
     return state
 
 
-def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
+def _acceptance(budget: Mapping[str, Any], repo: str, number: int) -> list[str] | None:
+    """The PR's acceptance points, from the body the budget read carried."""
+    if budget.get("body_changed"):
+        raise Refused(
+            "the PR body changed between the two reads, so its acceptance "
+            "points are not known: run status again"
+        )
+    # The body comes with the budget read. Only a budget that carries no
+    # body at all (an older review_budget) is answered by asking again; a
+    # carried body of None (two reads that disagreed) never is.
+    if "body" in budget:
+        body = budget.get("body")
+        if not isinstance(body, str):
+            raise Refused("the PR body could not be read, so its acceptance is unknown")
+    else:
+        body = _pr_meta(repo, number).get("body") or ""
+    return acceptance_points(body)
+
+
+def _open_covered(
+    cwd: str, budget: Mapping[str, Any], state: Mapping[str, Any], acceptance: Sequence[str] | None
+) -> set[str]:
+    """``covered_keys`` for the open round, every argument taken from the budget."""
+    return covered_keys(
+        cwd,
+        str(state["head"]),
+        round_number=int(state["round"] or 0),
+        gate_lane=state["gate_lane"],
+        prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
+        acceptance=acceptance,
+        round_started=state["round_started"],
+    )
+
+
+_MODULE_CUTOVER = object()
+
+
+def status(
+    cwd: str, *, now: datetime | None = None, cutover: Any = _MODULE_CUTOVER
+) -> dict[str, Any]:
+    """What is owed now. ``cutover`` defaults to ``REFLECTION_CUTOVER_ISO`` as it
+    stands at the call; any other value is a report only: it shows what late
+    findings from that time on would owe, and enforces nothing."""
     import review_budget  # noqa: PLC0415
 
+    if cutover is _MODULE_CUTOVER:
+        cutover = REFLECTION_CUTOVER_ISO
     repo, number = pr_identity(cwd)
     budget = review_budget.evaluate_pr(repo, number)
+    if cutover is not None:
+        import review_late  # noqa: PLC0415
+
+        state = review_late.late_status(
+            cwd, budget, repo, number, now=now or datetime.now(UTC), cutover=cutover
+        )
+        state.update({"repo": repo, "pr": number, "errors": budget.get("errors", [])})
+        return state
     state = owed_state(budget, (), now=now or datetime.now(UTC))
     if state["status"] == "ok" and state["round_state"] == "open":
-        if budget.get("body_changed"):
-            raise Refused(
-                "the PR body changed between the two reads, so its acceptance "
-                "points are not known: run status again"
-            )
-        # The body comes with the budget read. Only a budget that carries no
-        # body at all (an older review_budget) is answered by asking again; a
-        # carried body of None (two reads that disagreed) never is.
-        if "body" in budget:
-            body = budget.get("body")
-            if not isinstance(body, str):
-                raise Refused("the PR body could not be read, so its acceptance is unknown")
-        else:
-            body = _pr_meta(repo, number).get("body") or ""
-        covered = covered_keys(
-            cwd,
-            str(state["head"]),
-            round_number=int(state["round"] or 0),
-            gate_lane=state["gate_lane"],
-            prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
-            acceptance=acceptance_points(body),
-            round_started=state["round_started"],
-        )
+        covered = _open_covered(cwd, budget, state, _acceptance(budget, repo, number))
         if state["reflection_keys"] == "ok":
             state["owed"] = [k for k in state["open_keys"] if k not in covered]
     state.update({"repo": repo, "pr": number, "errors": budget.get("errors", [])})
@@ -913,7 +1082,12 @@ def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("status", help="what the open round owes")
+    status_cmd = sub.add_parser("status", help="what the open round owes")
+    status_cmd.add_argument(
+        "--cutover",
+        default=None,
+        help="report what late findings from this ISO time on would owe (enforces nothing)",
+    )
     validate = sub.add_parser("validate", help="check a file against the grammar, offline")
     validate.add_argument("file", type=Path)
     validate.add_argument("--round", type=int, default=None)
@@ -921,7 +1095,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "status":
-            print(json.dumps(status(os.getcwd()), indent=2))
+            report = (
+                status(os.getcwd(), cutover=args.cutover) if args.cutover else status(os.getcwd())
+            )
+            print(json.dumps(report, indent=2))
             return 0
         text = args.file.read_bytes().decode("utf-8")
         parsed = parse(text, round_number=args.round, gate_lane=args.gate)

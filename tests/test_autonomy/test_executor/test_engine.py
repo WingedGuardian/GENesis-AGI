@@ -149,6 +149,7 @@ class TestFullLifecycle:
 
     async def test_task_not_found_returns_false(
         self, db, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
     ):
         engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
         result = await engine.execute("nonexistent")
@@ -156,6 +157,7 @@ class TestFullLifecycle:
 
     async def test_no_plan_path_returns_false(
         self, db, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
     ):
         await _seed_task(db, plan_path="")
         engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
@@ -164,6 +166,7 @@ class TestFullLifecycle:
 
     async def test_unreadable_plan_returns_false(
         self, db, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
     ):
         await _seed_task(db, plan_path="/nonexistent/plan.md")
         engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
@@ -272,6 +275,7 @@ class TestAmendment1Blocker:
 
     async def test_blocker_contains_resume_phase(
         self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
     ):
         mock_reviewer.review_plan = AsyncMock(
             return_value=ReviewResult(passed=False, gaps=["gap"]),
@@ -763,6 +767,7 @@ class TestHelpers:
 class TestPreMortemIntegration:
     async def test_premortem_blocks_low_confidence(
         self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
     ):
         """Pre-mortem with confidence < 50 blocks the task."""
         mock_reviewer.pre_mortem = AsyncMock(
@@ -784,6 +789,7 @@ class TestPreMortemIntegration:
 
     async def test_premortem_injects_mitigations(
         self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
     ):
         """Pre-mortem with confidence 50-70 injects mitigations and proceeds."""
         mock_reviewer.pre_mortem = AsyncMock(
@@ -807,6 +813,7 @@ class TestPreMortemIntegration:
 
     async def test_premortem_high_confidence_proceeds(
         self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
     ):
         """Pre-mortem with confidence > 70 proceeds normally."""
         mock_reviewer.pre_mortem = AsyncMock(
@@ -1463,6 +1470,7 @@ class TestDispatchClaim:
 
     async def test_pending_with_unreadable_plan_is_failed_not_claimed(
         self, db, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
     ):
         """A pending task with an unreadable plan is marked failed, and the plan
         read (which fails) happens before the claim — so the row is never left
@@ -1596,6 +1604,7 @@ class TestLedgerAndBusEmits:
 
     async def test_fail_task_emits_negative_once_even_when_double_invoked(
         self, db, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
     ):
         await _seed_task(db, plan_path="/nonexistent/plan.md")
         engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)

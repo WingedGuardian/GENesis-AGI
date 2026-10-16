@@ -802,6 +802,9 @@ def test_update_state_persists_the_recovery_ownership_inputs(
         old_commit="abc",
         started_at="2026-01-01T00:00:00Z",
         services_stopped=services_stopped,
+        # Which kind of run wrote it: the restart guard reads a --post-merge's
+        # "fetching" as covering merged code (#3139).
+        post_merge=False,
     )
 
 
@@ -1071,6 +1074,28 @@ def test_a_merge_killed_writing_a_flagged_path_is_refused(tmp_path, flag):
     assert "tracked files changed during the merge" in proc.stdout + proc.stderr
     assert "changed.txt" in proc.stdout + proc.stderr
     assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+@pytest.mark.parametrize("conflict", [True, False], ids=["conflict-exit", "killed-before-merge"])
+def test_a_merge_conflict_exit_is_not_recovered_as_a_crash(tmp_path, conflict):
+    """#3139: update.sh's conflict exit leaves "merging" at the tag plus
+    update_conflicts.json for the same commit. That is the resolver's anchor (its
+    rollback tag and old commit for the later --post-merge), not a crash: it is
+    kept and nothing is recorded. Without the conflict record it is a run killed
+    before its merge, recovered as before."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    dot = tmp_path / "home" / ".genesis"
+    dot.mkdir(parents=True)
+    if conflict:
+        (dot / "update_conflicts.json").write_text(json.dumps({"deploy_head": rollback}))
+    proc, state_path = _recover(
+        tmp_path, root, phase="merging", own_head=rollback, deploy_head=rollback
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert state_path.exists() is conflict
+    said = "stopped on merge conflicts" in proc.stdout
+    assert said is conflict, proc.stdout
+    assert ("Crash recovery complete" in proc.stdout) is not conflict
 
 
 @pytest.mark.parametrize("phase", ["activation", "", "MIGRATIONS", "health-check"])

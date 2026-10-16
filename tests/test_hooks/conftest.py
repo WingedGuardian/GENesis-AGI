@@ -229,6 +229,25 @@ def _hermetic_main_reverts(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_rework(monkeypatch):
+    """Pin the BLOCKING ``rework`` gate's sent-back list EMPTY for EVERY hook test.
+
+    The gate reads ``gh pr list --label needs-rework`` (and the architecture label)
+    first, in both the ``--check-pr`` report and the merge arm, so without this pin
+    every test driving either one makes a live call (some as a subprocess, hence an
+    environment variable the children inherit). An empty list makes every PR ``n/a``
+    unless its body declares a replacement: a declared reference then falls to a
+    timeline read, whose seam is pinned empty here so it reads as UNREADABLE rather
+    than reaching the network. No existing test body declares one. The gate's own
+    behaviour is tested in tests/test_hooks/test_rework_gate.py, which overrides
+    these per case."""
+    monkeypatch.setenv("_TEST_GH_REWORK_SENT_BACK", "")
+    monkeypatch.setenv("_TEST_GH_REWORK_TIMELINE", "{}")
+    monkeypatch.setenv("_TEST_GH_REWORK_ACK", "{}")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_outside_contribution(monkeypatch):
     """Pin the leaks exemption's PR read to a FAILED read for every hook test.
 

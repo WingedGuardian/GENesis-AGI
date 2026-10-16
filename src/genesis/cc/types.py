@@ -445,6 +445,8 @@ class CCInvocation:
     # content there (visible in the enforce ledger + auto-demote), never
     # toward injecting into an unsupervised session.
     supervised: bool = False
+    # Managed native receipts may release capacity only after the group exits.
+    confirm_cleanup: bool = False
     # Applied LAST in CCInvoker._build_env, after every computed key — the
     # per-invocation escape hatch for env the invoker doesn't model (e.g. the
     # eval bench's CLAUDE_CONFIG_DIR cleanroom). Overrides win over inherited
@@ -556,6 +558,9 @@ class CCOutput:
     # that survives a model switch. A caller that SUMS `cost_usd` across turns
     # must record the difference, via `cc_sessions.record_turn_cost`.
     cost_is_cumulative: bool = False
+    # False for a streaming EOF fallback without a structured terminal result.
+    # Ordinary callers retain their legacy interpretation of that fallback.
+    result_received: bool = True
 
     # How many over-limit stream-json lines the reader DROPPED on this run.
     # Nonzero means the event stream this output was built from is INCOMPLETE:
@@ -604,6 +609,28 @@ class StreamEvent:
             for b in blocks
             if isinstance(b, dict) and b.get("type") in StreamEvent._RECOGNIZED_BLOCKS
         )
+
+    def tool_uses(self) -> list[tuple[str, object]]:
+        """Every ``(name, input)`` tool_use this event carries.
+
+        ``from_raw`` stops at the first recognized block, so a line shaped
+        ``text + tool_use`` parses as "text". Telemetry that is persisted as an
+        inventory reads the raw content array through this instead. An event
+        built without a raw ``assistant`` line falls back to its parsed fields.
+        """
+        raw = self.raw or {}
+        if raw.get("type") == "assistant":
+            blocks = raw.get("message", {}).get("content", [])
+            if not isinstance(blocks, list):
+                return []
+            return [
+                (b["name"], b.get("input"))
+                for b in blocks
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name")
+            ]
+        if self.event_type == "tool_use" and self.tool_name:
+            return [(self.tool_name, self.tool_input)]
+        return []
 
     @classmethod
     def from_raw(cls, raw: dict) -> StreamEvent:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -245,6 +246,7 @@ def require_no_batch() -> None:
         text=True,
         check=True,
         timeout=30,
+        env=systemctl_env(),
     )
     for row in result.stdout.splitlines():
         unit = row.split()[0]
@@ -261,6 +263,7 @@ def retire_managed() -> None:
             capture_output=True,
             text=True,
             timeout=60,
+            env=systemctl_env(),
         )
         if result.returncode and not manager_absent(argv[1]):
             errors.append((argv[0], result.stderr.strip()))
@@ -567,6 +570,7 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
     except (OSError, ValueError) as error:
         result["settings_error"] = str(error)
     try:
+        manager_env = systemctl_env()
         output = subprocess.check_output(
             [
                 "/usr/bin/systemctl",
@@ -587,11 +591,30 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
             text=True,
             timeout=30,
             stderr=subprocess.PIPE,
+            env=manager_env,
         )
         result["service"] = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
-    except (OSError, subprocess.SubprocessError) as error:
+    except (ImportError, OSError, SyntaxError, subprocess.SubprocessError) as error:
         result["manager_error"] = str(error)
     return result
+
+
+def systemctl_env() -> dict[str, str]:
+    """The user-manager environment from src/genesis/util/systemd.py.
+
+    Loaded by path because this script runs isolated (-I). Without it a service
+    started with no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS cannot reach the
+    user manager, and every systemctl --user call fails.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_genesis_util_systemd",
+        Path(__file__).resolve().parent.parent / "src/genesis/util/systemd.py",
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load systemd utilities")
+    systemd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(systemd)
+    return systemd.systemctl_env()
 
 
 def show(unit: str, *properties: str, timeout: float = 30) -> dict[str, str]:
@@ -606,6 +629,7 @@ def show(unit: str, *properties: str, timeout: float = 30) -> dict[str, str]:
         text=True,
         timeout=timeout,
         stderr=subprocess.PIPE,
+        env=systemctl_env(),
     )
     value = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     if any(name not in value for name in properties):
