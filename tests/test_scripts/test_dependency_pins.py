@@ -175,23 +175,14 @@ def test_installers_enforce_the_pinned_tools_node_floor():
         assert '"$major" -gt 24' in text, relative
 
 
-def test_installers_do_not_run_cbm_installer_while_kill_switch_is_active():
-    """Neither install path may reach the installer while the kill switch is set.
-
-    The fetch moved to scripts/lib/cbm_installer.sh — one site for the pin, its
-    digest and the install — so the ordering is now checked against the CALL,
-    and the callers are additionally held to not growing a second copy of the
-    fetch. The shared script also refuses on its own when run directly, so the
-    guarantee does not rest on every future caller remembering to check.
-    """
+def test_installers_never_run_legacy_cbm_installer():
+    """Explicit managed staging owns acquisition; ordinary setup never fetches CBM."""
     for relative in ("scripts/install.sh", "scripts/bootstrap.sh"):
         text = (REPO_ROOT / relative).read_text()
-        # The sentinel is the resolved shared-site path (cbm_disable_file.sh),
-        # honouring CODEBASE_MEMORY_MCP_DISABLE_FILE — never a hard-coded
-        # $HOME literal that would ignore the override.
-        sentinel = '[ -e "$_cbm_disable" ]'
-        assert text.index(sentinel) < text.index("genesis_cbm_install"), relative
-        assert 'lib/cbm_disable_file.sh' in text, relative
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        assert "genesis_cbm_install" not in code, relative
+        assert "cbm_installer.sh" not in code, relative
+        assert "codebase-memory-mcp --version" not in code, relative
         assert "raw.githubusercontent.com/DeusData/codebase-memory-mcp/" not in text, relative
     # The shared script's OWN kill switch is exercised, not grepped, by
     # test_bootstrap_guards.py::test_b9_direct_run_honours_the_kill_switch — a
@@ -708,3 +699,38 @@ def test_an_explicit_override_ends_the_search(tmp_path):
         {"GITNEXUS_BIN": str(chosen)},
     )
     assert out.stdout.strip() == str(chosen), out.stdout + out.stderr
+
+
+def _browser_requirements() -> dict[str, Requirement]:
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    reqs = [Requirement(dep) for dep in data["project"]["optional-dependencies"]["browser"]]
+    return {r.name: r for r in reqs}
+
+
+def _admitted_minors(req: Requirement) -> set[tuple[int, int]]:
+    return {
+        (major, minor)
+        for major in range(0, 3)
+        for minor in range(0, 100)
+        for patch in range(0, 30)
+        if Version(f"{major}.{minor}.{patch}") in req.specifier
+    }
+
+
+def test_playwright_and_patchright_pins_admit_one_shared_minor():
+    """patchright ships the Chromium build of the playwright release it tracks, so
+    one minor for both means one Chromium download and one build ever opening the
+    profile (patchright 1.62 = Chromium 151 build 1234; 1.63 ships 153/1243)."""
+    reqs = _browser_requirements()
+    playwright = _admitted_minors(reqs["playwright"])
+    patchright = _admitted_minors(reqs["patchright"])
+    assert len(playwright) == 1, f"playwright admits several minors: {sorted(playwright)}"
+    assert playwright == patchright
+
+
+def test_camoufox_pin_stays_on_its_browser_pin_line():
+    """0.5.7 brought the browser pin the provisioner fetches by; <0.6 because the
+    0.4 -> 0.5 step changed the engine layout with no migration guide."""
+    spec = _browser_requirements()["camoufox"].specifier
+    assert Version("0.5.7") in spec and Version("0.5.6") not in spec
+    assert Version("0.6.0") not in spec

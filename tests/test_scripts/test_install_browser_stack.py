@@ -4,8 +4,8 @@ provisioner's own exit code. The provisioner is a stub interpreter in a fake rep
 from __future__ import annotations
 
 import fcntl
-import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -26,7 +26,8 @@ def repo(tmp_path):
 
 def _run(repo, tmp_path, *, rc=0, env_extra=None, drop_home=False):
     env = {
-        "PATH": os.environ["PATH"],
+        # Hermetic: a Genesis venv on the caller's PATH would be preferred.
+        "PATH": "/usr/bin:/bin",
         "HOME": str(tmp_path / "home"),
         "GENESIS_HOME": str(tmp_path / "gh"),
         "GENESIS_REPO_DIR": str(repo),
@@ -79,6 +80,22 @@ def test_the_unit_template_runs_this_script_without_escalation():
     assert "[Install]" not in lines  # started by its timer or an operator, never at login
     # The module sets TMPDIR for its download children only (CLAUDE.md: never in a unit).
     assert not any(ln.startswith("Environment") and "TMPDIR" in ln for ln in lines)
+
+
+def test_venv_path_names_the_interpreter(repo, tmp_path):
+    """install.sh accepts a VENV_PATH outside the checkout, as genesis.env does."""
+    venv = tmp_path / "elsewhere"
+    (venv / "bin").mkdir(parents=True)
+    (repo / ".venv" / "bin" / "python").rename(venv / "bin" / "python")
+    r = _run(repo, tmp_path, env_extra={"VENV_PATH": str(venv)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / "stub.log").read_text().split() == ["-m", "genesis.browser.provision", "run"]
+
+
+def test_the_timer_retries_daily_and_catches_up():
+    timer = (_SCRIPT.parent / "systemd" / "genesis-browser-stack.timer.template").read_text()
+    assert "OnCalendar=*-*-* " in timer and "Persistent=true" in timer
+    assert "WantedBy=timers.target" in timer  # the installers' timer loop enables it
 
 
 def test_the_unit_allows_the_runs_whole_budget():
@@ -140,3 +157,72 @@ def test_a_secrets_path_override_is_honoured(repo, tmp_path):
     r = _run(repo, tmp_path, env_extra={"SECRETS_PATH": str(elsewhere)})
     assert r.returncode == 0, r.stdout + r.stderr
     assert out.read_text().split("|")[0] == "/other/pw"
+
+
+def test_with_a_wait_it_runs_once_the_other_run_finishes(repo, tmp_path):
+    """install.sh runs inline right after enabling the daily timer, whose
+    catch-up run can take the lock first. Waiting, then running (a no-op after a
+    complete run), reports the real outcome instead of a bare exit 0."""
+    lock_dir = tmp_path / "gh" / "locks"
+    lock_dir.mkdir(parents=True)
+    holder = subprocess.Popen(["flock", str(lock_dir / "browser-stack.lock"), "sleep", "2"])
+    try:
+        time.sleep(0.5)
+        r = _run(repo, tmp_path, rc=1, env_extra={"GENESIS_BROWSER_STACK_WAIT_S": "30"})
+    finally:
+        holder.wait(timeout=30)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert (tmp_path / "stub.log").read_text().split() == ["-m", "genesis.browser.provision", "run"]
+
+
+def test_a_wait_that_runs_out_is_exit_75(repo, tmp_path):
+    lock_dir = tmp_path / "gh" / "locks"
+    lock_dir.mkdir(parents=True)
+    with open(lock_dir / "browser-stack.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        r = _run(repo, tmp_path, env_extra={"GENESIS_BROWSER_STACK_WAIT_S": "1"})
+    assert r.returncode == 75
+    assert "still in progress" in r.stdout
+    assert not (tmp_path / "stub.log").exists()
+
+
+def _path_python(tmp_path, *, genesis_venv):
+    """A `python` first on PATH, as a unit rendered before it carried VENV_PATH
+    has (its PATH starts with the venv's bin)."""
+    bindir = tmp_path / "pathvenv" / "bin"
+    bindir.mkdir(parents=True)
+    py = bindir / "python"
+    check_rc = 0 if genesis_venv else 1
+    py.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$3" = "venv-check" ]; then exit {check_rc}; fi\n'
+        'echo "$@" > "$STUB_LOG"\n'
+        f'touch "{bindir.parent}/ran"\n'
+    )
+    py.chmod(0o755)
+    return f"{bindir}:/usr/bin:/bin"
+
+
+def test_without_venv_path_the_venv_on_path_is_used(repo, tmp_path):
+    (repo / ".venv" / "bin" / "python").unlink()
+    r = _run(repo, tmp_path, env_extra={"PATH": _path_python(tmp_path, genesis_venv=True)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / "stub.log").read_text().split() == ["-m", "genesis.browser.provision", "run"]
+
+
+def test_a_python_on_path_that_is_not_a_genesis_venv_is_refused(repo, tmp_path):
+    (repo / ".venv" / "bin" / "python").unlink()
+    r = _run(repo, tmp_path, env_extra={"PATH": _path_python(tmp_path, genesis_venv=False)})
+    assert r.returncode == 75
+    assert not (tmp_path / "stub.log").exists()
+
+
+def test_the_venv_on_path_wins_over_a_checkout_venv(repo, tmp_path):
+    """An older unit names its configured venv only through PATH; a checkout
+    .venv left beside it may be stale."""
+    r = _run(repo, tmp_path, env_extra={"PATH": _path_python(tmp_path, genesis_venv=True)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    # The PATH stub writes the run's arguments; the checkout stub would too, so
+    # tell them apart by which one ran the import check.
+    assert (tmp_path / "stub.log").read_text().split() == ["-m", "genesis.browser.provision", "run"]
+    assert (tmp_path / "pathvenv" / "ran").exists()

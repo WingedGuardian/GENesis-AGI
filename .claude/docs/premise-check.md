@@ -142,17 +142,25 @@ check that the reflection restates what you concluded. The rules:
   word. A qualifier follows a dash: `SOUND — UNPROVEN(2)`. Any other line at
   column 0 that starts with `Design-premise:` (in any case, with a space for the
   hyphen, or in bold) makes the whole output refused, and so does a heading or
-  list item that gives a verdict (`## Design-premise: BROKEN`). So never write
-  `Design-premise: SOUND (80%)`, or a bold or bulleted one, in a summary.
+  list item labelled `Design-premise:` that carries an uppercase `SOUND` or
+  `BROKEN` (`## Design-premise: BROKEN`). So never write
+  `Design-premise: SOUND (80%)`, or a bold or bulleted one, in a summary. A
+  heading that only names the section, or asks a question in lowercase, is fine.
 - Each claim line puts its verdict FIRST, right after its number, then a dash
   and the claim: `P1 TRUE — …`. A short qualifier may follow the verdict in
   parentheses (`P3 FALSE (partially) — …`); the verdict word is still the one read.
   A claim line with its verdict at the end is refused.
-- The claim lines sit directly under the verdict line, with only the
-  `Expected before checking:` line (one line) between them. One line per claim:
-  do not wrap a claim line. A blank line ends the claims. Until that blank line,
-  no line may start like a claim (`P` and a digit, even bulleted or bold) unless it
-  is one, so leave a blank line before prose that names a premise.
+- The `Expected before checking:` line is required: one line, directly under the
+  verdict line. If you restate your block in a summary, the Expected line may sit
+  in either one, as long as that block also has claim lines. The claim lines follow it. One line per claim: do not wrap a claim
+  line.
+- The block is closed. From the verdict line to the next blank line, every line
+  must be one of the block's lines: the verdict, the Expected line, the claims,
+  then `Effect:`, `Better shape:`, `PR-shape:` and `Persisted-state:` (one line
+  each), or a code-fence line. Anything else there refuses the whole output, naming its line, so leave a
+  blank line before any other text, and put a blank line above the verdict line:
+  the block begins there. Outside the block, only the `Design-premise:` rules in
+  the first bullet apply; claims, Expected lines and other text there are not read.
 - Plain text only: no bullets, bold or tables inside the block. Prose around it is
   fine, and so is a code fence around the whole block.
 - One block per output. If you quote an example or an earlier check, indent its

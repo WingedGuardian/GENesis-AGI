@@ -263,3 +263,91 @@ async def test_store_finding_uses_recon_finding_contract():
     assert "demo-skill" in kwargs["content"]
     assert "DO NOT INSTALL" in kwargs["content"]  # summary folded into content
     fake_db.commit.assert_awaited_once()
+
+
+def _seed(tmp_path, *extra):
+    from genesis.security import skill_scan
+
+    roots = tmp_path / "skills"
+    for name in ("alpha", "beta"):
+        (roots / name).mkdir(parents=True, exist_ok=True)
+        (roots / name / "SKILL.md").write_text("---\nname: x\n---\n")
+    trusted = tmp_path / "trusted.txt"
+    rc = skill_scan.main(
+        ["--roots", str(roots), "--trusted-file", str(trusted), "--seed-trusted", *extra]
+    )
+    return rc, trusted, roots
+
+
+def test_seed_if_missing_seeds_a_fresh_install(tmp_path):
+    rc, trusted, _ = _seed(tmp_path, "--if-missing")
+    assert rc == 0
+    names = {ln for ln in trusted.read_text().splitlines() if ln and not ln.startswith("#")}
+    assert names == {"alpha", "beta"}
+
+
+def test_seed_if_missing_never_blesses_a_skill_installed_later(tmp_path):
+    """bootstrap.sh runs on every update; a skill added since the first install
+    must stay untrusted until someone re-blesses it on purpose."""
+    _, trusted, roots = _seed(tmp_path, "--if-missing")
+    before = trusted.read_text()
+    (roots / "newcomer").mkdir()
+    (roots / "newcomer" / "SKILL.md").write_text("---\nname: x\n---\n")
+    rc, trusted, _ = _seed(tmp_path, "--if-missing")
+    assert rc == 0
+    assert trusted.read_text() == before
+    assert "newcomer" not in trusted.read_text()
+
+
+def test_a_plain_seed_still_re_blesses(tmp_path):
+    """The deliberate, by-hand re-bless keeps working."""
+    _, trusted, roots = _seed(tmp_path)
+    (roots / "newcomer").mkdir()
+    (roots / "newcomer" / "SKILL.md").write_text("---\nname: x\n---\n")
+    _seed(tmp_path)
+    assert "newcomer" in trusted.read_text().splitlines()
+
+
+def test_seed_if_missing_preserves_a_file_created_during_the_write(tmp_path, monkeypatch, capsys):
+    from genesis.util import atomic
+
+    trusted = tmp_path / "trusted.txt"
+    real_fsync = atomic.os.fsync
+    created = []
+
+    def create_curated_allowlist(fd):
+        real_fsync(fd)
+        trusted.write_text("# Reviewed by the operator\nalpha\n")
+        trusted.chmod(0o640)
+        created.append(trusted.stat())
+
+    monkeypatch.setattr(atomic.os, "fsync", create_curated_allowlist)
+    rc, _, _ = _seed(tmp_path, "--if-missing")
+
+    assert rc == 0
+    assert len(created) == 1
+    assert trusted.read_text() == "# Reviewed by the operator\nalpha\n"
+    after = trusted.stat()
+    assert (after.st_ino, after.st_mode, after.st_mtime_ns) == (
+        created[0].st_ino, created[0].st_mode, created[0].st_mtime_ns,
+    )
+    assert "already exists; left unchanged" in capsys.readouterr().out
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_bootstrap_seeds_only_when_missing():
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[2] / "scripts" / "bootstrap.sh").read_text()
+    calls = [ln for ln in text.splitlines() if "skill_scan --seed-trusted" in ln and not ln.lstrip().startswith("#")]
+    assert calls and all("--if-missing" in ln for ln in calls), calls
+
+
+def test_if_missing_alone_is_an_error_not_a_full_scan(tmp_path):
+    import pytest
+
+    from genesis.security import skill_scan
+
+    with pytest.raises(SystemExit) as exc:
+        skill_scan.main(["--roots", str(tmp_path), "--if-missing", "--no-store"])
+    assert exc.value.code == 2
