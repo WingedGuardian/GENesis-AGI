@@ -308,6 +308,33 @@ def test_a_plain_seed_still_re_blesses(tmp_path):
     assert "newcomer" in trusted.read_text().splitlines()
 
 
+def test_seed_if_missing_preserves_a_file_created_during_the_write(tmp_path, monkeypatch, capsys):
+    from genesis.util import atomic
+
+    trusted = tmp_path / "trusted.txt"
+    real_fsync = atomic.os.fsync
+    created = []
+
+    def create_curated_allowlist(fd):
+        real_fsync(fd)
+        trusted.write_text("# Reviewed by the operator\nalpha\n")
+        trusted.chmod(0o640)
+        created.append(trusted.stat())
+
+    monkeypatch.setattr(atomic.os, "fsync", create_curated_allowlist)
+    rc, _, _ = _seed(tmp_path, "--if-missing")
+
+    assert rc == 0
+    assert len(created) == 1
+    assert trusted.read_text() == "# Reviewed by the operator\nalpha\n"
+    after = trusted.stat()
+    assert (after.st_ino, after.st_mode, after.st_mtime_ns) == (
+        created[0].st_ino, created[0].st_mode, created[0].st_mtime_ns,
+    )
+    assert "already exists; left unchanged" in capsys.readouterr().out
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 def test_bootstrap_seeds_only_when_missing():
     from pathlib import Path
 

@@ -15,8 +15,10 @@ import tempfile
 from pathlib import Path
 
 
-def atomic_write_text(path: Path | str, content: str, *, encoding: str | None = None) -> None:
-    """Atomically write ``content`` to ``path`` (temp file in the same dir + rename)."""
+def atomic_write_text(
+    path: Path | str, content: str, *, encoding: str | None = None, overwrite: bool = True,
+) -> None:
+    """Publish complete text; ``overwrite=False`` raises FileExistsError if occupied."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -25,8 +27,10 @@ def atomic_write_text(path: Path | str, content: str, *, encoding: str | None = 
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, str(path))
-    except BaseException:
+        if overwrite:
+            os.replace(tmp, str(path))
+        else:
+            os.link(tmp, str(path))
+    finally:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
-        raise

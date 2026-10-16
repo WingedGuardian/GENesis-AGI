@@ -350,6 +350,42 @@ def load_trusted_names(path: Path) -> set[str]:
     }
 
 
+def _seed_trusted_file(trusted_file: Path, skill_dirs: list[Path], *, if_missing: bool) -> int:
+    """Seed once without replacing an allowlist another writer has published."""
+    if if_missing and trusted_file.exists():
+        # bootstrap.sh runs on every update. Re-seeding there would bless
+        # every skill installed since the last update, which is exactly what
+        # the allowlist exists to catch (see the header written below).
+        print(
+            f"Trusted allowlist {trusted_file} already exists; left unchanged. "
+            "To trust a skill you have reviewed, add its name to that file."
+        )
+        return 0
+    from genesis.util.atomic import atomic_write_text
+
+    names = sorted({d.name for d in skill_dirs})
+    trusted_file.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic: bootstrap never re-seeds an existing file (--if-missing), so a
+    # torn write would otherwise stay torn.
+    content = (
+        "# Trusted skill names — scanned but NOT filed to recon.\n"
+        "# Seeded from the skills installed at this moment. Skills installed\n"
+        "# LATER are untrusted and will surface as recon findings. To trust one\n"
+        "# after reviewing its finding, add its name below. Re-seeding trusts\n"
+        "# EVERY installed skill: python -m genesis.security.skill_scan --seed-trusted\n"
+        + "\n".join(names) + "\n"
+    )
+    try:
+        atomic_write_text(trusted_file, content, overwrite=not if_missing)
+    except FileExistsError:
+        if not if_missing:
+            raise
+        print(f"Trusted allowlist {trusted_file} already exists; left unchanged.")
+        return 0
+    print(f"Seeded {len(names)} trusted skill names -> {trusted_file}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI: scan installed skills with SkillSpector.
 
@@ -398,32 +434,7 @@ def main(argv: list[str] | None = None) -> int:
     trusted_file = Path(args.trusted_file) if args.trusted_file else default_trusted_file()
 
     if args.seed_trusted:
-        if args.if_missing and trusted_file.exists():
-            # bootstrap.sh runs on every update. Re-seeding there would bless
-            # every skill installed since the last update, which is exactly what
-            # the allowlist exists to catch (see the header written below).
-            print(
-                f"Trusted allowlist {trusted_file} already exists; left unchanged. "
-                "To trust a skill you have reviewed, add its name to that file."
-            )
-            return 0
-        from genesis.util.atomic import atomic_write_text
-
-        names = sorted({d.name for d in skill_dirs})
-        trusted_file.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic: bootstrap never re-seeds an existing file (--if-missing), so a
-        # torn write would otherwise stay torn.
-        atomic_write_text(
-            trusted_file,
-            "# Trusted skill names — scanned but NOT filed to recon.\n"
-            "# Seeded from the skills installed at this moment. Skills installed\n"
-            "# LATER are untrusted and will surface as recon findings. To trust one\n"
-            "# after reviewing its finding, add its name below. Re-seeding trusts\n"
-            "# EVERY installed skill: python -m genesis.security.skill_scan --seed-trusted\n"
-            + "\n".join(names) + "\n",
-        )
-        print(f"Seeded {len(names)} trusted skill names -> {trusted_file}")
-        return 0
+        return _seed_trusted_file(trusted_file, skill_dirs, if_missing=args.if_missing)
 
     trusted_names = set() if args.no_trust else load_trusted_names(trusted_file)
     trusted_roots = [] if args.no_trust else repo_skill_roots()
