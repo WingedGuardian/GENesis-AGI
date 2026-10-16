@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import shutil
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -46,6 +48,7 @@ from genesis.cc.types import (
 )
 from genesis.observability.session_context import set_session_id as _set_obs_session
 from genesis.util.inflight import close_unit, open_unit, within
+from genesis.util.proc_kill import ProcessCleanupUncertain
 from genesis.util.tasks import tracked_task
 
 if TYPE_CHECKING:
@@ -107,7 +110,13 @@ _BG_CC_TMP_ROOT = Path.home() / "tmp" / "bg-cc-sessions"
 
 
 def _bg_session_root(session_id: str) -> Path:
-    """Per-session root dir for a background CC session's isolated sandbox."""
+    """Per-session root dir for a background CC session's isolated sandbox.
+
+    Callers remove this tree recursively, so the id must be one plain path
+    component; anything else is refused rather than resolved.
+    """
+    if not session_id or session_id in {".", ".."} or Path(session_id).name != session_id:
+        raise ValueError("Session id is not a single path component")
     return _BG_CC_TMP_ROOT / session_id
 
 
@@ -862,8 +871,23 @@ class DirectSessionRequest:
     # to route a RESULT delivery back to that conversation. Captured from
     # GENESIS_SESSION_ID at dispatch (see direct_session_run). None otherwise.
     origin_session_id: str | None = None
+    # Server-owned prepared receipt mode, never reconstructed from queue payloads.
+    managed: bool = False
 
     def __post_init__(self) -> None:
+        if self.managed and (
+            self.profile not in {"observe", "interact"}
+            or self.tool_exceptions
+            or self.source_tag != "agent_api"
+            or not (self.caller_context or "").startswith("agent_api:")
+            or type(self.timeout_s) is not int
+            or not 1 <= self.timeout_s <= 7200
+            or self.origin_session_id
+            or self.origin_caller_context
+            or self.delivery_mode not in {None, DeliveryMode.SILENT}
+            or self.notify
+        ):
+            raise ValueError("Invalid managed session controls")
         if self.profile not in VALID_PROFILES:
             raise ValueError(
                 f"Invalid profile {self.profile!r}. "
@@ -896,6 +920,8 @@ class DirectSessionResult:
     tools_called: list[dict] = field(default_factory=list)
     model_used: str = ""
     roster_model: str = ""  # roster NAME the chokepoint selected (peer name or "claude")
+    stream_lines_dropped: int = 0
+    partial: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -938,6 +964,9 @@ class DirectSessionRunner:
         self._rt = runtime
         self._semaphore = asyncio.Semaphore(self._MAX_CONCURRENT)
         self._active: dict[str, asyncio.Task] = {}
+        self._managed_cancel: dict[str, asyncio.Event] = {}
+        # Managed sessions whose runner slot is held through finalization.
+        self._managed_slots: set[str] = set()
         self._protected_paths: object | None = None
         self._auditor: object | None = None
 
@@ -951,8 +980,8 @@ class DirectSessionRunner:
 
     # -- Public API --------------------------------------------------------
 
-    async def spawn(self, request: DirectSessionRequest) -> str:
-        """Fire-and-forget. Returns genesis session_id immediately.
+    async def _check_background(self, request: DirectSessionRequest) -> None:
+        """Check the existing background breaker, strictly for managed work.
 
         Includes a lightweight autonomy ceiling check: if the background
         cognitive category has been fully regressed, block ALL background
@@ -966,6 +995,18 @@ class DirectSessionRunner:
         _SKIP_TAGS = {"foreground", "user_request"}
         if request.source_tag not in _SKIP_TAGS:
             mgr = getattr(self._rt, "_autonomy_manager", None)
+            if request.managed:
+                from genesis.autonomy.types import AutonomyCategory
+
+                required = 3 if request.profile == "interact" else 1
+                if (
+                    mgr is None
+                    or await mgr.effective_level(
+                        AutonomyCategory.BACKGROUND_COGNITIVE.value,
+                    )
+                    < required
+                ):
+                    raise RuntimeError("Background authority is unavailable")
             if mgr is not None:
                 try:
                     from genesis.autonomy.types import AutonomyCategory
@@ -998,12 +1039,19 @@ class DirectSessionRunner:
                 except RuntimeError:
                     raise  # re-raise the circuit breaker
                 except Exception:
+                    if request.managed:
+                        raise
                     # Non-fatal: if check fails, allow spawn
                     logger.debug(
                         "Autonomy ceiling check failed (non-fatal)",
                         exc_info=True,
                     )
 
+    async def spawn(self, request: DirectSessionRequest) -> str:
+        """Fire-and-forget. Managed requests must adopt an atomic receipt."""
+        if request.managed:
+            raise ValueError("Managed requests require a prepared receipt")
+        await self._check_background(request)
         session = await self._session_manager.create_background(
             session_type=SessionType.BACKGROUND_TASK,
             model=request.model,
@@ -1042,6 +1090,74 @@ class DirectSessionRunner:
     def active_count(self) -> int:
         return len(self._active)
 
+    def is_active(self, session_id: str) -> bool:
+        return session_id in self._active
+
+    def cancel(self, session_id: str) -> bool:
+        """Signal a managed session; repeated signals never interrupt its drain."""
+        signal = self._managed_cancel.get(session_id)
+        if signal is None:
+            return False
+        signal.set()
+        return True
+
+    async def adopt(self, session_id: str, request: DirectSessionRequest) -> str:
+        """Register an already persisted receipt before any awaited hook/effect."""
+        from genesis.cc.managed_session import fingerprint, metadata
+        from genesis.db.crud import cc_sessions
+
+        # The receipt id names files and directories (sandbox, artifact), so
+        # only a canonical UUID is adoptable, whoever created the row.
+        try:
+            canonical = str(uuid.UUID(session_id)) == session_id
+        except (ValueError, TypeError, AttributeError):
+            canonical = False
+        if not canonical:
+            raise ValueError("Prepared receipt cannot be adopted")
+        # Verify and run one private snapshot: a caller mutating its own
+        # request (e.g. the skills list) after adoption cannot change what runs.
+        request = copy.deepcopy(request)
+        row = await cc_sessions.get_by_id(self._session_manager.db, session_id)
+        if (
+            not request.managed
+            or row is None
+            or session_id in self._active
+            or getattr(self._rt, "_db", None) is not self._session_manager.db
+            or row["source_tag"] != "agent_api"
+            or row["status"] != "active"
+            or row["session_type"] != "background_task"
+            or row["channel"] != "agent"
+            or row["origin_class"] != "external_untrusted"
+            or metadata(row).get("native_state") != "pending"
+            or metadata(row).get("managed_fingerprint") != fingerprint(request)
+        ):
+            raise ValueError("Prepared receipt cannot be adopted")
+        signal = asyncio.Event()
+        unit = open_unit("direct_session", "managed native session", item_id=session_id)
+        coroutine = self._run_session_registered(request, session_id, unit)
+        try:
+            task = tracked_task(coroutine, name=f"managed-session-{session_id[:8]}")
+        except BaseException:
+            coroutine.close()
+            close_unit(unit)
+            from genesis.cc.managed_session import update_state
+
+            await update_state(
+                self._session_manager.db,
+                session_id,
+                "failed",
+                error="not_started",
+            )
+            await cc_sessions.update_status(self._session_manager.db, session_id, status="failed")
+            raise
+        self._active[session_id] = task
+        self._managed_cancel[session_id] = signal
+        self._session_manager.set_background_liveness(self.is_active)
+        task.add_done_callback(lambda _t: self._active.pop(session_id, None))
+        task.add_done_callback(lambda _t: self._managed_cancel.pop(session_id, None))
+        task.add_done_callback(lambda _t: close_unit(unit))
+        return session_id
+
     async def _run_session_registered(
         self,
         request: DirectSessionRequest,
@@ -1054,6 +1170,12 @@ class DirectSessionRunner:
         it. ``shutdown`` cancels it anywhere in that span. The unit closes when
         the task does (a done-callback), whichever way it ends."""
         with within(unit):
+            if request.managed:
+                from genesis.cc.managed_session import run_managed
+
+                return await run_managed(
+                    self, request, session_id, self._managed_cancel[session_id]
+                )
             return await self._run_session(request, session_id)
 
     async def shutdown(self, *, grace_s: float = 10.0) -> int:
@@ -1075,7 +1197,9 @@ class DirectSessionRunner:
         """
         tasks = [t for t in self._active.values() if not t.done()]
         for t in tasks:
-            t.cancel()
+            sid = next((sid for sid, active in self._active.items() if active is t), None)
+            if sid is None or not self.cancel(sid):
+                t.cancel()
         if tasks:
             await asyncio.wait(tasks, timeout=grace_s)
         return len(tasks)
@@ -1091,6 +1215,67 @@ class DirectSessionRunner:
 
     # -- Internal ----------------------------------------------------------
 
+    async def _invoke(self, request, session_id, on_event) -> CCOutput:
+        """Shared profile configuration, runner slot and native invocation."""
+        if not request.managed:
+            async with self._semaphore:
+                return await self._invoke_in_slot(request, session_id, on_event)
+        # A managed run keeps its slot until its receipt is finalized, not just
+        # until the subprocess exits: run_managed releases it through
+        # release_managed_slot() once finalization has committed.
+        await self._semaphore.acquire()
+        self._managed_slots.add(session_id)
+        return await self._invoke_in_slot(request, session_id, on_event)
+
+    def release_managed_slot(self, session_id: str) -> None:
+        """Free the slot a managed run took, once its receipt is persisted."""
+        if session_id in self._managed_slots:
+            self._managed_slots.discard(session_id)
+            self._semaphore.release()
+
+    async def _invoke_in_slot(self, request, session_id, on_event) -> CCOutput:
+        invocation = self._build_invocation(request, session_id)
+        if request.managed:
+            invocation = replace(
+                invocation,
+                confirm_cleanup=True,
+                origin="external_untrusted",
+                supervised=False,
+            )
+        if invocation.claude_code_tmpdir:
+            Path(invocation.claude_code_tmpdir).mkdir(parents=True, exist_ok=True)
+        try:
+            return await self._invoker.run_streaming(invocation, on_event=on_event)
+        except ProcessCleanupUncertain:
+            if not request.managed:
+                raise
+            from genesis.cc.managed_session import hold_uncertain
+
+            # A child may still be running: keep this runner slot with it.
+            await hold_uncertain(self._session_manager.db, session_id)
+            raise  # unreachable: hold_uncertain never returns
+
+    @staticmethod
+    def _result(session_id, output: CCOutput, telemetry, elapsed) -> DirectSessionResult:
+        return DirectSessionResult(
+            session_id=session_id,
+            cc_session_id=output.session_id,
+            success=not output.is_error,
+            output_text=(
+                output.text + _BG_TRUNCATION_NOTICE if output.bg_truncated else output.text
+            ),
+            error=output.error_message if output.is_error else None,
+            cost_usd=output.cost_usd,
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens,
+            duration_s=round(elapsed, 1),
+            tools_called=telemetry,
+            model_used=output.model_used,
+            roster_model=output.roster_model,
+            stream_lines_dropped=output.stream_lines_dropped,
+            partial=output.bg_truncated or not output.result_received,
+        )
+
     async def _run_session(
         self,
         request: DirectSessionRequest,
@@ -1102,49 +1287,19 @@ class DirectSessionRunner:
         start = time.monotonic()
 
         async def on_event(event: StreamEvent) -> None:
-            if event.event_type == "tool_use" and event.tool_name:
+            for name, tool_input in event.tool_uses():
                 telemetry.append(
                     {
-                        "name": event.tool_name,
-                        "input_preview": (str(event.tool_input)[:200] if event.tool_input else ""),
+                        "name": name,
+                        "input_preview": (str(tool_input)[:200] if tool_input else ""),
                     }
                 )
 
         try:
-            async with self._semaphore:
-                invocation = self._build_invocation(request, session_id)
-                # Create this session's isolated CC sandbox (off cc-tmp) just
-                # before the run; removed in the finally below. The guard is
-                # intentional: if claude_code_tmpdir is unset (tests, or any
-                # future non-isolated path), CC falls back to the shared cc-tmp
-                # (the old behaviour) rather than this crashing.
-                if invocation.claude_code_tmpdir:
-                    Path(invocation.claude_code_tmpdir).mkdir(
-                        parents=True,
-                        exist_ok=True,
-                    )
-                output: CCOutput = await self._invoker.run_streaming(
-                    invocation,
-                    on_event=on_event,
-                )
+            output = await self._invoke(request, session_id, on_event)
 
             elapsed = time.monotonic() - start
-            result = DirectSessionResult(
-                session_id=session_id,
-                cc_session_id=output.session_id,
-                success=not output.is_error,
-                output_text=(
-                    output.text + _BG_TRUNCATION_NOTICE if output.bg_truncated else output.text
-                ),
-                error=output.error_message if output.is_error else None,
-                cost_usd=output.cost_usd,
-                input_tokens=output.input_tokens,
-                output_tokens=output.output_tokens,
-                duration_s=round(elapsed, 1),
-                tools_called=telemetry,
-                model_used=output.model_used,
-                roster_model=output.roster_model,
-            )
+            result = self._result(session_id, output, telemetry, elapsed)
 
             # Persist result in session metadata (merge, don't overwrite).
             # A dropped over-limit stream line is recorded alongside the result:
