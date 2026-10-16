@@ -1417,7 +1417,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 513bfa0d4 2026-10-16
+verified: 61f9e45b9 2026-10-16
 ```
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
@@ -1438,6 +1438,10 @@ verified: 513bfa0d4 2026-10-16
   independently of the boot manifest. External health accepts only a sample from
   the active primary server's MainPID observed within 90 seconds. Authenticated
   health probes return 503 with readiness details when enabled but unready.
+  The existing awareness tick records readiness incidents and sends ordered
+  outage/recovery Telegram notices. Unknown readings preserve an open incident;
+  deliberate disablement closes it quietly. Incident/phase delivery history
+  supplies durable retry deduplication without a second queue.
   `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
   existing Flask/runtime loop: it atomically persists native receipts, binds
   contexts and retries to relationship epochs, and admits at most two
