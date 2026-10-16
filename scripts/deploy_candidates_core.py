@@ -217,14 +217,31 @@ def gh_default(args: list[str], cwd: str, env: Mapping[str, str]) -> tuple[int, 
     return p.returncode, p.stdout, p.stderr
 
 
+#: serving()'s reason when nothing runs Genesis's code: genesis-server and
+#: genesis-bridge are both in a definite stopped state. Readiness then judges the
+#: code the next start runs (HEAD) instead of a running server's. Compared by
+#: equality, never parsed.
+SERVER_DOWN = "genesis-server and genesis-bridge are both stopped"
+_STOPPED = frozenset({"inactive", "failed"})
+
+
 def parse_serving(stdout: str, returncode: int) -> tuple[str | None, str]:
     """The `serving:` line of `deploy_code_only.sh status`: a full commit id, or
-    the reason it prints in its place. Anything else is unknown."""
+    the reason it prints in its place. Anything else is unknown. With no commit,
+    a `server-state:` line naming both units in a definite stopped state gives
+    SERVER_DOWN; any other state (unreadable, starting, stopping, a running
+    bridge) stays unknown."""
+    states: list[str] | None = None
+    for line in stdout.splitlines():
+        if line.startswith("server-state: "):
+            states = line[len("server-state: ") :].split()
     for line in stdout.splitlines():
         if line.startswith("serving: "):
             value = line[len("serving: ") :].strip()
             if HEX40.match(value):
                 return value, ""
+            if states is not None and len(states) == 2 and all(s in _STOPPED for s in states):
+                return None, SERVER_DOWN
             return None, value or "an empty serving line"
     return None, f"deploy_code_only.sh status printed no serving line (exit {returncode})"
 
@@ -481,11 +498,13 @@ class Repo:
             and any(TRAILER_LINE.match(ln) for ln in self.body_lines(msg))
         )
 
-    def live_chain(self, base: str) -> tuple[str | None, list[tuple[str, str]]]:
-        """What `live` holds now: the commit its rebuild merges sit on, and the
-        (branch, head) each merged, oldest first. (None, []) when `live` does not
-        exist; (tip, []) when it has no rebuild merge on top."""
-        tip = self.resolve(LIVE_REF)
+    def live_chain(
+        self, base: str, at: str | None = None
+    ) -> tuple[str | None, list[tuple[str, str]]]:
+        """What `live` holds now (or the commit ``at``): the commit its rebuild
+        merges sit on, and the (branch, head) each merged, oldest first. (None, [])
+        when it does not exist; (tip, []) when it has no rebuild merge on top."""
+        tip = self.resolve(at or LIVE_REF)
         if not tip:
             return None, []
         chain = self.rev_list("--first-parent", tip, "--not", base)
@@ -509,11 +528,11 @@ class Repo:
         merged.reverse()
         return live_base, merged
 
-    def foreign_commits(self, base: str) -> list[str]:
-        """Commits on `live` (not on origin/main) that are neither a rebuild merge
-        nor reachable from a candidate head a rebuild merged. `switch -C` would
-        orphan them silently."""
-        tip = self.resolve(LIVE_REF)
+    def foreign_commits(self, base: str, at: str | None = None) -> list[str]:
+        """Commits on `live` (or under ``at``), not on origin/main, that are
+        neither a rebuild merge nor reachable from a candidate head a rebuild
+        merged. `switch -C` would orphan them silently."""
+        tip = self.resolve(at or LIVE_REF)
         if not tip:
             return []
         commits = self.rev_list(tip, "--not", base)

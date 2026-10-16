@@ -89,3 +89,4 @@ changes, use the standard open-source flow (see `CONTRIBUTING.md`).
 | `scripts/restore.sh --dry-run` | Report what would be restored without touching the filesystem |
 | `python -m genesis restore` | Python CLI wrapper around `restore.sh` |
 | `genesis contribute <sha>` | Open an upstream PR for a committed bug fix |
+| `python -m genesis vault init\|add\|list\|retire\|status` | Encrypted payment card vault for virtual cards (secret-reading commands need your own terminal) |

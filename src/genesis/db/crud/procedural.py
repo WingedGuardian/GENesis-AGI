@@ -8,6 +8,29 @@ from datetime import UTC, datetime
 import aiosqlite
 
 
+def _json_or_none(value: dict | None) -> str | None:
+    return None if value is None else json.dumps(value)
+
+
+def _live_clause(live_only: bool) -> str:
+    """SQL that leaves out held lessons (external origin, not reviewed)."""
+    if not live_only:
+        return ""
+    from genesis.learning.procedural.lesson_shape import LIVE_LESSON_SQL
+
+    return f" AND ({LIVE_LESSON_SQL})"
+
+
+def _kind_clause(lessons: bool | None) -> str:
+    """SQL keeping only lessons (True), only earned rows (False), or both (None).
+
+    Chosen in SQL so rows of the other kind can never fill a caller's limit.
+    """
+    if lessons is None:
+        return ""
+    return " AND lesson IS NOT NULL" if lessons else " AND lesson IS NULL"
+
+
 async def create(
     db: aiosqlite.Connection,
     *,
@@ -32,15 +55,21 @@ async def create(
     principle_embedding: bytes | None = None,
     extraction_context: str | None = None,
     first_mover: int = 0,
+    trigger_spec: dict | None = None,
+    lesson: dict | None = None,
+    deprecated_reason: str | None = None,
 ) -> str:
+    """Insert a row. A ``deprecated_reason`` writes it deprecated in the same
+    statement, so no reader ever sees it live in between."""
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, scenario, steps, tools_used,
             context_tags, draft, attempted_workarounds, version, created_at,
             activation_tier, tool_trigger, success_count, confidence,
             source, promotion_history, principle_embedding,
-            extraction_context, first_mover)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            extraction_context, first_mover, trigger_spec, lesson,
+            deprecated, deprecated_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, person_id, task_type, principle, scenario,
          json.dumps(steps), json.dumps(tools_used),
          json.dumps(context_tags), draft,
@@ -48,7 +77,9 @@ async def create(
          version, created_at, activation_tier,
          json.dumps(tool_trigger) if tool_trigger else None,
          success_count, confidence, source, promotion_history,
-         principle_embedding, extraction_context, first_mover),
+         principle_embedding, extraction_context, first_mover,
+         _json_or_none(trigger_spec), _json_or_none(lesson),
+         1 if deprecated_reason else 0, deprecated_reason),
     )
     await db.commit()
     return id
@@ -74,6 +105,8 @@ async def upsert(
     confidence: float = 0.0,
     source: str | None = None,
     promotion_history: str | None = None,
+    trigger_spec: dict | None = None,
+    lesson: dict | None = None,
 ) -> str:
     """Idempotent write: insert or update on conflict.
 
@@ -82,14 +115,18 @@ async def upsert(
     future explicit-teach upserters) can't accidentally land rows with the
     invisible-to-recall (draft=0, success_count=0, confidence=0.0)
     profile that bit `procedure_store` before this fix.
+
+    ``trigger_spec`` and ``lesson`` replace the stored values only when
+    given, so an upsert that does not carry them cannot turn a lesson back
+    into an earned row.
     """
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, steps, tools_used, context_tags,
             draft, attempted_workarounds, version, created_at,
             activation_tier, tool_trigger, success_count, confidence,
-            source, promotion_history)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source, promotion_history, trigger_spec, lesson)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              person_id = excluded.person_id,
              task_type = excluded.task_type, principle = excluded.principle,
@@ -102,13 +139,16 @@ async def upsert(
              success_count = excluded.success_count,
              confidence = excluded.confidence,
              source = COALESCE(procedural_memory.source, excluded.source),
-             promotion_history = COALESCE(procedural_memory.promotion_history, excluded.promotion_history)""",
+             promotion_history = COALESCE(procedural_memory.promotion_history, excluded.promotion_history),
+             trigger_spec = COALESCE(excluded.trigger_spec, procedural_memory.trigger_spec),
+             lesson = COALESCE(excluded.lesson, procedural_memory.lesson)""",
         (id, person_id, task_type, principle, json.dumps(steps), json.dumps(tools_used),
          json.dumps(context_tags), draft,
          json.dumps(attempted_workarounds) if attempted_workarounds else None,
          version, created_at, activation_tier,
          json.dumps(tool_trigger) if tool_trigger else None,
-         success_count, confidence, source, promotion_history),
+         success_count, confidence, source, promotion_history,
+         _json_or_none(trigger_spec), _json_or_none(lesson)),
     )
     await db.commit()
     return id
@@ -158,7 +198,8 @@ async def find_by_context_overlap(
     if not query_tags:
         return []
 
-    rows = await list_active(db, limit=200)
+    # A held lesson is untrusted text: it never counts as an established procedure.
+    rows = await list_active(db, limit=200, live_only=True)
     scored = []
     for row in rows:
         if exclude_id and row["id"] == exclude_id:
@@ -180,7 +221,9 @@ async def list_by_task_type(
     task_type: str,
     *,
     person_id: str | None = None,
-    limit: int = 50,
+    limit: int | None = 50,
+    live_only: bool = False,
+    lessons: bool | None = None,
 ) -> list[dict]:
     # Exclude deprecated/quarantined rows: the dominant caller is the procedure
     # novelty/dedup gate, which must NOT let a deprecated procedure suppress a new
@@ -194,8 +237,12 @@ async def list_by_task_type(
     if person_id is not None:
         sql += " AND person_id = ?"
         params.append(person_id)
-    sql += " ORDER BY confidence DESC LIMIT ?"
-    params.append(limit)
+    sql += _live_clause(live_only)
+    sql += _kind_clause(lessons)
+    sql += " ORDER BY confidence DESC"
+    if limit is not None:  # None: every row (an identity lookup must see them all)
+        sql += " LIMIT ?"
+        params.append(limit)
     cursor = await db.execute(sql, params)
     return [dict(r) for r in await cursor.fetchall()]
 
@@ -205,13 +252,39 @@ async def list_by_tier(
     tier: str,
     *,
     limit: int = 100,
+    lessons: bool | None = None,
 ) -> list[dict]:
     """List active procedures at a specific activation tier."""
     cursor = await db.execute(
-        """SELECT * FROM procedural_memory
-           WHERE activation_tier = ? AND deprecated = 0 AND quarantined = 0
-           ORDER BY confidence DESC LIMIT ?""",
+        "SELECT * FROM procedural_memory "  # noqa: S608 - fixed SQL fragments only
+        "WHERE activation_tier = ? AND deprecated = 0 AND quarantined = 0"
+        + _kind_clause(lessons)
+        + " ORDER BY confidence DESC LIMIT ?",
         (tier, limit),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def list_lessons(
+    db: aiosqlite.Connection,
+    *,
+    include_quarantined: bool = False,
+    include_deprecated: bool = False,
+) -> list[dict]:
+    """Every non-deprecated row that carries a lesson record.
+
+    UNBOUNDED on purpose, unlike :func:`list_by_tier`: lessons are authored
+    rather than earned, every one is meant to be live, and a cap would drop
+    the oldest silently. Quarantined rows are left out, as every sibling
+    listing leaves them out, unless a caller that manages them asks.
+    """
+    quarantine = "" if include_quarantined else " AND quarantined = 0"
+    deprecated = "" if include_deprecated else " AND deprecated = 0"
+    cursor = await db.execute(
+        "SELECT * FROM procedural_memory WHERE lesson IS NOT NULL"
+        + deprecated
+        + quarantine
+        + " ORDER BY created_at"
     )
     return [dict(r) for r in await cursor.fetchall()]
 
@@ -241,8 +314,9 @@ async def update(db: aiosqlite.Connection, id: str, **fields) -> bool:
                  "attempted_workarounds", "tool_trigger", "promotion_history"):
         if key in fields and isinstance(fields[key], list):
             fields[key] = json.dumps(fields[key])
-    if "source" in fields and isinstance(fields["source"], dict):
-        fields["source"] = json.dumps(fields["source"])
+    for key in ("source", "trigger_spec", "lesson"):
+        if key in fields and isinstance(fields[key], dict):
+            fields[key] = json.dumps(fields[key])
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [id]
     cursor = await db.execute(
@@ -291,13 +365,20 @@ async def list_active(
     *,
     person_id: str | None = None,
     limit: int = 100,
+    live_only: bool = False,
+    lessons: bool | None = None,
 ) -> list[dict]:
-    """List non-deprecated, non-quarantined procedures."""
+    """List non-deprecated, non-quarantined procedures.
+
+    ``live_only`` leaves out held lessons and ``lessons`` picks a kind, both in
+    SQL, before the limit applies.
+    """
     sql = "SELECT * FROM procedural_memory WHERE deprecated = 0 AND quarantined = 0"
     params: list = []
     if person_id is not None:
         sql += " AND person_id = ?"
         params.append(person_id)
+    sql += _live_clause(live_only) + _kind_clause(lessons)
     sql += " ORDER BY confidence DESC LIMIT ?"
     params.append(limit)
     cursor = await db.execute(sql, params)

@@ -12,6 +12,7 @@ from genesis.mcp.outreach_mcp import mcp
 async def test_all_tools_registered():
     tools = await mcp.get_tools()
     for name in [
+        "agent_send",
         "outreach_send",
         "outreach_poll",
         "outreach_queue",

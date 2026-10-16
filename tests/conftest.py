@@ -519,6 +519,21 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
     monkeypatch.setattr(cb_mod, "_STATE_FILE", tmp_path / "cb_state.json")
 
 
+# ── The dashboard update routes: one sandbox for every test that imports them ──
+@pytest.fixture
+def updates_sandbox(tmp_path, monkeypatch):
+    """HOME, GENESIS_HOME and every path constant of
+    ``genesis.dashboard.routes.updates`` in a temporary home, its ``Popen``
+    refusing, and a scratch git repository as ``_GENESIS_ROOT``. See
+    tests/_update_routes_sandbox.py; tests/test_dashboard/
+    test_update_sandbox_coverage.py requires it of every module importing the routes."""
+    from tests._update_routes_sandbox import isolate_update_routes, scratch_repo
+
+    return isolate_update_routes(
+        monkeypatch, tmp_path / "sandbox-home", scratch_repo(tmp_path / "sandbox-repo")
+    )
+
+
 # ── Graph-traversal telemetry is OFF unless a test opts in ─────────────────
 @pytest.fixture(autouse=True, scope="session")
 def _graph_telemetry_off():

@@ -378,10 +378,21 @@ unclassified row never expires.
 Spawning, tracking, and recovering Claude Code sessions — Genesis's hands for
 any task bigger than an LLM call.
 
+Machine connectors can adopt a prepared `cc_sessions` receipt through the same
+native runner (`cc/managed_session.py`, `DirectSessionRunner.adopt`), rather than
+adding another execution queue. This opt-in mode registers before start hooks,
+uses the existing background breaker plus a fail-closed effective ceiling,
+keeps external unattended provenance, and supervises cancellation/deadline
+cleanup. Structured terminal state and private full artifacts distinguish model
+failure/partial output from legacy completion. Receipt retention and boot orphan
+reconciliation prevent automatic replay; live registered work is excluded from
+the stale reaper. It is a native primitive, not an enabled peer transport. See
+`docs/reference/native-managed-sessions.md`.
+
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 6aae986bb 2026-10-04
+verified: 6ef113ecd 2026-10-14
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
@@ -945,10 +956,34 @@ treats `start == end` as off, matching `ego/cadence.py`), so nothing delays an
 owner-facing send by default. The salience thresholds and the shared daily cap
 are the other timing/volume controls on that path.
 
+Governance can also DROP an owner-facing send as a duplicate, writing no history
+row (`GovernanceGate._is_duplicate`). Inside the signal type's window
+(`_DEDUP_WINDOWS`, default 24 h; 0 turns dedup off), a delivered row with the same
+`(signal_type, topic, category)` suppresses it, and so does one with the same
+signal type, category and `content_hash` (SHA-256 of the first 200 characters of
+`context`, topic ignored). The content-hash match is skipped for the signal types
+whose topic is the message identity (`_TOPIC_IS_IDENTITY`: `queued_alert`,
+`morning_report`, `career_outreach_nudged`, `peer_message`) and for any empty or whitespace-only
+context. Before that exemption, at least 3 of a live install's 84 recorded
+morning-report job runs (mid-July to October) delivered nothing this way: the
+next day's report finished drafting a few seconds sooner, fell inside the 24 h
+window, and opened with the same 200 characters. For a queued alert the topic is
+`alert:<dedupe_key>`, or `alert:<source>` when the producer passed no key, so a
+keyless producer's distinct alerts still collide on the topic check. `backup.sh`
+gives a repeated failure one dedupe key with `alert_stable_key`
+(`scripts/lib/alert_queue.sh`), which leaves the per-run
+`Time:`/`Duration:`/`SQLite lines:` lines out of the hash.
+
+Peer messages use their peer/epoch/message identity as the topic. Every
+`agent_send` first reserves the existing pending queue; the adapter checks its
+immutable payload and canceled/dequeued state before committing a new outbox
+message. Collection ACKs and peer traffic are excluded from human engagement
+judgments, without changing outbound governance or granting authority.
+
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: d6edbcc6 2026-09-11
+verified: 0164dd1f0 2026-10-14
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -1377,10 +1412,42 @@ Every surface a human (or host process) talks to Genesis through.
 
 ```yaml subsystem-map
 entry: channels-interfaces
-modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 637f7f7bb679 2026-10-05
+modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
+verified: cfbb876243f2 2026-10-07
 ```
 
+- **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
+  pinned node/realm/principal and scoped credentials. Disabled by default; no
+  implicit capability grants. Enrollment requires no daily task budget; the
+  deprecated allowance field remains only for database compatibility. Local
+  `genesis peers` CLI writes relationships; `/v1/agent/a2a/health` authenticates
+  through the existing runtime loop. The Agent Card returns `503 not_ready`
+  until the conversation service below is installed and ready.
+  Revocation disables access immediately; only active peer credentials contribute
+  to fallback readiness, while inactive credentials still participate in scope
+  collision checks. Scope checks also reject equality with loaded active/fallback
+  Flask signing keys, without request-time credential-file reads.
+  `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
+  existing Flask/runtime loop: it atomically persists native receipts, binds
+  contexts and retries to relationship epochs, and admits at most two
+  outstanding peer turns globally and per peer, without a daily submission
+  quota. Fresh native turns use Genesis identity/cognition, available memory
+  enrichment, observe/interact tools, external unattended provenance and the
+  native background ceiling. Result heads and full artifacts have bounded
+  disclosure checks. Approval attribution survives notification updates; the API
+  lists pending owner actions and never resolves them. Presented peer/backend
+  bearers are refused before owner mutation shortcuts. Deployment/enrollment and
+  connector-only ingress verification are separate prerequisites. No new listener
+  or peer execution queue. See `docs/reference/peer-registry.md` and
+  `docs/reference/agent-conversations.md`.
+  `peers/outbox.py` retains addressed A2A messages for collection, with scoped
+  idempotent ACKs and atomic first-reply correlation in the native receipt.
+  `channels/agent_adapter.py` queues locally through ordinary outreach governance;
+  `agent_send` is denied to observe/restricted mail profiles and available to
+  permitted interact turns. Pending/deferred delivery preserves typed message
+  identity. ACKs confer no owner engagement or approval. This is a pull channel,
+  not an HTTP sender or new listener; the separately operated peer client must
+  durably deduplicate before ACK/execution. See `docs/reference/agent-outbox.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is
@@ -1446,10 +1513,18 @@ verified: 637f7f7bb679 2026-10-05
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
   live runtime (stale-but-functional).
-  External Codebase has explicit pinned configuration staging/diagnostics in
-  `scripts/codebase_managed.py`; staging does not activate it or alter the
-  existing indexing route. See `docs/reference/codebase-managed.md`.
-- **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
+  External Codebase has pinned configuration staging/diagnostics and bounded
+  native query unit entry points in `scripts/codebase_managed.py`. Install and
+  bootstrap render disabled query/client-slice templates without auto-upgrading
+  a PATH provider. Staging does not activate it; MCP registration and indexing
+  retain their existing routes until their integration concerns land. See
+  `docs/reference/codebase-managed.md`.
+- **hosting/**: the OUTER layer that calls the runtime. Standalone's scoped peer
+  request-input handler provides a trusted 256 KiB body reader with a five-second
+  absolute deadline on peer send/cancel POST paths. It bounds framing and refusal
+  cleanup while preserving the configured listener and ordinary-route/WebSocket
+  policies; it does not activate the peer API. See
+  [peer request input](../reference/peer-request-input.md). `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at
   `/v1/desk/chat/completions` — `dashboard/routes/desk_api.py`, an
@@ -1490,8 +1565,38 @@ verified: 637f7f7bb679 2026-10-05
   copy's own burst would raise it), though a disk already ORANGE
   still gets one; never stops the launch, though a launch waits up to 10 minutes
   for another session's copy of the same profile).
-  `scripts/browser.py` launches without a copy. `scripts/disk_hygiene.sh` keeps
-  the newest copy per profile, and the newest per version for 90 days. The automation TOOLS live in
+  `scripts/browser.py` copies too when it can import Genesis (else it says so and
+  launches without a copy). The Chromium fallback and that CLI run
+  through patchright when installed. `scripts/disk_hygiene.sh` keeps
+  the newest copy per profile, and the newest per version for 90 days. Once
+  the paired Camoufox engine has been in use 14 days, it also removes older
+  engine versions and the pre-0.5 root engine (`scripts/prune_browser_engines.py`
+  decides; none while an override or `camoufox set` choice is in effect or access
+  times are not kept, never an engine a running browser uses, the one the browser
+  profile last ran, or one launched in 14 days, never camoufox 0.5's own files).
+  Every install gets the `browser` extra (pinned camoufox 0.5.7+, playwright and
+  patchright on one minor): bootstrap.sh and install.sh install it after the core
+  packages, never fatally (`venv_setup.sh` `install_browser_extra`, checked by
+  `provision.py check-packages`). `provision.py` (run by
+  `scripts/install_browser_stack.sh`: unit `genesis-browser-stack.service`, which
+  bootstrap starts without waiting and its daily timer retries; inline in
+  install.sh) installs what the tools launch: the
+  engine the camoufox package pairs with (only from camoufox 0.5.7: 0.4's fetch
+  empties the cache and 0.5.3-0.5.6 have no pin), the Chromium the fallback
+  launches (`chromium.py`: patchright's when installed, else playwright's; where
+  it lives is asked of the package's own `install --dry-run`, and a build counts
+  only with its marker AND executable, a broken one repaired by upstream's
+  `install --force`), and their system libraries (`install-deps` through
+  `sudo -n`, else the command is printed). Free space is checked on every
+  destination with the disk guardian's effective figure (`util/disk_headroom.py`);
+  every step's timeout comes off one run budget inside the unit's limit. One
+  outcome line; a re-run is a no-op. The Chromium launches refuse with the
+  operator step while their build is not installed: the MCP fallback judges it at
+  the executable its started driver names, the CLI where the package's dry-run says
+  the headless shell lives. The `browser_automation` capability is probed when
+  genesis-server starts, so after an update that pins a new engine it reads
+  degraded until the next restart after the unit finishes (documented, not
+  refreshed). The automation TOOLS live in
   `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
   TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
   1 h idle reclaim of one layer never touches another (TinyFish included:
@@ -2576,7 +2681,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 4117f6ed 2026-10-05
+verified: 8b445d636b26 2026-10-16
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2718,7 +2823,7 @@ verified: 4117f6ed 2026-10-05
   and recovery state. Incremental publication follows durable append; uncertain
   publication stops derived-state reading until reconstruction. Historical
   reading never creates or truncates files; version-1 evidence cannot execute.
-  No transport, CLI, automatic execution or qualification verdict is wired yet;
+  No CLI, automatic execution or qualification verdict is wired yet;
   subsequent replacement PRs supply those callers. Production credentials and
   accounting stores are outside this boundary. See
   `docs/reference/qualification-journal.md`. Offline reference admission also
@@ -2738,6 +2843,29 @@ verified: 4117f6ed 2026-10-05
   full-schema SQLite fixtures and observes the actual rendered candidate IDs.
   Full preflight, storage replay and execution/reporting orchestration land later.
   See `docs/reference/qualification-corpus.md`.
+  Qualification's pinned transport supplies a caller-provided adapter router
+  through the production delegate, a shared one-egress wire guard, response-hook
+  durability and exact lexical Decimal GET billing. Documented selected-route
+  metadata is checked on live acceptance and replay; gateway response caching
+  is explicitly disabled. Contradictory served identities retain unresolved
+  liability, while expense settlement cannot qualify invalid routing evidence.
+  Frozen schedule/provider
+  mapping and dedicated nonreset credentials are required; any journal incident
+  pauses new requests and replay until verified recovery. These checks do not
+  admit more than reported or exact limit-minus-spend headroom supports. Local
+  client setup precedes durable dispatch; recovery metadata uses the shared JSON
+  authority before redaction, and diagnostic formatting cannot interrupt calls.
+  External JSON has explicit local byte/depth bounds and a shared forward string
+  scanner. Unsafe response/receipt bodies retain opaque error evidence; decoded
+  strings stay untrusted through bounded nested JSON redaction. Refusals preserve
+  unresolved funding and never resend a completion.
+  Credential lending preserves known redaction values while keeping production
+  aliases hidden from the SDK, including log calls on SDK threads.
+  These checks do not
+  establish provider spend bounds or owner approval. The isolated runner remains
+  a later replacement. This verification refresh covers the qualification slice;
+  other learning/evaluation entries retain their previous verification scope.
+  See `docs/reference/qualification-transport.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
@@ -3114,11 +3242,25 @@ config resolution, and hygiene utilities.
 ```yaml subsystem-map
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
-          restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
-          _config_overlay.py]
+          restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
+          env.py, _config_overlay.py]
 verified: ba9dd8a37 2026-10-09
 ```
 
+- **payments/**: the encrypted card vault, virtual cards only.
+  `python -m genesis vault init|add|list|retire|status` (`payments/cli.py`);
+  `vault_store.py` keeps `~/.genesis/payment_vault/` (0700, files 0600): an age
+  X25519 identity sealed under the owner's passphrase (zxcvbn score 4), its
+  public key, and `cards.db`, whose card details exist only as age blobs
+  encrypted to that key, each carrying its own `card_ref` and merchant scope;
+  cards.db also records the sealed key's sha256 and public key, checked (with no
+  passphrase) before any add, so a damaged or swapped key is refused; the public
+  key is checked again on the connection that writes the card, so a swapped
+  database takes nothing. `add` needs no passphrase and requires a merchant
+  scope or `--single-use`; init/add/retire need a TTY that can hide input (every
+  answer is hidden) and refuse inside a coding agent's session, Claude Code or
+  Codex (accident guard). Needs the `payments` extra. No runtime
+  caller yet: nothing decrypts a card, and the directory is not backed up.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;
@@ -3499,6 +3641,48 @@ verified: ba9dd8a37 2026-10-09
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
   `secrets_path()` is repo-relative unless SECRETS_PATH set.
+- **Managed systemd user units** (deploy scripts, no `src/genesis` module):
+  `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
+  renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through
+  `scripts/lib/managed_units.sh`. Every render ends with a
+  `# genesis-managed v1 sha256=` stamp of its own body
+  (`scripts/lib/managed_units.py` holds the grammar), so a later run tells
+  Genesis's output from a hand edit: an edited unit is KEPT and named, never
+  overwritten. A plain `update.sh` run checks every unit BEFORE it stops
+  anything and exits 4 naming the edited ones; `--post-merge` does not refuse
+  (its merge already happened), and bootstrap keeps and names the unit
+  instead (`--take-template <unit>` installs the template and
+  backs the old file up under `~/.genesis/deploy-backups/`, pruned at 90 days by
+  `disk_hygiene.sh`); a unit from before stamps is accepted when it matches a
+  version of its template in git history. Local unit changes belong in a
+  drop-in (`<unit>.d/*.conf`), which nothing here touches. Timers listed in
+  `~/.genesis/config/disabled_timers` are not re-enabled (`systemctl mask`
+  cannot work on a unit in `~/.config/systemd/user`). The dashboard's update
+  card shows edited units (stamp check only). A refusal is recorded in
+  `~/.genesis/update_refused.json` (units, commit judged), which every other
+  preflight verdict removes; the supervised update's orchestrator removes it
+  before tier 1 and never escalates while it stands. `update.sh` prints what bootstrap changed
+  outside the checkout at the end of every run, a failed one included. A
+  symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
+  `--take-templates`.
+- **The restart guard, `~/.genesis/update_state.json`** (deploy scripts and the
+  dashboard update routes, #3139): `update.sh` writes it at each phase; an
+  update that merged code and never activated it, or that stopped on merge
+  conflicts, leaves it behind. Whether it still guards is ONE rule,
+  `scripts/lib/update_state_guard.py` (stdlib; `safe` / `guards` /
+  `conflict_pending`, plus the remedy text): a "done" state, a plain run's
+  "fetching" at its rollback tag, and a "merging" at the tag with no merge
+  residue and no recorded conflict guard nothing; anything unreadable guards.
+  `deploy_code_only.sh` and the live engine refuse to restart or move the
+  checkout while it guards; a plain `update.sh` exits 5 (before tagging or
+  writing anything), and the dashboard's `/apply` answers 409 on both paths;
+  `--post-merge` is the run that finishes it. Only the run that wrote the file
+  deletes it on its exits (never a `--post-merge`, never a run that had not
+  written yet), a rollback that left merged code keeps it, and bootstrap's
+  crash recovery keeps a pending conflict. The dashboard's progress poll is
+  read-only: it reports the verdict and offers Dismiss, the one retirement by
+  hand. The merge-residue check is shared with bootstrap
+  (`genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`).
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.
@@ -3559,6 +3743,19 @@ verified: 4ab8bf71c 2026-10-10
   recall tools. The launcher also selects `--external-client`; memory initialization
   then disables processing of Claude's pending plan-bookmark file. Ordinary
   Genesis memory initialization keeps that processing enabled by default.
+  The standalone server enforces the `external` or `validator` tool profile
+  during discovery and direct calls. Both currently admit the same health/recall
+  floor; other tool bodies cannot be entered through those MCP processes.
+  External health initialization skips the LLM router, dispatch queue setup,
+  and campaign wiring. Profiles constrain tools, not an operator's host access.
+  The separately launched validator can admit one canonical invocation of
+  `scripts/codex_validator_request.py` through its native shell hook. Its
+  bounded, private UUID request files use strict JSON and a closed operation
+  schema; only `protocol_probe` exists. Request creation and retirement use
+  the admitted workspace patch path. Serving probes, verification recording
+  and publication operations remain GROUNDWORK, and this boundary has no
+  activation wiring in the ordinary project configuration. Its dedicated
+  launcher must establish private workspace modes and umask before activation.
   In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
   the main checkout, which owns the live database and secrets. This gives Codex
   on-demand access without registering its transcript,
