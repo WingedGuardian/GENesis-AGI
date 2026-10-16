@@ -4,6 +4,9 @@
 point. Run it in a dedicated, serial qualification process with an owned scratch
 directory. Rendering and storage replay temporarily patch production globals;
 do not call them inside the serving process or concurrent qualification tasks.
+Start a fresh interpreter after changing the checkout so imported code and
+constants match the sources being recorded. Repeated checks on an unchanged
+checkout are supported.
 
 The caller supplies the complete corpus, reference policy, independently read
 current policy, human reference approval, explicit candidate parameters, and
@@ -53,6 +56,16 @@ earned procedures have no authored-lesson record. Tools and context metadata
 accept strings (normalized to lists) or lists of Unicode scalar strings;
 missing fields default to empty lists, while nulls and objects refuse.
 Source evidence includes the actual schema creation module and table DDL module.
+It also includes the two builtin tool-registry modules and every source the
+normalizer's shallow MCP AST loader attempts to read, using that loader's shared
+path enumeration and exclusions. Complete admission requires readable registry
+files and directory enumeration; normal runtime normalization keeps its existing
+warning/skip behavior. The complete source path/hash mapping is rebuilt after
+rendering, so additions, removals and byte changes refuse admission. Before and
+after rendering, cached MCP owners must equal a fresh scan through the actual
+loader. Matching caches remain in use; preflight does not clear or replace them.
+These are explicit module and registry inputs, not a transitive Python dependency
+or already-loaded bytecode authentication claim.
 
 Extraction and scoping use deterministic synthetic responses, distinguished by
 their actual prompts despite a shared call-site ID. These responses isolate

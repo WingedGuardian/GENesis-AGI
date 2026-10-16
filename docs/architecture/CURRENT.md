@@ -2858,10 +2858,15 @@ verified: 83536c40b734 2026-10-16
   Historical exports require full Git identifiers and repository-relative paths;
   procedure metadata requires strings or string lists. Independent database
   reads verify committed effects; evidence binds schema creation and table DDL.
+  Normalizer source evidence includes builtin tool registries and the shared
+  shallow MCP source population; full path/hash rechecks detect membership drift,
+  and cached owners must match an uncached scan without cache invalidation.
   Disposable current/promoted replay uses both real stores, checks all original
   procedure columns and verifies new insertion semantics; synthetic classifiers
   isolate novelty wiring. Dedicated serial process only; no execution consent,
   paid eligibility, model quality or promotion follows from this evidence.
+  A fresh interpreter follows checkout changes; unchanged checkouts permit
+  repeated checks with matching caches.
   The later runner must recompute it before credentials. See
   `docs/reference/qualification-preflight.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools

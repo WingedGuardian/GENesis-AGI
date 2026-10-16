@@ -3,6 +3,8 @@
 Run in a dedicated serial qualification process: disposable replay temporarily
 patches production globals. The runner must recompute ``check`` from current
 files before credentials; a saved or caller-supplied plan is not authority.
+Start a fresh interpreter after checkout changes; unchanged checkouts support
+repeated checks without invalidating the normalizer's cache.
 """
 
 import hashlib
@@ -102,6 +104,18 @@ def file_hash(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def production_source_inventory(modules):
+    """Bind explicit modules and actual registry inputs, refusing stale MCP data."""
+    paths = {Path(module.__file__) for module in modules}
+    paths.update(path for _, path in storage.tool_names._mcp_source_files(strict=True))
+    root = Path(__file__).resolve().parents[4]
+    sources = {str(path.relative_to(root)): file_hash(path) for path in sorted(paths)}
+    owners = storage.tool_names._mcp_owners
+    if owners() != owners.__wrapped__():
+        raise Incomplete("tool registry cache differs from current source declarations")
+    return sources
+
+
 def source_nodes(value):
     """Composite references retain both arms and historical baseline evidence."""
     if isinstance(value, dict):
@@ -170,6 +184,8 @@ def source_evidence(cases, source_files):
 async def check(cases, temp_root, *, reference_policy, current_policy,
                 reference_approval, candidates, source_files, config=None):
     """Complete CURRENT offline evidence; conveys no consent, budget or quality."""
+    from genesis.cc import session_config
+    from genesis.cc import types as cc_types
     from genesis.db.schema import _tables, create_all_tables
     from genesis.learning.procedural import extractor, judge, operations, scoping, validation_gate
 
@@ -205,12 +221,9 @@ async def check(cases, temp_root, *, reference_policy, current_policy,
                inspect.getmodule(contracts.J9EvalBatchExecutor), inspect.getmodule(check),
                inspect.getmodule(resolve), inspect.getmodule(contracts.pack_embedding),
                inspect.getmodule(contracts.connect_aiosqlite_rw), contracts.procedural, storage.tool_names,
-               inspect.getmodule(operations.validate_trigger_spec), inspect.getmodule(create_all_tables), _tables]
-    production_sources = {
-        str(Path(module.__file__).relative_to(Path(__file__).resolve().parents[4])):
-            file_hash(module.__file__)
-        for module in modules
-    }
+               inspect.getmodule(operations.validate_trigger_spec), inspect.getmodule(create_all_tables), _tables,
+               session_config, cc_types]
+    production_sources = production_source_inventory(modules)
     plan = await prepare(cases, temp_root, reference_policy=policy)
     frozen_params = {
         alias: parameters(alias, params, plan, config=config)
@@ -218,9 +231,7 @@ async def check(cases, temp_root, *, reference_policy, current_policy,
     }
     if (source_evidence(cases, sources) != verified_sources or corpus.versions() != versions
         or [asdict(r) for r in list_rubrics()] != rubric_definitions
-        or any(file_hash(module.__file__) !=
-               production_sources[str(Path(module.__file__).relative_to(Path(__file__).resolve().parents[4]))]
-               for module in modules)):
+        or production_source_inventory(modules) != production_sources):
         raise Incomplete("source or contract changed during offline preflight")
     return {
         "complete": True, "corpus_hash": digest(cases), "policy_hash": digest(policy),

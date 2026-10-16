@@ -2,11 +2,13 @@
 
 import asyncio
 import copy
+import functools
 import hashlib
 import json
 import tracemalloc
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -458,4 +460,179 @@ async def test_schema_sources_bound_and_rechecked(tmp_path, monkeypatch, module_
     monkeypatch.setattr(preflight, "file_hash", file_hash)
     monkeypatch.setattr(preflight, "prepare", prepare)
     with pytest.raises(Incomplete, match="source or contract changed"):
+        await preflight.check(cases, tmp_path, **options)
+
+
+async def test_complete_check_binds_actual_normalizer_registry_inputs(tmp_path, monkeypatch):
+    from genesis.cc import session_config, types
+    from genesis.learning.procedural import tool_names
+
+    attempted, read_text = set(), Path.read_text
+
+    def observe(path, *args, **kwargs):
+        attempted.add(path)
+        return read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as observer:
+        observer.setattr(Path, "read_text", observe)
+        tool_names._mcp_owners.__wrapped__()
+    attempted.update(Path(m.__file__) for m in (session_config, types))
+    cases, options = admitted(tmp_path)
+    monkeypatch.setattr(preflight, "prepare", AsyncMock(return_value={}))
+    result = await preflight.check(cases, tmp_path, **options)
+    root = Path(preflight.__file__).resolve().parents[4]
+    for path in attempted:
+        assert result["production_sources"][str(path.relative_to(root))] == preflight.file_hash(path)
+
+
+@pytest.fixture
+def registry_files(monkeypatch):
+    """Virtual registry additions exercise public admission without editing the checkout."""
+    from genesis.learning.procedural import tool_names
+
+    health = Path(tool_names.__file__).resolve().parents[2] / "mcp" / "health"
+    files = {"_qualification_registry_fixture.py": ""}
+    assert not (health / next(iter(files))).exists()
+    glob, iterdir, read_text, file_hash = Path.glob, Path.iterdir, Path.read_text, preflight.file_hash
+
+    def children():
+        return {health / name.split("/", 1)[0] for name in files}
+
+    def glob_sources(path, pattern, **kwargs):
+        yield from glob(path, pattern, **kwargs)
+        if path == health:
+            yield from (child for child in children() if child.match(pattern))
+
+    def iter_sources(path):
+        yield from iterdir(path)
+        if path == health:
+            yield from children()
+
+    def source_text(path, *args, **kwargs):
+        if path.parent == health and path.name in files:
+            return files[path.name]
+        return read_text(path, *args, **kwargs)
+
+    def source_hash(path):
+        path = Path(path)
+        if path.parent == health and path.name in files:
+            return hashlib.sha256(files[path.name].encode()).hexdigest()
+        return file_hash(path)
+
+    monkeypatch.setattr(Path, "glob", glob_sources)
+    monkeypatch.setattr(Path, "iterdir", iter_sources)
+    monkeypatch.setattr(Path, "read_text", source_text)
+    monkeypatch.setattr(preflight, "file_hash", source_hash)
+    # Isolate the test cache without clearing the production cache.
+    cache = functools.cache(tool_names._mcp_owners.__wrapped__)
+    monkeypatch.setattr(tool_names, "_mcp_owners", cache)
+    return files, cache
+
+
+@pytest.mark.parametrize("change", ["add", "remove", "modify", "literal", "hidden"])
+async def test_complete_check_rechecks_registry_population(tmp_path, monkeypatch, registry_files, change):
+    files, _cache = registry_files
+    cases, options = admitted(tmp_path)
+
+    async def prepare(*args, **kwargs):
+        if change == "remove":
+            files.clear()
+        elif change == "modify":
+            files[next(iter(files))] = '"changed supporting bytes"'
+        else:
+            files[{"add": "_new_registry_fixture.py", "literal": ".py", "hidden": ".hidden.py"}[change]] = ""
+        return {}
+
+    monkeypatch.setattr(preflight, "prepare", prepare)
+    with pytest.raises(Incomplete, match="source or contract changed"):
+        await preflight.check(cases, tmp_path, **options)
+
+
+@pytest.mark.parametrize("when", ["before", "during"])
+async def test_complete_check_refuses_stale_registry_cache(tmp_path, monkeypatch, registry_files, when):
+    files, cache = registry_files
+    name = next(iter(files))
+    files[name] = "@mcp.tool()\ndef qualification_registry_probe(): pass\n"
+    cache()
+    cases, options = admitted(tmp_path)
+
+    def change():
+        files[name] = "@mcp.tool()\ndef changed_registry_probe(): pass\n"
+
+    async def prepare(*args, **kwargs):
+        assert when == "during", "stale initial registry reached rendering"
+        change()
+        return {}
+
+    if when == "before":
+        change()
+    monkeypatch.setattr(preflight, "prepare", prepare)
+    with pytest.raises(Incomplete, match="registry"):
+        await preflight.check(cases, tmp_path, **options)
+
+
+@pytest.mark.parametrize("ignored", ["user_job_tools.py", "nested/fixture.py"])
+async def test_complete_check_retains_registry_exclusions_and_matching_cache(
+    tmp_path, monkeypatch, registry_files, ignored,
+):
+    files, cache = registry_files
+    cached = cache()
+    cases, options = admitted(tmp_path)
+
+    async def prepare(*args, **kwargs):
+        files[ignored] = "@mcp.tool()\ndef excluded_registry_probe(): pass\n"
+        return {}
+
+    monkeypatch.setattr(preflight, "prepare", prepare)
+    for _ in range(2):
+        assert (await preflight.check(cases, tmp_path, **options))["complete"]
+        assert cache() is cached
+
+
+@pytest.mark.parametrize("module_name", ["session_config", "types"])
+async def test_complete_check_rechecks_builtin_registry_sources(tmp_path, monkeypatch, module_name):
+    from genesis.cc import session_config, types
+
+    module = {"session_config": session_config, "types": types}[module_name]
+    cases, options = admitted(tmp_path)
+    original, changed = preflight.file_hash, False
+
+    def file_hash(path):
+        return "0" * 64 if changed and str(path) == module.__file__ else original(path)
+
+    async def prepare(*args, **kwargs):
+        nonlocal changed
+        changed = True
+        return {}
+
+    monkeypatch.setattr(preflight, "file_hash", file_hash)
+    monkeypatch.setattr(preflight, "prepare", prepare)
+    with pytest.raises(Incomplete, match="source or contract changed"):
+        await preflight.check(cases, tmp_path, **options)
+
+
+@pytest.mark.parametrize("unreadable", ["directory", "file"])
+async def test_complete_check_requires_readable_registry_inputs(
+    tmp_path, monkeypatch, registry_files, unreadable,
+):
+    from genesis.learning.procedural import tool_names
+
+    health = Path(tool_names.__file__).resolve().parents[2] / "mcp" / "health"
+    iterate, hash_source = Path.iterdir, preflight.file_hash
+
+    def iterdir(path):
+        if path == health:
+            raise PermissionError("synthetic unreadable registry directory")
+        return iterate(path)
+
+    def file_hash(path):
+        if Path(path) == health / "_qualification_registry_fixture.py":
+            raise PermissionError("synthetic unreadable registry source")
+        return hash_source(path)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir if unreadable == "directory" else iterate)
+    monkeypatch.setattr(preflight, "file_hash", file_hash if unreadable == "file" else hash_source)
+    cases, options = admitted(tmp_path)
+    monkeypatch.setattr(preflight, "prepare", AsyncMock(return_value={}))
+    with pytest.raises(PermissionError):
         await preflight.check(cases, tmp_path, **options)
