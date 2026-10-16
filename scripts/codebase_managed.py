@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
@@ -144,7 +144,14 @@ def validate_provider_paths(config: dict) -> None:
     """The pinned POSIX provider folds backslashes before native storage use."""
     for key in ("main", "cache"):
         path = absolute(config[key])
-        if "\\" in str(path) or "\\" in str(path.resolve()):
+        physical = path.resolve()
+        # Python 3.13+ non-strict resolve leaves symlink loops unresolved.
+        # Let the kernel reject loops in both the literal and resolved paths;
+        # missing staging directories remain supported.
+        for candidate in (path, physical):
+            with suppress(FileNotFoundError):
+                candidate.stat()
+        if "\\" in str(path) or "\\" in str(physical):
             raise ValueError(f"pinned provider does not support backslash in {key} paths")
 
 

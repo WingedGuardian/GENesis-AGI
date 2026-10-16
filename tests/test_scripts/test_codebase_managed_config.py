@@ -482,6 +482,25 @@ def test_configure_backslash_alias_to_supported_identity_succeeds(
 
 
 @pytest.mark.parametrize("key", ["main", "cache"])
+@pytest.mark.parametrize("suffix", ["", "/child", "/../safe", "/../../safe"])
+def test_native_environment_refuses_provider_symlink_loops(managed, tmp_path, key, suffix):
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    (tmp_path / "safe").mkdir()
+    data = config(tmp_path, managed)
+    data[key] = str(loop) + suffix
+    with pytest.raises((OSError, RuntimeError)):
+        managed.native_env(data)
+
+
+@pytest.mark.parametrize("key", ["main", "cache"])
+def test_native_environment_keeps_missing_staging_paths_supported(managed, tmp_path, key):
+    data = config(tmp_path, managed)
+    data[key] = str(tmp_path / "missing" / "stage")
+    assert managed.native_env(data)["CBM_ALLOWED_ROOT"] == data["main"]
+
+
+@pytest.mark.parametrize("key", ["main", "cache"])
 def test_status_provider_symlink_loop_keeps_manager_diagnostics(
     managed, tmp_path, monkeypatch, key
 ):
