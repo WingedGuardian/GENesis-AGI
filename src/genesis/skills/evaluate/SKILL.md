@@ -39,8 +39,8 @@ to Genesis. Produce a structured evaluation with clear recommendations.
    - **Genesis's own queue.** Open PRs and issues on the public Genesis repo
      that touch the same area. Foreground: `gh pr list --state open --search
      "<terms>" --limit 1000`, same for `gh issue list`. Research background:
-     `recon_github_search(kind="issues", repository=<public repo>)` finds
-     issues only; open PRs have no background route. A draft PR or an issue may
+     `recon_github_search(kind="issues", query="<terms>", state="open", repository="<public repo>")`
+     finds issues only; follow its pagination signal. Open PRs have no background route. A draft PR or an issue may
      already own the capability, or the target may replace one.
    - **Existing implementations.** Public repositories (`gh search repos`,
      `recon_github_search`) and exact code (`searchGitHub` / grep.app,
@@ -59,7 +59,8 @@ to Genesis. Produce a structured evaluation with clear recommendations.
      The community catalogue has no background route yet (#3321).
      Check each candidate's validated CC version against the pin in
      `docs/reference/cc-compatibility.md`: below 2.1.287 a mod needs the
-     early-access flag, so it is ADOPT-pending-pin-bump. Mods are unsandboxed:
+     early-access flag. Keep `action: ADOPT` and record the required pin bump
+     in `next_step` / `scope`; do not invent an action enum value. Mods are unsandboxed:
      record each candidate's access footprint, and never propose a mod as the
      only enforcement for a guard, because a mod that denies a tool call ran
      before the classic `PreToolUse` hooks and suppressed them when measured
