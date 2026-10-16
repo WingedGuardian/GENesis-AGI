@@ -641,12 +641,13 @@ async def test_host_bootstrap_records_peer_binding_readiness(bridge, monkeypatch
     monkeypatch.setattr("genesis.runtime._capabilities.write_capabilities_file", write)
     app = Flask(__name__)
     adapter = StandaloneAdapter()
+    app.config.update(GENESIS_PEER_RUNTIME=bridge.runtime, GENESIS_PEER_REGISTRY=bridge.registry)
     monkeypatch.setattr(adapter, "_create_flask_app", lambda: app)
     monkeypatch.setattr(
         adapter, "_register_blueprints", lambda: app.register_blueprint(agent_api_bp)
     )
     await adapter.bootstrap()
-    assert bridge.runtime._bootstrap_manifest["agent_api"] == ("ok" if enabled else "degraded")
+    assert bridge.runtime._bootstrap_manifest["agent_api"] == ("ok" if enabled else "disabled")
     assert "agent_api" in _CAPABILITY_DESCRIPTIONS
     write.assert_called_once_with(bridge.runtime)
 
