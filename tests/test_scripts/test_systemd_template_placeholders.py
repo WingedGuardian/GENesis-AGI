@@ -33,7 +33,9 @@ next token nobody thought of, which is the only kind that has ever shipped.
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -207,6 +209,32 @@ def test_the_two_renderers_agree_on_their_substitution_sets():
         f"  only in {a}: {sorted(only_a)}\n"
         f"  only in {b}: {sorted(only_b)}"
     )
+
+
+def test_hosted_install_inventory_covers_slice_templates(tmp_path):
+    source = (REPO / ".github/workflows/install-test.yml").read_text()
+    start = source.index('          _unrendered=""')
+    terminal = '          echo "  $_tpl_count shipped unit template(s), all rendered"'
+    end = source.index(terminal, start) + len(terminal)
+    block = "set -euo pipefail\n" + source[start:end]
+    templates = tmp_path / "scripts/systemd"
+    units = tmp_path / ".config/systemd/user"
+    templates.mkdir(parents=True)
+    units.mkdir(parents=True)
+    name = "genesis-cbm-query-clients.slice"
+    (templates / (name + ".template")).write_text("[Slice]\nMemoryMax=2G\n")
+    rendered = units / name
+    rendered.write_text("[Slice]\nMemoryMax=2G\n")
+    env = dict(os.environ, HOME=str(tmp_path))
+    result = subprocess.run(
+        ["bash", "-c", block], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 0 and "1 shipped unit" in result.stdout, result.stdout
+    rendered.unlink()
+    result = subprocess.run(
+        ["bash", "-c", block], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+    assert result.returncode != 0 and name in result.stdout
 
 
 def test_the_graph_projection_units_use_only_shared_tokens():

@@ -1394,3 +1394,96 @@ def test_a_descriptor_shared_by_two_generations_is_kept_once(box):
         """,
     )
     assert "L=[5/1]" in out.stdout, out.stdout
+
+
+# ── holder identity (scripts/lib/wg_proc.py) ──────────────────────
+
+
+def _stat(box, pid: int, comm: str, ppid: int, st: int) -> None:
+    """Give a fake holder a stat record (field 22 = start time)."""
+    rest = ["S", str(ppid)] + ["0"] * 17 + [str(st)] + ["0"] * 10
+    (box["proc"] / str(pid) / "stat").write_text(f"{pid} ({comm}) {' '.join(rest)}\n")
+
+
+def test_a_holders_identity_is_read_through_its_own_handle(box):
+    f = _file(box, "out.log", 60)
+    _holder(box, 4242, f, comm="grep", ppid=4241)
+    _holder(box, 4241, f, comm="bash", ppid=1)
+    # The stat records name differently from comm: the page must show what
+    # was read through the handle.
+    _stat(box, 4242, "grep-h", 4241, 9001)
+    _stat(box, 4241, "bash-h", 1, 9000)
+    r = _run(
+        box, f"wg_runaway_check '{_domain(box, 200)}'; printf 'ID=%s\\n' \"${{_RW_IDENT[4242]}}\""
+    )
+    assert "ID=9001\tS\tgrep-h\t4241\tbash-h" in r.stdout, r.stdout + r.stderr
+    assert "pid 4242 grep-h (parent 4241: bash-h)" in _pages(box)[0]["body"]
+
+
+def test_a_newline_in_a_holders_name_cannot_forge_page_lines(box):
+    f = _file(box, "out.log", 60)
+    _holder(box, 4242, f, comm="evil\nFAKE: all clear", ppid=1)
+    _check(box, _domain(box, 200))
+    body = _pages(box)[0]["body"]
+    assert "pid 4242 evil?FAKE: all clear" in body
+    assert "\nFAKE" not in body
+
+
+def test_a_holder_the_identity_read_does_not_confirm_is_not_a_writer(box, tmp_path):
+    """The read ran to completion and confirmed nobody (the descriptor closed,
+    or its process exited, after the stat): the file has no writer to name."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 4242, f, comm="grep")
+    stub = tmp_path / "none.py"
+    stub.write_text("import sys; sys.stdin.read()\n")
+    _run(box, f"_RW_PROC_PY='{stub}'; wg_runaway_check '{_domain(box, 200)}'")
+    assert not _pages(box)
+    log = (box["home"] / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "confirmed none of the 1 writers" in log, "a read that confirms nobody is never silent"
+
+
+def test_detection_survives_an_identity_read_that_fails(box, tmp_path):
+    """Without the identity read (it failed, or there is no python), the holders
+    are the ones the stat found, and names still lose their control bytes."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 4242, f, comm="evil\tname", ppid=1)
+    stub = tmp_path / "fail.py"
+    stub.write_text("import sys; sys.exit(1)\n")
+    _run(box, f"_RW_PROC_PY='{stub}'; wg_runaway_check '{_domain(box, 200)}'")
+    pages = _pages(box)
+    assert len(pages) == 1
+    assert "pid 4242 evil?name" in pages[0]["body"]
+    log = (box["home"] / ".genesis" / "logs" / "tmp_watchgod.log").read_text()
+    assert "identity read failed (status 1" in log, "a failed read is never silent"
+
+
+def test_a_file_name_cannot_forge_page_lines(box):
+    """The runaway file's own name is chosen by whoever created it: a newline,
+    a line separator or a bidi control in it reaches the page as "?", like a
+    process name (review finding). The real name still keys the domain."""
+    name = "evil\nWriters:\n  pid 1 sshd\u2028x\u202egol.txt"
+    f = _file(box, name, 60)
+    _holder(box, 4242, f, comm="grep")
+    _check(box, _domain(box, 200))
+    pages = _pages(box)
+    assert len(pages) == 1, "still detected: the raw name keys the domain"
+    page = pages[0]
+    for text in (page["title"], page["body"]):
+        assert "\n  pid 1 sshd" not in text
+        assert "\u2028" not in text and "\u202e" not in text
+    assert "evil?Writers:?  pid 1 sshd?x?gol.txt" in page["body"]
+    assert page["body"].count("\nWriters:\n") == 1
+
+
+def test_without_the_identity_read_names_keep_printable_ascii_only(box, tmp_path):
+    """The fallback (no identity read) cannot rely on the locale to know a
+    multibyte line separator or bidi control: it keeps printable ASCII and
+    replaces every other byte (review finding)."""
+    f = _file(box, "out.log", 60)
+    _holder(box, 4242, f, comm="evil\u2028FAKE: all clear", ppid=1)
+    stub = tmp_path / "fail.py"
+    stub.write_text("import sys; sys.exit(1)\n")
+    _run(box, f"_RW_PROC_PY='{stub}'; wg_runaway_check '{_domain(box, 200)}'")
+    body = _pages(box)[0]["body"]
+    assert "pid 4242 evil???FAKE: all clear" in body
+    assert "\u2028" not in body

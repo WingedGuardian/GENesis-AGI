@@ -42,7 +42,16 @@ __all__ = [
 
 # Container-side paths
 _CONTAINER_SHARED_DIR = Path("~/.genesis/shared").expanduser()
-_CONTAINER_SECRETS = Path("~/genesis/secrets.env").expanduser()
+
+
+def _container_secrets() -> Path:
+    """The container's secrets.env: ``genesis.env.secrets_path()``, so
+    ``SECRETS_PATH`` is honoured. Imported here, never at module import: the
+    host Guardian imports this module with only the stdlib and yaml."""
+    from genesis.env import secrets_path
+
+    return secrets_path()
+
 
 # Output filename (same on both sides of the mount)
 _CREDS_FILENAME = "telegram_creds.env"
@@ -142,7 +151,7 @@ def propagate_telegram_credentials(
 
     Returns the path written, or None if no bot token found.
     """
-    src = secrets_path or _CONTAINER_SECRETS
+    src = secrets_path or _container_secrets()
     out_dir = (shared_dir or _CONTAINER_SHARED_DIR) / _CREDS_SUBDIR
 
     # Read source secrets
@@ -200,7 +209,7 @@ def propagate_provisioning_credentials(
     provision token is propagated when present. Returns the path written, or
     None if the audit token is absent.
     """
-    src = secrets_path or _CONTAINER_SECRETS
+    src = secrets_path or _container_secrets()
     out_dir = (shared_dir or _CONTAINER_SHARED_DIR) / _CREDS_SUBDIR
 
     source_secrets = _read_dotenv(src)
@@ -254,7 +263,7 @@ def propagate_backup_passphrase(
     the very secrets.env the backup encrypts with it. Returns the path written,
     or None if the passphrase is absent.
     """
-    src = secrets_path or _CONTAINER_SECRETS
+    src = secrets_path or _container_secrets()
     out_dir = (shared_dir or _CONTAINER_SHARED_DIR) / _CREDS_SUBDIR
 
     if not src.exists():

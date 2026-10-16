@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 
 # pgrep patterns for detecting browser-related processes. Single source of truth
 # used by the awareness signal collector, health probe, process reaper, and
@@ -15,6 +16,10 @@ from enum import StrEnum
 # browser processes". tests/test_browser/test_pgrep_patterns.py runs each one
 # through real pgrep. The driver pattern covers patchright, which ships the same
 # Node driver under its own package directory.
+# The one Camoufox profile: the browser tools' persistent context, and the record
+# (compatibility.ini) of the engine that last opened it.
+CAMOUFOX_PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
+
 BROWSER_PGREP_PATTERNS: tuple[str, ...] = (
     "camoufox-bin",
     r"ms-playwright.*chrome",
