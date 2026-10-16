@@ -177,9 +177,9 @@ async def test_excluded_identical_candidate_does_not_collide(tmp_path, flag):
     original = contracts.extractor._row_get
     probe = contracts.Probe()
     async with contracts.Sandbox(tmp_path) as sandbox:
-        await contracts.novelty(case, probe, sandbox)
+        result = await contracts.novelty(case, probe, sandbox)
     assert contracts.extractor._row_get is original
-    assert probe.candidate_ids == ["candidate-b", "candidate-a"]
+    assert result["candidate_ids"] == ["candidate-b", "candidate-a"]
 
 
 @pytest.mark.parametrize("population", [11, 501])
@@ -196,10 +196,10 @@ async def test_unselected_identical_candidate_does_not_collide(tmp_path, populat
         case["existing"].append(clone)
     probe = contracts.Probe()
     async with contracts.Sandbox(tmp_path) as sandbox:
-        await contracts.novelty(case, probe, sandbox)
-    assert len(probe.candidate_ids) == 10
-    assert probe.candidate_ids[0] == "candidate-b"
-    assert f"population-{population - 1}" not in probe.candidate_ids
+        result = await contracts.novelty(case, probe, sandbox)
+    assert len(result["candidate_ids"]) == 10
+    assert result["candidate_ids"][0] == "candidate-b"
+    assert f"population-{population - 1}" not in result["candidate_ids"]
 
 
 async def test_candidate_observer_restored_after_cancellation(tmp_path, monkeypatch):
@@ -229,7 +229,9 @@ async def test_nonfinite_j9_answers_are_errors(value):
 def test_legal_unicode_in_jsonl_is_preserved(tmp_path, separator):
     case = relevance_case("synthetic", True)
     case["query"] += separator + "second part"
-    (tmp_path / f"{corpus.RELEVANCE}.jsonl").write_text(json.dumps(case, ensure_ascii=False) + "\n")
+    (tmp_path / f"{corpus.RELEVANCE}.jsonl").write_text(
+        json.dumps(case, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     assert corpus.load(tmp_path)[corpus.RELEVANCE][0]["query"] == case["query"]
 
 
@@ -279,8 +281,8 @@ async def test_repeated_slugs_map_and_replay_exact_targets(tmp_path, target, sam
     await preflight.prepare({corpus.NOVELTY: [case]}, tmp_path)
     probe = contracts.Probe()
     async with contracts.Sandbox(tmp_path) as sandbox:
-        await contracts.novelty(case, probe, sandbox)
-    mapping = contracts.candidate_mapping(case, probe.calls[0][0], probe.candidate_ids)
+        rendered = await contracts.novelty(case, probe, sandbox)
+    mapping = contracts.candidate_mapping(case, probe.calls[0][0], rendered["candidate_ids"])
     assert set(mapping) == {"candidate-a", "candidate-b"}
     answer = json.dumps({"redundant_with": mapping.index(target) + 1})
     assert contracts.raw_target(answer, mapping) == target
@@ -340,9 +342,9 @@ async def test_saved_verdict_replays_both_storage_paths(tmp_path, target):
     case = novelty_case("synthetic-storage", target)
     probe = contracts.Probe()
     async with contracts.Sandbox(tmp_path) as sandbox:
-        await contracts.novelty(case, probe, sandbox)
+        rendered = await contracts.novelty(case, probe, sandbox)
         messages = probe.calls[0][0]
-        mapping = contracts.candidate_mapping(case, messages, probe.candidate_ids)
+        mapping = contracts.candidate_mapping(case, messages, rendered["candidate_ids"])
         content = json.dumps({"redundant_with": mapping.index(target) + 1 if target else None})
         result = await replay(
             case, messages, mapping, content, sandbox, "openrouter-mimo", "xiaomi/mimo-v2.6-pro"
@@ -374,12 +376,12 @@ async def test_independent_storage_gates_are_reported_without_model_error(tmp_pa
     await preflight.prepare({corpus.NOVELTY: [case]}, tmp_path)
     probe = contracts.Probe()
     async with contracts.Sandbox(tmp_path) as sandbox:
-        await contracts.novelty(case, probe, sandbox)
+        rendered = await contracts.novelty(case, probe, sandbox)
         messages, content = probe.calls[0]
         result = await replay(
             case,
             messages,
-            contracts.candidate_mapping(case, messages, probe.candidate_ids),
+            contracts.candidate_mapping(case, messages, rendered["candidate_ids"]),
             content,
             sandbox,
             "openrouter-mimo",

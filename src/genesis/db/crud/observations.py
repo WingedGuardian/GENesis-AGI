@@ -1280,6 +1280,23 @@ async def oldest_created_at(
     return row[0] if row and row[0] else None
 
 
+async def has_unresolved_matching(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    content_like: str,
+) -> bool:
+    """Whether any unresolved row of ``source`` has content matching
+    ``content_like`` (SQL LIKE pattern). The deploy-staleness check uses it to
+    learn, from the store rather than process memory, whether a dirty-checkout
+    alert is standing: that has to survive a server restart."""
+    cursor = await db.execute(
+        "SELECT 1 FROM observations WHERE source = ? AND content LIKE ? AND resolved = 0 LIMIT 1",
+        (source, content_like),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def rewrite_resolution_notes(
     db: aiosqlite.Connection,
     *,

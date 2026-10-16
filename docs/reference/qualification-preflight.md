@@ -39,12 +39,17 @@ refuse until their semantics are covered. Generated UUID/time are checked for
 their production shape, not fixed values or chronology. Existing/upserted IDs cannot masquerade as
 new insertion. Scoping and validation decisions are reported separately from
 the raw novelty target; a failed mode returns no complete four-mode result.
+Judge triggers follow the production tool-name normalizer and command-spec
+builder, including dropped invalid names and command-only triggers. Their
+helper source files are included in the returned source evidence. Replayed
+earned procedures have no authored-lesson record.
 
 Extraction and scoping use deterministic synthetic responses, distinguished by
 their actual prompts despite a shared call-site ID. These responses isolate
 novelty wiring; they do not measure classifier quality. The simulated allowlist,
 gate wrappers and fail-open cooldown are restored after each mode. Database
-handles close on success, error and cancellation.
+handles close and their disposable files are deleted on success, error and
+cancellation through the sandbox's database context manager.
 
 Returned evidence binds corpus, policy, approval, current versions, source bytes,
 candidate models, explicit parameters and the actual rendered plan. It supplies

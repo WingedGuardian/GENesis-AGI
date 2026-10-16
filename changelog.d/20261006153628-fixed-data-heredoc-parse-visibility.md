@@ -1,0 +1,1 @@
+- Strictly proven data-bearing heredocs for `cat`, Git message, and `gh` body receivers no longer expose prose as shell commands; unproven heredocs remain visible to shell and secrets guards.

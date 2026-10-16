@@ -7,6 +7,12 @@ import aiohttp
 import pytest
 from aioresponses import aioresponses
 
+from tests.test_scripts._deploy_candidates_world import (  # noqa: F401  (deploy_candidates)
+    dc,
+    dc_ready,
+    dc_world,
+)
+
 
 def _patch_client_response_init():
     """Patch ClientResponse.__init__ to accept stream_writer / writer kwargs.

@@ -95,6 +95,10 @@ def validate(contract: str, cases: list[dict], *, reference_policy=None):
         raise Incomplete("unknown reference contract")
     if any(not isinstance(c, dict) for c in cases):
         raise Incomplete("reference case must be an object")
+    # Every string a case or the policy carries can reach SQLite or a judge request,
+    # whichever contract reads it, so check them all once here rather than per field.
+    if not references.all_scalar(cases) or not references.all_scalar(reference_policy):
+        raise Incomplete(f"{contract}: text holds a lone surrogate (not Unicode scalar values)")
     if reference_policy is not None:
         references.validate_policy(reference_policy, versions())
         references.admit(
@@ -171,13 +175,22 @@ def validate_novelty(case: dict):
             raise Incomplete("procedure must be a JSON object")
         for key in ("task_type", "principle"):
             value = row.get(key)
-            if not isinstance(value, str) or not value.strip() or "\n" in value or "\r" in value:
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or "\n" in value
+                or "\r" in value
+                or not references.scalar_text(value)
+            ):
                 raise Incomplete("invalid procedure text")
         steps = row.get("steps")
         if (
             not isinstance(steps, list)
             or not steps
-            or any(not isinstance(s, str) or not s.strip() for s in steps)
+            or any(
+                not isinstance(s, str) or not s.strip() or not references.scalar_text(s)
+                for s in steps
+            )
             or any(
                 re.search(r"(?:^|[\r\n])  \[\d+\] task_type:", s)
                 for s in steps
@@ -204,7 +217,12 @@ def validate_novelty(case: dict):
             raise Incomplete("same principle must have a consistent deterministic embedding")
         embeddings[row["principle"]] = vector_key
     for row in existing:
-        if not isinstance(row.get("id"), str) or not row["id"] or row["id"] in ids:
+        if (
+            not isinstance(row.get("id"), str)
+            or not row["id"]
+            or not references.scalar_text(row["id"])
+            or row["id"] in ids
+        ):
             raise Incomplete("invalid procedure id")
         ids.add(row["id"])
     target = case["expected_target"]

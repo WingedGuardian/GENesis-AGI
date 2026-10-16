@@ -27,8 +27,10 @@ Schema v1 (one JSON file per alert, named ``<ts>-<uuid>.json``)::
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -43,6 +45,54 @@ _MAX_PER_RUN = 10
 _PRUNE_MAX_FILES = 200
 _PRUNE_MAX_AGE_S = 14 * 24 * 3600  # 14 days
 _DEDUPE_SCAN_LIMIT = 200  # bound the enqueue-time dedupe scan on a huge backlog
+_TEXT_FIELDS = ("title", "body", "severity", "source")
+# Meta keys the host drain reads (guardian/check.py _alert_from_queue_entry).
+_HOST_META_KEYS = ("likely_cause", "proposed_action", "approval_url")
+
+
+def _finite(value: float) -> bool:
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int too large for a float
+        return False
+
+
+def v1_entry_problem(entry: Any) -> str | None:
+    """Name the field that makes ``entry`` unusable as a schema-v1 alert, or
+    return None when every reader can use it. Never raises.
+
+    The readers fail on more than bad JSON: a non-numeric ``ts`` raises in the
+    oldest-first sort, a non-str title raises in the host's HTML escaping, a
+    non-dict ``meta`` raises in the host's ``meta.get``. Any of those wedges the
+    drain head every tick. One rule is policy rather than a crash guard: an
+    entry with neither title nor body is a blank page, never delivered. Mirrored in scripts/lib/alert_queue.sh (its dedupe
+    scan runs under ``python3 -I -S`` and cannot import this module); keep the
+    two in step — tests/test_scripts/test_alert_queue_sh.py checks parity.
+    """
+    if not isinstance(entry, dict):
+        return "entry"
+    schema = entry.get("schema")
+    if type(schema) is not int or schema != SCHEMA_VERSION:
+        return "schema"
+    ts = entry.get("ts")
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not _finite(ts):
+        return "ts"
+    for name in _TEXT_FIELDS:
+        if name in entry and not isinstance(entry[name], str):
+            return name
+    if not (entry.get("title") or entry.get("body")):
+        return "title"
+    dedupe_key = entry.get("dedupe_key")
+    if dedupe_key is not None and not isinstance(dedupe_key, str):
+        return "dedupe_key"
+    meta = entry.get("meta")
+    if meta is not None and not isinstance(meta, dict):
+        return "meta"
+    for name in _HOST_META_KEYS:
+        value = (meta or {}).get(name)
+        if value is not None and not isinstance(value, str):
+            return f"meta.{name}"
+    return None
 
 
 def enqueue_alert(
@@ -90,8 +140,9 @@ def enqueue_alert(
 def list_queued(root: Path | str) -> list[tuple[Path, dict[str, Any]]]:
     """Return ``(path, entry)`` pairs oldest-first (by ``ts``, then filename).
 
-    A file that cannot be parsed as a v1 entry is renamed ``<name>.corrupt`` and
-    skipped, so one bad write can never wedge the drain.
+    A file that is not a usable v1 entry (``v1_entry_problem``) is renamed
+    ``<name>.corrupt``, logged, and skipped, so one bad write can never wedge the
+    drain, the prune or the enqueue-time dedupe scan.
     """
     root = Path(root).expanduser()
     if not root.exists():
@@ -100,12 +151,28 @@ def list_queued(root: Path | str) -> list[tuple[Path, dict[str, Any]]]:
     for path in root.glob("*.json"):
         try:
             entry = json.loads(path.read_text())
-            if not isinstance(entry, dict) or "ts" not in entry:
-                raise ValueError("not a v1 alert entry")
-        except Exception:
+            problem = v1_entry_problem(entry)
+            if problem is not None:
+                raise ValueError(f"not a v1 alert entry: bad {problem}")
+            ts = float(entry["ts"])
+        except FileNotFoundError:
+            continue  # drained or quarantined by another reader meanwhile
+        except OSError as exc:
+            if isinstance(exc, (IsADirectoryError, NotADirectoryError)) or exc.errno == errno.ELOOP:
+                # Not a file at all: no retry will ever read it, so quarantine
+                # it like bad content (review finding: kept, it warned forever).
+                logger.warning("alert-queue entry %s quarantined (%s)", path.name, exc)
+                _quarantine_corrupt(path)
+                continue
+            # Unreadable right now (permissions, fd limit, I/O): the content may
+            # be fine, so keep it for the next pass rather than quarantine it.
+            logger.warning("alert-queue entry %s unreadable, kept (%s)", path.name, exc)
+            continue
+        except Exception as exc:
+            logger.warning("alert-queue entry %s quarantined (%s)", path.name, exc)
             _quarantine_corrupt(path)
             continue
-        out.append((float(entry.get("ts", 0.0)), path.name, path, entry))
+        out.append((ts, path.name, path, entry))
     out.sort(key=lambda t: (t[0], t[1]))
     return [(p, e) for _, _, p, e in out]
 
@@ -149,12 +216,31 @@ def prune(
     max_age_s: float = _PRUNE_MAX_AGE_S,
 ) -> int:
     """Bound the queue: drop entries older than ``max_age_s``, then oldest over
-    ``max_files``. Best-effort — returns the number removed, never raises.
+    ``max_files``. Quarantined ``*.corrupt`` files (nothing reads them) get the
+    same two bounds: older than ``max_age_s``, then oldest over ``max_files``, so
+    a producer that keeps writing bad entries cannot grow them without limit
+    (review finding). A quarantined directory is never removed here.
+    Best-effort — returns the number removed, never raises.
     """
     removed = 0
     try:
         entries = list_queued(root)
         now = time.time()
+        kept_corrupt: list[tuple[float, str, Path]] = []
+        for path in Path(root).expanduser().glob("*.corrupt"):
+            try:
+                st = path.lstat()
+                if not os.path.isfile(path) or os.path.islink(path):
+                    continue
+                if now - st.st_mtime > max_age_s:
+                    removed += _safe_unlink(path)
+                else:
+                    kept_corrupt.append((st.st_mtime, path.name, path))
+            except OSError:
+                continue
+        kept_corrupt.sort()
+        for _, _, path in kept_corrupt[: max(0, len(kept_corrupt) - max_files)]:
+            removed += _safe_unlink(path)
         survivors: list[tuple[Path, dict[str, Any]]] = []
         for path, entry in entries:
             if now - float(entry.get("ts", now)) > max_age_s:

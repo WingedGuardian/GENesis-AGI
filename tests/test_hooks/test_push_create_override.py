@@ -33,14 +33,33 @@ import pytest  # noqa: F401  (used by fixtures/tests appended below)
 
 _GUARD = Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "git_push_guard.py"
 
+_BLOCKED_COMMAND_CONFIG = (
+    "BLOCKED: this push carries a prefix, wrapper or git config option "
+    "(-c / --config-env / VAR=…). Config supplied that way can retarget the push "
+    "or make it a force push (e.g. remote.<name>.push=+…, "
+    "remote.<name>.pushurl=…) that no flag shows, and the guard cannot read it "
+    "before the command runs.\n"
+    "Retype it as a plain `git push` (`-C <dir>` is fine)."
+)
 
-def _run(command: str, *, dispatched: bool = False) -> subprocess.CompletedProcess:
+
+def _run(
+    command: str, *, dispatched: bool = False, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     # Explicitly set the session kind — never leak the ambient value.
     env = {
         k: v for k, v in os.environ.items() if k not in ("CLAUDE_TOOL_INPUT", "GENESIS_CC_SESSION")
     }
     if dispatched:
         env["GENESIS_CC_SESSION"] = "1"
+    # These run in the test process's checkout, whose origin is the real public
+    # repo. With an install's declared public repo in scope, a first push of the
+    # current branch there with no chained PR is refused outright (the
+    # first-push-requires-PR rule) — an answer that depends on install config and live branch state,
+    # not on what these tests are about. Pin "no public repo declared", as on a
+    # CI runner; the rule itself is covered in test_push_publish_ask_switch.py.
+    env["_TEST_CANONICAL_PUBLIC_REPO"] = ""
+    env.update(extra_env or {})
     payload = json.dumps(
         {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
     )
@@ -292,7 +311,7 @@ def test_push_via_credential_helper_idiom_detected():
         dispatched=True,
     )
     assert res.returncode == 2
-    assert "git push requires user approval" in res.stderr
+    assert _BLOCKED_COMMAND_CONFIG in res.stderr
 
 
 def test_push_via_sudo_detected():
@@ -330,11 +349,11 @@ def test_push_in_command_substitution_detected():
     assert res.returncode == 2
 
 
-def test_interactive_push_through_wrapper_still_asks():
-    """Detection is session-independent; interactive asks instead of denying."""
+def test_interactive_push_through_wrapper_blocks():
+    """The command-borne config rule is session-independent."""
     res = _run("sudo git push origin main")
-    assert res.returncode == 0
-    assert _decision(res) == "ask"
+    assert res.returncode == 2
+    assert _BLOCKED_COMMAND_CONFIG in res.stderr
 
 
 # ── git commit --no-verify (session-agnostic hard block; unchanged) ──
@@ -959,8 +978,14 @@ class TestLauncherCarriedGatedOps:
         `== "ask"` therefore went RED exactly when run on a live PR branch — the
         only state a PR is ever in — which makes it a control that fails when it
         is needed and passes when it is not.
+
+        The public-repo scope is switched OFF here for the same reason: on an
+        install that declares a public repo, a bare FIRST push of an unpublished
+        branch to it is now refused by the first-push-requires-PR rule — a
+        different, legitimate refusal that depends on install config and branch
+        state, not on the carrier branch this control is about.
         """
-        res = _run(f"git {self.PUSH}")
+        res = _run(f"git {self.PUSH}", extra_env={"_TEST_CANONICAL_PUBLIC_REPO": ""})
         assert res.returncode == 0, (
             f"the bare spelling must not be refused: {res.stdout[:160]!r}"
         )

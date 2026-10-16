@@ -18,6 +18,7 @@ from genesis.learning.procedural import (
     judge,
     operations,
     scoping,
+    tool_names,
     validation_gate,
 )
 from genesis.routing.types import RoutingResult
@@ -123,7 +124,12 @@ def insertion(before, after, stored, case, path, gates):
     tags = new.get("context_tags", []) if path == "judge" else ["qualification-new"]
     tools = [tools] if isinstance(tools, str) else tools
     tags = [tags] if isinstance(tags, str) else tags
-    trigger = new.get("tool_trigger") if path == "judge" else None
+    trigger, commands, _dropped = tool_names.normalize_tool_trigger(
+        new.get("tool_trigger") if path == "judge" else None
+    )
+    trigger_spec = None
+    if commands:
+        trigger_spec, trigger, _warnings = operations.commands_spec(trigger, commands)
     expected = {
         "task_type": new["task_type"], "principle": new["principle"],
         "steps": json.dumps(new["steps"]), "draft": 1, "success_count": 0,
@@ -138,6 +144,8 @@ def insertion(before, after, stored, case, path, gates):
         "failure_modes": None, "last_used": None, "last_validated": None,
         "deprecated_reason": None, "superseded_by": None, "attempted_workarounds": None,
         "promotion_history": None,
+        "trigger_spec": json.dumps(trigger_spec) if trigger_spec is not None else None,
+        "lesson": None,
         "first_mover": 0 if path == "judge" else int(gates.results["validation"]["first_mover"]),
         "extraction_context": None if path == "judge" else gates.results["validation"]["extraction_context"],
     }
@@ -165,8 +173,8 @@ async def replay(case, messages, mapping, content, sandbox, alias, model):
     contracts.candidate_mapping(case, messages, mapping)
     target = contracts.raw_target(content, mapping)
     probe = contracts.Probe()
-    await contracts.novelty(case, probe, sandbox)
-    selected = contracts.candidate_mapping(case, probe.calls[0][0], probe.candidate_ids)
+    rendered = await contracts.novelty(case, probe, sandbox)
+    selected = contracts.candidate_mapping(case, probe.calls[0][0], rendered["candidate_ids"])
     if probe.calls[0][0] != messages or selected != mapping:
         raise Incomplete("storage replay differs from the actual production question")
     outcomes = {}
@@ -175,9 +183,8 @@ async def replay(case, messages, mapping, content, sandbox, alias, model):
         if promoted:
             allowlist[alias] = model
         for path in ("judge", "extractor"):
-            db = await sandbox.database(case)
-            router, gates = Replay(case, messages, content, alias, model), OtherGates()
-            try:
+            async with sandbox.database(case) as db:
+                router, gates = Replay(case, messages, content, alias, model), OtherGates()
                 before = await rows(db)
                 with (
                     patch.dict(extractor._NOVELTY_VALIDATED_MODELS, allowlist, clear=True),
@@ -211,6 +218,4 @@ async def replay(case, messages, mapping, content, sandbox, alias, model):
                     "gates": gates.results, "provider": alias, "model": model,
                     "raw_target": target, "suppression_authorized": allowlist.get(alias) == model,
                 }
-            finally:
-                await db.close()
     return outcomes

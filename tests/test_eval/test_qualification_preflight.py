@@ -3,7 +3,9 @@
 import asyncio
 import copy
 import hashlib
+import json
 import tracemalloc
+from contextlib import asynccontextmanager
 from dataclasses import replace
 
 import pytest
@@ -19,8 +21,8 @@ async def replay(tmp_path, case=None):
     case = case or novelty_case("probe", None)
     async with contracts.Sandbox(tmp_path) as sandbox:
         probe = contracts.Probe()
-        await contracts.novelty(case, probe, sandbox)
-        mapping = contracts.candidate_mapping(case, probe.calls[0][0], probe.candidate_ids)
+        rendered = await contracts.novelty(case, probe, sandbox)
+        mapping = contracts.candidate_mapping(case, probe.calls[0][0], rendered["candidate_ids"])
         return await storage.replay(case, probe.calls[0][0], mapping,
                                     '{"redundant_with":null}', sandbox, "synthetic", "model")
 
@@ -48,7 +50,7 @@ async def test_mutating_any_original_column_is_detected(tmp_path, monkeypatch, f
     "person_id", "scenario", "tools_used", "context_tags", "failure_count", "failure_modes",
     "last_used", "last_validated", "deprecated_reason", "superseded_by", "invocation_count",
     "attempted_workarounds", "version", "tool_trigger", "promotion_history", "surfaced_count",
-    "extraction_context", "first_mover",
+    "extraction_context", "first_mover", "trigger_spec", "lesson",
 ])
 async def test_every_new_row_semantic_column_is_verified(tmp_path, monkeypatch, path, field):
     create = contracts.procedural.create
@@ -67,11 +69,39 @@ async def test_every_new_row_semantic_column_is_verified(tmp_path, monkeypatch, 
         await replay(tmp_path)
 
 
-async def test_judge_input_metadata_and_extractor_fixture_metadata_stay_distinct(tmp_path):
+@pytest.mark.parametrize("trigger,expected,spec", [
+    (["SyntheticTrigger"], None, None),
+    (["Bash"], ["Bash"], None),
+    (["Bash (running tests)"], ["Bash"], None),
+    (["Read", "Read", "SyntheticTrigger"], ["Read"], None),
+    (["ssh"], ["Bash"], {"patterns": [], "commands": ["ssh"], "repeat": "every"}),
+    (["ssh", "Bash"], ["Bash"], None),
+    (["Read", "ssh"], ["Read", "ssh"], None),
+    (["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git push"],
+     ["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git push"], None),
+])
+async def test_judge_input_metadata_and_extractor_fixture_metadata_stay_distinct(
+    tmp_path, monkeypatch, trigger, expected, spec,
+):
     case = novelty_case("metadata", None)
     case["new"].update(tools_used="SyntheticTool", context_tags="SyntheticTag",
-                       tool_trigger=["SyntheticTrigger"], scenario="Synthetic scenario")
+                       tool_trigger=trigger, scenario="Synthetic scenario")
+    original, inserted = storage.rows, []
+
+    async def observe(db):
+        result = await original(db)
+        inserted.extend(row for key, row in result.items()
+                        if key not in {"candidate-a", "candidate-b"})
+        return result
+
+    monkeypatch.setattr(storage, "rows", observe)
     assert all(r["stored"] for r in (await replay(tmp_path, case)).values())
+    assert len(inserted) == 4
+    for index, row in enumerate(inserted):
+        judge_path = index % 2 == 0
+        assert json.loads(row["tool_trigger"] or "null") == (expected if judge_path else None)
+        assert json.loads(row["trigger_spec"] or "null") == (spec if judge_path else None)
+        assert row["lesson"] is None
 
 
 @pytest.mark.parametrize("flag", ["deprecated", "quarantined"])
@@ -113,10 +143,11 @@ async def test_cancellation_closes_database_and_restores_globals(tmp_path, monke
     cooldown = dict(embedding._fail_open_timestamps)
     validator, classifier = validation_gate.validate_extraction, scoping.is_behavioral_directive
 
+    @asynccontextmanager
     async def opening(sandbox, case):
-        db = await database(sandbox, case)
-        handles.append(db)
-        return db
+        async with database(sandbox, case) as db:
+            handles.append(db)
+            yield db
 
     async def cancelled(router, call_site_id, messages, **kwargs):
         nonlocal calls
@@ -148,9 +179,9 @@ async def test_saved_answer_cannot_bind_another_rendered_question(tmp_path, chan
     case = novelty_case("question", None)
     async with contracts.Sandbox(tmp_path) as sandbox:
         probe = contracts.Probe()
-        await contracts.novelty(case, probe, sandbox)
+        rendered = await contracts.novelty(case, probe, sandbox)
         messages = copy.deepcopy(probe.calls[0][0])
-        mapping = contracts.candidate_mapping(case, messages, probe.candidate_ids)
+        mapping = contracts.candidate_mapping(case, messages, rendered["candidate_ids"])
         if change == "prefix":
             messages[0]["content"] = "Changed question\n" + messages[0]["content"]
         elif change == "candidate_order":

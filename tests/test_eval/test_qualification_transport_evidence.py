@@ -190,10 +190,13 @@ async def test_production_adapter_delegate_billing_and_offline_replay(
         if kind == "judge":
             assert not json.loads(measured[2]).get("error")
         else:
-            assert measured == {
+            expected = {
                 "prediction": True if kind == "relevance" else "candidate-b",
                 "error": None,
             }
+            if kind == "novelty":
+                expected["candidate_ids"] = ["candidate-b", "candidate-a"]
+            assert measured == expected
     monkeypatch.delenv(pinned.KEY_ENV)
     with campaign:
         target = pinned.PinnedRouter(
@@ -436,6 +439,93 @@ async def test_key_status_requires_finite_nonreset_funded_evidence(change):
         await key_status("synthetic-only-key", transport, required="0.2")
 
 
+def _budget(remaining):
+    """One KeyBudget as OpenRouter's GET /key schema documents it."""
+    return {
+        "scope": "member", "guardrail_id": "synthetic-guardrail", "budget_id": None,
+        "limit_usd": 50, "spend_usd": 32.5, "remaining_usd": remaining,
+        "reset_interval": None, "resets_at": None, "include_byok": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("budgets", "evidence"),
+    [
+        ({}, {"available": "1"}),
+        ({"effective_budget": None}, {"effective_budget_remaining_usd": None, "available": "1"}),
+        (
+            {"effective_budget": None, "budgets": []},
+            {"effective_budget_remaining_usd": None, "budgets_remaining_usd": [], "available": "1"},
+        ),
+        ({"effective_budget": _budget(5)}, {"effective_budget_remaining_usd": "5", "available": "1"}),
+        (
+            {"effective_budget": _budget(0.2), "budgets": [_budget(0.2), _budget(7)]},
+            {
+                "effective_budget_remaining_usd": "0.2",
+                "budgets_remaining_usd": ["0.2", "7"],
+                "available": "0.2",
+            },
+        ),
+    ],
+)
+async def test_key_status_accepts_absent_or_sufficient_budgets(budgets, evidence):
+    """The returned snapshot (journaled on dispatch) shows every deciding remainder."""
+    data = {"limit": 1, "limit_remaining": 1, "usage": 0, "limit_reset": None, **budgets}
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"data": data}))
+    info = await key_status("synthetic-only-key", transport, required="0.2")
+    budget_rows = [
+        item for item in [budgets.get("effective_budget"), *budgets.get("budgets", [])]
+        if item is not None
+    ]
+    if budget_rows:
+        evidence["budget_headroom"] = [
+            {"limit_usd": "50", "spend_usd": "32.5", "available": "17.5"}
+            for _ in budget_rows
+        ]
+    assert info == {
+        "limit": "1", "limit_remaining": "1", "limit_reset": None, "usage": "0", **evidence,
+    }
+
+
+@pytest.mark.parametrize(
+    "budgets",
+    [
+        {"effective_budget": _budget(0.1)},
+        {"effective_budget": _budget(0)},
+        {"effective_budget": _budget(5), "budgets": [_budget(5), _budget(0.1)]},
+        {"budgets": [_budget(0.1)]},
+    ],
+)
+async def test_effective_budget_below_key_limit_refuses_dispatch(budgets):
+    """The key's own limit covers ``required``; a tighter budget layer does not."""
+    data = {"limit": 1, "limit_remaining": 1, "usage": 0, "limit_reset": None, **budgets}
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"data": data}))
+    with pytest.raises(LocalFailure, match="insufficient"):
+        await key_status("synthetic-only-key", transport, required="0.2")
+
+
+@pytest.mark.parametrize(
+    "budgets",
+    [
+        {"effective_budget": "synthetic"},
+        {"effective_budget": []},
+        {"effective_budget": {k: v for k, v in _budget(5).items() if k != "remaining_usd"}},
+        {"effective_budget": _budget("5")},
+        {"effective_budget": _budget(True)},
+        {"effective_budget": _budget(None)},
+        {"effective_budget": _budget(-1)},
+        {"budgets": "synthetic"},
+        {"budgets": [None]},
+        {"budgets": [_budget("5")]},
+    ],
+)
+async def test_malformed_budget_evidence_refuses_dispatch(budgets):
+    data = {"limit": 1, "limit_remaining": 1, "usage": 0, "limit_reset": None, **budgets}
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"data": data}))
+    with pytest.raises(LocalFailure):
+        await key_status("synthetic-only-key", transport, required="0.2")
+
+
 async def test_get_only_billing_and_offline_full_history_recovery(tmp_path, isolated_key):
     campaign, expected = wire_campaign(tmp_path)
     sent = []
@@ -533,8 +623,25 @@ async def test_invalid_get_receipts_retain_funded_liability(tmp_path, isolated_k
 
 
 async def test_receipt_only_recovery_needs_explicit_association_and_never_resends(
-    tmp_path, isolated_key
+    tmp_path, isolated_key, monkeypatch
 ):
+    await _check_receipt_only_recovery(tmp_path, monkeypatch, None)
+
+
+@pytest.mark.parametrize("collision", ["request_hash", "generation_id", "evidence"])
+async def test_receipt_only_recovery_with_schema_name_collision(
+    tmp_path, isolated_key, monkeypatch, collision
+):
+    await _check_receipt_only_recovery(tmp_path, monkeypatch, collision)
+
+
+async def _check_receipt_only_recovery(
+    tmp_path, monkeypatch, collision
+):
+    if collision:
+        monkeypatch.setenv("SYNTHETIC_DB_PASSWORD", collision)
+    extra = "synthetic-private-field-name"
+    monkeypatch.setenv("SYNTHETIC_EXTRA_TOKEN", extra)
     campaign, _ = wire_campaign(tmp_path)
     requests = []
 
@@ -570,13 +677,112 @@ async def test_receipt_only_recovery_needs_explicit_association_and_never_resend
                 "request_hash": spec["request_hash"],
                 "generation_id": "gen-0",
                 "evidence": "synthetic verified recovery record",
+                extra: {extra: (extra, {extra: (extra,)})},
             },
         )
+        association = campaign.lines[-1]["receipt"]["association"]
+        assert association["attempt"] == "case-0"
+        assert association["request_hash"] == spec["request_hash"]
+        assert association["generation_id"] == "gen-0"
+        assert association["evidence"] == "synthetic verified recovery record"
+        assert association["[REDACTED]"] == {
+            "[REDACTED]": ["[REDACTED]", {"[REDACTED]": ["[REDACTED]"]}]
+        }
+        assert extra not in (campaign.directory / "answers.jsonl").read_text()
         assert campaign.state.settled == Decimal("0.0001")
         assert campaign.state.blockers == {"answer:case-0"}
         campaign.acknowledge("answer:case-0", "synthetic answer loss reviewed; never resend")
         assert not campaign.state.answers and not campaign.state.blockers
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize("field", ["attempt", "request_hash", "generation_id", "evidence"])
+def test_association_preserves_schema_and_redacts_untrusted_keys(monkeypatch, field):
+    monkeypatch.setenv(pinned.KEY_ENV, field)
+    source = {"attempt": "case-0", "request_hash": "frozen", "generation_id": "gen-0", "evidence": "verified"}
+    result = pinned.safe_association(source)
+    assert all(result[name] == value for name, value in source.items())
+    assert pinned.safe_evidence({"association": result})["association"] == result
+
+
+def test_trusted_record_still_redacts_arbitrary_nested_value_keys(monkeypatch):
+    secret = "synthetic-nested-private-key"
+    monkeypatch.setenv(pinned.KEY_ENV, secret)
+    result = pinned.safe_evidence({
+        "usage": {"prompt_tokens": {secret: secret}},
+        "content": [{secret: secret}],
+    })
+    assert result == {
+        "usage": {"prompt_tokens": {"[REDACTED]": "[REDACTED]"}},
+        "content": [{"[REDACTED]": "[REDACTED]"}],
+    }
+
+
+@pytest.mark.parametrize("error", [asyncio.CancelledError(), pinned.LocalFailure(), AssertionError()])
+def test_exception_names_are_redacted_as_diagnostic_values(monkeypatch, error):
+    monkeypatch.setenv(pinned.KEY_ENV, type(error).__name__)
+    assert pinned.exception_name(error) == "[REDACTED]"
+    assert pinned.failure_message(error) == "[REDACTED]"
+
+
+def test_diagnostic_redaction_failure_still_produces_nonblank_error(monkeypatch):
+    def broken(_value):
+        raise RuntimeError("synthetic redactor failure")
+
+    monkeypatch.setattr(pinned, "safe_text", broken)
+    assert pinned.failure_message(ValueError("synthetic message")) == "[REDACTED]"
+
+
+async def test_stream_cleanup_note_redacts_exception_class_value(monkeypatch):
+    original = ValueError("synthetic record failure")
+
+    def record(_observation):
+        raise original
+
+    handler = ObservedHTTPHandler(
+        {}, "synthetic-key", record, transport=httpx.MockTransport(lambda _request: None)
+    )
+    body = {
+        "id": "gen-0", "model": "synthetic/model",
+        "choices": [{"message": {"content": "synthetic answer"}, "finish_reason": "stop"}],
+        "usage": {"cost": 0.0001},
+    }
+
+    class FailingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield json.dumps(body).encode()
+
+        async def aclose(self):
+            monkeypatch.setenv(pinned.KEY_ENV, "OSError")
+            raise OSError("synthetic close failure")
+
+    response = httpx.Response(200, stream=FailingStream())
+    assert not response.is_closed
+    try:
+        with pytest.raises(ValueError) as caught:
+            await handler.after(response)
+        assert caught.value is original
+        assert original.__notes__ == ["response stream cleanup also failed: [REDACTED]"]
+    finally:
+        await handler.close()
+
+
+async def test_failure_append_note_redacts_exception_class_value(tmp_path, isolated_key, monkeypatch):
+    data, server = bundle(tmp_path), Gateway()
+    with data.campaign:
+        target = router(data, server)
+        await ask(target, data.messages)
+        original = asyncio.CancelledError()
+
+        def append_failure(*_args):
+            monkeypatch.setenv(pinned.KEY_ENV, "OSError")
+            raise OSError("synthetic append failure")
+
+        monkeypatch.setattr(data.campaign, "fail", append_failure)
+        target._failure("case-1", original)
+        assert original.__notes__ == ["failure evidence append failed: [REDACTED]"]
+        assert target.failure is not None
+    assert len(server.requests) == 1
 
 
 async def test_production_delegate_to_journal_billing_reopen_and_offline_replay(
@@ -777,6 +983,49 @@ def test_raw_numeric_lexemes_survive_credential_redaction(monkeypatch, encoded):
     result = pinned.safe_body(raw)
     assert "1.2300e-4" in result
     assert json.loads(result)["content"] == "echo [REDACTED]"
+
+
+@pytest.mark.parametrize("encoded", [False, True])
+def test_credential_digits_inside_a_json_number_stay_valid_json(monkeypatch, encoded):
+    """A numeric secret colliding with a cost lexeme must not corrupt the retained body."""
+    monkeypatch.setenv("SYNTHETIC_DB_PASSWORD", "12345678")
+    echo = "".join("\\u" + format(ord(char), "04x") for char in "12345678") if encoded else "12345678"
+    raw = ('{"usage":{"cost":0.12345678},"content":"echo ' + echo + '"}').encode()
+    for result in (pinned.safe_body(raw), pinned.safe_evidence({"raw_body": pinned.safe_body(raw)})["raw_body"]):
+        assert '"cost":0.12345678' in result
+        assert json.loads(result)["content"] == "echo [REDACTED]"
+        assert financial_json(result.encode(), (("usage", "cost"),))["usage"]["cost"] == "0.12345678"
+    # Non-JSON diagnostic text keeps the unrestricted literal pass.
+    assert pinned.safe_text("RAW 12345678 tail") == "RAW [REDACTED] tail"
+    assert pinned.safe_text("12345678") == "[REDACTED]"
+
+
+@pytest.mark.parametrize("field", sorted(pinned._WIRE_FIELDS))
+@pytest.mark.parametrize("encoded", [False, True])
+def test_wire_schema_keys_survive_while_values_and_unknown_keys_are_redacted(
+    monkeypatch, field, encoded
+):
+    secret = "synthetic-private-field-name"
+    monkeypatch.setenv(pinned.KEY_ENV, field)
+    monkeypatch.setenv("SYNTHETIC_EXTRA_TOKEN", secret)
+
+    def spelling(value):
+        return "".join("\\u" + format(ord(char), "04x") for char in value) if encoded else value
+
+    raw = (
+        '{"' + spelling(field) + '":"' + spelling(field)
+        + '","amount":1.2300e-4,"' + spelling(secret) + '":"' + spelling(secret) + '"}'
+    ).encode()
+    result = pinned.safe_evidence({"raw_body": pinned.safe_body(raw)})["raw_body"]
+    body = json.loads(result)
+    assert body[field] == "[REDACTED]"
+    assert body["[REDACTED]"] == "[REDACTED]"
+    assert secret not in result and "1.2300e-4" in result
+    assert financial_json(result.encode(), (("amount",),))["amount"] == "0.00012300"
+    # Schema trust is confined to raw response/billing bodies, not diagnostics.
+    assert field not in json.loads(pinned.safe_text(raw.decode()))
+    diagnostic = pinned.safe_text("RAW " + raw.decode(), schema_keys=pinned._WIRE_FIELDS)
+    assert field not in json.loads(diagnostic.removeprefix("RAW "))
 
 
 @pytest.mark.parametrize("surface", ["message", "exception", "stack"])

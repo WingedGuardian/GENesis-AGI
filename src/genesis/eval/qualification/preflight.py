@@ -44,7 +44,7 @@ async def prepare(cases, temp_root, *, reference_policy=None):
             for case in rows:
                 capture = Capture()
                 if name == corpus.NOVELTY:
-                    await contracts.novelty(case, capture, sandbox)
+                    rendered = await contracts.novelty(case, capture, sandbox)
                 elif name == corpus.RELEVANCE:
                     await contracts.relevance(case, capture)
                 else:
@@ -64,7 +64,7 @@ async def prepare(cases, temp_root, *, reference_policy=None):
                     "call_parameters": capture.parameters[0],
                 }
                 if name == corpus.NOVELTY:
-                    mapping = contracts.candidate_mapping(case, messages, capture.candidate_ids)
+                    mapping = contracts.candidate_mapping(case, messages, rendered["candidate_ids"])
                     target = case["expected_target"]
                     content = canonical({
                         "redundant_with": mapping.index(target) + 1 if target else None
@@ -183,7 +183,8 @@ async def check(cases, temp_root, *, reference_policy, current_policy,
                validation_gate, inspect.getmodule(LLMJudgeScorer),
                inspect.getmodule(contracts.J9EvalBatchExecutor), inspect.getmodule(check),
                inspect.getmodule(resolve), inspect.getmodule(contracts.pack_embedding),
-               inspect.getmodule(contracts.connect_aiosqlite_rw), contracts.procedural]
+               inspect.getmodule(contracts.connect_aiosqlite_rw), contracts.procedural,
+               storage.tool_names, inspect.getmodule(operations.validate_trigger_spec)]
     production_sources = {
         str(Path(module.__file__).relative_to(Path(__file__).resolve().parents[4])):
             file_hash(module.__file__)

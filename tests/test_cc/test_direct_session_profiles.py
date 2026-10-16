@@ -3,6 +3,7 @@
 Validates that profile changes don't accidentally grant or revoke tool access.
 """
 
+import re
 import sys
 import types
 from unittest.mock import MagicMock
@@ -27,6 +28,7 @@ from genesis.cc.direct_session import (
     _build_profile_addendum,
 )
 from genesis.cc.types import CCModel
+from genesis.mcp.health.direct_session_tools import direct_session_run
 
 # --- Profile existence ---
 
@@ -40,6 +42,46 @@ def test_all_expected_profiles_exist():
     assert "observe" in PROFILES
     assert "interact" in PROFILES
     assert "research" in PROFILES
+
+
+def test_direct_session_run_description_matches_profile_disallows():
+    description = direct_session_run.description
+    assert description is not None
+
+    universal_match = re.search(r"All built-in profiles block:\s*(.+?)\.", description)
+    assert universal_match is not None
+    universal_tools = {
+        tool.strip().strip("`., ")
+        for tool in re.split(r",|\band\b", universal_match.group(1))
+        if tool.strip().strip("`., ")
+    }
+    assert universal_tools
+    for tool in universal_tools:
+        assert all(
+            tool in denied or any(denied_tool.endswith(f"__{tool}") for denied_tool in denied)
+            for denied in (PROFILES[name] for name in _SHIPPED_PROFILE_NAMES)
+        ), f"{tool} must be blocked by every built-in profile"
+
+    write_match = re.search(r"Built-in profiles that block `Write`:\s*(.+?)\.", description)
+    assert write_match is not None
+    described_write_profiles = set(re.findall(r"`([^`]+)`", write_match.group(1)))
+    actual_write_profiles = {
+        name for name in _SHIPPED_PROFILE_NAMES if "Write" in PROFILES[name]
+    }
+    assert described_write_profiles == actual_write_profiles
+
+    # Every tool the sentence names, not only the first. Built-in profiles only:
+    # an install-local overlay (genesis.cc.profile_overlay) is a supported way to
+    # add profiles with other rules, and must not redden this.
+    no_call = re.search(r"No built-in profile can call\s*(.+?)\.", description, re.S)
+    assert no_call is not None
+    named = set(re.findall(r"`([^`]+)`", no_call.group(1)))
+    assert "memory_store" in named and len(named) >= 7
+    for tool in named:
+        assert all(
+            any(t == tool or t.endswith(f"__{tool}") for t in PROFILES[name])
+            for name in _SHIPPED_PROFILE_NAMES
+        ), f"{tool} must be blocked by every built-in profile"
 
 
 # --- Universal safety blocks (all profiles) ---
