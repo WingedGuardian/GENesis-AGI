@@ -2516,6 +2516,8 @@ KNOWLEDGE_FTS5_DDL = """
 # ─── Indexes ──────────────────────────────────────────────────────────────────
 
 INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_peer_outbox_collect ON peer_outbox(peer_id, epoch, created_at, message_id) WHERE acknowledged_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_peer_outbox_context ON peer_outbox(peer_id, epoch, context_id, created_at, message_id)",
     "CREATE INDEX IF NOT EXISTS idx_autonomy_events_cat_time ON autonomy_events(category, occurred_at)",
     "CREATE INDEX IF NOT EXISTS idx_cch_cell_time ON calibration_cell_history(domain, metric, snapshot_at)",
     "CREATE INDEX IF NOT EXISTS idx_attention_events_session ON attention_events(session_id)",

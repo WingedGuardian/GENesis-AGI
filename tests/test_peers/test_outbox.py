@@ -245,6 +245,86 @@ async def test_pending_queue_atomic_identity_changed_retry_and_owner_cancellatio
     assert not (await box.poll(bridge.identities["alpha"]))[0]
 
 
+@pytest.mark.parametrize("acked", [False, True])
+async def test_retained_message_cannot_report_successful_pending_cancellation(bridge, acked):
+    from genesis.db.crud import pending_outreach
+
+    box = Outbox(bridge.registry)
+    envelope, _ = await box.prepare("alpha", "Retained before queue accounting")
+    pending_id, _ = await box.enqueue(envelope)
+    await box.put(envelope)
+    if acked:
+        await box.ack(bridge.identities["alpha"], envelope.message_id)
+    assert await pending_outreach.cancel(bridge.db, pending_id) == (False, "already_dequeued")
+    row = await (
+        await bridge.db.execute(
+            "SELECT delivered,cancelled_at FROM pending_outreach WHERE id=?", (pending_id,)
+        )
+    ).fetchone()
+    assert tuple(row) == (0, None)  # Scheduler/history reconciliation still owns closure.
+    rows, _ = await box.poll(bridge.identities["alpha"])
+    assert rows == [] if acked else rows[0]["message"] == envelope.message
+
+
+async def test_pending_cancel_before_retention_prevents_publication(bridge):
+    from genesis.db.crud import pending_outreach
+
+    box = Outbox(bridge.registry)
+    envelope, _ = await box.prepare("alpha", "Cancelled before publication")
+    pending_id, _ = await box.enqueue(envelope)
+    assert await pending_outreach.cancel(bridge.db, pending_id) == (True, "cancelled")
+    with pytest.raises(ConversationRefusal, match="state_conflict"):
+        await box.put(envelope)
+    assert await box.poll(bridge.identities["alpha"]) == ([], "")
+
+
+async def test_pending_cancel_waits_for_retained_publication_and_rechecks_atomically(
+    bridge, monkeypatch
+):
+    from contextlib import asynccontextmanager
+
+    from genesis.db.crud import pending_outreach
+
+    box = Outbox(bridge.registry)
+    envelope, _ = await box.prepare("alpha", "Publication wins concurrent cancellation")
+    pending_id, _ = await box.enqueue(envelope)
+    inserted, release, attempted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    transaction = bridge.registry.transaction
+    execute = bridge.db.execute
+
+    @asynccontextmanager
+    async def held_publication():
+        async with transaction() as db:
+            yield db
+            inserted.set()
+            await release.wait()
+
+    async def observed_cancel(sql, *args, **kwargs):
+        if "UPDATE pending_outreach" in sql:
+            attempted.set()
+        return await execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(bridge.registry, "transaction", held_publication)
+    monkeypatch.setattr(bridge.db, "execute", observed_cancel)
+    publishing = asyncio.create_task(box.put(envelope))
+    cancelling = None
+    try:
+        await asyncio.wait_for(inserted.wait(), 10)
+        cancelling = asyncio.create_task(pending_outreach.cancel(bridge.db, pending_id))
+        await asyncio.wait_for(attempted.wait(), 10)
+        release.set()
+        assert await asyncio.wait_for(publishing, 10) == envelope.message_id
+        assert await asyncio.wait_for(cancelling, 10) == (False, "already_dequeued")
+    finally:
+        release.set()
+        for task in (publishing, cancelling):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (publishing, cancelling) if task is not None), return_exceptions=True
+        )
+
+
 async def test_deferred_retry_preserves_typed_identity_and_rechecks_governance(bridge, monkeypatch):
     from genesis.db.crud import deferred_work
     from genesis.resilience.deferred_work import DeferredWorkQueue
