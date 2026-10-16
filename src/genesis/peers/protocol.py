@@ -131,6 +131,7 @@ def parse_send(body: bytes) -> Incoming:
             "model",
             "effort",
             "timeout_s",
+            "inReplyTo",
         }:
             raise ValueError
         if options.get("profile", "observe") not in {"observe", "interact"}:
@@ -146,6 +147,12 @@ def parse_send(body: bytes) -> Incoming:
             options["timeout_s"] = int(timeout)
         if options.get("effort", "medium") not in {"low", "medium", "high"}:
             raise ValueError
+        if "inReplyTo" in options:
+            from genesis.peers.conversation import uuid_id
+
+            uuid_id(options["inReplyTo"])
+            if not msg.context_id:
+                raise ValueError
         prompt = "\n\n".join(
             part["text"] if "text" in part else json.dumps(part["data"], ensure_ascii=False)
             for part in message_dict["parts"]

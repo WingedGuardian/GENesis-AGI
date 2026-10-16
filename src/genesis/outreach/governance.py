@@ -122,6 +122,7 @@ _TOPIC_IS_IDENTITY: frozenset[str] = frozenset(
         # topic carries a hash of the full staged company set
         # (recon/career_outreach.py), so a distinct batch has a distinct topic.
         "career_outreach_nudged",
+        "peer_message",  # addressed message identity, never fuzzy body identity
     }
 )
 

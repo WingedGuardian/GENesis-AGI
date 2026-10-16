@@ -178,6 +178,7 @@ async def test_no_unexpected_tables(db):
         "peer_settings",  # peer registry: install-wide peer mode (one row)
         "peers",  # peer registry: admitted peers
         "peer_grants",  # peer registry: per-peer grants
+        "peer_outbox",  # retained collection and reply anchors
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"

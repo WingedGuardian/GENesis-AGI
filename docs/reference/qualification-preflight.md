@@ -38,8 +38,11 @@ it is deliberately insufficient for complete execution admission.
 
 Each saved novelty verdict is replayed through the actual judge and extractor
 stores under current and simulated promoted allowlists. Replay first regenerates
-the production question and mapping. Full-schema disposable databases contain
-the original candidate population, including deprecated/quarantined rows.
+the production question and mapping. Disposable databases use production table
+definitions and contain the original candidate population, including
+deprecated/quarantined rows. The shared template omits some secondary indexes;
+replay establishes procedure-state behavior, not full index parity or database
+performance.
 All original procedure columns must remain unchanged. Independent connections
 verify committed rows before and after each store; pending transactions refuse
 without committing on the store's behalf. A returned store ID must

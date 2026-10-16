@@ -69,7 +69,7 @@ def _runtime():
     return current_app.config.get("GENESIS_PEER_RUNTIME") or GenesisRuntime.peek()
 
 
-def _service():
+def _service(*, require_runner=True):
     runtime = _runtime()
     if runtime is None or runtime._db is None:
         raise ConversationRefusal("not_ready", 503)
@@ -77,7 +77,8 @@ def _service():
     if service is None or service.runtime is not runtime:
         service = ConversationService(_registry(), runtime)
         current_app.config["GENESIS_CONVERSATION_SERVICE"] = service
-    _ = service.runner
+    if require_runner:
+        _ = service.runner
     return service
 
 
@@ -136,6 +137,7 @@ def _install_gate(state):
         consumes = request.method == "POST" and (
             request.path == ROOT + "/message:send"
             or (request.path.startswith(ROOT + "/tasks/") and request.path.endswith(":cancel"))
+            or (request.path.startswith(ROOT + "/outbox/") and request.path.endswith(":ack"))
         )
         if consumes:
             capability = request.environ.get(INPUT_KEY)
@@ -254,9 +256,7 @@ async def approvals():
     ):
         raise InvalidParamsError("Unsupported list options")
     size = _integer("pageSize", 20, 1, 100)
-    page, token = await _service().approvals(
-        g.peer_identity, size, request.args.get("pageToken")
-    )
+    page, token = await _service().approvals(g.peer_identity, size, request.args.get("pageToken"))
     return jsonify(approvals=page, nextPageToken=token, pageSize=size)
 
 
@@ -313,3 +313,50 @@ def agent_health():
 @agent_api_bp.route(ROOT + "/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 def unavailable_path(path):
     return _err("not_found", 404)
+
+
+async def _outbox():
+    from genesis.peers.outbox import Outbox
+
+    service = _service(require_runner=False)
+    async with service.registry.connection() as db:
+        await service._same_database(db)
+    return Outbox(service.registry)
+
+
+@agent_api_bp.route(ROOT + "/outbox", methods=["GET"])
+@_handled
+async def outbox_list():
+    try:
+        if set(request.args) - {"pageSize", "pageToken"} or any(
+            len(request.args.getlist(k)) != 1 for k in request.args
+        ):
+            raise ValueError
+        size = int(request.args.get("pageSize", "20"))
+    except ValueError:
+        raise InvalidParamsError("Invalid outbox page") from None
+    messages, token = await (await _outbox()).poll(
+        g.peer_identity,
+        size,
+        request.args.get("pageToken"),
+    )
+    return jsonify(messages=messages, nextPageToken=token)
+
+
+@agent_api_bp.route(ROOT + "/outbox/<message_id>:ack", methods=["POST"])
+@_handled
+async def outbox_ack(message_id):
+    import json
+
+    from genesis.peers.conversation import uuid_id
+    from genesis.peers.protocol import _unique_object
+
+    g.peer_task_id = uuid_id(message_id)
+    try:
+        body = json.loads(g.peer_body or b"{}", object_pairs_hook=_unique_object)
+        if body != {}:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise InvalidParamsError("Invalid collection acknowledgement") from None
+    await (await _outbox()).ack(g.peer_identity, message_id)
+    return jsonify(messageId=message_id, acknowledged=True)
