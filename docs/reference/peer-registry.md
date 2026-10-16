@@ -1,74 +1,77 @@
 # Trusted peer registry
 
-This foundation enables authenticated health checks and local peer management.
-The Agent Card returns `503 not_ready`; it cannot advertise an A2A transport
-before the message and task routes are installed. Task service readiness is
-false until the coordinator lands. It changes no listener or live deployment. Follow the ingress runbook
-before operator activation; a peer credential is never dashboard authority.
+The registry supports scoped health, local relationship management and the
+same-owner native A2A conversation binding. Access starts disabled. A ready
+native runner/database is required before advertising the Agent Card. No new
+listener, automatic deployment or enrollment. See
+[agent conversations](agent-conversations.md) and the existing ingress runbook.
 
-The database must already exist and contain the migrated peer tables. Local
-operator commands use private guarded connections; missing/quarantined databases
-are refused. No HTTP endpoint changes configuration, identities or grants.
+The database must already exist with migrated peer tables. Operator commands
+use private guarded SQLite connections; a missing/quarantined database is
+refused. No peer endpoint changes configuration, identities, grants or secrets.
 
 ```bash
-python -m genesis peers configure fallback --service-url https://YOUR-TAILNET-HOST/v1/agent/a2a
+python -m genesis peers configure fallback --service-url https://YOUR-HOST/v1/agent/a2a
 python -m genesis peers register muse --same-owner --token-name GENESIS_PEER_MUSE_TOKEN
-python -m genesis peers grant muse conversation ask
+python -m genesis peers grant muse conversation allow
 python -m genesis peers list
 python -m genesis peers revoke muse
 python -m genesis peers configure disabled
 ```
 
-Each registration creates a new relationship epoch and grants nothing. Genesis
-decides permitted requests under its own authority; enrollment does not assign
-a daily task budget. The optional deprecated `--daily-allowance` argument only
-preserves the positive legacy database field for backup compatibility; it is
-not an execution limit in the corrected admission slice. Revocation
-retains identity, epoch and history. Grant
-changes increment the relationship revision. Resource decisions use
-`resource:<32 lowercase hex ID>` and capability decisions use `allow`, `ask` or
-`deny`. Actual admission and capability enforcement are dependent slices.
+Registration creates a relationship epoch and grants nothing. Conversation
+admission requires current same-owner identity and `conversation allow`; `ask`
+or `deny` refuses work until the operator changes that grant. No per-day task
+allowance is enforced. Deprecated `--daily-allowance` preserves the positive
+legacy field for database compatibility only. Native concurrency, wall deadline,
+background autonomy and permitted tool gates still apply.
 
-SAM selection additionally requires `--sam-realm`; register each peer with
-`--sam-realm`, `--sam-node` and optional exact `--principal`. Select `--cross-owner`
-instead of `--same-owner` when applicable. Node and fallback credential names
-are unique. SAM uses only `GENESIS_PEER_BACKEND_TOKEN`; fallback uses only active
-registered scoped names and ignores SAM identity headers. There is no automatic
-downgrade. Valid backend-only health probes return no owned peer state; the card
-remains unavailable in this foundation. Revoked peer credentials never make
-fallback readiness appear usable, but still participate in collision checks.
+Revocation retains the identity, epoch and history and denies subsequent
+admission/disclosure without restart. Grant changes increment revision.
+Resource keys (`resource:<32 lowercase hex ID>`) and other capabilities may be
+recorded, but the conversation binding does not implement knowledge/recurrence
+or leased federation. Already accepted work remains Genesis-owned; revocation
+does not automatically replay or cancel it.
 
-Provide independent ASCII values through protected operator storage. Never reuse
-the MCP, desk, another peer, internal API credential, dashboard password, or a
-Flask session-signing key. Collision checks use the app's loaded active and
-accepted fallback signing keys, including during boot diagnostics; editing the
-key file does not change the live app's signing authority. Equality refuses
-activation and generates a boot warning without exposing values. The CLI lists
-credential names only; the database stores no token values. Clear a value and
-use the approved restart path for file-based revocation; relationship revocation
-applies on the next request without restart. No production token is generated
-by development tests.
+Optional SAM mode additionally needs `--sam-realm`, pinned peer `--sam-node`
+and optionally exact delegated `--principal`. Cross-owner identities can be
+recorded with `--cross-owner` but this MVP refuses their conversations. Node
+and scoped credential names are unique. SAM accepts only the dedicated backend
+credential and verified identity headers; fallback accepts only active registered
+peer credentials and ignores those headers. No automatic downgrade.
 
-Readiness: `GET /v1/agent/a2a/health`. The reserved discovery path,
-`GET /v1/agent/a2a/.well-known/agent-card.json`, returns `503 not_ready`
-after valid authentication until the task transport is installed. Both paths
-require scoped bearer authentication, including
-OPTIONS and otherwise unmatched paths. A running runtime loop is required; the
-test-only fallback loop in the shared dashboard decorator is not accepted here.
-The owner-configured HTTPS URL is reserved for the later A2A transport, never
-derived from the request Host. The A2A SDK is pinned to 1.2.2 for that dependent
-transport. Streaming, push and extended-card capabilities are not advertised.
+Backend-only SAM health/card probes return no owned task data. Active peer
+credentials determine fallback readiness; inactive credentials still participate
+in scope collision checks. Values must be ASCII and independently generated,
+stored/transferred through protected operator storage and the Secure Vault.
+Never reuse MCP, desk, another peer, internal API, dashboard password or active/
+fallback Flask signing authority. Equality refuses access and gives a boot
+warning with no values. Request checks use cached/environment credentials;
+no request opens `secrets.env` or a signing/internal token file. CLI/DB record
+credential names, never values.
 
-Request bodies are never read by these routes: no current route consumes one.
-(The development server still discards any unread body after responding, so
-this alone does not bound how long a slow client can hold a connection.) After authentication,
-a declared Content-Length over 256 KiB is refused `413 body_too_large` from the
-header alone. The task transport must add its own bounded, deadlined body read.
-Logs record timestamp, credential name, verified peer or unverified marker,
-endpoint, task-ID placeholder and status; never bearer values, request bodies
-or tool arguments. These routes do not read provider credentials or token files.
+Clear a value and restart through the approved deploy path for file-based
+revocation. With no selected configured credentials the API fails closed 503;
+an invalid/cleared credential against an otherwise configured surface receives
+401. Development does not generate or enroll production credentials.
 
-Registry SQL stays inside the private guarded transaction boundary so relationship
-revisions and grant changes commit together without sharing an active transaction
-with unrelated runtime coroutines. It neither creates a missing database nor
-opens one quarantined by the restore guard.
+Readiness: authenticated `GET /v1/agent/a2a/health`. The card is authenticated at
+`/v1/agent/a2a/.well-known/agent-card.json`; its HTTPS URL is operator-configured,
+never derived from Host. A running runtime loop is mandatory. A2A SDK is pinned
+to 1.2.2; streaming, push and extended-card capabilities are unavailable.
+Send/cancel consume bounded host input; alternate mounts without the trusted
+capability cannot accept work. Logs contain timestamp, credential name, verified
+peer, endpoint, task ID when known and outcome, never bearer values or bodies.
+
+Scope ingress to the connector before activation. Presented peer/backend
+bearers are refused on owner mutations before passwordless/off/cookie shortcuts;
+this does not protect an otherwise passwordless owner route reached **without**
+that bearer from a trusted network. Do not expose owner tool/resolution routes
+through a root peer proxy.
+
+Registry revisions/grants share private `BEGIN IMMEDIATE` transactions, separate
+from unrelated runtime coroutines. Conversation receipts bind peer/epoch and are
+retained for retries. Existing restore handling resets saved peer authority on
+normal data restore; Guardian snapshot rollback uses the owner's informed
+snapshot-specific approval. Do not claim retained-state exactly-once behavior
+across deliberate purge or rollback; re-enrollment resets client epoch/context.

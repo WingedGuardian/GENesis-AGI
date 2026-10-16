@@ -1416,12 +1416,24 @@ verified: cfbb876243f2 2026-10-07
   deprecated allowance field remains only for database compatibility. Local
   `genesis peers` CLI writes relationships; `/v1/agent/a2a/health` authenticates
   through the existing runtime loop. The Agent Card returns `503 not_ready`
-  until an installed task transport can fulfill its advertised interface.
+  until the conversation service below is installed and ready.
   Revocation disables access immediately; only active peer credentials contribute
   to fallback readiness, while inactive credentials still participate in scope
   collision checks. Scope checks also reject equality with loaded active/fallback
   Flask signing keys, without request-time credential-file reads.
-  See `docs/reference/peer-registry.md`.
+  `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
+  existing Flask/runtime loop: it atomically persists native receipts, binds
+  contexts and retries to relationship epochs, and admits at most two
+  outstanding peer turns globally and per peer, without a daily submission
+  quota. Fresh native turns use Genesis identity/cognition, available memory
+  enrichment, observe/interact tools, external unattended provenance and the
+  native background ceiling. Result heads and full artifacts have bounded
+  disclosure checks. Approval attribution survives notification updates; the API
+  lists pending owner actions and never resolves them. Presented peer/backend
+  bearers are refused before owner mutation shortcuts. Deployment/enrollment and
+  connector-only ingress verification are separate prerequisites. No new listener
+  or peer execution queue. See `docs/reference/peer-registry.md` and
+  `docs/reference/agent-conversations.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is

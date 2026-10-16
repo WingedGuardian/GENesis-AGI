@@ -77,7 +77,7 @@ async def test_health_auth_and_withheld_card_audit_do_not_disclose(app, registry
     assert card.status_code == 503
     assert card.json["code"] == "not_ready"
     assert "supportedInterfaces" not in card.json
-    assert client.post(ROOT + "/message:send", headers=headers).status_code == 404
+    assert client.post(ROOT + "/message:send", headers=headers).status_code == 503
 
 
 class _UnreadableBody:
@@ -105,7 +105,7 @@ async def test_slow_or_unterminated_body_is_never_read(app, registry, monkeypatc
     client = app.test_client()
     for method, path, status in (
         ("GET", "/health", 200),
-        ("POST", "/message:send", 404),
+        ("POST", "/message:send", 503),
         ("GET", "/.well-known/agent-card.json", 503),
     ):
         stream = _UnreadableBody()
