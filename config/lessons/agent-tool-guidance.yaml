@@ -1,0 +1,11 @@
+task_type: agent_tool_guidance
+principle: "When dispatching agents for research or exploration, include tool guidance:"
+steps:
+  - "Web: use web_fetch(url) and web_search(query) MCP tools (anti-bot, JS rendering)"
+  - "Code: use CBM search_graph/trace_path, Serena find_symbol/find_referencing_symbols"
+  - "These MCP tools are available to the agent. Prefer them over CC WebFetch/WebSearch and raw Grep."
+tool_trigger: [Agent, Task]
+patterns:
+  - '(?i)\b(fetch|search|web|url|http|research|explore|find|discover|investigate|codebase|architecture|symbol|function|class|import|call.?chain)\b'
+repeat: session
+context_tags: [subagent, tool-guidance]

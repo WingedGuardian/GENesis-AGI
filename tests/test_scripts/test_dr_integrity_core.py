@@ -361,12 +361,8 @@ def test_corrupt_sql_fails_and_withheld(sandbox):
     """A dump that won't decrypt with its OWN env passphrase (corruption) fails
     the backup AND is withheld from the off-site snapshot."""
     _install_curl(sandbox, _CURL_HEALTHY)
-    # Corrupt the artifact after encryption by making the round-trip gpg see a
-    # truncated file: stub gpg's decrypt to fail. Simplest deterministic route —
-    # wrong env passphrase can't be injected mid-run, so overwrite the encrypted
-    # file via a wrapper is complex; instead assert via a broken cipher: feed a
-    # DB whose dump encrypts fine but we corrupt the .gpg with a post-encrypt
-    # hook is not available. Use the escrow-absent + a gpg stub that fails -d.
+    # Fail decryption while allowing real encryption. Cover both GPG spellings:
+    # the authenticated reader uses --decrypt, while older readers use -d.
     gpg_stub = sandbox["bind"] / "gpg"
     real_gpg = subprocess.run(
         ["bash", "-lc", "command -v gpg"], capture_output=True, text=True
@@ -374,7 +370,7 @@ def test_corrupt_sql_fails_and_withheld(sandbox):
     _make_stub(
         gpg_stub,
         f"#!/usr/bin/env bash\n"
-        f'for a in "$@"; do [ "$a" = "-d" ] && {{ echo "gpg: decryption failed: Bad session key" >&2; exit 2; }}; done\n'
+        'for a in "$@"; do case "$a" in -d|--decrypt) echo "gpg: decryption failed: Bad session key" >&2; exit 2 ;; esac; done\n'
         f'exec {real_gpg} "$@"\n',
     )
     prior = sandbox["clone"] / "data" / "genesis.sql.gpg"
@@ -455,7 +451,7 @@ def test_roundtrip_error_detail_sanitized_valid_json(sandbox):
     _make_stub(
         gpg_stub,
         f"#!/usr/bin/env bash\n"
-        f'for a in "$@"; do [ "$a" = "-d" ] && {{ printf "gpg:\\tbad\\rk\\xc3\\xa9y\\n" >&2; exit 2; }}; done\n'
+        'for a in "$@"; do case "$a" in -d|--decrypt) printf "gpg:\\tbad\\rk\\xc3\\xa9y\\n" >&2; exit 2 ;; esac; done\n'
         f'exec {real_gpg} "$@"\n',
     )
     proc, status = _run_backup(sandbox)
@@ -544,9 +540,12 @@ def test_corruption_backup_update_gate_and_database_restore_e2e(sandbox):
         sandbox["bind"] / "systemctl",
         '#!/usr/bin/env bash\ncase "$*" in *"is-active"*) exit 1 ;; *) exit 0 ;; esac\n',
     )
+    # The fixture closes its only SQLite connection before spawning backup; no
+    # server starts against this private database. Use that offline boundary
+    # rather than depend on host-wide /proc visibility for this recovery test.
     restored = subprocess.run(
         ["bash", str(_RESTORE), "--database-only"],
-        env=_env(sandbox),
+        env=_env(sandbox, GENESIS_RESTORE_HOLDER_SCAN="none"),
         capture_output=True,
         text=True,
         input="y\n",

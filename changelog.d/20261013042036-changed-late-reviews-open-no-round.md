@@ -1,0 +1,1 @@
+- A review that lands on a commit after one of that commit's descendants in the same PR was already reviewed no longer counts as a new review round; it belongs to the earlier round. The review budget now lists every finding review with the round it belongs to (or none, when no earlier round exists), so the round reflection can later be made to answer it.

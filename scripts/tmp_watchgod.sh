@@ -25,14 +25,22 @@
 #           spared); on cc-tmp's, run the retention sweep at 2 days. Page a
 #           WARNING.
 #   RED     release the reserve file, start genesis-disk-hygiene-pressure@
-#           last-resort, page EMERGENCY with attribution.
+#           last-resort, page EMERGENCY with attribution. On cc-tmp's own
+#           volume, release its small reserve (CC_RESERVE_NAME) instead, a
+#           poll later when the runaway response has just emptied a file
+#           there (that RED was measured before the emptying freed the space).
 # Reclaim levers only run for the filesystem they can actually relieve; the
 # others page with attribution.
 #
 # RUNAWAY FILES, at every tier (scripts/lib/watchgod_runaway.sh): a file held
 # open for writing that alone is a large share of its filesystem, or that grew
 # a large share in one poll, is paged CRITICAL with its path and the processes
-# holding it. Fast growth switches to the fast poll. Detection only.
+# holding it. Fast growth switches to the fast poll. One response, in act mode:
+# a Claude Code task output growing fast while its domain is ORANGE or RED has
+# its command PAUSED (SIGSTOP; recorded for `scripts/watchgod thaw|kill`), then
+# the file EMPTIED once every writer it paused is confirmed stopped (its last
+# MB kept in ~/tmp/watchgod-truncated where there is room; a writer it missed
+# only refills the file, and is paused again).
 #
 # OBSERVE mode (WATCHGOD_ACT=0) changes nothing on disk but still sends every
 # page, titled as observe-mode.
@@ -67,24 +75,11 @@ ALERT_DIR="$HOME/.genesis/alerts"
 # point it at a fixture file. OOM_LOG lives beside the watchgod log (NOT in
 # cc-tmp) so it survives cleanup.
 OOM_EVENTS_FILE="${OOM_EVENTS_FILE:-/sys/fs/cgroup/memory.events}"
-# The trigger discriminator (Codex P1, #1790): a unit's `oom_kill` count records
-# WHICH process died, not WHOSE limit fired — when the container (or any
-# ancestor) hits its limit, the kernel can pick a high-RSS victim inside a
-# contained child scope, and the journal then names that child. Only the cgroup
-# whose OWN limit was hit records a LOCAL `oom` event, so the container root's
-# memory.events.local `oom` counter distinguishes container pressure from a
-# contained cap doing its job. Readable since kernel 4.19 wherever
-# memory.events is; unreadable here means the trigger cannot be verified and
-# the kill PAGES (attribution never silences on missing evidence).
-# Deliberately NOT resolved here. An explicit override wins, but the DEFAULT is
-# derived from OOM_EVENTS_FILE at the moment it is read (see
-# _read_oom_local_trigger), because resolving it at source time freezes it
-# against whatever OOM_EVENTS_FILE happened to be then — and anything that
-# reassigns OOM_EVENTS_FILE afterwards leaves this pointing at the real
-# /sys/fs/cgroup while believing otherwise. That is silent, and it is
-# environment-dependent: it reads correct on a host that has the file and
-# inverts every suppression decision on one that does not.
-OOM_EVENTS_LOCAL_FILE="${OOM_EVENTS_LOCAL_FILE:-}"
+# Whose limit fired is read from the same file's hierarchical `oom` field, and
+# where the victim lived from the contained slices' own memory.events (see
+# scripts/lib/watchgod_oom.sh). OOM_USER_CGROUP_DIR, when set, overrides the
+# user manager's cgroup directory the slices hang off (tests).
+OOM_USER_CGROUP_DIR="${OOM_USER_CGROUP_DIR:-}"
 # shellcheck disable=SC2034  # read by scripts/lib/watchgod_oom.sh
 OOM_LOG="$(dirname "$LOG_FILE")/oom_events.log"
 
@@ -106,9 +101,22 @@ source "$_SCRIPT_DIR/lib/disk_guardian.sh"
 # Liveness (open fds + cwds) for the cc-tmp retention sweep.
 # shellcheck source=scripts/lib/tmp_liveness.sh
 source "$_SCRIPT_DIR/lib/tmp_liveness.sh"
-# Runaway-file detection: names a file filling a disk, and who is writing it.
+# Process identity and generation-bound signals, and the pause records
+# (shared with scripts/watchgod status|thaw|kill).
+# shellcheck source=scripts/lib/watchgod_signal.sh
+source "$_SCRIPT_DIR/lib/watchgod_signal.sh"
+# shellcheck source=scripts/lib/watchgod_records.sh
+source "$_SCRIPT_DIR/lib/watchgod_records.sh"
+# Runaway-file detection: names a file filling a disk, and who is writing it;
+# pauses the command when it is a Claude Code task output.
 # shellcheck source=scripts/lib/watchgod_runaway.sh
 source "$_SCRIPT_DIR/lib/watchgod_runaway.sh"
+# The response itself: pause the command, empty its output.
+# shellcheck source=scripts/lib/watchgod_act.sh
+source "$_SCRIPT_DIR/lib/watchgod_act.sh"
+# This poll's tier of each watched domain, by domain key (the runaway response
+# acts only on an ORANGE or RED one).
+declare -gA RW_TIER=()
 
 LOCAL_CONF_FILE="$HOME/.genesis/config/watchgod.local.conf"
 FAST_POLL_INTERVAL=5
@@ -129,7 +137,13 @@ RESERVE_MAX_MB=2048
 PRESSURE_RETRIGGER_S=600
 # Where space usually goes on this layout; `du` of each is logged at YELLOW.
 DG_ATTRIBUTION_PATHS=""
-OOM_CONTAINED_UNIT_PREFIXES="${OOM_CONTAINED_UNIT_PREFIXES:-code-intel- cbm-mcp-}"
+# Slices whose OOM kills are capped work hitting its own cap: logged, not
+# paged, when that slice's own counters account for the kill (see
+# scripts/lib/watchgod_oom.sh). app-capped.slice holds the hostmetrics job
+# runner's scopes, the codebase-memory MCP scope and GitNexus index batches;
+# genesis-workload.slice holds opt-in indexing batches. A kill anywhere else, or
+# triggered by a limit outside these slices, pages.
+OOM_CONTAINED_SLICES="${OOM_CONTAINED_SLICES:-app-capped.slice genesis-workload.slice}"
 
 # ── Load config ──────────────────────────────────────────────
 # Every tunable a conf file may set. Their STARTUP values (code default, or an
@@ -143,7 +157,7 @@ _WG_TUNABLES="CC_TMP_DIR DOWNLOADS_DIR WATCHGOD_ACT WATCH_EXTRA_PATHS RESERVE_MA
     PRESSURE_RETRIGGER_S DG_ATTRIBUTION_PATHS
     DG_YELLOW_PCT DG_ORANGE_PCT DG_RED_PCT DG_RED_MIN_MB
     DG_ETA_YELLOW_MIN DG_ETA_ORANGE_MIN DG_ETA_RED_MIN DG_META_RED_PCT DG_UNALLOC_RED_MB
-    CC_SWEEP_INTERVAL_S CC_SWEEP_AGE_MIN CC_SWEEP_PRESSURE_AGE_MIN OOM_CONTAINED_UNIT_PREFIXES
+    CC_SWEEP_INTERVAL_S CC_SWEEP_AGE_MIN CC_SWEEP_PRESSURE_AGE_MIN OOM_CONTAINED_SLICES
     DG_RUNAWAY_PCT DG_RUNAWAY_RATE_PCT DG_RUNAWAY_MIN_MB"
 declare -A _WG_BASE=()
 _wg_snapshot_defaults() {
@@ -310,44 +324,9 @@ log_attribution() {
     ) </dev/null >/dev/null 2>&1 &
 }
 
-# ── Reserve file ─────────────────────────────────────────────
-RESERVE_FILE="$DG_STATE_DIR/reserve"
-
-reserve_ensure() {
-    # Create the reserve on the $HOME filesystem when it is healthy. $1 free
-    # MB, $2 total MB. Never takes the filesystem below its ORANGE floor.
-    local free="$1" total="$2" size orange_floor
-    [[ -f "$RESERVE_FILE" ]] && return 0
-    size=$(( total / 100 ))
-    (( size > RESERVE_MAX_MB )) && size=$RESERVE_MAX_MB
-    (( size >= 64 )) || return 0
-    orange_floor=$(( total * DG_ORANGE_PCT / 100 ))
-    (( free - size > orange_floor )) || return 0
-    if (( WATCHGOD_ACT == 0 )); then
-        _wg_warn_once reserve_obs "OBSERVE: would create a ${size} MB reserve file at ${RESERVE_FILE}"
-        return 0
-    fi
-    mkdir -p "$DG_STATE_DIR" 2>/dev/null || true
-    if fallocate -l "${size}M" "$RESERVE_FILE" 2>/dev/null; then
-        log INFO "reserve file created: ${size} MB at ${RESERVE_FILE} (released at RED)"
-    else
-        rm -f "$RESERVE_FILE" 2>/dev/null || true
-        _wg_warn_once reserve_fail "reserve file could not be preallocated (fallocate unsupported here?) — RED has no reserve to release"
-    fi
-    return 0
-}
-
-reserve_release() {
-    [[ -f "$RESERVE_FILE" ]] || { echo "none held"; return 0; }
-    local sz
-    sz=$(( $(stat -c %s -- "$RESERVE_FILE" 2>/dev/null || echo 0) / 1048576 ))
-    if (( WATCHGOD_ACT == 0 )); then
-        echo "OBSERVE: would release ${sz} MB"
-        return 0
-    fi
-    rm -f -- "$RESERVE_FILE" && echo "released ${sz} MB (a snapshot may still pin its blocks; the next poll measures what was actually freed)"
-    return 0
-}
+# ── Reserve files ────────────────────────────────────────────
+# shellcheck source=scripts/lib/watchgod_reserve.sh
+source "$_SCRIPT_DIR/lib/watchgod_reserve.sh"
 
 # ── Action stamps and pages ──────────────────────────────────
 # Two rules every stamp, marker and page in this daemon follows (review
@@ -480,7 +459,7 @@ _cc_sweep_units() {
     while IFS= read -r -d '' c; do
         name="${c##*/}"
         case "$name" in
-            cc-socks|"cc-socks-$uid"|"cc-daemon-$uid") continue ;;
+            cc-socks|"cc-socks-$uid"|"cc-daemon-$uid"|"$CC_RESERVE_NAME") continue ;;
         esac
         if [[ "$name" =~ ^claude-[0-9]+$ && -d "$c" ]]; then
             find "$c" -mindepth 2 -maxdepth 2 -print0 2>/dev/null
@@ -663,6 +642,7 @@ handle_fs() {
         fi
         episode_clear "$dev"
         (( is_home )) && reserve_ensure "$free" "$total"
+        (( is_cc && ! is_home )) && cc_reserve_ensure "$free" "$total"
         return 0
     fi
 
@@ -693,8 +673,19 @@ handle_fs() {
     if [[ "$tier" == red ]]; then
         rel="not applicable (reserve lives on the \$HOME filesystem)"
         if (( is_home )); then
-            rel="$(reserve_release)"
+            rel="$(reserve_release)" || true
             start_pressure_unit last-resort
+        elif (( is_cc )); then
+            # Spend the last reserve only on a RED measured after the runaway
+            # response: this poll's RED was read before it emptied a file here.
+            # Held only when there is a reserve to hold (review finding: a
+            # RED with none made the first emergency page claim one).
+            if [[ -n "${RUNAWAY_RELIEVED[$dev]:-}" && -f "$CC_TMP_DIR/$CC_RESERVE_NAME" \
+                    && ! -L "$CC_TMP_DIR/$CC_RESERVE_NAME" ]]; then
+                rel="cc-tmp reserve held: a runaway output was emptied this poll; released next poll if still RED"
+            else
+                rel="cc-tmp reserve $(cc_reserve_release)" || true
+            fi
         fi
         if ! episode_seen "$dev" "red$pg"; then
             body="${summary}. Reserve: ${rel}."$'\n'"${writers_block}"
@@ -794,24 +785,35 @@ check_disks() {
         done
     fi
 
-    # Pass 2: tier and act, once per domain.
+    # Pass 2: tier every domain and run its levers, except cc-tmp's own
+    # domain: its levers run after pass 3 (the runaway response), so its RED
+    # sees whether the response just relieved it. Every other domain's levers
+    # run first, so no fault in the response can cost them their poll (review
+    # finding: under set -u an unbound variable there kills the daemon).
     local rw_domains=""
+    local -A tier_of=() free_of=() total_of=() eta_of=() fstype_of=()
+    RW_TIER=()
     for key in "${order[@]}"; do
         p="${path_of[$key]}"
         read -r free total quota unalloc meta fstype used_raw <<< "${meas_of[$key]}"
         used=$(( total - free ))
         [[ "$used_raw" =~ ^[0-9]+$ ]] || used_raw=$used
         binding=fs; (( quota )) && binding=quota
-        rate="$(dg_rate_update "$key" "$used_raw" "$now" "$binding")"
+        rate="$(dg_rate_update "$key" "$used_raw" "$now" "$binding" "$(_wg_reserve_mb "$p" "$binding")")"
         eta="$(dg_eta_min "$free" "$rate")"
         floor="$(dg_floor_tier "$free" "$total" "$unalloc" "$meta")"
         etat="$(dg_eta_tier "$eta")"
         tier="$(dg_tier "$floor" "$etat")"
         [[ "$tier" == orange || "$tier" == red || "$etat" != green ]] && fast=1
 
-        handle_fs "$p" "$key" "$tier" "$free" "$total" "$eta" "$writers" "$fstype"
+        tier_of[$key]="$tier"; free_of[$key]="$free"; total_of[$key]="$total"
+        eta_of[$key]="$eta"; fstype_of[$key]="$fstype"
+        if [[ -z "$CC_KEY" || "$key" != "$CC_KEY" || "$key" == "$HOME_KEY" ]]; then
+            handle_fs "$p" "$key" "$tier" "$free" "$total" "$eta" "$writers" "$fstype"
+        fi
         # Canonical root: /proc names a held file by its resolved path.
         rw_domains+="${key} ${key%%[qm]*} ${total} $(wg_canon "$p")"$'\n'
+        RW_TIER[$key]="$tier"
 
         [[ -n "$DISK_JSON" ]] && DISK_JSON+=", "
         DISK_JSON+="$(_wg_json_str "$p"): {\"tier\": \"$tier\", \"floor_tier\": \"$floor\", \"free_mb\": $free, \"total_mb\": $total, \"used_pct\": $(( total > 0 ? used * 100 / total : 0 )), \"eta_min\": $([[ "$eta" == - ]] && echo null || echo "$eta"), \"rate_mb_per_min\": $rate, \"quota\": $([[ $quota == 1 ]] && echo true || echo false), \"unalloc_mb\": $([[ "$unalloc" == - ]] && echo null || echo "$unalloc"), \"meta_pct\": $([[ "$meta" == - ]] && echo null || echo "$meta"), \"fstype\": $(_wg_json_str "$fstype")}"
@@ -839,12 +841,21 @@ check_disks() {
         if [[ -n "$tmp_key" && "$key" == "$tmp_key" ]]; then SYS_COMPAT="$floor $free $total $fstype"; fi
     done
 
-    # Name the file filling a disk, and who is writing it, on every domain.
-    # A failure here must never cost the tiers above their poll.
+    # Pass 3: name the file filling a disk and who is writing it, on every
+    # domain, and answer a runaway Claude Code task output in cc-tmp. A failure
+    # here must never cost the tiers their poll.
+    RUNAWAY_RELIEVED=()
     if [[ -n "$rw_domains" ]]; then
         # The || keeps errexit off inside the check; it logs its own failures.
         wg_runaway_check "$rw_domains" || true
         (( RUNAWAY_FAST )) && fast=1
+    fi
+
+    # Pass 4: cc-tmp's own domain's levers and pages.
+    key="$CC_KEY"
+    if [[ -n "$key" && "$key" != "$HOME_KEY" && -n "${tier_of[$key]:-}" ]]; then
+        handle_fs "${path_of[$key]}" "$key" "${tier_of[$key]}" "${free_of[$key]}" "${total_of[$key]}" \
+            "${eta_of[$key]}" "$writers" "${fstype_of[$key]}"
     fi
 
     NEXT_POLL=$POLL_INTERVAL

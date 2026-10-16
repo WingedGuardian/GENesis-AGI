@@ -1,4 +1,4 @@
-"""``<venv python> -m genesis.trash list | restore ENTRY [--to PATH]``.
+"""``<venv python> -m genesis.trash put PATH... --reason R | list | restore ENTRY [--to PATH]``.
 
 Exit codes: 0 done, 1 refused (the reason is on stderr), 64 usage error.
 """
@@ -9,7 +9,7 @@ import argparse
 import os
 import sys
 
-from genesis.trash import TrashRefused, list_entries, restore
+from genesis.trash import TrashRefused, list_entries, restore, trash
 
 EXIT_REFUSED = 1
 EXIT_USAGE = 64
@@ -61,14 +61,36 @@ def _list() -> int:
     return 0
 
 
+def _put(paths: list[str], reason: str) -> int:
+    """Trash each path; one refusal does not stop the others. Unlike ``rm -f``,
+    a missing path is a refusal (exit 1)."""
+    status = 0
+    for path in paths:
+        try:
+            stone = trash(path, reason=reason, caller="cli")
+        except TrashRefused as exc:
+            print(f"genesis.trash: refused: {_show(exc)}", file=sys.stderr)
+            status = EXIT_REFUSED
+            continue
+        print(f"{_show(stone.entry_id)}  {_show(stone.original_path)}")
+    return status
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = _Parser(prog="genesis.trash", description="List or restore trashed items.")
+    parser = _Parser(prog="genesis.trash", description="Trash, list or restore items.")
     sub = parser.add_subparsers(dest="cmd", required=True, parser_class=_Parser)
+    pt = sub.add_parser("put", help="move paths into the trash")
+    pt.add_argument("paths", nargs="+", metavar="PATH")
+    pt.add_argument("--reason", required=True, help="why it is being removed (kept in the tombstone)")
     sub.add_parser("list", help="every trash entry, oldest first")
     rs = sub.add_parser("restore", help="move an entry's item back")
     rs.add_argument("entry", help="the entry id shown by `list`")
     rs.add_argument("--to", help="restore here instead of the original path")
     args = parser.parse_args(argv)
+    if args.cmd == "put":
+        if not args.reason.strip():
+            parser.error("--reason must say why")
+        return _put(args.paths, args.reason)
     if args.cmd == "list":
         return _list()
     try:

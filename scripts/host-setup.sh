@@ -614,10 +614,13 @@ echo "  + boot.autostart enabled (container survives host reboots)"
 # block so re-running host-setup retrofits existing containers too.
 incus config set "$CONTAINER_NAME" limits.memory.swap true
 echo "  + limits.memory.swap enabled (memory spikes degrade into swap, not thrash)"
-# incus applies limits.memory.swap only at container START, so the running
-# container (freshly created above, or an existing one being retrofitted) still
-# has memory.swap.max=0 until a restart — the setting silently no-ops meanwhile.
-# Activate it live now so swap works without a disruptive restart.
+# The `incus config set` just above is ITSELF a live update to a limits.memory*
+# key, and with `true` (boolean swap-on) that is exactly the value Incus writes
+# memory.swap.max=0 for, at both container start and on every such live update
+# (driver_lxc.go, v6.0.0 and main) -- so the running container (freshly created
+# above, or an existing one being retrofitted) has memory.swap.max=0 right now,
+# not only until the next restart. Activate it live now so swap works without
+# a disruptive restart.
 # shellcheck source=lib/container_swap.sh
 . "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/container_swap.sh"
 container_swap_activate_live "$CONTAINER_NAME"

@@ -4,8 +4,10 @@ update.sh must NOT unconditionally delete ~/.genesis/update_in_progress.pid: on
 the supervised path the orchestrator holds it with ITS pid across tiers, and
 scripts/restore.sh holds it with its own pid while rebuilding the DB — stripping
 a live foreign holder's marker reopens the watchdog-revives-mid-op hazard. The
-`_clear_deploy_state` helper deletes the marker only if WE own it ($$) OR its
-holder is dead. The state file is always removed (update.sh wrote it).
+`_clear_deploy_marker` helper (which `_clear_deploy_state` calls) deletes the
+marker only if WE own it ($$) OR its holder is dead. `_clear_deploy_state`
+removes the state file only when this run wrote it (_STATE_WRITTEN) and is not a
+--post-merge (#3139); the harnesses below are such a run.
 
 These drive the ACTUAL shipped `_clear_deploy_state` function against each marker
 state.
@@ -37,11 +39,25 @@ def _extract_func(text: str, name: str) -> str:
     return f"{name}() {{\n{m.group(1)}\n}}"
 
 
+def _helpers(text: str) -> str:
+    """The owner-checked marker half and the cleanup that calls it."""
+    return (
+        _extract_func(text, "_clear_deploy_marker")
+        + "\n"
+        + _extract_func(text, "_clear_deploy_state")
+    )
+
+
+# A state file THIS run wrote, by a plain (not --post-merge) run.
+_OWN_RUN = "_STATE_WRITTEN=1\nPOST_MERGE=false\n"
+
+
 def test_no_unconditional_marker_rm_remains(text: str) -> None:
-    """Every marker delete must go through the owner-checked helper — no raw
-    `rm -f ... update_in_progress.pid` outside `_clear_deploy_state`."""
-    body = _extract_func(text, "_clear_deploy_state")
-    outside = text.replace(body, "")
+    """Every marker delete must go through the owner-checked helpers — no raw
+    `rm -f ... update_in_progress.pid` outside them."""
+    outside = text
+    for name in ("_clear_deploy_marker", "_clear_deploy_state"):
+        outside = outside.replace(_extract_func(text, name), "")
     # No raw DELETE of the marker may survive outside the helper.
     assert not re.search(r"rm -f[^\n]*update_in_progress\.pid", outside), (
         "a raw marker rm survives outside the helper"
@@ -50,7 +66,7 @@ def test_no_unconditional_marker_rm_remains(text: str) -> None:
     # The direct path no longer adopts/writes a marker (it signals via the state
     # file), so update.sh must NOT reference the marker outside the helper at all.
     assert "update_in_progress.pid" not in outside, (
-        "no marker use should survive outside the helper"
+        "no marker use should survive outside the helpers"
     )
 
 
@@ -71,8 +87,8 @@ def _run_clear(
     harness = f"""#!/bin/bash
 set -Eeuo pipefail
 STATE_FILE="{state}"
-. "{MARKER_LIB}"
-{_extract_func(text, "_clear_deploy_state")}
+{_OWN_RUN}. "{MARKER_LIB}"
+{_helpers(text)}
 _clear_deploy_state
 """
     script = tmp_path / "h.sh"
@@ -96,9 +112,9 @@ def test_deletes_marker_we_own(tmp_path: Path, text: str) -> None:
     harness = f"""#!/bin/bash
 set -Eeuo pipefail
 STATE_FILE="{state}"
-echo "$$" > "{marker}"      # marker holds OUR pid → owned
+{_OWN_RUN}echo "$$" > "{marker}"      # marker holds OUR pid → owned
 . "{MARKER_LIB}"
-{_extract_func(text, "_clear_deploy_state")}
+{_helpers(text)}
 _clear_deploy_state
 """
     (tmp_path / "h.sh").write_text(harness)
@@ -109,7 +125,7 @@ _clear_deploy_state
         check=True,
     )
     assert not marker.exists(), "an owned marker must be deleted"
-    assert not state.exists(), "the state file is always removed"
+    assert not state.exists(), "a state file this run wrote is removed"
 
 
 def test_keeps_live_foreign_marker(tmp_path: Path, text: str) -> None:
@@ -117,7 +133,7 @@ def test_keeps_live_foreign_marker(tmp_path: Path, text: str) -> None:
     # os.getpid() is this pytest process — alive and NOT the harness's $$.
     marker_exists, state_exists = _run_clear(tmp_path, text, str(os.getpid()))
     assert marker_exists, "a live foreign marker must NOT be stripped"
-    assert not state_exists, "the state file is still removed"
+    assert not state_exists, "a state file this run wrote is still removed"
 
 
 def test_deletes_dead_marker(tmp_path: Path, text: str) -> None:

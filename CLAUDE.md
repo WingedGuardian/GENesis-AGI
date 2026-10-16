@@ -36,7 +36,10 @@ Use `codebase_navigate` MCP to explore.
   once. The `genesis-tmp-watchgod` service guards whole disks and sweeps cc-tmp
   of what ended sessions left behind (untouched 7 days, nothing holding it); it
   never kills a session and never deletes live work — so nothing will clean up
-  a big file you park there in time. A CC session's `TMPDIR` points at `cc-tmp` by design;
+  a big file you park there in time. One exception: a Bash task whose output is
+  filling cc-tmp fast (ORANGE/RED) is PAUSED (SIGSTOP), never killed, until
+  `scripts/watchgod thaw <pid>` (or `scripts/watchgod kill <pid>`), and its output is
+  emptied (last MB kept in `~/tmp/watchgod-truncated` when there is room); `status` lists pauses. A CC session's `TMPDIR` points at `cc-tmp` by design;
   do NOT override `TMPDIR` in scripts or service files (breaks CC — see the
   `tmp_filesystem_limit` procedure). Code that creates large temp must pass an
   explicit dir (`mktemp -p ~/tmp` / `tempfile(dir=…)`), never the default. For a
@@ -80,6 +83,10 @@ that the FalkorDB store reads — the staleness BOUND, since that store's
 `invalidate()` is a no-op and nothing else refreshes it; a clean no-op on
 installs with no graph engine, so it is enabled everywhere; see
 `scripts/graph_project_runner.sh`),
+`genesis-browser-stack.timer` (daily retry of `genesis-browser-stack.service`,
+the oneshot bootstrap starts after installing the browser packages: the
+Camoufox engine and Chromium they pin, and their system libraries; see
+`scripts/install_browser_stack.sh`),
 `genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
@@ -100,6 +107,7 @@ pytest tests/test_memory/test_drift.py -v         # Targeted tests (ALWAYS speci
 python3 scripts/pytest_lock_wait.py                # Another run holds the test lock? wait
 gh pr checks <PR-number>                          # CI results (replaces local full suite)
 ~/genesis/.venv/bin/python -m genesis.hostmetrics run --name N --ram GB --cpu PCT -- CMD  # Admit + cap a heavy job
+~/genesis/.venv/bin/python -m genesis.trash put PATH --reason R  # Delete user/project data recoverably, not with rm
 curl -s http://localhost:6333/collections | jq .  # Verify Qdrant
 scripts/deploy_code_only.sh                       # Deploy main: locked pull + restart (launch detached)
 systemctl --user restart genesis-server           # Bare restart, bypasses the deploy lock (NEVER nohup)
