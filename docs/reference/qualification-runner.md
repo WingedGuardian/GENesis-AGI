@@ -13,6 +13,10 @@ also needs `--params` (JSON keyed by routing alias), `--reference-policy`,
 independently. The same inputs are required for reports. An optional `--alias`
 selects the candidate for a complete check.
 
+Keep the corpus, policies, approval and original source bytes in durable private
+storage before admission. The source map records hashes and locations; it does
+not back up those files or make a missing source recoverable.
+
 `review-references --spec <JSON>` returns aggregate admission counts offline.
 It publishes no case IDs, prompts, raw judgments or exception text.
 

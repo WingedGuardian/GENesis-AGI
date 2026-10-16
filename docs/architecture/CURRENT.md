@@ -1523,6 +1523,15 @@ verified: cfbb876243f2 2026-10-07
   a PATH provider. Staging does not activate it; MCP registration and indexing
   retain their existing routes until their integration concerns land. See
   `docs/reference/codebase-managed.md`.
+  Whole-install removal enters the same fixed guarded transaction from direct
+  and host cleanup: runner/repository/lifecycle locks survive exec and all root
+  deletions; native query/client cgroup proof and orphan-scope checks precede
+  cleanup regardless of configuration validity. External configured state and
+  foreign symlink targets are retained. Host cleanup uses the container user's
+  default coordination namespace unless an explicit `--container-genesis-home`
+  names an external namespace; literal argv assigns it after login initialization.
+  No live-install removal acceptance is
+  claimed by isolated fixture tests.
 - **hosting/**: the OUTER layer that calls the runtime. Standalone's scoped peer
   request-input handler provides a trusted 256 KiB body reader with a five-second
   absolute deadline on peer send/cancel POST paths. It bounds framing and refusal
@@ -2685,7 +2694,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: adc15e37ff5a 2026-10-16
+verified: e943bc114e2b 2026-10-16
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2898,8 +2907,12 @@ verified: adc15e37ff5a 2026-10-16
   guarantee. Detached reports score retained snapshots under current admission,
   read no credentials and do not authenticate current external spending consent.
   No paid quality, promotion or live activation follows from synthetic wiring.
-  Runner integration verification is pending; inherited preflight evidence above
-  does not clear the new execution path. See `docs/reference/qualification-runner.md`.
+  After source review, the integrated runner passed 1,777 affected tests and a
+  complete synthetic 750-case/2,250-request actual-CLI run plus credential-free
+  detached report. Independent readback reconciled all 9,001 journal rows and
+  529 frozen inputs; the E2E observed no Python network attempts. Main integration
+  preserved these runtime inputs. This is synthetic wiring evidence, not real
+  model quality, provider billing or deployment. See `docs/reference/qualification-runner.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).

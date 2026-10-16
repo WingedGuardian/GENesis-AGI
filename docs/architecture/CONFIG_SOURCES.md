@@ -259,7 +259,12 @@ names, so an overlay of a read-only file is editable (#2446).
    routing reads only `config/model_routing.local.yaml`; outreach may read a whole-file
    `~/.genesis/config/outreach.yaml`. `settings_get` shows the domain-standard merge, which
    for `model_routing` and `outreach` is not necessarily what the runtime loads.
-5. **`GENESIS_HOME` does not move config.** `genesis.yaml`, the overlay user dir, and the
+5. **`GENESIS_HOME` does not move config.** Host `scripts/uninstall.sh` uses the
+   container user's default `HOME/.genesis` unless `--container-genesis-home`
+   explicitly designates an external container coordination namespace. Host
+   `GENESIS_HOME` is not copied across login; the explicit path is assigned after
+   login initialization. Direct container cleanup retains its process environment.
+   `genesis.yaml`, the overlay user dir, and the
    settings writer all use `Path.home()/.genesis/config`.
 6. **The health, memory, outreach and recon MCP children get the whole file.** Their
    `_MCP_VARS` allowlist in `scripts/genesis_mcp_server.py` is superseded by the
