@@ -56,7 +56,14 @@ that the line covers the point.
 it, and it applies every local rule, so a reflection committed by hand is held
 to exactly the standard a tool-made one is.
 
-CLI: ``status`` (what the open round owes, whether it has settled) and
+Late findings (reviews that opened no round, and round-opening reviews that
+arrived after a fix to their head) are owed from ``REFLECTION_CUTOVER_ISO`` on,
+each credited only under its own round's context; ``review_late`` holds that
+reader and is imported only when a cutover is set. The cutover is None until the
+commit gate enforces reflections, so until then nothing more is owed.
+
+CLI: ``status`` (what the open round owes, whether it has settled; ``--cutover``
+reports what late findings from that time on would owe, enforcing nothing) and
 ``validate`` (a file, offline). Exit 1 means the reflection is invalid; exit
 2 means the check could not be made.
 """
@@ -82,6 +89,11 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 SETTLE = timedelta(minutes=30)
+#: When late findings start being owed (``review_late``). None until the commit
+#: gate enforces reflections, which sets it at its own merge, so no debt appears
+#: before anything enforces it (owner ruling 50cc9dec). With None, what is owed
+#: is exactly the open round's, and ``review_late`` is never imported.
+REFLECTION_CUTOVER_ISO: str | None = None
 MIN_BLOCK_CHARS = 300
 LOG_DEPTH = 1000
 #: A template placeholder; it can never match a field, so it is refused anyway,
@@ -516,11 +528,21 @@ def previous_class_labels(cwd: str, prior_heads: Sequence[str]) -> list[str]:
     other head is ignored, so a stray or mistyped one cannot stand in for the
     previous round. Drafts never count: an invalid or escalating reflection
     was never accepted as its round's answer."""
+    if not prior_heads:
+        return []
+    return _class_labels(_log_reflections(cwd), prior_heads)
+
+
+def _class_labels(
+    log: Sequence[tuple[str, str, str, datetime | None]], prior_heads: Sequence[str]
+) -> list[str]:
+    """``previous_class_labels`` over reflection rows already read
+    (``_log_reflections``' shape), so a caller can choose which rows count."""
     wanted = set(prior_heads)
     classes: list[str] = []
     if not wanted:
         return classes
-    for _, kind, body, _ in _log_reflections(cwd):
+    for _, kind, body, _ in log:
         parsed = parse(body)
         if kind == "empty" and parsed.ok and not parsed.escalate and parsed.head in wanted:
             classes.extend(c for c in parsed.classes if c not in classes)
@@ -916,9 +938,21 @@ def covered_keys(
 
 
 def owed_state(
-    budget: Mapping[str, Any], covered: Iterable[str], *, now: datetime
+    budget: Mapping[str, Any],
+    covered: Iterable[str],
+    *,
+    now: datetime,
+    cutover: str | None = None,
+    fix_time: Any = None,
+    late_covered: Iterable[str] = (),
 ) -> dict[str, Any]:
-    """What the open round owes, from a ``review_budget`` result. Pure."""
+    """What is owed, from a ``review_budget`` result: the open round's keys less
+    ``covered`` (``covered_keys``). With ``cutover`` None that is all, and pure.
+    With a cutover, the late keys from it on (``review_late.late_owed``) less
+    ``late_covered`` are owed too. The two are subtracted apart, so a
+    reflection judged under the open round never clears a late key, which only
+    its own round's context can. ``fix_time`` (``review_late.fix_time_reader``)
+    reads local git and may raise ``Refused``."""
     state: dict[str, Any] = {
         "status": budget.get("status"),
         "round": budget.get("count"),
@@ -934,18 +968,33 @@ def owed_state(
         "round_started": None,
         "settled": False,
         "settle_until": None,
+        "cutover": cutover,
+        # None (unknown) until a cutover's late findings have been read.
+        "late_keys": [] if cutover is None else None,
     }
     rounds = budget.get("rounds") or []
     if budget.get("status") == "ok" and rounds:
         state["round_head"] = rounds[-1].get("head")
     if budget.get("status") != "ok":
         return state
+    late_owed: list[str] | None = []
+    if cutover is not None:
+        import review_late  # noqa: PLC0415
+
+        state["late_keys"], late_owed = review_late.late_owed(
+            budget, late_covered, cutover=cutover, fix_time=fix_time
+        )
     if budget.get("round_state") != "open":
-        state["owed"] = []
+        state["owed"] = late_owed
+        if cutover is not None:
+            # No settle window applies to late reviews: each is owed as it
+            # lands. So with no round open, the state is settled once the late
+            # debt is known, owed or not. With no cutover this is main's False.
+            state["settled"] = late_owed is not None
         return state
-    if state["reflection_keys"] == "ok":
+    if state["reflection_keys"] == "ok" and late_owed is not None:
         done = set(covered)
-        state["owed"] = [k for k in state["open_keys"] if k not in done]
+        state["owed"] = [k for k in state["open_keys"] if k not in done] + late_owed
     times = [
         when
         for source in (rounds[-1].get("reviews") or [] if rounds else [])
@@ -961,36 +1010,66 @@ def owed_state(
     return state
 
 
-def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
+def _acceptance(budget: Mapping[str, Any], repo: str, number: int) -> list[str] | None:
+    """The PR's acceptance points, from the body the budget read carried."""
+    if budget.get("body_changed"):
+        raise Refused(
+            "the PR body changed between the two reads, so its acceptance "
+            "points are not known: run status again"
+        )
+    # The body comes with the budget read. Only a budget that carries no
+    # body at all (an older review_budget) is answered by asking again; a
+    # carried body of None (two reads that disagreed) never is.
+    if "body" in budget:
+        body = budget.get("body")
+        if not isinstance(body, str):
+            raise Refused("the PR body could not be read, so its acceptance is unknown")
+    else:
+        body = _pr_meta(repo, number).get("body") or ""
+    return acceptance_points(body)
+
+
+def _open_covered(
+    cwd: str, budget: Mapping[str, Any], state: Mapping[str, Any], acceptance: Sequence[str] | None
+) -> set[str]:
+    """``covered_keys`` for the open round, every argument taken from the budget."""
+    return covered_keys(
+        cwd,
+        str(state["head"]),
+        round_number=int(state["round"] or 0),
+        gate_lane=state["gate_lane"],
+        prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
+        acceptance=acceptance,
+        round_started=state["round_started"],
+    )
+
+
+_MODULE_CUTOVER = object()
+
+
+def status(
+    cwd: str, *, now: datetime | None = None, cutover: Any = _MODULE_CUTOVER
+) -> dict[str, Any]:
+    """What is owed now. ``cutover`` defaults to ``REFLECTION_CUTOVER_ISO`` as it
+    stands at the call; any other value is a report only: it shows what late
+    findings from that time on would owe, and enforces nothing."""
     import review_budget  # noqa: PLC0415
 
+    if cutover is _MODULE_CUTOVER:
+        cutover = REFLECTION_CUTOVER_ISO
     repo, number = pr_identity(cwd)
     budget = review_budget.evaluate_pr(repo, number)
+    if cutover is not None:
+        import review_late  # noqa: PLC0415
+
+        state = review_late.late_status(
+            cwd, budget, repo, number, now=now or datetime.now(UTC), cutover=cutover
+        )
+        state.update({"repo": repo, "pr": number, "errors": budget.get("errors", [])})
+        return state
     state = owed_state(budget, (), now=now or datetime.now(UTC))
     if state["status"] == "ok" and state["round_state"] == "open":
-        if budget.get("body_changed"):
-            raise Refused(
-                "the PR body changed between the two reads, so its acceptance "
-                "points are not known: run status again"
-            )
-        # The body comes with the budget read. Only a budget that carries no
-        # body at all (an older review_budget) is answered by asking again; a
-        # carried body of None (two reads that disagreed) never is.
-        if "body" in budget:
-            body = budget.get("body")
-            if not isinstance(body, str):
-                raise Refused("the PR body could not be read, so its acceptance is unknown")
-        else:
-            body = _pr_meta(repo, number).get("body") or ""
-        covered = covered_keys(
-            cwd,
-            str(state["head"]),
-            round_number=int(state["round"] or 0),
-            gate_lane=state["gate_lane"],
-            prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
-            acceptance=acceptance_points(body),
-            round_started=state["round_started"],
-        )
+        covered = _open_covered(cwd, budget, state, _acceptance(budget, repo, number))
         if state["reflection_keys"] == "ok":
             state["owed"] = [k for k in state["open_keys"] if k not in covered]
     state.update({"repo": repo, "pr": number, "errors": budget.get("errors", [])})
@@ -1003,7 +1082,12 @@ def status(cwd: str, *, now: datetime | None = None) -> dict[str, Any]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("status", help="what the open round owes")
+    status_cmd = sub.add_parser("status", help="what the open round owes")
+    status_cmd.add_argument(
+        "--cutover",
+        default=None,
+        help="report what late findings from this ISO time on would owe (enforces nothing)",
+    )
     validate = sub.add_parser("validate", help="check a file against the grammar, offline")
     validate.add_argument("file", type=Path)
     validate.add_argument("--round", type=int, default=None)
@@ -1011,7 +1095,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "status":
-            print(json.dumps(status(os.getcwd()), indent=2))
+            report = (
+                status(os.getcwd(), cutover=args.cutover) if args.cutover else status(os.getcwd())
+            )
+            print(json.dumps(report, indent=2))
             return 0
         text = args.file.read_bytes().decode("utf-8")
         parsed = parse(text, round_number=args.round, gate_lane=args.gate)

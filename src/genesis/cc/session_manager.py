@@ -36,6 +36,24 @@ class SessionManager:
         self._day_boundary_hour = day_boundary_hour
         self._on_start_hooks: list[OnSessionStart] = []
         self._on_end_hooks: list[OnSessionEnd] = []
+        self._live_background: Callable[[str], bool] = lambda _sid: False
+
+    @property
+    def db(self):
+        """The connection this manager writes cc_sessions rows through."""
+        return self._db
+
+    def set_background_liveness(self, probe: Callable[[str], bool]) -> None:
+        self._live_background = probe
+
+    async def start_prepared(self, session_id: str) -> None:
+        """Fire normal lifecycle hooks after a prepared session is registered."""
+        row = await cc_sessions.get_by_id(self._db, session_id)
+        for hook in self._on_start_hooks:
+            try:
+                await hook(session_id, row["session_type"], row["source_tag"])
+            except Exception:
+                logger.error("Session start hook failed for %s", session_id[:8], exc_info=True)
 
     _PENDING_BOOKMARK_FILE = Path.home() / ".genesis" / "pending_bookmark.json"
 
@@ -245,6 +263,8 @@ class SessionManager:
         stale = await cc_sessions.query_stale(self._db, older_than=cutoff)
         count = 0
         for row in stale:
+            if self._live_background(row["id"]):
+                continue
             session_type = row.get("session_type", "")
             source_tag = row.get("source_tag", "")
 

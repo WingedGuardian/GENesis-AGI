@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -174,28 +175,28 @@ def test_it_never_returns_a_blocking_exit_code():
     )
 
 
-def test_a_crash_inside_main_still_exits_zero():
-    """The copy lives BESIDE the real hook, not in tmp_path.
+def test_a_crash_inside_main_still_exits_zero(tmp_path):
+    """The copy lives in tmp_path, with the real hook directory on PYTHONPATH.
 
-    A copy elsewhere cannot import `hook_input`, so it dies at import time and
-    tests the wrong thing -- which is how the first version of this test failed
-    for a reason unrelated to the property it names.
+    A copy elsewhere without it cannot import `hook_input`, so it dies at import
+    time and tests the wrong thing -- which is how the first version of this test
+    failed for a reason unrelated to the property it names. The copy used to be
+    written beside the real hook instead, which put a stray file in the
+    checkout's hook directory (the live one, when run from the deployed tree).
     """
-    broken = _HOOK.parent / "_broken_reminder_probe.py"
-    broken.write_text(
-        _HOOK.read_text(encoding="utf-8").replace(
-            "    payload = read_payload()",
-            "    raise RuntimeError('injected')\n    payload = read_payload()",
-        ),
-        encoding="utf-8",
+    source = _HOOK.read_text(encoding="utf-8")
+    injected = source.replace(
+        "    payload = read_payload()",
+        "    raise RuntimeError('injected')\n    payload = read_payload()",
     )
-    try:
-        proc = subprocess.run([sys.executable, str(broken)],
-                              input=json.dumps(_payload()),
-                              capture_output=True, text=True, timeout=30)
-        assert proc.returncode == 0, proc.stderr
-    finally:
-        broken.unlink(missing_ok=True)
+    assert injected != source, "the injection point moved; the test would prove nothing"
+    broken = tmp_path / "_broken_reminder_probe.py"
+    broken.write_text(injected, encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": str(_HOOK.parent)}
+    proc = subprocess.run([sys.executable, str(broken)],
+                          input=json.dumps(_payload()),
+                          capture_output=True, text=True, timeout=30, env=env)
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_even_an_unimportable_hook_cannot_block(tmp_path):

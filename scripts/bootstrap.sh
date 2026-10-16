@@ -55,6 +55,14 @@ _crash_recovery_refuse() {
     exit 1
 }
 
+# Is the state a pending merge conflict (scripts/lib/update_state_guard.py, the rule
+# update.sh, deploy_code_only.sh and the dashboard share; its exit 3)?
+_state_is_conflict_pending() {
+    local rc=0
+    python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$UPDATE_STATE" "$GENESIS_ROOT" >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 3 ]
+}
+
 if [ -f "$UPDATE_STATE" ]; then
     echo "--- Detected interrupted update state file ---"
     ROLLBACK_TAG=""
@@ -106,6 +114,11 @@ PY
     elif [ "$STATE_PHASE" = "done" ]; then
         echo "  Update completed successfully — cleaning up state file."
         rm -f "$UPDATE_STATE"
+    elif _state_is_conflict_pending; then
+        # A merge-conflict exit (update.sh exit 2): nothing merged, and the state is
+        # the resolver's anchor (its rollback tag and old commit) for the later
+        # --post-merge. It is not a crash, so it is neither recovered nor recorded.
+        echo "  An update stopped on merge conflicts (nothing was merged); its state is kept for the resolver."
     else
         echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID is dead)."
         if [ -z "$ROLLBACK_TAG" ] || ! git -C "$GENESIS_ROOT" check-ref-format "refs/tags/$ROLLBACK_TAG" >/dev/null 2>&1; then
@@ -153,33 +166,13 @@ PY
             # fast-forward killed mid-write leaves: HEAD unmoved, files half
             # new. update.sh treats that state as CRITICAL; installing over it
             # would run half-written code, so refuse and keep the state file.
-            # Every tracked path counts here, the ephemeral allowlist included:
-            # the merge writes those too, and the deployability predicate below
-            # skips them. git status cannot see a file whose index entry is
-            # flagged skip-worktree or assume-unchanged, so the lib's hidden-edit
-            # scan runs as well.
+            # The check is genesis_merge_residue (lib/deploy_checkout.sh): every
+            # tracked path (the ephemeral allowlist included: the merge writes
+            # those too), flagged entries, and files the range added. It is
+            # shared with scripts/lib/update_state_guard.py, so the guard's
+            # verdict on this state and this recovery agree.
             if [ "$STATE_PHASE" = "merging" ]; then
-                merge_dirty="" merge_hidden=""
-                if ! merge_dirty="$(git -C "$GENESIS_ROOT" status --porcelain --untracked-files=no --no-renames 2>/dev/null)"; then
-                    merge_dirty="(status unreadable)"
-                fi
-                if ! merge_hidden="$(_genesis_hidden_dirty_lines "$GENESIS_ROOT" 2>/dev/null)"; then
-                    merge_hidden="(flagged-entry status unreadable)"
-                fi
-                # A fast-forward killed after writing only the files the range
-                # ADDS leaves them untracked, which status cannot show. update.sh's
-                # pre-stop scan refuses a range that lands on an existing
-                # untracked path, so one present now appeared during the run.
-                merge_new=""
-                if [ -n "$DEPLOY_HEAD" ]; then
-                    collide_rc=0
-                    merge_new="$(genesis_range_collisions "$GENESIS_ROOT" "$rb_commit" "$DEPLOY_HEAD" 2>/dev/null)" \
-                        || collide_rc=$?
-                    if [ "$collide_rc" -eq 2 ]; then
-                        merge_new="(the update's incoming range cannot be listed)"
-                    fi
-                fi
-                merge_dirty="$(printf '%s\n%s\n%s\n' "$merge_dirty" "$merge_hidden" "$merge_new" | grep -v '^$' || true)"
+                merge_dirty="$(genesis_merge_residue "$GENESIS_ROOT" "$rb_commit" "$DEPLOY_HEAD")"
                 if [ -n "$merge_dirty" ]; then
                     printf '%s\n' "$merge_dirty" | sed 's/^/    /'
                     _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but tracked files changed during the merge (a half-written update or edits by someone else)"
@@ -213,6 +206,12 @@ PY
             # anywhere else (someone's commit or pull, another branch) is left.
             genesis_checkout_unmoved "$GENESIS_ROOT" "$OWN_HEAD" "$ORIGINAL_BRANCH" \
                 || _crash_recovery_refuse "the checkout is not at the merge this update recorded as its own; refusing to change code it does not own"
+            # On `live` the move was a rebuild, and moving it back also means
+            # putting back the git hooks the rebuild installed, which only
+            # update.sh's own rollback does.
+            if [ "$ORIGINAL_BRANCH" = live ]; then
+                _crash_recovery_refuse "the update ran on live; finish it with scripts/update.sh --post-merge (bootstrap does not roll live back until the live recovery guard lands)"
+            fi
             if ! genesis_rollback_checkout \
                 "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH" "$EPHEMERAL_BACKUP_ROOT" "$rb_commit"; then
                 _crash_recovery_refuse "the non-forced rollback checkout was refused; code was left in place"
@@ -559,11 +558,6 @@ echo
 echo "--- Installing code intelligence tools ---"
 
 # codebase-memory-mcp (code graph — 66 languages)
-# Always re-runs the upstream installer: it is idempotent and pulls the latest
-# release, so existing installs are upgraded in place.
-# --skip-config: the installer's own agent-config step registers the RAW binary
-# in ~/.claude/.mcp.json, bypassing our 2G-capped launcher. We register the
-# capped wrapper below via _register_mcp, so the installer must NOT self-register.
 # The kill-switch path resolves through the ONE shared site — an override via
 # CODEBASE_MEMORY_MCP_DISABLE_FILE is honoured here the same way the launcher
 # and indexer honour it, and an UNRESOLVABLE path refuses rather than falling
@@ -574,33 +568,7 @@ if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
     . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
     _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
 fi
-if [ -z "$_cbm_disable" ]; then
-    echo "  WARNING: codebase-memory-mcp kill-switch path unresolvable — refusing install (fail closed)"
-elif [ -e "$_cbm_disable" ]; then
-    echo "  codebase-memory-mcp: install/upgrade skipped (machine kill switch active: $_cbm_disable)"
-else
-    echo "  codebase-memory-mcp: installing/upgrading..."
-    # The pin, the digest and the install itself live in ONE place, shared with
-    # install.sh, so the commit and its digest cannot drift apart.
-    # shellcheck source=lib/cbm_installer.sh
-    . "$SCRIPT_DIR/lib/cbm_installer.sh"
-    _cbm_rc=0
-    genesis_cbm_install || _cbm_rc=$?
-    case "$_cbm_rc" in
-        0) ;;
-        1) echo "  WARNING: codebase-memory-mcp installer download failed (non-critical)" ;;
-        3) echo "  ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
-        4) echo "  WARNING: codebase-memory-mcp install refused — machine kill switch active" ;;
-        *) echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)" ;;
-    esac
-fi
-if [ -z "$_cbm_disable" ]; then
-    echo "  codebase-memory-mcp status probe skipped (kill-switch path unresolvable)"
-elif [ -e "$_cbm_disable" ]; then
-    echo "  codebase-memory-mcp status probe skipped (machine kill switch active)"
-elif command -v codebase-memory-mcp &>/dev/null; then
-    echo "  codebase-memory-mcp: $(codebase-memory-mcp --version 2>/dev/null || echo 'installed')"
-fi
+echo "  Codebase: explicit pinned setup required; see docs/reference/codebase-managed.md"
 
 # GitNexus (blast radius, impact analysis, execution flows)
 # Exact, shared pin — GitNexus index storage formats can change between
@@ -799,10 +767,13 @@ install_browser_extra "$GENESIS_ROOT" "$VENV_DIR" \
 echo
 
 # --- Skill-security trusted baseline ---
-# Bless the currently-installed skills so the scheduled scan files findings only
-# for NEW/untrusted skills (a raw scan flags ~every capable skill as CRITICAL).
+# Bless the skills installed the FIRST time bootstrap runs, so the scheduled
+# scan files findings only for NEW/untrusted skills (a raw scan flags ~every
+# capable skill as CRITICAL). --if-missing: bootstrap runs on every update, and
+# re-seeding here would silently bless every skill added since the last one.
+# Trusting a new skill is a deliberate act: add its name to the allowlist.
 echo "--- Seeding skill-security trusted allowlist ---"
-"$VENV_DIR/bin/python" -m genesis.security.skill_scan --seed-trusted 2>&1 | tail -1 || true
+"$VENV_DIR/bin/python" -m genesis.security.skill_scan --seed-trusted --if-missing 2>&1 | tail -1 || true
 echo
 
 # --- Baseline procedures ---
@@ -1375,6 +1346,13 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        case "$svc_name" in
+            genesis-cbm-query.service | genesis-cbm-query-clients.slice)
+                if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+                    echo "  ERROR: refusing nonregular managed Codebase unit: $target" >&2
+                    exit 1
+                fi ;;
+        esac
         # The graph engine's unit only advances to a module that is verified on
         # disk. Provisioning above returns 0 when it skips or fails, so without
         # this a failed or unpinned provision would point a working unit at a
@@ -1399,6 +1377,10 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         # fail outright, and a failing render aborts bootstrap — the UPDATE
         # path — under set -e.
         _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+        _systemd_exec_esc() { printf '%s' "$1" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g'; }
+        _home_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$HOME")")
+        _repo_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$GENESIS_ROOT")")
+        _venv_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$GENESIS_ROOT/.venv")")
         _home_esc=$(_sed_repl_esc "$HOME")
         _venv_esc=$(_sed_repl_esc "$GENESIS_ROOT/.venv")
         _repo_esc=$(_sed_repl_esc "$GENESIS_ROOT")
@@ -1419,6 +1401,9 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
         _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
         sed -e "s|__HOME__|$_home_esc|g" \
+            -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
+            -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
+            -e "s|__VENV_EXEC__|$_venv_exec_esc|g" \
             -e "s|__VENV__|$_venv_esc|g" \
             -e "s|__REPO_DIR__|$_repo_esc|g" \
             -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \

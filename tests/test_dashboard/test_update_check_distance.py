@@ -15,6 +15,8 @@ from flask import Flask
 
 from genesis.dashboard.routes import updates
 
+pytestmark = pytest.mark.usefixtures("updates_sandbox")
+
 
 def _call(count, tags, remote="origin"):
     """Drive update_check with a stubbed git, returning (payload, status)."""

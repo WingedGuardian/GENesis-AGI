@@ -18,7 +18,7 @@ from genesis.learning.procedural.lesson_shape import (
     validate_lesson,
     validate_trigger_spec,
 )
-from genesis.learning.procedural.tool_names import normalize_tool_trigger
+from genesis.learning.procedural.tool_names import names_a_tool, normalize_tool_trigger
 from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,8 @@ class StoreResult:
     # decision (None when no embedding was available to compare). Observability +
     # test assertions; does not affect the stored row.
     matched_similarity: float | None = None
-    # For a lesson write: whether the trigger cache was rebuilt (None otherwise).
+    # For a lesson write or a refine of a cached earned row: whether the trigger
+    # cache was rebuilt (None when no rebuild was needed).
     cache_rebuilt: bool | None = None
 
 
@@ -114,14 +115,13 @@ async def store_procedure(
     """
     proc_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
-    tool_trigger, patterns, dropped = normalize_tool_trigger(tool_trigger)
-    if dropped or patterns:
-        logger.info(
-            "Procedure %s: dropped non-tool trigger values %s; command patterns not kept %s",
-            task_type,
-            dropped,
-            patterns,
-        )
+    tool_trigger, commands, dropped = normalize_tool_trigger(tool_trigger)
+    if dropped:
+        logger.info("Procedure %s: dropped non-tool trigger values %s", task_type, dropped)
+    if commands and trigger_spec is None:
+        trigger_spec, tool_trigger, spec_warnings = commands_spec(tool_trigger, commands)
+        if spec_warnings:
+            logger.info("Procedure %s: %s", task_type, "; ".join(spec_warnings))
     await procedural.create(
         db,
         id=proc_id,
@@ -146,6 +146,34 @@ async def store_procedure(
         deprecated_reason=deprecated_reason,
     )
     return proc_id
+
+
+def _stored_lesson(row: dict) -> dict:
+    """A row's lesson record as a dict, or {} when absent or unreadable."""
+    try:
+        value = json.loads(row.get("lesson") or "null")
+    except (TypeError, ValueError, RecursionError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def commands_spec(tools: list[str], commands: list[str]) -> tuple[dict | None, list[str], list[str]]:
+    """``(spec, stored_tools, warnings)`` for an earned row named by shell commands.
+
+    The one rule every writer and the trigger backfill apply. A spec makes the
+    row fire on those commands only, never on any Bash call its tags match. It
+    replaces the row's tags for every tool, so it is written only when Bash is
+    the row's one tool and the commands fit the validator's cap. Otherwise the
+    command words are stored as written, inert (they name no tool), so the
+    row's other tools keep their tags and no Bash is widened.
+    """
+    from genesis.learning.procedural.lesson_shape import MAX_PATTERNS
+
+    if tools == ["Bash"] and len(commands) <= MAX_PATTERNS:
+        spec = validate_trigger_spec({"patterns": [], "commands": commands, "repeat": "every"})
+        return spec, tools, []
+    stored = [t for t in tools if t != "Bash"] + [c for c in commands if c not in tools]
+    return None, stored, [f"shell commands kept as written, not stored as a command spec: {commands}"]
 
 
 def _best_same_procedure_match(
@@ -214,7 +242,7 @@ async def store_procedure_checked(
     - High context_tag overlap with a different task_type → warn but still create.
 
     A LESSON (``lesson`` and ``trigger_spec`` given) is authored, not earned:
-    the normalizer's command patterns join the author's, both records are
+    the normalizer's command phrases join the author's commands, both records are
     validated (``ValueError`` refuses the call), its tier comes from its
     origin (live ADVISORY, held LIBRARY) and the trigger cache is rebuilt.
     A lesson call refines only a lesson and a plain call only an earned row, so
@@ -224,34 +252,34 @@ async def store_procedure_checked(
     the owner reviews it. A trusted author of the same lesson therefore creates
     a live lesson of its own rather than refining the held one.
     """
-    trigger, patterns, dropped = normalize_tool_trigger(tool_trigger)
+    trigger, commands, dropped = normalize_tool_trigger(tool_trigger)
     held = False
     if lesson is not None:
         if not trigger:
             raise ValueError("a lesson needs at least one tool name in tool_trigger")
         spec = dict(trigger_spec or {})
-        authored = list(spec.get("patterns") or [])
-        spec["patterns"] = authored + [p for p in patterns if p not in authored]
+        authored = list(spec.get("commands") or [])
+        if commands or authored:
+            spec["commands"] = authored + [c for c in commands if c not in authored]
         try:
             trigger_spec = validate_trigger_spec(spec)
         except ValueError as exc:
-            derived = len(spec["patterns"]) - len(authored)
-            if derived:
+            derived = len(spec.get("commands") or []) - len(authored)
+            if derived and "commands" in str(exc):
                 raise ValueError(
-                    f"{exc} (counting {derived} pattern(s) derived from shell commands in tool_trigger)"
+                    f"{exc} (counting {derived} command(s) derived from tool_trigger)"
                 ) from exc
             raise
         lesson = validate_lesson(lesson)
         held = not is_live_lesson(lesson)
         activation_tier = "LIBRARY" if held else "ADVISORY"
-        patterns = []  # stored in the spec, so not a warning
+    spec_warnings: list[str] = []
+    if lesson is None and commands:
+        # An earned row named by shell commands fires on those commands only.
+        trigger_spec, trigger, spec_warnings = commands_spec(trigger, commands)
     trigger_warnings = (
         [f"tool_trigger values dropped as not tool names: {dropped}"] if dropped else []
-    )
-    if patterns:
-        # The command pattern is not stored yet, so the row fires on any Bash call
-        # its tags match, not only on the command it named.
-        trigger_warnings.append(f"shell commands stored as Bash; patterns not kept: {patterns}")
+    ) + spec_warnings
     # A lesson refines only a lesson, a plain teach only an earned row; the kind
     # is chosen in SQL so rows of the other kind cannot fill the limit.
     candidates = await procedural.list_by_task_type(
@@ -263,6 +291,19 @@ async def store_procedure_checked(
         # whatever the caller passed as its origin.
         candidates = [c for c in candidates if c.get("lesson") is None]
     matched, best_sim = _best_same_procedure_match(candidates, principle_embedding)
+
+    if matched is not None and lesson is not None:
+        prior = _stored_lesson(matched)
+        if prior.get("authored_via") == "shipped":
+            # The repository file is the source of truth; the next seed would
+            # silently revert an edit made here.
+            raise ValueError(
+                f"lesson {matched['id']} ships with the repository; edit its file in config/lessons/"
+            )
+        if prior.get("reviewed") is True and not held and lesson.get("authored_in") == "foreground":
+            # The owner's review survives an edit made in the foreground; a
+            # dispatched session's rewrite goes back to unreviewed.
+            lesson = {**lesson, "reviewed": True}
 
     if matched is not None:
         # Auto-extracted should never overwrite an explicit-teach of the SAME
@@ -302,17 +343,25 @@ async def store_procedure_checked(
         if principle_embedding is not None:
             update_fields["principle_embedding"] = principle_embedding
         # A refine with no usable trigger keeps the stored one. Writing None
-        # through took a live CORE row out of the trigger cache.
-        if trigger:
+        # through took a live CORE row out of the trigger cache, and command
+        # words kept as written name no tool, so they never replace one.
+        if names_a_tool(trigger):
             update_fields["tool_trigger"] = trigger
             try:
                 stored = json.loads(matched["tool_trigger"]) if matched.get("tool_trigger") else None
             except (ValueError, TypeError, RecursionError):
                 stored = None  # unreadable: the new trigger replaces it, as a change
-            if lesson is None and trigger != stored:
-                # An earned row's spec was written for its old trigger: drop it
-                # rather than gate new tools with a pattern meant for others.
+            if lesson is None and trigger_spec is not None:
+                update_fields["trigger_spec"] = trigger_spec  # the commands it now names
+            elif lesson is None and (trigger != stored or "Bash" in trigger):
+                # An earned row's spec was written for its old trigger, or the
+                # teach names Bash itself (every Bash call): drop the spec rather
+                # than gate the row with commands it no longer names.
                 update_fields["trigger_spec"] = None
+        elif trigger:
+            trigger_warnings.append(
+                f"stored trigger kept: {trigger} names no tool the advisor can match"
+            )
         elif tool_trigger == [] and draft == 0:
             # An explicit teach that passes an empty list means "no trigger".
             # Auto-extraction (draft=1) emitting [] keeps the stored one: an
@@ -339,7 +388,11 @@ async def store_procedure_checked(
         if lesson is not None:
             update_fields.update(trigger_spec=trigger_spec, lesson=lesson, activation_tier=activation_tier)
         await procedural.update(db, matched["id"], **update_fields)
-        rebuilt = await _regenerate_cache(db) if lesson is not None else None
+        # A lesson, or any refine of a cached earned row (its principle, steps
+        # and tags are cached too; tags are its patterns), must reach the
+        # advisor now, not at the promoter's next tier change.
+        earned_cached = lesson is None and matched.get("activation_tier") in ("CORE", "ADVISORY")
+        rebuilt = await _regenerate_cache(db) if lesson is not None or earned_cached else None
         logger.info(
             "Refined procedure %s (v%d, cosine=%.3f): %s",
             matched["id"], new_version, best_sim, task_type,
@@ -402,14 +455,14 @@ async def store_procedure_checked(
 
 
 async def _regenerate_cache(db: aiosqlite.Connection) -> bool:
-    """Rebuild the trigger cache after a lesson write; a failure is logged and returned."""
+    """Rebuild the trigger cache after a write it carries; a failure is logged and returned."""
     from genesis.learning.procedural.trigger_cache import regenerate
 
     try:
         await regenerate(db)
         return True
     except Exception:
-        logger.error("Trigger cache regeneration after a lesson write failed", exc_info=True)
+        logger.error("Trigger cache regeneration after a procedure write failed", exc_info=True)
         return False
 
 

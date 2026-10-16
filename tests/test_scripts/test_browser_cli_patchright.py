@@ -74,7 +74,14 @@ def test_open_copies_the_profile_for_the_package_that_launches(cli, monkeypatch)
 def test_open_without_genesis_makes_no_copy(cli, monkeypatch):
     monkeypatch.setattr(cli, "_installed", lambda dist: False)
     manager = _package(monkeypatch, "playwright")
+    # Both halves, or the import still succeeds: once any earlier test imported
+    # the submodule, ``from genesis.browser import profile_backup`` reads the
+    # package attribute and never consults sys.modules, and _prepare then probes
+    # the machine's real Chromium install.
+    import genesis.browser
+
     monkeypatch.setitem(sys.modules, "genesis.browser.profile_backup", None)
+    monkeypatch.delattr(genesis.browser, "profile_backup", raising=False)
     assert cli._open() is manager
 
 

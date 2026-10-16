@@ -164,6 +164,26 @@ async def test_more_invalid_files_are_reported(db, lessons, name, text):
     assert len(await _rows(db)) == 1
 
 
+async def test_a_re_seed_clears_a_spec_left_on_a_seed_row(tmp_path):
+    import aiosqlite
+
+    path = tmp_path / "genesis.db"
+    await seed.main(path)
+    seed_id = seed.SEED_PROCEDURES[0]["id"]
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            "UPDATE procedural_memory SET trigger_spec = ? WHERE id = ?",
+            (json.dumps({"patterns": [], "commands": ["ssh"], "repeat": "every"}), seed_id),
+        )
+        await db.commit()
+    await seed.main(path)  # restores the seed's trigger, so its spec must go too
+    async with aiosqlite.connect(path) as db:
+        rows = await db.execute_fetchall(
+            "SELECT trigger_spec FROM procedural_memory WHERE id = ?", (seed_id,)
+        )
+    assert rows[0][0] is None
+
+
 async def test_the_last_line_names_every_skipped_file(tmp_path, monkeypatch, capsys):
     async def two_errors(_db):
         return ["a.yaml: bad", "b.yaml: worse"]
@@ -211,3 +231,16 @@ async def test_an_unreadable_authored_at_is_replaced_so_the_lesson_stays_live(db
     await db.commit()
     await seed.seed_shipped_lessons(db, lessons)
     assert is_live_lesson((await _rows(db))[row_id]["lesson"])
+
+
+def test_the_agent_tool_guidance_lesson_matches_what_the_hook_did():
+    """The shipped lesson replaces the retired agent_tool_guidance hook: it
+    fires on a research prompt for Agent and Task, and not on other work."""
+    import re
+
+    lesson = seed._lesson_from_file(seed.LESSONS_DIR / "agent-tool-guidance.yaml")
+    assert set(lesson["tool_trigger"]) == {"Agent", "Task"}
+    (pattern,) = lesson["trigger_spec"]["patterns"]
+    assert re.search(pattern, "Research the codebase ARCHITECTURE of the memory module")
+    assert not re.search(pattern, "write a short poem about autumn")
+    assert lesson["trigger_spec"]["repeat"] == "session"

@@ -114,6 +114,10 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("src/genesis/channels/stt.py", "provider"): (1, "Groq STT call site"),
     ("src/genesis/deliberation/backends/fusion.py", "provider"): (1, "OpenRouter fusion call site"),
     ("src/genesis/eval/longmemeval/client.py", "provider"): (1, "OpenRouter eval client"),
+    ("src/genesis/eval/qualification/pinned.py", "provider"): (
+        3,
+        "frozen eval transport, doc cites",
+    ),
     ("src/genesis/mcp/discord_bot_mcp.py", "egress"): (1, "Discord API send; shadow-observed"),
     ("src/genesis/mcp/outreach_mcp.py", "egress"): (4, "Discord webhook polling"),
     ("src/genesis/memory/embeddings.py", "provider"): (2, "embedding provider calls"),
