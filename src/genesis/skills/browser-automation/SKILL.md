@@ -47,10 +47,11 @@ so after a failure take the layer from the call you made.
   accounts here.
 
 ### Layer 2: Chromium fallback
-- `browser_navigate(url, stealth=False)`. Playwright's Chromium, profile at
-  `~/.genesis/browser-profile/`, 1280x720 viewport.
-- For sites that break under Camoufox. No added delays, atomic fill, and plain
-  Playwright Chromium is easy for sites to detect.
+- `browser_navigate(url, stealth=False)`. patchright's Chromium (Playwright with
+  its automation signals hidden), profile at `~/.genesis/browser-profile/`; the
+  page follows the maximized window. Plain Playwright Chromium, which sites
+  detect easily, is used only where patchright is not installed (logged).
+- For sites that break under Camoufox. No added delays, atomic fill.
 
 ### Layer 3: Remote CDP (the user's Chrome)
 - `browser_navigate(url, remote=True)`, optional `cdp_url=`; default endpoint
@@ -164,7 +165,7 @@ All on genesis-health. The browser starts lazily on the first navigate.
 | `browser_click` | 60 s | returns `clicked`, `url`, `snapshot`, and `new_page` when a tab the click opened was seen within the click's wait; no `new_page` does not prove no tab opened (see "Tabs and popups") |
 | `browser_fill` | none overall; fails if one step (clearing, focusing, a keystroke) makes no progress for 30 s | see "Long text" |
 | `browser_upload` | 60 s | file must exist on the Genesis host, also for remote CDP |
-| `browser_run_js` | 60 s | expression is written to the log; never put a secret in it. On Camoufox it runs in an isolated world: DOM yes, page JavaScript globals no |
+| `browser_run_js` | 60 s | expression is written to the log; never put a secret in it. On Camoufox it runs in an isolated world: DOM yes, page JavaScript globals no; on Chromium it runs in the page's own world |
 | `browser_screenshot`, `browser_snapshot`, `browser_press_key` | 30 s | the snapshot read gives up at 15 s and returns `(snapshot timed out after 15s)` |
 | `browser_sessions`, `browser_clear_domain`, `browser_collaborate` | none | no browser launched |
 
@@ -198,14 +199,31 @@ single-label host such as `localhost`, or an IPv4 address, matches only itself.
 An IPv6 address is refused (anything containing `:` is), so its cookies
 cannot be cleared this way.
 
-**Not installed?** If `browser_navigate` returns `Browser not available` or
-`Camoufox is not ready: …`, the browser packages or the Camoufox engine are
-missing or broken on this install: tell the user, passing on the operator step
-the error names. Never run that step, `camoufox fetch` or `pip install` from
-inside a session; every session's MCP server shares the engine and the venv,
-and the engine download is far larger than a session's temp space. If the
+**Profile copies.** A different browser build upgrades a profile the first
+time it opens it, and the older build may then refuse it. So before the first
+launch on a new build, the profile is copied to
+`<profile>.pre-v<old version>-<time>` beside it (Camoufox:
+`~/.genesis/camoufox-profile`, Chromium: `~/.genesis/browser-profile`). Going
+back to the old build means restoring that copy with no browser open: an
+operator step, never one a session takes. The newest copy is kept, and the
+newest of each version for 90 days; older ones are deleted after 14 days.
+`scripts/browser.py` copies the Chromium profile the same way when Genesis is
+importable from where it runs; otherwise it prints a note and launches without a
+copy.
+
+**Not installed?** If `browser_navigate` returns `Browser not available`,
+`Camoufox is not ready: …` or `Chromium is not ready: …`, the browser packages,
+the Camoufox engine or the Chromium build are missing or broken on this
+install: tell the user, passing on the operator step the error names. Never run
+that step, `camoufox fetch`, `patchright install` or `pip install` from inside a
+session; every session's MCP server shares the engine and the venv, and the
+engine download is far larger than a session's temp space. Right after an
+update the download may still be running in `genesis-browser-stack.service`;
+the error then clears on its own. If the
 error says the browser packages changed after this session started, the fix
-is restarting the session, not reinstalling.
+is restarting the session, not reinstalling. The operator's one-step repair for
+the whole stack is `scripts/install_browser_stack.sh` (engine, Chromium and
+system libraries; it prints one `browser-stack:` outcome line).
 
 ## Verify after every action
 

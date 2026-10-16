@@ -58,6 +58,7 @@ if [ -f "$_SCRIPT_DIR/lib/alert_queue.sh" ]; then
     source "$_SCRIPT_DIR/lib/alert_queue.sh"
 else
     queue_alert() { :; }
+    alert_stable_key() { printf '%s:\n' "${1:-alert}"; }
 fi
 
 # ── Mutual exclusion (SF5): backup↔restore share one whole-run lock ──
@@ -256,10 +257,11 @@ _send_telegram() {
         -d "{\"chat_id\":\"${TELEGRAM_FORUM_CHAT_ID}\",\"text\":$(printf '%s' "$1" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"parse_mode\":\"Markdown\"}" \
         > /dev/null 2>&1 || {
         # Send failed (network/token) — don't lose the alert. Content-derived
-        # dedupe key so distinct backup alerts stay separate but identical
-        # repeats collapse to one queued entry.
+        # dedupe key, minus the per-run Time/Duration/SQLite lines, so distinct
+        # backup alerts stay separate while a repeated identical failure keeps
+        # one key and is delivered once per outreach dedup window.
         local _dkey
-        _dkey="backup:$(printf '%s' "$1" | md5sum 2>/dev/null | cut -c1-12)"
+        _dkey="$(alert_stable_key backup "$1")"
         log "WARNING: Telegram alert failed to send — queued for retry"
         queue_alert emergency "backup" "Backup alert (Telegram send failed)" "$1" "$_dkey"
     }

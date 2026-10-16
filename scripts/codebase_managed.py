@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Stage immutable, pinned Codebase configuration; diagnose without activation.
+"""Stage immutable Codebase settings and run its bounded native query service.
 
-This command does not render units, start providers, index repositories or remove
-the machine sentinel. Native runtime and lifecycle are separate integration steps.
+Configure does not activate providers, index repositories or remove the machine
+sentinel. Serve/ready are native unit entry points requiring persistent enablement.
 Configuration is published once. Native enablement owns operational state.
 """
 
@@ -14,16 +14,25 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
+import time
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from code_intel_cbm_admission import (  # noqa: E402
+    _host_available,
+    _working_charge,
+    number,
+    read_number,
+    resolve_cgroup,
+)
 from code_intel_cbm_worker import BUILD  # noqa: E402
 
 SCRIPT = Path(__file__).resolve()
@@ -131,7 +140,23 @@ def sentinel_armed(raw: str) -> bool:
     return True
 
 
+def validate_provider_paths(config: dict) -> None:
+    """The pinned POSIX provider folds backslashes before native storage use."""
+    for key in ("main", "cache"):
+        path = absolute(config[key])
+        physical = path.resolve()
+        # Python 3.13+ non-strict resolve leaves symlink loops unresolved.
+        # Let the kernel reject loops in both the literal and resolved paths;
+        # missing staging directories remain supported.
+        for candidate in (path, physical):
+            with suppress(FileNotFoundError):
+                candidate.stat()
+        if "\\" in str(path) or "\\" in str(physical):
+            raise ValueError(f"pinned provider does not support backslash in {key} paths")
+
+
 def native_env(config: dict) -> dict[str, str]:
+    validate_provider_paths(config)
     env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
     env.update(
         CBM_CACHE_DIR=config["cache"],
@@ -242,6 +267,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         sentinel=str(absolute(args.sentinel)),
     )
     validate_settings(config)
+    validate_provider_paths(config)
     with lifecycle_lock():
         if any(os.path.lexists(p) for p in (path, absolute(args.state), state)):
             raise ValueError("existing settings/state preserved; choose a fresh staging state")
@@ -302,17 +328,11 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
                 if key in ("version", "build", "enabled", *PATH_KEYS)
             }
             validate_settings(value)
-    except (OSError, ValueError) as error:
+            validate_provider_paths(value)
+    except (OSError, ValueError, RuntimeError) as error:
         result["settings_error"] = str(error)
     try:
-        systemd_spec = importlib.util.spec_from_file_location(
-            "_genesis_util_systemd",
-            Path(__file__).resolve().parent.parent / "src/genesis/util/systemd.py",
-        )
-        if systemd_spec is None or systemd_spec.loader is None:
-            raise ImportError("could not load systemd utilities")
-        systemd = importlib.util.module_from_spec(systemd_spec)
-        systemd_spec.loader.exec_module(systemd)
+        manager_env = systemctl_env()
         output = subprocess.check_output(
             [
                 "/usr/bin/systemctl",
@@ -333,12 +353,186 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
             text=True,
             timeout=30,
             stderr=subprocess.PIPE,
-            env=systemd.systemctl_env(),
+            env=manager_env,
         )
         result["service"] = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     except (ImportError, OSError, SyntaxError, subprocess.SubprocessError) as error:
         result["manager_error"] = str(error)
     return result
+
+
+def systemctl_env() -> dict[str, str]:
+    """The user-manager environment from src/genesis/util/systemd.py.
+
+    Loaded by path because this script runs isolated (-I). Without it a service
+    started with no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS cannot reach the
+    user manager, and every systemctl --user call fails.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_genesis_util_systemd",
+        Path(__file__).resolve().parent.parent / "src/genesis/util/systemd.py",
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load systemd utilities")
+    systemd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(systemd)
+    return systemd.systemctl_env()
+
+
+def show(unit: str, *properties: str, timeout: float = 30) -> dict[str, str]:
+    output = subprocess.check_output(
+        [
+            "/usr/bin/systemctl",
+            "--user",
+            "show",
+            unit,
+            *(arg for name in properties for arg in ("-p", name)),
+        ],
+        text=True,
+        timeout=timeout,
+        stderr=subprocess.PIPE,
+        env=systemctl_env(),
+    )
+    value = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    if any(name not in value for name in properties):
+        raise ValueError(f"manager omitted requested properties for {unit}")
+    return value
+
+
+def require_enabled(config: dict, *, timeout: float = 30) -> None:
+    if show(BACKEND, "UnitFileState", timeout=timeout)["UnitFileState"] != "enabled":
+        raise ValueError("managed query service must be persistently enabled")
+    if sentinel_armed(config["sentinel"]):
+        raise ValueError("managed Codebase sentinel is armed")
+
+
+def verify_query_boundary(pid: str, *, startup: bool = False) -> None:
+    leaf, root, version = resolve_cgroup(
+        Path(f"/proc/{pid}/cgroup"), Path(f"/proc/{pid}/mountinfo")
+    )
+    if version != 2 or leaf == root or leaf.name != BACKEND:
+        raise ValueError("managed daemon is outside its cgroup v2 service")
+    if (leaf / "memory.max").read_text().strip() != str(2 * 1024**3) or (
+        leaf / "memory.swap.max"
+    ).read_text().strip() != "0":
+        raise ValueError("managed daemon lacks exact memory/zero-swap cap")
+    cpu = (leaf / "cpu.max").read_text().split()
+    if len(cpu) != 2:
+        raise ValueError("managed daemon lacks an enforced CPU ceiling")
+    quota, period = (number(value, "cpu.max") for value in cpu)
+    if quota == 0 or period == 0 or quota > 2 * period:
+        raise ValueError("managed daemon exceeds the two-core CPU ceiling")
+    if number((leaf / "pids.max").read_text().strip(), "pids.max") > 128:
+        raise ValueError("managed daemon exceeds the 128-task ceiling")
+    cursor = leaf.parent
+    while cursor == root or root in cursor.parents:
+        try:
+            limit = (cursor / "memory.max").read_text().strip()
+        except FileNotFoundError:
+            if cursor != root:
+                raise
+            limit = "max"  # true cgroup filesystem root has no memory.max
+        if limit != "max" and number(limit, "ancestor memory.max") < 2 * 1024**3:
+            raise ValueError("ancestor cap is smaller than managed query budget")
+        if startup and limit != "max":
+            charge = _working_charge(
+                read_number(cursor / "memory.current"), cursor / "memory.stat", 2 * 1024**3, 2
+            )
+            # Admission includes this small staging process; do not subtract
+            # raw leaf usage from a cache-discounted ancestor charge. This is
+            # a startup snapshot, not a reservation or recurring RPC gate.
+            if number(limit, "ancestor memory.max") - charge < 2 * 1024**3:
+                raise ValueError("insufficient ancestor headroom for managed query budget")
+        if cursor == root:
+            break
+        cursor = cursor.parent
+    if startup and _host_available(Path("/proc/meminfo")) < 2 * 1024**3:
+        raise ValueError("insufficient host available memory for managed query budget")
+
+
+def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) -> str:
+    value = show(BACKEND, "ActiveState", "MainPID", timeout=timeout)
+    if value["ActiveState"] not in (("active", "activating") if starting else ("active",)):
+        raise ValueError("managed native daemon is unavailable")
+    pid = value["MainPID"]
+    if number(pid, "MainPID") == 0 or not os.path.samefile(f"/proc/{pid}/exe", config["binary"]):
+        raise ValueError("managed native daemon identity mismatch")
+    verify_query_boundary(pid)
+    return pid
+
+
+def ready(config: dict) -> None:
+    deadline = time.monotonic() + 120
+    native_deadline = None
+    require_enabled(config)
+
+    def manager_timeout() -> float:
+        remaining = (native_deadline or deadline) - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("managed native daemon readiness deadline expired")
+        return min(30, remaining)
+
+    with verified_binary(Path(config["binary"])) as executable:
+        while time.monotonic() < (native_deadline or deadline):
+            try:
+                pid = check_backend(config, starting=True, timeout=manager_timeout())
+                now = time.monotonic()
+                if native_deadline is None:
+                    native_deadline = min(deadline, now + 60)
+                remaining = native_deadline - now
+                if remaining <= 0:
+                    break
+                response = subprocess.run(
+                    [f"/proc/self/fd/{executable.fileno()}", "daemon", "status"],
+                    env=native_env(config),
+                    pass_fds=(executable.fileno(),),
+                    capture_output=True,
+                    text=True,
+                    timeout=remaining,
+                )
+                if (
+                    response.returncode == 0
+                    and "daemon: active (permanent)" in response.stdout
+                    and re.search(r"^  pid: " + re.escape(pid) + r"$", response.stdout, re.M)
+                    and "state: stopping" not in response.stdout
+                    and check_backend(config, starting=True, timeout=manager_timeout()) == pid
+                ):
+                    require_enabled(config, timeout=manager_timeout())
+                    if time.monotonic() < native_deadline:
+                        return
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass  # bounded startup polling; deadline is a terminal refusal
+            time.sleep(0.1)
+    raise ValueError("managed native daemon did not become ready")
+
+
+def serve(config: dict) -> None:
+    require_enabled(config)
+    verify_cache(config)
+    verify_query_boundary("self")
+    os.chdir(config["main"])
+    # No shared lifecycle lock here: enable will hold exclusive while it waits
+    # for ExecStartPost readiness. Native startup must not deadlock against it.
+    with verified_binary(Path(config["binary"])) as executable:
+        # The pinned local CLI repairs a dead endpoint generation. Internal
+        # daemon startup alone refuses stale sockets after a prior SIGKILL.
+        subprocess.run(
+            [f"/proc/self/fd/{executable.fileno()}", "config", "get", "auto_index"],
+            env=native_env(config),
+            pass_fds=(executable.fileno(),),
+            stdout=subprocess.DEVNULL,
+            check=True,
+            timeout=45,
+        )
+        require_enabled(config)
+        verify_cache(config)
+        verify_query_boundary("self", startup=True)
+        os.set_inheritable(executable.fileno(), True)
+        os.execve(  # noqa: S606 - accepted inode and fixed stock daemon argv
+            f"/proc/self/fd/{executable.fileno()}",
+            [config["binary"], "--cbm-daemon-internal", "--cbm-daemon-permanent"],
+            native_env(config),
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -349,6 +543,8 @@ def main(argv: list[str] | None = None) -> int:
     for key in ("main", "binary", "state", "sentinel"):
         setup.add_argument("--" + key, required=True)
     commands.add_parser("status")
+    commands.add_parser("serve")
+    commands.add_parser("ready")
     args = parser.parse_args(argv)
     raw = (
         args.config
@@ -369,8 +565,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "configure":
             configure(args, path)
-        else:
+        elif args.command == "status":
             print(json.dumps(status(path), indent=2))
+        else:
+            config = read_settings(path)
+            main = absolute(config["main"]).resolve(strict=True)
+            if main != SCRIPT.parent.parent or not (main / ".git").is_dir():
+                raise ValueError("managed runtime requires its configured primary checkout")
+            (serve if args.command == "serve" else ready)(config)
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
         print(f"managed Codebase refused: {error}", file=sys.stderr)

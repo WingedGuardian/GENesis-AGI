@@ -1375,10 +1375,9 @@ question. Anyone relaxing an option-count or uniqueness guard on the grounds tha
 failure is harmless is mis-pricing it by a severity level.
 
 Also measured: exactly **one** PreToolUse invocation per call, so an unconditional append
-cannot compound. And `procedure_advisor.py` (matcher `.*`) emits **nothing** for
-`AskUserQuestion`, so its `permissionDecision: "allow"` never meets another hook's
-`updatedInput` — verified by feeding it the payload directly, not inferred from the
-matcher.
+cannot compound. And `procedure_advisor.py` (matcher `.*`) never returns a
+`permissionDecision` at all (it emits advisory `additionalContext` only), so it cannot
+meet another hook's `updatedInput`.
 
 **The transcript is NOT a record of what the user saw.** It stores the tool call AS THE
 AGENT EMITTED IT — substitution is applied afterwards — so a transcript-read
