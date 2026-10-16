@@ -80,6 +80,34 @@ Optional pipeline and attempt-history keys remain available to refusal checks.
 Retained raw bodies use that same boundary again; diagnostic text does not
 receive schema-key trust.
 
+Production credential aliases remain hidden from SDK key selection during a
+completion. Their known values remain available to redaction for that scope;
+the temporary log factory also retains its entry snapshot for SDK logging threads.
+Both contexts restore their prior state on exit, including cancellation.
+
+External JSON is limited locally to 1 MiB of UTF-8 and 64 nested containers.
+These processing bounds are not provider limits or a promise that every remote
+response fits. The existing loader still rejects duplicate keys and nonfinite
+numbers. HTTPX still buffers the complete decoded response before this check;
+the 1 MiB bound limits normalization work, not transport memory or network reads.
+Decimal remains the financial authority. A single delimiter pass
+uses the standard JSON string scanner, so quotes inside strings cannot cause
+repeated suffix matching. Structured local records also have a depth safeguard.
+Existing JSON surrogate serialization remains unchanged.
+
+Malformed, oversized or overly nested response bodies retain the fixed
+`[REDACTED: unsafe evidence]` marker and an explicit error in the observation or
+receipt. Unusable body content, identity and charges are not invented. Safe
+independent response headers may still be retained. Journal publication must
+succeed; an uncertain write still poisons the writer. Refused evidence cannot
+qualify an answer or release its unresolved funded liability. Recovery never
+resends a completion. The opaque marker intentionally sacrifices malformed raw
+diagnostic detail to keep reversible escaped credentials out of the journal.
+Diagnostic text over 1,048,576 characters, malformed quoted spans and
+backslashes outside certified JSON string spans use the same opaque fallback.
+Decoded string values pass through that text boundary again, up to 64 layers;
+embedding escaped text inside another JSON string does not make it trusted.
+
 `reconcile(journal, attempt, ...)` only performs GET generation lookup. It
 rejects error-bearing envelopes, checks frozen model/provider identity and appends the exact receipt to the
 journal. Costs must agree and remain within the funded maximum. Invalid or

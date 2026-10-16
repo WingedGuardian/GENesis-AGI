@@ -2655,7 +2655,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: a95ae76ce923 2026-10-15
+verified: 8b445d636b26 2026-10-16
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2829,6 +2829,12 @@ verified: a95ae76ce923 2026-10-15
   admit more than reported or exact limit-minus-spend headroom supports. Local
   client setup precedes durable dispatch; recovery metadata uses the shared JSON
   authority before redaction, and diagnostic formatting cannot interrupt calls.
+  External JSON has explicit local byte/depth bounds and a shared forward string
+  scanner. Unsafe response/receipt bodies retain opaque error evidence; decoded
+  strings stay untrusted through bounded nested JSON redaction. Refusals preserve
+  unresolved funding and never resend a completion.
+  Credential lending preserves known redaction values while keeping production
+  aliases hidden from the SDK, including log calls on SDK threads.
   These checks do not
   establish provider spend bounds or owner approval. The isolated runner remains
   a later replacement. This verification refresh covers the qualification slice;

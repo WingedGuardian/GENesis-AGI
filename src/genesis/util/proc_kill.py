@@ -26,6 +26,7 @@ import contextlib
 import logging
 import os
 import signal
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,11 @@ async def reap_bounded(proc, timeout_s: float | None = None) -> None:
 
 
 async def confirm_process_exit(
-    proc, *, graceful: bool = False, escalation_grace_s: float = 0.0
+    proc,
+    *,
+    graceful: bool = False,
+    escalation_grace_s: float = 0.0,
+    confirm_timeout_s: float | None = None,
 ) -> None:
     """Opt-in strong drain: refusals are unknown, never proof of group exit.
 
@@ -117,7 +122,14 @@ async def confirm_process_exit(
     result): it first gets the ordinary bounded reap, and a surviving group
     gets ``escalation_grace_s`` to flush, before the group kill and the
     confirmation that follows it.
+
+    Absence is confirmed for at most ``confirm_timeout_s`` after the group kill
+    (``None`` resolves ``DEFAULT_REAP_TIMEOUT_S`` at call time, the same bound
+    as the ordinary reap). Past it the group is reported as uncertain rather
+    than watched forever; the caller keeps holding what it owns either way.
     """
+    if confirm_timeout_s is None:
+        confirm_timeout_s = DEFAULT_REAP_TIMEOUT_S
 
     async def drain():
         if graceful:
@@ -126,6 +138,8 @@ async def confirm_process_exit(
                 await asyncio.sleep(escalation_grace_s)
         with contextlib.suppress(OSError):
             kill_process_group(proc)
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + confirm_timeout_s
         while True:
             gone = False
             pgid = getattr(proc, "pid", None)
@@ -138,6 +152,8 @@ async def confirm_process_exit(
                     pass  # Includes PermissionError: liveness remains unknown.
             if gone and proc.returncode is not None:
                 return
+            if loop.time() >= give_up:
+                raise TimeoutError("process group absence unconfirmed")
             await asyncio.sleep(0.1)
 
     cleanup = asyncio.create_task(drain())
@@ -154,6 +170,31 @@ async def confirm_process_exit(
     cleanup.result()
     if interrupted:
         raise asyncio.CancelledError
+
+
+def _raised_by_popen(exc: BaseException) -> bool:
+    """True when ``exc`` left ``subprocess.Popen`` construction with no child.
+
+    Judged from the Popen object being constructed, not from where it raised:
+    either no child was created (``pid`` is still None: a stdio pipe, error
+    pipe, fork or posix_spawn failure) or CPython reaped it (``returncode``
+    set: an exec failure reported through the error pipe). Any other raise,
+    such as an error-pipe read failing after the fork, leaves a child that may
+    still be running. Relies on CPython 3.12's Popen internals; if they change,
+    the check fails toward uncertain. One double fault (a fork that succeeds,
+    then a non-OSError before ``pid`` is assigned, then an OSError closing the
+    error pipe) would read as no child; it is not handled.
+    """
+    if not isinstance(exc, OSError):
+        return False
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        popen = frame.f_locals.get("self")
+        if frame.f_code.co_name == "__init__" and isinstance(popen, subprocess.Popen):
+            return popen.pid is None or popen.returncode is not None
+        tb = tb.tb_next
+    return False
 
 
 async def spawn_owned(*args, **kwargs):
@@ -173,7 +214,15 @@ async def spawn_owned(*args, **kwargs):
         if launch.cancelled():
             raise ProcessCleanupUncertain("Process creation is unconfirmed")
         proc = launch.result()
-    except Exception:
+    except Exception as exc:
+        if _raised_by_popen(exc):
+            # Popen failed with no child left (never forked, or exec failed
+            # and CPython reaped it), so nothing is left to own. An ordinary
+            # failure, not an uncertain one. A cancel received meanwhile
+            # still ends the caller as cancelled.
+            if interrupted:
+                raise asyncio.CancelledError from exc
+            raise
         # CPython may raise while connecting pipes AFTER Popen starts a child;
         # its transport closes only the leader. No handle means no proof that
         # startup descendants exited, including when the caller was cancelled.

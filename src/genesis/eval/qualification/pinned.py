@@ -15,6 +15,7 @@ import re
 import sys
 import traceback
 from contextlib import contextmanager
+from contextvars import ContextVar
 from decimal import Decimal, DecimalException
 from pathlib import Path
 
@@ -51,26 +52,63 @@ class LocalFailure(Incomplete):
     """Harness failure, not a candidate verdict."""
 
 
-def _literal_text(value: str) -> str:
-    """Redact environment credentials, including overlapping prefixes."""
-    secrets = {
+_SCOPED_SECRETS = ContextVar("qualification_redaction_secrets", default=frozenset())
+
+
+def _redaction_values() -> frozenset[str]:
+    """Retain known credentials while their SDK aliases are temporarily hidden."""
+    return _SCOPED_SECRETS.get() | {
         value
         for name, value in os.environ.items()
         if value
         and (name == KEY_ENV or len(value) >= 8)
         and any(word in name.upper() for word in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
     }
-    for secret in sorted(secrets, key=len, reverse=True):
+
+
+def _literal_text(value: str) -> str:
+    """Redact known credentials, including overlapping prefixes."""
+    for secret in sorted(_redaction_values(), key=len, reverse=True):
         value = value.replace(secret, "[REDACTED]")
     return value
 
 
-def _json_document(value: str) -> bool:
-    """True for a JSON object/array: outside its strings are only numbers and literals."""
+# Local processing bounds, not provider limits or billing precision.
+MAX_EVIDENCE_BYTES = 1024 * 1024
+MAX_EVIDENCE_DEPTH = 64
+OPAQUE_EVIDENCE = "[REDACTED: unsafe evidence]"
+_JSON_PARTS = re.compile(r'["{}\[\]]')
+
+
+def _json_parts(value):
+    """Scan delimiters once; the stdlib consumes disjoint JSON string spans."""
+    end = 0
+    for match in _JSON_PARTS.finditer(value):
+        if match.start() < end:
+            continue
+        decoded, end = None, match.end()
+        if match.group() == '"':
+            decoded, end = json.decoder.scanstring(value, end)
+        yield match, end, decoded
+
+
+def external_json(value):
+    """Bound external parsing; the existing loader still decides JSON validity."""
     try:
-        return isinstance(json.loads(value), (dict, list))
-    except (ValueError, RecursionError):
-        return False
+        if len(value) > MAX_EVIDENCE_BYTES:
+            raise ValueError
+        text = value.decode("utf-8") if isinstance(value, bytes) else value
+        if len(text.encode("utf-8")) > MAX_EVIDENCE_BYTES:
+            raise ValueError
+        depth = 0
+        for match, _, _ in _json_parts(text):
+            token = match.group()
+            depth += (token in ("{", "[")) - (token in ("}", "]"))
+            if depth > MAX_EVIDENCE_DEPTH:
+                raise ValueError
+        return load_json(text)
+    except (ValueError, UnicodeError, TypeError, RecursionError):
+        raise LocalFailure("invalid or excessive external JSON") from None
 
 
 _WIRE_FIELDS = frozenset({
@@ -84,27 +122,43 @@ _WIRE_FIELDS = frozenset({
 _KEY_COLON = re.compile(r"\s*:")
 
 
-def safe_text(value: str, *, schema_keys: frozenset[str] = frozenset()) -> str:
+def safe_text(value: str, *, schema_keys: frozenset[str] = frozenset(), _depth=0) -> str:
     """Redact literal and JSON-escaped credentials in arbitrary diagnostic text.
 
     A JSON object/array is redacted only inside its string tokens, so a numeric
     lexeme that happens to contain a credential's digits stays valid JSON.
     Other text also gets a final literal pass over everything.
     """
-    document = _json_document(value)
+    if len(value) > MAX_EVIDENCE_BYTES or _depth > MAX_EVIDENCE_DEPTH:
+        return OPAQUE_EVIDENCE
+    try:
+        return _redacted_text(value, schema_keys, _depth)
+    except (ValueError, RecursionError):
+        return OPAQUE_EVIDENCE
 
-    def redact(match):
-        token = match.group()
-        try:
-            decoded = json.loads(token)
-        except ValueError:
-            return _literal_text(token)
-        if document and decoded in schema_keys and _KEY_COLON.match(value, match.end()):
-            return token  # Fixed public wire schema, never an untrusted value.
-        redacted = _literal_text(decoded)
-        return json.dumps(redacted) if redacted != decoded else token
 
-    strings = re.sub(r'"(?:[^"\\]|\\.)*"', redact, value)
+def _redacted_text(value, schema_keys, depth):
+    """Certify string spans without reserializing numeric wire lexemes."""
+    try:
+        document = isinstance(external_json(value), (dict, list))
+    except LocalFailure:
+        document = False
+    pieces, end = [], 0
+    for match, token_end, decoded in _json_parts(value):
+        if decoded is None:
+            continue
+        prefix, token = value[end:match.start()], value[match.start():token_end]
+        if "\\" in prefix:
+            return OPAQUE_EVIDENCE
+        trusted = document and decoded in schema_keys and _KEY_COLON.match(value, token_end)
+        # Decoded values remain untrusted text, including another JSON layer.
+        # The final literal pass keeps numeric text inside values untrusted.
+        redacted = decoded if trusted else _literal_text(safe_text(decoded, _depth=depth + 1))
+        pieces.extend((prefix, json.dumps(redacted) if redacted != decoded else token))
+        end = token_end
+    if "\\" in value[end:]:
+        return OPAQUE_EVIDENCE
+    strings = "".join((*pieces, value[end:]))
     return strings if document else _literal_text(strings)
 
 
@@ -130,39 +184,43 @@ def failure_message(error: BaseException) -> str:
     return message if message.strip() else exception_name(error)
 
 
-def _safe_value(value):
+def _safe_value(value, depth=0):
     """Redact untrusted values, including arbitrary nested dictionary keys."""
+    if depth > 2 * MAX_EVIDENCE_DEPTH:
+        raise LocalFailure("evidence nesting exceeds the processing bound")
     if isinstance(value, str):
         return safe_text(value)
     if isinstance(value, dict):
-        return {safe_text(key): _safe_value(item) for key, item in value.items()}
+        return {safe_text(key): _safe_value(item, depth + 1) for key, item in value.items()}
     if isinstance(value, list):
-        return [_safe_value(item) for item in value]
+        return [_safe_value(item, depth + 1) for item in value]
     return value
 
 
-def safe_evidence(value: dict) -> dict:
+def safe_evidence(value: dict, depth=0) -> dict:
     """Redact a locally constructed evidence record without renaming its schema.
 
     Usage, selected response headers and already-sanitized association are
     nested schema records.
     Their field values, and other arbitrary structured values, stay untrusted.
     """
+    if depth > 2 * MAX_EVIDENCE_DEPTH:
+        raise LocalFailure("evidence nesting exceeds the processing bound")
     result = {}
     for key, item in value.items():
         if key == "raw_body" and isinstance(item, str):
             result[key] = safe_text(item, schema_keys=_WIRE_FIELDS)
         elif key in ("usage", "association", "response_headers") and isinstance(item, dict):
-            result[key] = safe_evidence(item)
+            result[key] = safe_evidence(item, depth + 1)
         else:
-            result[key] = _safe_value(item)
+            result[key] = _safe_value(item, depth + 1)
     return result
 
 
 def safe_association(value):
     """Keep association schema names; redact all extra operator-supplied keys."""
     try:
-        value = load_json(canonical(value))
+        value = external_json(canonical(value))
     except (ValueError, TypeError, RecursionError, OverflowError):
         raise LocalFailure("association must be finite serializable JSON") from None
     if not isinstance(value, dict):
@@ -197,7 +255,11 @@ def safe_money_evidence(value: dict, money: dict[tuple, str]) -> dict:
 
 def safe_body(data: bytes) -> str:
     """Redact decoded JSON strings while leaving numeric lexemes untouched."""
-    return safe_text(data.decode("utf-8", errors="replace"), schema_keys=_WIRE_FIELDS)
+    try:
+        external_json(data)
+        return safe_text(data.decode("utf-8"), schema_keys=_WIRE_FIELDS)
+    except LocalFailure:
+        return OPAQUE_EVIDENCE
 
 
 def fixed_currency(value: Decimal) -> str:
@@ -220,7 +282,7 @@ def financial_json(raw: bytes, paths: tuple[tuple[str, ...], ...]) -> dict:
     Its floats are never used to calculate or normalize a financial field.
     """
     try:
-        result = load_json(raw)
+        result = external_json(raw)
         exact = json.loads(raw, parse_float=Decimal, parse_int=Decimal)
         if not isinstance(result, dict):
             raise LocalFailure("provider JSON must be an object")
@@ -256,7 +318,7 @@ def _selected_routes(raw):
 def _route_facts(observation):
     """Derive identity from retained bytes; no acknowledgement changes these facts."""
     try:
-        raw = load_json(observation["raw_body"])
+        raw = external_json(observation["raw_body"])
         if not isinstance(raw, dict):
             raise LocalFailure("routing response is not an object")
     except (KeyError, ValueError, UnicodeError, TypeError) as exc:
@@ -432,7 +494,7 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
             self.error = failure_message(exc)
             # Preserve valid identity/content even when cost is absent or invalid.
             try:
-                raw = load_json(data)
+                raw = external_json(data)
             except (ValueError, UnicodeError):
                 raw = {}
         raw = raw if isinstance(raw, dict) else {}
@@ -473,8 +535,17 @@ class ObservedHTTPHandler(AsyncHTTPHandler):
 def private_logs():
     """Redact log records and suppress normal SDK verbosity; restore both."""
     original = logging.getLogRecordFactory()
+    # Log calls can originate on SDK threads without the caller's context.
+    secrets = _redaction_values()
 
     def redacted(*args, **kwargs):
+        token = _SCOPED_SECRETS.set(_redaction_values() | secrets)
+        try:
+            return render(*args, **kwargs)
+        finally:
+            _SCOPED_SECRETS.reset(token)
+
+    def render(*args, **kwargs):
         record = original(*args, **kwargs)
         try:
             record.msg = safe_text(record.getMessage())
@@ -548,9 +619,12 @@ def production_credentials() -> set[str]:
 @contextmanager
 def scoped_credential(key: str):
     """The delegate reads its key from the environment; lend it the dedicated one."""
-    saved = {name: os.environ.pop(name, None) for name in PRODUCTION_KEY_NAMES}
-    os.environ["OPENROUTER_API_KEY"] = key
+    saved = {name: os.environ.get(name) for name in PRODUCTION_KEY_NAMES}
+    token = _SCOPED_SECRETS.set(_redaction_values())
     try:
+        for name in PRODUCTION_KEY_NAMES:
+            os.environ.pop(name, None)
+        os.environ["OPENROUTER_API_KEY"] = key
         yield
     finally:
         for name, value in saved.items():
@@ -558,6 +632,7 @@ def scoped_credential(key: str):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+        _SCOPED_SECRETS.reset(token)
 
 
 def _budget_paths(raw: bytes) -> tuple[tuple, ...]:
@@ -568,7 +643,7 @@ def _budget_paths(raw: bytes) -> tuple[tuple, ...]:
     Absent fields add nothing; any present, malformed one refuses.
     """
     try:
-        data = load_json(raw)["data"]
+        data = external_json(raw)["data"]
     except (ValueError, UnicodeError, KeyError, TypeError):
         return ()  # financial_json reports the malformed envelope itself
     if not isinstance(data, dict):
