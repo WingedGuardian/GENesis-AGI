@@ -119,9 +119,10 @@ maximum of zero), with the reply head in `status.message`. Unsupported list
 filters are explicitly refused; no silently ignored filter. Terminal reply
 messages are always summaries of native metadata, never labeled full results.
 
-Full result fetch checks the derived UUID artifact, file type, symlinks, UTF-8
-and a 2 MiB disclosure limit. Missing/partial/uncommitted/oversized artifacts are
-explicitly unavailable; a truncated metadata head is never returned as full.
+Full result fetch checks the derived UUID artifact, file type, symlinks, UTF-8,
+a 2 MiB disclosure limit and the SHA-256 committed at finalization.
+Missing/partial/uncommitted/oversized or rewritten artifacts are explicitly
+unavailable; a truncated metadata head is never returned as full.
 Whole result and summary disclosure use bounded credential/path scanning,
 including decoded and embedded JSON. Malformed plausible JSON and compound JSON
 mapping keys may be refused. This is the existing deterministic pattern policy,

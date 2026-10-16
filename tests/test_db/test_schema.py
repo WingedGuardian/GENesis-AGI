@@ -164,10 +164,6 @@ async def test_no_unexpected_tables(db):
         "entity_mentions",
         "entity_links",  # entity layer (WS-H P2)
         "entity_merge_journal",  # reversibility snapshot for applied merges (approval gate)
-        "peer_settings",
-        "peers",
-        "peer_grants",
-        "peer_outbox",
         "job_run_events",
         "alert_events",  # WS-2 sensor fabric (M9/M10)
         "memory_consistency_reports",
@@ -182,6 +178,7 @@ async def test_no_unexpected_tables(db):
         "peer_settings",  # peer registry: install-wide peer mode (one row)
         "peers",  # peer registry: admitted peers
         "peer_grants",  # peer registry: per-peer grants
+        "peer_outbox",  # retained collection and reply anchors
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"
