@@ -100,6 +100,7 @@ def _no_real_claude_login(tmp_path, monkeypatch):
 
     from genesis.cc import login_health
 
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     absent = tmp_path / "no-claude-home" / ".claude"
 
     def credentials_path() -> Path:
