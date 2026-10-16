@@ -8,7 +8,8 @@
   session directory and never walks the tree.
 - ``review <id>``: the owner's approval. A lesson held for review (written
   deprecated with ``HELD_REASON``) becomes live; a live, unreviewed lesson loses
-  its label. It is the only path that revives a held lesson.
+  its label. It is the only path that revives a held lesson, and a dispatched
+  session or one of external origin is refused it.
 - ``deprecate <id> --reason R``: takes a lesson out of service; for a held one it
   is the rejection. A shipped lesson stays deprecated across seeds.
 
@@ -258,11 +259,34 @@ def _comparable(blob) -> bool:
     return vec is not None and all(math.isfinite(x) for x in vec) and any(vec)
 
 
+def _unattended() -> str | None:
+    """Why this session may not approve a lesson, or None when it may.
+
+    Approval is the owner's act: a dispatched (unsupervised) session, or one of
+    external origin, could be steered by the very text a held lesson carries.
+    A foreground session the owner works through, or a terminal, may approve.
+    """
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, session_origin_from_env
+    from genesis.security.immunity_shadow import DispatchGateRefused, guard_human_gate
+
+    try:
+        guard_human_gate("lesson_review")
+    except DispatchGateRefused:
+        return "a dispatched session cannot approve a lesson; run review from a foreground session or a terminal"
+    if session_origin_from_env() == ORIGIN_EXTERNAL_UNTRUSTED:
+        return "a session of external origin cannot approve a lesson"
+    return None
+
+
 async def _review(args) -> int:
     from genesis.db.crud import procedural
     from genesis.learning.procedural.lesson_shape import HELD_REASON, is_live_lesson
     from genesis.learning.procedural.operations import _best_same_procedure_match
 
+    refusal = _unattended()
+    if refusal:
+        print(f"refused: {refusal}")
+        return REFUSED
     db = await _connect(write=True)
     try:
         # Hold the write lock for the whole review: what is checked here (the

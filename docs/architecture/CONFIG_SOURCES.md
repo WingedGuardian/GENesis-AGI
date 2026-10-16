@@ -33,10 +33,14 @@ lives in, never the CWD. Gitignored; seeded from `secrets.env.example`.
 | `genesis-bridge` (legacy fallback) | no `EnvironmentFile=`; runtime `load_dotenv(override=True)` | file wins |
 | MCP children (`scripts/genesis_mcp_server.py`) | `main()` copies an **allowlist** (`_MCP_VARS`) and only for keys NOT already in the env; then the health/memory/outreach/recon lifespans call `create_standalone_router()`, whose builder runs `load_dotenv(override=True)` on the **whole** file (`src/genesis/routing/standalone.py`) | net effect: **file wins, whole file** (discord-bot: allowlist only) — EXCEPT values read at module import, before either load: the database path (`_DEFAULT_DB` via `genesis_db_path()`) is fixed then, so a `GENESIS_DB_PATH` that exists only in `secrets.env` never reaches the MCP servers of a foreground session (an MCP child of a server-dispatched session inherits it from the server's environment) |
 | Dispatched CC sessions | `CCInvoker._build_env` (`src/genesis/cc/invoker.py`) copies the server's `os.environ` | inherit the server's snapshot |
-| CC hooks (`proactive_memory_hook.py`, `genesis_session_context.py`, `genesis_urgent_alerts.py`) | `load_dotenv(<main checkout>/secrets.env)`, default `override=False`; path hardcoded, ignores `SECRETS_PATH` | **inherited env wins** |
+| CC hooks (`proactive_memory_hook.py`, `genesis_session_context.py`, `genesis_urgent_alerts.py`) and `scripts/gmodel` | at import, before `genesis` is importable: `load_dotenv($SECRETS_PATH or <their own checkout>/secrets.env)`, default `override=False` | **inherited env wins** |
+| `eval` harnesses (`reflection_golden_set`, `longmemeval.client`) | `secrets_path()`, then `~/genesis/secrets.env` as a worktree fallback that is skipped when `SECRETS_PATH` is set; `os.environ.setdefault` | inherited env wins |
 | One-off scripts (`reindex_fts_to_qdrant`, `backfill_session_memories`, `migrate_reference_data`, `mine_references_from_history`, `eval` CLI) | `load_dotenv(override=True)` | file wins |
 | `wing_backfill`, `wing_payload_resync`, `ambient_replay` | `load_dotenv(...)`, default | inherited env wins |
 | Shell (`backup.sh`, `restore.sh`) | `scripts/lib/load_secrets.sh` — literal, never expanded or executed | exported |
+| Guardian credential bridge (`credential_bridge.py`, awareness tick) | reads `secrets_path()` by name to propagate the Telegram, provisioning and backup credentials to the shared mount | not loaded into the env |
+| Credential-integrity check (`guardian/cred_integrity.py`, `cred_selfheal.py`) | `$HOME/genesis/secrets.env`, home-relative **by design** (the targets are shared with the host Guardian); isolate it with `HOME` / `--home`, not `SECRETS_PATH` | not loaded into the env |
+| `scripts/disk_hygiene.sh` store knobs (`_load_store_knob`) | the checkout's `secrets.env` by name; only the browser settings follow `SECRETS_PATH` | exported to that run |
 | `python -m genesis.db.migrations --apply` (update path) | does **not** load it (see `db/migrations/0086_seed_timezone_config.py` docstring) | — |
 | Host guardian | its own file: `GUARDIAN_SECRETS` (`src/genesis/guardian/config.py`) | separate |
 
