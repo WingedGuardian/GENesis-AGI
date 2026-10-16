@@ -1,6 +1,7 @@
 """Receipt admission and disclosure through real disposable SQLite and Flask."""
 
 import asyncio
+import hashlib
 import json
 import secrets
 import threading
@@ -650,13 +651,110 @@ async def test_host_bootstrap_records_peer_binding_readiness(bridge, monkeypatch
     write.assert_called_once_with(bridge.runtime)
 
 
+async def test_a_rewritten_result_file_is_not_served(bridge):
+    row = await settle(bridge, await bridge.service.send(bridge.identities["alpha"], incoming()))
+    assert full_result(row) == "A considered reply"
+    path = bridge.home / ".genesis/output" / f"bg-session-{row['id']}.md"
+    path.write_text("A later session's replacement")  # same path, same file type
+    with pytest.raises(ConversationRefusal, match="result_unavailable"):
+        full_result(row)
+    meta = json.loads(row["metadata"])
+    del meta["result_sha256"]  # a receipt without a committed digest
+    row["metadata"] = json.dumps(meta)
+    path.write_text("A considered reply")
+    with pytest.raises(ConversationRefusal, match="result_unavailable"):
+        full_result(row)
+    meta["result_sha256"] = "é" * 64  # corrupted metadata fails closed, not 500
+    row["metadata"] = json.dumps(meta)
+    with pytest.raises(ConversationRefusal, match="result_unavailable"):
+        full_result(row)
+
+
+@pytest.mark.parametrize("second_service", [False, True])
+async def test_a_retry_in_admission_shares_its_claim(bridge, monkeypatch, second_service):
+    entered, release = [], asyncio.Event()
+
+    class SlowAssembler:
+        async def assemble(self, **kwargs):
+            entered.append(True)
+            await release.wait()
+            return "Synthetic identity"
+
+    monkeypatch.setattr("genesis.peers.conversation.SystemPromptAssembler", SlowAssembler)
+    identity, payload = bridge.identities["alpha"], message()
+    other = (
+        ConversationService(bridge.registry, bridge.runtime) if second_service else bridge.service
+    )
+    sends = [
+        asyncio.create_task((other if index % 2 else bridge.service).send(identity, incoming(p)))
+        for index, p in enumerate((*([payload] * 12), message()))
+    ]
+    for _ in range(100):
+        if len(entered) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)
+    assert len(entered) == 2 and not any(send.done() for send in sends)
+    release.set()
+    rows = [await send for send in sends]
+    assert len({row["id"] for row in rows[:12]}) == 1
+    assert rows[0]["id"] != rows[-1]["id"]
+    for row in (rows[0], rows[-1]):
+        await settle(bridge, row)
+    assert bridge.service._enriching == {}
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_failed_identity_work_releases_admission_claim(bridge, monkeypatch, failure):
+    class BrokenAssembler:
+        async def assemble(self, **kwargs):
+            raise failure("Synthetic failure")
+
+    monkeypatch.setattr("genesis.peers.conversation.SystemPromptAssembler", BrokenAssembler)
+    with pytest.raises(failure):
+        await bridge.service.send(bridge.identities["alpha"], incoming())
+    assert bridge.runner._peer_admissions == {}
+    assert bridge.runner._active == {}
+    bridge.invoker.run_streaming.assert_not_awaited()
+
+
+@pytest.mark.parametrize("peer", ["alpha", "beta"])
+async def test_a_send_burst_does_identity_work_only_within_capacity(bridge, monkeypatch, peer):
+    entered, release = [], asyncio.Event()
+
+    class SlowAssembler:
+        async def assemble(self, **kwargs):
+            entered.append(True)
+            await release.wait()
+            return "Synthetic identity"
+
+    monkeypatch.setattr("genesis.peers.conversation.SystemPromptAssembler", SlowAssembler)
+    identities = [bridge.identities["alpha"], bridge.identities[peer], bridge.identities["alpha"]]
+    sends = [asyncio.create_task(bridge.service.send(i, incoming())) for i in identities]
+    # Preflights interleave, so which send is refused is not fixed.
+    done, _ = await asyncio.wait(sends, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+    (refused,) = done
+    with pytest.raises(ConversationRefusal, match="rate_limited"):
+        await refused
+    assert len(entered) == 2
+    release.set()
+    for send in sends:
+        if send is not refused:
+            task = bridge.runner._active.get((await send)["id"])
+            if task:
+                await asyncio.wait_for(asyncio.shield(task), 3)
+    assert bridge.service._enriching == {}
+
+
 async def test_missing_partial_symlink_and_whole_result_scan(bridge):
     row = await settle(bridge, await bridge.service.send(bridge.identities["alpha"], incoming()))
     path = bridge.home / ".genesis/output" / f"bg-session-{row['id']}.md"
     path.write_text("benign prefix\n" + json.dumps({"password": "syntheticcredential"}))
+    meta = json.loads(row["metadata"])
+    meta["result_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()  # as committed
+    row["metadata"] = json.dumps(meta)
     with pytest.raises(ConversationRefusal, match="disclosure_refused"):
         full_result(row)
-    meta = json.loads(row["metadata"])
     meta["output_text"] = path.read_text()
     row["metadata"] = json.dumps(meta)
     assert "message" not in project(row)["status"]

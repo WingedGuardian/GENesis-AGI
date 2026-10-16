@@ -1,5 +1,6 @@
 """Owned result projection; never return raw metadata or a stored file path."""
 
+import hashlib
 import os
 import stat
 from pathlib import Path
@@ -41,6 +42,10 @@ def full_result(row):
             raw = file.read(MAX_RESULT + 1)
             if len(raw) > MAX_RESULT:
                 raise ValueError
+        # Only the bytes finalization committed are served: a later session
+        # may have rewritten the file in its shared output directory.
+        if hashlib.sha256(raw).hexdigest() != meta.get("result_sha256"):
+            raise ValueError
         text = raw.decode("utf-8")
     except (OSError, ValueError):
         # The saved metadata head is deliberately lossy; never label it full.

@@ -274,6 +274,11 @@ async def _finalize(runner, request, result, state):
                     "native_state": state,
                     "result_committed": committed,
                     "result_path": str(path) if committed else None,
+                    # Readers verify the file against this: later sessions can
+                    # write in the same output directory.
+                    "result_sha256": hashlib.sha256(result.output_text.encode("utf-8")).hexdigest()
+                    if committed
+                    else None,
                     "stream_lines_dropped": result.stream_lines_dropped,
                     "result_partial": result.partial,
                     # Written with the terminal state, so a restart before

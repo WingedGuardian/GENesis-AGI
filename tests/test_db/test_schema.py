@@ -164,9 +164,6 @@ async def test_no_unexpected_tables(db):
         "entity_mentions",
         "entity_links",  # entity layer (WS-H P2)
         "entity_merge_journal",  # reversibility snapshot for applied merges (approval gate)
-        "peer_settings",
-        "peers",
-        "peer_grants",
         "job_run_events",
         "alert_events",  # WS-2 sensor fabric (M9/M10)
         "memory_consistency_reports",
