@@ -721,10 +721,13 @@ async def test_failed_identity_work_releases_admission_claim(bridge, monkeypatch
 @pytest.mark.parametrize("peer", ["alpha", "beta"])
 async def test_a_send_burst_does_identity_work_only_within_capacity(bridge, monkeypatch, peer):
     entered, release = [], asyncio.Event()
+    both_entered = asyncio.Event()
 
     class SlowAssembler:
         async def assemble(self, **kwargs):
             entered.append(True)
+            if len(entered) == 2:
+                both_entered.set()
             await release.wait()
             return "Synthetic identity"
 
@@ -736,6 +739,9 @@ async def test_a_send_burst_does_identity_work_only_within_capacity(bridge, monk
     (refused,) = done
     with pytest.raises(ConversationRefusal, match="rate_limited"):
         await refused
+    # A refused send may finish while another admitted send is still awaiting
+    # its preflight or autonomy lookup. Wait for both actual assembly entries.
+    await asyncio.wait_for(both_entered.wait(), 5)
     assert len(entered) == 2
     release.set()
     for send in sends:
