@@ -117,8 +117,19 @@ class StandaloneAdapter:
             warning = await configuration_warning(PeerRegistry(), app=self._app)
             if warning:
                 logger.warning(warning)
+            self._runtime._bootstrap_manifest["agent_api"] = (
+                "degraded"
+                if warning
+                or self._runtime._direct_session_runner is None
+                or "agent_api" not in self._app.blueprints
+                else "ok"
+            )
         except Exception:
+            self._runtime._bootstrap_manifest["agent_api"] = "degraded"
             logger.warning("Peer API unavailable: check migrated peer registry")
+        from genesis.runtime._capabilities import write_capabilities_file
+
+        write_capabilities_file(self._runtime)
         logger.info("Standalone adapter bootstrapped")
 
     async def serve(self) -> None:

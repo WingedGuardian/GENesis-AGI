@@ -1416,12 +1416,24 @@ verified: cfbb876243f2 2026-10-07
   deprecated allowance field remains only for database compatibility. Local
   `genesis peers` CLI writes relationships; `/v1/agent/a2a/health` authenticates
   through the existing runtime loop. The Agent Card returns `503 not_ready`
-  until an installed task transport can fulfill its advertised interface.
+  until the conversation service below is installed and ready.
   Revocation disables access immediately; only active peer credentials contribute
   to fallback readiness, while inactive credentials still participate in scope
   collision checks. Scope checks also reject equality with loaded active/fallback
   Flask signing keys, without request-time credential-file reads.
-  See `docs/reference/peer-registry.md`.
+  `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
+  existing Flask/runtime loop: it atomically persists native receipts, binds
+  contexts and retries to relationship epochs, and admits at most two
+  outstanding peer turns globally and per peer, without a daily submission
+  quota. Fresh native turns use Genesis identity/cognition, available memory
+  enrichment, observe/interact tools, external unattended provenance and the
+  native background ceiling. Result heads and full artifacts have bounded
+  disclosure checks. Approval attribution survives notification updates; the API
+  lists pending owner actions and never resolves them. Presented peer/backend
+  bearers are refused before owner mutation shortcuts. Deployment/enrollment and
+  connector-only ingress verification are separate prerequisites. No new listener
+  or peer execution queue. See `docs/reference/peer-registry.md` and
+  `docs/reference/agent-conversations.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is
@@ -2655,7 +2667,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 4117f6ed 2026-10-05
+verified: 8b445d636b26 2026-10-16
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2797,7 +2809,7 @@ verified: 4117f6ed 2026-10-05
   and recovery state. Incremental publication follows durable append; uncertain
   publication stops derived-state reading until reconstruction. Historical
   reading never creates or truncates files; version-1 evidence cannot execute.
-  No transport, CLI, automatic execution or qualification verdict is wired yet;
+  No CLI, automatic execution or qualification verdict is wired yet;
   subsequent replacement PRs supply those callers. Production credentials and
   accounting stores are outside this boundary. See
   `docs/reference/qualification-journal.md`. Offline reference admission also
@@ -2817,6 +2829,29 @@ verified: 4117f6ed 2026-10-05
   full-schema SQLite fixtures and observes the actual rendered candidate IDs.
   Full preflight, storage replay and execution/reporting orchestration land later.
   See `docs/reference/qualification-corpus.md`.
+  Qualification's pinned transport supplies a caller-provided adapter router
+  through the production delegate, a shared one-egress wire guard, response-hook
+  durability and exact lexical Decimal GET billing. Documented selected-route
+  metadata is checked on live acceptance and replay; gateway response caching
+  is explicitly disabled. Contradictory served identities retain unresolved
+  liability, while expense settlement cannot qualify invalid routing evidence.
+  Frozen schedule/provider
+  mapping and dedicated nonreset credentials are required; any journal incident
+  pauses new requests and replay until verified recovery. These checks do not
+  admit more than reported or exact limit-minus-spend headroom supports. Local
+  client setup precedes durable dispatch; recovery metadata uses the shared JSON
+  authority before redaction, and diagnostic formatting cannot interrupt calls.
+  External JSON has explicit local byte/depth bounds and a shared forward string
+  scanner. Unsafe response/receipt bodies retain opaque error evidence; decoded
+  strings stay untrusted through bounded nested JSON redaction. Refusals preserve
+  unresolved funding and never resend a completion.
+  Credential lending preserves known redaction values while keeping production
+  aliases hidden from the SDK, including log calls on SDK threads.
+  These checks do not
+  establish provider spend bounds or owner approval. The isolated runner remains
+  a later replacement. This verification refresh covers the qualification slice;
+  other learning/evaluation entries retain their previous verification scope.
+  See `docs/reference/qualification-transport.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).

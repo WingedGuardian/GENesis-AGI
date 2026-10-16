@@ -965,6 +965,12 @@ class DirectSessionRunner:
         self._semaphore = asyncio.Semaphore(self._MAX_CONCURRENT)
         self._active: dict[str, asyncio.Task] = {}
         self._managed_cancel: dict[str, asyncio.Event] = {}
+        # Admissions that may still adopt a receipt. shutdown() closes the gate
+        # and drains them before cancelling sessions, while the DB is open.
+        self._admissions: set[asyncio.Task] = set()
+        # Peer identity work shares this runner-wide budget across HTTP services.
+        self._peer_admissions: dict[str, tuple[str, str, asyncio.Task]] = {}
+        self._closing = False
         # Managed sessions whose runner slot is held through finalization.
         self._managed_slots: set[str] = set()
         self._protected_paths: object | None = None
@@ -1093,6 +1099,17 @@ class DirectSessionRunner:
     def is_active(self, session_id: str) -> bool:
         return session_id in self._active
 
+    def register_admission(self, task: asyncio.Task) -> None:
+        """Track a task that may adopt a receipt; refused once shutdown began."""
+        if self._closing:
+            raise RuntimeError("Direct-session runner is shutting down")
+        self._admissions.add(task)
+        task.add_done_callback(self._admissions.discard)
+
+    @property
+    def closing(self) -> bool:
+        return self._closing
+
     def cancel(self, session_id: str) -> bool:
         """Signal a managed session; repeated signals never interrupt its drain."""
         signal = self._managed_cancel.get(session_id)
@@ -1112,7 +1129,7 @@ class DirectSessionRunner:
             canonical = str(uuid.UUID(session_id)) == session_id
         except (ValueError, TypeError, AttributeError):
             canonical = False
-        if not canonical:
+        if not canonical or self._closing:
             raise ValueError("Prepared receipt cannot be adopted")
         # Verify and run one private snapshot: a caller mutating its own
         # request (e.g. the skills list) after adoption cannot change what runs.
@@ -1195,6 +1212,17 @@ class DirectSessionRunner:
 
         Returns the number of tasks that were still in flight.
         """
+        # Close the admission gate first: an admission racing shutdown either
+        # finishes (its adopt is refused while closing) or is cancelled here,
+        # never adopting after the cancellation pass below.
+        self._closing = True
+        admissions = [t for t in self._admissions if not t.done()]
+        if admissions:
+            _, pending = await asyncio.wait(admissions, timeout=grace_s)
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.wait(pending, timeout=grace_s)
         tasks = [t for t in self._active.values() if not t.done()]
         for t in tasks:
             sid = next((sid for sid, active in self._active.items() if active is t), None)

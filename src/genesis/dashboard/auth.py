@@ -13,6 +13,7 @@ import hmac
 import ipaddress
 import logging
 import os
+import re
 import secrets
 from collections import defaultdict
 from pathlib import Path
@@ -466,6 +467,20 @@ def check_api_mutation_auth():
     A cookie-authed cross-origin/originless mutation is rejected 403; a request with
     no credential at all is rejected 401.
     """
+    # Peer credentials never convey owner authority, including on installs
+    # with passwordless mutations or a valid accompanying browser cookie.
+    # Check names even for revoked peers; do not create an unconfigured DB.
+    if request.method not in ("GET", "HEAD", "OPTIONS") and request.path.startswith(
+        _GENESIS_API_PREFIXES
+    ):
+        from genesis.peers.auth import BACKEND_TOKEN
+
+        names = (BACKEND_TOKEN, *(
+            name for name in os.environ
+            if re.fullmatch(r"GENESIS_PEER_[A-Z0-9_]+_TOKEN", name)
+        ))
+        if any(presented_bearer_is(name) for name in names):
+            return jsonify(error="Owner authority required", code="unauthorized"), 403
     if not get_dashboard_password():
         return None
     if api_mutation_auth_disabled():
