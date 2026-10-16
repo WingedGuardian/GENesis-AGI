@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import threading
 from datetime import UTC, datetime
@@ -25,11 +26,25 @@ def _caller() -> str:
     return "<unknown>:<unknown>"
 
 
+def _open_regular_log(log_path: Path, flags: int) -> int:
+    """Refuse a final symlink or special file without waiting for a peer."""
+    fd = os.open(log_path, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("recorder log must be a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _load_seen_keys(log_path: Path) -> set[tuple[str, str, str]]:
     seen: set[tuple[str, str, str]] = set()
     try:
-        with log_path.open("r", encoding="utf-8", errors="replace") as stream:
-            for line in stream:
+        with os.fdopen(_open_regular_log(log_path, os.O_RDONLY), "rb") as stream:
+            # Only inspect the bounded snapshot the append threshold can cover.
+            snapshot = stream.read(_MAX_LOG_BYTES).decode("utf-8", errors="replace")
+            for line in snapshot.split("\n"):
                 try:
                     entry = json.loads(line)
                 except (TypeError, ValueError):
@@ -94,13 +109,12 @@ def install(
             fd: int | None = None
             try:
                 log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                fd = os.open(
+                fd = _open_regular_log(
                     log_path,
                     os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                    0o600,
                 )
                 if (os.fstat(fd).st_mode & 0o777) != 0o600:
-                    os.chmod(log_path, 0o600)
+                    os.fchmod(fd, 0o600)
                 if os.fstat(fd).st_size >= _MAX_LOG_BYTES:
                     return
                 with os.fdopen(fd, "a", encoding="utf-8") as stream:

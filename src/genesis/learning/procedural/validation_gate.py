@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 import aiosqlite
 
 from genesis.db.crud.watermarks import get_watermark, upsert_watermark
+from genesis.learning.procedural.lesson_shape import LIVE_LESSON_SQL
 
 logger = logging.getLogger(__name__)
 
@@ -235,8 +236,9 @@ async def _check_regression(
     """
     try:
         cursor = await db.execute(
-            "SELECT principle FROM procedural_memory "
-            "WHERE task_type = ? AND success_count >= 2 AND quarantined = 0",
+            # A held lesson never counts as validated. LIVE_LESSON_SQL is a constant.
+            "SELECT principle FROM procedural_memory "  # noqa: S608
+            f"WHERE task_type = ? AND success_count >= 2 AND quarantined = 0 AND ({LIVE_LESSON_SQL})",
             (task_type,),
         )
         rows = await cursor.fetchall()

@@ -110,6 +110,26 @@ class StandaloneAdapter:
 
         self._app = self._create_flask_app()
         self._register_blueprints()
+        try:
+            from genesis.peers.auth import configuration_warning
+            from genesis.peers.registry import PeerRegistry
+
+            warning = await configuration_warning(PeerRegistry(), app=self._app)
+            if warning:
+                logger.warning(warning)
+            self._runtime._bootstrap_manifest["agent_api"] = (
+                "degraded"
+                if warning
+                or self._runtime._direct_session_runner is None
+                or "agent_api" not in self._app.blueprints
+                else "ok"
+            )
+        except Exception:
+            self._runtime._bootstrap_manifest["agent_api"] = "degraded"
+            logger.warning("Peer API unavailable: check migrated peer registry")
+        from genesis.runtime._capabilities import write_capabilities_file
+
+        write_capabilities_file(self._runtime)
         logger.info("Standalone adapter bootstrapped")
 
     async def serve(self) -> None:
@@ -806,13 +826,25 @@ class StandaloneAdapter:
         except Exception:
             logger.exception("Failed to register desk brain API blueprint")
 
+        try:
+            from genesis.dashboard.routes.agent_api import agent_api_bp
+
+            if "agent_api" not in app.blueprints:
+                app.register_blueprint(agent_api_bp)
+                logger.info("Peer API blueprint registered; access defaults disabled")
+        except Exception:
+            logger.exception("Failed to register peer API blueprint")
+
     def _run_flask(self) -> None:
         """Run Flask in a thread (called from daemon thread)."""
+        from genesis.hosting.request_input import PeerRequestHandler
+
         self._app.run(
             host=self._host,
             port=self._port,
             threaded=True,
             use_reloader=False,
+            request_handler=PeerRequestHandler,
         )
 
     async def _start_telegram(self) -> None:

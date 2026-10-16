@@ -363,18 +363,29 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # ── Refusals: nothing has changed yet ─────────────────────────────────
-# A state file is an unfinished update.sh run UNLESS its phase is "done": update.sh
-# writes "done" just before deleting the file, so a run killed in between leaves a
-# finished one behind, and the watchdog's reader already treats it as over. Under
-# the exclusive lock no update.sh can be running. Anything unreadable refuses.
-if [ -e "$UPDATE_STATE_FILE" ]; then
-    _state_phase="$(python3 -I -S -c 'import json, sys
-d = json.load(open(sys.argv[1]))
-p = d.get("phase") if isinstance(d, dict) else None
-print(p if isinstance(p, str) else "")' "$UPDATE_STATE_FILE" 2>/dev/null || true)"
-    [ "$_state_phase" = "done" ] \
-        || die "$UPDATE_STATE_FILE records an unfinished update.sh run; finish it with scripts/update.sh --post-merge."
+# BEGIN update-state-refusal
+# An update.sh run's state file refuses this deploy while it still guards code that
+# run merged and never activated, or a merge conflict it is waiting on. The rule is
+# scripts/lib/update_state_guard.py, the one update.sh, bootstrap, the live engine
+# and the dashboard use (#3139): exit 10 means nothing to guard (a finished run, or
+# one that stopped before merging anything); any other exit, a check that crashed or
+# could not run included, refuses with the guard's own remedy. Under the exclusive
+# lock no update.sh can be running. A leftover that guards nothing is removed before
+# a mode that moves HEAD (deploy, pull): once HEAD moves, a "fetching" or "merging"
+# state no longer sits at its rollback tag and would read as guarding merged code
+# it never merged (the supervised Apply clears it the same way).
+if [ -e "$UPDATE_STATE_FILE" ] || [ -L "$UPDATE_STATE_FILE" ]; then
+    _state_rc=0
+    _state_msg="$(python3 -I -S "$_SELF_DIR/lib/update_state_guard.py" "$UPDATE_STATE_FILE" "$GENESIS_ROOT" 2>&1)" \
+        || _state_rc=$?
+    [ "$_state_rc" -eq 10 ] \
+        || die "${_state_msg:-$UPDATE_STATE_FILE could not be checked (exit $_state_rc), so it is kept.}"
+    if [ "$MODE" = deploy ] || [ "$MODE" = pull ]; then
+        rm -f "$UPDATE_STATE_FILE" \
+            || die "$UPDATE_STATE_FILE guards nothing but could not be removed before the pull; remove it, then re-run."
+    fi
 fi
+# END update-state-refusal
 # `live`, the integration branch scripts/deploy_candidates builds from the deploy
 # manifest, is never pulled into: a fast-forward from upstream would drop every
 # candidate. restart runs on it as it stands; the rebuild moves it (#2978).
@@ -449,13 +460,14 @@ fi
 # Does the venv match the pyproject.toml read from stdin (<what> names that
 # tree)? A code-only deploy never reinstalls, so any difference goes to the
 # command in <remedy>, which does. Exit 3 is the one difference a reinstall
-# cannot fix: this interpreter is older than the incoming requires-python.
+# cannot fix: this interpreter is outside the incoming requires-python (too old,
+# or too new for its upper bound).
 _deps_ok() {
     local what="$1" remedy="$2" out rc=0
     out="$("$VENV_DIR/bin/python" -P "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
     case "$rc" in
         0) return 0 ;;
-        3) echo "ERROR: $what needs a newer Python than this venv runs, and a reinstall cannot change that:" >&2 ;;
+        3) echo "ERROR: $what needs a Python version (its requires-python) that this venv does not run, and a reinstall cannot change that:" >&2 ;;
         *) echo "ERROR: the venv does not match $what's pyproject.toml — run $remedy instead:" >&2 ;;
     esac
     echo "$out" | sed 's/^/         /' >&2

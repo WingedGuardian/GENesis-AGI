@@ -2,10 +2,47 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import pytest
+
+
+@pytest.mark.parametrize("kind", ["fifo", "symlink", "directory"])
+@pytest.mark.parametrize("timing", ["install", "append"])
+def test_nonregular_log_never_blocks_or_changes_target(recorder, tmp_path, kind, timing):
+    # Run in a child so the original blocking FIFO defect fails with a deadline.
+    probe = r'''
+import importlib.util, os, pathlib, sys
+spec = importlib.util.spec_from_file_location("isolated_recorder", sys.argv[1])
+recorder = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(recorder)
+root, kind, timing = pathlib.Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+log, target = root / "log", root / "unrelated"
+target.write_text("untouched\n")
+target.chmod(0o644)
+def make_target():
+    if kind == "fifo": os.mkfifo(log)
+    elif kind == "symlink": log.symlink_to(target)
+    else: log.mkdir()
+os.environ.pop("GENESIS_MCP_ENV_RECORDER", None)
+os.environ["RECORDER_SYNTHETIC_KEY"] = "synthetic-canary-value"
+if timing == "install": make_target()
+recorder.install("memory", declared=frozenset(), declared_prefixes=(),
+                 secret_keys=frozenset({"RECORDER_SYNTHETIC_KEY"}), log_path=log)
+if timing == "append": make_target()
+assert os.getenv("RECORDER_SYNTHETIC_KEY") == "synthetic-canary-value"
+assert os.getenv("RECORDER_SYNTHETIC_KEY") == "synthetic-canary-value"
+recorder.uninstall()
+assert target.read_text() == "untouched\n"
+assert target.stat().st_mode & 0o777 == 0o644
+'''
+    subprocess.run(
+        [sys.executable, "-c", probe, recorder.__file__, str(tmp_path), kind, timing],
+        check=True, capture_output=True, text=True, timeout=5,
+    )
 
 
 @pytest.fixture
@@ -41,6 +78,40 @@ def _install(
 
 def _read_with_get(key: str) -> str | None:
     return os.environ.get(key)
+
+
+def test_preload_reads_a_bounded_snapshot_without_splitting_unicode(recorder, tmp_path, monkeypatch):
+    log = tmp_path / "log"
+    entry = {"server": "memory", "key": "KEY\u0085NAME", "caller": "module:caller"}
+    first = (json.dumps(entry, ensure_ascii=False) + "\n").encode()
+    monkeypatch.setattr(recorder, "_MAX_LOG_BYTES", len(first) + 10)
+    log.write_bytes(first + b"x" * 100 + b'\n{"server":"late","key":"K","caller":"C"}\n')
+    assert recorder._load_seen_keys(log) == {("memory", "KEY\u0085NAME", "module:caller")}
+
+
+def test_permissions_follow_open_descriptor_when_path_is_replaced(recorder, tmp_path, monkeypatch):
+    key = "MCP_ENV_READ_DESCRIPTOR_RACE"
+    monkeypatch.setenv(key, "synthetic-value")
+    log = _install(recorder, tmp_path, secret_keys=frozenset({key}))
+    log.write_text("")
+    log.chmod(0o644)
+    opened = tmp_path / "opened-log"
+    original_open = os.open
+
+    def replace_after_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        if Path(path) == log and flags & os.O_WRONLY:
+            log.rename(opened)
+            log.write_text("replacement remains untouched\n")
+            log.chmod(0o644)
+        return fd
+
+    monkeypatch.setattr(os, "open", replace_after_open)
+    assert _read_with_get(key) == "synthetic-value"
+    assert log.read_text() == "replacement remains untouched\n"
+    assert log.stat().st_mode & 0o777 == 0o644
+    assert opened.stat().st_mode & 0o777 == 0o600
+    assert json.loads(opened.read_text())["key"] == key
 
 
 def _read_with_index(key: str) -> str:

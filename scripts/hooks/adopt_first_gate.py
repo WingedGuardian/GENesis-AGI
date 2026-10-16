@@ -166,7 +166,8 @@ def _sentinel(cwd: str) -> Path:
 
     An empty sentinel rather than a JSON dict, for two reasons. It matches what
     three sibling hooks already do for once-per-X nudges
-    (``agent_tool_guidance``, ``stealth_skill_nudge``, ``subsystem_traps_hook``)
+    (``stealth_skill_nudge``, ``subsystem_traps_hook``, and the retired
+    ``agent_tool_guidance``)
     — adding a fifth mechanism to a change whose whole subject is "stop
     reinventing what exists" would have been the funniest possible defect. And
     it is ATOMIC: the previous JSON version did a read-modify-write, and several

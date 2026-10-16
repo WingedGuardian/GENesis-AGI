@@ -487,7 +487,9 @@ observed on PR #1541. A reasoned rejection is a valid resolution; silence is not
 after reading its findings. A ROUND is a distinct head on the PR that drew
 findings from a GitHub App reviewer (before the cutover in
 `scripts/review_budget.py`, a head Codex reviewed) — that word is reserved for it;
-a clean review confirms a head and adds no round. Your own internal subagent audits are
+a clean review confirms a head and adds no round, and a review that lands on a
+commit after one of that commit's descendants was already reviewed is a late
+review of an earlier round, never a round of its own. Your own internal subagent audits are
 AUDIT PASSES: they advance nothing, and no counter sees them, so never report a
 round number you did not get from `scripts/review_budget.py`. Reaching the
 budget CONSUMES standing approval — a prior "keep going until it's green" is

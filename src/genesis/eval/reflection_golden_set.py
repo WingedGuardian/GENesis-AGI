@@ -48,8 +48,15 @@ def _ensure_secrets() -> None:
 
     import os
 
-    secrets_path = Path.home() / "genesis" / "secrets.env"
-    if not secrets_path.exists():
+    from genesis.env import secrets_path as _resolve_secrets_path
+
+    # SECRETS_PATH (or the repo's own secrets.env) first; the main-tree file is
+    # the fallback for a worktree run, unless SECRETS_PATH names the file.
+    candidates = [_resolve_secrets_path()]
+    if not os.environ.get("SECRETS_PATH"):
+        candidates.append(Path.home() / "genesis" / "secrets.env")
+    secrets_path = next((p for p in candidates if p.exists()), None)
+    if secrets_path is None:
         return
 
     for line in secrets_path.read_text().splitlines():
