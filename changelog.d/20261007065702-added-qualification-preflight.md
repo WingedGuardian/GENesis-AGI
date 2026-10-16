@@ -1,1 +1,1 @@
-- Add offline qualification preflight that checks complete reference admission, actual production questions and disposable storage effects before the later runner can request execution approval.
+- Add offline qualification preflight that checks complete reference admission, actual production questions and committed disposable storage effects before the later runner can request execution approval, with historical-source and procedure-metadata validation.

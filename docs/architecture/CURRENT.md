@@ -2667,7 +2667,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: c60278493d4d 2026-10-16
+verified: 83536c40b734 2026-10-16
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2855,6 +2855,9 @@ verified: c60278493d4d 2026-10-16
   Complete offline preflight checks all registered corpus floors, current
   reference policy/approval/source identities and explicit call-site parameters.
   Production rendering determines duplicate questions and selected novelty IDs.
+  Historical exports require full Git identifiers and repository-relative paths;
+  procedure metadata requires strings or string lists. Independent database
+  reads verify committed effects; evidence binds schema creation and table DDL.
   Disposable current/promoted replay uses both real stores, checks all original
   procedure columns and verifies new insertion semantics; synthetic classifiers
   isolate novelty wiring. Dedicated serial process only; no execution consent,

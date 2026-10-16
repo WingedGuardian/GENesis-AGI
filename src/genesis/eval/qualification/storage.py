@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from unittest.mock import patch
 from uuid import UUID
 
-from genesis.eval.qualification import contracts
+from genesis.eval.qualification import contracts, corpus
 from genesis.eval.qualification.evidence import Incomplete, canonical, load_json
 from genesis.learning.procedural import (
     embedding,
@@ -111,6 +111,26 @@ async def rows(db):
         return {row["id"]: dict(row) for row in await cursor.fetchall()}
 
 
+async def committed_rows(db):
+    """Observe committed bytes independently; never commit for the store.
+
+    SQLite isolation: https://www.sqlite.org/isolation.html. A new connection
+    gets a fresh snapshot (including committed WAL), not the writer's pending
+    transaction. Use the guarded, existing-only connector for path admission.
+    """
+    if db.in_transaction:
+        raise Incomplete("storage replay effects are not committed")
+    visible = await rows(db)
+    async with db.execute("PRAGMA database_list") as cursor:
+        path = next(row[2] for row in await cursor.fetchall() if row[1] == "main")
+    async with contracts.connect_aiosqlite_rw(path, existing_only=True) as reader:
+        reader.row_factory = db.row_factory
+        committed = await rows(reader)
+    if visible != committed:
+        raise Incomplete("storage replay effects are not committed")
+    return committed
+
+
 def insertion(before, after, stored, case, path, gates):
     if any(after.get(key) != row for key, row in before.items()):
         raise Incomplete("storage replay changed an original candidate row")
@@ -170,6 +190,7 @@ def insertion(before, after, stored, case, path, gates):
 
 async def replay(case, messages, mapping, content, sandbox, alias, model):
     case, messages, mapping = load_json(canonical([case, messages, mapping]))
+    corpus.validate_novelty(case)
     contracts.candidate_mapping(case, messages, mapping)
     target = contracts.raw_target(content, mapping)
     probe = contracts.Probe()
@@ -185,7 +206,7 @@ async def replay(case, messages, mapping, content, sandbox, alias, model):
         for path in ("judge", "extractor"):
             async with sandbox.database(case) as db:
                 router, gates = Replay(case, messages, content, alias, model), OtherGates()
-                before = await rows(db)
+                before = await committed_rows(db)
                 with (
                     patch.dict(extractor._NOVELTY_VALIDATED_MODELS, allowlist, clear=True),
                     patch.dict(embedding._fail_open_timestamps, deepcopy(embedding._fail_open_timestamps), clear=True),
@@ -205,7 +226,7 @@ async def replay(case, messages, mapping, content, sandbox, alias, model):
                             outcome="success", router=router,
                             embedding_provider=contracts.Embedder(case), session_tools_count=2,
                         )
-                after = await rows(db)
+                after = await committed_rows(db)
                 insertion(before, after, stored, case, path, gates)
                 expected_store = not gates.flags and (target is None or allowlist.get(alias) != model)
                 if (router.errors or router.calls != (0 if "behavioral_directive" in gates.flags else 1)

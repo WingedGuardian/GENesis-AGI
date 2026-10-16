@@ -7,6 +7,7 @@ import json
 import tracemalloc
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -17,14 +18,14 @@ from tests.test_eval.qualification_fixtures import novelty_case
 from tests.test_eval.qualification_preflight_fixtures import admitted, params
 
 
-async def replay(tmp_path, case=None):
+async def replay(tmp_path, case=None, content='{"redundant_with":null}'):
     case = case or novelty_case("probe", None)
     async with contracts.Sandbox(tmp_path) as sandbox:
         probe = contracts.Probe()
         rendered = await contracts.novelty(case, probe, sandbox)
         mapping = contracts.candidate_mapping(case, probe.calls[0][0], rendered["candidate_ids"])
         return await storage.replay(case, probe.calls[0][0], mapping,
-                                    '{"redundant_with":null}', sandbox, "synthetic", "model")
+                                    content, sandbox, "synthetic", "model")
 
 
 @pytest.mark.parametrize("field", ["principle", "steps", "version", "confidence", "source",
@@ -96,9 +97,9 @@ async def test_judge_input_metadata_and_extractor_fixture_metadata_stay_distinct
 
     monkeypatch.setattr(storage, "rows", observe)
     assert all(r["stored"] for r in (await replay(tmp_path, case)).values())
-    assert len(inserted) == 4
+    assert len(inserted) == 8  # writer plus independent committed reader in each mode
     for index, row in enumerate(inserted):
-        judge_path = index % 2 == 0
+        judge_path = index // 2 % 2 == 0
         assert json.loads(row["tool_trigger"] or "null") == (expected if judge_path else None)
         assert json.loads(row["trigger_spec"] or "null") == (spec if judge_path else None)
         assert row["lesson"] is None
@@ -288,7 +289,7 @@ def test_composite_sources_check_every_nested_arm_and_git_baseline(tmp_path, mis
     path.write_text("historical bytes")
     sha = preflight.file_hash(path)
     source = {"query_source": {"path": str(path), "sha256": sha}, "baselines": [
-        {"path": "historical/repo/path", "commit": "historical-commit",
+        {"path": "historical/repo/path", "commit": "a" * 40,
          "sha256": "0" * 64 if missing else sha}
     ]}
     cases = {"test": [{"source": source}]}
@@ -297,3 +298,164 @@ def test_composite_sources_check_every_nested_arm_and_git_baseline(tmp_path, mis
             preflight.source_evidence(cases, {str(path): sha})
     else:
         assert preflight.source_evidence(cases, {str(path): sha}) == {str(path): sha}
+
+
+@pytest.mark.parametrize("commit", [None, "", " ", False, {}, [], 42, "not-a-commit", "a" * 39])
+@pytest.mark.parametrize("hash_key", ["sha256", "before_sha256", "after_sha256"])
+def test_malformed_git_source_cannot_relax_path_binding(tmp_path, commit, hash_key):
+    path = tmp_path / "export"
+    path.write_text("historical bytes")
+    sha = preflight.file_hash(path)
+    case = {"source": {"path": "wrong", "commit": commit, hash_key: sha}}
+    with pytest.raises(Incomplete):
+        preflight.source_evidence({"test": [case]}, {str(path): sha})
+
+
+@pytest.mark.parametrize("path", [None, "", ".", "/absolute", "../outside", "nul\x00path"])
+def test_historical_source_requires_repository_path(tmp_path, path):
+    export = tmp_path / "export"
+    export.write_text("historical bytes")
+    sha = preflight.file_hash(export)
+    case = {"source": {"path": path, "commit": "a" * 40, "before_sha256": sha}}
+    with pytest.raises(Incomplete):
+        preflight.source_evidence({"test": [case]}, {str(export): sha})
+
+
+@pytest.mark.parametrize("length", [40, 64])
+@pytest.mark.parametrize("paired", [False, True])
+def test_valid_git_exports_retain_both_byte_arms(tmp_path, length, paired):
+    exports = [tmp_path / "before", tmp_path / "after"]
+    for index, path in enumerate(exports):
+        path.write_text(f"historical bytes {index}")
+    sources = {str(path): preflight.file_hash(path) for path in exports}
+    node = {"commit": "a" * length, "path": "historical/repo/path"}
+    if paired:
+        node.update(parent="b" * length, before_sha256=sources[str(exports[0])],
+                    after_sha256=sources[str(exports[1])])
+    else:
+        node["sha256"] = sources[str(exports[0])]
+    assert preflight.source_evidence({"test": [{"source": node}]}, sources) == sources
+
+
+@pytest.mark.parametrize("key", ["sha256", "snapshot_sha256", "before_sha256", "after_sha256"])
+def test_missing_commit_retains_ordinary_path_binding(tmp_path, key):
+    export = tmp_path / "export"
+    export.write_text("bytes")
+    sha = preflight.file_hash(export)
+    path_key = "path" if key == "sha256" else key.removesuffix("_sha256")
+    with pytest.raises(Incomplete, match="source path"):
+        preflight.source_evidence({"test": [{"source": {path_key: "wrong", key: sha}}]},
+                                  {str(export): sha})
+
+
+@pytest.mark.parametrize("git_hashes", ["none", "single", "paired"])
+@pytest.mark.parametrize("other", ["snapshot", "transcript", "before_snapshot"])
+def test_git_exception_never_waives_other_source_paths(tmp_path, git_hashes, other):
+    export = tmp_path / "export"
+    export.write_text("historical bytes")
+    sha = preflight.file_hash(export)
+    node = {"commit": "a" * 40, "path": "historical/path",
+            other: "wrong", other + "_sha256": sha}
+    if git_hashes == "single":
+        node["sha256"] = sha
+    elif git_hashes == "paired":
+        node.update(parent="b" * 40, before_sha256=sha, after_sha256=sha)
+    with pytest.raises(Incomplete, match="source path"):
+        preflight.source_evidence({"test": [{"source": node}]}, {str(export): sha})
+
+
+@pytest.mark.parametrize("missing", ["before_sha256", "after_sha256", "parent"])
+def test_paired_git_export_requires_both_arms_and_parent(tmp_path, missing):
+    export = tmp_path / "export"
+    export.write_text("historical bytes")
+    sha = preflight.file_hash(export)
+    node = {"commit": "a" * 40, "path": "historical/path", "parent": "b" * 40,
+            "before_sha256": sha, "after_sha256": sha}
+    node.pop(missing)
+    with pytest.raises(Incomplete, match="historical"):
+        preflight.source_evidence({"test": [{"source": node}]}, {str(export): sha})
+
+
+@pytest.mark.parametrize("parent", [None, "", " ", False, {}, [], 42, "not-an-id", "a" * 39])
+def test_paired_git_export_requires_full_parent_identifier(tmp_path, parent):
+    export = tmp_path / "export"
+    export.write_text("historical bytes")
+    sha = preflight.file_hash(export)
+    node = {"commit": "a" * 40, "path": "historical/path", "parent": parent,
+            "before_sha256": sha, "after_sha256": sha}
+    with pytest.raises(Incomplete, match="historical"):
+        preflight.source_evidence({"test": [{"source": node}]}, {str(export): sha})
+
+
+@pytest.mark.parametrize("mode", [1, 2, 3, 4])
+@pytest.mark.parametrize("suppress", [False, True])
+async def test_uncommitted_store_effects_are_refused(tmp_path, monkeypatch, mode, suppress):
+    from genesis.learning.procedural import judge
+
+    calls = 0
+
+    def wrap(original):
+        async def store(db, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == mode:
+                monkeypatch.setattr(db, "commit", AsyncMock())
+            result = await original(db, *args, **kwargs)
+            if calls == mode and suppress:
+                await db.execute("UPDATE procedural_memory SET success_count=success_count")
+            return result
+        return store
+
+    monkeypatch.setattr(judge, "_store_judged_procedure", wrap(judge._store_judged_procedure))
+    monkeypatch.setattr(extractor, "extract_procedure", wrap(extractor.extract_procedure))
+    if suppress:
+        monkeypatch.setitem(extractor._NOVELTY_VALIDATED_MODELS, "synthetic", "model")
+    content = '{"redundant_with":1}' if suppress else '{"redundant_with":null}'
+    with pytest.raises(Incomplete):
+        await replay(tmp_path, content=content)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("field", ["tools_used", "context_tags"])
+@pytest.mark.parametrize("value", [None, {}, {"bad": "shape"}, 0, False, [None], [["Bash"]], ["Bash", 1]])
+async def test_invalid_metadata_refused_before_database(tmp_path, monkeypatch, field, value):
+    case = novelty_case("bad-metadata", None)
+    case["new"][field] = value
+
+    def never(*args, **kwargs):
+        raise AssertionError("invalid metadata reached database")
+
+    monkeypatch.setattr(contracts.Sandbox, "database", never)
+    with pytest.raises(Incomplete, match="metadata"):
+        await preflight.prepare({corpus.NOVELTY: [case]}, tmp_path)
+
+
+@pytest.mark.parametrize("value", ["", "Bash", [], ["Bash"], ["", "Bash"]])
+@pytest.mark.parametrize("field", ["tools_used", "context_tags"])
+async def test_supported_metadata_shapes_are_preserved(tmp_path, field, value):
+    case = novelty_case("metadata-shape", None)
+    case["new"][field] = value
+    assert all(row["stored"] for row in (await replay(tmp_path, case)).values())
+
+
+@pytest.mark.parametrize("module_name", ["_migrations", "_tables"])
+async def test_schema_sources_bound_and_rechecked(tmp_path, monkeypatch, module_name):
+    from genesis.db.schema import _migrations, _tables
+
+    module = {"_migrations": _migrations, "_tables": _tables}[module_name]
+    cases, options = admitted(tmp_path)
+    original = preflight.file_hash
+    changed = False
+
+    def file_hash(path):
+        return "0" * 64 if changed and str(path) == module.__file__ else original(path)
+
+    async def prepare(*args, **kwargs):
+        nonlocal changed
+        changed = True
+        return {}
+
+    monkeypatch.setattr(preflight, "file_hash", file_hash)
+    monkeypatch.setattr(preflight, "prepare", prepare)
+    with pytest.raises(Incomplete, match="source or contract changed"):
+        await preflight.check(cases, tmp_path, **options)

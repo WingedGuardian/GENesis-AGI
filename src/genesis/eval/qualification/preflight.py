@@ -7,11 +7,12 @@ files before credentials; a saved or caller-supplied plan is not authority.
 
 import hashlib
 import inspect
+import re
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
-from genesis.eval.qualification import contracts, corpus, references
+from genesis.eval.qualification import contracts, corpus, references, storage
 from genesis.eval.qualification.evidence import Incomplete, canonical, digest, load_json
 from genesis.eval.qualification.pinned import ROUTE_KEYS, resolve, routing, validate_params
 from genesis.eval.rubrics import list_rubrics
@@ -112,6 +113,23 @@ def source_nodes(value):
             yield from source_nodes(child)
 
 
+def historical_source(node):
+    """Validate exported Git identity syntax; this does not prove ancestry."""
+    identities, path = [node["commit"]], node.get("path")
+    if "before_sha256" in node or "after_sha256" in node:
+        if not {"before_sha256", "after_sha256", "parent"} <= node.keys():
+            raise Incomplete("incomplete historical reference source pair")
+        identities.append(node["parent"])
+    for identity in identities:
+        if (not isinstance(identity, str)
+            or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", identity) is None):
+            raise Incomplete("invalid historical reference source identifier")
+    if (not isinstance(path, str) or not path or "\x00" in path
+        or not references.scalar_text(path) or not Path(path).parts
+        or Path(path).is_absolute() or ".." in Path(path).parts):
+        raise Incomplete("invalid historical reference source identity")
+
+
 def source_evidence(cases, source_files):
     """Check the frozen original source bytes, including hashes without paths."""
     if not isinstance(source_files, dict) or not source_files:
@@ -136,10 +154,13 @@ def source_evidence(cases, source_files):
                 if any(v not in verified.values() for v in hashes.values()):
                     raise Incomplete("reference source hash is not in the frozen source files")
                 for key, value in hashes.items():
+                    if "commit" in node and key in ("sha256", "before_sha256", "after_sha256"):
+                        historical_source(node)
+                        continue
                     path = node.get("path" if key == "sha256" else key.removesuffix("_sha256"))
                     # Git baselines name a historical repository-relative path;
                     # their exported immutable bytes are identified by SHA-256.
-                    if path is not None and "commit" not in node and verified.get(path) != value:
+                    if path is not None and verified.get(path) != value:
                         raise Incomplete("reference source path differs from its frozen identity")
             if not count:
                 raise Incomplete("reference source evidence has no frozen byte identity")
@@ -149,7 +170,7 @@ def source_evidence(cases, source_files):
 async def check(cases, temp_root, *, reference_policy, current_policy,
                 reference_approval, candidates, source_files, config=None):
     """Complete CURRENT offline evidence; conveys no consent, budget or quality."""
-    from genesis.eval.qualification import storage
+    from genesis.db.schema import _tables, create_all_tables
     from genesis.learning.procedural import extractor, judge, operations, scoping, validation_gate
 
     cases, policy, current, approval, candidates, sources = load_json(canonical([
@@ -183,8 +204,8 @@ async def check(cases, temp_root, *, reference_policy, current_policy,
                validation_gate, inspect.getmodule(LLMJudgeScorer),
                inspect.getmodule(contracts.J9EvalBatchExecutor), inspect.getmodule(check),
                inspect.getmodule(resolve), inspect.getmodule(contracts.pack_embedding),
-               inspect.getmodule(contracts.connect_aiosqlite_rw), contracts.procedural,
-               storage.tool_names, inspect.getmodule(operations.validate_trigger_spec)]
+               inspect.getmodule(contracts.connect_aiosqlite_rw), contracts.procedural, storage.tool_names,
+               inspect.getmodule(operations.validate_trigger_spec), inspect.getmodule(create_all_tables), _tables]
     production_sources = {
         str(Path(module.__file__).relative_to(Path(__file__).resolve().parents[4])):
             file_hash(module.__file__)

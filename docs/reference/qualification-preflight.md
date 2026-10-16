@@ -14,7 +14,12 @@ exclusion from reference graders. Every source hash declared in case `source`
 metadata must match a supplied file's actual bytes; explicit source paths must
 also match. Composite references check all nested arms. Historical Git baselines
 bind exported bytes by their declared hash; their repository-relative path is
-part of approved provenance, not the export's filesystem location. Hashing uses
+part of approved provenance, not the export's filesystem location. This exception
+requires a full 40- or 64-hex Git object name and a nonempty relative path;
+paired before/after exports also require both hashes and a full parent object
+name. Only `sha256`, `before_sha256` and `after_sha256` use this exception;
+ordinary sibling source paths remain bound to their supplied files. Syntax
+does not authenticate Git ancestry. Hashing uses
 a bounded buffer, including large database snapshots. Source bytes and contract
 versions are checked again after rendering.
 Historical missing actor declarations still require real provenance; this API
@@ -32,7 +37,9 @@ Each saved novelty verdict is replayed through the actual judge and extractor
 stores under current and simulated promoted allowlists. Replay first regenerates
 the production question and mapping. Full-schema disposable databases contain
 the original candidate population, including deprecated/quarantined rows.
-All original procedure columns must remain unchanged. A returned store ID must
+All original procedure columns must remain unchanged. Independent connections
+verify committed rows before and after each store; pending transactions refuse
+without committing on the store's behalf. A returned store ID must
 identify the one new row with all expected semantic columns, including tools,
 context, counters, version and validation audit fields. Unknown new columns
 refuse until their semantics are covered. Generated UUID/time are checked for
@@ -42,7 +49,10 @@ the raw novelty target; a failed mode returns no complete four-mode result.
 Judge triggers follow the production tool-name normalizer and command-spec
 builder, including dropped invalid names and command-only triggers. Their
 helper source files are included in the returned source evidence. Replayed
-earned procedures have no authored-lesson record.
+earned procedures have no authored-lesson record. Tools and context metadata
+accept strings (normalized to lists) or lists of Unicode scalar strings;
+missing fields default to empty lists, while nulls and objects refuse.
+Source evidence includes the actual schema creation module and table DDL module.
 
 Extraction and scoping use deterministic synthetic responses, distinguished by
 their actual prompts despite a shared call-site ID. These responses isolate
