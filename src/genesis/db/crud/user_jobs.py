@@ -194,3 +194,28 @@ async def get_run_history(
         (job_id, limit),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def request_run(db: aiosqlite.Connection, job_id: str) -> bool:
+    """Stamp a run-now request the owning scheduler will pick up.
+
+    This is the cross-process channel: a caller in a process without the
+    scheduler (the standalone MCP server) writes the flag; the scheduler's
+    reconcile loop reads, clears, and dispatches it.
+    """
+    cursor = await db.execute(
+        "UPDATE user_jobs SET run_requested_at = datetime('now'), "
+        "updated_at = datetime('now') WHERE id = ?",
+        (job_id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def clear_run_request(db: aiosqlite.Connection, job_id: str) -> None:
+    """Clear a pending run-now flag (called by the scheduler before dispatch)."""
+    await db.execute(
+        "UPDATE user_jobs SET run_requested_at = NULL WHERE id = ?",
+        (job_id,),
+    )
+    await db.commit()
