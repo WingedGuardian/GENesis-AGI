@@ -158,13 +158,14 @@ explanatory alert on approach.
 at or above 80%, the loop also records which processes hold the tasks
 (`observability/pid_breakdown.py`), whether or not the alert itself is in its
 hourly cooldown. It reads only `/proc` and the cgroup filesystem (no fork) and
-writes one JSON file per tick to `~/.genesis/logs/pid_snapshots/`: every cgroup
-under the binding level with its task count, and every process in it grouped
+writes a best-effort JSON sample to `~/.genesis/logs/pid_snapshots/`: sampled cgroups
+under the binding level with their task counts, and observed process candidates grouped
 into trees (one per Claude Code session, and one per service or session scope
 otherwise), each with its thread total and its five largest members. A process
 is named by its program, plus the module or script for an interpreter, never
 its other arguments. The alert text carries the top five trees and cgroups and
-the file's path. Files older than 7 days are pruned, and the directory is kept
+the file's path when retained; collection limits are reported as a partial sample.
+Files older than 7 days are pruned, and the directory is kept
 under 20 MB. `GENESIS_PID_BREAKDOWN_DISABLED=1` in the server's environment
 turns the recording off.
 

@@ -537,9 +537,9 @@ jobs:
     # workflow-run duration, which is ~20 min longer because it includes 12
     # sibling jobs and queue time: min 19m38s, p50 29m22s, max 31m15s.
     # The ceiling must exceed the worst LEGITIMATE case — that max plus one
-    # full per-test kill (pyproject `timeout = 3600`) = ~91 min — or this job
+    # full per-test kill (pyproject `timeout = 600`) = ~41 min — or this job
     # would pre-empt the per-test timeout and make it dead code. 180 leaves
-    # ~89 min of growth headroom and still halves the default.
+    # ~139 min of growth headroom and still halves the default.
     # Revisit as the suite grows — the --durations output below is the data.
     timeout-minutes: 180
     # fetch-depth: 0 because measurement tests derive a rate from this

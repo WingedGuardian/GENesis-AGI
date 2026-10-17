@@ -318,3 +318,34 @@ async def test_no_thread_to_start_still_names_the_holders(
     budget["path"] = "/cg"
     await loop._check_pid_budget(object(), budget=budget)
     assert "Top task holders: x." in create.await_args.kwargs["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize("path", ["/fixture/\udcff/x.json", "/fixture/é/x.json", None])
+async def test_final_alert_path_is_utf8_even_for_filesystem_surrogates(
+    _reset_cooldown_and_mock_create, monkeypatch, inline, path
+):
+    from genesis.observability import pid_breakdown
+
+    if inline:
+
+        async def no_thread(*_a, **_k):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(loop.asyncio, "to_thread", no_thread)
+    monkeypatch.setattr(
+        pid_breakdown, "snapshot_for", lambda b: {"text": "Top task holders: x.", "file": path}
+    )
+    budget = _budget("error", 100.0, scope="user-1000.slice")
+    budget["path"] = "/cg"
+    await loop._check_pid_budget(object(), budget=budget)
+    create = _reset_cooldown_and_mock_create
+    assert create.await_count == 1
+    content = create.await_args.kwargs["content"]
+    content.encode("utf-8")
+    assert "Top task holders: x." in content
+    if path is None:
+        assert "Full breakdown:" not in content
+    else:
+        assert path.encode("utf-8", "backslashreplace").decode("utf-8") in content

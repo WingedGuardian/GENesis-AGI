@@ -2977,8 +2977,8 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
                 breakdown = await asyncio.to_thread(pid_breakdown.snapshot_for, budget)
             except RuntimeError:
                 # No worker thread could start: the budget itself is exhausted,
-                # the tick this exists for. ~0.1 s inline beats an alert that
-                # names nobody. (The executor queued the work before failing
+                # the tick this exists for. The collector's finite work limits
+                # also apply inline. (The executor queued the work before failing
                 # to start a thread, so a later worker may take a second,
                 # harmless snapshot file.)
                 breakdown = pid_breakdown.snapshot_for(budget)
@@ -3052,7 +3052,8 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
                 f"Each Claude Code session spawns MCP subprocess trees. {remedy}"
                 + (f" {breakdown['text']}" if breakdown else "")
                 + (
-                    f" Full breakdown: {breakdown['file']}"
+                    " Full breakdown: "
+                    + str(breakdown["file"]).encode("utf-8", "backslashreplace").decode("utf-8")
                     if breakdown and breakdown.get("file")
                     else ""
                 )

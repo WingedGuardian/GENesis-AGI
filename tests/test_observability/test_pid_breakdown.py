@@ -19,6 +19,64 @@ from genesis.observability import pid_breakdown as pb
 from genesis.util import proc_io
 
 
+def test_broad_cgroup_frontier_is_a_reported_partial_sample(fake, monkeypatch):
+    monkeypatch.setattr(pb, "_CGROUP_NODE_LIMIT", 3, raising=False)
+    fake.cgroup("", 0)
+    for n in range(8):
+        fake.cgroup(f"empty-{n}", 0)
+    snapshot = pb.take_snapshot(_budget(fake))
+    assert len(snapshot["cgroups"]) <= 3
+    assert "cgroups" in snapshot["truncated"]
+    assert "partial sample" in pb.summarize(snapshot)
+
+
+def test_outside_proc_population_has_a_separate_scan_bound(fake, monkeypatch):
+    monkeypatch.setattr(pb, "_PROC_ENTRY_LIMIT", 3, raising=False)
+    fake.cgroup("", 0)
+    for n in range(10, 18):
+        fake.process(n, "outside", 1, 1, ["outside"], cgroup="/other")
+    reads = []
+    original = pb._read_cgroup
+    monkeypatch.setattr(pb, "_read_cgroup", lambda pid: reads.append(pid) or original(pid))
+    snapshot = pb.take_snapshot(_budget(fake))
+    assert len(reads) <= 3
+    assert "proc entries" in snapshot["truncated"]
+    assert snapshot["processes_seen"] == 0
+
+
+def test_pid_candidates_and_membership_bytes_are_bounded(fake, monkeypatch):
+    monkeypatch.setattr(pb, "_PID_LIMIT", 2, raising=False)
+    monkeypatch.setattr(pb, "_CGROUP_PROCS_BYTES", 8, raising=False)
+    fake.cgroup("", 8, procs=range(10, 18))
+    for n in range(10, 18):
+        fake.process(n, "worker", 1, 1, ["worker"], cgroup="/cg")
+    snapshot = pb.take_snapshot(_budget(fake, current=8))
+    assert snapshot["processes_seen"] <= 2
+    assert "processes" in snapshot["truncated"]
+    assert "cgroup PID bytes" in snapshot["truncated"]
+    assert snapshot["processes_seen"] == sum(t["processes"] for t in snapshot["trees"])
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["python3", "-m", "x" * 80], "python3"),
+        (["python3", "-m", "", "x" * 80], "python3 -m"),
+        (["python3", "/" + "x" * 80 + ".py"], "python3"),
+        (["python3", "-m", "safe", "x" * 80], "python3 -m safe"),
+        (["python3", "safe.py", "x" * 80], "python3 safe.py"),
+        (["x" * 80], "[python3]"),
+        (["python3", "", "secret.py", "x" * 80], "python3"),
+    ],
+)
+def test_cmdline_prefix_never_promotes_an_incomplete_or_later_argument(
+    fake, monkeypatch, argv, expected
+):
+    monkeypatch.setattr(pb, "_CMDLINE_BYTES", 32, raising=False)
+    fake.process(60, "python3", 1, 1, argv)
+    assert pb.process_label(60) == expected
+
+
 def _stat(pid: int, comm: str, ppid: int, threads: int, starttime: int = 100) -> str:
     # Fields after "(comm) ": state(3) ppid(4) ... num_threads(20) ... starttime(22).
     after = ["S", str(ppid)] + ["0"] * 15 + [str(threads), "0", str(starttime)] + ["0"] * 5
@@ -359,7 +417,7 @@ def test_a_pid_that_exits_or_is_reused_during_membership_read_is_not_counted(
     fake.cgroup("", 7, procs=[20])
     fake.process(20, "old", 1, 7, ["old"], cgroup="/cg")
     real_read = pb._read_cgroup
-    monkeypatch.setattr(pb, "_pids_by_cgroup_prefix", lambda prefix: {20})
+    monkeypatch.setattr(pb, "_pids_by_cgroup_prefix", lambda prefix, truncated: {20})
 
     def churn(pid):
         path = real_read(pid)

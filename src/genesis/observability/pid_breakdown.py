@@ -6,10 +6,10 @@ budget is nearly gone but not WHO holds it. By the time anyone reads the alert,
 the processes that filled it may have exited, so this module records the
 holders at the moment the budget runs low:
 
-  - every cgroup under the binding level, to ``_CGROUP_DEPTH`` levels, with its
+  - cgroups sampled under the binding level, to ``_CGROUP_DEPTH`` levels, with their
     ``pids.current`` (a cgroup's ``pids.current`` counts TASKS, i.e. threads, in
     its whole subtree);
-  - every process in that subtree, grouped into trees, with the threads each
+  - process candidates sampled in that subtree, grouped into trees, with the threads each
     tree holds. A tree is rooted at the nearest ``claude`` process (one Claude
     Code session and the MCP servers, tools and shells under it), or, for
     processes with no ``claude`` above them, at the topmost ancestor in the
@@ -61,6 +61,14 @@ _CGROUP_DEPTH = 4
 # Stops a pathological (or looping, via bind mounts) cgroup tree; real trees are
 # a handful of levels deep.
 _CGROUP_WALK_LIMIT = 32
+# Diagnostic work limits, independent of the binding cgroup's task ceiling.
+# These are finite sampling bounds, not a guarantee about kernel I/O latency.
+_CGROUP_NODE_LIMIT = 512
+_CGROUP_ENTRY_LIMIT = 16384
+_PROC_ENTRY_LIMIT = 16384
+_PID_LIMIT = 8192
+_CGROUP_PROCS_BYTES = 128 * 1024
+_CMDLINE_BYTES = 4096
 _TOP_N = 5
 _RETENTION_S = 7 * 86400
 _RETENTION_BYTES = 20 * 1024 * 1024
@@ -78,14 +86,26 @@ def _comm(pid: int) -> str:
     return f"[{stat[0]}]" if stat else "?"
 
 
-def process_label(pid: int) -> str:
-    """A short, credential-free name for a process (see the module docstring)."""
+def _cmdline_args(pid: int) -> list[str]:
+    """Decode a bounded prefix, retaining only complete arguments if truncated."""
     try:
         with open(f"{_PROC}/{pid}/cmdline", "rb") as f:
-            raw = f.read()
+            raw = f.read(_CMDLINE_BYTES + 1)
     except OSError:
         raw = b""
-    args = [a.decode("utf-8", "replace") for a in raw.removesuffix(b"\x00").split(b"\x00")]
+    if len(raw) > _CMDLINE_BYTES:
+        # Only complete arguments may supply labels; an incomplete argv[0]
+        # cannot identify the executable. Preserve empty interior arguments.
+        end = raw[:_CMDLINE_BYTES].rfind(b"\x00")
+        if end < 0:
+            return [""]
+        raw = raw[: end + 1]
+    return [a.decode("utf-8", "replace") for a in raw.removesuffix(b"\x00").split(b"\x00")]
+
+
+def process_label(pid: int) -> str:
+    """A short, credential-free name for a process (see the module docstring)."""
+    args = _cmdline_args(pid)
     if not args[0]:
         return _comm(pid)
     # A process that rewrites its title (redis, postgres, sshd) puts the whole
@@ -100,7 +120,9 @@ def process_label(pid: int) -> str:
     rest = iter(args[1:])
     for arg in rest:
         if arg == "-m":
-            module = next(rest, "")
+            module = next(rest, None)
+            if module is None:
+                return head
             return f"{head} -m {module}" if _SAFE_ARG_RE.match(module) else f"{head} -m"
         if arg == "-c":
             return f"{head} -c"
@@ -134,33 +156,72 @@ def _read_cgroup(pid: int) -> str | None:
     return None
 
 
-def _walk_cgroups(root: str) -> tuple[list[dict], set[int], int]:
+def _cgroup_pids(path: str, pids: set[int], truncated: set[str]) -> None:
+    """Add a bounded PID prefix without growing the sample past its limit."""
+    with open(f"{path}/cgroup.procs", "rb") as f:
+        raw = f.read(_CGROUP_PROCS_BYTES + 1)
+    if len(raw) > _CGROUP_PROCS_BYTES:
+        truncated.add("cgroup PID bytes")
+        raw = raw[:_CGROUP_PROCS_BYTES].rpartition(b"\n")[0]
+    values = raw.split()
+    remaining = _PID_LIMIT - len(pids)
+    if len(values) > remaining:
+        truncated.add("processes")
+    pids.update(int(x) for x in values[:remaining])
+
+
+def _cgroup_children(
+    path: str, capacity: int, entries_seen: int, truncated: set[str]
+) -> tuple[list[str], int]:
+    """Bound both frontier allocation and directory entries across the walk."""
+    children = []
+    with os.scandir(path) as entries:
+        for entry in entries:
+            if entries_seen >= _CGROUP_ENTRY_LIMIT:
+                truncated.add("cgroup entries")
+                break
+            entries_seen += 1
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if len(children) >= capacity:
+                truncated.add("cgroups")
+                break
+            children.append(entry.path)
+    return children, entries_seen
+
+
+def _walk_cgroups(root: str, truncated: set[str]) -> tuple[list[dict], set[int], int]:
     """``(nodes, pids, unreadable)`` for the cgroup subtree at ``root``.
 
     ``nodes``: one ``{"cgroup", "depth", "tasks", "leaf"}`` per cgroup down to
     ``_CGROUP_DEPTH`` (``cgroup`` relative to ``root``; ``leaf`` when it has no
-    child cgroup or sits at the depth limit). ``pids``: every process in the whole
-    subtree, from each level's ``cgroup.procs``. ``unreadable``: cgroups whose
+    child cgroup or sits at the depth limit). ``pids``: process candidates from the
+    sampled subtree, from bounded prefixes of ``cgroup.procs``. ``unreadable``: cgroups whose
     ``cgroup.procs`` could not be read, so a gap is counted rather than hidden.
     """
     nodes: list[dict] = []
     pids: set[int] = set()
     unreadable = 0
+    admitted = 1
+    entries_seen = 0
     stack: list[tuple[str, int]] = [(root, 0)]
     while stack:
         path, depth = stack.pop()
         try:
-            with open(f"{path}/cgroup.procs") as f:
-                pids.update(int(x) for x in f.read().split())
+            _cgroup_pids(path, pids, truncated)
         except (OSError, ValueError):
             unreadable += 1
         children: list[str] = []
         if depth < _CGROUP_WALK_LIMIT:
             try:
-                with os.scandir(path) as it:
-                    children = [e.path for e in it if e.is_dir(follow_symlinks=False)]
+                children, entries_seen = _cgroup_children(
+                    path, _CGROUP_NODE_LIMIT - admitted, entries_seen, truncated
+                )
+                admitted += len(children)
             except OSError:
-                pass
+                truncated.add("cgroup entries unreadable")
+        else:
+            truncated.add("cgroup depth")
         if depth <= _CGROUP_DEPTH:
             nodes.append(
                 {
@@ -190,21 +251,27 @@ def _in_cgroup(path: str | None, prefix: str | None) -> bool:
     )
 
 
-def _pids_by_cgroup_prefix(prefix: str | None) -> set[int]:
-    """Every pid in /proc whose cgroup path lies at or under ``prefix``."""
+def _pids_by_cgroup_prefix(prefix: str | None, truncated: set[str]) -> set[int]:
+    """A bounded /proc sample whose cgroup paths lie at or under ``prefix``."""
     found: set[int] = set()
     if prefix is None:
         return found
     try:
-        names = os.listdir(_PROC)
+        with os.scandir(_PROC) as entries:
+            for count, entry in enumerate(entries):
+                if count >= _PROC_ENTRY_LIMIT:
+                    truncated.add("proc entries")
+                    break
+                if not entry.name.isdigit():
+                    continue
+                pid = int(entry.name)
+                if _in_cgroup(_read_cgroup(pid), prefix):
+                    if len(found) >= _PID_LIMIT:
+                        truncated.add("processes")
+                        break
+                    found.add(pid)
     except OSError:
         return found
-    for name in names:
-        if not name.isdigit():
-            continue
-        path = _read_cgroup(int(name))
-        if _in_cgroup(path, prefix):
-            found.add(int(name))
     return found
 
 
@@ -241,12 +308,14 @@ def _group_processes(pids: set[int], prefix: str | None) -> tuple[list[dict], in
     root_of: dict[int, int] = {}
     for pid in info:
         path: list[int] = []
+        seen: set[int] = set()
         cur = pid
         while True:
             if cur in root_of:
                 root = root_of[cur]
                 break
             path.append(cur)
+            seen.add(cur)
             parent = info[cur][2]
             # A claude process roots its own tree; so does a process whose parent
             # is outside the subtree, or in a different cgroup (a unit boundary:
@@ -257,7 +326,7 @@ def _group_processes(pids: set[int], prefix: str | None) -> tuple[list[dict], in
             if (
                 info[cur][0] == "claude"
                 or parent not in info
-                or parent in path
+                or parent in seen
                 or cgroup[parent] != cgroup[cur]
             ):
                 root = cur
@@ -309,12 +378,16 @@ def take_snapshot(budget: dict) -> dict | None:
     root = budget.get("path")
     if not root:
         return None
-    nodes, pids, unreadable = _walk_cgroups(root)
+    truncated: set[str] = set()
+    nodes, pids, unreadable = _walk_cgroups(root, truncated)
     # cgroup.procs omits a process with no live threads (an unreaped zombie),
     # which pids.current still counts until it is reaped: find those through
     # their own /proc/<pid>/cgroup.
     prefix = _cgroup_prefix(root)
-    pids |= _pids_by_cgroup_prefix(prefix)
+    pids |= _pids_by_cgroup_prefix(prefix, truncated)
+    if len(pids) > _PID_LIMIT:
+        truncated.add("processes")
+        pids = set(sorted(pids)[:_PID_LIMIT])
     trees, threads_seen, vanished, excluded = _group_processes(pids, prefix)
     # Labels need a cmdline read each, so only for what the snapshot shows.
     for tree in trees:
@@ -333,10 +406,11 @@ def take_snapshot(budget: dict) -> dict | None:
         "budget_current": budget.get("current"),
         "budget_max": budget.get("max"),
         "threads_seen": threads_seen,
-        "processes_seen": len(pids) - vanished - excluded,
+        "processes_seen": sum(t["processes"] for t in trees),
         "vanished": vanished,
         "excluded": excluded,
         "cgroups_unreadable": unreadable,
+        "truncated": sorted(truncated),
         "top_cgroups": leaves[:_TOP_N],
         "trees": trees,
         "cgroups": nodes,
@@ -367,6 +441,8 @@ def summarize(snapshot: dict) -> str:
         f"Top cgroups: {cgroups or 'none readable'}. "
         f"Counted {snapshot['threads_seen']} of {snapshot['budget_current']} tasks."
     )
+    if snapshot.get("truncated"):
+        text += " Collection is a partial sample (" + ", ".join(snapshot["truncated"]) + ")."
     # Filesystem-surrogate paths retain byte identity in JSON; the alert is text.
     return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
