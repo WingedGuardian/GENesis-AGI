@@ -691,6 +691,13 @@ _NOT_WIRED = {
     # vanished guard. MEASURED 2026-10-01: 0 references to it in .claude/settings.json,
     # .claude/ or scripts/hooks/, so Claude Code never runs it as a hook.
     "deploy_candidates.py": "a CLI, not a hook: wired nowhere in .claude/settings.json",
+    # Not a hook either: the validator's sealed shell command RUNS this program;
+    # the PreToolUse decision is codex_validator_guard.py's. A failed import exits
+    # 1 before any request is read, so nothing is served and the caller sees a
+    # failure. MEASURED 2026-10-14: 0 references in .claude/settings.json or
+    # .claude/; its only scripts/hooks/ mention is codex_validator_shell.py naming
+    # it as the admitted runner.
+    "codex_validator_request.py": "a sealed-command CLI, not a hook: wired nowhere in .claude/",
 }
 
 

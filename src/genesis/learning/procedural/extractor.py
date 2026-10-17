@@ -38,6 +38,7 @@ from genesis.learning.procedural.embedding import (
     unpack_embedding,
 )
 from genesis.learning.procedural.operations import store_procedure
+from genesis.learning.procedural.tool_names import TOOL_TRIGGER_GUIDANCE
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -128,7 +129,8 @@ async def _cross_type_duplicate(
     try:
         from genesis.db.crud.procedural import list_active
 
-        active = await list_active(db, limit=500)
+        # Held lessons are untrusted text: kept out of the novelty prompt.
+        active = await list_active(db, limit=500, live_only=True)
     except Exception:
         logger.warning(
             "Cross-type dedup: list_active failed; treating as novel",
@@ -266,7 +268,8 @@ async def _principle_is_novel(
     try:
         from genesis.db.crud.procedural import list_by_task_type
 
-        existing = await list_by_task_type(db, task_type)
+        # A held lesson must not make a trusted extraction look like a duplicate.
+        existing = await list_by_task_type(db, task_type, live_only=True)
     except Exception:
         logger.warning(
             "Procedure novelty lookup failed; allowing storage",
@@ -356,7 +359,8 @@ Return a JSON object with these fields:
 - "steps": array of step strings (imperative, specific, actionable)
 - "tools_used": array of tool names involved (e.g., ["Bash", "WebFetch"])
 - "context_tags": array of tags for matching (e.g., ["youtube", "ssl", "video"])
-- "tool_trigger": array of CC tool names that should trigger this procedure, or null
+- "tool_trigger": array of CC tool names that should trigger this procedure, or null.
+  """ + TOOL_TRIGGER_GUIDANCE + """
 - "reusability_score": float 0.0-1.0 (how likely is this to help future tasks?)
 
 Return ONLY the JSON object, no markdown fences or explanation.

@@ -7,6 +7,7 @@ downloads, nothing runs sudo, and the engine cache is a tmp dir.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -68,6 +69,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.delenv("GENESIS_BROWSER_MIN_FREE_GB", raising=False)
     monkeypatch.setattr(provision, "free_bytes", lambda path: 100 * 1024**3)
     monkeypatch.setattr(provision, "_device_free", lambda path: 100 * 1024**3)
+    # check-packages imports each browser package's launch module; tests decide.
+    monkeypatch.setattr(provision, "_import_problem", lambda module: None, raising=False)
     monkeypatch.setattr(provision, "_pin_capable", lambda: True)
     monkeypatch.setattr(provision, "_explicit_choice", lambda: False)
     monkeypatch.setattr(provision, "_live_engine_in", lambda path: False)
@@ -94,14 +97,58 @@ def _resolves(monkeypatch, *statuses):
 # ── free space ────────────────────────────────────────────────────────────────
 
 
-def test_low_disk_skips_everything_and_succeeds(env, monkeypatch):
-    """The timer retries tomorrow; a full disk is not a failed unit."""
+def test_low_disk_with_nothing_to_install_succeeds(env, monkeypatch):
+    """The stack is already ready, so a full disk costs nothing today."""
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
+    _resolves(monkeypatch, READY)
+    run = Runner()
+    out = provision.provision(run)
+    # Only read-only probes ran: nothing was fetched or installed.
+    assert out.ok and not run.ran("camoufox fetch") and not run.ran(" install")
+    assert "low disk" in out.line()
+
+
+def test_low_disk_while_the_engine_is_missing_fails_visibly(env, monkeypatch):
+    """After the browser packages moved to a new pin, a skipped download leaves
+    the browser unusable; reporting that as success would hide it every day."""
     monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
     _resolves(monkeypatch, MISSING)
     run = Runner()
     out = provision.provision(run)
-    assert out.ok and run.calls == []
+    assert not out.ok and run.calls == []
     assert "low disk" in out.line()
+
+
+def test_low_disk_while_chromium_is_missing_fails_visibly(env, monkeypatch):
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
+    _layout(env, chrome=False)  # the fallback's Chromium has lost its executable
+    _resolves(monkeypatch, READY)
+    assert not provision.provision(Runner()).ok
+
+
+def test_low_disk_with_everything_in_place_is_a_success(env, monkeypatch):
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
+    _resolves(monkeypatch, READY)
+    assert provision.provision(Runner()).ok
+
+
+def test_low_disk_with_the_fingerprint_model_missing_fails_visibly(env, monkeypatch):
+    """A launch installs the add-ons and fingerprint model first; a full disk that
+    stops that install is not a ready stack."""
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
+    _resolves(monkeypatch, READY)
+    run = Runner({"is_pinned": (1, "")})
+    assert not provision.provision(run).ok
+    assert run.ran("is_pinned")
+
+
+def test_low_disk_with_a_missing_system_library_fails_visibly(env, monkeypatch):
+    monkeypatch.setattr(provision, "free_bytes", lambda path: 1 * 1024**3)
+    status = _engine_on_disk(env)
+    _resolves(monkeypatch, status)
+    run = Runner({"ldd": (0, "\tlibgtk-3.so.0 => not found\n")})
+    out = provision.provision(run)
+    assert not out.ok and "low disk" in out.line()
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-1", "0", "abc", ""])
@@ -217,6 +264,75 @@ def test_corrupt_pinned_dir_is_removed_then_fetched(env, monkeypatch):
     out = provision.provision(run)
     assert provision._removed == [bad]
     assert len(run.ran("camoufox fetch")) == 1 and out.ok
+
+
+def _bad_engine(env, *, age_days=1):
+    bad = env / "xdg" / "camoufox" / "browsers" / "official" / "156.0.1-beta.36-abc"
+    bad.mkdir(parents=True)
+    (bad / "version.json").write_text("{}")
+    then = time.time() - age_days * 86400
+    os.utime(bad / "version.json", (then, then))
+    return bad, engine.EngineStatus(engine.INVALID, "corrupt", bad / "camoufox-bin")
+
+
+def test_an_engine_damaged_after_a_good_install_is_repaired(env, monkeypatch):
+    """A recent version.json says the install completed, not that the engine is
+    still whole: one damaged since (files removed) is repaired, not left a week."""
+    bad, invalid = _bad_engine(env, age_days=1)
+    _resolves(monkeypatch, invalid, READY)
+    run = Runner()
+    out = provision.provision(run)
+    assert provision._removed == [bad] and len(run.ran("camoufox fetch")) == 1
+    assert out.ok
+
+
+def test_after_a_fetch_that_stays_invalid_the_next_runs_do_not_fetch(env, monkeypatch):
+    """The daily timer would otherwise repeat a delete and a 1.3 GB fetch every day
+    for an engine that installs invalid by Genesis's checks."""
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid)
+    first = provision.provision(Runner())
+    assert "engine=invalid (after fetch)" in first.line()
+    provision._removed.clear()
+    run = Runner()
+    out = provision.provision(run)
+    assert run.ran("camoufox fetch") == [] and provision._removed == []
+    assert not out.ok and any("remove it by hand" in n for n in out.notes)
+
+
+def test_a_failed_fetch_is_retried_after_a_week(env, monkeypatch):
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid)
+    provision.provision(Runner())
+    real = time.time
+    monkeypatch.setattr(provision.time, "time", lambda: real() + 8 * 86400)
+    run = Runner()
+    provision.provision(run)
+    assert len(run.ran("camoufox fetch")) == 1
+
+
+def test_a_ready_engine_clears_the_failed_fetch_record(env, monkeypatch):
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid)
+    provision.provision(Runner())
+    _resolves(monkeypatch, READY)
+    provision.provision(Runner())
+    _resolves(monkeypatch, invalid, READY)
+    run = Runner()
+    provision.provision(run)
+    assert len(run.ran("camoufox fetch")) == 1  # damaged again later: repaired
+
+
+@pytest.mark.parametrize("content", ["not json", "[]", '{"x": "y"}'])
+def test_an_unreadable_record_does_not_stop_a_repair(env, monkeypatch, content):
+    record = provision._failed_fetches_path()
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(content)
+    bad, invalid = _bad_engine(env)
+    _resolves(monkeypatch, invalid, READY)
+    run = Runner()
+    provision.provision(run)
+    assert len(run.ran("camoufox fetch")) == 1
 
 
 def test_a_fresh_fetch_that_stays_invalid_is_not_deleted_again(env, monkeypatch):
@@ -647,7 +763,9 @@ def test_every_destination_must_have_room(env, monkeypatch):
     _resolves(monkeypatch, MISSING)
     run = Runner()
     out = provision.provision(run)
-    assert out.ok and run.calls == []
+    # Nothing downloaded and the engine is missing: not a success (see
+    # test_low_disk_while_chromium_is_missing_fails_visibly).
+    assert not out.ok and run.ran("camoufox fetch") == []
     assert "low disk" in out.line() and str(temp) in out.line()
 
 
@@ -664,7 +782,7 @@ def test_chromiums_destination_must_have_room(env, monkeypatch):
     run = Runner()
     out = provision.provision(run)
     assert run.ran("install chromium") == []
-    assert "chromium=skipped (low disk" in out.line()
+    assert "chromium=skipped (low disk" in out.line() and not out.ok
 
 
 def test_a_destination_that_cannot_be_measured_skips(env, monkeypatch):
@@ -906,6 +1024,110 @@ def test_main_prints_one_outcome_line_and_exits_by_it(env, monkeypatch, capsys):
     )
 
 
+def test_check_packages_passes_with_the_whole_extra(env, monkeypatch, capsys):
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    assert provision.main(["check-packages"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+
+def test_check_packages_names_a_package_whose_module_does_not_import(env, monkeypatch, capsys):
+    """pip counts a package whose .dist-info survived as installed even when its
+    module files are gone; the launch then fails on the import."""
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(
+        provision,
+        "_import_problem",
+        lambda module: "No module named 'patchright.async_api'"
+        if module.startswith("patchright")
+        else None,
+    )
+    assert provision.main(["check-packages"]) == 1
+    out = capsys.readouterr().out
+    assert "patchright" in out and "does not import" in out and "reinstall" in out
+
+@pytest.mark.parametrize(
+    ("versions", "pin_capable", "expected"),
+    [
+        ({"camoufox": None, "playwright": "1.62.0", "patchright": "1.62.3"}, False, "camoufox"),
+        ({"camoufox": "0.4.11", "playwright": "1.62.0", "patchright": "1.62.3"}, False, "0.5.7"),
+        ({"camoufox": "0.5.8", "playwright": None, "patchright": "1.62.3"}, True, "playwright"),
+        ({"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": None}, True, "patchright"),
+    ],
+)
+def test_check_packages_names_what_the_browser_extra_left_out(
+    env, monkeypatch, capsys, versions, pin_capable, expected
+):
+    """pip's exit status is masked in venv_setup.sh, and a failed resolution leaves
+    the old packages importable; bootstrap and install.sh read this instead."""
+    monkeypatch.setattr(provision.packages, "installed_versions", lambda: versions)
+    monkeypatch.setattr(provision, "_pin_capable", lambda: pin_capable)
+    monkeypatch.setenv("CLAUDECODE", "1")  # read-only: allowed inside a session
+    assert provision.main(["check-packages"]) == 1
+    out = capsys.readouterr().out
+    assert expected in out and out.startswith("browser-stack:")
+
+
+_REQUIRES = [
+    "aiosqlite",
+    'tomli>=2; python_version < "3.13"',
+    'camoufox<0.6,>=0.5.7; extra == "browser"',
+    'playwright<1.63,>=1.62; extra == "browser"',
+    'patchright<1.63,>=1.62.1; extra == "browser"',
+    'openai>=2; extra == "voice"',
+]
+
+
+def _metadata(monkeypatch, requires=_REQUIRES):
+    monkeypatch.setattr(
+        provision.metadata, "packages_distributions", lambda: {"genesis": ["genesis-v3"]}
+    )
+    monkeypatch.setattr(
+        provision.metadata, "requires", lambda dist: requires if dist == "genesis-v3" else None
+    )
+
+
+def test_check_packages_reads_the_extra_from_the_installed_metadata(env, monkeypatch, capsys):
+    """A failed or offline pip run can leave a playwright outside the pinned minor,
+    which breaks the one-Chromium-build pairing the pins exist for."""
+    _metadata(monkeypatch)
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.58.0", "patchright": "1.62.3"},
+    )
+    assert provision.main(["check-packages"]) == 1
+    out = capsys.readouterr().out
+    assert "playwright 1.58.0" in out and "1.63" in out
+    assert "camoufox" not in out and "patchright" not in out
+
+
+def test_browser_requirements_are_exactly_the_extra(monkeypatch):
+    """A core requirement whose marker holds anyway (python_version) is not one."""
+    _metadata(monkeypatch)
+    names = sorted(r.name for r in provision._browser_requirements())
+    assert names == ["camoufox", "patchright", "playwright"]
+
+
+def test_check_packages_ignores_other_groups_and_core_markers(env, monkeypatch, capsys):
+    _metadata(monkeypatch)
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    assert provision.main(["check-packages"]) == 0
+    assert capsys.readouterr().out == ""
+
+
 def test_main_refuses_inside_a_claude_code_session(env, monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "1")
     assert provision.main(["run"]) == 2
@@ -946,6 +1168,81 @@ def test_main_exits_nonzero_when_not_ok(env, monkeypatch):
     _resolves(monkeypatch, MISSING, MISSING)
     monkeypatch.setattr(provision.subprocess, "run", Runner())
     assert provision.main(["run"]) == 1
+
+
+def test_check_packages_without_packaging_checks_presence_and_notes_it(env, monkeypatch, capsys):
+    """Not being able to read the version ranges is not a range violation: a venv
+    without `packaging` must not report a correctly installed extra as incomplete."""
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+
+    def no_packaging(pyproject=None):
+        raise ModuleNotFoundError("No module named 'packaging'")
+
+    monkeypatch.setattr(provision, "_browser_requirements", no_packaging)
+    assert provision.main(["check-packages"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "" and "version ranges" in captured.err
+
+
+def test_check_packages_reads_the_extra_from_the_checkout_not_stale_metadata(
+    env, monkeypatch, capsys, tmp_path
+):
+    """A pip run that fails before writing metadata leaves the OLD extra's ranges on
+    disk; the checkout's pyproject.toml holds the ones this install asked for."""
+    _metadata(monkeypatch, ['playwright>=1.40; extra == "browser"'])
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "genesis-v3"\n[project.optional-dependencies]\n'
+        'browser = ["camoufox>=0.5.7,<0.6", "playwright>=1.62,<1.63", "patchright>=1.62.1,<1.63"]\n'
+        'voice = ["openai>=2"]\n'
+    )
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.60.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(provision, "_pin_capable", lambda: True)
+    assert provision.main(["check-packages", "--pyproject", str(pyproject)]) == 1
+    assert "playwright 1.60.0 is outside" in capsys.readouterr().out
+
+
+def test_check_packages_with_an_unreadable_pyproject_says_so(env, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(provision, "_pin_capable", lambda: True)
+    missing = tmp_path / "missing.toml"
+    assert provision.main(["check-packages", "--pyproject", str(missing)]) == 1
+    out = capsys.readouterr().out
+    assert "could not be read" in out and str(missing) in out
+
+
+def test_a_checkout_requirement_whose_marker_fails_here_is_not_checked(
+    env, monkeypatch, capsys, tmp_path
+):
+    """pip skips a requirement whose environment marker is false on this host, so
+    the check must too, or it reports a package pip was right not to install."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "genesis-v3"\n[project.optional-dependencies]\n'
+        'browser = ["camoufox>=0.5.7,<0.6", "playwright>=1.62,<1.63", '
+        '"patchright>=1.62.1,<1.63", "playwright>=9; python_version < \'3\'"]\n'
+    )
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+    monkeypatch.setattr(provision, "_pin_capable", lambda: True)
+    assert provision.main(["check-packages", "--pyproject", str(pyproject)]) == 0, (
+        capsys.readouterr().out
+    )
 
 
 # ── review fixes ──────────────────────────────────────────────────────────────
@@ -993,7 +1290,9 @@ def test_a_fetch_needs_room_for_itself_above_the_floor(env, monkeypatch):
     run = Runner()
     out = provision.provision(run)
     assert run.ran("camoufox fetch") == []
-    assert "engine=skipped (low disk" in out.line() and out.ok
+    # The engine is missing and nothing was fetched: not a success, or the daily
+    # timer would repeat the skip as one.
+    assert "engine=skipped (low disk" in out.line() and not out.ok
 
 
 def test_a_ready_engine_needs_no_room_for_a_fetch(env, monkeypatch):
@@ -1309,4 +1608,66 @@ def test_printed_commands_quote_a_path_with_spaces(env, monkeypatch):
     assert any(
         "sudo '/opt/my venv/bin/python' -m playwright install-deps chromium firefox" in n
         for n in out.notes
+    )
+
+
+def test_a_failed_fetch_record_from_the_future_does_not_block_a_retry(env, monkeypatch):
+    """After a clock rollback the record's age is negative; it must not suppress
+    retries until the clock catches up."""
+    directory = env / "xdg" / "camoufox" / "browsers" / "official" / "156.0.1-beta.36"
+    provision._failed_fetches_path().parent.mkdir(parents=True, exist_ok=True)
+    provision._failed_fetches_path().write_text(
+        json.dumps({str(directory): provision.time.time() + 86400})
+    )
+    assert not provision._fetched_invalid_recently(directory)
+
+
+def test_check_packages_reports_unreadable_camoufox_metadata(env, monkeypatch, capsys):
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {
+            "camoufox": provision.packages.UNREADABLE,
+            "playwright": "1.62.0",
+            "patchright": "1.62.3",
+        },
+    )
+
+    def pin_capable():
+        raise AssertionError("the pin is not probed through unreadable metadata")
+
+    monkeypatch.setattr(provision, "_pin_capable", pin_capable)
+    assert provision.main(["check-packages"]) == 1
+    out = capsys.readouterr().out
+    assert "camoufox" in out and "unreadable" in out and "reinstall" in out
+
+
+def test_check_packages_reports_an_unreadable_record(env, monkeypatch, capsys):
+    """METADATA readable, RECORD corrupt: the version reads, the pin probe (which
+    reads the file list) raises."""
+    monkeypatch.setattr(
+        provision.packages,
+        "installed_versions",
+        lambda: {"camoufox": "0.5.8", "playwright": "1.62.0", "patchright": "1.62.3"},
+    )
+
+    def pin_capable():
+        raise engine._UnreadableMetadata("camoufox", UnicodeDecodeError("utf-8", b"\xff", 0, 1, "x"))
+
+    monkeypatch.setattr(provision, "_pin_capable", pin_capable)
+    assert provision.main(["check-packages"]) == 1
+    out = capsys.readouterr().out
+    assert "camoufox" in out and "unreadable" in out and "reinstall" in out
+
+
+def test_venv_check_accepts_only_a_venv_serving_this_checkout(tmp_path):
+    repo = tmp_path / "repo"
+    module = repo / "src" / "genesis" / "__init__.py"
+    other = tmp_path / "other" / "src" / "genesis" / "__init__.py"
+    assert provision._serves_checkout(repo, prefix="/v", base_prefix="/usr", module_file=module)
+    assert not provision._serves_checkout(
+        repo, prefix="/v", base_prefix="/usr", module_file=other
+    )
+    assert not provision._serves_checkout(
+        repo, prefix="/usr", base_prefix="/usr", module_file=module
     )

@@ -46,6 +46,7 @@ on:
       - "scripts/code_intel_freeze.sh"
       - "scripts/code_intel_runner.sh"
       - "scripts/disk_hygiene.sh"
+      - "scripts/install_browser_stack.sh"
       - "scripts/tmp_watchgod.sh"
       - "scripts/hooks/pre-commit"
       - "scripts/hooks/pre-push"
@@ -131,6 +132,10 @@ jobs:
       - name: Run installer (non-interactive, strict)
         env:
           GENESIS_INSTALL_STRICT: "1"
+          # No GITHUB_TOKEN here, though the browser stack step's engine fetch lists
+          # releases through api.github.com (anonymous: 60 calls an hour per
+          # address): this job runs the pull request's own code, which must not
+          # read the token (see persist-credentials above).
         run: ./scripts/install.sh --non-interactive
 
       - name: Verify install outcome
@@ -170,6 +175,7 @@ jobs:
           # literal __AZ_ROOT__ (fixed in this PR).
           for _unit in ~/.config/systemd/user/genesis-*.service \
                        ~/.config/systemd/user/genesis-*.timer \
+                       ~/.config/systemd/user/genesis-*.slice \
                        ~/.config/systemd/user/agent-zero.service \
                        ~/.config/systemd/user/qdrant.service; do
             [ -f "$_unit" ] || continue
@@ -199,7 +205,7 @@ jobs:
           # inside the loop already handles the literal-pattern case.
           _unrendered=""
           _tpl_count=0
-          for _tpl in scripts/systemd/*.service.template scripts/systemd/*.timer.template; do
+          for _tpl in scripts/systemd/*.service.template scripts/systemd/*.timer.template scripts/systemd/*.slice.template; do
             [ -f "$_tpl" ] || continue
             _tpl_count=$((_tpl_count + 1))
             _want=$(basename "$_tpl" .template)
@@ -215,6 +221,11 @@ jobs:
             exit 1
           fi
           echo "  $_tpl_count shipped unit template(s), all rendered"
+
+          # Managed query setup is rendered everywhere but explicitly activated.
+          # A fresh install cannot make this provider available without setup.
+          test "$(systemctl --user show genesis-cbm-query.service -p UnitFileState --value)" = disabled
+          test "$(systemctl --user show genesis-cbm-query.service -p ActiveState --value)" = inactive
 
           # AUTO-STARTED units must actually be RUNNING, for the same reason
           # genesis-server is checked above and for a sharper one: the installer

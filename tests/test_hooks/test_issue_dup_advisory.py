@@ -120,7 +120,8 @@ def _note(
 @pytest.mark.parametrize("sub", ["create", "new"])
 def test_a_filed_issue_is_checked_against_its_own_repo(monkeypatch, capsys, sub):
     note, gh = _note(monkeypatch, capsys, f'gh issue {sub} -t "x" -b y', NEW_URL + "\n")
-    assert note == "Duplicate check for acme/widgets#900: no close open or recently closed issue."
+    assert note.startswith("Duplicate check for acme/widgets#900: no eligible matches")
+    assert "may exist outside" in note
     (view,) = gh.of("view")
     (search,) = gh.of("search")
     assert view[3] == NEW_URL
@@ -152,8 +153,40 @@ def test_a_failed_create_with_no_url_is_silent(monkeypatch, capsys):
 
 def test_a_successful_create_with_no_url_says_it_could_not_check(monkeypatch, capsys):
     note, gh = _note(monkeypatch, capsys, CREATE + " > /dev/null", "")
-    assert note.startswith("Duplicate check did not run") and "no issue it created appears" in note
+    assert note.startswith("Duplicate check did not run") and "no newly created issue URL" in note
     assert gh.calls == []
+
+
+def test_a_skipped_fallback_does_not_claim_an_issue_was_created(monkeypatch, capsys):
+    note, gh = _note(monkeypatch, capsys, "gh issue view 5 >/dev/null || " + CREATE)
+    assert "may not have run" in note
+    assert "no issue it created appears" not in note
+    assert gh.calls == []
+
+
+@pytest.mark.parametrize("flag", ["--title", "-t", "--body", "-b", "--body-file", "-F"])
+@pytest.mark.parametrize("value", ["--web", "-w"])
+@pytest.mark.parametrize("before_path", [False, True])
+def test_web_like_string_values_do_not_suppress_a_confirmed_filing(
+    monkeypatch, capsys, flag, value, before_path
+):
+    options = f"{flag} {value}"
+    command = f"gh {options} issue create" if before_path else f"gh issue create {options}"
+    note, gh = _note(monkeypatch, capsys, command, NEW_URL)
+    assert "acme/widgets#900" in note
+    assert len(gh.of("view")) == len(gh.of("search")) == 1
+
+
+@pytest.mark.parametrize("flag", ["--title", "-t", "--body", "-b", "--body-file", "-F"])
+@pytest.mark.parametrize("value", ["--web", "-w"])
+def test_attached_web_like_values_still_check_a_confirmed_filing(monkeypatch, capsys, flag, value):
+    note, gh = _note(monkeypatch, capsys, f"gh issue create {flag}={value}", NEW_URL)
+    assert "acme/widgets#900" in note and len(gh.of("search")) == 1
+
+
+def test_an_explicit_false_web_flag_still_checks_a_confirmed_filing(monkeypatch, capsys):
+    note, gh = _note(monkeypatch, capsys, CREATE + " --web=false", NEW_URL)
+    assert "acme/widgets#900" in note and len(gh.of("search")) == 1
 
 
 def test_a_backgrounded_create_says_to_check_later(monkeypatch, capsys):
@@ -185,7 +218,7 @@ def test_commands_that_file_nothing_here_stay_silent(monkeypatch, capsys, comman
 )
 def test_only_whole_line_urls_are_candidates(monkeypatch, capsys, line):
     note, gh = _note(monkeypatch, capsys, CREATE, line + "\n")
-    assert "no issue it created appears" in note and gh.calls == []
+    assert "no newly created issue URL" in note and gh.calls == []
 
 
 def test_a_continued_create_is_still_checked_from_its_output(monkeypatch, capsys):
@@ -246,7 +279,7 @@ def test_without_duration_a_ten_minute_window_applies(monkeypatch, capsys):
     note, _ = _note(
         monkeypatch, capsys, CREATE, NEW_URL, _Gh(created={NEW_URL: six_min}), duration_ms=4000
     )
-    assert "no issue it created appears" in note
+    assert "no newly created issue URL" in note
 
 
 def test_no_more_issues_are_checked_than_creates_ran(monkeypatch, capsys):
@@ -391,6 +424,22 @@ def test_query_words_after_double_dash_keep_colon_terms(monkeypatch, capsys):
 
 def test_query_builder_drops_a_word_that_is_only_dashes():
     assert hook._query_words("fix -- the: thing") == ["fix", "the", "thing"]
+
+
+@pytest.mark.parametrize("operator", ["OR", "AND"])
+def test_title_boolean_words_are_literal_search_terms(monkeypatch, capsys, operator):
+    _, gh = _note(monkeypatch, capsys, CREATE, NEW_URL, _Gh(title=f"Linux {operator} macOS"))
+    (argv,) = gh.of("search")
+    assert argv[argv.index("--") + 1 :] == ["Linux", operator.lower(), "macOS"]
+
+
+@pytest.mark.parametrize("size", [1, 7])
+def test_filtered_search_results_do_not_certify_absence(monkeypatch, capsys, size):
+    rows = _rows(*[(n, "Old issue", "closed", "2026-08-01T09:00:00Z") for n in range(size)])
+    note, gh = _note(monkeypatch, capsys, CREATE, NEW_URL, _Gh(search=rows))
+    assert "returned search results" in note and "may exist outside" in note
+    assert "no close open or recently closed issue." not in note
+    assert len(gh.of("search")) == 1
 
 
 def test_matches_exclude_the_new_issue_keep_recent_closed_and_drop_old(monkeypatch, capsys):

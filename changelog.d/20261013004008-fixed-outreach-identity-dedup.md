@@ -1,0 +1,1 @@
+- A morning report, or a queued alert with its own identity, is no longer dropped as a duplicate just because its first 200 characters match an earlier message, and deliveries retried after a send failure are no longer dropped as duplicates of each other. A repeated identical backup failure that had to be queued for retry is still delivered once a day.

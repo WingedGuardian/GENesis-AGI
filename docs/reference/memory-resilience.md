@@ -70,7 +70,8 @@ remediation for the detected vantage — because the knob is never local:
   that advance via bare `git pull` and never re-run host-setup. A heal pages
   an INFO alert; opt a host out with `swap_reconcile_enabled: false` in the
   guardian config (an explicitly-false knob is otherwise reconciled back to
-  true — swap-on is the install invariant).
+  true — swap-on is the install invariant). A configured ceiling change also
+  pages its own INFO alert naming `swap_ceiling_pct`.
   **Opt-in ceiling**: `swap_ceiling_pct` (install-local only — set it in the
   deployed `guardian.yaml`, never in this repo's shipped template) caps the
   container's swap at that percentage of the HOST's `SwapTotal`, so the cap

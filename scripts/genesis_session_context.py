@@ -53,7 +53,12 @@ def _db_is_fenced(db_path) -> bool:
 
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
-_SECRETS_PATH = Path(__file__).resolve().parent.parent / "secrets.env"
+# SECRETS_PATH wins, as in genesis.env.secrets_path() (not importable yet here).
+_SECRETS_PATH = (
+    Path(os.environ["SECRETS_PATH"]).expanduser()
+    if os.environ.get("SECRETS_PATH")
+    else Path(__file__).resolve().parent.parent / "secrets.env"
+)
 if _SECRETS_PATH.is_file():
     try:
         from dotenv import load_dotenv
@@ -686,10 +691,6 @@ def _emit_body() -> tuple[str, str, str] | None:
             sys.stdout.flush()
             return
 
-    # Eject lever: flag file absent → no Genesis context
-    if not _FLAG.exists():
-        return
-
     # Hook input (session_id, source) — mirrors genesis_session_end.py. CC
     # pipes SessionStart input as stdin JSON; before this was parsed, the
     # script had no session identity and could not read per-session state.
@@ -702,6 +703,13 @@ def _emit_body() -> tuple[str, str, str] | None:
         _hook_input = {}
     _hook_session_id = str(_hook_input.get("session_id", "") or "")
     _hook_source = str(_hook_input.get("source", "") or "")
+    if _hook_source in ("compact", "clear"):
+        _stamp_compaction(_hook_session_id)
+
+    # Eject lever: flag file absent → no Genesis context
+    if not _FLAG.exists():
+        return
+
     # CC sends `model` on SessionStart for `startup` and `compact` — the two
     # events that matter here, because it means the header stays correct across a
     # compaction (the baked "You are powered by …" env line freezes at original
@@ -1446,6 +1454,26 @@ def _record_miswire(reason: str) -> None:
             fh.write(f"{datetime.now(UTC).isoformat()}\t{' '.join(str(reason).split())}\n")
     except OSError as exc:
         print(f"[session_context] could not record the mis-wire: {exc}", file=sys.stderr)
+
+
+def _stamp_compaction(session_id: str) -> None:
+    """Touch ``<session>/compacted.stamp`` after a compaction.
+
+    The procedure advisor reads its mtime as the start of the current context
+    window, so a lesson shown before the compaction can be shown again. Only a
+    SessionStart whose source is ``compact`` (or ``clear``, which also empties
+    the context) writes it: a resume keeps its context. Written before every other step, for foreground and dispatched
+    sessions alike. Fail-open: session start must never break on it.
+    """
+    try:
+        from hook_input import session_path
+
+        stamp = session_path(Path.home() / ".genesis" / "sessions", session_id, "compacted.stamp")
+        if stamp is not None:
+            stamp.parent.mkdir(parents=True, exist_ok=True)
+            stamp.touch()
+    except Exception as exc:
+        print(f"genesis_session_context: compaction stamp skipped: {exc}", file=sys.stderr)
 
 
 def _write_mirror(path: Path | None, text: str) -> bool:

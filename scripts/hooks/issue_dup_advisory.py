@@ -184,7 +184,9 @@ def _query_words(title: str) -> list[str]:
     a flag, so its leading dashes go.
     """
     words = (w.lstrip("-") for w in re.sub(r"[^\w\s.-]", " ", title).split())
-    return [w for w in words if w]
+    # Separate uppercase OR/AND tokens are query operators even with semantic
+    # ranking; keep title words as ordinary natural-language terms.
+    return [w.lower() if w in {"OR", "AND"} else w for w in words if w]
 
 
 def _gh(argv: list[str], deadline: float, what: str) -> str:
@@ -294,7 +296,10 @@ def _check(url: str, repo: str, num: int, title: str, deadline: float, now: date
     )
     found = _matches(out, num, now)
     if not found:
-        return f"Duplicate check for {repo}#{num}: no close open or recently closed issue."
+        return (
+            f"Duplicate check for {repo}#{num}: no eligible matches in the returned search results. "
+            "A matching open or recently closed issue may exist outside these results."
+        )
     lines = [
         f"You filed {repo}#{num} {_one_line(title, 120)!r}. "
         "Closest existing issues (GitHub semantic search):"
@@ -324,7 +329,7 @@ def _manual(where: str, reason: str) -> str:
 
 
 def _creates_in(cmd: str) -> int:
-    """How many issue creates the command runs at top level (a bounded estimate when unreadable)."""
+    """How many syntactic top-level issue creates may run (bounded when unreadable)."""
     segments, blind = analyze_checked(cmd)
     if blind is not None and blind.bounds_induced:
         # House ruling (see pr_close_advisory): never re-parse a joined command.
@@ -339,7 +344,11 @@ def _creates_in(cmd: str) -> int:
         if inv is None or inv.group != "issue" or inv.subcommand not in _CREATE_SUBCOMMANDS:
             continue
         # These file nothing: help prints usage, --web opens a browser form.
-        if gh_requests_help(argv) or "--web" in argv or "-w" in argv:
+        # Reuse the option-aware help walk for web flags: string values remain
+        # consumed values even when mapped, rather than becoming flag positions.
+        if gh_requests_help(argv) or gh_requests_help(
+            ["--help" if arg in {"--web", "-w"} else arg for arg in argv]
+        ):
             continue
         count += 1
     return count
@@ -428,8 +437,8 @@ def _process(payload: dict, now: datetime | None = None) -> None:
             hits.append((created, position, url, repo, num, title))
     filed = sorted(hits, key=lambda h: (h[0], h[1]), reverse=True)[:creates]
     if not filed and not notes and (event == "PostToolUse" or unread):
-        # A successful call probably filed an issue, but none created during it is
-        # in the output. A failed call with no such URL filed nothing, so it gets no
+        # A successful overall call can skip a conditional create. Without a
+        # confirmed URL, its execution is unknown. A failed call gets no
         # note, unless a URL it printed could not be read: that one may be its own.
         if len(candidates) > _MAX_VIEWS:
             reason = "its output holds too many issue URLs to tell which one it filed"
@@ -438,7 +447,10 @@ def _process(payload: dict, now: datetime | None = None) -> None:
         elif _OTHER_HOST_URL.search(text):
             reason = "the issue is not on github.com, and only github.com is checked"
         else:
-            reason = "no issue it created appears in the command's output"
+            reason = (
+                "no newly created issue URL was identified in the command's output; "
+                "a conditional create may not have run"
+            )
         notes.append(_manual("this `gh issue create`", reason))
     # Report in output order (oldest first), checking at most _MAX_CHECKS.
     for _created, _pos, url, repo, num, title in sorted(
