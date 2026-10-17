@@ -1765,7 +1765,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 83a835e32 2026-10-08
+verified: 85652265c 2026-10-09
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -3652,6 +3652,18 @@ verified: ba9dd8a37 2026-10-09
   beyond those reset targets; required peer tables must be ordinary tables.
   Guardian snapshot rollback instead warns at its existing action-approval gate
   that approval explicitly reauthorizes saved peers.
+  encrypted `scripts/backup.sh` timer). Recovery pins a selected off-site snapshot across retries,
+  authenticates legacy and v2 transcript archives, and verifies pooled
+  objects before restoring. Pooled SMB downloads retain the backend credential
+  lease until the off-site pull returns; library definitions load before that lease.
+  Explicit local directories take precedence over
+  off-site configuration; independently identified Tier-1 audit records restore
+  additively with separate provenance. Cache entry points validate selected identity
+  and required component inventory structure,
+  and interrupted retirement resumes through fenced tombstones. Identical legacy
+  copies collapse; distinct decoded copies require an explicit encoding choice.
+  Reader support precedes new-format capture;
+  persistent analytics settings recovery lands separately.
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
   tmp discipline (`~/tmp` for large temp — never override TMPDIR),

@@ -354,7 +354,8 @@ def _child_pytest(crumb: Path, *, owner: str | None) -> subprocess.CompletedProc
     return subprocess.run(
         [sys.executable, "-m", "pytest", *_CHILD_TARGET, "-q", "--no-header",
          "-p", "no:cacheprovider"],
-        cwd=_REPO, env=env, capture_output=True, text=True, timeout=600,
+        # 300 s: below the 600 s per-test timeout, so this fires first.
+        cwd=_REPO, env=env, capture_output=True, text=True, timeout=300,
     )
 
 

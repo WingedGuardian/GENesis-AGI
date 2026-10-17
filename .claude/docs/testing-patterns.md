@@ -94,7 +94,12 @@ yet?". It decides nothing.
 
 ### When a run is refused
 
-The message names the holder's pid, command and age, plus how to wait:
+The message names the holder's pid, command and age, the test it is running
+now and for how long, plus how to wait. When one test has run longer than
+`GENESIS_PYTEST_LOCK_STALL_SECONDS` (default 600) it adds a `LIKELY HUNG` line
+with the holder's wait channel, and says when no per-test timeout applies in
+that run. Nothing is killed; the line tells you what to look at. A hang during
+collection names no test, so it is not flagged.
 
 ```bash
 python3 scripts/pytest_lock_wait.py            # default: 2h ceiling
@@ -117,6 +122,7 @@ line — so it waits on itself forever, and it matches other sessions' waiters t
 | `GENESIS_PYTEST_LOCK_WAIT=1` | Queue until free instead of failing fast. The right shape for a background eval. |
 | `GENESIS_PYTEST_LOCK_WAIT_TIMEOUT=<s>` | Bound on that wait (default 7200, capped 86400). |
 | `GENESIS_PYTEST_LOCK_PATH=<file>` | Point the lock at an explicit file instead of the default. |
+| `GENESIS_PYTEST_LOCK_STALL_SECONDS=<s>` | When a contender calls one long-running test `LIKELY HUNG` (default 600). Advisory only. |
 
 The lock fails **open** by contract: a missing `~/.genesis`, an unreadable lock
 directory, an unrecognised value for one of those variables, or any unexpected
