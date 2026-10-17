@@ -26,10 +26,15 @@ import contextlib
 import logging
 import os
 import signal
+import subprocess
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_REAP_TIMEOUT_S = 30.0
+
+
+class ProcessCleanupUncertain(RuntimeError):
+    """Managed supervisor must retain ownership; process exit is unconfirmed."""
 
 
 def kill_process_group(proc, sig: signal.Signals = signal.SIGKILL) -> None:
@@ -99,3 +104,132 @@ async def reap_bounded(proc, timeout_s: float | None = None) -> None:
         timeout_s = DEFAULT_REAP_TIMEOUT_S
     with contextlib.suppress(Exception):
         await asyncio.wait_for(proc.wait(), timeout=timeout_s)
+
+
+async def confirm_process_exit(
+    proc,
+    *,
+    graceful: bool = False,
+    escalation_grace_s: float = 0.0,
+    confirm_timeout_s: float | None = None,
+) -> None:
+    """Opt-in strong drain: refusals are unknown, never proof of group exit.
+
+    A managed receipt holds capacity while this waits. Shield the cleanup task
+    against repeated cancellation; deliver cancellation after confirmation.
+
+    ``graceful`` is for a child already asked to stop (SIGTERM after its
+    result): it first gets the ordinary bounded reap, and a surviving group
+    gets ``escalation_grace_s`` to flush, before the group kill and the
+    confirmation that follows it.
+
+    Absence is confirmed for at most ``confirm_timeout_s`` after the group kill
+    (``None`` resolves ``DEFAULT_REAP_TIMEOUT_S`` at call time, the same bound
+    as the ordinary reap). Past it the group is reported as uncertain rather
+    than watched forever; the caller keeps holding what it owns either way.
+    """
+    if confirm_timeout_s is None:
+        confirm_timeout_s = DEFAULT_REAP_TIMEOUT_S
+
+    async def drain():
+        if graceful:
+            await reap_bounded(proc)
+            if process_group_alive(proc):
+                await asyncio.sleep(escalation_grace_s)
+        with contextlib.suppress(OSError):
+            kill_process_group(proc)
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + confirm_timeout_s
+        while True:
+            gone = False
+            pgid = getattr(proc, "pid", None)
+            if isinstance(pgid, int) and pgid > 1:
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    gone = True
+                except OSError:
+                    pass  # Includes PermissionError: liveness remains unknown.
+            if gone and proc.returncode is not None:
+                return
+            if loop.time() >= give_up:
+                raise TimeoutError("process group absence unconfirmed")
+            await asyncio.sleep(0.1)
+
+    cleanup = asyncio.create_task(drain())
+    interrupted = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            interrupted = True
+        except Exception:
+            break  # Classify below; never infer exit from a failed drain.
+    if cleanup.cancelled() or cleanup.exception() is not None:
+        raise ProcessCleanupUncertain("Process cleanup is unconfirmed") from None
+    cleanup.result()
+    if interrupted:
+        raise asyncio.CancelledError
+
+
+def _raised_by_popen(exc: BaseException) -> bool:
+    """True when ``exc`` left ``subprocess.Popen`` construction with no child.
+
+    Judged from the Popen object being constructed, not from where it raised:
+    either no child was created (``pid`` is still None: a stdio pipe, error
+    pipe, fork or posix_spawn failure) or CPython reaped it (``returncode``
+    set: an exec failure reported through the error pipe). Any other raise,
+    such as an error-pipe read failing after the fork, leaves a child that may
+    still be running. Relies on CPython 3.12's Popen internals; if they change,
+    the check fails toward uncertain. One double fault (a fork that succeeds,
+    then a non-OSError before ``pid`` is assigned, then an OSError closing the
+    error pipe) would read as no child; it is not handled.
+    """
+    if not isinstance(exc, OSError):
+        return False
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        popen = frame.f_locals.get("self")
+        if frame.f_code.co_name == "__init__" and isinstance(popen, subprocess.Popen):
+            return popen.pid is None or popen.returncode is not None
+        tb = tb.tb_next
+    return False
+
+
+async def spawn_owned(*args, **kwargs):
+    """Retain a managed subprocess launch until its process handle is known.
+
+    Cancelling CPython's creation coroutine kills only the transport's leader.
+    Shield it, then drain the group before delivering the caller's cancel.
+    """
+    launch = asyncio.create_task(asyncio.create_subprocess_exec(*args, **kwargs))
+    interrupted = False
+    try:
+        while not launch.done():
+            try:
+                await asyncio.shield(launch)
+            except asyncio.CancelledError:
+                interrupted = True
+        if launch.cancelled():
+            raise ProcessCleanupUncertain("Process creation is unconfirmed")
+        proc = launch.result()
+    except Exception as exc:
+        if _raised_by_popen(exc):
+            # Popen failed with no child left (never forked, or exec failed
+            # and CPython reaped it), so nothing is left to own. An ordinary
+            # failure, not an uncertain one. A cancel received meanwhile
+            # still ends the caller as cancelled.
+            if interrupted:
+                raise asyncio.CancelledError from exc
+            raise
+        # CPython may raise while connecting pipes AFTER Popen starts a child;
+        # its transport closes only the leader. No handle means no proof that
+        # startup descendants exited, including when the caller was cancelled.
+        # Transfer uncertainty to the registered managed supervisor, never to
+        # ordinary/nonstreaming callers (they do not use this opt-in helper).
+        raise ProcessCleanupUncertain("Process creation is unconfirmed") from None
+    if interrupted:
+        await confirm_process_exit(proc)
+        raise asyncio.CancelledError
+    return proc

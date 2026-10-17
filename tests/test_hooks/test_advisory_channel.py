@@ -1,6 +1,7 @@
 """Channel regression tests for the advisory hooks (audit H-2 / B7).
 
-web_tools_gate, agent_tool_guidance, stealth_skill_nudge and the
+web_tools_gate, agent_tool_guidance (since retired: its nudge ships as the
+lesson config/lessons/agent-tool-guidance.yaml), stealth_skill_nudge and the
 cbm-discovery-gate all emitted a bare top-level ``{"additionalContext": …}``,
 which Claude Code silently discards — the nudge never reached the model. They
 must emit it nested under ``hookSpecificOutput`` with the correct
@@ -42,19 +43,6 @@ def test_web_tools_gate_wrapped(tmp_path: Path) -> None:
     out = _run(
         "scripts/hooks/web_tools_gate.py",
         {"tool_name": "WebFetch", "tool_input": {"url": "https://x.com"}, "session_id": "s1"},
-        tmp_path,
-    )
-    _assert_wrapped(out, "PreToolUse")
-
-
-def test_agent_tool_guidance_wrapped(tmp_path: Path) -> None:
-    out = _run(
-        "scripts/hooks/agent_tool_guidance.py",
-        {
-            "tool_name": "Agent",
-            "tool_input": {"prompt": "research the codebase architecture"},
-            "session_id": "s2",
-        },
         tmp_path,
     )
     _assert_wrapped(out, "PreToolUse")

@@ -564,6 +564,17 @@ class TestDeployGuardFires:
         "cat x; <<'EOF' python3\nimport os; os.system('./scripts/update.sh')\nEOF",
         # The heredoc's receiver spawns from its own -c text.
         "python3 -c \"import sys, os; os.system(sys.stdin.read())\" <<'EOF'\n./scripts/update.sh\nEOF",
+        # Approved terminal repair: expansion precedes a data reader, shell
+        # noexec can be cleared, and ext names its helper explicitly in argv.
+        "cat <<EOF\n$(./scripts/update.sh)\nEOF",
+        "cat <<EOF\n`./scripts/update.sh`\nEOF",
+        "bash -n +o noexec scripts/update.sh",
+        "bash -o noexec +o noexec scripts/update.sh",
+        "GIT_ALLOW_PROTOCOL=ext git ls-remote 'ext::./scripts/update.sh %S repo'",
+        "GIT_ALLOW_PROTOCOL=ext git fetch 'ext::./scripts/update.sh %S repo'",
+        "cat <(./scripts/update.sh)",
+        'printf "%s" "$(: <(./scripts/update.sh); wait)"',
+        "bash -c 'cat <(./scripts/update.sh)'",
     )
 
     @pytest.mark.parametrize("command", LAUNCHES)
@@ -573,6 +584,15 @@ class TestDeployGuardFires:
     # Reads, edits and mentions. None can run the script, and every one of these
     # shapes drew the full advisory under the old substring match.
     READS = (
+        "printf '%s' '<(./scripts/update.sh)'",
+        'printf "%s" "<(./scripts/update.sh)"',
+        "printf '%s' '>(./scripts/update.sh)'",
+        'printf "%s" ">(./scripts/update.sh)"',
+        "cat <<'EOF'\n$(./scripts/update.sh)\nEOF",
+        "cat <<\\EOF\n$(./scripts/update.sh)\nEOF",
+        "bash -o noexec scripts/update.sh",
+        "bash +n -o noexec scripts/update.sh",
+        "bash --norc -o noexec scripts/update.sh",
         "sed -n '100,140p' scripts/update.sh",
         "grep -n 'HEALTH' scripts/update.sh",
         "grep -rn 'update.sh' scripts",

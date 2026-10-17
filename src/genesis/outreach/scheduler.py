@@ -779,7 +779,12 @@ class OutreachScheduler:
                         # the LLM drafter must never re-word a stored message.
                         verbatim=True,
                     )
-                    if row.get("urgency") == "high":
+                    if channel == "agent":
+                        from genesis.peers.outbox import PeerEnvelope
+
+                        # Typed identity, never message-prefix dedup or urgent bypass.
+                        req = PeerEnvelope.decode(row["message"]).request(defer_retry=False)
+                    if row.get("urgency") == "high" and channel != "agent":
                         result = await self._pipeline.submit_urgent(req)
                     else:
                         result = await self._pipeline.submit(req)
@@ -790,11 +795,26 @@ class OutreachScheduler:
                     # IGNORED = the pipeline deliberately dropped it (self-send /
                     # no recipient). Anything else (REJECTED via quiet_hours,
                     # FAILED) is transient and retried next cycle.
-                    if result.status in (
-                        OutreachStatus.DELIVERED,
-                        OutreachStatus.ENGAGED,
-                        OutreachStatus.HELD,
-                        OutreachStatus.IGNORED,
+                    # As in deferred recovery, exact agent-history dedup means
+                    # the retained message was already delivered; close its queue row.
+                    agent_duplicate = (
+                        channel == "agent"
+                        and result.status == OutreachStatus.REJECTED
+                        and result.governance_result
+                        and any(
+                            check.startswith("dedup")
+                            for check in result.governance_result.checks_failed
+                        )
+                    )
+                    if (
+                        result.status
+                        in (
+                            OutreachStatus.DELIVERED,
+                            OutreachStatus.ENGAGED,
+                            OutreachStatus.HELD,
+                            OutreachStatus.IGNORED,
+                        )
+                        or agent_duplicate
                     ):
                         delivered_at = datetime.now(UTC).isoformat()
                         await self._mark_row_delivered(row, delivered_at)

@@ -60,7 +60,8 @@ def test_rollback_restores_db_only_when_migrated(text: str) -> None:
     assert snap.index("DB_SNAPSHOT_TAKEN=1") > snap.index('".backup'), (
         "flag set AFTER the .backup succeeds, inside the success branch"
     )
-    assert snap.index("DB_SNAPSHOT_TAKEN=1") > snap.index("-m genesis.db.crud.peer_restore")
+    # The authority check runs the copy read at the run's start, isolated.
+    assert snap.index("DB_SNAPSHOT_TAKEN=1") > snap.index('python3 -I -S -c "$_PEER_RESTORE_PY"')
     assert 'if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then' in rb
     assert 'rm -f "$DB_FILE-wal" "$DB_FILE-shm"' in rb, (
         "restore MUST clear the stale WAL/SHM or SQLite replays the migrated changes"

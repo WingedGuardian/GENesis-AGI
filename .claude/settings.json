@@ -401,16 +401,6 @@
                 ]
             },
             {
-                "matcher": "Agent",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/agent_tool_guidance.py",
-                        "timeout": 10
-                    }
-                ]
-            },
-            {
                 "matcher": "ExitPlanMode",
                 "hooks": [
                     {

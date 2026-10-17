@@ -1243,6 +1243,17 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   action itself. (Origin: the fence test in PR #2935, for issue #2863: its verify-RED ran a real
   `systemctl --user stop genesis-server` and took a live server down for about
   3.5 minutes.)
+- **Bound every mutant run with its own short timeout.** A mutation often turns
+  a test into a HANG rather than a failure (a mutant that never sets an event,
+  never cancels a task), and a hung run holds the box-wide test lock for the
+  whole per-test timeout while every other session waits. MEASURED: one sweep's
+  hung mutant held it for 53 minutes. Pass `-p timeout -o timeout=<N>` to each
+  mutant run, with N = max(60, 10 × the baseline run's slowest test). Spell it
+  `-p timeout`, never `-p pytest_timeout`: the plugin registers under the name
+  `timeout`, and the module name aborts pytest with "Plugin already registered"
+  (MEASURED, pytest 9.0.2 with pytest-timeout 2.4.0). And read the test result,
+  not the exit code: a missing plugin also exits 1, which a sweep would count
+  as a killed mutant.
 - **Never edit a shell script while a test that runs it is in progress.** bash
   reads a script as it executes it, so an edit mid-run yields bogus syntax
   errors that look like real failures. Wait for the run to finish, or test a
@@ -2990,7 +3001,14 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   cannot read, and any top-level comment from a reviewer with no known format, DOES
   count. Humans, workflow bots and CodeQL never open a round. A clean review, a Codex
   clean comment and the configured identity template CONFIRM a head; they never add a
-  round. Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
+  round. A round advances only on the newest reviewed head (owner ruling, 2026-10-12):
+  every review MARKS the head it reviewed, clean ones too, and a finding review that
+  lands on a head after one of that head's descendants was marked is a LATE review. It
+  opens no round; `review_budget`'s `findings` list keeps it with the round it belongs
+  to, for the round reflection to owe: `scripts/review_late.py` owes it from `REFLECTION_CUTOVER_ISO` (`scripts/review_reflection.py`) on, and credits it only by a reflection judged under its own round. The cutover stays None (nothing more owed) until the commit gate enforces reflections; `review_reflection.py status --cutover <iso>` reports what it would owe.
+  Each entry says whether it was late (`late`) and each round when it opened
+  (`opened_at`, None when unknown); read those, never membership in `rounds[].reviews`, which also lists
+  late reviews of a head that already is a round. Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
   keeps the old rule (every head Codex reviewed, clean included), so no PR's count
   moved at the cutover. The rule lives in `review_findings.is_finding` and
   `review_budget.evaluate_evidence`; read those, not this paragraph, for an edge case.

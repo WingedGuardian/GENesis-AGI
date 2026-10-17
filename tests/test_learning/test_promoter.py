@@ -94,6 +94,31 @@ def test_compute_tier_promotes_to_core_with_trigger():
     assert _compute_tier(row) == "CORE"
 
 
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        json.dumps(["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git add"]),
+        "[]",
+        ["gh pr create"],
+    ],
+)
+def test_compute_tier_no_core_on_command_words_kept_as_written(trigger):
+    # Command words stored inert name no tool the advisor can match.
+    row = {
+        "success_count": 8, "confidence": 0.86, "draft": 0,
+        "tool_trigger": trigger, "activation_tier": "DORMANT",
+    }
+    assert _compute_tier(row) == "ADVISORY"
+
+
+def test_compute_tier_core_with_a_stored_tool_name():
+    row = {
+        "success_count": 8, "confidence": 0.86, "draft": 0,
+        "tool_trigger": json.dumps(["Read", "ssh"]), "activation_tier": "DORMANT",
+    }
+    assert _compute_tier(row) == "CORE"
+
+
 def test_compute_tier_no_core_without_trigger():
     """CORE requires tool_trigger; without it, fall back to ADVISORY."""
     row = {

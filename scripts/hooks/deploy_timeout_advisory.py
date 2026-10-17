@@ -29,8 +29,8 @@ it does not cover fires.
 - No ``update.sh`` in the text: silent, before the parser is even imported (the
   hot path, every Bash call).
 - A blind parse, a parse error, a missing parser, or a crash: fires.
-- A process substitution (``<(…)``, ``>(…)``): fires; the parser does not see
-  inside one.
+- An active process substitution (``<(…)``, ``>(…)``): fires; quoted literal
+  spellings remain data. The parser does not see inside an active one.
 - A segment that can run the script WITHOUT naming it fires: a shell reading
   stdin (no script operand, or ``-s``), a shell given a ``$`` operand, a
   program held in a variable (``$S``), ``eval``, and ``source``/``.`` of the
@@ -156,6 +156,9 @@ _AWK_SPAWN = re.compile(r"\bsystem\b|(?<!\|)\|(?!\|)")
 # it (`<<'END-NOTES'`) cannot end the body early and expose the lines after it.
 _HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)\\?([^\s'\"<>;|&()]+)\1")
 _PROCESS_SUBSTITUTION = re.compile(r"[<>]\(")
+# Backslash pairs preserve expansion; a lone escape suppresses it. Quotes in
+# an unquoted heredoc BODY are data and do not suppress shell expansion.
+_HEREDOC_EXPANSION = re.compile(r"(?<!\\)(?:\\\\)*(?:\$\(|`)")
 _ASSIGNMENTS_ONLY = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_]*\+?=\S*\s*)+")
 _STDIN_PATH = re.compile(r"/dev/(?:stdin|fd/)|/proc/[^/]+/fd/")
 # Input that one program hands another: a pipe, an input redirect, a
@@ -205,10 +208,24 @@ def _names_target(segment) -> bool:
 
 def _shell_operand(argv: list[str]) -> tuple[str | None, bool, bool]:
     """(first operand, reads stdin, syntax check only) for a shell's argv."""
+    exe = os.path.basename(argv[0])
+    allowed = _PARSER._C_BUNDLE_OPTIONS[exe]
+    takes_value = _PARSER._C_VALUE_TAKING.get(exe, _PARSER._C_VALUE_TAKING_DEFAULT)
     i = 1
-    syntax_only = False
+    noexec = sticky = False
     while i < len(argv):
         arg = argv[i]
+        values = (
+            1 if arg in _SHELL_VALUE_OPTIONS else
+            sum(c in takes_value for c in arg[1:]) if not arg.startswith("--") else 0
+        )
+        if arg.startswith(("-", "+")) and arg not in ("-", "+", "--"):
+            # Fold one option bundle through the existing state machine. The
+            # local walk still accepts pre-script long options such as --norc;
+            # _first_operand's post--c long-option refusal is not their grammar.
+            _, _, noexec, sticky = _PARSER._first_operand(
+                argv[i : i + 1 + values], 0, allowed, takes_value, noexec, sticky
+            )
         if arg in _SHELL_VALUE_OPTIONS:
             i += 2
             continue
@@ -218,13 +235,11 @@ def _shell_operand(argv: list[str]) -> tuple[str | None, bool, bool]:
         if arg.startswith(("-", "+")) and arg not in ("-", "+"):
             if not arg.startswith("--") and "s" in arg[1:]:
                 return None, True, False  # -s: commands come from stdin
-            if not arg.startswith("--") and "n" in arg[1:]:
-                syntax_only = arg.startswith("-")  # `+n` turns execution back on
-            i += 1
+            i += 1 + values
             continue
         break
     operand = argv[i] if i < len(argv) and argv[i] != "-" else None
-    return operand, operand is None, syntax_only
+    return operand, operand is None, noexec or sticky
 
 
 def _is_consumer(segment, *, fed_heredoc: bool) -> bool:
@@ -278,6 +293,8 @@ def _runs_value(word: str, options: frozenset) -> bool:
 
 
 def _git_reads(segment) -> bool:
+    if any(a.startswith("ext::") for a in segment.argv[1:]):
+        return False  # an explicit remote-helper program, not hidden config
     subcommand = _PARSER.git_subcommand(segment.argv)
     position = segment.argv.index(subcommand) if subcommand in segment.argv else len(segment.argv)
     # A global `-c` can define an alias that runs a program
@@ -352,7 +369,7 @@ def _after_comment(command: str, at: int) -> bool:
 
 
 def _split_heredoc(command: str):
-    """None when there is no heredoc; else (outer, body, text before ``<<``, closed).
+    """None without a heredoc; else (outer, body, before, closed, quoted).
 
     ``outer`` is the command with the first heredoc's body removed. The receiver
     is the last command in the text before the operator: the parser drops a
@@ -376,24 +393,66 @@ def _split_heredoc(command: str):
             continue
         (rest if closed else body).append(line)
     outer = command[:newline] + "\n" + "\n".join(rest)
-    return outer, "\n".join(body), command[: match.start()], closed
+    quoted = bool(match.group(1)) or "\\" in match.group(0)
+    return outer, "\n".join(body), command[: match.start()], closed, quoted
 
 
 def _depth0(segments) -> list:
     return [s for s in segments if s.depth == 0]
 
 
+def _active_process_substitution(text: str) -> bool:
+    """Active syntax in one parser segment, rather than quoted/escaped prose.
+
+    The shared parser supplies nested command/substitution segments separately.
+    This scanner only distinguishes their local quotes and escapes.
+    """
+    quote = None
+    escaped = False
+    for i, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char in "<>" and text[i + 1 : i + 2] == "(":
+            return True
+    return False
+
+
+def _process_substitution_runs(command: str, segments) -> bool:
+    """Inspect raw syntax plus command bodies supplied by the existing parser."""
+    pending = [(command, 0)] + [
+        (_PARSER._nested_script(s.argv, s.exe), 0) for s in segments if s.exe in _SHELLS
+    ]
+    while pending:
+        text, depth = pending.pop()
+        if _active_process_substitution(text):
+            return True
+        if depth >= 32 or len(pending) >= 128:
+            return True  # cannot prove silence beyond this bounded traversal
+        pending.extend((body, depth + 1) for body in _PARSER._substitutions(text))
+    return False
+
+
 def _runs_target(command: str) -> bool:
     """True unless the command is shown to only read, list or describe the script."""
-    if _PROCESS_SUBSTITUTION.search(command):
-        return True  # the parser does not see a process substitution's segments
     fed_position = None
-    if _PARSER.excise_data_heredoc(command) is None:
+    excised = _PARSER.excise_data_heredoc(command)
+    if excised is not None:
+        command = excised[0]
+    else:
         split = _split_heredoc(command)
         if split is not None:
-            outer, body, before, closed = split
+            outer, body, before, closed, quoted = split
             if not closed:
                 return True  # an unclosed body could hide anything after it
+            if not quoted and _HEREDOC_EXPANSION.search(body):
+                return True  # expansion happens before even a data reader starts
             if not re.split(r"[;&|\n(]", before)[-1].strip():
                 return True  # `<<EOF python3`: the receiver follows the operator
             before_segments, before_blind = _PARSER.analyze_checked(before)
@@ -416,6 +475,8 @@ def _runs_target(command: str) -> bool:
     segments, blind = _PARSER.analyze_checked(command)
     if blind is not None:
         return True
+    if _PROCESS_SUBSTITUTION.search(command) and _process_substitution_runs(command, segments):
+        return True  # active process-substitution bodies are not parsed
     strict = bool(_FEEDS_INPUT.search(command) or _VARIABLE.search(command))
     position = -1
     for segment in segments:

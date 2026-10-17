@@ -68,7 +68,8 @@ Its cost is that a requirements change the venv already satisfies is still
 sent to a reinstall. Equality alone cannot see a package removed or downgraded
 after the install, so the base requirements are also checked for presence.
 Optional groups are not: which of them an install uses is not recorded
-anywhere, and `update.sh` installs none. A base requirement that names extras
+anywhere, and the one an update installs (`browser`, through bootstrap.sh's
+non-fatal step) may legitimately be incomplete, which its own check reports. A base requirement that names extras
 is checked by its own version only, as pip's resolver would have left it.
 """
 

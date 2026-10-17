@@ -53,7 +53,7 @@ queue_alert_try() {
     ALERT_SEVERITY="$severity" ALERT_SOURCE="$source" \
     ALERT_TITLE="$title" ALERT_BODY="$body" ALERT_DEDUPE="$dedupe" \
     python3 -I -S - <<'PY' 2>/dev/null
-import json, os, time, uuid
+import json, math, os, time, uuid
 root = os.environ["ALERT_QUEUE_ROOT"]
 ts = time.time()
 
@@ -75,6 +75,44 @@ entry = {
     "dedupe_key": text("ALERT_DEDUPE") or None,
     "meta": {},
 }
+
+
+def problem(e):
+    # Mirror of genesis.guardian.alert.queue.v1_entry_problem (this script runs
+    # isolated and cannot import it). A file the drainer would quarantine is not
+    # a delivery, so it must not suppress this one. Keep the two in step:
+    # tests/test_scripts/test_alert_queue_sh.py checks parity.
+    if not isinstance(e, dict):
+        return "entry"
+    s = e.get("schema")
+    if type(s) is not int or s != 1:
+        return "schema"
+    t = e.get("ts")
+    if isinstance(t, bool) or not isinstance(t, (int, float)):
+        return "ts"
+    try:
+        if not math.isfinite(t):
+            return "ts"
+    except OverflowError:
+        return "ts"
+    for f in ("title", "body", "severity", "source"):
+        if f in e and not isinstance(e[f], str):
+            return f
+    if not (e.get("title") or e.get("body")):
+        return "title"
+    k = e.get("dedupe_key")
+    if k is not None and not isinstance(k, str):
+        return "dedupe_key"
+    m = e.get("meta")
+    if m is not None and not isinstance(m, dict):
+        return "meta"
+    for f in ("likely_cause", "proposed_action", "approval_url"):
+        v = (m or {}).get(f)
+        if v is not None and not isinstance(v, str):
+            return "meta." + f
+    return None
+
+
 # The same identity already waiting to be delivered: a second copy adds
 # nothing, and a caller that restarts in a loop while delivery is down would
 # otherwise fill the queue with it. Already durable, so report success.
@@ -84,10 +122,12 @@ if entry["dedupe_key"]:
             continue
         try:
             with open(os.path.join(root, name), encoding="utf-8") as fh:
-                if json.load(fh).get("dedupe_key") == entry["dedupe_key"]:
-                    raise SystemExit(0)
-        except (OSError, ValueError, AttributeError):
-            continue
+                queued = json.load(fh)
+            live = problem(queued) is None and queued.get("dedupe_key") == entry["dedupe_key"]
+        except Exception:
+            continue  # a file this scan cannot judge never suppresses a page
+        if live:
+            raise SystemExit(0)
 tmp = os.path.join(root, ".%s.tmp" % uuid.uuid4().hex)
 try:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
