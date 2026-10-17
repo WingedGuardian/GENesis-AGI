@@ -82,6 +82,8 @@ def archive(sources, generation):
     sync_directory(root)
     blobs = destination / "blobs"
     blobs.mkdir(mode=0o700)
+    sync_directory(blobs)
+    sync_directory(destination)
     written = set()
     for original, expected in sources.items():
         with _read(Path(original), private=False) as source:
@@ -90,12 +92,17 @@ def archive(sources, generation):
             else:
                 target = private_open(blobs / expected, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
                 with os.fdopen(target, "wb") as output:
-                    digest = hashlib.sha256()
-                    while block := source.read(1024 * 1024):
-                        output.write(block)
-                        digest.update(block)
-                    output.flush()
-                    os.fsync(output.fileno())
+                    # Checkpoint the entry before a later source failure. Flush
+                    # copied prefixes on abort too; failed I/O remains uncertain.
+                    sync_directory(blobs)
+                    try:
+                        digest = hashlib.sha256()
+                        while block := source.read(1024 * 1024):
+                            output.write(block)
+                            digest.update(block)
+                    finally:
+                        output.flush()
+                        os.fsync(output.fileno())
                     actual = digest.hexdigest()
             if actual != expected:
                 raise Incomplete("source bytes differ from frozen identity")

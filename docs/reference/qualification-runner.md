@@ -32,6 +32,12 @@ including partial generations, are never overwritten or repaired. Failure after
 manifest publication reports failure and uncertain durability while preserving
 evidence; readable complete bytes do not retroactively establish a successful
 durable publication.
+The blob directory and each new blob entry are synchronized before copying.
+Copied bytes are flushed and synchronized even when a source read aborts, so
+later read or validation failures preserve completed blobs and copied prefixes
+when those operations succeed. Failed flush, synchronization or close still
+reports failure with uncertain durability and retains the normal Python
+exception chain; it never establishes successful publication.
 
 Complete admission requires genuine human approval metadata `source_retention`
 with `primary_generation`, `restored_backup_generation` and `backup_evidence`.

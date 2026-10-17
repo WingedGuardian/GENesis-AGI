@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import stat
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -149,6 +150,71 @@ def test_source_mutation_during_copy_never_publishes_manifest(tmp_path, monkeypa
     with pytest.raises(Incomplete, match="changed during"):
         sources.archive(mapping, "mutation")
     assert not (sources.store() / "mutation/manifest.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["missing", "hash", "alias", "read", "mutation"])
+def test_later_source_failure_preserves_checkpointed_evidence(tmp_path, monkeypatch, failure):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.write_bytes(b"first frozen source")
+    second_bytes = b"second frozen source"
+    second.write_bytes(second_bytes)
+    first_hash = hashlib.sha256(first.read_bytes()).hexdigest()
+    second_hash = hashlib.sha256(second_bytes).hexdigest()
+    old = sources.archive({str(first): first_hash}, "existing")
+
+    def snapshot():
+        return {str(p.relative_to(old)): (p.stat().st_mode, p.stat().st_mtime_ns,
+                p.read_bytes() if p.is_file() else None) for p in [old, *old.rglob("*")]}
+
+    preserved = snapshot()
+    if failure == "missing":
+        second.unlink()
+    expected = "0" * 64 if failure == "hash" else first_hash if failure == "alias" else second_hash
+    mapping = {str(first): first_hash, str(second): expected}
+    real_sync, real_read = os.fsync, sources._read
+    syncs, before_second = [], []
+    interrupted = False
+
+    def measured(fd):
+        syncs.append((Path(os.readlink(f"/proc/self/fd/{fd}")), interrupted))
+        real_sync(fd)
+
+    @contextmanager
+    def read(path, *, private):
+        nonlocal interrupted
+        if path == second:
+            before_second.extend(syncs)
+        with real_read(path, private=private) as stream:
+            if path == second and failure == "read":
+                class Interrupted:
+                    def read(self, size):
+                        nonlocal interrupted
+                        if interrupted:
+                            raise OSError("synthetic interrupted source read")
+                        interrupted = True
+                        return stream.read(4)
+
+                yield Interrupted()
+            else:
+                yield stream
+                if path == second and failure == "mutation":
+                    second.write_bytes(b"synthetic source mutation")
+
+    monkeypatch.setattr(sources.os, "fsync", measured)
+    monkeypatch.setattr(sources, "_read", read)
+    with pytest.raises((OSError, Incomplete)):
+        sources.archive(mapping, "aborted")
+    generation = sources.store() / "aborted"
+    blobs = generation / "blobs"
+    assert (blobs / first_hash).read_bytes() == first.read_bytes()
+    assert not (generation / "manifest.json").exists()
+    checkpointed = {path for path, _ in before_second}
+    assert {generation, blobs, blobs / first_hash} <= checkpointed
+    if failure == "read":
+        assert (blobs / second_hash).read_bytes() == second_bytes[:4]
+        assert (blobs / second_hash, True) in syncs
+    assert snapshot() == preserved
 
 
 @pytest.mark.parametrize("generation", ["", ".", "..", "../escape", "/absolute", "a/b", "a\x00b"])
