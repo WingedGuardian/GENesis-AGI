@@ -144,6 +144,110 @@ stability:
 - **Hook enforcement** (`test_hooks/`): Verifies that PreToolUse hooks
   correctly block dangerous tool invocations.
 
+### The live fence: tests never run real commands on the machine
+
+`tests/_live_fence.py`, armed for every run by `tests/conftest.py`, stops a
+test from starting a real process against the machine it runs on. It is a
+guardrail (code in the test process could get around it), not a sandbox.
+
+- **Refused, and the test fails:**
+  - `claude` (anything but a bare `--version` or `--help`; `claude.exe` and
+    `claude-code` count) and `sudo`;
+  - any `systemctl`/`systemd-run`/`gh`/`loginctl` called by a real path outside
+    the test's temp dirs (`tempfile.gettempdir()` and pytest's basetemp);
+  - a deploy script (`scripts/{update,deploy_code_only,restore,backup,
+    bootstrap}.sh`) run with the real `HOME`, or acting on the deployed checkout
+    (`~/genesis`, plus a checkout named in `GENESIS_LIVE_FENCE_LIVE_ROOT`, which
+    counts only if it holds `scripts/update.sh`). Where each script acts:
+    `update.sh` and `deploy_code_only.sh` on their root override
+    (`GENESIS_UPDATE_ORIG_DIR`, `GENESIS_DEPLOY_ROOT`) or else the checkout they
+    live in; `backup.sh` and `restore.sh` on `GENESIS_DIR` or else
+    `$HOME/genesis`; `bootstrap.sh` on the checkout it lives in. A deploy script
+    in a `scripts/` directory under a temp dir is still refused with the real
+  `HOME`. A command named like
+    one whose file cannot be found (`cd <dir> && ./update.sh`) is judged by the
+    `HOME` rule alone.
+
+  Every command is judged as far as the repo's own parser can read it:
+  wrappers (`env`, `timeout`, `sudo`, ...) are judged and stripped, `sh -c`
+  strings and here-strings fed to a shell are opened, every `PATH=` the line
+  sets is honored, and heredoc bodies that only feed data to a command
+  (`cat <<EOF`) are skipped. The refusal is a
+  `BaseException`, so an `except Exception` fallback in the code under test
+  cannot catch it and try another route; in a forked child the child exits 127
+  instead.
+- **Answered like CI, and reported:** `systemctl`, `systemd-run`, `gh` and
+  `loginctl` called by bare name (and `claude --version`/`--help`) reach a stub
+  that answers as the real tool does on a CI runner, where nothing is reachable
+  ("Failed to connect to bus", exit 1; `gh` unauthenticated, exit 4). The test
+  is not failed; the call is listed under "live-state reads answered by a
+  stub". Stub the call in the test if its result matters. A stub exists only
+  for a tool installed on the machine, so `shutil.which` still reports a missing
+  tool as missing.
+- **A refusal that lands after its test ended** (a detached child) fails the
+  whole session, listed under "refusals outside their test".
+- Any program inside the test's temp dirs that is not a deploy script runs, so
+  a test that needs a fake of one of these tools puts it in `tmp_path`.
+- Give a test that runs a deploy script a private `HOME` and point the script's
+  root at a fixture tree (the `tests/test_scripts/_deploy_station.py` fixture
+  is the model).
+- Two explicit opt-outs, each listed in the run summary:
+  - `user_manager`: may run the real `systemd-run` (a transient `--user` scope, a
+    unit check) and gets the real session-bus variables back; the command that
+    `systemd-run` would start is still judged, against the user manager's PATH.
+  - `real_tool("gh", ...)`: deliberately runs the named installed tools (a
+    table checked against their own `--help`, a kernel probe).
+  Deploy scripts against live state stay refused for both.
+- Known gaps, by design (an in-process fence sees only this interpreter's own
+  launches and what its parser can read; the OS-level sandbox is the answer):
+  - a program a child process starts by absolute path;
+  - a child given a hand-built `env` without the fence's `PATH` and bus
+    variables: a script that defaults `XDG_RUNTIME_DIR` when it is unset then
+    reaches the real user manager;
+  - what the parser does not open (`eval`, a command held in a variable, a
+    function body, a script piped or redirected into a shell, `find -exec`,
+    `su`/`runuser`/`flock`/`script`/`unshare`/`setpriv`): only the PATH stubs
+    judge these, so a bare name is caught and an absolute path is not;
+  - a `systemd-run` started by a child in a `user_manager` test;
+  - the stubs answer like CI only approximately: `claude --version` exits 127
+    where CI raises "not found", and a system-level `systemctl` also gets "Failed
+    to connect to bus".
+
+### The live closure: tests run without this machine's credentials
+
+`tests/_live_closure.py`, armed right after the live fence, takes credentials
+and live state paths out of the process environment before any test runs, so
+a test behaves as it does on CI, where none exist. Child processes inherit it.
+
+- `SECRETS_PATH` names a file that does not exist, so every `secrets.env`
+  loader that honours it loads nothing. Each test gets its own such path under
+  its `tmp_path`, so a script that writes there (`restore.sh`) cannot leave a
+  file for the next test. A test that runs `backup.sh` or `restore.sh` against
+  a sandbox `GENESIS_DIR` drops `SECRETS_PATH` from the child's environment, so
+  the sandbox decides where the secrets file is, as on CI.
+- Credential-shaped variables are removed for the run: `SSH_AUTH_SOCK`,
+  `GH_TOKEN`, `GITHUB_TOKEN`, and names containing `_API_KEY`, `_SECRET`,
+  `PASSWORD`, `PASSPHRASE`, `WEBHOOK`, `CREDENTIAL`, `_ACCESS_KEY` or
+  `_PRIVATE_KEY`, starting `API_KEY_`, or ending `_TOKEN`, `_PASS` or
+  `_KEY_ID`. The run summary lists their names, never values.
+- `GH_CONFIG_DIR` points at an empty directory, `GIT_TERMINAL_PROMPT=0`, and
+  `GIT_SSH_COMMAND=false`.
+- `GENESIS_PROACTIVE_HOOK_URL` points at a closed port, so a test running the
+  memory hook as a child never posts to the live server.
+- `GENESIS_DB_PATH` is set per test (`_isolate_genesis_db_path` in
+  `tests/conftest.py`) to the same temp database the in-process patch returns.
+- A test that sets its own value with `monkeypatch` still wins.
+- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves secrets in place, and the
+  summary says so; the git, gh and hook-URL settings still apply.
+- Not covered:
+  - a reader that builds its own path to `secrets.env` instead of honouring
+    `SECRETS_PATH`;
+  - credentials kept in other files (`~/.claude`, `~/.genesis`, `~/.ssh`,
+    `~/.git-credentials`);
+  - state paths other than the database: `GENESIS_HOME` is not redirected,
+    and a reader of the fixed `~/genesis/data/genesis.db` path ignores
+    `GENESIS_DB_PATH`.
+
 ## Integration Tests
 
 Integration tests in `tests/integration/` require running external services
