@@ -100,6 +100,7 @@ def _run(
     else:
         _make_stub(backup_env["bind"] / "smbclient", f"#!/usr/bin/env bash\nexit {smb_rc}\n")
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(backup_env["home"]),
         GENESIS_DIR=str(backup_env["gd"]),

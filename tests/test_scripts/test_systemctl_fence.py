@@ -1,5 +1,5 @@
-"""The autouse fence in conftest.py keeps script tests away from the real
-`systemctl --user` (issue #2863)."""
+"""The suite-wide live fence keeps script tests away from the real
+`systemctl --user` (issue #2863; now `tests/_live_fence.py`)."""
 
 import os
 import shutil
@@ -7,36 +7,36 @@ import subprocess
 
 import pytest
 
-# Captured at import (collection), before any per-test fixture runs.
-_BUS_AT_IMPORT = {k: os.environ.get(k) for k in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")}
+from tests import _live_fence as fence
 
 
 @pytest.mark.user_manager
-def test_a_user_manager_test_keeps_the_bus_but_systemctl_stays_shimmed():
-    for k, v in _BUS_AT_IMPORT.items():
+def test_a_user_manager_test_keeps_the_bus_but_systemctl_stays_stubbed():
+    for k, v in fence._S.saved_bus.items():
         assert os.environ.get(k) == v, k
     found = shutil.which("systemctl")
-    assert found is not None and "systemctl-fence" in found, found
+    assert found is not None and found.startswith(fence._S.base), found
 
 
-def test_systemctl_resolves_to_the_fence_shim():
+def test_systemctl_resolves_to_the_fence_stub():
     found = shutil.which("systemctl")
-    assert found is not None and "systemctl-fence" in found, found
+    assert found is not None and found.startswith(fence._S.base), found
 
 
 def test_the_session_bus_points_nowhere():
     xdg = os.environ["XDG_RUNTIME_DIR"]
-    assert "systemctl-fence" in xdg and not os.path.exists(xdg)
+    assert xdg.startswith(fence._S.base) and not os.path.exists(xdg)
     assert os.environ["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={xdg}/bus"
 
 
+@pytest.mark.real_tool("systemctl")
 def test_a_script_seeding_its_own_bus_default_still_cannot_connect():
     """deploy_code_only.sh / update.sh style: `${XDG_RUNTIME_DIR:-/run/user/$uid}`
     keeps the fence's value, and the real systemctl (called by absolute path, so
-    the PATH shim is bypassed on purpose) cannot reach the user manager."""
+    the stub is bypassed on purpose) cannot reach the user manager."""
     real = "/usr/bin/systemctl"
     if not os.path.exists(real):
-        return
+        pytest.skip("no systemctl here")
     script = (
         'XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" '
         + real
@@ -48,7 +48,7 @@ def test_a_script_seeding_its_own_bus_default_still_cannot_connect():
     assert "Failed to connect to bus" in proc.stderr, proc
 
 
-def test_a_script_calling_systemctl_reaches_the_shim_and_is_refused():
+def test_a_script_calling_systemctl_reaches_the_stub_and_is_answered():
     # A harmless probe on purpose: if the fence were missing, this would reach the
     # real user manager, so it must never be a command that changes anything there
     # (an unfenced `stop genesis-server` here once stopped a live server).
@@ -59,8 +59,8 @@ def test_a_script_calling_systemctl_reaches_the_shim_and_is_refused():
         capture_output=True,
         text=True,
     )
-    assert proc.returncode == 3, proc
-    assert "fenced" in proc.stderr, proc.stderr
-    log = os.path.join(os.path.dirname(shutil.which("systemctl")), "calls.log")
-    with open(log) as f:
-        assert probe in f.read().splitlines()
+    assert proc.returncode == 1, proc  # what the real tool exits with no bus
+    assert "Failed to connect to bus" in proc.stderr, proc.stderr
+    lines = fence._drain()
+    assert any(f"\tanswered\tsystemctl {probe}" in ln for ln in lines), lines
+    fence._pending.extend(lines)

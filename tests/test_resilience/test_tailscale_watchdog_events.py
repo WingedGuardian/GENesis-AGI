@@ -25,6 +25,9 @@ from genesis.resilience.tailscale_watchdog_events import (
     record_new_events,
 )
 
+# Real awareness ticks here: keep their git-health and bundle steps off the live install.
+pytestmark = pytest.mark.usefixtures("quiet_live_tick")
+
 BOOT = "5f524ce5-5df1-49b5-a1fe-572ba51e3709"
 NOW = 900_000.0  # CLOCK_MONOTONIC
 A, B = "100.64.0.7", "100.64.0.8"
