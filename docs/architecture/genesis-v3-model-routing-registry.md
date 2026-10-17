@@ -1,5 +1,12 @@
 # Model Routing Registry
 
+The neural monitor also exposes **Fallback** (`cc_fallback`), a non-routing
+observation of configured CC-roster fallback in conversations and managed API
+tasks. It reports actual execution outcomes and provider/model labels without
+private responses. It adds no API routing chain or foreground `gmodel` catalog
+members; managed selection is documented in
+[native managed sessions](../reference/native-managed-sessions.md#provider-selection-before-work).
+
 **Status:** Active | **Last updated:** 2026-03-22
 
 

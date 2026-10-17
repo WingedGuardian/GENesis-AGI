@@ -5,6 +5,40 @@ persisted `cc_sessions` receipt through the existing native invoker and profiles
 This is an execution primitive, not an enabled network connector. Ordinary
 `spawn` callers retain their existing defaults and delivery/parking behavior.
 
+## Provider selection before work
+
+Roster-eligible managed invocations check provider readiness before sending the
+task prompt. The home model is checked first; a classified provider refusal
+advances through credentialed alternatives in the configured CC roster order.
+Other failures stop selection. Explicit routing opt-outs and provider pins
+remain authoritative. Foreground-only `gmodel` catalog entries are not added to
+the automated roster.
+
+Each check uses a fixed diagnostic prompt, safe mode with OAuth support,
+`--tools ""`, and an empty strict MCP configuration. A complete exact response
+and an observed empty tools/MCP inventory are required. The check carries no
+task content or resume state. Each check receives an invocation timeout of up to
+90 seconds within the receipt's existing absolute deadline and runner slot;
+there is no separate task budget.
+These extra inference calls consume provider quota and may incur provider fees.
+
+Once selected, one provider executes the real task through the existing native
+profile and approval gates. A successful readiness check cannot guarantee that
+the subsequent task will finish: a later limit or failure ends the task without
+switching providers, parking, or replaying effects. Cleanup uncertainty retains
+capacity and the probe directory. The idle recovery worker also suspends further
+probes after uncertain cleanup until runtime recreation. Confirmed readiness
+for the current home provider clears its shared unavailable status before
+retiring the fallback banner. Restart reconciliation remains unchanged.
+
+Receipt metadata records `provider_attempts`, `home_provider`,
+`execution_provider` and the selected endpoint context without credential
+values. The endpoint is pinned from the same roster snapshot as execution.
+The neural monitor's **Fallback** entry records actual execution outcomes, not
+probe success; private prompts, results and provider error prose are omitted.
+The existing idle recovery worker uses the same enforced readiness check while
+retaining its 30-minute cadence and 300-second per-check bound.
+
 Construct a server-owned `DirectSessionRequest(managed=True, notify=False,
 source_tag="agent_api", caller_context="agent_api:<receipt>")`. Only `observe`
 and `interact` profiles are supported in this mode; tool exceptions and origin

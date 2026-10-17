@@ -108,6 +108,19 @@ def test_build_args_safe_mode(invoker):
     assert "--safe-mode" not in default_args
 
 
+def test_disable_tools_is_explicit_and_probe_settings_keep_only_env(invoker, monkeypatch):
+    from genesis.cc.provider_readiness import isolated_provider
+
+    hooks = MagicMock(return_value="/unused-hooks.json")
+    monkeypatch.setattr("genesis.cc.invoker.cc_span_settings_path", hooks)
+    with isolated_provider(probe=True):
+        args = invoker._build_args(CCInvocation(prompt="probe", disable_tools=True))
+    assert args[args.index("--tools") + 1] == ""
+    assert set(json.loads(args[args.index("--settings") + 1])) == {"env"}
+    hooks.assert_not_called()
+    assert "--tools" not in invoker._build_args(CCInvocation(prompt="ordinary"))
+
+
 def test_build_args_includes_span_settings(invoker, monkeypatch):
     """Dispatched sessions get --settings pointing at the span-hook file."""
     import genesis.cc.invoker as inv_mod

@@ -337,6 +337,9 @@ class CCInvocation:
     timeout_s: int = 7200
     allowed_tools: list[str] | None = None
     disallowed_tools: list[str] | None = None
+    # Positive removal of ALL built-in tools (--tools ""). An empty allowlist
+    # is not equivalent, especially under skip-permissions.
+    disable_tools: bool = False
     skip_permissions: bool = False
     skill_tags: list[str] | None = None
     working_dir: str | None = None
