@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Stage immutable, pinned Codebase configuration; diagnose without activation.
+"""Stage immutable Codebase settings and run its bounded native query service.
 
-This command does not render units, start providers, index repositories or remove
-the machine sentinel. Native runtime and lifecycle are separate integration steps.
+Configure does not activate providers, index repositories or remove the machine
+sentinel. Serve/ready are native unit entry points requiring persistent enablement.
 Configuration is published once. Native enablement owns operational state.
 """
 
@@ -14,16 +14,26 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
+import time
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager, suppress
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from code_intel_cbm_admission import (  # noqa: E402
+    _host_available,
+    _mount_path,
+    _working_charge,
+    number,
+    read_number,
+    resolve_cgroup,
+)
 from code_intel_cbm_worker import BUILD  # noqa: E402
 
 SCRIPT = Path(__file__).resolve()
@@ -55,18 +65,277 @@ def units_dir() -> Path:
 
 
 @contextmanager
-def lifecycle_lock(*, shared: bool = False):
+def file_lock(path: Path, *, shared: bool = False):
     """Coordinate cooperating tools; never replace/delete the lock pathname."""
-    directory = units_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    fd = os.open(
-        directory / ".genesis-codebase-config.lock", os.O_RDWR | os.O_CREAT | OPEN_FLAGS, 0o600
-    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | OPEN_FLAGS, 0o600)
     with os.fdopen(fd, "a") as stream:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError("lifecycle lock must be regular")
         fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         yield stream
+
+
+def lifecycle_lock(*, shared: bool = False):
+    return file_lock(units_dir() / ".genesis-codebase-config.lock", shared=shared)
+
+
+def uninstall_lock_paths() -> tuple[Path, Path, Path]:
+    main = (Path.home() / "genesis").resolve(strict=True)
+    if main != SCRIPT.parent.parent or (main / ".git").is_file():
+        raise ValueError("uninstall requires the installed primary checkout")
+    directory = Path(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis")) / "locks"
+    absolute(str(directory))
+    roots = [Path.home() / name for name in ("genesis", ".genesis", "data", ".qdrant")]
+    default = Path.home() / ".genesis/locks"
+    protected = [units_dir()]
+    if directory == default:
+        if directory.parent.is_symlink() or directory.is_symlink():
+            raise ValueError("uninstall refuses symlinked default lock namespace")
+    else:
+        protected.append(directory)
+    for location in protected:
+        for root in roots:
+            for namespace, deletion in ((location, root), (location.resolve(), root.resolve())):
+                if namespace.is_relative_to(deletion) or deletion.is_relative_to(namespace):
+                    raise ValueError("uninstall refuses lock namespace overlapping deletion roots")
+    digest = hashlib.sha1(os.fsencode(main), usedforsecurity=False).hexdigest()[:16]
+    return (
+        directory / "code-intel-runner.lock",
+        directory / f"code-intel-{digest}.lock",
+        units_dir() / ".genesis-codebase-config.lock",
+    )
+
+
+def verify_uninstall_locks(fds: list[int]) -> None:
+    if len(set(fds)) != 3 or any(fd <= 2 for fd in fds):
+        raise ValueError("uninstall requires three inherited lock descriptors")
+    for fd, path in zip(fds, uninstall_lock_paths(), strict=True):
+        held, named = os.fstat(fd), path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(held.st_mode) or (held.st_dev, held.st_ino) != (
+            named.st_dev,
+            named.st_ino,
+        ):
+            raise ValueError("uninstall lock identity mismatch")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def cgroup_empty(control: str) -> None:
+    if not control:
+        return
+    path = absolute(control)
+    if ".." in path.parts:
+        raise ValueError("invalid managed ControlGroup")
+    mountinfo = Path("/proc/self/mountinfo")
+    _, root, version = resolve_cgroup(Path("/proc/self/cgroup"), mountinfo)
+    if version != 2:
+        raise ValueError("uninstall requires visible cgroup v2 state")
+    mappings = []
+    for row in mountinfo.read_text().splitlines():
+        left, separator, right = row.partition(" - ")
+        fields = left.split()
+        if (
+            separator
+            and right.split()[:1] == ["cgroup2"]
+            and len(fields) >= 5
+            and _mount_path(fields[4]) == root
+        ):
+            mappings.append(_mount_path(fields[3]))
+    if len(set(mappings)) != 1:
+        raise ValueError("ambiguous managed cgroup mount")
+    mounted = mappings[0]
+    relative = path.relative_to(mounted) if path.is_relative_to(mounted) else path.relative_to("/")
+    group = root / relative
+    try:
+        values = dict(line.split() for line in (group / "cgroup.events").read_text().splitlines())
+    except FileNotFoundError:
+        if group.exists():
+            raise
+        return  # stopped group has been removed from the visible hierarchy
+    if values.get("populated") != "0":
+        raise ValueError("managed cgroup still contains processes (including descendants)")
+
+
+def require_quiescent(unit: str) -> None:
+    properties = ["ActiveState", "ControlGroup"]
+    if unit.endswith(".service"):
+        properties.append("MainPID")
+    value = show(unit, *properties)
+    if value["ActiveState"] not in ("inactive", "failed") or (
+        unit.endswith(".service") and number(value["MainPID"], "MainPID")
+    ):
+        raise ValueError(f"uninstall refuses nonquiescent {unit}")
+    cgroup_empty(value["ControlGroup"])
+
+
+def manager_absent(unit: str) -> bool:
+    expected = {"LoadState": "not-found", "ActiveState": "inactive", "ControlGroup": ""}
+    if unit.endswith(".service"):
+        expected["MainPID"] = "0"
+    return show(unit, *expected) == expected
+
+
+def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
+    """Recognize repository targets of the existing wrapper and native modes."""
+    entrypoint = main / "scripts/lib/code_intel_index.sh"
+    for index, arg in enumerate(argv[:-1]):
+        if Path(arg).name != "code_intel_index.sh":
+            continue
+        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
+        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
+            return True
+    # GITNEXUS_BIN permits arbitrary executable names. Exact analyze arguments
+    # targeting main are possible writers, including after the wrapper exits.
+    # Skip argv[0]; an executable itself can be named analyze.
+    for index, arg in enumerate(argv[1:], 1):
+        if arg != "analyze":
+            continue
+        tail = argv[index + 1 :]
+        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
+        if target.resolve() == main:
+            return True
+    return False
+
+
+def observed_index_writers(proc: Path = Path("/proc")) -> list[int]:
+    """Observe existing lockless/scopeless writers; never signal a process."""
+    main = SCRIPT.parent.parent
+    writers = []
+    for process in proc.iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            # proc_pid_stat(5): comm can contain ')' and arbitrary filename bytes;
+            # starttime is field 22, after the final parenthesized comm delimiter.
+            started = process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19]
+            argv = [os.fsdecode(arg) for arg in process.joinpath("cmdline").read_bytes().split(b"\0") if arg]
+            wrapper = any(Path(arg).name == "code_intel_index.sh" for arg in argv)
+            native = "analyze" in argv[1:]
+            if not (wrapper or native):
+                continue
+            cwd = process.joinpath("cwd").resolve(strict=True)
+            recognized = index_writer_targets_main(argv, cwd, main)
+            if process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19] != started:
+                raise ValueError(f"index writer PID {process.name} changed during observation")
+            if recognized:
+                writers.append(int(process.name))
+        except FileNotFoundError:
+            if process.exists():
+                raise ValueError(f"cannot prove index writer identity for PID {process.name}") from None
+            continue  # process disappeared during observation
+        except (OSError, RuntimeError, IndexError) as error:
+            raise ValueError(f"cannot prove index writer identity for PID {process.name}") from error
+    return writers
+
+
+def require_no_batch() -> None:
+    writers = observed_index_writers()
+    if writers:
+        raise ValueError(f"uninstall refuses possible index writers: {writers}")
+    result = subprocess.run(
+        [
+            "/usr/bin/systemctl",
+            "--user",
+            "list-units",
+            "--all",
+            "--type=scope",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            "code-intel-*.scope",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+        env=systemctl_env(),
+    )
+    for row in result.stdout.splitlines():
+        unit = row.split()[0]
+        if not re.fullmatch(r"code-intel-[0-9a-f]{12}-(?:cbm|gitnexus)-[0-9]+\.scope", unit):
+            raise ValueError("unrecognized code-intel scope; cannot prove writer absence")
+        require_quiescent(unit)
+
+
+def retire_managed() -> None:
+    errors = []
+    for argv in (("disable", BACKEND), ("stop", BACKEND), ("stop", SLICE)):
+        result = subprocess.run(
+            ["/usr/bin/systemctl", "--user", *argv],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=systemctl_env(),
+        )
+        if result.returncode and not manager_absent(argv[1]):
+            errors.append((argv[0], result.stderr.strip()))
+    for unit in (BACKEND, SLICE):
+        require_quiescent(unit)
+    state = show(BACKEND, "UnitFileState", "LoadState")
+    safe = state == {"UnitFileState": "disabled", "LoadState": "loaded"}
+    absent = state == {"UnitFileState": "", "LoadState": "not-found"}
+    if any(action == "stop" for action, _ in errors) or not (safe or absent):
+        raise ValueError(f"managed retirement failed: errors={errors}, state={state}")
+
+
+def report_retained_state() -> None:
+    try:
+        config = read_settings(
+            Path.home() / ".genesis/config/codebase-managed.json", require_build=False
+        )
+    except (OSError, ValueError, RuntimeError):
+        config = None  # missing/bad settings never expand uninstall deletion roots
+    if config:
+        roots = [Path.home() / name for name in ("genesis", ".genesis", "data", ".qdrant")]
+        for key in ("binary", "cache", "runtime"):
+            try:
+                path = absolute(config[key]).resolve()
+                # A final root symlink is unlinked, never recursively followed.
+                # Runtime pruning keeps its addressed locks child; another real
+                # deletion root may still cover the candidate independently.
+                inside = any(
+                    not root.is_symlink()
+                    and path.is_relative_to(root.resolve())
+                    and not (
+                        root.name == ".genesis"
+                        and path.is_relative_to(root.resolve() / "locks")
+                    )
+                    for root in roots
+                )
+            except (OSError, RuntimeError) as error:
+                print(f"Preserved configured {key}; path classification failed: {error}", flush=True)
+                continue
+            if not inside:
+                print(f"Preserved configured {key}: {path}", flush=True)
+
+
+def uninstall(arguments: list[str]) -> None:
+    # Only the fixed sibling script is executable; no caller-supplied command.
+    if any(arg not in ("--genesis-only", "--non-interactive") for arg in arguments):
+        raise ValueError("guarded cleanup accepts only --genesis-only/--non-interactive")
+    with ExitStack() as stack:
+        locks = [stack.enter_context(file_lock(path)) for path in uninstall_lock_paths()]
+        require_no_batch()  # refuse orphan workers before retiring query readers
+        retire_managed()
+        print("Managed Codebase query retired; cancelling removal leaves it disabled.", flush=True)
+        require_no_batch()
+        report_retained_state()
+        fds = [stream.fileno() for stream in locks]
+        for fd in fds:
+            os.set_inheritable(fd, True)
+        os.execv(  # noqa: S606 - fixed Bash and sibling script, validated cleanup flags
+            "/bin/bash",
+            [
+                "/bin/bash",
+                str(SCRIPT.with_name("uninstall.sh")),
+                "--genesis-only",
+                *arguments,
+                "--managed-uninstall-fds",
+                *map(str, fds),
+            ],
+        )
 
 
 def read_document(path: Path) -> dict:
@@ -131,7 +400,23 @@ def sentinel_armed(raw: str) -> bool:
     return True
 
 
+def validate_provider_paths(config: dict) -> None:
+    """The pinned POSIX provider folds backslashes before native storage use."""
+    for key in ("main", "cache"):
+        path = absolute(config[key])
+        physical = path.resolve()
+        # Python 3.13+ non-strict resolve leaves symlink loops unresolved.
+        # Let the kernel reject loops in both the literal and resolved paths;
+        # missing staging directories remain supported.
+        for candidate in (path, physical):
+            with suppress(FileNotFoundError):
+                candidate.stat()
+        if "\\" in str(path) or "\\" in str(physical):
+            raise ValueError(f"pinned provider does not support backslash in {key} paths")
+
+
 def native_env(config: dict) -> dict[str, str]:
+    validate_provider_paths(config)
     env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
     env.update(
         CBM_CACHE_DIR=config["cache"],
@@ -242,6 +527,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         sentinel=str(absolute(args.sentinel)),
     )
     validate_settings(config)
+    validate_provider_paths(config)
     with lifecycle_lock():
         if any(os.path.lexists(p) for p in (path, absolute(args.state), state)):
             raise ValueError("existing settings/state preserved; choose a fresh staging state")
@@ -302,17 +588,11 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
                 if key in ("version", "build", "enabled", *PATH_KEYS)
             }
             validate_settings(value)
-    except (OSError, ValueError) as error:
+            validate_provider_paths(value)
+    except (OSError, ValueError, RuntimeError) as error:
         result["settings_error"] = str(error)
     try:
-        systemd_spec = importlib.util.spec_from_file_location(
-            "_genesis_util_systemd",
-            Path(__file__).resolve().parent.parent / "src/genesis/util/systemd.py",
-        )
-        if systemd_spec is None or systemd_spec.loader is None:
-            raise ImportError("could not load systemd utilities")
-        systemd = importlib.util.module_from_spec(systemd_spec)
-        systemd_spec.loader.exec_module(systemd)
+        manager_env = systemctl_env()
         output = subprocess.check_output(
             [
                 "/usr/bin/systemctl",
@@ -333,12 +613,199 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
             text=True,
             timeout=30,
             stderr=subprocess.PIPE,
-            env=systemd.systemctl_env(),
+            env=manager_env,
         )
         result["service"] = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     except (ImportError, OSError, SyntaxError, subprocess.SubprocessError) as error:
         result["manager_error"] = str(error)
     return result
+
+
+def systemctl_env() -> dict[str, str]:
+    """The user-manager environment from src/genesis/util/systemd.py.
+
+    Loaded by path because this script runs isolated (-I). Without it a service
+    started with no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS cannot reach the
+    user manager, and every systemctl --user call fails.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_genesis_util_systemd",
+        Path(__file__).resolve().parent.parent / "src/genesis/util/systemd.py",
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load systemd utilities")
+    systemd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(systemd)
+    return systemd.systemctl_env()
+
+
+def show(unit: str, *properties: str, timeout: float = 30) -> dict[str, str]:
+    output = subprocess.check_output(
+        [
+            "/usr/bin/systemctl",
+            "--user",
+            "show",
+            unit,
+            *(arg for name in properties for arg in ("-p", name)),
+        ],
+        text=True,
+        timeout=timeout,
+        stderr=subprocess.PIPE,
+        env=systemctl_env(),
+    )
+    value = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+    if any(name not in value for name in properties):
+        raise ValueError(f"manager omitted requested properties for {unit}")
+    return value
+
+
+def require_enabled(config: dict, *, timeout: float = 30) -> None:
+    if show(BACKEND, "UnitFileState", timeout=timeout)["UnitFileState"] != "enabled":
+        raise ValueError("managed query service must be persistently enabled")
+    if sentinel_armed(config["sentinel"]):
+        raise ValueError("managed Codebase sentinel is armed")
+
+
+def verify_query_boundary(pid: str, *, startup: bool = False) -> None:
+    leaf, root, version = resolve_cgroup(
+        Path(f"/proc/{pid}/cgroup"), Path(f"/proc/{pid}/mountinfo")
+    )
+    if version != 2 or leaf == root or leaf.name != BACKEND:
+        raise ValueError("managed daemon is outside its cgroup v2 service")
+    if (leaf / "memory.max").read_text().strip() != str(2 * 1024**3) or (
+        leaf / "memory.swap.max"
+    ).read_text().strip() != "0":
+        raise ValueError("managed daemon lacks exact memory/zero-swap cap")
+    cpu = (leaf / "cpu.max").read_text().split()
+    if len(cpu) != 2:
+        raise ValueError("managed daemon lacks an enforced CPU ceiling")
+    quota, period = (number(value, "cpu.max") for value in cpu)
+    if quota == 0 or period == 0 or quota > 2 * period:
+        raise ValueError("managed daemon exceeds the two-core CPU ceiling")
+    if number((leaf / "pids.max").read_text().strip(), "pids.max") > 128:
+        raise ValueError("managed daemon exceeds the 128-task ceiling")
+    cursor = leaf.parent
+    while cursor == root or root in cursor.parents:
+        try:
+            limit = (cursor / "memory.max").read_text().strip()
+        except FileNotFoundError:
+            if cursor != root:
+                raise
+            limit = "max"  # true cgroup filesystem root has no memory.max
+        if limit != "max" and number(limit, "ancestor memory.max") < 2 * 1024**3:
+            raise ValueError("ancestor cap is smaller than managed query budget")
+        if startup and limit != "max":
+            charge = _working_charge(
+                read_number(cursor / "memory.current"), cursor / "memory.stat", 2 * 1024**3, 2
+            )
+            # Admission includes this small staging process; do not subtract
+            # raw leaf usage from a cache-discounted ancestor charge. This is
+            # a startup snapshot, not a reservation or recurring RPC gate.
+            if number(limit, "ancestor memory.max") - charge < 2 * 1024**3:
+                raise ValueError("insufficient ancestor headroom for managed query budget")
+        if cursor == root:
+            break
+        cursor = cursor.parent
+    if startup and _host_available(Path("/proc/meminfo")) < 2 * 1024**3:
+        raise ValueError("insufficient host available memory for managed query budget")
+
+
+def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) -> str:
+    value = show(BACKEND, "ActiveState", "MainPID", timeout=timeout)
+    if value["ActiveState"] not in (("active", "activating") if starting else ("active",)):
+        raise ValueError("managed native daemon is unavailable")
+    pid = value["MainPID"]
+    if number(pid, "MainPID") == 0 or not os.path.samefile(f"/proc/{pid}/exe", config["binary"]):
+        raise ValueError("managed native daemon identity mismatch")
+    verify_query_boundary(pid)
+    return pid
+
+
+def ready(config: dict) -> None:
+    deadline = time.monotonic() + 120
+    native_deadline = None
+    require_enabled(config)
+
+    def manager_timeout() -> float:
+        remaining = (native_deadline or deadline) - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("managed native daemon readiness deadline expired")
+        return min(30, remaining)
+
+    with verified_binary(Path(config["binary"])) as executable:
+        while time.monotonic() < (native_deadline or deadline):
+            try:
+                pid = check_backend(config, starting=True, timeout=manager_timeout())
+                now = time.monotonic()
+                if native_deadline is None:
+                    native_deadline = min(deadline, now + 60)
+                remaining = native_deadline - now
+                if remaining <= 0:
+                    break
+                response = subprocess.run(
+                    [f"/proc/self/fd/{executable.fileno()}", "daemon", "status"],
+                    env=native_env(config),
+                    pass_fds=(executable.fileno(),),
+                    capture_output=True,
+                    text=True,
+                    timeout=remaining,
+                )
+                if (
+                    response.returncode == 0
+                    and "daemon: active (permanent)" in response.stdout
+                    and re.search(r"^  pid: " + re.escape(pid) + r"$", response.stdout, re.M)
+                    and "state: stopping" not in response.stdout
+                    and check_backend(config, starting=True, timeout=manager_timeout()) == pid
+                ):
+                    require_enabled(config, timeout=manager_timeout())
+                    if time.monotonic() < native_deadline:
+                        return
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass  # bounded startup polling; deadline is a terminal refusal
+            time.sleep(0.1)
+    raise ValueError("managed native daemon did not become ready")
+
+
+def serve(config: dict) -> None:
+    require_enabled(config)
+    verify_cache(config)
+    verify_query_boundary("self")
+    os.chdir(config["main"])
+    # No shared lifecycle lock here: enable will hold exclusive while it waits
+    # for ExecStartPost readiness. Native startup must not deadlock against it.
+    with verified_binary(Path(config["binary"])) as executable:
+        # The pinned local CLI repairs a dead endpoint generation. Internal
+        # daemon startup alone refuses stale sockets after a prior SIGKILL.
+        subprocess.run(
+            [f"/proc/self/fd/{executable.fileno()}", "config", "get", "auto_index"],
+            env=native_env(config),
+            pass_fds=(executable.fileno(),),
+            stdout=subprocess.DEVNULL,
+            check=True,
+            timeout=45,
+        )
+        require_enabled(config)
+        verify_cache(config)
+        verify_query_boundary("self", startup=True)
+        os.set_inheritable(executable.fileno(), True)
+        os.execve(  # noqa: S606 - accepted inode and fixed stock daemon argv
+            f"/proc/self/fd/{executable.fileno()}",
+            [config["binary"], "--cbm-daemon-internal", "--cbm-daemon-permanent"],
+            native_env(config),
+        )
+
+
+def uninstall_main(args: argparse.Namespace) -> int:
+    try:
+        if args.command == "uninstall":
+            arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+            uninstall(arguments)
+        else:
+            verify_uninstall_locks(args.fds)
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"managed uninstall refused: {error}", file=sys.stderr)
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -349,7 +816,15 @@ def main(argv: list[str] | None = None) -> int:
     for key in ("main", "binary", "state", "sentinel"):
         setup.add_argument("--" + key, required=True)
     commands.add_parser("status")
+    commands.add_parser("serve")
+    commands.add_parser("ready")
+    teardown = commands.add_parser("uninstall")
+    teardown.add_argument("arguments", nargs=argparse.REMAINDER)
+    verification = commands.add_parser("verify-uninstall-locks")
+    verification.add_argument("fds", type=int, nargs=3)
     args = parser.parse_args(argv)
+    if args.command in ("uninstall", "verify-uninstall-locks"):
+        return uninstall_main(args)
     raw = (
         args.config
         or (
@@ -369,8 +844,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "configure":
             configure(args, path)
-        else:
+        elif args.command == "status":
             print(json.dumps(status(path), indent=2))
+        else:
+            config = read_settings(path)
+            main = absolute(config["main"]).resolve(strict=True)
+            if main != SCRIPT.parent.parent or not (main / ".git").is_dir():
+                raise ValueError("managed runtime requires its configured primary checkout")
+            (serve if args.command == "serve" else ready)(config)
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
         print(f"managed Codebase refused: {error}", file=sys.stderr)
