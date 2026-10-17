@@ -1,0 +1,143 @@
+# Frozen qualification transport (replacement 4 of 6)
+
+`PinnedRouter` adapts rubric, relevance and novelty callers to the production
+`LiteLLMDelegate` without the production Router's fallback or cost-store writes.
+It supports one frozen model campaign. The campaign funds every scheduled
+maximum before execution; this module does not establish provider billing
+bounds or grant spending approval. Complete preflight and the isolated CLI
+runner are later replacements. No automatic execution or route promotion is
+wired by this change.
+
+`binding.transports[alias]` freezes model, requested `params`, gateway `endpoint`,
+common `generation_namespace` and SHA256 `credential_fingerprint`. Every attempt
+also repeats the credential fingerprint and binds contract/version/case/repetition/prompt hash, the exact serialized
+request hash, `receipt_provider` display name and `provider_identity_evidence`.
+The display name needs verified mapping to the pinned endpoint variant; a
+routing tag is not automatically a generation receipt's provider name.
+Other aliases, duplicate coordinates, implicit routing defaults, changed
+requests and unfunded schedules refuse before credential access.
+
+Run in a fresh isolated process with serialized judgments. Global LiteLLM
+observers and any nonempty `LITELLM_PRINT_STANDARD_LOGGING_PAYLOAD` refuse live
+execution and GET reconciliation before credential access. Even `0` and `false`
+enable that SDK printer; an empty or unset value is required. Offline retained
+answer replay does not use the SDK and remains available. The dedicated key must differ from all visible
+production OpenRouter credentials and match the frozen fingerprint. Each new
+completion reads its finite nonreset limit, remaining credit and usage; explicit
+`limit_reset: null` is required. Available credit is the least of reported
+`limit_remaining`, exact `limit - usage`, every returned budget's `remaining_usd`
+and its exact `limit_usd - spend_usd` when those constraints are supplied.
+All arithmetic uses retained lexical decimals. A partial/malformed budget pair
+refuses; a lower reported remainder remains binding. This conservative envelope
+does not assume atomic or exactly equal snapshots. It must cover the outstanding
+scheduled maxima. A current key snapshot cannot prove exclusive key use,
+in-flight overshoot, billable reasoning/framing or fees. `max_price` filters
+rates; it is not a per-request dollar cap. The later runner must still require complete admission and concrete owner
+approval of the frozen operating parameters and allowance. An approved operating
+allowance with disclosed overrun risk does not establish a hard invoice ceiling.
+
+Local HTTP client construction precedes reservation/dispatch. Failed setup
+therefore leaves no durable dispatch, and an initialized client is closed even
+when reservation or dispatch publication fails. Ambiguous historical dispatches
+remain unresolved and are never resent. Reservation and dispatch are durable
+before the delegate runs. Every SDK
+replacement client shares the same exact-wire and second-request refusal guard.
+The serialized HTTP hook enables documented routing metadata and explicitly
+disables OpenRouter response caching. Each qualified answer needs one selected
+endpoint matching the frozen model and provider display, direct routing, one
+gateway attempt, no BYOK and no material pipeline. Unselected candidates and
+unrelated additive metadata fields do not imply retries. The legacy top-level
+provider is optional; if present, it cannot contradict the selected identity.
+This gateway witness does not prove effective backend parameters or internal
+provider retries. See [routing metadata](https://openrouter.ai/docs/guides/features/router-metadata)
+and [response caching](https://openrouter.ai/docs/guides/features/response-caching).
+The response hook defers stream closure until the complete decoded response is
+durably recorded, then releases the original stream. Partial reads retain the
+funded dispatch without inventing an answer. It appends before auth/SDK/client cleanup can
+fail. Failed delegate results are checked explicitly even when no exception
+was raised. Answers and failures are retained independently. Cancellation
+keeps its meaning; uncertain journal publication poisons further state reads
+and egress until a new writer reconstructs the durable prefix.
+
+Financial JSON first uses the existing duplicate-key/nonfinite validator, then
+parses the same immutable bytes with Decimal. Only financial fields become
+nonnegative fixed-point strings; no float or delegate estimate determines
+settlement. Numeric lexemes remain in the redacted raw body. Redaction decodes
+JSON strings in diagnostic messages, exception traces and stack text as well as
+response evidence, so escaped credential echoes are removed. Expansion above
+4096 characters refuses rather than rounding or allocating exponent-sized
+strings. This is an evidence-processing limit, not a claimed provider precision.
+Locally constructed evidence field names stay unchanged when a credential value
+matches a schema name. Usage records and the four association fields retain
+their schema, as do the selected identity/cache headers. Arbitrary nested values and extra association key material remain
+redacted. Association metadata is normalized through the existing finite-JSON
+serializer before redaction and before GET; tuples become arrays, while unsupported
+or cyclic inputs refuse. Existing retained records require no migration. Logging
+message, cached exception, traceback and stack formatting failures use a fixed
+redacted diagnostic rather than interrupting a request. Valid raw response/billing JSON preserves its fixed public schema key
+tokens while redacting values and unknown keys without reserializing numbers.
+Optional pipeline and attempt-history keys remain available to refusal checks.
+Retained raw bodies use that same boundary again; diagnostic text does not
+receive schema-key trust.
+
+Production credential aliases remain hidden from SDK key selection during a
+completion. Their known values remain available to redaction for that scope;
+the temporary log factory also retains its entry snapshot for SDK logging threads.
+Both contexts restore their prior state on exit, including cancellation.
+
+External JSON is limited locally to 1 MiB of UTF-8 and 64 nested containers.
+These processing bounds are not provider limits or a promise that every remote
+response fits. The existing loader still rejects duplicate keys and nonfinite
+numbers. HTTPX still buffers the complete decoded response before this check;
+the 1 MiB bound limits normalization work, not transport memory or network reads.
+Decimal remains the financial authority. A single delimiter pass
+uses the standard JSON string scanner, so quotes inside strings cannot cause
+repeated suffix matching. Structured local records also have a depth safeguard.
+Existing JSON surrogate serialization remains unchanged.
+
+Malformed, oversized or overly nested response bodies retain the fixed
+`[REDACTED: unsafe evidence]` marker and an explicit error in the observation or
+receipt. Unusable body content, identity and charges are not invented. Safe
+independent response headers may still be retained. Journal publication must
+succeed; an uncertain write still poisons the writer. Refused evidence cannot
+qualify an answer or release its unresolved funded liability. Recovery never
+resends a completion. The opaque marker intentionally sacrifices malformed raw
+diagnostic detail to keep reversible escaped credentials out of the journal.
+Diagnostic text over 1,048,576 characters, malformed quoted spans and
+backslashes outside certified JSON string spans use the same opaque fallback.
+Decoded string values pass through that text boundary again, up to 64 layers;
+embedding escaped text inside another JSON string does not make it trusted.
+
+`reconcile(journal, attempt, ...)` only performs GET generation lookup. It
+rejects error-bearing envelopes, checks frozen model/provider identity and appends the exact receipt to the
+journal. Costs must agree and remain within the funded maximum. Invalid or
+contradictory retained evidence keeps liability unresolved; it is not replaced
+by a later receipt. Missing or contradictory observed generation IDs refuse.
+Receipt-only recovery requires explicit independently verified attempt/request
+association, never an inferred latest generation. A settled lost answer needs
+an explicit answer-loss acknowledgement and is never resent.
+Body and response-header generation identities are retained separately; a
+contradiction stays unresolved. An ID captured from this response's header may
+support expense recovery when the body ID is absent, but cannot qualify an
+answer lacking the required completion evidence. Only generation and cache
+status headers are retained; credentials and unrelated headers are excluded.
+Contradictory observed model/provider identities remain lists of actual contrary
+facts in the existing observation fields, which cannot match frozen string
+identities. They block settlement, including when appended after an earlier
+receipt. Missing identity is not silently replaced by requested routing.
+
+Any unresolved campaign incident pauses both new completions and answer replay.
+Processing and cleanup failures with empty, whitespace-only or unformattable
+messages retain their exception type as the durable error; nonblank redacted
+messages are kept. Formatting does not suppress the original call/cleanup
+exception or change cancellation propagation.
+After GET settlement and explicit acknowledgement of a retained local failure,
+an eligible retained answer can replay without reading a credential or sending another
+completion. An acknowledged undispatched reservation continues the same attempt
+without reserving twice. Neither acknowledgement deletes evidence. Final reports
+must reconstruct current accounting, including generation collisions that can
+invalidate earlier answers; the later runner owns those reports.
+Every live acceptance and retained replay rechecks the raw routing evidence.
+Expense settlement and failure acknowledgement cannot qualify a cached,
+transformed, retried or otherwise invalid response. Recovery remains explicit
+GET-only; rejected answers never trigger another completion.

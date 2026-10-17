@@ -136,6 +136,26 @@ def test_status_checks_build_and_preserves_metadata(managed, tmp_path, monkeypat
     assert result["service"] == {"ActiveState": "inactive"}
 
 
+def test_status_seeds_systemd_session_environment(managed, monkeypatch):
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    calls = []
+
+    def check_output(args, **kwargs):
+        env = kwargs.get("env", {})
+        calls.append(env)
+        if not env.get("XDG_RUNTIME_DIR") or not env.get("DBUS_SESSION_BUS_ADDRESS"):
+            raise subprocess.CalledProcessError(1, args)
+        return "ActiveState=inactive\n"
+
+    monkeypatch.setattr(subprocess, "check_output", check_output)
+    result = managed.status(None)
+    uid = os.getuid()
+    assert result["manager_error"] is None
+    assert calls[0]["XDG_RUNTIME_DIR"] == f"/run/user/{uid}"
+    assert calls[0]["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path=/run/user/{uid}/bus"
+
+
 @pytest.mark.parametrize("command", ["status", "configure"])
 @pytest.mark.parametrize("explicit", [False, True])
 def test_config_path_precedence(managed, tmp_path, monkeypatch, command, explicit):
@@ -176,7 +196,7 @@ def staged_configuration(managed, tmp_path, monkeypatch):
     monkeypatch.setattr(
         hashlib, "file_digest", lambda *a: SimpleNamespace(hexdigest=lambda: managed.BUILD)
     )
-    state = tmp_path / "new ancestor" / "nested" / "staged $%\\ Unicode \u00e9 "
+    state = tmp_path / "new ancestor" / "nested" / "staged $% Unicode \u00e9 "
     settings = home / ".genesis/config/codebase-managed.json"
     args = SimpleNamespace(
         main=str(repo), binary=str(binary), state=str(state), sentinel=str(home / "disabled")
@@ -354,8 +374,11 @@ def test_source_refusal_does_not_claim_retained_staging(
             source.mkdir()
         elif kind == "fifo":
             os.mkfifo(source)
-    with pytest.raises((OSError, ValueError)):
+    with pytest.raises((OSError, ValueError)) as raised:
         managed.configure(args, settings)
+    if kind == "wrong-pin":
+        # A digest mismatch is named distinctly, never folded into a generic failure.
+        assert "unsupported managed executable" in str(raised.value)
     assert "Incomplete staging retained" not in capsys.readouterr().err
     assert not state.exists() and not settings.exists()
 
@@ -398,6 +421,143 @@ def test_native_environment_scrubs_provider_overrides(managed, tmp_path, monkeyp
     env = managed.native_env(config(tmp_path, managed))
     assert "CBM_AUTO_INDEX" not in env
     assert env["CBM_CACHE_DIR"] == str(tmp_path / "cache")
+
+
+@pytest.mark.parametrize("key", ["main", "cache"])
+@pytest.mark.parametrize("linked", [False, True])
+def test_native_environment_refuses_unsupported_provider_identity(managed, tmp_path, key, linked):
+    data = config(tmp_path, managed)
+    physical = tmp_path / "physical\\identity"
+    physical.mkdir()
+    selected = physical
+    if linked:
+        selected = tmp_path / "plain-alias"
+        selected.symlink_to(physical, target_is_directory=True)
+    data[key] = str(selected / "missing-suffix")
+    with pytest.raises(ValueError, match="pinned provider.*backslash"):
+        managed.native_env(data)
+
+
+@pytest.mark.parametrize("key", ["main", "cache"])
+def test_status_retains_incompatible_path_and_retirement_document(
+    managed, tmp_path, monkeypatch, key
+):
+    data = config(tmp_path, managed)
+    data[key] += "\\unsupported"
+    path = tmp_path / "settings"
+    path.write_text(json.dumps(data))
+    manager = Mock(return_value="ActiveState=inactive\n")
+    monkeypatch.setattr(subprocess, "check_output", manager)
+    result = managed.status(path)
+    assert result["settings"] == data
+    assert "backslash" in result["settings_error"]
+    assert result["service"] == {"ActiveState": "inactive"}
+    manager.assert_called_once()
+    assert managed.read_settings(path, require_build=False) == data
+
+
+@pytest.mark.parametrize("key", ["binary", "runtime", "sentinel"])
+def test_nonprovider_paths_retain_literal_backslash_support(managed, tmp_path, key):
+    data = config(tmp_path, managed)
+    data[key] += "\\literal"
+    assert managed.validate_settings(data) == data
+    env = managed.native_env(data)
+    assert env["CBM_CACHE_DIR"] == data["cache"]
+    assert env["CBM_RUNTIME_DIR"] == data["runtime"]
+
+
+@pytest.mark.parametrize("field", ["main", "state"])
+def test_configure_backslash_alias_to_supported_identity_succeeds(
+    managed, staged_configuration, tmp_path, field
+):
+    args, settings, _state = staged_configuration
+    alias = tmp_path / "alias\\literal"
+    target = Path(args.main) if field == "main" else tmp_path / "plain-state-parent"
+    target.mkdir(exist_ok=True)
+    alias.symlink_to(target, target_is_directory=True)
+    setattr(args, field, str(alias if field == "main" else alias / "fresh"))
+    managed.configure(args, settings)
+    data = managed.read_settings(settings)
+    assert "\\" not in data["main"] and "\\" not in data["cache"]
+
+
+@pytest.mark.parametrize("key", ["main", "cache"])
+@pytest.mark.parametrize("suffix", ["", "/child", "/../safe", "/../../safe"])
+def test_native_environment_refuses_provider_symlink_loops(managed, tmp_path, key, suffix):
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    (tmp_path / "safe").mkdir()
+    data = config(tmp_path, managed)
+    data[key] = str(loop) + suffix
+    with pytest.raises((OSError, RuntimeError)):
+        managed.native_env(data)
+
+
+@pytest.mark.parametrize("key", ["main", "cache"])
+def test_native_environment_keeps_missing_staging_paths_supported(managed, tmp_path, key):
+    data = config(tmp_path, managed)
+    data[key] = str(tmp_path / "missing" / "stage")
+    assert managed.native_env(data)["CBM_ALLOWED_ROOT"] == data["main"]
+
+
+@pytest.mark.parametrize("key", ["main", "cache"])
+def test_status_provider_symlink_loop_keeps_manager_diagnostics(
+    managed, tmp_path, monkeypatch, key
+):
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    data = config(tmp_path, managed)
+    data[key] = str(loop / "path")
+    path = tmp_path / "settings"
+    path.write_text(json.dumps(data))
+    manager = Mock(return_value="ActiveState=inactive\n")
+    monkeypatch.setattr(subprocess, "check_output", manager)
+    result = managed.status(path)
+    assert result["settings"] == data and result["settings_error"]
+    assert result["service"] == {"ActiveState": "inactive"}
+    manager.assert_called_once()
+
+
+@pytest.mark.parametrize("field", ["main", "state"])
+@pytest.mark.parametrize("linked", [False, True])
+def test_configure_unsupported_identity_has_zero_effects(
+    managed, staged_configuration, tmp_path, monkeypatch, field, linked
+):
+    args, settings, _state = staged_configuration
+    physical = tmp_path / "owned\\state"
+    if field == "main":
+        Path(args.main).rename(physical)
+        monkeypatch.setitem(
+            managed.configure.__globals__, "SCRIPT", physical / "scripts/codebase_managed.py"
+        )
+    elif linked:
+        physical.mkdir()
+    selected = physical
+    if linked:
+        selected = tmp_path / "clean-alias"
+        selected.symlink_to(physical, target_is_directory=True)
+    setattr(args, field, str(selected if field == "main" else selected / "missing/stage"))
+    sibling = (
+        Path(str(Path(args.state).resolve() / "cache").replace("\\", "/"))
+        if field == "state"
+        else tmp_path / "unrelated/cache"
+    )
+    sibling.mkdir(parents=True)
+    evidence = sibling / "_config.db"
+    evidence.write_bytes(b"foreign config evidence")
+    sibling.chmod(0o750)
+    evidence_bytes = evidence.read_bytes()
+    before = (sibling.stat(), evidence.stat(), evidence_bytes)
+    native = Mock(side_effect=AssertionError("must refuse before native execution"))
+    monkeypatch.setattr(subprocess, "run", native)
+    with pytest.raises(ValueError, match="pinned provider.*backslash"):
+        managed.configure(args, settings)
+    native.assert_not_called()
+    assert not settings.exists()
+    assert not (settings.parents[2] / ".config").exists()
+    assert not Path(args.state).exists()
+    assert sibling.stat() == before[0]
+    assert evidence.stat() == before[1] and evidence.read_bytes() == before[2]
 
 
 def test_status_reports_missing_settings_without_starting_provider(tmp_path):
@@ -497,7 +657,9 @@ def test_native_configure_cli_e2e(native_root, long_runtime):
     shutil.copy2(
         ROOT / "scripts/lib/codebase_managed_unit.py", repo / "scripts/lib/codebase_managed_unit.py"
     )
-    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    shutil.copy2(ROOT / "scripts/lib/managed_units.py", repo / "scripts/lib/managed_units.py")
+    git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True, env=git_env)
     settings = home / ".genesis/config/codebase-managed.json"
     state = home / ("staged" + ("x" * 100 if long_runtime else ""))
     sentinel = home / "disabled"
@@ -516,7 +678,8 @@ def test_native_configure_cli_e2e(native_root, long_runtime):
         "--sentinel",
         str(sentinel),
     ]
-    env = dict(os.environ, HOME=str(home))
+    env = {key: value for key, value in git_env.items()}
+    env["HOME"] = str(home)
     result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
     if long_runtime:
         assert result.returncode == 1

@@ -295,13 +295,28 @@ class RecoveryEngine:
 
     async def _revert_code(self, container: str) -> tuple[bool, str]:
         """Stash uncommitted changes and revert last commit, then restart."""
-        # Stash any uncommitted work
-        rc, _, _ = await _run_subprocess(
+        # Stash any uncommitted work. git revert itself refuses to overwrite
+        # dirty files, so this guard is not about data loss: a failed stash
+        # leaves uncommitted code live, a revert commit cannot fix a fault that
+        # lives there, and an unfinished stash may still hold the index.
+        rc, _, stderr = await _run_subprocess(
             "incus", "exec", container, "--",
             "su", "-", "ubuntu", "-c",
             "cd ~/genesis && git stash",
-            timeout=15.0,
+            timeout=30.0,
         )
+        if rc == -1:
+            # _run_subprocess returns -1 for a timeout or exec error: the stash
+            # did not report, so whether it ran is unknown.
+            return False, (
+                f"git stash did not report ({stderr}); not reverting. "
+                "Check `git stash list` and the working tree before retrying"
+            )
+        if rc != 0:
+            return False, (
+                f"git stash (or the exec around it) failed ({stderr}); not "
+                "reverting. Check `git stash list` and the working tree"
+            )
 
         # Revert the last commit
         rc, stdout, stderr = await _run_subprocess(

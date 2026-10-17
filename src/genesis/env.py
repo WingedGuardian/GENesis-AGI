@@ -215,6 +215,16 @@ def falkordb_socket_path() -> Path:
     return genesis_home() / "falkordb" / "falkordb.sock"
 
 
+def vault_socket_path() -> Path:
+    """Unix socket of the payment-card vault service (``~/.genesis/run/payment_vault.sock``).
+
+    genesis-server listens; ``python -m genesis vault`` connects. Its directory
+    is the 0700 boundary (``~/.genesis`` itself is 0755). Composed from
+    ``genesis_home()`` so tests redirect it to a tmp dir.
+    """
+    return genesis_home() / "run" / "payment_vault.sock"
+
+
 def alert_queue_root() -> Path:
     """Durable alert-queue root for the CONTAINER side (``~/.genesis/alerts/queue``).
 

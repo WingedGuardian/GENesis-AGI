@@ -323,3 +323,66 @@ def test_ensure_local_absent_everywhere_still_installs(tmp_path):
     assert "not installed — installing pinned" in res.stdout
     log = (tmp_path / "npm.log").read_text()
     assert "install -g" in log and "@anthropic-ai/claude-code@2.1.201" in log
+
+
+def test_a_shadow_that_cannot_be_removed_is_never_reported_removed(tmp_path):
+    """The run summary used to name the removal before rm ran; callers use
+    `cc_shadow_scan || true`, so a failed rm fell through silently (#3138 review)."""
+    canon = _canonical(tmp_path)
+    home = tmp_path / "home"
+    nvm_prefix = home / ".nvm" / "versions" / "node" / "v24.15.0"
+    link = _plant_npm_tree(nvm_prefix)
+    summary = tmp_path / "summary.txt"
+    (nvm_prefix / "bin").chmod(0o555)  # the link cannot be unlinked
+    try:
+        res = _run(
+            tmp_path,
+            "cc_shadow_scan || true",
+            canonical=canon,
+            extra_env={"GENESIS_DEPLOY_SUMMARY": str(summary)},
+        )
+    finally:
+        (nvm_prefix / "bin").chmod(0o755)
+    assert res.returncode == 0, res.stderr
+    assert link.is_symlink()
+    assert "could not remove" in res.stderr
+    assert not summary.exists() or "removed a shadow" not in summary.read_text()
+
+
+def test_a_removed_shadow_is_named_in_the_run_summary(tmp_path):
+    canon = _canonical(tmp_path)
+    nvm_prefix = tmp_path / "home" / ".nvm" / "versions" / "node" / "v24.15.0"
+    _plant_npm_tree(nvm_prefix)
+    summary = tmp_path / "summary.txt"
+    res = _run(
+        tmp_path, "cc_shadow_scan", canonical=canon, extra_env={"GENESIS_DEPLOY_SUMMARY": str(summary)}
+    )
+    assert res.returncode == 0, res.stderr
+    assert "removed a shadow Claude Code copy" in summary.read_text()
+
+
+def test_a_half_done_removal_names_what_is_left(tmp_path):
+    """The launcher goes but its package cannot: the summary and the warning say
+    which half is left, rather than nothing at all."""
+    canon = _canonical(tmp_path)
+    home = tmp_path / "home"
+    launcher = _write_exec(home / ".claude" / "local" / "claude", "#!/usr/bin/env bash\n")
+    pkg = home / ".claude" / "local" / "node_modules" / "@anthropic-ai" / "claude-code"
+    pkg.mkdir(parents=True)
+    (pkg / "package.json").write_text("{}", encoding="utf-8")
+    summary = tmp_path / "summary.txt"
+    pkg.chmod(0o555)  # its contents cannot be unlinked
+    try:
+        res = _run(
+            tmp_path,
+            "cc_shadow_scan || true",
+            canonical=canon,
+            extra_env={"GENESIS_DEPLOY_SUMMARY": str(summary)},
+        )
+    finally:
+        pkg.chmod(0o755)
+    assert res.returncode == 0, res.stderr
+    assert not launcher.exists() and pkg.is_dir()
+    assert "could not remove" in res.stderr and str(pkg) in res.stderr
+    text = summary.read_text()
+    assert "could not be removed" in text and "removed a shadow Claude Code copy" not in text

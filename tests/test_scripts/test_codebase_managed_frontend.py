@@ -136,7 +136,8 @@ def test_busy_child_has_no_settings_read_or_exec(frontend, child):
     assert events == []
 
 
-def test_launch_uses_primary_helper_literal_paths_and_native_dependencies(frontend, tmp_path, monkeypatch):
+@pytest.mark.parametrize("manager_env", ["missing", "inherited"])
+def test_launch_uses_primary_helper_literal_paths_and_native_dependencies(frontend, tmp_path, monkeypatch, manager_env):
     main = tmp_path / 'main$%&|λ" '
     (main / ".git").mkdir(parents=True)
     interpreter = main / ".venv/bin/python"
@@ -147,9 +148,20 @@ def test_launch_uses_primary_helper_literal_paths_and_native_dependencies(fronte
     monkeypatch.setitem(namespace, "verify_cache", Mock())
     monkeypatch.setitem(namespace, "ready", Mock())
     settings = tmp_path / 'settings$%" '
+    expected_env = {
+        "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus",
+    }
+    for key in expected_env:
+        if manager_env == "missing":
+            monkeypatch.delenv(key, raising=False)
+        else:
+            expected_env[key] = "explicit-" + key
+            monkeypatch.setenv(key, expected_env[key])
 
-    def execute(executable, argv):
+    def execute(executable, argv, env):
         assert executable == "/usr/bin/systemd-run"
+        assert {key: env[key] for key in expected_env} == expected_env
         for required in ("--pipe", "--collect", "--wait", "--working-directory=/",
                          "--slice=" + frontend.SLICE, "MemoryMax=256M", "MemorySwapMax=0",
                          "TasksMax=32", "OOMScoreAdjust=500", "Requisite=" + frontend.BACKEND,
@@ -165,7 +177,7 @@ def test_launch_uses_primary_helper_literal_paths_and_native_dependencies(fronte
         assert "--scope" not in argv
         raise Executed
 
-    monkeypatch.setattr(namespace["os"], "execv", execute)
+    monkeypatch.setattr(namespace["os"], "execve", execute)
     with pytest.raises(Executed):
         frontend.launch({"main": str(main)}, settings)
 
@@ -176,7 +188,7 @@ def test_failed_parent_preflight_never_creates_unit(frontend, monkeypatch, stage
     for name in ("verify_cache", "ready"):
         monkeypatch.setitem(namespace, name, Mock(side_effect=ValueError(stage) if name == stage else None))
     native = Mock()
-    monkeypatch.setattr(namespace["os"], "execv", native)
+    monkeypatch.setattr(namespace["os"], "execve", native)
     with pytest.raises(ValueError):
         frontend.launch({}, Path("/settings"))
     native.assert_not_called()

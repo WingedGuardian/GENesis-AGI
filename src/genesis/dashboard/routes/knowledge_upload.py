@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import mimetypes
+import os
 import re
+import stat
 import uuid
 from pathlib import Path
 
@@ -36,6 +39,99 @@ def _sanitize_filename(name: str) -> str:
         stem = Path(name).stem[:_MAX_FILENAME_LEN - len(Path(name).suffix) - 1]
         name = stem + Path(name).suffix
     return name or "unnamed"
+
+
+def _own_entry(dir_fd: int, wanted: str) -> str | None:
+    """Return the directory's own name for the entry called ``wanted``, or None.
+
+    Callers address the entry with the returned name, so what reaches the
+    filesystem is something the directory listed, never request or row data.
+    """
+    with os.scandir(dir_fd) as entries:
+        for entry in entries:
+            if entry.name == wanted:
+                return entry.name
+    return None
+
+
+def _remove_upload_file(upload_id: str, stored_path: str) -> str | None:
+    """Delete an upload's file and its emptied directory through DESCRIPTORS.
+
+    Returns None when the goal state holds (the file is gone), or the reason
+    nothing was touched. The upload directory is opened relative to the upload
+    root with ``O_NOFOLLOW``, and the file is addressed by bare name relative to
+    that descriptor, so no symlink below the root is ever followed and the
+    stored path is never used to address anything. Same pattern as
+    ``_purge_dir_entries`` in ``genesis.cc.invoker``.
+
+    The one comparison on the stored path is a consistency check on the row, not
+    the containment boundary: a row that does not describe
+    ``<root>/<upload_id>/<name>`` is left for a human instead of being dropped.
+    """
+    if os.path.dirname(stored_path) != os.path.join(str(_UPLOAD_DIR), upload_id):
+        return "Stored file path is not this upload's file"
+    # The name must be one the upload route could have written: it stores
+    # `_sanitize_filename(...)`. Anything else (`.`, `..`, an empty name from a
+    # trailing slash, NUL, newline, an overlong name) never matches a listed
+    # entry, so it would read as "already removed" and drop the row while the
+    # real file stays on disk.
+    name = os.path.basename(stored_path)
+    if not name or name != _sanitize_filename(name):
+        return "Stored file path is not this upload's file"
+
+    try:
+        root_fd = os.open(_UPLOAD_DIR, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        logger.warning("Could not open the upload root %s", _UPLOAD_DIR, exc_info=True)
+        return "Upload directory could not be opened"
+    try:
+        try:
+            dir_name = _own_entry(root_fd, upload_id)
+        except OSError:
+            logger.warning("Could not list the upload root %s", _UPLOAD_DIR, exc_info=True)
+            return "Upload directory could not be opened"
+        if dir_name is None:
+            return None
+        try:
+            dir_fd = os.open(
+                dir_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
+            )
+        except OSError:
+            # A symlink (ELOOP, including one that points at itself) or a
+            # non-directory where the upload's directory should be.
+            return "Upload directory is not a real directory"
+        try:
+            file_name = _own_entry(dir_fd, name)
+            if file_name is None:
+                # Not listed means already removed only if nothing else is in
+                # the upload's directory. If something is, the row names a file
+                # that is not there (a case or spelling mismatch) and the real
+                # file would be orphaned: leave both for a human.
+                with os.scandir(dir_fd) as entries:
+                    if any(True for _ in entries):
+                        return "Stored file is not in the upload directory, which is not empty"
+            else:
+                if not stat.S_ISREG(os.lstat(file_name, dir_fd=dir_fd).st_mode):
+                    return "Stored file path is not a regular file"
+                # Unlinks the entry itself. If it is swapped for a link after
+                # the lstat, the link is removed and its target is untouched.
+                os.unlink(file_name, dir_fd=dir_fd)
+        except OSError:
+            logger.warning("Could not remove upload file %s", stored_path, exc_info=True)
+            return "Stored file could not be removed"
+        finally:
+            os.close(dir_fd)
+        try:
+            os.rmdir(dir_name, dir_fd=root_fd)
+        except OSError as exc:
+            # Other files still in the directory is expected; anything else is worth a line.
+            if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT):
+                logger.warning("Could not remove upload directory for %s", upload_id, exc_info=True)
+    finally:
+        os.close(root_fd)
+    return None
 
 
 @blueprint.route("/api/genesis/knowledge/upload", methods=["POST"])
@@ -224,13 +320,23 @@ async def knowledge_upload_cancel(upload_id: str):
     if upload["status"] == "processing":
         return jsonify({"error": "Cannot cancel — ingestion in progress"}), 409
 
-    # Remove file from disk
-    file_path = Path(upload["file_path"])
-    if file_path.exists():
-        file_path.unlink()
-    # Clean up empty parent directory
-    if file_path.parent.exists() and not any(file_path.parent.iterdir()):
-        file_path.parent.rmdir()
+    # Upload ids are minted by uuid4() in the upload route. Anything else never
+    # names a directory this route created, so it is not used to address one.
+    try:
+        is_own_id = str(uuid.UUID(upload_id)) == upload_id
+    except ValueError:
+        is_own_id = False
+    refusal = (
+        _remove_upload_file(upload_id, upload["file_path"])
+        if is_own_id
+        else "Upload id is not a UUID"
+    )
+    if refusal:
+        logger.error(
+            "Refusing to cancel upload %s (stored path %s): %s",
+            upload_id, upload["file_path"], refusal,
+        )
+        return jsonify({"error": refusal}), 409
 
     await knowledge_uploads.delete(rt.db, upload_id)
     return jsonify({"status": "ok"})

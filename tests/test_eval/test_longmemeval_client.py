@@ -61,11 +61,18 @@ def test_load_secrets_does_not_overwrite_existing(monkeypatch, tmp_path):
     assert os.environ["API_KEY_OPENROUTER"] == "already-set"
 
 
-def test_candidate_secret_paths_includes_maintree_fallback():
+def test_candidate_secret_paths_includes_maintree_fallback(monkeypatch):
     from pathlib import Path
 
+    monkeypatch.delenv("SECRETS_PATH", raising=False)
     paths = client_mod._candidate_secret_paths()
     assert Path.home() / "genesis" / "secrets.env" in paths
+
+
+def test_secrets_path_is_the_only_candidate_when_set(monkeypatch, tmp_path):
+    chosen = tmp_path / "secrets.env"
+    monkeypatch.setenv("SECRETS_PATH", str(chosen))
+    assert client_mod._candidate_secret_paths() == [chosen]
 
 
 def test_require_results_db_fails_fast_on_missing_db(tmp_path):

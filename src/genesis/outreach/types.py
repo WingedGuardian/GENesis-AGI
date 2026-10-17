@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from genesis.peers.outbox import PeerEnvelope
 
 
 class OutreachCategory(StrEnum):
@@ -119,7 +123,9 @@ MECHANICAL_ENGAGEMENT_SIGNALS_SQL_IN: str = ", ".join(
 # a NEW external channel counts automatically. The tradeoff: a NEW OWNER-facing
 # delivery channel (e.g. a future owner-directed email digest) MUST be added
 # here, or its rows would be miscounted as external outreach.
-OWNER_FACING_CHANNELS: frozenset[str] = frozenset({"telegram", "voice"})
+# Same-owner machine conversations also stay outside human engagement scoring.
+# This set is a metric exclusion, never an authority/origin classifier.
+OWNER_FACING_CHANNELS: frozenset[str] = frozenset({"telegram", "voice", "agent"})
 
 # SQL IN-list rendering (same trusted-constant rationale as
 # POSITIVE_ENGAGEMENT_SQL_IN above). Trusted module constant — safe to inline.
@@ -201,6 +207,8 @@ class OutreachRequest:
     # retry budget is ~82 minutes before it discards the row, so that trade
     # swaps a duplicate for a DROPPED page on any outage longer than that.
     defer_retry: bool = True
+    # Stable addressed identity survives the existing pending/deferred queues.
+    peer_envelope: PeerEnvelope | None = None
 
 
 @dataclass(frozen=True)

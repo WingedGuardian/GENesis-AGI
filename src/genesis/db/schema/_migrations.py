@@ -1691,6 +1691,16 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE procedural_memory ADD COLUMN surfaced_count INTEGER NOT NULL DEFAULT 0",
         "procedural_memory.surfaced_count")
 
+    # Lessons as data: a lesson row's trigger_spec and authorship record (both
+    # JSON, NULL on an earned procedure). Here as well as in the base table
+    # because bootstrap seeds procedures before numbered migrations run.
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN trigger_spec TEXT",
+        "procedural_memory.trigger_spec")
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN lesson TEXT",
+        "procedural_memory.lesson")
+
     # Rebuild cognitive_state table if CHECK constraint lacks resilience_degradation.
     # SQLite can't ALTER CHECK constraints — requires table rebuild.
     await _migrate_cognitive_state_check(db)

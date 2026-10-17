@@ -1083,8 +1083,6 @@ def test_no_raw_index_spawns_outside_entrypoint():
                 violations.append(f"{rel}:{lineno}: raw index_repository spawn")
             elif "gitnexus" in line and "analyze" in line:
                 if (rel, stripped) in {
-                    (Path("scripts/lib/codebase_managed_unit.py"), 'if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):'),
-                    (Path("scripts/codebase_managed.py"), 'native = "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv)'),
                     (Path("tests/test_scripts/test_codebase_managed_uninstall.py"), '(process / "cmdline").write_bytes(b"node\\0/opt/gitnexus/dist/cli/index.js\\0analyze\\0")'),
                     (Path("tests/test_scripts/test_codebase_managed_uninstall.py"), 'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "/opt/gitnexus/dist/cli/index.js", "analyze"], cwd=transaction / "genesis")'),
                 }:
@@ -1136,14 +1134,7 @@ def test_installer_does_not_claim_queue_success_after_writer_failure():
     assert "WARNING: could not queue initial code intelligence index" in queue
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
-        "scripts/codebase_managed.py",
-        "scripts/lib/codebase_managed_unit.py",
-        "tests/test_scripts/test_codebase_managed_uninstall.py",
-    ],
-)
+@pytest.mark.parametrize("path", ["scripts/codebase_managed.py", "tests/test_scripts/test_codebase_managed_uninstall.py"])
 def test_observation_exceptions_do_not_exempt_raw_spawns(tmp_path, monkeypatch, path):
     file = tmp_path / path
     file.parent.mkdir(parents=True)

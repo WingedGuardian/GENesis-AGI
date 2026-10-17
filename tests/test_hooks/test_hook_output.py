@@ -43,6 +43,22 @@ def test_cap_constant_is_the_measured_harness_threshold():
     assert _ho.DEFAULT_BUDGET < _ho.HOOK_STDOUT_CAP
 
 
+@pytest.mark.parametrize("text", ["timeout", "😀timeout", "😀" * 20])
+@pytest.mark.parametrize("remaining", [0, 1, 2, 3, 4, 5, 20, 10000])
+def test_final_notice_preserves_locked_count_and_newline_margin(text, remaining):
+    emitted = _ho.HOOK_STDOUT_CAP - remaining
+    notice = _ho.clip_final_notice(text, emitted_units=emitted)
+    if remaining <= 3:
+        assert notice is None
+    else:
+        assert notice is not None
+        # Both framing newlines plus the spare unit fit, including astral text.
+        assert emitted + _ho.utf16_len("\n" + notice + "\n") < _ho.HOOK_STDOUT_CAP
+        assert text.startswith(notice)
+        if remaining >= _ho.utf16_len(text) + 3:
+            assert notice == text
+
+
 def test_under_budget_emits_everything_uncut(sink):
     out = _writer(sink)
     out.emit("alpha", block="a")

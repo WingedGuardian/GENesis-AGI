@@ -89,9 +89,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pyyaml
+      - name: Install pyyaml and markdown-it-py
         if: steps.handoff.outputs.have == 'true'
-        run: pip install pyyaml
+        run: pip install pyyaml "markdown-it-py>=3"
 
       - name: Re-evaluate the merge gate
         id: gate

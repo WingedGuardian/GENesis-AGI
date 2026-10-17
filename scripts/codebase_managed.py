@@ -49,8 +49,11 @@ from codebase_managed_unit import (  # noqa: E402,F401
     native_install,
     parent_identity,
     sentinel_armed,
+    systemctl_env,
+    units_dir,
     validate_backend,
     validate_frontend_boundary,
+    validate_provider_paths,
     validate_source_identity,
 )
 
@@ -60,10 +63,6 @@ SLICE = "genesis-cbm-query-clients.slice"
 DISABLED_KEYS = ("auto_index", "auto_watch", "watcher_enabled")
 PATH_KEYS = ("main", "binary", "cache", "runtime", "sentinel")
 OPEN_FLAGS = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-
-
-def units_dir() -> Path:
-    return Path.home() / ".config/systemd/user"
 
 
 @contextmanager
@@ -156,7 +155,7 @@ def observed_index_writers(proc: Path = Path("/proc")) -> list[int]:
             started = process.joinpath("stat").read_text(errors="surrogateescape").rsplit(")", 1)[1].split()[19]
             argv = [os.fsdecode(arg) for arg in process.joinpath("cmdline").read_bytes().split(b"\0") if arg]
             wrapper = any(Path(arg).name == "code_intel_index.sh" for arg in argv)
-            native = "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv)
+            native = "analyze" in argv[1:]
             if not (wrapper or native):
                 continue
             cwd = process.joinpath("cwd").resolve(strict=True)
@@ -177,7 +176,7 @@ def observed_index_writers(proc: Path = Path("/proc")) -> list[int]:
 def require_no_batch() -> None:
     writers = observed_index_writers()
     if writers:
-        raise ValueError(f"uninstall refuses observed index writers: {writers}")
+        raise ValueError(f"uninstall refuses possible index writers: {writers}")
     result = subprocess.run(
         [
             "/usr/bin/systemctl",
@@ -194,6 +193,7 @@ def require_no_batch() -> None:
         text=True,
         check=True,
         timeout=30,
+        env=systemctl_env(),
     )
     for row in result.stdout.splitlines():
         unit = row.split()[0]
@@ -226,7 +226,8 @@ def refresh_sources(sources, config=None, *, removed=False) -> None:
         raise ValueError("managed unit sources changed before refresh")
     if not removed and all(snapshot is None for snapshot, _ in sources[1].values()):
         return  # strict native absence needs no global manager mutation
-    subprocess.run(["/usr/bin/systemctl", "--user", "daemon-reload"], check=True, timeout=30)
+    subprocess.run(["/usr/bin/systemctl", "--user", "daemon-reload"], check=True, timeout=30,
+                   env=systemctl_env())
     if inspect_sources(config) != sources:
         raise ValueError("managed unit sources changed during refresh")
     for unit, (snapshot, parameters) in sources[1].items():
@@ -259,7 +260,7 @@ def retire_managed():
                 native_install("disable", BACKEND, runtime="--runtime" in argv)
             else:
                 subprocess.run(["/usr/bin/systemctl", "--user", *argv], capture_output=True,
-                               text=True, check=True, timeout=60)
+                               text=True, check=True, timeout=60, env=systemctl_env())
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             errors.append(("command", f"{argv[0]}: {error}"))
     for unit in (BACKEND, SLICE):
@@ -330,7 +331,7 @@ def enable(config: dict) -> None:
         refresh_sources(sources, config)
         enable_preflight(config)
         subprocess.run(["/usr/bin/systemctl", "--user", "start", BACKEND],
-                       capture_output=True, text=True, check=True, timeout=150)
+                       capture_output=True, text=True, check=True, timeout=150, env=systemctl_env())
         ready(config)
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as startup:
         rollback = "complete"
@@ -622,6 +623,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         sentinel=str(absolute(args.sentinel)),
     )
     validate_settings(config)
+    validate_provider_paths(config)
     with lifecycle_lock():
         if any(os.path.lexists(p) for p in (path, absolute(args.state), state)):
             raise ValueError("existing settings/state preserved; choose a fresh staging state")
@@ -682,9 +684,11 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
                 if key in ("version", "build", "enabled", *PATH_KEYS)
             }
             validate_settings(value)
-    except (OSError, ValueError) as error:
+            validate_provider_paths(value)
+    except (OSError, ValueError, RuntimeError) as error:
         result["settings_error"] = str(error)
     try:
+        manager_env = systemctl_env()
         output = subprocess.check_output(
             [
                 "/usr/bin/systemctl",
@@ -705,11 +709,14 @@ def status(path: Path | None, path_error: str | None = None) -> dict:
             text=True,
             timeout=30,
             stderr=subprocess.PIPE,
+            env=manager_env,
         )
         result["service"] = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
-    except (OSError, subprocess.SubprocessError) as error:
+    except (ImportError, OSError, SyntaxError, subprocess.SubprocessError) as error:
         result["manager_error"] = str(error)
     return result
+
+
 
 
 def show(unit: str, *properties: str, timeout: float = 30) -> dict[str, str]:
@@ -724,6 +731,7 @@ def show(unit: str, *properties: str, timeout: float = 30) -> dict[str, str]:
         text=True,
         timeout=timeout,
         stderr=subprocess.PIPE,
+        env=systemctl_env(),
     )
     value = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
     if any(name not in value for name in properties):
@@ -796,7 +804,7 @@ def launch(config: dict, path: Path) -> None:
         raise ValueError("managed frontend requires the configured primary checkout")
     unit = "genesis-cbm-query-client-" + uuid.uuid4().hex + ".service"
     command = frontend_command(main, path, unit, BACKEND, SLICE)
-    os.execv(command[0], command)  # noqa: S606 - fixed systemd executable
+    os.execve(command[0], command, systemctl_env())  # noqa: S606 - fixed manager executable
 
 
 def client(path: Path, unit: str) -> None:

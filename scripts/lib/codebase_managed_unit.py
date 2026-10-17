@@ -2,21 +2,43 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
 import stat
 import subprocess
+from contextlib import suppress
 from pathlib import Path
 
 from code_intel_cbm_admission import _mount_path, number, resolve_cgroup
+from managed_units import stamp
+
+
+def systemctl_env() -> dict[str, str]:
+    """The user-manager environment from src/genesis/util/systemd.py.
+
+    Loaded by path because this script runs isolated (-I). Without it a service
+    started with no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS cannot reach the
+    user manager, and every systemctl --user call fails.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_genesis_util_systemd",
+        Path(__file__).resolve().parents[2] / "src/genesis/util/systemd.py",
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load systemd utilities")
+    systemd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(systemd)
+    return systemd.systemctl_env()
+
 
 
 def bus_call(path: str, interface: str, method: str, *args: str) -> dict:
     result = subprocess.run(
         ["/usr/bin/busctl", "--user", "--json=short", "call", "org.freedesktop.systemd1",
          path, interface, method, *args],
-        capture_output=True, text=True, check=True, timeout=30,
+        capture_output=True, text=True, check=True, timeout=30, env=systemctl_env(),
     )
     value = json.loads(result.stdout)
     if not isinstance(value, dict) or set(value) != {"type", "data"}:
@@ -228,7 +250,8 @@ def canonical_sources(script: Path, roots: tuple[Path, Path], names: tuple[str, 
                                    os.environ.get("VENV_PATH") or config["main"] + "/.venv")
                                   if config else retirement_parameters(unit))
                 template = script.parent / "systemd" / (unit + ".template")
-                if snapshot[2] != canonical_bytes(template, parameters):
+                expected = canonical_bytes(template, parameters)
+                if snapshot[2] not in (expected, stamp(expected)):
                     raise ValueError(f"unsupported noncanonical managed unit: {unit}")
             snapshots[unit] = (snapshot, parameters)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
@@ -314,26 +337,6 @@ def parent_identity(path: Path):
     return value.st_dev, value.st_ino
 
 
-def sentinel_armed(raw: str) -> bool:
-    try:
-        os.lstat(raw)
-    except FileNotFoundError:
-        return any(os.path.lexists(p) and not os.path.exists(p) for p in Path(raw).parents)
-    except OSError:
-        return True
-    return True
-
-
-def native_env(config: dict) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
-    env.update(
-        CBM_CACHE_DIR=config["cache"],
-        CBM_RUNTIME_DIR=config["runtime"],
-        CBM_ALLOWED_ROOT=config["main"],
-    )
-    return env
-
-
 def absolute(raw: str) -> Path:
     if not isinstance(raw, str) or not raw or any(c in raw for c in "\n\r\x00"):
         raise ValueError("invalid managed path")
@@ -341,6 +344,10 @@ def absolute(raw: str) -> Path:
     if not path.is_absolute():
         raise ValueError("managed path must be absolute")
     return path
+
+
+def units_dir() -> Path:
+    return Path.home() / ".config/systemd/user"
 
 
 def config_path(raw: str) -> Path:
@@ -384,6 +391,64 @@ def cgroup_empty(control: str) -> None:
         return  # stopped group has been removed from the visible hierarchy
     if values.get("populated") != "0":
         raise ValueError("managed cgroup still contains processes (including descendants)")
+
+
+def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
+    """Recognize repository targets of the existing wrapper and native modes."""
+    entrypoint = main / "scripts/lib/code_intel_index.sh"
+    for index, arg in enumerate(argv[:-1]):
+        if Path(arg).name != "code_intel_index.sh":
+            continue
+        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
+        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
+            return True
+    # GITNEXUS_BIN permits arbitrary executable names. Exact analyze arguments
+    # targeting main are possible writers, including after the wrapper exits.
+    # Skip argv[0]; an executable itself can be named analyze.
+    for index, arg in enumerate(argv[1:], 1):
+        if arg != "analyze":
+            continue
+        tail = argv[index + 1 :]
+        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
+        if target.resolve() == main:
+            return True
+    return False
+
+
+def sentinel_armed(raw: str) -> bool:
+    try:
+        os.lstat(raw)
+    except FileNotFoundError:
+        return any(os.path.lexists(p) and not os.path.exists(p) for p in Path(raw).parents)
+    except OSError:
+        return True
+    return True
+
+
+def validate_provider_paths(config: dict) -> None:
+    """The pinned POSIX provider folds backslashes before native storage use."""
+    for key in ("main", "cache"):
+        path = absolute(config[key])
+        physical = path.resolve()
+        # Python 3.13+ non-strict resolve leaves symlink loops unresolved.
+        # Let the kernel reject loops in both the literal and resolved paths;
+        # missing staging directories remain supported.
+        for candidate in (path, physical):
+            with suppress(FileNotFoundError):
+                candidate.stat()
+        if "\\" in str(path) or "\\" in str(physical):
+            raise ValueError(f"pinned provider does not support backslash in {key} paths")
+
+
+def native_env(config: dict) -> dict[str, str]:
+    validate_provider_paths(config)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
+    env.update(
+        CBM_CACHE_DIR=config["cache"],
+        CBM_RUNTIME_DIR=config["runtime"],
+        CBM_ALLOWED_ROOT=config["main"],
+    )
+    return env
 
 
 def verify_memory_ancestors(leaf: Path, root: Path) -> None:
@@ -441,21 +506,3 @@ def frontend_command(main: Path, settings: Path, unit: str, backend: str, slice_
     bridge = 'exec "$$CBM_CLIENT_PYTHON" -I "$$CBM_CLIENT_HELPER" --config "$$CBM_CLIENT_CONFIG" client --unit "$$CBM_CLIENT_UNIT"'
     command.extend(("--", "/bin/sh", "-c", bridge))
     return command
-
-
-def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
-    """Recognize repository targets of the existing wrapper and native modes."""
-    entrypoint = main / "scripts/lib/code_intel_index.sh"
-    for index, arg in enumerate(argv[:-1]):
-        if Path(arg).name != "code_intel_index.sh":
-            continue
-        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
-        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
-            return True
-    # The private OOM launcher contains both wrapper and native argv. Its fixed
-    # flag is not a repository argument; native classification must still run.
-    if "analyze" in argv and any("gitnexus" in Path(arg).parts for arg in argv):
-        tail = argv[argv.index("analyze") + 1 :]
-        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
-        return target.resolve() == main
-    return False
