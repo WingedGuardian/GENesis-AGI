@@ -657,7 +657,7 @@ def test_novelty_mixed_source_requires_real_target_and_keeps_history():
 
 
 async def test_current_guidance_and_approval_stop_before_router_or_network(tmp_path, monkeypatch):
-    cases, options = admitted(tmp_path)
+    cases, options = admitted(tmp_path, monkeypatch)
 
     def refuse(*_args, **_kwargs):
         pytest.fail("admission failure must precede router or key")
@@ -675,7 +675,7 @@ async def test_current_guidance_and_approval_stop_before_router_or_network(tmp_p
 
 
 async def test_conflicting_legacy_label_fields_stop_before_router(tmp_path, monkeypatch):
-    cases, options = admitted(tmp_path)
+    cases, options = admitted(tmp_path, monkeypatch)
     cases[next(iter(cases))][0]["reference_passed"] = True
     monkeypatch.setattr(pinned, "PinnedRouter", lambda *_a, **_k: pytest.fail("router constructed"))
     with pytest.raises(Incomplete, match="conflicting reference label"):

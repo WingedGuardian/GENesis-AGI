@@ -217,7 +217,7 @@ async def test_actual_duplicate_question_classes(tmp_path, variant):
 @pytest.mark.parametrize("change", ["missing_contract", "class_floor", "policy", "approval",
                                    "actor", "version", "source", "source_path", "params"])
 async def test_complete_admission_refuses_before_rendering_or_credentials(tmp_path, monkeypatch, change):
-    cases, options = admitted(tmp_path)
+    cases, options = admitted(tmp_path, monkeypatch)
     row = cases[corpus.NOVELTY][0]
     if change == "missing_contract":
         cases.pop(corpus.RELEVANCE)
@@ -233,7 +233,8 @@ async def test_complete_admission_refuses_before_rendering_or_credentials(tmp_pa
         row["reference_provenance"]["rubric_version"] = "old"
     elif change == "source":
         from pathlib import Path
-        Path(next(iter(options["source_files"]))).write_text("changed")
+        (Path(options["reference_approval"]["source_retention"]["primary_generation"])
+         / "blobs" / next(iter(options["source_files"].values()))).write_text("changed")
     elif change == "source_path":
         row["source"]["snapshot"] = "unbound-path"
     else:
@@ -445,7 +446,7 @@ async def test_schema_sources_bound_and_rechecked(tmp_path, monkeypatch, module_
     from genesis.db.schema import _migrations, _tables
 
     module = {"_migrations": _migrations, "_tables": _tables}[module_name]
-    cases, options = admitted(tmp_path)
+    cases, options = admitted(tmp_path, monkeypatch)
     original = preflight.file_hash
     changed = False
 
@@ -477,7 +478,7 @@ async def test_complete_check_binds_actual_normalizer_registry_inputs(tmp_path, 
         observer.setattr(Path, "read_text", observe)
         tool_names._mcp_owners.__wrapped__()
     attempted.update(Path(m.__file__) for m in (session_config, types))
-    cases, options = admitted(tmp_path)
+    cases, options = admitted(tmp_path, monkeypatch)
     monkeypatch.setattr(preflight, "prepare", AsyncMock(return_value={}))
     result = await preflight.check(cases, tmp_path, **options)
     root = Path(preflight.__file__).resolve().parents[4]
@@ -532,7 +533,7 @@ def registry_files(monkeypatch):
 @pytest.mark.parametrize("change", ["add", "remove", "modify", "literal", "hidden"])
 async def test_complete_check_rechecks_registry_population(tmp_path, monkeypatch, registry_files, change):
     files, _cache = registry_files
-    cases, options = admitted(tmp_path)
+    cases, options = admitted(tmp_path, monkeypatch)
 
     async def prepare(*args, **kwargs):
         if change == "remove":
@@ -554,7 +555,7 @@ async def test_complete_check_refuses_stale_registry_cache(tmp_path, monkeypatch
     name = next(iter(files))
     files[name] = "@mcp.tool()\ndef qualification_registry_probe(): pass\n"
     cache()
-    cases, options = admitted(tmp_path)
+    cases, options = admitted(tmp_path, monkeypatch)
 
     def change():
         files[name] = "@mcp.tool()\ndef changed_registry_probe(): pass\n"
@@ -577,7 +578,7 @@ async def test_complete_check_retains_registry_exclusions_and_matching_cache(
 ):
     files, cache = registry_files
     cached = cache()
-    cases, options = admitted(tmp_path)
+    cases, options = admitted(tmp_path, monkeypatch)
 
     async def prepare(*args, **kwargs):
         files[ignored] = "@mcp.tool()\ndef excluded_registry_probe(): pass\n"
@@ -594,7 +595,7 @@ async def test_complete_check_rechecks_builtin_registry_sources(tmp_path, monkey
     from genesis.cc import session_config, types
 
     module = {"session_config": session_config, "types": types}[module_name]
-    cases, options = admitted(tmp_path)
+    cases, options = admitted(tmp_path, monkeypatch)
     original, changed = preflight.file_hash, False
 
     def file_hash(path):
@@ -632,7 +633,7 @@ async def test_complete_check_requires_readable_registry_inputs(
 
     monkeypatch.setattr(Path, "iterdir", iterdir if unreadable == "directory" else iterate)
     monkeypatch.setattr(preflight, "file_hash", file_hash if unreadable == "file" else hash_source)
-    cases, options = admitted(tmp_path)
+    cases, options = admitted(tmp_path, monkeypatch)
     monkeypatch.setattr(preflight, "prepare", AsyncMock(return_value={}))
     with pytest.raises(PermissionError):
         await preflight.check(cases, tmp_path, **options)

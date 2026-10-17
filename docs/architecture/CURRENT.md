@@ -2917,6 +2917,10 @@ verified: 788a6d75c178 2026-10-17
   repeated checks with matching caches.
   The runner recomputes it before credentials. See
   `docs/reference/qualification-preflight.md`.
+  Complete admission requires exact source archives in durable private storage
+  and separately restored bytes bound by human approval. Original paths remain
+  logical provenance identities; archive creation supplies no approval or
+  independent-backup claim. Missing retained evidence refuses before rendering.
   The isolated serial CLI supports Flash-only or historical paired execution
   under an exact frozen operating plan and a separate local spending assertion.
   A credential-scoped lock precedes journal writers and credential reads. The

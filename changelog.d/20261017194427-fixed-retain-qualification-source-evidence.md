@@ -1,0 +1,1 @@
+- Retain qualification source bytes outside temporary storage and require verified primary and restored evidence before complete admission.
