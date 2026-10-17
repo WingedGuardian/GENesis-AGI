@@ -1,0 +1,21 @@
+[Unit]
+Description=Genesis External Review — hourly autonomous PR-review dispatch
+
+[Timer]
+# HOURLY, and the tick rate is deliberately NOT the review rate. Each tick
+# dispatches at most `max_dispatches_per_scan` (default 1) and most ticks dispatch
+# nothing at all: a PR is skipped when the orchestrator already reviewed its current head,
+# when CI is not green, and when the per-scan budget is spent. The cadence sets an
+# upper bound on responsiveness, the config sets the spend.
+#
+# Why an upper bound matters here: one review spawns a fleet of Claude Code sessions
+# and consumed ~3% of the 5-hour subscription window when measured on 2026-09-14 —
+# a window shared with every FOREGROUND session. Hourly with a budget of 1 caps the
+# worst case at 24 reviews a day and, in practice, lands far below it.
+OnCalendar=hourly
+Persistent=true
+AccuracySec=5min
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
