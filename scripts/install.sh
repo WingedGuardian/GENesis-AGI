@@ -992,11 +992,11 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
-        # The managed Codebase units must be regular files Genesis renders: a
-        # link or other non-regular path there is refused, not kept.
+        # Keep links (including masks) through the ordinary policy below, without
+        # writing through them. Other nonregular Codebase destinations refuse.
         case "$svc_name" in
             genesis-cbm-query.service | genesis-cbm-query-clients.slice)
-                if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+                if [[ ! -L "$target" && -e "$target" && ! -f "$target" ]]; then
                     echo "    ERROR: refusing nonregular managed Codebase unit: $target" >&2
                     exit 1
                 fi ;;
