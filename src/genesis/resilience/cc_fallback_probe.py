@@ -25,6 +25,8 @@ import asyncio
 import contextlib
 import logging
 
+from genesis.util.proc_kill import ProcessCleanupUncertain
+
 logger = logging.getLogger(__name__)
 
 # Slow backstop: foreground/background success clears fallback much faster in an
@@ -39,9 +41,12 @@ class CCFallbackProbeWorker:
         self._invoker = invoker
         self._interval_s = interval_s
         self._task: asyncio.Task | None = None
+        self._cleanup_uncertain = False
 
     def start(self) -> None:
         """Start the probe loop (idempotent — no-op if a task is already running)."""
+        if self._cleanup_uncertain:
+            return  # Runtime recreation is required after an uncertain child.
         if self._task is None or self._task.done():
             from genesis.util.tasks import tracked_task
 
@@ -69,8 +74,12 @@ class CCFallbackProbeWorker:
                 await self._probe_once()
             except asyncio.CancelledError:
                 raise
+            except ProcessCleanupUncertain:
+                self._cleanup_uncertain = True
+                logger.warning("CC recovery probes suspended: process cleanup unconfirmed")
+                return
             except Exception:
-                logger.warning("CC fallback probe iteration failed", exc_info=True)
+                logger.warning("CC fallback probe iteration failed; provider details withheld")
 
     async def _probe_once(self) -> None:
         """One probe cycle: no-op unless in fallback; minimal HOME-model call; clear
@@ -85,12 +94,8 @@ class CCFallbackProbeWorker:
             return  # only probe while degraded — zero cost in the normal state
 
         from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
-        from genesis.cc.types import (
-            PROBE_CALLER_TAG,
-            CCInvocation,
-            CCModel,
-            EffortLevel,
-        )
+        from genesis.cc.provider_readiness import probe_provider
+        from genesis.cc.types import CCInvocation
 
         home = state.original or roster.CLAUDE
         try:
@@ -102,34 +107,22 @@ class CCFallbackProbeWorker:
             logger.warning("CC fallback probe: cannot resolve home model %r", home)
             return
 
-        # Minimal call: bare (no system prompt / MCP), cheapest effort.
+        # The shared probe suppresses customizations/tools while retaining OAuth.
         inv = CCInvocation(
-            prompt="ping",
-            model=CCModel.SONNET,
-            effort=EffortLevel.LOW,
-            bare=True,
-            roster_eligible=False,
-            # Fail fast: a liveness probe must NOT inherit the 2h default and
-            # block the fallback scheduler. 300s (not 60s) leaves headroom for
-            # cross-machine latency while still bounding a hung probe.
-            timeout_s=300,
-            # Its rate-limit/quota failures are the expected "not back yet"
-            # answer, so the invoker skips cc.invocation_failed for those; any
-            # other probe failure (timeout, missing binary) is still emitted.
-            caller_tag=PROBE_CALLER_TAG,
+            prompt="",
             **overrides,
         )
         try:
-            output = await self._invoker.run(inv)
+            # Keep the worker's existing 300s bound and 30-minute cadence.
+            await probe_provider(self._invoker, inv, timeout_s=300)
         except (CCRateLimitError, CCQuotaExhaustedError):
             logger.info("CC fallback probe: home model %r still rate-limited", home)
             return
 
-        if output is not None and not output.is_error:
-            from genesis.cc.fallback_recovery import note_home_recovery
+        from genesis.cc.fallback_recovery import note_home_recovery
 
-            if await note_home_recovery():
-                logger.info(
-                    "CC fallback probe: home model %r recovered — fallback cleared",
-                    home,
-                )
+        # A validated HOME answer, not an arbitrary peer success, may clear the
+        # shared status. All automatic callbacks were isolated during the probe.
+        observer = self._invoker if home == roster.active_model() else None
+        if await note_home_recovery(invoker=observer):
+            logger.info("CC fallback probe: home model %r recovered — fallback cleared", home)

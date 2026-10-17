@@ -108,6 +108,26 @@ def test_build_args_safe_mode(invoker):
     assert "--safe-mode" not in default_args
 
 
+@pytest.mark.parametrize("ephemeral", [False, True])
+def test_session_persistence_can_be_disabled_without_changing_the_default(invoker, ephemeral):
+    args = invoker._build_args(CCInvocation(prompt="diagnostic", no_session_persistence=ephemeral))
+    assert ("--no-session-persistence" in args) == ephemeral
+    assert "--no-session-persistence" not in invoker._build_args(CCInvocation(prompt="ordinary"))
+
+
+def test_disable_tools_is_explicit_and_probe_settings_keep_only_env(invoker, monkeypatch):
+    from genesis.cc.provider_readiness import isolated_provider
+
+    hooks = MagicMock(return_value="/unused-hooks.json")
+    monkeypatch.setattr("genesis.cc.invoker.cc_span_settings_path", hooks)
+    with isolated_provider(probe=True):
+        args = invoker._build_args(CCInvocation(prompt="probe", disable_tools=True))
+    assert args[args.index("--tools") + 1] == ""
+    assert set(json.loads(args[args.index("--settings") + 1])) == {"env"}
+    hooks.assert_not_called()
+    assert "--tools" not in invoker._build_args(CCInvocation(prompt="ordinary"))
+
+
 def test_build_args_includes_span_settings(invoker, monkeypatch):
     """Dispatched sessions get --settings pointing at the span-hook file."""
     import genesis.cc.invoker as inv_mod
@@ -3644,6 +3664,58 @@ async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(invok
 
     assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
     assert output.text == "the answer survived"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "infos,refused",
+    [
+        ([{"status": "allowed", "overageStatus": "rejected"}], False),
+        ([{"status": "rejected", "isUsingOverage": False}], True),
+        ([{"status": "rejected", "isUsingOverage": True}], False),
+        ([{"status": "rejected"}, {"status": "allowed"}], False),
+        ([{"status": "allowed"}, {"status": "rejected"}], True),
+    ],
+)
+async def test_readiness_receives_effective_limits_through_the_real_stream_decoder(
+    invoker, monkeypatch, tmp_path, infos, refused
+):
+    from genesis.cc import invoker as invoker_module
+    from genesis.cc.exceptions import CCRateLimitError
+    from genesis.cc.provider_readiness import READY, probe_provider
+
+    _no_host_syscalls(monkeypatch)
+    monkeypatch.setenv("GENESIS_BIG_TMP", str(tmp_path))
+    monkeypatch.setattr(invoker, "_network_preflight", AsyncMock())
+    monkeypatch.setattr(invoker, "_cc_version", AsyncMock(return_value=(2, 1, 280)))
+    monkeypatch.setattr(invoker, "_apply_login_fallback", AsyncMock(side_effect=lambda env, inv: env))
+    monkeypatch.setattr(
+        invoker, "_build_env", lambda inv: dict.fromkeys(invoker_module._GH_CREDENTIAL_ENV, "")
+    )
+    monkeypatch.setattr("genesis.cc.invoker._get_scope_args", AsyncMock(return_value=[]))
+    monkeypatch.setattr("genesis.cc.invoker._settings_env_pins", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        "genesis.cc.invoker.admit_launch",
+        AsyncMock(return_value=SimpleNamespace(release=lambda: None)),
+    )
+    monkeypatch.setattr("genesis.cc.invoker.confirm_process_exit", AsyncMock())
+    status = AsyncMock()
+    invoker._on_cc_status_change = status
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "tools": [], "mcp_servers": []},
+        *({"type": "rate_limit_event", "rate_limit_info": info} for info in infos),
+        _result_event(READY),
+    )
+    proc = _streaming_proc(data)
+    proc.pid = 424213
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        if refused:
+            with pytest.raises(CCRateLimitError):
+                await probe_provider(invoker, CCInvocation(prompt="private task"), timeout_s=7)
+        else:
+            result = await probe_provider(invoker, CCInvocation(prompt="private task"), timeout_s=7)
+            assert result.text == READY
+    status.assert_not_awaited()
 
 
 @pytest.mark.asyncio

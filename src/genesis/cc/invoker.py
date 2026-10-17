@@ -36,6 +36,7 @@ from genesis.cc.exceptions import (
     CCStreamTruncatedError,
     CCTimeoutError,
 )
+from genesis.cc.provider_readiness import probing_provider, provider_status_isolated
 from genesis.cc.types import (
     PROBE_CALLER_TAG,
     CCInvocation,
@@ -1995,6 +1996,8 @@ class CCInvoker:
 
     async def _fire_downgrade_callback(self, output: CCOutput) -> None:
         """Invoke model downgrade callback if applicable. Never raises."""
+        if provider_status_isolated():
+            return
         if not output.downgraded or not self._on_model_downgrade:
             return
         try:
@@ -2023,7 +2026,7 @@ class CCInvoker:
         output is still returned to the caller exactly as before). Never raises;
         mirrors ``_fire_downgrade_callback``.
         """
-        if self._on_cc_empty_output is None:
+        if provider_status_isolated() or self._on_cc_empty_output is None:
             return
         try:
             await self._on_cc_empty_output(invocation, output)
@@ -2358,7 +2361,7 @@ class CCInvoker:
             if settings_pins is not None
             else _settings_env_pins(tuple(inv.bash_allowlist))
         )
-        span_settings = cc_span_settings_path(pins)
+        span_settings = None if probing_provider() else cc_span_settings_path(pins)
         if span_settings:
             args += ["--settings", span_settings]
         else:
@@ -2377,10 +2380,14 @@ class CCInvoker:
             args += ["--allowedTools", ",".join(inv.allowed_tools)]
         if inv.disallowed_tools:
             args += ["--disallowedTools", ",".join(inv.disallowed_tools)]
+        if inv.disable_tools:
+            args += ["--tools", ""]
         if inv.bare:
             args.append("--bare")
         if inv.safe_mode:
             args.append("--safe-mode")
+        if inv.no_session_persistence:
+            args.append("--no-session-persistence")
         # Prompt is passed via stdin (see run/run_streaming), not as a CLI
         # argument.  This avoids argument-parsing edge cases (the "--"
         # separator broke -p prompt detection) and handles arbitrarily long
@@ -2809,7 +2816,7 @@ class CCInvoker:
         Args:
             error: The CC error, or None on recovery (success after failure).
         """
-        if self._on_cc_status_change is None:
+        if provider_status_isolated() or self._on_cc_status_change is None:
             return
 
         async with self._status_lock:
