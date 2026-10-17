@@ -1427,7 +1427,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 4606e5969 2026-10-16
+verified: a6d1fa0ec4c2 2026-10-17
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1535,8 +1535,9 @@ the shared banner is not an assertion about all concurrent sessions.
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`. Install and
   bootstrap render disabled query/client-slice templates without auto-upgrading
-  a PATH provider. Staging does not activate it; MCP registration and indexing
-  retain their existing routes until their integration concerns land. See
+  a PATH provider. Staging does not activate it; MCP registration always uses
+  the managed launcher, including absent PATH binaries. Index queue integration
+  remains a separate concern. See
   `docs/reference/codebase-managed.md`.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
@@ -1559,8 +1560,15 @@ the shared banner is not an assertion about all concurrent sessions.
   selected interpreter, proves actual quiescence and preserves immutable state.
   Remove unlinks fixed artifacts only after validating the full population;
   partial unlink failures refresh only after proving quiescence and accepted
-  remaining sources. Frontend and queued-worker admission integration
-  remain separate concerns.
+  remaining sources. Managed frontends use the installed interpreter and
+  normalized HOME, preserve literal paths through a fixed environment bridge,
+  and prove shared admission and kernel caps inside the transient child:
+  256 MiB/zero swap/Tasks32 under a 2 GiB/zero-swap/Tasks512 aggregate. They
+  retain fixed analysis tools, permanent PID readiness and native stop
+  propagation without backend activation or a raw fallback. Their own-cap OOMs
+  use the existing counted containment policy; uncertain or ancestor-limit
+  events still page, and explicit operator overrides remain. Queued-worker
+  admission integration remains separate.
 - **hosting/**: the OUTER layer that calls the runtime. Standalone's scoped peer
   request-input handler provides a trusted 256 KiB body reader with a five-second
   absolute deadline on peer send/cancel POST paths. It bounds framing and refusal

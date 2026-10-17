@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import sqlite3
@@ -21,13 +22,12 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import ExitStack, closing, contextmanager, suppress
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from code_intel_cbm_admission import (  # noqa: E402
     _host_available,
-    _mount_path,
     _working_charge,
     number,
     read_number,
@@ -35,15 +35,25 @@ from code_intel_cbm_admission import (  # noqa: E402
 )
 from code_intel_cbm_worker import BUILD  # noqa: E402
 from codebase_managed_unit import (  # noqa: E402,F401
+    absolute,
     artifact_parent,
     artifact_snapshot,
     canonical_sources,
+    cgroup_empty,
+    config_path,
+    frontend_command,
     implicit_slice_absent,
+    index_writer_targets_main,
     loaded_properties,
+    native_env,
     native_install,
     parent_identity,
+    sentinel_armed,
     systemctl_env,
+    units_dir,
     validate_backend,
+    validate_frontend_boundary,
+    validate_provider_paths,
     validate_source_identity,
 )
 
@@ -53,26 +63,6 @@ SLICE = "genesis-cbm-query-clients.slice"
 DISABLED_KEYS = ("auto_index", "auto_watch", "watcher_enabled")
 PATH_KEYS = ("main", "binary", "cache", "runtime", "sentinel")
 OPEN_FLAGS = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-
-
-def absolute(raw: str) -> Path:
-    if not isinstance(raw, str) or not raw or any(c in raw for c in "\n\r\x00"):
-        raise ValueError("invalid managed path")
-    path = Path(raw)
-    if not path.is_absolute():
-        raise ValueError("managed path must be absolute")
-    return path
-
-
-def config_path(raw: str) -> Path:
-    path = absolute(raw)
-    if not path.name:
-        raise ValueError("settings path must name a file")
-    return absolute(str(path.parent.resolve() / path.name))
-
-
-def units_dir() -> Path:
-    return Path.home() / ".config/systemd/user"
 
 
 @contextmanager
@@ -131,42 +121,6 @@ def verify_uninstall_locks(fds: list[int]) -> None:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
-def cgroup_empty(control: str) -> None:
-    if not control:
-        return
-    path = absolute(control)
-    if ".." in path.parts:
-        raise ValueError("invalid managed ControlGroup")
-    mountinfo = Path("/proc/self/mountinfo")
-    _, root, version = resolve_cgroup(Path("/proc/self/cgroup"), mountinfo)
-    if version != 2:
-        raise ValueError("uninstall requires visible cgroup v2 state")
-    mappings = []
-    for row in mountinfo.read_text().splitlines():
-        left, separator, right = row.partition(" - ")
-        fields = left.split()
-        if (
-            separator
-            and right.split()[:1] == ["cgroup2"]
-            and len(fields) >= 5
-            and _mount_path(fields[4]) == root
-        ):
-            mappings.append(_mount_path(fields[3]))
-    if len(set(mappings)) != 1:
-        raise ValueError("ambiguous managed cgroup mount")
-    mounted = mappings[0]
-    relative = path.relative_to(mounted) if path.is_relative_to(mounted) else path.relative_to("/")
-    group = root / relative
-    try:
-        values = dict(line.split() for line in (group / "cgroup.events").read_text().splitlines())
-    except FileNotFoundError:
-        if group.exists():
-            raise
-        return  # stopped group has been removed from the visible hierarchy
-    if values.get("populated") != "0":
-        raise ValueError("managed cgroup still contains processes (including descendants)")
-
-
 def require_quiescent(unit: str) -> None:
     properties = ["ActiveState", "ControlGroup"]
     if unit.endswith(".service"):
@@ -184,28 +138,6 @@ def manager_absent(unit: str) -> bool:
     if unit.endswith(".service"):
         expected["MainPID"] = "0"
     return show(unit, *expected) == expected
-
-
-def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
-    """Recognize repository targets of the existing wrapper and native modes."""
-    entrypoint = main / "scripts/lib/code_intel_index.sh"
-    for index, arg in enumerate(argv[:-1]):
-        if Path(arg).name != "code_intel_index.sh":
-            continue
-        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
-        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
-            return True
-    # GITNEXUS_BIN permits arbitrary executable names. Exact analyze arguments
-    # targeting main are possible writers, including after the wrapper exits.
-    # Skip argv[0]; an executable itself can be named analyze.
-    for index, arg in enumerate(argv[1:], 1):
-        if arg != "analyze":
-            continue
-        tail = argv[index + 1 :]
-        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
-        if target.resolve() == main:
-            return True
-    return False
 
 
 def observed_index_writers(proc: Path = Path("/proc")) -> list[int]:
@@ -590,42 +522,6 @@ def verified_binary(path: Path):
     return stream
 
 
-def sentinel_armed(raw: str) -> bool:
-    try:
-        os.lstat(raw)
-    except FileNotFoundError:
-        return any(os.path.lexists(p) and not os.path.exists(p) for p in Path(raw).parents)
-    except OSError:
-        return True
-    return True
-
-
-def validate_provider_paths(config: dict) -> None:
-    """The pinned POSIX provider folds backslashes before native storage use."""
-    for key in ("main", "cache"):
-        path = absolute(config[key])
-        physical = path.resolve()
-        # Python 3.13+ non-strict resolve leaves symlink loops unresolved.
-        # Let the kernel reject loops in both the literal and resolved paths;
-        # missing staging directories remain supported.
-        for candidate in (path, physical):
-            with suppress(FileNotFoundError):
-                candidate.stat()
-        if "\\" in str(path) or "\\" in str(physical):
-            raise ValueError(f"pinned provider does not support backslash in {key} paths")
-
-
-def native_env(config: dict) -> dict[str, str]:
-    validate_provider_paths(config)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
-    env.update(
-        CBM_CACHE_DIR=config["cache"],
-        CBM_RUNTIME_DIR=config["runtime"],
-        CBM_ALLOWED_ROOT=config["main"],
-    )
-    return env
-
-
 def verify_cache(config: dict) -> None:
     cache = Path(config["cache"])
     if read_document(cache / "config.json").get("ui_enabled") is not False:
@@ -894,6 +790,43 @@ def verify_query_boundary(pid: str, *, startup: bool = False) -> None:
         raise ValueError("insufficient host available memory for managed query budget")
 
 
+def verify_frontend_boundary(unit: str) -> None:
+    leaf, root, version = resolve_cgroup(Path("/proc/self/cgroup"), Path("/proc/self/mountinfo"))
+    validate_frontend_boundary(unit, leaf, root, version, SLICE)
+
+
+def launch(config: dict, path: Path) -> None:
+    """Read-only preflight; the actual capped child owns final admission."""
+    verify_cache(config)
+    ready(config)
+    main = absolute(config["main"]).resolve(strict=True)
+    if not (main / ".git").is_dir():
+        raise ValueError("managed frontend requires the configured primary checkout")
+    unit = "genesis-cbm-query-client-" + uuid.uuid4().hex + ".service"
+    command = frontend_command(main, path, unit, BACKEND, SLICE)
+    os.execve(command[0], command, systemctl_env())  # noqa: S606 - fixed manager executable
+
+
+def client(path: Path, unit: str) -> None:
+    with lifecycle_lock(shared=True):
+        # Re-read inside the actual limited process after acquiring admission.
+        config = runtime_config(path)
+        verify_frontend_boundary(unit)
+        verify_cache(config)
+        ready(config)
+        os.chdir(config["main"])
+        with verified_binary(Path(config["binary"])) as executable:
+            require_enabled(config)
+            check_backend(config)
+            os.set_inheritable(executable.fileno(), True)
+            # The lifecycle descriptor stays CLOEXEC: admitted readers do not
+            # prevent disable, which stops their native dependency and slice.
+            os.execve(  # noqa: S606 - accepted inode and fixed analysis profile
+                f"/proc/self/fd/{executable.fileno()}",
+                [config["binary"], "--tool-profile=analysis"], native_env(config),
+            )
+
+
 def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) -> str:
     value = show(BACKEND, "ActiveState", "MainPID", timeout=timeout)
     if value["ActiveState"] not in (("active", "activating") if starting else ("active",)):
@@ -1002,6 +935,9 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     commands.add_parser("status")
     commands.add_parser("serve")
     commands.add_parser("ready")
+    commands.add_parser("launch")
+    child = commands.add_parser("client")
+    child.add_argument("--unit", required=True)
     for command in ("enable", "disable", "remove"):
         commands.add_parser(command)
     teardown = commands.add_parser("uninstall")
@@ -1013,6 +949,13 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_arguments(argv)
+    try:
+        home = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+        absolute(home)
+        os.environ["HOME"] = home
+    except (KeyError, OSError, ValueError, RuntimeError) as error:
+        print(f"managed Codebase refused: invalid HOME: {error}", file=sys.stderr)
+        return 1
     if args.command in ("uninstall", "verify-uninstall-locks"):
         return uninstall_main(args)
     if args.command in ("enable", "disable", "remove"):
@@ -1038,6 +981,10 @@ def main(argv: list[str] | None = None) -> int:
             configure(args, path)
         elif args.command == "status":
             print(json.dumps(status(path), indent=2))
+        elif args.command == "launch":
+            launch(read_settings(path), path)
+        elif args.command == "client":
+            client(path, args.unit)
         else:
             config = runtime_config(path)
             (serve if args.command == "serve" else ready)(config)
