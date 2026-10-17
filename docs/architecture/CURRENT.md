@@ -3296,7 +3296,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: ba9dd8a37 2026-10-09
+verified: da43da6e4f73 2026-10-17
 ```
 
 - **payments/**: the encrypted card vault, virtual cards only.
@@ -3745,6 +3745,11 @@ verified: ba9dd8a37 2026-10-09
   outside the checkout at the end of every run, a failed one included. A
   symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
   `--take-templates`.
+- **Deployment status** (`scripts/lib/deploy_status.sh`): status captures the
+  MainPID, invocation, runtime edits and runtime overrides once for its printed
+  fields and bracket calculation. This keeps those fields aligned with the
+  token; it does not make separate systemd/git/file reads an atomic snapshot.
+  Direct `_bracket` calls without captured arguments retain their own reads.
 - **The restart guard, `~/.genesis/update_state.json`** (deploy scripts and the
   dashboard update routes, #3139): `update.sh` writes it at each phase; an
   update that merged code and never activated it, or that stopped on merge
