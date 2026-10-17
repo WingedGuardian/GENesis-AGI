@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
+from html import escape
 
-from genesis.cc import fallback_state, peer_availability, roster
+from genesis.cc import fallback_recovery, fallback_state, peer_availability, roster
 from genesis.cc.exceptions import CCProcessError, CCTimeoutError
 from genesis.cc.provider_readiness import probe_provider
 from genesis.db.connection import get_raw_db
@@ -24,29 +25,35 @@ async def database_path(db) -> str:
 
 
 async def select_provider(runner, request, sid, invocation):
-    if not invocation.roster_eligible:
+    if not invocation.roster_eligible and request.roster_model is None:
         return "", invocation  # Explicit routing opt-out remains authoritative.
     from genesis.cc.managed_session import metadata
 
     config = roster.load_roster()
-    home = request.roster_model or roster.active_model(config)
-    names = [home] if request.roster_model else [home, *roster.failover_chain(home, config)]
+    home = request.roster_model if request.roster_model is not None else roster.active_model(config)
+    # Home/pin errors are fatal; the established roster helper skips unusable
+    # backups. Resolve every candidate from this single snapshot.
+    routing = dict(anthropic_base_url=None, anthropic_auth_token=None, model_id_override=None)
+    routing.update(roster.overrides_for(home, config))
+    candidates = [
+        (
+            home,
+            replace(
+                invocation,
+                roster_eligible=bool(routing["model_id_override"]),
+                resume_session_id=None,
+                **routing,
+            ),
+        )
+    ]
+    if request.roster_model is None:
+        candidates.extend(roster.failover_invocations(home, invocation, config))
     path = await database_path(runner._session_manager.db)
     async with get_raw_db(path) as db:
         row = await cc_sessions.get_by_id(db, sid)
     deadline = datetime.fromisoformat(metadata(row)["deadline_at"])
     attempts = []
-    for name in names:
-        # Resolve from ONE config snapshot, pin all fields, and never let the
-        # invoker re-select a mutable global default (even for native Claude).
-        routing = dict(anthropic_base_url=None, anthropic_auth_token=None, model_id_override=None)
-        routing.update(roster.overrides_for(name, config))
-        selected = replace(
-            invocation,
-            roster_eligible=bool(routing["model_id_override"]),
-            resume_session_id=None,
-            **routing,
-        )
+    for name, selected in candidates:
         remaining = (deadline - datetime.now(UTC)).total_seconds()
         if remaining <= 0:
             raise CCTimeoutError("Managed provider selection deadline expired")
@@ -73,7 +80,8 @@ async def select_provider(runner, request, sid, invocation):
             if not peer_availability.is_provider_refusal(exc):
                 raise
             attempt["outcome"] = "refused"
-            await asyncio.to_thread(peer_availability.note_failure, name, exc)
+            if name != home:
+                await asyncio.to_thread(peer_availability.note_failure, name, exc)
         else:
             attempt["outcome"] = "ready"
             patch["execution_provider"] = name
@@ -118,18 +126,25 @@ async def record_managed_outcome(runner, sid, result):
         db = runner._session_manager.db
         row = await cc_sessions.get_by_id(db, sid)
         meta = metadata(row)
-        if not meta.get("fallback_attempted"):
+        selected = meta.get("execution_provider")
+        if not meta.get("fallback_attempted") or not selected:
             return
         success = meta.get("native_state") == "succeeded" and row["status"] == "completed"
-        selected = meta.get("execution_provider")
         last = meta["provider_attempts"][-1]
-        await record_fallback(
-            db, selected or last["provider"], result.model_used or last["model"], success=success
-        )
-        if success and selected and selected != meta["home_provider"]:
+        await record_fallback(db, selected, result.model_used or last["model"], success=success)
+        if success and selected != meta["home_provider"]:
             await asyncio.to_thread(peer_availability.note_success, selected)
-            await asyncio.to_thread(
-                fallback_state.enter, meta["home_provider"], selected, "rate_limit"
-            )
+            # Like conversation/recovery, keep this read-modify-write on the
+            # runtime loop; a worker thread could race another enter or clear.
+            if fallback_state.enter(meta["home_provider"], selected, "rate_limit"):
+                await fallback_recovery.fire_fallback_alert(
+                    topic="cc_fallback_switch",
+                    context=(
+                        "<b>Fallback</b>\n\nA managed task completed using "
+                        f"<b>{escape(selected)}</b> while "
+                        f"<b>{escape(meta['home_provider'])}</b> was unavailable. "
+                        "Genesis checks the home provider again for each new task."
+                    ),
+                )
     except Exception:
         pass  # Classified, committed receipts do not depend on diagnostics.

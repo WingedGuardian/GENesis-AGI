@@ -11,7 +11,14 @@ from uuid import uuid4
 import aiosqlite
 import pytest
 
-from genesis.cc import fallback_state, roster
+from genesis.cc import (
+    direct_session,
+    fallback_recovery,
+    fallback_state,
+    peer_availability,
+    roster,
+    types,
+)
 from genesis.cc.direct_session import DirectSessionRequest, DirectSessionRunner
 from genesis.cc.exceptions import CCProcessError, CCQuotaExhaustedError, CCRateLimitError
 from genesis.cc.managed_session import prepared_metadata
@@ -29,12 +36,27 @@ def answer(text="actual answer", **changes):
     )
 
 
+async def readiness(on_event):
+    await on_event(
+        StreamEvent(
+            "init", raw={"type": "system", "subtype": "init", "tools": [], "mcp_servers": []}
+        )
+    )
+    return answer(READY)
+
+
 @pytest.fixture
 async def managed(tmp_path, monkeypatch):
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
     monkeypatch.setenv("GENESIS_BIG_TMP", str(tmp_path / "probes"))
     monkeypatch.setenv("SYNTHETIC_PROVIDER_KEY", "synthetic-key")
+    monkeypatch.setattr(types, "_BACKGROUND_SESSION_DIR", tmp_path / "working")
+    monkeypatch.setattr(direct_session, "_BG_CC_TMP_ROOT", tmp_path / "sessions")
+    alerts = AsyncMock()
+    monkeypatch.setattr(fallback_recovery, "fire_fallback_alert", alerts)
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text('{"mcpServers":{}}')
     config = {
         "default": "claude",
         "models": {
@@ -67,13 +89,7 @@ async def managed(tmp_path, monkeypatch):
         if invocation.disable_tools:
             if not invocation.anthropic_base_url:
                 raise CCQuotaExhaustedError("synthetic refusal")
-            await on_event(
-                StreamEvent(
-                    "init",
-                    raw={"type": "system", "subtype": "init", "tools": [], "mcp_servers": []},
-                )
-            )
-            return answer(READY)
+            return await readiness(on_event)
         tasks.append(invocation)
         return answer()
 
@@ -88,8 +104,9 @@ async def managed(tmp_path, monkeypatch):
         invoker=invoker,
         session_manager=SessionManager(db=db),
         runtime=runtime,
-        config_builder=AsyncMock(),
+        config_builder=SimpleNamespace(build_mcp_config=lambda **kwargs: str(mcp)),
     )
+    native_build = runner._build_invocation
     runner._build_invocation = lambda req, sid: CCInvocation(
         prompt=req.prompt,
         system_prompt=req.system_prompt,
@@ -105,19 +122,23 @@ async def managed(tmp_path, monkeypatch):
         tasks=tasks,
         execute=execute,
         config=config,
+        native_build=native_build,
+        alerts=alerts,
     )
     await runner.shutdown()
     await db.close()
 
 
-async def start(b, *, adopt=True, **meta):
+async def start(b, *, adopt=True, roster_model=None, **meta):
     req = DirectSessionRequest(
         prompt="private actual task",
+        system_prompt="Synthetic independent Genesis identity",
         profile="observe",
         source_tag="agent_api",
         caller_context="agent_api:synthetic",
         managed=True,
         notify=False,
+        roster_model=roster_model,
     )
     sid = str(uuid4())
     fields = prepared_metadata(req)
@@ -246,6 +267,9 @@ async def test_failed_selection_executes_no_task(managed, error):
     expected = 3 if isinstance(error, CCQuotaExhaustedError) else 1
     assert managed.invoker.run_streaming.await_count == expected
     assert not fallback_state.read().is_fallback
+    assert not await managed.db.execute_fetchall(
+        "SELECT 1 FROM call_site_last_run WHERE call_site_id='cc_fallback'"
+    )
 
 
 async def test_mid_task_limit_does_not_replay_side_effect(managed, tmp_path):
@@ -356,3 +380,119 @@ async def test_selection_does_not_commit_the_runtime_connections_transaction(man
     assert managed.db.in_transaction
     await managed.db.rollback()
     assert not managed.tasks
+
+
+@pytest.mark.parametrize("missing", ["anthropic_base_url", "model_id", "auth_env"])
+async def test_unusable_backup_does_not_hide_a_later_provider(managed, missing):
+    managed.config["models"]["backup"].pop(missing)
+    row, meta = await settle(managed, await start(managed))
+    assert row["status"] == "completed" and meta["execution_provider"] == "last"
+    assert len(managed.tasks) == 1
+    assert [attempt["provider"] for attempt in meta["provider_attempts"]] == ["claude", "last"]
+
+
+@pytest.mark.parametrize("missing", ["anthropic_base_url", "model_id", "auth_env"])
+@pytest.mark.parametrize("pinned", [False, True])
+async def test_unusable_home_or_pin_fails_without_running_elsewhere(managed, missing, pinned):
+    managed.config["models"]["backup"].pop(missing)
+    managed.config["default"] = "claude" if pinned else "backup"
+    row, meta = await settle(
+        managed, await start(managed, roster_model="backup" if pinned else None)
+    )
+    assert row["status"] == "failed" and meta["error"] == "execution_failed"
+    managed.invoker.run_streaming.assert_not_awaited()
+    assert not managed.tasks
+
+
+@pytest.mark.parametrize("pin", ["", "not-configured"])
+async def test_unknown_pin_does_not_fall_back_to_the_global_default(managed, pin):
+    row, meta = await settle(managed, await start(managed, roster_model=pin))
+    assert row["status"] == "failed" and meta["error"] == "execution_failed"
+    managed.invoker.run_streaming.assert_not_awaited()
+
+
+@pytest.mark.parametrize("home", ["claude", "backup"])
+async def test_home_refusal_is_not_a_standby_observation(managed, home):
+    managed.config["default"] = home
+    home_model = managed.config["models"][home].get("model_id")
+
+    async def run(invocation, on_event=None):
+        if invocation.disable_tools:
+            if invocation.model_id_override == home_model:
+                raise CCQuotaExhaustedError("synthetic home refusal")
+            return await readiness(on_event)
+        return await managed.execute(invocation, on_event)
+
+    managed.invoker.run_streaming.side_effect = run
+    row, meta = await settle(managed, await start(managed))
+    assert row["status"] == "completed"
+    assert meta["provider_attempts"][0]["outcome"] == "refused"
+    selected = "backup" if home == "claude" else "claude"
+    assert set(peer_availability.read()) == {selected}
+
+
+@pytest.mark.parametrize("pin", ["claude", "native-alias"])
+@pytest.mark.parametrize("ready", [False, True])
+async def test_real_builder_native_pin_still_checks_readiness(managed, pin, ready):
+    managed.config["models"]["native-alias"] = {"native_subscription": True}
+    managed.config["default"] = "backup"
+    managed.runner._build_invocation = managed.native_build
+
+    async def run(invocation, on_event=None):
+        managed.calls.append(invocation)
+        if invocation.disable_tools:
+            if not ready:
+                raise CCQuotaExhaustedError("synthetic pinned refusal")
+            return await readiness(on_event)
+        managed.tasks.append(invocation)
+        return answer()
+
+    managed.invoker.run_streaming.side_effect = run
+    row, meta = await settle(managed, await start(managed, roster_model=pin))
+    assert row["status"] == ("completed" if ready else "failed")
+    assert [inv.disable_tools for inv in managed.calls] == ([True, False] if ready else [True])
+    assert all(inv.anthropic_base_url is None for inv in managed.calls)
+    assert len(managed.tasks) == int(ready)
+    assert meta.get("execution_provider") == (pin if ready else None)
+    assert [attempt["provider"] for attempt in meta["provider_attempts"]] == [pin]
+
+
+async def test_unpinned_routing_opt_out_stays_direct(managed):
+    managed.runner._build_invocation = lambda req, sid: CCInvocation(prompt=req.prompt)
+    row, meta = await settle(managed, await start(managed))
+    assert row["status"] == "completed" and len(managed.tasks) == 1
+    assert len(managed.calls) == 1 and not managed.calls[0].disable_tools
+    assert "provider_attempts" not in meta
+
+
+async def test_cancelled_backup_probe_is_not_a_failed_execution(managed):
+    entered = asyncio.Event()
+
+    async def run(invocation, on_event=None):
+        if invocation.disable_tools and invocation.model_id_override == "backup-id":
+            entered.set()
+            await asyncio.Event().wait()
+        return await managed.execute(invocation, on_event)
+
+    managed.invoker.run_streaming.side_effect = run
+    sid = await start(managed)
+    await asyncio.wait_for(entered.wait(), 2)
+    assert managed.runner.cancel(sid)
+    row, meta = await settle(managed, sid)
+    assert row["status"] == "failed" and meta["native_state"] == "cancelled"
+    assert not managed.tasks and "execution_provider" not in meta
+    assert not await managed.db.execute_fetchall(
+        "SELECT 1 FROM call_site_last_run WHERE call_site_id='cc_fallback'"
+    )
+
+
+async def test_managed_switch_alert_follows_the_outage_transition(managed):
+    ids = await asyncio.gather(start(managed), start(managed))
+    await asyncio.gather(*(settle(managed, sid) for sid in ids))
+    await settle(managed, await start(managed))
+    assert managed.alerts.await_count == 1
+    assert managed.alerts.call_args.kwargs["topic"] == "cc_fallback_switch"
+    assert "private actual task" not in managed.alerts.call_args.kwargs["context"]
+    fallback_state.clear()
+    await settle(managed, await start(managed))
+    assert managed.alerts.await_count == 2

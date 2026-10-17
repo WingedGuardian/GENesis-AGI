@@ -10,8 +10,11 @@ This is an execution primitive, not an enabled network connector. Ordinary
 Roster-eligible managed invocations check provider readiness before sending the
 task prompt. The home model is checked first; a classified provider refusal
 advances through credentialed alternatives in the configured CC roster order.
-Other failures stop selection. Explicit routing opt-outs and provider pins
-remain authoritative. Foreground-only `gmodel` catalog entries are not added to
+Unusable backup entries are skipped; a misconfigured home or explicit pin fails
+without trying another provider. Other failures stop selection. Explicit
+provider pins, including native Claude, receive a single-provider readiness
+check. Unpinned routing opt-outs retain direct execution. Foreground-only
+`gmodel` catalog entries are not added to
 the automated roster.
 
 Each check uses a fixed diagnostic prompt, safe mode with OAuth support,
@@ -35,7 +38,11 @@ Receipt metadata records `provider_attempts`, `home_provider`,
 `execution_provider` and the selected endpoint context without credential
 values. The endpoint is pinned from the same roster snapshot as execution.
 The neural monitor's **Fallback** entry records actual execution outcomes, not
-probe success; private prompts, results and provider error prose are omitted.
+probe success; a failed or cancelled selection does not replace the last actual
+execution observation. Private prompts, results and provider error prose are
+omitted. Home refusals remain in the receipt rather than the standby-peer
+availability store. The first successful managed fallback in an outage emits
+the existing owner switch alert once; later successes do not repeat it.
 The existing idle recovery worker uses the same enforced readiness check while
 retaining its 30-minute cadence and 300-second per-check bound.
 

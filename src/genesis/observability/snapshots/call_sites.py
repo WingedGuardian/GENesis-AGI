@@ -242,7 +242,7 @@ async def call_sites(
         mf.setdefault(_k, _v)
 
     fallback = result.setdefault("cc_fallback", {"status": "idle", "routing": False})
-    for key, value in _CALL_SITE_META["cc_fallback"].items():
+    for key, value in _CALL_SITE_META.get("cc_fallback", {}).items():
         fallback.setdefault(key, value)
     if fallback.get("last_run_success") is False:
         fallback["status"] = "warning"  # Last attempt failed, not a live provider outage.
