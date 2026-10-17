@@ -20,6 +20,28 @@ from tests.test_scripts.test_codebase_managed_config import managed
 operator = managed
 
 
+@pytest.mark.parametrize("runtime", [None, "/owned/runtime"])
+@pytest.mark.parametrize("bus", [None, "unix:path=/owned/bus"])
+def test_typed_manager_calls_use_shared_environment(operator, monkeypatch, runtime, bus):
+    namespace = operator.native_install.__globals__
+    for name, value in (("XDG_RUNTIME_DIR", runtime), ("DBUS_SESSION_BUS_ADDRESS", bus)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append(kwargs.get("env"))
+        return SimpleNamespace(stdout='{"type":"a(sss)","data":[[]]}')
+
+    monkeypatch.setattr(namespace["subprocess"], "run", run)
+    namespace["bus_call"]("/owned", "org.owned", "Read")
+    assert len(seen) == 1 and seen[0] is not None
+    assert seen[0]["XDG_RUNTIME_DIR"] == (runtime or f"/run/user/{os.getuid()}")
+    assert seen[0]["DBUS_SESSION_BUS_ADDRESS"] == (bus or f"unix:path=/run/user/{os.getuid()}/bus")
+
+
 @pytest.fixture
 def loaded(operator, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))

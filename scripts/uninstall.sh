@@ -60,7 +60,7 @@ MANAGED_UNINSTALL_FDS=()
 GENESIS_PERSISTENT_TIMERS="genesis-cc-settings-align.timer genesis-cc-align.timer \
 genesis-disk-hygiene.timer genesis-watchdog.timer genesis-graph-project.timer \
 genesis-code-intel.timer genesis-backup.timer genesis-cc-tmp-align.timer \
-genesis-star-milestone.timer"
+genesis-star-milestone.timer genesis-browser-stack.timer"
 # The ROOT timers scripts/lib/network_resilience.sh installs under
 # /etc/systemd/system, with their scripts and /run files. Both removal paths
 # (direct and via incus) run this one command, so they cannot drift apart. The
@@ -559,6 +559,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-graph-project.timer genesis-graph-project.service \
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-star-milestone.timer genesis-star-milestone.service \
+                    genesis-browser-stack.timer genesis-browser-stack.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \
@@ -604,7 +605,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
 
         # Remove systemd unit files
         SYSTEMD_DIR="$HOME/.config/systemd/user"
-        for f in "$SYSTEMD_DIR"/genesis-*.service "$SYSTEMD_DIR"/genesis-*.timer "$SYSTEMD_DIR/qdrant.service"; do
+        for f in "$SYSTEMD_DIR"/genesis-*.service "$SYSTEMD_DIR"/genesis-*.timer "$SYSTEMD_DIR/genesis-workload.slice" "$SYSTEMD_DIR/qdrant.service"; do
             { [ -e "$f" ] || [ -L "$f" ]; } && safe_remove "$f" "systemd/$(basename "$f")"
         done
         systemctl --user daemon-reload 2>/dev/null || true

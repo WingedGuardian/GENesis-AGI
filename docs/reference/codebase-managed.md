@@ -5,10 +5,19 @@ a pinned provider and publishes immutable settings; `status` diagnoses settings
 and native service state. The ordinary install/bootstrap loops render disabled
 query service/client slice templates on every install and do not automatically
 install, upgrade or version-probe a PATH Codebase binary. Registration always
-uses the managed launcher, including when no PATH provider exists. The existing
-index queue admits the guarded managed worker when CBM is configured and enabled;
-unavailable CBM work remains durably queued.
+uses the managed launcher, including when no PATH provider exists. The index
+queue remains on its previous route until its separate integration lands.
 Staging and rendering alone do not make Codebase available.
+
+Existing symlinks at either managed query unit destination, including `/dev/null`
+masks and dangling links, are kept during install and bootstrap without writing
+through them. Bootstrap lists the kept unit in its update summary and continues
+to reload units and process timers. Only an explicitly named
+`--take-template genesis-cbm-query.service` (or the client slice's exact name)
+lets bootstrap back up and replace that link; `--take-templates` keeps masks.
+Install always keeps existing links. Directories and FIFOs at these two
+destinations remain errors. Use the configured disablement sentinel for the
+runtime off-switch; masking may refuse when a local regular unit already exists.
 
 ## Native lifecycle
 
@@ -21,7 +30,7 @@ python3 -I scripts/codebase_managed.py remove
 ```
 
 `enable` uses the fixed installed settings path and validates the pin/cache/sentinel.
-Before native mutation it requires exact current rendered service and slice sources
+Before native mutation it requires exact current rendered service and slice sources (raw or carrying the shared renderer stamp)
 in the supported installed namespaces, with no competing fragments or override
 namespaces anywhere in the manager's lookup paths. This includes `.d`, `.wants`,
 `.requires` and `.upholds` at the full-name, dash-prefix and unit-type scopes;
@@ -75,7 +84,7 @@ provider state are preserved. A later unlink failure reports partial removal and
 still reloads after successful deletions; no artifacts are recreated as rollback.
 Partial removal refresh requires this invocation's prior successful retirement,
 both units quiescent and remaining sources canonical or intentionally removed.
-No template ownership/header/repair mechanism is introduced.
+No new template ownership or repair mechanism is introduced; the existing managed-unit stamp is accepted only over the exact current canonical render.
 
 All three hold the exclusive nonblocking lifecycle lock through completion or
 rollback. Busy frontend/worker admission refuses; a worker already admitted is
@@ -177,129 +186,21 @@ Resolved paths must satisfy the same validation as the published settings:
 newline and carriage-return characters introduced by symlink ancestors are
 refused before staging. The final settings filename remains unresolved.
 
+The pinned provider rewrites literal backslashes as path separators on Linux.
+Repository and cache paths containing backslashes, including their resolved
+physical identities, therefore refuse before staging or native execution. This
+prevents native configuration writes from selecting a different cache directory.
+A configure argument's symlink alias may contain a backslash if it resolves to a
+supported physical main/state path. Binary, interpreter, runtime, sentinel and
+settings paths retain their existing literal-path handling; this restriction
+applies to provider-consumed repository/cache identities.
+
 No service is enabled, no unit is rendered and no sentinel is removed.
 Configuration uses schema 2: paths and build identity, with no mutable `enabled`
 flag. Native systemd enablement owns operational state. The lifecycle lock coordinates cooperating same-user tools;
 it is not protection against deliberate same-user filesystem interference.
 
-## Queued physical indexing
-
-The existing idle-gated runner checks managed availability before and after a
-CBM-only claim. The index entrypoint checks again before its CBM leg. Missing or
-invalid configuration, native disablement, an armed sentinel or an unavailable
-backend defers CBM without starting a service or charging an indexing failure.
-A combined request can finish GitNexus and durably retain only CBM (`rc=5`).
-
-CBM always uses the pinned stock internal worker in the existing admitted
-8 GiB, zero-swap scope, with a 6 GiB native memory budget. The Python
-coordinator preserves its inherited OOM adjustment and refuses an inherited
-maximum (`1000`). Only the disposable native child is promoted to `1000`, through
-the existing fixed Bash exec launcher, with its accepted executable FD retained.
-This removes deliberate maximum preference from the coordinator; it does not
-promise OOM immunity or override cgroup group-kill policy.
-Smaller or larger job-cap overrides refuse. Destination capacity, sibling/cache
-reserves and the existing pressure watchdog remain enforced. No PATH binary,
-ordinary daemon-delegating CLI or worker-binary environment override is used.
-
-Inside that actual scope, the worker acquires the shared lifecycle lock before
-fresh configuration and authorization checks, requires the configured physical
-main checkout, and executes the accepted inode with explicit managed environment.
-The lock releases immediately after child creation, before waiting. Disable
-refuses competing admission but does not cancel an already admitted worker;
-the existing scope watchdog owns cancellation and descendant cleanup.
-
-Authorization/capacity/lock refusals use the existing refusal marker and preserve
-queue attempts. Spawn, provider, response and crash failures remain charged
-errors (`111`); provider exit codes cannot impersonate queue deferrals. The
-generation-aware queue, escalation clock and durable outcomes are unchanged.
-The `available --repo /absolute/main --persistence true` command exposes
-these preflight checks; use `false` when artifact export is disabled. Both queue
-boundaries pass the actual `CODE_INTEL_INDEX_PERSISTENCE` selection. The check
-observes write permissions and readonly mounts in its caller's namespace for
-cache/runtime, existing index database/WAL/SHM files, queue/log/lock storage, and the
-artifact directory when persistence is enabled. It creates no probe or directory.
-This write-path diagnosis makes no filesystem changes. The inherited native
-configuration reader uses SQLite readonly mode; SQLite can maintain sidecar
-metadata if an operator changes that database from its native DELETE journal
-mode to WAL. The validator continues reading current keys rather than ignoring
-uncheckpointed WAL with SQLite's immutable option.
-An existing writable artifact directory does not require its repository parent
-to be writable. Missing directories require a writable existing ancestor.
-The native `_config.db` remains a reader surface, validated with SQLite `mode=ro`
-against its current disabled-key values; it does not require write permission.
-This diagnosis is not execution authorization for another process. Worker invocation
-requires an explicit `--managed-config` argument from the existing entrypoint.
-Managed indexing also requires the absolute canonical repository lock namespace.
-Failure to create it remains a refusal even when a temporary fallback lock opens.
-The legacy GitNexus fallback remains available to its own leg; it never authorizes
-the managed Codebase leg on a different inode.
-
-### Operator-owned runner filesystem allowlist
-
-The runner template sets `ProtectSystem=strict` and `ReadWritePaths=%h`. Ordinary
-unprivileged user managers without `PrivateUsers` may not enforce filesystem
-namespacing; privileged installations can enforce it. A nested batch scope
-inherits the runner's mount namespace. Direct shell availability therefore does
-not establish timer-service availability.
-
-Custom paths remain supported. When the runner's sandbox makes configured write
-roots readonly, the operator must append narrow native `ReadWritePaths` entries
-to **genesis-code-intel.service**, covering cache/runtime and custom
-`GENESIS_HOME` queue/log/locks. For persistence, also allow the existing
-`main/.codebase-memory` directory, or its existing ancestor if the directory
-must be created. Precreating the artifact directory permits a narrower exception.
-For example, an operator-owned service drop-in can append:
-
-```ini
-[Service]
-ReadWritePaths=/srv/cbm/cache /srv/cbm/runtime /srv/genesis-state
-ReadWritePaths=/srv/repository/.codebase-memory
-```
-
-These example directories must already exist. Keep `%h`, avoid a blank reset
-or `ReadWritePaths=/`, and preserve independent operator policy. These are native
-systemd path-list values, not shell commands: quote paths containing spaces and
-escape literal percent signs as `%%`. Reload the manager after editing and verify
-the effective runner namespace with a supervised queued run. Genesis does not
-create, rewrite or remove this operator-owned drop-in.
-
-Persistent export also needs snapshot scratch. The pinned POSIX provider uses
-hardcoded `/tmp` for an owner-private SQLite snapshot; it does not redirect this
-snapshot through `TMPDIR`. If `/tmp` is readonly in the runner namespace, supply
-an operator-owned mapping to an existing mode0700 disk directory with room for
-a graph snapshot, for example:
-
-```ini
-[Service]
-BindPaths=/srv/cbm/export-scratch:/tmp
-```
-
-This writable bind is local to the service namespace and its nested scope; it
-does not permit writes to the host's shared `/tmp`. It masks existing `/tmp`
-contents inside that namespace, so preserve any configured checkout, state or
-IPC paths there with explicit native mappings or another operator arrangement.
-Do not override `TMPDIR`, reset existing bind policy, or assume a small tmpfs can
-hold a production snapshot. The operator owns backing storage, capacity and
-cleanup of interrupted-export leftovers; Genesis does not create or retire this
-directory or drop-in. Persistence false does not require snapshot scratch;
-the provider can still attempt a best-effort refresh of an existing artifact,
-whose export failure does not fail the index.
-
-Filesystem allowance and user-scope routing are separate prerequisites. A runner
-launched by the privileged system manager can fail the default user-manager
-`--slice-inherit` probe because its current PID has no user-manager slice. Where
-that occurs, the existing `CODE_INTEL_WORKLOAD_SLICE=1` route selects
-`genesis-workload.slice` explicitly and verifies the physical worker's membership.
-Verify that route and its full resource admission before indexing; an allowlist
-alone does not establish a bounded scope. This setting does not relax the
-filesystem sandbox or the 8 GiB, zero-swap worker cap.
-
-Write diagnosis is advisory: ACL/permission changes, quota, disk exhaustion and
-publication races can still fail real IO. The worker repeats diagnosis inside its
-actual scope before spawning; detected restrictions preserve attempts through the
-existing refusal marker. Post-spawn provider/publication failures remain charged.
-
-## Native query service
+## Native query unit entry points
 
 `genesis-cbm-query.service` invokes `serve` and `ready` using the installed
 settings path. These are unit entry points alongside the operator lifecycle and
@@ -319,7 +220,6 @@ Unreadable or malformed limits/current usage refuse; invalid cache statistics us
 the full charge. Recurring readiness verifies containment without repeating
 startup admission when siblings allocate memory. The aggregate client slice
 has 2 GiB memory, zero swap and TasksMax 512.
-
 
 Startup verifies cache flags and the executable inode, uses the pinned native
 local configuration read to repair a stale endpoint generation, then execs the
@@ -347,10 +247,11 @@ as a literal positional argument, because systemd's executable-name grammar
 rejects some characters that its argument grammar accepts. The fixed script
 never interpolates path data into shell code or performs PATH lookup.
 Whitespace, quote, backslash, dollar, percent, ampersand, pipe
-and Unicode paths retain their literal meaning. A symlink, directory or FIFO at
-either managed template destination is refused before writing; unrelated unit
-and FalkorDB rendering retain their existing behavior. Install preserves an
-existing regular unit; bootstrap updates it through its ordinary rendering loop.
+and Unicode paths retain their literal meaning. Existing symlinks at either
+managed template destination follow the preservation and explicit takeover
+policy above; directories and FIFOs are refused before writing. Unrelated unit
+and FalkorDB rendering retain their existing behavior. Install preserves existing
+regular units; bootstrap follows the shared managed-unit ownership policy.
 
 ## Diagnose and recover
 
@@ -371,6 +272,10 @@ Diagnostic settings include only known scalar metadata; unknown fields and
 deeply nested invalid values cannot prevent reporting manager state.
 An incompatible build populates `settings_error` while retaining its metadata
 and independently reporting systemd status.
+Unsupported repository/cache identities and symlink-resolution failures also
+populate `settings_error` without suppressing metadata or the systemd check.
+Structural settings reads remain available for retained-state diagnosis; no
+incompatible cache is repaired or deleted automatically.
 
 Existing settings and state are never refreshed in place. Schema 1 and other
 builds remain diagnosable, but are not valid schema-2 execution configurations.

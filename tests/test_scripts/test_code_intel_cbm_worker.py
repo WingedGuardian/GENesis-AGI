@@ -82,7 +82,10 @@ def _fake_worker(tmp_path, monkeypatch, *, error=False, rc=0):
     monkeypatch.setattr(worker, "load_managed", lambda: managed)
 
 
-def test_verified_inode_exec_and_response_cleanup(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("file_digest", [True, False])
+def test_verified_inode_exec_and_response_cleanup(tmp_path, monkeypatch, capsys, file_digest):
+    if not file_digest:
+        monkeypatch.delattr(hashlib, "file_digest", raising=False)
     _fake_worker(tmp_path, monkeypatch)
     assert worker._execute_stock_worker(tmp_path / "settings", _args(tmp_path), 8 * 1024**3) == 0
     assert json.loads(capsys.readouterr().out)["isError"] is False

@@ -14,6 +14,31 @@ from tests.test_scripts.test_codebase_managed_config import ROOT, managed
 operator = managed
 
 
+@pytest.mark.parametrize("slot", [0, 1])
+@pytest.mark.parametrize("form", ["raw", "stamped", "changed", "forged", "repeated", "malformed"])
+def test_current_renderer_bytes_are_the_only_supported_stamp_forms(operator, authority, slot, form):
+    from managed_units import stamp
+
+    unit = (operator.BACKEND, operator.SLICE)[slot]
+    path = authority.roots[0] / unit
+    raw = path.read_bytes()
+    body = {
+        "raw": raw,
+        "stamped": stamp(raw),
+        "changed": raw + b"# local change\n",
+        "forged": stamp(raw + b"# local change\n"),
+        "repeated": stamp(raw) + stamp(raw),
+        "malformed": stamp(raw).replace(b"sha256=", b"sha256=broken"),
+    }[form]
+    path.write_bytes(body)
+    if form in ("raw", "stamped"):
+        assert operator.inspect_sources()[1][unit][0][2] == body
+    else:
+        with pytest.raises(ValueError, match="noncanonical"):
+            operator.inspect_sources()
+    assert path.read_bytes() == body
+
+
 @pytest.fixture
 def authority(operator, tmp_path, monkeypatch):
     module = operator.inspect_sources.__globals__["canonical_sources"].__globals__

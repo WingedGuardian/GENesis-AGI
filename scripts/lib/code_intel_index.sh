@@ -839,10 +839,10 @@ _leg_failed() {
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
     if [ "$_CBM_LOCK_REFUSE" = "1" ]; then
         MISSING="${MISSING}cbm "
-    elif /usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/../codebase_managed.py" \
+    elif _cbm_unavailable="$(/usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/../codebase_managed.py" \
         --config "$HOME/.genesis/config/codebase-managed.json" available --repo "$REPO_PATH" \
         --persistence "$PERSISTENCE" \
-        >/dev/null 2>&1; then
+        2>&1 >/dev/null)"; then
         CBM_MEM_REFUSE=""
         _cbm_want_b="$(_genesis_mem_bytes "$CBM_MEM_MAX")"
         if [ -n "$GENESIS_CBM_ENV_REFUSE" ]; then
@@ -900,7 +900,7 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
             fi
         fi
     else
-        _log "managed Codebase unavailable — skipped"
+        _log "managed Codebase unavailable — skipped: ${_cbm_unavailable##*$'\n'}"
         MISSING="${MISSING}cbm "
     fi
 fi

@@ -42,6 +42,7 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "perception": "Reflection engine — observation creation, pattern detection, signal processing",
     "cc_relay": "Claude Code invoker, session manager, checkpoints, and reflection bridge",
     "direct_session": "Direct session spawner — profile-constrained background CC sessions with tool restrictions, Telegram notifications, and streaming observability",
+    "agent_api": "Same-owner asynchronous A2A conversations and durable pull outbox; explicit peer configuration and enrollment required",
     "memory": "Hybrid memory store — SQLite + Qdrant vector search, wing/room taxonomy, essential knowledge layer, knowledge ingestion pipeline + resume review",
     "surplus": "Surplus compute scheduler — uses idle time for brainstorms and enrichment tasks",
     "learning": "Learning pipeline — triage, calibration, harvest, and procedural learning",
@@ -66,6 +67,7 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "voice_s2s": "Speech-to-speech session manager — GPT-Realtime/Gemini Live voice front-end with Genesis tool calling",
     "campaigns": "Campaign subsystem — persistent, scheduled, LLM-driven operations with strategy docs, pre-checks, and autonomous session dispatch",
     "office_deliverables": "OfficeCLI (iOfficeAI) — high-fidelity .xlsx/.pptx/.docx renderer for the deliverable-builder skill; degrades to pandoc/CSV when the binary is absent. Optional external tool, provisioned by bootstrap.sh into ~/.genesis/deps/officecli/.",
+    "browser_automation": "Camoufox browser engine for the browser_* tools. Active = the engine this install's camoufox package launches is present and launchable; degraded = the package or that engine is missing or broken (the logged reason says what to tell the user). Optional; provisioning is an operator step.",
 }
 
 

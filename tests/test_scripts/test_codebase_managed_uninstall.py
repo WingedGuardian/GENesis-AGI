@@ -26,6 +26,45 @@ def supported_retirement(guard, monkeypatch):
     monkeypatch.setitem(namespace, "native_install", lambda *a, **k: None)
 
 
+def test_batch_observation_seeds_the_user_manager_environment(guard, monkeypatch):
+    for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        monkeypatch.delenv(name, raising=False)
+    seen = {}
+
+    def run(argv, **kwargs):
+        seen.update(argv=argv, env=kwargs["env"])
+        return SimpleNamespace(stdout="")
+
+    g = guard.require_no_batch.__globals__
+    monkeypatch.setitem(g, "observed_index_writers", lambda: [])
+    monkeypatch.setattr(g["subprocess"], "run", run)
+    guard.require_no_batch()
+    assert seen["argv"][:3] == ["/usr/bin/systemctl", "--user", "list-units"]
+    assert seen["env"]["XDG_RUNTIME_DIR"].startswith("/run/user/")
+    assert seen["env"]["DBUS_SESSION_BUS_ADDRESS"].startswith("unix:path=/run/user/")
+
+
+def test_retirement_seeds_the_user_manager_environment(guard, monkeypatch, supported_retirement):
+    for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs["env"]))
+        return SimpleNamespace(returncode=0, stderr="")
+
+    g = guard.retire_managed.__globals__
+    monkeypatch.setattr(g["subprocess"], "run", run)
+    monkeypatch.setitem(g, "require_quiescent", lambda unit: None)
+    monkeypatch.setitem(g, "show", lambda *args: {"UnitFileState": "disabled", "LoadState": "loaded"})
+    guard.retire_managed()
+    assert [argv[2:] for argv, _env in calls] == [
+        ["stop", guard.BACKEND], ["stop", guard.SLICE]
+    ]
+    assert all(env["XDG_RUNTIME_DIR"].startswith("/run/user/") for _argv, env in calls)
+    assert all(env["DBUS_SESSION_BUS_ADDRESS"].startswith("unix:path=/run/user/") for _argv, env in calls)
+
+
 @pytest.mark.parametrize("layout", ["default", "empty", "external", "data", "repo", "qdrant", "nested", "default-alias", "locks-alias", "external-alias"])
 def test_namespace_layout_before_mutation(guard, transaction, monkeypatch, layout):
     home = transaction
@@ -208,7 +247,16 @@ def test_retained_diagnostics_tolerate_each_symlink_loop(guard, tmp_path, monkey
     assert sum("Preserved configured" in line for line in output.splitlines()) == 3
 
 
-@pytest.mark.parametrize("kind,expected", [("native", True), ("heap", True), ("wrapper", True), ("private-launch", True), ("query", False), ("foreign-cwd", False), ("foreign-path", False), ("unrelated", False), ("foreign-wrapper", False)])
+@pytest.mark.parametrize("kind,expected", [
+    ("native", True), ("heap", True), ("wrapper", True), ("private-launch", True),
+    ("renamed", True), ("renamed-target", True), ("renamed-alias", True),
+    ("renamed-relative", True), ("atom-executable", True), ("multiple-analyze", True),
+    ("program-only", False),
+    ("renamed-foreign-cwd", False), ("renamed-foreign-target", False),
+    ("python-renamed", True), ("ambiguous-analyze", True), ("substring", False),
+    ("query", False), ("foreign-cwd", False), ("foreign-path", False),
+    ("unrelated", False), ("foreign-wrapper", False),
+])
 def test_existing_fallback_writer_population(guard, transaction, tmp_path, kind, expected):
     repo = transaction / "genesis"
     other = tmp_path / "other"
@@ -231,7 +279,33 @@ def test_existing_fallback_writer_population(guard, transaction, tmp_path, kind,
     elif kind == "foreign-path":
         argv.append(str(other))
     elif kind == "unrelated":
-        argv[1] = "/opt/another/dist/cli/index.js"
+        argv = ["node", "/opt/another/dist/cli/index.js", "status"]
+    elif kind.startswith("renamed") or kind in ("python-renamed", "substring"):
+        argv = ["python3" if kind == "python-renamed" else "node", "/opt/gn", "analyze"]
+        if kind == "renamed-target":
+            argv.append(str(repo))
+            cwd = other
+        elif kind == "renamed-relative":
+            argv.append(".")
+        elif kind == "renamed-alias":
+            alias = other / "checkout-link"
+            alias.symlink_to(repo, target_is_directory=True)
+            argv.append(str(alias))
+            cwd = other
+        elif kind == "renamed-foreign-cwd":
+            cwd = other
+        elif kind == "renamed-foreign-target":
+            argv.append(str(other))
+        elif kind == "substring":
+            argv[-1] = "preanalyze"
+    elif kind == "ambiguous-analyze":
+        argv = ["rg", "analyze"]  # Possible writer: argv cannot prove its implementation.
+    elif kind == "atom-executable":
+        argv = ["analyze", "analyze"]
+    elif kind == "multiple-analyze":
+        argv = ["node", "--title", "analyze", "/opt/gn", "analyze"]
+    elif kind == "program-only":
+        argv = ["analyze"]
     (process / "cmdline").write_bytes(b"\0".join(os.fsencode(arg) for arg in argv) + b"\0")
     (process / "stat").write_text("123 (worker) " + " ".join(["S"] + ["0"] * 18 + ["10"]))
     (process / "cwd").symlink_to(cwd, target_is_directory=True)
@@ -470,6 +544,10 @@ os.execv("/usr/bin/rm",["rm",*sys.argv[1:]])
     for name in ("code_intel_cbm_worker.py", "code_intel_cbm_admission.py", "codebase_managed_unit.py"):
         content = (ROOT / "scripts/lib" / name).read_text()
         (scripts / "lib" / name).write_text(content.replace('"/usr/bin/busctl"', json.dumps(str(busctl))))
+    shutil.copy2(ROOT / "scripts/lib/managed_units.py", scripts / "lib/managed_units.py")
+    utility = repo / "src/genesis/util/systemd.py"
+    utility.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "src/genesis/util/systemd.py", utility)
     for name in (
         ".genesis/config",
         "data",
@@ -560,11 +638,12 @@ def test_fixture_refuses_final_directory_aliases(owned_install, command):
         assert (home / ".bashrc.tmp").read_text() == "owned"
 
 
-def test_owned_process_observation_refuses_actual_cleanup(owned_install):
+@pytest.mark.parametrize("index", ["/opt/gitnexus/dist/cli/index.js", "/opt/gn"])
+def test_owned_process_observation_refuses_actual_cleanup(owned_install, index):
     home, scripts, env = owned_install
     process = home / "test-proc/123"
     process.mkdir()
-    (process / "cmdline").write_bytes(b"node\0/opt/gitnexus/dist/cli/index.js\0analyze\0")
+    (process / "cmdline").write_bytes(f"node\0{index}\0analyze\0".encode())
     (process / "stat").write_text("123 (worker) " + " ".join(["S"] + ["0"] * 18 + ["10"]))
     (process / "cwd").symlink_to(home / "genesis", target_is_directory=True)
     result = subprocess.run(["/bin/bash", str(scripts / "uninstall.sh"), "--genesis-only", "--non-interactive"], env=env, capture_output=True, text=True, timeout=10)
@@ -964,7 +1043,7 @@ def test_cleanup_unlinks_known_units_without_removing_foreign_target(owned_insta
     target.parent.mkdir()
     if target_exists:
         target.write_text("foreign unit")
-    links = [home / ".config/systemd/user" / name for name in ("genesis-old.service", "genesis-old.timer", "qdrant.service")]
+    links = [home / ".config/systemd/user" / name for name in ("genesis-old.service", "genesis-old.timer", "genesis-workload.slice", "qdrant.service")]
     for link in links:
         link.symlink_to(target)
     result = subprocess.run(["/bin/bash", str(scripts / "uninstall.sh"), "--genesis-only", "--non-interactive"], env=env, capture_output=True, text=True, timeout=20)
@@ -978,3 +1057,27 @@ def test_retained_diagnostics_do_not_require_file_digest(guard, monkeypatch, tmp
     monkeypatch.setitem(guard.report_retained_state.__globals__, "read_settings", lambda *a, **kw: {key: str(tmp_path / key) for key in ("binary", "cache", "runtime")})
     guard.report_retained_state()
     assert capsys.readouterr().out.count("Preserved configured") == 3
+
+
+@pytest.mark.parametrize("unsupported_managed_slice", [False, True])
+def test_cleanup_removes_installed_slices_and_keeps_unrelated_slices(owned_install, unsupported_managed_slice):
+    home, scripts, env = owned_install
+    directory = home / ".config/systemd/user"
+    installed = {path.name.removesuffix(".template") for path in ROOT.glob("scripts/systemd/*.slice.template")}
+    assert "genesis-workload.slice" in installed
+    if not unsupported_managed_slice:
+        installed.remove("genesis-cbm-query-clients.slice")
+    for name in installed:
+        (directory / name).write_text("owned installed slice")
+    foreign = directory / "genesis-foreign.slice"
+    foreign.write_text("unrelated slice")
+    result = subprocess.run(["/bin/bash", str(scripts / "uninstall.sh"), "--genesis-only", "--non-interactive"], env=env, capture_output=True, text=True, timeout=20)
+    if unsupported_managed_slice:
+        assert result.returncode != 0 and "authority refused" in result.stderr
+        assert all((directory / name).read_text() == "owned installed slice" for name in installed)
+        assert all((home / name).is_dir() for name in ("genesis", ".genesis", "data", ".qdrant"))
+        assert foreign.read_text() == "unrelated slice"
+        return
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not any((directory / name).exists() for name in installed)
+    assert foreign.read_text() == "unrelated slice"

@@ -120,7 +120,7 @@ def _spawn_worker(
         "index_repository",
         json.dumps(
             {
-                "repo_path": args.repo_path,
+                "repo_path": config["main"],
                 "mode": args.mode,
                 "persistence": args.persistence == "true",
             }

@@ -72,8 +72,13 @@ def invoke(args):
     )
 
 
-def test_physical_spawn_holds_shared_lock_but_wait_does_not(managed, monkeypatch):
+@pytest.mark.parametrize("alias", [False, True])
+def test_physical_spawn_holds_shared_lock_but_wait_does_not(managed, monkeypatch, alias):
     namespace, config, events, lock, marker, args = managed
+    if alias:
+        checkout = Path(config["main"]) / "checkout-alias"
+        checkout.symlink_to(config["main"], target_is_directory=True)
+        args.repo_path = str(checkout)
 
     def popen(argv, **kwargs):
         assert events == ["locked"]
@@ -81,6 +86,8 @@ def test_physical_spawn_holds_shared_lock_but_wait_does_not(managed, monkeypatch
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         assert kwargs["cwd"] == config["main"]
         assert kwargs["env"] == {"CBM_CACHE_DIR": config["cache"]}
+        payload = json.loads(argv[argv.index("--response-out") - 1])
+        assert payload["repo_path"] == config["main"]
         assert argv[argv.index("--index-worker-memory-budget-bytes") + 1] == str(6 * 1024**3)
         response = Path(argv[argv.index("--response-out") + 1])
         response.write_text(json.dumps({"isError": False, "content": []}))

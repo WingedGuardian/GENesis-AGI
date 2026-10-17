@@ -89,7 +89,7 @@ _cbm_disabled() {
     ! /usr/bin/python3 -I "$SCRIPT_DIR/codebase_managed.py" \
         --config "$HOME/.genesis/config/codebase-managed.json" available --repo "$1" \
         --persistence "${CODE_INTEL_INDEX_PERSISTENCE:-true}" \
-        >/dev/null 2>&1
+        >/dev/null 2>> "$LOG_FILE"
 }
 
 # Returns 0 (idle enough to run) or 1. Relaxed gate once a marker is starved.
