@@ -18,6 +18,84 @@ Install always keeps existing links. Directories and FIFOs at these two
 destinations remain errors. Use the configured disablement sentinel for the
 runtime off-switch; masking may refuse when a local regular unit already exists.
 
+## Native lifecycle
+
+After staging and ordinary template rendering, deliberately use:
+
+```bash
+python3 -I scripts/codebase_managed.py enable
+python3 -I scripts/codebase_managed.py disable
+python3 -I scripts/codebase_managed.py remove
+```
+
+`enable` uses the fixed installed settings path and validates the pin/cache/sentinel.
+Before native mutation it requires exact current rendered service and slice sources (raw or carrying the shared renderer stamp)
+in the supported installed namespaces, with no competing fragments or override
+namespaces anywhere in the manager's lookup paths. This includes `.d`, `.wants`,
+`.requires` and `.upholds` at the full-name, dash-prefix and unit-type scopes;
+even empty directories or dangling namespace links are unsupported and retained.
+Extra directives, comments,
+whitespace changes, masks, generated/transient sources and final fragment symlinks
+refuse; selected directory aliases and literal installation paths remain supported.
+It explicitly refreshes accepted sources, verifies their loaded identities, commands
+and limits, enables through the same manager's native installation API without
+starting, rechecks and refreshes accepted sources again, then starts and verifies
+native readiness. Backend argv must match
+the installed positional bridge, including its `no-env-expand` flag; auxiliary
+execution commands refuse. A custom installation must supply the same absolute
+`VENV_PATH` used by `install.sh` when invoking `enable`; otherwise the configured
+main checkout's `.venv` is expected. Disable/remove do not require that variable.
+Missing typed manager properties, unsupported native namespace layouts or unavailable
+`busctl` refuse activation. Installation calls cannot fall back to a client-side
+reader. Current canonical templates are the authority, not a partial directive
+allowlist or `NeedDaemonReload` flag.
+Enable also requires an initially inactive or failed backend with no main PID or
+populated cgroup. An already running backend refuses before reload or retirement;
+this prevents rollback from executing newly reloaded incompatible stop commands.
+It never removes the
+sentinel. Failed startup uses the same canonical retirement contract; startup and
+incomplete rollback errors remain visible. A command timeout does not prevent the
+remaining independently authorized retirement attempts.
+Persistent and runtime enablement links are disabled independently before final
+native state proof, including installations with both kinds of link.
+
+`disable` retires supported canonical native units without reading settings, including
+missing, malformed, old-schema or stale-build settings. It verifies service PID,
+native enablement and recursive empty cgroups; slices/scopes do not expose the
+service-only MainPID property. Inert parameters from both typed startup commands
+allow retirement without the current virtualenv selection, interpreter existence,
+pin or sentinel. Unknown/customized/stale unit contracts refuse with files,
+settings and processes preserved for operator-directed native intervention. Because
+refresh is global, an unsupported source for either fixed unit blocks refresh and
+automated stopping of the pair; both units' state proofs and errors are reported.
+Manager uncertainty or failed stop refuses success. Accepted sources and quiescence
+are rechecked before refreshing cached installation state for final disablement.
+Native disable removes fixed-name and target-associated enablement links in its
+persistent/runtime namespaces, including aliases to the managed target; it never
+deletes their target files or recursively disables an independent auxiliary unit.
+`remove` first performs the same retirement, then unlinks only the fixed service,
+client slice and known persistent/runtime enablement artifacts and reloads the
+manager. All eight fixed candidates are validated before the first unlink;
+directories, FIFOs, lookup errors and observed replacements refuse. Selected unit
+and membership directory aliases are supported and remain intact. Final artifact
+links are unlinked without following their targets. Unrelated names, settings and
+provider state are preserved. A later unlink failure reports partial removal and
+still reloads after successful deletions; no artifacts are recreated as rollback.
+Partial removal refresh requires this invocation's prior successful retirement,
+both units quiescent and remaining sources canonical or intentionally removed.
+No new template ownership or repair mechanism is introduced; the existing managed-unit stamp is accepted only over the exact current canonical render.
+
+All three hold the exclusive nonblocking lifecycle lock through completion or
+rollback. Busy frontend/worker admission refuses; a worker already admitted is
+left to its existing watchdog. Daemon startup/readiness does not take a shared
+lock that could deadlock with this exclusive enable operation. The commands do
+not change immutable settings bytes. None starts the indexing queue or registers
+the forthcoming managed MCP frontend.
+These checks coordinate cooperating tools; validation followed by native start or
+unlink is not atomic against a noncooperating operator replacing files or parents.
+The user manager's environment, global defaults and unrelated native dependency
+owners remain trusted; canonical matching is not a sandbox for the whole manager.
+
 ## Configure
 
 Run from the primary Genesis checkout, using the accepted v0.11.0 Linux x86_64
@@ -64,6 +142,15 @@ differs from the installed service's default. Absolute paths retain whitespace.
 Resolved paths must satisfy the same validation as the published settings:
 newline and carriage-return characters introduced by symlink ancestors are
 refused before staging. The final settings filename remains unresolved.
+
+The pinned provider rewrites literal backslashes as path separators on Linux.
+Repository and cache paths containing backslashes, including their resolved
+physical identities, therefore refuse before staging or native execution. This
+prevents native configuration writes from selecting a different cache directory.
+A configure argument's symlink alias may contain a backslash if it resolves to a
+supported physical main/state path. Binary, interpreter, runtime, sentinel and
+settings paths retain their existing literal-path handling; this restriction
+applies to provider-consumed repository/cache identities.
 
 No service is enabled, no unit is rendered and no sentinel is removed.
 Configuration uses schema 2: paths and build identity, with no mutable `enabled`
@@ -143,6 +230,10 @@ Diagnostic settings include only known scalar metadata; unknown fields and
 deeply nested invalid values cannot prevent reporting manager state.
 An incompatible build populates `settings_error` while retaining its metadata
 and independently reporting systemd status.
+Unsupported repository/cache identities and symlink-resolution failures also
+populate `settings_error` without suppressing metadata or the systemd check.
+Structural settings reads remain available for retained-state diagnosis; no
+incompatible cache is repaired or deleted automatically.
 
 Existing settings and state are never refreshed in place. Schema 1 and other
 builds remain diagnosable, but are not valid schema-2 execution configurations.
@@ -163,6 +254,84 @@ staging directory.
 Failed staging is not an exemption from whole-install uninstall. Existing
 documented deletion roots can still contain it. State outside those roots is
 not automatically deleted merely because a settings file names it.
+
+## Whole-install removal
+
+Run the ordinary `scripts/uninstall.sh` entry point. Real container cleanup
+enters the managed guard before changing monitoring or state. It acquires the
+existing runner lock, physical repository index lock, then lifecycle lock without
+waiting; a busy writer or freeze refuses removal. It also refuses surviving
+index scopes, including workers whose queue parent has gone away.
+It also observes same-account fallback GitNexus entrypoints/analyze processes
+for this checkout, using kernel argv/cwd and stable process start identity.
+Observed writers or uncertain identity refuse removal; discovery sends no signals.
+The snapshot cannot prohibit a new unlocked process launched afterward.
+Retirement precedes the direct script's backup/confirmation prompts. Cancelling
+keeps the repository and state, but leaves the query service stopped and disabled,
+as the entry point explicitly reports; deliberate native enablement is required
+to resume it. Make any desired backup before entering removal.
+
+The guard retires the fixed query service and client slice using native systemd
+commands and verifies inactive/failed state, zero MainPID and empty cgroups,
+including descendants. Missing, malformed or stale settings cannot bypass this
+proof. Unsupported unit contracts abort before deleting the installation; inspect
+the preserved definitions and use operator-directed native recovery. A native
+implicit slice can remain loaded without a fragment: it counts as absent only
+with empty source/override/enablement metadata, no transient identity, and proven
+inactive state and empty descendant groups. Manager failures, failed stop or
+uncertain state abort cleanup.
+Final enablement is checked even when the native disable call succeeds: surviving
+global/runtime enablement still refuses removal.
+
+The helper executes its fixed sibling uninstall script with the real lock
+descriptors inherited and checked on entry. Those descriptors remain held through
+removal of the repository, runtime contents, database and Qdrant roots. Existing
+`~/.genesis/locks` and its original inodes remain as coordination state; settings,
+queue and provider contents elsewhere within the fixed deletion roots are removed. This prevents a
+stalled entrypoint from recreating a different lock inode during teardown.
+Plain default locks and nonoverlapping external `GENESIS_HOME` are supported.
+Direct container cleanup uses its process's `GENESIS_HOME`. Host cleanup defaults
+to the container user's `HOME/.genesis`, independently of the host's environment.
+For an external namespace, pass `--container-genesis-home /absolute/container/path`
+to `scripts/uninstall.sh` on the host. It must match the namespace used by every
+cooperating container runner, freeze and manual index entrypoint. The override
+travels as literal arguments and is assigned after login initialization. Duplicate,
+missing, empty, relative and CR/LF-containing values refuse before monitoring
+changes. The option is invalid inside the container, with `--guardian-only`, or
+with `--full`; it does not change direct cleanup or full-container deletion.
+Custom lock layouts intersecting the four deletion roots, or default namespace
+symlinks that cleanup would unlink, refuse before retirement. No lock relocation
+is performed. The lifecycle lock's systemd-directory namespace must also remain
+outside all four roots in both lexical and resolved paths, including through
+symlink ancestors; aliasing it into the retained runner locks is unsupported.
+Safe external systemd-directory aliases remain supported. No broad native-state
+retention mode is introduced. Assess conflicting layouts
+with all writers stopped; do not move live locks to bypass refusal. Host cleanup
+delegates once to this same container transaction after its normal backup and
+confirmation; a missing/older guard or failed container command refuses cleanup
+without falling back to separate deletion commands. Default host cleanup finishes
+before Guardian artifacts are removed. On refusal, its installation remains;
+the earlier monitoring pause is not automatically undone. Full container deletion
+keeps its existing inner-cleanup skip and separate confirmation behavior.
+
+Only the fixed CBM service/slice fragments and their known persistent/runtime
+enablement locations are removed. Symlinks are unlinked without deleting foreign
+targets; unrelated slices survive. Valid settings can report external retained
+binary/cache/runtime paths, but cannot expand the documented deletion roots.
+Retirement requires the backend to be loaded and disabled, or exactly absent;
+masked, generated, transient and static backend definitions refuse cleanup.
+Retention diagnostics distinguish recursive removal of real roots from unlinking
+a final root symlink, and account for the exact retained runtime `locks` child.
+Unclassifiable diagnostic paths are reported and do not alter deletion authority.
+Both Qdrant binary locations and dangling known unit links are handled; foreign
+symlink targets remain untouched. Failed runtime inventory aborts before deleting
+install roots and retains the inventory for inspection.
+Dry-run does not acquire locks, stop managed units or delete state. An internal
+reentry marker alone is insufficient: it requires verified inherited descriptors.
+The teardown helper retains its system Python entry point and uses only standard
+library operations available on the supported Python 3.10 platform. It does not
+perform the native binary hash/launch acceptance used by the installed query
+runtime. Current-install tests are not a separate Python 3.10 runtime qualification.
 
 ## Verification
 

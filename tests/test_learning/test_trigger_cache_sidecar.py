@@ -39,7 +39,7 @@ def test_regenerate_writes_yaml_and_json(tmp_path, monkeypatch):
 
     import genesis.db.crud.procedural as procedural
 
-    async def fake_list_by_tier(db, tier):
+    async def fake_list_by_tier(db, tier, **_kwargs):
         return [_fake_row("core_tt")] if tier == "CORE" else [_fake_row("adv_tt")]
 
     monkeypatch.setattr(procedural, "list_by_tier", fake_list_by_tier)
@@ -71,7 +71,7 @@ def test_regenerate_json_matches_yaml(tmp_path, monkeypatch):
 
     import genesis.db.crud.procedural as procedural
 
-    async def fake_list_by_tier(db, tier):
+    async def fake_list_by_tier(db, tier, **_kwargs):
         return [_fake_row("core_tt")] if tier == "CORE" else []
 
     monkeypatch.setattr(procedural, "list_by_tier", fake_list_by_tier)

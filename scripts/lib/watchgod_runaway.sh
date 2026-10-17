@@ -14,7 +14,14 @@
 # the command's own shell. So the writer is taken from who holds the file open,
 # never from I/O counters.
 #
-# This file only DETECTS and PAGES. It stops no process and changes no file.
+# It DETECTS and PAGES on every watched filesystem. It ACTS in one case only:
+# a Claude Code Bash command's tasks/*.output in cc-tmp that is GROWING fast
+# (the growth test, live this poll), while its domain is ORANGE or RED and the
+# guardian is in act mode. Then it pauses that command (SIGSTOP: never the
+# session, never a kill), records the pause for `scripts/watchgod thaw|kill`,
+# and once every writer it paused is confirmed stopped, empties the file
+# (keeping its last MB where there is room; a writer it missed only refills
+# it, and is paused again). Nothing else is stopped or changed.
 #
 # One poll costs one size-filtered walk of /proc/*/fd. A file is followed only
 # when it is held open FOR WRITING by a process this uid can see and has at
@@ -284,6 +291,7 @@ wg_runaway_check() {
     local domains="$1" now key size pid fd dev
     now="$(date +%s)"
     RUNAWAY_FAST=0
+    _rw_flush_pending
     local -A size_of=() dev_of=() fds_of=()
     local scan scan_rc=""
     scan="$(_rw_scan)" || scan="#rc unknown"
@@ -316,7 +324,7 @@ wg_runaway_check() {
         log WARN "runaway-file walk of /proc did not complete (status ${scan_rc:-missing}; timeout ${DG_RUNAWAY_SCAN_TIMEOUT_S} s) — files it did not report were not checked this poll"
     fi
 
-    local dt pg path dom dtotal dpath size_mb raw_b norm_b why sid body
+    local dt pg path dom dkey dtotal dpath size_mb raw_b norm_b why sid body grew
     local link id birth blk pfpid st_line st_rc=0 opened vlinks
     local -A size_now=() st_of=()
     local -a holders links=()
@@ -435,7 +443,7 @@ wg_runaway_check() {
         path="$(readlink -- "$link" 2>/dev/null)" || path="?"
         dom="$(_rw_domain_for "${dev_of[$key]}" "${path% (deleted)}" "$domains")"
         [[ -n "$dom" ]] || continue   # not on a watched filesystem
-        read -r _ dtotal dpath <<< "$dom"
+        read -r dkey dtotal dpath <<< "$dom"
         [[ "$dtotal" =~ ^[0-9]+$ ]] && (( dtotal > 0 )) || continue
         size_mb=$(( ${size_of[$key]} / 1048576 ))
         raw_b=-1; norm_b=-1
@@ -454,10 +462,14 @@ wg_runaway_check() {
                 && (( ${_RW_PREV[$gen]} / 1048576 * 100 >= DG_RUNAWAY_PCT * dtotal )); then
             size_armed=0
         fi
+        local over=0
         if (( size_armed && size_mb * 100 >= DG_RUNAWAY_PCT * dtotal )); then
+            over=1
             why="it alone uses $(( size_mb * 100 / dtotal ))% of ${dpath} (threshold ${DG_RUNAWAY_PCT}%)"
         fi
+        grew=0
         if (( norm_b >= 0 && norm_b * 100 >= DG_RUNAWAY_RATE_PCT * dtotal * 1048576 )); then
+            grew=1
             why="${why}${why:+; }it grew $(( raw_b / 1048576 )) MB in ${dt} s, $(( norm_b * 100 / (dtotal * 1048576) ))% of ${dpath} per ${POLL_INTERVAL} s (threshold ${DG_RUNAWAY_RATE_PCT}%)"
         fi
         if (( norm_b >= 0 && norm_b * 200 >= DG_RUNAWAY_RATE_PCT * dtotal * 1048576 )); then
@@ -468,6 +480,40 @@ wg_runaway_check() {
         # an acting poll owes (review finding).
         if [[ -z "$why" && -n "${_RW_DUE[$gen$pg]:-}" ]]; then
             why="${_RW_DUE[$gen$pg]} (found at an earlier poll, whose page could not be queued)"
+        fi
+        # The response, every poll while it holds: only for a Claude Code task
+        # output, only once its domain is ORANGE or RED, and only when it is
+        # GROWING fast this poll or every writer of it is one this guardian
+        # paused (its emptying is still owed, whatever its size: review
+        # finding, a paused file under the size threshold was never retried).
+        # Never on size alone otherwise: a writer someone thawed would be
+        # paused again for the size it left behind. The one size exception: a
+        # file over the size threshold within the episode this guardian's own
+        # emptying opened, whose size was all written after it (review
+        # finding: a missed writer refilling slowly). Never on a reason carried
+        # from an earlier poll, and never on the poll that opened an episode.
+        _RW_ACTED=""; _RW_PAUSED_NOW=0; _RW_EMPTIED=0; _RW_OWED=0
+        if (( ! opened )) && [[ "${RW_TIER[$dkey]:-}" == orange || "${RW_TIER[$dkey]:-}" == red ]] \
+                && _rw_task_output "$path" \
+                && { (( grew )) \
+                     || { (( over )) && [[ -n "${_RW_EP[$gen]:-}" && "${_RW_EMPTIED_EP[$gen]:-}" == "${_RW_EP[$gen]}" ]]; } \
+                     || { _rw_all_paused "$key" "${holders[@]}" && _RW_OWED=1; }; }; then
+            if (( ! WATCHGOD_ACT )); then
+                _wg_warn_once "rw_obs_${gen}" "OBSERVE: would pause the command writing $(_rw_show "$path") (pid ${holders[*]})"
+            elif (( ! walk_ok )); then
+                log WARN "runaway $(_rw_show "$path"): not paused this poll: the /proc walk did not complete"
+            else
+                _rw_respond "$gen" "$key" "$path" "$size_mb" "$domains" "${holders[@]}"
+            fi
+        fi
+        # Emptied this poll: the action page says everything, and the episode
+        # it closed must not page "again" for the size it no longer has. Its
+        # baseline is the empty file, not the size before the truncate.
+        if (( _RW_EMPTIED )); then
+            # shellcheck disable=SC2034  # read by handle_fs in tmp_watchgod.sh
+            RUNAWAY_RELIEVED[$dkey]=1
+            size_now[$gen]=0
+            continue
         fi
         [[ -n "$why" ]] || continue
         (( opened )) && continue
@@ -488,7 +534,15 @@ wg_runaway_check() {
             pkey+=":e${_RW_EP[$gen]}"; again=" (again since ${since})"
             body+=$'\n'"It shrank after an earlier page (at ${since}) and is over the threshold again."
         fi
-        body+=$'\n'"The guardian has not acted on it. Stop the writer, or empty the file, before the filesystem fills."
+        if [[ "$_RW_ACTED" == paused ]]; then
+            body+=$'\n'"The guardian paused the command writing it (its action page says how to resume or end it); the file could not be emptied yet."
+        elif [[ "$_RW_ACTED" == unconfirmed ]]; then
+            body+=$'\n'"The guardian sent SIGSTOP to the command writing it, but no stop is confirmed yet (its action page says how to resume or end it). Make sure the writer stops before the filesystem fills."
+        elif [[ -n "$_RW_ACTED" ]]; then
+            body+=$'\n'"The guardian did not pause it (${_RW_ACTED}). Stop the writer, or empty the file, before the filesystem fills."
+        else
+            body+=$'\n'"The guardian has not acted on it. Stop the writer, or empty the file, before the filesystem fills."
+        fi
         if _wg_page critical "Runaway file on ${dpath}: ${spath##*/}${again}" "$body" \
                 "$pkey" "CRITICAL — runaway ${spath} (${size_mb} MB)${again}"; then
             _RW_PAGED[$gen]="${_RW_PAGED[$gen]:-} mode${pg}"
@@ -516,6 +570,9 @@ wg_runaway_check() {
             (( now - ${_RW_LAST[$gen]} > ttl )) || continue
             unset "_RW_LAST[$gen]" "_RW_PAGED[$gen]" "_RW_EP[$gen]" "_RW_PREV[$gen]" "_RW_PREV_AT[$gen]" \
                   "_RW_LINKS[$gen]" "_RW_DUE[$gen]" "_RW_DUE[${gen}_observe]"
+            # Its tail markers too (watchgod_act.sh; one per episode).
+            for k in "${!_RW_TAILED[@]}"; do [[ "$k" == "$gen:"* ]] && unset "_RW_TAILED[$k]"; done
+            unset "_RW_EMPTIED_EP[$gen]"
         done
     fi
 
@@ -536,5 +593,6 @@ wg_runaway_check() {
         _RW_PREV[$gen]="${carry[$gen]}"; _RW_PREV_AT[$gen]="${carry_at[$gen]}"
     done
     _RW_PREV_T=$now
+    _rw_repage "$now"
     return 0
 }

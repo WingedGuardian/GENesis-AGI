@@ -12,6 +12,25 @@ def _json_or_none(value: dict | None) -> str | None:
     return None if value is None else json.dumps(value)
 
 
+def _live_clause(live_only: bool) -> str:
+    """SQL that leaves out held lessons (external origin, not reviewed)."""
+    if not live_only:
+        return ""
+    from genesis.learning.procedural.lesson_shape import LIVE_LESSON_SQL
+
+    return f" AND ({LIVE_LESSON_SQL})"
+
+
+def _kind_clause(lessons: bool | None) -> str:
+    """SQL keeping only lessons (True), only earned rows (False), or both (None).
+
+    Chosen in SQL so rows of the other kind can never fill a caller's limit.
+    """
+    if lessons is None:
+        return ""
+    return " AND lesson IS NOT NULL" if lessons else " AND lesson IS NULL"
+
+
 async def create(
     db: aiosqlite.Connection,
     *,
@@ -38,15 +57,19 @@ async def create(
     first_mover: int = 0,
     trigger_spec: dict | None = None,
     lesson: dict | None = None,
+    deprecated_reason: str | None = None,
 ) -> str:
+    """Insert a row. A ``deprecated_reason`` writes it deprecated in the same
+    statement, so no reader ever sees it live in between."""
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, scenario, steps, tools_used,
             context_tags, draft, attempted_workarounds, version, created_at,
             activation_tier, tool_trigger, success_count, confidence,
             source, promotion_history, principle_embedding,
-            extraction_context, first_mover, trigger_spec, lesson)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            extraction_context, first_mover, trigger_spec, lesson,
+            deprecated, deprecated_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, person_id, task_type, principle, scenario,
          json.dumps(steps), json.dumps(tools_used),
          json.dumps(context_tags), draft,
@@ -55,7 +78,8 @@ async def create(
          json.dumps(tool_trigger) if tool_trigger else None,
          success_count, confidence, source, promotion_history,
          principle_embedding, extraction_context, first_mover,
-         _json_or_none(trigger_spec), _json_or_none(lesson)),
+         _json_or_none(trigger_spec), _json_or_none(lesson),
+         1 if deprecated_reason else 0, deprecated_reason),
     )
     await db.commit()
     return id
@@ -174,7 +198,8 @@ async def find_by_context_overlap(
     if not query_tags:
         return []
 
-    rows = await list_active(db, limit=200)
+    # A held lesson is untrusted text: it never counts as an established procedure.
+    rows = await list_active(db, limit=200, live_only=True)
     scored = []
     for row in rows:
         if exclude_id and row["id"] == exclude_id:
@@ -196,7 +221,9 @@ async def list_by_task_type(
     task_type: str,
     *,
     person_id: str | None = None,
-    limit: int = 50,
+    limit: int | None = 50,
+    live_only: bool = False,
+    lessons: bool | None = None,
 ) -> list[dict]:
     # Exclude deprecated/quarantined rows: the dominant caller is the procedure
     # novelty/dedup gate, which must NOT let a deprecated procedure suppress a new
@@ -210,8 +237,12 @@ async def list_by_task_type(
     if person_id is not None:
         sql += " AND person_id = ?"
         params.append(person_id)
-    sql += " ORDER BY confidence DESC LIMIT ?"
-    params.append(limit)
+    sql += _live_clause(live_only)
+    sql += _kind_clause(lessons)
+    sql += " ORDER BY confidence DESC"
+    if limit is not None:  # None: every row (an identity lookup must see them all)
+        sql += " LIMIT ?"
+        params.append(limit)
     cursor = await db.execute(sql, params)
     return [dict(r) for r in await cursor.fetchall()]
 
@@ -221,19 +252,24 @@ async def list_by_tier(
     tier: str,
     *,
     limit: int = 100,
+    lessons: bool | None = None,
 ) -> list[dict]:
     """List active procedures at a specific activation tier."""
     cursor = await db.execute(
-        """SELECT * FROM procedural_memory
-           WHERE activation_tier = ? AND deprecated = 0 AND quarantined = 0
-           ORDER BY confidence DESC LIMIT ?""",
+        "SELECT * FROM procedural_memory "  # noqa: S608 - fixed SQL fragments only
+        "WHERE activation_tier = ? AND deprecated = 0 AND quarantined = 0"
+        + _kind_clause(lessons)
+        + " ORDER BY confidence DESC LIMIT ?",
         (tier, limit),
     )
     return [dict(r) for r in await cursor.fetchall()]
 
 
 async def list_lessons(
-    db: aiosqlite.Connection, *, include_quarantined: bool = False
+    db: aiosqlite.Connection,
+    *,
+    include_quarantined: bool = False,
+    include_deprecated: bool = False,
 ) -> list[dict]:
     """Every non-deprecated row that carries a lesson record.
 
@@ -243,8 +279,10 @@ async def list_lessons(
     listing leaves them out, unless a caller that manages them asks.
     """
     quarantine = "" if include_quarantined else " AND quarantined = 0"
+    deprecated = "" if include_deprecated else " AND deprecated = 0"
     cursor = await db.execute(
-        "SELECT * FROM procedural_memory WHERE lesson IS NOT NULL AND deprecated = 0"
+        "SELECT * FROM procedural_memory WHERE lesson IS NOT NULL"
+        + deprecated
         + quarantine
         + " ORDER BY created_at"
     )
@@ -327,13 +365,20 @@ async def list_active(
     *,
     person_id: str | None = None,
     limit: int = 100,
+    live_only: bool = False,
+    lessons: bool | None = None,
 ) -> list[dict]:
-    """List non-deprecated, non-quarantined procedures."""
+    """List non-deprecated, non-quarantined procedures.
+
+    ``live_only`` leaves out held lessons and ``lessons`` picks a kind, both in
+    SQL, before the limit applies.
+    """
     sql = "SELECT * FROM procedural_memory WHERE deprecated = 0 AND quarantined = 0"
     params: list = []
     if person_id is not None:
         sql += " AND person_id = ?"
         params.append(person_id)
+    sql += _live_clause(live_only) + _kind_clause(lessons)
     sql += " ORDER BY confidence DESC LIMIT ?"
     params.append(limit)
     cursor = await db.execute(sql, params)

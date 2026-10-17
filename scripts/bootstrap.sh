@@ -55,6 +55,14 @@ _crash_recovery_refuse() {
     exit 1
 }
 
+# Is the state a pending merge conflict (scripts/lib/update_state_guard.py, the rule
+# update.sh, deploy_code_only.sh and the dashboard share; its exit 3)?
+_state_is_conflict_pending() {
+    local rc=0
+    python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$UPDATE_STATE" "$GENESIS_ROOT" >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 3 ]
+}
+
 if [ -f "$UPDATE_STATE" ]; then
     echo "--- Detected interrupted update state file ---"
     ROLLBACK_TAG=""
@@ -106,6 +114,11 @@ PY
     elif [ "$STATE_PHASE" = "done" ]; then
         echo "  Update completed successfully — cleaning up state file."
         rm -f "$UPDATE_STATE"
+    elif _state_is_conflict_pending; then
+        # A merge-conflict exit (update.sh exit 2): nothing merged, and the state is
+        # the resolver's anchor (its rollback tag and old commit) for the later
+        # --post-merge. It is not a crash, so it is neither recovered nor recorded.
+        echo "  An update stopped on merge conflicts (nothing was merged); its state is kept for the resolver."
     else
         echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID is dead)."
         if [ -z "$ROLLBACK_TAG" ] || ! git -C "$GENESIS_ROOT" check-ref-format "refs/tags/$ROLLBACK_TAG" >/dev/null 2>&1; then
@@ -153,33 +166,13 @@ PY
             # fast-forward killed mid-write leaves: HEAD unmoved, files half
             # new. update.sh treats that state as CRITICAL; installing over it
             # would run half-written code, so refuse and keep the state file.
-            # Every tracked path counts here, the ephemeral allowlist included:
-            # the merge writes those too, and the deployability predicate below
-            # skips them. git status cannot see a file whose index entry is
-            # flagged skip-worktree or assume-unchanged, so the lib's hidden-edit
-            # scan runs as well.
+            # The check is genesis_merge_residue (lib/deploy_checkout.sh): every
+            # tracked path (the ephemeral allowlist included: the merge writes
+            # those too), flagged entries, and files the range added. It is
+            # shared with scripts/lib/update_state_guard.py, so the guard's
+            # verdict on this state and this recovery agree.
             if [ "$STATE_PHASE" = "merging" ]; then
-                merge_dirty="" merge_hidden=""
-                if ! merge_dirty="$(git -C "$GENESIS_ROOT" status --porcelain --untracked-files=no --no-renames 2>/dev/null)"; then
-                    merge_dirty="(status unreadable)"
-                fi
-                if ! merge_hidden="$(_genesis_hidden_dirty_lines "$GENESIS_ROOT" 2>/dev/null)"; then
-                    merge_hidden="(flagged-entry status unreadable)"
-                fi
-                # A fast-forward killed after writing only the files the range
-                # ADDS leaves them untracked, which status cannot show. update.sh's
-                # pre-stop scan refuses a range that lands on an existing
-                # untracked path, so one present now appeared during the run.
-                merge_new=""
-                if [ -n "$DEPLOY_HEAD" ]; then
-                    collide_rc=0
-                    merge_new="$(genesis_range_collisions "$GENESIS_ROOT" "$rb_commit" "$DEPLOY_HEAD" 2>/dev/null)" \
-                        || collide_rc=$?
-                    if [ "$collide_rc" -eq 2 ]; then
-                        merge_new="(the update's incoming range cannot be listed)"
-                    fi
-                fi
-                merge_dirty="$(printf '%s\n%s\n%s\n' "$merge_dirty" "$merge_hidden" "$merge_new" | grep -v '^$' || true)"
+                merge_dirty="$(genesis_merge_residue "$GENESIS_ROOT" "$rb_commit" "$DEPLOY_HEAD")"
                 if [ -n "$merge_dirty" ]; then
                     printf '%s\n' "$merge_dirty" | sed 's/^/    /'
                     _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but tracked files changed during the merge (a half-written update or edits by someone else)"
@@ -213,6 +206,12 @@ PY
             # anywhere else (someone's commit or pull, another branch) is left.
             genesis_checkout_unmoved "$GENESIS_ROOT" "$OWN_HEAD" "$ORIGINAL_BRANCH" \
                 || _crash_recovery_refuse "the checkout is not at the merge this update recorded as its own; refusing to change code it does not own"
+            # On `live` the move was a rebuild, and moving it back also means
+            # putting back the git hooks the rebuild installed, which only
+            # update.sh's own rollback does.
+            if [ "$ORIGINAL_BRANCH" = live ]; then
+                _crash_recovery_refuse "the update ran on live; finish it with scripts/update.sh --post-merge (bootstrap does not roll live back until the live recovery guard lands)"
+            fi
             if ! genesis_rollback_checkout \
                 "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH" "$EPHEMERAL_BACKUP_ROOT" "$rb_commit"; then
                 _crash_recovery_refuse "the non-forced rollback checkout was refused; code was left in place"
@@ -768,10 +767,13 @@ install_browser_extra "$GENESIS_ROOT" "$VENV_DIR" \
 echo
 
 # --- Skill-security trusted baseline ---
-# Bless the currently-installed skills so the scheduled scan files findings only
-# for NEW/untrusted skills (a raw scan flags ~every capable skill as CRITICAL).
+# Bless the skills installed the FIRST time bootstrap runs, so the scheduled
+# scan files findings only for NEW/untrusted skills (a raw scan flags ~every
+# capable skill as CRITICAL). --if-missing: bootstrap runs on every update, and
+# re-seeding here would silently bless every skill added since the last one.
+# Trusting a new skill is a deliberate act: add its name to the allowlist.
 echo "--- Seeding skill-security trusted allowlist ---"
-"$VENV_DIR/bin/python" -m genesis.security.skill_scan --seed-trusted 2>&1 | tail -1 || true
+"$VENV_DIR/bin/python" -m genesis.security.skill_scan --seed-trusted --if-missing 2>&1 | tail -1 || true
 echo
 
 # --- Baseline procedures ---

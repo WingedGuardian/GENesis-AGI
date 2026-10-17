@@ -24,6 +24,12 @@ from datetime import datetime
 from genesis.memory.provenance import ORIGIN_CLASSES, ORIGIN_FIRST_PARTY, ORIGIN_OWNER
 
 MAX_PATTERNS = 8
+# A held lesson is written deprecated with this reason, so every reader that
+# skips deprecated rows skips it; the owner's review removes it.
+HELD_REASON = "held: awaiting review"
+# Written by genesis.learning.procedural.shipped_lessons when a shipped lesson's file is removed;
+# only the seed revives a row with this reason.
+SHIPPED_RETIRED_REASON = "shipped lesson file removed"
 MAX_PATTERN_CHARS = 200
 REPEAT_MODES = frozenset({"session", "every"})
 AUTHORED_VIA = frozenset({"mcp", "shipped"})
@@ -68,13 +74,15 @@ LIVE_LESSON_SQL = (
 )
 
 
-def _exact_keys(value: object, keys: frozenset[str], what: str) -> dict:
+def _exact_keys(
+    value: object, keys: frozenset[str], what: str, optional: frozenset[str] = frozenset()
+) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"{what} must be an object, not {type(value).__name__}")
     missing = sorted(keys - value.keys())
     if missing:
         raise ValueError(f"{what} is missing {', '.join(missing)}")
-    extra = sorted(value.keys() - keys)
+    extra = sorted(value.keys() - keys - optional)
     if extra:
         raise ValueError(f"{what} has unknown field(s): {', '.join(map(str, extra))}")
     return value
@@ -82,9 +90,21 @@ def _exact_keys(value: object, keys: frozenset[str], what: str) -> dict:
 
 def validate_trigger_spec(spec: object) -> dict:
     """Return *spec* if it is a valid trigger_spec, else raise ValueError."""
-    spec = _exact_keys(spec, _SPEC_KEYS, "trigger_spec")
+    spec = _exact_keys(spec, _SPEC_KEYS, "trigger_spec", frozenset({"commands"}))
+    commands = spec.get("commands")
+    if "commands" in spec:  # present means a list; null is refused, not ignored
+        # Matched on the parsed command, never as text: a shell phrase the
+        # normalizer knows (`git push`, `pytest`), checked here so the advisor
+        # can trust what it splits.
+        from genesis.learning.procedural.tool_names import _CLI_COMMANDS
+
+        if not isinstance(commands, list) or not commands or len(commands) > MAX_PATTERNS:
+            raise ValueError(f"trigger_spec.commands must list 1 to {MAX_PATTERNS} commands")
+        unknown = [c for c in commands if not isinstance(c, str) or c not in _CLI_COMMANDS]
+        if unknown:
+            raise ValueError(f"trigger_spec.commands has unknown command(s): {unknown}")
     patterns = spec["patterns"]
-    if not isinstance(patterns, list) or not patterns:
+    if not isinstance(patterns, list) or not (patterns or commands):
         raise ValueError("trigger_spec.patterns must be a list of at least one regex")
     if len(patterns) > MAX_PATTERNS:
         raise ValueError(f"trigger_spec.patterns may hold at most {MAX_PATTERNS} regexes")

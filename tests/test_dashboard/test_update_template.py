@@ -1,6 +1,10 @@
 """Verify the orchestrator template is valid Python after substitution."""
 
+import pytest
+
 from genesis.dashboard.routes.updates import _ORCHESTRATOR_TEMPLATE
+
+pytestmark = pytest.mark.usefixtures("updates_sandbox")
 
 
 def test_orchestrator_template_compiles():

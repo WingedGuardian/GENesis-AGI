@@ -12,6 +12,8 @@
 #   _git_dir             its git directory (the reflog is <that>/logs/HEAD)
 #   _SERVING_COMMIT_PY   the source of scripts/lib/serving_commit.py, read at
 #                        the caller's start so a merge cannot swap it mid-run
+#   _server_outside_unit succeeds (setting _OUTSIDE_PID) when a server runs
+#                        outside the unit; defined by deploy_code_only.sh
 #
 # The files under scripts/ the server itself consumes, in two kinds, each with
 # the call site that consumes it. tests/test_scripts/
@@ -29,10 +31,11 @@ _RUNTIME_FRESH_SCRIPTS=(
     scripts/disk_reclaim.py               # run by autonomy/remediation.py
     scripts/lib/live_checkout.py          # run by dashboard/routes/updates.py before an update
     scripts/lib/managed_units.py          # run by dashboard/routes/updates.py for the update status card
+    scripts/lib/update_state_guard.py     # loaded by dashboard/routes/updates.py for /apply and the progress poll
     scripts/hooks/bash_allowlist_guard.sh # run through .claude/hooks/genesis-hook by cc/invoker.py
     scripts/hooks/bash_allowlist_lib.sh   # sourced by bash_allowlist_guard.sh on every run
     scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot
-    scripts/lib/deploy_checkout.sh        # sourced by the same probe (its dirty-tree predicate)
+    scripts/lib/deploy_checkout.sh        # sourced by the same probe (its dirty-tree predicate), and by update_state_guard.py
     scripts/hooks/main_checkout_guard.py  # registered by cc/invoker.py for dispatched sessions
     scripts/hooks/hook_input.py           # imported by main_checkout_guard.py on every run
     scripts/hooks/hook_output.py          # imported by main_checkout_guard.py to emit a note
@@ -317,12 +320,29 @@ _bracket() {
     BRACKET="b1-$(printf '%s\n' "$SERVING" "$mainpid" "$inv" "$overrides" "$fresh" | sha256sum | cut -c1-24)"
 }
 
+# ActiveState of one user unit, or "unknown" when systemd does not say.
+_unit_active_state() {
+    local s
+    s="$(systemctl --user show "$1" -p ActiveState --value 2>/dev/null || true)"
+    printf '%s' "${s:-unknown}"
+}
+
 # `status [--verify <token>]`. Prints the fields a human reads and the bracket;
 # with --verify, exits 0 when the token still holds and 1 when it does not.
 _status_main() {
     local verify="$1" inv
     _read_serving
     echo "serving: ${SERVING:-unknown ($SERVING_WHY)}"
+    # For scripts/deploy_candidates: with nothing running Genesis's code (the
+    # server, and the bridge that runs the full stack while the server is down),
+    # readiness judges the code the next start runs instead. A server outside the
+    # unit (update.sh's degraded fallback) runs while both units read stopped: it
+    # adds a third word, and a line of any other length never reads as stopped.
+    local outside=""
+    if _server_outside_unit; then
+        outside=" outside:$_OUTSIDE_PID"
+    fi
+    echo "server-state: $(_unit_active_state genesis-server) $(_unit_active_state genesis-bridge)$outside"
     echo "head: $(_git_ro rev-parse HEAD)"
     echo "mainpid: $(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || echo unknown)"
     inv="$(systemctl --user show genesis-server -p InvocationID --value 2>/dev/null || true)"

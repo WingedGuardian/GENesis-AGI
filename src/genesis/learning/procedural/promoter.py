@@ -34,6 +34,7 @@ from genesis.learning.procedural.operations import (
     READ_CONFIDENCE_DISCOUNT,
     effective_confidence,
 )
+from genesis.learning.procedural.tool_names import names_a_tool
 from genesis.learning.procedural.trigger_cache import regenerate
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,8 @@ def _compute_tier(row: dict) -> str:
     """
     s = row["success_count"]
     conf = row["confidence"]
-    has_trigger = bool(row.get("tool_trigger"))
+    # A trigger the advisor can match: inert command words or [] are not one.
+    has_trigger = names_a_tool(row.get("tool_trigger"))
     current = row.get("activation_tier") or "DORMANT"
 
     qualified = "DORMANT"
@@ -105,7 +107,10 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
 
     Returns summary: {"promotions": N, "demotions": N, "quarantined": N}.
     """
-    rows = await procedural.list_active(db)
+    # Earned rows and lessons are listed apart, so lessons (all at the same
+    # authored confidence) never push earned rows out of the earned window.
+    # Every lesson is checked for quarantine; none is ever promoted.
+    rows = await procedural.list_active(db, lessons=False) + await procedural.list_lessons(db)
     promotions = 0
     demotions = 0
     quarantined = 0

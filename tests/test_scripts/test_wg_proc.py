@@ -18,6 +18,7 @@ What these pin:
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import os
 import subprocess
@@ -56,6 +57,22 @@ def _key(path: Path) -> str:
     return f"{st.st_dev}:{st.st_ino}"
 
 
+def _fd_of(pid: int, target: Path) -> str | None:
+    """The fd number at which pid holds target, or None. Descriptors come and
+    go while the interpreter starts: one can vanish between list and read."""
+    try:
+        names = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return None
+    for n in names:
+        try:
+            if os.readlink(f"/proc/{pid}/fd/{n}") == str(target):
+                return n
+        except OSError:
+            continue
+    return None
+
+
 @pytest.fixture
 def writer(tmp_path):
     """A real process holding tmp_path/out open for writing on fd 3."""
@@ -70,16 +87,11 @@ def writer(tmp_path):
         ],
     )
     deadline = time.time() + 10
-    while time.time() < deadline and not any(
-        os.path.realpath(f"/proc/{p.pid}/fd/{n}") == str(target)
-        for n in os.listdir(f"/proc/{p.pid}/fd")
-    ):
+    fd = _fd_of(p.pid, target)
+    while fd is None and time.time() < deadline:
         time.sleep(0.05)
-    fd = next(
-        n
-        for n in os.listdir(f"/proc/{p.pid}/fd")
-        if os.path.realpath(f"/proc/{p.pid}/fd/{n}") == str(target)
-    )
+        fd = _fd_of(p.pid, target)
+    assert fd is not None, "fixture precondition: the writer opened the file"
     yield p, target, fd
     if p.poll() is None:
         p.kill()
@@ -270,6 +282,61 @@ def test_every_candidate_of_one_pid_is_read_through_one_handle(fake, monkeypatch
     assert fields[0][1:] == fields[1][1:], "both rows describe the same process"
 
 
+@pytest.mark.parametrize("err", [errno.EACCES, errno.EPERM])
+def test_a_process_that_cannot_be_inspected_is_unknown_never_gone(fake, monkeypatch, err):
+    """Only a disappearance (ENOENT, ESRCH) means gone. Any other failure to
+    open /proc/<pid> reads as unknown in a chain (so the response vetoes) and
+    as an unknown identity for a holder (so the file stays watched) (review
+    finding)."""
+    proc, target = fake
+    _fake(proc, 4200, target, comm=b"dd")
+    real_open = os.open
+
+    def deny(path, *a, **kw):
+        if str(path) == f"{proc}/4200":
+            raise OSError(err, os.strerror(err))
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(wg.os, "open", deny)
+    assert wg.chain(str(proc), ["4200 -"])[0].split("\t")[1] == "unknown"
+    assert wg.holders(str(proc), [f"{_key(target)} 4200 1"]) == [
+        "\t".join([_key(target), "4200", "?", "?", "?", "?", "?"])
+    ]
+
+
+def test_a_pid_with_an_unreadable_file_ends_with_an_unknown_identity(fake, monkeypatch):
+    """One process holds a readable file and one whose descriptor cannot be
+    read: the unknown row is printed LAST, so the watchgod (one identity per
+    pid, the last row wins) never acts on it with the readable file's start
+    time (review finding)."""
+    proc, target = fake
+    other = target.parent / "other"
+    other.touch()
+    _fake(proc, 4300, target, comm=b"dd")
+    (proc / "4300" / "fd" / "2").symlink_to(other)
+    (proc / "4300" / "fdinfo" / "2").write_text("pos:\t0\nflags:\t0102001\n")
+    real_stat = os.stat
+
+    def stale(path, *a, **kw):
+        if str(path) == "fd/2":
+            raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(wg.os, "stat", stale)
+    rows = [
+        r.split("\t")
+        for r in wg.holders(str(proc), [f"{_key(target)} 4300 1", f"{_key(other)} 4300 2"])
+    ]
+    assert [r[0] for r in rows] == [_key(target), _key(other)]
+    assert rows[0][2] == "777" and rows[-1][2:] == ["?"] * 5, "the last row for the pid is unknown"
+
+
+def test_a_process_that_is_gone_is_gone(fake):
+    proc, _target = fake
+    assert wg.chain(str(proc), ["4299 -"])[0].split("\t")[1] == "gone"
+    assert wg.holders(str(proc), ["1:2 4299 1"]) == []
+
+
 def test_malformed_candidates_are_skipped(fake):
     proc, target = fake
     _fake(proc, 4103, target)
@@ -289,3 +356,98 @@ def test_usage_error_exits_2():
         [sys.executable, "-I", "-S", str(_PY), "/proc"], capture_output=True, timeout=60
     )
     assert r.returncode == 2
+
+
+# ── chain: the ancestry, each link bound ──────────────────────────
+
+
+def _cfake(
+    proc: Path, pid: int, comm: bytes, ppid: int, st: int, state: str = "S", threads: int = 1
+) -> None:
+    d = proc / str(pid)
+    d.mkdir(parents=True, exist_ok=True)
+    rest = [state, str(ppid)] + ["0"] * 15 + [str(threads), "0", str(st)] + ["0"] * 10
+    (d / "stat").write_bytes(f"{pid} (".encode() + comm + b") " + " ".join(rest).encode() + b"\n")
+
+
+def _chain(root: Path, stdin: str) -> list[list[str]]:
+    return [r.split("\t") for r in wg.chain(str(root), stdin.splitlines())]
+
+
+def test_chain_finds_the_claude_ancestor_and_the_command_root(tmp_path):
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    _cfake(tmp_path, 200, b"bash", 100, 2000)
+    _cfake(tmp_path, 201, b"grep", 200, 2010, threads=3)
+    assert _chain(tmp_path, "201 2010") == [
+        ["201", "ok", "grep", "S", "3", "2", "200:2000", "201:2010,200:2000"]
+    ]
+    assert _chain(tmp_path, "200 -")[0][1:2] + _chain(tmp_path, "200 -")[0][5:7] == [
+        "ok",
+        "1",
+        "200:2000",
+    ]
+
+
+def test_chain_says_claude_for_the_session_itself_and_nocc_without_one(tmp_path):
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    _cfake(tmp_path, 300, b"python", 1, 3000)
+    assert _chain(tmp_path, "100 500")[0][1] == "claude"
+    assert _chain(tmp_path, "300 3000")[0][1] == "nocc"
+
+
+def test_chain_says_gone_for_another_start_time_or_no_process(tmp_path):
+    _cfake(tmp_path, 200, b"bash", 100, 2000)
+    assert _chain(tmp_path, "200 9999")[0][1] == "gone", (
+        "a reused pid is not the process asked about"
+    )
+    assert _chain(tmp_path, "4242 1")[0][1] == "gone"
+
+
+def test_chain_says_unknown_when_a_parent_changes_while_read(tmp_path, monkeypatch):
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    _cfake(tmp_path, 200, b"bash", 100, 2000)
+    real = wg._stat_fields
+    calls = []
+
+    def reparented(dfd):
+        calls.append(dfd)
+        start, state, comm, ppid = real(dfd)
+        # The child's re-read after its parent was read: reparented to init.
+        return (
+            (start, state, comm, "1")
+            if comm == "bash" and len(calls) > 2
+            else (start, state, comm, ppid)
+        )
+
+    monkeypatch.setattr(wg, "_stat_fields", reparented)
+    assert _chain(tmp_path, "200 2000")[0][1] == "unknown"
+
+
+def test_chain_says_unknown_when_a_start_time_cannot_be_read(tmp_path):
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    d = tmp_path / "200"
+    d.mkdir()
+    (d / "comm").write_bytes(b"bash\n")
+    (d / "status").write_bytes(b"Name:\tbash\nPPid:\t100\n")
+    assert _chain(tmp_path, "200 -")[0][1] == "unknown"
+
+
+def test_chain_skips_malformed_lines(tmp_path):
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    assert _chain(tmp_path, "x 1\n100\n100 5a\n") == []
+
+
+def test_chain_says_gone_when_the_process_itself_exits_mid_walk(tmp_path, monkeypatch):
+    """Its own re-read after the parent was read finds it gone: gone, not
+    unknown (unknown would veto the whole response)."""
+    _cfake(tmp_path, 100, b"claude", 1, 500)
+    _cfake(tmp_path, 200, b"bash", 100, 2000)
+    real = wg._stat_fields
+    calls = []
+
+    def exits(dfd):
+        calls.append(dfd)
+        return None if len(calls) == 3 else real(dfd)
+
+    monkeypatch.setattr(wg, "_stat_fields", exits)
+    assert _chain(tmp_path, "200 2000")[0][1] == "gone"
