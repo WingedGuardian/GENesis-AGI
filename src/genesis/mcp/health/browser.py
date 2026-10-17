@@ -57,7 +57,10 @@ _REFUSE_CARD_RUN_JS = (
 # File-based logging for the entire MCP health server — routes ALL log
 # output to ~/tmp/mcp_health.log so it's readable after timeouts.
 # The MCP server runs as a CC child process; its stderr is inaccessible.
-_mcp_log_dir = Path.home() / "tmp"
+# This runs at import, in every process that imports the module (a test run
+# included), so GENESIS_MCP_LOG_DIR can move it; a directory that does not
+# exist attaches no handler at all.
+_mcp_log_dir = Path(os.environ.get("GENESIS_MCP_LOG_DIR") or Path.home() / "tmp").expanduser()
 if _mcp_log_dir.is_dir():
     _mcp_fh = logging.FileHandler(_mcp_log_dir / "mcp_health.log")
     _mcp_fh.setFormatter(logging.Formatter(
@@ -70,7 +73,7 @@ if _mcp_log_dir.is_dir():
 # Direct file-write debug log for Turnstile — bypasses logging framework
 # entirely to guarantee output is visible. The logging.FileHandler approach
 # produced empty files despite correct setup (likely a process/import issue).
-_TS_LOG_PATH = Path.home() / "tmp" / "turnstile_debug.log"
+_TS_LOG_PATH = _mcp_log_dir / "turnstile_debug.log"
 
 
 def _ts_log_write(msg: str) -> None:
