@@ -117,22 +117,22 @@ def process_label(pid: int) -> str:
         return _comm(pid)
     if not _INTERPRETER_RE.match(head):
         return head
-    rest = iter(args[1:])
-    for arg in rest:
-        if arg == "-m":
-            module = next(rest, None)
-            if module is None:
-                return head
-            return f"{head} -m {module}" if _SAFE_ARG_RE.match(module) else f"{head} -m"
-        if arg == "-c":
-            return f"{head} -c"
-        if arg.startswith("-"):
-            continue
-        # The first positional may be an option's VALUE (`node --inspect-port 9229
-        # x.js`), so only something shaped like a script path names the program.
-        if _SAFE_ARG_RE.match(arg) and ("/" in arg or arg.endswith(_SCRIPT_SUFFIXES)):
-            return f"{head} {os.path.basename(arg)}"
+    if len(args) < 2:
         return head
+    arg = args[1]
+    if arg == "-m" and head.startswith("python"):
+        if len(args) < 3:
+            return head
+        module = args[2]
+        return f"{head} -m {module}" if _SAFE_ARG_RE.match(module) else f"{head} -m"
+    if arg == "-c":
+        return f"{head} -c"
+    # Unknown options stop enrichment: their following word can be a private
+    # option value even when it looks exactly like a script or module name.
+    if arg.startswith("-"):
+        return head
+    if _SAFE_ARG_RE.match(arg) and ("/" in arg or arg.endswith(_SCRIPT_SUFFIXES)):
+        return f"{head} {os.path.basename(arg)}"
     return head
 
 
@@ -142,6 +142,16 @@ def _read_int(path: str) -> int | None:
             return int(f.read().strip())
     except (OSError, ValueError):
         return None
+
+
+def _cgroup_type(root: str) -> str | None:
+    """Read the binding's accounting regime; unknown is not a process domain."""
+    try:
+        with open(f"{root}/cgroup.type") as f:
+            kind = f.read(64).strip()
+    except OSError:
+        return None
+    return kind if kind in {"domain", "domain threaded", "threaded", "domain invalid"} else None
 
 
 def _read_cgroup(pid: int) -> str | None:
@@ -378,17 +388,31 @@ def take_snapshot(budget: dict) -> dict | None:
     root = budget.get("path")
     if not root:
         return None
+    kind = _cgroup_type(root)
     truncated: set[str] = set()
     nodes, pids, unreadable = _walk_cgroups(root, truncated)
     # cgroup.procs omits a process with no live threads (an unreaped zombie),
     # which pids.current still counts until it is reaped: find those through
     # their own /proc/<pid>/cgroup.
     prefix = _cgroup_prefix(root)
-    pids |= _pids_by_cgroup_prefix(prefix, truncated)
-    if len(pids) > _PID_LIMIT:
-        truncated.add("processes")
-        pids = set(sorted(pids)[:_PID_LIMIT])
-    trees, threads_seen, vanished, excluded = _group_processes(pids, prefix)
+    trees = []
+    threads_seen = vanished = excluded = None
+    # A domain-threaded ROOT contains the whole thread domain; a threaded
+    # interior can contain only some threads of a process. Whole-process stat
+    # counts cannot be assigned to that interior, even through the /proc fallback.
+    reason = None
+    if kind in {"domain", "domain threaded"}:
+        pids |= _pids_by_cgroup_prefix(prefix, truncated)
+        if len(pids) > _PID_LIMIT:
+            truncated.add("processes")
+            pids = set(sorted(pids)[:_PID_LIMIT])
+        trees, threads_seen, vanished, excluded = _group_processes(pids, prefix)
+    else:
+        reason = "binding cgroup type unavailable" if kind is None else "unsupported binding cgroup type"
+    if _cgroup_type(root) != kind:
+        reason = "binding cgroup type changed during collection"
+        trees = []
+        threads_seen = vanished = excluded = None
     # Labels need a cmdline read each, so only for what the snapshot shows.
     for tree in trees:
         tree["label"] = _label_if_same(tree["root_pid"], tree["root_starttime"])
@@ -405,8 +429,13 @@ def take_snapshot(budget: dict) -> dict | None:
         "path": root,
         "budget_current": budget.get("current"),
         "budget_max": budget.get("max"),
+        "process_attribution": {
+            "status": "unavailable" if reason else "sampled",
+            "reason": reason,
+            "cgroup_type": kind,
+        },
         "threads_seen": threads_seen,
-        "processes_seen": sum(t["processes"] for t in trees),
+        "processes_seen": sum(t["processes"] for t in trees) if reason is None else None,
         "vanished": vanished,
         "excluded": excluded,
         "cgroups_unreadable": unreadable,
@@ -436,11 +465,19 @@ def summarize(snapshot: dict) -> str:
         f"{n['cgroup']}: {n['tasks'] if n['tasks'] is not None else '?'}"
         for n in snapshot["top_cgroups"]
     )
-    text = (
-        f"Top task holders: {trees or 'none readable'}. "
-        f"Top cgroups: {cgroups or 'none readable'}. "
-        f"Counted {snapshot['threads_seen']} of {snapshot['budget_current']} tasks."
-    )
+    attribution = snapshot.get("process_attribution", {})
+    if attribution.get("status") == "unavailable":
+        text = (
+            f"Process attribution unavailable ({attribution['reason']}). "
+            f"Top cgroups: {cgroups or 'none readable'}. "
+            f"Binding cgroup reports {snapshot['budget_current']} tasks."
+        )
+    else:
+        text = (
+            f"Top task holders: {trees or 'none readable'}. "
+            f"Top cgroups: {cgroups or 'none readable'}. "
+            f"Counted {snapshot['threads_seen']} of {snapshot['budget_current']} tasks."
+        )
     if snapshot.get("truncated"):
         text += " Collection is a partial sample (" + ", ".join(snapshot["truncated"]) + ")."
     # Filesystem-surrogate paths retain byte identity in JSON; the alert is text.

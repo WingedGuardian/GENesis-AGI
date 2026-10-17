@@ -104,6 +104,7 @@ class Fake:
         d.mkdir(parents=True, exist_ok=True)
         (d / "pids.current").write_text(f"{tasks}\n")
         (d / "cgroup.procs").write_text("".join(f"{p}\n" for p in procs))
+        (d / "cgroup.type").write_text("domain\n")
         return d
 
 
@@ -227,7 +228,7 @@ def test_no_path_is_no_snapshot(fake):
 @pytest.mark.parametrize(
     ("argv", "label"),
     [
-        (["/usr/bin/node", "--max-old-space-size=4096", "/a/b/cli.js"], "node cli.js"),
+        (["/usr/bin/node", "--max-old-space-size=4096", "/a/b/cli.js"], "node"),
         (["python3.12", "-m", "genesis"], "python3.12 -m genesis"),
         (["bash", "-c", "curl -H 'Authorization: x' http://h"], "bash -c"),
         (["uvx", "--from", "git+https://u:tok@host/r", "tool"], "uvx"),
@@ -487,3 +488,66 @@ def test_snapshot_publication_uses_private_atomic_file_permissions(fake, tmp_pat
     result = pb.snapshot_for(_budget(fake))
     assert result is not None
     assert Path(result["file"]).stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("kind", ["threaded", "domain invalid", "unknown", None])
+@pytest.mark.parametrize("readable_procs", [True, False])
+def test_unsupported_accounting_retains_tasks_without_process_claims(fake, kind, readable_procs):
+    root = fake.cgroup("", 2, procs=[12])
+    fake.process(12, "worker", 1, 7, ["worker"], cgroup="/cg")
+    (root / "cgroup.type").unlink()
+    if kind is not None:
+        (root / "cgroup.type").write_text(kind + "\n")
+    if not readable_procs:
+        (root / "cgroup.procs").unlink()
+    snap = pb.take_snapshot(_budget(fake, current=2))
+    assert snap["process_attribution"]["status"] == "unavailable"
+    assert snap["threads_seen"] is snap["processes_seen"] is None
+    assert snap["trees"] == []
+    assert snap["top_cgroups"][0]["tasks"] == 2
+    text = pb.summarize(json.loads(json.dumps(snap)))
+    assert "Process attribution unavailable" in text
+    assert "Binding cgroup reports 2 tasks" in text
+    assert "Top task holders" not in text and "Counted" not in text
+
+
+def test_full_thread_domain_root_remains_supported(fake):
+    root = fake.cgroup("", 7, procs=[12])
+    (root / "cgroup.type").write_text("domain threaded\n")
+    child = fake.cgroup("threaded", 2)
+    (child / "cgroup.type").write_text("threaded\n")
+    (child / "cgroup.procs").unlink()  # Interior reads are unsupported.
+    fake.process(12, "worker", 1, 7, ["worker"], cgroup="/cg")
+    snap = pb.take_snapshot(_budget(fake, current=7))
+    assert snap["process_attribution"]["status"] == "sampled"
+    assert snap["threads_seen"] == 7 and snap["processes_seen"] == 1
+    assert snap["cgroups_unreadable"] == 1
+
+
+@pytest.mark.parametrize("after", ["threaded", "domain invalid", None])
+def test_accounting_type_change_discards_process_totals(fake, monkeypatch, after):
+    fake.cgroup("", 7, procs=[12])
+    fake.process(12, "worker", 1, 7, ["worker"], cgroup="/cg")
+    kinds = iter(["domain", after])
+    monkeypatch.setattr(pb, "_cgroup_type", lambda root: next(kinds))
+    snap = pb.take_snapshot(_budget(fake, current=7))
+    assert snap["threads_seen"] is None and snap["trees"] == []
+    assert "changed during collection" in pb.summarize(snap)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["node", "--require", "/private/preload.js", "main.js"],
+        ["node", "--require=/private/preload.js", "main.js"],
+        ["bash", "-lc", "/private/command.sh"],
+        ["python3", "-W", "/private/filter.py", "main.py"],
+        ["python3", "-I", "-m", "private.module"],
+        ["node", "-m", "private.module"],
+        ["bash", "-m", "private.module"],
+        ["uv", "--directory", "/private/project.py", "run"],
+    ],
+)
+def test_unknown_options_never_enrich_labels(fake, argv):
+    fake.process(60, "fixture", 1, 1, argv)
+    assert pb.process_label(60) == argv[0]
