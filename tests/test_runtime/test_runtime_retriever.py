@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -36,13 +37,18 @@ class TestRuntimeRetrieverProperties:
         GenesisRuntime.reset()
 
     @pytest.mark.skipif(
-        not _qdrant_available(),
-        reason="Qdrant not reachable; bootstrap test requires real Qdrant "
-               "because its mocks don't patch the lazy imports in "
-               "genesis.runtime.init.memory",
+        os.environ.get("GENESIS_LIVE_E2E") != "1",
+        reason="bootstrap test requires real Qdrant because its mocks don't patch "
+               "the lazy imports in genesis.runtime.init.memory; it runs against "
+               "the live Qdrant, so opt in with GENESIS_LIVE_E2E=1",
     )
+    @pytest.mark.live_service
     @pytest.mark.asyncio
     async def test_retriever_created_after_bootstrap(self):
+        # Probed here, inside the live_service test, never at collection: the
+        # outbound fence refuses a connect made outside any test.
+        if not _qdrant_available():
+            pytest.skip("Qdrant not reachable")
         GenesisRuntime.reset()
         rt = GenesisRuntime.instance()
 

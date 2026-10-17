@@ -1,12 +1,10 @@
 """Integration test — real CC CLI invocation.
 
-Skipped when:
-- claude CLI is not on PATH
-- Running inside a Claude Code session (CLAUDECODE env var set)
+Skipped unless opted in with GENESIS_LIVE_E2E=1 (it calls the real Claude API),
+and inside a Claude Code session (CLAUDECODE env var set).
 """
 
 import os
-import shutil
 
 import pytest
 
@@ -14,8 +12,8 @@ from genesis.cc.invoker import CCInvoker
 from genesis.cc.types import CCInvocation
 
 _skip_no_claude = pytest.mark.skipif(
-    not shutil.which("claude"),
-    reason="claude CLI not available",
+    os.environ.get("GENESIS_LIVE_E2E") != "1",
+    reason="calls the real Claude API; opt in with GENESIS_LIVE_E2E=1",
 )
 _skip_inside_cc = pytest.mark.skipif(
     os.environ.get("CLAUDECODE") == "1",
@@ -25,6 +23,7 @@ _skip_inside_cc = pytest.mark.skipif(
 
 @_skip_no_claude
 @_skip_inside_cc
+@pytest.mark.real_tool("claude")
 async def test_real_cc_invocation():
     """Invoke claude -p with a trivial prompt and verify output parsing."""
     invoker = CCInvoker()
@@ -42,6 +41,7 @@ async def test_real_cc_invocation():
 
 @_skip_no_claude
 @_skip_inside_cc
+@pytest.mark.real_tool("claude")
 async def test_real_cc_with_system_prompt():
     """Invoke claude -p with a system prompt."""
     invoker = CCInvoker()

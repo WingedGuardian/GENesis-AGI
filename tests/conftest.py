@@ -391,7 +391,33 @@ def _is_introspection_only(config) -> bool:
     )
 
 
+pytest_plugins = [
+    "tests._live_fence",
+    "tests._live_closure",
+    "tests._live_outbound",
+    "tests._live_writes",
+]
+
+
 def pytest_configure(config):
+    _configure_lock_and_basetemp(config)
+    # Armed AFTER the lock (a run refused by it exits above) and after basetemp is
+    # placed (the fence allows fakes under it). See tests/_live_fence.py.
+    from tests import _live_closure, _live_fence, _live_outbound, _live_writes
+
+    _live_fence.install(config)
+    # Credentials and state paths out of the environment, before any test runs
+    # (a test's own monkeypatch still wins). See tests/_live_closure.py.
+    _live_closure.install(config)
+    # Connections to live services on this machine refused, as on CI. See
+    # tests/_live_outbound.py.
+    _live_outbound.install(config)
+    # Writes into the real home outside the test's temp dirs, reported (not
+    # failed). See tests/_live_writes.py.
+    _live_writes.install(config)
+
+
+def _configure_lock_and_basetemp(config):
     # ── Box-wide serialization ─────────────────────────────────────────────
     # Acquire BEFORE anything else, and before the basetemp early-return
     # below, so every exit path from this function is already governed.
@@ -493,6 +519,10 @@ def pytest_unconfigure(config):
     produces."""
     target = getattr(config, "_genesis_basetemp_cleanup", None)
     try:
+        from tests import _live_closure, _live_fence
+
+        _live_fence.uninstall_files(config)
+        _live_closure.uninstall_files(config)
         if target:
             # BROAD for the same reason as pytest_configure's fallback: a hook that
             # raises turns a passing suite into exit 1, and cleanup is best-effort.
@@ -720,6 +750,9 @@ def _isolate_genesis_db_path(tmp_path):
         "genesis.env.genesis_db_path",
         lambda: tmp_path / "isolated-genesis.db",
     )
+    # The same file for child processes, and for modules that bound the name
+    # before this patch (``from genesis.env import genesis_db_path``).
+    mp.setenv("GENESIS_DB_PATH", str(tmp_path / "isolated-genesis.db"))
     yield
     mp.undo()
 
