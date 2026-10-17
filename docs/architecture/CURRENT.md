@@ -3736,7 +3736,22 @@ verified: ba9dd8a37 2026-10-09
   before tier 1 and never escalates while it stands. `update.sh` prints what bootstrap changed
   outside the checkout at the end of every run, a failed one included. A
   symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
-  `--take-templates`.
+  `--take-templates`. The root-owned files the deploy writes under `/etc`
+  (bootstrap's journald and sshd drop-ins, and the memory and network resilience
+  drop-ins and watchdog units) carry the same stamp through
+  `scripts/lib/managed_etc.sh`: one edited by hand (or a symlink) is KEPT and
+  named in the run summary as `kept-etc <path>` (so is one sudo could not
+  inspect or read, which is never written), a file from before stamps is
+  stamped once without restarting anything (the networkd keep-config drop-in
+  and journald: nothing else runs; the memory-resilience drop-ins, oomd's
+  config included, and the network watchdog units: a `systemctl daemon-reload`
+  only; sshd: `sshd -t` only), and `--take-template <full path>` (or `etc:*`,
+  never a bare `*`) replaces one after copying it, mode 0600, to the same path
+  under the run's `~/.genesis/deploy-backups/<time>/`. A taken sshd drop-in that
+  `sshd -t` rejects is put back from that copy. Unlike units, an edited `/etc`
+  file does not make the update refuse yet: each has had one Genesis content
+  version, so keeping it loses nothing; the refusal comes with the first content
+  change (#3282).
 - **The restart guard, `~/.genesis/update_state.json`** (deploy scripts and the
   dashboard update routes, #3139): `update.sh` writes it at each phase; an
   update that merged code and never activated it, or that stopped on merge
