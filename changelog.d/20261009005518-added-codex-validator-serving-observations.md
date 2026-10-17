@@ -1,0 +1,1 @@
+- Add inactive, bounded serving-status observations for the dedicated Codex validator, using the existing deployment validation token.

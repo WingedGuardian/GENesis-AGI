@@ -12,8 +12,11 @@ exactly one command: the sealed request invocation
 --workspace-root <workspace> --request <workspace>/requests/<uuid>.json`),
 matched as exact argv and exact canonical quoting, with the request file
 private, owned and unshared (`codex_validator_shell.py`); every other shell
-command is refused. Requests use strict JSON and a closed schema whose only
-operation is `protocol_probe`. Patches admit
+command is refused. Requests use strict JSON and closed per-operation schemas;
+the operations are `protocol_probe`, `serving_status` and `serving_verify`.
+Serving observations project the existing deploy status tripwire; unknown,
+changed, partial or oversized output does not establish serving identity. The
+bracket retains the existing deploy tripwire limitations. Patches admit
 every potential source and move destination inside the trusted workspace;
 existing symlinks, special files, hardlinked leaves, parent traversal, and
 instruction/configuration paths (`AGENTS.md`, `.codex`, `.agents`, `.git`) are
