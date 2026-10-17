@@ -17,7 +17,6 @@ import os
 import string
 import subprocess
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -29,21 +28,10 @@ CHECKER = REPO / "scripts" / "lib" / "managed_units.py"
 
 
 @pytest.fixture(autouse=True)
-def _never_the_install(tmp_path, monkeypatch):
-    home = tmp_path / "isolated-home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-
-    def _refuse(*args, **kwargs):
-        raise AssertionError(f"a test reached a real process launch: {args!r}")
-
-    # The routes module's own view of subprocess, with Popen refused. Patching
-    # subprocess.Popen itself would also break subprocess.run everywhere.
-    routes_subprocess = types.SimpleNamespace(
-        **{name: getattr(subprocess, name) for name in dir(subprocess) if not name.startswith("__")}
-    )
-    routes_subprocess.Popen = _refuse
-    monkeypatch.setattr(updates, "subprocess", routes_subprocess)
+def _never_the_install(updates_sandbox):
+    """The shared sandbox (tests/_update_routes_sandbox.py): HOME and every path
+    constant in a temporary home, and the routes module's Popen refusing."""
+    return updates_sandbox
 
 
 def _git(repo: Path, *args: str) -> None:

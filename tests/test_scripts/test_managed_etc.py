@@ -47,6 +47,24 @@ def test_content_ending_in_a_newline_still_migrates_a_legacy_file(tmp_path):
     assert _put(tmp_path, target, "[X]\nY=1\n").startswith("migrated|")
 
 
+def test_nul_corrupted_legacy_content_is_not_owned_by_text_normalization(tmp_path):
+    target = tmp_path / "etc" / "x.conf"
+    target.parent.mkdir()
+    original = b"[X]\nY=1\x00\n"
+    target.write_bytes(original)
+    assert _put(tmp_path, target, "[X]\nY=1") == "kept-edited|"
+    assert target.read_bytes() == original
+
+
+def test_nul_corrupted_stamp_is_verified_as_raw_bytes(tmp_path):
+    target = tmp_path / "etc" / "x.conf"
+    assert _put(tmp_path, target, "[X]\nY=1") == "written|"
+    original = target.read_bytes().replace(b"Y=1", b"Y=1\x00")
+    target.write_bytes(original)
+    assert _put(tmp_path, target, "[X]\nY=2") == "kept-edited|"
+    assert target.read_bytes() == original
+
+
 def test_a_stale_backup_path_never_survives_into_the_next_call(tmp_path):
     target = tmp_path / "etc" / "x.conf"
     out = _put(tmp_path, target, "[X]\nY=1", extra="GENESIS_ETC_BACKUP=/stale/path")
@@ -162,6 +180,26 @@ def test_a_sudo_that_cannot_inspect_never_writes_an_edited_file(tmp_path):
     assert result == "kept-nonregular"
     assert f"kept-etc {target}: could not be inspected" in lines
     assert "left as it is" in out
+
+
+def test_next_put_cannot_publish_or_retire_stale_validation_context(tmp_path):
+    target = tmp_path / "etc" / "x.conf"
+    retained = tmp_path / "earlier-recovery"
+    retained.write_bytes(b"earlier original\n")
+    result, _, _, lines = _put_logged(
+        tmp_path, target, "[X]\nY=1", {},
+        extra=(
+            f'GENESIS_ETC_SNAPSHOT="{retained}"; '
+            'GENESIS_ETC_PENDING_SUMMARY="created-etc /wrong-target"; '
+            'GENESIS_ETC_TARGET=/wrong-target; GENESIS_ETC_DEFERRED=validate; '
+            'GENESIS_ETC_EXISTED=1; GENESIS_ETC_ATTEMPTED=1; '
+            'GENESIS_ETC_BACKUP=/wrong-backup'
+        ),
+    )
+    assert result == "written"
+    assert lines == [f"created-etc {target}"]
+    assert retained.read_bytes() == b"earlier original\n"
+    assert target.read_text().startswith("[X]\nY=1\n# genesis-managed v1 sha256=")
 
 
 def test_a_sudo_that_cannot_read_never_writes(tmp_path):

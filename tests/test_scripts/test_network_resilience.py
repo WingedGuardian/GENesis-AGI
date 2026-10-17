@@ -161,6 +161,26 @@ def _run_apply(env_overlay: dict) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.mark.parametrize("partial", [False, True])
+def test_failed_metadata_migration_does_not_claim_network_configuration_applied(tmp_path, partial):
+    env = _stage(tmp_path)
+    assert _run_apply(env).returncode == 0
+    target = _paths(env)["keepconf"]
+    original = target.read_text().split("# genesis-managed v1 sha256=", 1)[0].encode()
+    target.write_bytes(original)
+    log = Path(env["SYSTEMCTL_LOG"])
+    log.write_text("")
+    fault = 'head -c 7 > "$2"; ' if partial else ''
+    sudo = tmp_path / "bin/sudo"
+    sudo.write_text(_SUDO_STUB.replace('exec "$@"',
+        f'if [ "$1" = tee ] && [[ "$2" == */genesis-keep-config.conf ]]; then {fault}exit 1; fi\nexec "$@"'))
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("NOT fully applied" in result.stdout) == partial
+    assert target.read_bytes() == (original[:7] if partial else original)
+    assert "reload" not in log.read_text().splitlines()
+
+
 def _paths(env: dict) -> dict[str, Path]:
     etc = Path(env["NETRES_ETC_ROOT"])
     libexec = Path(env["NETRES_LIBEXEC_DIR"])
@@ -953,7 +973,8 @@ def test_root_watchdog_reporter_keeps_left_warning():
 
 def test_both_uninstall_paths_report_instead_of_claiming_success():
     text = UNINSTALL.read_text()
-    assert text.count('report_root_watchdog_removal "$(') == 2
+    assert text.count('report_root_watchdog_removal "$(') == 1
+    assert '"$HOME/genesis/scripts/codebase_managed.py" uninstall' in text
     for match in re.finditer(r'report_root_watchdog_removal "\$\(', text):
         before = text[max(0, match.start() - 300) : match.start()]
         start = before.rfind('if [ "$DRY_RUN" = true ]; then')

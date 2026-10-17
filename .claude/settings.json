@@ -343,8 +343,8 @@
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cc-deploy-timeout-guard",
-                        "timeout": 5
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/deploy_timeout_advisory.py",
+                        "timeout": 10
                     }
                 ]
             },
@@ -396,16 +396,6 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/web_tools_gate.py",
-                        "timeout": 10
-                    }
-                ]
-            },
-            {
-                "matcher": "Agent",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/agent_tool_guidance.py",
                         "timeout": 10
                     }
                 ]

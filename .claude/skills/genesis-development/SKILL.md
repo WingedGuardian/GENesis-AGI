@@ -516,8 +516,10 @@ INT/TERM as it starts, so a second signal lands mid-rollback with default
 disposition, and the rollback has failure exits that report `ROLLBACK INCOMPLETE`.
 Either way: verify state (server active, no mid-rebase, pin, both CC versions)
 before re-running; it is idempotent. (A non-blocking PreToolUse advisory hook,
-`.claude/hooks/cc-deploy-timeout-guard`, nudges toward this on any deploy — it does
-not check whether you already detached, which is tracked in issue #2088.)
+`scripts/hooks/deploy_timeout_advisory.py`, nudges toward this whenever a command
+can run `update.sh`, and stays quiet on reads of it. It deliberately does not
+check whether you already detached: that needs systemd-run's option grammar, an
+open set, so a detached launch still gets the note.)
 
 **Why this paragraph is worded so defensively:** PR #1221 shipped both this policy
 and that hook on 2026-07-22 prescribing `run_in_background`, from a CC memory
@@ -1241,6 +1243,17 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   action itself. (Origin: the fence test in PR #2935, for issue #2863: its verify-RED ran a real
   `systemctl --user stop genesis-server` and took a live server down for about
   3.5 minutes.)
+- **Bound every mutant run with its own short timeout.** A mutation often turns
+  a test into a HANG rather than a failure (a mutant that never sets an event,
+  never cancels a task), and a hung run holds the box-wide test lock for the
+  whole per-test timeout while every other session waits. MEASURED: one sweep's
+  hung mutant held it for 53 minutes. Pass `-p timeout -o timeout=<N>` to each
+  mutant run, with N = max(60, 10 × the baseline run's slowest test). Spell it
+  `-p timeout`, never `-p pytest_timeout`: the plugin registers under the name
+  `timeout`, and the module name aborts pytest with "Plugin already registered"
+  (MEASURED, pytest 9.0.2 with pytest-timeout 2.4.0). And read the test result,
+  not the exit code: a missing plugin also exits 1, which a sweep would count
+  as a killed mutant.
 - **Never edit a shell script while a test that runs it is in progress.** bash
   reads a script as it executes it, so an edit mid-run yields bogus syntax
   errors that look like real failures. Wait for the run to finish, or test a

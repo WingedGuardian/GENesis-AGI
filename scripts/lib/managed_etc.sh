@@ -94,18 +94,96 @@ _genesis_etc_take_hint() {
     esac
 }
 
-# genesis_etc_put <path> <content> <mode or ""> <class: dropin|unit|sshd>
+# Compare bytes, tolerating only trailing LF as the old shell comparison did.
+# Installed bytes never pass through a Bash variable (which would discard NUL).
+_genesis_etc_equal() {
+    printf '%s\n' "$2" | python3 -I -S -c \
+        'import pathlib,sys; sys.exit(pathlib.Path(sys.argv[1]).read_bytes().rstrip(b"\n") != sys.stdin.buffer.read().rstrip(b"\n"))' "$1" 2>/dev/null
+}
+
+_genesis_etc_original_intact() {
+    local current status=1
+    current="$(mktemp)" || return 1
+    if sudo cat "$1" > "$current" 2>/dev/null && cmp -s -- "$2" "$current"; then
+        status=0
+    fi
+    rm -f -- "$current"
+    return "$status"
+}
+
+# Finalize exactly one put. Durable takeover backups are never removed here.
+# retain is used after failed recovery, when the temporary file may be the only
+# intact original. Its path is reported before the per-call state is cleared.
+genesis_etc_finalize() {
+    if [[ "$1" == commit && -n "${GENESIS_ETC_PENDING_SUMMARY:-}" ]]; then
+        _genesis_etc_summary "$GENESIS_ETC_PENDING_SUMMARY"
+    fi
+    if [[ "$1" != retain && -n "${GENESIS_ETC_SNAPSHOT:-}" ]]; then
+        rm -f -- "$GENESIS_ETC_SNAPSHOT" \
+            || echo "  WARNING: could not remove private snapshot $GENESIS_ETC_SNAPSHOT"
+    fi
+    GENESIS_ETC_SNAPSHOT=""
+    GENESIS_ETC_PENDING_SUMMARY=""
+    GENESIS_ETC_TARGET=""
+    GENESIS_ETC_DEFERRED=""
+    GENESIS_ETC_EXISTED=0
+    GENESIS_ETC_ATTEMPTED=0
+    return 0
+}
+
+# Only the explicitly deferred bootstrap sshd caller uses rollback. Recover
+# bytes before its fatal write error or rejected validation; never reload here.
+genesis_etc_rollback() {
+    local path="$1" reason="$2"
+    if [[ "${GENESIS_ETC_DEFERRED:-}" != validate || "$path" != "${GENESIS_ETC_TARGET:-}" ]]; then
+        echo "  WARNING: no current validation context for $path; not rolling back."
+        return 1
+    fi
+    if [[ "$GENESIS_ETC_EXISTED" == 1 ]]; then
+        if [[ -z "$GENESIS_ETC_SNAPSHOT" ]] \
+            || ! sudo tee "$path" < "$GENESIS_ETC_SNAPSHOT" >/dev/null \
+            || ! _genesis_etc_original_intact "$path" "$GENESIS_ETC_SNAPSHOT"; then
+            echo "  WARNING: $reason; could not restore $path. Original bytes retained at $GENESIS_ETC_SNAPSHOT"
+            genesis_etc_finalize retain
+            return 1
+        fi
+        echo "  WARNING: $reason — your previous drop-in was put back, sshd untouched"
+    else
+        # A successful rm alone does not prove a failed sudo removed the target.
+        # shellcheck disable=SC2016
+        if ! sudo rm -f "$path" \
+            || ! sudo /bin/sh -c '[ ! -e "$1" ] && [ ! -L "$1" ]' _ "$path"; then
+            echo "  WARNING: $reason; could not remove newly written $path."
+            genesis_etc_finalize retain
+            return 1
+        fi
+        echo "  WARNING: $reason — drop-in removed, sshd untouched"
+    fi
+    genesis_etc_finalize discard
+}
+
+# genesis_etc_put <path> <content> <mode or ""> <class> [validate]
+# validate retains original bytes and a pending success for the caller to
+# finalize after sshd validation; existing four-argument callers stay immediate.
 genesis_etc_put() {
-    local path="$1" content="$2" mode="$3" class="$4" stamped cur state
     GENESIS_ETC_RESULT="failed"
     GENESIS_ETC_BACKUP=""
-    # Compare like with like: `$(sudo cat …)` below drops trailing newlines, so
-    # drop them from the content too (the file is written with exactly one).
-    content="$(printf '%s' "$content")"
-    if ! stamped="$(printf '%s\n' "$content" | python3 -I -S "$_GENESIS_ETC_MU" stamp)"; then
-        echo "  WARNING: could not stamp the content for $path — not written."
-        return 0
+    GENESIS_ETC_SNAPSHOT=""
+    GENESIS_ETC_PENDING_SUMMARY=""
+    GENESIS_ETC_TARGET="$1"
+    GENESIS_ETC_DEFERRED="${5:-}"
+    GENESIS_ETC_EXISTED=0
+    GENESIS_ETC_ATTEMPTED=0
+    _genesis_etc_put_impl "$1" "$2" "$3" "$4"
+    if [[ "$GENESIS_ETC_DEFERRED" != validate ]]; then
+        genesis_etc_finalize commit
     fi
+    return 0
+}
+
+_genesis_etc_put_impl() {
+    local path="$1" content="$2" mode="$3" class="$4" stamped state legacy=0
+    content="$(printf '%s' "$content")"
     # ONE sudo call classifies the path. Separate `sudo test` probes would read a
     # failing sudo as "missing" and fall through to the write, overwriting an
     # edited file with no backup. Anything but a clean answer is kept, unwritten.
@@ -125,18 +203,35 @@ genesis_etc_put() {
     esac
     local result="written" verb="created-etc"
     if [ "$kind" = file ]; then
+        GENESIS_ETC_EXISTED=1
         verb="updated-etc"
-        if ! cur="$(sudo cat "$path" 2>/dev/null)"; then
+        if ! GENESIS_ETC_SNAPSHOT="$(mktemp)"; then
+            _genesis_etc_uninspected "$path" "could not snapshot"
+            return 0
+        fi
+        if ! sudo cat "$path" > "$GENESIS_ETC_SNAPSHOT" 2>/dev/null; then
             _genesis_etc_uninspected "$path" "could not read"
             return 0
         fi
-        if [[ "$cur" == "$stamped" ]]; then
+        if _genesis_etc_equal "$GENESIS_ETC_SNAPSHOT" "$content"; then
+            legacy=1
+        fi
+    fi
+    if ! stamped="$(printf '%s\n' "$content" | python3 -I -S "$_GENESIS_ETC_MU" stamp)"; then
+        echo "  WARNING: could not stamp the content for $path — not written."
+        if [[ "$legacy" == 1 ]] && _genesis_etc_original_intact "$path" "$GENESIS_ETC_SNAPSHOT"; then
+            GENESIS_ETC_RESULT="unchanged"
+        fi
+        return 0
+    fi
+    if [ "$kind" = file ]; then
+        if _genesis_etc_equal "$GENESIS_ETC_SNAPSHOT" "$stamped"; then
             GENESIS_ETC_RESULT="unchanged"
             return 0
-        elif [[ "$cur" == "$content" ]]; then
+        elif [[ "$legacy" == 1 ]]; then
             result="migrated"
         else
-            state="$(printf '%s\n' "$cur" | python3 -I -S "$_GENESIS_ETC_MU" verify 2>/dev/null)" || state=""
+            state="$(python3 -I -S "$_GENESIS_ETC_MU" verify < "$GENESIS_ETC_SNAPSHOT" 2>/dev/null)" || state=""
             if [ "$state" != "stamped" ]; then
                 if ! _genesis_etc_taken "$path"; then
                     echo "  Kept: $path was edited by hand. Not overwritten."
@@ -148,7 +243,7 @@ genesis_etc_put() {
                 fi
                 : "${GENESIS_MU_BACKUP_DIR:=$HOME/.genesis/deploy-backups/$(date -u +%Y%m%dT%H%M%SZ)}"  # the path disk_hygiene.sh prunes; as managed_units.sh
                 local backup="$GENESIS_MU_BACKUP_DIR$path"
-                if ! (umask 077 && mkdir -p "$(dirname "$backup")" && sudo cat "$path" > "$backup"); then
+                if ! (umask 077 && mkdir -p "$(dirname "$backup")" && cat "$GENESIS_ETC_SNAPSHOT" > "$backup"); then
                     echo "  WARNING: could not back up $path — kept, not overwritten."
                     GENESIS_ETC_RESULT="kept-edited"
                     _genesis_etc_summary "kept-etc $path: take requested but the backup failed; not overwritten"
@@ -159,9 +254,15 @@ genesis_etc_put() {
             fi
         fi
     fi
+    GENESIS_ETC_ATTEMPTED=1
     if ! sudo mkdir -p "$(dirname "$path")" 2>/dev/null \
         || ! printf '%s\n' "$stamped" | sudo tee "$path" >/dev/null 2>&1; then
-        echo "  WARNING: could not write $path (read-only /etc?) — not applied."
+        if [[ "$result" == migrated ]] && _genesis_etc_original_intact "$path" "$GENESIS_ETC_SNAPSHOT"; then
+            echo "  WARNING: could not stamp $path; original effective configuration is unchanged."
+            GENESIS_ETC_RESULT="unchanged"
+        else
+            echo "  WARNING: could not write $path (read-only /etc?) — not applied."
+        fi
         return 0
     fi
     if [ -n "$mode" ]; then
@@ -170,8 +271,8 @@ genesis_etc_put() {
     fi
     GENESIS_ETC_RESULT="$result"
     case "$result" in
-        taken) _genesis_etc_summary "taken-etc $path: Genesis version installed, old file saved in $GENESIS_ETC_BACKUP" ;;
-        written) _genesis_etc_summary "$verb $path" ;;
+        taken) GENESIS_ETC_PENDING_SUMMARY="taken-etc $path: Genesis version installed, old file saved in $GENESIS_ETC_BACKUP" ;;
+        written) GENESIS_ETC_PENDING_SUMMARY="$verb $path" ;;
     esac
     return 0
 }

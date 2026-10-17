@@ -14,6 +14,8 @@ import hashlib
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
 SCRIPTS = REPO_ROOT / "scripts"
@@ -29,13 +31,27 @@ _SUDO_STUB = """#!/bin/bash
 # Passthrough; SUDO_FAIL_TEE=1 makes a write fail, as a sudo that needs a password
 # and has no terminal would.
 if [ "$1" = "tee" ] && [ -n "${SUDO_FAIL_TEE:-}" ]; then exit 1; fi
+if [ "$1" = "tee" ] && [[ "$2" == */00-genesis-clientalive.conf ]]; then
+    if [ -n "${PARTIAL_WRITE_ONCE_MARKER:-}" ] && [ ! -e "$PARTIAL_WRITE_ONCE_MARKER" ]; then
+        : > "$PARTIAL_WRITE_ONCE_MARKER"
+        head -c 7 > "$2"
+        exit 1
+    fi
+    if [ -n "${SSHD_RESTORE_FAILURE_MARKER:-}" ] && [ -e "$SSHD_RESTORE_FAILURE_MARKER" ]; then exit 1; fi
+fi
+if [ "$1" = "rm" ] && [ -n "${SUDO_FAIL_REMOVE:-}" ]; then exit 1; fi
+if [ "$1" = "rm" ] && [ -n "${SUDO_NOOP_REMOVE:-}" ]; then exit 0; fi
+if [ "$1" = "cat" ] && [ -n "${SSHD_READBACK_FAILURE_MARKER:-}" ] && [ -e "$SSHD_READBACK_FAILURE_MARKER" ]; then exit 1; fi
 exec "$@"
 """
 
 _SSHD_STUB = """#!/bin/bash
 echo "sshd $*" >> "$CALL_LOG"
 case "$1" in
-    -t) exit "${SSHD_T_RC:-0}" ;;
+    -t)
+        if [ -n "${SSHD_RESTORE_FAILURE_MARKER:-}" ]; then : > "$SSHD_RESTORE_FAILURE_MARKER"; fi
+        if [ -n "${SSHD_READBACK_FAILURE_MARKER:-}" ]; then : > "$SSHD_READBACK_FAILURE_MARKER"; fi
+        exit "${SSHD_T_RC:-0}" ;;
     -T) echo "clientaliveinterval ${SSHD_EFFECTIVE:-15}" ;;
 esac
 exit 0
@@ -182,3 +198,216 @@ def test_a_sudo_that_cannot_write_still_stops_bootstrap(tmp_path):
     result = _run(env)
     assert result.returncode == 1
     assert "bootstrap stops here" in result.stdout
+
+
+@pytest.mark.parametrize("existing", ["missing", "legacy", "legacy-trailing", "older-stamp", "taken"])
+def test_rejected_sshd_preserves_original_bytes_and_has_no_success_summary(tmp_path, existing):
+    env = _stage(tmp_path)
+    journald, sshd = _paths(env)
+    journald.parent.mkdir(parents=True)
+    journald.write_text(_stamped(JOURNALD))
+    originals = {
+        "legacy": SSHD.encode(),
+        "legacy-trailing": (SSHD + "\n\n").encode(),
+        "older-stamp": _stamped("ClientAliveInterval 10\nClientAliveCountMax 4\n").encode(),
+        "taken": b"# operator's bytes\nClientAliveInterval 30\n\n",
+    }
+    if existing != "missing":
+        sshd.parent.mkdir(parents=True)
+        sshd.write_bytes(originals[existing])
+    if existing == "taken":
+        env["GENESIS_TAKE_TEMPLATES"] = str(sshd)
+        env["GENESIS_MU_BACKUP_DIR"] = str(tmp_path / "backups")
+    env["SSHD_T_RC"] = "1"
+    result = _run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    if existing == "missing":
+        assert not sshd.exists()
+    else:
+        assert sshd.read_bytes() == originals[existing]
+    summary_path = Path(env["GENESIS_DEPLOY_SUMMARY"])
+    summary = summary_path.read_text() if summary_path.exists() else ""
+    assert not any(line.startswith(("created-etc ", "updated-etc ", "taken-etc "))
+                   and str(sshd) in line for line in summary.splitlines())
+    assert "reload" not in _calls(env)
+
+
+def test_failed_metadata_only_write_retains_effective_legacy_configuration(tmp_path):
+    env = _stage(tmp_path)
+    journald, sshd = _paths(env)
+    for path, content in ((journald, JOURNALD), (sshd, SSHD)):
+        path.parent.mkdir(parents=True)
+        path.write_text(content)
+    env["SUDO_FAIL_TEE"] = "1"
+    result = _run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert journald.read_bytes() == JOURNALD.encode()
+    assert sshd.read_bytes() == SSHD.encode()
+    assert "already configured and effective" in result.stdout
+    assert "restart" not in _calls(env) and "reload" not in _calls(env)
+
+
+def test_failed_stamp_retains_effective_legacy_configuration(tmp_path):
+    env = _stage(tmp_path)
+    journald, sshd = _paths(env)
+    for path, content in ((journald, JOURNALD), (sshd, SSHD)):
+        path.parent.mkdir(parents=True)
+        path.write_text(content)
+    failed_stamper = tmp_path / "failed-stamper.py"
+    failed_stamper.write_text("raise SystemExit(1)\n")
+    env["_GENESIS_ETC_MU"] = str(failed_stamper)
+    result = _run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert journald.read_bytes() == JOURNALD.encode()
+    assert sshd.read_bytes() == SSHD.encode()
+    assert "restart" not in _calls(env) and "reload" not in _calls(env)
+
+
+@pytest.mark.parametrize("existing", ["missing", "legacy", "older-stamp", "taken"])
+def test_partial_sshd_write_recovers_original_before_fatal_exit(tmp_path, existing):
+    env = _stage(tmp_path)
+    journald, sshd = _paths(env)
+    journald.parent.mkdir(parents=True)
+    journald.write_text(_stamped(JOURNALD))
+    sshd.parent.mkdir(parents=True)
+    original = (SSHD if existing == "legacy" else _stamped("ClientAliveInterval 10\n"))
+    if existing == "taken":
+        original = "# private fixture\nClientAliveInterval 30\n\n"
+        env["GENESIS_TAKE_TEMPLATES"] = str(sshd)
+        env["GENESIS_MU_BACKUP_DIR"] = str(tmp_path / "backups")
+    if existing != "missing":
+        sshd.write_text(original)
+    env["PARTIAL_WRITE_ONCE_MARKER"] = str(tmp_path / "first-write-failed")
+    result = _run(env)
+    assert result.returncode != 0
+    if existing == "missing":
+        assert not sshd.exists()
+    else:
+        assert sshd.read_bytes() == original.encode()
+    assert "sshd -t" not in _calls(env) and "reload" not in _calls(env)
+
+
+@pytest.mark.parametrize("taken", [False, True])
+def test_failed_sshd_restore_retains_and_names_recovery_bytes_without_success(tmp_path, taken):
+    env = _stage(tmp_path)
+    journald, sshd = _paths(env)
+    journald.parent.mkdir(parents=True)
+    journald.write_text(_stamped(JOURNALD))
+    sshd.parent.mkdir(parents=True)
+    original = SSHD if not taken else "ClientAliveInterval 30\n\n"
+    sshd.write_text(original)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    env.update(TMPDIR=str(scratch), SSHD_T_RC="1",
+               SSHD_RESTORE_FAILURE_MARKER=str(tmp_path / "validation-rejected"))
+    if taken:
+        env["GENESIS_TAKE_TEMPLATES"] = str(sshd)
+        env["GENESIS_MU_BACKUP_DIR"] = str(tmp_path / "backups")
+    result = _run(env)
+    assert result.returncode != 0
+    assert "previous drop-in was put back" not in result.stdout
+    assert "drop-in removed, sshd untouched" not in result.stdout
+    recovery = [path for base in (scratch, tmp_path / "backups") if base.exists()
+                for path in base.rglob("*") if path.is_file() and path.read_bytes() == original.encode()]
+    assert recovery and any(str(path) in result.stdout for path in recovery)
+    summary_path = Path(env["GENESIS_DEPLOY_SUMMARY"])
+    summary = summary_path.read_text() if summary_path.exists() else ""
+    assert not any(line.startswith(("created-etc ", "updated-etc ", "taken-etc "))
+                   and str(sshd) in line for line in summary.splitlines())
+    assert "reload" not in _calls(env)
+
+
+def test_failed_rejected_new_file_removal_is_fatal_and_has_no_success_summary(tmp_path):
+    env = _stage(tmp_path)
+    journald, sshd = _paths(env)
+    journald.parent.mkdir(parents=True)
+    journald.write_text(_stamped(JOURNALD))
+    env.update(SSHD_T_RC="1", SUDO_FAIL_REMOVE="1")
+    result = _run(env)
+    assert result.returncode != 0
+    assert "drop-in removed, sshd untouched" not in result.stdout
+    summary_path = Path(env["GENESIS_DEPLOY_SUMMARY"])
+    summary = summary_path.read_text() if summary_path.exists() else ""
+    assert str(sshd) not in summary
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_stamp_failure_without_identical_original_stays_fatal(tmp_path, existing):
+    env = _stage(tmp_path)
+    journald, sshd = _paths(env)
+    journald.parent.mkdir(parents=True)
+    journald.write_text(JOURNALD)
+    original = b"ClientAliveInterval 30\n"
+    if existing:
+        sshd.parent.mkdir(parents=True)
+        sshd.write_bytes(original)
+    stamper = tmp_path / "failed-stamper.py"
+    stamper.write_text("raise SystemExit(1)\n")
+    env["_GENESIS_ETC_MU"] = str(stamper)
+    result = _run(env)
+    assert result.returncode != 0
+    assert journald.read_bytes() == JOURNALD.encode()
+    assert sshd.read_bytes() == original if existing else not sshd.exists()
+    assert "sshd -t" not in _calls(env) and "reload" not in _calls(env)
+
+
+@pytest.mark.parametrize("failure", ["readback", "noop-remove"])
+def test_recovery_requires_proof_not_only_successful_write_or_remove(tmp_path, failure):
+    env = _stage(tmp_path)
+    journald, sshd = _paths(env)
+    journald.parent.mkdir(parents=True)
+    journald.write_text(_stamped(JOURNALD))
+    original = SSHD.encode()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    env.update(SSHD_T_RC="1", TMPDIR=str(scratch))
+    if failure == "readback":
+        sshd.parent.mkdir(parents=True)
+        sshd.write_bytes(original)
+        env["SSHD_READBACK_FAILURE_MARKER"] = str(tmp_path / "rejected")
+    else:
+        env["SUDO_NOOP_REMOVE"] = "1"
+    result = _run(env)
+    assert result.returncode != 0
+    assert "previous drop-in was put back" not in result.stdout
+    assert "drop-in removed, sshd untouched" not in result.stdout
+    if failure == "readback":
+        assert sshd.read_bytes() == original
+        retained = [p for p in scratch.iterdir() if p.read_bytes() == original]
+        assert retained and any(str(p) in result.stdout for p in retained)
+    else:
+        assert sshd.read_text() == _stamped(SSHD)
+    assert "reload" not in _calls(env)
+
+
+@pytest.mark.parametrize("fatal", [False, True])
+def test_sshd_rejection_preserves_prior_unrelated_success_summary(tmp_path, fatal):
+    env = _stage(tmp_path)
+    journald, sshd = _paths(env)
+    env["SSHD_T_RC"] = "1"
+    if fatal:
+        env["SUDO_FAIL_REMOVE"] = "1"
+    result = _run(env)
+    assert (result.returncode != 0) == fatal
+    summary = Path(env["GENESIS_DEPLOY_SUMMARY"]).read_text().splitlines()
+    assert f"created-etc {journald}" in summary
+    assert not any(str(sshd) in line for line in summary)
+    assert "systemctl restart systemd-journald" in _calls(env)
+    assert "reload" not in _calls(env)
+
+
+def test_snapshot_creation_failure_keeps_existing_bytes_without_writing(tmp_path):
+    env = _stage(tmp_path)
+    journald, sshd = _paths(env)
+    for target, content in ((journald, JOURNALD), (sshd, SSHD)):
+        target.parent.mkdir(parents=True)
+        target.write_text(content)
+    mktemp = tmp_path / "bin/mktemp"
+    mktemp.write_text("#!/bin/sh\nexit 1\n")
+    mktemp.chmod(0o755)
+    result = _run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert journald.read_bytes() == JOURNALD.encode()
+    assert sshd.read_bytes() == SSHD.encode()
+    assert "could not snapshot" in result.stdout
+    assert "sshd -t" not in _calls(env) and "restart" not in _calls(env)

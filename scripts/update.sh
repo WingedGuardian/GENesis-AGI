@@ -45,7 +45,11 @@
 # Exit codes: 0 updated (or nothing to do); 1 failed (rolled back where it got that
 # far); 2 merge conflicts; 4 refused, nothing stopped: hand-edited units are named,
 # and ~/.genesis/update_refused.json records the refusal for the dashboard's
-# supervised update, which never escalates past it.
+# supervised update, which never escalates past it; 5 refused, nothing changed:
+# an earlier update's ~/.genesis/update_state.json still guards code it merged and
+# never activated, or a merge conflict it is waiting on (the rule is
+# scripts/lib/update_state_guard.py). Finish that one with --post-merge, resolve
+# its conflicts, or Dismiss it on the dashboard's update card.
 
 set -Eeuo pipefail  # -E: the ERR trap is inherited by functions AND subshells
                     # (see _on_err's BASH_SUBSHELL guard for the subshell case)
@@ -117,7 +121,20 @@ _flush_deploy_summary() {
     rm -f "${GENESIS_DEPLOY_SUMMARY:-}" 2>/dev/null || true
     GENESIS_DEPLOY_SUMMARY=""
 }
-trap 'rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
+# A plain run's own "fetching" state (written just before the stop, naming
+# nothing merged) goes on EVERY exit that leaves it behind: a failed DB snapshot,
+# a server that would not stop. Left there it would make deploy_code_only.sh and
+# the live engine read an unfinished update, and the dashboard's progress poll no
+# longer deletes anything. Only this run's file, only that phase: from "merging"
+# on, the rollback and the success path decide, and a --post-merge never deletes
+# the state it finishes. On every EXIT trap below.
+_drop_own_prestop_state() {
+    [ "${_STATE_WRITTEN:-0}" = 1 ] && [ "${_STATE_PHASE:-}" = fetching ] \
+        && [ "${POST_MERGE:-false}" = false ] && [ "${ON_LIVE:-0}" != 1 ] \
+        && rm -f "${STATE_FILE:-}" 2>/dev/null
+    return 0
+}
+trap 'rm -f "$_SELF_COPY" 2>/dev/null; _drop_own_prestop_state; _flush_deploy_summary' EXIT
 # The copy handshake is spent. Nothing this run starts (bootstrap, a nohup'd
 # server, a later dashboard update) may inherit it.
 unset GENESIS_UPDATE_FROM_TEMP GENESIS_UPDATE_SELF_COPY
@@ -209,27 +226,52 @@ _PEER_RESTORE_PY="$(cat "$GENESIS_ROOT/src/genesis/db/crud/peer_restore.py")"
 
 # ── Update state file helper ────────────────────────────
 # Written at each phase boundary so crash recovery knows where we stopped.
+# "post_merge" says which kind of run wrote it: a --post-merge run writes
+# "fetching" over code that is already merged, which the restart-guard rule
+# (scripts/lib/update_state_guard.py) must not read as "nothing merged".
+# _STATE_WRITTEN and _STATE_PHASE record that THIS run wrote the file, and its
+# last phase: a run that never wrote it never deletes it (another run's file).
+_STATE_WRITTEN=0
+_STATE_PHASE=""
 _write_state() {
     local phase="$1"
     mkdir -p "$HOME/.genesis"
     python3 - "$STATE_FILE" "$phase" "${ROLLBACK_TAG:-}" "${ORIGINAL_BRANCH:-}" \
         "${UPDATE_OWN_HEAD:-}" "${DEPLOY_HEAD:-}" "${OLD_TAG:-}" "${OLD_COMMIT:-}" \
-        "$STARTED_AT" "$$" "$(date -Iseconds)" "${WERE_RUNNING[@]}" <<'PY'
+        "$STARTED_AT" "$$" "$(date -Iseconds)" "${POST_MERGE:-false}" "${WERE_RUNNING[@]}" <<'PY'
 import json, os, sys
 keys = ("phase", "rollback_tag", "original_branch", "own_head", "deploy_head",
-        "old_tag", "old_commit", "started_at", "pid", "timestamp")
+        "old_tag", "old_commit", "started_at", "pid", "timestamp", "post_merge")
 path, *values = sys.argv[1:]
 state = dict(zip(keys, values))
 state["pid"] = int(state["pid"])
+state["post_merge"] = state["post_merge"] == "true"
 state["services_stopped"] = values[len(keys):]
 with open(path + ".tmp", "w", encoding="utf-8") as f:
     json.dump(state, f, indent=4)
 os.replace(path + ".tmp", path)
 PY
+    _STATE_WRITTEN=1
+    _STATE_PHASE="$phase"
 }
 
-# Clear this run's deploy state files. The state file is ours (we wrote it) so
-# always remove it. The PID marker is NOT necessarily ours to delete: only the
+# The marker half of _clear_deploy_state, alone: what a run releases when the
+# state file is not its to delete.
+_clear_deploy_marker() {
+    local _m="${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid" _pid
+    _pid="$(cat "$_m" 2>/dev/null || true)"
+    # "Dead" includes a zombie (_deploy_marker_holder_live, in deploy_marker.sh),
+    # which would otherwise keep a stale marker until its parent reaps it.
+    if [ "$_pid" = "$$" ] || { [ -n "$_pid" ] && ! _deploy_marker_holder_live "$_pid"; }; then
+        rm -f "$_m" 2>/dev/null || true
+    fi
+}
+
+# Clear this run's deploy state files. The state file goes only when THIS run
+# wrote it (_STATE_WRITTEN) and is not a --post-merge: an exit before the first
+# write leaves another run's file alone, and a --post-merge never deletes the
+# state of the merge it is finishing except on success or a rollback that put the
+# code back (both delete it explicitly). The PID marker is NOT necessarily ours to delete: only the
 # dashboard DIRECT path makes it our $$; the supervised orchestrator holds it
 # with ITS pid ACROSS tiers, and scripts/restore.sh holds it with its own pid
 # while it rebuilds the DB. So delete the marker ONLY if we own it ($$) OR its
@@ -239,14 +281,10 @@ PY
 # that run finished); env.update_in_progress() reads such a dead marker as "no
 # deploy", so the window before it is cleaned is harmless.
 _clear_deploy_state() {
-    rm -f "$STATE_FILE" 2>/dev/null || true
-    local _m="${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid" _pid
-    _pid="$(cat "$_m" 2>/dev/null || true)"
-    # "Dead" includes a zombie (_deploy_marker_holder_live, in deploy_marker.sh),
-    # which would otherwise keep a stale marker until its parent reaps it.
-    if [ "$_pid" = "$$" ] || { [ -n "$_pid" ] && ! _deploy_marker_holder_live "$_pid"; }; then
-        rm -f "$_m" 2>/dev/null || true
+    if [ "${_STATE_WRITTEN:-0}" = 1 ] && [ "${POST_MERGE:-false}" = false ]; then
+        rm -f "$STATE_FILE" 2>/dev/null || true
     fi
+    _clear_deploy_marker
 }
 
 # Signal handler for the PRE-STOP window: an interrupt before services are
@@ -498,6 +536,31 @@ if [ "${ON_LIVE:-0}" = 1 ]; then
     fi
 fi
 # END live-lock-recheck
+
+# BEGIN prior-state-guard (extracted by tests/test_scripts/test_update_prior_state_guard.py)
+# An earlier run that merged code it never activated (a crash, an interrupted or
+# refused --post-merge), or that stopped on merge conflicts, left
+# update_state.json behind. That file is what stops deploy_code_only.sh and the
+# live engine restarting onto the unactivated code, and the conflict resolver's
+# --post-merge reads its rollback tag. This run's own _write_state would overwrite
+# it and its exits would delete it, so a plain run refuses while it stands (exit
+# 5, before the rollback tag or anything else). --post-merge is the run that
+# finishes it. The rule is scripts/lib/update_state_guard.py, shared with
+# bootstrap.sh, deploy_code_only.sh, the live engine and the dashboard: exit 10
+# means nothing to guard; any other exit, a check that crashed or could not run
+# included, keeps the file. No state file means no check at all, so a broken guard cannot
+# block an install with nothing to guard.
+if [[ "$POST_MERGE" != "true" ]] && { [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; }; then
+    _prior_state_rc=0
+    _prior_state_msg="$(python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$STATE_FILE" "$GENESIS_ROOT" 2>&1)" \
+        || _prior_state_rc=$?
+    if [ "$_prior_state_rc" -ne 10 ]; then
+        echo "REFUSED: ${_prior_state_msg:-$STATE_FILE could not be checked (exit $_prior_state_rc); it is kept.}"
+        echo "         Nothing was changed."
+        exit 5
+    fi
+fi
+# END prior-state-guard
 
 echo ""
 echo "  Genesis Update"
@@ -1837,7 +1900,7 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     # deploy). It is armed BEFORE the pause, so no signal can land between an
     # accepted pause and its resume; _guardian_resume no-ops until a pause is
     # accepted.
-    trap '_guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
+    trap '_guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _drop_own_prestop_state; _flush_deploy_summary' EXIT
     # On `live` the deploy marker this run holds goes on every exit too.
     if [ "${ON_LIVE:-0}" = 1 ]; then
         trap '_live_prestop_exit; _guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
@@ -2415,7 +2478,18 @@ with open(sys.argv[11], 'w') as f:
     # leftover entry can't suppress the watchdog's deploy-restart guard after a
     # rollback. The server is back up (above); once this invocation exits its PID
     # dies anyway, but removing the files closes the PID-reuse window proactively.
-    _clear_deploy_state
+    # BEGIN rollback-state-clear (extracted by tests/test_scripts/test_update_prior_state_guard.py)
+    # The state file goes only when the code is back at the rollback tag
+    # (checkout_ok): a rollback that left merged code on disk keeps it, because
+    # it is what stops deploy_code_only.sh and the live engine restarting onto
+    # that code. The same holds for a --post-merge, whose state it is finishing.
+    if [ "$checkout_ok" = "true" ]; then
+        rm -f "$STATE_FILE" 2>/dev/null || true
+    else
+        echo "  $STATE_FILE is kept as the restart guard: finish with scripts/update.sh --post-merge, or Dismiss it on the dashboard's update card."
+    fi
+    _clear_deploy_marker
+    # END rollback-state-clear
 
     echo ""
     echo "  ──────────────────────────────────────"

@@ -1140,3 +1140,191 @@ def test_a_paused_record_for_another_file_does_not_empty_this_one(box):
     assert f.stat().st_size >= 150 * _MB and not [
         p for p in _pages(box) if p["title"].startswith("Emptied")
     ]
+
+
+# ── cc-tmp's reserve (D) ──────────────────────────────────────────
+
+
+def test_cc_tmp_reserve_is_created_green_and_spared_by_the_sweep(box):
+    cc_dev = os.stat(box["cc"]).st_dev
+    _run(
+        box,
+        f"CC_KEY='{cc_dev}'; HOME_KEY=none\nhandle_fs '{box['cc']}' '{cc_dev}' green 1800 2048 - '' btrfs",
+    )
+    reserve = box["cc"] / ".watchgod-reserve"
+    try:
+        assert reserve.stat().st_size == 102 * _MB  # 5% of 2048, under the 128 MB cap
+        out = _run(box, '_cc_sweep_units "$CC_TMP_DIR" | tr "\\0" "\\n"')
+        assert ".watchgod-reserve" not in out.stdout
+    finally:
+        reserve.unlink(missing_ok=True)
+
+
+def test_cc_tmp_red_releases_the_reserve_unless_the_runaway_response_relieved_it(box):
+    cc_dev = os.stat(box["cc"]).st_dev
+    reserve = box["cc"] / ".watchgod-reserve"
+    with open(reserve, "wb") as fh:
+        fh.truncate(16 * _MB)
+    held = _run(
+        box,
+        f"""CC_KEY='{cc_dev}'; HOME_KEY=none; RUNAWAY_RELIEVED[{cc_dev}]=1
+handle_fs '{box["cc"]}' '{cc_dev}' red 10 2048 - '' btrfs""",
+    )
+    assert reserve.exists(), held.stdout
+    _run(
+        box,
+        f"CC_KEY='{cc_dev}'; HOME_KEY=none\nhandle_fs '{box['cc']}' '{cc_dev}' red 10 2048 - '' btrfs",
+    )
+    assert not reserve.exists()
+    body = [p for p in _pages(box) if "RED" in p["title"]][0]["body"]
+    assert "reserve held" in body
+
+
+def test_no_reserve_is_claimed_held_when_there_is_none(box):
+    """A runaway emptying at cc-tmp RED with no reserve file: the page says
+    none is held, never that one is held (review finding)."""
+    cc_dev = os.stat(box["cc"]).st_dev
+    assert not (box["cc"] / ".watchgod-reserve").exists()
+    _run(
+        box,
+        f"""CC_KEY='{cc_dev}'; HOME_KEY=none; RUNAWAY_RELIEVED[{cc_dev}]=1
+handle_fs '{box["cc"]}' '{cc_dev}' red 10 2048 - '' btrfs""",
+    )
+    body = [p for p in _pages(box) if "RED" in p["title"]][0]["body"]
+    assert "reserve held" not in body
+    assert "none held" in body
+
+
+def test_a_reserve_is_discounted_in_every_domain_that_measures_it(box):
+    """cc-tmp's reserve counts in every domain whose measurement includes its
+    blocks: the same filesystem for a filesystem-wide measurement, the same
+    subvolume for a quota; never in a domain on another filesystem (review
+    finding: it was counted only in its owning domain)."""
+    reserve = box["cc"] / ".watchgod-reserve"
+    with open(reserve, "wb") as fh:
+        os.posix_fallocate(fh.fileno(), 0, 16 * _MB)
+    home = box["home"]
+    r = _run(
+        box,
+        f"""echo "FS=$(_wg_reserve_mb '{home}' fs)"
+echo "Q=$(_wg_reserve_mb '{home}' quota)"
+echo "OTHER=$(_wg_reserve_mb /proc fs)"
+echo "OTHERQ=$(_wg_reserve_mb /proc quota)"
+""",
+    )
+    assert "FS=16" in r.stdout, r.stdout
+    assert "Q=16" in r.stdout, "same device: the same subvolume"
+    assert "OTHER=0" in r.stdout and "OTHERQ=0" in r.stdout, r.stdout
+
+
+def test_a_project_quota_domain_on_a_shared_device_does_not_count_the_reserve(box):
+    """A filesystem-wide domain counts a reserve only when its statvfs is the
+    same filesystem: a project-quota volume shares the root's device but
+    reports only itself (a different raw size), so the root's reserve is not
+    its own (review finding)."""
+    reserve = box["cc"] / ".watchgod-reserve"
+    with open(reserve, "wb") as fh:
+        os.posix_fallocate(fh.fileno(), 0, 16 * _MB)
+    home = box["home"]
+    # Same device and filesystem id; only the raw statvfs sizes differ.
+    r = _run(
+        box,
+        f"""dg_raw_sizes_mb() {{ echo "100000 2048"; }}
+echo "FS=$(_wg_reserve_mb '{home}' fs)"
+""",
+    )
+    assert "FS=0" in r.stdout, r.stdout
+
+
+def test_a_cc_reserve_that_cannot_be_removed_is_reported_not_released(box):
+    cc_dev = os.stat(box["cc"]).st_dev
+    reserve = box["cc"] / ".watchgod-reserve"
+    with open(reserve, "wb") as fh:
+        fh.truncate(16 * _MB)
+    _run(
+        box,
+        f"""rm() {{ return 1; }}
+CC_KEY='{cc_dev}'; HOME_KEY=none
+handle_fs '{box["cc"]}' '{cc_dev}' red 10 2048 - '' btrfs""",
+    )
+    assert reserve.exists()
+    body = [p for p in _pages(box) if "RED" in p["title"]][0]["body"]
+    assert "NOT released" in body
+
+
+def test_the_home_reserve_release_reports_a_failed_removal(box):
+    out = _run(
+        box,
+        """: > "$RESERVE_FILE"
+rm() { return 1; }
+rc=0; msg="$(reserve_release)" || rc=$?
+echo "MSG=$msg RC=$rc"
+""",
+    )
+    assert "NOT released" in out.stdout and "RC=1" in out.stdout
+
+
+def test_a_reserve_never_reads_as_growth(box):
+    """The rate is kept net of the guardian's own reserves: 128 MB of reserve
+    appearing between two samples is not the disk filling."""
+    out = _run(
+        box,
+        """r1=$(dg_rate_update k1 1000 1000 fs 0)
+r2=$(dg_rate_update k1 1128 1060 fs 128)
+r3=$(dg_rate_update k1 1000 1120 fs 0)
+echo "R=$r1,$r2,$r3"
+# A sample written before the reserve field existed: no step on upgrade.
+printf '%s %s %s %s\\n' 1000 3048 0 fs > "$DG_STATE_DIR/rate_k2_fs"
+r4=$(dg_rate_update k2 3048 1060 fs 2048)
+echo "U=$r4"
+""",
+    )
+    assert "R=0,0,0" in out.stdout, out.stdout
+    assert "U=0" in out.stdout, out.stdout
+
+
+def test_an_emptying_marks_its_domain_relieved(box):
+    f = _task_output(box)
+    _session(box, f)
+    cc_key = f"{os.stat(box['cc']).st_dev}m9"
+    home_key = f"{os.stat(box['home'] / 'tmp').st_dev}m8"
+    out = _run(
+        box,
+        f"""
+        RW_TIER[{cc_key}]=red
+        RW_TIER[{home_key}]=green
+        wg_runaway_check '{_domains(box)}'
+        _RW_PREV_T=$(( _RW_PREV_T - 30 ))
+        python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_WRONLY); os.posix_fallocate(fd, 0, 100*1048576)' '{f}'
+        RUNAWAY_RELIEVED=()
+        wg_runaway_check '{_domains(box)}'
+        echo "RELIEVED=${{!RUNAWAY_RELIEVED[*]}}"
+        """,
+    )
+    assert f.stat().st_size == 0
+    assert f"RELIEVED={cc_key}" in out.stdout, out.stdout + out.stderr
+
+
+def test_a_link_where_the_cc_reserve_goes_is_removed_never_followed(box):
+    cc_dev = os.stat(box["cc"]).st_dev
+    victim = box["tmp"] / "elsewhere" / "victim"
+    victim.parent.mkdir()
+    (box["cc"] / ".watchgod-reserve").symlink_to(victim)
+    _run(
+        box,
+        f"CC_KEY='{cc_dev}'; HOME_KEY=none\nhandle_fs '{box['cc']}' '{cc_dev}' green 1800 2048 - '' btrfs",
+    )
+    assert not victim.exists(), "fallocate never followed the link out of cc-tmp"
+    assert not (box["cc"] / ".watchgod-reserve").is_symlink()
+
+
+def test_the_cc_reserve_never_takes_cc_tmp_into_yellow(box):
+    """Room for the reserve above ORANGE but not above YELLOW: none is placed
+    (YELLOW sheds routing call sites; review finding)."""
+    cc_dev = os.stat(box["cc"]).st_dev
+    # 2048 MB volume: YELLOW line 307 MB, ORANGE 163 MB, reserve 102 MB.
+    _run(
+        box,
+        f"CC_KEY='{cc_dev}'; HOME_KEY=none\nhandle_fs '{box['cc']}' '{cc_dev}' green 400 2048 - '' btrfs",
+    )
+    assert not (box["cc"] / ".watchgod-reserve").exists()

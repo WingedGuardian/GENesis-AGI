@@ -130,6 +130,9 @@ REFUSAL_FILES = (
     # above), and the dependency gate the restart on `live` runs by path.
     "scripts/lib/live_checkout.py",
     "scripts/lib/venv_matches_pyproject.py",
+    # The restart-guard rule update.sh and deploy_code_only.sh run by path, the
+    # engine loads for its own move refusal, and the dashboard loads (#3139).
+    "scripts/lib/update_state_guard.py",
     "src/genesis/dashboard/routes/updates.py",
     # PR C's file: readiness reads it from the server's base, and it will hold
     # bootstrap's crash-recovery branch guard.

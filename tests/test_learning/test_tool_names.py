@@ -3,6 +3,7 @@
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -92,6 +93,54 @@ def test_the_mcp_short_names_match_the_registered_tools():
     # names no session can call.
     assert tool_names._mcp_short_names() == unique
     assert tool_names._genesis_mcp_names() == {n for full in registered.values() for n in full}
+
+
+@pytest.mark.parametrize("name,attempted,registered", [
+    ("visible.py", True, True), (".py", True, True), (".hidden.py", True, True),
+    ("directory.py", True, False), ("UPPER.PY", False, False),
+    ("middle.py.txt", False, False), ("nested/tool.py", False, False),
+    ("user_job_tools.py", False, False),
+])
+def test_ast_registry_file_membership_and_default_loader_behavior(
+    tmp_path, monkeypatch, name, attempted, registered,
+):
+    root = tmp_path / "genesis"
+    health = root / "mcp" / "health"
+    health.mkdir(parents=True)
+    path = health / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if name == "directory.py":
+        path.mkdir()
+    else:
+        path.write_text("@mcp.tool()\ndef qualification_registry_probe(): pass\n")
+    monkeypatch.setattr(tool_names, "__file__", str(root / "learning/procedural/tool_names.py"))
+    monkeypatch.setattr(tool_names, "_MCP_MODULES", {"genesis-health": "genesis.mcp.health"})
+    default = list(tool_names._mcp_source_files())
+    assert (path in [p for _, p in default]) is attempted
+    assert list(tool_names._mcp_source_files(strict=True)) == default
+    expected = {"qualification_registry_probe": ["mcp__genesis-health__qualification_registry_probe"]}
+    assert tool_names._mcp_owners.__wrapped__() == (expected if registered else {})
+
+
+def test_strict_registry_enumeration_does_not_change_default_loader(tmp_path, monkeypatch):
+    health = tmp_path / "mcp" / "health"
+    health.mkdir(parents=True)
+    (health / "readable.py").write_text("@mcp.tool()\ndef qualification_registry_probe(): pass\n")
+    monkeypatch.setattr(tool_names, "__file__", str(tmp_path / "learning/procedural/tool_names.py"))
+    monkeypatch.setattr(tool_names, "_MCP_MODULES", {"genesis-health": "genesis.mcp.health"})
+    iterate = Path.iterdir
+
+    def unreadable(path):
+        if path == health:
+            raise PermissionError("synthetic unreadable registry directory")
+        return iterate(path)
+
+    monkeypatch.setattr(Path, "iterdir", unreadable)
+    with pytest.raises(PermissionError):
+        list(tool_names._mcp_source_files(strict=True))
+    assert tool_names._mcp_owners.__wrapped__() == {
+        "qualification_registry_probe": ["mcp__genesis-health__qualification_registry_probe"]
+    }
 
 
 @pytest.mark.parametrize(

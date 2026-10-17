@@ -25,6 +25,7 @@ test_venv_matches_pyproject.py.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import subprocess
@@ -186,6 +187,90 @@ def test_a_finished_update_left_behind_does_not_block(station):
     r = _run(station)
     assert r.returncode == 0, r.stderr
     assert "genesis-server pid 2222" in r.stdout, r.stdout
+
+
+def _guard_state(station, content: dict, *, conflict: bool = False) -> str:
+    """Write update_state.json against a rollback tag `pre` at the station's HEAD."""
+    head = _git(station["root"], "rev-parse", "HEAD")
+    _git(station["root"], "tag", "-f", "pre")
+    if content.get("deploy_head") == "HEAD":
+        content = {**content, "deploy_head": head}
+    dot = station["home"] / ".genesis"
+    (dot / "update_state.json").write_text(json.dumps(content))
+    if conflict:
+        (dot / "update_conflicts.json").write_text(json.dumps({"deploy_head": head}))
+    return head
+
+
+def test_a_merge_conflict_waiting_on_its_resolver_is_refused(station):
+    """#3139: the shared rule's conflict verdict, and its remedy."""
+    head = _guard_state(
+        station, {"phase": "merging", "rollback_tag": "pre", "deploy_head": "HEAD"}, conflict=True
+    )
+    _advance_upstream(station)
+    r = _run(station)
+    _assert_untouched(station, head, r)
+    assert "merge conflicts" in r.stderr and "Resolve" in r.stderr
+
+
+def test_merged_code_never_activated_is_refused(station):
+    # The rollback tag is not HEAD: the checkout holds what the run merged.
+    head = _guard_state(station, {"phase": "merging", "rollback_tag": "not-head"})
+    _advance_upstream(station)
+    r = _run(station)
+    _assert_untouched(station, head, r)
+    assert "update.sh --post-merge" in r.stderr and "Dismiss" in r.stderr
+
+
+def test_a_run_that_stopped_before_merging_anything_does_not_block(station):
+    """The shared rule, not "any phase but done": a plain run that left its
+    "fetching" state with nothing merged guards nothing."""
+    _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": False},
+    )
+    tip = _advance_upstream(station)
+    r = _run(station)
+    assert r.returncode == 0, r.stderr
+    assert _git(station["root"], "rev-parse", "HEAD") == tip
+
+
+@pytest.mark.parametrize("mode", ["deploy", "pull"])
+def test_a_harmless_leftover_is_removed_before_the_pull_moves_head(station, mode):
+    """SF-C: after the pull HEAD is off the leftover's rollback tag, where the
+    same file would read as guarding merged code (update.sh would then exit 5
+    and the card would offer --post-merge)."""
+    _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": False},
+    )
+    _advance_upstream(station)
+    r = _run(station) if mode == "deploy" else _run(station, "pull")
+    assert r.returncode == 0, r.stderr
+    assert not (station["home"] / ".genesis" / "update_state.json").exists()
+
+
+def test_restart_moves_nothing_and_leaves_a_harmless_leftover(station):
+    state = station["home"] / ".genesis" / "update_state.json"
+    _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": False},
+    )
+    r = _run(station, "restart")
+    assert r.returncode == 0, r.stderr
+    assert state.exists(), "restart does not move HEAD; the leftover stays harmless"
+
+
+def test_a_post_merge_fetching_state_is_refused(station):
+    """SF1: a --post-merge writes "fetching" over code already merged."""
+    head = _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": True},
+    )
+    _advance_upstream(station)
+    r = _run(station)
+    _assert_untouched(station, head, r)
+    assert "update.sh --post-merge" in r.stderr
 
 
 def test_a_branch_other_than_main_is_refused(station):

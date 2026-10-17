@@ -55,6 +55,14 @@ _crash_recovery_refuse() {
     exit 1
 }
 
+# Is the state a pending merge conflict (scripts/lib/update_state_guard.py, the rule
+# update.sh, deploy_code_only.sh and the dashboard share; its exit 3)?
+_state_is_conflict_pending() {
+    local rc=0
+    python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$UPDATE_STATE" "$GENESIS_ROOT" >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 3 ]
+}
+
 if [ -f "$UPDATE_STATE" ]; then
     echo "--- Detected interrupted update state file ---"
     ROLLBACK_TAG=""
@@ -106,6 +114,11 @@ PY
     elif [ "$STATE_PHASE" = "done" ]; then
         echo "  Update completed successfully — cleaning up state file."
         rm -f "$UPDATE_STATE"
+    elif _state_is_conflict_pending; then
+        # A merge-conflict exit (update.sh exit 2): nothing merged, and the state is
+        # the resolver's anchor (its rollback tag and old commit) for the later
+        # --post-merge. It is not a crash, so it is neither recovered nor recorded.
+        echo "  An update stopped on merge conflicts (nothing was merged); its state is kept for the resolver."
     else
         echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID is dead)."
         if [ -z "$ROLLBACK_TAG" ] || ! git -C "$GENESIS_ROOT" check-ref-format "refs/tags/$ROLLBACK_TAG" >/dev/null 2>&1; then
@@ -153,33 +166,13 @@ PY
             # fast-forward killed mid-write leaves: HEAD unmoved, files half
             # new. update.sh treats that state as CRITICAL; installing over it
             # would run half-written code, so refuse and keep the state file.
-            # Every tracked path counts here, the ephemeral allowlist included:
-            # the merge writes those too, and the deployability predicate below
-            # skips them. git status cannot see a file whose index entry is
-            # flagged skip-worktree or assume-unchanged, so the lib's hidden-edit
-            # scan runs as well.
+            # The check is genesis_merge_residue (lib/deploy_checkout.sh): every
+            # tracked path (the ephemeral allowlist included: the merge writes
+            # those too), flagged entries, and files the range added. It is
+            # shared with scripts/lib/update_state_guard.py, so the guard's
+            # verdict on this state and this recovery agree.
             if [ "$STATE_PHASE" = "merging" ]; then
-                merge_dirty="" merge_hidden=""
-                if ! merge_dirty="$(git -C "$GENESIS_ROOT" status --porcelain --untracked-files=no --no-renames 2>/dev/null)"; then
-                    merge_dirty="(status unreadable)"
-                fi
-                if ! merge_hidden="$(_genesis_hidden_dirty_lines "$GENESIS_ROOT" 2>/dev/null)"; then
-                    merge_hidden="(flagged-entry status unreadable)"
-                fi
-                # A fast-forward killed after writing only the files the range
-                # ADDS leaves them untracked, which status cannot show. update.sh's
-                # pre-stop scan refuses a range that lands on an existing
-                # untracked path, so one present now appeared during the run.
-                merge_new=""
-                if [ -n "$DEPLOY_HEAD" ]; then
-                    collide_rc=0
-                    merge_new="$(genesis_range_collisions "$GENESIS_ROOT" "$rb_commit" "$DEPLOY_HEAD" 2>/dev/null)" \
-                        || collide_rc=$?
-                    if [ "$collide_rc" -eq 2 ]; then
-                        merge_new="(the update's incoming range cannot be listed)"
-                    fi
-                fi
-                merge_dirty="$(printf '%s\n%s\n%s\n' "$merge_dirty" "$merge_hidden" "$merge_new" | grep -v '^$' || true)"
+                merge_dirty="$(genesis_merge_residue "$GENESIS_ROOT" "$rb_commit" "$DEPLOY_HEAD")"
                 if [ -n "$merge_dirty" ]; then
                     printf '%s\n' "$merge_dirty" | sed 's/^/    /'
                     _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but tracked files changed during the merge (a half-written update or edits by someone else)"
@@ -774,10 +767,13 @@ install_browser_extra "$GENESIS_ROOT" "$VENV_DIR" \
 echo
 
 # --- Skill-security trusted baseline ---
-# Bless the currently-installed skills so the scheduled scan files findings only
-# for NEW/untrusted skills (a raw scan flags ~every capable skill as CRITICAL).
+# Bless the skills installed the FIRST time bootstrap runs, so the scheduled
+# scan files findings only for NEW/untrusted skills (a raw scan flags ~every
+# capable skill as CRITICAL). --if-missing: bootstrap runs on every update, and
+# re-seeding here would silently bless every skill added since the last one.
+# Trusting a new skill is a deliberate act: add its name to the allowlist.
 echo "--- Seeding skill-security trusted allowlist ---"
-"$VENV_DIR/bin/python" -m genesis.security.skill_scan --seed-trusted 2>&1 | tail -1 || true
+"$VENV_DIR/bin/python" -m genesis.security.skill_scan --seed-trusted --if-missing 2>&1 | tail -1 || true
 echo
 
 # --- Baseline procedures ---
@@ -1106,28 +1102,25 @@ SSHD_CONTENT=$'# Genesis: detect dead SSH clients fast so an orphaned foreground
 if ! command -v sshd >/dev/null 2>&1 && [[ ! -x /usr/sbin/sshd ]]; then
     echo "  sshd not installed — skipping"
 else
-    GENESIS_ETC_BACKUP=""
-    genesis_etc_put "$SSHD_DROP_IN" "$SSHD_CONTENT" "" sshd
+    genesis_etc_put "$SSHD_DROP_IN" "$SSHD_CONTENT" "" sshd validate
     _sshd_result="$GENESIS_ETC_RESULT"
     if [[ "$_sshd_result" == failed ]]; then
+        if [[ "$GENESIS_ETC_ATTEMPTED" == 1 ]]; then
+            genesis_etc_rollback "$SSHD_DROP_IN" "sshd drop-in write failed" || _bootstrap_etc_failed "$SSHD_DROP_IN"
+        else
+            genesis_etc_finalize discard
+        fi
         _bootstrap_etc_failed "$SSHD_DROP_IN"
     fi
     if [[ "$_sshd_result" == written || "$_sshd_result" == taken || "$_sshd_result" == migrated ]]; then
         if ! sudo sshd -t 2>/dev/null; then
-            # Undo only what this run did: put back the file it took, or remove
-            # its own write. A file it kept was never touched.
-            if [[ "$_sshd_result" == taken && -n "$GENESIS_ETC_BACKUP" ]]; then
-                sudo tee "$SSHD_DROP_IN" < "$GENESIS_ETC_BACKUP" >/dev/null || _bootstrap_etc_failed "$SSHD_DROP_IN"
-                echo "  WARNING: sshd -t rejected the config — your previous drop-in was put back, sshd untouched"
-            else
-                sudo rm -f "$SSHD_DROP_IN"
-                echo "  WARNING: sshd -t rejected the config — drop-in removed, sshd untouched"
-            fi
+            genesis_etc_rollback "$SSHD_DROP_IN" "sshd -t rejected the config" || _bootstrap_etc_failed "$SSHD_DROP_IN"
             _sshd_result="rejected"
         elif [[ "$_sshd_result" != migrated ]]; then
             sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd 2>/dev/null || true
         fi
     fi
+    genesis_etc_finalize commit
     if [[ "$_sshd_result" != rejected && "$_sshd_result" != kept-* ]]; then
         # Verify the EFFECTIVE value — another drop-in sorting earlier would
         # silently win (first-value-wins), leaving dead-client detection off.

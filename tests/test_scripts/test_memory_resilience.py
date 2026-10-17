@@ -15,6 +15,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIB = REPO_ROOT / "scripts" / "lib" / "memory_resilience.sh"
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
@@ -101,6 +103,31 @@ def _dropins(env: dict) -> dict[str, str]:
         "user_service": (etc / "systemd/system/user@.service.d/genesis-oomd.conf"),
         "oomd_conf": (etc / "systemd/oomd.conf.d/genesis.conf"),
     }
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_failed_metadata_migration_reports_actual_memory_policy_state(tmp_path, partial):
+    env = _stage(tmp_path)
+    assert _run(env).returncode == 0
+    originals = {}
+    for path in _dropins(env).values():
+        legacy = path.read_text().split("# genesis-managed v1 sha256=", 1)[0]
+        path.write_text(legacy)
+        originals[path] = legacy.encode()
+    log = Path(env["SYSTEMCTL_LOG"])
+    log.write_text("")
+    fault = 'head -c 7 > "$2"; ' if partial else ''
+    sudo = tmp_path / "bin/sudo"
+    sudo.write_text(_SUDO_STUB.replace('exec "$@"',
+        f'if [ "$1" = tee ]; then {fault}exit 1; fi\nexec "$@"'))
+    result = _run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("NOT fully applied" in result.stdout) == partial
+    assert ("policy already in place" in result.stdout) == (not partial)
+    for path, original in originals.items():
+        assert path.read_bytes() == (original[:7] if partial else original)
+    calls = log.read_text()
+    assert "daemon-reload" not in calls and "restart" not in calls
 
 
 def test_fresh_apply_writes_dropins_and_reloads(tmp_path):

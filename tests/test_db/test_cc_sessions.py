@@ -140,6 +140,45 @@ async def test_merge_metadata_tolerates_corrupt_and_missing(db, sess_fields):
     assert await cc_sessions.merge_metadata(db, "nope", {"k": "v"}) is False
 
 
+async def test_concurrent_merges_to_one_row_are_not_lost(db, sess_fields):
+    import asyncio
+    import json
+
+    await cc_sessions.create(db, **{**sess_fields, "metadata": "{}"})
+    await asyncio.gather(
+        *(cc_sessions.merge_metadata(db, "sess-1", {f"k{i}": i}) for i in range(10))
+    )
+    row = await cc_sessions.get_by_id(db, "sess-1")
+    assert json.loads(row["metadata"]) == {f"k{i}": i for i in range(10)}
+
+
+async def test_merge_unless_true_leaves_a_set_flag_alone(db, sess_fields):
+    import json
+
+    stored = {"error": "cleanup_unconfirmed", "cleanup_unconfirmed": True}
+    await cc_sessions.create(db, **{**sess_fields, "metadata": json.dumps(stored)})
+    patch = {"error": "cancelled", "nested": {"a": None}}
+    assert not await cc_sessions.merge_metadata(
+        db, "sess-1", patch, unless_true="cleanup_unconfirmed"
+    )
+    assert json.loads((await cc_sessions.get_by_id(db, "sess-1"))["metadata"]) == stored
+    assert await cc_sessions.merge_metadata(db, "sess-1", patch, unless_true="absent")
+    merged = json.loads((await cc_sessions.get_by_id(db, "sess-1"))["metadata"])
+    assert merged == {**stored, **patch}
+
+
+async def test_merge_keeps_metadata_python_wrote_with_nan(db, sess_fields):
+    import json
+    import math
+
+    stored = json.dumps({"managed_fingerprint": "f", "cost": float("nan")})
+    await cc_sessions.create(db, **{**sess_fields, "metadata": stored})
+    assert await cc_sessions.merge_metadata(db, "sess-1", {"a": 1})
+    merged = json.loads((await cc_sessions.get_by_id(db, "sess-1"))["metadata"])
+    assert merged["managed_fingerprint"] == "f" and merged["a"] == 1
+    assert math.isnan(merged["cost"])
+
+
 async def test_query_active(db, sess_fields):
     await cc_sessions.create(db, **sess_fields)
     await cc_sessions.create(db, **{**sess_fields, "id": "sess-2", "status": "completed"})

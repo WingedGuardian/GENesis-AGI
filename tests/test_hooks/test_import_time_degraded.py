@@ -1355,13 +1355,10 @@ def test_degraded_pretool_check_reads_the_stamp_exactly_as_the_healthy_path_does
 #:
 #: Keyed on the EXACT normalised command, not a substring. A substring key is an
 #: exemption with a wildcard on the end: a newly wired
-#: `python3 scripts/cc-deploy-timeout-guard.py` would inherit the shell hook's
+#: `python3 scripts/<hook>.py` would inherit a shell hook's
 #: waiver and never be executed, which is precisely the "a new guard fails by
 #: construction" guarantee this gate exists to make.
-_NOT_PYTHON_ON_BASH = {
-    "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cc-deploy-timeout-guard":
-        "shell script; never imports hook_input",
-}
+_NOT_PYTHON_ON_BASH: dict[str, str] = {}
 
 #: The inline `bash -c` guard is exempted by its own exact text, which is long and
 #: contains quoting, so it is matched after whitespace normalisation rather than
@@ -1391,6 +1388,7 @@ _INLINE_SHELL_PREFIX = "bash -c 'IN=$(cat);"
 _ADVISORY_BY_DESIGN = {
     "hooks/capped_read_advisory.py": "ADVISORY ONLY.",
     "hooks/credential_surface_hook.py": "Exit 0 always — advisory, never blocks.",
+    "hooks/deploy_timeout_advisory.py": "ADVISORY ONLY. It never blocks and never asks",
     "hooks/pipe_status_guard.py": "ADVISORY, never blocking:",
     "hooks/pr_close_advisory.py": "Say so; never block it.",
     "hooks/pre_push_privacy_review.py": "NON-BLOCKING.",
