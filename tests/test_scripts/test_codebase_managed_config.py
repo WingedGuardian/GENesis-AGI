@@ -654,6 +654,10 @@ def test_native_configure_cli_e2e(native_root, long_runtime):
     shutil.copy2(
         ROOT / "scripts/lib/code_intel_cbm_admission.py", repo / "scripts/lib/code_intel_cbm_admission.py"
     )
+    shutil.copy2(
+        ROOT / "scripts/lib/codebase_managed_unit.py", repo / "scripts/lib/codebase_managed_unit.py"
+    )
+    shutil.copy2(ROOT / "scripts/lib/managed_units.py", repo / "scripts/lib/managed_units.py")
     git_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     subprocess.run(["git", "init", "--quiet", str(repo)], check=True, env=git_env)
     settings = home / ".genesis/config/codebase-managed.json"
