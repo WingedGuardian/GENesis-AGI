@@ -189,6 +189,30 @@ def test_an_explicit_false_web_flag_still_checks_a_confirmed_filing(monkeypatch,
     assert "acme/widgets#900" in note and len(gh.of("search")) == 1
 
 
+@pytest.mark.parametrize("flag", ["--web", "-w"])
+@pytest.mark.parametrize("value", ["1", "t", "T", "TRUE", "true", "True"])
+def test_attached_true_web_flags_do_not_file(monkeypatch, capsys, flag, value):
+    note, gh = _note(monkeypatch, capsys, CREATE + f" {flag}={value}", NEW_URL)
+    assert note is None and gh.calls == []
+
+
+@pytest.mark.parametrize("flag", ["--title", "-t", "--body", "-b", "--body-file", "-F"])
+@pytest.mark.parametrize("value", ["--web=true", "-w=1"])
+def test_boolean_web_spelling_as_a_string_value_still_files(monkeypatch, capsys, flag, value):
+    note, gh = _note(monkeypatch, capsys, f"gh issue create {flag} {value}", NEW_URL)
+    assert "acme/widgets#900" in note and len(gh.of("search")) == 1
+
+
+@pytest.mark.parametrize("joiner", [";", "&&", "||"])
+@pytest.mark.parametrize("event", ["PostToolUse", "PostToolUseFailure"])
+def test_partial_multi_create_reports_unattributed_possible_filing(monkeypatch, capsys, joiner, event):
+    note, gh = _note(monkeypatch, capsys, CREATE + " >/dev/null " + joiner + " " + CREATE,
+                     NEW_URL, event=event)
+    assert "acme/widgets#900" in note and len(gh.of("search")) == 1
+    assert "1 additional possible issue filing" in note
+    assert "may not have run" in note
+
+
 def test_a_backgrounded_create_says_to_check_later(monkeypatch, capsys):
     note, gh = _note(monkeypatch, capsys, CREATE, "", response_extra={"backgroundTaskId": "b1"})
     assert "started in the background" in note and gh.calls == []

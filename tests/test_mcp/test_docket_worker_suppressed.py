@@ -237,7 +237,7 @@ def _modules_imported_by_the_real_servers() -> set[str]:
         text=True,
         cwd=str(_REPO_ROOT),
         env=env,
-        timeout=600,
+        timeout=300,  # below the 600 s per-test timeout, so this fires first
     )
     assert result.returncode == 0, (
         f"the import probe failed, so this test proved nothing:\n{result.stderr[-2000:]}"

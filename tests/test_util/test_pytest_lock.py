@@ -269,6 +269,12 @@ class TestContentionMessage:
             "not-a-pid\n0\npytest x",
             "4242",  # torn: pid only, no age or command yet
             "4242\nnot-a-timestamp\npytest x",  # torn: unparseable age
+            "²\n0\npytest x",
+            "١\n0\npytest x",
+            "4242\n-inf\npytest x",
+            "4242\n0\npytest x\ntest_x\n-inf\n",
+            "4242\n0\npytest x\ntest_x\ninf\n",
+            "4242\n0\npytest x\ntest_x\nnan\n",
         ],
     )
     def test_partial_or_corrupt_holder_record_still_blocks(
@@ -730,7 +736,8 @@ class TestConftestWiring:
         path = tmp_path / "pytest.lock"
         holder(path)
 
-        result = self._run(mode, path)
+        # Introspection must bypass contention, independent of suite size.
+        result = self._run([*mode, str(Path(__file__).resolve())], path)
         out = result.stdout + result.stderr
 
         assert result.returncode == 0, f"{mode} was refused: {out[:400]}"
@@ -889,3 +896,200 @@ class TestPostAcquisitionIsTotal:
         assert not self._held_by_another_process(path), (
             "a post-flock failure outside _write_holder_record stranded the fd"
         )
+class TestStallReport:
+    """The record names the running test, and a contender flags a stuck one.
+
+    Origin (#3135): one hung mutation-sweep test held this lock for 53 minutes
+    while six runs queued behind it, and the refusal said only "pid N, running
+    53m" — indistinguishable from a long healthy suite.
+    """
+
+    @staticmethod
+    def _record(label_age: float | None, *, note: str = "") -> str:
+        now = time.time()
+        rec = f"4242\n{now - 900}\npytest tests/x.py\n"
+        if label_age is not None:
+            rec += f"tests/x.py::test_y\n{now - label_age}\n{note}\n"
+        return rec
+
+    def test_a_long_running_test_reads_as_likely_hung(self, tmp_path, holder):
+        path = tmp_path / "pytest.lock"
+        holder(path, record=self._record(700))
+        lock = acquire(lock_path=path)
+        assert lock.blocked
+        assert "current: tests/x.py::test_y (running 11m" in lock.message
+        assert "LIKELY HUNG" in lock.message
+        assert "Nothing is killed" in lock.message
+
+    def test_a_fresh_test_is_named_but_not_flagged(self, tmp_path, holder):
+        path = tmp_path / "pytest.lock"
+        holder(path, record=self._record(30))
+        lock = acquire(lock_path=path)
+        assert "current: tests/x.py::test_y (running 30s)" in lock.message
+        assert "LIKELY HUNG" not in lock.message
+
+    def test_a_record_without_a_current_test_is_described_as_before(self, tmp_path, holder):
+        """The gauntlet's record carries no test lines; nothing is invented."""
+        path = tmp_path / "pytest.lock"
+        holder(path, record=self._record(None))
+        lock = acquire(lock_path=path)
+        assert "pid 4242" in lock.message
+        assert "current:" not in lock.message
+        assert "LIKELY HUNG" not in lock.message
+
+    def test_the_threshold_is_a_lever(self, tmp_path, holder, monkeypatch):
+        path = tmp_path / "pytest.lock"
+        holder(path, record=self._record(30))
+        monkeypatch.setenv(pytest_lock.STALL_ENV, "10")
+        assert "LIKELY HUNG" in acquire(lock_path=path).message
+
+    @pytest.mark.parametrize("raw", ["", "abc", "0", "-5", "nan", "inf"])
+    def test_an_unusable_threshold_falls_back_to_the_default(self, monkeypatch, raw):
+        monkeypatch.setenv(pytest_lock.STALL_ENV, raw)
+        assert pytest_lock.stall_seconds() == pytest_lock.STALL_SECONDS
+
+    def test_the_no_timeout_note_reaches_the_flag(self, tmp_path, holder):
+        path = tmp_path / "pytest.lock"
+        holder(path, record=self._record(700, note="per-test timeout: none"))
+        assert "per-test timeout: none." in acquire(lock_path=path).message
+
+    def test_note_rewrites_the_record_and_keeps_the_start(self, tmp_path):
+        path = tmp_path / "pytest.lock"
+        lock = acquire(lock_path=path)
+        try:
+            first = path.read_text().split("\n")
+            lock.note_suffix = "per-test timeout: none"
+            lock.note("tests/a.py::test_b\nwith a newline")
+            lines = path.read_text().split("\n")
+        finally:
+            lock.release()
+        assert lines[:3] == first[:3], "pid, start and argv must survive a note"
+        assert lines[3] == "tests/a.py::test_b with a newline"
+        assert time.time() - float(lines[4]) < 60
+        assert lines[5] == "per-test timeout: none"
+
+    def test_note_is_a_no_op_without_the_lock(self, tmp_path, holder, monkeypatch):
+        """A nested run (HELD set) must never rewrite its parent's record."""
+        path = tmp_path / "pytest.lock"
+        holder(path, record="4242\n0\nouter run\n")
+        monkeypatch.setenv(pytest_lock.HELD_ENV, "4242")
+        inner = acquire(lock_path=path)
+        assert not inner.acquired
+        inner.note("tests/inner.py::test_z")
+        assert path.read_text() == "4242\n0\nouter run\n"
+
+    def test_an_oversized_label_declares_truncation(self, tmp_path):
+        path = tmp_path / "pytest.lock"
+        lock = acquire(lock_path=path)
+        try:
+            lock.note("tests/x.py::test_value[" + "x" * 600 + "]")
+            label = path.read_text().split("\n")[3]
+        finally:
+            lock.release()
+        assert len(label) <= 500
+        assert label.endswith("[truncated]")
+
+    def test_the_wait_cli_copy_describes_a_record_identically(self, monkeypatch):
+        """``scripts/pytest_lock_wait.py`` carries a copy (it runs without
+        ``genesis``); the two must never drift apart."""
+        import importlib.util
+
+        script = Path(__file__).resolve().parents[2] / "scripts" / "pytest_lock_wait.py"
+        spec = importlib.util.spec_from_file_location("_plw_parity", script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert mod.STALL_SECONDS == pytest_lock.STALL_SECONDS
+        assert mod.STALL_ENV == pytest_lock.STALL_ENV
+        for age, note in ((5, ""), (700, ""), (700, "per-test timeout: none")):
+            for stall in (None, "3"):
+                if stall is None:
+                    monkeypatch.delenv(pytest_lock.STALL_ENV, raising=False)
+                else:
+                    monkeypatch.setenv(pytest_lock.STALL_ENV, stall)
+                lines = self._record(age, note=note).split("\n")
+                # A pid that is certainly not running, so both read wchan the same.
+                ours = pytest_lock.describe_current(lines, 2**22 + 7)
+                theirs = mod.describe_current(lines, 2**22 + 7)
+                assert ours == theirs, (age, note, stall)
+        for lines in (["1", "0"], ["1", "0", "x", "", ""], ["1", "0", "x", "t", "bad"]):
+            assert pytest_lock.describe_current(lines, 1) == mod.describe_current(lines, 1)
+
+
+class TestStallReportWiring:
+    """Through a REAL pytest and this repo's conftest: the holder's record
+    follows the running test, ends on teardown, and a missing pytest-timeout is
+    announced at the top of the run."""
+
+    PROBE = "tests/test_util/test_pytest_lock.py::TestStallReportWiring::test_holder_sleep_probe"
+
+    def test_holder_sleep_probe(self):
+        """A no-op unless the wiring tests below ask it to sleep."""
+        time.sleep(float(os.environ.get("_GENESIS_LOCK_TEST_SLEEP", "0")))
+
+    def _spawn(self, path: Path, *extra: str, sleep: str = "6") -> subprocess.Popen:
+        worktree = Path(__file__).resolve().parent.parent.parent
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(worktree / "src")
+        env["GENESIS_PYTEST_LOCK_PATH"] = str(path)
+        env["_GENESIS_LOCK_TEST_SLEEP"] = sleep
+        env.pop(pytest_lock.HELD_ENV, None)
+        for leaked in (
+            pytest_lock.DISABLE_ENV,
+            pytest_lock.WAIT_ENV,
+            pytest_lock.WAIT_TIMEOUT_ENV,
+            pytest_lock.STALL_ENV,
+        ):
+            env.pop(leaked, None)
+        return subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *extra, self.PROBE],
+            cwd=worktree,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+    @staticmethod
+    def _lines(path: Path) -> list[str]:
+        try:
+            return path.read_text().split("\n")
+        except OSError:
+            return []
+
+    def test_a_contender_names_the_running_test_then_teardown(self, tmp_path, monkeypatch):
+        path = tmp_path / "pytest.lock"
+        proc = self._spawn(path)
+        try:
+            assert _wait_for(
+                lambda: len(self._lines(path)) > 3 and self._lines(path)[3] == self.PROBE,
+                timeout=120,
+            ), f"the holder never recorded its running test: {self._lines(path)}"
+            monkeypatch.setenv(pytest_lock.STALL_ENV, "1")
+            assert _wait_for(lambda: "LIKELY HUNG" in acquire(lock_path=path).message, timeout=10)
+            message = acquire(lock_path=path).message
+            assert f"current: {self.PROBE} (running" in message
+            out, _ = proc.communicate(timeout=120)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        assert proc.returncode == 0, out
+        assert self._lines(path)[3] == "(session teardown)"
+
+    def test_a_run_without_pytest_timeout_says_so_first(self, tmp_path):
+        path = tmp_path / "pytest.lock"
+        proc = self._spawn(path, "-p", "no:timeout", sleep="0")
+        out, _ = proc.communicate(timeout=120)
+        assert proc.returncode == 0, out
+        first = out.strip().splitlines()[0]
+        assert "pytest-timeout is not active" in first, out
+        assert "per-test timeout: none" in self._lines(path)[5]
+
+    def test_a_run_with_pytest_timeout_says_nothing(self, tmp_path):
+        if not __import__("importlib").util.find_spec("pytest_timeout"):
+            pytest.skip("pytest-timeout is not installed in this venv")
+        path = tmp_path / "pytest.lock"
+        proc = self._spawn(path, sleep="0")
+        out, _ = proc.communicate(timeout=120)
+        assert proc.returncode == 0, out
+        assert "pytest-timeout is not active" not in out

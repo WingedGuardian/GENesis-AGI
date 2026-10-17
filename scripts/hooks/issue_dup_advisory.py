@@ -109,6 +109,11 @@ _GH_WORD = re.compile(r"(?<![\w-])gh(?![\w-])")
 #: For a command the parser could not read: raw text only, never a re-parse.
 _CREATE_WORDS = re.compile(r"\bissue\s+(?:create|new)\b")
 _CREATE_SUBCOMMANDS = frozenset({"create", "new"})
+_WEB_FLAGS = frozenset({"--web", "-w"}) | frozenset(
+    f"{flag}={value}"
+    for flag in ("--web", "-w")
+    for value in ("1", "t", "T", "TRUE", "true", "True")
+)
 #: gh prints the new issue's URL alone on a line of stdout. Only a WHOLE-line
 #: github.com URL is a candidate: an issue link inside prose does not even cost a
 #: lookup, and no other host is ever contacted (see the module docstring).
@@ -347,7 +352,7 @@ def _creates_in(cmd: str) -> int:
         # Reuse the option-aware help walk for web flags: string values remain
         # consumed values even when mapped, rather than becoming flag positions.
         if gh_requests_help(argv) or gh_requests_help(
-            ["--help" if arg in {"--web", "-w"} else arg for arg in argv]
+            ["--help" if arg in _WEB_FLAGS else arg for arg in argv]
         ):
             continue
         count += 1
@@ -468,6 +473,12 @@ def _process(payload: dict, now: datetime | None = None) -> None:
         notes.append(
             f"{len(filed) - _MAX_CHECKS} more new issues from this command were not checked."
         )
+    if filed and creates > len(filed):
+        notes.append(_manual(
+            f"{creates - len(filed)} additional possible issue filing(s)",
+            "not every syntactic create has an attributable newly created issue URL; "
+            "it may not have run, or its output may be hidden",
+        ))
     if len(hits) > len(filed):
         # More issues were created during the call than the command visibly runs
         # creates (a create inside a loop, say). Not claimed as this call's filings.

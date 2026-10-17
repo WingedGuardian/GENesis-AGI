@@ -63,9 +63,10 @@ def _run_inner(tmp_path: Path, *extra: str) -> Path:
         text=True,
         # The inner run is two trivial tests (~3 s). Bounded because a hung
         # inner pytest would otherwise block a local run forever: pytest-timeout
-        # is not installed in a local venv (see the comment on `timeout` in
-        # pyproject.toml). 600 s is far past any legitimate run.
-        timeout=600,
+        # may not be installed in a local venv (see the comment on `timeout` in
+        # pyproject.toml). 300 s is far past any legitimate run, and below the
+        # 600 s per-test timeout, so this bound fires first and says why.
+        timeout=300,
     )
     out = result.stdout + result.stderr
     # Guard the guard: the inner session must have RUN both tests, one passing
