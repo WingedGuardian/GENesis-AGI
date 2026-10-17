@@ -88,6 +88,11 @@ def manifest_problem(data: object) -> str:
     return ""
 
 
+class ForeignManifest(Refusal):
+    """The manifest names another repository: for this checkout there is no
+    manifest (what the predicate reads as `other`), not a broken one."""
+
+
 class ManifestStore:
     """Reads and writes one manifest, bound to one repository's git directory."""
 
@@ -114,7 +119,7 @@ class ManifestStore:
                 f"the deploy manifest {self.path} is malformed: {why}. Fix it by hand; nothing was changed."
             )
         if os.path.realpath(data["repo"]) != self._common_dir():
-            raise Refusal(
+            raise ForeignManifest(
                 f"the deploy manifest {self.path} belongs to another repository ({data['repo']}), "
                 f"not {self._common_dir()}."
             )

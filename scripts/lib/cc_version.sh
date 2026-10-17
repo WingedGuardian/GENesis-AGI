@@ -1198,6 +1198,15 @@ PYEOF
 #                                misrouting — matches install.sh)
 #   - post-install: re-check `claude --version`; still != pin -> warn + return 1
 #
+# One line in an update's run summary (update.sh / bootstrap.sh set
+# GENESIS_DEPLOY_SUMMARY), so a pin realignment or a deleted shadow copy is
+# never visible only in output a `tail` has already dropped.
+_cc_deploy_summary() {
+    if [ -n "${GENESIS_DEPLOY_SUMMARY:-}" ]; then
+        printf '%s\n' "$*" >> "$GENESIS_DEPLOY_SUMMARY" 2>/dev/null || true
+    fi
+}
+
 # Exact-match to the pin (the pin may legitimately go DOWN for incident rollback;
 # `npm install @X.Y.Z` pins exactly X.Y.Z). NOTE `claude --version` prints
 # "2.1.173 (Claude Code)", so the version is field 1 (awk '{print $1}').
@@ -1295,6 +1304,7 @@ cc_ensure_local() {
     [ -n "$installed" ] || installed="$(claude --version 2>/dev/null | awk '{print $1}')"
     if [ "$installed" = "$pin" ]; then
         echo "  + Claude Code now at pin ($pin)"
+        _cc_deploy_summary "Claude Code aligned to the pin ($pin)"
         return 0
     fi
     echo "  WARNING: cc_ensure_local: install ran but 'claude --version' is ${installed:-unknown} (expected $pin) — possible npm-prefix/PATH mismatch" >&2
@@ -1382,7 +1392,11 @@ cc_shadow_scan() {
                 ;;
             *)
                 echo "  cc_shadow_scan: removing native-installer version blobs ($HOME/.local/share/claude/versions)"
-                rm -rf "$HOME/.local/share/claude/versions"
+                if rm -rf "$HOME/.local/share/claude/versions"; then
+                    _cc_deploy_summary "removed Claude Code native-installer versions ($HOME/.local/share/claude/versions)"
+                else
+                    echo "  WARNING: cc_shadow_scan: could not remove $HOME/.local/share/claude/versions" >&2
+                fi
                 ;;
         esac
     fi
@@ -1466,8 +1480,19 @@ _cc_remove_shadow() {
             ;;
     esac
     echo "  cc_shadow_scan: removing shadow copy $candidate${pkg_dir:+ (+ $pkg_dir)}"
-    "${rm_link[@]}"
-    [ -n "$pkg_dir" ] && "${rm_pkg[@]}"
+    # Every caller runs `cc_shadow_scan || true`, which turns errexit off in
+    # here, so a failed rm would fall through silently. Check each, and name
+    # the removal in the run summary only once it happened.
+    if ! "${rm_link[@]}"; then
+        echo "  WARNING: cc_shadow_scan: could not remove $candidate${pkg_dir:+ (+ $pkg_dir)} — it may still shadow the canonical copy on PATH" >&2
+        return 1
+    fi
+    if [ -n "$pkg_dir" ] && ! "${rm_pkg[@]}"; then
+        echo "  WARNING: cc_shadow_scan: removed $candidate but could not remove $pkg_dir — delete it by hand" >&2
+        _cc_deploy_summary "removed a shadow Claude Code link $candidate; its package $pkg_dir could not be removed"
+        return 1
+    fi
+    _cc_deploy_summary "removed a shadow Claude Code copy: $candidate${pkg_dir:+ (+ $pkg_dir)}"
     return 0
 }
 

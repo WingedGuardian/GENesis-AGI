@@ -159,9 +159,30 @@ class OutreachRecoveryWorker:
                 await self._queue.mark_discarded(item_id, "Empty content")
                 return
 
-            result = await self._pipeline.submit_raw(content, request)
+            if payload.get("channel") == "agent":
+                from genesis.peers.outbox import PeerEnvelope
 
-            if result.status == OutreachStatus.DELIVERED:
+                request = PeerEnvelope.decode(payload["peer_envelope"]).request(defer_retry=False)
+                result = await self._pipeline.submit(request)
+            else:
+                result = await self._pipeline.submit_raw(content, request)
+
+            if (
+                payload.get("channel") == "agent"
+                and result.status == OutreachStatus.REJECTED
+                and not (
+                    result.governance_result
+                    and any(
+                        check.startswith("dedup")
+                        for check in result.governance_result.checks_failed
+                    )
+                )
+            ):
+                # Full peer governance can refuse temporarily; ordinary raw
+                # recovery's REJECTED-as-delivered-dedup contract stays below.
+                await self._queue.reset_to_pending(item_id)
+                logger.info("Peer outreach retry temporarily governed: %s", item_id)
+            elif result.status == OutreachStatus.DELIVERED:
                 await self._queue.mark_completed(item_id)
                 logger.info(
                     "Outreach recovery: delivered %s on attempt %d",

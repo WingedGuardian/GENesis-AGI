@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -9,12 +10,33 @@ import stat
 import subprocess
 from pathlib import Path
 
+from managed_units import stamp
+
+
+def systemctl_env() -> dict[str, str]:
+    """The user-manager environment from src/genesis/util/systemd.py.
+
+    Loaded by path because this script runs isolated (-I). Without it a service
+    started with no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS cannot reach the
+    user manager, and every systemctl --user call fails.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_genesis_util_systemd",
+        Path(__file__).resolve().parents[2] / "src/genesis/util/systemd.py",
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("could not load systemd utilities")
+    systemd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(systemd)
+    return systemd.systemctl_env()
+
+
 
 def bus_call(path: str, interface: str, method: str, *args: str) -> dict:
     result = subprocess.run(
         ["/usr/bin/busctl", "--user", "--json=short", "call", "org.freedesktop.systemd1",
          path, interface, method, *args],
-        capture_output=True, text=True, check=True, timeout=30,
+        capture_output=True, text=True, check=True, timeout=30, env=systemctl_env(),
     )
     value = json.loads(result.stdout)
     if not isinstance(value, dict) or set(value) != {"type", "data"}:
@@ -226,7 +248,8 @@ def canonical_sources(script: Path, roots: tuple[Path, Path], names: tuple[str, 
                                    os.environ.get("VENV_PATH") or config["main"] + "/.venv")
                                   if config else retirement_parameters(unit))
                 template = script.parent / "systemd" / (unit + ".template")
-                if snapshot[2] != canonical_bytes(template, parameters):
+                expected = canonical_bytes(template, parameters)
+                if snapshot[2] not in (expected, stamp(expected)):
                     raise ValueError(f"unsupported noncanonical managed unit: {unit}")
             snapshots[unit] = (snapshot, parameters)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
@@ -310,23 +333,3 @@ def parent_identity(path: Path):
     if not stat.S_ISDIR(value.st_mode):
         raise ValueError(f"refusing non-directory managed unit parent: {path}")
     return value.st_dev, value.st_ino
-
-
-def sentinel_armed(raw: str) -> bool:
-    try:
-        os.lstat(raw)
-    except FileNotFoundError:
-        return any(os.path.lexists(p) and not os.path.exists(p) for p in Path(raw).parents)
-    except OSError:
-        return True
-    return True
-
-
-def native_env(config: dict) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
-    env.update(
-        CBM_CACHE_DIR=config["cache"],
-        CBM_RUNTIME_DIR=config["runtime"],
-        CBM_ALLOWED_ROOT=config["main"],
-    )
-    return env

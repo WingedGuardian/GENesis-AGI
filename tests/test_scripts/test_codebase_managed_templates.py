@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -18,6 +19,23 @@ def loop(renderer):
     start = source.index('    for template in "$SYSTEMD_TEMPLATE_DIR"/')
     end = source.index("    done\n", start) + len("    done\n")
     return source[start:end]
+
+
+def prelude(scratch):
+    """What both scripts set up before their render loops: SCRIPT_DIR (install's
+    unit stamp) and bootstrap's managed-unit writer with its render file. The
+    writer is sourced against this repository, then GENESIS_ROOT is restored to
+    the test's literal home so the Exec path substitutions stay under test."""
+    scripts = shlex.quote(str(ROOT / "scripts"))
+    return (
+        f"SCRIPT_DIR={scripts}\n"
+        '_test_root="$GENESIS_ROOT"\n'
+        f"GENESIS_ROOT={shlex.quote(str(ROOT))}\n"
+        '. "$SCRIPT_DIR/lib/managed_units.sh"\n'
+        'GENESIS_ROOT="$_test_root"\n'
+        f"_mu_dir=$(mktemp -d -p {shlex.quote(str(scratch))})\n"
+        '_mu_render="$_mu_dir/render"\n'
+    )
 
 
 @pytest.fixture
@@ -46,7 +64,7 @@ def render(tmp_path):
             [
                 "/bin/bash",
                 "-euc",
-                "_falkordb_redis_server_bin() { printf /usr/bin/redis-server; }\n" + loop(renderer),
+                "_falkordb_redis_server_bin() { printf /usr/bin/redis-server; }\n" + prelude(tmp_path) + loop(renderer),
             ],
             env=env,
             capture_output=True,
@@ -110,6 +128,12 @@ def test_ordinary_units_keep_existing_renderer_behavior(render, renderer):
     ordinary.write_text("foreign ordinary")
     template = units.parent / "templates/ordinary.service.template"
     template.write_text("[Service]\nExecStart=/bin/true\n")
-    assert run(renderer).returncode == 0
-    expected = "foreign ordinary" if renderer == "install.sh" else template.read_text()
-    assert ordinary.read_text() == expected
+    result = run(renderer)
+    assert result.returncode == 0, result.stderr
+    # Neither renderer replaces a unit it did not write. install.sh leaves an
+    # existing unit alone; bootstrap's managed-unit writer keeps an unstamped
+    # unit and names it. Whether it was classified as a hand edit is not
+    # asserted here: that is lib/managed_units.sh's own tests' job.
+    assert ordinary.read_text() == "foreign ordinary"
+    if renderer == "bootstrap.sh":
+        assert "Kept: ordinary.service" in result.stdout, result.stdout
