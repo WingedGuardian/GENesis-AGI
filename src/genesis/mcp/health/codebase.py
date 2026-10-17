@@ -6,6 +6,7 @@ AST-indexed code_modules and code_symbols tables:
   L0 (no params): Package index — top-level packages with module counts and LOC.
   L1 (package):   Module list — modules in that package with top symbols.
   L2 (module):    Symbol detail — all public symbols in a specific module.
+  Seams (seams=True or seam="Name"): extension points and their implementers.
 """
 
 from __future__ import annotations
@@ -17,7 +18,9 @@ from genesis.mcp.health import mcp
 logger = logging.getLogger(__name__)
 
 
-async def _impl_codebase_navigate(package: str = "", module: str = "") -> dict:
+async def _impl_codebase_navigate(
+    package: str = "", module: str = "", seams: bool = False, seam: str = ""
+) -> dict:
     """Navigate the codebase progressively.
 
     Args:
@@ -33,6 +36,11 @@ async def _impl_codebase_navigate(package: str = "", module: str = "") -> dict:
         return {"error": "DB not available — code index may not be populated"}
 
     db = _service._db
+
+    if seams or seam:
+        from genesis.codebase.seams import load_seams
+
+        return await load_seams(db, name=seam)
 
     # L2: Symbol detail for a specific module
     if module:
@@ -141,7 +149,9 @@ async def _impl_codebase_navigate(package: str = "", module: str = "") -> dict:
 
 
 @mcp.tool()
-async def codebase_navigate(package: str = "", module: str = "") -> dict:
+async def codebase_navigate(
+    package: str = "", module: str = "", seams: bool = False, seam: str = ""
+) -> dict:
     """Navigate the Genesis codebase progressively.
 
     Three levels of detail:
@@ -150,5 +160,14 @@ async def codebase_navigate(package: str = "", module: str = "") -> dict:
       - module="src/genesis/awareness/loop.py" → L2: All symbols in that module
 
     Use L0 to orient, L1 to explore a package, L2 to find specific symbols.
+
+    seams=True → extension seams (Protocol/ABC bases) with the classes that
+    implement them, nominally or structurally, plus registry-style extension
+    points. seam="Name" → one seam, uncapped. Check here before writing a new
+    adapter, provider or collector. A ``low`` confidence link matched on one
+    method name or an ambiguous base name: verify it. ``possible`` lists classes
+    that lack only members a class attribute could supply (the index sees no
+    attributes) or a zero-argument method: check them before concluding a seam
+    has no implementers. With ``complete: false`` an empty answer is not a "no".
     """
-    return await _impl_codebase_navigate(package=package, module=module)
+    return await _impl_codebase_navigate(package=package, module=module, seams=seams, seam=seam)

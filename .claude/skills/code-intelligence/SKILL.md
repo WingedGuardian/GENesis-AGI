@@ -11,6 +11,7 @@ user-invocable: false
 | Need | Tool | Example |
 |------|------|---------|
 | Package/module overview | `codebase_navigate` MCP (L0→L1→L2) | "What packages exist?" |
+| Extension seams + who implements them | `codebase_navigate(seams=True)`, or `seam="Name"` | "Is there a Protocol for search providers, and which classes satisfy it?" |
 | Symbol definition/signature | Serena `find_symbol` | "Where is Router defined?" |
 | Who calls/references X | Serena `find_referencing_symbols` | "Who calls _set_output?" |
 | File symbol overview | Serena `get_symbols_overview` | "What's in engine.py?" |

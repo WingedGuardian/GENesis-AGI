@@ -154,13 +154,16 @@ def _extract_symbols_and_imports(
 
         elif isinstance(node, ast.ClassDef):
             class_doc = ast.get_docstring(node)
+            parts = [ast.unparse(b) for b in node.bases] + [ast.unparse(k) for k in node.keywords]
             classes.append(
                 SymbolInfo(
                     name=node.name,
                     symbol_type="class",
                     line_start=node.lineno,
                     line_end=node.end_lineno,
-                    signature=None,
+                    signature=f"class {node.name}({', '.join(parts)})"
+                    if parts
+                    else f"class {node.name}",
                     docstring=class_doc,
                     is_public=not node.name.startswith("_"),
                 )
@@ -330,6 +333,14 @@ async def index_codebase(
         async for row in cursor:
             existing[row[0]] = row[1]
 
+    # Class rows written before bases were recorded have a NULL signature:
+    # re-parse those modules once, whatever their mtime.
+    async with db.execute(
+        "SELECT DISTINCT module_path FROM code_symbols "
+        "WHERE symbol_type = 'class' AND signature IS NULL"
+    ) as cursor:
+        stale = {row[0] async for row in cursor}
+
     source_path = repo_root / source_dir
     if not source_path.is_dir():
         logger.warning("Source directory does not exist: %s", source_path)
@@ -357,7 +368,8 @@ async def index_codebase(
         mtime = abs_path.stat().st_mtime
 
         # Compare as int milliseconds to avoid float precision issues across FSes
-        if rel_path in existing and int(existing[rel_path] * 1000) == int(mtime * 1000):
+        unchanged = rel_path in existing and int(existing[rel_path] * 1000) == int(mtime * 1000)
+        if unchanged and rel_path not in stale:
             modules_unchanged += 1
             continue
 
