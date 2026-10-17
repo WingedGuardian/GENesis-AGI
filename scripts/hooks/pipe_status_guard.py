@@ -120,7 +120,7 @@ def main() -> None:
         return
     # PreToolUse structured stdout. exit 0 + stderr counts as "no objection" and is
     # NOT surfaced to the model, which would make this invisible in the exact path
-    # it protects (same reason cc-deploy-timeout-guard uses additionalContext).
+    # it protects (same reason deploy_timeout_advisory uses additionalContext).
     print(
         json.dumps(
             {
