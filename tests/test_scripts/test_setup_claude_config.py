@@ -10,6 +10,7 @@ therefore stays in the template and is left out of the interactive render (#2319
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
@@ -459,7 +460,9 @@ def test_the_files_group_is_kept(tmp_path, _scratch_home):
     assert path.stat().st_gid == gid
 
 
-def test_a_group_that_cannot_be_kept_leaves_the_file_unchanged(tmp_path, _scratch_home, monkeypatch):
+def test_a_group_that_cannot_be_kept_leaves_the_file_unchanged(
+    tmp_path, _scratch_home, monkeypatch
+):
     gid = _secondary_group()
     if gid is None:
         pytest.skip("this user belongs to no second group")
@@ -468,17 +471,19 @@ def test_a_group_that_cannot_be_kept_leaves_the_file_unchanged(tmp_path, _scratc
     path = _drifted(mod, root, {})
     os.chown(path, -1, gid)
     before = path.read_bytes()
-    monkeypatch.setattr(mod.os, "chown", lambda *a, **k: (_ for _ in ()).throw(PermissionError("no")))
+    monkeypatch.setattr(
+        mod.os, "chown", lambda *a, **k: (_ for _ in ()).throw(PermissionError("no"))
+    )
     assert mod.render_mcp_config(root, dry_run=False) is None
     assert path.read_bytes() == before and path.stat().st_gid == gid
     assert not list(root.glob(".mcp.json.*")), "temp file left behind"
 
 
-def _acl_bytes() -> bytes:
+def _acl_bytes(named_uid: int = 65534) -> bytes:
     import struct
 
     u = 0xFFFFFFFF
-    entries = [(1, 6, u), (2, 4, 65534), (4, 4, u), (0x10, 4, u), (0x20, 4, u)]
+    entries = [(1, 6, u), (2, 4, named_uid), (4, 4, u), (0x10, 4, u), (0x20, 4, u)]
     return struct.pack("<I", 2) + b"".join(struct.pack("<HHI", t, p, i) for t, p, i in entries)
 
 
@@ -499,7 +504,9 @@ def test_a_posix_acl_is_kept(tmp_path, _scratch_home):
     assert os.getxattr(path, "system.posix_acl_access") == acl
 
 
-def test_an_acl_that_cannot_be_carried_leaves_the_file_unchanged(tmp_path, _scratch_home, monkeypatch):
+def test_an_acl_that_cannot_be_carried_leaves_the_file_unchanged(
+    tmp_path, _scratch_home, monkeypatch
+):
     mod = _module()
     root = _root(tmp_path)
     path = _drifted(mod, root, {})
@@ -511,9 +518,15 @@ def test_an_acl_that_cannot_be_carried_leaves_the_file_unchanged(tmp_path, _scra
     assert not list(root.glob(".mcp.json.*")), "temp file left behind"
 
 
-def _bootstrap_run(root: Path, tmp_path: Path, extra_env: dict | None = None) -> subprocess.CompletedProcess:
+def _bootstrap_run(
+    root: Path, tmp_path: Path, extra_env: dict | None = None
+) -> subprocess.CompletedProcess:
     """The script on the command line, bounded so a hang fails, not blocks."""
-    env = {**os.environ, "GENESIS_DEPLOY_SUMMARY": str(tmp_path / "summary.txt"), **(extra_env or {})}
+    env = {
+        **os.environ,
+        "GENESIS_DEPLOY_SUMMARY": str(tmp_path / "summary.txt"),
+        **(extra_env or {}),
+    }
     return subprocess.run(
         [sys.executable, str(SCRIPT), "--mcp-only", "--genesis-root", str(root)],
         capture_output=True,
@@ -599,3 +612,153 @@ def test_absurdly_deep_json_is_treated_as_unreadable_not_a_crash(tmp_path, _scra
     (root / ".mcp.json").write_text("[" * 100_000 + "]" * 100_000)
     assert mod.render_mcp_config(root, dry_run=False) is True
     assert "genesis-health" in json.loads((root / ".mcp.json").read_text())["mcpServers"]
+
+
+@pytest.mark.parametrize("control", [*range(32), 127])
+def test_summary_names_escape_all_ascii_controls(
+    tmp_path, _scratch_home, monkeypatch, capsys, control
+):
+    mod = _module()
+    root = _root(tmp_path)
+    summary = tmp_path / "summary.txt"
+    monkeypatch.setenv("GENESIS_DEPLOY_SUMMARY", str(summary))
+    name = "custom" + chr(control) + "server"
+    path = _drifted(mod, root, {name: {"command": "/custom"}})
+    assert mod.render_mcp_config(root, dry_run=False) is True
+    assert name in json.loads(path.read_text())["mcpServers"]
+    line = summary.read_text()
+    assert line.endswith("\n") and line.count("\n") == 1
+    assert all(c.isprintable() for c in line[:-1])
+    assert chr(control) not in capsys.readouterr().out.replace("\n", "")
+
+
+@pytest.mark.parametrize("number", ["1e400", "-1e400"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_unrepresentable_json_numbers_decline_before_backup(
+    tmp_path, _scratch_home, monkeypatch, number, dry_run
+):
+    mod = _module()
+    root = _root(tmp_path)
+    path = _drifted(mod, root, {"mine": {"command": "/custom"}})
+    data = json.loads(path.read_text())
+    data["custom-number"] = "overflow-placeholder"
+    before = json.dumps(data).replace('"overflow-placeholder"', number).encode()
+    path.write_bytes(before)
+    summary = tmp_path / "summary.txt"
+    monkeypatch.setenv("GENESIS_DEPLOY_SUMMARY", str(summary))
+    assert mod.render_mcp_config(root, dry_run=dry_run) is None
+    assert path.read_bytes() == before
+    assert not (_scratch_home / "deploy-backups").exists()
+    assert "mcp.json NOT updated" in summary.read_text()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_first_creation_summary_matches_whether_it_wrote(
+    tmp_path, _scratch_home, monkeypatch, dry_run
+):
+    mod = _module()
+    root = _root(tmp_path)
+    summary = tmp_path / "summary.txt"
+    monkeypatch.setenv("GENESIS_DEPLOY_SUMMARY", str(summary))
+    assert mod.render_mcp_config(root, dry_run=dry_run) is True
+    assert (root / ".mcp.json").exists() is not dry_run
+    if dry_run:
+        assert not summary.exists()
+    else:
+        assert summary.read_text() == "mcp.json created\n"
+    assert not (_scratch_home / "deploy-backups").exists()
+
+
+@pytest.mark.parametrize("stage", ["before-writer", "during-staging"])
+def test_initial_absence_does_not_overwrite_a_concurrent_creation(
+    tmp_path, _scratch_home, monkeypatch, stage
+):
+    mod = _module()
+    root = _root(tmp_path)
+    path = root / ".mcp.json"
+    theirs = b'{"mcpServers":{"custom":{"command":"/custom"}}}\n'
+    if stage == "before-writer":
+        writer = mod._write_keeping_mode
+
+        def create_then_write(*args, **kwargs):
+            path.write_bytes(theirs)
+            return writer(*args, **kwargs)
+
+        monkeypatch.setattr(mod, "_write_keeping_mode", create_then_write)
+    else:
+        mkstemp = mod.tempfile.mkstemp
+
+        def create_during_staging(*args, **kwargs):
+            path.write_bytes(theirs)
+            return mkstemp(*args, **kwargs)
+
+        monkeypatch.setattr(mod.tempfile, "mkstemp", create_during_staging)
+    assert mod.render_mcp_config(root, dry_run=False) is None
+    assert path.read_bytes() == theirs
+    assert not (_scratch_home / "deploy-backups").exists()
+    assert not list(root.glob(".mcp.json.*"))
+
+
+def test_a_present_but_different_inherited_acl_does_not_count_as_preserved(
+    tmp_path, _scratch_home, monkeypatch
+):
+    mod = _module()
+    root = _root(tmp_path)
+    try:
+        os.setxattr(root, "system.posix_acl_default", _acl_bytes(65533))
+    except OSError:
+        pytest.skip("no POSIX default ACL support")
+    path = _drifted(mod, root, {})
+    _with_acl(path)
+    before, acl = path.read_bytes(), os.getxattr(path, mod._ACL)
+    setxattr = os.setxattr
+
+    def denied_copy(destination, name, value, *args, **kwargs):
+        if name == mod._ACL and Path(destination) != path:
+            raise PermissionError(errno.EPERM, "synthetic ACL copy refusal")
+        return setxattr(destination, name, value, *args, **kwargs)
+
+    monkeypatch.setattr(mod.os, "setxattr", denied_copy)
+    assert mod.render_mcp_config(root, dry_run=False) is None
+    assert path.read_bytes() == before and os.getxattr(path, mod._ACL) == acl
+    assert not list(root.glob(".mcp.json.*"))
+
+
+def test_acl_verification_checks_the_final_metadata(tmp_path, _scratch_home, monkeypatch):
+    mod = _module()
+    root = _root(tmp_path)
+    path = _drifted(mod, root, {})
+    _with_acl(path)
+    before, acl = path.read_bytes(), os.getxattr(path, mod._ACL)
+    chown = os.chown
+
+    def changed_after_chown(destination, *args, **kwargs):
+        chown(destination, *args, **kwargs)
+        os.setxattr(destination, mod._ACL, _acl_bytes(65533))
+
+    monkeypatch.setattr(mod.os, "chown", changed_after_chown)
+    assert mod.render_mcp_config(root, dry_run=False) is None
+    assert path.read_bytes() == before and os.getxattr(path, mod._ACL) == acl
+    assert not list(root.glob(".mcp.json.*"))
+
+
+@pytest.mark.parametrize("target", ["original", "temporary"])
+def test_unreadable_acl_metadata_declines_instead_of_claiming_success(
+    tmp_path, _scratch_home, monkeypatch, target
+):
+    mod = _module()
+    root = _root(tmp_path)
+    path = _drifted(mod, root, {})
+    _with_acl(path)
+    before = path.read_bytes()
+    getxattr = os.getxattr
+
+    def denied_read(filename, name, *args, **kwargs):
+        if name == mod._ACL and (Path(filename) == path) == (target == "original"):
+            raise PermissionError(errno.EACCES, "synthetic ACL read refusal")
+        return getxattr(filename, name, *args, **kwargs)
+
+    monkeypatch.setattr(mod.os, "getxattr", denied_read)
+    assert mod.render_mcp_config(root, dry_run=False) is None
+    assert path.read_bytes() == before
+    assert not list(root.glob(".mcp.json.*"))

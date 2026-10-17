@@ -70,6 +70,7 @@ config/*.local.yaml
 # / the procedure promoter; must not ship a stale cache whose IDs aren't DB rows.
 config/procedure_triggers.yaml
 config/procedure_triggers.json
+config/procedure_triggers.lock
 .gstack/
 .context/
 .playwright-mcp/

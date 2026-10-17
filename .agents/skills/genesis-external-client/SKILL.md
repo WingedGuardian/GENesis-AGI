@@ -20,6 +20,13 @@ does not expose persistent memory writes, task dispatch, browser control,
 outreach, Discord, recon, campaign management, or session controls. Do not
 work around this allowlist; expanding it needs a separate capability review.
 
+The standalone launcher enforces `--external-client` on the server as well as
+the client allowlist. Both the `external` default and explicit `validator`
+profile currently expose the same health and recall floor. Direct calls to
+other tools are rejected before their bodies run; the health bootstrap also
+skips dispatch queue and campaign initialization. These tool profiles are not
+authentication or isolation from an operator with full host access.
+
 Do not pass a Codex thread or session identifier to `session_charter`,
 `session_ledger_*`, or other session-bound tools. Those tools operate only on an
 explicitly identified, existing Genesis session. Never create a synthetic session

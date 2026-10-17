@@ -11,8 +11,10 @@ Usage:
     python scripts/setup_claude_config.py --global     # Also configure ~/.claude/settings.json
     python scripts/setup_claude_config.py --dry-run    # Preview changes
 """
+
 import argparse
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -99,7 +101,7 @@ def _save_backup(data: bytes) -> Path:
 def _shown(text: str) -> str:
     """Printable on any terminal: a lone surrogate or other non-ASCII text in a
     server name (or a path) is shown escaped instead of crashing the print."""
-    return text.encode("ascii", "backslashreplace").decode("ascii")
+    return json.dumps(text, ensure_ascii=True)[1:-1]
 
 
 def _summary(line: str) -> None:
@@ -117,18 +119,34 @@ def _summary(line: str) -> None:
 
 
 _ACL = "system.posix_acl_access"
+_NO_EXPECTATION = object()
 
 
-def _write_keeping_mode(path: Path, text: str, expected: bytes | None = None) -> str | None:
+def _access_acl(path: str | Path) -> bytes | None:
+    """An absent/unsupported ACL is distinct from metadata we cannot read."""
+    try:
+        return os.getxattr(path, _ACL)
+    except OSError as exc:
+        if exc.errno in {errno.ENODATA, errno.ENOTSUP}:
+            return None
+        raise
+
+
+def _write_keeping_mode(
+    path: Path, text: str, expected: bytes | None | object = _NO_EXPECTATION
+) -> str | None:
     """Write through a symlink to its target, atomically (same-dir temp file,
     then rename), keeping the old file's mode, owner, group, ACL and xattrs.
     Returns None once written, or why it declined (nothing replaced): a
     replacement that could not carry the old file's group or ACL would change
     who can read a file that may hold API keys. With ``expected``, it also
     declines when the file no longer holds those bytes: someone wrote it
-    after it was read, and replacing it would lose that write."""
+    after it was read, and replacing it would lose that write. None means the
+    caller observed absence; omitting expected makes no concurrency check.
+    This is a best-effort check, not atomic CAS against other writers."""
     target = Path(os.path.realpath(path))
     before = target.stat() if target.exists() else None
+    acl = _access_acl(target) if before is not None else None
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".mcp.json.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -145,20 +163,21 @@ def _write_keeping_mode(path: Path, text: str, expected: bytes | None = None) ->
             except OSError:
                 os.chmod(tmp, before.st_mode & 0o777)
             os.utime(tmp, None)
-            try:
-                lost_acl = _ACL in os.listxattr(target) and _ACL not in os.listxattr(tmp)
-            except OSError:
-                lost_acl = False  # no xattr support: nothing to carry
-            if lost_acl:
-                Path(tmp).unlink(missing_ok=True)
-                return "its POSIX ACL could not be carried to the replacement"
             with contextlib.suppress(OSError):  # judged on the result below
                 os.chown(tmp, before.st_uid, before.st_gid)
             now = os.stat(tmp)
             if (now.st_uid, now.st_gid) != (before.st_uid, before.st_gid):
                 Path(tmp).unlink(missing_ok=True)
                 return f"its owner/group ({before.st_uid}:{before.st_gid}) could not be kept"
-        if expected is not None and target.read_bytes() != expected:
+            if acl is not None and _access_acl(tmp) != acl:
+                Path(tmp).unlink(missing_ok=True)
+                return "its POSIX ACL could not be carried to the replacement"
+        changed = (
+            target.exists() or target.is_symlink()
+            if expected is None
+            else expected is not _NO_EXPECTATION and target.read_bytes() != expected
+        )
+        if changed:
             Path(tmp).unlink(missing_ok=True)
             return "it changed while the merge ran (run bootstrap again)"
         os.replace(tmp, target)
@@ -252,7 +271,10 @@ def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool | None:
     else:
         try:
             existing = json.loads(old_bytes.decode("utf-8"), parse_constant=_reject_constant)
-        except (ValueError, RecursionError):  # JSONDecodeError, UnicodeDecodeError, NaN/Infinity, absurd nesting
+        except (
+            ValueError,
+            RecursionError,
+        ):  # JSONDecodeError, UnicodeDecodeError, NaN/Infinity, absurd nesting
             existing = None
         merged = merge_mcp(existing, rendered, template_servers)
         # Compared as objects: key order and formatting are not changes (serena's
@@ -285,6 +307,11 @@ def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool | None:
             ]
             why = "; ".join(parts) or "rewrote the file's other keys"
 
+    try:
+        serialized = json.dumps(new, indent=2, allow_nan=False) + "\n"
+    except (ValueError, RecursionError):
+        _not_updated("the merged configuration cannot be represented safely as JSON")
+        return None
     print(f".mcp.json: rendering with GENESIS_ROOT={_shown(str(genesis_root))} ({why})")
     if dry_run:
         return True
@@ -298,17 +325,14 @@ def render_mcp_config(genesis_root: Path, dry_run: bool) -> bool | None:
             return None
         note = f"; previous file saved as {_shown(str(saved))}"
     try:
-        declined = _write_keeping_mode(
-            output_path, json.dumps(new, indent=2, allow_nan=False) + "\n", expected=old_bytes
-        )
+        declined = _write_keeping_mode(output_path, serialized, expected=old_bytes)
     except OSError as exc:
         declined = f"cannot write it ({_shown(str(exc))})"
     if declined is not None:
         _not_updated(f"{declined}{note}")
         return None
     print(f"  Written{note}.")
-    if old_bytes is not None:
-        _summary(f"mcp.json {why}{note}")
+    _summary(f"mcp.json {why}{note}")
     return True
 
 
@@ -444,10 +468,15 @@ def main():
     parser = argparse.ArgumentParser(description="Set up Claude Code config for this machine")
     parser.add_argument("--genesis-root", type=Path, help="Override genesis root path")
     parser.add_argument("--dry-run", action="store_true", help="Show changes without writing")
-    parser.add_argument("--global", dest="do_global", action="store_true",
-                        help="Also configure ~/.claude/settings.json from manifest")
-    parser.add_argument("--mcp-only", action="store_true",
-                        help="Only render .mcp.json (install.sh uses this)")
+    parser.add_argument(
+        "--global",
+        dest="do_global",
+        action="store_true",
+        help="Also configure ~/.claude/settings.json from manifest",
+    )
+    parser.add_argument(
+        "--mcp-only", action="store_true", help="Only render .mcp.json (install.sh uses this)"
+    )
     args = parser.parse_args()
 
     genesis_root = (args.genesis_root or find_genesis_root()).resolve()

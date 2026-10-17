@@ -719,3 +719,62 @@ class TestAuditFindings:
         assert not self._touches(
             command=f"git commit -F - <<'EOF'\nrotate the keys in {target}\nEOF"
         )
+
+    def test_executor_after_data_heredoc_is_scanned(self, fake_home: Path) -> None:
+        command = "git commit -F - <<'EOF'\nmsg\nEOF\nbash <<'EOF'\ncat \"secrets.env\"\nEOF\n"
+        assert self._touches(command=command)
+
+    def test_sh_executor_after_data_heredoc_is_scanned(self, fake_home: Path) -> None:
+        command = "git commit -F - <<'EOF'\nmsg\nEOF\nsh <<'EOF'\ncat \"secrets.env\"\nEOF\n"
+        assert self._touches(command=command)
+
+    def test_python_executor_after_data_heredoc_is_scanned(self, fake_home: Path) -> None:
+        command = (
+            "git commit -F - <<'EOF'\nmsg\nEOF\n"
+            "python3 <<'EOF'\nopen(\"secrets.env\").read()\nEOF\n"
+        )
+        assert self._touches(command=command)
+
+    def test_different_heredoc_delimiters_keep_executor_visible(self, fake_home: Path) -> None:
+        command = "git commit -F - <<'MSG'\nmsg\nMSG\nbash <<'EOF'\ncat \"secrets.env\"\nEOF\n"
+        assert self._touches(command=command)
+
+    def test_executor_heredoc_before_data_heredoc_is_scanned(self, fake_home: Path) -> None:
+        command = "bash <<'EOF'\ncat \"secrets.env\"\nEOF\ngit commit -F - <<'MSG'\nmsg\nMSG\n"
+        assert self._touches(command=command)
+
+    def test_an_executor_fed_heredoc_body_is_scanned(self, fake_home: Path) -> None:
+        commands = [
+            "cat <<EOF\n$(cat secrets.env)\nEOF",
+            "python3 - <<'PY'\nopen('secrets.env')\nPY",
+            "python3 -c \"open('secrets.env')\"",
+        ]
+        for command in commands:
+            assert self._touches(command=command), command
+
+    def test_a_quoted_or_arithmetic_shift_is_not_a_heredoc(self, fake_home: Path) -> None:
+        commands = [
+            "echo '<<' 'secrets.env'",
+            "git commit -m 'a << b' -m 'secrets.env'",
+            "git commit -m 'document << heredoc syntax near secrets.env'",
+            "echo $((1<<2)) 'secrets.env'",
+        ]
+        for command in commands:
+            assert not self._touches(command=command), command
+
+    def test_a_writer_heredoc_does_not_promote_unrelated_quoted_mentions(
+        self, fake_home: Path
+    ) -> None:
+        command = "git commit -m \"document secrets.env\" && cat > f <<'EOF'\nbody\nEOF"
+        assert not self._touches(command=command), command
+
+    def test_a_mention_in_a_second_data_heredoc_body_is_data(self, fake_home: Path) -> None:
+        # Two data heredocs: neither body is scanned, as on main.
+        command = "cat <<'ONE'\nhello\nONE\ncat <<'TWO'\nsecrets.env\nTWO"
+        assert not self._touches(command=command), command
+
+    def test_a_glued_tail_redirect_does_not_hide_a_body_mention(self, fake_home: Path) -> None:
+        # `>/dev/null2` is a file named /dev/null2, outside the proven grammar,
+        # so the body is scanned as on main.
+        command = "cat <<'EOF' >/dev/null2>/dev/null\ncat ~/genesis/secrets.env\nEOF"
+        assert self._touches(command=command), command
