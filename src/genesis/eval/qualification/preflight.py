@@ -1,0 +1,247 @@
+"""Offline admission and actual production rendering, never spending approval.
+
+Run in a dedicated serial qualification process: disposable replay temporarily
+patches production globals. The runner must recompute ``check`` from current
+files before credentials; a saved or caller-supplied plan is not authority.
+Start a fresh interpreter after checkout changes; unchanged checkouts support
+repeated checks without invalidating the normalizer's cache.
+"""
+
+import hashlib
+import inspect
+import re
+from copy import deepcopy
+from dataclasses import asdict
+from pathlib import Path
+
+from genesis.eval.qualification import contracts, corpus, references, storage
+from genesis.eval.qualification.evidence import Incomplete, canonical, digest, load_json
+from genesis.eval.qualification.pinned import ROUTE_KEYS, resolve, routing, validate_params
+from genesis.eval.rubrics import list_rubrics
+from genesis.eval.scorers import LLMJudgeScorer
+
+
+class Capture(contracts.Probe):
+    def __init__(self):
+        super().__init__()
+        self.parameters = []
+        self.call_sites = []
+
+    async def route_call(self, call_site_id, messages, **kwargs):
+        self.parameters.append(load_json(canonical(kwargs)))
+        self.call_sites.append(call_site_id)
+        return await super().route_call(call_site_id, load_json(canonical(messages)), **kwargs)
+
+
+async def prepare(cases, temp_root, *, reference_policy=None):
+    """Render a validated subset; this primitive is NOT complete admission."""
+    from genesis.eval.qualification.storage import replay
+
+    cases, reference_policy = load_json(canonical([cases, reference_policy]))
+    for name, rows in cases.items():
+        corpus.validate(name, rows, reference_policy=reference_policy)
+    plan = {}
+    async with contracts.Sandbox(temp_root) as sandbox:
+        for name, rows in cases.items():
+            seen, plan[name] = set(), {}
+            for case in rows:
+                capture = Capture()
+                if name == corpus.NOVELTY:
+                    rendered = await contracts.novelty(case, capture, sandbox)
+                elif name == corpus.RELEVANCE:
+                    await contracts.relevance(case, capture)
+                else:
+                    await LLMJudgeScorer(router=capture).score_async(
+                        case["actual"], case.get("expected", ""), case["scorer_config"]
+                    )
+                if len(capture.calls) != 1:
+                    raise Incomplete(f"{name}: case must render exactly one judge request")
+                messages = capture.calls[0][0]
+                prompt_hash = digest(messages)
+                if prompt_hash in seen:
+                    raise Incomplete(f"{name}: duplicate rendered grading question")
+                seen.add(prompt_hash)
+                row = {
+                    "messages": messages, "prompt_hash": prompt_hash,
+                    "call_site_id": capture.call_sites[0],
+                    "call_parameters": capture.parameters[0],
+                }
+                if name == corpus.NOVELTY:
+                    mapping = contracts.candidate_mapping(case, messages, rendered["candidate_ids"])
+                    target = case["expected_target"]
+                    content = canonical({
+                        "redundant_with": mapping.index(target) + 1 if target else None
+                    }).decode()
+                    row["candidate_mapping"] = mapping
+                    row["storage"] = await replay(
+                        case, messages, mapping, content, sandbox,
+                        "qualification-probe", "synthetic",
+                    )
+                plan[name][case["id"]] = row
+    return load_json(canonical(plan))
+
+
+def parameters(alias, configured, plan, *, config=None):
+    """Freeze explicit params, refusing implicit or contradictory transformations."""
+    configured = load_json(canonical(validate_params(configured)))
+    provider = resolve(alias, config)
+    if provider.params:
+        raise Incomplete("alias has implicit routing parameters forbidden in qualification")
+    for name, rows in plan.items():
+        body = configured[corpus.route(name)]
+        for row in rows.values():
+            for key, value in row["call_parameters"].items():
+                if key == "chain_offset" and type(value) is int and value == 0:
+                    continue
+                if key not in ROUTE_KEYS or key not in body or canonical(body[key]) != canonical(value):
+                    raise Incomplete(f"{name}: call-site parameter {key!r} contradicts params")
+    return configured
+
+
+def file_hash(path):
+    """Hash disk sources with hashlib's bounded buffer, never a whole DB copy."""
+    with Path(path).open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def production_source_inventory(modules):
+    """Bind explicit modules and actual registry inputs, refusing stale MCP data."""
+    paths = {Path(module.__file__) for module in modules}
+    paths.update(path for _, path in storage.tool_names._mcp_source_files(strict=True))
+    root = Path(__file__).resolve().parents[4]
+    sources = {str(path.relative_to(root)): file_hash(path) for path in sorted(paths)}
+    owners = storage.tool_names._mcp_owners
+    if owners() != owners.__wrapped__():
+        raise Incomplete("tool registry cache differs from current source declarations")
+    return sources
+
+
+def source_nodes(value):
+    """Composite references retain both arms and historical baseline evidence."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from source_nodes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from source_nodes(child)
+
+
+def historical_source(node):
+    """Validate exported Git identity syntax; this does not prove ancestry."""
+    identities, path = [node["commit"]], node.get("path")
+    if "before_sha256" in node or "after_sha256" in node:
+        if not {"before_sha256", "after_sha256", "parent"} <= node.keys():
+            raise Incomplete("incomplete historical reference source pair")
+        identities.append(node["parent"])
+    for identity in identities:
+        if (not isinstance(identity, str)
+            or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", identity) is None):
+            raise Incomplete("invalid historical reference source identifier")
+    if (not isinstance(path, str) or not path or "\x00" in path
+        or not references.scalar_text(path) or not Path(path).parts
+        or Path(path).is_absolute() or ".." in Path(path).parts):
+        raise Incomplete("invalid historical reference source identity")
+
+
+def source_evidence(cases, source_files):
+    """Check the frozen original source bytes, including hashes without paths."""
+    if not isinstance(source_files, dict) or not source_files:
+        raise Incomplete("frozen reference source files are required")
+    verified = {}
+    for path, expected in source_files.items():
+        if not isinstance(path, str) or not isinstance(expected, str) or len(expected) != 64:
+            raise Incomplete("invalid reference source identity")
+        actual = file_hash(path)
+        if actual != expected:
+            raise Incomplete("reference source bytes changed")
+        verified[path] = actual
+    for rows in cases.values():
+        for case in rows:
+            source = case.get("source")
+            if not isinstance(source, dict):
+                raise Incomplete("reference source evidence is required")
+            count = 0
+            for node in source_nodes(source):
+                hashes = {k: v for k, v in node.items() if k == "sha256" or k.endswith("_sha256")}
+                count += len(hashes)
+                if any(v not in verified.values() for v in hashes.values()):
+                    raise Incomplete("reference source hash is not in the frozen source files")
+                for key, value in hashes.items():
+                    if "commit" in node and key in ("sha256", "before_sha256", "after_sha256"):
+                        historical_source(node)
+                        continue
+                    path = node.get("path" if key == "sha256" else key.removesuffix("_sha256"))
+                    # Git baselines name a historical repository-relative path;
+                    # their exported immutable bytes are identified by SHA-256.
+                    if path is not None and verified.get(path) != value:
+                        raise Incomplete("reference source path differs from its frozen identity")
+            if not count:
+                raise Incomplete("reference source evidence has no frozen byte identity")
+    return verified
+
+
+def production_modules():
+    """The direct production population shared by admission and final scoring."""
+    from genesis.cc import session_config
+    from genesis.cc import types as cc_types
+    from genesis.db.schema import _tables, create_all_tables
+    from genesis.learning.procedural import extractor, judge, operations, scoping, validation_gate
+
+    return [contracts, corpus, references, storage, extractor, judge, operations, scoping,
+            validation_gate, inspect.getmodule(LLMJudgeScorer),
+            inspect.getmodule(contracts.J9EvalBatchExecutor), inspect.getmodule(check),
+            inspect.getmodule(resolve), inspect.getmodule(contracts.pack_embedding),
+            inspect.getmodule(contracts.connect_aiosqlite_rw), contracts.procedural, storage.tool_names,
+            inspect.getmodule(operations.validate_trigger_spec), inspect.getmodule(create_all_tables), _tables,
+            session_config, cc_types]
+
+
+async def check(cases, temp_root, *, reference_policy, current_policy,
+                reference_approval, candidates, source_files, config=None):
+    """Complete CURRENT offline evidence; conveys no consent, budget or quality."""
+    cases, policy, current, approval, candidates, sources = load_json(canonical([
+        cases, reference_policy, current_policy, reference_approval, candidates, source_files
+    ]))
+    config = deepcopy(config or routing())
+    versions = corpus.versions()
+    rubric_definitions = [asdict(r) for r in list_rubrics()]
+    references.validate_policy(policy, versions)
+    if canonical(policy) != canonical(current):
+        raise Incomplete("reference policy differs from current policy")
+    for name, rows in cases.items():
+        corpus.validate(name, rows, reference_policy=policy)
+    issues = corpus.coverage(cases, complete=True)
+    issues += references.approval_issues(cases, policy, approval, contracts=versions)
+    if issues:
+        raise Incomplete("; ".join(issues))
+    if not isinstance(candidates, dict) or not candidates:
+        raise Incomplete("explicit qualification candidates are required")
+    models = {}
+    for alias, configured in candidates.items():
+        provider = resolve(alias, config)
+        model = references.identity(provider.model_id)
+        if model in {references.identity(m) for m in policy["approved_models"]}:
+            raise Incomplete("qualification candidate cannot grade its own references")
+        models[alias] = provider.model_id
+        # Reject malformed/implicit routing settings before expensive rendering.
+        parameters(alias, configured, {}, config=config)
+    verified_sources = source_evidence(cases, sources)
+    modules = production_modules()
+    production_sources = production_source_inventory(modules)
+    plan = await prepare(cases, temp_root, reference_policy=policy)
+    frozen_params = {
+        alias: parameters(alias, params, plan, config=config)
+        for alias, params in candidates.items()
+    }
+    if (source_evidence(cases, sources) != verified_sources or corpus.versions() != versions
+        or [asdict(r) for r in list_rubrics()] != rubric_definitions
+        or production_source_inventory(modules) != production_sources):
+        raise Incomplete("source or contract changed during offline preflight")
+    return {
+        "complete": True, "corpus_hash": digest(cases), "policy_hash": digest(policy),
+        "approval_hash": digest(approval), "versions": versions,
+        "rubrics": rubric_definitions,
+        "reference_sources": verified_sources, "production_sources": production_sources,
+        "models": models, "parameters": frozen_params, "plan": plan,
+    }

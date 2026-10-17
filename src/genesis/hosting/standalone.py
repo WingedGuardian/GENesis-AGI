@@ -117,8 +117,19 @@ class StandaloneAdapter:
             warning = await configuration_warning(PeerRegistry(), app=self._app)
             if warning:
                 logger.warning(warning)
+            self._runtime._bootstrap_manifest["agent_api"] = (
+                "degraded"
+                if warning
+                or self._runtime._direct_session_runner is None
+                or "agent_api" not in self._app.blueprints
+                else "ok"
+            )
         except Exception:
+            self._runtime._bootstrap_manifest["agent_api"] = "degraded"
             logger.warning("Peer API unavailable: check migrated peer registry")
+        from genesis.runtime._capabilities import write_capabilities_file
+
+        write_capabilities_file(self._runtime)
         logger.info("Standalone adapter bootstrapped")
 
     async def serve(self) -> None:
@@ -236,6 +247,11 @@ class StandaloneAdapter:
 
         # Wyoming STT+TTS servers for S2S voice pipeline (Phase 2)
         await self._init_wyoming_servers()
+
+        # Payment card vault service: holds the vault key between unlock and lock
+        from genesis.payments.vault_service import start_vault_service
+
+        self._vault_service = await start_vault_service(self._runtime)
 
         # Flask in daemon thread
         flask_thread = threading.Thread(
@@ -436,6 +452,9 @@ class StandaloneAdapter:
         logger.info("Shutdown requested")
         self._shutdown_event.set()
 
+        from genesis.payments.vault_service import stop_vault_service
+
+        await stop_vault_service(getattr(self, "_vault_service", None))  # drop the key first
         await self._voice_last_breath()
 
         if self._runtime and self._runtime.awareness_loop is not None:

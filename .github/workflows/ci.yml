@@ -346,7 +346,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-10: 73 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-16: 79 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -537,9 +537,9 @@ jobs:
     # workflow-run duration, which is ~20 min longer because it includes 12
     # sibling jobs and queue time: min 19m38s, p50 29m22s, max 31m15s.
     # The ceiling must exceed the worst LEGITIMATE case — that max plus one
-    # full per-test kill (pyproject `timeout = 3600`) = ~91 min — or this job
+    # full per-test kill (pyproject `timeout = 600`) = ~41 min — or this job
     # would pre-empt the per-test timeout and make it dead code. 180 leaves
-    # ~89 min of growth headroom and still halves the default.
+    # ~139 min of growth headroom and still halves the default.
     # Revisit as the suite grows — the --durations output below is the data.
     timeout-minutes: 180
     # fetch-depth: 0 because measurement tests derive a rate from this

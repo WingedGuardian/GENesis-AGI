@@ -588,10 +588,12 @@ def test_installers_still_register_cbm_to_the_launcher_while_disabled():
     remains true, so it is asserted rather than assumed.
     """
     launcher = (REPO_ROOT / ".claude" / "mcp" / "run-codebase-memory").read_text()
-    assert "codebase-memory-mcp.disabled" in launcher and "exit 1" in launcher, (
-        "the launcher is no longer fail-closed on the kill switch, so registering "
-        "while disabled is no longer safe and that change must be revisited"
-    )
+    assert 'scripts/codebase_managed.py" launch' in launcher
+    helper = (REPO_ROOT / "scripts/codebase_managed.py").read_text()
+    assert 'sentinel_armed(config["sentinel"])' in helper
+    # Native query and frontend suites exercise the configured sentinel against
+    # actual admission. Both real registration loops run while it is present in
+    # test_run_codebase_memory_launcher.py, including a stale raw registration.
 
     for relative in ("scripts/install.sh", "scripts/bootstrap.sh"):
         text = (REPO_ROOT / relative).read_text()
