@@ -36,6 +36,14 @@ Use `genesis-health` for live status and `genesis-memory` for recall. Recall
 may update Genesis retrieval-use metadata; this is expected and does not make
 the conversation a Genesis session.
 
+The project also configures `gitnexus` through `.claude/mcp/run-gitnexus`,
+which enforces the repository's installed-version and Node compatibility pin.
+Its explicit tool list includes code edits and group metadata updates: having
+the tool does not authorize those actions. GitNexus reads a snapshot, so check
+freshness before relying on it for current code. Linked worktrees use live
+symbol tools for branch truth rather than indexing another checkout. See
+`docs/reference/codex-gitnexus.md` for setup and qualification limits.
+
 If a capability requires automatic context injection, transcript extraction,
 session continuity, or background delivery into this conversation, explain that
 it is unavailable to an external client. Do not add lifecycle hooks or work

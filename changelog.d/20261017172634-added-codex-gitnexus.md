@@ -1,0 +1,1 @@
+- Make the existing GitNexus tools available through portable Codex project configuration, using the repository's pinned launcher.

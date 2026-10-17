@@ -3775,7 +3775,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 4ab8bf71c 2026-10-10
+verified: da181d90c7f7 2026-10-17
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3842,6 +3842,12 @@ verified: 4ab8bf71c 2026-10-10
   creating a charter, or joining Genesis foreground/background lifecycle
   management. Recall remains read-oriented rather than side-effect-free: its
   normal retrieval-use metadata may still be updated.
+  The same project configuration exposes the 17 explicitly named GitNexus tools
+  through `.claude/mcp/run-gitnexus`, reusing the existing installed-version and
+  Node pin checks. It adds no Genesis writers or lifecycle integration. GitNexus
+  snapshots can be stale; connection startup does not rebuild an index, and
+  write-capable code/group tools still require task authorization. See
+  `docs/reference/codex-gitnexus.md` for native qualification and configuration.
   `web-research` is the shared method for foreground sessions, the
   `genesis-researcher` subagent, and research-profile background sessions;
   task risk and breadth select its depth. Tier-2 `research` resources resolve and
