@@ -575,6 +575,12 @@ class _ParsedSegment(NamedTuple):
 
 
 def _command_sub_end(command: str, i: int, n: int) -> int:
+    """:func:`_command_sub_close`, with an unterminated substitution running to ``n``."""
+    close = _command_sub_close(command, i, n)
+    return n if close is None else close
+
+
+def _command_sub_close(command: str, i: int, n: int) -> int | None:
     """Index just past the matching ``)`` of a ``$(…)`` command substitution that
     opens at ``command[i:i+2] == "$("``.
 
@@ -583,8 +589,9 @@ def _command_sub_end(command: str, i: int, n: int) -> int:
     ``$(…)``/``(…)`` bumps the paren depth; a ``` `…` ``` backtick span is skipped
     whole. This bounds the sub at its TRUE close so a following control operator
     (``&& rm``) can never be swallowed into a redirect target (the Codex-P1
-    regression a paren-only balancer caused). Fail-open: an UNTERMINATED sub returns
-    ``n`` (consume to EOL) — it never raises (the module's no-crash contract).
+    regression a paren-only balancer caused). An UNTERMINATED sub returns None, so
+    a caller can tell it from one that closes on the last character; it never
+    raises (the module's no-crash contract).
 
     Shared by ``_redirect_target_end`` (target boundary) and ``_substitutions``
     (body extraction) so the two agree on where a ``$()`` ends — one scanner, not
@@ -620,7 +627,7 @@ def _command_sub_end(command: str, i: int, n: int) -> int:
             if depth == 0:
                 return j + 1
         j += 1
-    return n  # unterminated — fail-open to EOL, never raise
+    return None  # unterminated
 
 
 def _redirect_target_end(command: str, j0: int, n: int) -> int:
@@ -1305,6 +1312,123 @@ def _decode_escape_free_ansi_c(text: str) -> str:
         last = end
     out.append(text[last:])
     return "".join(out)
+
+
+def _keep_substitutions_whole(text: str) -> str:
+    """Quote every ``$(…)`` and backtick span so shlex keeps it inside its word.
+
+    To bash a command substitution is PART OF ONE WORD, whatever spaces, quotes
+    or parentheses it holds: ``X=$(id -u) git push`` is the assignment
+    ``X=$(id -u)`` and then ``git push``. shlex implements no substitution and
+    splits inside it, so the words became ``X=$(id``, ``-u)``, ``git`` … and
+    every walk that skips a word by position (a prefix assignment, a wrapper's
+    option value or operand) landed on the debris. The resolved program was
+    ``-u)`` and no guard saw the push. MEASURED before this function: ten such
+    forms, through ``env``, ``sudo``, ``timeout -s``, ``nice -n`` and backticks.
+
+    Each span is bounded by :func:`_command_sub_close` and passed through
+    byte for byte; inside ``"…"`` the quote is closed around it and reopened.
+    An arithmetic ``$((…))`` is one word too (``X=$((1 + 2)) git push`` hid the
+    push the same way), and its parentheses balance the same way. An
+    unterminated span leaves the text unchanged (bash refuses it as a syntax
+    error and runs none of it).
+
+    KNOWN OVER-BLOCK: a heredoc body is still split into segments here (issue
+    #1748), so a body line such as ``X=$(id -u) git push`` now yields a push
+    segment, exactly as the same line without the prefix already did. It adds a
+    refusal of data, never hides a command.
+
+    This reading is ADDED to the old one, never substituted for it: see
+    :func:`_whole_word_reading`. The scanner does not model every construct bash
+    does (``${x:-(}``, an escaped backtick inside a backtick, a comment, a
+    heredoc), and where it ends a span late, this reading swallows the words
+    after it. MEASURED in the review of an earlier revision that REPLACED the old
+    reading: four spellings bash runs had their push hidden that way.
+    """
+    if "$(" not in text and "`" not in text:
+        return text
+    out: list[str] = []
+    i, n, last = 0, len(text), 0
+    in_sq = in_dq = False
+    while i < n:
+        c = text[i]
+        if in_sq:
+            in_sq = c != "'"
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if c == "'" and not in_dq:
+            in_sq = True
+            i += 1
+            continue
+        if c == '"':
+            in_dq = not in_dq
+            i += 1
+            continue
+        if c == "$" and text.startswith("$(", i):
+            close = _command_sub_close(text, i, n)
+            if close is None:
+                return text
+            end = close
+        elif c == "`":
+            j = i + 1
+            while j < n and text[j] != "`":
+                j += 2 if text[j] == "\\" else 1
+            if j >= n:
+                return text
+            end = j + 1
+        else:
+            i += 1
+            continue
+        quoted = shlex.quote(text[i:end])
+        out.append(text[last:i])
+        out.append(f'"{quoted}"' if in_dq else quoted)
+        last = i = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _whole_word_reading(
+    argv_src: str, tokens: list[str], argv: list[str], carried_open: int
+) -> list[str] | None:
+    """The argv of *argv_src* read with substitutions kept whole, when it names a
+    DIFFERENT program from the ordinary reading; otherwise None.
+
+    The caller adds it as one more segment beside the ordinary one and never in
+    its place, so nothing the ordinary reading resolves can disappear: a mistake
+    in this reading can only add a segment, never hide one. It is left out when
+    both readings agree up to the first word that holds a substitution, because
+    there (``git push origin $(git branch --show-current)``) a second segment
+    would count one push as two. Agreeing on the PROGRAM is not enough:
+    ``X=$(command git rev-parse HEAD) git push`` reads as git in both, as
+    ``rev-parse`` in one and ``push`` in the other (MEASURED, review of this
+    change).
+    """
+    # A single word cannot become a different program by being kept whole, so
+    # one-word segments skip the second tokenization, which keeps a nested worst
+    # case inside the nesting-cost budget. A cheaper-looking test (is any word
+    # the head of a split substitution?) reads words after shlex removed their
+    # quotes, so `$(echo")" a b)` passed it as closed and the push hid again.
+    if len(tokens) < 2:
+        return None
+    core = _strip_trailing_comment(_decode_escape_free_ansi_c(argv_src))
+    whole = _keep_substitutions_whole(core)
+    if whole == core:
+        return None
+    try:
+        whole_tokens = shlex.split(whole)
+    except ValueError:
+        return None
+    if whole_tokens == tokens:
+        return None
+    whole_argv = _strip_wrappers(whole_tokens, carried_open)
+    if not whole_argv:
+        return None
+    first = next((k for k in range(1, len(argv)) if "$(" in argv[k] or "`" in argv[k]), None)
+    same = whole_argv == argv if first is None else whole_argv[:first] == argv[:first]
+    return None if same else whole_argv
 
 
 def _argv(seg: str) -> list[str]:
@@ -2814,7 +2938,11 @@ def _embedded_commands(
     ):
         return [shlex.join(raw_argv[1:])]
 
-    if argv[0].endswith(")") and len(argv) > 1:
+    # A prefix assignment ending in the `)` of its substitution (`X=$(id) git
+    # push`) is not a case pattern: re-parsing the rest one level down counted
+    # its push twice and refused it as two publish operations (MEASURED on
+    # main). The ordinary walk already skips the assignment and resolves it.
+    if argv[0].endswith(")") and len(argv) > 1 and not _is_prefix_assignment(argv[0]):
         return [shlex.join(argv[1:])]
 
     if argv[0] == "function" and len(argv) > 2:
@@ -3520,6 +3648,7 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         # (incl. an expansion one) can never become argv[1] and spoof the subcommand.
         tokens = _argv(seg.argv_src)
         argv = _strip_wrappers(tokens, carried_open)
+        whole_argv = _whole_word_reading(seg.argv_src, tokens, argv, carried_open)
         carried_open = max(0, carried_open + _net_subshell_depth(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
         out.append(
@@ -3540,6 +3669,31 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
 
         nested.extend(_embedded_commands(_argv(seg.argv_src)))
         nested.extend(_substitutions(raw))
+        if whole_argv is not None:
+            # The same text read with its substitutions kept whole, which names
+            # a program the ordinary reading missed (`X=$(id -u) git push`). It
+            # is reported one level down so the depth-0 segments still map one
+            # to one onto the command's segments, and added as it stands rather
+            # than re-parsed from joined text: re-quoting heredoc prose and
+            # parsing it again invented commands (MEASURED, an `rm` out of a
+            # docstring). The substitution bodies are already parsed from `raw`;
+            # the one thing left to descend into is a `-c` script it reveals.
+            whole_exe = _basename(whole_argv[0])
+            out.append(
+                Segment(
+                    exe=whole_exe,
+                    argv=whole_argv,
+                    override=override,
+                    raw=raw,
+                    depth=1,
+                    redirects=list(seg.redirects),
+                    verb_unresolved=_verb_unresolved(whole_argv),
+                )
+            )
+            if whole_exe in _NESTED:
+                script = _nested_script(whole_argv, whole_exe)
+                if script:
+                    nested.append(script)
         if not nested:
             continue
         # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
