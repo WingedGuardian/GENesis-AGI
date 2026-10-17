@@ -2487,6 +2487,14 @@ CREATE TABLE IF NOT EXISTS peer_grants (
         created_at           TEXT NOT NULL
     )
     """,
+    "payment_vault_events": """
+    CREATE TABLE IF NOT EXISTS payment_vault_events (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        event       TEXT NOT NULL,
+        detail      TEXT,
+        created_at  TEXT NOT NULL
+    )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -2867,6 +2875,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_board_events_issue "
     "ON board_events(repo, issue_number, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_board_events_created ON board_events(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_payment_vault_events_created "
+    "ON payment_vault_events(created_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
