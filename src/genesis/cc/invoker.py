@@ -2386,6 +2386,8 @@ class CCInvoker:
             args.append("--bare")
         if inv.safe_mode:
             args.append("--safe-mode")
+        if inv.no_session_persistence:
+            args.append("--no-session-persistence")
         # Prompt is passed via stdin (see run/run_streaming), not as a CLI
         # argument.  This avoids argument-parsing edge cases (the "--"
         # separator broke -p prompt detection) and handles arbitrarily long

@@ -462,6 +462,10 @@ class CCInvocation:
         repr=False,
     )
 
+    # --no-session-persistence: disposable print-mode checks must not leave
+    # transcripts in CC's separate project tree. Actual tasks keep persistence.
+    no_session_persistence: bool = False
+
     def __post_init__(self) -> None:
         # Producer-side loud validation of the WS-3 origin (the env READER is
         # fail-safe instead): a dispatch-site typo like "external-untrusted"

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from genesis.cc.exceptions import CCProcessError, CCQuotaExhaustedError
+from genesis.cc.exceptions import CCProcessError, CCQuotaExhaustedError, CCRateLimitError
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.provider_readiness import READY, isolated_provider, probe_provider
 from genesis.cc.types import CCInvocation, CCOutput, StreamEvent
@@ -36,6 +36,7 @@ async def test_probe_removes_task_authority_and_observes_it(tmp_path):
         assert invocation.prompt != "private task"
         assert invocation.safe_mode and invocation.disable_tools and not invocation.bare
         assert invocation.confirm_cleanup and not invocation.supervised
+        assert invocation.no_session_persistence
         assert invocation.system_prompt is None and invocation.resume_session_id is None
         assert Path(invocation.mcp_config).read_text() == '{"mcpServers":{}}'
         assert invocation.timeout_s == 7
@@ -89,6 +90,45 @@ async def test_uncertain_cleanup_retains_directory(tmp_path):
     with pytest.raises(ProcessCleanupUncertain):
         await probe_provider(invoker, CCInvocation(prompt="x"), timeout_s=7)
     assert len(list(tmp_path.iterdir())) == 1
+
+
+@pytest.mark.parametrize(
+    "infos,refused",
+    [
+        ([{"status": "allowed", "overageStatus": "rejected", "isUsingOverage": False}], False),
+        ([{"status": "allowed_warning", "isUsingOverage": False}], False),
+        ([{"status": "rejected", "isUsingOverage": False}], True),
+        ([{"status": "rejected"}], True),
+        ([{"status": "rejected", "overageStatus": "allowed", "isUsingOverage": True}], False),
+        (
+            [{"status": "rejected", "overageStatus": "allowed_warning", "isUsingOverage": True}],
+            False,
+        ),
+        ([{"status": "rejected", "overageStatus": "allowed", "isUsingOverage": False}], True),
+        ([{"status": "allowed"}, {"status": "rejected", "isUsingOverage": False}], True),
+        ([{"status": "rejected"}, {"status": "allowed"}], False),
+        ([{"status": "rejected"}, {"status": "allowed_warning"}], False),
+    ],
+)
+async def test_readiness_uses_latest_effective_limit_status(infos, refused):
+    async def run(invocation, on_event):
+        await on_event(init())
+        for info in infos:
+            await on_event(
+                StreamEvent(
+                    "rate_limit_event", raw={"type": "rate_limit_event", "rate_limit_info": info}
+                )
+            )
+        return answer()
+
+    invoke = probe_provider(
+        SimpleNamespace(run_streaming=run), CCInvocation(prompt="x"), timeout_s=7
+    )
+    if refused:
+        with pytest.raises(CCRateLimitError):
+            await invoke
+    else:
+        assert (await invoke).text == READY
 
 
 async def test_probe_status_isolation_is_task_local_and_does_not_clear_prior_failure():

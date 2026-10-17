@@ -496,3 +496,136 @@ async def test_managed_switch_alert_follows_the_outage_transition(managed):
     fallback_state.clear()
     await settle(managed, await start(managed))
     assert managed.alerts.await_count == 2
+
+
+@pytest.mark.parametrize("home", ["claude", "backup"])
+@pytest.mark.parametrize(
+    "refusal,status_name",
+    [
+        (CCQuotaExhaustedError(), "UNAVAILABLE"),
+        (CCRateLimitError(), "RATE_LIMITED"),
+        (CCProcessError("insufficient credit"), "UNAVAILABLE"),
+    ],
+)
+async def test_only_current_home_refusal_updates_shared_health(managed, home, refusal, status_name):
+    from genesis.cc.invoker import CCInvoker
+
+    status = AsyncMock()
+    shared = CCInvoker(on_cc_status_change=status)
+    managed.runner._rt._cc_invoker = shared
+    managed.config["default"] = home
+    home_model = managed.config["models"][home].get("model_id")
+
+    async def run(invocation, on_event=None):
+        if invocation.disable_tools:
+            if invocation.model_id_override == home_model:
+                raise refusal
+            return await readiness(on_event)
+        managed.tasks.append(invocation)
+        return answer()
+
+    managed.invoker.run_streaming.side_effect = run
+    row, meta = await settle(managed, await start(managed))
+    assert row["status"] == "completed" and meta["execution_provider"] != home
+    status.assert_awaited_once_with(status_name)
+    assert shared._last_was_error
+
+
+async def test_home_recovery_clears_health_without_a_successful_fallback_banner(managed):
+    from genesis.cc.invoker import CCInvoker
+
+    status = AsyncMock()
+    shared = CCInvoker(on_cc_status_change=status)
+    managed.runner._rt._cc_invoker = shared
+    managed.invoker.run_streaming.side_effect = CCQuotaExhaustedError()
+    row, _ = await settle(managed, await start(managed))
+    assert row["status"] == "failed" and not fallback_state.read().is_fallback
+    status.assert_awaited_once_with("UNAVAILABLE")
+
+    async def run(invocation, on_event=None):
+        return await readiness(on_event) if invocation.disable_tools else answer()
+
+    managed.invoker.run_streaming.side_effect = run
+    row, _ = await settle(managed, await start(managed))
+    assert row["status"] == "completed" and not fallback_state.read().is_fallback
+    assert status.await_count == 2 and status.call_args.args == ("NORMAL",)
+    assert not shared._last_was_error
+    managed.alerts.assert_not_awaited()
+
+
+async def test_refused_old_home_cannot_overwrite_current_home_health(managed):
+    from genesis.cc.invoker import CCInvoker
+
+    status = AsyncMock()
+    managed.runner._rt._cc_invoker = CCInvoker(on_cc_status_change=status)
+
+    async def run(invocation, on_event=None):
+        if invocation.disable_tools:
+            if invocation.anthropic_base_url is None:
+                managed.config["default"] = "backup"
+                raise CCQuotaExhaustedError()
+            return await readiness(on_event)
+        return answer()
+
+    managed.invoker.run_streaming.side_effect = run
+    row, _ = await settle(managed, await start(managed))
+    assert row["status"] == "completed"
+    status.assert_not_awaited()
+
+
+async def test_explicitly_rejected_readiness_never_starts_home_task(managed):
+    async def run(invocation, on_event=None):
+        if invocation.disable_tools and invocation.anthropic_base_url is None:
+            await on_event(
+                StreamEvent(
+                    "init",
+                    raw={"type": "system", "subtype": "init", "tools": [], "mcp_servers": []},
+                )
+            )
+            await on_event(
+                StreamEvent(
+                    "rate_limit_event",
+                    raw={
+                        "type": "rate_limit_event",
+                        "rate_limit_info": {"status": "rejected", "isUsingOverage": False},
+                    },
+                )
+            )
+            return answer(READY)
+        return await managed.execute(invocation, on_event)
+
+    managed.invoker.run_streaming.side_effect = run
+    row, meta = await settle(managed, await start(managed))
+    assert row["status"] == "completed" and meta["execution_provider"] == "backup"
+    assert len(managed.tasks) == 1 and managed.tasks[0].model_id_override == "backup-id"
+
+
+async def test_current_home_recovery_preserves_another_homes_banner(managed):
+    from genesis.cc.invoker import CCInvoker
+
+    status = AsyncMock()
+    shared = CCInvoker(on_cc_status_change=status)
+    managed.runner._rt._cc_invoker = shared
+    await shared._notify_status_change(CCQuotaExhaustedError())
+    fallback_state.enter("other-home", "last", "rate_limit")
+
+    async def run(invocation, on_event=None):
+        return await readiness(on_event) if invocation.disable_tools else answer()
+
+    managed.invoker.run_streaming.side_effect = run
+    row, _ = await settle(managed, await start(managed))
+    assert row["status"] == "completed" and not shared._last_was_error
+    assert status.await_count == 2 and status.call_args.args == ("NORMAL",)
+    assert fallback_state.read().is_fallback and fallback_state.read().original == "other-home"
+    managed.alerts.assert_not_awaited()
+
+
+async def test_pinned_other_provider_refusal_preserves_shared_home_health(managed):
+    from genesis.cc.invoker import CCInvoker
+
+    status = AsyncMock()
+    managed.runner._rt._cc_invoker = CCInvoker(on_cc_status_change=status)
+    managed.config["default"] = "backup"
+    row, _ = await settle(managed, await start(managed, roster_model="claude"))
+    assert row["status"] == "failed"
+    status.assert_not_awaited()

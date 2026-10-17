@@ -24,6 +24,11 @@ task content or resume state. Each check receives an invocation timeout of up to
 90 seconds within the receipt's existing absolute deadline and runner slot;
 there is no separate task budget.
 These extra inference calls consume provider quota and may incur provider fees.
+Checks disable CLI session persistence, so deleting their scratch directory
+does not leave separate probe transcripts in the CLI's project tree. Actual
+task transcript persistence is unchanged. Informational limit events and usable
+overage do not reject readiness; a final effective refusal does, even alongside
+the exact readiness answer. Later allowed state can supersede an earlier refusal.
 
 Once selected, one provider executes the real task through the existing native
 profile and approval gates. A successful readiness check cannot guarantee that
@@ -31,8 +36,11 @@ the subsequent task will finish: a later limit or failure ends the task without
 switching providers, parking, or replaying effects. Cleanup uncertainty retains
 capacity and the probe directory. The idle recovery worker also suspends further
 probes after uncertain cleanup until runtime recreation. Confirmed readiness
-for the current home provider clears its shared unavailable status before
-retiring the fallback banner. Restart reconciliation remains unchanged.
+for the current home provider clears its shared unavailable status, even when
+no fallback ever succeeded. A matching fallback banner is then retired.
+Confirmed refusals from the still-current home update shared rate/quota health;
+standby and pinned-other outcomes cannot overwrite it. Restart reconciliation
+remains unchanged.
 
 Receipt metadata records `provider_attempts`, `home_provider`,
 `execution_provider` and the selected endpoint context without credential

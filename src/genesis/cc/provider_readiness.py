@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
-from genesis.cc.exceptions import CCProcessError
+from genesis.cc.exceptions import CCProcessError, CCRateLimitError
 from genesis.cc.types import PROBE_CALLER_TAG, CCInvocation, EffortLevel
 from genesis.util.execution_privacy import private_execution
 from genesis.util.proc_kill import ProcessCleanupUncertain
@@ -52,6 +52,7 @@ async def probe_provider(invoker, base: CCInvocation, *, timeout_s: float):
         effort=EffortLevel.LOW,
         safe_mode=True,
         disable_tools=True,
+        no_session_persistence=True,
         mcp_config=str(empty_mcp),
         strict_mcp_config=True,
         working_dir=str(root),
@@ -67,11 +68,14 @@ async def probe_provider(invoker, base: CCInvocation, *, timeout_s: float):
         caller_tag=PROBE_CALLER_TAG,
     )
     empty_init = False
+    last_limit = None
     uncertain = False
 
     async def observe(event):
-        nonlocal empty_init
+        nonlocal empty_init, last_limit
         raw = event.raw or {}
+        if raw.get("type") == "rate_limit_event":
+            last_limit = raw
         if raw.get("type") == "system" and raw.get("subtype") == "init":
             empty_init = raw.get("tools") == [] and raw.get("mcp_servers") == []
             if not empty_init:
@@ -90,6 +94,12 @@ async def probe_provider(invoker, base: CCInvocation, *, timeout_s: float):
             or output.text.strip() != READY
         ):
             raise CCProcessError("Provider readiness was not established")
+        # CC also emits informational limits and usable-overage states. Use
+        # the last effective state, as the CLI does; a later allowed update can
+        # supersede a rejection encountered while the diagnostic was retrying.
+        info = (last_limit or {}).get("rate_limit_info") or {}
+        if info.get("status") == "rejected" and info.get("isUsingOverage") is not True:
+            raise CCRateLimitError("Provider readiness was refused", raw_event=last_limit)
         return output
     except ProcessCleanupUncertain:
         uncertain = True

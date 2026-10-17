@@ -8,7 +8,12 @@ from datetime import UTC, datetime
 from html import escape
 
 from genesis.cc import fallback_recovery, fallback_state, peer_availability, roster
-from genesis.cc.exceptions import CCProcessError, CCTimeoutError
+from genesis.cc.exceptions import (
+    CCProcessError,
+    CCQuotaExhaustedError,
+    CCRateLimitError,
+    CCTimeoutError,
+)
 from genesis.cc.provider_readiness import probe_provider
 from genesis.db.connection import get_raw_db
 from genesis.db.crud import cc_sessions
@@ -22,6 +27,23 @@ async def database_path(db) -> str:
     if not path:
         raise ValueError("Managed provider selection requires a durable receipt")
     return path
+
+
+async def _observe_home(runner, home, provider, error=None):
+    """Forward current-home evidence; callers already classify refusals."""
+    if provider != home or roster.active_model() != home:
+        return
+    observer = getattr(runner._rt, "_cc_invoker", None)
+    if observer is not None:
+        # The shared notifier understands rate/quota, while this seam also
+        # receives already-classified credit refusals from process errors.
+        if error is not None and not isinstance(error, (CCRateLimitError, CCQuotaExhaustedError)):
+            error = CCQuotaExhaustedError()
+        await observer._notify_status_change(error)
+    # Health can recover without a successful fallback; another home's banner
+    # must survive. Omitting the observer here avoids a second NORMAL callback.
+    if error is None and fallback_state.read().original == home:
+        await fallback_recovery.note_home_recovery()
 
 
 async def select_provider(runner, request, sid, invocation):
@@ -80,6 +102,7 @@ async def select_provider(runner, request, sid, invocation):
             if not peer_availability.is_provider_refusal(exc):
                 raise
             attempt["outcome"] = "refused"
+            await _observe_home(runner, home, name, exc)
             if name != home:
                 await asyncio.to_thread(peer_availability.note_failure, name, exc)
         else:
@@ -90,14 +113,7 @@ async def select_provider(runner, request, sid, invocation):
             if not await cc_sessions.merge_metadata(db, sid, patch):
                 raise ValueError("Managed receipt is unavailable")
         if attempt["outcome"] == "ready":
-            if (
-                name == home
-                and fallback_state.read().original == home
-                and roster.active_model() == home
-            ):
-                from genesis.cc.fallback_recovery import note_home_recovery
-
-                await note_home_recovery(invoker=getattr(runner._rt, "_cc_invoker", None))
+            await _observe_home(runner, home, name)
             return name, selected
     raise CCProcessError("No configured provider established readiness")
 
