@@ -16,6 +16,7 @@ deleted everything between the two.
 from __future__ import annotations
 
 import os
+import socket
 import stat
 import subprocess
 import sys
@@ -367,3 +368,40 @@ def test_an_unreadable_target_is_not_reported_as_a_marker_problem(tmp_path):
     assert result.returncode == 1
     assert "could not read" in result.stderr
     assert "fix the markers" not in result.stderr
+
+
+@pytest.mark.parametrize("kind", ["directory", "directory-symlink", "fifo", "socket"])
+def test_nonregular_targets_are_refused_even_when_awk_skips_them(tmp_path, monkeypatch, kind):
+    target = tmp_path / "CLAUDE.md"
+    listener = None
+    if kind == "directory":
+        target.mkdir()
+    elif kind == "directory-symlink":
+        destination = tmp_path / "actual-directory"
+        destination.mkdir()
+        target.symlink_to(destination)
+    elif kind == "fifo":
+        os.mkfifo(target)
+    else:
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(target))
+    # GNU awk skips directory operands with success; rejecting file types must
+    # not depend on the chosen awk implementation (or block reading a FIFO).
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "awk").write_text("#!/bin/sh\nexit 0\n")
+    (tools / "awk").chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
+    before = target.lstat()
+    try:
+        result = _shell(target)
+        assert result.returncode == 1
+        assert "could not read" in result.stderr
+        assert "fix the markers" not in result.stderr
+        assert (target.lstat().st_ino, target.lstat().st_mode) == (before.st_ino, before.st_mode)
+        assert not list(tmp_path.glob(".claude-md-block.*"))
+        if target.is_dir():
+            assert list(target.iterdir()) == []
+    finally:
+        if listener is not None:
+            listener.close()

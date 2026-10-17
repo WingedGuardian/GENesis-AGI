@@ -37,6 +37,31 @@ _spec = importlib.util.spec_from_file_location("pytest_lock_wait", _SCRIPT)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "²\n0\npytest x",
+        "١\n0\npytest x",
+        "4242\n-inf\npytest x",
+        "4242\n0\npytest x\ntest_x\n-inf\n",
+        "4242\n0\npytest x\ntest_x\ninf\n",
+        "4242\n0\npytest x\ntest_x\nnan\n",
+    ],
+)
+def test_malformed_metadata_does_not_break_a_waiter(lock_file, lock_holder, record):
+    lock_holder(lock_file, record=record)
+    active, description = _mod.pytest_is_active()
+    assert active
+    assert description
+
+
+def test_a_marker_in_the_test_name_is_not_a_stall_report():
+    fresh = "  pid 4242 (running 2m)\n  current: test_x[LIKELY HUNG] (running 2s)"
+    assert _mod._stall_key(fresh) is None
+    stalled = fresh + "\n  LIKELY HUNG: one step has run 11m; wait channel unknown."
+    assert _mod._stall_key(stalled) == ("pid 4242", "current: test_x[LIKELY HUNG]")
+
 argv_is_pytest = _mod.argv_is_pytest
 scan_pytest_processes = _mod.scan_pytest_processes
 parse_wait_arg = _mod.parse_wait_arg
@@ -445,6 +470,78 @@ class TestWaitMode:
         rc = _mod.wait_for_clear(0.02, out=out)
         assert rc == 0, out.getvalue()
         assert "TIMEOUT" not in out.getvalue()
+
+
+    def test_a_holder_that_goes_stale_mid_wait_is_reported_when_it_does(
+        self, lock_file, lock_holder, monkeypatch
+    ):
+        """The flag must not wait for the TIMEOUT summary: a waiter learns the
+        holder is stuck on the first progress line after it becomes so (#3135).
+        """
+        import io
+
+        now = time.time()
+        lock_holder(
+            lock_file,
+            record=f"4242\n{now - 60}\npytest tests/x.py\ntests/x.py::t\n{now - 1}\n\n",
+        )
+        monkeypatch.setenv(_mod.STALL_ENV, "2.5")
+        monkeypatch.setattr(_mod, "_POLL_SECONDS", 0.2)
+        monkeypatch.setattr(_mod, "_PROGRESS_SECONDS", 0.5)
+        out = io.StringIO()
+        assert _mod.wait_for_clear(6.0, out=out) == 1
+        text = out.getvalue()
+        head, _, _tail = text.partition("TIMEOUT")
+        assert "LIKELY HUNG" not in head.split("still waiting", 1)[0], (
+            "the holder was fresh when the wait began"
+        )
+        assert head.count("LIKELY HUNG") == 1, text
+
+
+    def test_a_second_stuck_step_in_the_same_wait_is_reported_too(
+        self, lock_file, lock_holder, monkeypatch
+    ):
+        """One report per stuck step, not one per wait: a holder that moves on
+        and hangs again (or a new holder that hangs) is news (#3135 review)."""
+        import io
+        import threading
+
+        old = time.time() - 900
+        lock_holder(
+            lock_file,
+            record=f"4242\n{old}\npytest tests/x.py\ntests/x.py::first\n{old}\n\n",
+        )
+        monkeypatch.setenv(_mod.STALL_ENV, "2")
+        monkeypatch.setattr(_mod, "_POLL_SECONDS", 0.2)
+        monkeypatch.setattr(_mod, "_PROGRESS_SECONDS", 0.5)
+
+        def _second_hang():
+            time.sleep(1.5)
+            lock_file.write_text(
+                f"4242\n{old}\npytest tests/x.py\ntests/x.py::second\n{old}\n\n"
+            )
+
+        threading.Thread(target=_second_hang, daemon=True).start()
+        out = io.StringIO()
+        assert _mod.wait_for_clear(5.0, out=out) == 1
+        head = out.getvalue().partition("TIMEOUT")[0]
+        assert "current: tests/x.py::first" in head
+        assert "current: tests/x.py::second" in head, head
+        assert head.count("LIKELY HUNG") == 2, head
+
+    def test_a_hidden_wait_channel_reads_as_unknown(self, monkeypatch, tmp_path):
+        """The kernel shows "0" when it hides the symbol; say unknown."""
+        fake = tmp_path / "wchan"
+        fake.write_text("0")
+        real_open = open
+
+        def _open(path, *a, **k):
+            if str(path).endswith("/wchan"):
+                return real_open(fake, *a, **k)
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr("builtins.open", _open)
+        assert _mod._wait_channel(1) == "unknown"
 
 
 class TestPinnedToTheLockModule:

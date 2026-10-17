@@ -406,8 +406,14 @@ def pytest_configure(config):
     from genesis.util import pytest_lock
     from genesis.util.tmp import big_tmp_dir, should_redirect_pytest_basetemp
 
+    global _BOX_LOCK
     lock = pytest_lock.acquire()
     config._genesis_pytest_lock = lock
+    _BOX_LOCK = lock
+    if not config.pluginmanager.hasplugin("timeout"):
+        # The holder record says so, which the stall report quotes: nothing
+        # will end a hung test in this run.
+        lock.note_suffix = "per-test timeout: none (pytest-timeout is not active)"
     if lock.blocked and not _is_introspection_only(config):
         pytest.exit(lock.message, returncode=pytest_lock.EXIT_LOCK_HELD)
     elif lock.blocked:
@@ -1071,6 +1077,50 @@ with contextlib.suppress(Exception):  # see the best-effort note above
     _claim_active_test_breadcrumb()
 
 
+# The box lock this session holds, for the per-test hooks below (they get no
+# ``config``). Set in ``pytest_configure``; ``BoxLock.note`` is a no-op unless
+# this process actually holds the lock.
+_BOX_LOCK = None
+
+_NO_TIMEOUT_WARNING = (
+    "genesis: pytest-timeout is not active (not installed, or disabled with "
+    "-p no:timeout), so the per-test timeout in pyproject.toml does nothing: a "
+    "hung test runs until killed and holds the box-wide test lock (every other "
+    "session's pytest waits). Install it into this venv: pytest-timeout, or the "
+    "package's [test] extra."
+)
+
+
+def pytest_sessionstart(session):
+    """Say LOUDLY, at the top of the run, when no per-test timeout applies.
+
+    pytest's own signal for this is ``Unknown config option: timeout`` in the
+    warnings summary at the END of the run, which is exactly when it no longer
+    helps. Nothing installs the ``[test]`` extra on an install (bootstrap's
+    editable install names no extras), so the plugin is present only where
+    someone put it, and a hang observed on 2026-10-11 held the box lock for
+    about 40 minutes in a venv without it.
+    """
+    config = session.config
+    if config.pluginmanager.hasplugin("timeout"):
+        return
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(_NO_TIMEOUT_WARNING, yellow=True, bold=True)
+    else:
+        sys.stderr.write(_NO_TIMEOUT_WARNING + "\n")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Tell a contender that the tests are done and teardown is running.
+
+    Without this the record keeps naming the LAST test through basetemp removal
+    (``pytest_unconfigure``), so a slow teardown would read as that test hung.
+    """
+    if _BOX_LOCK is not None:
+        _BOX_LOCK.note("(session teardown)")
+
+
 def pytest_runtest_logstart(nodeid, location):
     """Record the test about to run, for a crash that never writes a report.
 
@@ -1088,6 +1138,8 @@ def pytest_runtest_logstart(nodeid, location):
     throughout -- a breadcrumb that could fail the suite it exists to diagnose
     would be a poor trade.
     """
+    if _BOX_LOCK is not None:
+        _BOX_LOCK.note(nodeid)
     path = os.environ.get(ACTIVE_TEST_FILE_ENV)
     if not path or not _owns_active_test_breadcrumb():
         return

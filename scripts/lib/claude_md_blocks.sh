@@ -92,6 +92,12 @@ write_sentinel_block() {
     if [ -n "$body" ] && [ "${body: -1}" != $'\n' ]; then
         body+=$'\n'
     fi
+    # awk implementations disagree on directories; a FIFO could block forever.
+    # Refuse nonregular targets before reading or staging a replacement.
+    if [ -e "$file" ] && [ ! -f "$file" ]; then
+        echo "CLAUDE.md block '$name' left unchanged: could not read $file (not a regular file)" >&2
+        return 1
+    fi
     dir=$(dirname -- "$file")
     tmp=$(mktemp "$dir/.claude-md-block.XXXXXX") || return 1
     rc=0
