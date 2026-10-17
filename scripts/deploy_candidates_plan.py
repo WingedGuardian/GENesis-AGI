@@ -13,7 +13,9 @@ Flat sibling of deploy_candidates.py (see that file for the commands).
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
+import json
 import os
 import subprocess
 import time
@@ -289,6 +291,37 @@ def _acquire_checkout_lock(repo: Repo) -> int:
         raise
 
 
+#: Where a caller (update.sh on `live`) asks for the move record: a JSON file
+#: {"to": <tip>, "phase": <phase>} saying how far the move got, so the caller
+#: never infers from git afterwards what the move did. Phases: "ref" (the ref is
+#: about to move, the tree is unchanged), "moving" (the switch is about to run),
+#: "partial" (git wrote part of the tree and failed), "clean" (git refused and
+#: wrote nothing), "done" (the checkout is at "to"). No variable, no record.
+MOVE_RECORD_ENV = "DEPLOY_CANDIDATES_MOVE_RECORD"
+
+
+def _write_move_record(repo: Repo, to: str, phase: str, *, before: bool) -> None:
+    """Write the move record atomically (same-directory temp + os.replace).
+    Before the move a failure refuses (nothing has moved: a missing record must
+    keep meaning "the engine never moved"); after it, a failure only warns."""
+    path = repo.env.get(MOVE_RECORD_ENV)
+    if not path:
+        return
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"to": to, "phase": phase}, fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        if before:
+            raise Refusal(f"cannot write the move record {path} ({exc}); nothing moved") from exc
+        out(
+            f"  WARNING: the checkout is at {to[:12]}, but the move record {path} could not be written: {exc}"
+        )
+
+
 def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> Move:
     lock_fd = _acquire_checkout_lock(repo)
     try:
@@ -321,6 +354,7 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
         out(f"  checkout: unchanged ({cur_tip[:12]}): same origin/main, same candidate heads.")
     elif branch == LIVE_BRANCH and cur_tip and repo.tree(cur_tip) == repo.tree(plan.tip):
         # Same files under new commits: move the ref, not the working tree.
+        _write_move_record(repo, plan.tip, "ref", before=True)
         repo.git(
             "update-ref",
             "-m",
@@ -329,6 +363,7 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
             plan.tip,
             cur_tip,
         )
+        _write_move_record(repo, plan.tip, "done", before=False)
         out(
             f"  checkout: tree unchanged; `live` moved to {plan.tip[:12]} without touching the files."
         )
@@ -352,6 +387,7 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
             else None
         )
         before = _worktree_status(repo, move_paths)
+        _write_move_record(repo, plan.tip, "moving", before=True)
         p = repo.git("switch", "--no-overwrite-ignore", "-C", LIVE_BRANCH, plan.tip, check=False)
         if p.returncode != 0:
             # git returns a post-checkout hook's status AFTER the checkout has
@@ -364,6 +400,7 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
                 # write error; MEASURED, git 2.43). Compare, never infer.
                 changed = sorted({rec[3:] for rec in before ^ _worktree_status(repo, move_paths)})
                 if changed:
+                    _write_move_record(repo, plan.tip, "partial", before=False)
                     more = f"\n  … and {len(changed) - 20} more" if len(changed) > 20 else ""
                     raise Refusal(
                         f"git failed partway through moving the checkout to {plan.tip[:12]}: HEAD "
@@ -375,6 +412,7 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
                         "the new untracked ones, fix the cause below, then retry:\n"
                         + p.stderr.strip()
                     )
+                _write_move_record(repo, plan.tip, "clean", before=False)
                 raise Refusal(
                     f"git refused to move the checkout to {plan.tip[:12]}; nothing moved:\n{p.stderr.strip()}"
                 )
@@ -384,6 +422,7 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
             )
         else:
             out(f"  checkout: moved to {plan.tip[:12]}.")
+        _write_move_record(repo, plan.tip, "done", before=False)
         files_moved = True
     # Past the commit point: the checkout has moved (or was already right), so
     # nothing below may raise a refusal that would claim nothing changed.

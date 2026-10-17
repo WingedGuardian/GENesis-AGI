@@ -9,6 +9,7 @@ exclusion has a control that goes live, so a rebuild that excludes everything
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import subprocess
@@ -1008,3 +1009,61 @@ def test_the_dirty_list_matches_the_deploy_scripts_pipeline(dc, dc_ready):
         ln[3:] for ln in porcelain if not ln.startswith("??") and not re.search(regex, ln)
     )
     assert got == want and "a.txt" in got
+
+
+# ── the move record update.sh reads (#3370) ─────────────────────────────────
+
+
+def _record(w) -> Path:
+    return w.home / "live_move.json"
+
+
+def test_a_rebuild_that_moves_records_done_at_its_tip(dc, dc_ready, capsys):
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    rec = _record(w)
+    assert w.run(dc, "rebuild", extra_env={"DEPLOY_CANDIDATES_MOVE_RECORD": str(rec)}) == 0, (
+        capsys.readouterr()
+    )
+    assert json.loads(rec.read_text()) == {"to": w.rev("refs/heads/live"), "phase": "done"}
+    assert not list(rec.parent.glob("live_move.json.*.tmp")), "the temp file was left behind"
+
+
+def test_without_the_variable_no_record_is_written(dc, dc_ready, capsys):
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert not _record(w).exists()
+    assert not list(w.home.rglob("live_move.json*"))
+
+
+def test_a_switch_that_fails_partway_records_partial(dc, dc_ready, capsys):
+    """The partial-switch scenario above: HEAD stays, part of the tree is
+    written; the record says so, so update.sh restarts nothing on it."""
+    w = dc_ready
+    w.candidate("feat/a", {"b.txt": None, "z.bin": "data\n"})
+    w.write_manifest([w.entry("feat/a")])
+    (w.root / ".git" / "info").mkdir(exist_ok=True)
+    (w.root / ".git" / "info" / "attributes").write_text("*.bin filter=bad\n")
+    w.git(w.root, "config", "filter.bad.smudge", "false")
+    w.git(w.root, "config", "filter.bad.required", "true")
+    rec = _record(w)
+    assert w.run(dc, "rebuild", extra_env={"DEPLOY_CANDIDATES_MOVE_RECORD": str(rec)}) == 1
+    assert "failed partway" in capsys.readouterr().err
+    got = json.loads(rec.read_text())
+    assert got["phase"] == "partial" and got["to"] != w.rev("HEAD")
+
+
+def test_an_unwritable_record_refuses_before_anything_moves(dc, dc_ready, capsys):
+    """A missing record must keep meaning "never moved": a record that cannot be
+    written before the move refuses the move."""
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    head = w.rev("HEAD")
+    rec = w.home / "no-such-dir" / "live_move.json"
+    assert w.run(dc, "rebuild", extra_env={"DEPLOY_CANDIDATES_MOVE_RECORD": str(rec)}) == 1
+    assert "move record" in capsys.readouterr().err
+    assert w.rev("HEAD") == head and not w.live_merges()

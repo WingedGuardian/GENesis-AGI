@@ -3649,9 +3649,20 @@ verified: ba9dd8a37 2026-10-09
   update.lock is handed to the engine; `update.sh` holds genesis-checkout.lock
   only while it clears the excused local edits, never across the rebuild (the
   engine's move takes that lock itself). A refusal, failure or interrupt of the
-  rebuild runs the normal rollback: a moved checkout is adopted only when it is
-  a rebuild's tip (`live-shaped`), moved back to the rollback tag with its git
-  hooks restored (`restore-hooks`), and the services restart on the old tip.
+  rebuild runs the normal rollback. What the engine did to the checkout is read
+  from its move record (`DEPLOY_CANDIDATES_MOVE_RECORD`, here
+  `~/.genesis/live_move.json`: `{"to", "phase"}` with phase `ref` / `moving` /
+  `partial` / `clean` / `done`, written by `deploy_candidates_plan.py` before and
+  after the move; a record that cannot be written before the move refuses it),
+  never inferred from git: a moved checkout is adopted only when HEAD is on
+  `live` at exactly the commit the record names, then moved back to the
+  rollback tag with its git hooks restored (`restore-hooks`), and the services
+  restart on the old tip. A record that cannot be read, or that says the switch
+  began or wrote part of the tree while HEAD is not at its target, means a
+  possibly mixed working tree: nothing is restarted and the rollback reports
+  itself incomplete. Exit 4 after such a rollback needs it to have completed,
+  hook restore and every service restart included; otherwise the run exits 1
+  and leaves no `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.

@@ -361,14 +361,30 @@ def test_u6_a_unit_refusal_whose_rollback_does_not_complete_exits_1(dc, dc_ready
     r = _bash(_rebuild_script(w, old_base, mu_src=refuse), _env(w.home))
     assert r.returncode == 1, _out(r)
     assert "ROLLBACK INCOMPLETE" in r.stdout, r.stdout
+    assert not (w.home / ".genesis" / "update_refused.json").exists(), (
+        "exit 1 left the refusal record that means exit 4"
+    )
 
 
 # ── the rebuild in the merge slot, against a stub engine ────────────────────
 
 _STUB_ENGINE = """\
-import fcntl, os, signal, subprocess, sys
+import fcntl, json, os, signal, subprocess, sys
 mode = os.environ.get("STUB_MODE", "")
 root = os.environ["STUB_ROOT"]
+
+
+def record(to, phase):
+    # The engine's move record, as deploy_candidates_plan.py writes it.
+    path = os.environ.get("DEPLOY_CANDIDATES_MOVE_RECORD")
+    if path:
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"to": to, "phase": phase}) if phase != "garbage" else "{")
+
+
+def head():
+    return subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True,
+                          text=True, check=True).stdout.strip()
 
 
 def checkout_lock():
@@ -388,14 +404,28 @@ with open(os.environ["STUB_LOG"], "a") as fh:
              + " own=" + os.environ.get("DEPLOY_CANDIDATES_OWN_STATE_PID", "-")
              + " ppid=" + str(os.getppid()) + " checkout=" + checkout_lock() + "\\n")
 if sys.argv[1] == "rebuild":
-    if mode in ("move", "move-fail", "move-signal", "move-unshaped"):
+    if mode in ("move", "move-fail", "move-signal", "foreign", "foreign-success",
+                "unrecorded-success", "move-ref", "move-moving"):
         subprocess.run(["git", "-C", root, "-c", "core.hooksPath=/dev/null", "commit", "-q",
                         "--allow-empty", "-m", "moved"], check=True)
+        # move-signal: killed between the switch and its "done" (the record says
+        # "moving", HEAD is at its target). foreign: the record names another commit.
+        if mode != "unrecorded-success":
+            record("f" * 40 if mode in ("foreign", "foreign-success") else head(),
+                   "moving" if mode in ("move-signal", "move-moving") else
+                   "ref" if mode == "move-ref" else "done")
+    if mode in ("partial", "garbage"):
+        # git wrote part of the new tree (an untracked file) and failed; HEAD stayed.
+        open(os.path.join(root, "half-written.py"), "w").write("x = 1\\n")
+        record("e" * 40, mode)
     if mode == "move-signal":
         os.kill(os.getppid(), signal.SIGTERM)
-    sys.exit(0 if mode in ("", "move") else 1)
+    sys.exit(0 if mode in ("", "move", "foreign-success", "unrecorded-success",
+                          "move-ref", "move-moving") else 1)
+if sys.argv[1] == "restore-hooks" and os.environ.get("STUB_HOOKS_FAIL") == "1":
+    sys.exit(1)
 if sys.argv[1] == "live-shaped":
-    sys.exit(1) if mode == "move-unshaped" else print(os.environ["STUB_BASE"])
+    print(os.environ["STUB_BASE"])
 sys.exit(0)
 """
 
@@ -421,8 +451,12 @@ def plain_live(tmp_path: Path):
     return root, home, stub, env, tmp_path / "engine.log"
 
 
-def _plain_script(root: Path, stub: Path) -> str:
-    return _engine_script(root, stub, "$VALIDATED_HEAD", '_mu_src="import sys"\n')
+def _plain_script(root: Path, stub: Path, mu_src: str = "import sys\n", pre: str = "") -> str:
+    return _engine_script(root, stub, "$VALIDATED_HEAD", _assign("_mu_src", mu_src), pre)
+
+
+def _move_record(home: Path) -> Path:
+    return home / ".genesis" / "live_move.json"
 
 
 def _engine_calls(log: Path) -> list[str]:
@@ -443,6 +477,7 @@ def test_the_engine_gets_the_update_lock_its_own_state_pid_and_a_free_checkout_l
     state = _state(home)
     assert state["phase"] == "merging" and state["pid"] == int(fields["own"])
     assert state["own_head"] == _git(root, "rev-parse", "HEAD") != state["rollback_tag"]
+    assert not _move_record(home).exists(), "the adopted move's record outlived the adoption"
 
 
 def test_p2_an_interrupt_during_the_rebuild_rolls_back_onto_the_old_tip(plain_live):
@@ -484,16 +519,76 @@ def test_an_unmoved_refusal_restarts_the_old_tip_and_keeps_the_tag(plain_live):
     assert not any(c.startswith("restore-hooks ") for c in _engine_calls(log))
 
 
-def test_a_moved_tip_that_is_not_a_rebuilds_is_never_adopted(plain_live):
-    """Control for the adoption: a checkout moved to something that is not a
-    rebuild's tip is left as found, and nothing is restarted on it."""
+@pytest.mark.parametrize("mode", ["foreign", "foreign-success", "unrecorded-success"])
+def test_a_moved_tip_the_record_does_not_name_is_never_adopted(plain_live, mode):
+    """Codex P2 (exact ownership): HEAD moved, but not to the commit the engine's
+    record names. It is someone else's move: the code is not reset to the tag,
+    nothing restarts on it, and the restart guard stays."""
     root, home, stub, env, log = plain_live
     old = _git(root, "rev-parse", "HEAD")
-    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "move-unshaped"})
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": mode})
     assert r.returncode == 1, _out(r)
-    assert _git(root, "rev-parse", "HEAD") != old
+    assert _git(root, "rev-parse", "HEAD") != old, "the rollback reset a move it does not own"
+    assert "rolling that back" not in r.stdout
     assert "restart-server" not in _calls(home)
+    assert not any(c.startswith("restore-hooks ") for c in _engine_calls(log))
     assert _state(home) is not None, "the restart guard went while moved code stays"
+    assert not _move_record(home).exists()
+
+
+@pytest.mark.parametrize("mode", ["", "move-ref", "move-moving"])
+def test_success_adopts_only_the_unchanged_or_recorded_tip(plain_live, mode):
+    """No-op success has no receipt; moved success may retain a pre-move phase
+    if the final receipt write failed. Neither loses exact ownership."""
+    root, home, stub, env, log = plain_live
+    old = _git(root, "rev-parse", "HEAD")
+    r = _bash(_plain_script(root, stub, _REFUSE_UNITS), {**env, "STUB_MODE": mode})
+    assert r.returncode == 4, _out(r)
+    _assert_rolled_back_onto(home, _git(root, "rev-parse", "HEAD"), old)
+    assert any(c.startswith("restore-hooks ") for c in _engine_calls(log)) is bool(mode)
+    assert not _move_record(home).exists()
+
+
+@pytest.mark.parametrize("mode", ["partial", "garbage"])
+def test_a_partly_written_tree_is_never_restarted(plain_live, mode):
+    """Codex P2: git wrote part of the new tree (here an untracked file, which
+    no tracked-dirt check sees) and failed with HEAD unmoved; or the record
+    cannot be read. The rollback restarts nothing and says the tree may be mixed."""
+    root, home, stub, env, log = plain_live
+    old = _git(root, "rev-parse", "HEAD")
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": mode})
+    assert r.returncode == 1, _out(r)
+    assert _git(root, "rev-parse", "HEAD") == old
+    assert "restart-server" not in _calls(home), "services restarted on a mixed tree"
+    assert "ROLLBACK INCOMPLETE" in r.stdout and "mixed working tree" in r.stdout, r.stdout
+    assert _state(home) is not None
+
+
+_REFUSE_UNITS = 'import sys\nprint("REFUSED: demo.service (edited by hand)")\nsys.exit(4)\n'
+
+
+@pytest.mark.parametrize(
+    ("hooks_fail", "pre", "rc"),
+    [
+        ("0", "", 4),
+        ("1", "", 1),
+        ("0", '_start_genesis_server() { echo "restart-server" >> "$CALLS"; return 1; }\n', 1),
+    ],
+    ids=["clean", "hook-restore-fails", "restart-fails"],
+)
+def test_exit_4_needs_a_rollback_that_completed(plain_live, hooks_fail, pre, rc):
+    """Codex P2 (F5, F6): exit 4 promises the old tip is back with its hooks and
+    its services; a failed hook restore or service restart exits 1 instead, and
+    only an exit 4 leaves the refusal record the dashboard reads."""
+    root, home, stub, env, log = plain_live
+    r = _bash(
+        _plain_script(root, stub, _REFUSE_UNITS, pre),
+        {**env, "STUB_MODE": "move", "STUB_HOOKS_FAIL": hooks_fail},
+    )
+    assert r.returncode == rc, _out(r)
+    assert any(c.startswith("restore-hooks ") for c in _engine_calls(log))
+    refused = home / ".genesis" / "update_refused.json"
+    assert refused.exists() is (rc == 4), "a refusal record without exit 4 (or the reverse)"
 
 
 def test_u5_order_snapshot_stop_merging_engine_bootstrap():
