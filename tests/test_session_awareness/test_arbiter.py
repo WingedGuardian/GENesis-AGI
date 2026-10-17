@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 import textwrap
 from pathlib import Path
 
@@ -204,8 +203,10 @@ async def test_timeout_group_kills_children(tmp_path):
 
 
 @pytest.mark.skipif(
-    shutil.which("claude") is None, reason="claude CLI not on PATH",
+    os.environ.get("GENESIS_LIVE_E2E") != "1",
+    reason="calls the real Claude API; opt in with GENESIS_LIVE_E2E=1",
 )
+@pytest.mark.real_tool("claude")
 @pytest.mark.asyncio
 async def test_live_arbiter_e2e():
     """The smoke test through the real module: deterministic pick."""

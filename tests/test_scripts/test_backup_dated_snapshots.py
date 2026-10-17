@@ -126,6 +126,7 @@ _SESSION_BUS_VARS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
 def _run(backup_env):
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(backup_env["home"]),
         GENESIS_DIR=str(backup_env["gd"]),
@@ -176,6 +177,7 @@ def test_snapshot_dir_is_created(backup_env):
 def _run_local(backup_env, offsite_root: Path, extra_env: dict | None = None):
     """Run backup.sh through the `local` Tier-2 backend (no smbclient stub)."""
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(backup_env["home"]),
         GENESIS_DIR=str(backup_env["gd"]),
@@ -289,6 +291,7 @@ def test_large_temp_goes_to_dedicated_dir_not_inherited_tmpdir(backup_env, tmp_p
     bigtmp = tmp_path / "dedicated-big-tmp"
     bigtmp.mkdir()
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(backup_env["home"]),
         GENESIS_DIR=str(backup_env["gd"]),
@@ -605,7 +608,12 @@ def test_extra_round_trip_real_backup_into_real_restore_keeps_links(backup_env, 
     (fresh / "tmp").mkdir()
     (fresh / ".gnupg").mkdir(mode=0o700)
     env = {
-        **{k: v for k, v in os.environ.items() if k not in _SESSION_BUS_VARS},
+        # GENESIS_DIR names the secrets file, as on CI: SECRETS_PATH is dropped too.
+        **{
+            k: v
+            for k, v in os.environ.items()
+            if k not in (*_SESSION_BUS_VARS, "SECRETS_PATH")
+        },
         "HOME": str(fresh),
         "GENESIS_DIR": str(fresh / "genesis"),
         "GENESIS_BACKUP_TMPDIR": str(fresh / "tmp"),
