@@ -1,0 +1,1 @@
+Preserve owner lifecycle state during peer memory repair, require durable deletion intent before permanent denial, and prevent stale recovery and capped-search starvation.
