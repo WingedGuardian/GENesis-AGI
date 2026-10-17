@@ -1,9 +1,9 @@
 """scripts/uninstall.sh stops and disables every systemd user unit a template installs.
 
-The three lists it does that from (the in-container loop, the host-driven stop list
-and the host-driven disable loop) are kept by hand, so the expected set here is
-derived from scripts/systemd/*.template: a unit added without reaching all three
-fails. Known gaps are named, each with the issue that owns it.
+Host cleanup delegates to the guarded container transaction, which has one
+ordinary-unit list plus managed Codebase retirement. Derive the expected set
+from scripts/systemd/*.template so neither route can omit an installed unit.
+Known gaps are named, each with the issue that owns it.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ _KNOWN_GAPS = {
 }
 # Started per instance on demand and never enabled: stopped by instance name, not disabled.
 _INSTANCE_TEMPLATES = {"genesis-disk-hygiene-pressure@.service"}
+# This service must retire through the fail-closed guard, before shell cleanup.
+_MANAGED_UNITS = {"genesis-cbm-query.service"}
 
 
 def _code() -> str:
@@ -37,30 +39,15 @@ def _between(code: str, start: str, end: str) -> str:
     return code[i : code.index(end, i)]
 
 
-def _last_before(code: str, start: str, end: str) -> str:
-    """From the LAST ``start`` before ``end``: the same stop line also pauses the
-    watchdog far earlier, and a slice from there would take in the other sites."""
-    j = code.index(end)
-    return code[code.rindex(start, 0, j) : j]
-
-
 def _sites() -> dict[str, str]:
     code = _code()
     return {
-        "in-container stop+disable": _between(
+        "shared stop+disable": _between(
             # The trailing backslash: a shorter loop over the watchdog alone
             # (the pre-teardown pause) starts with the same words.
             code,
             "for unit in genesis-watchdog.timer genesis-watchdog.service \\\n",
             'safe_disable_service "$unit"',
-        ),
-        "host-driven stop": _last_before(
-            code,
-            "systemctl --user stop genesis-watchdog.timer genesis-watchdog.service",
-            "for u in genesis-server.service",
-        ),
-        "host-driven disable": _between(
-            code, "for u in genesis-server.service", 'systemctl --user disable \\"\\$u\\"'
         ),
     }
 
@@ -73,7 +60,7 @@ def _units() -> list[str]:
     )
 
 
-def test_the_scan_finds_the_three_sites_and_the_templates():
+def test_the_scan_finds_the_shared_site_and_the_templates():
     """Denominators: an empty site or template list would make the test vacuous."""
     sites = _sites()
     assert all("genesis-server.service" in s for s in sites.values()), sites.keys()
@@ -83,23 +70,48 @@ def test_the_scan_finds_the_three_sites_and_the_templates():
 def test_each_site_is_only_its_own_block():
     """A slice that ran into another site would credit it with that site's units."""
     sites = _sites()
-    assert "safe_disable_service" not in sites["host-driven stop"]
-    assert "PRESSURE_UNIT=" not in sites["host-driven stop"]
-    assert "container_exec" not in sites["host-driven stop"]
-    assert "systemctl --user disable" not in sites["host-driven stop"]
+    text = sites["shared stop+disable"]
+    assert "safe_disable_service" not in text
+    assert "PRESSURE_UNIT=" not in text
+    assert "container_exec" not in text
+    assert "incus exec" not in text
 
 
-@pytest.mark.parametrize(
-    "site", ["in-container stop+disable", "host-driven stop", "host-driven disable"]
-)
+@pytest.mark.parametrize("site", ["shared stop+disable"])
 def test_every_installed_unit_reaches_every_uninstall_site(site):
     text = _sites()[site]
     missing = [
         u
         for u in _units()
-        if u not in _KNOWN_GAPS and u not in _INSTANCE_TEMPLATES and u not in text
+        if u not in _KNOWN_GAPS | _INSTANCE_TEMPLATES | _MANAGED_UNITS and u not in text
     ]
     assert not missing, f"{site} does not stop/disable: {missing}"
+
+
+def test_host_cleanup_delegates_to_the_shared_guarded_transaction():
+    host = _between(
+        _code(),
+        'log "Cleaning Genesis inside container',
+        'ok "Genesis removal complete (via incus exec)"',
+    )
+    assert 'incus exec "$CONTAINER_NAME" -- /usr/bin/su --login' in host
+    assert 'codebase_managed.py" uninstall -- --genesis-only --non-interactive' in host
+    assert 'genesis-uninstall "$CONTAINER_GENESIS_HOME"' in host
+    assert "systemctl --user stop" not in host
+    assert "systemctl --user disable" not in host
+
+
+def test_managed_units_retire_before_the_shared_shell_cleanup():
+    managed = (REPO / "scripts/codebase_managed.py").read_text(encoding="utf-8")
+    assert set(_units()) >= _MANAGED_UNITS
+    assert 'BACKEND = "genesis-cbm-query.service"' in managed
+    retirement = _between(managed, "def retire_managed()", "def report_retained_state()")
+    assert '("disable", BACKEND)' in retirement
+    assert '("stop", BACKEND)' in retirement
+    assert '("stop", SLICE)' in retirement
+    assert "require_quiescent(unit)" in retirement
+    transaction = _between(managed, "def uninstall(", "def read_document(")
+    assert transaction.index("retire_managed()") < transaction.index("os.execv(")
 
 
 def test_the_browser_stack_timer_goes_before_its_service():
