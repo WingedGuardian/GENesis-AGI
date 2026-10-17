@@ -72,6 +72,22 @@ async def test_generate_returns_outreach_request(db, mock_health, mock_drafter):
 
 
 @pytest.mark.asyncio
+async def test_topic_is_one_report_per_utc_day(db, mock_health, mock_drafter):
+    """Governance treats the morning-report topic as the message identity
+    (governance._TOPIC_IS_IDENTITY): one topic per UTC date, so a same-day
+    resend collapses and the next day's report never does. Pin the format."""
+    import re
+    from datetime import UTC, datetime
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    before = datetime.now(UTC).strftime("%Y-%m-%d")
+    req = await gen.generate()
+    after = datetime.now(UTC).strftime("%Y-%m-%d")
+    assert re.fullmatch(r"Morning Report — \d{4}-\d{2}-\d{2}", req.topic)
+    assert req.topic[-10:] in {before, after}  # robust across a UTC midnight
+
+
+@pytest.mark.asyncio
 async def test_critical_issues_dedupes_subsystem_stale(db, mock_health, mock_drafter):
     """A subsystem already surfaced as a subsystem_stale:<name> alert is NOT listed
     a second time by the heartbeat-staleness block (P2-6 dedup). A subsystem with a

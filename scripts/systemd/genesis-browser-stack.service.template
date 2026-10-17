@@ -1,7 +1,8 @@
 [Unit]
 Description=Genesis browser stack — install the Camoufox engine, the fallback's Chromium and their system libraries
-# No [Install] section: an operator starts this unit (and, once installs enable it,
-# its timer), never login. A run that has nothing to do exits in seconds.
+# No [Install] section: bootstrap.sh starts this unit after installing the browser
+# packages, genesis-browser-stack.timer retries it daily, and an operator may run
+# it; never login. A run that has nothing to do exits in seconds.
 
 [Service]
 Type=oneshot
@@ -14,6 +15,8 @@ ExecStart=/bin/bash "__REPO_DIR__/scripts/install_browser_stack.sh"
 # stay inside their own limit cannot together be killed mid-install.
 TimeoutStartSec=28800
 Environment="PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin"
+# install_browser_stack.sh runs ${VENV_PATH:-<repo>/.venv}/bin/python.
+Environment="VENV_PATH=__VENV__"
 # No environment file: install_browser_stack.sh reads the browser settings it needs
 # from secrets.env by name, so no other secret reaches the downloaders.
 StandardOutput=journal

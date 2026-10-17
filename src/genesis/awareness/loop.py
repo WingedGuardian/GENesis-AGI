@@ -598,8 +598,9 @@ _INFRA_POSTURE_DETAIL = {
         "(scripts/host-setup.sh prints the swapfile recipe)"
     ),
     "container_swap_knob_off": (
-        "incus limits.memory.swap is explicitly false — swap stays disabled "
-        "across container restarts. On the host: incus config set <container> "
+        "incus limits.memory.swap holds an Incus false value (false/0/no/off, "
+        "any case, or a zero byte size) — swap stays disabled across container "
+        "restarts. On the host: incus config set <container> "
         "limits.memory.swap true (scripts/host-setup.sh sets this; the host "
         "guardian also reconciles it when healthy)"
     ),
@@ -796,12 +797,17 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     # container (meminfo swap isn't virtualized; verified live 2026-07-16).
     if _explicit_zero(_facts("host_system").get("swap_total_kb")):
         missing.append("host_swap_absent")
-    # Persistent incus knob, visible container-side. Explicit "false" only —
-    # the incus default is true, so absent/unset is healthy. Covers installs
-    # WITHOUT a working guardian (the guardian reconciles this knob itself).
+    # Persistent incus knob, visible container-side. Any nonempty Incus false
+    # value is off; the Incus default is true, so absent/unset is healthy.
+    # Covers installs WITHOUT a working guardian (the guardian reconciles this
+    # knob itself).
     limits = _facts("host_virt").get("container_limits")
-    if isinstance(limits, dict) and limits.get("limits.memory.swap") == "false":
-        missing.append("container_swap_knob_off")
+    raw = limits.get("limits.memory.swap") if isinstance(limits, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        from genesis.guardian.swap_watch import is_swap_on
+
+        if not is_swap_on(raw):
+            missing.append("container_swap_knob_off")
     # Network plane, gated on networkd actually managing the default route
     # (collectors/container.py::_networkd_manages_link). On a NetworkManager
     # box the fact is False/absent, so these rules stay silent — the
