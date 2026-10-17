@@ -48,6 +48,15 @@ def _ensure_secrets() -> None:
 
     import os
 
+    from genesis.routing.standalone import load_external_secrets
+
+    if load_external_secrets():
+        for key, target in _GENESIS_TO_LITELLM.items():
+            value = os.environ.get(key)
+            if value:
+                os.environ.setdefault(target, value)
+        return
+
     from genesis.env import secrets_path as _resolve_secrets_path
 
     # SECRETS_PATH (or the repo's own secrets.env) first; the main-tree file is

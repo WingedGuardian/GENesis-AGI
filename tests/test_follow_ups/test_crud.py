@@ -23,6 +23,24 @@ async def db():
 
 
 class TestFollowUpCRUD:
+    @pytest.mark.parametrize("include_tabled", [False, True])
+    async def test_recent_owner_sources_are_distinct_from_system(self, db, include_tabled):
+        rows = {}
+        for source in ("foreground_session", "external_interactive", "ego_dispatch", "pipeline"):
+            for kind in ("follow_up", "tabled"):
+                rows[source, kind] = await follow_ups.create(
+                    db, content="Synthetic source filter", source=source,
+                    strategy="ego_judgment", kind=kind,
+                )
+        for mode in ("mine", "system"):
+            found = await follow_ups.get_recent(db, source_mode=mode, include_tabled=include_tabled)
+            expected = {
+                fid for (source, kind), fid in rows.items()
+                if (source in ("foreground_session", "external_interactive")) == (mode == "mine")
+                and (include_tabled or kind == "follow_up")
+            }
+            assert {r["id"] for r in found} == expected
+
     async def test_create_and_get(self, db):
         fid = await follow_ups.create(
             db,

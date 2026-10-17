@@ -1224,6 +1224,9 @@ verified: 50b79ffb 2026-09-01
   (ready/blocked_on_trigger/deferred_cold) and DERIVE the hot(`follow_up`)/
   cold(`tabled`) lane, so priority never picks the lane; `blocked_on_trigger`
   requires a `revisit_condition` (nullable column on `follow_ups`).
+  Attended external interactive writes record `external_interactive` and retain
+  sanctioned lane selection; dispatched writes still route cold. The `mine`
+  source filter includes this external source without registering a session.
 - GROUNDWORK: v4-parallel-dispatch, v4-surplus-tasks, v4-rate-tracking.
 
 ## 5. Information intake & research
@@ -3775,7 +3778,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 4ab8bf71c 2026-10-10
+verified: 8b445d636 2026-10-15
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3823,11 +3826,33 @@ verified: 4ab8bf71c 2026-10-10
   recall tools. The launcher also selects `--external-client`; memory initialization
   then disables processing of Claude's pending plan-bookmark file. Ordinary
   Genesis memory initialization keeps that processing enabled by default.
-  The standalone server enforces the `external` or `validator` tool profile
-  during discovery and direct calls. Both currently admit the same health/recall
-  floor; other tool bodies cannot be entered through those MCP processes.
-  External health initialization skips the LLM router, dispatch queue setup,
-  and campaign wiring. Profiles constrain tools, not an operator's host access.
+  The standalone server enforces closed `external`, `validator` and `interactive`
+  profiles during discovery and direct calls. The first two retain the same
+  health/recall floor and skip health router, dispatch queue and campaign setup.
+  Opt-in `--profile interactive` admits 34 memory and 83 health tools and reuses
+  ordinary health setup without starting a worker. The committed project
+  configuration still selects the floor; connection activation is separate.
+  External startup and lazy routing share a secret-loading policy: no restoration
+  of eight session markers or GENESIS_REPO_ROOT, and existing environment values
+  win over file values. Ordinary standalone dotenv overrides are unchanged.
+  Native startup clears inherited session markers for either transport. External
+  file loading uses a shared positive configuration/provider allowlist, retaining
+  proposal kill switches and the custom privacy fingerprint path; it does
+  not remove unrelated credentials already inherited from the operator.
+  The shared experiment/evolution/skill-replay secret loader follows the same
+  external policy and preserves ordinary eval loading/key remapping.
+  Profiles constrain tools, not an operator's host access or per-action permission.
+  Directed follow-up writes use request-local external profile provenance and
+  persist `external_interactive`, without a Genesis session identity; dispatched
+  cold routing still wins. The `mine` source filter includes this sanctioned
+  interactive source. `session_config` remains deferred because its cache is global.
+  Charter-creating external writes require an existing transcript identity in
+  the charter, recorded-session or heartbeat store, after prefix resolution.
+  External bookmarks and structured knowledge/reference session provenance use
+  the same recorded-identity boundary before transcript reads or storage; unknown
+  follow-up session provenance is stored null with a diagnostic. Ordinary clients
+  retain existing behavior, including filesystem-only legacy bookmarks.
+  See `docs/reference/codex-interactive-mcp.md` for deferred tools and scope.
   The separately launched validator can admit one canonical invocation of
   `scripts/codex_validator_request.py` through its native shell hook. Its
   bounded, private UUID request files use strict JSON and a closed operation

@@ -12,7 +12,7 @@ from fastmcp.server.middleware import Middleware
 from genesis.mcp.external_profiles import ExternalProfileMiddleware, profile_tools
 
 
-@pytest.mark.parametrize("profile", ["external", "validator"])
+@pytest.mark.parametrize("profile", ["external", "validator", "interactive"])
 @pytest.mark.parametrize("server", ["health", "memory"])
 async def test_native_protocol_filters_and_blocks_direct_calls(profile, server):
     mcp = FastMCP("fixture")
@@ -93,7 +93,7 @@ def test_cli_rejects_external_profile_on_other_servers(server, capsys):
     assert "External client profiles support only health and memory servers" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("profile", ["external", "validator", None])
+@pytest.mark.parametrize("profile", ["external", "validator", "interactive", None])
 @pytest.mark.parametrize("has_db", [True, False])
 async def test_health_bootstrap_scopes_before_initialization_and_skips_dispatch(
     monkeypatch, tmp_path, profile, has_db,
@@ -142,7 +142,7 @@ async def test_health_bootstrap_scopes_before_initialization_and_skips_dispatch(
             with pytest.raises(ToolError, match="unavailable"):
                 await client.call_tool("session_start")
     assert entered == ["init", "read"]
-    expected_init = has_db and profile is None
+    expected_init = has_db and profile in (None, "interactive")
     assert router.called is expected_init
     assert direct.called is expected_init
     assert campaign.called is expected_init

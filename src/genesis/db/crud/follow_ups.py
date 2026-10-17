@@ -679,8 +679,8 @@ async def get_recent(
     source_mode:
         Filter by source category:
         - ``"all"`` — no filter (default)
-        - ``"mine"`` — only ``foreground_session`` source
-        - ``"system"`` — everything except ``foreground_session``
+        - ``"mine"`` — sanctioned foreground and attended external-client sources
+        - ``"system"`` — everything except those sanctioned sources
         Takes precedence over ``exclude_source`` when not ``"all"``.
     include_tabled:
         Defaults True (existing callers unchanged); pass False to restrict to
@@ -690,14 +690,14 @@ async def get_recent(
     if source_mode == "mine":
         cursor = await db.execute(
             "SELECT * FROM follow_ups "
-            f"WHERE source = 'foreground_session' {kind_and}"
+            f"WHERE source IN ('foreground_session', 'external_interactive') {kind_and}"
             "ORDER BY created_at DESC LIMIT ?",
             (limit,),
         )
     elif source_mode == "system":
         cursor = await db.execute(
             "SELECT * FROM follow_ups "
-            f"WHERE source != 'foreground_session' {kind_and}"
+            f"WHERE source NOT IN ('foreground_session', 'external_interactive') {kind_and}"
             "ORDER BY created_at DESC LIMIT ?",
             (limit,),
         )

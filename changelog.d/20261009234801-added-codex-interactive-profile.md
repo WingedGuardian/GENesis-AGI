@@ -1,0 +1,4 @@
+- Opt-in external interactive MCP profile with 34 memory and 83 health tools, preserving the narrow external and validator roles.
+- External MCP routing secret reloads retain launch targets and cannot restore scrubbed Genesis session identity.
+- Native external startup clears inherited session identity, shared file loading preserves explicit configuration/provider inputs and safety controls, and external charter creation requires an existing Genesis target.
+- External bookmarks and structured memory session references require a recorded Genesis target; unknown follow-up provenance is dropped with a diagnostic while preserving the work.

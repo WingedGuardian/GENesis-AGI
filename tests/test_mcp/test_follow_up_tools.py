@@ -116,6 +116,39 @@ async def test_foreground_ready_stays_on_the_board(db):
     assert row["source"] == "foreground_session"
 
 
+@pytest.mark.parametrize("dispatched", [False, True])
+@pytest.mark.parametrize("work_state", ["ready", "blocked_on_trigger", "deferred_cold"])
+async def test_external_interactive_follow_up_retains_provenance_and_lane(db, monkeypatch, dispatched, work_state):
+    from fastmcp import Client, FastMCP
+
+    from genesis.mcp.external_profiles import ExternalProfileMiddleware
+
+    if dispatched:
+        monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    fixture = FastMCP("external-follow-up-fixture")
+    registered = await follow_up_tools.mcp.get_tools()
+    fixture.add_tool(registered["follow_up_create"])
+    fixture.add_tool(registered["follow_up_update"])
+    fixture.add_middleware(ExternalProfileMiddleware("health", "interactive"))
+    with patch.object(follow_up_tools, "_get_db", return_value=db):
+        async with Client(fixture) as client:
+            result = await client.call_tool("follow_up_create", {
+                "content": "Synthetic owner-directed follow-up", "reason": "user requested",
+                "strategy": "ego_judgment", "work_state": work_state,
+                "revisit_condition": "when synthetic precondition holds" if work_state == "blocked_on_trigger" else "",
+            })
+            if dispatched:
+                await client.call_tool("follow_up_update", {"follow_up_id": result.data["id"], "work_state": "ready"})
+    row = await follow_ups.get_by_id(db, result.data["id"])
+    assert row["source"] == ("ego_dispatch" if dispatched else "external_interactive")
+    assert row["kind"] == ("tabled" if dispatched or work_state == "deferred_cold" else "follow_up")
+    assert row["source_session"] is None
+    mine = {r["id"] for r in await follow_ups.get_recent(db, source_mode="mine")}
+    system = {r["id"] for r in await follow_ups.get_recent(db, source_mode="system")}
+    assert (row["id"] in mine) is (not dispatched)
+    assert (row["id"] in system) is dispatched
+
+
 # ─── work_state → kind derivation (create) ───────────────────────────────────
 
 

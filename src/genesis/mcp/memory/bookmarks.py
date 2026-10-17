@@ -28,7 +28,18 @@ async def bookmark_shelve(
     memory_mod._require_init()
     assert memory_mod._bookmark_mgr is not None
 
-    session_id = memory_mod._resolve_session_id(session_id)
+    from genesis.mcp.external_profiles import current_external_profile
+
+    if current_external_profile() is not None:
+        from genesis.db.crud import session_charters
+
+        assert memory_mod._db is not None
+        session_id = await session_charters.resolve_session_id(memory_mod._db, session_id)
+        if (not session_charters.is_full_session_id(session_id)
+                or not await session_charters.session_exists(memory_mod._db, session_id)):
+            raise ValueError("External bookmarks require an existing Genesis session")
+    else:
+        session_id = memory_mod._resolve_session_id(session_id)
 
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
 

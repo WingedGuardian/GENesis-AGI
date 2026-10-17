@@ -189,6 +189,17 @@ async def get(db: aiosqlite.Connection, session_id: str) -> dict | None:
     return _decode_pointers(dict(row)) if row else None
 
 
+async def session_exists(db: aiosqlite.Connection, session_id: str) -> bool:
+    """Exact transcript identity membership in the resolver's three stores."""
+    cursor = await db.execute(
+        "SELECT session_id FROM session_charters WHERE session_id = ?"
+        " UNION SELECT cc_session_id FROM cc_sessions WHERE cc_session_id = ?"
+        " UNION SELECT cc_session_id FROM session_heartbeats WHERE cc_session_id = ? LIMIT 1",
+        (session_id, session_id, session_id),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def resolve_session_id(db: aiosqlite.Connection, session_id: str) -> str:
     """Resolve a truncated session id to the full one by unique prefix match.
 

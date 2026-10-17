@@ -50,6 +50,75 @@ async def test_charter_update_creates_stub_and_sets_mission(db, sessions_dir):
     assert "Ship PR-2a" in md
 
 
+@pytest.mark.parametrize("writer", ["session_charter_update", "session_ledger_add"])
+@pytest.mark.parametrize("store", ["charter", "recorded", "heartbeat"])
+@pytest.mark.parametrize("prefix", [False, True])
+async def test_external_charter_writers_accept_each_existing_identity_store(
+    db, sessions_dir, writer, store, prefix,
+):
+    from fastmcp import Client, FastMCP
+
+    from genesis.mcp.external_profiles import ExternalProfileMiddleware
+
+    if store == "charter":
+        await crud.upsert_stub(db, SID)
+    elif store == "recorded":
+        await db.execute(
+            "INSERT INTO cc_sessions(id,session_type,model,started_at,last_activity_at,cc_session_id)"
+            " VALUES ('different-row-id','foreground','synthetic','t0','t0',?)", (SID,),
+        )
+    else:
+        await db.execute("INSERT INTO session_heartbeats(cc_session_id,updated_at) VALUES (?,'t0')", (SID,))
+    await db.commit()
+    fixture = FastMCP("external-charter-existing-target")
+    fixture.add_tool((await tools.mcp.get_tools())[writer])
+    fixture.add_middleware(ExternalProfileMiddleware("health", "interactive"))
+    arguments = {"session_id": SID[:8] if prefix else SID}
+    arguments.update({"mission": "Synthetic directed mission"} if writer == "session_charter_update"
+                     else {"text": "Synthetic directed commitment"})
+    with patch.object(tools, "_get_db", return_value=db):
+        async with Client(fixture) as client:
+            result = await client.call_tool(writer, arguments)
+    assert "error" not in result.data
+    assert await crud.get(db, SID) is not None
+    assert result.data["session_id"] == SID
+    if writer == "session_ledger_add":
+        ledger_ids = {item["id"] for item in await crud.ledger_list(db, SID)}
+        assert result.data["id"] in ledger_ids
+    assert (sessions_dir / SID / "charter.md").is_file()
+
+
+@pytest.mark.parametrize("writer", ["session_charter_update", "session_ledger_add"])
+@pytest.mark.parametrize("target", [SID, SID[:8], "bad%prefix", "f" * 36, "12345678-1234-4321-8123-123456789abc"])
+async def test_external_charter_writers_refuse_unknown_or_wrong_namespace_without_mutation(
+    db, sessions_dir, writer, target,
+):
+    from fastmcp import Client, FastMCP
+
+    from genesis.mcp.external_profiles import ExternalProfileMiddleware
+
+    # A valid Genesis row UUID is still not a transcript UUID for charter keys.
+    await db.execute(
+        "INSERT INTO cc_sessions(id,session_type,model,started_at,last_activity_at,cc_session_id)"
+        " VALUES ('12345678-1234-4321-8123-123456789abc','foreground','synthetic','t0','t0',"
+        "'99998888-7777-6666-5555-444433332222')",
+    )
+    await db.commit()
+    fixture = FastMCP("external-charter-unknown-target")
+    fixture.add_tool((await tools.mcp.get_tools())[writer])
+    fixture.add_middleware(ExternalProfileMiddleware("health", "interactive"))
+    arguments = {"session_id": target}
+    arguments.update({"mission": "Synthetic rejected mission"} if writer == "session_charter_update"
+                     else {"text": "Synthetic rejected commitment"})
+    with patch.object(tools, "_get_db", return_value=db):
+        async with Client(fixture) as client:
+            result = await client.call_tool(writer, arguments)
+    assert "error" in result.data
+    assert (await (await db.execute("SELECT COUNT(*) FROM session_charters")).fetchone())[0] == 0
+    assert (await (await db.execute("SELECT COUNT(*) FROM session_ledger")).fetchone())[0] == 0
+    assert not list(sessions_dir.iterdir())
+
+
 async def test_charter_update_pointer_add_remove_dedup(db, sessions_dir):
     with patch.object(tools, "_get_db", return_value=db):
         await tools._impl_session_charter_update(SID, add_pointer="a.md")

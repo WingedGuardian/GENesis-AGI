@@ -558,27 +558,21 @@ class TestBuildChainPriorityTier:
         assert self._deepinfra(chain)._service_tier is None
 
 
-def test_embedding_levers_reach_the_memory_mcp_child() -> None:
-    """The memory MCP child loads secrets.env only through its `_MCP_VARS`
-    allowlist, and it builds embedding chains that read both levers. A lever
-    missing from the allowlist is silently dropped when set only in secrets.env,
-    so the child would disagree with the main runtime. Parsed from the source:
-    importing the server would drag in the whole MCP stack."""
-    import ast
-    from pathlib import Path
+def test_embedding_levers_reach_the_memory_mcp_child(monkeypatch, tmp_path) -> None:
+    """Execute the child loader and embedding readers with file-only settings."""
+    from genesis import env
+    from scripts import genesis_mcp_server
 
-    src = (Path(__file__).resolve().parents[2] / "scripts/genesis_mcp_server.py").read_text()
-    allow: set[str] = set()
-    for node in ast.walk(ast.parse(src)):
-        if (
-            isinstance(node, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "_MCP_VARS" for t in node.targets)
-            and isinstance(node.value, ast.Set)
-        ):
-            allow |= {e.value for e in node.value.elts if isinstance(e, ast.Constant)}
-    assert allow, "_MCP_VARS set literal not found"
-    for lever in ("GENESIS_EMBED_LOCAL_FIRST", "GENESIS_EMBED_PRIORITY_TIER"):
-        assert lever in allow, f"{lever} is read by the child but missing from _MCP_VARS"
+    secrets = tmp_path / "synthetic.env"
+    secrets.write_text("GENESIS_EMBED_LOCAL_FIRST=0\nGENESIS_EMBED_PRIORITY_TIER=1\n")
+    monkeypatch.setattr(env, "secrets_path", lambda: secrets)
+    for key in ("GENESIS_EMBED_LOCAL_FIRST", "GENESIS_EMBED_PRIORITY_TIER"):
+        monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
+    genesis_mcp_server._load_mcp_environment(None)
+    assert env.embed_local_first() is False
+    assert env.embed_priority_tier() is True
 
 
 class TestRecallChainWiring:

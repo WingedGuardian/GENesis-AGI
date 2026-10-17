@@ -113,10 +113,13 @@ async def _impl_follow_up_create(
         import os
 
         from genesis.ego.domain_classifier import classify_domain
+        from genesis.mcp.external_profiles import ExternalProfile, current_external_profile
 
         # Detect dispatched session context for proper source attribution
         if os.environ.get("GENESIS_CC_SESSION") == "1":
             source = "ego_dispatch"
+        elif current_external_profile() == ExternalProfile.INTERACTIVE:
+            source = "external_interactive"
         else:
             source = "foreground_session"
 
@@ -154,15 +157,18 @@ async def _impl_follow_up_create(
             # unchanged when it cannot resolve, so a >= 32-char value reaching
             # here has never been checked against anything — a mistyped UUID or
             # a 32-char fragment used to pass a length test and be written as
-            # provenance (Codex P2, PR #1622). A valid-shaped id that no store
-            # knows yet is still accepted: this asks what the value IS, not
-            # whether it has been seen.
-            if _charters.is_full_session_id(resolved):
+            # provenance (Codex P2, PR #1622). Ordinary clients still accept an
+            # unrecorded canonical id; external references require membership.
+            external = current_external_profile() is not None
+            if _charters.is_full_session_id(resolved) and (
+                not external or await _charters.session_exists(db, resolved)
+            ):
                 source_session = resolved
             else:
+                target_requirement = "existing Genesis session" if external else "unique full session id"
                 source_session_note = (
                     f"source_session '{source_session}' did not resolve to a "
-                    "unique full session id — stored NULL rather than a "
+                    f"{target_requirement} — stored NULL rather than a "
                     "truncated or malformed id"
                 )
                 source_session = None

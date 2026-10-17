@@ -317,6 +317,20 @@ async def _ingest_knowledge_unit(
     assert memory_mod._db is not None
     assert memory_mod._qdrant is not None
 
+    from genesis.mcp.external_profiles import current_external_profile
+
+    if current_external_profile() is not None and provenance and provenance.get("session_id") is not None:
+        from genesis.db.crud import session_charters
+
+        raw_session = provenance["session_id"]
+        if not isinstance(raw_session, str):
+            raise ValueError("External knowledge provenance requires an existing Genesis session")
+        session_id = await session_charters.resolve_session_id(memory_mod._db, raw_session)
+        if (not session_charters.is_full_session_id(session_id)
+                or not await session_charters.session_exists(memory_mod._db, session_id)):
+            raise ValueError("External knowledge provenance requires an existing Genesis session")
+        provenance = {**provenance, "session_id": session_id}
+
     from genesis.memory.knowledge_ingest import ingest_knowledge_unit
 
     return await ingest_knowledge_unit(

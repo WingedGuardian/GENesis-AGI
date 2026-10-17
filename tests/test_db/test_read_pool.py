@@ -385,29 +385,22 @@ def test_session_pool_honours_the_legacy_knob_on_upgrade(monkeypatch):
     assert env.session_read_pool_size() == DEFAULT_SESSION_READ_POOL_SIZE
 
 
-def test_session_pool_knob_reaches_the_mcp_child():
-    """A knob the MCP child READS must also be in its env ALLOWLIST, or it is inert.
+def test_session_pool_knob_reaches_the_mcp_child(monkeypatch, tmp_path):
+    """Execute the child loader and readers with file-only pool settings."""
+    from genesis import env
+    from scripts import genesis_mcp_server
 
-    `genesis_mcp_server.py` filters the environment it passes to the child through
-    `_MCP_VARS`; a variable absent from that list is silently dropped, so a
-    documented lever does nothing and nothing reports it. This exact class has
-    shipped twice before (the list's own comments cite #1302 and #1587), and this
-    PR made it a third time — the new `session_read_pool_size` reader was wired
-    without its allowlist entry.
-
-    Asserted against the file text because the allowlist is a module-level literal
-    consumed at subprocess-spawn time; importing the module is not needed and would
-    drag in the whole MCP stack.
-    """
-    from pathlib import Path
-
-    src = (Path(__file__).resolve().parents[2] / "scripts/genesis_mcp_server.py").read_text()
-    assert "session_read_pool_size()" in src, "the child no longer reads the session knob"
-    assert '"GENESIS_SESSION_READ_POOL_SIZE"' in src, (
-        "GENESIS_SESSION_READ_POOL_SIZE is read by the child but missing from "
-        "_MCP_VARS — the documented lever would be INERT"
-    )
-    assert '"GENESIS_RECALL_READ_POOL_OFF"' in src  # the kill switch it still honours
+    secrets = tmp_path / "synthetic.env"
+    secrets.write_text("GENESIS_SESSION_READ_POOL_SIZE=7\nGENESIS_RECALL_READ_POOL_OFF=1\n")
+    monkeypatch.setattr(env, "secrets_path", lambda: secrets)
+    for key in ("GENESIS_SESSION_READ_POOL_SIZE", "GENESIS_RECALL_READ_POOL_OFF"):
+        monkeypatch.delenv(key, raising=False)
+        # Own subsequent os.environ writes so teardown restores the original.
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
+    genesis_mcp_server._load_mcp_environment(None)
+    assert env.session_read_pool_size() == 7
+    assert env.recall_read_pool_off() is True
 
 
 def test_the_two_pool_constructors_use_different_size_readers():

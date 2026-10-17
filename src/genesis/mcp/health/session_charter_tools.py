@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 
+from genesis.mcp.external_profiles import current_external_profile
 from genesis.mcp.health import mcp
 from genesis.session_charter import SESSIONS_DIR as _canonical_sessions_dir
 
@@ -426,6 +427,8 @@ async def _impl_session_charter_update(
             return err
         # A stub row lets mission/pointers precede the first compaction; the
         # PreCompact hook fills origin later (WHERE origin_prompt IS NULL).
+        if current_external_profile() is not None and not await crud.session_exists(db, sid):
+            return {"error": "External charter writes require an existing Genesis session"}
         await crud.upsert_stub(db, sid)
         updated: list[str] = []
         if mission is not None:
@@ -490,6 +493,8 @@ async def _impl_session_ledger_add(
                 f"{sorted(crud.CALLER_SETTABLE_ADDED_BY)} — {added_by!r} is "
                 "internal provenance and cannot be set by a caller"
             }
+        if current_external_profile() is not None and not await crud.session_exists(db, sid):
+            return {"error": "External charter writes require an existing Genesis session"}
         await crud.upsert_stub(db, sid)
         item_id = await crud.ledger_add(
             db,
