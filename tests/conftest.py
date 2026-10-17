@@ -595,6 +595,9 @@ def _isolate_alert_queue(tmp_path):
     # machine must not become an observation.
     mp.setenv("GENESIS_TSWD_STATE_FILE", str(tmp_path / "no-tailscale-watchdog.json"))
     mp.setenv("GENESIS_TSWD_SYSTEMCTL", "/bin/false")
+    # At >= 80% of the live PID budget the tick would also write a breakdown of
+    # the real /proc into the real ~/.genesis/logs/pid_snapshots.
+    mp.setenv("GENESIS_PID_BREAKDOWN_DISABLED", "1")
     yield
     mp.undo()
 

@@ -9,6 +9,16 @@ uses the managed launcher, including when no PATH provider exists. The index
 queue remains on its previous route until its separate integration lands.
 Staging and rendering alone do not make Codebase available.
 
+Existing symlinks at either managed query unit destination, including `/dev/null`
+masks and dangling links, are kept during install and bootstrap without writing
+through them. Bootstrap lists the kept unit in its update summary and continues
+to reload units and process timers. Only an explicitly named
+`--take-template genesis-cbm-query.service` (or the client slice's exact name)
+lets bootstrap back up and replace that link; `--take-templates` keeps masks.
+Install always keeps existing links. Directories and FIFOs at these two
+destinations remain errors. Use the configured disablement sentinel for the
+runtime off-switch; masking may refuse when a local regular unit already exists.
+
 ## Native lifecycle
 
 After staging and ordinary template rendering, deliberately use:
@@ -237,10 +247,11 @@ as a literal positional argument, because systemd's executable-name grammar
 rejects some characters that its argument grammar accepts. The fixed script
 never interpolates path data into shell code or performs PATH lookup.
 Whitespace, quote, backslash, dollar, percent, ampersand, pipe
-and Unicode paths retain their literal meaning. A symlink, directory or FIFO at
-either managed template destination is refused before writing; unrelated unit
-and FalkorDB rendering retain their existing behavior. Install preserves an
-existing regular unit; bootstrap updates it through its ordinary rendering loop.
+and Unicode paths retain their literal meaning. Existing symlinks at either
+managed template destination follow the preservation and explicit takeover
+policy above; directories and FIFOs are refused before writing. Unrelated unit
+and FalkorDB rendering retain their existing behavior. Install preserves existing
+regular units; bootstrap follows the shared managed-unit ownership policy.
 
 ## Diagnose and recover
 
