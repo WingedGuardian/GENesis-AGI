@@ -24,6 +24,7 @@ reindex before trusting them for anything load-bearing.
 | "Read this specific file" | Read | `Read(file_path)` |
 | "Where is class X defined?" | Serena | `find_symbol(name_path="X", include_body=True)` |
 | "What methods does class X have?" | Serena | `find_symbol(name_path="X", depth=1)` |
+| "Is there a seam for this, and what implements it?" | `codebase_navigate` | `seams=True` (all), `seam="X"` (one). Lists structural implementers of a Protocol, which Serena and grep miss |
 | "Who calls function Y?" | Serena | `find_referencing_symbols(name_path="Y")` |
 | "What's the project architecture?" | CBM | `get_architecture(aspects=["overview"])` |
 | "Find all functions related to Z" | CBM | `search_graph(name_pattern="Z")` |

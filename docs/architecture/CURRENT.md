@@ -3314,9 +3314,11 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: ba9dd8a37 2026-10-09
+verified: 9f3cc994c 2026-10-12
 ```
 
+- Verification refresh (2026-10-12) is limited to the `codebase/` line below;
+  the other modules' lines keep their earlier dated basis.
 - **payments/**: the encrypted card vault, virtual cards only.
   `python -m genesis vault init|add|list|retire|status` (`payments/cli.py`);
   `vault_store.py` keeps `~/.genesis/payment_vault/` (0700, files 0600): an age
@@ -3653,7 +3655,19 @@ verified: ba9dd8a37 2026-10-09
   observation rows, so a normal explicit-recall session can't flip the gate
   back to shadow. Red-team acceptance: `test_redteam_enforce.py` (synthetic).
 - **codebase/**: AST indexer (surplus task, set-difference deletes with
-  CASCADE) behind the `codebase_navigate` MCP tool.
+  CASCADE) behind the `codebase_navigate` MCP tool. A class row's `signature`
+  is `class Name(<bases>)`; modules whose class rows predate that (NULL) are
+  re-parsed once whatever their mtime. `seams.py` serves the tool's seams view
+  (`seams=True` / `seam="Name"`), computed at query time and never stored:
+  every public Protocol/ABC base with its nominal and call-compatible
+  structural implementers, plus a hand-kept list of registry-style extension
+  points (`REGISTRIES`, path-checked by a test). Sub-Protocols show as
+  `extends`. The index holds no attributes, so a class supplying a member as a
+  class attribute (`name = "x"` for a `name` property) is listed under
+  `possible` with what it lacks, not as an implementer (#3283 tracks indexing
+  class attributes). Blind to methods inherited from a concrete parent; a
+  single-method seam's structural links are `low` confidence. `complete: false`
+  until the index has run and the heal has finished.
 - **infra_profile/**: the infrastructure body schema — deterministic fact
   collectors (container plane + host plane via the guardian `host-profile`
   gateway verb; a missing guardian or un-redeployed gateway degrades to

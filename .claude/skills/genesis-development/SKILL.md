@@ -4911,6 +4911,7 @@ references on every trigger.
 | Subsystem purpose/maturity/do-not-touch (judgment layer) | `docs/architecture/CURRENT.md` |
 | Codebase structure, package map, gotchas, debugging | `references/codebase-map.md` |
 | Package/module/symbol navigation (progressive drill) | `codebase_navigate` MCP tool (L0→L1→L2) |
+| Existing extension seams and their implementers, before writing a new adapter | `codebase_navigate(seams=True)` |
 | venv, DB paths, Qdrant, Ollama, network, commands | `references/environment.md` |
 | Worktree rules, concurrent sessions, branch naming | `references/worktrees.md` |
 | tracked_task, exc_info, os.killpg, logging patterns | `references/observability.md` |

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -148,3 +149,87 @@ async def test_index_codebase_deletes_removed(tmp_path: Path) -> None:
             assert (await cur.fetchone())[0] == 0
         async with db.execute("SELECT COUNT(*) FROM code_symbols") as cur:
             assert (await cur.fetchone())[0] == 0
+
+
+def test_parse_module_records_class_bases(tmp_path: Path) -> None:
+    """A class signature names its bases and keywords, in a form that parses back."""
+    import ast
+
+    src = tmp_path / "shapes.py"
+    src.write_text(
+        "import typing\n"
+        "from abc import ABC, ABCMeta\n"
+        "class Plain:\n    pass\n"
+        "class Child(Plain):\n    pass\n"
+        "class Proto(typing.Protocol[T]):\n    pass\n"
+        "class Meta(ABC, metaclass=ABCMeta):\n    pass\n"
+    )
+
+    info = parse_module(src, repo_root=tmp_path)
+    sigs = {s.name: s.signature for s in info.classes if s.symbol_type == "class"}
+
+    assert sigs == {
+        "Plain": "class Plain",
+        "Child": "class Child(Plain)",
+        "Proto": "class Proto(typing.Protocol[T])",
+        "Meta": "class Meta(ABC, metaclass=ABCMeta)",
+    }
+    for sig in sigs.values():
+        assert isinstance(ast.parse(sig + ": ...").body[0], ast.ClassDef)
+
+
+async def _null_class_rows(db: aiosqlite.Connection) -> int:
+    async with db.execute(
+        "SELECT COUNT(*) FROM code_symbols WHERE symbol_type = 'class' AND signature IS NULL"
+    ) as cur:
+        return (await cur.fetchone())[0]
+
+
+@pytest.mark.asyncio
+async def test_index_codebase_heals_class_rows_without_bases(tmp_path: Path) -> None:
+    """Class rows from before bases were recorded are re-parsed once, mtime or not."""
+    src = tmp_path / "src" / "genesis"
+    src.mkdir(parents=True)
+    (src / "has_class.py").write_text("class Thing(Base):\n    pass\n")
+    (src / "no_class.py").write_text("def f(): pass\n")
+
+    async with aiosqlite.connect(":memory:") as db:
+        await index_codebase(db, tmp_path)
+        # The state an index written by the old code leaves behind.
+        await db.execute("UPDATE code_symbols SET signature = NULL WHERE symbol_type = 'class'")
+        await db.commit()
+        assert await _null_class_rows(db) == 1
+
+        healed = await index_codebase(db, tmp_path)
+        assert healed.modules_indexed == 1  # only the module that had a NULL class row
+        assert healed.modules_unchanged == 1
+        assert await _null_class_rows(db) == 0
+        async with db.execute("SELECT signature FROM code_symbols WHERE name = 'Thing'") as cur:
+            assert (await cur.fetchone())[0] == "class Thing(Base)"
+
+        again = await index_codebase(db, tmp_path)
+        assert again.modules_indexed == 0  # the heal does not repeat
+
+
+@pytest.mark.asyncio
+async def test_index_codebase_heal_does_not_loop_on_unparseable_module(tmp_path: Path) -> None:
+    """A module that no longer parses drops its stale class rows instead of re-healing forever."""
+    src = tmp_path / "src" / "genesis"
+    src.mkdir(parents=True)
+    broken = src / "broken.py"
+    broken.write_text("class Ok:\n    pass\n")
+
+    async with aiosqlite.connect(":memory:") as db:
+        await index_codebase(db, tmp_path)
+        await db.execute("UPDATE code_symbols SET signature = NULL WHERE symbol_type = 'class'")
+        await db.commit()
+        mtime = broken.stat().st_mtime
+        broken.write_text("class Ok(:\n")
+        os.utime(broken, (mtime, mtime))  # same mtime: only the heal can re-parse it
+
+        first = await index_codebase(db, tmp_path)
+        assert first.modules_indexed == 1
+        assert await _null_class_rows(db) == 0
+
+        second = await index_codebase(db, tmp_path)
+        assert second.modules_indexed == 0
