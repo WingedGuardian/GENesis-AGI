@@ -211,12 +211,15 @@ newest of each version for 90 days; older ones are deleted after 14 days.
 importable from where it runs; otherwise it prints a note and launches without a
 copy.
 
-**Not installed?** If `browser_navigate` returns `Browser not available` or
-`Camoufox is not ready: …`, the browser packages or the Camoufox engine are
-missing or broken on this install: tell the user, passing on the operator step
-the error names. Never run that step, `camoufox fetch` or `pip install` from
-inside a session; every session's MCP server shares the engine and the venv,
-and the engine download is far larger than a session's temp space. If the
+**Not installed?** If `browser_navigate` returns `Browser not available`,
+`Camoufox is not ready: …` or `Chromium is not ready: …`, the browser packages,
+the Camoufox engine or the Chromium build are missing or broken on this
+install: tell the user, passing on the operator step the error names. Never run
+that step, `camoufox fetch`, `patchright install` or `pip install` from inside a
+session; every session's MCP server shares the engine and the venv, and the
+engine download is far larger than a session's temp space. Right after an
+update the download may still be running in `genesis-browser-stack.service`;
+the error then clears on its own. If the
 error says the browser packages changed after this session started, the fix
 is restarting the session, not reinstalling. The operator's one-step repair for
 the whole stack is `scripts/install_browser_stack.sh` (engine, Chromium and

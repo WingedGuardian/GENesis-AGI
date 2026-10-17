@@ -234,6 +234,23 @@ async def test_the_alert_names_who_holds_the_budget(_reset_cooldown_and_mock_cre
 
 
 @pytest.mark.asyncio
+async def test_a_pruned_breakdown_keeps_its_summary_without_advertising_a_file(
+    _reset_cooldown_and_mock_create, monkeypatch
+):
+    from genesis.observability import pid_breakdown
+
+    monkeypatch.setattr(
+        pid_breakdown, "snapshot_for", lambda b: {"text": "Top task holders: claude.", "file": None}
+    )
+    budget = _budget("error", 100.0, 2400, 2400, scope="user-1000.slice")
+    budget["path"] = "/sys/fs/cgroup/user.slice/user-1000.slice"
+    await loop._check_pid_budget(object(), budget=budget)
+    content = _reset_cooldown_and_mock_create.await_args.kwargs["content"]
+    assert "Top task holders: claude." in content
+    assert "Full breakdown:" not in content
+
+
+@pytest.mark.asyncio
 async def test_the_breakdown_is_taken_inside_the_cooldown(
     _reset_cooldown_and_mock_create, monkeypatch
 ):

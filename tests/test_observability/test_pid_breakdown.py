@@ -34,7 +34,7 @@ class Fake:
         monkeypatch.setattr(proc_io, "_PROC", str(self.proc))
         monkeypatch.setattr(pb, "_CGROUP_ROOT", str(tmp_path))
 
-    def process(self, pid, comm, ppid, threads, argv, *, cgroup="/x/session.scope", start=100):
+    def process(self, pid, comm, ppid, threads, argv, *, cgroup="/cg/session.scope", start=100):
         d = self.proc / str(pid)
         d.mkdir()
         (d / "stat").write_text(_stat(pid, comm, ppid, threads, start))
@@ -237,9 +237,9 @@ def test_each_service_is_its_own_tree_not_the_managers(fake):
     boundary they would all be counted as one 'systemd' tree (measured live: 220
     tasks in one lump)."""
     fake.cgroup("", 60, procs=[2, 3, 4])
-    fake.process(2, "systemd", 1, 1, ["/lib/systemd/systemd", "--user"], cgroup="/u/init.scope")
-    fake.process(3, "python3", 2, 50, ["python", "-m", "genesis"], cgroup="/u/app/server.service")
-    fake.process(4, "redis", 2, 9, ["redis-server"], cgroup="/u/app/graph.service")
+    fake.process(2, "systemd", 1, 1, ["/lib/systemd/systemd", "--user"], cgroup="/cg/init.scope")
+    fake.process(3, "python3", 2, 50, ["python", "-m", "genesis"], cgroup="/cg/app/server.service")
+    fake.process(4, "redis", 2, 9, ["redis-server"], cgroup="/cg/app/graph.service")
     trees = {t["root_pid"]: t for t in pb.take_snapshot(_budget(fake))["trees"]}
     assert set(trees) == {2, 3, 4}
     assert trees[3]["threads"] == 50
@@ -317,3 +317,115 @@ def test_a_non_utf8_process_name_is_counted(fake):
     snap = pb.take_snapshot(_budget(fake))
     assert snap["vanished"] == 0
     assert snap["threads_seen"] == 4
+
+
+@pytest.mark.parametrize(
+    ("argv", "label"),
+    [
+        (["", "example-private-value"], "[x]"),
+        (["", "", "example-private-value"], "[x]"),
+        (["python3", "-m", "", "example_private_module"], "python3 -m"),
+        (["python3", "-m", "", "", "example_private_module"], "python3 -m"),
+        (["node", "", "example-private.js"], "node"),
+        (["bash", "", "", "example-private.sh"], "bash"),
+        (["python3", "-m", "genesis", ""], "python3 -m genesis"),
+        (["node", "server.js", ""], "node server.js"),
+        ([""], "[x]"),
+    ],
+)
+def test_empty_argument_slots_never_promote_later_values(fake, argv, label):
+    fake.process(60, "x", 1, 1, argv)
+    assert pb.process_label(60) == label
+
+
+@pytest.mark.parametrize("membership", ["/other.scope", "/cg-sibling", None])
+def test_listed_pids_with_outside_or_unknown_current_membership_are_excluded(fake, membership):
+    fake.cgroup("", 8, procs=[10, 20])
+    fake.process(10, "inside", 1, 1, ["inside"], cgroup="/cg")
+    fake.process(20, "moved", 1, 7, ["moved"], cgroup=membership or "/cg")
+    if membership is None:
+        (fake.proc / "20" / "cgroup").unlink()
+    snap = pb.take_snapshot(_budget(fake))
+    assert [t["root_pid"] for t in snap["trees"]] == [10]
+    assert snap["threads_seen"] == snap["processes_seen"] == 1
+    assert snap["excluded"] == 1
+    assert snap["vanished"] == 0
+
+
+@pytest.mark.parametrize("replacement", [None, 999])
+def test_a_pid_that_exits_or_is_reused_during_membership_read_is_not_counted(
+    fake, monkeypatch, replacement
+):
+    fake.cgroup("", 7, procs=[20])
+    fake.process(20, "old", 1, 7, ["old"], cgroup="/cg")
+    real_read = pb._read_cgroup
+    monkeypatch.setattr(pb, "_pids_by_cgroup_prefix", lambda prefix: {20})
+
+    def churn(pid):
+        path = real_read(pid)
+        stat = fake.proc / str(pid) / "stat"
+        if replacement is None:
+            stat.unlink(missing_ok=True)
+        else:
+            stat.write_text(_stat(pid, "new", 1, 99, replacement))
+        return path
+
+    monkeypatch.setattr(pb, "_read_cgroup", churn)
+    snap = pb.take_snapshot(_budget(fake))
+    assert snap["trees"] == []
+    assert snap["threads_seen"] == snap["processes_seen"] == 0
+    assert snap["vanished"] == (1 if replacement is None else 0)
+    assert snap["excluded"] == (0 if replacement is None else 1)
+
+
+@pytest.mark.parametrize("member", [b"/cg/byte-\xff.scope", b"/cg/trailing-space ", b"/other/\xff"])
+def test_cgroup_paths_preserve_filesystem_bytes_and_whitespace(fake, member):
+    fake.cgroup("", 4)
+    fake.process(12, "x", 1, 4, ["x"])
+    (fake.proc / "12" / "cgroup").write_bytes(b"0::" + member + b"\n")
+    assert pb._read_cgroup(12) == os.fsdecode(member)
+    snap = pb.take_snapshot(_budget(fake))
+    expected = 0 if member.startswith(b"/other/") else 4
+    assert snap["threads_seen"] == expected
+    # Native JSON remains round-trippable; alert text carries escaped path bytes.
+    restored = json.loads(json.dumps(snap))
+    if expected:
+        assert os.fsencode(restored["trees"][0]["unit"]) == member.rsplit(b"/", 1)[-1]
+    else:
+        assert restored["trees"] == []
+    pb.summarize(snap).encode("utf-8")
+
+
+def test_a_binding_leaf_is_itself_a_readable_top_cgroup(fake):
+    fake.cgroup("", 3)
+    snap = pb.take_snapshot(_budget(fake, current=3))
+    assert [(n["cgroup"], n["tasks"]) for n in snap["top_cgroups"]] == [(".", 3)]
+    assert "Top cgroups: .: 3" in pb.summarize(snap)
+
+
+@pytest.mark.parametrize("cap", [1, 10_000])
+def test_a_pruned_new_snapshot_retains_summary_without_a_dangling_reference(
+    fake, tmp_path, monkeypatch, cap
+):
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "gh"))
+    monkeypatch.delenv(pb._DISABLE_ENV, raising=False)
+    monkeypatch.setattr(pb, "_RETENTION_BYTES", cap)
+    fake.cgroup("", 1, procs=[12])
+    fake.process(12, "claude", 1, 1, ["claude"])
+    result = pb.snapshot_for(_budget(fake))
+    assert result is not None and "claude" in result["text"]
+    files = list((tmp_path / "gh" / "logs" / "pid_snapshots").glob("*.json"))
+    assert sum(p.stat().st_size for p in files) <= cap
+    if cap == 1:
+        assert result["file"] is None and files == []
+    else:
+        assert Path(result["file"]).is_file()
+
+
+def test_snapshot_publication_uses_private_atomic_file_permissions(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "gh"))
+    monkeypatch.delenv(pb._DISABLE_ENV, raising=False)
+    fake.cgroup("", 1)
+    result = pb.snapshot_for(_budget(fake))
+    assert result is not None
+    assert Path(result["file"]).stat().st_mode & 0o777 == 0o600

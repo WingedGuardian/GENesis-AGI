@@ -4396,12 +4396,16 @@ def test_sealed_gh_config_is_idempotent_and_self_healing(monkeypatch, tmp_path):
     assert (repaired / "config.yml").stat().st_mode & 0o777 == 0o400
 
 
-def test_build_env_hardens_gh_only_for_an_allowlisted_session(invoker, monkeypatch, tmp_path):
+@pytest.mark.parametrize("operator_pager", ["cat", "synthetic-pager"])
+def test_build_env_hardens_gh_only_for_an_allowlisted_session(
+    invoker, monkeypatch, tmp_path, operator_pager
+):
     """The hardening rides the allowlist, not the binary being present.
 
     An ordinary dispatch must keep the operator's own gh config — repointing
     GH_CONFIG_DIR for every session would change unrelated behaviour.
     """
+    monkeypatch.setenv("GH_PAGER", operator_pager)
     _seal(monkeypatch, tmp_path)
 
     scoped = invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
@@ -4410,7 +4414,7 @@ def test_build_env_hardens_gh_only_for_an_allowlisted_session(invoker, monkeypat
 
     unscoped = invoker._build_env(CCInvocation(prompt="hi"))
     assert unscoped.get("GH_CONFIG_DIR") != scoped["GH_CONFIG_DIR"]
-    assert "GH_PAGER" not in unscoped or unscoped["GH_PAGER"] != "cat"
+    assert unscoped["GH_PAGER"] == operator_pager
 
 
 def test_build_env_does_not_harden_gh_for_an_unrelated_allowlist(invoker, monkeypatch, tmp_path):

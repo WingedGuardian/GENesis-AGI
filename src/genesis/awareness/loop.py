@@ -3050,7 +3050,12 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
                 f"{where} at {pct:.0f}% ({current}/{maximum} tasks). When it fills, new "
                 f"processes fail with 'Cannot fork' even though memory/CPU/disk are fine. "
                 f"Each Claude Code session spawns MCP subprocess trees. {remedy}"
-                + (f" {breakdown['text']} Full breakdown: {breakdown['file']}" if breakdown else "")
+                + (f" {breakdown['text']}" if breakdown else "")
+                + (
+                    f" Full breakdown: {breakdown['file']}"
+                    if breakdown and breakdown.get("file")
+                    else ""
+                )
             ),
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),

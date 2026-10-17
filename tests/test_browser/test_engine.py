@@ -338,25 +338,27 @@ def test_package_without_pin_is_invalid(cache, monkeypatch):
 # ── each INVALID cause names the step that repairs it ─────────────────────────
 
 
-def test_non_executable_engine_is_repaired_by_chmod_not_fetch(cache, monkeypatch):
+def test_non_executable_pinned_engine_is_repaired_by_the_stack_script(cache, monkeypatch):
     """camoufox writes version.json, then runs chmod -R 755 (multiversion.py:450-454);
-    a fetch killed in between leaves this state, and fetch skips a directory that
-    already has version.json, so fetching again never repairs it."""
+    a fetch killed in between leaves this state. The provisioning script finishes
+    that chmod (provision._engine_step), so the hint names the script, never a fetch,
+    which skips a directory that already has version.json."""
     _versions(monkeypatch, camoufox="0.5.7")
     broken = _installed(cache, executable=False)
     _fake_camoufox(monkeypatch, installed=[broken])
     detail = engine.resolve_camoufox_engine().detail
-    assert f"chmod -R 755 {broken.path}" in detail
+    assert "scripts/install_browser_stack.sh" in detail
     assert "camoufox fetch" not in detail
 
 
-def test_corrupt_pinned_engine_is_removed_then_fetched(cache, monkeypatch):
+def test_corrupt_pinned_engine_is_repaired_by_the_stack_script(cache, monkeypatch):
+    """The script removes a corrupt pinned directory and fetches it again, once."""
     _versions(monkeypatch, camoufox="0.5.7")
     broken = _installed(cache, ini=False)
     _fake_camoufox(monkeypatch, installed=[broken])
     detail = engine.resolve_camoufox_engine().detail
-    assert f"remove `{broken.path}`" in detail
-    assert detail.index("remove") < detail.index("camoufox fetch")
+    assert "scripts/install_browser_stack.sh" in detail
+    assert "camoufox fetch" not in detail
 
 
 def test_legacy_engine_without_exec_bit_is_repaired_by_chmod(cache, monkeypatch):
@@ -604,12 +606,12 @@ def test_fontconfig_is_not_required_off_linux(cache, monkeypatch, tmp_path):
     assert engine.resolve_camoufox_engine().kind == engine.READY
 
 
-def test_corrupt_pinned_engine_missing_assets_is_removed_then_fetched(
+def test_corrupt_pinned_engine_missing_assets_names_the_stack_script(
     cache, monkeypatch, tmp_path, linux
 ):
     _kind_engine("versioned", cache, monkeypatch, tmp_path, properties=False)
     detail = engine.resolve_camoufox_engine().detail
-    assert "remove `" in detail and detail.index("remove") < detail.index("camoufox fetch")
+    assert "scripts/install_browser_stack.sh" in detail and "camoufox fetch" not in detail
 
 
 def test_blank_override_is_unset(cache, monkeypatch):
@@ -723,23 +725,26 @@ def test_unreadable_package_pin_names_the_package(cache, monkeypatch, exc):
 # ── the operator hint ─────────────────────────────────────────────────────────
 
 
-def test_hint_marks_legacy_engine_before_fetch(cache, monkeypatch):
-    """0.5's fetch deletes the whole cache when .0.5_FLAG is absent
-    (__main__.py:259-263), so the flag step must come first."""
+def test_missing_pinned_engine_names_the_stack_script(cache, monkeypatch):
+    """On camoufox 0.5.7+ the provisioning script is the one repair: it marks a
+    pre-0.5 root engine with .0.5_FLAG before fetching (0.5's fetch deletes the
+    whole cache without it, __main__.py:259-263), then fetches the pin."""
     _versions(monkeypatch, camoufox="0.5.7")
     _engine_dir(cache)  # a pre-0.5 root engine, no flag
     _fake_camoufox(monkeypatch, installed=[])
-    detail = engine.resolve_camoufox_engine().detail
-    assert ".0.5_FLAG" in detail
-    assert detail.index(".0.5_FLAG") < detail.index("camoufox fetch")
+    status = engine.resolve_camoufox_engine()
+    assert status.kind == engine.NOT_INSTALLED
+    assert "tell the user" in status.detail
+    assert "scripts/install_browser_stack.sh" in status.detail
+    assert "camoufox fetch" not in status.detail
 
 
-def test_hint_has_no_flag_step_when_flag_present(cache, monkeypatch):
-    _versions(monkeypatch, camoufox="0.5.7")
-    _engine_dir(cache)
-    (cache / ".0.5_FLAG").touch()
-    _fake_camoufox(monkeypatch, installed=[])
-    assert ".0.5_FLAG" not in engine.resolve_camoufox_engine().detail
+def test_stack_step_names_the_checkout_script_quoted(monkeypatch, tmp_path):
+    root = tmp_path / "x; rm -rf ~"
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(root))
+    step = engine.stack_step()
+    assert step.startswith("tell the user")
+    assert f"'{root}/scripts/install_browser_stack.sh'" in step
 
 
 def test_legacy_hint_warns_that_0_4_fetch_replaces_the_whole_cache(cache, monkeypatch):
@@ -873,7 +878,9 @@ def test_a_pinned_directory_list_installed_skips_is_invalid_and_named(cache, mon
     status = engine.resolve_camoufox_engine()
     assert status.kind == engine.INVALID
     assert status.path == broken.path / "camoufox-bin"
-    assert str(broken.path) in status.detail and "remove" in status.detail
+    # The provisioner removes and refetches an invalid pinned directory, so the
+    # step names it rather than a manual remove.
+    assert str(broken.path) in status.detail and "install_browser_stack.sh" in status.detail
 
 
 def test_an_unreadable_directory_of_another_build_does_not_block_the_pin(cache, monkeypatch):

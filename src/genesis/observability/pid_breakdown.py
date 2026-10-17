@@ -44,6 +44,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis.util import proc_io
+from genesis.util.atomic import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +85,8 @@ def process_label(pid: int) -> str:
             raw = f.read()
     except OSError:
         raw = b""
-    args = [a.decode("utf-8", "replace") for a in raw.split(b"\x00") if a]
-    if not args:
+    args = [a.decode("utf-8", "replace") for a in raw.removesuffix(b"\x00").split(b"\x00")]
+    if not args[0]:
         return _comm(pid)
     # A process that rewrites its title (redis, postgres, sshd) puts the whole
     # title, spaces and arguments included, in argv[0]: keep its first word only.
@@ -124,10 +125,10 @@ def _read_int(path: str) -> int | None:
 def _read_cgroup(pid: int) -> str | None:
     """The pid's cgroup-v2 path (the ``0::`` line of ``/proc/<pid>/cgroup``)."""
     try:
-        with open(f"{_PROC}/{pid}/cgroup") as f:
+        with open(f"{_PROC}/{pid}/cgroup", "rb") as f:
             for line in f:
-                if line.startswith("0::"):
-                    return line[3:].strip()
+                if line.startswith(b"0::"):
+                    return os.fsdecode(line[3:].removesuffix(b"\n"))
     except OSError:
         pass
     return None
@@ -173,15 +174,27 @@ def _walk_cgroups(root: str) -> tuple[list[dict], set[int], int]:
     return nodes, pids, unreadable
 
 
-def _pids_by_cgroup_prefix(root: str) -> set[int]:
-    """Every pid in /proc whose cgroup path lies at or under ``root``."""
+def _cgroup_prefix(root: str) -> str | None:
+    """The binding's /proc-relative path, or None outside the cgroup mount."""
     rel = os.path.relpath(root, _CGROUP_ROOT)
-    if rel == "..":
-        return set()
-    if rel.startswith("../"):
-        return set()  # not under the cgroup mount: nothing in /proc names it
-    rel = "/" if rel == "." else "/" + rel
+    if rel == ".." or rel.startswith("../"):
+        return None
+    return "/" if rel == "." else "/" + rel
+
+
+def _in_cgroup(path: str | None, prefix: str | None) -> bool:
+    return (
+        path is not None
+        and prefix is not None
+        and (prefix == "/" or path == prefix or path.startswith(prefix + "/"))
+    )
+
+
+def _pids_by_cgroup_prefix(prefix: str | None) -> set[int]:
+    """Every pid in /proc whose cgroup path lies at or under ``prefix``."""
     found: set[int] = set()
+    if prefix is None:
+        return found
     try:
         names = os.listdir(_PROC)
     except OSError:
@@ -190,32 +203,40 @@ def _pids_by_cgroup_prefix(root: str) -> set[int]:
         if not name.isdigit():
             continue
         path = _read_cgroup(int(name))
-        if path is None:
-            continue
-        if rel == "/" or path == rel or path.startswith(rel + "/"):
+        if _in_cgroup(path, prefix):
             found.add(int(name))
     return found
 
 
-def _group_processes(pids: set[int]) -> tuple[list[dict], int, int]:
-    """``(trees, threads_seen, vanished)`` for the given pids (see module docstring).
+def _group_processes(pids: set[int], prefix: str | None) -> tuple[list[dict], int, int, int]:
+    """``(trees, threads_seen, vanished, excluded)`` for the given pids.
 
     A pid that exits between the cgroup read and its ``stat`` read is counted in
-    ``vanished``. Trees are sorted by threads, largest first.
+    ``vanished``. Unreadable/outside membership or a reused PID is ``excluded``.
+    Trees are sorted by threads, largest first. Reads remain a best-effort sample.
     """
     # pid -> (comm, state, ppid, threads, starttime). A zombie reports 0 or 1
     # thread; it still holds a pid, so it counts at least 1.
     info: dict[int, tuple[str, str, int, int, int]] = {}
     cgroup: dict[int, str | None] = {}
     vanished = 0
+    excluded = 0
     for pid in pids:
         stat = proc_io.read_stat(pid)
         if stat is None:
             vanished += 1
         else:
+            path = _read_cgroup(pid)
+            after = proc_io.read_stat(pid)
+            if after is None:
+                vanished += 1
+                continue
+            if after[4] != stat[4] or not _in_cgroup(path, prefix):
+                excluded += 1
+                continue
             comm, state, ppid, threads, starttime = stat
             info[pid] = (comm, state, ppid, max(1, threads), starttime)
-            cgroup[pid] = _read_cgroup(pid)
+            cgroup[pid] = path
 
     root_of: dict[int, int] = {}
     for pid in info:
@@ -273,7 +294,7 @@ def _group_processes(pids: set[int]) -> tuple[list[dict], int, int]:
             }
         )
     trees.sort(key=lambda t: t["threads"], reverse=True)
-    return trees, sum(v[3] for v in info.values()), vanished
+    return trees, sum(v[3] for v in info.values()), vanished, excluded
 
 
 def _label_if_same(pid: int, starttime: int) -> str:
@@ -292,15 +313,16 @@ def take_snapshot(budget: dict) -> dict | None:
     # cgroup.procs omits a process with no live threads (an unreaped zombie),
     # which pids.current still counts until it is reaped: find those through
     # their own /proc/<pid>/cgroup.
-    pids |= _pids_by_cgroup_prefix(root)
-    trees, threads_seen, vanished = _group_processes(pids)
+    prefix = _cgroup_prefix(root)
+    pids |= _pids_by_cgroup_prefix(prefix)
+    trees, threads_seen, vanished, excluded = _group_processes(pids, prefix)
     # Labels need a cmdline read each, so only for what the snapshot shows.
     for tree in trees:
         tree["label"] = _label_if_same(tree["root_pid"], tree["root_starttime"])
         for member in tree["top"]:
             member["label"] = _label_if_same(member["pid"], member["starttime"])
     leaves = sorted(
-        (n for n in nodes if n["leaf"] and n["depth"] > 0),
+        (n for n in nodes if n["leaf"]),
         key=lambda n: n["tasks"] or 0,
         reverse=True,
     )
@@ -311,8 +333,9 @@ def take_snapshot(budget: dict) -> dict | None:
         "budget_current": budget.get("current"),
         "budget_max": budget.get("max"),
         "threads_seen": threads_seen,
-        "processes_seen": len(pids) - vanished,
+        "processes_seen": len(pids) - vanished - excluded,
         "vanished": vanished,
+        "excluded": excluded,
         "cgroups_unreadable": unreadable,
         "top_cgroups": leaves[:_TOP_N],
         "trees": trees,
@@ -339,11 +362,13 @@ def summarize(snapshot: dict) -> str:
         f"{n['cgroup']}: {n['tasks'] if n['tasks'] is not None else '?'}"
         for n in snapshot["top_cgroups"]
     )
-    return (
+    text = (
         f"Top task holders: {trees or 'none readable'}. "
         f"Top cgroups: {cgroups or 'none readable'}. "
         f"Counted {snapshot['threads_seen']} of {snapshot['budget_current']} tasks."
     )
+    # Filesystem-surrogate paths retain byte identity in JSON; the alert is text.
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def _snapshot_dir() -> Path:
@@ -376,6 +401,8 @@ def _prune(directory: Path, now: float) -> None:
 def snapshot_for(budget: dict) -> dict | None:
     """Take, write and prune; ``{"text", "file"}`` for the alert, or None.
 
+    ``file`` is None when the new snapshot exceeds the retention cap and is pruned.
+
     None when disabled or ``budget`` names no path. Never raises: a failed
     snapshot must not take the alert down with it, so it is logged and None
     returned. Blocking (file I/O over a few thousand small files): call it
@@ -391,15 +418,9 @@ def snapshot_for(budget: dict) -> dict | None:
         directory.mkdir(parents=True, exist_ok=True)
         name = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ") + ".json"
         target = directory / name
-        tmp = directory / f".{name}.tmp"
-        try:
-            tmp.write_text(json.dumps(snapshot, indent=1))
-            os.replace(tmp, target)
-        except BaseException:
-            tmp.unlink(missing_ok=True)  # never leave an unpruned partial file
-            raise
+        atomic_write_text(target, json.dumps(snapshot, indent=1), encoding="utf-8")
         _prune(directory, time.time())
-        return {"text": summarize(snapshot), "file": str(target)}
+        return {"text": summarize(snapshot), "file": str(target) if target.is_file() else None}
     except Exception:
         logger.warning("pid budget breakdown snapshot failed", exc_info=True)
         return None

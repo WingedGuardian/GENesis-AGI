@@ -118,7 +118,8 @@ def test_pre_stop_fetch_is_post_merge_gated(text):
     f = _idx(text, FETCH)
     # The nearest gate opener before the fetch, with no column-0 `fi` closing it
     # in between: the fetch sits INSIDE that block, however long the comments.
-    gate = text.rfind('if [[ "$POST_MERGE" == "false" ]]; then', 0, f)
+    # (On `live` the same gate also skips it: `&& [ "${ON_LIVE:-0}" != 1 ]`.)
+    gate = text.rfind('if [[ "$POST_MERGE" == "false" ]]', 0, f)
     assert gate != -1, "pre-stop fetch must be POST_MERGE-gated"
     assert "\nfi\n" not in text[gate:f], "the POST_MERGE gate closes before the fetch"
 

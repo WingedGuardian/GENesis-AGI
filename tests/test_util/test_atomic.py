@@ -33,6 +33,36 @@ def test_creates_parent_dirs(tmp_path):
     assert target.read_text() == "x"
 
 
+def test_missing_only_publication_is_complete_and_cleans_up(tmp_path):
+    target = tmp_path / "out.txt"
+    atomic_write_text(target, "complete\n" * 100, overwrite=False)
+    assert target.read_text() == "complete\n" * 100
+    assert list(tmp_path.iterdir()) == [target]
+
+
+@pytest.mark.parametrize("kind", ["file", "empty", "directory", "dangling_symlink"])
+def test_missing_only_publication_preserves_existing_entries(tmp_path, kind):
+    target = tmp_path / "out.txt"
+    if kind == "directory":
+        target.mkdir()
+    elif kind == "dangling_symlink":
+        target.symlink_to("missing-target")
+    else:
+        target.write_text("curated" if kind == "file" else "")
+    before = target.lstat()
+
+    with pytest.raises(FileExistsError):
+        atomic_write_text(target, "replacement", overwrite=False)
+
+    after = target.lstat()
+    assert (after.st_ino, after.st_mode, after.st_mtime_ns) == (
+        before.st_ino, before.st_mode, before.st_mtime_ns,
+    )
+    if kind in ("file", "empty"):
+        assert target.read_text() == ("curated" if kind == "file" else "")
+    assert list(tmp_path.iterdir()) == [target]
+
+
 def test_a_failed_write_leaves_no_temp_behind(tmp_path):
     """The `except BaseException:` cleanup branch -- untested until now, and the
     branch every fix in the atomic-write class is about to depend on.
