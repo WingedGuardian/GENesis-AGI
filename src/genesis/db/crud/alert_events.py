@@ -31,6 +31,7 @@ async def reconcile_open_set(
     *,
     active: list[dict],
     now: str,
+    resolution_reasons: dict[str, str] | None = None,
 ) -> dict[str, int]:
     """Reconcile the durable open-set against the currently-firing ``active`` alerts.
 
@@ -40,6 +41,8 @@ async def reconcile_open_set(
     Returns ``{"opened": n, "resolved": n}``.
     """
     active_ids = [a["alert_id"] for a in active]
+    if any(reason not in {"healthy", "disabled"} for reason in (resolution_reasons or {}).values()):
+        raise ValueError("invalid alert resolution reason")
 
     opened = 0
     for a in active:
@@ -58,6 +61,16 @@ async def reconcile_open_set(
         )
         opened += cursor.rowcount or 0
 
+    # Persist closure and cause in the SAME statement. A later sample or
+    # process restart must not reinterpret deliberate disablement as recovery.
+    resolved = 0
+    for alert_id, reason in (resolution_reasons or {}).items():
+        if alert_id not in active_ids:
+            cursor = await db.execute(
+                "UPDATE alert_events SET resolved_at=?, resolution_reason=? "
+                "WHERE alert_id=? AND resolved_at IS NULL", (now, reason, alert_id),
+            )
+            resolved += cursor.rowcount or 0
     if active_ids:
         placeholders = ",".join("?" for _ in active_ids)
         cursor = await db.execute(
@@ -71,7 +84,7 @@ async def reconcile_open_set(
             "UPDATE alert_events SET resolved_at = ? WHERE resolved_at IS NULL",
             (now,),
         )
-    resolved = cursor.rowcount or 0
+    resolved += cursor.rowcount or 0
 
     await db.commit()
     return {"opened": opened, "resolved": resolved}

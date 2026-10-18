@@ -34,10 +34,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
@@ -110,29 +112,63 @@ def build_text(fields: Mapping[str, str]) -> str:
         lines.append(_safe_str(f"{key}: {value}"))
     lines.append("Tap Approve to release the card for this payment, once.")
     text = "\n".join(lines)
+    if holds_long_digit_run(text):  # a newline joins runs too: check the message whole
+        raise ValueError("the message holds 12 or more digits")
     if _utf16_len(text) > _TG_MAX_UTF16:
         raise ValueError("the message is over Telegram's 4096-character limit")
     return text
 
 
 def _audit_detail(detail: Mapping | None) -> dict:
-    """The caller's value-light audit facts: str, int, bool or None, one level of dict.
+    """The caller's value-light audit facts: plain values, one level of dict.
 
     For ``card_ref``, host, amount, the label or last four digits already shown,
     and the requesting process. Free text (a page title) does not belong here;
-    the shown fields are recorded only as lengths.
+    the shown fields are recorded only as lengths. Every value passes the digit
+    guard: a str as written, a number on its decimal form (a short int such as
+    a pid passes, an int or float card number does not). Any other type is
+    refused, and so are NaN, infinities, a Decimal beyond 64 digits of
+    exponent, and two keys that stringify alike.
     """
+    def number(value):
+        # The exact base type first, so a subclass's __str__ cannot hide its digits.
+        if isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, int):
+            return int.__int__(value)
+        value = float.__float__(value) if isinstance(value, float) else Decimal(value)
+        finite = math.isfinite(value) if isinstance(value, float) else value.is_finite()
+        if not finite or (isinstance(value, Decimal) and abs(value.adjusted()) > 64):
+            raise ValueError("an audit number is not a plain finite number")
+        # Also the fixed-point form: an exponent form shows no run, the fixed-point one does.
+        for form in (str(value), format(value, "f")):
+            _safe_str(form)
+        return str(value) if isinstance(value, Decimal) else value
 
-    def clean(value, depth=0):
-        if value is None or isinstance(value, bool | int):
-            return value
+    def mapping(items, depth):
+        out: dict = {}
+        for k, v in items:
+            key = _safe_str(str(k))
+            if key in out:
+                raise ValueError("two audit keys collide")
+            out[key] = clean(v, depth)
+        return out
+
+    def clean(value, depth):
+        if value is None:
+            return None
         if isinstance(value, str):
-            return _safe_str(value)
+            return _safe_str(str.__str__(value))
+        if isinstance(value, bool | int | float | Decimal):
+            value = number(value)
+            if isinstance(value, int) and not isinstance(value, bool):
+                _safe_str(str(value))
+            return value
         if isinstance(value, Mapping) and depth == 0:
-            return {_safe_str(str(k)): clean(v, 1) for k, v in value.items()}
+            return mapping(value.items(), 1)
         raise ValueError("an audit value is not a plain value")
 
-    return {_safe_str(str(k)): clean(v) for k, v in (detail or {}).items()}
+    return mapping((detail or {}).items(), 0)
 
 
 class PaymentApprovalRegistry:
@@ -145,6 +181,7 @@ class PaymentApprovalRegistry:
         self._audit: Audit | None = None
         self._stopping: Callable[[], bool] = lambda: False
         self._pending: dict[str, _Pending] = {}
+        self._writes: set[asyncio.Task] = set()  # shielded audit writes still running
 
     def attach_audit(self, audit: Audit) -> None:
         self._audit = audit
@@ -155,8 +192,22 @@ class PaymentApprovalRegistry:
         self._stopping = stopping or (lambda: False)
 
     async def _record(self, event: str, detail: dict) -> bool:
+        """Write one audit row; shielded, so cancelling the caller never cancels the write.
+
+        The row still lands and the vault connection is never left between an
+        INSERT and its COMMIT; the cancellation still reaches the caller.
+        """
         if self._audit is None:
             return False
+        return await asyncio.shield(self._spawn(event, detail))
+
+    def _spawn(self, event: str, detail: dict) -> asyncio.Task:
+        task = asyncio.ensure_future(self._write(event, detail))
+        self._writes.add(task)  # held, so a write its caller abandoned is not collected
+        task.add_done_callback(self._writes.discard)
+        return task
+
+    async def _write(self, event: str, detail: dict) -> bool:
         try:
             return bool(await self._audit(event, detail))
         except Exception as exc:  # noqa: BLE001 - a lost row is a refusal, never a crash
@@ -189,7 +240,16 @@ class PaymentApprovalRegistry:
             return REFUSED
         detail["nonce"] = nonce
         detail["field_lengths"] = {k: len(v) for k, v in fields.items()}
-        if not await self._record("approval_requested", detail):
+        # Shielded like every row; on a cancel, wait for it so the closing
+        # refusal lands after it, then let the cancel through.
+        write = self._spawn("approval_requested", detail) if self._audit else None
+        try:
+            requested = bool(write) and await asyncio.shield(write)
+        except asyncio.CancelledError:
+            await write
+            await self._record("approval_refused", {**detail, "reason": "requester cancelled"})
+            raise
+        if not requested:
             return REFUSED  # no trail, no request: nothing was sent
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -309,6 +369,7 @@ class PaymentApprovalRegistry:
                 },
             )
             return False
+        closed = False  # True once this tap wrote its own terminal row
         try:
             reason = self._mismatch(pending, user_id, message)
             if reason is None and pending.future.done():  # the requester stopped waiting
@@ -324,11 +385,17 @@ class PaymentApprovalRegistry:
             await self._record(
                 "approval_refused", {**pending.detail, "reason": reason, "tapper": user_id}
             )
+            closed = True
             return False
         finally:
-            # A cancelled or failed tap still settles the request it consumed.
+            # A cancelled or failed tap still settles the request it consumed,
+            # and closes its trail.
             if not pending.future.done():
                 pending.future.set_result(REFUSED)
+                if not closed:
+                    await self._record(
+                        "approval_refused", {**pending.detail, "reason": "tap interrupted"}
+                    )
 
 
 async def start_payment_services(runtime):

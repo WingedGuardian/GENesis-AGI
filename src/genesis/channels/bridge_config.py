@@ -59,8 +59,11 @@ def build_bridge_config(
     allowed_users: set[int] = set()
     # The same ids in written order, first occurrence kept: the owner is the
     # FIRST one (payment approval). The set above is unchanged for other callers.
+    # Empty when the first written entry is not a valid id (a typo, a leading
+    # comma), so a malformed owner entry never hands approval to the next id.
     allowed_ordered: list[int] = []
     allowed_raw = secrets.get("TELEGRAM_ALLOWED_USERS", "")
+    owner_entry_valid = allowed_raw.split(",", 1)[0].strip().isdigit()
     if allowed_raw:
         for idx, uid in enumerate(allowed_raw.split(","), start=1):
             uid = uid.strip()
@@ -94,7 +97,7 @@ def build_bridge_config(
     return {
         "token": token,
         "allowed_users": allowed_users,
-        "allowed_users_ordered": tuple(allowed_ordered),
+        "allowed_users_ordered": tuple(allowed_ordered) if owner_entry_valid else (),
         "whisper_model": secrets.get("WHISPER_MODEL", "whisper-large-v3"),
         "day_boundary_hour": int(secrets.get("DAY_BOUNDARY_HOUR", "0")),
         "forum_chat_id": forum_chat_id,

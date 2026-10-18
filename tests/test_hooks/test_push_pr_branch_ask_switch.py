@@ -85,7 +85,7 @@ def _hso(out: str) -> dict:
 def _env(monkeypatch):
     """Foreground, no network; the destination branch has one open PR."""
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: None)
     monkeypatch.setattr(gpg, "push_allowlist", None)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
     monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", lambda *a, **k: True)
