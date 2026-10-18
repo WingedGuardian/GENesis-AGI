@@ -4294,6 +4294,7 @@ class TestBrowserScreenshotUniquePath:
                 fh.write(b"\x89PNG")
 
         page.screenshot = AsyncMock(side_effect=_write)
+        page.frames = [_text_frame("Example")]  # the card check reads each frame
         return page
 
     @pytest.mark.asyncio
@@ -6908,8 +6909,20 @@ def _assert_redacted(result) -> None:
     assert REDACTED in text, text
 
 
+def _text_frame(text="", fails=False, detached=False):
+    """A frame whose visible text and field values read as ``text``."""
+    frame = MagicMock()
+    frame.evaluate = AsyncMock(
+        side_effect=RuntimeError("frame unreadable") if fails else None,
+        return_value=text,
+    )
+    frame.is_detached.return_value = detached
+    return frame
+
+
 def _card_page(url=f"https://shop.example/receipt/{_CARD}"):
     page = MagicMock()
+    page.frames = [_text_frame("")]
     page.url = url
     page.title = AsyncMock(return_value=f"Receipt for {_CARD_SPACED}")
     page.goto = AsyncMock()
@@ -6986,7 +6999,7 @@ class TestToolOutputIsRedacted:
         _assert_redacted(result)
 
     @pytest.mark.asyncio
-    async def test_screenshot(self, tmp_path):
+    async def test_screenshot_metadata(self, tmp_path):
         page = _card_page()
         page.screenshot = AsyncMock()
         browser._active_page = page
@@ -6994,6 +7007,54 @@ class TestToolOutputIsRedacted:
             result = await browser._impl_browser_screenshot()
         assert result["path"].startswith(str(tmp_path))  # the path is untouched
         _assert_redacted(result)
+
+    @pytest.mark.parametrize(
+        ("frames", "refusal"),
+        [
+            # the main frame shows a card
+            ([f"Saved card {_CARD_SPACED}"], "_REFUSE_CARD_SCREENSHOT"),
+            # one digit group per element: innerText puts each on its own line
+            (["Card\n4242\n4242\n4242\n4242\nPay"], "_REFUSE_CARD_SCREENSHOT"),
+            # a cross-origin payment iframe holds the field value
+            (["Checkout", _CARD], "_REFUSE_CARD_SCREENSHOT"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_screenshot_refuses_a_page_showing_a_card(self, tmp_path, frames, refusal):
+        page = _card_page()
+        page.frames = [_text_frame(t) for t in frames]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert result["error"] == getattr(browser, refusal)
+        page.screenshot.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_screenshot_refuses_when_a_frame_cannot_be_read(self, tmp_path):
+        page = _card_page()
+        page.frames = [_text_frame("ok"), _text_frame(fails=True)]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert result["error"] == browser._REFUSE_UNREAD_SCREENSHOT
+        page.screenshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_screenshot_skips_a_detached_frame_and_allows_ordinary_numbers(self, tmp_path):
+        page = _card_page()
+        page.frames = [
+            _text_frame("Order 100234567, call +1 555 123 4567, total 12.50, 2019 2020 2021"),
+            _text_frame(fails=True, detached=True),
+        ]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert "error" not in result, result
+        page.screenshot.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_snapshot(self):
@@ -7022,6 +7083,50 @@ class TestToolOutputIsRedacted:
         assert got["as_float"] == REDACTED
         assert got["count"] == 3
         assert "4242" not in got["json"]
+
+    @pytest.mark.asyncio
+    async def test_snapshot_with_a_segmented_card_field(self):
+        page = _card_page(url="https://shop.example/pay")
+        page.title = AsyncMock(return_value="Pay")
+        page.locator.return_value.aria_snapshot = AsyncMock(return_value=(
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- button "Pay"'
+        ))
+        browser._active_page = page
+        result = await browser._impl_browser_snapshot()
+        assert "4242" not in result["snapshot"]
+        assert REDACTED in result["snapshot"] and '- button "Pay"' in result["snapshot"]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            ["4242", "4242", "4242", "4242"],
+            {"p1": "4242", "p2": "4242", "p3": "4242", "p4": "4242"},
+            [["4242", "4242"], {"rest": ["4242", "4242"]}],
+            list(_CARD),
+            [_CARD[:8], _CARD[8:]],
+            [4242, 4242, 4242, 4242],
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_run_js_card_split_across_values(self, value):
+        page = _card_page()
+        page.evaluate = AsyncMock(return_value=value)
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("parts()")
+        assert result["result"] == REDACTED
+        assert "4242" not in str(result)
+
+    @pytest.mark.asyncio
+    async def test_run_js_colliding_keys_withhold_the_mapping(self):
+        page = _card_page()
+        page.evaluate = AsyncMock(return_value={_CARD: "a", REDACTED: "b"})
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("keys()")
+        assert result["result"] == REDACTED
 
     @pytest.mark.asyncio
     async def test_run_js_error(self):
@@ -7261,3 +7366,72 @@ class TestLogsAreRedacted:
         assert "Errorcallingtool" in err and "Traceback" in err
         assert _CARD not in err
         assert "".join(REDACTED.split()) in err
+
+
+_RENDERED_SOURCES = (
+    "innerText", "'placeholder'", "'value'", "'aria-label'", "'aria-placeholder'",
+    "'aria-valuetext'", "'title'", "'alt'", "matches('option')", "pseudo(el, '::before')",
+    "pseudo(el, '::after')", "attr\\(", "SVGElement", "el.shadowRoot", "el.value",
+)
+
+
+def test_the_screenshot_check_reads_every_rendered_text_source():
+    """Contract: the frame read covers each source of rendered text that is
+    not innerText. Removing one fails here; the real-browser test below shows
+    each one actually reaching the check."""
+    missing = [s for s in _RENDERED_SOURCES if s not in browser._PAGE_TEXT_JS]
+    assert missing == []
+
+
+_RENDERED_CARD_PAGES = {
+    "placeholder": f'<input placeholder="{_CARD_SPACED}">',
+    "aria-label": f'<button aria-label="Pay with {_CARD_SPACED}">Pay</button>',
+    "title": f'<span title="{_CARD}">card</span>',
+    "alt": f'<img alt="card {_CARD_SPACED}">',
+    "option": f"<select><option>x</option><option>{_CARD_SPACED}</option></select>",
+    "value": f'<input value="{_CARD}">',
+    "before": f'<style>#c::before{{content:"{_CARD_SPACED}"}}</style><span id="c"></span>',
+    "attr": f'<style>#d::after{{content:attr(data-pan)}}</style><span id="d" data-pan="{_CARD}"></span>',
+    "svg": f'<svg><text x="0" y="15">{_CARD_SPACED}</text></svg>',
+    "shadow": (
+        '<div id="h"></div><script>document.getElementById("h")'
+        f'.attachShadow({{mode:"open"}}).innerHTML="<p>{_CARD_SPACED}</p>"</script>'
+    ),
+    "segmented": '<input value="4242" aria-label="Card">' * 4,
+    "iframe": f'<iframe srcdoc="<input value={_CARD}>"></iframe>',
+}
+
+
+@pytest.mark.asyncio
+async def test_the_screenshot_check_on_a_real_browser():
+    """Runs the frame read in a fresh headless Chromium, no profile. Skipped
+    where no Playwright Chromium is installed (the contract test above still
+    applies there)."""
+    from genesis.security.card_redaction import contains_card_text
+
+    try:
+        from playwright.async_api import async_playwright
+
+        pw = await async_playwright().start()
+    except Exception as e:  # noqa: BLE001 - no driver on this machine
+        pytest.skip(f"playwright unavailable: {e}")
+    try:
+        try:
+            chromium = await pw.chromium.launch(headless=True)
+        except Exception as e:  # noqa: BLE001 - browser not downloaded
+            pytest.skip(f"chromium unavailable: {e}")
+        page = await chromium.new_page()
+        found = {}
+        for name, html in {
+            **_RENDERED_CARD_PAGES,
+            "clean": '<input placeholder="1234 1234 1234 1234"><p>Order 100234567</p>',
+        }.items():
+            await page.set_content(f"<html><body>{html}</body></html>")
+            await page.wait_for_timeout(50)
+            texts = [await f.evaluate(browser._PAGE_TEXT_JS) for f in page.frames]
+            found[name] = contains_card_text("\n".join(texts))
+        await chromium.close()
+    finally:
+        await pw.stop()
+    assert found.pop("clean") is False
+    assert [n for n, hit in found.items() if not hit] == []
