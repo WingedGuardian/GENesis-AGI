@@ -288,6 +288,28 @@ process. `graph_traverse_prune` deletes rows, and file lines, older than 30 days
 kill switch `GENESIS_GRAPH_TELEMETRY_DISABLED=1`.
 The fallback WARNINGs alone could never answer this: MCP servers log to stderr,
 which never reaches the journal.
+A memory server started before that code was deployed traverses without writing
+anything, so genesis-server also runs an **hourly census** (`graph_traverse_census`
+job, `:45`, `memory/graph_census.py`): one `eval_events` row
+(`event_type="graph_traverse_census"`) listing each live
+`genesis_mcp_server.py --server memory` process with its start time, every
+commit the main checkout has held since it started (read by
+`scripts/lib/serving_commit.py`, the reader the deploy scripts use, which refuses
+on a reflog gap, a move in the start second, a clock step back or git's expiry
+cutoff), whether ALL of them contain the telemetry module (a module imported
+after start loads whatever is on disk then), its exec-time kill switch and DB
+path, plus whether HEAD has the module and whether `src/genesis/memory/` is
+dirty. Git runs with `--no-optional-locks`, so the hourly read never takes the
+index lock a deploy needs. The cutover clock can only start at a census with no
+server that could be running older code. Pruned with the telemetry rows.
+**The verdict** is `scripts/graph_cutover_report.py` over the pure
+`memory/graph_cutover.py`: PASS needs 14 days on the clock, at least 100
+falkordb-served traversals and falkordb traffic on at least 10 UTC days in the
+last 14. Outcomes are an allowlist (`primary` counts, `cancelled` is neutral but
+reported, anything else restarts the clock, as do a non-falkordb `configured` or
+`served`, a dirty census row and a census gap over 2h15m). Lost writes, an
+unreadable row, a stale or missing census, or telemetry switched off make it
+INCONCLUSIVE. Exit 0/1/2 = PASS/NOT_YET/INCONCLUSIVE, 3 = the report failed.
 
 Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
 `memory_links` writers, while the visibility predicate below reads
@@ -1449,6 +1471,14 @@ the shared banner is not an assertion about all concurrent sessions.
   Local readiness reads a consistent, read-only registry snapshot and reuses
   conversation admission's runner/database checks. Intentional disablement has
   its own startup/capability status and does not count as a deploy regression.
+  Health snapshots and the existing minute status writer report current readiness
+  independently of the boot manifest. External health accepts only a sample from
+  the active primary server's MainPID observed within 90 seconds. Authenticated
+  health probes return 503 with readiness details when enabled but unready.
+  The existing awareness tick records readiness incidents and sends ordered
+  outage/recovery Telegram notices. Unknown readings preserve an open incident;
+  deliberate disablement closes it quietly. Incident/phase delivery history
+  supplies durable retry deduplication without a second queue.
   `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
   existing Flask/runtime loop: it atomically persists native receipts, binds
   contexts and retries to relationship epochs, and admits at most two

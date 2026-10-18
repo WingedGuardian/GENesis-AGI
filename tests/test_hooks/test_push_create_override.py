@@ -419,12 +419,9 @@ def test_push_then_no_verify_hard_blocks_not_asks():
 
 
 # ── First-push-only gate (re-push to an already-published branch is un-gated) ──
-# The load-bearing new behavior gets a REAL local bare remote so the ALLOW path is
-# deterministic in CI (not dependent on the network / real origin). Mirrors
-# git_push_guard.py::_push_is_republish: a branch already on the remote was
-# approved on its first push, so a re-push must not re-prompt; a genuinely-first
-# push (branch absent) still asks; dispatched still hard-denies; force still blocks;
-# push-to-main / cross-name refspec still ask.
+# The load-bearing behavior gets a REAL local bare remote so the dry-run ref
+# verdict is deterministic in CI: a single update to the current branch is a
+# republish, while a first publication, push-to-main, or cross-name refspec asks.
 
 
 def _git(cwd, *args):
@@ -720,29 +717,28 @@ def test_exec_flag_asks(published_feat):
     assert _decision(res) == "ask"
 
 
-# ── push_allowlist offline cache (the transient-ls-remote-failure fix) ─────────
-# The re-push gate's canonical "already on the remote?" check is a live
-# ``git ls-remote`` that FAIL-CLOSES to a prompt on any network failure, so a
-# transient failure re-prompts an already-approved branch (the #1262 gap).
-# ``push_allowlist`` caches the confirmed-on-remote fact LOCALLY so a re-push is
-# decided OFFLINE. These prove: a live HIT records the branch; a recorded branch
-# is allowed offline even when ls-remote CANNOT succeed; the SAME failure WITHOUT
-# a record still prompts (fail-closed); and a record for a DIFFERENT repo url does
-# not authorize an offline allow (no branch-name conflation across repos).
+# ── push_allowlist offline cache ──────────────────────────────────────────────
+# Recorded branches use the complete offline config predicate and bypass the
+# dry run. These prove: a successful dry-run republish records the branch; a
+# recorded branch remains allowed when its local bare remote disappears; the
+# same failure without a record still prompts; and a record for a DIFFERENT repo
+# URL does not authorize an offline allow.
 
 
 @pytest.fixture(autouse=True)
 def _isolate_push_allowlist_home(tmp_path, monkeypatch):
     """Redirect GENESIS_HOME to a per-test tmp dir.
 
-    The re-push gate now WRITES push_allowlist state under GENESIS_HOME on an
-    ls-remote HIT (and READS it for the offline fast-path), so without this every
+    The re-push gate WRITES push_allowlist state under GENESIS_HOME after a
+    republish verdict (and READS it for the offline fast-path), so without this every
     test that reaches the re-push arm would read/pollute the developer's real
     ``~/.genesis/pushed_branches.json`` (isolation lesson from #1406). ``_run`` /
     ``_run_at`` copy ``os.environ`` into the subprocess, so the guard child sees
     the same isolated home.
     """
     monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "allowlist-home"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
 
 
 def _pa():
@@ -775,12 +771,12 @@ def test_republish_hit_records_branch(published_feat):
 
 
 def test_republish_offline_allow_when_ls_remote_fails(published_feat, tmp_path):
-    """Core RED→GREEN: with feat/x recorded, a re-push is ALLOWED OFFLINE even when
-    ls-remote cannot reach the remote (the transient-failure case #1262 mishandled).
+    """With feat/x recorded, a re-push is ALLOWED OFFLINE even when the dry run
+    could not reach the remote.
 
-    Deleting the bare remote makes ``git ls-remote`` fail while leaving the url
-    config — and thus the allowlist key — intact, so the allow can ONLY come from
-    the local record."""
+    Deleting the bare remote makes the dry run fail while leaving the URL config —
+    and thus the allowlist key — intact, so the allow can ONLY come from the
+    local record."""
     pa = _pa()
     pa.record(_push_urls(published_feat), "feat/x")
     shutil.rmtree(tmp_path / "remote.git")  # ls-remote now fails; url config unchanged
