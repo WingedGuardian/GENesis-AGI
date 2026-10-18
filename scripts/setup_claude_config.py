@@ -143,7 +143,11 @@ def _write_keeping_mode(
     declines when the file no longer holds those bytes: someone wrote it
     after it was read, and replacing it would lose that write. None means the
     caller observed absence; omitting expected makes no concurrency check.
-    This is a best-effort check, not atomic CAS against other writers."""
+    It also declines when the target's mode, owner, group, ACL, link count or
+    identity changed after they were captured, since the replacement would
+    publish the stale copy. These are best-effort checks, not atomic CAS: a
+    change landing between the final re-stat and the rename still goes
+    unnoticed."""
     target = Path(os.path.realpath(path))
     before = target.stat() if target.exists() else None
     if before is not None and before.st_nlink > 1:
@@ -159,6 +163,21 @@ def _write_keeping_mode(
             return f"its owner/group ({before.st_uid}:{before.st_gid}) could not be kept"
         if _access_acl(tmp) != acl:
             return "its POSIX ACL could not be carried to the replacement"
+        return None
+
+    def target_metadata_refusal() -> str | None:
+        # The temp carries a copy of the target's metadata as first captured; a
+        # chmod, chown, setfacl or new hard link since then would be undone (or
+        # the link split) by publishing it.
+        try:
+            now = os.stat(target)
+        except FileNotFoundError:
+            return "it changed while the merge ran (run bootstrap again)"
+        fields = ("st_mode", "st_uid", "st_gid", "st_nlink", "st_ino", "st_dev")
+        if any(getattr(now, f) != getattr(before, f) for f in fields) or (
+            _access_acl(target) != acl
+        ):
+            return "its permissions, owner, ACL or links changed while the merge ran (run bootstrap again)"
         return None
 
     try:
@@ -196,6 +215,10 @@ def _write_keeping_mode(
         )
         if changed:
             return "it changed while the merge ran (run bootstrap again)"
+        if before is not None:
+            refusal = target_metadata_refusal()
+            if refusal:
+                return refusal
         os.replace(tmp, target)
         return None
     finally:

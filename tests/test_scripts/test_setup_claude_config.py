@@ -827,3 +827,44 @@ def test_hard_linked_configs_keep_every_alias(tmp_path, _scratch_home, capsys, s
     if changed:
         assert "multiple hard links" in capsys.readouterr().out
     assert not list(root.glob(".mcp.json.*"))
+
+
+@pytest.mark.parametrize("change", ["mode", "acl", "hard-link"])
+def test_metadata_changed_after_staging_is_not_overwritten(
+    tmp_path, _scratch_home, monkeypatch, change
+):
+    """A chmod, setfacl or new hard link landing after the metadata was copied
+    to the temp file, but before the rename, would otherwise be undone (or the
+    link split) by publishing the temp's stale copy."""
+    mod = _module()
+    root = _root(tmp_path)
+    if change == "acl":
+        probe = tmp_path / "acl-probe"
+        probe.touch()
+        _with_acl(probe)  # skips here, not mid-write, where ACLs are unsupported
+    path = _drifted(mod, root, {})
+    path.chmod(0o640)
+    before = path.read_bytes()
+    alias = root / "linked-config.json"
+    fsync = os.fsync
+
+    def fsync_then_someone_changes_metadata(fd):
+        fsync(fd)
+        if change == "mode":
+            path.chmod(0o600)
+        elif change == "acl":
+            os.setxattr(path, mod._ACL, _acl_bytes())
+        else:
+            os.link(path, alias)
+
+    monkeypatch.setattr(mod.os, "fsync", fsync_then_someone_changes_metadata)
+    assert mod.render_mcp_config(root, dry_run=False) is None
+    assert path.read_bytes() == before
+    if change == "mode":
+        assert path.stat().st_mode & 0o777 == 0o600
+    elif change == "acl":
+        assert os.getxattr(path, mod._ACL) == _acl_bytes()
+    else:
+        assert path.stat().st_nlink == 2 and alias.read_bytes() == before
+        assert path.stat().st_ino == alias.stat().st_ino
+    assert not list(root.glob(".mcp.json.*")), "temp file left behind"
