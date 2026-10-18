@@ -150,6 +150,16 @@ def _ensure_dir(path: Path) -> None:
         raise VaultError(f"{path} cannot be made private ({exc.strerror})") from None
 
 
+def recipient_text(path: Path) -> str:
+    """recipient.txt's key text: read capped and not followed, checked by shape (a VaultError)."""
+    return _recipient_text(path)
+
+
+def ensure_private_dir(path: Path) -> None:
+    """Create (or check) a 0700 directory you own: the vault, or the service's socket dir."""
+    _ensure_dir(path)
+
+
 def _write_new(name: str, data: bytes, dir_fd: int) -> None:
     """Write ``data`` to a file that must not exist yet, created 0600."""
     fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
@@ -272,7 +282,10 @@ def _check_identity(path: Path) -> bytes:
     pyrage 1.4.0). A file cut anywhere fails this, before a card is sealed to
     a key whose secret half is gone.
     """
-    dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:  # replaced or removed since it was checked
+        raise VaultError(f"the vault directory cannot be opened ({exc.strerror})") from None
     try:
         data = _read_regular(IDENTITY, dfd)
     except OSError as exc:

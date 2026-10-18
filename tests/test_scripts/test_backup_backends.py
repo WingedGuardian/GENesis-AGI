@@ -198,11 +198,15 @@ def test_legacy_nas_resolves_to_smb(tmp_path):
 
 _SMB_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
-    cmd=""; prev=""
-    for a in "$@"; do [ "$prev" = "-c" ] && cmd="$a"; prev="$a"; done
-    printf '%s\\n' "$cmd" >> "$SMB_LOG"
+    cmd=""; directory=""; prev=""
+    for a in "$@"; do
+        [ "$prev" = "-c" ] && cmd="$a"
+        [ "$prev" = "-D" ] && directory="$a"
+        prev="$a"
+    done
+    printf '%s\\t%s\\n' "$directory" "$cmd" >> "$SMB_LOG"
     case "$cmd" in
-      *"; ls"*)
+      ls*)
          printf '  .                          D        0  Mon\\n'
          printf '  ..                         D        0  Mon\\n'
          printf '  20260617T180000Z           D        0  Mon\\n'
@@ -244,10 +248,13 @@ def test_smb_command_shapes_and_list_parsing(tmp_path):
     assert 'mkdir "Genesis"' in cmds
     assert 'mkdir "Genesis/host"' in cmds
     assert 'mkdir "Genesis/host/STAMP/data"' in cmds
-    # put cd's into the dir and puts the basename
-    assert 'cd "Genesis/host/STAMP/data"; put' in cmds
-    # get cd's into the dir and gets the basename
-    assert 'get "f.gpg"' in cmds
+    # -D refuses an invalid starting directory before the single command runs.
+    invocations = [line.split("\t", 1) for line in cmds.splitlines()]
+    assert ["Genesis/host/STAMP/data", f'put "{src}" "f.gpg"'] in invocations
+    assert ["Genesis/host/STAMP/data", f'get "f.gpg" "{tmp_path}/out.gpg"'] in invocations
+    assert ["Genesis/host/STAMP", "ls"] in invocations
+    assert ["Genesis/host/STAMP", 'ls "COMPLETE"'] in invocations
+    assert not any(command.startswith("cd ") for _, command in invocations)
     # delete is a recursive deltree
     assert 'deltree "Genesis/host/STAMP"' in cmds
     # list parsing extracted real entries only (no ./.. and no "blocks" summary)
