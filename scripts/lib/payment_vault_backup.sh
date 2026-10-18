@@ -170,8 +170,13 @@ backup_payment_vault() (
     if [ -L "$out" ] || [ -L "$(dirname -- "$out")" ]; then
         say failed "the backup directory is a symlink"
     fi
-    # The staging leftover of a killed earlier run.
+    # The staging leftovers of a killed earlier run: the encrypted temp name in
+    # the clone, and the plaintext stage under the temp root (SIGKILL skips the
+    # EXIT trap). backup.sh holds its run lock, so no live run owns either.
     rm -f -- "$tmpname" 2>/dev/null
+    for f in "${tmproot%/}"/payment_vault.??????; do
+        if [ -d "$f" ] && [ ! -L "$f" ]; then rm -rf -- "$f" 2>/dev/null; fi
+    done
     if [ ! -e "$vault" ] && [ ! -L "$vault" ]; then
         prior && say missing "the vault directory is gone"
         say absent

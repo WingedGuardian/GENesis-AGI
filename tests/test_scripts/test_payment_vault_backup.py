@@ -407,6 +407,22 @@ def test_a_staging_leftover_of_a_killed_run_is_removed(_sealed, tmp_path):
     assert sorted(p.name for p in out.iterdir()) == [ARCHIVE]
 
 
+def test_a_killed_backups_plaintext_stage_is_removed_by_the_next_run(tmp_path):
+    """SIGKILL skips the subshell's EXIT trap; the next run removes the stage it left
+    under the temp root (class audit on #3211)."""
+    big = tmp_path / "bigtmp"
+    stale = big / "payment_vault.Ab12Cd"
+    stale.mkdir(parents=True)
+    (stale / "cards.db").write_bytes(b"plaintext leftover")
+    keep = big / "payment_vault.notours-longer"
+    keep.mkdir()
+    out = tmp_path / "creds"
+    out.mkdir()
+    assert _lib(tmp_path, tmp_path / "none", out).stdout.split()[0] == "absent"
+    assert not stale.exists()
+    assert keep.exists()  # only the six-character mktemp shape is ours
+
+
 def test_the_staging_name_is_gitignored_and_the_archive_is_not(tmp_path):
     """The backups clone's .gitignore line keeps a killed run's staging file out of
     a commit, and never hides the archive itself."""
@@ -924,6 +940,114 @@ def test_a_symlinked_archive_is_named_and_not_staged(tmp_path):
     _assert_no_plaintext_tar(fresh)
 
 
+def test_a_restore_killed_before_placing_the_set_leaves_no_decrypted_copy(tmp_path):
+    """SIGTERM between unpacking and renaming the set into place: the EXIT trap
+    removes the unpacked set (Codex round 3 on #3211)."""
+    bind = _bind(tmp_path)
+    dated._make_stub(
+        bind / "mv",
+        "#!/usr/bin/env bash\n"
+        'case "$*" in *.payment_vault.*) kill -TERM "$PPID"; exit 1 ;; esac\n'
+        'exec /bin/mv "$@"\n',
+    )
+    fresh = tmp_path / "fresh"
+    r = _restore(fresh, _source_with_archive(tmp_path), bind)
+    assert r.returncode != 0, r.stdout[-3000:]
+    stage = fresh / ".genesis" / "restore-creds"
+    left = (
+        sorted(p.name for p in stage.iterdir() if "payment_vault" in p.name)
+        if stage.exists()
+        else []
+    )
+    assert left == [], left
+    _assert_no_plaintext_tar(fresh)
+
+
+def test_a_restore_killed_while_the_set_is_checked_leaves_no_decrypted_copy(tmp_path):
+    """SIGTERM while payment_vault_unpack checks the set, inside its subshell, before
+    restore has its name: the EXIT trap still removes it (architect, round 3). The
+    stub signals every process from itself up to the top restore process (its $(...)
+    subshells carry the same command line), as a stop of the whole
+    process group (systemd, Ctrl-C) would, so the subshell cannot clean up first."""
+    bind = _bind(tmp_path)
+    real = shutil.which("sqlite3")
+    assert real, "sqlite3 is needed"
+    dated._make_stub(
+        bind / "sqlite3",
+        "#!/usr/bin/env bash\n"
+        'case "$*" in *.payment_vault.*/cards.db*)\n'
+        '  p=$PPID; chain=""\n'
+        '  while [ "$p" -gt 1 ]; do\n'
+        '    chain="$chain $p"\n'
+        "    pp=$(awk '{print $4}' /proc/$p/stat)\n"
+        "    if tr '\\0' ' ' < /proc/$p/cmdline | grep -q 'restore.sh' &&\n"
+        "       ! tr '\\0' ' ' < /proc/$pp/cmdline | grep -q 'restore.sh'; then\n"
+        "      kill -TERM $chain; exit 1\n"
+        "    fi\n"
+        "    p=$pp\n"
+        "  done ;;\n"
+        "esac\n"
+        f'exec {real} "$@"\n',
+    )
+    fresh = tmp_path / "fresh"
+    r = _restore(fresh, _source_with_archive(tmp_path), bind)
+    assert r.returncode != 0, r.stdout[-3000:]
+    assert "Payment vault: staged at" not in r.stdout
+    stage = fresh / ".genesis" / "restore-creds"
+    left = (
+        sorted(p.name for p in stage.iterdir() if "payment_vault" in p.name)
+        if stage.exists()
+        else []
+    )
+    assert left == [], left
+    _assert_no_plaintext_tar(fresh)
+
+
+def test_an_earlier_staged_symlink_into_the_live_vault_is_moved_aside(tmp_path):
+    """A staged copy that is a symlink into the live vault is moved aside, not
+    reported as an overlap and not followed (class audit on #3211)."""
+    bind = _bind(tmp_path)
+    fresh = tmp_path / "fresh"
+    live = fresh / ".genesis" / "payment_vault"
+    _synthetic_set(live, mark="p")
+    before = _tree(live)
+    _staged(fresh).parent.mkdir(parents=True)
+    _staged(fresh).symlink_to(live)
+    r = _restore(fresh, _source_with_archive(tmp_path), bind)
+    assert "Payment vault: staged at" in r.stdout, r.stdout[-3000:]
+    assert "overlaps the live vault" not in r.stdout
+    assert not _staged(fresh).is_symlink() and _recipient_mark(_staged(fresh)) == "q"
+    assert _tree(live) == before
+
+
+def test_a_stage_on_the_shells_vault_is_refused_when_secrets_move_genesis_home(
+    tmp_path, monkeypatch
+):
+    """restore reads GENESIS_HOME after secrets.env; the vault CLI uses the shell's.
+    Staging onto either one is refused (class audit on #3211)."""
+    # restore loads secrets.env only when this is unset; the suite's conftest sets it.
+    monkeypatch.delenv("GENESIS_MERGE_OVERRIDE_DIR", raising=False)
+    bind = _bind(tmp_path)
+    fresh = tmp_path / "fresh"
+    shell_home = fresh / "shell-home"
+    (shell_home / "payment_vault").mkdir(parents=True)
+    (fresh / "genesis").mkdir(parents=True)
+    (fresh / "genesis" / "secrets.env").write_text(f"GENESIS_HOME={fresh / 'secret-home'}\n")
+    r = _restore(
+        fresh,
+        _source_with_archive(tmp_path),
+        bind,
+        env_extra={"GENESIS_HOME": str(shell_home), "GENESIS_CREDS_STAGE": str(shell_home)},
+    )
+    # The refusal names the vault that overlaps (the shell's), not the secrets one.
+    assert f"overlaps the live vault {shell_home / 'payment_vault'} " in r.stdout, r.stdout[-3000:]
+    assert "Payment vault: staged at" not in r.stdout
+    # Nothing moved aside or placed over the shell's vault (restore keeps its own locks/ dir there).
+    assert sorted(p.name for p in shell_home.iterdir() if "payment_vault" in p.name) == [
+        "payment_vault"
+    ]
+
+
 def test_restore_says_when_a_staged_vault_is_from_an_earlier_restore(tmp_path):
     bind = _bind(tmp_path)
     fresh = tmp_path / "fresh"
@@ -1309,6 +1433,72 @@ def test_an_extra_directory_can_never_take_the_vault(tmp_path, genesis_home):
     for probe in (gh / "payment_vault", gh / "payment_vault" / "sub", gh):
         proc = subprocess.run(
             ["bash", "-c", f'source "{core}"; backup_core_overlap "$1"', "x", str(probe)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, (probe, proc.stdout, proc.stderr)
+
+
+def test_a_relative_genesis_home_still_guards_the_vault_after_a_cd(tmp_path):
+    """backup.sh sources the core-path lib and then `cd`s into the backups clone:
+    a relative GENESIS_HOME must resolve where it was set, not after the cd, or
+    the live vault passes the guard (Codex round 3 on #3211)."""
+    home = tmp_path / "home"
+    (tmp_path / "rel" / "payment_vault").mkdir(parents=True)
+    elsewhere = tmp_path / "backups-clone"
+    elsewhere.mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "GENESIS_DIR": str(home / "genesis"),
+        "TRANSCRIPT_DIR": str(home / "t"),
+        "_SCRIPT_DIR": str(dated._BACKUP.parent),
+        "GENESIS_HOME": "rel",
+    }
+    core = dated._BACKUP.parent / "lib" / "backup_core_paths.sh"
+    probe = tmp_path / "rel" / "payment_vault"
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{core}"; cd "$2"; backup_core_overlap "$1"',
+            "x",
+            str(probe),
+            str(elsewhere),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+
+
+def test_a_genesis_home_set_after_sourcing_is_guarded_too(tmp_path):
+    """backup.sh loads secrets.env after sourcing the lib; a GENESIS_HOME set there
+    (the one genesis-server uses) must still be a core path (architect, round 3)."""
+    home = tmp_path / "home"
+    later = tmp_path / "server-home"
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "GENESIS_DIR": str(home / "genesis"),
+        "TRANSCRIPT_DIR": str(home / "t"),
+        "_SCRIPT_DIR": str(dated._BACKUP.parent),
+    }
+    env.pop("GENESIS_HOME", None)
+    core = dated._BACKUP.parent / "lib" / "backup_core_paths.sh"
+    for probe in (later / "payment_vault", home / ".genesis" / "payment_vault"):
+        proc = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'source "{core}"; export GENESIS_HOME="$2"; backup_core_overlap "$1"',
+                "x",
+                str(probe),
+                str(later),
+            ],
             env=env,
             capture_output=True,
             text=True,

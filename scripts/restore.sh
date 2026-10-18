@@ -151,6 +151,17 @@ _cleanup_plaintext() {
     if [ -n "${_DB_STAGE:-}" ]; then
         rm -f "$_DB_STAGE" "$_DB_STAGE-journal" "$_DB_STAGE-wal" "$_DB_STAGE-shm" 2>/dev/null || true
     fi
+    # §8 card vault: once staging began, every .payment_vault.* temp under
+    # CREDS_STAGE (the decrypted tar, the unpacked set) is this run's or an
+    # earlier killed run's, never a placed set (payment_vault) or an aside
+    # (payment_vault.pre-restore-*); the run holds the restore lock. A glob, not
+    # recorded names: the unpack creates its directory inside a subshell.
+    if [ -n "${_PV_STAGING:-}" ] && [ -n "${CREDS_STAGE:-}" ]; then
+        for _pv_tmp in "${CREDS_STAGE%/}"/.payment_vault.*; do
+            [ -e "$_pv_tmp" ] || [ -L "$_pv_tmp" ] || continue
+            rm -rf -- "$_pv_tmp" 2>/dev/null || true
+        done
+    fi
 }
 trap '_cleanup_plaintext; _write_status; _release_deploy_marker; backend_cleanup' EXIT
 
@@ -313,10 +324,26 @@ decrypt_file() {
 # which a GENESIS_CREDS_STAGE pointed at GENESIS_HOME would do with no symlink.
 _pv_overlaps() {
     local a b
-    a="$(realpath -m -- "$1")"
+    # The staging path's own last component stays literal: an earlier staged
+    # copy that is a symlink is moved aside (never followed) by _pv_stage_vault.
+    a="$(realpath -m -- "$(dirname -- "$1")")/$(basename -- "$1")"
     b="$(realpath -m -- "$2")"
     case "$a/" in "$b/"*) return 0 ;; esac
     case "$b/" in "$a/"*) return 0 ;; esac
+    return 1
+}
+
+# The live vault under both resolutions of GENESIS_HOME: the value now (which
+# secrets.env may have set) and the one the core-path lib took when sourced (the
+# shell's, which the vault CLI uses). _PV_OVERLAP names the one that matched.
+_pv_overlaps_live() {
+    local live
+    for live in "$_PV_LIVE" "$_BACKUP_CORE_VAULT"; do
+        if _pv_overlaps "$1" "$live"; then
+            _PV_OVERLAP="$live"
+            return 0
+        fi
+    done
     return 1
 }
 
@@ -326,6 +353,7 @@ _pv_overlaps() {
 # rename the new one into place and print how to use it. Never places it.
 _pv_stage_vault() {
     local tarf dir why aside
+    _PV_STAGING=1  # from here on, the EXIT trap removes any .payment_vault.* temp
     tarf="$(umask 077 && mktemp -p "$CREDS_STAGE" .payment_vault.tar.XXXXXX 2>/dev/null)" || {
         warn "Payment vault: cannot create a temp file in $CREDS_STAGE; not staged"
         return 1
@@ -1747,8 +1775,8 @@ if [ -d "$CREDS_SRC_DIR" ]; then
         # run never predicts a stage the real run would refuse.
         if ! command -v realpath >/dev/null 2>&1; then
             warn "Payment vault: not staged. realpath is not installed, so the staging path cannot be checked against the live vault"
-        elif _pv_overlaps "$_PV_STAGE" "$_PV_LIVE"; then
-            warn "Payment vault: not staged. Its staging path $_PV_STAGE overlaps the live vault $_PV_LIVE (check GENESIS_CREDS_STAGE)"
+        elif _pv_overlaps_live "$_PV_STAGE"; then
+            warn "Payment vault: not staged. Its staging path $_PV_STAGE overlaps the live vault $_PV_OVERLAP (check GENESIS_CREDS_STAGE)"
         else
             log "Creds: would stage the card vault only if the selected off-site snapshot holds $PAYMENT_VAULT_ARCHIVE (a dry run pulls nothing, so it cannot tell)"
         fi
@@ -1757,8 +1785,8 @@ if [ -d "$CREDS_SRC_DIR" ]; then
     elif [ -f "$_PV_ARCHIVE" ]; then
         if ! command -v realpath >/dev/null 2>&1; then
             warn "Payment vault: not staged. realpath is not installed, so the staging path cannot be checked against the live vault"
-        elif _pv_overlaps "$_PV_STAGE" "$_PV_LIVE"; then
-            warn "Payment vault: not staged. Its staging path $_PV_STAGE overlaps the live vault $_PV_LIVE (check GENESIS_CREDS_STAGE)"
+        elif _pv_overlaps_live "$_PV_STAGE"; then
+            warn "Payment vault: not staged. Its staging path $_PV_STAGE overlaps the live vault $_PV_OVERLAP (check GENESIS_CREDS_STAGE)"
         elif $DRY_RUN; then
             log "Creds: would stage the card vault from $PAYMENT_VAULT_ARCHIVE"
             _PV_STAGED=true
