@@ -999,6 +999,9 @@ class TestHttpCredentialHeaders:
             ("Bearer token", "token"),
             ("Bearer $ecret", "$ecret"),
             ("Bearer abc:def", "def"),
+            ('{"authorization":"Digest username=\\"alice\\", response=\\"6629fae4\\""}', "6629fae4"),
+            ("{'cookie': 'SID=it\\'s-31d4d96e'}", "31d4d96e"),
+            ('\\"authorization\\": \\"Digest username=\\\\\\"a\\\\\\", response=\\\\\\"cafe1234\\\\\\"\\"', "cafe1234"),
             (
                 'curl -H "Authorization: Digest username=\\"alice\\", response=\\"deadbeef\\"" https://h',
                 "deadbeef",
@@ -1010,10 +1013,13 @@ class TestHttpCredentialHeaders:
         assert secret not in out
         assert R in out
 
-    def test_the_label_and_quoting_survive(self):
+    def test_the_value_is_withheld_to_the_end_of_the_line(self):
+        # Decision: quoting is not read, so no quoting shape can end the value
+        # early. A one-line record loses the rest of the line after the header.
         assert s.scrub("Authorization: Basic YTpi") == "Authorization: " + R
-        assert s.scrub("headers={'authorization': 'Basic YTpi'}") == "headers={'authorization': '" + R + "'}"
-        assert s.scrub('curl -H "Cookie: SID=abc" url') == 'curl -H "Cookie: ' + R + '" url'
+        assert s.scrub("headers={'authorization': 'Basic YTpi'} done") == "headers={'authorization': " + R
+        assert s.scrub('curl -H "Cookie: SID=abc" url') == 'curl -H "Cookie: ' + R
+        assert s.scrub("Cookie: a=b\nnext line") == "Cookie: " + R + "\nnext line"
 
     @pytest.mark.parametrize(
         "text",
@@ -1032,7 +1038,7 @@ class TestHttpCredentialHeaders:
         # no rule can tell "Bearer token" the credential from "Bearer token"
         # the prose. Prose that names a bearer loses one word.
         assert s.scrub("Bearer tokens are documented") == "Bearer " + R + " are documented"
-        assert s.scrub('\\"Authorization\\": \\"x\\", \\"b\\": \\"Bearer abc\\"').endswith("Bearer " + R + '\\"')
+        assert s.scrub('\\"b\\": \\"Bearer abc\\"').endswith("Bearer " + R + '\\"')
 
     @pytest.mark.parametrize(
         "shape",

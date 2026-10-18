@@ -280,32 +280,23 @@ _CREDENTIAL_TOKEN_PATTERN = re.compile(
 # HTTP credential headers. Their VALUE is the secret, whatever its shape: a
 # scheme plus a token (``Bearer x``, ``Basic YTpi``), a parameter list
 # (``Digest username=..., response=...``, ``AWS4-HMAC-SHA256 Credential=...``)
-# or cookie pairs (``SID=...; HttpOnly``). So the whole value is redacted, up
-# to its closing quote or the end of the line, never parsed: a value grammar is
-# the thing that kept missing shapes. The label may sit in a quoted key
-# (``'authorization': ...``, ``"cookie": ...``, or an escaped ``\"cookie\"``
-# inside a serialized string), and the value may be quoted the same ways.
-# ``credential_label_kind`` also treats these names as token labels, so a
-# structured member is withheld whatever its value looks like.
+# or cookie pairs (``SID=...; HttpOnly``). Everything from the separator to the
+# END OF THE LINE is withheld, and quoting is deliberately not read: three
+# review rounds each found a quoting shape (a curl argument with escaped
+# quotes, an escaped quote inside a JSON value, double-encoded JSON) where a
+# value grammar stopped early and let the credential through. Not finding the
+# end of the value is what removes that whole class. The cost is that a
+# one-line record (a serialized tool response) loses everything after such a
+# header, the cheap direction. The label may sit in a quoted or escaped-quoted
+# key (``'authorization': ...``, ``\"cookie\": ...``). ``credential_label_kind``
+# also treats these names as token labels, so a structured member is withheld
+# whatever its value looks like.
 _HEADER_LABEL = r"(?<![A-Za-z])(?:(?:proxy[_\s-]?)?authorization|(?:set[_\s-]?)?cookie)"
 _HEADER_PATTERN = re.compile(
-    # ``open``: the quote (possibly escaped) that opened a string the whole
-    # header sits in, as in ``curl -H "Authorization: ..."``. An unquoted value
-    # then ends at that same quote; with no opening quote it runs to the end of
-    # the line, so quotes INSIDE the value (Digest parameters) cannot cut it short.
-    r"(?P<open>\\?[\"'])?" + _HEADER_LABEL + r"(?:\\?[\"'])?[ \t]*[:=][ \t]*"
-    r"(?P<value>"
-    r"\\\"(?:[^\"\\\n]|\\[^\"\n])*\\\""  # an escaped-quoted value: \"...\"
-    r"|\\'(?:[^'\\\n]|\\[^'\n])*\\'"
-    r"|\"[^\"\n]*\""
-    r"|'[^'\n]*'"
-    # A backslash pair is consumed whole, so an escaped quote inside the value
-    # (`-H "Authorization: Digest username=\"a\", response=\"...\""`) is
-    # content, not the closing quote.
-    r"|(?(open)(?:\\.|(?!(?P=open))[^\r\n])+|[^\r\n]+)"
-    r")",
+    _HEADER_LABEL + r"(?:\\?[\"'])?[ \t]*[:=][ \t]*(?P<value>[^\r\n]*[^\s])",
     re.IGNORECASE,
 )
+
 
 # A bearer credential wherever it appears, with no header label in front: a
 # curl command line, a log line, a copied value. The word after "bearer" is
@@ -320,24 +311,6 @@ _BEARER_VALUE_PATTERN = re.compile(
     r"(?P<token>[^\s\"']+?)(?=\\[\"']|[\s\"']|\Z)",
     re.IGNORECASE,
 )
-
-
-def _redact_header_value(text: str) -> str:
-    """Replace a credential header's whole value, keeping its quoting."""
-
-    def _repl(m: re.Match) -> str:
-        value = m.group("value")
-        for quote in ('\\"', "\\'", '"', "'"):
-            if len(value) >= 2 * len(quote) and value.startswith(quote) and value.endswith(quote):
-                replacement = f"{quote}{_REDACTED}{quote}"
-                break
-        else:
-            trailing = value[len(value.rstrip()):]
-            replacement = _REDACTED + trailing
-        start = m.start("value") - m.start()
-        return m.group(0)[:start] + replacement
-
-    return _HEADER_PATTERN.sub(_repl, text)
 
 
 # password/passphrase/pin values — keep the label, redact the value. A quoted
@@ -520,7 +493,7 @@ def scrub(text: str) -> str:
         text = _redact_pem_blocks(text)
         text = _KNOWN_KEY_PREFIX_PATTERN.sub(_REDACTED, text)
         text = _STRUCTURED_CREDENTIAL_PATTERN.sub(_REDACTED, text)
-        text = _redact_header_value(text)
+        text = _redact_value_group(_HEADER_PATTERN, text, "value")
         text = _redact_value_group(_BEARER_VALUE_PATTERN, text, "token")
         text = _redact_value_group(_CREDENTIAL_TOKEN_PATTERN, text, "token")
         text = _redact_value_group(_SINGLE_CREDENTIAL_PATTERN, text, "value")
