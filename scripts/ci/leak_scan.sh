@@ -93,6 +93,13 @@ step_detect_secrets() {
       exit 3
     fi
     (cd -- "$hist_dir" && _detect_secrets_scan "$WORK/ds-history.json" .)
+    # Owner-verified historical false positives, read from origin/main only (a
+    # branch cannot allowlist its own finding). Exact match on commit, path,
+    # detector and hash; an unreadable or malformed list fails closed.
+    if ! python3 scripts/ci/leak_history_allow.py "$WORK/ds-history.json"; then
+      echo "::error::detect-secrets history scan: the history allowlist could not be applied. Failing closed."
+      exit 3
+    fi
     hist_count="$(_detect_secrets_count "$WORK/ds-history.json")"
   fi
   if [[ "$count" != "0" || "$hist_count" != "0" ]]; then
