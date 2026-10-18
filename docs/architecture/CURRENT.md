@@ -2731,7 +2731,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: adc15e37ff5a 2026-10-16
+verified: 788a6d75c178 2026-10-17
 ```
 
 - **The graders are TOLD the response status; they must never infer it.** The
@@ -2873,8 +2873,8 @@ verified: adc15e37ff5a 2026-10-16
   and recovery state. Incremental publication follows durable append; uncertain
   publication stops derived-state reading until reconstruction. Historical
   reading never creates or truncates files; version-1 evidence cannot execute.
-  No CLI, automatic execution or qualification verdict is wired yet;
-  subsequent replacement PRs supply those callers. Production credentials and
+  The isolated qualification CLI supplies explicit execution and reporting
+  callers; it does not schedule automatic execution. Production credentials and
   accounting stores are outside this boundary. See
   `docs/reference/qualification-journal.md`. Offline reference admission also
   binds current policy, source-labelled decisions and whole-corpus feedback
@@ -2891,7 +2891,7 @@ verified: adc15e37ff5a 2026-10-16
   standalone adapters run production relevance and novelty judgments with
   synthetic routers or caller-provided transport. Novelty uses disposable
   full-schema SQLite fixtures and observes the actual rendered candidate IDs.
-  Execution/reporting orchestration lands later.
+  The isolated runner supplies execution/reporting orchestration.
   See `docs/reference/qualification-corpus.md`.
   Qualification's pinned transport supplies a caller-provided adapter router
   through the production delegate, a shared one-egress wire guard, response-hook
@@ -2912,8 +2912,7 @@ verified: adc15e37ff5a 2026-10-16
   Credential lending preserves known redaction values while keeping production
   aliases hidden from the SDK, including log calls on SDK threads.
   These checks do not
-  establish provider spend bounds or owner approval. The isolated runner remains
-  a later replacement. This verification refresh covers the qualification slice;
+  establish provider spend bounds or owner approval. This verification refresh covers the qualification slice;
   other learning/evaluation entries retain their previous verification scope.
   See `docs/reference/qualification-transport.md`.
   Complete offline preflight checks all registered corpus floors, current
@@ -2931,8 +2930,27 @@ verified: adc15e37ff5a 2026-10-16
   paid eligibility, model quality or promotion follows from this evidence.
   A fresh interpreter follows checkout changes; unchanged checkouts permit
   repeated checks with matching caches.
-  The later runner must recompute it before credentials. See
+  The runner recomputes it before credentials. See
   `docs/reference/qualification-preflight.md`.
+  The isolated serial CLI supports Flash-only or historical paired execution
+  under an exact frozen operating plan and a separate local spending assertion.
+  A credential-scoped lock precedes journal writers and credential reads. The
+  actual pre-dispatch key snapshot must fund the whole selected pending
+  population, including effective/member headroom; uncertain evidence stops
+  acquisition without resending dispatched coordinates. Observed expenses and
+  unresolved liability remain distinct; operating allowances are not guaranteed
+  invoice ceilings. Source population/cache checks at admission and completion
+  invalidate scoring on detected drift, without a per-request source-integrity
+  guarantee. Detached reports score retained snapshots under current admission,
+  read no credentials and do not authenticate current external spending consent.
+  No paid quality, promotion or live activation follows from synthetic wiring.
+  After source review, the integrated runner passed 1,777 affected tests and a
+  complete synthetic 750-case/2,250-request actual-CLI run plus credential-free
+  detached report. Independent readback reconciled all 9,001 journal rows and
+  531 frozen source/test inputs. Current-main database schema and test controls
+  were included in acceptance; the E2E observed no Python network attempts.
+  This is synthetic wiring evidence, not real
+  model quality, provider billing or deployment. See `docs/reference/qualification-runner.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).

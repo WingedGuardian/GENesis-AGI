@@ -181,14 +181,25 @@ def source_evidence(cases, source_files):
     return verified
 
 
-async def check(cases, temp_root, *, reference_policy, current_policy,
-                reference_approval, candidates, source_files, config=None):
-    """Complete CURRENT offline evidence; conveys no consent, budget or quality."""
+def production_modules():
+    """The direct production population shared by admission and final scoring."""
     from genesis.cc import session_config
     from genesis.cc import types as cc_types
     from genesis.db.schema import _tables, create_all_tables
     from genesis.learning.procedural import extractor, judge, operations, scoping, validation_gate
 
+    return [contracts, corpus, references, storage, extractor, judge, operations, scoping,
+            validation_gate, inspect.getmodule(LLMJudgeScorer),
+            inspect.getmodule(contracts.J9EvalBatchExecutor), inspect.getmodule(check),
+            inspect.getmodule(resolve), inspect.getmodule(contracts.pack_embedding),
+            inspect.getmodule(contracts.connect_aiosqlite_rw), contracts.procedural, storage.tool_names,
+            inspect.getmodule(operations.validate_trigger_spec), inspect.getmodule(create_all_tables), _tables,
+            session_config, cc_types]
+
+
+async def check(cases, temp_root, *, reference_policy, current_policy,
+                reference_approval, candidates, source_files, config=None):
+    """Complete CURRENT offline evidence; conveys no consent, budget or quality."""
     cases, policy, current, approval, candidates, sources = load_json(canonical([
         cases, reference_policy, current_policy, reference_approval, candidates, source_files
     ]))
@@ -216,13 +227,7 @@ async def check(cases, temp_root, *, reference_policy, current_policy,
         # Reject malformed/implicit routing settings before expensive rendering.
         parameters(alias, configured, {}, config=config)
     verified_sources = source_evidence(cases, sources)
-    modules = [contracts, corpus, references, storage, extractor, judge, operations, scoping,
-               validation_gate, inspect.getmodule(LLMJudgeScorer),
-               inspect.getmodule(contracts.J9EvalBatchExecutor), inspect.getmodule(check),
-               inspect.getmodule(resolve), inspect.getmodule(contracts.pack_embedding),
-               inspect.getmodule(contracts.connect_aiosqlite_rw), contracts.procedural, storage.tool_names,
-               inspect.getmodule(operations.validate_trigger_spec), inspect.getmodule(create_all_tables), _tables,
-               session_config, cc_types]
+    modules = production_modules()
     production_sources = production_source_inventory(modules)
     plan = await prepare(cases, temp_root, reference_policy=policy)
     frozen_params = {
