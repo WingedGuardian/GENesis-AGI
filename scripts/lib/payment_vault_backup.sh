@@ -177,6 +177,9 @@ backup_payment_vault() (
     # the clone, and the plaintext stage under the temp root (SIGKILL skips the
     # EXIT trap). backup.sh holds its run lock, so no live run owns either.
     rm -f -- "$tmpname" 2>/dev/null
+    if [ -e "$tmpname" ] || [ -L "$tmpname" ]; then
+        say failed "something other than a file is at $tmpname"
+    fi
     for f in "${tmproot%/}"/payment_vault.??????; do
         if [ -d "$f" ] && [ ! -L "$f" ]; then rm -rf -- "$f" 2>/dev/null; fi
     done
@@ -231,11 +234,13 @@ backup_payment_vault() (
         2>/dev/null || say failed "packing the vault failed"
     encrypt_file "$stage/payment_vault.tar" "$stage/$PAYMENT_VAULT_ARCHIVE" || say failed "encrypting the vault failed"
     mkdir -p "$out" 2>/dev/null || say failed "cannot create the output directory"
-    cp -- "$stage/$PAYMENT_VAULT_ARCHIVE" "$tmpname" 2>/dev/null || {
+    cp -T -- "$stage/$PAYMENT_VAULT_ARCHIVE" "$tmpname" 2>/dev/null || {
         rm -f -- "$tmpname" 2>/dev/null
         say failed "writing the backup copy failed"
     }
-    mv -f -- "$tmpname" "$archive" 2>/dev/null || {
+    # -T: a directory at the archive path is an error, never a destination to
+    # move the archive into (which would report ok with no archive in place).
+    mv -f -T -- "$tmpname" "$archive" 2>/dev/null || {
         rm -f -- "$tmpname" 2>/dev/null
         say failed "renaming the archive into place failed"
     }

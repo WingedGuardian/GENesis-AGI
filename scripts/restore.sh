@@ -334,12 +334,15 @@ _pv_overlaps() {
     return 1
 }
 
-# The live vault under both resolutions of GENESIS_HOME: the value now (which
-# secrets.env may have set) and the one the core-path lib took when sourced (the
-# shell's, which the vault CLI uses). _PV_OVERLAP names the one that matched.
+# The live vault under every resolution of GENESIS_HOME: the value now, the one
+# the core-path lib took when sourced (the shell's, which the vault CLI uses), and
+# the one secrets.env sets (the server's), read on its own because restore loads
+# secrets.env wholesale only when GENESIS_MERGE_OVERRIDE_DIR is unset.
+# _PV_OVERLAP names the one that matched.
 _pv_overlaps_live() {
     local live
-    for live in "$_PV_LIVE" "$_BACKUP_CORE_VAULT"; do
+    for live in "$_PV_LIVE" "$_BACKUP_CORE_VAULT" ${_PV_SECRETS_VAULT:+"$_PV_SECRETS_VAULT"} \
+        "$HOME/.genesis/payment_vault"; do
         if _pv_overlaps "$1" "$live"; then
             _PV_OVERLAP="$live"
             return 0
@@ -392,6 +395,11 @@ _pv_stage_vault() {
     log "      3. mv -T \"$_PV_STAGE\" \"$_PV_LIVE\""
     log "      4. systemctl --user start genesis-server, then: python -m genesis vault unlock"
     log "         (a successful unlock proves the passphrase and the key match)"
+    if [ -n "$_PV_SECRETS_VAULT" ] \
+        && [ "$(realpath -m -- "$_PV_SECRETS_VAULT")" != "$(realpath -m -- "$_PV_LIVE")" ]; then
+        log "      NOTE: genesis-server reads the vault at $_PV_SECRETS_VAULT (GENESIS_HOME in"
+        log "      secrets.env), not $_PV_LIVE: use that path in steps 1 and 3"
+    fi
     log "      Until it is placed (or retired: git rm creds/$PAYMENT_VAULT_ARCHIVE in the backups"
     log "      repo), every backup reports payment_vault: missing and fails."
     if [ "$CREDS_SRC_DIR" != "$BACKUP_DIR/creds" ]; then
@@ -1775,6 +1783,42 @@ if [ -d "$CREDS_SRC_DIR" ]; then
     _PV_ARCHIVE="$CREDS_SRC_DIR/$PAYMENT_VAULT_ARCHIVE"
     _PV_STAGE="$CREDS_STAGE/payment_vault"
     _PV_LIVE="$(_backup_core_home)/payment_vault"
+    # The vault genesis-server uses when secrets.env sets GENESIS_HOME: read with
+    # the server's own parser (python-dotenv, which interpolates ${VAR}), an empty
+    # value meaning the default as in genesis.env.genesis_home(), and a relative
+    # one anchored at the repo, the unit's WorkingDirectory. Only that key leaves
+    # the file.
+    _PV_SECRETS_VAULT=""
+    if [ -f "$SECRETS_FILE" ]; then
+        _pv_py="$_SCRIPT_DIR/../.venv/bin/python"
+        [ -x "$_pv_py" ] || _pv_py="$(command -v python3.12 || command -v python3 || true)"
+        if [ -n "$_pv_py" ] && _PV_SECRETS_VAULT="$("$_pv_py" -I -c '
+import os, sys
+try:
+    from dotenv import dotenv_values
+except ImportError:
+    sys.exit(3)
+value = dotenv_values(sys.argv[1]).get("GENESIS_HOME")
+if value is not None:
+    home = os.path.expanduser(value) if value else os.path.expanduser("~/.genesis")
+    print(os.path.join(sys.argv[2], home, "payment_vault"))
+' "$SECRETS_FILE" "$GENESIS_DIR" 2>/dev/null)"; then
+            :
+        else
+            # No python-dotenv: the shell parser (no ${VAR} interpolation).
+            _PV_SECRETS_VAULT="$(
+                unset GENESIS_HOME
+                # shellcheck source=scripts/lib/load_secrets.sh
+                source "$_SCRIPT_DIR/lib/load_secrets.sh" >/dev/null 2>&1 \
+                    && load_secrets_file "$SECRETS_FILE" >/dev/null 2>&1
+                # A ${VAR} value needs dotenv's interpolation: no guess here.
+                if [ -n "${GENESIS_HOME+x}" ] && [[ "$GENESIS_HOME" != *'$'* ]]; then
+                    _BACKUP_CORE_CWD="$GENESIS_DIR"
+                    printf '%s/payment_vault' "$(_backup_core_home)"
+                fi
+            )"
+        fi
+    fi
     _PV_STAGED=false
     if $DRY_RUN && $_RESTORE_MANAGED; then
         # The refusals that do not depend on the snapshot still apply, so a dry

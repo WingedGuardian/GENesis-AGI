@@ -409,6 +409,26 @@ def test_a_staging_leftover_of_a_killed_run_is_removed(_sealed, tmp_path):
     assert sorted(p.name for p in out.iterdir()) == [ARCHIVE]
 
 
+def test_a_directory_at_the_archive_path_is_a_failure_not_ok(_sealed, tmp_path):
+    """mv would move the archive INTO a directory there and report ok."""
+    vault = _place_vault(_sealed, tmp_path / "v" / "payment_vault")
+    out = tmp_path / "creds"
+    (out / ARCHIVE).mkdir(parents=True)
+    r = _lib(tmp_path, vault, out)
+    assert r.stdout.split()[0] == "failed", r.stdout
+    assert list((out / ARCHIVE).iterdir()) == []
+
+
+def test_a_directory_at_the_temp_name_is_a_failure_not_ok(_sealed, tmp_path):
+    """cp would copy INTO a directory there, and mv would publish the directory."""
+    vault = _place_vault(_sealed, tmp_path / "v" / "payment_vault")
+    out = tmp_path / "creds"
+    (out / TMPNAME).mkdir(parents=True)
+    r = _lib(tmp_path, vault, out)
+    assert r.stdout.split()[0] == "failed", r.stdout
+    assert not (out / ARCHIVE).exists()
+
+
 def test_a_killed_backups_plaintext_stage_is_removed_by_the_next_run(tmp_path):
     """SIGKILL skips the subshell's EXIT trap; the next run removes the stage it left
     under the temp root (class audit on #3211)."""
@@ -778,6 +798,7 @@ def _restore(
     }
     for k in (
         "GENESIS_HOME",
+        "SECRETS_PATH",
         "GENESIS_CREDS_STAGE",
         "GENESIS_CREDS_MIRROR",
         "GENESIS_BACKUP_NAS_HOST",
@@ -1375,6 +1396,80 @@ def test_a_tilde_genesis_home_finds_the_vault(_sealed, backup_env, tmp_path):
     proc = dated._run_local(backup_env, offsite, extra_env={"GENESIS_HOME": "~/custom"})
     status = json.loads((backup_env["home"] / "custom" / "backup_status.json").read_text())
     assert status["payment_vault"] == "ok", (status, proc.stdout[-3000:])
+
+
+def test_a_stage_on_the_secrets_home_is_refused_with_the_audit_override_set(tmp_path):
+    """An exported GENESIS_MERGE_OVERRIDE_DIR skips restore's wholesale secrets load;
+    the GENESIS_HOME secrets.env sets still names the live vault for the guard."""
+    assert os.environ.get("GENESIS_MERGE_OVERRIDE_DIR")  # the suite's conftest sets it
+    bind = _bind(tmp_path)
+    fresh = tmp_path / "fresh"
+    secret_home = fresh / "secret-home"
+    live = secret_home / "payment_vault"
+    _synthetic_set(live, mark="p")
+    before = _tree(live)
+    (fresh / "genesis").mkdir(parents=True)
+    (fresh / "genesis" / "secrets.env").write_text(f"GENESIS_HOME={secret_home}\n")
+    r = _restore(
+        fresh,
+        _source_with_archive(tmp_path),
+        bind,
+        env_extra={"GENESIS_CREDS_STAGE": str(secret_home)},
+    )
+    assert f"overlaps the live vault {live} " in r.stdout, r.stdout[-3000:]
+    assert "Payment vault: staged at" not in r.stdout
+    assert _tree(live) == before
+
+
+def _restore_python_has_dotenv() -> bool:
+    """The interpreter restore.sh picks for secrets.env: the repo venv, else python3."""
+    venv = dated._RESTORE.parent.parent / ".venv" / "bin" / "python"
+    py = str(venv) if venv.exists() else (shutil.which("python3.12") or shutil.which("python3"))
+    return py is not None and subprocess.run([py, "-I", "-c", "import dotenv"]).returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "home"),
+    [
+        ("secret-home", "genesis/secret-home"),  # relative: the repo, the server's cwd
+        ("${HOME}/interp", "interp"),  # interpolated, as python-dotenv does
+        ("", ".genesis"),  # empty: the default
+    ],
+)
+def test_the_secrets_home_is_resolved_as_the_server_does(tmp_path, value, home):
+    if "$" in value and not _restore_python_has_dotenv():
+        pytest.skip("interpolation needs python-dotenv in the interpreter restore picks")
+    bind = _bind(tmp_path)
+    fresh = tmp_path / "fresh"
+    live = fresh / home / "payment_vault"
+    _synthetic_set(live, mark="p")
+    before = _tree(live)
+    (fresh / "genesis").mkdir(parents=True, exist_ok=True)
+    (fresh / "genesis" / "secrets.env").write_text(f"GENESIS_HOME={value}\n")
+    r = _restore(
+        fresh,
+        _source_with_archive(tmp_path),
+        bind,
+        env_extra={
+            "GENESIS_HOME": str(fresh / "shell-home"),
+            "GENESIS_CREDS_STAGE": str(live.parent),
+        },
+    )
+    assert f"overlaps the live vault {live} " in r.stdout, r.stdout[-3000:]
+    assert "Payment vault: staged at" not in r.stdout
+    assert _tree(live) == before
+
+
+def test_restore_names_the_servers_vault_when_secrets_set_another_home(tmp_path):
+    bind = _bind(tmp_path)
+    fresh = tmp_path / "fresh"
+    (fresh / "genesis").mkdir(parents=True)
+    (fresh / "genesis" / "secrets.env").write_text(f"GENESIS_HOME={fresh / 'server-home'}\n")
+    r = _restore(fresh, _source_with_archive(tmp_path), bind)
+    assert "Payment vault: staged at" in r.stdout, r.stdout[-3000:]
+    assert (
+        f"genesis-server reads the vault at {fresh / 'server-home' / 'payment_vault'}" in r.stdout
+    )
 
 
 def test_a_stage_on_a_tilde_genesis_home_is_refused(tmp_path):
