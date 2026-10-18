@@ -96,6 +96,7 @@ class HealthDataService:
         activity_tracker: object | None = None,
         provider_health_checker: ProviderHealthChecker | None = None,
         event_bus: GenesisEventBus | None = None,
+        agent_api_reader=None,
     ) -> None:
         self._breakers = circuit_breakers
         self._routing_config = routing_config
@@ -113,6 +114,7 @@ class HealthDataService:
         self._activity_tracker = activity_tracker
         self._provider_health = provider_health_checker
         self._event_bus = event_bus
+        self._agent_api_reader = agent_api_reader
         # One tracker per service instance. This service is a singleton in the
         # server process (constructed only in runtime/init/health_data.py), so the
         # tracker sees every snapshot and is the sole emitter of probe transitions.
@@ -442,6 +444,7 @@ class HealthDataService:
             deploy_health(self._db),
             # Reflex-arc nerve state (ingestor counters + signal aggregates).
             reflex(self._db),
+            self._agent_api_snapshot(),
             return_exceptions=True,
         )
         # Isolate any failed section uniformly: one raising sub-snapshot degrades
@@ -467,6 +470,7 @@ class HealthDataService:
             r_provider_fallbacks,
             r_deploy_health,
             r_reflex,
+            r_agent_api,
         ) = results
 
         # Surface infra probe healthy<->unhealthy transitions to the activity
@@ -508,7 +512,18 @@ class HealthDataService:
             "deploy_health": r_deploy_health,
             "vcr": r_vcr,
             "reflex": r_reflex,
+            "agent_api": r_agent_api,
         }
+
+    async def _agent_api_snapshot(self):
+        from genesis.peers.readiness import unknown
+
+        if self._agent_api_reader is None:
+            return unknown()
+        try:
+            return await self._agent_api_reader()
+        except Exception:
+            return unknown("check_unavailable")
 
     async def _emit_probe_transitions(self, infra: object) -> None:
         """Drive the probe-transition tracker from the freshly-built infra dict,
