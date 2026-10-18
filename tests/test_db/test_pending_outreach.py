@@ -8,6 +8,8 @@ less email to the agent's own address.
 
 from __future__ import annotations
 
+import json
+
 import aiosqlite
 import pytest
 
@@ -170,6 +172,43 @@ async def test_cancel_refuses_a_dequeued_message_without_claiming_delivery(db):
 async def test_cancel_unknown_id_returns_false(db):
     """An unknown id is not a silent success — the caller must be able to tell."""
     assert await pending_outreach.cancel(db, "no-such-id") == (False, "unknown_id")
+
+
+@pytest.mark.parametrize("retained_store", [False, True])
+@pytest.mark.parametrize(
+    "channel,message",
+    [
+        ("telegram", "ordinary text"),
+        ("agent", "legacy untyped text"),
+        ("agent", "null"),
+        ("agent", '{"message":null}'),
+        ("agent", '{"peer_id":"another","epoch":"epoch","message":{"messageId":"id"}}'),
+        ("telegram", '{"peer_id":"alpha","epoch":"epoch","message":{"messageId":"id"}}'),
+    ],
+)
+async def test_cancel_preserves_legacy_and_unrelated_messages(db, retained_store, channel, message):
+    if retained_store:
+        await db.execute("CREATE TABLE peer_outbox(peer_id TEXT,epoch TEXT,message_id TEXT)")
+        await db.execute("INSERT INTO peer_outbox VALUES('alpha','epoch','id')")
+        await db.commit()
+    pid = await pending_outreach.enqueue(
+        db, message=message, category="notification", channel=channel
+    )
+    assert await pending_outreach.cancel(db, pid) == (True, "cancelled")
+
+
+@pytest.mark.parametrize("different", ["peer_id", "epoch", "messageId"])
+async def test_cancel_only_matches_the_exact_retained_identity(db, different):
+    await db.execute("CREATE TABLE peer_outbox(peer_id TEXT,epoch TEXT,message_id TEXT)")
+    await db.execute("INSERT INTO peer_outbox VALUES('alpha','epoch','id')")
+    await db.commit()
+    envelope = {"peer_id": "alpha", "epoch": "epoch", "message": {"messageId": "id"}}
+    target = envelope["message"] if different == "messageId" else envelope
+    target[different] = "different"
+    pid = await pending_outreach.enqueue(
+        db, message=json.dumps(envelope), category="notification", channel="agent"
+    )
+    assert await pending_outreach.cancel(db, pid) == (True, "cancelled")
 
 
 @pytest.mark.asyncio

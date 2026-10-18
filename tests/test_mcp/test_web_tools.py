@@ -53,8 +53,12 @@ class TestWebFetch:
             text="Hello world",
             title="Example",
             status_code=200,
+            client="scrapling",
         )
-        with patch("genesis.mcp.health.web_tools._get_fetcher") as mock:
+        with (
+            patch("genesis.mcp.health.web_tools._try_tinyfish_fetch", new_callable=AsyncMock, return_value=None),
+            patch("genesis.mcp.health.web_tools._get_fetcher") as mock,
+        ):
             mock.return_value.fetch = AsyncMock(return_value=mock_result)
             result = await _impl_web_fetch("example.com", "auto", 50000)
         assert result["content"] == "Hello world"
@@ -67,8 +71,12 @@ class TestWebFetch:
             text="Page content here",
             title="Test Page",
             status_code=200,
+            client="scrapling",
         )
-        with patch("genesis.mcp.health.web_tools._get_fetcher") as mock:
+        with (
+            patch("genesis.mcp.health.web_tools._try_tinyfish_fetch", new_callable=AsyncMock, return_value=None),
+            patch("genesis.mcp.health.web_tools._get_fetcher") as mock,
+        ):
             mock.return_value.fetch = AsyncMock(return_value=mock_result)
             result = await _impl_web_fetch("https://example.com", "auto", 50000)
 
@@ -80,6 +88,60 @@ class TestWebFetch:
         assert result["error"] is None
 
     @pytest.mark.asyncio
+    async def test_auto_reports_httpx_client_for_success(self):
+        mock_result = FetchResult(
+            url="https://example.com",
+            text="Page content here",
+            title="Example",
+            status_code=200,
+            client="httpx",
+        )
+        with (
+            patch("genesis.mcp.health.web_tools._try_tinyfish_fetch", new_callable=AsyncMock, return_value=None),
+            patch("genesis.mcp.health.web_tools._get_fetcher") as mock,
+        ):
+            mock.return_value.fetch = AsyncMock(return_value=mock_result)
+            result = await _impl_web_fetch("https://example.com", "auto", 50000)
+
+        assert result["backend_used"] == "httpx"
+
+    @pytest.mark.asyncio
+    async def test_auto_reports_scrapling_client_for_error(self):
+        mock_result = FetchResult(
+            url="https://example.com",
+            text="",
+            status_code=0,
+            error="connection failed",
+            client="scrapling",
+        )
+        with (
+            patch("genesis.mcp.health.web_tools._try_tinyfish_fetch", new_callable=AsyncMock, return_value=None),
+            patch("genesis.mcp.health.web_tools._get_fetcher") as mock,
+        ):
+            mock.return_value.fetch = AsyncMock(return_value=mock_result)
+            result = await _impl_web_fetch("https://example.com", "auto", 50000)
+
+        assert result["backend_used"] == "scrapling"
+
+    @pytest.mark.asyncio
+    async def test_explicit_httpx_forwards_client_and_reports_result(self):
+        mock_result = FetchResult(
+            url="https://example.com",
+            text="Page content here",
+            title="Example",
+            status_code=200,
+            client="httpx",
+        )
+        with patch("genesis.mcp.health.web_tools._get_fetcher") as mock:
+            mock.return_value.fetch = AsyncMock(return_value=mock_result)
+            result = await _impl_web_fetch("https://example.com", "httpx", 50000)
+
+        mock.return_value.fetch.assert_awaited_once_with(
+            "https://example.com", max_chars=50000, client="httpx",
+        )
+        assert result["backend_used"] == "httpx"
+
+    @pytest.mark.asyncio
     async def test_auto_escalates_to_crawl4ai_on_challenge(self):
         """When Scrapling gets a 403 and Ladder is unavailable, should try Crawl4AI."""
         challenge_result = FetchResult(
@@ -87,6 +149,7 @@ class TestWebFetch:
             text="cloudflare challenge",
             title="",
             status_code=403,
+            client="scrapling",
         )
         with (
             patch("genesis.mcp.health.web_tools._get_fetcher") as mock_fetcher,
@@ -117,6 +180,7 @@ class TestWebFetch:
             text="cloudflare challenge",
             title="",
             status_code=403,
+            client="scrapling",
         )
         with patch("genesis.mcp.health.web_tools._get_fetcher") as mock_fetcher:
             mock_fetcher.return_value.fetch = AsyncMock(return_value=challenge_result)
@@ -436,6 +500,7 @@ class TestFirecrawlBackend:
                     status_code=403,
                     truncated=False,
                     error=None,
+                    client="httpx",
                 )
 
         with (

@@ -96,6 +96,9 @@ async def init(rt: GenesisRuntime) -> None:
         formatter = ContentFormatter()
 
         channels: dict = {}
+        from genesis.channels.agent_adapter import AgentChannelAdapter
+
+        channels["agent"] = AgentChannelAdapter(rt._db)
         recipients: dict = {}
         for key, val in os.environ.items():
             if key.startswith("OUTREACH_RECIPIENT_") and val:

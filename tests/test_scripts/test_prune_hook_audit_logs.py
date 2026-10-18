@@ -241,7 +241,7 @@ def test_the_hygiene_groom_reads_the_store_knobs_without_executing_secrets_env()
     assert "_load_store_knob() {" in body, (
         "the loader is gone, so the scan below would silently cover the whole file"
     )
-    loader = body.split("_load_store_knob() {", 1)[-1].split("\n    }", 1)[0]
+    loader = body.split("_load_store_knob() {", 1)[-1].split("\n}", 1)[0]
     # CODE lines only. Scanning prose too makes any comment containing ". " fail this,
     # which trains the next person to delete the comment rather than keep the property.
     code = [

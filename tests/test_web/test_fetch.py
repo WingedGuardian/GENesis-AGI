@@ -64,6 +64,7 @@ async def test_fetch_html_extracts_text(fetcher: WebFetcher):
     assert "This is content" in result.text
     assert result.status_code == 200
     assert result.error is None
+    assert result.client == "httpx"
 
 
 @pytest.mark.asyncio
@@ -78,6 +79,7 @@ async def test_fetch_plain_text(fetcher: WebFetcher):
     assert "Plain text here" in result.text
     assert "<external-content" in result.text
     assert result.title == ""
+    assert result.client == "httpx"
 
 
 @pytest.mark.asyncio
@@ -90,6 +92,7 @@ async def test_fetch_json(fetcher: WebFetcher):
     fetcher._client = mock_client
     result = await fetcher.fetch("https://example.com/api")
     assert '"key"' in result.text
+    assert result.client == "httpx"
 
 
 @pytest.mark.asyncio
@@ -103,6 +106,7 @@ async def test_fetch_binary_returns_error(fetcher: WebFetcher):
     result = await fetcher.fetch("https://example.com/doc.pdf")
     assert result.error is not None
     assert "Unsupported" in result.error
+    assert result.client == "httpx"
 
 
 @pytest.mark.asyncio
@@ -117,6 +121,7 @@ async def test_fetch_http_error(fetcher: WebFetcher):
     result = await fetcher.fetch("https://example.com/missing")
     assert result.error is not None
     assert result.status_code == 404
+    assert result.client == "httpx"
 
 
 @pytest.mark.asyncio
@@ -128,6 +133,7 @@ async def test_fetch_connection_error(fetcher: WebFetcher):
     result = await fetcher.fetch("https://down.example.com")
     assert result.error is not None
     assert result.text == ""
+    assert result.client == "httpx"
 
 
 @pytest.mark.asyncio
@@ -141,6 +147,7 @@ async def test_fetch_truncation(fetcher: WebFetcher):
     assert result.truncated is True
     assert "x" * 50 in result.text
     assert "<external-content" in result.text
+    assert result.client == "httpx"
 
 
 @pytest.mark.asyncio
@@ -154,6 +161,22 @@ async def test_fetch_noise_stripping(fetcher: WebFetcher):
     assert "Navigation" not in result.text
     assert "Footer stuff" not in result.text
     assert "color:red" not in result.text
+    assert result.client == "httpx"
+
+
+@pytest.mark.asyncio
+@patch("genesis.web.fetch._HAS_SCRAPLING", True)
+async def test_httpx_can_be_forced_when_scrapling_is_available(fetcher: WebFetcher):
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=_make_httpx_response(SIMPLE_HTML))
+    fetcher._client = mock_client
+    with patch("genesis.web.fetch._ScraplingFetcher") as mock_scrapling:
+        mock_scrapling.get = AsyncMock(side_effect=AssertionError("Scrapling must not run"))
+        result = await fetcher.fetch("https://example.com", client="httpx")
+
+    mock_client.get.assert_awaited_once_with("https://example.com")
+    mock_scrapling.get.assert_not_awaited()
+    assert result.client == "httpx"
 
 
 # ── Scrapling path tests ─────────────────────────────────────────
@@ -170,6 +193,7 @@ async def test_scrapling_html_extracts_text(fetcher: WebFetcher):
     assert "Hello World" in result.text
     assert result.status_code == 200
     assert result.error is None
+    assert result.client == "scrapling"
     mock_fetcher.get.assert_awaited_once()
     call_kwargs = mock_fetcher.get.call_args
     assert call_kwargs.kwargs.get("impersonate") == "chrome" or call_kwargs[1].get("impersonate") == "chrome"
@@ -184,6 +208,7 @@ async def test_scrapling_status_error(fetcher: WebFetcher):
         result = await fetcher.fetch("https://blocked.example.com")
     assert result.error is not None
     assert result.status_code == 403
+    assert result.client == "scrapling"
 
 
 @pytest.mark.asyncio
@@ -194,6 +219,7 @@ async def test_scrapling_connection_error(fetcher: WebFetcher):
         result = await fetcher.fetch("https://down.example.com")
     assert result.error is not None
     assert result.text == ""
+    assert result.client == "scrapling"
 
 
 @pytest.mark.asyncio
@@ -205,6 +231,7 @@ async def test_scrapling_plain_text(fetcher: WebFetcher):
         result = await fetcher.fetch("https://example.com/plain")
     assert "Just plain text" in result.text
     assert "<external-content" in result.text
+    assert result.client == "scrapling"
 
 
 @pytest.mark.asyncio
@@ -216,3 +243,4 @@ async def test_scrapling_unsupported_content_type(fetcher: WebFetcher):
         result = await fetcher.fetch("https://example.com/doc.pdf")
     assert result.error is not None
     assert "Unsupported" in result.error
+    assert result.client == "scrapling"

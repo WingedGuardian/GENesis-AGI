@@ -125,15 +125,21 @@ def _build(tmp_path, sub: str, exe: str | None, *, marker=True, mode=0o755):
 
 
 @pytest.mark.parametrize(
-    ("build", "sub", "exe"),
+    ("build", "sub", "exe", "machine"),
     [
-        ("chromium", "chrome-linux64", "chrome"),  # linux-x64
-        ("chromium", "chrome-linux", "chrome"),  # linux-arm64
-        ("chromium-headless-shell", "chrome-headless-shell-linux64", "chrome-headless-shell"),
-        ("chromium-headless-shell", "chrome-linux", "headless_shell"),  # linux-arm64
+        ("chromium", "chrome-linux64", "chrome", "x86_64"),
+        ("chromium", "chrome-linux", "chrome", "aarch64"),
+        (
+            "chromium-headless-shell",
+            "chrome-headless-shell-linux64",
+            "chrome-headless-shell",
+            "x86_64",
+        ),
+        ("chromium-headless-shell", "chrome-linux", "headless_shell", "aarch64"),
     ],
 )
-def test_a_complete_build_is_ready(tmp_path, build, sub, exe):
+def test_a_complete_build_is_ready(tmp_path, monkeypatch, build, sub, exe, machine):
+    monkeypatch.setattr(chromium.platform, "machine", lambda: machine)
     d = _build(tmp_path, sub, exe)
     assert chromium.problem(build, d) is None
     assert chromium.executable(build, d) == d / sub / exe
@@ -159,3 +165,114 @@ def test_an_executable_without_the_marker_is_not_ready(tmp_path):
 def test_a_non_executable_file_is_not_the_executable(tmp_path):
     d = _build(tmp_path, "chrome-linux64", "chrome", mode=0o644)
     assert chromium.problem("chromium", d) is not None
+
+
+# ── the launches' readiness checks ────────────────────────────────────────────
+
+
+def test_package_dir_never_raises(monkeypatch):
+    """A stubbed module with no spec, or no module at all, reads as absent."""
+    assert chromium.package_dir("no_such_package_xyz") is None
+    monkeypatch.setitem(sys.modules, "stubbed_pkg_xyz", object())
+    assert chromium.package_dir("stubbed_pkg_xyz") is None
+
+
+def test_the_fallback_is_judged_where_the_driver_launches_from(tmp_path):
+    """Playwright's executable_path is <install dir>/<platform dir>/<executable>; the
+    build is judged at that install directory, so a host override that moves it
+    (revisionOverrides, PLAYWRIGHT_BROWSERS_PATH) is the package's answer, not ours."""
+    d = _build(tmp_path, "chrome-linux64", "chrome")
+    assert chromium.not_ready_at("patchright", "chromium", d / "chrome-linux64" / "chrome") is None
+
+
+@pytest.mark.parametrize("marker", [True, False])
+def test_an_incomplete_fallback_names_the_package_and_the_stack_script(
+    tmp_path, monkeypatch, marker
+):
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(tmp_path / "repo"))
+    d = _build(tmp_path, "chrome-linux64", None, marker=marker)
+    detail = chromium.not_ready_at("playwright", "chromium", d / "chrome-linux64" / "chrome")
+    assert detail.startswith("playwright's chromium at ")
+    assert str(tmp_path / "repo" / "scripts" / "install_browser_stack.sh") in detail
+
+
+def _dry_run_into(tmp_path):
+    return DRY_RUN.replace("/cache/ms-playwright", str(tmp_path / "ms-playwright"))
+
+
+def _install(tmp_path, name: str, sub: str, exe: str) -> None:
+    d = tmp_path / "ms-playwright" / name
+    (d / sub).mkdir(parents=True)
+    (d / sub / exe).write_bytes(b"\x7fELF")
+    (d / sub / exe).chmod(0o755)
+    (d / "INSTALLATION_COMPLETE").write_text("")
+
+
+def test_the_cli_asks_the_package_where_its_headless_shell_lives(tmp_path, monkeypatch):
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(tmp_path / "repo"))
+    run = _run(_dry_run_into(tmp_path))
+    _install(tmp_path, "chromium-1234", "chrome-linux64", "chrome")
+    detail = chromium.not_ready("patchright", headless=True, run=run)
+    assert "chromium-headless-shell at" in detail and "chromium_headless_shell-1234" in detail
+    assert run.calls[0][0][-3:] == ["install", "--dry-run", "chromium"]
+    _install(
+        tmp_path,
+        "chromium_headless_shell-1234",
+        "chrome-headless-shell-linux64",
+        "chrome-headless-shell",
+    )
+    assert chromium.not_ready("patchright", headless=True, run=run) is None
+
+
+def test_the_cli_leaves_an_unanswered_layout_to_the_launch(tmp_path):
+    assert chromium.not_ready("patchright", run=_run("", rc=1)) is None
+
+
+def test_browser_version_reads_the_version_a_package_launches(tmp_path):
+    pkg = tmp_path / "pkg"
+    (pkg / "driver" / "package").mkdir(parents=True)
+    (pkg / "driver" / "package" / "browsers.json").write_text(
+        '{"browsers": [{"name": "chromium", "revision": "1234", "browserVersion": "151.0.7922.34"}]}'
+    )
+    assert chromium.browser_version(pkg) == "151.0.7922.34"
+    assert chromium.browser_version(tmp_path / "missing") is None
+
+
+def test_not_ready_at_checks_the_selected_executable_not_a_sibling(tmp_path):
+    """A cache shared across platforms can hold another platform's build beside
+    the one Playwright selected."""
+    install = tmp_path / "chromium-1234"
+    (install / "chrome-linux").mkdir(parents=True)
+    other = install / "chrome-linux" / "chrome"
+    other.write_text("#!/bin/sh\n")
+    other.chmod(0o755)
+    (install / "INSTALLATION_COMPLETE").write_text("")
+    selected = install / "chrome-linux64" / "chrome"
+    assert chromium.not_ready_at("patchright", "chromium", selected)
+
+
+def test_not_ready_at_rejects_a_selected_executable_without_its_exec_bit(tmp_path):
+    install = tmp_path / "chromium-1234"
+    (install / "chrome-linux64").mkdir(parents=True)
+    exe = install / "chrome-linux64" / "chrome"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o644)
+    (install / "INSTALLATION_COMPLETE").write_text("")
+    assert chromium.not_ready_at("patchright", "chromium", exe)
+    exe.chmod(0o755)
+    assert chromium.not_ready_at("patchright", "chromium", exe) is None
+
+
+def test_another_platforms_build_is_not_this_hosts_executable(tmp_path, monkeypatch):
+    """Playwright launches only its own platform's path (registry executablePaths);
+    a shared cache can hold the other one beside it."""
+    monkeypatch.setattr(chromium.platform, "machine", lambda: "x86_64")
+    d = _build(tmp_path, "chrome-linux", "chrome")  # the linux-arm64 layout
+    assert chromium.executable("chromium", d) is None
+    assert chromium.problem("chromium", d)
+
+
+def test_an_unknown_machine_accepts_any_layout(tmp_path, monkeypatch):
+    monkeypatch.setattr(chromium.platform, "machine", lambda: "riscv64")
+    d = _build(tmp_path, "chrome-linux64", "chrome")
+    assert chromium.executable("chromium", d) == d / "chrome-linux64" / "chrome"
