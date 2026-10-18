@@ -1538,7 +1538,7 @@ def test_receivepack_helper_is_not_run_before_the_config_gate(tmp_path, monkeypa
     assert not marker.exists()
 
 
-@pytest.mark.parametrize("scenario", ["receivepack", "pushInsteadOf", "execpath"])
+@pytest.mark.parametrize("scenario", ["receivepack", "pushInsteadOf", "insteadOf", "execpath"])
 def test_unapproved_probe_does_not_run_push_side_programs(
     monkeypatch, tmp_path, capsys, scenario: str
 ) -> None:
@@ -1566,6 +1566,17 @@ def test_unapproved_probe_does_not_run_push_side_programs(
         config_text = (
             '[url "ssh://127.0.0.1/rewritten/"]\n'
             "    pushInsteadOf = https://127.0.0.1:1/\n"
+        )
+        hook_env["GIT_SSH_COMMAND"] = str(helper)
+    elif scenario == "insteadOf":
+        # The fetch-side rewrite moves a push too, and a raw destination has no
+        # remote section for `git remote get-url` to expand.
+        helper = tmp_path / "ssh-command"
+        _write_program_stub(helper, marker)
+        command = "git push https://127.0.0.1:1/original/repo.git HEAD"
+        config_text = (
+            '[url "ssh://127.0.0.1/rewritten/"]\n'
+            "    insteadOf = https://127.0.0.1:1/\n"
         )
         hook_env["GIT_SSH_COMMAND"] = str(helper)
     else:

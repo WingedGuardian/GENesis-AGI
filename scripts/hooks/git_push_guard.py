@@ -12681,6 +12681,12 @@ def _push_transport_precheck(urls: set[str], remote: str | None, cwd: str | None
     transports = [_push_url_transport(url) for url in urls]
     if any(transport is None for transport in transports):
         return False
+    if urls == {remote} and not _no_url_rewrite_rules(cwd):
+        # A raw destination is classified as typed, but git applies any
+        # insteadOf/pushInsteadOf rule inside the dry run, which could pick a
+        # transport this precheck never saw. A named remote's urls already
+        # carry the rewrite (`git remote get-url --push`).
+        return False
     base = ["git"] + (["-C", cwd] if cwd else [])
     if remote and not _looks_like_url(remote):
         got = _git_config_get(base, f"remote.{remote}.vcs", all_values=True)
