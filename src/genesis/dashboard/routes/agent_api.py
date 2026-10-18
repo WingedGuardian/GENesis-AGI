@@ -298,15 +298,21 @@ async def agent_card():
 
 
 @agent_api_bp.route(ROOT + "/health")
-def agent_health():
+@_async_route(timeout=15)
+async def agent_health():
+    from genesis.peers.readiness import evaluate
+
     runtime = _runtime()
     runner = getattr(runtime, "_direct_session_runner", None)
+    readiness = await evaluate(current_app)
+    if readiness["status"] != "healthy":
+        # Keep the readiness body through the existing 503 normalization gate.
+        readiness["code"] = "not_ready"
     return jsonify(
-        runtime_ready=True,
-        task_service_ready=runner is not None,
+        **readiness,
         active_tasks=len(getattr(runner, "_managed_cancel", {})),
         queue_depth=0,
-    )
+    ), 200 if readiness["status"] == "healthy" else 503
 
 
 @agent_api_bp.route(ROOT, defaults={"path": ""}, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

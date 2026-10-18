@@ -1,0 +1,1 @@
+- Expose current peer API readiness in health snapshots and periodic status, and return an unavailable response when an enabled API cannot accept conversations.

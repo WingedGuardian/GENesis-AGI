@@ -4007,7 +4007,7 @@
           // Fallback is more specific than the rate-limit that triggered it, so it
           // takes precedence over the RATE_LIMITED/THROTTLED branch below.
           if (cc.fallback?.is_fallback) {
-            return { state: "fallback", reason: `running on ${cc.fallback.fallback || 'a roster peer'} (Claude ${(cc.fallback.reason || 'unavailable').replace(/_/g, ' ')})` };
+            return { state: "fallback", reason: `last fallback: ${cc.fallback.fallback || 'a roster peer'} (home model ${(cc.fallback.reason || 'unavailable').replace(/_/g, ' ')})` };
           }
           if (rt === "RATE_LIMITED" || rt === "THROTTLED") {
             return { state: "degraded", reason: `CC is ${rt.toLowerCase().replace('_', '-')}` };

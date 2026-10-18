@@ -67,7 +67,7 @@ async def test_health_auth_and_withheld_card_audit_do_not_disclose(app, registry
     assert client.get(ROOT + "/health", headers=bad).status_code == 401
     with caplog.at_level("INFO"):
         response = client.get(ROOT + "/health", headers=headers)
-    assert response.status_code == 200 and response.json["task_service_ready"] is False
+    assert response.status_code == 503 and response.json["task_service_ready"] is False
     assert "GENESIS_PEER_MUSE_TOKEN" in caplog.text
     # Boolean comparison keeps values out of assertion diagnostics.
     assert not bool(headers["Authorization"][7:] in caplog.text)
@@ -104,7 +104,7 @@ async def test_slow_or_unterminated_body_is_never_read(app, registry, monkeypatc
     headers = await configure(registry, monkeypatch)
     client = app.test_client()
     for method, path, status in (
-        ("GET", "/health", 200),
+        ("GET", "/health", 503),
         ("POST", "/message:send", 503),
         ("GET", "/.well-known/agent-card.json", 503),
     ):
@@ -136,7 +136,7 @@ async def test_declared_oversize_body_refused_from_header_after_auth(app, regist
         headers=headers,
         environ_overrides=_body_environ(stream, MAX_BODY_BYTES),
     )
-    assert response.status_code == 200 and stream.reads == 0
+    assert response.status_code == 503 and stream.reads == 0
     # Authorization still precedes the size refusal.
     stream = _UnreadableBody()
     response = client.open(
@@ -160,4 +160,4 @@ async def test_agent_card_withheld_until_transport_installed(app, registry, monk
     assert response.status_code == 503
     assert response.json["code"] == "not_ready"
     assert "supportedInterfaces" not in response.json
-    assert client.get(ROOT + "/health", headers=headers).status_code == 200
+    assert client.get(ROOT + "/health", headers=headers).status_code == 503
