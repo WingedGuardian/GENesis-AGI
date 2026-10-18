@@ -4292,6 +4292,7 @@ class TestBrowserScreenshotUniquePath:
                 fh.write(b"\x89PNG")
 
         page.screenshot = AsyncMock(side_effect=_write)
+        page.frames = [_text_frame("Example")]  # the card check reads each frame
         return page
 
     @pytest.mark.asyncio
@@ -6906,8 +6907,20 @@ def _assert_redacted(result) -> None:
     assert REDACTED in text, text
 
 
+def _text_frame(text="", fails=False, detached=False):
+    """A frame whose visible text and field values read as ``text``."""
+    frame = MagicMock()
+    frame.evaluate = AsyncMock(
+        side_effect=RuntimeError("frame unreadable") if fails else None,
+        return_value=text,
+    )
+    frame.is_detached.return_value = detached
+    return frame
+
+
 def _card_page(url=f"https://shop.example/receipt/{_CARD}"):
     page = MagicMock()
+    page.frames = [_text_frame("")]
     page.url = url
     page.title = AsyncMock(return_value=f"Receipt for {_CARD_SPACED}")
     page.goto = AsyncMock()
@@ -6984,7 +6997,7 @@ class TestToolOutputIsRedacted:
         _assert_redacted(result)
 
     @pytest.mark.asyncio
-    async def test_screenshot(self, tmp_path):
+    async def test_screenshot_metadata(self, tmp_path):
         page = _card_page()
         page.screenshot = AsyncMock()
         browser._active_page = page
@@ -6992,6 +7005,54 @@ class TestToolOutputIsRedacted:
             result = await browser._impl_browser_screenshot()
         assert result["path"].startswith(str(tmp_path))  # the path is untouched
         _assert_redacted(result)
+
+    @pytest.mark.parametrize(
+        ("frames", "refusal"),
+        [
+            # the main frame shows a card
+            ([f"Saved card {_CARD_SPACED}"], "_REFUSE_CARD_SCREENSHOT"),
+            # one digit group per element: innerText puts each on its own line
+            (["Card\n4242\n4242\n4242\n4242\nPay"], "_REFUSE_CARD_SCREENSHOT"),
+            # a cross-origin payment iframe holds the field value
+            (["Checkout", _CARD], "_REFUSE_CARD_SCREENSHOT"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_screenshot_refuses_a_page_showing_a_card(self, tmp_path, frames, refusal):
+        page = _card_page()
+        page.frames = [_text_frame(t) for t in frames]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert result["error"] == getattr(browser, refusal)
+        page.screenshot.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_screenshot_refuses_when_a_frame_cannot_be_read(self, tmp_path):
+        page = _card_page()
+        page.frames = [_text_frame("ok"), _text_frame(fails=True)]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert result["error"] == browser._REFUSE_UNREAD_SCREENSHOT
+        page.screenshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_screenshot_skips_a_detached_frame_and_allows_ordinary_numbers(self, tmp_path):
+        page = _card_page()
+        page.frames = [
+            _text_frame("Order 100234567, call +1 555 123 4567, total 12.50, 2019 2020 2021"),
+            _text_frame(fails=True, detached=True),
+        ]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert "error" not in result, result
+        page.screenshot.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_snapshot(self):
@@ -7020,6 +7081,50 @@ class TestToolOutputIsRedacted:
         assert got["as_float"] == REDACTED
         assert got["count"] == 3
         assert "4242" not in got["json"]
+
+    @pytest.mark.asyncio
+    async def test_snapshot_with_a_segmented_card_field(self):
+        page = _card_page(url="https://shop.example/pay")
+        page.title = AsyncMock(return_value="Pay")
+        page.locator.return_value.aria_snapshot = AsyncMock(return_value=(
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- button "Pay"'
+        ))
+        browser._active_page = page
+        result = await browser._impl_browser_snapshot()
+        assert "4242" not in result["snapshot"]
+        assert REDACTED in result["snapshot"] and '- button "Pay"' in result["snapshot"]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            ["4242", "4242", "4242", "4242"],
+            {"p1": "4242", "p2": "4242", "p3": "4242", "p4": "4242"},
+            [["4242", "4242"], {"rest": ["4242", "4242"]}],
+            list(_CARD),
+            [_CARD[:8], _CARD[8:]],
+            [4242, 4242, 4242, 4242],
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_run_js_card_split_across_values(self, value):
+        page = _card_page()
+        page.evaluate = AsyncMock(return_value=value)
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("parts()")
+        assert result["result"] == REDACTED
+        assert "4242" not in str(result)
+
+    @pytest.mark.asyncio
+    async def test_run_js_colliding_keys_withhold_the_mapping(self):
+        page = _card_page()
+        page.evaluate = AsyncMock(return_value={_CARD: "a", REDACTED: "b"})
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("keys()")
+        assert result["result"] == REDACTED
 
     @pytest.mark.asyncio
     async def test_run_js_error(self):

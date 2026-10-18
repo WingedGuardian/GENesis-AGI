@@ -15,6 +15,7 @@ from genesis.security import card_redaction
 from genesis.security.card_redaction import (
     CARD_FILTER,
     CardRedactingFilter,
+    contains_card_text,
     redact_text,
     redact_value,
     redacted,
@@ -188,3 +189,87 @@ class TestFilter:
             card_redaction.logger.removeHandler(handler)
         assert len(records) == 1
         assert _CARD not in records[0] and REDACTED in records[0]
+
+
+class TestSplitAcrossStructure:
+    """Card digits split across rendering or structure, which a per-scalar
+    detector does not see."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Card\n4242\n4242\n4242\n4242\nPay",
+            '- textbox "Card number": "4242"\n  - textbox "Card number": "4242"\n'
+            '  - textbox "Card number": "4242"\n  - textbox "Card number": "4242"',
+            "4242 | 4242 | 4242 | 4242",
+            "4242  4242  4242  4242",
+            "4242\t4242\t4242\t4242",
+            "4 2 4 2 4 2 4 2 4 2 4 2 4 2 4 2",
+            "[4][2][4][2][4][2][4][2][4][2][4][2][4][2][4][2]",
+            # a checkout: quantity before, expiry, security code and ZIP after
+            '- text: Qty 3\n  - textbox "Card": "4242"\n  - textbox "Card": "4242"\n'
+            '  - textbox "Card": "4242"\n  - textbox "Card": "4242"\n'
+            '  - textbox "MM": "05"\n  - textbox "YY": "29"\n  - textbox "CVC": "123"\n'
+            '  - textbox "ZIP": "94110"',
+        ],
+    )
+    def test_split_text_is_found_and_redacted(self, text):
+        assert contains_card_text(text)
+        out = redact_text(text)
+        assert REDACTED in out
+        assert not contains_card_text(out)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Call +1 555 123 4567 or +1 555 987 6543",
+            "Years 2019\n2020\n2021\n2022\n2023\n2024",
+            "Order #100234567 total 12.50, qty 3",
+            "Price 4.242 4242 4242 4242",
+            "id 3f4a2b1c9d8e7f6a5b4c3d2e1f0a",
+            '- textbox "Card number part 1": "4242"\n- textbox "Card number part 2": "4242"',
+            # inside a list of 4-digit numbers: the detector's table rule
+            "1999\n4242\n4242\n4242\n4242\n1888",
+        ],
+    )
+    def test_non_cards_and_stated_limits_stay(self, text):
+        assert redact_text(text) == text
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            ["4242", "4242", "4242", "4242"],
+            ["x", "4242", "4242", "4242", "4242", 5],
+            {"a": "4242", "b": "4242", "c": "4242", "d": "4242"},
+            [["4242", "4242"], [{"z": "4242"}, "4242"]],
+            list(_CARD),
+            [_CARD[:8], _CARD[8:]],
+            [4242, 4242, 4242, 4242],
+        ],
+    )
+    def test_container_hiding_a_card_is_withheld(self, value):
+        assert redact_value(value) == REDACTED
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            [2019, 2020, 2021, 2022, 2023, 2024],
+            {"x": 120, "y": 340, "w": 800, "h": 600},
+            ["12", "34", "56", "78", "90", "12", "34", "56", "78", "90"],
+        ],
+    )
+    def test_containers_of_ordinary_numbers_stay(self, value):
+        assert redact_value(value) == value
+
+    def test_colliding_keys_withhold_the_mapping(self):
+        assert redact_value({_CARD: 1, REDACTED: 2}) == REDACTED
+        assert redact_value({_CARD: 1, "4242 4242 4242 4242": 2}) == REDACTED
+        assert redact_value({_CARD: 1, "other": 2}) == {REDACTED: 1, "other": 2}
+
+    def test_a_withheld_dict_result_keeps_the_dict_shape(self):
+        @redacted
+        def _impl_tool():
+            return {"a": "4242", "b": "4242", "c": "4242", "d": "4242"}
+
+        assert "spelled a card number" in _impl_tool()["error"]

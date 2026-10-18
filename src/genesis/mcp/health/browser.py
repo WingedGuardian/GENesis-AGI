@@ -38,9 +38,9 @@ from fastmcp import Context
 from genesis.browser import chromium, engine, packages, profile_backup
 from genesis.browser.types import CAMOUFOX_PROFILE_DIR, BrowserLayer
 from genesis.mcp.health import mcp
-from genesis.security.card_redaction import CARD_FILTER
+from genesis.security.card_redaction import CARD_FILTER, contains_card_text, redact_text
 from genesis.security.card_redaction import redacted as _redacted
-from genesis.security.card_shapes import contains_card_number, redact
+from genesis.security.card_shapes import contains_card_number
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ def _ts_log_write(msg: str) -> None:
 
         ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         with open(_TS_LOG_PATH, "a") as f:
-            f.write(f"{ts} {redact(msg)}\n")
+            f.write(f"{ts} {redact_text(msg)}\n")
             f.flush()
     except Exception:
         pass  # debug logging must never crash the tool
@@ -1772,7 +1772,7 @@ async def _with_tool_timeout(
         _active_page = None
         # Outside @_redacted: the operation names the caller's selector or key.
         return {
-            "error": redact(
+            "error": redact_text(
                 f"{operation} timed out after {timeout_s:.0f}s. {note}"
                 "Browser state was reset — call browser_navigate to resume."
             )
@@ -2506,14 +2506,14 @@ async def _send_turnstile_alert(page_url: str) -> None:
             severity=AlertSeverity.WARNING,
             title="CAPTCHA Challenge Detected",
             body=(
-                f"Browser at {redact(page_url)} hit a Cloudflare challenge. "
+                f"Browser at {redact_text(page_url)} hit a Cloudflare challenge. "
                 f"Auto-resolve and VNC click both failed after multiple attempts. "
                 f"Genesis will retry on next navigation.\n\n"
                 f"VNC available at: {vnc_url}"
             ),
         )
         await channel.send(alert)
-        logger.info("CAPTCHA alert sent to Telegram for %s", redact(page_url))
+        logger.info("CAPTCHA alert sent to Telegram for %s", redact_text(page_url))
     except Exception:
         logger.warning("Failed to send CAPTCHA Telegram alert", exc_info=True)
 
@@ -4273,6 +4273,57 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
             return {"error": f"Upload failed on '{selector}': {e}"}
 
 
+# A screenshot is pixels: text redaction cannot reach a card number drawn in
+# it. Before capturing, the visible text and the form-field values of every
+# frame are read (open shadow roots included) and checked, split readings
+# too; a card number anywhere refuses the capture and no file is written. A
+# frame that cannot be read refuses it as well, except one already detached.
+_PAGE_TEXT_JS = """() => {
+  const out = [document.body ? document.body.innerText : ''];
+  const visit = (root) => {
+    for (const el of root.querySelectorAll('*')) {
+      if (el.matches('input, textarea, select')) out.push(String(el.value || ''));
+      if (el.shadowRoot) {
+        for (const child of el.shadowRoot.children) out.push(child.innerText || '');
+        visit(el.shadowRoot);
+      }
+    }
+  };
+  visit(document);
+  return out.join('\\n');
+}"""
+_SCREENSHOT_FRAME_READ_S: float = 5.0
+_REFUSE_CARD_SCREENSHOT = (
+    "Refused: the page shows what looks like a payment card number, so no "
+    "screenshot was taken. Use browser_snapshot, which redacts it."
+)
+_REFUSE_UNREAD_SCREENSHOT = (
+    "Refused: a frame of the page could not be read to check it for a payment "
+    "card number, so no screenshot was taken."
+)
+
+
+async def _screenshot_refusal(page) -> str | None:
+    """A fixed refusal when the page may show a card number, else None."""
+    texts = []
+    for frame in list(page.frames):
+        try:
+            text = await asyncio.wait_for(
+                frame.evaluate(_PAGE_TEXT_JS), timeout=_SCREENSHOT_FRAME_READ_S
+            )
+        except Exception:
+            if frame.is_detached():
+                continue
+            logger.warning("Screenshot card check could not read a frame", exc_info=True)
+            return _REFUSE_UNREAD_SCREENSHOT
+        texts.append(text if isinstance(text, str) else str(text))
+    if not texts:
+        return _REFUSE_UNREAD_SCREENSHOT
+    if contains_card_text("\n".join(texts)):
+        return _REFUSE_CARD_SCREENSHOT
+    return None
+
+
 @_redacted
 async def _impl_browser_screenshot() -> dict:
     """Take a screenshot of the current page."""
@@ -4285,6 +4336,9 @@ async def _impl_browser_screenshot() -> dict:
             return health
         page = _active_page
     try:
+        refusal = await _screenshot_refusal(page)
+        if refusal:
+            return {"error": refusal, "url": page.url}
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         # Unique per call: consecutive captures must not overwrite one another
         # (a session capturing 8 pages kept only the last one). The timestamp
@@ -4822,6 +4876,9 @@ async def browser_screenshot() -> dict:
     call gets its own file, so consecutive screenshots don't overwrite one
     another and sort chronologically) and returns the path. Always read the
     returned "path" — never reconstruct it. Use the Read tool to view it.
+
+    Refused, with no file written, when the page's text or form values show a
+    payment card number (in any frame), or a frame cannot be read to check.
     """
     return await _with_tool_timeout(
         _impl_browser_screenshot(), 30.0, "browser_screenshot"
