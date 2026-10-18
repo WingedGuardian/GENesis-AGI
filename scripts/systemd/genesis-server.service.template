@@ -47,6 +47,10 @@ ExecStartPre=-/bin/sh -c 'd="$$SQLITE_TMPDIR"; mkdir -p "$$d"; [ -d "$$d" ] && [
 Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
 MemoryMax=80%
 LimitNOFILE=65536
+# The server holds the payment vault's key while it is unlocked (payments/vault_service.py).
+# The soft core limit is already 0; this pins the hard limit too, so nothing in the
+# process tree can raise it and dump a core holding the key.
+LimitCORE=0
 # 100, not a negative value, and REPLACING the old -500 rather than deleting it.
 #
 # MEASURED 2026-09-08: this unit declared OOMScoreAdjust=-500 while the live

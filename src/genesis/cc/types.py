@@ -337,6 +337,9 @@ class CCInvocation:
     timeout_s: int = 7200
     allowed_tools: list[str] | None = None
     disallowed_tools: list[str] | None = None
+    # Positive removal of ALL built-in tools (--tools ""). An empty allowlist
+    # is not equivalent, especially under skip-permissions.
+    disable_tools: bool = False
     skip_permissions: bool = False
     skill_tags: list[str] | None = None
     working_dir: str | None = None
@@ -458,6 +461,10 @@ class CCInvocation:
         compare=False,
         repr=False,
     )
+
+    # --no-session-persistence: disposable print-mode checks must not leave
+    # transcripts in CC's separate project tree. Actual tasks keep persistence.
+    no_session_persistence: bool = False
 
     def __post_init__(self) -> None:
         # Producer-side loud validation of the WS-3 origin (the env READER is

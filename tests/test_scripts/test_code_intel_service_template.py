@@ -44,16 +44,9 @@ def test_runner_path_includes_cbm_and_gitnexus_dirs() -> None:
     )
 
 
-def test_cbm_launcher_default_dir_is_on_runner_path() -> None:
-    """The launcher's default binary dir must be a segment of the runner PATH.
-
-    Guards against the two drifting apart: if the vendor default install dir in
-    run-codebase-memory ever changes, this fails until the unit PATH follows.
-    """
+def test_managed_launcher_does_not_select_a_path_provider() -> None:
+    """Frontend uses managed authority; legacy runner PATH is not its binary pin."""
     launcher = _CBM_LAUNCHER.read_text(encoding="utf-8")
-    # run-codebase-memory:  BINARY="${CODEBASE_MEMORY_MCP_BIN:-${HOME}/.local/bin/codebase-memory-mcp}"
-    assert "${HOME}/.local/bin/codebase-memory-mcp" in launcher, (
-        "cbm launcher default path changed — update this test and the unit PATH together."
-    )
-    # Template uses __HOME__ where the launcher uses ${HOME}; the tail dir must match.
-    assert "__HOME__/.local/bin" in _path_line()
+    assert 'scripts/codebase_managed.py" launch' in launcher
+    assert "CODEBASE_MEMORY_MCP_BIN" not in launcher
+    assert "command -v codebase-memory-mcp" not in launcher

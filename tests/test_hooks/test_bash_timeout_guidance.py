@@ -22,12 +22,11 @@ assertion in this file while returning early — and therefore staying SILENT �
 `run_in_background` was true, which is the input that actually killed a deploy.
 A text assertion cannot see that, so the regression is pinned by running the guard.
 
-SCOPE OF THIS FILE. It covers what the advice SAYS and whether the guard fires at
-all. It deliberately does NOT cover whether a command has already been detached:
-deciding that needs real parsing of both shell and systemd-run option grammar, and
-is tracked separately in issue #2088. The guard consequently also fires on an
-already-detached launch and on a read of one of these files — over-firing, which
-costs a line, rather than silence, which cost three deploys.
+SCOPE OF THIS FILE. It covers what the advice SAYS, and WHEN the guard fires:
+on a command that can run update.sh, and not on one that only reads it (#2088).
+It deliberately does NOT cover whether a launch has already been detached:
+deciding that needs systemd-run's option grammar, an open set, so a detached
+launch still gets the advisory. That is the moment the advice applies.
 """
 
 from __future__ import annotations
@@ -36,6 +35,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -45,7 +45,7 @@ _REPO = Path(__file__).resolve().parents[2]
 # The Bash tool's documented hard maximum, in milliseconds.
 _CEILING_MS = 600_000
 
-_HOOK = Path(".claude/hooks/cc-deploy-timeout-guard")
+_HOOK = Path("scripts/hooks/deploy_timeout_advisory.py")
 _SKILL = Path(".claude/skills/genesis-development/SKILL.md")
 _ADVICE_SURFACES = (_HOOK, _SKILL)
 
@@ -336,17 +336,21 @@ class TestDeployAdviceIsDetachment:
             )
 
 
-@pytest.mark.skipif(shutil.which("jq") is None, reason="hook requires jq")
 class TestDeployGuardFires:
-    """The guard, executed. jq ships on ubuntu-latest, so this does not skip in CI."""
+    """The guard, executed: whether it fires, and on what."""
 
     HOOK = _REPO / _HOOK
     DEPLOY = "bash scripts/update.sh"
 
     def _run(self, command: str, background: bool = False) -> str:
         proc = subprocess.run(
-            ["bash", str(self.HOOK)],
-            input=json.dumps({"tool_input": {"command": command, "run_in_background": background}}),
+            [sys.executable, str(self.HOOK)],
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command, "run_in_background": background},
+                }
+            ),
             capture_output=True,
             text=True,
             timeout=30,
@@ -378,9 +382,7 @@ class TestDeployGuardFires:
         /tmp is small. The shell opens the redirect BEFORE exec'ing update.sh, so a
         missing directory kills the unit instantly — and --collect then leaves no
         trace, which is the exact invisible failure this advisory warns about."""
-        ctx = json.loads(self._run(self.DEPLOY))["hookSpecificOutput"][
-            "additionalContext"
-        ]
+        ctx = json.loads(self._run(self.DEPLOY))["hookSpecificOutput"]["additionalContext"]
         assert "mkdir -p ~/tmp" in ctx, (
             "prescribed command does not create its log directory; if ~/tmp is "
             "absent the unit dies on the redirect and leaves nothing to diagnose"
@@ -396,9 +398,9 @@ class TestDeployGuardFires:
         )
 
     def test_silent_on_bootstrap(self):
-        """bootstrap.sh calls sudo unconditionally (:165) and its bare `sudo mkdir`
-        at :813 is fatal under `set -e`. Detached it has no auth channel, so on any
-        install where sudo prompts it aborts partway through configuring the machine.
+        """bootstrap.sh calls sudo unconditionally and a bare `sudo mkdir` in it is
+        fatal under `set -e`. Detached it has no auth channel, so on any install
+        where sudo prompts it aborts partway through configuring the machine.
         `update.sh` has NO sudo calls, which is why it is the only script covered."""
         assert self._run("bash scripts/bootstrap.sh").strip() == "", (
             "guard fired on bootstrap.sh — its only advice is detachment, which "
@@ -413,6 +415,14 @@ class TestDeployGuardFires:
         assert payload["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
         assert payload["hookSpecificOutput"]["additionalContext"].strip()
 
+    def test_advisory_never_decides_a_permission(self):
+        """`permissionDecision: "allow"` tells Claude Code to skip the permission
+        prompt (plan_confidence_reminder.py records the bundle read). An advisory
+        must state no decision at all, or it auto-approves the deploy it warns
+        about on installs where prompts are on."""
+        payload = json.loads(self._run(self.DEPLOY))
+        assert "permissionDecision" not in payload["hookSpecificOutput"]
+
     def test_advisory_prescribes_detachment_not_the_remedy_that_failed(self):
         ctx = json.loads(self._run(self.DEPLOY))["hookSpecificOutput"]["additionalContext"]
         assert "Use run_in_background: true" not in ctx
@@ -424,38 +434,213 @@ class TestDeployGuardFires:
 
     def test_advisory_keeps_shell_syntax_literal(self):
         """The prescribed command contains $HOME, $PATH and $(date …) that must
-        reach the reader UNEXPANDED. A double-quoted bash assignment would have
-        expanded them into the hook's own environment."""
+        reach the reader UNEXPANDED."""
         ctx = json.loads(self._run(self.DEPLOY))["hookSpecificOutput"]["additionalContext"]
         assert "$HOME/genesis" in ctx
         assert '"$PATH"' in ctx
         assert "$(date " in ctx
 
     def test_always_exits_zero_on_hostile_input(self):
-        for payload in ("", "not json", "{}", '{"tool_input":{}}'):
+        for payload in ("", "not json", "{}", '{"tool_input":{}}', "[1]", '{"tool_input":3}'):
             proc = subprocess.run(
-                ["bash", str(self.HOOK)],
+                [sys.executable, str(self.HOOK)],
                 input=payload,
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
             assert proc.returncode == 0, f"non-zero exit on payload: {payload!r}"
+            assert proc.stdout.strip() == "", f"output on hostile payload: {payload!r}"
 
-    def test_always_exits_zero_under_inherited_errexit(self):
-        """`read -d ''` returns non-zero at EOF. bash imports errexit from an
-        exported SHELLOPTS, and settings.json spawns this hook as `bash <path>`."""
-        import os
+    # Every form below can run update.sh. Missing one is the expensive direction:
+    # the advisory exists because three deploys were killed. The first eight are
+    # the forms a review proved silent under a rule that judged only the segments
+    # naming the script.
+    LAUNCHES = (
+        "echo ./scripts/update.sh | bash",
+        "cat scripts/update.sh | bash",
+        "bash < scripts/update.sh",
+        "bash <<< './scripts/update.sh'",
+        "S=./scripts/update.sh; $S",
+        "F=scripts/update.sh; bash $F",
+        "ls scripts/update.sh | xargs bash",
+        "cat scripts/update.sh > >(bash)",
+        "./scripts/update.sh",
+        "scripts/update.sh --post-merge",
+        "cd ~/genesis && ./scripts/update.sh > ~/tmp/d.log 2>&1",
+        "bash scripts/update.sh",
+        "bash /opt/checkout/scripts/update.sh",
+        "bash -xc './scripts/update.sh'",
+        "nohup ./scripts/update.sh &",
+        "timeout 600 ./scripts/update.sh",
+        "setsid ./scripts/update.sh",
+        "env -i X=1 timeout 30 bash /opt/checkout/scripts/update.sh",
+        "sudo -u svc ./scripts/update.sh",
+        "eval './scripts/update.sh'",
+        "source scripts/update.sh",
+        ". scripts/update.sh",
+        "git -c alias.d='!./scripts/update.sh' d",
+        "bash <<'EOF'\n./scripts/update.sh\nEOF",
+        "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['scripts/update.sh'])\nPY",
+        "python3 -c \"import os; os.system('scripts/update.sh')\"",
+        "systemd-run --user --collect --unit d --working-directory=/opt/checkout "
+        "/bin/bash -c 'exec ./scripts/update.sh > /tmp/d.log 2>&1'",
+        "systemd-run --user --collect --property KillMode=process /bin/bash "
+        "/opt/checkout/scripts/update.sh",
+        # The parser reads this as a program named `-u)` and reports no blind
+        # spot; a rule that silenced unrecognised programs missed a real deploy.
+        "X=$(id -u) systemd-run --user --collect --unit d /bin/bash "
+        "/opt/checkout/scripts/update.sh 2>&1 | tail -5",
+        'XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \\\n'
+        "  systemd-run --user --collect --unit d \\\n"
+        "  /bin/bash -c 'mkdir -p ~/tmp; exec ./scripts/update.sh > ~/tmp/d.log 2>&1'",
+        # A pre-push review constructed these against an earlier draft whose
+        # sub-rules decided when to FIRE from short lists; each was silent.
+        "systemd-run --user --pipe --wait bash <<'EOF'\n./scripts/update.sh\nEOF",
+        "incus exec c -- bash <<'EOF'\n./scripts/update.sh\nEOF",
+        "docker exec -i c bash <<'EOF'\n./scripts/update.sh\nEOF",
+        "flock /tmp/l bash <<'EOF'\n./scripts/update.sh\nEOF",
+        "su - svc <<'EOF'\n./scripts/update.sh\nEOF",
+        "sudo -s <<'EOF'\n./scripts/update.sh\nEOF",
+        "cat > /tmp/n <<'END-NOTES'\nnotes\nEND-NOTES\n./scripts/update.sh",
+        "(( a << b ))\n./scripts/update.sh",
+        "perl -e 'system(\"./scripts/update.sh\")'",
+        "ruby -e 'system(\"./scripts/update.sh\")'",
+        "python3 -c \"import os; os.popen('./scripts/update.sh').read()\"",
+        "python3 -c \"from os import system; system('./scripts/update.sh')\"",
+        "python3 - <<'PY'\nimport os\nos.popen('./scripts/update.sh').read()\nPY",
+        "bash -o pipefail < scripts/update.sh",
+        "bash -euo pipefail < scripts/update.sh",
+        "bash -s x < scripts/update.sh",
+        "bash scripts/update.sh -n",
+        "cat scripts/update.sh | bash; bash <<'EOF'\necho hi\nEOF",
+        "ssh host 'bash -s' < scripts/update.sh",
+        "cat scripts/update.sh | ssh host",
+        "at now <<< ./scripts/update.sh",
+        "S=./scripts/update.sh bash <<'EOF'\n\"$S\"\nEOF",
+        "awk 'BEGIN { system(\"./scripts/update.sh\") }'",
+        # A third pass found these through readers added in the second.
+        "echo \"import os; os.system('./scripts/update.sh')\" | python3",
+        "python3 <<< \"import os; os.system('./scripts/update.sh')\"",
+        "source /dev/stdin < scripts/update.sh",
+        "cat scripts/update.sh | . /dev/fd/0",
+        "sudo -s < scripts/update.sh",
+        "git fetch --upload-pack=./scripts/update.sh /tmp/repo",
+        "git grep -O./scripts/update.sh foo",
+        "git config alias.d '!./scripts/update.sh' && git d",
+        "bash -n +n scripts/update.sh",
+        "ssh host bash -s 0< scripts/update.sh",
+        # The secondary review found these: the path rides in a variable, so
+        # no segment names the script.
+        "V=scripts/update.sh; python3 -c \"import os; os.system('$V')\"",
+        "U=scripts/update.sh\npython3 -c \"import subprocess; subprocess.run(['bash', '$U'])\"",
+        "V=scripts/update.sh; perl -e 'system(\"$V\")'",
+        "V=scripts/update.sh; node -e \"require('child_process').spawnSync('$V')\"",
+        'V=scripts/update.sh; su -c "$V" svc',
+        "V=scripts/update.sh; systemd-run --user /bin/bash -c '\"$V\"'",
+        "for f in scripts/update.sh; do python3 -c \"import os; os.system('$f')\"; done",
+        # Review round 1: a reader whose option value runs the script, and a
+        # heredoc receiver's explicit operand.
+        "git fetch --upload-pack ./scripts/update.sh /tmp/repo",
+        "git grep -O ./scripts/update.sh needle",
+        "git ls-remote -u ./scripts/update.sh origin",
+        "sort --compress-program=./scripts/update.sh -S 1K big",
+        "sort --compress-program ./scripts/update.sh -S 1K big",
+        "bash --rcfile ./scripts/update.sh -i -c ':'",
+        "bash --init-file scripts/update.sh -i",
+        "bash scripts/update.sh <<'EOF'\nhello\nEOF",
+        # Class audit after review round 1.
+        "python3 -m genesis.hostmetrics run --name d -- ./scripts/update.sh",
+        "~/genesis/.venv/bin/python -m genesis.hostmetrics run -- ./scripts/update.sh",
+        "python3 runner.py ./scripts/update.sh",
+        "node runner.js ./scripts/update.sh",
+        "awk -f prog.awk scripts/update.sh",
+        "sort -S 1K --compress-prog ./scripts/update.sh big.txt",
+        "git fetch --upload-p ./scripts/update.sh /tmp/repo",
+        "git ls-remote --upload ./scripts/update.sh /tmp/repo",
+        "rg --hostname-bin ./scripts/update.sh --hyperlink-format 'file://{host}{path}' x",
+        "cat x # see <<EOF\n./scripts/update.sh\nEOF",
+        "bash -c 'systemd-run --user --collect \"$1\"' _ ./scripts/update.sh",
+        "cat x; <<'EOF' python3\nimport os; os.system('./scripts/update.sh')\nEOF",
+        # The heredoc's receiver spawns from its own -c text.
+        "python3 -c \"import sys, os; os.system(sys.stdin.read())\" <<'EOF'\n./scripts/update.sh\nEOF",
+        # Approved terminal repair: expansion precedes a data reader, shell
+        # noexec can be cleared, and ext names its helper explicitly in argv.
+        "cat <<EOF\n$(./scripts/update.sh)\nEOF",
+        "cat <<EOF\n`./scripts/update.sh`\nEOF",
+        "bash -n +o noexec scripts/update.sh",
+        "bash -o noexec +o noexec scripts/update.sh",
+        "GIT_ALLOW_PROTOCOL=ext git ls-remote 'ext::./scripts/update.sh %S repo'",
+        "GIT_ALLOW_PROTOCOL=ext git fetch 'ext::./scripts/update.sh %S repo'",
+        "cat <(./scripts/update.sh)",
+        'printf "%s" "$(: <(./scripts/update.sh); wait)"',
+        "bash -c 'cat <(./scripts/update.sh)'",
+    )
 
+    @pytest.mark.parametrize("command", LAUNCHES)
+    def test_fires_on_every_launch_form(self, command):
+        assert self._run(command).strip(), f"silent on a command that runs update.sh: {command!r}"
+
+    # Reads, edits and mentions. None can run the script, and every one of these
+    # shapes drew the full advisory under the old substring match.
+    READS = (
+        "printf '%s' '<(./scripts/update.sh)'",
+        'printf "%s" "<(./scripts/update.sh)"',
+        "printf '%s' '>(./scripts/update.sh)'",
+        'printf "%s" ">(./scripts/update.sh)"',
+        "cat <<'EOF'\n$(./scripts/update.sh)\nEOF",
+        "cat <<\\EOF\n$(./scripts/update.sh)\nEOF",
+        "bash -o noexec scripts/update.sh",
+        "bash +n -o noexec scripts/update.sh",
+        "bash --norc -o noexec scripts/update.sh",
+        "sed -n '100,140p' scripts/update.sh",
+        "grep -n 'HEALTH' scripts/update.sh",
+        "grep -rn 'update.sh' scripts",
+        "git log --oneline -- scripts/update.sh",
+        "git diff origin/main -- scripts/update.sh",
+        "cat scripts/update.sh | head -40",
+        "wc -l scripts/update.sh && shellcheck -S warning scripts/update.sh",
+        "bash -n scripts/update.sh && echo ok",
+        "bash -c 'cat scripts/update.sh'",
+        "python3 -c \"print(open('scripts/update.sh').read()[:80])\"",
+        "python3 - <<'PY'\nimport pathlib\nprint(pathlib.Path('scripts/update.sh').read_text()[:80])\nPY",
+        "cat > notes.md <<'EOF'\nupdate.sh runs subprocess calls; see scripts/update.sh\nEOF",
+        "source .venv/bin/activate && grep -c x scripts/update.sh",
+        'for f in scripts/update.sh scripts/bootstrap.sh; do wc -l "$f"; done',
+        "gh pr list --search 'update.sh in:title'",
+        "gh pr comment 1 --body 'On second look, update.sh\nRather than that, read it.'",
+        "cp scripts/update.sh /tmp/update.sh.bak",
+        "git commit -m \"$(cat <<'EOF'\nfix: scripts/update.sh rollback\nEOF\n)\"",
+        "gh pr create --title t --body \"$(cat <<'EOF'\nTouches scripts/update.sh.\nEOF\n)\"",
+        "awk 'NR<5' scripts/update.sh",
+        "git log -c -- scripts/update.sh",
+    )
+
+    @pytest.mark.parametrize("command", READS)
+    def test_silent_on_reads_and_mentions(self, command):
+        assert self._run(command).strip() == "", f"fired on a read: {command!r}"
+
+    def test_fires_when_the_parse_is_blind(self):
+        """An over-long command cannot be parsed; silence would need proof that
+        nothing in it runs the script, and there is none."""
+        assert self._run("echo x; " * 9000 + "grep x scripts/update.sh").strip()
+
+    def test_fires_when_shell_parse_cannot_be_imported(self, tmp_path):
+        """Degrade = FIRE: without the parser there is no proof of a read."""
+        hooks = tmp_path / "scripts" / "hooks"
+        hooks.mkdir(parents=True)
+        shutil.copy(self.HOOK, hooks / self.HOOK.name)
+        for name in ("hook_input.py", "hook_output.py"):
+            src = self.HOOK.parent / name
+            if src.exists():
+                shutil.copy(src, hooks / name)
+        (hooks / "shell_parse.py").write_text("raise ImportError('broken on purpose')\n")
         proc = subprocess.run(
-            ["bash", str(self.HOOK)],
-            input=json.dumps({"tool_input": {"command": self.DEPLOY}}),
+            [sys.executable, str(hooks / self.HOOK.name)],
+            input=json.dumps({"tool_input": {"command": "grep x scripts/update.sh"}}),
             capture_output=True,
             text=True,
             timeout=30,
-            env={**os.environ, "SHELLOPTS": "errexit"},
         )
-        assert proc.returncode == 0, (
-            "hook exited non-zero under inherited errexit; a PreToolUse hook's "
-            "non-zero exit is not a no-objection signal"
-        )
+        assert proc.returncode == 0
+        assert proc.stdout.strip(), "silent while unable to parse — degrade must fire"
