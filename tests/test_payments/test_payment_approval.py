@@ -449,6 +449,115 @@ async def test_a_cancelled_requester_gets_no_grant(make, db):
     assert (await _events(db))[-1] == "approval_refused"
 
 
+# -- round 1 review: the digit-run guard, value-light rows, the healing send -------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "4111\u20131111\u20131111\u20131111",  # en dash
+        "4111\u20141111\u20141111\u20141111",  # em dash
+        "4242\u00a04242\u00a04242\u00a04242",  # no-break space
+        "4222222222222",  # 13-digit Visa, outside the detector's grammar
+        "\uff14\uff12\uff14\uff12" * 3,  # fullwidth digits: str.isdigit is True
+        "4242 4242 4242 4242",  # Stripe's public test number
+        "Order 1234-5678-9012",  # 12 digits in a run: refused on purpose (fails safe)
+    ],
+)
+async def test_a_digit_run_is_refused_in_fields_and_audit_detail(make, db, value):
+    assert "\uff14".isdigit()
+    registry, bot, _ctx = make(timeout_s=0.05)  # a send that slips through expires fast
+    assert await registry.request({"Note": value}) == ap.REFUSED
+    assert await registry.request(FIELDS, audit_detail={"page": value}) == ap.REFUSED
+    assert bot.sent == []
+    assert value not in json.dumps(await audit.list_recent(db, 100), ensure_ascii=False)
+
+
+@pytest.mark.parametrize("value", ["12.00 USD", "card 4242", "2026-10-18", "ab12345678901cd"])
+def test_short_or_letter_broken_digits_pass(value):
+    assert not ap.holds_long_digit_run(value)
+
+
+async def test_the_audit_row_is_value_light(make, db):
+    registry, bot, ctx = make(timeout_s=0.05)
+    shown = {"Merchant": "example.test", "Page": "Checkout - Example Store"}
+    facts = {
+        "card_ref": "c-1",
+        "host": "example.test",
+        "amount": "12.00 USD",
+        "last4": "4242",
+        "requester": {"pid": 7, "comm": "python"},
+    }
+    assert await registry.request(shown, audit_detail=facts) == ap.EXPIRED
+    row = (await audit.list_recent(db, 100))[-1]
+    assert row["event"] == "approval_requested"
+    assert "Checkout - Example Store" not in json.dumps(row)
+    assert row["detail"]["field_lengths"] == {"Merchant": 12, "Page": 24}
+    assert {k: row["detail"][k] for k in facts} == facts
+
+
+async def test_free_text_is_not_a_plain_audit_value(make):
+    registry, _bot, _ctx = make()
+    assert await registry.request(FIELDS, audit_detail={"page": ["a", "b"]}) == ap.REFUSED
+
+
+async def test_the_send_heals_a_closed_client(make):
+    bot = FakeBot()
+    bot.request = MagicMock(initialize=AsyncMock())
+    real_send = bot.send_message
+    calls = []
+
+    async def closed_once(**kw):
+        calls.append(kw)
+        if len(calls) == 1:
+            raise RuntimeError("This HTTPXRequest is not initialized!")
+        return await real_send(**kw)
+
+    bot.send_message = closed_once
+    registry, _bot, _ctx = make(bot=bot, timeout_s=0.05)
+    assert await registry.request(FIELDS) == ap.EXPIRED  # sent, then nobody tapped
+    bot.request.initialize.assert_awaited_once()
+    assert len(bot.sent) == 1
+
+
+async def test_a_tap_landing_as_the_deadline_fires_wins(make, db, monkeypatch):
+    """Deterministic: the future is settled at the moment wait_for reports its timeout."""
+    registry, _bot, _ctx = make(timeout_s=60)
+    real = asyncio
+
+    class _Asyncio:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        @staticmethod
+        async def wait_for(aw, timeout):
+            next(iter(registry._pending.values())).future.set_result(ap.GRANTED)
+            aw.cancel()
+            raise TimeoutError
+
+    monkeypatch.setattr(ap, "asyncio", _Asyncio())
+    assert await registry.request(FIELDS) == ap.GRANTED
+    assert "approval_expired" not in await _events(db)
+
+
+async def test_a_cancelled_requester_is_audited_and_its_button_refuses(make, db):
+    registry, bot, ctx = make()
+    task = asyncio.create_task(registry.request(FIELDS))
+    nonce = await _wait_recorded(registry)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    rows = list(reversed(await audit.list_recent(db, 100)))
+    assert (rows[-1]["event"], rows[-1]["detail"]["reason"]) == (
+        "approval_refused",
+        "requester cancelled",
+    )
+    answer = await _tap(ctx, bot, data=f"payapprove:{nonce}", message=_msg(bot.sent[0], bot))
+    assert answer["text"] == "Refused"
+    last = (await audit.list_recent(db, 1))[0]
+    assert last["detail"]["reason"] == "unknown nonce" and last["detail"]["nonce"] == nonce
+
+
 # -- production wiring ------------------------------------------------------------
 
 
