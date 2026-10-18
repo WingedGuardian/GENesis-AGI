@@ -146,45 +146,60 @@ def _write_keeping_mode(
     This is a best-effort check, not atomic CAS against other writers."""
     target = Path(os.path.realpath(path))
     before = target.stat() if target.exists() else None
+    if before is not None and before.st_nlink > 1:
+        return "it has multiple hard links; atomic replacement would separate their contents"
     acl = _access_acl(target) if before is not None else None
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".mcp.json.")
+
+    def metadata_refusal() -> str | None:
+        if before is None:
+            return None
+        now = os.stat(tmp)
+        if (now.st_uid, now.st_gid) != (before.st_uid, before.st_gid):
+            return f"its owner/group ({before.st_uid}:{before.st_gid}) could not be kept"
+        if _access_acl(tmp) != acl:
+            return "its POSIX ACL could not be carried to the replacement"
+        return None
+
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            if before is not None:
+                # Qualify readers while the temp is EMPTY. copystat/chown can
+                # change effective ACL/mode access, so payload must come later.
+                if acl is None and _access_acl(tmp) is not None:
+                    os.removexattr(tmp, _ACL)
+                try:
+                    shutil.copystat(target, tmp)
+                except OSError:
+                    os.chmod(tmp, before.st_mode & 0o777)
+                os.utime(tmp, None)
+                with contextlib.suppress(OSError):  # judged on the result below
+                    os.chown(tmp, before.st_uid, before.st_gid)
+                refusal = metadata_refusal()
+                if refusal:
+                    return refusal
+            # The FD was opened before metadata preparation and remains writable
+            # even when the preserved target mode is read-only.
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
         if before is None:
             os.chmod(tmp, 0o666 & ~_umask())
         else:
-            # copystat carries mode, xattrs and (for the owner) the POSIX ACL;
-            # then a fresh mtime, so the rewrite looks rewritten.
-            try:
-                shutil.copystat(target, tmp)
-            except OSError:
-                os.chmod(tmp, before.st_mode & 0o777)
-            os.utime(tmp, None)
-            with contextlib.suppress(OSError):  # judged on the result below
-                os.chown(tmp, before.st_uid, before.st_gid)
-            now = os.stat(tmp)
-            if (now.st_uid, now.st_gid) != (before.st_uid, before.st_gid):
-                Path(tmp).unlink(missing_ok=True)
-                return f"its owner/group ({before.st_uid}:{before.st_gid}) could not be kept"
-            if acl is not None and _access_acl(tmp) != acl:
-                Path(tmp).unlink(missing_ok=True)
-                return "its POSIX ACL could not be carried to the replacement"
+            refusal = metadata_refusal()
+            if refusal:
+                return refusal
         changed = (
             target.exists() or target.is_symlink()
             if expected is None
             else expected is not _NO_EXPECTATION and target.read_bytes() != expected
         )
         if changed:
-            Path(tmp).unlink(missing_ok=True)
             return "it changed while the merge ran (run bootstrap again)"
         os.replace(tmp, target)
         return None
-    except BaseException:
+    finally:
         Path(tmp).unlink(missing_ok=True)
-        raise
 
 
 def _umask() -> int:

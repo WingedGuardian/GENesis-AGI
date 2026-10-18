@@ -240,7 +240,8 @@ names, so an overlay of a read-only file is editable (#2446).
   `serena` entry bootstrap registers) and every other top-level key is kept. When the file
   changes, the old one is saved under `~/.genesis/deploy-backups/<UTC time>/` and the run
   names the servers it updated, added, removed or kept. The rewrite goes through a symlink
-  and keeps the file's mode, owner, group and ACL (a hard link to it is not kept). The file
+  and keeps the file's mode, owner, group and ACL. A changed file with multiple hard links
+  is left unchanged so every alias keeps the same contents. The file
   is left as it was, and the run says so, when it cannot keep those, cannot make a backup,
   cannot read or write it, finds something other than a regular file, or the file changed
   while the merge ran; `--mcp-only` then exits 1. A file that is not valid JSON is

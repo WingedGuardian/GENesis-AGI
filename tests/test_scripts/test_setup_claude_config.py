@@ -762,3 +762,68 @@ def test_unreadable_acl_metadata_declines_instead_of_claiming_success(
     assert mod.render_mcp_config(root, dry_run=False) is None
     assert path.read_bytes() == before
     assert not list(root.glob(".mcp.json.*"))
+
+
+@pytest.mark.parametrize("original_acl", [False, True])
+@pytest.mark.parametrize("default_acl", [False, True])
+@pytest.mark.parametrize("mode", [0o440, 0o640])
+def test_existing_metadata_is_qualified_before_staging_payload(
+    tmp_path, _scratch_home, monkeypatch, original_acl, default_acl, mode
+):
+    mod = _module()
+    root = _root(tmp_path)
+    path = _drifted(mod, root, {})
+    if original_acl:
+        _with_acl(path)
+    path.chmod(mode)
+    wanted_acl = mod._access_acl(path)
+    if default_acl:
+        try:
+            os.setxattr(root, "system.posix_acl_default", _acl_bytes(65533))
+        except OSError:
+            pytest.skip("no POSIX default ACL support")
+    copied = []
+    copystat = mod.shutil.copystat
+
+    def observe_metadata(source, destination):
+        # Metadata copying can enable inherited readers before its final check.
+        # There must be no configuration payload at that transition.
+        copied.append(Path(destination).read_bytes())
+        assert copied[-1] == b""
+        return copystat(source, destination)
+
+    monkeypatch.setattr(mod.shutil, "copystat", observe_metadata)
+    assert mod.render_mcp_config(root, dry_run=False) is True
+    assert copied == [b""]
+    assert mod._access_acl(path) == wanted_acl
+    assert path.stat().st_mode & 0o777 == mode
+    assert json.loads(path.read_text())["mcpServers"]["genesis-health"]["command"] != "/old/path"
+    assert not list(root.glob(".mcp.json.*"))
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+@pytest.mark.parametrize("changed", [False, True])
+def test_hard_linked_configs_keep_every_alias(tmp_path, _scratch_home, capsys, symlink, changed):
+    mod = _module()
+    root = _root(tmp_path)
+    path = root / ".mcp.json"
+    if changed:
+        _drifted(mod, root, {})
+    else:
+        path.write_text(json.dumps(_render(mod, root)))
+    target = path
+    if symlink:
+        target = root / "config-target.json"
+        path.rename(target)
+        path.symlink_to(target.name)
+    alias = root / "linked-config.json"
+    os.link(target, alias)
+    before, inode = target.read_bytes(), target.stat().st_ino
+    assert mod.render_mcp_config(root, dry_run=False) is (None if changed else False)
+    assert target.read_bytes() == alias.read_bytes() == before
+    assert target.stat().st_ino == alias.stat().st_ino == inode
+    assert target.stat().st_nlink == 2
+    assert path.is_symlink() == symlink
+    if changed:
+        assert "multiple hard links" in capsys.readouterr().out
+    assert not list(root.glob(".mcp.json.*"))
