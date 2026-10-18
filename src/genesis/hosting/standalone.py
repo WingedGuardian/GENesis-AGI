@@ -245,10 +245,13 @@ class StandaloneAdapter:
         # Wyoming STT+TTS servers for S2S voice pipeline (Phase 2)
         await self._init_wyoming_servers()
 
-        # Payment card vault service: holds the vault key between unlock and lock
+        # Payment card vault service: holds the vault key between unlock and lock;
+        # card-release approvals audit through its connection, bot attached below
+        from genesis.payments.approval import PaymentApprovalRegistry
         from genesis.payments.vault_service import start_vault_service
 
-        self._vault_service = await start_vault_service(self._runtime)
+        self._payment_approvals = PaymentApprovalRegistry()
+        self._vault_service = await start_vault_service(self._runtime, self._payment_approvals)
 
         # Flask in daemon thread
         flask_thread = threading.Thread(
@@ -965,8 +968,12 @@ class StandaloneAdapter:
             )
             rt.register_channel("telegram", adapter, recipient=recipient)
 
+            adapter.payment_approvals = getattr(self, "_payment_approvals", None)
             await adapter.start()
             logger.info("Telegram adapter started")
+            owner = (config.get("allowed_users_ordered") or (None,))[0]  # first id as written
+            if adapter.payment_approvals is not None and owner is not None:
+                adapter.payment_approvals.attach_bot(adapter._app.bot, owner)
 
             # TopicManager wiring — forum topic routing for reflections,
             # outreach, and awareness.  Ported from channels/bridge.py.
