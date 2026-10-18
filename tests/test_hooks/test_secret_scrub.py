@@ -952,3 +952,69 @@ class TestPatternsStayPortable:
         assert possessive.search(r"(?P<key>_*+[A-Z]{2,512}+)")
         assert possessive.search(r"(?P<key>[A-Z0-9_]++)")  # possessive one-or-more
         assert not possessive.search(r"(?P<key>_{0,4}[A-Z]{2,512})")
+
+
+class TestHttpCredentialHeaders:
+    """HTTP credential headers: the label, the scheme word and the bare value.
+
+    A header value is ``<scheme> <credential>``, so a label pattern that wants
+    the credential straight after the colon sees only the scheme word. Each
+    shape here passed through whole before the header labels and the bearer
+    value pattern existed.
+    """
+
+    TOKEN = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MA"  # pragma: allowlist secret
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            f"Authorization: Bearer {TOKEN}",
+            f"authorization: bearer {TOKEN}",
+            f"Proxy-Authorization: Bearer {TOKEN}",
+            f"Authorization: Token {TOKEN}",
+            f"Authorization: {TOKEN}",
+            f'curl -H "Authorization: Bearer {TOKEN}" https://api.example.com/v1',
+            f"Bearer {TOKEN}",
+            f"headers={{'authorization': 'Bearer {TOKEN}'}}",
+        ],
+    )
+    def test_the_credential_is_redacted(self, text):
+        out = s.scrub(text)
+        assert self.TOKEN not in out
+        assert R in out
+
+    def test_a_short_basic_credential_is_redacted(self):
+        basic = "dXNlcjpwYXNz"  # base64("user:pass"), 12 characters
+        out = s.scrub(f"Authorization: Basic {basic}")
+        assert basic not in out
+        assert out.startswith("Authorization: Basic ")
+
+    def test_the_label_and_scheme_survive(self):
+        assert s.scrub(f"Authorization: Bearer {self.TOKEN}") == "Authorization: Bearer " + R
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "the request needs a bearer token",
+            "Bearer tokens are documented in RFC 6750",
+            "authorization is checked by the gateway",
+            "set an Authorization header",
+        ],
+    )
+    def test_prose_is_kept(self, text):
+        assert s.scrub(text) == text
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            "Bearer " * 20000,
+            "Authorization: " + " " * 40000 + "x",
+            ("authorization: Basic " + "A" * 7 + "\n") * 6000,
+        ],
+    )
+    def test_header_shapes_complete_promptly(self, shape):
+        import time
+
+        start = time.perf_counter()
+        s.scrub(shape)
+        assert time.perf_counter() - start < 5.0

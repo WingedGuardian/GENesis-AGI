@@ -265,15 +265,42 @@ _STRUCTURED_CREDENTIAL_PATTERN = re.compile(
 # Labeled API/access/secret tokens — keep the label, redact the value.
 # ``secret[_\s-]?access[_\s-]?key`` is listed explicitly (before the shorter
 # ``secret[_\s-]?key``) so the AWS secret-key label is caught.
+# HTTP credential headers are labels too: ``Authorization`` and
+# ``Proxy-Authorization`` carry a credential after a scheme word, and
+# ``Cookie``/``Set-Cookie`` carry session tokens. Listing them here also makes
+# ``credential_label_kind`` treat a structured ``{"authorization": ...}`` or
+# ``{"cookie": ...}`` member as a token, whatever its value looks like.
+_AUTH_HEADER_LABEL = r"(?:proxy[_\s-]?)?authorization"
 _TOKEN_LABEL = (  # noqa: S105 - credential label regex, not a value
     r"(?<![A-Za-z])(?:api[_\s-]?key|access[_\s-]?token|bearer[_\s-]?token|"  # noqa: S105
     r"secret[_\s-]?access[_\s-]?key|secret[_\s-]?key|auth[_\s-]?token|"
-    r"refresh[_\s-]?token|api[_\s-]?secret|private[_\s-]?key)"
+    r"refresh[_\s-]?token|api[_\s-]?secret|private[_\s-]?key|"
+    rf"{_AUTH_HEADER_LABEL}|(?:set[_\s-]?)?cookie)"
 )
 _CREDENTIAL_TOKEN_PATTERN = re.compile(
     # (?<![A-Za-z]) (not \b) so an underscore-joined prefix still matches, e.g.
     # the ``aws_secret_access_key`` form used in ~/.aws/credentials.
     _TOKEN_LABEL + r"\s*(?:is\s+|[:=]\s*)(?P<token>[A-Za-z0-9_\-\./+]{16,})",
+    re.IGNORECASE,
+)
+
+# ``Authorization: <scheme> <credential>``. The label pattern above wants the
+# value straight after the separator, so a scheme word (``Basic``, ``Bearer``,
+# ``Token``, ``Digest`` ...) would hide the credential behind it. The label is
+# high-confidence, so the value floor is lower than the prose floor: a Basic
+# credential for a short user:password pair is only a dozen characters.
+_AUTH_HEADER_PATTERN = re.compile(
+    rf"(?<![A-Za-z]){_AUTH_HEADER_LABEL}\s*[:=]\s*"
+    r"(?:[A-Za-z][A-Za-z0-9\-]{0,31}\s+)?"
+    r"(?P<token>[A-Za-z0-9_\-\./+~]{8,}=*)",
+    re.IGNORECASE,
+)
+
+# A bearer credential wherever it appears (RFC 6750 ``b64token`` characters),
+# with or without a header label in front: a curl command line, a log line or a
+# copied header. The 16-character floor keeps prose like "bearer token" intact.
+_BEARER_VALUE_PATTERN = re.compile(
+    r"(?<![A-Za-z])bearer\s+(?P<token>[A-Za-z0-9_\-\./+~]{16,}=*)",
     re.IGNORECASE,
 )
 
@@ -454,6 +481,8 @@ def scrub(text: str) -> str:
         text = _KNOWN_KEY_PREFIX_PATTERN.sub(_REDACTED, text)
         text = _STRUCTURED_CREDENTIAL_PATTERN.sub(_REDACTED, text)
         text = _redact_value_group(_CREDENTIAL_TOKEN_PATTERN, text, "token")
+        text = _redact_value_group(_AUTH_HEADER_PATTERN, text, "token")
+        text = _redact_value_group(_BEARER_VALUE_PATTERN, text, "token")
         text = _redact_value_group(_SINGLE_CREDENTIAL_PATTERN, text, "value")
         text = _redact_value_group(_URL_CREDENTIAL_PATTERN, text, "pw")
         text = _redact_env(text)
