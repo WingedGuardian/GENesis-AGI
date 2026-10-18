@@ -18,6 +18,7 @@ from genesis.reflection.types import (
     PendingWorkSummary,
     ProcedureStats,
 )
+from genesis.surplus.intake import INTAKE_PIPELINE_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -418,10 +419,13 @@ class ContextGatherer:
             since = (datetime.now(UTC) - timedelta(days=2)).isoformat()
 
         try:
+            # knowledge_units is shared (uploads, saved references, manual
+            # ingests write it too); only the intake pipeline's rows carry
+            # source_doc 'intake:<source>' (surplus/intake.py).
             cursor = await db.execute(
-                "SELECT COALESCE(source_pipeline, 'unknown') AS pipeline, "
-                "COUNT(*) AS cnt FROM knowledge_units "
-                "WHERE ingested_at > ? GROUP BY pipeline ORDER BY cnt DESC",
+                "SELECT source_pipeline, COUNT(*) AS cnt FROM knowledge_units "
+                "WHERE ingested_at > ? AND source_doc LIKE 'intake:%' "
+                "GROUP BY source_pipeline",
                 (since,),
             )
             rows = await cursor.fetchall()
@@ -431,7 +435,18 @@ class ContextGatherer:
                 exc_info=True,
             )
             return None
-        return [(row[0], row[1]) for row in rows]
+        # The label is rendered into the Deep-reflection prompt, and
+        # source_pipeline is caller-writable: show only the intake vocabulary.
+        counts: dict[str, int] = {}
+        for pipeline, count in rows:
+            if pipeline is None:
+                label = "unknown"
+            elif pipeline in INTAKE_PIPELINE_LABELS:
+                label = pipeline
+            else:
+                label = "other"
+            counts[label] = counts.get(label, 0) + count
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
     async def _intelligence_digest(self, db: aiosqlite.Connection) -> str:
         """Build a summary of intelligence intake since last Deep cycle.
