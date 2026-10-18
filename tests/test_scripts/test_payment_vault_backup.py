@@ -9,7 +9,6 @@ unpack side are driven directly. Sandboxed like test_backup_dated_snapshots
 (HOME, GENESIS_DIR, GNUPGHOME in tmp; systemctl and curl stubbed).
 """
 
-import hashlib
 import io
 import json
 import os
@@ -537,6 +536,11 @@ def _rebuild_cards(db: Path, schema: str) -> None:
         ("no vault_meta", "does not record the vault keys"),
         ("identity flipped", "identity.age is not the key this vault was created with"),
         ("recipient swapped", "recipient.txt is not the public key this vault was created with"),
+        # Codex round 2 on #3211: what only the vault's own acceptance catches.
+        ("recipient extra line", "recipient.txt does not hold a valid age public key"),
+        ("cards constraint dropped", "cards.db is not a vault card database"),
+        ("extra trigger", "cards.db is not a vault card database"),
+        ("extra index", "cards.db is not a vault card database"),
     ],
 )
 def test_the_shell_check_refuses_what_vault_store_would(_sealed, tmp_path, damage, reason):
@@ -568,6 +572,23 @@ def test_the_shell_check_refuses_what_vault_store_would(_sealed, tmp_path, damag
         from pyrage import x25519
 
         (vault / "recipient.txt").write_text(str(x25519.Identity.generate().to_public()) + "\n")
+    elif damage == "recipient extra line":
+        (vault / "recipient.txt").write_text(key + "\nage1extra\n")
+    elif damage == "cards constraint dropped":
+        # Same columns in the same order, label's NOT NULL gone: the names-only
+        # column check passed this. vault_meta (the key binding) is kept.
+        loose = vs._SCHEMA.replace("label       TEXT NOT NULL", "label       TEXT")
+        with sqlite3.connect(db) as conn:
+            conn.execute("ALTER TABLE cards RENAME TO old_cards")
+            conn.execute(loose)
+            conn.execute("INSERT INTO cards SELECT * FROM old_cards")
+            conn.execute("DROP TABLE old_cards")
+    elif damage == "extra trigger":
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TRIGGER t AFTER INSERT ON cards BEGIN SELECT 1; END")
+    elif damage == "extra index":
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE INDEX i ON cards (label)")
     else:
         (vault / "recipient.txt").write_text(key[:-1] + "b\n")  # 'b' is not Bech32
     proc = _check(vault)
@@ -577,27 +598,28 @@ def test_the_shell_check_refuses_what_vault_store_would(_sealed, tmp_path, damag
 # ── payment_vault_unpack: restore's side of the archive ────────────────
 
 
+#: Two real vaults, one per mark, made once per module by _real_sets (scrypt
+#: costs seconds). A stand-in set would not pass payment_vault_check, which runs
+#: the vault's own acceptance (vault_store.verify_set).
+_REAL_SETS: dict[str, Path] = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _real_sets(tmp_path_factory):
+    for mark in ("p", "q"):
+        path = tmp_path_factory.mktemp(f"real-{mark}") / "payment_vault"
+        vs.init_vault(PASSPHRASE, path)
+        _REAL_SETS[mark] = path
+    yield
+    _REAL_SETS.clear()
+
+
 def _synthetic_set(dest: Path, *, cards_ok: bool = True, mark: str = "q") -> None:
-    """A set that passes payment_vault_check without a scrypt init. `mark` fills
-    the recipient key, so two sets can be told apart."""
-    dest.mkdir(parents=True)
-    identity = b"age-encryption.org/v1\n-> scrypt x\n"
-    recipient = "age1" + mark * 58
-    (dest / "identity.age").write_bytes(identity)
-    (dest / "recipient.txt").write_text(recipient + "\n")
-    if cards_ok:
-        with sqlite3.connect(dest / "cards.db") as conn:
-            conn.execute(vs._SCHEMA)
-            conn.execute(vs._META_SCHEMA)
-            conn.executemany(
-                "INSERT INTO vault_meta (key, value) VALUES (?, ?)",
-                [
-                    ("identity_sha256", hashlib.sha256(identity).hexdigest()),
-                    ("recipient", recipient),
-                ],
-            )
-            conn.execute(f"PRAGMA user_version = {vs.SCHEMA_VERSION}")
-    else:
+    """A copy of the real vault named by `mark`, so two sets can be told apart
+    (_recipient_mark). With cards_ok False, cards.db is replaced by junk."""
+    shutil.copytree(_REAL_SETS[mark], dest)
+    os.chmod(dest, 0o700)
+    if not cards_ok:
         (dest / "cards.db").write_bytes(b"not sqlite" * 100)
 
 
@@ -798,7 +820,10 @@ def _staged(fresh: Path) -> Path:
 
 
 def _recipient_mark(d: Path) -> str:
-    return (d / "recipient.txt").read_text().strip()[4]
+    """Which real set `d` is a copy of, by its recipient key."""
+    key = (d / "recipient.txt").read_text().strip()
+    (mark,) = [m for m, p in _REAL_SETS.items() if (p / "recipient.txt").read_text().strip() == key]
+    return mark
 
 
 def _assert_no_plaintext_tar(fresh: Path) -> None:
@@ -1361,3 +1386,26 @@ def test_smb_offsite_puts_the_one_archive_flat_in_creds(_sealed, backup_env, tmp
     # chooses how it reaches that directory.
     assert any(f'put "creds/{ARCHIVE}" "{ARCHIVE}"' in c for c in cmds), cmds
     assert not [c for c in cmds if "mkdir" in c and "creds/payment_vault" in c], cmds
+
+
+def test_an_unresolved_src_path_refuses_instead_of_importing_from_cwd(_sealed, tmp_path):
+    """An empty sys.path entry is the current directory: with src/ unresolved, a
+    stray genesis/ there must not stand in for vault_store."""
+    vault = _place_vault(_sealed, tmp_path / "vault")
+    with sqlite3.connect(vault / "cards.db") as conn:
+        conn.execute("CREATE INDEX i ON cards (label)")  # vault_store refuses this set
+    stub = tmp_path / "cwd" / "genesis" / "payments"
+    stub.mkdir(parents=True)
+    for d in (stub.parent, stub):
+        (d / "__init__.py").write_text("")
+    (stub / "vault_store.py").write_text(
+        "class VaultError(Exception):\n    pass\n\ndef verify_set(path):\n    return None\n"
+    )
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{_LIB}"; _PV_SRC=""; payment_vault_check "$1"', "x", str(vault)],
+        cwd=tmp_path / "cwd",
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "cannot find vault_store" in proc.stdout

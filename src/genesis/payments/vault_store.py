@@ -327,6 +327,19 @@ def _check_bound_keys(path: Path, sealed: bytes) -> None:
         )
 
 
+def verify_set(path: Path) -> None:
+    """Everything the vault requires of its three files, checked without the passphrase.
+
+    The sealed identity's shape, the exact schema (``_shape``: version, DDL, no
+    other objects), the whole recipient file with its checksum, and the key pair
+    recorded at init. Backup and restore run this (``payment_vault_check`` in
+    scripts/lib/payment_vault_backup.sh), so a set the vault would refuse is
+    never published over the last good archive. Raises VaultError on the first
+    defect.
+    """
+    _check_bound_keys(path, _check_identity(path))
+
+
 def _translate(exc: sqlite3.Error) -> VaultError:
     if isinstance(exc, sqlite3.OperationalError):  # locked, disk I/O, shape: maybe transient
         return VaultError(f"cards.db could not be read or written ({exc})")

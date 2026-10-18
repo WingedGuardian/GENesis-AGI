@@ -14,8 +14,9 @@
 # pull), so no reader can ever hold two files from different backups.
 #
 #   payment_vault_check <dir>
-#       Return 0 when <dir> holds a complete set vault_store would accept;
-#       otherwise print the reason (fixed text, never a value) and return 1.
+#       Return 0 when <dir> holds a complete set vault_store accepts (its own
+#       verify_set runs last); otherwise print the reason (fixed text, never a
+#       value) and return 1. The shell checks before it may refuse more, never less.
 #       Shared by both sides, so backup only ever ships a set restore accepts.
 #
 #   backup_payment_vault <vault_dir> <creds_dir> <temp_root>
@@ -46,6 +47,8 @@
 # clone, and moved in by one rename from a name no `*.gpg` reader matches.
 
 PAYMENT_VAULT_FILES=(identity.age recipient.txt cards.db)
+# The repository's src/, for payment_vault_check's vault_store call.
+_PV_SRC="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../src" 2>/dev/null && pwd)" || _PV_SRC=""
 PAYMENT_VAULT_ARCHIVE=payment_vault.tar.gpg
 # vault_store.SCHEMA_VERSION and the cards table's columns, in order (a parity
 # test builds a real vault with vault_store and checks it here).
@@ -53,7 +56,7 @@ PAYMENT_VAULT_SCHEMA_VERSION=1
 PAYMENT_VAULT_COLUMNS="card_ref label brand last4 merchant single_use status created_at retired_at blob"
 
 payment_vault_check() {
-    local dir="$1" f ic uv cols meta digest sum rec
+    local dir="$1" f ic uv cols meta digest sum rec why
     for f in "${PAYMENT_VAULT_FILES[@]}"; do
         if [ -L "$dir/$f" ] || [ ! -f "$dir/$f" ]; then
             printf '%s is missing or not a regular file\n' "$f"
@@ -113,6 +116,43 @@ payment_vault_check() {
         "SELECT value FROM vault_meta WHERE key = 'recipient'" 2>/dev/null)" || rec=""
     if [ -z "$rec" ] || [ "$rec" != "$(head -n 1 "$dir/recipient.txt")" ]; then
         printf 'recipient.txt is not the public key this vault was created with\n'
+        return 1
+    fi
+    # The checks above give fast, specific reasons; this one is authoritative.
+    # The vault's own acceptance (vault_store.verify_set): the whole recipient
+    # file with its checksum, the exact table DDL, no other schema objects. A
+    # set the vault would refuse is never published over the last good archive.
+    # The src/ path must hold vault_store: an empty sys.path entry is the
+    # current directory, which -I exists to keep out.
+    if [ -z "$_PV_SRC" ] || [ ! -f "$_PV_SRC/genesis/payments/vault_store.py" ]; then
+        printf 'the vault check cannot find vault_store under src/\n'
+        return 1
+    fi
+    # The venv's interpreter first (the version the code is written for), then
+    # a 3.12, then python3. -I: no user site, no cwd on sys.path.
+    local py="$_PV_SRC/../.venv/bin/python" rc=0
+    [ -x "$py" ] || py="$(command -v python3.12 || command -v python3 || true)"
+    if [ -z "$py" ]; then
+        printf 'the vault check needs python3, which is not installed\n'
+        return 1
+    fi
+    why="$("$py" -I - "$_PV_SRC" "$dir" 2>/dev/null <<'PYVERIFY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from genesis.payments import vault_store
+try:
+    vault_store.verify_set(Path(sys.argv[2]))
+except vault_store.VaultError as exc:
+    print(exc)
+    sys.exit(1)
+PYVERIFY
+)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # A VaultError prints its fixed reason; anything else (an interpreter
+        # too old for the code, an import failure, a crash) prints nothing, and
+        # its stderr is dropped so no value can reach the output.
+        printf '%s\n' "${why:-vault_store could not be loaded or crashed under $py (needs Python 3.11+)}"
         return 1
     fi
     return 0
