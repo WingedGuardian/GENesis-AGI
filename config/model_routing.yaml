@@ -257,16 +257,24 @@ providers:
         models:
           - google/gemma-4-26b-a4b-it:free
           - nvidia/nemotron-3-super-120b-a12b:free
+  # OpenRouter's '~<vendor>/<family>-latest' ids always redirect to the newest
+  # model in that family (owner ruling 2026-10-18: always the latest model). The
+  # profile names the model the alias served when the route was last reviewed;
+  # its ratings can lag a family release until the profile is updated.
   openrouter-haiku:
     type: openrouter
-    model: anthropic/claude-haiku-5.5
+    model: ~anthropic/claude-haiku-latest
     profile: claude-haiku-5.5
     free: false
     rpm_limit: 20
     open_duration_s: 120
+    params:
+      # Haiku 5.5 still accepts sampling parameters, but newer Claude models
+      # reject them; drop them so a family release cannot break this route.
+      additional_drop_params: [temperature, top_p, top_k]
   openrouter-sonnet:
     type: openrouter
-    model: anthropic/claude-sonnet-5.5
+    model: ~anthropic/claude-sonnet-latest
     profile: claude-sonnet-5.5
     free: false
     rpm_limit: 20
@@ -279,7 +287,7 @@ providers:
       additional_drop_params: [temperature, top_p, top_k]
   openrouter-opus:
     type: openrouter
-    model: anthropic/claude-opus-5.5
+    model: ~anthropic/claude-opus-latest
     profile: claude-opus-5.5
     free: false
     rpm_limit: 20
@@ -337,6 +345,10 @@ providers:
   # NOTE (2026-08-07): openrouter-qwen3coder removed — its qwen/qwen3-coder:free
   # slug is delisted (0 OpenRouter endpoints, verified live) and it was wired
   # into no chain, so it was dead weight. Drop rather than repoint.
+  # Deliberately PINNED, not '~deepseek/deepseek-pro-latest': this exact
+  # alias/model pair carries an evaluation-bound authority to suppress duplicate
+  # procedures (_NOVELTY_VALIDATED_MODELS in learning/procedural/extractor.py).
+  # Floating it would silently disable that dedup until a new model is evaluated.
   openrouter-deepseek-v4:
     type: openrouter
     model: deepseek/deepseek-v4-pro
@@ -344,6 +356,10 @@ providers:
     free: false
     rpm_limit: 20
     open_duration_s: 120
+  # Deliberately PINNED, not '~deepseek/deepseek-flash-latest': this route is in
+  # the eval `judge` chain, whose longitudinal baseline must not move silently,
+  # and eval qualification (eval/qualification/pinned.py) freezes the route's
+  # model id and rejects any response from a different one.
   openrouter-deepseek-flash:
     type: openrouter
     model: deepseek/deepseek-v4.1-flash
@@ -354,7 +370,7 @@ providers:
   # The frontier GPT lane: hard reasoning where correctness outweighs cost.
   openrouter-gpt-max:
     type: openrouter
-    model: openai/gpt-6-astra
+    model: ~openai/gpt-astra-latest
     profile: gpt-6-astra
     free: false
     rpm_limit: 20
@@ -435,13 +451,13 @@ providers:
   # The general GPT lane: most work, cost-held.
   openrouter-gpt:
     type: openrouter
-    model: openai/gpt-5.6-sol
+    model: ~openai/gpt-sol-latest
     profile: gpt-5.6-sol
     free: false
     open_duration_s: 120
   kimi:
     type: openrouter
-    model: moonshotai/kimi-k3
+    model: ~moonshotai/kimi-latest
     profile: kimi-k3
     free: false
     rpm_limit: 20

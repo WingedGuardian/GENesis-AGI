@@ -55,7 +55,7 @@ CONFIDENCE_THRESHOLD = 75
 # than the router would make. gemini pinned to the currently-recommended 3.x
 # (docs/reference/gemini-routing.md: 2.0 = "Do not use", being phased out).
 _FALLBACK_MODELS = [
-    ("openrouter/anthropic/claude-haiku-5.5", "openrouter", None),
+    ("openrouter/~anthropic/claude-haiku-latest", "openrouter", None),
     ("groq/openai/gpt-oss-120b", "groq", {"extra_body": {"reasoning_effort": "low"}}),
     # Mirrors the canonical gemini-free provider in model_routing.yaml: the GA
     # gemini-3.5-flash (Google's replacement for the deprecated 3-flash-preview)
