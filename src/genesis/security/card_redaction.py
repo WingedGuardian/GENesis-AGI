@@ -40,9 +40,12 @@ def redact_text(text: str) -> str:
     The plain pass catches a number written out. A JSON string can also spell
     the digits as ``\\u`` escapes, which only parsing reveals; when parsing
     finds a number the plain pass missed, the JSON is re-serialised redacted.
+    Parsed: text starting with ``{``, ``[`` or ``"`` (a JSON string scalar).
+    Bare numeric text is not parsed: its digits are exact, so the plain pass
+    checks them (a rounded number already written out as text is not caught).
     """
     out = redact(text)
-    if out.lstrip()[:1] not in ("{", "["):
+    if out.lstrip()[:1] not in ("{", "[", '"'):
         return out
     try:
         parsed = json.loads(out)
@@ -52,17 +55,32 @@ def redact_text(text: str) -> str:
     return out if walked == parsed else json.dumps(walked, ensure_ascii=False)
 
 
+# JavaScript's Number.MAX_SAFE_INTEGER. A page script that returns a 17-19
+# digit card number as a Number gets it back ROUNDED above this, and a rounded
+# value fails the checksum, so it cannot be told apart from any other number.
+_MAX_SAFE_INTEGER = 2**53 - 1
+# One past the largest 19-digit value: no card number is longer.
+_CARD_MAGNITUDE_END = 10**19
+
+
 def _redact_number(value: int | float) -> int | float | str:
-    whole = (
-        value
-        if isinstance(value, int)
-        else (
-            int(value)
-            if math.isfinite(value) and value.is_integer() and abs(value) < 1e20
-            else None
-        )
-    )
-    return REDACTED if whole is not None and contains_card_number(str(whole)) else value
+    """A number holding a card number, or possibly a rounded one, as REDACTED.
+
+    Beyond the safe-integer range and below 20 digits, every number is
+    withheld without a checksum: it may be a rounded card. Accepted false
+    positive: any other number in that range (a 64-bit id, a large count).
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return value
+    if _MAX_SAFE_INTEGER < abs(value) < _CARD_MAGNITUDE_END:
+        return REDACTED
+    if isinstance(value, float):
+        if not value.is_integer():
+            return value
+        value_digits = str(int(value))
+    else:
+        value_digits = str(value)
+    return REDACTED if contains_card_number(value_digits) else value
 
 
 def redact_value(value):
