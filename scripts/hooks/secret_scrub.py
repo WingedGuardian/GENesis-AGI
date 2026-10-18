@@ -293,7 +293,9 @@ _CREDENTIAL_TOKEN_PATTERN = re.compile(
 # whatever its value looks like.
 _HEADER_LABEL = r"(?<![A-Za-z])(?:(?:proxy[_\s-]?)?authorization|(?:set[_\s-]?)?cookie)"
 _HEADER_PATTERN = re.compile(
-    _HEADER_LABEL + r"(?:\\?[\"'])?[ \t]*[:=][ \t]*(?P<value>[^\r\n]*[^\s])",
+    # The value may start on the NEXT line (pretty-printed JSON puts it there),
+    # so the gap after the separator may hold one line break.
+    _HEADER_LABEL + r"(?:\\?[\"'])?[ \t]*[:=][ \t]*(?:\r?\n[ \t]*)?(?P<value>[^\r\n]*[^\s])",
     re.IGNORECASE,
 )
 

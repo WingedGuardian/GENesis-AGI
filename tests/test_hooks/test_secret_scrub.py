@@ -999,6 +999,8 @@ class TestHttpCredentialHeaders:
             ("Bearer token", "token"),
             ("Bearer $ecret", "$ecret"),
             ("Bearer abc:def", "def"),
+            ('{\n  "authorization":\n    "Basic YTpi"\n}', "YTpi"),
+            ("Cookie:\r\n  SID=31d4d96e407aad42", "31d4d96e407aad42"),
             ('{"authorization":"Digest username=\\"alice\\", response=\\"6629fae4\\""}', "6629fae4"),
             ("{'cookie': 'SID=it\\'s-31d4d96e'}", "31d4d96e"),
             ('\\"authorization\\": \\"Digest username=\\\\\\"a\\\\\\", response=\\\\\\"cafe1234\\\\\\"\\"', "cafe1234"),
