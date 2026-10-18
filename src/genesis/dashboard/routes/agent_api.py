@@ -298,7 +298,7 @@ async def agent_card():
 
 
 @agent_api_bp.route(ROOT + "/health")
-@_async_route
+@_async_route(timeout=15)
 async def agent_health():
     from genesis.peers.readiness import evaluate
 
