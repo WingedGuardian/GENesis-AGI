@@ -15,6 +15,7 @@ handshake (RFC 6455 §4.1), is the branch that decides most real requests.
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 from flask import Flask
@@ -156,6 +157,29 @@ def test_browser_same_origin_passes_the_hook(app, host, headers):
     assert resp.status_code != 403
 
 
+@pytest.mark.parametrize(
+    ("scheme", "origin", "refused"),
+    [
+        # Over TLS, an http page on the same host is a different origin.
+        ("https", "http://dash.example", True),
+        ("https", "https://dash.example", False),
+        # Plain HTTP as the server sees it (direct, or behind a TLS proxy).
+        ("http", "http://dash.example", False),
+        ("http", "https://dash.example", False),
+        # Not a scheme this server can be.
+        ("http", "ftp://dash.example", True),
+        ("http", "chrome-extension://dash.example", True),
+    ],
+)
+def test_origin_scheme_must_be_one_this_server_can_be(app, scheme, origin, refused):
+    resp = app.test_client().get(
+        "/ws/terminal",
+        base_url=f"{scheme}://dash.example",
+        headers=_upgrade_headers(Origin=origin),
+    )
+    assert (resp.status_code == 403) is refused
+
+
 def test_hook_ignores_other_routes(app):
     @app.route("/other")
     def other():
@@ -189,6 +213,11 @@ def test_real_handshake_same_origin_connects(served):
     )
     try:
         assert ws.connected
+        # The handler builds the session on the server thread after the
+        # handshake returns to the client, so wait for it rather than race it.
+        deadline = time.monotonic() + 10
+        while not _FakeSession.instances and time.monotonic() < deadline:
+            time.sleep(0.01)
     finally:
         ws.close()
     assert len(_FakeSession.instances) == 1

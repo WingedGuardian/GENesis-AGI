@@ -400,17 +400,26 @@ _SAFE_FETCH_SITES = frozenset({"same-origin", "none"})
 
 
 def _origin_matches_host(url: str) -> bool:
-    """True when ``url``'s host[:port] equals the request's ``Host`` header.
+    """True when ``url``'s host[:port] equals the request's ``Host`` header and its
+    scheme can be this server's.
 
     Host comparison is case-insensitive (hostnames are per RFC; browsers already
     lowercase, this covers hand-crafted same-origin tooling) — a case mismatch can
     only make the check stricter (fail-closed), never open a bypass.
+
+    Scheme: only ``http``/``https`` origins can be ours, and an ``http`` origin on a
+    request that arrived over TLS is a different origin. Where TLS ends at a proxy
+    the server sees plain HTTP; there ``Sec-Fetch-Site``, which current browsers
+    send to ``https``/``wss`` targets, is checked first by ``_is_same_origin_request``.
     """
     try:
-        netloc = urlsplit(url).netloc
+        parts = urlsplit(url)
     except ValueError:
         return False
-    return bool(netloc) and netloc.lower() == (request.host or "").lower()
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or (scheme == "http" and request.is_secure):
+        return False
+    return bool(parts.netloc) and parts.netloc.lower() == (request.host or "").lower()
 
 
 def _is_same_origin_request() -> bool:

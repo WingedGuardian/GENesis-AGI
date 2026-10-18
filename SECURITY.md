@@ -165,14 +165,10 @@ isolation is still load-bearing for you — it is:
   else. The interactive terminal runs over a WebSocket and the noVNC console
   over its own port; neither is behind this gate, so for those the control is
   still network isolation and the dashboard password on the UI. The terminal
-  WebSocket does refuse a handshake that is not same-origin (403 before any
-  upgrade), so a page from another origin, including another port on the same
-  host, cannot open it through your browser. This compares the page's origin
-  with the Host it addressed, so it does not cover DNS rebinding, where the two
-  match by construction. A plain-HTTP reverse proxy in front of the dashboard
-  must pass the original Host header (nginx: `proxy_set_header Host $host`),
-  or the terminal refuses its connections; refusals are logged with the
-  Origin and Host seen.
+  WebSocket accepts same-origin connections only. A plain-HTTP reverse proxy in
+  front of the dashboard must pass the original Host header (nginx:
+  `proxy_set_header Host $host`), or the terminal refuses its connections;
+  refusals are logged with the Origin and Host seen.
 
 This is safe **only under the assumed deployment model: the host is not
 publicly exposed.** The dashboard is meant to be reachable through one of:
