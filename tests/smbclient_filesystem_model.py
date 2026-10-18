@@ -46,18 +46,28 @@ def main():
                 target.write_bytes(b"acknowledged-but-corrupt")
             else:
                 shutil.copyfile(values[0], target)
-        elif operation == "get":
+        elif operation in ("get", "reget"):
             source = cwd / values[0]
             if not source.is_file():
                 print("NT_STATUS_OBJECT_NAME_NOT_FOUND")
                 return 1
-            shutil.copyfile(source, values[1])
+            destination = Path(values[1])
+            if operation == "get":
+                shutil.copyfile(source, destination)
+            else:
+                offset = destination.stat().st_size if destination.exists() else 0
+                with source.open("rb") as incoming, destination.open("ab") as out:
+                    incoming.seek(offset)
+                    shutil.copyfileobj(incoming, out)
         elif operation == "rename":
             source, target = (cwd / name for name in values[:2])
             if target.exists() and values[2:] != ["-f"]:
                 print("NT_STATUS_OBJECT_NAME_COLLISION")
                 return 1
             os.replace(source, target)
+            match = os.environ.get("SMB_CORRUPT_MATCH")
+            if match and match in target.name:
+                target.write_bytes(b"acknowledged-but-corrupt")
         elif operation == "ls":
             entries = [cwd / values[0]] if values else sorted(cwd.iterdir())
             for entry in entries:

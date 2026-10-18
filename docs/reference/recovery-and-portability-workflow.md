@@ -16,7 +16,9 @@ documentation.
 ## Database integrity, quarantine, and backup admission
 
 `scripts/backup.sh` verifies the live SQLite database through
-`genesis.db.integrity` before touching the backup clone. There is deliberately
+`genesis.db.integrity` before producing fresh local payloads. A previously frozen off-site epoch may
+resume first on timer/manual runs; it was admitted when those inputs were
+created. Update-triggered runs still verify current SQL first. There is deliberately
 no raw `sqlite3 quick_check` fallback: if the inode-bound checker is unavailable
 or the database changes identity throughout the check, integrity is
 `indeterminate` and no new backup is admitted. A stable failure writes the
@@ -618,9 +620,34 @@ from guardian.yaml, else `genesis`), `CCTMPVOL_POOL` (root device's pool),
 `CCTMPVOL_VOLUME_NAME` (`<container>-cc-tmp`), `CCTMPVOL_USER` (`ubuntu`),
 `CCTMPVOL_DISABLE` (opt out).
 
+Restore maps memory to the current installation's project identity using the
+same byte-preserving path substitution as backup, including trailing newlines.
 Pooled transcript recovery over SMB uses the same temporary credential file for
 snapshot selection, manifest/object downloads and later extra payloads. Restore
 loads library definitions before creating that credential lease; function-return
 cleanup retires it when the pull returns; the script EXIT handler provides a
 fallback for early exit. An existing status-write failure can interrupt that EXIT
 handler before credential cleanup, so that fallback is not unconditional.
+
+
+### Frozen off-site publication
+
+Backup publication can span several runs while retaining its original UTC
+snapshot identity. Its authenticated journal and frozen payloads live outside
+Git and temp under `~/backups/.genesis-backup-publication`. Preserve this spool
+when retrying. Backend/key/scope/index changes retain an incompatible epoch and
+report incomplete; recovery or explicit retirement is required rather than
+silently dropping accepted history. Read the original timestamp, age and progress
+in the backup log or `backup_status.json`; a current run timestamp does not make
+an older off-site snapshot fresh. The unauthenticated dashboard omits the raw
+progress object. See [capture validation](transcript-capture-validation.md) for
+receipt, upload-window, optional-extra and local-freeze limits.
+
+A new-format snapshot requires the pooled reader already present in this tree.
+The reader independently authenticates its inventory and verifies downloaded
+objects; backup receipts, including earlier-in-epoch receipts, never waive that
+restore check. Before verification and marker publication, pending work has no COMPLETE
+marker and is not selected. A lost final acknowledgement can leave an already
+published recovery point alongside its pending journal; retry acknowledges the
+exact original marker before retiring that journal. Native NAS, live Qdrant and timer rollout
+verification are separate from isolated local-backend test evidence.

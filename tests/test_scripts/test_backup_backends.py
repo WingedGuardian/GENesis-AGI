@@ -81,6 +81,31 @@ def _kill_session(session_id: int) -> None:
 
 # ── local backend: real-filesystem regression anchor ─────────────────
 
+@pytest.mark.parametrize("operation", ["_t_ctl", "_t_xfer", "_t_del", "_smb_run"])
+def test_publication_deadline_reserves_checkpoint_time(tmp_path, operation):
+    _make_stub(tmp_path / "smbclient", "#!/bin/bash\nsleep 30\n")
+    start = time.monotonic()
+    result = _run_bash(f"{operation} sleep 30", {
+        "_BACKEND_DEADLINE": str(start + 26.5),
+        "GENESIS_BACKUP_CTL_TIMEOUT": "30m",
+        "GENESIS_BACKUP_XFER_TIMEOUT": "30m",
+        "GENESIS_BACKUP_DEL_TIMEOUT": "30m",
+    }, extra_path=tmp_path, timeout=5)
+    assert result.returncode == 124, result.stderr
+    assert time.monotonic() - start < 4
+
+
+@pytest.mark.parametrize("whole_backup", [False, True])
+def test_backend_timer_group_matches_owning_launcher(whole_backup):
+    result = _run_bash('printf "%s\\n" "$$"\n'
+                       '_t_ctl python3 -c "import os; print(os.getpgrp())"', {
+        "_GENESIS_BACKUP_DEADLINE": "owned-probe" if whole_backup else "",
+    }, timeout=5)
+    assert result.returncode == 0, result.stderr
+    launcher, child_group = map(int, result.stdout.split())
+    assert (launcher == child_group) is whole_backup
+
+
 def test_local_full_roundtrip(tmp_path):
     """init → mkdir → put → exists → list → get → delete on a REAL filesystem.
 

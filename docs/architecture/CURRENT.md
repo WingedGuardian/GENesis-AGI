@@ -3378,7 +3378,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: da43da6e4f73 2026-10-17
+verified: 368be0b0a 2026-10-18
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3789,9 +3789,23 @@ tool-disabled CC probe without changing its schedule or routing authority.
   beyond those reset targets; required peer tables must be ordinary tables.
   Guardian snapshot rollback instead warns at its existing action-approval gate
   that approval explicitly reauthorizes saved peers.
-  encrypted `scripts/backup.sh` timer). Recovery pins a selected off-site snapshot across retries,
+  Backup's development candidate freezes one off-site epoch under
+  `~/backups/.genesis-backup-publication`, with authenticated progress bound to
+  the backend/scope/index/validator. Timer/manual runs resume that epoch first;
+  update-triggered runs verify current SQL before resuming. Whole uploads retry;
+  exact readback prefixes and completed receipts survive interruption. Original
+  timestamp/age remain in stdout/status; COMPLETE requires all core receipts and
+  exact final-marker acknowledgement. Optional extras retain their gap contract.
+  SMB command paths are admitted before durable freeze; incompatible required
+  names/transfer roots report incomplete without poisoning a new epoch. Existing
+  invalid pending state is retained, while failed optional extras remain gaps.
+  The spool is outside Git/temp and excluded by extra-dir overlap checks.
+  Initial freeze and indivisible upload limits remain explicit; native/live
+  rollout and final post-review verification are not implied by local tests.
+  Recovery pins a selected off-site snapshot across retries,
   authenticates legacy and v2 transcript archives, and verifies pooled
-  objects before restoring. Pooled SMB downloads retain the backend credential
+  objects before restoring. Memory mapping preserves current project path bytes.
+  Pooled SMB downloads retain the backend credential
   lease until the off-site pull returns; library definitions load before that lease.
   Explicit local directories take precedence over
   off-site configuration; independently identified Tier-1 audit records restore

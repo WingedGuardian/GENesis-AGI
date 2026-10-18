@@ -74,9 +74,21 @@ _BACKEND_DEL_TIMEOUT="${GENESIS_BACKUP_DEL_TIMEOUT:-600}"
 # later. (A truly uninterruptible D-state mount wait survives even SIGKILL
 # until the kernel IO returns — no userland timeout can escape that; the -k
 # just bounds the SIGTERM-ignoring case.)
-_t_ctl()  { timeout -k 10 "$_BACKEND_CTL_TIMEOUT"  "$@"; }
-_t_xfer() { timeout -k 10 "$_BACKEND_XFER_TIMEOUT" "$@"; }
-_t_del()  { timeout -k 10 "$_BACKEND_DEL_TIMEOUT"  "$@"; }
+_backend_timeout() {
+    local duration="$1" remaining; shift
+    if [ -n "${_BACKEND_DEADLINE:-}" ]; then
+        remaining=$(python3 -c 'import sys,time;print(max(0,int(float(sys.argv[1])-time.monotonic()-25)))' "$_BACKEND_DEADLINE") || return 1
+        [ "$remaining" -gt 0 ] || return 124
+        set -- timeout --foreground -k 10 "$duration" "$@"
+        duration="$remaining"
+    fi
+    # Backup already owns a whole-run timeout group: do not escape its deadline
+    # or inherited DR lock lifetime. Restore keeps its existing standalone group.
+    timeout ${_GENESIS_BACKUP_DEADLINE:+--foreground} -k 10 "$duration" "$@"
+}
+_t_ctl()  { _backend_timeout "$_BACKEND_CTL_TIMEOUT"  "$@"; }
+_t_xfer() { _backend_timeout "$_BACKEND_XFER_TIMEOUT" "$@"; }
+_t_del()  { _backend_timeout "$_BACKEND_DEL_TIMEOUT"  "$@"; }
 
 _backend_resolve() {
     local b="${GENESIS_BACKUP_TIER2_BACKEND:-}"
@@ -127,7 +139,7 @@ backend_available() {
 # ── smb backend ──────────────────────────────────────────────────────
 # _SMB_OP_TIMEOUT is dynamically scoped: put/get/delete override it per-call
 # (bash `local` in the caller is visible here); everything else gets ctl.
-_smb_run() { timeout -k 10 "${_SMB_OP_TIMEOUT:-$_BACKEND_CTL_TIMEOUT}" smbclient "$_BACKEND_NAS" -A "$_BACKEND_CREDS" "$@"; }
+_smb_run() { _backend_timeout "${_SMB_OP_TIMEOUT:-$_BACKEND_CTL_TIMEOUT}" smbclient "$_BACKEND_NAS" -A "$_BACKEND_CREDS" "$@"; }
 
 # Every smb operation is one `smbclient -c` string with the paths quoted inside
 # it, and names reach it from the backups clone (anything pushed there). A path
@@ -256,6 +268,28 @@ backend_get() {
     esac
 }
 
+# Append a download suffix; the publication caller authenticates the saved
+# prefix and compares every new byte. A failed transfer may leave useful bytes
+# but its exit status grants no integrity receipt.
+backend_get_resume() {
+    local remote="$1" destination="$2" offset=0
+    case "$_BACKEND" in
+        smb)
+            _smb_paths_ok "$remote" "$destination" || return 1
+            local _SMB_OP_TIMEOUT="$_BACKEND_XFER_TIMEOUT"
+            _smb_run -D "$(dirname "$remote")" -c "reget \"$(basename "$remote")\" \"$destination\"" >/dev/null 2>&1
+            ;;
+        local)
+            if [ -e "$destination" ]; then
+                offset=$(stat -c %s -- "$destination") || return 1
+            fi
+            _t_xfer dd if="$_BACKEND_LOCAL_ROOT/$remote" of="$destination" \
+                iflag=skip_bytes skip="$offset" oflag=append conv=notrunc status=none
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 # Scratch must be an explicit caller-owned directory on the large-temp volume.
 # Transfer acknowledgment does not authorize snapshot completion or retention.
 backend_verify_remote() {
@@ -298,6 +332,9 @@ backend_list_strict() {
 backend_put_atomic() {
     [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || return 1
     local source="$1" target="$2" stage rc=0
+    if [ "$_BACKEND" = smb ]; then
+        _smb_paths_ok "$source" "$target" || return 1
+    fi
     stage="$(dirname "$target")/.partial-$(date +%s)-${BASHPID:-$$}-${RANDOM}-${RANDOM}"
     backend_put "$source" "$stage" || rc=$?
     if [ "$rc" -ne 0 ]; then backend_delete "$stage" || true; return 1; fi

@@ -169,7 +169,7 @@ trap '_cleanup_plaintext; _write_status; _release_deploy_marker; backend_cleanup
 # ── Setup ────────────────────────────────────────────────────────────
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
 BACKUP_DIR="$HOME/backups/genesis-backups"
-_CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
+_CC_PROJECT_ID=${GENESIS_DIR//\//-}
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
 # shellcheck source=scripts/lib/backup_core_paths.sh

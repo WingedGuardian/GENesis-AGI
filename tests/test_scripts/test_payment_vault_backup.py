@@ -661,11 +661,11 @@ def _synthetic_set(dest: Path, *, cards_ok: bool = True, mark: str = "q") -> Non
         (dest / "cards.db").write_bytes(b"not sqlite" * 100)
 
 
-def _write_tar(path: Path, members: list[tuple[str, str, object]]) -> None:
+def _write_tar(path: Path, members: list[tuple[str, str, object]], *, tar_format=tarfile.USTAR_FORMAT) -> None:
     """members: (name, kind, payload); kind is file (bytes), symlink or hardlink
     (target), or dir. Every member claims mode 0644, to show the unpack's own
     modes win."""
-    with tarfile.open(path, "w", format=tarfile.USTAR_FORMAT) as tf:
+    with tarfile.open(path, "w", format=tar_format) as tf:
         for name, kind, payload in members:
             ti = tarfile.TarInfo(name)
             ti.mode = 0o644
@@ -742,7 +742,9 @@ def test_unpack_refuses_anything_but_the_three_files(tmp_path, case):
         "dir": [ident, recip, ("cards.db", "dir", None)],
     }[case]
     tarf = tmp_path / "v.tar"
-    _write_tar(tarf, members)
+    # PAX can encode the absolute symlink target even under a long pytest root;
+    # the unpacker must still reject this forbidden member before writing.
+    _write_tar(tarf, members, tar_format=tarfile.PAX_FORMAT if case == "symlink cards.db" else tarfile.USTAR_FORMAT)
     parent = tmp_path / "parent"
     parent.mkdir()
     (parent / "keep.txt").write_text("keep\n")
@@ -1692,51 +1694,13 @@ def test_a_genesis_home_set_after_sourcing_is_guarded_too(tmp_path):
 
 
 def _smb_filesystem_stub(bind: Path, root: Path, log: Path) -> None:
-    """A filesystem model of smbclient -c: mkdir is not recursive (and a failed one
-    lets the batch go on, which _smb_mkdir relies on); a cd into a missing directory
-    stops the batch with an error (an assumption: no real server here)."""
+    """Reuse the shared transport model, including strict missing-path responses."""
+    model = Path(__file__).parents[1] / "smbclient_filesystem_model.py"
     dated._make_stub(
         bind / "smbclient",
-        textwrap.dedent(f"""\
-        #!{sys.executable}
-        import shlex, shutil, sys
-        from pathlib import Path
-        root = Path({str(root)!r})
-        cmd = sys.argv[sys.argv.index("-c") + 1]
-        with open({str(log)!r}, "a") as f:
-            f.write(cmd + "\\n")
-        # -D DIR starts the batch in DIR (main's atomic rename uses it).
-        cwd = root / sys.argv[sys.argv.index("-D") + 1] if "-D" in sys.argv else root
-        for clause in cmd.split(";"):
-            args = shlex.split(clause)
-            if not args:
-                continue
-            op, *vals = args
-            if op == "cd":
-                cwd = root / vals[0]
-                if not cwd.is_dir():
-                    print("NT_STATUS_OBJECT_PATH_NOT_FOUND")
-                    sys.exit(1)
-            elif op == "mkdir":
-                try:
-                    (cwd / vals[0]).mkdir()
-                except OSError:
-                    pass
-            elif op == "put":
-                shutil.copyfile(vals[0], cwd / vals[1])
-            elif op == "get":
-                shutil.copyfile(cwd / vals[0], vals[1])
-            elif op == "ls":
-                entries = [cwd / vals[0]] if vals else sorted(cwd.iterdir())
-                for e in entries:
-                    if e.exists():
-                        print(f"  {{e.name}} {{'D' if e.is_dir() else 'A'}} 0 Synthetic")
-            elif op == "deltree":
-                shutil.rmtree(cwd / vals[0], ignore_errors=True)
-            elif op == "rename":  # smbclient rename SRC DST [-f]
-                shutil.move(str(cwd / vals[0]), str(cwd / vals[1]))
-        sys.exit(0)
-    """),
+        f"#!{sys.executable}\nimport os, runpy\n"
+        f"os.environ.update(SMB_ROOT={str(root)!r}, SMB_LOG={str(log)!r})\n"
+        f"runpy.run_path({str(model)!r}, run_name='__main__')\n",
     )
 
 
@@ -1757,9 +1721,8 @@ def test_smb_offsite_puts_the_one_archive_flat_in_creds(_sealed, backup_env, tmp
     assert (snap / "creds" / ARCHIVE).read_bytes() == (repo / "creds" / ARCHIVE).read_bytes()
     assert not (snap / "creds" / "payment_vault").exists()
     cmds = log.read_text().splitlines()
-    # The put targets the flat creds/ level (checked on disk above); the backend
-    # chooses how it reaches that directory.
-    assert any(f'put "creds/{ARCHIVE}" "{ARCHIVE}"' in c for c in cmds), cmds
+    # The frozen source name is opaque; final rename names the flat archive.
+    assert any(c.startswith("rename ") and f'"{ARCHIVE}"' in c for c in cmds), cmds
     assert not [c for c in cmds if "mkdir" in c and "creds/payment_vault" in c], cmds
 
 

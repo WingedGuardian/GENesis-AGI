@@ -1,0 +1,3 @@
+- Added resumable encrypted transcript capture with retained source identities, durable validation checkpoints, and verification of every referenced remote object before publishing COMPLETE. Restore preserves project path bytes when locating memory. Compatible restore support precedes producer activation; persistent analytics settings remain a separate change.
+- Fixed source inspection errors being mistaken for empty scope and preserved pooled recovery for existing host-label prefixes.
+- Backup publication resumes one frozen snapshot across runs, preserving its original age and verified download progress within the two-hour window. Whole uploads retry; incomplete required work cannot publish COMPLETE.

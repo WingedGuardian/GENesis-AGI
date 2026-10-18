@@ -1,0 +1,1 @@
+- Off-site SMB backups reject unsupported required filenames before preserving a frozen retry snapshot, so correcting those managed filenames in the backups clone allows the next attempt to proceed. Existing frozen snapshots remain preserved for explicit resolution, and failed optional extras remain reported gaps.
