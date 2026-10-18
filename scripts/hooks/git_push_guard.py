@@ -12980,9 +12980,10 @@ def _review_request_compound_is_inert(segs, review_seg, command: str) -> bool:
     ``gh_command``, to exactly ``pr view`` or ``pr checks`` with no unmodelled
     flag; ``gh_pr_subcommand`` finds ``pr`` anywhere in argv, which reads
     ``gh alias set pv -- pr view`` as a read. A neighbor must be spelled with
-    the bare program name, and a git neighbor carrying ``--output``, ``-o``,
-    ``--ext-diff`` or ``--textconv`` is refused, since those write a file or
-    run a program.
+    the bare program name. ``git log`` is deliberately absent (owner ruling
+    2026-10-18): under any spelling, repo config can make it run a program
+    (``gpg.program`` through ``log.showSignature`` or a ``%G`` format alias,
+    textconv drivers for diff output), and ``--output`` writes a file.
     """
 
     def review_neighbour_is_inert(s: Segment) -> bool:
@@ -12998,14 +12999,7 @@ def _review_request_compound_is_inert(segs, review_seg, command: str) -> bool:
                 if s.argv[i] != "-C":
                     return False
                 i += 2
-            # `git log --output=<file>` writes a file, the same effect as the
-            # redirect refused above; `--ext-diff`/`--textconv` run programs.
-            if any(
-                a == "-o" or a.startswith(("--output", "--ext-diff", "--textconv"))
-                for a in s.argv[i:]
-            ):
-                return False
-            return git_subcommand(s.argv) in {"status", "log"}
+            return git_subcommand(s.argv) == "status"
         if s.exe == "gh":
             inv = gh_command(s.argv)
             return (
@@ -13501,6 +13495,21 @@ def _urls_name_repo(urls: set[str], canonical: str) -> bool:
     if not urls or want is None:
         return False
     return all(_repo_identity_from_url(u) == want for u in urls)
+
+
+def _no_open_pr_deny_message(cur: str | None) -> str:
+    """The no-open-PR BLOCK text, shared by the plain and close-compound arms."""
+    return (
+        f"BLOCKED: re-push to '{cur}' — this branch is "
+        f"PUBLIC but has NO OPEN PR, so CI and the leak "
+        f"detector never run on it (ci.yml triggers on "
+        f"pull_request; a branch with no PR matches no "
+        f"trigger).\n"
+        f"Open its PR first — `gh pr create` — then push "
+        f"again. Or close the branch out if it is "
+        f"finished with. Both leave the branch in a state "
+        f"something actually looks at."
+    )
 
 
 def _no_pr_block_applies(urls: set[str]) -> bool:
@@ -14897,7 +14906,7 @@ def _run_merge_and_push_gates() -> int:
                     round_compound_deny = (
                         "BLOCKED: this review request needs its own fresh user approval, "
                         "but the same command also runs a step that is not on the inert "
-                        "list (cd, sleep, git status/log, gh pr view/checks), or "
+                        "list (cd, sleep, git status, gh pr view/checks), or "
                         "carries a redirect. "
                         "Run the review request separately so one approval cannot "
                         "authorize multiple actions."
@@ -15214,25 +15223,34 @@ def _run_merge_and_push_gates() -> int:
                     # blip.
                     # A close is never an inert neighbour, so the
                     # _push_compound_is_inert check further down would also ask
-                    # here; this block changes no allow/ask outcome.
-                    # It runs first so the message names the close, and so it
-                    # skips the no-PR lookup, keeping close compounds off the
-                    # network and preserving their ask.
+                    # here. It runs first so the message names the close. On the
+                    # public repo it still takes the no-PR BLOCK below when the
+                    # branch already has no open PR: a close cannot add one, and
+                    # turning that deny into an ask would let one approval publish
+                    # the state the block forbids. Off the public repo the lookup
+                    # is skipped (_no_pr_block_applies is local and runs first).
                     closes_pr = any(
                         pr_close_reason(s.argv) is not None for s in segs
                     )
                     if push_allow_reason and closes_pr:
                         push_allow_reason = None
-                        ask_routine = True
-                        routine_dests.append((push_remote, urls, pcwd, cur))
-                        ask_reason = (
-                            f"re-push to '{cur}': an earlier step in this command "
-                            f"CLOSES a pull request, so the push that follows may "
-                            f"land on a branch with no open PR — outside CI and "
-                            f"the leak scan. Run the close and the push as "
-                            f"separate commands so each is judged on the state it "
-                            f"actually runs in."
-                        )
+                        if (
+                            not _push_is_dry_run(push_segs[0])
+                            and _no_pr_block_applies(urls)
+                            and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
+                        ):
+                            no_open_pr_deny = _no_open_pr_deny_message(cur)
+                        else:
+                            ask_routine = True
+                            routine_dests.append((push_remote, urls, pcwd, cur))
+                            ask_reason = (
+                                f"re-push to '{cur}': an earlier step in this command "
+                                f"CLOSES a pull request, so the push that follows may "
+                                f"land on a branch with no open PR — outside CI and "
+                                f"the leak scan. Run the close and the push as "
+                                f"separate commands so each is judged on the state it "
+                                f"actually runs in."
+                            )
                     # NO `gh pr create` exemption: whether a same-command create
                     # yields a PR for THIS branch is not decidable from argv
                     # (another --head, --dry-run, a failing create before `&&`,
@@ -15259,17 +15277,7 @@ def _run_merge_and_push_gates() -> int:
                             # `&& gh pr create`, since the create needs the branch
                             # on the remote. Dispatched sessions never get here
                             # (`_is_dispatched()` denies every push above).
-                            no_open_pr_deny = (
-                                f"BLOCKED: re-push to '{cur}' — this branch is "
-                                f"PUBLIC but has NO OPEN PR, so CI and the leak "
-                                f"detector never run on it (ci.yml triggers on "
-                                f"pull_request; a branch with no PR matches no "
-                                f"trigger).\n"
-                                f"Open its PR first — `gh pr create` — then push "
-                                f"again. Or close the branch out if it is "
-                                f"finished with. Both leave the branch in a state "
-                                f"something actually looks at."
-                            )
+                            no_open_pr_deny = _no_open_pr_deny_message(cur)
                         else:
                             # Off the public repo — or when the public repo is not
                             # declared — the pre-existing ask, unchanged.

@@ -509,7 +509,7 @@ def test_the_probe_sees_an_armed_deadline_on_the_push_path(
 def test_a_pr_close_in_the_same_command_cancels_the_silent_allow(
     monkeypatch, tmp_path, capsys
 ) -> None:
-    """Close detection is message only; the decision was already an ask via
+    """Off the public repo, close detection only shapes the message; the decision was already an ask via
     `_push_compound_is_inert`.
     """
     fake = FakeRun()
@@ -545,7 +545,7 @@ def test_a_pr_close_in_the_same_command_cancels_the_silent_allow(
 def test_a_pr_close_by_other_spelling_still_cancels_the_silent_allow(
     monkeypatch, tmp_path, capsys, command
 ) -> None:
-    """Close detection is message only; the decision was already an ask via
+    """Off the public repo, close detection only shapes the message; the decision was already an ask via
     `_push_compound_is_inert`.
     """
     fake = FakeRun()
@@ -564,8 +564,53 @@ def test_a_pr_close_by_other_spelling_still_cancels_the_silent_allow(
     assert "CLOSES a pull request" in reason, (command, reason)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr close 5 && git push",
+        "gh api -X PATCH repos/o/r/pulls/5 -f state=closed && git push",
+    ],
+)
+def test_a_close_compound_keeps_the_no_open_pr_block_on_the_public_repo(
+    monkeypatch, tmp_path, capsys, on_the_public_repo, command
+) -> None:
+    """A close cannot add an open PR, so a public branch that already has none
+    keeps the BLOCK instead of the close compound's ask."""
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_dest_urls", lambda *a, **k: {PUBLIC_URL})
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(monkeypatch, tmp_path, fake, capsys, command=command)
+    assert rc == 2, (command, rc, out, err)
+    assert "NO OPEN PR" in err, (command, err)
+
+
+def test_a_close_compound_with_an_open_pr_still_asks_naming_the_close(
+    monkeypatch, tmp_path, capsys, on_the_public_repo
+) -> None:
+    fake = FakeRun()
+    monkeypatch.setattr(gpg, "_push_dest_urls", lambda *a, **k: {PUBLIC_URL})
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+
+    rc, out, err = _run_guard_on_push(
+        monkeypatch,
+        tmp_path,
+        fake,
+        capsys,
+        command="gh api -X PATCH repos/o/r/pulls/5 -f state=closed && git push",
+    )
+    assert rc == 0, (rc, out, err)
+    doc = json.loads(out)
+    assert doc["hookSpecificOutput"]["permissionDecision"] == "ask", out
+    assert "CLOSES a pull request" in doc["hookSpecificOutput"]["permissionDecisionReason"]
+
+
 def test_api_close_short_circuits_repush_pr_lookup(monkeypatch, tmp_path, capsys) -> None:
-    """Close detection is message only; the decision was already an ask via
+    """Off the public repo, close detection only shapes the message; the decision was already an ask via
     `_push_compound_is_inert`.
     """
     fake = FakeRun()
@@ -574,7 +619,7 @@ def test_api_close_short_circuits_repush_pr_lookup(monkeypatch, tmp_path, capsys
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
 
     def pr_count_must_not_run(*a, **k):
-        raise AssertionError("a close compound must skip the open-PR lookup")
+        raise AssertionError("off the public repo, a close compound must skip the open-PR lookup")
 
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", pr_count_must_not_run)
 

@@ -383,6 +383,13 @@ def test_review_approval_plus_unlisted_get_is_refused(monkeypatch, capsys):
         "./sleep 1",
         "git log -1 --format=%B --output=.git/config",
         "git log -1 --ext-diff",
+        "git log -p",
+        "git log -1 --stat",
+        "git log --patch -2",
+        "git log -u",
+        "git log -1",
+        "git log --oneline -5",
+        "git log -1 --format=%G?",
     ],
     ids=[
         "graphql-mutation-with-other-name",
@@ -404,6 +411,13 @@ def test_review_approval_plus_unlisted_get_is_refused(monkeypatch, capsys):
         "path-qualified-sleep",
         "git-log-output-file",
         "git-log-ext-diff",
+        "git-log-patch-runs-textconv",
+        "git-log-stat",
+        "git-log-patch-long",
+        "git-log-u",
+        "git-log-plain",
+        "git-log-oneline",
+        "git-log-signature-format-runs-gpg",
     ],
 )
 def test_review_approval_blocks_unlisted_compound_steps(monkeypatch, capsys, other):
@@ -425,9 +439,9 @@ def test_review_approval_blocks_unlisted_compound_steps(monkeypatch, capsys, oth
         ("gh pr checks 5", False),
         ("gh pr view 5", False),
         ("git status", False),
-        ("git -C {wt} log -1", True),
+        ("git -C {wt} status --short", True),
     ],
-    ids=["cd", "sleep", "gh-pr-checks", "gh-pr-view", "git-status", "git-c-log"],
+    ids=["cd", "sleep", "gh-pr-checks", "gh-pr-view", "git-status", "git-c-status"],
 )
 def test_review_approval_allows_inert_neighbors(monkeypatch, capsys, tmp_path, other, before):
     _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
