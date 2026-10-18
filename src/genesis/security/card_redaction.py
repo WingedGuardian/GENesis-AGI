@@ -226,8 +226,8 @@ def _hides_split_card(parts: list[tuple[str, bool]]) -> bool:
       strings or numbers);
     * every contiguous subrun of two or more digit-only STRINGS whose digits
       total 12-19 is joined with nothing and checked for brand, length and
-      checksum (a card cut into chunks of any widths, ``["40000000",
-      "00000002"]``). Each start extends only while the total stays within 19
+      checksum (a card cut into chunks of any widths, ``["424242",
+      "4242424242"]``). Each start extends only while the total stays within 19
       digits, so the work is O(n x 19). Strings only: a number cannot carry a
       chunk's leading zeros, and over numeric lists this reading withheld
       about one result in five (MEASURED on synthetic numeric script results).
