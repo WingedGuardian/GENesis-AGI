@@ -259,8 +259,8 @@ providers:
           - nvidia/nemotron-3-super-120b-a12b:free
   openrouter-haiku:
     type: openrouter
-    model: anthropic/claude-haiku-4.5
-    profile: claude-haiku-4.5
+    model: anthropic/claude-haiku-5.5
+    profile: claude-haiku-5.5
     free: false
     rpm_limit: 20
     open_duration_s: 120

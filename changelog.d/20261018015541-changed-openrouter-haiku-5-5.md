@@ -1,0 +1,1 @@
+- **Routed calls that use Claude Haiku through OpenRouter now use Haiku 5.5** (was 4.5): the contribution gate and the retrieval grader (`crag_grade`), plus the contribution version gate's fallback. Haiku 5.5 has a 1M-token context and lists at $0.10/$0.50 per million tokens on OpenRouter, against $1/$5 for 4.5.
