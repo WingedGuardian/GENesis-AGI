@@ -38,7 +38,13 @@ _LIB = dated._BACKUP.parent / "lib" / "payment_vault_backup.sh"
 _GATE = dated._BACKUP.parent / "lib" / "backup_status_gate.py"
 PASSPHRASE = "quartz lantern ember noodle 41"
 VISA = "4242" * 4  # Stripe's public test Visa
-FUTURE = f"12/{(datetime.now(UTC).year + 2) % 100:02d}"
+
+
+def _future() -> str:
+    """An expiry two years out, read when the card is made, not at import."""
+    return f"12/{(datetime.now(UTC).year + 2) % 100:02d}"
+
+
 NAMES = ("identity.age", "recipient.txt", "cards.db")
 ARCHIVE = "payment_vault.tar.gpg"
 TMPNAME = f".{ARCHIVE}.tmp"
@@ -57,7 +63,11 @@ def _place_vault(sealed: Path, dest: Path) -> Path:
     shutil.copytree(sealed, dest)
     os.chmod(dest, 0o700)
     vs.add_card(
-        vs.parse_card(VISA, FUTURE, "123"), label="test", merchant=None, single_use=True, path=dest
+        vs.parse_card(VISA, _future(), "123"),
+        label="test",
+        merchant=None,
+        single_use=True,
+        path=dest,
     )
     return dest
 
