@@ -3855,7 +3855,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 4ab8bf71c 2026-10-10
+verified: f9a1d4cb 2026-10-18
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3911,9 +3911,12 @@ verified: 4ab8bf71c 2026-10-10
   The separately launched validator can admit one canonical invocation of
   `scripts/codex_validator_request.py` through its native shell hook. Its
   bounded, private UUID request files use strict JSON and a closed operation
-  schema; only `protocol_probe` exists. Request creation and retirement use
-  the admitted workspace patch path. Serving probes, verification recording
-  and publication operations remain GROUNDWORK, and this boundary has no
+  schema. `serving_status` and `serving_verify` project one invocation of the
+  existing deployment status tripwire, with bounded collection and scoped SIGTERM
+  cancellation through owned-child cleanup. The request CLI sanitizes cancellation;
+  these observations are not functional verdicts. Request creation and retirement
+  use the admitted workspace patch path. Verification recording and publication
+  remain GROUNDWORK, and this boundary has no
   activation wiring in the ordinary project configuration. Its dedicated
   launcher must establish private workspace modes and umask before activation.
   In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
