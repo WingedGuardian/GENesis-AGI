@@ -16,6 +16,7 @@ So every home-model success funnels through :func:`note_home_recovery`:
 All functions here are fire-and-forget and never raise — they sit on success
 paths that must not be broken by recovery bookkeeping.
 """
+
 from __future__ import annotations
 
 import logging
@@ -38,18 +39,20 @@ async def fire_fallback_alert(*, topic: str, context: str) -> None:
             return
         from genesis.outreach.types import OutreachCategory, OutreachRequest
 
-        await pipeline.submit(OutreachRequest(
-            category=OutreachCategory.ALERT,
-            topic=topic,
-            context=context,
-            salience_score=0.9,
-            verbatim=True,  # pre-composed recovery alert — never reword
-        ))
+        await pipeline.submit(
+            OutreachRequest(
+                category=OutreachCategory.ALERT,
+                topic=topic,
+                context=context,
+                salience_score=0.9,
+                verbatim=True,  # pre-composed recovery alert — never reword
+            )
+        )
     except Exception:
         logger.debug("fallback ALERT dispatch failed", exc_info=True)
 
 
-async def note_home_recovery() -> bool:
+async def note_home_recovery(*, invoker=None) -> bool:
     """Clear account-wide fallback after a confirmed home-model success.
 
     Idempotent: ``fallback_state.clear()`` only transitions active→inactive once,
@@ -63,6 +66,10 @@ async def note_home_recovery() -> bool:
     try:
         from genesis.cc import fallback_state
 
+        # Supplying an invoker requires proof that the current home is ready.
+        # Retiring the flag first would disable the worker that clears its latch.
+        if invoker is not None:
+            await invoker._notify_status_change(None)
         if fallback_state.clear():
             await fire_fallback_alert(
                 topic="cc_fallback_recovery",

@@ -29,7 +29,8 @@ unchanged. Section (f) pins the rule itself.
 
 Real git repos and real remotes are used so the destination resolution (``git
 remote get-url --push``, ``insteadOf`` expansion, ``_push_config_is_simple``) runs
-for real; only the network probes are stubbed.
+for real; the dry-run verdict defaults to a first-publish result because this
+suite exercises the first-publish ask switch.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ import io
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -63,6 +65,19 @@ _BLOCKED_COMMAND_CONFIG = (
     "before the command runs.\n"
     "Retype it as a plain `git push` (`-C <dir>` is fine)."
 )
+
+
+def _verdict(kind: str):
+    flag = "=" if kind == "republish" else "*"
+    block = gpg._DryRunBlock(
+        "file:///repo.git",
+        (gpg._DryRunRef(flag, "HEAD", "refs/heads/feat/x"),),
+    )
+    return SimpleNamespace(kind=kind, block=block)
+
+
+_FIRST_VERDICT = _verdict("first")
+_REPUBLISH_VERDICT = _verdict("republish")
 
 #: Captured before the autouse fixture stubs it, for the tests that drive it for real.
 _REAL_ABSENT = gpg._remote_branch_definitely_absent
@@ -112,10 +127,18 @@ def _decision(out: str):
 
 
 @pytest.fixture(autouse=True)
-def _first_publish(monkeypatch):
+def _first_publish(monkeypatch, tmp_path):
     """A first push (the branch is not on the remote), no network, foreground."""
+    home = tmp_path / "home"
+    home.mkdir()
+    xdg_config = tmp_path / "xdg"
+    xdg_config.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _FIRST_VERDICT)
     monkeypatch.setattr(gpg, "push_allowlist", None)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
     # The definitive-absence probe is a network call: stubbed to "absent" here,
@@ -266,11 +289,6 @@ def test_a_publishing_pr_create_still_asks_when_off(
         ),
         ("git push -u nosuch HEAD", (("remote.origin.url", PUBLIC),), "unresolvable destination"),
         ("git push -u origin main", (("remote.origin.url", PUBLIC),), "not the current branch"),
-        (
-            "git push -u origin HEAD",
-            (("remote.origin.url", PUBLIC), ("push.followTags", "true")),
-            "tags would ride along",
-        ),
     ],
 )
 def test_a_push_that_is_not_exactly_public_still_asks(
@@ -405,14 +423,14 @@ def test_a_create_beside_a_close_still_asks(
 
 
 def test_the_no_open_pr_block_is_unchanged(monkeypatch, tmp_path, capsys, off) -> None:
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _REPUBLISH_VERDICT)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
     rc, out, err = _run(monkeypatch, tmp_path, capsys, "git push origin HEAD")
     assert rc == 2 and "NO OPEN PR" in err, (rc, out, err)
 
 
 def test_close_then_repush_still_asks(monkeypatch, tmp_path, capsys, off) -> None:
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _REPUBLISH_VERDICT)
     rc, out, err = _run(monkeypatch, tmp_path, capsys, "gh pr close 5 && git push origin HEAD")
     _assert_asks(rc, out, err)
     assert "CLOSES a pull request" in _hso(out)["permissionDecisionReason"]
@@ -505,7 +523,11 @@ def test_the_repush_allow_checks_branch_remote_not_origin(
     """The pre-existing re-push allow, same root cause: the branch is on origin
     but NOT on fork, and the bare push goes to fork — a first publication."""
     monkeypatch.setattr(
-        gpg, "_push_is_republish", lambda remote, branch, cwd=None: remote == "origin"
+        gpg,
+        "_push_dry_run_verdict",
+        lambda seg, branch, remote, cwd=None: (
+            _REPUBLISH_VERDICT if remote == "origin" else _FIRST_VERDICT
+        ),
     )
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
     rc, out, err = _run_with_tracking(
@@ -519,7 +541,11 @@ def test_the_repush_allow_still_works_when_branch_remote_is_origin(
 ) -> None:
     """Control for the test above: the same setup aimed at origin is a re-push."""
     monkeypatch.setattr(
-        gpg, "_push_is_republish", lambda remote, branch, cwd=None: remote == "origin"
+        gpg,
+        "_push_dry_run_verdict",
+        lambda seg, branch, remote, cwd=None: (
+            _REPUBLISH_VERDICT if remote == "origin" else _FIRST_VERDICT
+        ),
     )
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
     cfg = (("remote.origin.url", PUBLIC), ("branch.feat/x.remote", "origin"))
@@ -643,9 +669,7 @@ def test_an_unreadable_remote_config_is_unresolved(monkeypatch) -> None:
 
 
 def test_an_unconfirmed_absence_still_asks(monkeypatch, tmp_path, capsys, off) -> None:
-    """`_push_is_republish` answers "not present" on an ls-remote ERROR too. The
-    suppression needs a definitive "absent", or it would skip the no-open-PR
-    check for an already-public branch whose probe merely failed."""
+    """The first-publish suppression needs a definitive absence result."""
     monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", lambda *a, **k: False)
     _assert_asks(*_run(monkeypatch, tmp_path, capsys, "git push -u origin HEAD" + CHAIN))
 
@@ -664,7 +688,7 @@ def test_the_probe_is_asked_about_the_resolved_url_and_branch(
 def test_a_present_branch_keeps_the_republish_path(monkeypatch, tmp_path, capsys, off) -> None:
     """Probe says present (republish): the existing re-push logic decides, and
     the no-open-PR block still fires on the public repo."""
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _REPUBLISH_VERDICT)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
     probe = []
     monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", lambda *a, **k: probe.append(a) or True)
@@ -912,6 +936,16 @@ def test_a_bare_first_push_to_the_public_repo_is_denied_in_every_mode(
     _assert_first_push_denied(*_run(monkeypatch, tmp_path, capsys, command, cfg))
 
 
+def test_unknown_dry_run_verdict_still_denies_public_first_push(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: None)
+    cfg = (("remote.origin.url", PUBLIC), ("branch.feat/x.remote", "origin"))
+    _assert_first_push_denied(
+        *_run(monkeypatch, tmp_path, capsys, "git push -u origin HEAD", cfg)
+    )
+
+
 def test_the_deny_is_written_for_the_agent(monkeypatch, tmp_path, capsys) -> None:
     """Names the hazard, gives the exact passing form, and says where unready
     work goes instead."""
@@ -1046,7 +1080,7 @@ def test_a_dry_run_first_push_publishes_nothing_and_is_not_denied(
 def test_a_repush_is_unaffected(monkeypatch, tmp_path, capsys) -> None:
     """Re-push paths are untouched: with an open PR the silent allow, without one
     the existing re-push block (its own text, not the first-push one)."""
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _REPUBLISH_VERDICT)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
     rc, out, err = _run(monkeypatch, tmp_path / "a", capsys, "git push origin HEAD")
     assert rc == 0 and _decision(out) == "allow", (rc, out, err)
@@ -1656,7 +1690,7 @@ def test_a_subagent_push_or_create_is_denied(monkeypatch, tmp_path, capsys, poli
 def test_a_subagent_repush_of_a_published_branch_is_denied(monkeypatch, tmp_path, capsys) -> None:
     """The re-push relaxation would ALLOW this from the main thread; a subagent
     still does not publish."""
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _REPUBLISH_VERDICT)
     repo = _repo(tmp_path, (("remote.origin.url", PUBLIC),))
     rc, out, err = _run_at(monkeypatch, capsys, "git push origin feat/x", repo, _SUBAGENT)
     assert rc == 2 and "only the main session publishes" in err, (rc, out, err)

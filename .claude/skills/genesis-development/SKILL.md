@@ -50,8 +50,10 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   public repo in its own VM, with no access to an install: no running Genesis, no
   `~/.genesis/`, none of an install's hooks or local reviewers. Hand it only
   self-contained, spec-complete work whose tests run in CI, off the enforcement-hook
-  surface, as a public issue. Only the owner applies the `devin-ready` label that
-  hands it over: the label starts a paid session, so a session never applies it.
+  surface, as a public issue. The `devin-ready` label hands it over and starts a
+  paid session, so a session applies it only after the owner explicitly approves
+  that issue in conversation. Once approved, the session applies the label itself;
+  the owner does not apply it by hand.
   Its PRs join the same queue (closing-session, "Devin-built PRs").
 
 The handoff between them is **the PR itself** — a durable artifact that survives
@@ -230,7 +232,9 @@ own `TASK_INTAKE.md` section contract instead):
    read-only, or by a probe that changes nothing beyond scratch state, using
    tools it already holds. It is owed whenever its answer could change a decision. That covers: the code and every caller the change touches,
    its `CURRENT.md` entry, recent commits and PRs in the area, overlapping open
-   PRs and issues, peer sessions, code intelligence, an API or renderer probe,
+   PRs and issues, existing implementations outside the repo (public repos,
+   grep.app, and the Claude Code mods catalogue for anything that runs inside
+   a CC session), peer sessions, code intelligence, an API or renderer probe,
    and a corpus measurement. "I did not verify X, but it should be fine" is not
    an answer for an X like that: verify it, or name it as a residual with the
    reason no read or probe settles it.
@@ -295,7 +299,19 @@ no substitute checklist.
 - **Before any done / fixed / passing claim** →
   `superpowers:verification-before-completion`, if installed.
 - **An external tool or repo surfaces as a candidate** → the `evaluate`
-  skill; on an ADOPT verdict, `integrate-module`.
+  skill; on an ADOPT verdict, `integrate-module`; on an ADAPT verdict,
+  reverse-engineer the reference before writing code (`evaluate`, Decision
+  Protocol step 4).
+- **About to build anything that runs inside a Claude Code session** — a hook
+  or guard, status line, prompt or context injection, tool interception, a
+  notification, an in-terminal pane → search Claude Code mods and plugins
+  first (`evaluate` workflow step 2 names the sources per session context).
+  From CC 2.1.287 mods can carry UI, tools, agents and model calls; below that
+  version they need the early-access flag, so check the pin in
+  `docs/reference/cc-compatibility.md`. Genesis has already shipped one
+  (`plugins/genesis-web-override/`). A mod may AUGMENT an enforcement guard
+  but never replace it: a mod that denied a tool call ran before the classic
+  `PreToolUse` chain and suppressed it when measured (#2260).
 - **A diff touches dashboard or other UI** → `/qa-only` or `/qa`, plus
   `/design-review`, if installed.
 
@@ -516,8 +532,10 @@ INT/TERM as it starts, so a second signal lands mid-rollback with default
 disposition, and the rollback has failure exits that report `ROLLBACK INCOMPLETE`.
 Either way: verify state (server active, no mid-rebase, pin, both CC versions)
 before re-running; it is idempotent. (A non-blocking PreToolUse advisory hook,
-`.claude/hooks/cc-deploy-timeout-guard`, nudges toward this on any deploy — it does
-not check whether you already detached, which is tracked in issue #2088.)
+`scripts/hooks/deploy_timeout_advisory.py`, nudges toward this whenever a command
+can run `update.sh`, and stays quiet on reads of it. It deliberately does not
+check whether you already detached: that needs systemd-run's option grammar, an
+open set, so a detached launch still gets the note.)
 
 **Why this paragraph is worded so defensively:** PR #1221 shipped both this policy
 and that hook on 2026-07-22 prescribing `run_in_background`, from a CC memory
@@ -1241,6 +1259,17 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   action itself. (Origin: the fence test in PR #2935, for issue #2863: its verify-RED ran a real
   `systemctl --user stop genesis-server` and took a live server down for about
   3.5 minutes.)
+- **Bound every mutant run with its own short timeout.** A mutation often turns
+  a test into a HANG rather than a failure (a mutant that never sets an event,
+  never cancels a task), and a hung run holds the box-wide test lock for the
+  whole per-test timeout while every other session waits. MEASURED: one sweep's
+  hung mutant held it for 53 minutes. Pass `-p timeout -o timeout=<N>` to each
+  mutant run, with N = max(60, 10 × the baseline run's slowest test). Spell it
+  `-p timeout`, never `-p pytest_timeout`: the plugin registers under the name
+  `timeout`, and the module name aborts pytest with "Plugin already registered"
+  (MEASURED, pytest 9.0.2 with pytest-timeout 2.4.0). And read the test result,
+  not the exit code: a missing plugin also exits 1, which a sweep would count
+  as a killed mutant.
 - **Never edit a shell script while a test that runs it is in progress.** bash
   reads a script as it executes it, so an edit mid-run yields bogus syntax
   errors that look like real failures. Wait for the run to finish, or test a

@@ -923,26 +923,9 @@ echo "--- Registering code intelligence MCP servers ---"
 if [ -x "$GENESIS_ROOT/.claude/mcp/run-gitnexus" ]; then
     _register_mcp "gitnexus" "user" "$GENESIS_ROOT/.claude/mcp/run-gitnexus" "mcp"
 fi
-if command -v codebase-memory-mcp &>/dev/null; then
-    # Registered via the repo launcher (NOT the bare binary): the launcher
-    # wraps the server in a systemd scope with MemoryMax to contain upstream's
-    # unbounded leak (DeusData/codebase-memory-mcp#581). See
-    # .claude/mcp/run-codebase-memory for the full rationale.
-    # REGISTERED EVEN WHEN THE KILL SWITCH IS ACTIVE, deliberately. Registration
-    # does not start anything, and the launcher is fail-closed on the sentinel
-    # (.claude/mcp/run-codebase-memory exits 1 with "disabled by <file>"), so
-    # writing the registration while disabled cannot run the server.
-    #
-    # Skipping preserved the exact drift this helper exists to repair: a
-    # PRE-EXISTING registration pointing at the bare `codebase-memory-mcp`
-    # binary survives untouched, bypasses the launcher entirely, and starts the
-    # uncapped raw server in the next session — and stays uncapped after the
-    # sentinel is removed until somebody runs this again.
-    _register_mcp "codebase-memory-mcp" "user" "$GENESIS_ROOT/.claude/mcp/run-codebase-memory"
-    if [ -n "${_cbm_disable:-}" ] && [ -e "$_cbm_disable" ]; then
-        echo "  codebase-memory-mcp registered to the launcher; the kill switch is active, so it will refuse to start"
-    fi
-fi
+# Register managed setup even without a PATH provider. Registration never
+# activates it; the launcher requires immutable settings and native enablement.
+_register_mcp "codebase-memory-mcp" "user" "$GENESIS_ROOT/.claude/mcp/run-codebase-memory"
 if _serena_registration_available; then
     # `-s project` writes .mcp.json keyed to the git-root of the CURRENT dir (no
     # flag overrides this), so register from the repo root regardless of the
@@ -1348,7 +1331,9 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         target="$SYSTEMD_USER_DIR/$svc_name"
         case "$svc_name" in
             genesis-cbm-query.service | genesis-cbm-query-clients.slice)
-                if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+                # Links reach the shared writer's keep/named-take policy below;
+                # it never writes through them. Other nonregular paths refuse.
+                if [[ ! -L "$target" && -e "$target" && ! -f "$target" ]]; then
                     echo "  ERROR: refusing nonregular managed Codebase unit: $target" >&2
                     exit 1
                 fi ;;

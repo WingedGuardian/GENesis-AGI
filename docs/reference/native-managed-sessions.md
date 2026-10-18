@@ -5,6 +5,55 @@ persisted `cc_sessions` receipt through the existing native invoker and profiles
 This is an execution primitive, not an enabled network connector. Ordinary
 `spawn` callers retain their existing defaults and delivery/parking behavior.
 
+## Provider selection before work
+
+Roster-eligible managed invocations check provider readiness before sending the
+task prompt. The home model is checked first; a classified provider refusal
+advances through credentialed alternatives in the configured CC roster order.
+Unusable backup entries are skipped; a misconfigured home or explicit pin fails
+without trying another provider. Other failures stop selection. Explicit
+provider pins, including native Claude, receive a single-provider readiness
+check. Unpinned routing opt-outs retain direct execution. Foreground-only
+`gmodel` catalog entries are not added to
+the automated roster.
+
+Each check uses a fixed diagnostic prompt, safe mode with OAuth support,
+`--tools ""`, and an empty strict MCP configuration. A complete exact response
+and an observed empty tools/MCP inventory are required. The check carries no
+task content or resume state. Each check receives an invocation timeout of up to
+90 seconds within the receipt's existing absolute deadline and runner slot;
+there is no separate task budget.
+These extra inference calls consume provider quota and may incur provider fees.
+Checks disable CLI session persistence, so deleting their scratch directory
+does not leave separate probe transcripts in the CLI's project tree. Actual
+task transcript persistence is unchanged. Informational limit events and usable
+overage do not reject readiness; a final effective refusal does, even alongside
+the exact readiness answer. Later allowed state can supersede an earlier refusal.
+
+Once selected, one provider executes the real task through the existing native
+profile and approval gates. A successful readiness check cannot guarantee that
+the subsequent task will finish: a later limit or failure ends the task without
+switching providers, parking, or replaying effects. Cleanup uncertainty retains
+capacity and the probe directory. The idle recovery worker also suspends further
+probes after uncertain cleanup until runtime recreation. Confirmed readiness
+for the current home provider clears its shared unavailable status, even when
+no fallback ever succeeded. A matching fallback banner is then retired.
+Confirmed refusals from the still-current home update shared rate/quota health;
+standby and pinned-other outcomes cannot overwrite it. Restart reconciliation
+remains unchanged.
+
+Receipt metadata records `provider_attempts`, `home_provider`,
+`execution_provider` and the selected endpoint context without credential
+values. The endpoint is pinned from the same roster snapshot as execution.
+The neural monitor's **Fallback** entry records actual execution outcomes, not
+probe success; a failed or cancelled selection does not replace the last actual
+execution observation. Private prompts, results and provider error prose are
+omitted. Home refusals remain in the receipt rather than the standby-peer
+availability store. The first successful managed fallback in an outage emits
+the existing owner switch alert once; later successes do not repeat it.
+The existing idle recovery worker uses the same enforced readiness check while
+retaining its 30-minute cadence and 300-second per-check bound.
+
 Construct a server-owned `DirectSessionRequest(managed=True, notify=False,
 source_tag="agent_api", caller_context="agent_api:<receipt>")`. Only `observe`
 and `interact` profiles are supported in this mode; tool exceptions and origin

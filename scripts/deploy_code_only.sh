@@ -136,6 +136,9 @@
 # (a config/*.local.yaml, which git status never lists) and of the user overlays
 # in ~/.genesis/config, which the loaders prefer. HEAD may move over docs, or
 # over hooks and scripts the server never runs, without invalidating the run.
+# Status prints the captured MainPID, invocation, edits and overrides used by
+# its bracket calculation. These captures are separate reads, not an atomic
+# snapshot of systemd, git and the filesystem.
 # It is a TRIPWIRE, not a certificate: "valid" means none of those changes
 # happened, not that nothing the server runs changed. It cannot see, and reads
 # valid through: a change to the venv's installed packages (imported lazily

@@ -2978,6 +2978,24 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
     status = budget.get("status")
     if status not in ("degraded", "error"):
         return  # healthy / no sub-cap (pids.max="max") / unavailable → nothing to alert
+    # Record WHO holds the budget on every low tick, cooldown or not: the holders
+    # may be gone by the next alert, and the count alone cannot name them.
+    breakdown = None
+    if budget.get("path"):
+        from genesis.observability import pid_breakdown
+
+        try:
+            try:
+                breakdown = await asyncio.to_thread(pid_breakdown.snapshot_for, budget)
+            except RuntimeError:
+                # No worker thread could start: the budget itself is exhausted,
+                # the tick this exists for. The collector's finite work limits
+                # also apply inline. (The executor queued the work before failing
+                # to start a thread, so a later worker may take a second,
+                # harmless snapshot file.)
+                breakdown = pid_breakdown.snapshot_for(budget)
+        except Exception:
+            logger.warning("pid budget breakdown could not run", exc_info=True)
     scope = budget.get("scope")
     now = time.monotonic()
     # Per-scope cooldown with escalation bypass: fire when the scope is new, its
@@ -3044,6 +3062,13 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
                 f"{where} at {pct:.0f}% ({current}/{maximum} tasks). When it fills, new "
                 f"processes fail with 'Cannot fork' even though memory/CPU/disk are fine. "
                 f"Each Claude Code session spawns MCP subprocess trees. {remedy}"
+                + (f" {breakdown['text']}" if breakdown else "")
+                + (
+                    " Full breakdown: "
+                    + str(breakdown["file"]).encode("utf-8", "backslashreplace").decode("utf-8")
+                    if breakdown and breakdown.get("file")
+                    else ""
+                )
             ),
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
