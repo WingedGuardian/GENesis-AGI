@@ -1,0 +1,11 @@
+{
+  "entries": [
+    {
+      "commit": "42293ad2c56c812eeabe766151a2fd257c9054f4",
+      "path": "src/genesis/payments/vault_store.py",
+      "type": "Base64 High Entropy String",
+      "sha1": "9a96960baa4d8c0559cf89f72b5f3486736762e9",
+      "reason": "the public BIP-173 bech32 character set (_BECH32), not sensitive; main's copy carries the inline pragma"
+    }
+  ]
+}

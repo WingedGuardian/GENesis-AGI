@@ -172,8 +172,15 @@ async def _persist_health_alerts(db) -> None:
     try:
         from genesis.db.crud import alert_events as _ae
         from genesis.mcp.health.errors import _compute_alerts
+        from genesis.observability.agent_api_alerts import ALERT_ID, active_alerts, notify_pending
+        from genesis.runtime import GenesisRuntime
 
-        alerts, _current_ids = await _compute_alerts()
+        observation = {}
+        alerts, _current_ids = await _compute_alerts(agent_api_observation=observation)
+        # Also preserve an open API incident if the health service itself could
+        # not initialize and _compute_alerts returned before taking a snapshot.
+        alerts = [a for a in alerts if a.get("id") != ALERT_ID]
+        alerts.extend(await active_alerts(db, observation))
         active = [
             {
                 "alert_id": a["id"],
@@ -184,7 +191,12 @@ async def _persist_health_alerts(db) -> None:
             for a in alerts
             if a.get("id")
         ]
-        await _ae.reconcile_open_set(db, active=active, now=datetime.now(UTC).isoformat())
+        state = observation.get("status")
+        reasons = {ALERT_ID: state} if state in {"healthy", "disabled"} else None
+        await _ae.reconcile_open_set(db, active=active, now=datetime.now(UTC).isoformat(),
+                                     resolution_reasons=reasons)
+        runtime = GenesisRuntime.peek()
+        await notify_pending(db, getattr(runtime, "_outreach_pipeline", None))
     except Exception:
         logger.debug("alert_events persistence failed (best-effort)", exc_info=True)
 

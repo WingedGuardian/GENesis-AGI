@@ -331,6 +331,52 @@ async def test_model_fusion_seeded_idle_without_run():
 
 
 @pytest.mark.asyncio
+async def test_fallback_seed_is_non_routing_and_does_not_claim_cc_subscription():
+    result = await call_sites(db=None, routing_config=_config({}, {}), breakers=_registry())
+    fallback = result["cc_fallback"]
+    assert fallback["status"] == "idle" and fallback["routing"] is False
+    assert fallback["cost_policy"] == "Configured roster (billing varies)"
+    assert not fallback.get("chain_health")
+
+
+@pytest.mark.parametrize("success", [True, False])
+async def test_fallback_snapshot_renders_actual_last_outcome_without_response(db, success):
+    import json
+    import shutil
+    import subprocess
+
+    from genesis.observability.call_site_recorder import record_last_run
+
+    await record_last_run(db, "cc_fallback", provider="backup", model_id="actual-model",
+                          response_text=None, success=success)
+    result = await call_sites(db=db, routing_config=_config({}, {}), breakers=_registry())
+    fallback = result["cc_fallback"]
+    assert fallback["last_run_success"] is success and fallback["last_response"] is None
+    assert fallback["status"] == ("active" if success else "warning")
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is needed for the monitor's DOM renderer")
+    source = (_REPO_ROOT / "src/genesis/dashboard/templates/neural_monitor.html").read_text()
+    helpers = source[source.index("function el("):source.index("// ── Shared Tooltip")]
+    start = source.index("const lastRunSection =")
+    end = source.index("content.appendChild(lastRunSection);", start)
+    render = source[start:end + len("content.appendChild(lastRunSection);")]
+    script = """
+const item=JSON.parse(require('fs').readFileSync(0,'utf8'));
+const document={createElement:tag=>({tag,style:{},textContent:'',children:[],
+    appendChild(child){this.children.push(child);}})};
+const content=document.createElement('div');
+""" + helpers + render + """
+function text(element){return element.textContent+element.children.map(text).join(' ');}
+process.stdout.write(text(content));
+"""
+    output = subprocess.run([node, "-e", script], input=json.dumps({"id": "cc_fallback", "data": fallback}),
+                            capture_output=True, text=True, check=True, timeout=10)
+    assert "backup (actual-model)" in output.stdout
+    assert ("Succeeded" if success else "Failed") in output.stdout
+
+
+@pytest.mark.asyncio
 async def test_model_fusion_active_with_recorded_run(tmp_path):
     import aiosqlite
 

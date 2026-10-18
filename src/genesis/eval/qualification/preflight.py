@@ -14,7 +14,7 @@ from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
-from genesis.eval.qualification import contracts, corpus, references, storage
+from genesis.eval.qualification import contracts, corpus, references, sources, storage
 from genesis.eval.qualification.evidence import Incomplete, canonical, digest, load_json
 from genesis.eval.qualification.pinned import ROUTE_KEYS, resolve, routing, validate_params
 from genesis.eval.rubrics import list_rubrics
@@ -144,12 +144,12 @@ def historical_source(node):
         raise Incomplete("invalid historical reference source identity")
 
 
-def source_evidence(cases, source_files):
+def source_evidence(cases, source_files, *, retention=None):
     """Check the frozen original source bytes, including hashes without paths."""
     if not isinstance(source_files, dict) or not source_files:
         raise Incomplete("frozen reference source files are required")
-    verified = {}
-    for path, expected in source_files.items():
+    verified = sources.retained(source_files, retention) if retention is not None else {}
+    for path, expected in (() if retention is not None else source_files.items()):
         if not isinstance(path, str) or not isinstance(expected, str) or len(expected) != 64:
             raise Incomplete("invalid reference source identity")
         actual = file_hash(path)
@@ -188,7 +188,7 @@ def production_modules():
     from genesis.db.schema import _tables, create_all_tables
     from genesis.learning.procedural import extractor, judge, operations, scoping, validation_gate
 
-    return [contracts, corpus, references, storage, extractor, judge, operations, scoping,
+    return [contracts, corpus, references, sources, storage, extractor, judge, operations, scoping,
             validation_gate, inspect.getmodule(LLMJudgeScorer),
             inspect.getmodule(contracts.J9EvalBatchExecutor), inspect.getmodule(check),
             inspect.getmodule(resolve), inspect.getmodule(contracts.pack_embedding),
@@ -226,7 +226,10 @@ async def check(cases, temp_root, *, reference_policy, current_policy,
         models[alias] = provider.model_id
         # Reject malformed/implicit routing settings before expensive rendering.
         parameters(alias, configured, {}, config=config)
-    verified_sources = source_evidence(cases, sources)
+    retention = approval.get("source_retention")
+    if retention is None:
+        raise Incomplete("source retention and genuine restore evidence are required")
+    verified_sources = source_evidence(cases, sources, retention=retention)
     modules = production_modules()
     production_sources = production_source_inventory(modules)
     plan = await prepare(cases, temp_root, reference_policy=policy)
@@ -234,7 +237,7 @@ async def check(cases, temp_root, *, reference_policy, current_policy,
         alias: parameters(alias, params, plan, config=config)
         for alias, params in candidates.items()
     }
-    if (source_evidence(cases, sources) != verified_sources or corpus.versions() != versions
+    if (source_evidence(cases, sources, retention=retention) != verified_sources or corpus.versions() != versions
         or [asdict(r) for r in list_rubrics()] != rubric_definitions
         or production_source_inventory(modules) != production_sources):
         raise Incomplete("source or contract changed during offline preflight")

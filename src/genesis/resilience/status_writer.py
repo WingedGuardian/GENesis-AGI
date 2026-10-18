@@ -85,6 +85,9 @@ class StatusFileWriter:
             "last_recovery": None,
             "human_summary": summary,
         }
+        from genesis.observability.agent_api_health import sample
+
+        data["agent_api"] = await sample(self._runtime)
         if failing_jobs:
             data["failing_jobs"] = failing_jobs
 

@@ -291,7 +291,7 @@
             </template>
             <template x-if="$store.genesisDashboard.health.cc_sessions?.fallback?.is_fallback">
               <div class="health-card-detail" style="color: #f0ad4e; font-weight: 600;"
-                   x-text="'on ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'roster peer') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
+                   x-text="'Last fallback: ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'roster peer') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
             </template>
             <div class="health-card-reason" x-text="$store.genesisDashboard.ccSemantic().reason"></div>
           </div>
