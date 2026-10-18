@@ -7038,7 +7038,7 @@ def _track_checkout_admission(monkeypatch, invoker, *, streaming, spawn_error=No
     monkeypatch.setattr(invoker, "_build_env", lambda _invocation: {})
     monkeypatch.setattr(invoker, "_apply_login_fallback", fallback)
     monkeypatch.setattr(invoker, "_launch_env", lambda env, _invocation: env)
-    monkeypatch.setattr(invoker, "_register_proc", lambda *_args: None)
+    monkeypatch.setattr(invoker, "_register_proc", lambda key, _proc, **_kwargs: key)
     monkeypatch.setattr(invoker, "_unregister_proc", lambda *_args: None)
 
     result = {

@@ -1277,13 +1277,9 @@ class DirectSessionRunner:
             Path(invocation.claude_code_tmpdir).mkdir(parents=True, exist_ok=True)
         try:
             if request.managed:
-                from genesis.cc.managed_fallback import select_provider
-                from genesis.cc.provider_readiness import isolated_provider
+                from genesis.cc.managed_fallback import execute_selected
 
-                provider, invocation = await select_provider(self, request, session_id, invocation)
-                with isolated_provider():
-                    output = await self._invoker.run_streaming(invocation, on_event=on_event)
-                return replace(output, roster_model=provider) if provider else output
+                return await execute_selected(self, request, session_id, invocation, on_event)
             return await self._invoker.run_streaming(invocation, on_event=on_event)
         except ProcessCleanupUncertain:
             if not request.managed:

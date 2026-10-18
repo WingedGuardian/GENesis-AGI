@@ -42,11 +42,13 @@ class CCFallbackProbeWorker:
         self._interval_s = interval_s
         self._task: asyncio.Task | None = None
         self._cleanup_uncertain = False
+        self._uncertain_process = None
+        self._uncertain_directory = None
 
     def start(self) -> None:
         """Start the probe loop (idempotent — no-op if a task is already running)."""
         if self._cleanup_uncertain:
-            return  # Runtime recreation is required after an uncertain child.
+            return  # Restarting this worker is not proof the old group exited.
         if self._task is None or self._task.done():
             from genesis.util.tasks import tracked_task
 
@@ -74,8 +76,10 @@ class CCFallbackProbeWorker:
                 await self._probe_once()
             except asyncio.CancelledError:
                 raise
-            except ProcessCleanupUncertain:
+            except ProcessCleanupUncertain as exc:
                 self._cleanup_uncertain = True
+                self._uncertain_process = exc.process
+                self._uncertain_directory = getattr(exc, "probe_directory", None)
                 logger.warning("CC recovery probes suspended: process cleanup unconfirmed")
                 return
             except Exception:

@@ -50,6 +50,7 @@ from genesis.cc.types import (
 from genesis.observability.spans import SpanKind, start_span
 from genesis.util.inflight import inflight
 from genesis.util.proc_kill import (
+    ProcessCleanupUncertain,
     confirm_process_exit,
     kill_process_group,
     process_group_alive,
@@ -1887,6 +1888,7 @@ class CCInvoker:
         # so concurrent sessions don't clobber each other and `/stop` can
         # interrupt the RIGHT proc. Single-threaded asyncio → no lock needed.
         self._active_procs: dict[str, asyncio.subprocess.Process] = {}
+        self._cleanup_owned_procs: set[str] = set()
         self._on_cc_status_change = on_cc_status_change
         self._on_model_downgrade = on_model_downgrade
         self._on_cc_empty_output = on_cc_empty_output
@@ -1996,7 +1998,7 @@ class CCInvoker:
 
     async def _fire_downgrade_callback(self, output: CCOutput) -> None:
         """Invoke model downgrade callback if applicable. Never raises."""
-        if provider_status_isolated():
+        if probing_provider():
             return
         if not output.downgraded or not self._on_model_downgrade:
             return
@@ -2655,7 +2657,9 @@ class CCInvoker:
         pin_dispatched_env(env)
         return env
 
-    def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:
+    def _register_proc(
+        self, key: str, proc: asyncio.subprocess.Process, *, confirm_cleanup: bool = False
+    ) -> str:
         """Register a live subprocess under a session key.
 
         Prunes dead entries first — a safety net so the registry only ever
@@ -2666,12 +2670,36 @@ class CCInvoker:
         the same key would orphan the prior proc — keep that invariant if the
         locking model changes.
         """
-        for dead in [k for k, p in self._active_procs.items() if p.returncode is not None]:
+        for dead in [
+            k
+            for k, p in self._active_procs.items()
+            if p.returncode is not None and k not in self._cleanup_owned_procs
+        ]:
             self._active_procs.pop(dead, None)
+        if key in self._cleanup_owned_procs:
+            key = f"pid:{proc.pid}:{id(proc)}"
         self._active_procs[key] = proc
+        if confirm_cleanup:
+            self._cleanup_owned_procs.add(key)
+        return key
 
     def _unregister_proc(self, key: str) -> None:
         self._active_procs.pop(key, None)
+        self._cleanup_owned_procs.discard(key)
+
+    async def _confirm_registered_exit(self, proc, key: str, **kwargs) -> None:
+        """Uncertain groups retain ownership even after their leader exits."""
+        try:
+            await confirm_process_exit(proc, **kwargs)
+        except ProcessCleanupUncertain as exc:
+            exc.process = proc
+            raise
+        except asyncio.CancelledError:
+            # confirm_process_exit delivers cancellation only after proving exit.
+            self._unregister_proc(key)
+            raise
+        else:
+            self._unregister_proc(key)
 
     async def interrupt(self, key: str | None = None) -> None:
         """Send SIGINT to a session's subprocess. No-op if none match.
@@ -3066,7 +3094,7 @@ class CCInvoker:
             )
             admission.release()
             reg_key = invocation.session_key or f"pid:{proc.pid}"
-            self._register_proc(reg_key, proc)
+            reg_key = self._register_proc(reg_key, proc)
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
             set_oom_score_adj(proc.pid, 500)
             if invocation.on_spawn is not None:
@@ -3319,6 +3347,10 @@ class CCInvoker:
                 start_new_session=True,
             )
             admission.release()
+        except ProcessCleanupUncertain as exc:
+            if exc.process is not None:
+                self._register_proc(f"pid:{exc.process.pid}", exc.process, confirm_cleanup=True)
+            raise
         except FileNotFoundError:
             logger.error(
                 "Claude CLI not found at %r. Ensure @anthropic-ai/claude-code "
@@ -3337,7 +3369,7 @@ class CCInvoker:
         # pipe, task cancellation), reap the proc and drop the registry entry —
         # don't leak either. The streaming `try` below unregisters on its paths.
         reg_key = invocation.session_key or f"pid:{proc.pid}"
-        self._register_proc(reg_key, proc)
+        reg_key = self._register_proc(reg_key, proc, confirm_cleanup=invocation.confirm_cleanup)
         try:
             if invocation.on_spawn is not None:
                 try:
@@ -3358,10 +3390,7 @@ class CCInvoker:
                 self._unregister_proc(reg_key)
                 kill_process_group(proc)
             else:
-                try:
-                    await confirm_process_exit(proc)
-                finally:
-                    self._unregister_proc(reg_key)
+                await self._confirm_registered_exit(proc, reg_key)
             raise
 
         result_data: dict | None = None
@@ -3608,17 +3637,16 @@ class CCInvoker:
             kill_process_group(proc)
             raise
         finally:
-            try:
-                if invocation.confirm_cleanup:
-                    # After a clean result the child was only asked to stop:
-                    # give it the same reap and flush grace an ordinary run
-                    # gets below, then confirm the group is gone.
-                    await confirm_process_exit(
-                        proc,
-                        graceful=terminated_after_result,
-                        escalation_grace_s=_ESCALATION_GRACE_S,
-                    )
-            finally:
+            if invocation.confirm_cleanup:
+                # A result asks the child to stop; ownership ends only when
+                # the complete group, rather than just its leader, is gone.
+                await self._confirm_registered_exit(
+                    proc,
+                    reg_key,
+                    graceful=terminated_after_result,
+                    escalation_grace_s=_ESCALATION_GRACE_S,
+                )
+            else:
                 self._unregister_proc(reg_key)
 
         # Bounded reap: proc.terminate() on the result path is a GRACEFUL stop

@@ -118,6 +118,87 @@ async def select_provider(runner, request, sid, invocation):
     raise CCProcessError("No configured provider established readiness")
 
 
+def _refusal(error):
+    """Reuse provider classification, including wrapped errors but never MCP faults."""
+    chain, seen = [], set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        chain.append(error)
+        error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+    if any(peer_availability._mentions_mcp(exc) for exc in chain):
+        return None
+    return next((exc for exc in chain if peer_availability.is_provider_refusal(exc)), None)
+
+
+async def execute_selected(runner, request, sid, invocation, on_event):
+    """Own one actual launch; observe only attributable evidence, never replay."""
+    from genesis.cc.invoker import CCInvoker
+    from genesis.cc.provider_readiness import isolated_provider
+
+    provider, selected = await select_provider(runner, request, sid, invocation)
+    db = runner._session_manager.db
+    row = await cc_sessions.get_by_id(db, sid)
+    from genesis.cc.managed_session import metadata
+
+    home = metadata(row).get("home_provider")
+    last_limit = None
+    launched = False
+
+    async def spawned(pid):
+        nonlocal launched
+        launched = True
+        try:
+            async with get_raw_db(await database_path(db)) as owned:
+                await cc_sessions.merge_metadata(owned, sid, {"execution_started": True})
+        finally:
+            if selected.on_spawn is not None:
+                await selected.on_spawn(pid)
+
+    async def event_seen(event):
+        nonlocal last_limit
+        if (event.raw or {}).get("type") == "rate_limit_event":
+            last_limit = event.raw
+        if on_event is not None:
+            await on_event(event)
+
+    async def observe(error):
+        if not provider or not launched:
+            return
+        # Advisory writes must never change task outcome or cause replay.
+        try:
+            if error is not None:
+                error = _refusal(error)
+                if error is None:
+                    return
+            if provider == home:
+                await _observe_home(runner, home, provider, error)
+            elif error is not None:
+                await asyncio.to_thread(peer_availability.note_failure, provider, error)
+            else:
+                await asyncio.to_thread(peer_availability.note_success, provider)
+        except Exception:
+            pass
+
+    try:
+        with isolated_provider():
+            output = await runner._invoker.run_streaming(
+                replace(selected, on_spawn=spawned), on_event=event_seen
+            )
+    except Exception as exc:
+        await observe(exc)
+        raise
+    info = (last_limit or {}).get("rate_limit_info") or {}
+    if not isinstance(info, dict):
+        info = {}  # Malformed advisory evidence cannot discard completed work.
+    if info.get("status") == "rejected" and info.get("isUsingOverage") is not True:
+        await observe(CCRateLimitError(raw_event=last_limit))
+    elif output.is_error:
+        await observe(CCInvoker._classify_error(output.error_message or output.text))
+    elif output.result_received and not output.bg_truncated:
+        await observe(None)
+    return replace(output, roster_model=provider) if provider else output
+
+
 async def record_fallback(db, provider, model, *, success):
     """Non-routing last observation; no task/response/provider-error content."""
     try:
@@ -143,24 +224,25 @@ async def record_managed_outcome(runner, sid, result):
         row = await cc_sessions.get_by_id(db, sid)
         meta = metadata(row)
         selected = meta.get("execution_provider")
-        if not meta.get("fallback_attempted") or not selected:
+        if not meta.get("fallback_attempted") or not selected or not meta.get("execution_started"):
             return
         success = meta.get("native_state") == "succeeded" and row["status"] == "completed"
         last = meta["provider_attempts"][-1]
         await record_fallback(db, selected, result.model_used or last["model"], success=success)
-        if success and selected != meta["home_provider"]:
-            await asyncio.to_thread(peer_availability.note_success, selected)
-            # Like conversation/recovery, keep this read-modify-write on the
-            # runtime loop; a worker thread could race another enter or clear.
-            if fallback_state.enter(meta["home_provider"], selected, "rate_limit"):
-                await fallback_recovery.fire_fallback_alert(
-                    topic="cc_fallback_switch",
-                    context=(
-                        "<b>Fallback</b>\n\nA managed task completed using "
-                        f"<b>{escape(selected)}</b> while "
-                        f"<b>{escape(meta['home_provider'])}</b> was unavailable. "
-                        "Genesis checks the home provider again for each new task."
-                    ),
-                )
+        # Keep this transition on the runtime loop, as recovery does.
+        if (
+            success
+            and selected != meta["home_provider"]
+            and fallback_state.enter(meta["home_provider"], selected, "rate_limit")
+        ):
+            await fallback_recovery.fire_fallback_alert(
+                topic="cc_fallback_switch",
+                context=(
+                    "<b>Fallback</b>\n\nA managed task completed using "
+                    f"<b>{escape(selected)}</b> while "
+                    f"<b>{escape(meta['home_provider'])}</b> was unavailable. "
+                    "Genesis checks the home provider again for each new task."
+                ),
+            )
     except Exception:
         pass  # Classified, committed receipts do not depend on diagnostics.

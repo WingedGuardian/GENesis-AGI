@@ -91,6 +91,8 @@ async def managed(tmp_path, monkeypatch):
                 raise CCQuotaExhaustedError("synthetic refusal")
             return await readiness(on_event)
         tasks.append(invocation)
+        if invocation.on_spawn is not None:
+            await invocation.on_spawn(424215)
         return answer()
 
     invoker = SimpleNamespace(run_streaming=AsyncMock(side_effect=execute))
@@ -321,6 +323,7 @@ async def test_no_false_success_when_result_is_partial(managed):
     async def run(invocation, on_event=None):
         if invocation.disable_tools:
             return await managed.execute(invocation, on_event)
+        await invocation.on_spawn(424215)
         return answer(result_received=False)
 
     managed.invoker.run_streaming.side_effect = run

@@ -101,8 +101,9 @@ async def probe_provider(invoker, base: CCInvocation, *, timeout_s: float):
         if info.get("status") == "rejected" and info.get("isUsingOverage") is not True:
             raise CCRateLimitError("Provider readiness was refused", raw_event=last_limit)
         return output
-    except ProcessCleanupUncertain:
+    except ProcessCleanupUncertain as exc:
         uncertain = True
+        exc.probe_directory = root
         raise
     finally:
         if not uncertain:
