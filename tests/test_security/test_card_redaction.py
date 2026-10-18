@@ -22,6 +22,7 @@ from genesis.security.card_redaction import (
 from genesis.security.card_shapes import REDACTED
 
 _CARD = "4242424242424242"
+_MAX_SAFE = 2**53 - 1  # JavaScript's Number.MAX_SAFE_INTEGER
 
 
 def test_module_imports_only_stdlib_and_card_shapes():
@@ -66,8 +67,29 @@ class TestRedactValue:
         assert "4242" not in out and REDACTED in out
         assert '"n": 1' in out
 
+    def test_a_json_string_scalar_is_decoded(self):
+        out = redact_text('"\\u0034242424242424242"')
+        assert out == f'"{REDACTED}"'
+
+    def test_numbers_beyond_the_safe_integer_range_are_withheld(self):
+        """A 17-19 digit card returned as a JS Number arrives rounded and fails
+        the checksum; every number in that range is withheld."""
+        big = int(_CARD + "123")  # 19 digits, built at runtime: not a card literal
+        assert big > _MAX_SAFE
+        assert redact_value(big) == REDACTED
+        assert redact_value(float(big)) == REDACTED
+        assert redact_value(-big) == REDACTED
+        assert redact_value({"a": [1, {"b": big}]}) == {"a": [1, {"b": REDACTED}]}
+        out = redact_text(f'{{"n": {big}, "m": 2}}')
+        assert str(big) not in out and REDACTED in out and '"m": 2' in out
+
+    def test_numbers_that_are_not_cards_stay(self):
+        for n in (_MAX_SAFE, 1_760_000_000_000, 10**19, 12345, 0.5):
+            assert redact_value(n) == n
+        assert redact_value(float("inf")) == float("inf")
+
     def test_text_without_a_card_is_unchanged(self):
-        for text in ("order 12345", '{"a": 1}', "[1, 2", "- heading: x"):
+        for text in ("order 12345", '{"a": 1}', "[1, 2", "- heading: x", '"quoted" text', '"plain"'):
             assert redact_text(text) == text
 
 
