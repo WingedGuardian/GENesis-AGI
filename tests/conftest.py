@@ -630,6 +630,21 @@ def _isolate_boundary_key(tmp_path):
     mp.undo()
 
 
+# ── Safety: no test reads or writes the REAL payment-tab pending file ───────
+@pytest.fixture(autouse=True)
+def _isolate_payment_tab_pending(tmp_path):
+    """Point the payment-tab guard's pending-origins file at tmp. Every Camoufox
+    launch in a test reads it, and a live file would make that launch clear
+    real origins (or refuse run_js). Fixture-owned ``MonkeyPatch``, as above."""
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        "genesis.env.payment_tab_pending_path",
+        lambda: tmp_path / "payment_tab_pending.json",
+    )
+    yield
+    mp.undo()
+
+
 # ── Safety: a ticking test must not start the REAL daily git fsck ──────────
 @pytest.fixture(autouse=True)
 def _skip_daily_git_deep_scan():

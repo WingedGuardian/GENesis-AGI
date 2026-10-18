@@ -61,19 +61,30 @@ _REFUSE_PAYMENT_RUN_JS = (
     "Refused: a payment tab is open, or a closed one's site data is still being "
     "cleared, so no script runs in this browser until the payment flow finishes."
 )
+_REFUSE_PAYMENT_STORE = (
+    "Refused: the payment-tab pending file (payment_tab_pending.json in the Genesis "
+    "home) cannot be read, so site data earlier payment tabs showed may be uncleared. "
+    "No script runs in this browser until the owner checks and removes it; the next "
+    "browser launch then picks that up."
+)
 _REFUSE_PAYMENT_TAB = (
     "Refused: this is a payment tab. Screenshots, typing, uploads and navigation "
     "are off on it until the payment flow finishes."
 )
 _REFUSE_PAYMENT_KEY = (
-    "Refused: a payment tab takes only Enter, Tab, Shift+Tab, Escape, Space, the "
-    "arrow keys, PageUp, PageDown, Home and End."
+    "Refused: a payment tab takes only Enter, Tab, Shift+Tab and Escape (the other "
+    "keys can change a filled field)."
 )
 _REFUSE_PAYMENT_SCHEME = "Refused: only http(s) URLs open while a payment tab is open."
 _PAYMENT_TAB_FAILED = (
     "The action on the payment tab failed. The detail is withheld because the tab "
     "holds card data: call browser_snapshot to see its state."
 )
+
+
+def _run_js_refusal() -> dict:
+    tabs = payment_tab.TABS
+    return {"error": _REFUSE_PAYMENT_STORE if tabs.store_broken() else _REFUSE_PAYMENT_RUN_JS}
 
 
 def _armed_refusal(page) -> dict | None:
@@ -495,7 +506,9 @@ async def async_cleanup():
             await _idle_task
         _idle_task = None
 
-    # A closed payment tab's site-storage clear needs its browser: let it end.
+    # A payment tab's site-storage clear needs its browser: finish any armed
+    # tab now (only finish starts a clear), then let every clear end.
+    await payment_tab.TABS.finish_all()
     await payment_tab.TABS.drain()
 
     # Remote CDP: disconnect (does NOT close user's Chrome), then let shielded
@@ -591,12 +604,13 @@ async def _ensure_browser():
         # With persistent_context, browser IS the context
         _stealth_cm, _stealth_browser = cm, ctx
         _layer_launched[BrowserLayer.CAMOUFOX] = time.monotonic()
-        payment_tab.TABS.prefs_pinned = card_fill
         ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CAMOUFOX, c))
         ctx.on("dialog", _on_dialog)
         _stealth_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         # Site storage a payment tab of the previous launch left uncleared.
         await payment_tab.TABS.clear_pending(ctx, BrowserLayer.CAMOUFOX)
+        # Only now may a tab be armed: the pending file is read and cleared.
+        payment_tab.TABS.prefs_pinned = card_fill
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
         logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
         return _stealth_page
@@ -4471,7 +4485,9 @@ async def _impl_browser_snapshot() -> dict:
             _remote_last_url = url_now
         return result
     except Exception as e:
-        if payment_tab.TABS.is_armed(page):
+        # Judged by the arming the call began under too: a finish that landed
+        # meanwhile does not make the page's error text safe to show.
+        if armed or tabs.epoch != epoch or tabs.is_armed(page):
             return {"error": _PAYMENT_TAB_FAILED}
         return {"error": f"Snapshot failed: {e}"}
 
@@ -4509,7 +4525,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
     # Refused in the whole browser, not only on the payment tab: a script in
     # any tab can reach it through window.opener or a window.open handle.
     if payment_tab.TABS.run_js_blocked():
-        return {"error": _REFUSE_PAYMENT_RUN_JS}
+        return _run_js_refusal()
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -4522,7 +4538,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
         if refused:
             return refused
         if payment_tab.TABS.run_js_blocked():  # armed while this call waited
-            return {"error": _REFUSE_PAYMENT_RUN_JS}
+            return _run_js_refusal()
         # Before the script runs: what it plants can outlive it (a timer, a
         # handle on another tab), so Camoufox stays tainted for card fill.
         if _layer_of(page) in (None, BrowserLayer.CAMOUFOX):
@@ -4768,7 +4784,7 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
 
     if refused := _key_refused():
         return refused
-    armed = payment_tab.TABS.is_armed(page)
+    armed, epoch = payment_tab.TABS.is_armed(page), payment_tab.TABS.epoch
     async with _page_action(page) as refused:  # Enter on a link may open a tab
         if refused := refused or _key_refused():
             return refused
@@ -4779,7 +4795,8 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
                 await page.keyboard.press(key)
             return {"pressed": key, "count": count, "url": _shown_url(page, page.url, armed)}
         except Exception as e:
-            if payment_tab.TABS.is_armed(page):
+            # Judged by the arming the call began under too, as in the snapshot.
+            if armed or payment_tab.TABS.epoch != epoch or payment_tab.TABS.is_armed(page):
                 return {"error": _PAYMENT_TAB_FAILED}
             return {"error": f"Key press failed for '{key}': {e}"}
 

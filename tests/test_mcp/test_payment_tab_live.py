@@ -192,14 +192,14 @@ def _no_secret(blob) -> None:
 
 async def _fill(page) -> None:
     """The harness's fill (PR7b-2's job): top level and the card iframe."""
-    payment_tab.begin_fill(page)
+    payment_tab.begin_fill(page, (NAME, PAN, FRAME_PAN, EXP, CVC))
     frame = page.frame_locator("#card")
     for target, pan in ((page, PAN), (frame, FRAME_PAN)):
         await target.locator("#name").fill(NAME)
         await target.locator("#num").fill(pan)
         await target.locator("#exp").fill(EXP)
         await target.locator("#cvc").fill(CVC)
-    payment_tab.mark_filled(page, (NAME, PAN, FRAME_PAN, EXP, CVC))
+    payment_tab.mark_filled(page)
 
 
 async def _values(page) -> dict:

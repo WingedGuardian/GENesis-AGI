@@ -11,12 +11,17 @@ import ast
 import asyncio
 import json
 import logging
+import shutil
+import stat
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit
 
 import pytest
 
+from genesis import env
 from genesis.browser.types import BrowserLayer
 from genesis.mcp.health import browser, payment_tab
 from genesis.mcp.health.payment_tab import HIDDEN, TABS, PaymentTabError
@@ -46,6 +51,8 @@ SNAPSHOT = (
     "- iframe"
 )
 STATES = ("awaiting_tap", "filling", "armed", "crashed")
+# Read at import, before tests/conftest.py points it at a tmp dir.
+_REAL_PENDING_PATH = getattr(env, "payment_tab_pending_path", None)
 
 
 def _no_secret(blob) -> None:
@@ -95,10 +102,10 @@ def _fire(page, event):
 
 async def _arm_in(state: str, page):
     await payment_tab.arm(page)
-    if state == "filling":
-        payment_tab.begin_fill(page)
-    elif state in ("armed", "crashed"):
-        payment_tab.mark_filled(page, FILLED)
+    if state in ("filling", "armed", "crashed"):
+        payment_tab.begin_fill(page, FILLED)
+    if state in ("armed", "crashed"):
+        payment_tab.mark_filled(page)
     if state == "crashed":
         _fire(page, "crash")
 
@@ -106,6 +113,7 @@ async def _arm_in(state: str, page):
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch, tmp_path):
     TABS.reset()
+    TABS.prefs_pinned = True  # a Camoufox launched with card fill on
     monkeypatch.setattr(browser, "_active_page", None)
     monkeypatch.setattr(browser, "_stealth_page", None)
     monkeypatch.setattr(browser, "_stealth_cm", None)
@@ -218,7 +226,8 @@ class TestHmacTokens:
     async def test_values_are_never_kept_only_keyed_hashes(self):
         page = _page()
         await payment_tab.arm(page)
-        payment_tab.mark_filled(page, FILLED)
+        payment_tab.begin_fill(page, FILLED)
+        payment_tab.mark_filled(page)
         entry = TABS._tabs[page]
         dump = repr(vars(entry)) + repr(vars(TABS))
         for v in FILLED + ("4242", "1234", "Tester"):
@@ -246,6 +255,29 @@ class TestHmacTokens:
         out = TABS.redact_text(text)
         _no_secret(out)
         assert "total 740 Al." in out  # short or non-matching tokens stay
+
+    @pytest.mark.asyncio
+    async def test_values_are_matched_from_begin_fill_before_any_is_typed(self):
+        # A fill that fails after typing some fields never reaches mark_filled:
+        # text mirroring what was typed must already be hidden.
+        page = _page()
+        await payment_tab.arm(page)
+        payment_tab.begin_fill(page, FILLED)
+        assert TABS.state(page) is payment_tab.State.FILLING
+        out = TABS.redact_text(f"Paying with card {CVC} of {NAME}, exp {EXP}")
+        _no_secret(out)
+        _drive(page)
+        _no_secret(await browser._impl_browser_snapshot())
+
+    @pytest.mark.asyncio
+    async def test_mark_filled_needs_begin_fill_first(self):
+        # begin_fill is where the mask and the pending file are checked.
+        page = _page()
+        await payment_tab.arm(page)
+        with pytest.raises(PaymentTabError) as e:
+            payment_tab.mark_filled(page, FILLED)
+        assert e.value.code == "wrong_state"
+        assert TABS.state(page) is payment_tab.State.AWAITING_TAP
 
     @pytest.mark.asyncio
     async def test_tokens_stop_matching_once_the_tab_is_finished(self):
@@ -399,13 +431,26 @@ class TestReaderMatrix:
         page = _page()
         await _arm_in(state, page)
         _drive(page)
-        for key in ("Control+c", "Control+a", "Backspace", "Shift+ArrowLeft", "Control+v", "a"):
+        edits = ("Space", " ", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight")
+        edits += ("PageUp", "PageDown", "Home", "End")  # each changes a <select> (MEASURED)
+        for key in (
+            "Control+c",
+            "Control+a",
+            "Backspace",
+            "Shift+ArrowLeft",
+            "Control+v",
+            "a",
+            *edits,
+        ):
             assert await browser._impl_browser_press_key(key) == {
                 "error": browser._REFUSE_PAYMENT_KEY
             }
         page.keyboard.press.assert_not_awaited()
         for key in sorted(payment_tab.ALLOWED_KEYS):
             assert "pressed" in await browser._impl_browser_press_key(key)
+
+    def test_the_allowlist_holds_no_key_that_edits_a_card_control(self):
+        assert {"Enter", "Tab", "Shift+Tab", "Escape"} == payment_tab.ALLOWED_KEYS
 
     @pytest.mark.asyncio
     async def test_press_key_on_another_tab_is_not_limited(self):
@@ -477,6 +522,29 @@ class TestReaderMatrix:
         )
         result = await browser._impl_browser_snapshot()
         assert result["snapshot"] == "(snapshot unavailable: payment tab, detail withheld)"
+
+    @pytest.mark.asyncio
+    async def test_an_error_after_the_tab_was_finished_mid_call_is_still_fixed_text(self):
+        # Armed when the call began, disarmed (finished) before its error:
+        # the error is judged by the arming the call started under.
+        for tool in ("snapshot", "press_key"):
+            TABS.reset()
+            TABS.prefs_pinned = True
+            page = _page()
+            await _arm_in("armed", page)
+            _drive(page)
+
+            def finished_then_fail(*_a, _page=page, **_kw):
+                TABS._tabs.pop(_page, None)
+                raise RuntimeError(f"<input value={CVC}>")
+
+            if tool == "snapshot":
+                page.title = AsyncMock(side_effect=finished_then_fail)
+                result = await browser._impl_browser_snapshot()
+            else:
+                page.keyboard.press = AsyncMock(side_effect=finished_then_fail)
+                result = await browser._impl_browser_press_key("Enter")
+            assert result == {"error": browser._PAYMENT_TAB_FAILED}, tool
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("state", STATES)
@@ -600,6 +668,215 @@ async def test_mcp_exit_lets_a_running_storage_clear_finish_before_closing_camou
     await page.close()  # the clear starts in the background
     await browser.async_cleanup()
     assert order == ["cleared", "camoufox closed"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_exit_finishes_an_armed_tab_before_closing_camoufox(monkeypatch):
+    order = []
+
+    async def clear(context, origins):
+        order.append(("cleared", frozenset(origins)))
+        return True
+
+    async def close_camoufox():
+        order.append("camoufox closed")
+
+    monkeypatch.setattr(payment_tab, "clear_site_storage", clear)
+    monkeypatch.setattr(browser, "_cleanup_camoufox", close_camoufox)
+    page = _page()
+    page.context.new_page = AsyncMock(return_value=_page("about:blank"))
+    _drive(page)
+    await _arm_in("armed", page)
+    await browser.async_cleanup()
+    assert order == [("cleared", frozenset({"https://shop.example"})), "camoufox closed"]
+    page.close.assert_awaited_once_with(run_before_unload=False)
+    assert not TABS.run_js_blocked()
+    assert not env.payment_tab_pending_path().exists()
+
+
+@pytest.mark.asyncio
+async def test_mcp_exit_keeps_a_tab_that_would_not_close_pending_on_disk(monkeypatch):
+    monkeypatch.setattr(browser, "_cleanup_camoufox", AsyncMock())
+    page = _page()
+    page.context.new_page = AsyncMock(return_value=_page("about:blank"))
+    page.close = AsyncMock(side_effect=RuntimeError("busy"))
+    await _arm_in("armed", page)
+    await browser.async_cleanup()
+    page.close.assert_awaited()  # the exit tried to finish it
+    assert json.loads(env.payment_tab_pending_path().read_text()) == ["https://shop.example"]
+
+
+# The real _CLEAR_STORAGE_JS, run by node against a fake IndexedDB whose
+# deleteDatabase request ends with the given event.
+_FAKE_STORAGE = """
+const outcome = process.argv[1];
+globalThis.self = globalThis;
+globalThis.localStorage = { clear() {} };
+globalThis.sessionStorage = { clear() {} };
+globalThis.indexedDB = {
+  deleteDatabase() {
+    const q = {};
+    setTimeout(() => {
+      // blocked is a notice: by spec the same request still ends in success
+      // once the other connections close (or stays blocked).
+      if (outcome.startsWith('blocked')) q.onblocked && q.onblocked();
+      if (outcome === 'blocked_then_success') setTimeout(() => q.onsuccess(), 50);
+      else if (outcome !== 'blocked') q['on' + outcome]();
+    }, 0);
+    return q;
+  },
+};
+if (outcome !== 'unenumerable') indexedDB.databases = async () => [{ name: 'cart' }];
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+@pytest.mark.parametrize(
+    ("outcome", "ok"),
+    [
+        ("success", True),
+        ("error", False),
+        ("blocked", False),  # still blocked when the bounded wait ends
+        ("blocked_then_success", True),
+        ("unenumerable", False),
+    ],
+)
+def test_the_storage_clear_counts_only_a_deleted_database(outcome, ok):
+    script = (
+        _FAKE_STORAGE
+        + "("
+        + payment_tab._CLEAR_STORAGE_JS
+        + ")().then((v) => console.log(JSON.stringify(v)));"
+    )
+    out = subprocess.run(
+        ["node", "-e", script, outcome], capture_output=True, text=True, timeout=60, check=True
+    )
+    assert json.loads(out.stdout) is ok
+
+
+class TestPendingFile:
+    """Origins a payment tab showed are on disk from arm until their storage
+    is cleared, so an MCP crash or kill leaves them for the next launch."""
+
+    @pytest.mark.asyncio
+    async def test_an_armed_tab_s_origins_are_on_disk_from_arm(self):
+        page = _page()
+        await payment_tab.arm(page)
+        path = env.payment_tab_pending_path()
+        assert json.loads(path.read_text()) == ["https://shop.example"]
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        for fn in page.handlers["framenavigated"]:
+            fn(MagicMock(url="https://pay.hosted.example/s/1"))
+        assert json.loads(path.read_text()) == [
+            "https://pay.hosted.example",
+            "https://shop.example",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_killed_process_s_origins_are_cleared_at_the_next_launch(self, monkeypatch):
+        await _arm_in("armed", _page())
+        TABS.reset()  # the MCP process was killed: its memory is gone, the file is not
+        path = env.payment_tab_pending_path()
+        clear = AsyncMock(return_value=False)
+        monkeypatch.setattr(payment_tab, "clear_site_storage", clear)
+        await TABS.clear_pending(MagicMock(), BrowserLayer.CAMOUFOX)
+        clear.assert_awaited_once_with(ANY, {"https://shop.example"})
+        # A failed clear keeps the entry, and run_js stays refused.
+        assert TABS.run_js_blocked() and path.exists()
+        _drive(_page("https://other.example/"))
+        assert await browser._impl_browser_run_js("1") == {"error": browser._REFUSE_PAYMENT_RUN_JS}
+        clear.return_value = True
+        await TABS.clear_pending(MagicMock(), BrowserLayer.CAMOUFOX)
+        assert not TABS.run_js_blocked() and not path.exists()
+
+    @pytest.mark.asyncio
+    async def test_finish_drops_an_origin_from_disk_only_after_its_clear(self, monkeypatch):
+        gate = asyncio.Event()
+
+        async def slow_clear(context, origins):
+            await gate.wait()
+            return True
+
+        monkeypatch.setattr(payment_tab, "clear_site_storage", slow_clear)
+        page = _page()
+        page.context.new_page = AsyncMock(return_value=_page("about:blank"))
+        await _arm_in("armed", page)
+        done = asyncio.ensure_future(payment_tab.finish(page))
+        await asyncio.sleep(0.01)
+        path = env.payment_tab_pending_path()
+        assert json.loads(path.read_text()) == ["https://shop.example"]
+        gate.set()
+        await done
+        assert not path.exists()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_file_keeps_run_js_refused_and_refuses_arming(self):
+        path = env.payment_tab_pending_path()
+        path.write_text("{not json")
+        await TABS.clear_pending(MagicMock(), BrowserLayer.CAMOUFOX)
+        assert TABS.run_js_blocked()
+        with pytest.raises(PaymentTabError) as e:
+            await payment_tab.arm(_page())
+        assert e.value.code == "pending_store_failed"
+        assert path.read_text() == "{not json"  # left for the owner to inspect
+
+    @pytest.mark.asyncio
+    async def test_arming_refuses_when_the_file_cannot_be_written(self, monkeypatch, tmp_path):
+        (tmp_path / "not-a-dir").write_text("")
+        monkeypatch.setattr(
+            env, "payment_tab_pending_path", lambda: tmp_path / "not-a-dir" / "pending.json"
+        )
+        page = _page()
+        with pytest.raises(PaymentTabError) as e:
+            await payment_tab.arm(page)
+        assert e.value.code == "pending_store_failed"
+        assert not TABS.is_armed(page)
+
+    @pytest.mark.asyncio
+    async def test_another_process_s_origins_are_kept(self):
+        path = env.payment_tab_pending_path()
+        path.write_text(json.dumps(["https://bank.example"]))  # another MCP process's
+        page = _page()
+        page.context.new_page = AsyncMock(return_value=_page("about:blank"))
+        await _arm_in("armed", page)
+        assert json.loads(path.read_text()) == ["https://bank.example", "https://shop.example"]
+        await payment_tab.finish(page)
+        assert json.loads(path.read_text()) == ["https://bank.example"]
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_file_says_so_and_recovers_once_removed(self):
+        path = env.payment_tab_pending_path()
+        path.write_text("{not json")
+        await TABS.clear_pending(MagicMock(), BrowserLayer.CAMOUFOX)
+        _drive(_page("https://other.example/"))
+        assert await browser._impl_browser_run_js("1") == {"error": browser._REFUSE_PAYMENT_STORE}
+        path.unlink()  # the owner checked it and removed it
+        await TABS.clear_pending(MagicMock(), BrowserLayer.CAMOUFOX)
+        assert not TABS.run_js_blocked()
+
+    @pytest.mark.asyncio
+    async def test_a_stray_temp_file_is_removed_at_launch(self):
+        path = env.payment_tab_pending_path()
+        stray = path.parent / f".{path.name}.abc123"
+        stray.write_text('["https://shop.example"]')  # a kill between write and rename
+        await TABS.clear_pending(MagicMock(), BrowserLayer.CAMOUFOX)
+        assert not stray.exists()
+
+    @pytest.mark.asyncio
+    async def test_the_launch_pins_prefs_only_after_the_pending_clear(self, monkeypatch, tmp_path):
+        seen = []
+
+        async def clear(context, layer):
+            seen.append(TABS.prefs_pinned)
+
+        monkeypatch.setattr(TABS, "clear_pending", clear)
+        TABS.prefs_pinned = False  # nothing launched yet in this process
+        await TestLaunchPrefs()._launch(monkeypatch, tmp_path, True)
+        assert seen == [False] and TABS.prefs_pinned is True
+
+    def test_the_path_is_under_genesis_home(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("GENESIS_HOME", str(tmp_path))
+        assert _REAL_PENDING_PATH() == tmp_path / "payment_tab_pending.json"
 
 
 class TestClickOnArmedTab:
@@ -750,7 +1027,8 @@ class TestFinish:
             fn(MagicMock(url="https://pay.hosted.example/session/1"))
         await payment_tab.finish(page)
         origins = payment_tab.clear_site_storage.await_args.args[1]
-        assert "https://pay.hosted.example" in origins
+        parsed = {(urlsplit(o).scheme, urlsplit(o).hostname) for o in origins}
+        assert ("https", "pay.hosted.example") in parsed
 
     @pytest.mark.asyncio
     async def test_re_arming_registers_the_handlers_once(self):
@@ -768,6 +1046,11 @@ class TestFinish:
         await _arm_in("armed", page)
         assert await payment_tab.finish(page) == {"closed": False, "storage_cleared": False}
         assert TABS.is_armed(page)
+        assert TABS.state(page) is payment_tab.State.ARMED  # not left CLOSING
+        page.close = AsyncMock(
+            side_effect=lambda **_kw: page.is_closed.configure_mock(return_value=True)
+        )
+        assert (await payment_tab.finish(page))["closed"] is True  # a retry can finish it
 
     @pytest.mark.asyncio
     async def test_frame_origins_are_cleared_too(self):
@@ -799,11 +1082,79 @@ class TestFinish:
         frame.evaluate.assert_awaited_once_with(payment_tab._MASK_JS)
 
     @pytest.mark.asyncio
+    async def test_a_failed_init_script_fails_the_arm(self):
+        page = _page()
+        page.add_init_script = AsyncMock(side_effect=RuntimeError("closed"))
+        with pytest.raises(PaymentTabError) as e:
+            await payment_tab.arm(page)
+        assert e.value.code == "mask_failed"
+        assert not TABS.is_armed(page)  # nothing was filled: the tab is released
+        assert not env.payment_tab_pending_path().exists()
+
+    @pytest.mark.asyncio
+    async def test_arming_refuses_a_browser_launched_without_the_card_prefs(self):
+        TABS.prefs_pinned = False  # launched while card_fill.enabled was false
+        page = _page()
+        with pytest.raises(PaymentTabError) as e:
+            await payment_tab.arm(page)
+        assert e.value.code == "prefs_not_pinned"
+        assert not TABS.is_armed(page)
+        page.add_init_script.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_arming_refuses_a_layer_with_no_card_prefs(self):
+        with pytest.raises(PaymentTabError) as e:
+            await payment_tab.arm(_page(), BrowserLayer.CHROMIUM)
+        assert e.value.code == "prefs_not_pinned"
+
+    @pytest.mark.asyncio
     async def test_a_mask_that_does_not_verify_is_reported(self):
         page = _page()
         page.frames[0].evaluate = AsyncMock(side_effect=lambda js: js != payment_tab._MASK_CHECK_JS)
         assert await payment_tab.arm(page) is False
         assert TABS.is_armed(page)  # still armed: the guards hold whatever the mask did
+        with pytest.raises(PaymentTabError) as e:
+            payment_tab.begin_fill(page, FILLED)  # but nothing is filled into it
+        assert e.value.code == "mask_unverified"
+        page.frames[0].evaluate = AsyncMock(return_value=True)
+        assert await TABS.verify_mask(page) is True
+        payment_tab.begin_fill(page, FILLED)
+
+    @pytest.mark.asyncio
+    async def test_a_navigation_after_arming_needs_a_new_mask_check(self):
+        page = _page()
+        assert await payment_tab.arm(page) is True
+        for fn in page.handlers["framenavigated"]:
+            fn(MagicMock(url="https://pay.hosted.example/s/1", evaluate=AsyncMock()))
+        with pytest.raises(PaymentTabError) as e:
+            payment_tab.begin_fill(page, FILLED)
+        assert e.value.code == "mask_unverified"
+        assert await TABS.verify_mask(page) is True
+        payment_tab.begin_fill(page, FILLED)
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_finish_leaves_the_tab_armed_and_finishable(self):
+        page = _page()
+        page.context.new_page = AsyncMock(return_value=_page("about:blank"))
+        await _arm_in("armed", page)
+        page.close = AsyncMock(side_effect=asyncio.CancelledError)
+        with pytest.raises(asyncio.CancelledError):
+            await payment_tab.finish(page)
+        assert TABS.state(page) is payment_tab.State.ARMED
+
+    @pytest.mark.asyncio
+    async def test_begin_fill_refuses_when_an_origin_is_not_on_disk(self, monkeypatch, tmp_path):
+        page = _page()
+        await payment_tab.arm(page)
+        (tmp_path / "not-a-dir").write_text("")
+        monkeypatch.setattr(
+            env, "payment_tab_pending_path", lambda: tmp_path / "not-a-dir" / "pending.json"
+        )
+        page.frames[0].url = "https://pay.hosted.example/s/1"  # a redirect not yet on disk
+        with pytest.raises(PaymentTabError) as e:
+            payment_tab.begin_fill(page, FILLED)
+        assert e.value.code == "pending_store_failed"
+        assert TABS.state(page) is payment_tab.State.AWAITING_TAP
 
     def test_mask_rule_covers_every_glyph_source(self):
         for prop in (

@@ -225,6 +225,14 @@ def vault_socket_path() -> Path:
     return genesis_home() / "run" / "payment_vault.sock"
 
 
+def payment_tab_pending_path() -> Path:
+    """Origins whose site storage a payment tab may have left uncleared
+    (``~/.genesis/payment_tab_pending.json``, 0600). Written from arm until
+    the clear succeeds, read at the next Camoufox launch. Composed from
+    ``genesis_home()`` so tests redirect it to a tmp dir."""
+    return genesis_home() / "payment_tab_pending.json"
+
+
 def alert_queue_root() -> Path:
     """Durable alert-queue root for the CONTAINER side (``~/.genesis/alerts/queue``).
 

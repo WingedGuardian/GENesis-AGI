@@ -21,9 +21,14 @@ launch taints the browser context, and arming then refuses with
 tab through ``window.opener`` or the handle ``window.open`` returned, so a
 per-page check is not enough. Only a Camoufox restart clears it.
 
-Filled values are never kept. :meth:`PaymentTabs.mark_filled` stores HMACs of
-them under a key made for that arming, and snapshot tokens whose HMAC matches
-are hidden.
+Filled values are never kept. :meth:`PaymentTabs.begin_fill` stores HMACs of
+them, under a key made for that arming, before the first one is typed, and
+snapshot tokens whose HMAC matches are hidden.
+
+The origins an armed tab shows are written to a 0600 file
+(:func:`genesis.env.payment_tab_pending_path`) from arm until their site
+storage is cleared, so an MCP crash or kill leaves them for the next Camoufox
+launch to clear. run_js stays refused until it has.
 """
 
 from __future__ import annotations
@@ -31,18 +36,22 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import enum
+import fcntl
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
 import secrets
+import tempfile
 import weakref
 from dataclasses import dataclass, field
 from urllib.parse import unquote_plus, urlsplit
 
 import yaml
 
+from genesis import env
 from genesis.browser.types import BrowserLayer
 from genesis.security.card_redaction import CARD_FILTER
 from genesis.security.card_shapes import redact
@@ -66,26 +75,17 @@ CARD_FILL_PREFS = {
     "clipboard.autocopy": False,
 }
 
-# Keys browser_press_key sends to an armed tab: focus movement, activation and
-# scrolling. Nothing that selects, copies, pastes, deletes or edits.
-ALLOWED_KEYS = frozenset(
-    {
-        "Enter",
-        "Tab",
-        "Shift+Tab",
-        "Escape",
-        "Space",
-        " ",
-        "ArrowUp",
-        "ArrowDown",
-        "ArrowLeft",
-        "ArrowRight",
-        "PageUp",
-        "PageDown",
-        "Home",
-        "End",
-    }
-)
+# Keys browser_press_key sends to an armed tab. MEASURED in Camoufox, each key
+# pressed in a focused text, tel, number, search, select, listbox, textarea,
+# checkbox and range control:
+#   Tab, Shift+Tab: move focus, change no value.
+#   Enter: submits; inserts a newline in a textarea, changes no card control.
+#   Escape: empties a type=search input, changes no card control.
+# Refused, because each changes a card control: Space (a text value, a
+# checkbox), ArrowUp/ArrowDown (a number, a select), and ArrowLeft/ArrowRight,
+# PageUp/PageDown, Home and End (a select, which is how an expiry month is
+# often picked). A snapshot reads the whole page, so no scroll key is needed.
+ALLOWED_KEYS = frozenset({"Enter", "Tab", "Shift+Tab", "Escape"})
 
 
 def card_fill_enabled() -> bool:
@@ -118,8 +118,12 @@ class State(enum.Enum):
 
 class PaymentTabError(Exception):
     """A refused arming call. ``code`` is one of: ``other_payment_tab``,
-    ``browser_tainted_restart``, ``already_armed``, ``no_payment_tab``,
-    ``wrong_state``."""
+    ``browser_tainted_restart``, ``prefs_not_pinned`` (the browser was not
+    launched with :data:`CARD_FILL_PREFS`), ``pending_store_failed`` (the
+    pending-origins file cannot be written), ``mask_failed`` (the mask for
+    later documents could not be installed), ``mask_unverified`` (begin_fill
+    on a tab whose mask did not verify), ``already_armed``,
+    ``no_payment_tab``, ``wrong_state``."""
 
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -169,12 +173,22 @@ _CLEAR_STORAGE_JS = """async () => {
   try { localStorage.clear(); } catch (e) { ok = false; }
   try { sessionStorage.clear(); } catch (e) { ok = false; }
   try {
-    if (indexedDB.databases) {
+    // Only success counts. "blocked" is a notice, not an end: another
+    // connection holds the database, and the same request still succeeds once
+    // it closes. A delete still blocked after 5 s (the clear runs on a page
+    // with no network, so nothing else should hold it longer) fails, leaving
+    // the origin pending. A browser that cannot list its databases cannot be
+    // cleared.
+    if (!indexedDB.databases) ok = false;
+    else {
       for (const d of await indexedDB.databases()) {
-        await new Promise((r) => {
+        const deleted = await new Promise((r) => {
           const q = indexedDB.deleteDatabase(d.name);
-          q.onsuccess = q.onerror = q.onblocked = () => r();
+          const t = setTimeout(() => r(false), 5000);
+          q.onsuccess = () => { clearTimeout(t); r(true); };
+          q.onerror = () => { clearTimeout(t); r(false); };
         });
+        if (!deleted) ok = false;
       }
     }
   } catch (e) { ok = false; }
@@ -263,6 +277,7 @@ class _Arming:
     lengths: set[int] = field(default_factory=set)
     origins: set[str] = field(default_factory=set)
     crashed: bool = False
+    masked: bool = False  # the last verify_mask passed
 
 
 class PaymentTabs:
@@ -281,6 +296,8 @@ class PaymentTabs:
         self._tasks: set[asyncio.Task] = set()
         self._listening = weakref.WeakSet()  # pages whose event handlers are registered
         self._tainted: str | None = None
+        self._written: frozenset[str] = frozenset()  # origins in the pending file
+        self._store_broken = False  # the pending file could not be read
         self.prefs_pinned = False
         self.epoch = 0  # bumped by every arm, so a read can tell one began meanwhile
 
@@ -299,9 +316,14 @@ class PaymentTabs:
         entry = self._tabs.get(page) if page is not None else None
         return None if entry is None else entry.state
 
+    def store_broken(self) -> bool:
+        """The pending file could not be read (run_js and arming refused)."""
+        return self._store_broken
+
     def run_js_blocked(self) -> bool:
-        """True while a tab is armed, or a closed one's storage is not yet cleared."""
-        return bool(self._tabs or self._pending)
+        """True while a tab is armed, a closed one's storage is not yet
+        cleared, or the pending file could not be read."""
+        return bool(self._tabs or self._pending or self._store_broken)
 
     # --- taint -----------------------------------------------------------
     def taint(self, reason: str) -> None:
@@ -327,10 +349,17 @@ class PaymentTabs:
             raise PaymentTabError("other_payment_tab")
         if self._tainted is not None:
             raise PaymentTabError("browser_tainted_restart")
+        # Only a Camoufox launched while card fill was on has the prefs that
+        # keep form data out of form history and the session store.
+        if layer is not BrowserLayer.CAMOUFOX or not self.prefs_pinned:
+            raise PaymentTabError("prefs_not_pinned")
         # Registered before the first await: every guard holds from here on.
         entry = self._tabs[page] = _Arming(layer=layer)
         self.epoch += 1
         entry.origins |= _frame_origins(page)
+        if not self._persist():  # a crash would leave its origins uncleared
+            self._release(page, entry)
+            raise PaymentTabError("pending_store_failed")
         if page not in self._listening:  # each handler does nothing once disarmed
             self._listening.add(page)
             page.once("close", lambda _p: self._on_close(page))
@@ -340,32 +369,55 @@ class PaymentTabs:
         try:
             await page.add_init_script(_MASK_INIT_JS)
         except Exception as e:
+            # Without it a document the tab loads later (Back builds one) is
+            # painted unmasked. Nothing is filled yet, so the tab is released.
             logger.warning("payment tab mask init script failed: %s", type(e).__name__)
+            if self._tabs.get(page) is entry and entry.state is State.AWAITING_TAP:
+                self._release(page, entry)
+            raise PaymentTabError("mask_failed") from None
         await self.apply_mask(page)
         return await self.verify_mask(page)
 
-    def begin_fill(self, page) -> None:
+    def begin_fill(self, page, values_for_hmac) -> None:
+        """Move to FILLING, recording HMACs of the values about to be filled
+        BEFORE any is typed: a fill that fails part-way never reaches
+        :meth:`mark_filled`, and what it typed must already be hidden."""
         entry = self._require(page)
         if entry.state is not State.AWAITING_TAP:
             raise PaymentTabError("wrong_state")
+        if not entry.masked:  # arm(), or the last verify_mask, did not verify
+            raise PaymentTabError("mask_unverified")
+        entry.origins |= _frame_origins(page)
+        if not self._persist():  # an origin a crash would leave uncleared
+            raise PaymentTabError("pending_store_failed")
+        self._register(entry, values_for_hmac)
         entry.state = State.FILLING
 
-    def mark_filled(self, page, values_for_hmac) -> None:
-        """Record HMACs of the filled values (never the values) and move to
-        ARMED. Each value is matched whole, as digits only, and by its
-        whitespace-separated parts of at least three characters."""
+    def mark_filled(self, page, values_for_hmac=()) -> None:
+        """Move to ARMED, recording HMACs of any further values (a read-back
+        that differs from what was sent). Only after :meth:`begin_fill`,
+        which checks the mask and the pending file."""
         entry = self._require(page)
-        if entry.state not in (State.AWAITING_TAP, State.FILLING, State.ARMED):
+        if entry.state not in (State.FILLING, State.ARMED):
             raise PaymentTabError("wrong_state")
-        for value in values_for_hmac:
+        self._register(entry, values_for_hmac)
+        entry.origins |= _frame_origins(page)
+        # A write failure is logged and not fatal: the values are typed, the
+        # in-memory guard holds, and only crash coverage of a new origin is lost.
+        self._persist()
+        entry.state = State.ARMED
+
+    def _register(self, entry: _Arming, values) -> None:
+        """Record HMACs of ``values`` (never the values). Each is matched
+        whole, as digits only, and by its whitespace-separated parts of at
+        least three characters."""
+        for value in values:
             v = str(value).strip()
             digits = "".join(c for c in v if c.isdigit())
             for part in {v, digits, *v.split()}:
                 if len(part) >= _MIN_PART:
                     entry.digests.add(self._mac(entry.key, part))
                     entry.lengths.add(len(part))
-        entry.origins |= _frame_origins(page)
-        entry.state = State.ARMED
 
     def disarm(self, page) -> None:
         """Release a tab nothing was filled into (AWAITING_TAP). A filled tab
@@ -376,7 +428,14 @@ class PaymentTabs:
         # Its listeners do nothing once it is not in _tabs. The mask init script
         # cannot be removed (Playwright has no API for it), so the tab's later
         # documents stay masked on screen.
-        del self._tabs[page]
+        self._release(page, entry)
+
+    def _release(self, page, entry: _Arming) -> None:
+        """Drop an arming nothing was filled into, and its origins from the
+        pending file (unless a pending clear still needs them)."""
+        if self._tabs.get(page) is entry:
+            del self._tabs[page]
+        self._persist()
 
     async def finish(self, page) -> dict:
         """Close the armed tab and clear its origins' site storage.
@@ -389,19 +448,26 @@ class PaymentTabs:
         entry = self._require(page)
         if entry.state is State.CLOSING:
             raise PaymentTabError("wrong_state")  # a finish is already running
-        entry.state = State.CLOSING
+        prior, entry.state = entry.state, State.CLOSING
         entry.origins |= _frame_origins(page)
+        self._persist()
         try:
-            if self.move_off is not None:
-                await self.move_off(page)
-            elif len(page.context.pages) <= 1:
-                await page.context.new_page()
-        except Exception as e:
-            logger.warning("payment tab: no page to move to (%s)", type(e).__name__)
-        try:
-            await page.close(run_before_unload=False)
-        except Exception as e:
-            logger.warning("payment tab close failed: %s", type(e).__name__)
+            try:
+                if self.move_off is not None:
+                    await self.move_off(page)
+                elif len(page.context.pages) <= 1:
+                    await page.context.new_page()
+            except Exception as e:
+                logger.warning("payment tab: no page to move to (%s)", type(e).__name__)
+            try:
+                await page.close(run_before_unload=False)
+            except Exception as e:
+                logger.warning("payment tab close failed: %s", type(e).__name__)
+        finally:
+            # A close that failed or was cancelled: still armed, and back in
+            # its state, so a later finish (or the MCP exit) can try again.
+            if not is_closed(page) and self._tabs.get(page) is entry:
+                entry.state = prior
         if not is_closed(page):
             return {"closed": False, "storage_cleared": False}
         self._on_close(page)  # no-op when the close event already ran
@@ -422,12 +488,92 @@ class PaymentTabs:
         if layer is not BrowserLayer.CAMOUFOX:
             for origin in [o for o, lay in self._pending.items() if lay is layer]:
                 del self._pending[origin]
+        self._persist()
 
     async def clear_pending(self, context, layer: BrowserLayer) -> None:
-        """At launch: clear the storage a previous launch left pending."""
+        """At launch: clear the storage a previous launch, or a previous MCP
+        process (the pending file), left pending."""
+        if layer is BrowserLayer.CAMOUFOX:
+            self._load()
         origins = {o for o, lay in self._pending.items() if lay is layer}
         if origins:
             await self._clear(context, origins, layer)
+
+    async def finish_all(self) -> None:
+        """MCP exit: finish every armed tab while its browser is still up, so
+        its storage clear runs before the drain and the browser shutdown. A
+        tab that will not finish in time stays armed; the layer cleanup then
+        leaves its origins pending, and they are in the pending file."""
+        for page, entry in list(self._tabs.items()):
+            if entry.state is State.CLOSING:
+                continue  # a finish is running; its clear is drained
+            try:
+                await asyncio.wait_for(self.finish(page), timeout=_CLEAR_TIMEOUT_MS / 1000 * 3)
+            except Exception as e:
+                logger.warning("payment tab not finished at exit: %s", type(e).__name__)
+
+    # --- the pending file --------------------------------------------------
+    def _on_disk(self) -> frozenset[str]:
+        """Camoufox origins whose storage may hold what a payment tab showed:
+        pending clears, and every armed tab's."""
+        cam = BrowserLayer.CAMOUFOX
+        armed = (o for e in self._tabs.values() if e.layer is cam for o in e.origins)
+        return frozenset(o for o, lay in self._pending.items() if lay is cam) | frozenset(armed)
+
+    def _persist(self) -> bool:
+        """Bring this process's entries in the pending file up to date, under
+        a lock: another MCP process's entries are kept (each CC session runs
+        its own, and they share the Camoufox profile). Atomic and 0600; an
+        empty file is removed. False when it could not be written, or the file
+        is unreadable (kept for the owner to inspect)."""
+        want = self._on_disk()
+        if self._store_broken:
+            return False
+        if want == self._written:
+            return True
+        path = env.payment_tab_pending_path()
+        try:
+            with _locked(path):
+                disk = _read_pending(path)
+                if disk is None:
+                    self._mark_broken(path)
+                    return False
+                _write_pending(path, (disk - (self._written - want)) | want)
+        except OSError as e:
+            logger.warning("payment tab pending file not written: %s", type(e).__name__)
+            return False
+        self._written = want
+        return True
+
+    def _load(self) -> None:
+        """At a Camoufox launch: take in the pending file other or earlier MCP
+        processes left, and remove temp files an interrupted write left. One
+        that cannot be read keeps run_js and arming refused (its origins are
+        unknown, so their storage cannot be cleared) until a launch finds it
+        readable or removed."""
+        path = env.payment_tab_pending_path()
+        try:
+            with _locked(path):
+                for stray in path.parent.glob(f".{path.name}.*"):
+                    with contextlib.suppress(OSError):
+                        stray.unlink()
+                disk = _read_pending(path)
+        except OSError:
+            disk = None
+        if disk is None:
+            self._mark_broken(path)
+            return
+        self._store_broken = False
+        for origin in disk:
+            self._pending.setdefault(origin, BrowserLayer.CAMOUFOX)
+        self._written |= disk  # now this process's to clear
+        self._persist()
+
+    def _mark_broken(self, path) -> None:
+        self._store_broken = True
+        logger.warning(
+            "payment tab pending file %s unreadable: run_js and card fill stay refused", path
+        )
 
     async def drain(self) -> None:
         """Wait for storage clears and mask tasks still running (MCP exit)."""
@@ -494,7 +640,15 @@ class PaymentTabs:
                 await frame.evaluate(_MASK_JS)
 
     async def verify_mask(self, page) -> bool:
-        """True when every form control in every frame computes as masked."""
+        """True when every form control in every frame computes as masked.
+        Recorded on the arming: :meth:`begin_fill` needs the last one True."""
+        ok = await self._mask_ok(page)
+        entry = self._tabs.get(page)
+        if entry is not None:
+            entry.masked = ok
+        return ok
+
+    async def _mask_ok(self, page) -> bool:
         try:
             frames = list(page.frames)
             for frame in frames:
@@ -520,11 +674,15 @@ class PaymentTabs:
         entry = self._tabs.get(page)
         if entry is None:
             return
+        if frame is not None:  # a new document: begin_fill needs a new mask check
+            entry.masked = False
         # Every origin the tab shows has its storage cleared at finish, not
         # only those present at arm, fill and finish (a redirect in between).
         with contextlib.suppress(Exception):
-            if frame is not None and (origin := origin_of(frame.url)):
+            origin = origin_of(frame.url) if frame is not None else None
+            if origin and origin not in entry.origins:
                 entry.origins.add(origin)
+                self._persist()  # failure is logged: the tab is armed, the in-memory guard holds
         if frame is None:
             self._spawn(self.apply_mask(page))
         else:
@@ -556,6 +714,7 @@ class PaymentTabs:
             for origin in origins:
                 if self._pending.get(origin) is layer:
                     del self._pending[origin]
+            self._persist()  # an entry leaves the file only after its clear
         else:
             logger.warning(
                 "payment tab site storage not cleared: run_js stays refused until the browser restarts"
@@ -572,6 +731,49 @@ class PaymentTabs:
 async def _mask_frame(frame) -> None:
     with contextlib.suppress(Exception):  # a frame detached meanwhile
         await frame.evaluate(_MASK_JS)
+
+
+@contextlib.contextmanager
+def _locked(path):
+    """An exclusive lock on the pending file's sidecar, held for one read-merge-write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path.parent / f"{path.name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # releases the lock
+
+
+def _read_pending(path) -> frozenset[str] | None:
+    """The origins in the pending file; empty when there is none, None when
+    its content is not a JSON list of origins. Other OSErrors propagate."""
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return frozenset()
+    except ValueError:
+        return None
+    if isinstance(data, list) and all(isinstance(o, str) and origin_of(o) == o for o in data):
+        return frozenset(data)
+    return None
+
+
+def _write_pending(path, origins: frozenset[str]) -> None:
+    if not origins:
+        path.unlink(missing_ok=True)
+        return
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(sorted(origins), f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def is_closed(page) -> bool:
@@ -638,11 +840,11 @@ async def arm(page, layer: BrowserLayer = BrowserLayer.CAMOUFOX) -> bool:
     return await TABS.arm(page, layer)
 
 
-def begin_fill(page) -> None:
-    TABS.begin_fill(page)
+def begin_fill(page, values_for_hmac) -> None:
+    TABS.begin_fill(page, values_for_hmac)
 
 
-def mark_filled(page, values_for_hmac) -> None:
+def mark_filled(page, values_for_hmac=()) -> None:
     TABS.mark_filled(page, values_for_hmac)
 
 
