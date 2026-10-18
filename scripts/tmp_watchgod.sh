@@ -140,10 +140,10 @@ DG_ATTRIBUTION_PATHS=""
 # Slices whose OOM kills are capped work hitting its own cap: logged, not
 # paged, when that slice's own counters account for the kill (see
 # scripts/lib/watchgod_oom.sh). app-capped.slice holds the hostmetrics job
-# runner's scopes, the codebase-memory MCP scope and GitNexus index batches;
-# genesis-workload.slice holds opt-in indexing batches. A kill anywhere else, or
-# triggered by a limit outside these slices, pages.
-OOM_CONTAINED_SLICES="${OOM_CONTAINED_SLICES:-app-capped.slice genesis-workload.slice}"
+# runner's scopes and GitNexus index batches; genesis-workload.slice holds opt-in
+# indexing batches, and genesis-cbm-query-clients.slice holds managed MCP readers.
+# A kill anywhere else, or triggered by a limit outside these slices, pages.
+OOM_CONTAINED_SLICES="${OOM_CONTAINED_SLICES:-app-capped.slice genesis-workload.slice genesis-cbm-query-clients.slice}"
 
 # ── Load config ──────────────────────────────────────────────
 # Every tunable a conf file may set. Their STARTUP values (code default, or an

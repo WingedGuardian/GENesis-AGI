@@ -14,10 +14,17 @@ ROOT = Path(__file__).resolve().parents[2]
 UNITS = ("genesis-cbm-query.service", "genesis-cbm-query-clients.slice")
 
 
-def loop(renderer):
+def loop(renderer, with_post=False):
     source = (ROOT / "scripts" / renderer).read_text()
     start = source.index('    for template in "$SYSTEMD_TEMPLATE_DIR"/')
     end = source.index("    done\n", start) + len("    done\n")
+    if with_post:
+        if renderer == "bootstrap.sh":
+            end = source.index("    # Enable the cc-tmp cold-start apply SERVICE", end)
+        else:
+            end = source.index("# Step 8 removed", end)
+            # This segment closes install's enclosing template-directory check.
+            return "if true; then\n" + source[start:end]
     return source[start:end]
 
 
@@ -46,7 +53,7 @@ def render(tmp_path):
     for name in UNITS:
         shutil.copy2(ROOT / "scripts/systemd" / (name + ".template"), templates)
 
-    def run(renderer, home=None):
+    def run(renderer, home=None, *, take="", tier="0", with_post=False):
         env = dict(
             os.environ,
             SYSTEMD_TEMPLATE_DIR=str(templates),
@@ -59,12 +66,22 @@ def render(tmp_path):
             SERVICES_GENERATED="0",
             SERVICES_UPDATED="0",
             FALKORDB_VERSION="4.20.4",
+            GENESIS_TAKE_TEMPLATES=take,
+            GENESIS_UPDATE_TIER=tier,
+            GENESIS_DEPLOY_SUMMARY=str(tmp_path / "summary"),
+            TEST_MANAGER_LOG=str(tmp_path / "manager.log"),
+            TEST_SCRATCH_PATH=str(tmp_path / "scratch-path"),
         )
         return subprocess.run(
             [
                 "/bin/bash",
                 "-euc",
-                "_falkordb_redis_server_bin() { printf /usr/bin/redis-server; }\n" + prelude(tmp_path) + loop(renderer),
+                "_falkordb_redis_server_bin() { printf /usr/bin/redis-server; }\n"
+                'systemctl() { printf "%s\\n" "$*" >> "$TEST_MANAGER_LOG"; }\n'
+                'loginctl() { printf "Linger=yes\\n"; }\n'
+                + prelude(tmp_path)
+                + 'printf "%s" "$_mu_dir" > "$TEST_SCRATCH_PATH"\n'
+                + loop(renderer, with_post),
             ],
             env=env,
             capture_output=True,
@@ -73,6 +90,55 @@ def render(tmp_path):
         )
 
     return units, run
+
+
+@pytest.mark.parametrize("renderer", ["install.sh", "bootstrap.sh"])
+@pytest.mark.parametrize("name", UNITS)
+def test_mask_kept_and_renderer_reaches_reload_and_timers(render, renderer, name):
+    units, run = render
+    target = units / name
+    target.symlink_to("/dev/null")
+    before = target.lstat()
+    templates = units.parent / "templates"
+    (templates / "continuity.timer.template").write_text("[Timer]\nOnBootSec=1h\n")
+    result = run(renderer, with_post=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert target.is_symlink() and os.readlink(target) == "/dev/null"
+    assert (target.lstat().st_dev, target.lstat().st_ino) == (before.st_dev, before.st_ino)
+    assert name in result.stdout and "kept" in result.stdout.lower()
+    commands = (units.parent / "manager.log").read_text().splitlines()
+    assert "--user daemon-reload" in commands
+    if renderer == "bootstrap.sh":
+        assert commands.index("--user daemon-reload") < commands.index("--user enable --now continuity.timer")
+        scratch = Path((units.parent / "scratch-path").read_text())
+        assert not scratch.exists(), "renderer scratch survived successful bootstrap"
+        assert f"kept {name}:" in (units.parent / "summary").read_text()
+
+
+@pytest.mark.parametrize("name", UNITS)
+@pytest.mark.parametrize("take", ["", "*", "named"])
+@pytest.mark.parametrize("tier", ["0", "1"])
+def test_bootstrap_mask_take_is_explicit_and_backed_up(render, name, take, tier):
+    units, run = render
+    target = units / name
+    for unit in UNITS:
+        (units / unit).symlink_to("/dev/null")
+    other = units / next(unit for unit in UNITS if unit != name)
+    other_inode = other.lstat().st_ino
+    before = target.lstat().st_ino
+    result = run("bootstrap.sh", take=name if take == "named" else take, tier=tier)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert other.is_symlink() and os.readlink(other) == "/dev/null"
+    assert other.lstat().st_ino == other_inode
+    if take == "named" and tier == "0":
+        assert not target.is_symlink() and target.is_file()
+        assert "genesis-managed" in target.read_text()
+        backups = list((units.parent / ".genesis/deploy-backups").glob("*/" + name))
+        assert len(backups) == 1 and backups[0].is_symlink()
+        assert os.readlink(backups[0]) == "/dev/null"
+    else:
+        assert target.is_symlink() and os.readlink(target) == "/dev/null"
+        assert target.lstat().st_ino == before
 
 
 @pytest.mark.parametrize("renderer", ["install.sh", "bootstrap.sh"])
@@ -115,7 +181,12 @@ def test_nonregular_template_destination_is_preserved(render, tmp_path, renderer
         os.mkfifo(target)
     before = target.lstat().st_ino
     result = run(renderer)
-    assert result.returncode != 0 and "nonregular managed Codebase unit" in result.stderr
+    if kind in ("link", "dangling"):
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert name in result.stdout and "kept" in result.stdout.lower()
+        assert target.is_symlink() and os.readlink(target) == str(foreign)
+    else:
+        assert result.returncode != 0 and "nonregular managed Codebase unit" in result.stderr
     assert target.lstat().st_ino == before
     if kind == "link":
         assert foreign.read_text() == "foreign"

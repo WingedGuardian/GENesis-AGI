@@ -296,3 +296,9 @@ def test_the_validator_accepts_commands_alone():
 
     spec = {"patterns": [], "commands": ["git push", "pytest"], "repeat": "session"}
     assert validate_trigger_spec(spec) == spec
+
+
+async def test_core_rows_past_default_limit_reach_the_cache(db, cache_path):
+    for i in range(101):
+        await _row(db, f"c{i:03d}", tier="CORE")
+    assert await trigger_cache.regenerate(db) == 101

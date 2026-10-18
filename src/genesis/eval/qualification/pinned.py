@@ -16,6 +16,7 @@ import sys
 import traceback
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from decimal import Decimal, DecimalException
 from pathlib import Path
 
@@ -933,6 +934,18 @@ def validate_params(params) -> dict:
     return params
 
 
+def request_body(model, params, contract, messages):
+    """One canonical wire constructor for scheduling and actual dispatch."""
+    return load_json(canonical({
+        "model": model, "messages": messages, **params[route(contract)],
+        "provider": {
+            "only": [params["upstream"]], "allow_fallbacks": False,
+            "require_parameters": True, "max_price": params["max_price"],
+        },
+        "usage": {"include": True},
+    }))
+
+
 class PinnedRouter:
     """Adapter router for one frozen, fully funded model campaign.
 
@@ -943,7 +956,8 @@ class PinnedRouter:
     the later runner's responsibility; this transport cannot derive a bound.
     """
 
-    def __init__(self, campaign, *, alias, params, dispatch, transport=None, config=None):
+    def __init__(self, campaign, *, alias, params, dispatch, transport=None, config=None,
+                 dispatch_admission=None):
         self.campaign, self.alias = campaign, alias
         self.config = config or routing()
         self.cfg = resolve(alias, self.config)
@@ -951,6 +965,7 @@ class PinnedRouter:
         if self.cfg.params:
             raise LocalFailure("implicit routing parameters are forbidden in qualification")
         self.transport, self.dispatch = transport, dispatch
+        self.dispatch_admission = dispatch_admission
         # One detached snapshot at construction, never a full campaign copy per call.
         state = campaign.state
         self.manifest = state.manifest
@@ -1030,24 +1045,7 @@ class PinnedRouter:
             self.campaign.fail(self.served[case_id], message)
 
     def request(self, messages):
-        body = self.params[route(self.contract)]
-        policy = {
-            "only": [self.params["upstream"]],
-            "allow_fallbacks": False,
-            "require_parameters": True,
-            "max_price": self.params["max_price"],
-        }
-        return load_json(
-            canonical(
-                {
-                    "model": self.cfg.model_id,
-                    "messages": messages,
-                    **body,
-                    "provider": policy,
-                    "usage": {"include": True},
-                }
-            )
-        )
+        return request_body(self.cfg.model_id, self.params, self.contract, messages)
 
     async def route_call(self, call_site_id, messages, **kwargs):
         case_id = self.case_id or self.prompts.get(digest(messages))
@@ -1131,6 +1129,10 @@ class PinnedRouter:
         if hashlib.sha256(secret.encode()).hexdigest() != self.fingerprint:
             raise LocalFailure("dedicated credential differs from frozen identity")
         info = await key_status(secret, self.transport, required=str(self.required))
+        if self.dispatch_admission is not None:
+            # Check the exact validated observation before owning a client or
+            # reserving/dispatching. Nested metadata remains detached evidence.
+            await self.dispatch_admission(self, attempt, deepcopy(info))
         row = self.campaign.attempt(attempt)
         def record(observation):
             spec = row["spec"]

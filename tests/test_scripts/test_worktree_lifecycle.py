@@ -2064,7 +2064,7 @@ def test_the_real_script_survives_a_worktree_name_that_is_not_utf8(tmp_path):
         text=True,
         errors="replace",
         env=env,
-        timeout=600,
+        timeout=300,  # below the 600 s per-test timeout, so this fires first
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert "TRASH" in proc.stdout, proc.stdout[-2000:]
