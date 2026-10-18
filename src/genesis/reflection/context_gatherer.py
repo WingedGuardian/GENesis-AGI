@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -392,79 +393,77 @@ class ContextGatherer:
         except Exception:
             return {}
 
+    async def _knowledge_intake_since_last_deep(
+        self, db: aiosqlite.Connection,
+    ) -> list[tuple[str, int]] | None:
+        """Knowledge units ingested since the last Deep cycle, per pipeline.
+
+        Returns ``(source_pipeline, count)`` pairs (largest first; a NULL
+        pipeline is reported as ``unknown``), ``[]`` when nothing was
+        ingested, or ``None`` when the read itself failed — so callers can
+        tell "none ingested" apart from "could not tell".
+        """
+        last_deep = await observations.query(
+            db, source="cc_reflection_deep", limit=1,
+            # WS-3: this row's timestamp is the reflection-window cutoff. `source`
+            # is a free observation_write param, so gate on origin — else a forged
+            # external cc_reflection_deep row moves the window and suppresses legit
+            # observations from the next cycle.
+            origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
+        )
+        since = last_deep[0].get("created_at", "") if last_deep else ""
+        if not since:
+            # Computed in Python so the cutoff has the same ISO-8601 shape as
+            # the stored ``ingested_at`` values and compares correctly as text.
+            since = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+
+        try:
+            cursor = await db.execute(
+                "SELECT COALESCE(source_pipeline, 'unknown') AS pipeline, "
+                "COUNT(*) AS cnt FROM knowledge_units "
+                "WHERE ingested_at > ? GROUP BY pipeline ORDER BY cnt DESC",
+                (since,),
+            )
+            rows = await cursor.fetchall()
+        except sqlite3.Error:
+            logger.warning(
+                "knowledge_units intake read failed; intake count unknown",
+                exc_info=True,
+            )
+            return None
+        return [(row[0], row[1]) for row in rows]
+
     async def _intelligence_digest(self, db: aiosqlite.Connection) -> str:
         """Build a summary of intelligence intake since last Deep cycle.
 
         Replaces the old surplus.list_pending() call. Deep gets a digest
         for pattern recognition, not individual promote/discard decisions.
         """
-        # Get last Deep reflection timestamp
-        last_deep = await observations.query(
-            db, source="cc_reflection_deep", limit=1,
-            # WS-3: this row's timestamp is the reflection-window cutoff. `source`
-            # is a free observation_write param, so gate on origin — else a forged
-            # external cc_reflection_deep row moves the window and suppresses legit
-            # observations from the next cycle.
-            origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
-        )
-        since = ""
-        if last_deep:
-            since = last_deep[0].get("created_at", "")
-
-        # Count knowledge units ingested since last Deep
-        try:
-            query = (
-                "SELECT authority, COUNT(*) as cnt FROM knowledge_units "
-                "WHERE created_at > ? GROUP BY authority ORDER BY cnt DESC"
-            ) if since else (
-                "SELECT authority, COUNT(*) as cnt FROM knowledge_units "
-                "WHERE created_at > datetime('now', '-2 days') "
-                "GROUP BY authority ORDER BY cnt DESC"
+        rows = await self._knowledge_intake_since_last_deep(db)
+        if rows is None:
+            return (
+                "Intelligence intake unavailable: the knowledge_units read "
+                "failed (see server logs); the count since the last Deep "
+                "cycle is unknown."
             )
-            params = (since,) if since else ()
-            cursor = await db.execute(query, params)
-            rows = await cursor.fetchall()
-        except Exception:
-            logger.debug("knowledge_units query failed in digest", exc_info=True)
-            rows = []
-
         if not rows:
             return "No intelligence items ingested since last Deep cycle."
 
-        total = sum(r[1] for r in rows)
+        total = sum(count for _, count in rows)
         parts = [f"**{total} intelligence items** triaged since last Deep cycle:"]
-        for row in rows:
-            parts.append(f"- {row[0]}: {row[1]} items")
+        for pipeline, count in rows:
+            parts.append(f"- {pipeline}: {count} items")
 
         return "\n".join(parts)
 
-    async def _intake_items_since_last_deep(self, db: aiosqlite.Connection) -> int:
-        """Count intake items since last Deep reflection."""
-        last_deep = await observations.query(
-            db, source="cc_reflection_deep", limit=1,
-            # WS-3: this row's timestamp is the reflection-window cutoff. `source`
-            # is a free observation_write param, so gate on origin — else a forged
-            # external cc_reflection_deep row moves the window and suppresses legit
-            # observations from the next cycle.
-            origin_class_in=list(observations.SAFE_SURFACING_ORIGINS),
-        )
-        since = ""
-        if last_deep:
-            since = last_deep[0].get("created_at", "")
-
-        try:
-            query = (
-                "SELECT COUNT(*) FROM knowledge_units WHERE created_at > ?"
-            ) if since else (
-                "SELECT COUNT(*) FROM knowledge_units "
-                "WHERE created_at > datetime('now', '-2 days')"
-            )
-            params = (since,) if since else ()
-            cursor = await db.execute(query, params)
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-        except Exception:
-            return 0
+    async def _intake_items_since_last_deep(
+        self, db: aiosqlite.Connection,
+    ) -> int | None:
+        """Count intake items since last Deep reflection; None if the read failed."""
+        rows = await self._knowledge_intake_since_last_deep(db)
+        if rows is None:
+            return None
+        return sum(count for _, count in rows)
 
     def _recent_conversation_turns(self) -> list[dict]:
         """Extract recent user messages from the active CC session JSONL."""

@@ -353,3 +353,89 @@ class TestOriginExclusion:
         assert "ro_owner" in ids
         assert "ro_ext" not in ids
         assert "ro_null" not in ids
+
+
+class TestIntelligenceIntake:
+    """The digest and the intake count read ``knowledge_units`` by its real
+    columns (``ingested_at`` / ``source_pipeline``), and a failed read is
+    reported as a failure, never as "nothing was ingested" (issue #2337)."""
+
+    async def _insert_unit(self, db, *, concept, pipeline, ingested_at):
+        await db.execute(
+            "INSERT INTO knowledge_units "
+            "(id, project_type, domain, source_doc, concept, body, "
+            "ingested_at, source_pipeline) "
+            "VALUES (?, 'genesis', 'intel', 'intake:test', ?, 'body', ?, ?)",
+            (str(uuid.uuid4()), concept, ingested_at, pipeline),
+        )
+
+    async def _insert_last_deep(self, db, created_at):
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, content, priority, created_at, origin_class) "
+            "VALUES (?, 'cc_reflection_deep', 'reflection', 'c', 'medium', ?, 'first_party')",
+            (str(uuid.uuid4()), created_at),
+        )
+
+    @pytest.mark.asyncio
+    async def test_digest_counts_recent_units_by_pipeline(self, db, gatherer):
+        now = datetime.now(UTC).isoformat()
+        old = (datetime.now(UTC) - timedelta(days=5)).isoformat()
+        await self._insert_unit(db, concept="a", pipeline="recon", ingested_at=now)
+        await self._insert_unit(db, concept="b", pipeline="recon", ingested_at=now)
+        await self._insert_unit(db, concept="c", pipeline="model_intelligence", ingested_at=now)
+        await self._insert_unit(db, concept="d", pipeline=None, ingested_at=now)
+        await self._insert_unit(db, concept="e", pipeline="recon", ingested_at=old)
+        await db.commit()
+
+        digest = await gatherer._intelligence_digest(db)
+        assert "**4 intelligence items**" in digest
+        assert "- recon: 2 items" in digest
+        assert "- model_intelligence: 1 items" in digest
+        assert "- unknown: 1 items" in digest
+
+        assert await gatherer._intake_items_since_last_deep(db) == 4
+
+    @pytest.mark.asyncio
+    async def test_fallback_window_boundary_is_iso_consistent(self, db, gatherer):
+        """With no prior Deep cycle the window is 2 days. A row ingested 2 days
+        and 1 hour ago is outside it, even on the boundary calendar day."""
+        stale = (datetime.now(UTC) - timedelta(days=2, hours=1)).isoformat()
+        await self._insert_unit(db, concept="a", pipeline="recon", ingested_at=stale)
+        await db.commit()
+        assert await gatherer._intake_items_since_last_deep(db) == 0
+
+    @pytest.mark.asyncio
+    async def test_window_starts_at_last_deep_reflection(self, db, gatherer):
+        last_deep = datetime.now(UTC) - timedelta(hours=6)
+        await self._insert_last_deep(db, last_deep.isoformat())
+        before = (last_deep - timedelta(hours=1)).isoformat()
+        after = (last_deep + timedelta(hours=1)).isoformat()
+        await self._insert_unit(db, concept="a", pipeline="recon", ingested_at=before)
+        await self._insert_unit(db, concept="b", pipeline="recon", ingested_at=after)
+        await db.commit()
+
+        digest = await gatherer._intelligence_digest(db)
+        assert "**1 intelligence items**" in digest
+        assert await gatherer._intake_items_since_last_deep(db) == 1
+
+    @pytest.mark.asyncio
+    async def test_genuinely_empty_reports_none_ingested(self, db, gatherer):
+        digest = await gatherer._intelligence_digest(db)
+        assert digest == "No intelligence items ingested since last Deep cycle."
+        assert await gatherer._intake_items_since_last_deep(db) == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_read_is_not_reported_as_empty(self, db, gatherer, caplog):
+        await db.execute("DROP TABLE knowledge_units")
+        await db.commit()
+
+        with caplog.at_level("WARNING", logger="genesis.reflection.context_gatherer"):
+            digest = await gatherer._intelligence_digest(db)
+            count = await gatherer._intake_items_since_last_deep(db)
+
+        assert "No intelligence items ingested" not in digest
+        assert "unavailable" in digest
+        assert count is None
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) >= 2
