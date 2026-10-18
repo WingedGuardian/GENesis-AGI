@@ -42,6 +42,7 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "perception": "Reflection engine — observation creation, pattern detection, signal processing",
     "cc_relay": "Claude Code invoker, session manager, checkpoints, and reflection bridge",
     "direct_session": "Direct session spawner — profile-constrained background CC sessions with tool restrictions, Telegram notifications, and streaming observability",
+    "agent_api": "Same-owner asynchronous A2A conversations and durable pull outbox; explicit peer configuration and enrollment required",
     "memory": "Hybrid memory store — SQLite + Qdrant vector search, wing/room taxonomy, essential knowledge layer, knowledge ingestion pipeline + resume review",
     "surplus": "Surplus compute scheduler — uses idle time for brainstorms and enrichment tasks",
     "learning": "Learning pipeline — triage, calibration, harvest, and procedural learning",
@@ -105,6 +106,8 @@ def write_capabilities_file(runtime: GenesisRuntime) -> None:
             capabilities[name] = {"status": "active", "description": desc}
         elif raw_status == "degraded":
             capabilities[name] = {"status": "degraded", "description": desc}
+        elif raw_status == "disabled":
+            capabilities[name] = {"status": "disabled", "description": desc}
         else:
             error_msg = raw_status.removeprefix("failed: ") if raw_status.startswith("failed:") else raw_status
             capabilities[name] = {

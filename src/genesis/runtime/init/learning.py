@@ -497,8 +497,31 @@ def build_learning_collectors(rt: GenesisRuntime) -> list:
     ]
 
 
+async def _seed_shipped_lessons(rt: GenesisRuntime) -> None:
+    """Seed shipped lessons at start and record the outcome in job health.
+
+    Job health is the durable signal (in memory and in the database): at this
+    point in startup the reflex bus that would carry ``task.failed`` is not
+    installed yet, and learning init has already returned.
+    """
+    from genesis.learning.procedural.shipped_lessons import seed_at_start
+
+    try:
+        await seed_at_start(rt._db)
+    except Exception as exc:
+        rt.record_job_failure("shipped_lesson_seed", exc=exc)
+    else:
+        rt.record_job_success("shipped_lesson_seed")
+
+
 async def init(rt: GenesisRuntime) -> None:
     """Initialize learning pipeline, triage, calibration, harvest, and all scheduled jobs."""
+    if rt._db is not None:
+        # First, and needing only the database: shipped lessons reach the
+        # advisor on every deploy path, whatever the rest of this step does.
+        from genesis.util.tasks import tracked_task
+
+        tracked_task(_seed_shipped_lessons(rt), name="shipped_lesson_seed")
     if rt._db is None or rt._router is None:
         logger.warning(
             "Learning skipped — missing prerequisites (db=%s, router=%s)",

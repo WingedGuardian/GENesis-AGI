@@ -281,6 +281,8 @@ def test_update_prepares_guarded_snapshot_before_stop(tmp_path, compatible):
         # The window also holds the staged-excused pre-stop guard (normal,
         # non --post-merge path); it reads git state and has its own tests.
         'POST_MERGE=false\n_staged_excused_divergence_guard() { :; }\n'
+        # update.sh reads the authority check's source at its start.
+        + f'_PEER_RESTORE_PY="$(cat "{ROOT / "src/genesis/db/crud/peer_restore.py"}")"\n'
         + block
         + '\nprintf "ADMITTED=%s\\n" "$DB_SNAPSHOT_TAKEN"\n'
     )

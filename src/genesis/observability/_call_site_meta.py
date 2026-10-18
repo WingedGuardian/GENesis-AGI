@@ -140,6 +140,15 @@ Fields:
 from __future__ import annotations
 
 _CALL_SITE_META: dict[str, dict] = {
+    "cc_fallback": {
+        "description": "Configured roster fallback for conversations and managed API jobs. Last execution outcome; readiness alone is not task success.",
+        "category": "core",
+        "frequency": "On provider refusal",
+        "cost_policy": "Configured roster (billing varies)",
+        "model_tier": "frontier",
+        "wired": True,
+        "status_reason": "WIRED",
+    },
     # ── WIRED: actively executing, have last_run records ──────────────
     "3_micro_reflection": {
         "description": "Fast LLM pattern check on the latest signals, fired only when a critical operational signal is active (~90% of micro ticks are silent by design; see PR #404). Free models.",

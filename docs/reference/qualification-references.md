@@ -3,7 +3,8 @@
 `genesis.eval.qualification.references` is an offline library. It examines
 already graded references and identifies outstanding review obligations;
 it makes no model calls and never invents labels, receipts or human approval.
-Corpus/prompt validation, CLI integration and candidate qualification land later.
+Corpus/prompt validation, CLI integration and candidate qualification are separate
+boundaries; see `qualification-preflight.md` and `qualification-runner.md`.
 
 The caller passes the full current contract-version mapping to `validate_policy`
 and `review`, and as `contracts=versions` to `admit`, `blockers` and
@@ -65,3 +66,9 @@ these counts confer no admission. These are declarations, not authenticated
 identities or signatures. Keep real approvals and references private; publish
 only synthetic test fixtures. Preserve approved snapshots when guidance changes,
 and record new evidence rather than overwriting their history.
+
+A clean reference attestation is not complete source admission. Complete
+preflight also requires durable exact source archives and genuine restore
+evidence in approval metadata `source_retention`; it verifies primary and
+restored bytes before rendering and again at completion. The archive command
+does not manufacture this attestation or authenticate the backup's origin.

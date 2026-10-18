@@ -330,38 +330,42 @@ async def direct_session_run(
     """Spawn a directed background CC session with profile-based tool restrictions.
 
     The session is queued and dispatched by the Genesis server, so it
-    outlives this MCP session. By default the session is FIRE-AND-FORGET:
-    successful runs are silent (poll ``direct_session_status`` for output) and
-    only failures raise a Telegram alert. Set ``deliver_to_origin=True`` to have
-    the terminal outcome (success AND failure) delivered back to THIS
-    conversation when it finishes — use this whenever you hand off long work from
-    a channel and tell the user you'll report back.
+    outlives this MCP session. Fire-and-forget by default: successful runs are
+    silent (poll ``direct_session_status``) and only failures send a Telegram
+    alert. Set ``deliver_to_origin=True`` to have the outcome (success or
+    failure) delivered back to THIS conversation; use it whenever you tell the
+    user you will report back.
 
-    Profiles control what the session can do:
-    - observe: Read everything, change nothing. Browser viewing, memory reads, web search.
-    - research: Observe + memory/observation writes + follow-ups. Stores findings for future use.
-    - interact: Full browser interaction + memory writes + outreach_send + follow-ups.
-      Use for workflows that operate external platforms and communicate with the user.
+    Profiles:
+    - observe: read everything, change nothing (browser viewing, memory
+      reads, web search).
+    - research: read tools, recon GitHub reads, observations, procedures
+      and follow-ups (SQLite), files under `~/.genesis/output/`.
+    - interact: full browser interaction, outreach_send, observations,
+      procedures, follow-ups and `~/.genesis/output/` files (no recon GitHub
+      reads; always runs on Opus). For operating external platforms.
+    `mail`, `campaign` and `community-responder` serve dedicated pipelines;
+    not for general work.
 
-    All profiles block: Bash, Edit, Write, task_submit, settings_update.
+    Built-in profile rules (profiles an install-local overlay adds may differ):
+    All built-in profiles block: `Bash`, `Edit`, `task_submit`, `settings_update`.
+    Built-in profiles that block `Write`: `observe` and `mail`.
+    No built-in profile can call `memory_store`, `memory_synthesize`,
+    `memory_extract`, `memory_supersede`, `knowledge_ingest`,
+    `knowledge_ingest_batch`, `knowledge_ingest_source`.
 
     Args:
-        prompt: The full instructions for the background session
-        profile: Safety profile (observe, interact, research)
-        model: LLM model (sonnet, opus, haiku, fable)
-        effort: Effort level (low, medium, high, xhigh, max)
-        timeout_minutes: Max runtime in minutes (default 15, max 60)
-        notify: Send a Telegram alert if the session FAILS (successful runs are
-            silent unless deliver_to_origin is set). Has no effect when
-            deliver_to_origin=True.
-        deliver_to_origin: Deliver the terminal outcome (success and failure)
-            back to the conversation this tool was called from. Requires a
-            foreground channel session as the caller.
-        roster_model: Optionally run this session on a specific roster model —
-            a peer from the cc_roster overlay — instead of the default,
-            i.e. intentional model selection. Omit/None to use the active
-            default. Fails the session if the named model is unknown or its
-            API key is not configured.
+        prompt: Full instructions for the session.
+        profile: observe | research | interact.
+        model: sonnet | opus | haiku | fable.
+        effort: low | medium | high | xhigh | max.
+        timeout_minutes: Max runtime (default 15, max 60).
+        notify: Telegram alert on FAILURE; ignored with deliver_to_origin.
+        deliver_to_origin: Deliver the outcome to the calling conversation
+            (needs a foreground channel session as the caller).
+        roster_model: Run on a named cc_roster peer model instead of the
+            default. An unknown name is rejected at call time; a missing API
+            key fails the session.
     """
     return await _impl_direct_session_run(
         prompt,

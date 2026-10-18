@@ -36,6 +36,7 @@ from genesis.cc.exceptions import (
     CCStreamTruncatedError,
     CCTimeoutError,
 )
+from genesis.cc.provider_readiness import probing_provider, provider_status_isolated
 from genesis.cc.types import (
     PROBE_CALLER_TAG,
     CCInvocation,
@@ -49,9 +50,12 @@ from genesis.cc.types import (
 from genesis.observability.spans import SpanKind, start_span
 from genesis.util.inflight import inflight
 from genesis.util.proc_kill import (
+    ProcessCleanupUncertain,
+    confirm_process_exit,
     kill_process_group,
     process_group_alive,
     reap_bounded,
+    spawn_owned,
 )
 
 logger = logging.getLogger(__name__)
@@ -1601,6 +1605,10 @@ async def _emit_invocation_failed_event(
     runtime/bus is absent and never raises — observability must not mask the
     real error the caller is about to receive.
     """
+    from genesis.util.execution_privacy import private_execution_active
+
+    if private_execution_active():
+        return  # Managed receipts expose classified failures, not raw provider data.
     is_limit = isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
     key: tuple[str, str | None, str] | None = None
     prev_state: list[float] | None = None
@@ -1880,6 +1888,7 @@ class CCInvoker:
         # so concurrent sessions don't clobber each other and `/stop` can
         # interrupt the RIGHT proc. Single-threaded asyncio → no lock needed.
         self._active_procs: dict[str, asyncio.subprocess.Process] = {}
+        self._cleanup_owned_procs: set[str] = set()
         self._on_cc_status_change = on_cc_status_change
         self._on_model_downgrade = on_model_downgrade
         self._on_cc_empty_output = on_cc_empty_output
@@ -1989,6 +1998,8 @@ class CCInvoker:
 
     async def _fire_downgrade_callback(self, output: CCOutput) -> None:
         """Invoke model downgrade callback if applicable. Never raises."""
+        if probing_provider():
+            return
         if not output.downgraded or not self._on_model_downgrade:
             return
         try:
@@ -2017,7 +2028,7 @@ class CCInvoker:
         output is still returned to the caller exactly as before). Never raises;
         mirrors ``_fire_downgrade_callback``.
         """
-        if self._on_cc_empty_output is None:
+        if provider_status_isolated() or self._on_cc_empty_output is None:
             return
         try:
             await self._on_cc_empty_output(invocation, output)
@@ -2352,7 +2363,7 @@ class CCInvoker:
             if settings_pins is not None
             else _settings_env_pins(tuple(inv.bash_allowlist))
         )
-        span_settings = cc_span_settings_path(pins)
+        span_settings = None if probing_provider() else cc_span_settings_path(pins)
         if span_settings:
             args += ["--settings", span_settings]
         else:
@@ -2371,10 +2382,14 @@ class CCInvoker:
             args += ["--allowedTools", ",".join(inv.allowed_tools)]
         if inv.disallowed_tools:
             args += ["--disallowedTools", ",".join(inv.disallowed_tools)]
+        if inv.disable_tools:
+            args += ["--tools", ""]
         if inv.bare:
             args.append("--bare")
         if inv.safe_mode:
             args.append("--safe-mode")
+        if inv.no_session_persistence:
+            args.append("--no-session-persistence")
         # Prompt is passed via stdin (see run/run_streaming), not as a CLI
         # argument.  This avoids argument-parsing edge cases (the "--"
         # separator broke -p prompt detection) and handles arbitrarily long
@@ -2489,8 +2504,9 @@ class CCInvoker:
         # stitch this session's tool spans under the dispatching operation's
         # trace (cross-process). Absent when no span is active → hook no-ops.
         from genesis.observability.spans import current_trace_context
+        from genesis.util.execution_privacy import private_execution_active
 
-        _tc = current_trace_context()
+        _tc = None if private_execution_active() else current_trace_context()
         if _tc:
             env["GENESIS_TRACE_ID"], env["GENESIS_PARENT_SPAN_ID"] = _tc
         else:
@@ -2641,7 +2657,9 @@ class CCInvoker:
         pin_dispatched_env(env)
         return env
 
-    def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:
+    def _register_proc(
+        self, key: str, proc: asyncio.subprocess.Process, *, confirm_cleanup: bool = False
+    ) -> str:
         """Register a live subprocess under a session key.
 
         Prunes dead entries first — a safety net so the registry only ever
@@ -2652,12 +2670,36 @@ class CCInvoker:
         the same key would orphan the prior proc — keep that invariant if the
         locking model changes.
         """
-        for dead in [k for k, p in self._active_procs.items() if p.returncode is not None]:
+        for dead in [
+            k
+            for k, p in self._active_procs.items()
+            if p.returncode is not None and k not in self._cleanup_owned_procs
+        ]:
             self._active_procs.pop(dead, None)
+        if key in self._cleanup_owned_procs:
+            key = f"pid:{proc.pid}:{id(proc)}"
         self._active_procs[key] = proc
+        if confirm_cleanup:
+            self._cleanup_owned_procs.add(key)
+        return key
 
     def _unregister_proc(self, key: str) -> None:
         self._active_procs.pop(key, None)
+        self._cleanup_owned_procs.discard(key)
+
+    async def _confirm_registered_exit(self, proc, key: str, **kwargs) -> None:
+        """Uncertain groups retain ownership even after their leader exits."""
+        try:
+            await confirm_process_exit(proc, **kwargs)
+        except ProcessCleanupUncertain as exc:
+            exc.process = proc
+            raise
+        except asyncio.CancelledError:
+            # confirm_process_exit delivers cancellation only after proving exit.
+            self._unregister_proc(key)
+            raise
+        else:
+            self._unregister_proc(key)
 
     async def interrupt(self, key: str | None = None) -> None:
         """Send SIGINT to a session's subprocess. No-op if none match.
@@ -2802,7 +2844,7 @@ class CCInvoker:
         Args:
             error: The CC error, or None on recovery (success after failure).
         """
-        if self._on_cc_status_change is None:
+        if provider_status_isolated() or self._on_cc_status_change is None:
             return
 
         async with self._status_lock:
@@ -3052,7 +3094,7 @@ class CCInvoker:
             )
             admission.release()
             reg_key = invocation.session_key or f"pid:{proc.pid}"
-            self._register_proc(reg_key, proc)
+            reg_key = self._register_proc(reg_key, proc)
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
             set_oom_score_adj(proc.pid, 500)
             if invocation.on_spawn is not None:
@@ -3289,7 +3331,8 @@ class CCInvoker:
 
         try:
             scope_args = await _get_scope_args()
-            proc = await asyncio.create_subprocess_exec(
+            create = spawn_owned if invocation.confirm_cleanup else asyncio.create_subprocess_exec
+            proc = await create(
                 *scope_args,
                 *args,
                 stdin=asyncio.subprocess.PIPE,
@@ -3304,6 +3347,10 @@ class CCInvoker:
                 start_new_session=True,
             )
             admission.release()
+        except ProcessCleanupUncertain as exc:
+            if exc.process is not None:
+                self._register_proc(f"pid:{exc.process.pid}", exc.process, confirm_cleanup=True)
+            raise
         except FileNotFoundError:
             logger.error(
                 "Claude CLI not found at %r. Ensure @anthropic-ai/claude-code "
@@ -3322,7 +3369,7 @@ class CCInvoker:
         # pipe, task cancellation), reap the proc and drop the registry entry —
         # don't leak either. The streaming `try` below unregisters on its paths.
         reg_key = invocation.session_key or f"pid:{proc.pid}"
-        self._register_proc(reg_key, proc)
+        reg_key = self._register_proc(reg_key, proc, confirm_cleanup=invocation.confirm_cleanup)
         try:
             if invocation.on_spawn is not None:
                 try:
@@ -3339,8 +3386,11 @@ class CCInvoker:
                 await proc.stdin.drain()
                 proc.stdin.close()
         except BaseException:
-            self._unregister_proc(reg_key)
-            kill_process_group(proc)
+            if not invocation.confirm_cleanup:
+                self._unregister_proc(reg_key)
+                kill_process_group(proc)
+            else:
+                await self._confirm_registered_exit(proc, reg_key)
             raise
 
         result_data: dict | None = None
@@ -3587,7 +3637,17 @@ class CCInvoker:
             kill_process_group(proc)
             raise
         finally:
-            self._unregister_proc(reg_key)
+            if invocation.confirm_cleanup:
+                # A result asks the child to stop; ownership ends only when
+                # the complete group, rather than just its leader, is gone.
+                await self._confirm_registered_exit(
+                    proc,
+                    reg_key,
+                    graceful=terminated_after_result,
+                    escalation_grace_s=_ESCALATION_GRACE_S,
+                )
+            else:
+                self._unregister_proc(reg_key)
 
         # Bounded reap: proc.terminate() on the result path is a GRACEFUL stop
         # the child can ignore (wedged node flush / MCP teardown) — an
@@ -3867,6 +3927,7 @@ class CCInvoker:
             await self._notify_status_change(None)
         output = CCOutput(
             session_id="",
+            result_received=False,
             text="".join(collected_text),
             model_used=str(invocation.model),
             cost_usd=0.0,

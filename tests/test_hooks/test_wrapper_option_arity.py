@@ -317,6 +317,11 @@ def _help_text(tool: str) -> str | None:
         except Exception:
             continue
         text = (proc.stdout or "") + (proc.stderr or "")
+        # A refusal is not help: under no_new_privs (a sandboxed test run) `sudo
+        # --help` prints only why it will not start, which is long enough to pass
+        # for help and leaves every listed option "NOT FOUND".
+        if proc.returncode != 0 and "usage" not in text.lower():
+            continue
         if len(text) > 80:
             return text
     return None
@@ -408,7 +413,9 @@ class TestTableAgreesWithTheToolsThemselves:
             pytest.skip(f"{tool} has no single authority to check against — see _UNVERIFIABLE")
         help_text = _help_text(tool)
         if help_text is None:
-            pytest.skip(f"{tool} is not installed here — arity cannot be measured")
+            pytest.skip(
+                f"{tool} is not installed here, or refused to run (no_new_privs) — arity cannot be measured"
+            )
         arity = _documented_arity(help_text)
         # The tool's OWN parser wins wherever it can be read, because it is what
         # actually runs; the help is prose about it and can omit an option
@@ -671,7 +678,9 @@ class TestTableAgreesWithTheToolsThemselves:
         once: before the fix the same injection produced a green, silent build.
         """
         if _help_text("sudo") is None:
-            pytest.skip("sudo is not installed here — the ambiguity cannot be measured")
+            pytest.skip(
+                "sudo is not installed here, or refused to run (no_new_privs) — the ambiguity cannot be measured"
+            )
         opts, *rest = sp._WRAPPER_SPEC["sudo"]
         monkeypatch.setitem(sp._WRAPPER_SPEC, "sudo", ({*opts, "--preserve-env"}, *rest))
         with pytest.raises(AssertionError) as caught:

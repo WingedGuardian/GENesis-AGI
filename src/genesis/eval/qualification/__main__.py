@@ -1,0 +1,160 @@
+"""Qualification admission, approved serial comparison and aggregate private reports."""
+
+import argparse
+import asyncio
+import contextlib
+import json
+import os
+from pathlib import Path
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    commands = result.add_subparsers(dest="command", required=True)
+    for name in ("check", "run", "report"):
+        command = commands.add_parser(name)
+        for flag in ("corpus", "temp-root", "reference-policy", "current-reference-policy",
+                     "reference-approval", "source-files", "params"):
+            command.add_argument("--" + flag, type=Path, required=flag in ("corpus", "temp-root"))
+        command.add_argument("--alias", required=name != "check")
+        if name != "check":
+            command.add_argument("--campaign", type=Path, required=True)
+        if name in ("run", "report"):
+            command.add_argument("--against")
+            command.add_argument("--against-campaign", type=Path)
+        if name == "run":
+            command.add_argument("--operating-plan", type=Path)
+            command.add_argument("--spending-approval", type=Path)
+    review = commands.add_parser("review-references")
+    review.add_argument("--spec", type=Path, required=True)
+    archive = commands.add_parser("archive-sources")
+    archive.add_argument("--source-files", type=Path, required=True)
+    archive.add_argument("--generation", required=True)
+    return result
+
+
+async def admit(args, cases, configured, options):
+    from genesis.eval.qualification import corpus, execution, preflight
+    from genesis.eval.qualification.evidence import Incomplete
+
+    paths = {}
+    if args.command == "run":
+        if (bool(args.against) != bool(args.against_campaign)
+                or args.against == args.alias):
+            raise Incomplete("paired_campaigns_invalid")
+        paths = {args.alias: args.campaign}
+        if args.against:
+            paths[args.against] = args.against_campaign
+        aliases = execution.selected_aliases(paths)
+        if (set(configured) != set(aliases)
+                or len({path.resolve() for path in paths.values()}) != len(aliases)):
+            raise Incomplete("paired_campaigns_invalid")
+    else:
+        aliases = [args.alias] if args.alias else list(configured)
+    checked = await preflight.check(
+        cases, args.temp_root, reference_policy=options["reference_policy"],
+        current_policy=options["current_reference_policy"],
+        reference_approval=options["reference_approval"], source_files=options["source_files"],
+        candidates={alias: configured[alias] for alias in aliases},
+    )
+    if args.command == "check":
+        return {"status": "pass", "scope": "offline admission only", "corpus": corpus.counts(cases)}
+    if not args.operating_plan or not args.spending_approval:
+        raise Incomplete("financial_eligibility_unavailable")
+    return await execution.execute(
+        cases, checked, paths,
+        args.temp_root, plan_path=args.operating_plan, approval_path=args.spending_approval,
+        options=options,
+    )
+
+
+async def run(args):
+    from genesis.eval.qualification import corpus, execution, preflight, references
+    from genesis.eval.qualification import run as qualification
+    from genesis.eval.qualification.evidence import Incomplete, load_json
+
+    def read(name):
+        path = getattr(args, name, None)
+        return load_json(path.read_bytes()) if path else None
+
+    if args.command == "archive-sources":
+        from genesis.eval.qualification.sources import archive
+
+        archive(read("source_files"), args.generation)
+        return {"status": "pass", "scope": "source retention only; no approval or backup claim"}
+
+    if args.command == "review-references":
+        reviewed = references.review(read("spec"), corpus.versions())
+        # Reference IDs and issue text can contain private user data.
+        return {"status": reviewed["status"], "counts": reviewed["counts"],
+                "scope": "reference admission only"}
+    policy = read("reference_policy")
+    cases = corpus.load(args.corpus, reference_policy=policy)
+    issues = corpus.coverage(cases, complete=True)
+    if issues:
+        if args.command == "check":
+            await preflight.prepare(cases, args.temp_root, reference_policy=policy)
+        return {"status": "incomplete", "reason": "coverage_incomplete",
+                "corpus": corpus.counts(cases), "coverage_issues": issues}
+    configured = read("params")
+    if not isinstance(configured, dict) or not configured:
+        raise Incomplete("admission_inputs_missing")
+    options = {
+        "reference_policy": policy, "current_reference_policy": read("current_reference_policy"),
+        "reference_approval": read("reference_approval"), "source_files": read("source_files"),
+    }
+    if args.command in ("check", "run"):
+        return await admit(args, cases, configured, options)
+    against = args.against
+    if bool(against) != bool(args.against_campaign) or against == args.alias:
+        raise Incomplete("paired_campaigns_invalid")
+    paths = [args.campaign] + ([args.against_campaign] if against else [])
+    if len(paths) == 2 and paths[0].resolve() == paths[1].resolve():
+        raise Incomplete("paired_campaigns_invalid")
+    reports, records = {}, {}
+    aliases = [args.alias] + ([against] if against else [])
+    # Pair scoring and financial ownership must use the same immutable snapshots.
+    views = {alias: qualification.ReadView(path) for alias, path in zip(aliases, paths, strict=True)} \
+        if against else {}
+    for alias, path in zip(aliases, paths, strict=True):
+        reports[alias], records[alias] = await qualification.qualify(
+            alias, cases, configured[alias], views.get(alias, path), args.temp_root, **options
+        )
+    if not against:
+        return reports[args.alias]
+    if reports[args.alias]["admission"] != reports[against]["admission"]:
+        raise Incomplete("paired_admission_changed")
+    financial = execution.cost_report({alias: view.state for alias, view in views.items()})
+    return {
+        "status": "incomplete" if financial["unresolved_attempts"] else
+        qualification.worst((r["status"] for r in reports.values()), qualification.OVERALL),
+        "models": reports, "paired": qualification.pair(cases, *(records[a] for a in aliases)),
+        "financial": financial,
+    }
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    previous = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    try:
+        # Dedicated serial CLI: SDK/scorer warnings and logs may echo private answers.
+        # Only the fixed aggregate result is public; campaign evidence stays private.
+        with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            result = asyncio.run(run(args))
+    except Exception as exc:
+        allowed = {"financial_eligibility_unavailable", "admission_inputs_missing",
+                   "paired_campaigns_invalid", "paired_admission_changed"}
+        reason = str(exc) if str(exc) in allowed else "admission_or_processing_failed"
+        result = {"status": "incomplete", "reason": reason}
+    finally:
+        if previous is None:
+            os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
+        else:
+            os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = previous
+    print(json.dumps(result, sort_keys=True, allow_nan=False))
+    return {"pass": 0, "fail": 1}.get(result["status"], 2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -25,7 +25,10 @@ from flask import Flask
 from genesis.dashboard._blueprint import blueprint
 from genesis.dashboard.routes import updates
 
-pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="flock + POSIX pids")
+pytestmark = [
+    pytest.mark.skipif(sys.platform.startswith("win"), reason="flock + POSIX pids"),
+    pytest.mark.usefixtures("updates_sandbox"),
+]
 
 
 @pytest.fixture()
@@ -37,10 +40,8 @@ def client():
 
 
 @pytest.fixture()
-def w(tmp_path, monkeypatch):
-    home = tmp_path / "gh"
-    home.mkdir()
-    monkeypatch.setenv("GENESIS_HOME", str(home))
+def w(tmp_path, monkeypatch, updates_sandbox):
+    home = updates_sandbox.genesis_dir
     script = tmp_path / "update.sh"
     script.write_text("#!/bin/bash\nexit 0\n")
     escalation = tmp_path / "escalation.txt"

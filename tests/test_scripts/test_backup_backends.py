@@ -19,6 +19,8 @@ import textwrap
 import time
 from pathlib import Path
 
+import pytest
+
 _LIB = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "backup_backends.sh"
 
 
@@ -196,11 +198,15 @@ def test_legacy_nas_resolves_to_smb(tmp_path):
 
 _SMB_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
-    cmd=""; prev=""
-    for a in "$@"; do [ "$prev" = "-c" ] && cmd="$a"; prev="$a"; done
-    printf '%s\\n' "$cmd" >> "$SMB_LOG"
+    cmd=""; directory=""; prev=""
+    for a in "$@"; do
+        [ "$prev" = "-c" ] && cmd="$a"
+        [ "$prev" = "-D" ] && directory="$a"
+        prev="$a"
+    done
+    printf '%s\\t%s\\n' "$directory" "$cmd" >> "$SMB_LOG"
     case "$cmd" in
-      *"; ls"*)
+      ls*)
          printf '  .                          D        0  Mon\\n'
          printf '  ..                         D        0  Mon\\n'
          printf '  20260617T180000Z           D        0  Mon\\n'
@@ -242,10 +248,13 @@ def test_smb_command_shapes_and_list_parsing(tmp_path):
     assert 'mkdir "Genesis"' in cmds
     assert 'mkdir "Genesis/host"' in cmds
     assert 'mkdir "Genesis/host/STAMP/data"' in cmds
-    # put cd's into the dir and puts the basename
-    assert 'cd "Genesis/host/STAMP/data"; put' in cmds
-    # get cd's into the dir and gets the basename
-    assert 'get "f.gpg"' in cmds
+    # -D refuses an invalid starting directory before the single command runs.
+    invocations = [line.split("\t", 1) for line in cmds.splitlines()]
+    assert ["Genesis/host/STAMP/data", f'put "{src}" "f.gpg"'] in invocations
+    assert ["Genesis/host/STAMP/data", f'get "f.gpg" "{tmp_path}/out.gpg"'] in invocations
+    assert ["Genesis/host/STAMP", "ls"] in invocations
+    assert ["Genesis/host/STAMP", 'ls "COMPLETE"'] in invocations
+    assert not any(command.startswith("cd ") for _, command in invocations)
     # delete is a recursive deltree
     assert 'deltree "Genesis/host/STAMP"' in cmds
     # list parsing extracted real entries only (no ./.. and no "blocks" summary)
@@ -279,6 +288,134 @@ def test_smb_creds_cleaned_up(tmp_path):
     assert "CREDS_VAR_CLEARED=yes" in proc.stdout
     creds_path = marker.read_text().strip()
     assert creds_path and not Path(creds_path).exists(), "creds temp file not removed by cleanup"
+
+
+@pytest.mark.parametrize("bad", ['x"; mkdir "pwned', "a;b", "a\\b", "a\nb", "a\rb"])
+def test_smb_refuses_a_path_that_could_leave_its_quotes(tmp_path, bad):
+    """Every smb operation is one `smbclient -c` string with the paths quoted inside,
+    and names reach it from the backups clone. A path holding a quote, ';', a
+    backslash or a newline is refused before smbclient runs: put/get/exists/delete
+    fail, mkdir/list do nothing."""
+    bind = tmp_path / "bin"
+    bind.mkdir()
+    log = tmp_path / "smb.log"
+    _make_stub(bind / "smbclient", _SMB_STUB)
+    src = tmp_path / "f.gpg"
+    src.write_text("x")
+    env = {
+        "GENESIS_BACKUP_TIER2_BACKEND": "smb",
+        "GENESIS_BACKUP_NAS": "//nas/share",
+        "GENESIS_BACKUP_NAS_USER": "u",
+        "GENESIS_BACKUP_NAS_PASS": "p",
+        "SMB_LOG": str(log),
+        "BAD": bad,
+    }
+    body = textwrap.dedent(f"""
+        backend_init
+        backend_mkdir "Genesis/$BAD" && echo "MKDIR=0"
+        backend_put "{src}" "Genesis/$BAD/f.gpg" || echo "PUT=refused"
+        backend_put "$BAD" "Genesis/ok/f.gpg" || echo "PUTSRC=refused"
+        backend_get "Genesis/$BAD/f.gpg" "{tmp_path}/out" || echo "GET=refused"
+        echo "LIST=[$(backend_list "Genesis/$BAD")]"
+        echo "DIRS=[$(backend_list_dirs "Genesis/$BAD")]"
+        backend_exists "Genesis/$BAD" || echo "EXISTS=refused"
+        backend_delete "Genesis/$BAD" || echo "DELETE=refused"
+        backend_cleanup
+    """)
+    proc = _run_bash(body, env, extra_path=bind)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    for marker in (
+        "MKDIR=0",
+        "PUT=refused",
+        "PUTSRC=refused",
+        "GET=refused",
+        "LIST=[]",
+        "DIRS=[]",
+        "EXISTS=refused",
+        "DELETE=refused",
+    ):
+        assert marker in proc.stdout, (marker, proc.stdout)
+    assert not log.exists() or log.read_text() == "", log.read_text()
+    assert "refusing smb path" in proc.stderr
+
+
+@pytest.mark.parametrize("good", ["with space.gpg", "üñí.gpg", "bang!.gpg", "it's.gpg", "a$b.gpg"])
+def test_smb_still_passes_ordinary_names(tmp_path, good):
+    """The guard refuses only what can leave the quotes; other names still go out."""
+    bind = tmp_path / "bin"
+    bind.mkdir()
+    log = tmp_path / "smb.log"
+    _make_stub(bind / "smbclient", _SMB_STUB)
+    src = tmp_path / "f.gpg"
+    src.write_text("x")
+    env = {
+        "GENESIS_BACKUP_TIER2_BACKEND": "smb",
+        "GENESIS_BACKUP_NAS": "//nas/share",
+        "GENESIS_BACKUP_NAS_USER": "u",
+        "GENESIS_BACKUP_NAS_PASS": "p",
+        "SMB_LOG": str(log),
+        "GOOD": good,
+    }
+    proc = _run_bash(
+        f'backend_init\nbackend_put "{src}" "Genesis/d/$GOOD" && echo PUT=ok\nbackend_cleanup',
+        env,
+        extra_path=bind,
+    )
+    assert "PUT=ok" in proc.stdout, proc.stdout + proc.stderr
+    assert good in log.read_text()
+
+
+def test_smb_delete_refuses_a_wildcard_mask(tmp_path):
+    bind = tmp_path / "bin"
+    bind.mkdir()
+    log = tmp_path / "smb.log"
+    _make_stub(bind / "smbclient", _SMB_STUB)
+    env = {
+        "GENESIS_BACKUP_TIER2_BACKEND": "smb",
+        "GENESIS_BACKUP_NAS": "//nas/share",
+        "GENESIS_BACKUP_NAS_USER": "u",
+        "GENESIS_BACKUP_NAS_PASS": "p",
+        "SMB_LOG": str(log),
+    }
+    proc = _run_bash(
+        'backend_init\nbackend_delete "Genesis/host/*" || echo DEL=refused\nbackend_cleanup',
+        env,
+        extra_path=bind,
+    )
+    assert "DEL=refused" in proc.stdout, proc.stdout + proc.stderr
+    assert not log.exists() or "deltree" not in log.read_text()
+    assert "refusing smb delete" in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("pattern", ["x*", "x" + "?" * len('"; deltree Genesis; echo "')])
+def test_smb_mkdir_does_not_glob_its_path(tmp_path, pattern):
+    """mkdir splits the path on '/'; the split must not expand a wildcard against
+    the working directory, or a local file name holding a quote and ';' would
+    reach the -c string after the path was checked."""
+    bind = tmp_path / "bin"
+    bind.mkdir()
+    log = tmp_path / "smb.log"
+    _make_stub(bind / "smbclient", _SMB_STUB)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / 'x"; deltree Genesis; echo "').write_text("")
+    env = {
+        "GENESIS_BACKUP_TIER2_BACKEND": "smb",
+        "GENESIS_BACKUP_NAS": "//nas/share",
+        "GENESIS_BACKUP_NAS_USER": "u",
+        "GENESIS_BACKUP_NAS_PASS": "p",
+        "SMB_LOG": str(log),
+        "PAT": pattern,
+    }
+    proc = _run_bash(
+        f'cd "{cwd}"\nbackend_init\nbackend_mkdir "Genesis/$PAT"\nbackend_cleanup',
+        env,
+        extra_path=bind,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    sent = log.read_text()
+    assert "deltree" not in sent, sent
+    assert f'mkdir "Genesis/{pattern}"' in sent, sent
 
 
 def test_smb_run_kills_client_that_ignores_term(tmp_path):

@@ -43,7 +43,8 @@ async def find_best_match(
     overlap = len(intersection) / len(union) of context_tags (Jaccard).
     Returns None if no non-deprecated procedures match.
     """
-    rows = await procedural.list_by_task_type(db, task_type)
+    # Held lessons are left out in SQL, so they cannot fill the limit.
+    rows = await procedural.list_by_task_type(db, task_type, live_only=True)
     if not rows:
         return None
 
@@ -80,7 +81,7 @@ async def find_relevant(
     Broader than find_best_match — searches all active procedures, not just one
     task_type. Used by SessionStart injection and procedure_recall MCP tool.
     """
-    rows = await procedural.list_active(db, limit=200)
+    rows = await procedural.list_active(db, limit=200, live_only=True)
     if not rows:
         return []
 

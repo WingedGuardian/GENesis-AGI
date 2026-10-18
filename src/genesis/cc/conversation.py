@@ -1559,6 +1559,8 @@ class ConversationLoop:
             # points reassigns it, so a second read would be identical. It is
             # simply needed there.
             for peer_name, peer_inv in peers:
+                from genesis.cc.managed_fallback import record_fallback
+
                 if streamed and streamed.get("text"):
                     break  # a prior peer already streamed answer text — can't fail
                     # over to another without double-output; degrade instead.
@@ -1569,6 +1571,9 @@ class ConversationLoop:
                         on_event=on_event, streamed=streamed,
                     )
                 except (CCRateLimitError, CCQuotaExhaustedError) as exc:
+                    await record_fallback(self._db, peer_name,
+                                          peer_inv.model_id_override or str(peer_inv.model),
+                                          success=False)
                     # The prose lives HERE, not in the availability record. This
                     # handler previously logged nothing at all, while the record
                     # persisted the provider's text into a file that is read into
@@ -1606,6 +1611,9 @@ class ConversationLoop:
                         return ""
                     continue  # this peer is also down → try the next one
                 except CCReplayUnsafeError as unsafe:
+                    await record_fallback(self._db, peer_name,
+                                          peer_inv.model_id_override or str(peer_inv.model),
+                                          success=False)
                     if unsafe.__cause__ is not None:
                         await _record_peer(peer_availability.note_failure, peer_name, unsafe.__cause__)
                     # The SAME hazard as the re-run inside `_run_failover_peer`,
@@ -1657,6 +1665,9 @@ class ConversationLoop:
                     return (UNREPLAYABLE if isinstance(unsafe, CCStreamTruncatedError)
                             else _Unreplayable(_replay_notice(unsafe)))
                 except CCError as exc:
+                    await record_fallback(self._db, peer_name,
+                                          peer_inv.model_id_override or str(peer_inv.model),
+                                          success=False)
                     logger.warning("failover peer %s failed", peer_name, exc_info=True)
                     # Routed through the SAME classifier on purpose: a local fault
                     # (offline — which never left the box — our own timeout, an MCP
@@ -1691,6 +1702,7 @@ class ConversationLoop:
                 # policy, deliberately out of scope here; the effects-guard
                 # follow-up owns it.
                 usable = not output.is_error and bool((output.text or "").strip())
+                await record_fallback(self._db, peer_name, output.model_used, success=usable)
                 if usable or (streamed and streamed.get("text")):
                     await _record_peer(peer_availability.note_success, peer_name)
                 # Success on this peer. Record the account-wide flag + this session's

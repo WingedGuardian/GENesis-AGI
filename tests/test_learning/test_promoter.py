@@ -94,6 +94,31 @@ def test_compute_tier_promotes_to_core_with_trigger():
     assert _compute_tier(row) == "CORE"
 
 
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        json.dumps(["ssh", "scp", "pytest", "ruff", "gitleaks", "pgrep", "incus", "gh", "git add"]),
+        "[]",
+        ["gh pr create"],
+    ],
+)
+def test_compute_tier_no_core_on_command_words_kept_as_written(trigger):
+    # Command words stored inert name no tool the advisor can match.
+    row = {
+        "success_count": 8, "confidence": 0.86, "draft": 0,
+        "tool_trigger": trigger, "activation_tier": "DORMANT",
+    }
+    assert _compute_tier(row) == "ADVISORY"
+
+
+def test_compute_tier_core_with_a_stored_tool_name():
+    row = {
+        "success_count": 8, "confidence": 0.86, "draft": 0,
+        "tool_trigger": json.dumps(["Read", "ssh"]), "activation_tier": "DORMANT",
+    }
+    assert _compute_tier(row) == "CORE"
+
+
 def test_compute_tier_no_core_without_trigger():
     """CORE requires tool_trigger; without it, fall back to ADVISORY."""
     row = {
@@ -230,6 +255,30 @@ async def test_promote_and_demote_demotes_on_failure_evidence(db):
 async def test_promote_and_demote_quarantines_low_confidence(db):
     """A procedure with confidence<0.3 and 3+ total samples must be
     quarantined, not just demoted."""
+    await _insert(
+        db, id="bad-1", task_type="t",
+        success_count=1, failure_count=10, confidence=0.15,
+        draft=0, activation_tier="LIBRARY",
+    )
+    result = await promote_and_demote(db)
+    assert result["quarantined"] == 1
+    cursor = await db.execute(
+        "SELECT quarantined FROM procedural_memory WHERE id = ?",
+        ("bad-1",),
+    )
+    row = await cursor.fetchone()
+    assert row[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_promote_and_demote_quarantines_row_past_default_limit(db):
+    """A low-confidence row beyond position 100 must still be quarantined."""
+    for i in range(100):
+        await _insert(
+            db, id=f"good-{i}", task_type="t",
+            success_count=5, failure_count=0, confidence=0.9,
+            draft=0, activation_tier="DORMANT",
+        )
     await _insert(
         db, id="bad-1", task_type="t",
         success_count=1, failure_count=10, confidence=0.15,
