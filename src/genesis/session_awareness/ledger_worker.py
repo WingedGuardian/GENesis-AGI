@@ -813,6 +813,10 @@ async def _run_locked(
         start_byte = end_byte - MAX_WINDOW_BYTES
         detail_notes.append("window_capped")
 
+    # The id Claude Code reports having served, once the call returns; the alias
+    # until then. Read by _base_row at CALL time, like detail_notes.
+    served = EXTRACTOR_MODEL
+
     def _base_row(**over) -> dict:
         row = dict(
             run_id=run_id,
@@ -825,7 +829,7 @@ async def _run_locked(
             mode=mode,
             latency_ms=int((time.monotonic() - t0) * 1000),
             prompt_version=PROMPT_VERSION,
-            model=EXTRACTOR_MODEL,
+            model=served,
             detail="; ".join(detail_notes) or None,
         )
         row.update(over)
@@ -866,6 +870,7 @@ async def _run_locked(
         claude_path=claude_path,
         timeout_s=EXTRACTOR_TIMEOUT_S,
     )
+    served = result.get("served_model") or EXTRACTOR_MODEL
     if result["status"] != "ok":
         status = "timeout" if result["status"] == "timeout" else "failed"
         if result.get("reason"):
@@ -1134,7 +1139,7 @@ async def _run_backfill(
                     truncated=truncated,
                     latency_ms=int((time.monotonic() - t0) * 1000),
                     prompt_version=PROMPT_VERSION,
-                    model=EXTRACTOR_MODEL,
+                    model=result.get("served_model") or EXTRACTOR_MODEL,
                     detail=f"{detail}; {reason}".strip("; "),
                 )
                 outcomes.append(status)
@@ -1158,7 +1163,7 @@ async def _run_backfill(
                 truncated=truncated,
                 latency_ms=int((time.monotonic() - t0) * 1000),
                 prompt_version=PROMPT_VERSION,
-                model=EXTRACTOR_MODEL,
+                model=result.get("served_model") or EXTRACTOR_MODEL,
                 detail=detail,
                 events=events,
             )

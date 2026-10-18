@@ -3,8 +3,10 @@
 One subprocess call per drift-trigger fire, spawned by the ambient
 worker. Locked design decisions (WS-C):
 
-- Model PINNED to ``claude-haiku-4-5-20251001`` (not bare "haiku") —
-  the smoke-tested binary contract, ~11-12.5s p50.
+- Model: ``headless.HEADLESS_JUDGE_MODEL`` — the CC ``haiku`` alias, so
+  the judge follows the newest Haiku the pinned CC release resolves. (It
+  was pinned to ``claude-haiku-4-5-20251001`` until 2026-10-18; Haiku 5.5
+  passed the same smoke test, parseable at ~4s per call.)
 - NO fallback chain: a failed call or unparseable output is a recorded
   ``failed`` verdict, never a guess.
 - ONE timeout (90s subprocess). On expiry the whole PROCESS GROUP is
@@ -25,11 +27,11 @@ from __future__ import annotations
 import json
 import re
 
+from .headless import HEADLESS_JUDGE_MODEL, run_headless_json
 from .headless import build_argv as _headless_argv
-from .headless import run_headless_json
 
-ARBITER_MODEL = "claude-haiku-4-5-20251001"
-ARBITER_TIMEOUT_S = 90.0  # smoke-tested p50 ~11-12.5s; 90s = hung-process guard
+ARBITER_MODEL = HEADLESS_JUDGE_MODEL
+ARBITER_TIMEOUT_S = 90.0  # 4.5 smoke-tested p50 ~11-12.5s; 90s = hung-process guard
 PROMPT_VERSION = "v1"
 MAX_PICKS = 2
 PREVIEW_CHARS = 300

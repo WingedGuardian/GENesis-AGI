@@ -19,13 +19,37 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 from collections.abc import Iterator
 from pathlib import Path
 
 from genesis.cc.child_env import pin_dispatched_env
+from genesis.cc.roster import apply_routing_env
 from genesis.util.proc_kill import kill_process_group, reap_bounded
+
+# The model every headless judge (arbiter, ledger extractor, repo-pulse) runs
+# on: the Claude Code ``haiku`` ALIAS, deliberately not a dated model id, so
+# the judges follow the newest Haiku that the pinned Claude Code release
+# resolves (owner ruling, 2026-10-18). Claude Code resolves the alias itself
+# (its binary and model catalog), so run rows record the id it reports having
+# served (``served_model`` below): that is how a move of the alias shows up.
+HEADLESS_JUDGE_MODEL = "haiku"
+
+
+def served_model(stdout_text: str) -> str | None:
+    """The model id a ``--output-format json`` envelope says actually served.
+
+    Run rows record this, not the alias, so a move of the alias stays visible
+    in the stored data. ``None`` when the envelope is unreadable or names no
+    single model.
+    """
+    try:
+        usage = json.loads(stdout_text).get("modelUsage") or {}
+    except (ValueError, AttributeError):
+        return None
+    return next(iter(usage)) if isinstance(usage, dict) and len(usage) == 1 else None
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +130,8 @@ def build_argv(
 ) -> list[str]:
     """The pinned headless argv (mirrors guardian/diagnosis.py).
 
-    No ``--effort``: the ambient call sites pin Haiku, which doesn't take
-    one. ``--strict-mcp-config`` + the repo's no_mcp.json keep MCP
+    No ``--effort``: the judges run short single-turn completions at the
+    CLI's default effort. ``--strict-mcp-config`` + the repo's no_mcp.json keep MCP
     servers out of the subprocess, and ``--disallowedTools "*"`` denies
     every BUILT-IN tool as well: these are pure-completion judges over
     text that includes EXTERNAL content (PR titles/bodies via repo-pulse),
@@ -179,7 +203,8 @@ async def run_headless_json(
 ) -> dict:
     """One headless claude call. Returns a status dict, never raises.
 
-    ``{"status": "ok", "stdout": <str>}`` on a zero exit;
+    ``{"status": "ok", "stdout": <str>, "served_model": <str|None>}`` on a
+    zero exit (``served_model`` is the id Claude Code reports having used);
     ``{"status": "timeout"}`` after a group-kill;
     ``{"status": "failed", "reason": <str>}`` on a nonzero exit
     (``exit_<code>``) or any spawn/communicate exception.
@@ -215,6 +240,11 @@ async def _run_in_cwd(
         env = dict(os.environ)
         env["GENESIS_CC_SESSION"] = "1"  # never re-enter Genesis hooks
         pin_dispatched_env(env)  # shared dispatched pins (genesis.cc.child_env)
+        # Judges always run NATIVE (the subscription): a parent launched through
+        # a peer route carries ANTHROPIC_BASE_URL and the ANTHROPIC_DEFAULT_*_MODEL
+        # slots, and under the ``haiku`` alias those would silently re-point the
+        # judge at the peer's model instead of failing.
+        apply_routing_env(env, base_url=None, auth_token=None, model_id=None)
         # WS-3: never leak a session origin into the nested claude
         # subprocess (mirrors CCInvoker._build_env's pop invariant).
         env.pop("GENESIS_SESSION_ORIGIN", None)
@@ -262,6 +292,7 @@ async def _run_in_cwd(
             raise
         if proc.returncode != 0:
             return {"status": "failed", "reason": f"exit_{proc.returncode}"}
-        return {"status": "ok", "stdout": stdout.decode(errors="replace")}
+        text = stdout.decode(errors="replace")
+        return {"status": "ok", "stdout": text, "served_model": served_model(text)}
     except Exception as exc:
         return {"status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
