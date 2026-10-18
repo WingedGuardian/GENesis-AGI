@@ -6,8 +6,10 @@ Only Stripe's public test numbers appear here, built from parts.
 from __future__ import annotations
 
 import argparse
+import getpass
 import importlib
 import json
+import warnings
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -53,9 +55,10 @@ def tty(monkeypatch):
 
 
 def _answers(monkeypatch, secrets, typed=("", "")):
-    getpass = MagicMock(side_effect=list(secrets))
+    """Every answer goes through getpass; an echoing input() prompt fails the test."""
+    getpass = MagicMock(side_effect=[*secrets, *typed])
     monkeypatch.setattr(cli.getpass, "getpass", getpass)
-    monkeypatch.setattr("builtins.input", MagicMock(side_effect=list(typed)))
+    monkeypatch.setattr("builtins.input", MagicMock(side_effect=AssertionError("echoed")))
     return getpass
 
 
@@ -141,7 +144,7 @@ class TestAdd:
         out = capsys.readouterr()
         assert "ending 4242" in out.out and VISA not in out.out + out.err
         assert "scripts/backup.sh" in out.out  # the next scheduled backup may be hours away
-        assert getpass.call_count == 3  # number, expiry and code are all hidden
+        assert getpass.call_count == 5  # number, expiry, code, name and postal code
         [card] = vs.list_cards()
         assert card["label"] == "bills" and card["merchant"] == "shop.example.com"
 
@@ -202,6 +205,8 @@ class TestRetire:
         assert "close the virtual card with its issuer" in out
         # Until the next backup, a restore would bring the retired card's details back.
         assert "scripts/backup.sh" in out
+        # A new backup does not erase the card from the backups already taken.
+        assert "earlier backups still hold the card" in out
 
     def test_bad_ref_is_refused_before_the_passphrase_prompt(self, card, monkeypatch, capsys):
         getpass = _answers(monkeypatch, [])
@@ -499,3 +504,129 @@ def test_no_vault_module_imports_crypto_at_load():
         top = [n for n in tree.body if isinstance(n, ast.Import | ast.ImportFrom)]
         names = {getattr(n, "module", None) or n.names[0].name for n in top}
         assert not names & {"pyrage", "zxcvbn"}, module.__name__
+
+
+class TestPromptsNeverEcho:
+    """#3253 round 1: a prompt that cannot hide its answer refuses instead."""
+
+    @pytest.fixture
+    def initialised(self, tty, monkeypatch):
+        _answers(monkeypatch, [PASSPHRASE, PASSPHRASE])
+        assert _run(["init"]) == 0
+
+    @staticmethod
+    def _echo_fallback(monkeypatch):
+        """getpass's own fallback: warn, then read with echo on."""
+        read = MagicMock(return_value=VISA)
+
+        def fallback(prompt=""):
+            warnings.warn(
+                "Can not control echo on the terminal.", getpass.GetPassWarning, stacklevel=2
+            )
+            return read(prompt)
+
+        monkeypatch.setattr(cli.getpass, "getpass", fallback)
+        return read
+
+    def test_add_refuses_when_the_terminal_cannot_hide_input(
+        self, initialised, monkeypatch, capsys
+    ):
+        read = self._echo_fallback(monkeypatch)
+        capsys.readouterr()
+        assert _run(["add", "--label", "x", "--single-use"]) == 2
+        read.assert_not_called()
+        assert "cannot hide" in capsys.readouterr().err
+        assert vs.list_cards() == []
+
+    @pytest.mark.parametrize("argv", [["init"], ["retire", "card_x"]])
+    def test_passphrase_prompts_refuse_when_the_terminal_cannot_hide_input(
+        self, tty, monkeypatch, capsys, argv
+    ):
+        if argv[0] == "retire":
+            _answers(monkeypatch, [PASSPHRASE, PASSPHRASE])
+            assert _run(["init"]) == 0
+            monkeypatch.setattr(vs, "check_active_card", lambda ref, path=None: None)
+        read = self._echo_fallback(monkeypatch)
+        assert _run(argv) == 2
+        read.assert_not_called()
+        assert "cannot hide" in capsys.readouterr().err
+
+    def test_the_real_getpass_fallback_is_refused_before_it_reads(self, monkeypatch):
+        """CPython's own getpass, with no terminal to hide input on and a pipe on stdin."""
+        import io
+
+        real_open = getpass.os.open
+
+        def no_tty(path, *a, **kw):
+            if path == "/dev/tty":
+                raise OSError("no controlling terminal")
+            return real_open(path, *a, **kw)
+
+        stdin = io.StringIO(VISA + "\n")
+        monkeypatch.setattr(getpass.os, "open", no_tty)
+        monkeypatch.setattr(cli.sys, "stdin", stdin)
+        with pytest.raises(vs.VaultError, match="cannot hide"):
+            cli._ask("Card number (hidden): ")
+        assert stdin.read() == VISA + "\n"  # nothing was read
+
+    def test_ctrl_c_at_a_prompt_is_a_controlled_refusal(self, initialised, monkeypatch, capsys):
+        monkeypatch.setattr(cli.getpass, "getpass", MagicMock(side_effect=KeyboardInterrupt))
+        capsys.readouterr()
+        assert _run(["add", "--label", "x", "--single-use"]) == 2
+        err = capsys.readouterr().err
+        assert "cancelled" in err and "Traceback" not in err
+
+    def test_unlock_refuses_a_vault_the_service_would_refuse_before_the_prompt(
+        self, tty, monkeypatch, capsys
+    ):
+        sent = []
+
+        def service(request):
+            sent.append(request)
+            return {
+                "ok": True,
+                "unlocked": False,
+                "initialised": True,
+                "ready_error": "not private: identity.age; fix the modes (see `vault status`)",
+                "payments_extra": True,
+                "audit": True,
+            }
+
+        monkeypatch.setattr(cli, "_service", service)
+        getpass = _answers(monkeypatch, [])
+        assert _run(["unlock"]) == 2
+        getpass.assert_not_called()
+        assert [r["op"] for r in sent] == ["status"]
+        assert "not private" in capsys.readouterr().err
+
+    def test_unlock_refuses_when_the_terminal_cannot_hide_input(self, tty, monkeypatch, capsys):
+        sent = []
+
+        def service(request):
+            sent.append(request)
+            return {
+                "ok": True,
+                "unlocked": False,
+                "initialised": True,
+                "payments_extra": True,
+                "audit": True,
+            }
+
+        monkeypatch.setattr(cli, "_service", service)
+        read = self._echo_fallback(monkeypatch)
+        assert _run(["unlock"]) == 2
+        read.assert_not_called()
+        assert [r["op"] for r in sent] == ["status"]  # no passphrase was ever sent
+        assert "cannot hide" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("answered", range(5))
+    def test_ended_input_at_any_add_prompt_is_a_controlled_refusal(
+        self, initialised, monkeypatch, capsys, answered
+    ):
+        given = [VISA, _future(), "123", "", ""][:answered]
+        monkeypatch.setattr(cli.getpass, "getpass", MagicMock(side_effect=[*given, EOFError]))
+        capsys.readouterr()
+        assert _run(["add", "--label", "x", "--single-use"]) == 2
+        err = capsys.readouterr().err
+        assert "input ended" in err and "Traceback" not in err and VISA not in err
+        assert vs.list_cards() == []

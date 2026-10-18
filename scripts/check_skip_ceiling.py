@@ -3,13 +3,17 @@
 
 WHY. A test that stops running is invisible. It does not turn the suite red;
 it turns it *smaller*, and a smaller green suite reads exactly like a healthy
-one. CI has no assertion on collection or skip counts today.
+one.
 
 TWO AXES, because dormancy moves in both directions and one number cannot see
 both. A broken ``skipif`` RAISES the skip count — the ceiling catches that. A
 marker lost in a refactor, or a directory that falls out of collection, LOWERS
 or leaves it unchanged, so the ceiling is structurally blind to them; the
-COLLECTED count is the only instrument for those. MEASURED on a 4-test sandbox
+COLLECTED count is the only instrument for those. In CI that axis is the
+``collected-floor`` job (``scripts/ci/collected_floor.py``), which compares
+collected test ids against the commit a change lands on, so the CI step passes
+only ``--ceiling``. ``--min-collected`` remains for a caller that wants a fixed
+floor. MEASURED on a 4-test sandbox
 at ``--ceiling 1``: dropping half the suite printed "1 skipped of 2 collected.
 OK." Each failure message names only the causes ITS axis can produce — a
 ceiling trip is never a lost directory, and a floor trip is never an xfail.
@@ -222,20 +226,21 @@ def main(argv: list[str] | None = None) -> int:
             f"Either a skipif condition broke and is now always true, or a skip "
             f"or xfail was added deliberately (junit counts xfail as skipped) "
             f"and the ceiling needs raising in the same commit. NOT a lost "
-            f"marker or a dropped directory — those LOWER this number; "
-            f"--min-collected is the check for them.",
+            f"marker or a dropped directory — those LOWER this number; the "
+            f"collected-floor CI job (or --min-collected) is the check for them.",
             file=sys.stderr,
         )
         return EXCEEDED
 
     if floor is None:
-        # The likely misconfiguration: this script and its CI step are both
-        # named for the ceiling, so an operator pasting one flag pastes this
-        # one — silently restoring the gap the floor was added to close.
+        # Ceiling-only is how CI runs this step since the collected axis moved
+        # to its own job (#2743). The note still names the gap, because outside
+        # CI nothing else covers it.
         _say(
             f"{skipped} skipped of {collected} collected, ceiling {ceiling}. "
-            f"OK (collection floor NOT enforced — the ceiling is blind to a lost "
-            f"marker or a dropped directory; set --min-collected {collected})."
+            f"OK (collection floor NOT enforced here — the ceiling is blind to a "
+            f"lost marker or a dropped directory; in CI the collected-floor job "
+            f"covers that axis, elsewhere set --min-collected {collected})."
         )
         return OK
 

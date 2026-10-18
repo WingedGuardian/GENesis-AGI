@@ -230,7 +230,9 @@ own `TASK_INTAKE.md` section contract instead):
    read-only, or by a probe that changes nothing beyond scratch state, using
    tools it already holds. It is owed whenever its answer could change a decision. That covers: the code and every caller the change touches,
    its `CURRENT.md` entry, recent commits and PRs in the area, overlapping open
-   PRs and issues, peer sessions, code intelligence, an API or renderer probe,
+   PRs and issues, existing implementations outside the repo (public repos,
+   grep.app, and the Claude Code mods catalogue for anything that runs inside
+   a CC session), peer sessions, code intelligence, an API or renderer probe,
    and a corpus measurement. "I did not verify X, but it should be fine" is not
    an answer for an X like that: verify it, or name it as a residual with the
    reason no read or probe settles it.
@@ -295,7 +297,19 @@ no substitute checklist.
 - **Before any done / fixed / passing claim** →
   `superpowers:verification-before-completion`, if installed.
 - **An external tool or repo surfaces as a candidate** → the `evaluate`
-  skill; on an ADOPT verdict, `integrate-module`.
+  skill; on an ADOPT verdict, `integrate-module`; on an ADAPT verdict,
+  reverse-engineer the reference before writing code (`evaluate`, Decision
+  Protocol step 4).
+- **About to build anything that runs inside a Claude Code session** — a hook
+  or guard, status line, prompt or context injection, tool interception, a
+  notification, an in-terminal pane → search Claude Code mods and plugins
+  first (`evaluate` workflow step 2 names the sources per session context).
+  From CC 2.1.287 mods can carry UI, tools, agents and model calls; below that
+  version they need the early-access flag, so check the pin in
+  `docs/reference/cc-compatibility.md`. Genesis has already shipped one
+  (`plugins/genesis-web-override/`). A mod may AUGMENT an enforcement guard
+  but never replace it: a mod that denied a tool call ran before the classic
+  `PreToolUse` chain and suppressed it when measured (#2260).
 - **A diff touches dashboard or other UI** → `/qa-only` or `/qa`, plus
   `/design-review`, if installed.
 
@@ -516,8 +530,10 @@ INT/TERM as it starts, so a second signal lands mid-rollback with default
 disposition, and the rollback has failure exits that report `ROLLBACK INCOMPLETE`.
 Either way: verify state (server active, no mid-rebase, pin, both CC versions)
 before re-running; it is idempotent. (A non-blocking PreToolUse advisory hook,
-`.claude/hooks/cc-deploy-timeout-guard`, nudges toward this on any deploy — it does
-not check whether you already detached, which is tracked in issue #2088.)
+`scripts/hooks/deploy_timeout_advisory.py`, nudges toward this whenever a command
+can run `update.sh`, and stays quiet on reads of it. It deliberately does not
+check whether you already detached: that needs systemd-run's option grammar, an
+open set, so a detached launch still gets the note.)
 
 **Why this paragraph is worded so defensively:** PR #1221 shipped both this policy
 and that hook on 2026-07-22 prescribing `run_in_background`, from a CC memory
@@ -1241,6 +1257,17 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   action itself. (Origin: the fence test in PR #2935, for issue #2863: its verify-RED ran a real
   `systemctl --user stop genesis-server` and took a live server down for about
   3.5 minutes.)
+- **Bound every mutant run with its own short timeout.** A mutation often turns
+  a test into a HANG rather than a failure (a mutant that never sets an event,
+  never cancels a task), and a hung run holds the box-wide test lock for the
+  whole per-test timeout while every other session waits. MEASURED: one sweep's
+  hung mutant held it for 53 minutes. Pass `-p timeout -o timeout=<N>` to each
+  mutant run, with N = max(60, 10 × the baseline run's slowest test). Spell it
+  `-p timeout`, never `-p pytest_timeout`: the plugin registers under the name
+  `timeout`, and the module name aborts pytest with "Plugin already registered"
+  (MEASURED, pytest 9.0.2 with pytest-timeout 2.4.0). And read the test result,
+  not the exit code: a missing plugin also exits 1, which a sweep would count
+  as a killed mutant.
 - **Never edit a shell script while a test that runs it is in progress.** bash
   reads a script as it executes it, so an edit mid-run yields bogus syntax
   errors that look like real failures. Wait for the run to finish, or test a
@@ -2988,7 +3015,14 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   cannot read, and any top-level comment from a reviewer with no known format, DOES
   count. Humans, workflow bots and CodeQL never open a round. A clean review, a Codex
   clean comment and the configured identity template CONFIRM a head; they never add a
-  round. Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
+  round. A round advances only on the newest reviewed head (owner ruling, 2026-10-12):
+  every review MARKS the head it reviewed, clean ones too, and a finding review that
+  lands on a head after one of that head's descendants was marked is a LATE review. It
+  opens no round; `review_budget`'s `findings` list keeps it with the round it belongs
+  to, for the round reflection to owe: `scripts/review_late.py` owes it from `REFLECTION_CUTOVER_ISO` (`scripts/review_reflection.py`) on, and credits it only by a reflection judged under its own round. The cutover stays None (nothing more owed) until the commit gate enforces reflections; `review_reflection.py status --cutover <iso>` reports what it would owe.
+  Each entry says whether it was late (`late`) and each round when it opened
+  (`opened_at`, None when unknown); read those, never membership in `rounds[].reviews`, which also lists
+  late reviews of a head that already is a round. Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
   keeps the old rule (every head Codex reviewed, clean included), so no PR's count
   moved at the cutover. The rule lives in `review_findings.is_finding` and
   `review_budget.evaluate_evidence`; read those, not this paragraph, for an edge case.
@@ -4947,19 +4981,27 @@ Standard open-source workflow: PRs go directly to the public repo.
   deletion in the PR body; if you suspect main's change is a bug rather than
   policy, file that before merging. A deleted test with no filed disagreement
   is how coverage disappears.
-- **The CI collected-test floor conflicts whenever main moved it while your
-  branch added tests.** `.github/workflows/ci.yml` carries one hand-maintained
-  `--min-collected` number, and both sides have raised it from a shared base.
-  Picking either side under-counts. The merged floor is MAIN's floor plus YOUR
-  branch's delta, and the delta is measured, never recalled. Run
-  `--collect-only` on main's version of each test file your branch changes and on
-  the merged version, after your LAST test-adding edit. A file new to the branch
-  counts in full. Keep main's comment block and add one paragraph showing your
-  per-file counts. The `--ceiling` on the same line merges the same way: main's
-  ceiling plus your branch's skip delta, counted on the CI runner from the junit
-  report, never locally (installed tools differ, so local skip counts are the
-  wrong denominator). Issue #2743 tracks replacing the hand-maintained number. A test path held in a shell variable reads to
-  `full_suite_guard` as a whole-suite run, so write the count as a script.
+- **Adding tests no longer touches `ci.yml`.** The collected-test count is
+  checked by the `collected-floor` CI job (#2743), which compares the test ids
+  your change collects against the commit it lands on. It is a required check
+  once `.github/rulesets/checks.json` is applied (`scripts/apply_rulesets.py`).
+  It goes red (exit 1) when ids vanish from test files your change did not
+  touch (a `conftest.py` edit does not count as touching the files below it),
+  or when your tree has a collection error the base does not. It refuses
+  (exit 2) when it cannot measure: a base it cannot resolve (not a 2-parent
+  merge, or an unreadable pre-push commit), base dependencies that would not
+  install, pytest exiting other than 0, 1 or 5, a collection that did not
+  finish or collected nothing, malformed collection output, an unreadable
+  changed-file list, a PR-body scanner that would not load, or an unexplained
+  drop whose PR body could not be read. Read the
+  step summary first; it names every vanished id. If a drop is deliberate, put
+  a line `Collected-drop: <reason>` in the PR body and re-run the job (or push,
+  if a re-run no longer clears it: #2624). A branch cut before #2743 that still edits the old
+  `--min-collected` line resolves that conflict by taking main's side and
+  deleting its own floor paragraph. The `--ceiling` (skip count) still lives on
+  the dormancy-guard line: raise it only in the commit that adds the skip,
+  counted on the CI runner from the junit report, never locally (installed
+  tools differ, so local skip counts are the wrong denominator).
 - **README is public-authoritative** — the public repo's `README.md` is
   hand-crafted and must NEVER be overwritten.
 - **Never edit `CHANGELOG.md` in an ordinary PR — add a `changelog.d/`

@@ -563,21 +563,16 @@ def test_missing_project_entry_registered_despite_user_scope_server(tmp_path, ex
 
 def uninstall_commands(path):
     source = (SCRIPT.parent / "uninstall.sh").read_text()
-    if path == "direct":
-        helper = source[
-            source.index("safe_disable_service() {") : source.index("# Run a command inside")
-        ]
-        start = source.index("        PRESSURE_UNIT=genesis-disk-hygiene-pressure")
-        commands = source[start : source.index("        # Persistent= timers", start)]
-    else:
-        helper = source[
-            source.index("remove_serena_enablement() {") : source.index("# Run a command inside")
-        ]
-        helper += 'container_exec() { [ "$DRY_RUN" = true ] || bash -c "$1"; }\n'
-        start = source.index(
-            '            container_exec "', source.index("# Stop all services (timers first")
-        )
-        commands = source[start : source.index('            ok "Stopped Genesis services"', start)]
+    if path == "host":
+        # This route now invokes the direct transaction, with no duplicate
+        # service inventory. Verify the delegation before exercising its body.
+        assert '"$HOME/genesis/scripts/codebase_managed.py" uninstall' in source
+    helper = source[
+        source.index("safe_disable_service() {") : source.index("# Run a command inside")
+    ]
+    start = source.index("        PRESSURE_UNIT=genesis-disk-hygiene-pressure")
+    commands = source[start : source.index("        # Persistent= timers", start)]
+    commands = commands.replace("        remove_cbm_units\n", "")
     return helper, commands
 
 

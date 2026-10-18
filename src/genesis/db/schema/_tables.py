@@ -7,6 +7,50 @@ Schema is derived from docs/architecture/genesis-v3-autonomous-behavior-design.m
 # ─── Table DDL ────────────────────────────────────────────────────────────────
 
 TABLES = {
+    'peer_outbox': """
+CREATE TABLE IF NOT EXISTS peer_outbox (
+    peer_id TEXT NOT NULL REFERENCES peers(peer_id),
+    epoch TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    context_id TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    acknowledged_at TEXT,
+    PRIMARY KEY(peer_id,epoch,message_id)
+)
+    """,
+    'peer_settings': """
+CREATE TABLE IF NOT EXISTS peer_settings (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    mode TEXT NOT NULL CHECK(mode IN ('disabled','fallback','sam')),
+    sam_realm TEXT,
+    service_url TEXT
+)
+    """,
+    'peers': """
+CREATE TABLE IF NOT EXISTS peers (
+    peer_id TEXT PRIMARY KEY,
+    epoch TEXT NOT NULL,
+    same_owner INTEGER NOT NULL CHECK(same_owner IN (0,1)),
+    daily_allowance INTEGER NOT NULL CHECK(daily_allowance > 0),
+    token_name TEXT UNIQUE,
+    sam_realm TEXT,
+    sam_node TEXT,
+    principal TEXT,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(sam_realm,sam_node)
+)
+    """,
+    'peer_grants': """
+CREATE TABLE IF NOT EXISTS peer_grants (
+    peer_id TEXT NOT NULL REFERENCES peers(peer_id),
+    capability TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN ('allow','ask','deny')),
+    PRIMARY KEY(peer_id,capability)
+)
+    """,
     "procedural_memory": """
         CREATE TABLE IF NOT EXISTS procedural_memory (
             id               TEXT PRIMARY KEY,
@@ -36,7 +80,9 @@ TABLES = {
             source            TEXT,                        -- JSON: {type, session_id?, observation_id?, triage_outcome?}
             promotion_history TEXT,                        -- JSON array: [{from_tier, to_tier, at, reason}]
             principle_embedding BLOB,                      -- qwen3-embedding(1024 float32) of `principle`, little-endian; read by proactive procedure hook
-            surfaced_count    INTEGER NOT NULL DEFAULT 0   -- contextual-hook surfacings (proactive hook / tool advisor); honest funnel signal, NOT read by promoter
+            surfaced_count    INTEGER NOT NULL DEFAULT 0,  -- contextual-hook surfacings (proactive hook / tool advisor); honest funnel signal, NOT read by promoter
+            trigger_spec      TEXT,                        -- JSON: {patterns, repeat} for a lesson (learning/procedural/lesson_shape.py)
+            lesson            TEXT                         -- JSON: {authored_via, authored_in, origin, reviewed, authored_at}; NULL = an earned procedure
         )
     """,
     "attention_events": """
@@ -2478,6 +2524,8 @@ KNOWLEDGE_FTS5_DDL = """
 # ─── Indexes ──────────────────────────────────────────────────────────────────
 
 INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_peer_outbox_collect ON peer_outbox(peer_id, epoch, created_at, message_id) WHERE acknowledged_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_peer_outbox_context ON peer_outbox(peer_id, epoch, context_id, created_at, message_id)",
     "CREATE INDEX IF NOT EXISTS idx_autonomy_events_cat_time ON autonomy_events(category, occurred_at)",
     "CREATE INDEX IF NOT EXISTS idx_cch_cell_time ON calibration_cell_history(domain, metric, snapshot_at)",
     "CREATE INDEX IF NOT EXISTS idx_attention_events_session ON attention_events(session_id)",

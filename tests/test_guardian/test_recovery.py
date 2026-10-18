@@ -245,6 +245,44 @@ class TestRecoveryRevertCode:
         assert result.success is True
         assert "reverted" in result.detail.lower()
 
+    @staticmethod
+    def _recording_subprocess(stash_result: tuple[int, str, str]):
+        calls: list[str] = []
+
+        async def mock(*args, **kwargs):
+            command = args[-1]
+            calls.append(command)
+            if "git stash" in command:
+                return stash_result
+            return (0, "", "")
+
+        return mock, calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stash_result", "expected"),
+        [
+            ((1, "", "fatal: index.lock exists"), "failed"),
+            ((-1, "", "timeout"), "did not report"),
+        ],
+    )
+    async def test_failed_stash_never_reverts(
+        self, engine: RecoveryEngine, stash_result, expected
+    ) -> None:
+        mock, calls = self._recording_subprocess(stash_result)
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            ok, detail = await engine._revert_code("genesis")
+        assert ok is False
+        assert expected in detail
+        assert not any("git revert" in c for c in calls), calls
+
+    @pytest.mark.asyncio
+    async def test_clean_tree_stash_still_reverts(self, engine: RecoveryEngine) -> None:
+        mock, calls = self._recording_subprocess((0, "No local changes to save", ""))
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            await engine._revert_code("genesis")
+        assert any("git revert" in c for c in calls), calls
+
 
 class TestRestartContainerStopped:
     """`incus restart` fails on a STOPPED instance (2026-07-04 outage: unclean

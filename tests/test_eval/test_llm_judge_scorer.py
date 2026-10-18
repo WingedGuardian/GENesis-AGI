@@ -147,6 +147,15 @@ async def test_score_async_pass(simple_rubric):
     assert "expected=expected_text" in router.last_messages[0]["content"]
 
 
+async def test_integer_float_conversion_overflow_is_a_parse_failure(simple_rubric):
+    router = StubRouter(response_content=json.dumps({"score": 10 ** 400}))
+    passed, score, detail = await LLMJudgeScorer(router=router).score_async(
+        "actual", "expected", {"rubric_name": simple_rubric.name}
+    )
+    assert passed is False and score == 0.0
+    assert json.loads(detail)["error"] == "judge_parse_fail"
+
+
 async def test_score_async_fail(simple_rubric):
     """Below pass_threshold (0.5) → passed=False."""
     router = StubRouter(

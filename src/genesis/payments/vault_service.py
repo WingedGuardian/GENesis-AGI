@@ -37,6 +37,7 @@ import os
 import socket
 import struct
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -47,6 +48,9 @@ from genesis.payments import vault_store as vs
 logger = logging.getLogger(__name__)
 
 IDLE_RELOCK_S = 30 * 60
+# How often an unlocked service compares the suspend-aware relock deadline:
+# after a resume the key is dropped within this much loop time.
+_IDLE_CHECK_S = 60.0
 # One request line, sent by the CLI as soon as it connects (it reads the
 # passphrase first). The bound keeps an idle client from holding the server
 # open: on 3.12, Server.wait_closed() waits for every connected client.
@@ -60,24 +64,32 @@ _STOP_WAIT_S = 5.0
 _MAX_REQUEST = 4096
 
 # Run as `python -I -c`: isolated from PYTHONPATH and the user site, importing
-# nothing but pyrage. Exit 1 = decryption failed (a wrong passphrase, or a
+# nothing but pyrage. Exit 10 = decryption failed (a wrong passphrase, or a
 # damaged file body: age cannot tell the two apart), 3 = pyrage missing, 4 = the
-# file could not be read or is not an age file (anything else that went wrong).
+# file could not be read, is a symlink or not a regular file, is larger than a
+# sealed key can be, or is not an age file (anything else that went wrong).
+# Not 1: an interpreter that dies before running this exits 1, which must not
+# read as a wrong passphrase. The read is capped like
+# the store's: a sealed X25519 key is well under 4096 bytes.
 _UNWRAP = r"""
+import os
+import stat
 import sys
 try:
     from pyrage import DecryptError, passphrase
 except ImportError:
     sys.exit(3)
 try:
-    with open(sys.argv[1], "rb") as f:
-        sealed = f.read()
-    if not sealed.startswith(b"age-encryption.org/v1"):
+    with os.fdopen(os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            sys.exit(4)
+        sealed = f.read(4097)
+    if len(sealed) > 4096 or not sealed.startswith(b"age-encryption.org/v1"):
         sys.exit(4)
     key = passphrase.decrypt(sealed, sys.stdin.buffer.read().decode("utf-8"))
 except DecryptError:
-    sys.exit(1)
-except BaseException:  # also a pyo3 panic, which is not an Exception; exit 1 stays DecryptError's
+    sys.exit(10)
+except BaseException:  # also a pyo3 panic, which is not an Exception; exit 10 stays DecryptError's
     sys.exit(4)
 try:
     sys.stdout.write(key.decode())
@@ -85,7 +97,7 @@ except BaseException:
     sys.exit(4)
 """
 _UNWRAP_REFUSALS = {
-    1: "wrong passphrase (or a damaged identity.age)",
+    10: "wrong passphrase (or a damaged identity.age)",
     3: "the payments extra is not installed in genesis-server",
     4: "identity.age could not be read",
     124: "the unwrap timed out",
@@ -126,17 +138,23 @@ class VaultService:
         vault_path: Path | None = None,
         socket_path: Path | None = None,
         idle_relock_s: float = IDLE_RELOCK_S,
+        idle_check_s: float = _IDLE_CHECK_S,
+        clock=None,
         python: str = sys.executable,
     ) -> None:
         self._db = db
         self._vault = vault_path or vs.vault_dir()
         self._socket_path = socket_path or vault_socket_path()
         self._idle_relock_s = idle_relock_s
+        self._idle_check_s = idle_check_s
+        # CLOCK_BOOTTIME counts time the host spent suspended; the loop's
+        # monotonic clock does not, so a sleep would stretch the unlock window.
+        self._clock = clock or (lambda: time.clock_gettime(time.CLOCK_BOOTTIME))
         self._python = python
         self._identity = None
         self._unlocked_at: str | None = None
         self._relock_handle: asyncio.TimerHandle | None = None
-        self._relock_at: float | None = None
+        self._relock_at: float | None = None  # on self._clock
         self._unlock_lock = asyncio.Lock()
         # The connection is shared by every audit write and read in this
         # service, and each write is two awaits (INSERT, COMMIT). Without this
@@ -173,13 +191,31 @@ class VaultService:
                 return False
         return True
 
+    async def _correct_trail(self) -> None:
+        """If the trail ends on "unlock" while no key is held, record that it is locked.
+
+        A row can be lost when the database fails: the correction after an
+        aborted unlock, or a lock's own row (a lock always drops the key). The
+        truth is derived from the trail itself, so nothing has to remember it.
+        Callers make sure no unlock is between its row and holding the key.
+        """
+        if self._db is None or self.unlocked:
+            return
+        try:
+            async with self._audit_lock:
+                rows = await audit.list_recent(self._db, 1)
+        except Exception:  # noqa: BLE001 - status reports the audit log as unavailable
+            return
+        if rows and rows[0]["event"] == "unlock":
+            await self._audit("lock", {"correction": "no key is held; an earlier row was lost"})
+
     # -- state -------------------------------------------------------------
 
     def _recipient_matches(self, identity=None) -> bool:
         identity = identity if identity is not None else self._identity
         try:
-            recipient = (self._vault / vs.RECIPIENT).read_bytes().decode("utf-8").strip()
-        except (OSError, UnicodeDecodeError):
+            recipient = vs.recipient_text(self._vault)
+        except vs.VaultError:
             return False
         return identity is not None and str(identity.to_public()) == recipient
 
@@ -201,14 +237,26 @@ class VaultService:
             self._relock_handle.cancel()
             self._relock_handle = None
 
-    def _arm_relock(self) -> None:
-        loop = asyncio.get_running_loop()
+    def _arm_relock(self, deadline: float) -> None:
+        self._relock_at = deadline
+        self._schedule_idle_check()
+
+    def _schedule_idle_check(self) -> None:
+        """Wake at most every ``idle_check_s`` (loop time) to compare the suspend-aware deadline."""
         if self._relock_handle is not None:
             self._relock_handle.cancel()
-        self._relock_at = loop.time() + self._idle_relock_s
-        self._relock_handle = loop.call_later(self._idle_relock_s, self._idle_fired)
+        remaining = max(0.0, self._relock_at - self._clock())
+        self._relock_handle = asyncio.get_running_loop().call_later(
+            min(remaining, self._idle_check_s), self._idle_check
+        )
 
-    def _idle_fired(self) -> None:
+    def _idle_check(self) -> None:
+        self._relock_handle = None
+        if self._relock_at is None:
+            return
+        if self._clock() < self._relock_at:
+            self._schedule_idle_check()
+            return
         from genesis.util.tasks import tracked_task
 
         task = tracked_task(self.lock(None, event="idle_relock"), name="payment-vault-idle-relock")
@@ -245,6 +293,8 @@ class VaultService:
     async def status(self) -> dict:
         if self.unlocked and not self._recipient_matches():
             await self.lock(None, event="stale_identity_relock")
+        if not self._unlock_lock.locked():  # never mid-unlock, between its row and the key
+            await self._correct_trail()
         last, audit_ok = None, self._db is not None
         if audit_ok:
             try:
@@ -253,15 +303,32 @@ class VaultService:
                 last = rows[0] if rows else None
             except Exception:  # noqa: BLE001 - reported as audit unavailable
                 audit_ok = False
+        try:
+            initialised = vs.is_initialised(self._vault)
+        except vs.VaultError:  # an unreadable vault directory: say not initialised, never crash
+            initialised = False
+        # The whole of check_ready, so `vault unlock` refuses a vault the
+        # service would refuse before it reads the passphrase.
+        ready_error = None
+        if initialised and not self.unlocked:
+            try:
+                await asyncio.to_thread(vs.check_ready, self._vault)
+            except vs.VaultError as exc:
+                ready_error = str(exc)
+            except ImportError:
+                ready_error = _UNWRAP_REFUSALS[3]
+            except OSError as exc:
+                ready_error = f"the vault could not be checked ({exc.strerror})"
         relock_in = None
         if self._relock_at is not None:
-            relock_in = max(0, round(self._relock_at - asyncio.get_running_loop().time()))
+            relock_in = max(0, round(self._relock_at - self._clock()))
         return {
             "ok": True,
             "unlocked": self.unlocked,
             "unlocked_at": self._unlocked_at,
             "relock_in_s": relock_in,
-            "initialised": vs.is_initialised(self._vault),
+            "initialised": initialised,
+            "ready_error": ready_error,
             "payments_extra": importlib.util.find_spec("pyrage") is not None,
             "audit": audit_ok,
             "last_event": last,
@@ -282,6 +349,7 @@ class VaultService:
                 return {"ok": False, "error": "the vault service is stopping"}
             if self.unlocked:  # checked first: a held key is never answered with a refusal
                 return {"ok": True, "state": "already unlocked"}
+            await self._correct_trail()
             try:
                 # Off the loop: it stats and opens files and cards.db.
                 await asyncio.to_thread(vs.check_ready, self._vault)
@@ -289,6 +357,8 @@ class VaultService:
                 return await self._refuse(str(exc), peer)
             except ImportError:  # check_ready parses recipient.txt with pyrage
                 return await self._refuse(_UNWRAP_REFUSALS[3], peer)
+            except OSError as exc:  # never an unaudited, unanswered unlock
+                return await self._refuse(f"the vault could not be checked ({exc.strerror})", peer)
             why = self._superseded(epoch, client_gone)
             if why:
                 return await self._refuse(why, peer)
@@ -320,10 +390,14 @@ class VaultService:
             if why is None and not self._recipient_matches(identity):
                 why = "recipient.txt changed during the unlock"
             if why:
+                # The "unlock" row is committed. If this refusal row is lost
+                # too, the next status or unlock records the lock
+                # (_correct_trail), so the trail does not end on "unlock".
                 return await self._refuse(why, peer)
+            deadline = self._clock() + self._idle_relock_s  # before the key is held
             self._identity = identity
             self._unlocked_at = _now()
-            self._arm_relock()
+            self._arm_relock(deadline)
             return {"ok": True, "state": "unlocked", "relock_in_s": round(self._idle_relock_s)}
 
     async def lock(self, peer: dict | None, *, event: str = "lock") -> dict:

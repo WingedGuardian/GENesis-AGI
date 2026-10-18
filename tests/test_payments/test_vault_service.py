@@ -313,6 +313,165 @@ class TestUnlockAndLock:
         assert (await _events(db))[-1]["event"] == "stale_identity_relock"
 
 
+class TestBoundedReads:
+    """The service reads vault files as the store does: capped, never through a symlink."""
+
+    @pytest.mark.parametrize("shape", ["oversized", "symlink"])
+    def test_the_unwrap_child_refuses_without_reading_the_whole_file(self, vault, tmp_path, shape):
+        import subprocess
+        import sys
+
+        sealed = (vault / vs.IDENTITY).read_bytes()
+        if shape == "oversized":
+            (vault / vs.IDENTITY).write_bytes(sealed + b"\n" * 8192)
+        else:
+            outside = tmp_path / "outside.age"
+            outside.write_bytes(sealed)
+            (vault / vs.IDENTITY).unlink()
+            (vault / vs.IDENTITY).symlink_to(outside)
+        child = subprocess.run(
+            [sys.executable, "-I", "-c", svc_mod._UNWRAP, str(vault / vs.IDENTITY)],
+            input=PASSPHRASE.encode(),
+            capture_output=True,
+            timeout=120,
+        )
+        assert child.returncode == 4 and child.stdout == b""
+
+    async def test_an_oversized_recipient_relocks_without_being_loaded(self, service, vault, db):
+        import tracemalloc
+
+        assert (await service.unlock(PASSPHRASE, None))["ok"]
+        text = (vault / vs.RECIPIENT).read_text().strip()
+        (vault / vs.RECIPIENT).write_text(text + " " * (1 << 20))
+        tracemalloc.start()
+        try:
+            assert (await service.status())["unlocked"] is False
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert peak < (512 << 10)  # a whole-file read would hold 1 MiB at once
+        assert (await _events(db))[-1]["event"] == "stale_identity_relock"
+
+
+class TestReplacementReviewFollowUp:
+    async def test_an_oserror_while_checking_is_an_audited_refusal(
+        self, service, vault, db, monkeypatch
+    ):
+        def gone(path=None):
+            raise OSError(40, "Too many levels of symbolic links")
+
+        monkeypatch.setattr(vs, "check_ready", gone)
+        result = await service.unlock(PASSPHRASE, None)
+        assert result == {
+            "ok": False,
+            "error": "the vault could not be checked (Too many levels of symbolic links)",
+        }
+        assert (await _events(db))[-1]["event"] == "unlock_refused"
+
+    async def test_status_answers_when_the_vault_directory_cannot_be_read(
+        self, service, monkeypatch
+    ):
+        def denied(path=None):
+            raise vs.VaultError("the vault cannot be checked (Permission denied)")
+
+        monkeypatch.setattr(vs, "is_initialised", denied)
+        status = await service.status()
+        assert status["ok"] and status["initialised"] is False
+
+    def test_a_child_that_dies_at_start_is_not_a_wrong_passphrase(self):
+        assert 1 not in svc_mod._UNWRAP_REFUSALS
+        assert "wrong passphrase" in svc_mod._UNWRAP_REFUSALS[10]
+
+    def test_the_unwrap_child_refuses_a_fifo(self, vault, tmp_path):
+        import subprocess
+        import sys
+
+        fifo = tmp_path / "fifo.age"
+        os.mkfifo(fifo)
+        child = subprocess.run(
+            [sys.executable, "-I", "-c", svc_mod._UNWRAP, str(fifo)],
+            input=PASSPHRASE.encode(),
+            capture_output=True,
+            timeout=120,
+        )
+        assert child.returncode == 4 and child.stdout == b""
+
+
+class TestRoundOneOf3281:
+    async def test_a_lost_correction_is_recorded_by_the_next_status(
+        self, service, vault, db, monkeypatch
+    ):
+        """The trail never stays on an "unlock" that did not take effect."""
+        real_record = audit.record_event
+        state = {}
+
+        async def record(conn, event, detail=None):
+            if event == "unlock" and "restore" not in state:
+                # The key file changes while the unlock row commits.
+                state["restore"] = (vault / vs.RECIPIENT).read_text()
+                (vault / vs.RECIPIENT).write_text(
+                    str(x25519.Identity.generate().to_public()) + "\n"
+                )
+            elif event == "unlock_refused" and "lost" not in state:
+                state["lost"] = True
+                raise sqlite3.OperationalError("disk full")
+            return await real_record(conn, event, detail)
+
+        monkeypatch.setattr(audit, "record_event", record)
+        result = await service.unlock(PASSPHRASE, None)
+        assert not result["ok"] and not service.unlocked
+        assert (await _events(db))[-1]["event"] == "unlock"  # the refusal row was lost
+        (vault / vs.RECIPIENT).write_text(state["restore"])
+        status = await service.status()  # the database works again
+        assert status["audit"] is True and status["last_event"]["event"] == "lock"
+        assert (await service.unlock(PASSPHRASE, None))["ok"]
+        assert [e["event"] for e in await _events(db)][-3:] == ["unlock", "lock", "unlock"]
+
+    async def test_a_lost_lock_row_is_recorded_by_the_next_status(self, service, db, monkeypatch):
+        assert (await service.unlock(PASSPHRASE, None))["ok"]
+        real_record = audit.record_event
+
+        async def lose_the_lock_row(conn, event, detail=None):
+            if event == "idle_relock":
+                raise sqlite3.OperationalError("disk full")
+            return await real_record(conn, event, detail)
+
+        monkeypatch.setattr(audit, "record_event", lose_the_lock_row)
+        await service.lock(None, event="idle_relock")
+        assert not service.unlocked and (await _events(db))[-1]["event"] == "unlock"
+        status = await service.status()
+        assert status["unlocked"] is False and status["last_event"]["event"] == "lock"
+
+    def test_the_default_relock_clock_counts_suspended_time(self, db, vault, tmp_path):
+        import time
+
+        svc = _make(db, vault, tmp_path)
+        assert abs(svc._clock() - time.clock_gettime(time.CLOCK_BOOTTIME)) < 1.0
+        assert svc._clock.__code__.co_names.count("CLOCK_BOOTTIME") == 1
+
+    async def test_status_reports_full_readiness_before_any_prompt(self, service, vault):
+        os.chmod(vault / vs.IDENTITY, 0o644)
+        status = await service.status()
+        assert status["initialised"] and "not private" in status["ready_error"]
+        os.chmod(vault / vs.IDENTITY, 0o600)
+        assert (await service.status())["ready_error"] is None
+
+    async def test_time_spent_suspended_counts_toward_the_idle_relock(self, db, vault, tmp_path):
+        now = {"t": 1000.0}
+        svc = _make(
+            db, vault, tmp_path, idle_relock_s=1800, idle_check_s=0.05, clock=lambda: now["t"]
+        )
+        await svc.start()
+        assert (await svc.unlock(PASSPHRASE, None))["ok"]
+        await asyncio.sleep(0.15)
+        assert svc.unlocked  # the loop's own time barely moved
+        now["t"] += 7200  # the host slept for two hours
+        await asyncio.sleep(0.2)
+        assert not svc.unlocked
+        assert (await _events(db))[-1]["event"] == "idle_relock"
+        await svc.stop()
+
+
 class TestFailClosed:
     async def test_no_audit_log_means_no_unlock(self, vault, tmp_path, monkeypatch):
         svc = _make(None, vault, tmp_path)

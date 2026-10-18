@@ -733,11 +733,24 @@ def _restore(
         "GENESIS_BACKUP_NAS_HOST",
     ):
         env.pop(k, None)
+    argv = ["--from", str(source)]
     if offsite is not None:
-        env.update(GENESIS_BACKUP_TIER2_BACKEND="local", GENESIS_BACKUP_LOCAL_PATH=str(offsite))
+        # An off-site restore reads no --from source (an explicit local source
+        # skips the pull): `source` becomes the ambient Tier-1 checkout, and the
+        # selected snapshot is pulled into restore's private view.
+        env.update(
+            GENESIS_BACKUP_TIER2_BACKEND="local",
+            GENESIS_BACKUP_LOCAL_PATH=str(offsite),
+            GENESIS_BACKUP_NAS_HOST="srchost",
+        )
+        checkout = fresh / "backups" / "genesis-backups"
+        if source.exists() and not checkout.exists():
+            checkout.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, checkout, symlinks=True)
+        argv = []
     env.update(env_extra or {})
     return subprocess.run(
-        ["bash", str(dated._RESTORE), "--from", str(source), *args],
+        ["bash", str(dated._RESTORE), *argv, *args],
         env=env,
         capture_output=True,
         text=True,
@@ -970,22 +983,20 @@ def _snapshot(tmp_path: Path) -> Path:
 
 
 def _assert_not_staged_from_checkout(r, fresh: Path) -> None:
-    assert "Payment vault: not staged." in r.stdout, r.stdout[-3000:]
+    assert "off-site: pulling latest snapshot" in r.stdout, r.stdout[-3000:]
     assert "Payment vault: staged at" not in r.stdout
     assert not _staged(fresh).exists()
     _assert_no_plaintext_tar(fresh)
-    assert r.returncode != 0
 
 
 def test_an_older_archive_in_the_checkout_is_not_staged_when_the_snapshot_has_none(tmp_path):
+    """An off-site restore reads the selected snapshot's private view, never the checkout."""
     bind = _bind(tmp_path)
     _snapshot(tmp_path)  # the selected snapshot holds creds but no vault archive
     src = _source_with_archive(tmp_path, mark="p")  # an older checkout's archive
     fresh = tmp_path / "fresh"
     r = _restore(fresh, src, bind, offsite=tmp_path / "offsite")
-    assert "off-site: pulling latest snapshot" in r.stdout, r.stdout[-3000:]
     _assert_not_staged_from_checkout(r, fresh)
-    assert "may come from another backup" in r.stdout
 
 
 def test_a_failed_pull_of_the_archive_is_not_staged(tmp_path):
@@ -997,9 +1008,58 @@ def test_a_failed_pull_of_the_archive_is_not_staged(tmp_path):
     r = _restore(fresh, src, bind, offsite=tmp_path / "offsite")
     assert f"failed to pull creds/{ARCHIVE}" in r.stdout, r.stdout[-3000:]
     _assert_not_staged_from_checkout(r, fresh)
+    assert r.returncode != 0
 
 
-def test_a_symlinked_creds_checkout_is_neither_pulled_into_nor_staged(tmp_path):
+@pytest.mark.parametrize(
+    "checkout_archive", [True, False], ids=["checkout-has-one", "checkout-has-none"]
+)
+def test_an_offsite_dry_run_does_not_predict_from_the_checkout(tmp_path, checkout_archive):
+    """A dry run pulls no snapshot, so the checkout's archive (or its absence) must
+    not be reported as what a real off-site restore would stage."""
+    bind = _bind(tmp_path)
+    snap = _snapshot(tmp_path)
+    _seal_archive(tmp_path, snap / "creds" / ARCHIVE, mark="q")
+    if checkout_archive:
+        src = _source_with_archive(tmp_path, mark="p")
+    else:
+        src = tmp_path / "source"
+        (src / "creds").mkdir(parents=True)
+        (tmp_path / "gh2").write_text("x\n")
+        _gpg_encrypt(tmp_path / "gh2", src / "creds" / "gh_hosts.yml.gpg", tmp_path / "srcgnupg")
+    fresh = tmp_path / "fresh"
+    r = _restore(fresh, src, bind, offsite=tmp_path / "offsite", args=("--dry-run",))
+    assert "off-site: (dry-run) would resume or select a snapshot" in r.stdout, r.stdout[-3000:]
+    assert "would stage the card vault only if the selected off-site snapshot holds" in r.stdout
+    assert "would stage the card vault from" not in r.stdout
+    assert not _staged(fresh).exists()
+    _assert_no_plaintext_tar(fresh)
+
+
+def test_an_offsite_dry_run_still_refuses_a_stage_that_aliases_the_live_vault(tmp_path):
+    """The overlap refusal does not depend on the snapshot, so the dry run says what
+    the real run would: not staged."""
+    bind = _bind(tmp_path)
+    snap = _snapshot(tmp_path)
+    _seal_archive(tmp_path, snap / "creds" / ARCHIVE, mark="q")
+    fresh = tmp_path / "fresh"
+    live = fresh / ".genesis" / "payment_vault"
+    _synthetic_set(live, mark="p")
+    before = _tree(live)
+    r = _restore(
+        fresh,
+        _source_with_archive(tmp_path, mark="p"),
+        bind,
+        offsite=tmp_path / "offsite",
+        env_extra={"GENESIS_CREDS_STAGE": str(fresh / ".genesis")},
+        args=("--dry-run",),
+    )
+    assert "overlaps the live vault" in r.stdout, r.stdout[-3000:]
+    assert "would stage the card vault" not in r.stdout
+    assert _tree(live) == before
+
+
+def test_a_symlinked_creds_checkout_is_left_alone_and_the_snapshot_vault_staged(tmp_path):
     bind = _bind(tmp_path)
     snap = _snapshot(tmp_path)
     _seal_archive(tmp_path, snap / "creds" / ARCHIVE, mark="q")
@@ -1013,9 +1073,11 @@ def test_a_symlinked_creds_checkout_is_neither_pulled_into_nor_staged(tmp_path):
     (src / "creds").symlink_to(target)
     fresh = tmp_path / "fresh"
     r = _restore(fresh, src, bind, offsite=tmp_path / "offsite")
-    assert "creds in the backup checkout is (or sits under) a symlink" in r.stdout, r.stdout[-3000:]
+    # The pull writes only restore's private view, so the link is never followed.
+    assert "off-site: pulling latest snapshot" in r.stdout, r.stdout[-3000:]
     assert _tree(target) == before
-    _assert_not_staged_from_checkout(r, fresh)
+    assert "Payment vault: staged at" in r.stdout, r.stdout[-3000:]
+    assert _recipient_mark(_staged(fresh)) == "q"  # the snapshot's, not the link target's
 
 
 # ── backup.sh and restore.sh, end to end ───────────────────────────────
@@ -1076,8 +1138,8 @@ def test_round_trip_through_the_clone_and_through_the_offsite_snapshot(
     empty = tmp_path / "empty-source"
     empty.mkdir()
     r2 = _restore(via_offsite, empty, backup_env["bind"], offsite=offsite)
-    assert f"pulled creds/{ARCHIVE}" in r2.stdout, r2.stdout[-3000:]
-    _staged_matches(vault, via_offsite, r2)
+    assert "off-site: pulling latest snapshot" in r2.stdout, r2.stdout[-3000:]
+    _staged_matches(vault, via_offsite, r2)  # only the snapshot held this archive
 
 
 def test_no_vault_is_absent_and_changes_nothing(backup_env, tmp_path):
@@ -1233,7 +1295,8 @@ def _smb_filesystem_stub(bind: Path, root: Path, log: Path) -> None:
         cmd = sys.argv[sys.argv.index("-c") + 1]
         with open({str(log)!r}, "a") as f:
             f.write(cmd + "\\n")
-        cwd = root
+        # -D DIR starts the batch in DIR (main's atomic rename uses it).
+        cwd = root / sys.argv[sys.argv.index("-D") + 1] if "-D" in sys.argv else root
         for clause in cmd.split(";"):
             args = shlex.split(clause)
             if not args:
@@ -1260,6 +1323,8 @@ def _smb_filesystem_stub(bind: Path, root: Path, log: Path) -> None:
                         print(f"  {{e.name}} {{'D' if e.is_dir() else 'A'}} 0 Synthetic")
             elif op == "deltree":
                 shutil.rmtree(cwd / vals[0], ignore_errors=True)
+            elif op == "rename":  # smbclient rename SRC DST [-f]
+                shutil.move(str(cwd / vals[0]), str(cwd / vals[1]))
         sys.exit(0)
     """),
     )
@@ -1282,7 +1347,7 @@ def test_smb_offsite_puts_the_one_archive_flat_in_creds(_sealed, backup_env, tmp
     assert (snap / "creds" / ARCHIVE).read_bytes() == (repo / "creds" / ARCHIVE).read_bytes()
     assert not (snap / "creds" / "payment_vault").exists()
     cmds = log.read_text().splitlines()
-    assert any(f'put "creds/{ARCHIVE}" "{ARCHIVE}"' in c and '/creds"; put' in c for c in cmds), (
-        cmds
-    )
+    # The put targets the flat creds/ level (checked on disk above); the backend
+    # chooses how it reaches that directory.
+    assert any(f'put "creds/{ARCHIVE}" "{ARCHIVE}"' in c for c in cmds), cmds
     assert not [c for c in cmds if "mkdir" in c and "creds/payment_vault" in c], cmds

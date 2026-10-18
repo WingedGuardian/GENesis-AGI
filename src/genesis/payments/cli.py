@@ -6,7 +6,8 @@ terminal: both stdin and stdout must be a TTY, and they refuse inside a coding
 agent's session (Claude Code or Codex markers set). That is an accident guard, so a session
 never ends up holding a card number or the passphrase; it is not a boundary
 against a process that controls its own environment. Secrets are read with
-``getpass`` and never echoed. ``unlock`` is guarded the same way and reads the
+``getpass`` and never echoed: a terminal that cannot hide input is refused,
+not answered in the clear. ``unlock`` is guarded the same way and reads the
 passphrase before it connects. ``list``, ``status`` and ``lock`` show nothing
 secret and run anywhere: locking is always the safe direction.
 """
@@ -20,6 +21,7 @@ import json
 import os
 import socket
 import sys
+import warnings
 
 from genesis.env import vault_socket_path
 from genesis.payments import vault_store as vs
@@ -44,6 +46,24 @@ _AGENT_SESSION_MARKERS = (
     "CODEX_SESSION_ID",
     "CODEX_SANDBOX_NETWORK_DISABLED",
 )
+
+
+def _ask(prompt: str) -> str:
+    """One hidden answer. Never echoed: refused instead, as is ended input."""
+    with warnings.catch_warnings():
+        # getpass falls back to ECHOED input, with only a warning, when it
+        # cannot turn echo off; raised as an error, that stops it before it reads.
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass(prompt)
+        except getpass.GetPassWarning:
+            raise vs.VaultError(
+                "this terminal cannot hide what you type; nothing was read"
+            ) from None
+        except EOFError:
+            raise vs.VaultError("input ended before an answer; nothing was saved") from None
+        except KeyboardInterrupt:
+            raise vs.VaultError("cancelled; nothing was saved") from None
 
 
 def _owner_terminal(command: str, *, needs_crypto: bool = True) -> bool:
@@ -108,6 +128,8 @@ def _cmd_unlock(args: argparse.Namespace) -> int:
             return 0
         if not state.get("initialised"):
             raise vs.VaultError("the vault is not initialised; run `python -m genesis vault init`")
+        if state.get("ready_error"):  # the service would refuse: never read the passphrase
+            raise vs.VaultError(state["ready_error"])
         if not state.get("payments_extra"):
             raise vs.VaultError("genesis-server lacks the payments extra")
         if not state.get("audit"):  # the service refuses an unlock it cannot record
@@ -115,7 +137,7 @@ def _cmd_unlock(args: argparse.Namespace) -> int:
                 "the vault service's audit log is unavailable, so it would refuse; "
                 "check genesis-server's logs"
             )
-        reply = _service({"op": "unlock", "passphrase": getpass.getpass("Vault passphrase: ")})
+        reply = _service({"op": "unlock", "passphrase": _ask("Vault passphrase: ")})
         if reply is None:
             raise vs.VaultError(_NOT_RUNNING)
         if not reply.get("ok"):
@@ -154,8 +176,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
         return 2
     try:
         vs.check_can_init()
-        first = getpass.getpass("New vault passphrase: ")
-        if first != getpass.getpass("Repeat it: "):
+        first = _ask("New vault passphrase: ")
+        if first != _ask("Repeat it: "):
             raise vs.VaultError("the passphrases differ; nothing was created")
         vs.init_vault(first)
     except vs.VaultError as exc:
@@ -180,12 +202,12 @@ def _cmd_add(args: argparse.Namespace) -> int:
         vs.check_ready()
         merchant = vs.check_entry(args.label, args.merchant, args.single_use)
         card = vs.parse_card(
-            getpass.getpass("Card number (hidden): "),
-            getpass.getpass("Expiry MM/YY (hidden): "),
-            getpass.getpass("Security code (hidden): "),
+            _ask("Card number (hidden): "),
+            _ask("Expiry MM/YY (hidden): "),
+            _ask("Security code (hidden): "),
         )
-        name = input("Name on card (Enter to skip): ").strip()
-        postal = input("Billing postal code (Enter to skip): ").strip()
+        name = _ask("Name on card (hidden, Enter to skip): ").strip()
+        postal = _ask("Billing postal code (hidden, Enter to skip): ").strip()
         ref = vs.add_card(
             card,
             label=args.label,
@@ -235,7 +257,7 @@ def _cmd_retire(args: argparse.Namespace) -> int:
     try:
         vs.check_ready()
         vs.check_active_card(args.card_ref)
-        vs.retire_card(args.card_ref, getpass.getpass("Vault passphrase: "))
+        vs.retire_card(args.card_ref, _ask("Vault passphrase: "))
     except vs.VaultError as exc:
         print(f"vault retire: {exc}", file=sys.stderr)
         return 2
@@ -245,6 +267,10 @@ def _cmd_retire(args: argparse.Namespace) -> int:
     )
     # Until the next backup, a restore would bring the retired card's details back.
     print(_BACKUP_HINT)
+    print(
+        "earlier backups still hold the card (git history, older snapshots, the host "
+        "archive); see docs/reference/recovery-and-portability-workflow.md"
+    )
     return 0
 
 

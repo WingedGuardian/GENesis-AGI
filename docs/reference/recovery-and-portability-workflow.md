@@ -493,6 +493,20 @@ next tick). The container drainer maps the outreach result: `DELIVERED`/
 treating it otherwise would wedge the entry forever); `FAILED`/`HELD`/`PENDING`
 → keep. `prune()` bounds the queue (200 files / 14 days).
 
+**A file no reader can use is quarantined, never read.** `list_queued` checks every
+file with `v1_entry_problem`: `schema` is the int 1, `ts` a finite number (not a
+bool), `title`/`body`/`severity`/`source` strings, at least one of `title`/`body`
+non-empty, `dedupe_key` a string or null, `meta` an object, null or absent, and its
+`likely_cause`/`proposed_action`/`approval_url` strings or null. A file that fails
+is renamed `<name>.corrupt` with a WARNING naming the field (a file that cannot be
+read at the moment, say a permission or I/O error, is kept for the next pass), so drain, prune and
+the enqueue-time dedupe scan all see only usable entries. (Before this check, one
+file with a non-numeric `ts` made every drain raise and every prune fail, and every
+keyed Python `enqueue_alert` returned False: the queue stopped draining, the file
+was never pruned, and keyed Python alerts were dropped while it sat there.) `prune()` deletes `*.corrupt` files older than 14 days. The shell writer's
+dedupe scan applies the same check, so a same-key file the drainer would
+quarantine never suppresses a new alert.
+
 **What pages vs. what stays quiet.** `tmp_watchgod` pages only the **emergency
 (red)** tier, transition-only (once per red episode, gated on the shared
 `tmp_emergency` flag). The **warning (orange)** tier stays dashboard-only — it is
@@ -603,3 +617,10 @@ non-standard topologies): `CCTMPVOL_SIZE_GIB` (2), `CCTMPVOL_CONTAINER` (resolve
 from guardian.yaml, else `genesis`), `CCTMPVOL_POOL` (root device's pool),
 `CCTMPVOL_VOLUME_NAME` (`<container>-cc-tmp`), `CCTMPVOL_USER` (`ubuntu`),
 `CCTMPVOL_DISABLE` (opt out).
+
+Pooled transcript recovery over SMB uses the same temporary credential file for
+snapshot selection, manifest/object downloads and later extra payloads. Restore
+loads library definitions before creating that credential lease; function-return
+cleanup retires it when the pull returns; the script EXIT handler provides a
+fallback for early exit. An existing status-write failure can interrupt that EXIT
+handler before credential cleanup, so that fallback is not unconditional.

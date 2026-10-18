@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
-# watchgod — look at the disk guardian.
+# watchgod — look at the disk guardian, and resume or end what it paused.
 #
 #   scripts/watchgod status          per-filesystem tier, free space, time to full
-#                                    and whether a quota binds, as of the last poll
+#                                    and whether a quota binds, as of the last poll;
+#                                    and every process the guardian paused
+#   scripts/watchgod thaw <pid>      resume one paused process (SIGCONT)
+#   scripts/watchgod thaw all        resume every paused process
+#   scripts/watchgod kill <pid>      end one paused process (SIGTERM, then
+#                                    SIGCONT, then SIGKILL after a grace period)
 #
 # Reads ~/.genesis/watchgod_state.json, which the guardian
-# (scripts/tmp_watchgod.sh, the genesis-tmp-watchgod service) rewrites every poll.
+# (scripts/tmp_watchgod.sh, the genesis-tmp-watchgod service) rewrites every poll,
+# and the pause records (scripts/lib/watchgod_records.sh).
+#
+# The guardian never resumes or ends a process on its own. A pid is signalled
+# only while it is still the SAME process that was paused (pid and start time,
+# scripts/lib/watchgod_signal.sh); a recycled pid is never touched. `kill` takes
+# one pid, never "all": it cannot be undone.
 set -euo pipefail
+# Records and their temp files are owner-only: they name the paths of
+# private task outputs.
+umask 077
 
 if [ -z "${HOME:-}" ]; then
     HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
@@ -14,15 +28,102 @@ if [ -z "${HOME:-}" ]; then
 fi
 
 STATE_FILE="${WATCHGOD_STATE_FILE:-$HOME/.genesis/watchgod_state.json}"
+DG_STATE_DIR="${DG_STATE_DIR:-$HOME/.genesis/watchgod}"
+LOG_FILE="${WATCHGOD_LOG_FILE:-$HOME/.genesis/logs/tmp_watchgod.log}"
+# Always the real process table: a pidfd binds a signal to one process only
+# against the real /proc (scripts/lib/watchgod_signal.sh).
+DG_PROC=/proc
+# How long `kill` waits after SIGTERM before SIGKILL. A process that was
+# stopped and is now resumed may trap or ignore TERM; ten seconds lets one
+# that honours it flush and exit on its own.
+KILL_GRACE_S="${WATCHGOD_KILL_GRACE_S:-10}"
+[[ "$KILL_GRACE_S" =~ ^[0-9]{1,6}$ ]] || KILL_GRACE_S=10
+KILL_GRACE_S=$(( 10#$KILL_GRACE_S ))
+# How long `status` waits for the pause-record lock before showing the last
+# complete list.
+STATUS_LOCK_WAIT_S=5
 
 usage() {
-    sed -n '4,5p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '4,10p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
+}
+
+_lib="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib"
+# shellcheck source=scripts/lib/watchgod_signal.sh
+source "$_lib/watchgod_signal.sh"
+# shellcheck source=scripts/lib/watchgod_records.sh
+source "$_lib/watchgod_records.sh"
+
+_stat_state() {
+    # The one-letter state field of a /proc stat file ($1), or nothing. The
+    # whole record: comm may hold a newline (see wg_starttime).
+    local rest=""
+    IFS= read -r -d '' rest 2>/dev/null < "$1" || true  # no NUL: always 1 at EOF
+    [[ "$rest" == *") "* ]] || return 0
+    rest="${rest##*) }"
+    printf '%s' "${rest%% *}"
+}
+
+_shown() {
+    # $1 for the operator's terminal and log: a record's comm and path are
+    # chosen by the paused process, so control bytes (escape sequences,
+    # carriage returns) are shown as "?" (review finding).
+    # Every control code (C0, DEL and C1, raw or UTF-8 encoded: some
+    # terminals act on a raw 0x9b) and every byte that is not valid UTF-8 is
+    # shown as "?"; other UTF-8 text is left alone (review findings).
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -I -S -c '
+import sys
+s = sys.argv[1]
+bad = lambda c: ord(c) < 32 or 0x7f <= ord(c) <= 0x9f or 0xdc80 <= ord(c) <= 0xdcff
+sys.stdout.buffer.write("".join("?" if bad(c) else c for c in s).encode("utf-8", "surrogateescape"))
+' "$1" 2>/dev/null && return 0
+    fi
+    # No python3: by bytes, which also turns some UTF-8 text into "?" (safe).
+    local LC_ALL=C s="$1"
+    s="${s//[[:cntrl:]]/?}"
+    printf '%s' "${s//[$'\x80'-$'\x9f']/?}"
+}
+
+_live_state() {
+    # The one-letter state of process $1, or nothing when it is gone. When the
+    # main thread has exited (Z) while other threads still run, the process is
+    # alive: report the state of a remaining thread instead.
+    local s t
+    s="$(_stat_state "$DG_PROC/$1/stat")"
+    if [[ "$s" == Z ]]; then
+        # Threads cannot be listed while the entry is there: cannot tell
+        # (review finding: the literal glob was skipped and Z read as gone).
+        if [[ -e "$DG_PROC/$1" && ! -r "$DG_PROC/$1/task" ]]; then
+            printf ''
+            return 0
+        fi
+        for t in "$DG_PROC/$1/task"/*/stat; do
+            [[ "$t" == "$DG_PROC/$1/task/$1/stat" ]] && continue
+            [[ -e "$t" ]] || continue
+            s="$(_stat_state "$t")"
+            if [[ -z "$s" ]]; then
+                # Unreadable while the thread is still there: cannot tell, and
+                # an empty state is never "gone" to a caller (review finding).
+                [[ -e "${t%/stat}" ]] && break
+                s=Z; continue
+            fi
+            [[ "$s" != Z && "$s" != X ]] && break
+            s=Z
+        done
+    fi
+    printf '%s' "$s"
+}
+
+_log() {
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [INFO] $*" >> "$LOG_FILE" 2>/dev/null \
+        || echo "watchgod: could not write the log at $LOG_FILE" >&2
 }
 
 cmd_status() {
     if [[ -f "$STATE_FILE" ]]; then
-        python3 - "$STATE_FILE" <<'PY'
+        # The paused list below matters more than the summary: never lose it.
+        python3 - "$STATE_FILE" <<'PY' || echo "the state file at $STATE_FILE could not be read"
 import json, sys
 d = json.load(open(sys.argv[1]))
 print(f"polled {d.get('poll_at', '?')}  mode: {'ACT' if d.get('act', 1) else 'OBSERVE'}")
@@ -34,10 +135,265 @@ PY
     else
         echo "no state file at $STATE_FILE (is genesis-tmp-watchgod running?)"
     fi
+    # "still paused" only while the SAME process (start time) is in state T or
+    # t now: a record says what the guardian did, not what is true now.
+    local pid st comm ts _key path rstate state live n=0 listing rc lk="" lrc=0
+    # Under the records lock, like thaw and kill, so a record is never shown
+    # before its stop is final (review finding). Bounded: status is read-only
+    # and must not hang; past the wait it reads the last complete file (writes
+    # are whole-file renames) and says so.
+    if [[ -e "$(wg_records_file)" || -e "$(wg_records_file).lock" ]]; then
+        wg_records_lock lk "$STATUS_LOCK_WAIT_S" \
+            || echo "paused: the guardian is updating the pause records; showing the last complete list" >&2
+    fi
+    listing="$(wg_records_list)" || lrc=$?
+    wg_records_unlock "$lk"
+    if (( lrc )); then
+        echo "paused: the pause records at $(wg_records_file) cannot be read" >&2
+        return 1
+    fi
+    while IFS=$'\t' read -r pid st comm ts _key path rstate; do
+        [[ -n "$pid" ]] || continue
+        (( n++ == 0 )) && echo "paused:"
+        comm="$(_shown "$comm")"; ts="$(_shown "$ts")"; path="$(_shown "$path")"
+        rc=0; wg_same_gen "$pid" "$st" || rc=$?
+        if (( rc == 1 )); then
+            state="gone"
+        elif (( rc == 2 )); then
+            state="cannot read its /proc entry, so unverified (record kept)"
+        else
+            live="$(_live_state "$pid")"
+            if [[ "${rstate:-paused}" == pending* ]]; then
+                state="SIGSTOP sent, not confirmed (state ${live:-?}); thaw resumes it"
+            elif [[ "$live" == T || "$live" == t ]]; then
+                state="still paused"
+            elif [[ -z "$live" ]]; then
+                state="cannot read its state, so unverified (record kept)"
+            else
+                state="RUNNING, not paused (state ${live:-?}; resumed elsewhere?)"
+            fi
+        fi
+        echo "  pid ${pid} (${comm}) since ${ts}, writing ${path} — ${state}"
+    done <<< "$listing"
+    (( n )) || echo "paused: none"
+}
+
+cmd_thaw() {
+    local want="${1:-}"
+    [[ -n "$want" ]] || usage 2
+    # At most 10 digits: bash arithmetic wraps at 2^64, so a longer operand
+    # could name a different pid (review finding). pid_max is at most 4194304.
+    [[ "$want" == all || "$want" =~ ^[0-9]{1,10}$ ]] || { echo "watchgod: thaw takes a pid or 'all'" >&2; exit 2; }
+    [[ "$want" == all ]] || want=$(( 10#$want ))
+    # The lock file alone counts: the guardian creates it before the first
+    # record ever exists, and its stop must not be missed.
+    [[ -e "$(wg_records_file)" || -e "$(wg_records_file).lock" ]] || { echo "nothing is paused"; return 0; }
+    # Held across read-decide-write, so a record is never seen before its stop.
+    local lk
+    wg_records_lock lk || { echo "watchgod: could not take the pause-record lock" >&2; return 1; }
+    local pid st comm _ts _key _path rstate live hit=0 left=0 rc listing
+    local -a recs=()
+    if ! listing="$(wg_records_list)"; then
+        wg_records_unlock "$lk"
+        echo "watchgod: could not read the pause records" >&2
+        return 1
+    fi
+    [[ -n "$listing" ]] && mapfile -t recs <<< "$listing"
+    if (( ${#recs[@]} == 0 )); then
+        wg_records_unlock "$lk"
+        echo "nothing is paused"
+        return 0
+    fi
+    local line
+    for line in "${recs[@]}"; do
+        IFS=$'\t' read -r pid st comm _ts _key _path rstate <<< "$line"
+        [[ "$want" == all || "$want" == "$pid" ]] || continue
+        hit=1
+        comm="$(_shown "$comm")"
+        rc=0; wg_same_gen "$pid" "$st" || rc=$?
+        if (( rc == 1 )); then
+            echo "pid ${pid} (${comm}) is no longer running — record dropped"
+            wg_record_drop "$pid" "$st" || left=1
+            continue
+        elif (( rc == 2 )); then
+            echo "cannot verify pid ${pid} (${comm}): its /proc entry could not be read — record kept" >&2
+            left=1
+            continue
+        fi
+        live="$(_live_state "$pid")"
+        if [[ -z "$live" && -e "$DG_PROC/$pid" && "${rstate:-paused}" != pending* ]]; then
+            echo "cannot verify pid ${pid} (${comm}): its /proc entry could not be read — record kept" >&2
+            left=1
+            continue
+        fi
+        # A pending record is resumed whatever its live state: SIGCONT is the
+        # exact inverse of the SIGSTOP that was sent, and also cancels one that
+        # has not landed yet.
+        if [[ "${rstate:-paused}" != pending* && "$live" != T && "$live" != t ]]; then
+            echo "pid ${pid} (${comm}) is not paused (state ${live:-?}; resumed elsewhere?) — record dropped, not signalled"
+            wg_record_drop "$pid" "$st" || left=1
+            continue
+        fi
+        rc=0
+        wg_signal_gen CONT "$pid" "$st" || rc=$?
+        if (( rc == 0 )); then
+            echo "resumed pid ${pid} (${comm})"
+            _log "THAWED pid ${pid} (${comm}) by operator"
+            wg_record_drop "$pid" "$st" || left=1
+        elif (( rc == 1 )); then
+            echo "pid ${pid} (${comm}) is no longer running — record dropped"
+            wg_record_drop "$pid" "$st" || left=1
+        elif (( rc == 3 )); then
+            echo "cannot verify pid ${pid} (${comm}): its /proc entry could not be read — record kept" >&2
+            left=1
+        else
+            echo "could not signal pid ${pid} (${comm}) — record kept" >&2
+            left=1
+        fi
+    done
+    wg_records_unlock "$lk"
+    if (( ! hit )); then
+        echo "pid ${want} is not in the paused list"
+        return 1
+    fi
+    # Nonzero when a record this call was asked to clear is still there, so a
+    # script that runs thaw knows a command is still stopped.
+    (( left )) && return 1
+    return 0
+}
+
+_kept() {
+    # Why a record is kept after signal rc $1 for pid $2 ($3 its comm).
+    if (( $1 == 3 )); then
+        echo "cannot verify pid $2 ($3): its /proc entry could not be read — record kept" >&2
+    else
+        echo "could not signal pid $2 ($3) — record kept" >&2
+    fi
+}
+
+_gone() {
+    # 0 when pid $1 no longer is the process that started at $2: it is gone,
+    # the pid names another process, or every thread has exited and it waits
+    # to be reaped by its parent (a zombie keeps its pid and start time).
+    # 1 when it is still there, or when that cannot be told: an unreadable
+    # /proc entry is never taken for "gone".
+    local rc=0 s
+    wg_same_gen "$1" "$2" || rc=$?
+    (( rc == 1 )) && return 0
+    (( rc == 2 )) && return 1
+    s="$(_live_state "$1")"
+    # An empty state with the entry still there is a failed read, not an exit.
+    [[ -z "$s" && -e "$DG_PROC/$1" ]] && return 1
+    [[ -z "$s" || "$s" == Z || "$s" == X ]]
+}
+
+
+cmd_kill() {
+    local want="${1:-}"
+    # At most 10 digits: see cmd_thaw.
+    [[ "$want" =~ ^[0-9]{1,10}$ ]] || { echo "watchgod: kill takes one pid (never 'all')" >&2; exit 2; }
+    want=$(( 10#$want ))
+    local lk
+    wg_records_lock lk || { echo "watchgod: could not take the pause-record lock" >&2; return 1; }
+    local listing line pid st comm _rest rc i target="" tcomm="" dropfail=0
+    if ! listing="$(wg_records_list)"; then
+        wg_records_unlock "$lk"
+        echo "watchgod: could not read the pause records" >&2
+        return 1
+    fi
+    # Every record for this pid number: older ones whose process is gone are
+    # dropped, and the one that is still the recorded process (at most one
+    # can be) is the target.
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS=$'\t' read -r pid st comm _rest <<< "$line"
+        [[ "$pid" == "$want" ]] || continue
+        comm="$(_shown "$comm")"
+        if _gone "$pid" "$st"; then
+            if wg_record_drop "$pid" "$st"; then
+                echo "record for pid ${pid} (${comm}, an earlier process) dropped"
+            else
+                echo "record for pid ${pid} (${comm}, an earlier process) could not be removed" >&2
+                dropfail=1
+            fi
+        else
+            target="$st"; tcomm="$comm"
+        fi
+    done <<< "$listing"
+    if [[ -z "$target" ]]; then
+        wg_records_unlock "$lk"
+        if grep -q . <<< "$(awk -F'\t' -v p="$want" '$1 == p' <<< "$listing")"; then
+            echo "pid ${want} is no longer running"
+            (( dropfail )) && return 1
+            return 0
+        fi
+        echo "pid ${want} is not in the paused list"
+        return 1
+    fi
+    st="$target"; comm="$tcomm"; pid="$want"
+    # TERM first, then CONT: a stopped process holds the TERM pending, so the
+    # runaway never runs between the two. Every signal is bound to the
+    # recorded start time, so a recycled pid is never touched.
+    # 2 (signal failed) or 3 (could not verify the process): stop, keep the
+    # record.
+    rc=0; wg_signal_gen TERM "$pid" "$st" || rc=$?
+    (( rc >= 2 )) && { wg_records_unlock "$lk"; _kept "$rc" "$pid" "$comm"; return 1; }
+    if (( rc == 1 )); then
+        # Gone before the signal: nothing was ended here (review finding).
+        if wg_record_drop "$pid" "$st"; then
+            wg_records_unlock "$lk"
+            echo "pid ${pid} (${comm}) is no longer running — record dropped"
+            return 0
+        fi
+        wg_records_unlock "$lk"
+        echo "pid ${pid} (${comm}) is no longer running — its record could not be removed" >&2
+        return 1
+    fi
+    if (( rc == 0 )); then
+        rc=0; wg_signal_gen CONT "$pid" "$st" || rc=$?
+        (( rc >= 2 )) && { wg_records_unlock "$lk"; _kept "$rc" "$pid" "$comm"; return 1; }
+    fi
+    for (( i = 0; i < KILL_GRACE_S * 10; i++ )); do
+        _gone "$pid" "$st" && break
+        sleep 0.1
+    done
+    if ! _gone "$pid" "$st"; then
+        rc=0; wg_signal_gen KILL "$pid" "$st" || rc=$?
+        (( rc >= 2 )) && { wg_records_unlock "$lk"; _kept "$rc" "$pid" "$comm"; return 1; }
+        for (( i = 0; i < 50; i++ )); do
+            _gone "$pid" "$st" && break
+            sleep 0.1
+        done
+    fi
+    if _gone "$pid" "$st"; then
+        echo "ended pid ${pid} (${comm})"
+        _log "KILLED pid ${pid} (${comm}) by operator"
+        if ! wg_record_drop "$pid" "$st"; then
+            wg_records_unlock "$lk"
+            echo "its record could not be removed" >&2
+            return 1
+        fi
+        wg_records_unlock "$lk"
+        (( dropfail )) && return 1
+        return 0
+    fi
+    wg_records_unlock "$lk"
+    echo "pid ${pid} (${comm}) did not exit — record kept" >&2
+    return 1
+}
+
+# Exact arity: `kill 123 456` must not end 123 and ignore the rest (review
+# finding).
+_arity() {
+    (( $1 == $2 )) && return 0
+    echo "watchgod: '$3' takes $(( $2 - 1 )) argument(s)" >&2
+    usage 2
 }
 
 case "${1:-}" in
-    status) cmd_status ;;
+    status) _arity "$#" 1 status; cmd_status ;;
+    thaw) _arity "$#" 2 thaw; cmd_thaw "$2" ;;
+    kill) _arity "$#" 2 kill; cmd_kill "$2" ;;
     -h|--help|help|"") usage 0 ;;
     *) echo "watchgod: unknown command '$1'" >&2; usage 2 ;;
 esac
