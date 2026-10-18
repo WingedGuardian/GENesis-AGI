@@ -61,6 +61,7 @@ DRY_RUN=false
 FORCE=false
 REFRESH_SNAPSHOT=false
 _RESTORE_MANAGED=false
+_PV_GAP=""  # set from the selected snapshot's COMPLETE marker (payment_vault <status>)
 DATABASE_ONLY=false
 _TRANSCRIPT_PREFERENCES=()
 while [ $# -gt 0 ]; do
@@ -674,6 +675,11 @@ PYBOUNDARY
             [ ! -d "$BACKUP_DIR/extra" ] || _EXTRA_PULLED=$(find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -printf '%f\n')
         fi
         while IFS= read -r fname; do warn "off-site: snapshot does not hold extra directory $fname (backup skipped it that run)"; done < <(awk '$1 == "skipped" {$1=""; sub(/^ /, ""); print}' "$marker" | tr -cd '[:print:]\n')
+        # The run that wrote this snapshot did not back up the card vault (§8 says so).
+        if grep -q '^payment_vault' "$marker"; then
+            _PV_GAP="$(awk '$1 == "payment_vault" {print $2; exit}' "$marker" | tr -cd 'a-z')"
+            _PV_GAP="${_PV_GAP:-unknown}"  # a malformed line still means a gap
+        fi
     elif [ -s "$marker" ]; then warn "off-site: unknown COMPLETE format; extra recovery withheld"; fi
 }
 
@@ -1752,7 +1758,7 @@ if [ -d "$CREDS_SRC_DIR" ]; then
         else
             warn "Creds: decrypt failed for $_rel"
         fi
-    done < <(find "$CREDS_SRC_DIR" -type f -name '*.gpg' ! -name "$PAYMENT_VAULT_ARCHIVE" -print0)
+    done < <(find "$CREDS_SRC_DIR" -type f -name '*.gpg' ! -name "$PAYMENT_VAULT_ARCHIVE" ! -name "$PAYMENT_VAULT_LAST_GOOD" -print0)
     umask "$_prev_umask"
     if ! $DRY_RUN; then
         log "Creds: $_CREDS_STAGED file(s) decrypted → $CREDS_STAGE (staged, NOT auto-placed)"
@@ -1768,7 +1774,7 @@ if [ -d "$CREDS_SRC_DIR" ]; then
     # nothing about the snapshot a real run would select.
     _PV_ARCHIVE="$CREDS_SRC_DIR/$PAYMENT_VAULT_ARCHIVE"
     _PV_STAGE="$CREDS_STAGE/payment_vault"
-    _PV_LIVE="${GENESIS_HOME:-$HOME/.genesis}/payment_vault"
+    _PV_LIVE="$(_backup_core_home)/payment_vault"
     _PV_STAGED=false
     if $DRY_RUN && $_RESTORE_MANAGED; then
         # The refusals that do not depend on the snapshot still apply, so a dry
@@ -1779,6 +1785,14 @@ if [ -d "$CREDS_SRC_DIR" ]; then
             warn "Payment vault: not staged. Its staging path $_PV_STAGE overlaps the live vault $_PV_OVERLAP (check GENESIS_CREDS_STAGE)"
         else
             log "Creds: would stage the card vault only if the selected off-site snapshot holds $PAYMENT_VAULT_ARCHIVE (a dry run pulls nothing, so it cannot tell)"
+        fi
+    elif [ -n "${_PV_GAP:-}" ]; then
+        # The selected snapshot's run did not back up the vault. What it carries is
+        # an earlier run's archive, which is not staged as if it were this snapshot's.
+        if [ -f "$CREDS_SRC_DIR/$PAYMENT_VAULT_LAST_GOOD" ] && [ ! -L "$CREDS_SRC_DIR/$PAYMENT_VAULT_LAST_GOOD" ]; then
+            warn "Payment vault: not staged. The selected snapshot's backup did not capture the vault (vault step: $_PV_GAP). It carries the last good archive from an earlier run at $CREDS_SRC_DIR/$PAYMENT_VAULT_LAST_GOOD. To stage that one, make a new empty directory <dir>, copy the file to <dir>/creds/$PAYMENT_VAULT_ARCHIVE, and run restore.sh --from <dir>"
+        else
+            warn "Payment vault: not staged. The selected snapshot's backup did not capture the vault (vault step: $_PV_GAP), and no earlier archive was pulled from it (see any off-site pull warning above)"
         fi
     elif [ -L "$_PV_ARCHIVE" ]; then
         warn "Payment vault: not staged. $PAYMENT_VAULT_ARCHIVE in the backup source is a symlink"

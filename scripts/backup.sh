@@ -82,8 +82,12 @@ source "$_SCRIPT_DIR/lib/dr_lock.sh"
 # Absolute from the start: §8 runs after `cd "$BACKUP_DIR"`, so a relative
 # GENESIS_HOME would otherwise resolve against the backups clone. -s keeps a
 # symlinked component as written, so the card vault step can still refuse a
-# symlinked vault directory (#3245 tracks where GENESIS_HOME is read from).
-_GENESIS_HOME="$(realpath -s -m -- "${GENESIS_HOME:-$HOME/.genesis}")"
+# symlinked vault directory (#3245 tracks where GENESIS_HOME is read from). A
+# leading ~ is expanded first, as the runtime's Path.expanduser does: the lib is
+# sourced here, before any cd, so its home rule is the one both scripts use.
+# shellcheck source=scripts/lib/backup_core_paths.sh
+source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
+_GENESIS_HOME="$(realpath -s -m -- "$(_backup_core_home)")"
 _STATUS_FILE="$_GENESIS_HOME/backup_status.json"
 _RUN_ID="${GENESIS_BACKUP_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 _TRIGGER="${GENESIS_BACKUP_TRIGGER:-timer}"
@@ -230,8 +234,7 @@ BACKUP_DIR="$HOME/backups/genesis-backups"
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
-# shellcheck source=scripts/lib/backup_core_paths.sh
-source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
+# (backup_core_paths.sh is sourced above, before _GENESIS_HOME.)
 # shellcheck source=scripts/lib/payment_vault_backup.sh
 source "$_SCRIPT_DIR/lib/payment_vault_backup.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
@@ -1443,6 +1446,13 @@ else
         [ -d creds/ssh ] && backend_mkdir "${_T2_DIR}/creds/ssh"
         while IFS= read -r -d '' f; do
             rel="${f#creds/}"
+            # The clone keeps the last good vault archive when this run's vault step
+            # did not succeed. The snapshot carries it under another name, so it is
+            # never presented as this run's vault, and never lost to GFS pruning of
+            # the earlier snapshot that holds it; COMPLETE records the gap.
+            if [ "$rel" = "$PAYMENT_VAULT_ARCHIVE" ] && [ "$_PV_STATUS" != ok ]; then
+                rel="$PAYMENT_VAULT_LAST_GOOD"
+            fi
             if backend_put "$f" "${_T2_DIR}/creds/${rel}"; then
                 log "  off-site: uploaded creds/${rel}"
             else
@@ -1472,6 +1482,10 @@ else
             for _n in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do
                 printf 'partial %s\n' "$_n"
             done
+            case "$_PV_STATUS" in
+                ok | absent) ;;
+                *) printf 'payment_vault %s\n' "$_PV_STATUS" ;;
+            esac
         } > "$_T2_MARKER"
         if ! backend_put "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
             log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"

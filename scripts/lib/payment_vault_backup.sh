@@ -50,6 +50,9 @@ PAYMENT_VAULT_FILES=(identity.age recipient.txt cards.db)
 # The repository's src/, for payment_vault_check's vault_store call.
 _PV_SRC="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../src" 2>/dev/null && pwd)" || _PV_SRC=""
 PAYMENT_VAULT_ARCHIVE=payment_vault.tar.gpg
+# The name a snapshot carries the clone's kept archive under when that run's
+# vault step did not succeed: restore never stages it on its own.
+PAYMENT_VAULT_LAST_GOOD=payment_vault.last-good.tar.gpg
 # vault_store.SCHEMA_VERSION and the cards table's columns, in order (a parity
 # test builds a real vault with vault_store and checks it here).
 PAYMENT_VAULT_SCHEMA_VERSION=1

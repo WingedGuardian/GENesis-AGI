@@ -51,7 +51,23 @@ _BACKUP_CORE_CWD="$PWD"
 _backup_core_abs() {
     case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$_BACKUP_CORE_CWD" "$1" ;; esac
 }
-_BACKUP_CORE_VAULT="$(_backup_core_abs "${GENESIS_HOME:-$HOME/.genesis}")/payment_vault"
+# GENESIS_HOME as genesis.env.genesis_home() resolves it, made absolute. The
+# runtime applies Path.expanduser, so a leading ~ (~, ~/x, ~user/x) is expanded
+# by Python's own rule here too; left literal it would name a directory called
+# "~" under the cwd, and the vault would be neither backed up nor guarded.
+_backup_core_home() {
+    local h="${GENESIS_HOME:-$HOME/.genesis}" e
+    case "$h" in
+        "~"*)
+            if e="$(python3 -I -c 'import os, sys; print(os.path.expanduser(sys.argv[1]))' "$h")" \
+                && [ -n "$e" ]; then
+                h="$e"
+            fi
+            ;;
+    esac
+    _backup_core_abs "$h"
+}
+_BACKUP_CORE_VAULT="$(_backup_core_home)/payment_vault"
 
 _backup_core_path_array() {
     # The merge-gate override store can be relocated (GENESIS_MERGE_OVERRIDE_DIR);
@@ -70,7 +86,7 @@ _backup_core_path_array() {
         "$GENESIS_DIR" "$TRANSCRIPT_DIR" "$HOME/.genesis/eval"
         "$HOME/.genesis/shared" "$HOME/.genesis/merge_overrides"
         "$override_store" "$HOME/.genesis/restore-creds"
-        "$_BACKUP_CORE_VAULT" "$(_backup_core_abs "${GENESIS_HOME:-$HOME/.genesis}")/payment_vault"
+        "$_BACKUP_CORE_VAULT" "$(_backup_core_home)/payment_vault"
         "$HOME/.genesis/restore_status.json" "$HOME/.ssh"
         "$HOME/.config/gh" "$HOME/.local/state/genesis-guardian"
     )

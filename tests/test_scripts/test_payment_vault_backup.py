@@ -9,6 +9,7 @@ unpack side are driven directly. Sandboxed like test_backup_dated_snapshots
 (HOME, GENESIS_DIR, GNUPGHOME in tmp; systemctl and curl stubbed).
 """
 
+import getpass
 import io
 import json
 import os
@@ -47,6 +48,7 @@ def _future() -> str:
 NAMES = ("identity.age", "recipient.txt", "cards.db")
 ARCHIVE = "payment_vault.tar.gpg"
 TMPNAME = f".{ARCHIVE}.tmp"
+LAST_GOOD = "payment_vault.last-good.tar.gpg"
 _ASIDE_RE = re.compile(r"payment_vault\.pre-restore-\d{8}T\d{6}Z\.\d+")
 
 
@@ -1158,6 +1160,22 @@ def test_an_older_archive_in_the_checkout_is_not_staged_when_the_snapshot_has_no
     _assert_not_staged_from_checkout(r, fresh)
 
 
+@pytest.mark.parametrize("line", ["payment_vault failed", "payment_vault"])
+def test_a_gap_snapshot_without_a_last_good_archive_says_so(tmp_path, line):
+    bind = _bind(tmp_path)
+    snap = _snapshot(tmp_path)
+    (snap / "COMPLETE").write_text(f"genesis-snapshot 1\n{line}\n")
+    src = _source_with_archive(tmp_path, mark="p")
+    fresh = tmp_path / "fresh"
+    r = _restore(fresh, src, bind, offsite=tmp_path / "offsite")
+    gap = "failed" if line.endswith("failed") else "unknown"
+    assert f"did not capture the vault (vault step: {gap}), and no earlier archive" in r.stdout, (
+        r.stdout[-3000:]
+    )
+    _assert_not_staged_from_checkout(r, fresh)
+    assert r.returncode != 0
+
+
 def test_a_failed_pull_of_the_archive_is_not_staged(tmp_path):
     bind = _bind(tmp_path)
     snap = _snapshot(tmp_path)
@@ -1349,6 +1367,34 @@ def test_a_relative_genesis_home_still_finds_the_vault(_sealed, backup_env, tmp_
     assert (dated._repo(backup_env) / "creds" / ARCHIVE).is_file()
 
 
+def test_a_tilde_genesis_home_finds_the_vault(_sealed, backup_env, tmp_path):
+    """GENESIS_HOME=~/x names $HOME/x for the runtime (Path.expanduser); so here."""
+    _place_vault(_sealed, backup_env["home"] / "custom" / "payment_vault")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = dated._run_local(backup_env, offsite, extra_env={"GENESIS_HOME": "~/custom"})
+    status = json.loads((backup_env["home"] / "custom" / "backup_status.json").read_text())
+    assert status["payment_vault"] == "ok", (status, proc.stdout[-3000:])
+
+
+def test_a_stage_on_a_tilde_genesis_home_is_refused(tmp_path):
+    """A literal ~ in GENESIS_HOME still names the live vault for the overlap check."""
+    bind = _bind(tmp_path)
+    fresh = tmp_path / "fresh"
+    live = fresh / "custom" / "payment_vault"
+    _synthetic_set(live, mark="p")
+    before = _tree(live)
+    r = _restore(
+        fresh,
+        _source_with_archive(tmp_path),
+        bind,
+        env_extra={"GENESIS_HOME": "~/custom", "GENESIS_CREDS_STAGE": str(fresh / "custom")},
+    )
+    assert f"overlaps the live vault {live} " in r.stdout, r.stdout[-3000:]
+    assert "Payment vault: staged at" not in r.stdout
+    assert _tree(live) == before
+
+
 def test_a_vault_backup_failure_fails_the_run_and_update_continues_degraded(
     _sealed, backup_env, tmp_path
 ):
@@ -1367,6 +1413,10 @@ def test_a_vault_backup_failure_fails_the_run_and_update_continues_degraded(
     assert "payment vault backup failed" in status["failure_reason"]
     assert status["tier2_status"] == "ok"  # the rest of the backup still landed
     assert _archive(repo / "creds") == earlier
+    newest = max(dated._snaps(offsite), key=lambda p: p.name)
+    assert not (newest / "creds" / ARCHIVE).exists()
+    assert (newest / "creds" / LAST_GOOD).read_bytes() == earlier
+    assert "payment_vault failed" in (newest / "COMPLETE").read_text().splitlines()
     gate = subprocess.run(
         [
             "python3",
@@ -1397,9 +1447,25 @@ def test_a_vault_that_vanished_fails_the_run_and_keeps_the_last_archive(
     assert "payment vault backup missing" in status["failure_reason"]
     assert _tracked(repo, f"creds/{ARCHIVE}") == [f"creds/{ARCHIVE}"]
     assert _archive(repo / "creds") == earlier
-    # The newest snapshot still carries the last archive, so a restore finds it.
+    # The newer snapshot does not present the kept archive as its own: it carries
+    # it under the last-good name (GFS may prune the earlier snapshot that holds it,
+    # as it does here) and its COMPLETE marker names the gap.
     newest = max(dated._snaps(offsite), key=lambda p: p.name)
-    assert (newest / "creds" / ARCHIVE).read_bytes() == earlier
+    assert not (newest / "creds" / ARCHIVE).exists()
+    assert (newest / "creds" / LAST_GOOD).read_bytes() == earlier
+    assert "payment_vault missing" in (newest / "COMPLETE").read_text().splitlines()
+    # A restore from that snapshot stages nothing, decrypts nothing, and says why.
+    fresh = tmp_path / "fresh"
+    empty = tmp_path / "empty-source"
+    empty.mkdir()
+    r = _restore(fresh, empty, backup_env["bind"], offsite=offsite)
+    assert "did not capture the vault (vault step: missing)" in r.stdout, r.stdout[-3000:]
+    assert "the last good archive from an earlier run at " in r.stdout
+    assert "Payment vault: staged at" not in r.stdout
+    assert not _staged(fresh).exists()
+    stage = fresh / ".genesis" / "restore-creds"
+    assert [p for p in stage.rglob("*") if "last-good" in p.name] == []
+    _assert_no_plaintext_tar(fresh)
 
 
 def test_no_passphrase_is_skipped_not_a_vault_failure(_sealed, backup_env, tmp_path):
@@ -1411,6 +1477,26 @@ def test_no_passphrase_is_skipped_not_a_vault_failure(_sealed, backup_env, tmp_p
     assert status["payment_vault"] == "skipped", status
     assert "payment vault" not in status["failure_reason"]
     assert not (dated._repo(backup_env) / "creds" / ARCHIVE).exists()
+
+
+@pytest.mark.parametrize("form", ["~", "~/custom", "~{user}/custom", "~nosuchuser9z/x"])
+def test_the_home_rule_matches_the_runtimes_expanduser(tmp_path, form):
+    """backup_core_paths.sh resolves GENESIS_HOME exactly as genesis.env does."""
+    value = form.format(user=getpass.getuser())
+    core = dated._BACKUP.parent / "lib" / "backup_core_paths.sh"
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{core}"; _backup_core_home'],
+        env={**os.environ, "HOME": str(tmp_path), "GENESIS_HOME": value},
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    expected = Path(value).expanduser() if not value.startswith("~nosuchuser") else None
+    if expected is None:  # an unknown user stays literal, as in Python
+        expected = tmp_path / value
+    elif value == "~" or value.startswith("~/"):
+        expected = tmp_path / value[2:] if value != "~" else tmp_path
+    assert proc.stdout == str(expected), (proc.stdout, proc.stderr)
 
 
 @pytest.mark.parametrize("genesis_home", [None, "relocated"])
