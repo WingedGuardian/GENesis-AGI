@@ -969,3 +969,49 @@ def test_recorded_upstream_push_asks_without_dry_run(
     assert rc == 0, (rc, out, err)
     assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "ask", out
     assert calls == []
+
+
+def _run_force_heredoc_guard(monkeypatch, tmp_path, capsys, command: str):
+    monkeypatch.setattr(gpg, "_push_dest_urls", lambda *a, **k: {PUBLIC_URL})
+    monkeypatch.setattr(gpg, "push_allowlist", None)
+    monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
+    monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
+    return _run_guard_on_push(
+        monkeypatch, tmp_path, FakeRun(), capsys, command=command
+    )
+
+
+def test_proven_commit_message_heredoc_does_not_block_body_push_text(
+    monkeypatch, tmp_path, capsys, on_the_public_repo
+) -> None:
+    command = (
+        "git commit -F - <<'EOF'\n"
+        "release notes mention git push --force origin main\n"
+        "EOF"
+    )
+    rc, out, err = _run_force_heredoc_guard(monkeypatch, tmp_path, capsys, command)
+    assert rc == 0, (out, err)
+    assert "Force push to origin" not in err
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat <<'EOF'\nprose\nEOF\ngit push --force origin main",
+        (
+            "python3 - <<'PY'\n"
+            "# It feeds the reviewer's answer into this gate. `cmd`\n"
+            "'''\n"
+            "PY\n"
+            "git push --force origin main"
+        ),
+        "./cat <<'EOF'\ngit push --force origin main\nEOF",
+        "cat <<'EOF' >&file\ngit push --force origin main\nEOF",
+    ],
+)
+def test_unproven_heredocs_do_not_hide_force_pushes(
+    monkeypatch, tmp_path, capsys, on_the_public_repo, command: str
+) -> None:
+    rc, out, err = _run_force_heredoc_guard(monkeypatch, tmp_path, capsys, command)
+    assert rc == 2, (command, out, err)
+    assert "Force push to origin" in err

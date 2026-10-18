@@ -163,6 +163,16 @@ def _rubric_question(contract, case):
     return render_rubric_prompt(rubric, case["actual"], case.get("expected", ""), config)
 
 
+def validate_metadata(row):
+    """Match the judge's string normalization, refusing non-string arrays."""
+    for key in ("tools_used", "context_tags"):
+        value = row.get(key, [])
+        values = [value] if isinstance(value, str) else value
+        if (not isinstance(values, list)
+            or any(not isinstance(v, str) or not references.scalar_text(v) for v in values)):
+            raise Incomplete(f"invalid procedure metadata: {key}")
+
+
 def validate_novelty(case: dict):
     if "expected_target" not in case:
         raise Incomplete("novelty requires an explicit target or null reference")
@@ -201,6 +211,7 @@ def validate_novelty(case: dict):
         for flag in ("deprecated", "quarantined"):
             if flag in row and type(row[flag]) is not bool:
                 raise Incomplete(f"procedure {flag} must be a boolean")
+        validate_metadata(row)
         vector = row.get("embedding")
         if (
             not isinstance(vector, list)

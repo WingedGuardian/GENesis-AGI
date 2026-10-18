@@ -863,7 +863,12 @@ OLD_PREMISE_BLOCK = (
 )
 
 
-def _block(head="Design-premise: SOUND", *claims, between=()):
+EXPECTED = "Expected before checking: it holds"
+
+
+def _block(head="Design-premise: SOUND", *claims, between=(EXPECTED,)):
+    """A canonical block: the verdict line, the required Expected line (#3238),
+    then the claims. Pass ``between=()`` for a block without the Expected line."""
     claims = claims or ("P1 TRUE — a", "P2 FALSE — b")
     return "\n".join([head, *between, *claims]) + "\n"
 
@@ -900,7 +905,11 @@ def _block(head="Design-premise: SOUND", *claims, between=()):
         (_block("Design-premise: SOUND", "P1 TRUE \u2014 a", "P2 FALSE (partially) \u2014 b"), True),
         (_block(between=("Expected before checking:",)), False),  # empty Expected
         (_block(between=("Expected before checking:   ",)), False),
-        ("Design-premise: SOUND  \r\nP1 TRUE — a \r\nP2 FALSE — b\r\n", True),  # CRLF
+        (
+            "Design-premise: SOUND  \r\nExpected before checking: x \r\nP1 TRUE — a \r\nP2 FALSE — b\r\n",
+            True,
+        ),  # CRLF
+        (_block(between=()), False),  # #3238: the Expected line is required
         ("Some prose first.\n\n```\n" + _block() + "```\n\nEffect: none\n", True),  # fenced
     ],
 )
@@ -979,6 +988,7 @@ def test_a_misstated_claim_is_refused_when_its_text_names_a_verdict(tmp_path):
     evidence = tmp_path / "premise.txt"
     evidence.write_text(
         "Design-premise: SOUND\n"
+        "Expected before checking: the values survive\n"
         "P1 FALSE — whether TRUE values survive · x.py:1\n"
         "P2 TRUE — the caller retries · y.py:3\n"
     )
@@ -1024,7 +1034,7 @@ def test_a_near_miss_claim_is_refused_by_its_line(line):
     the run used to end the claims silently, dropping it while the block was
     still accepted."""
     got = rr.premise_block(_block("Design-premise: SOUND", "P1 TRUE — a", "P2 TRUE — b", line))
-    assert got[0] is None and "line 4 looks like a claim" in got[2], got
+    assert got[0] is None and "line 5 is inside the premise block" in got[2], got
 
 
 @pytest.mark.parametrize(
@@ -1113,7 +1123,7 @@ def test_a_restated_verdict_then_claim_like_prose_is_refused_by_line():
     block's paragraph is refused by the paragraph scan, naming the line."""
     text = _block() + "\nDesign-premise: SOUND\nP3 FALSE positives remain\n"
     got = rr.premise_block(text)
-    assert got[0] is None and "line 6 looks like a claim" in got[2], got
+    assert got[0] is None and "line 7 is inside the premise block that starts at line 6" in got[2], got
 
 
 @pytest.mark.parametrize(
@@ -1124,22 +1134,125 @@ def test_a_restated_verdict_then_claim_like_prose_is_refused_by_line():
     ],
 )
 def test_a_broken_expected_line_is_named_not_the_claim_under_it(between, culprit):
-    """Fix audit SF-2: the refusal used to name the valid claim under a broken
-    Expected line instead of the line that broke the run."""
+    """Fix audit SF-2: the refusal names the line that broke the block, never
+    the valid claim under it."""
     got = rr.premise_block(_block(between=between))
-    assert got[0] is None and f"line {culprit} breaks the claim lines" in got[2], got
+    assert got[0] is None and f"line {culprit} is inside the premise block" in got[2], got
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # #3238 item 2: every markdown claim marker, and spellings no marker list names
+        "+ P3 FALSE — c",
+        "# P3 FALSE — c",
+        "1. P3 FALSE — c",
+        "(1) P3 FALSE — c",
+        "• P3 FALSE — c",
+        "- [ ] P3 FALSE — c",
+        "> - P3 FALSE — c",
+        "P-3 FALSE — c",
+        " P3 FALSE — c",
+        # #3238 item 1: a misplaced Expected line, and any other prose
+        "Expected before checking: later",
+        "Note: one more thing",
+        "Effect:",
+    ],
+)
+def test_the_block_paragraph_is_closed(line):
+    """#3238: from the verdict line to the next blank line, every line must be
+    one of the block's lines. Any other line refuses by its line number rather
+    than being read as prose, so no spelling of a claim can be dropped."""
+    got = rr.premise_block(_block() + line + "\n")
+    assert got[0] is None and "line 5 is inside the premise block" in got[2], got
+
+
+def test_the_trailer_lines_and_a_closing_fence_belong_to_the_block():
+    text = "```\n" + _block() + "Effect: x\nBetter shape: none found\nPR-shape: OK (10)\n```\n"
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+    claim_after_trailer = _block() + "Effect: x\nP3 FALSE — c\n"
+    assert "line 6 is inside the premise block" in rr.premise_block(claim_after_trailer)[2]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _block(between=()),
+        "Expected before checking: x\n" + _block(between=()),
+        _block(between=()) + "\nExpected before checking: x\n",
+    ],
+)
+def test_the_expected_line_is_required_directly_under_the_verdict(text):
+    """#3238 item 1 (owner: Expected is required): a block without its
+    Expected line, or with it anywhere but directly under the verdict, is
+    refused."""
+    got = rr.premise_block(text)
+    assert got[0] is None and "Expected before checking" in got[2], got
+
+
+def test_persisted_state_after_the_trailers_belongs_to_the_block():
+    """#3238 diff audit SF-1: the architect agent's Step 0.7 emits
+    Persisted-state right after PR-shape; the closed paragraph allows it."""
+    text = _block() + "Effect: x\nBetter shape: none found\nPR-shape: OK (5)\nPersisted-state: NONE\n"
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+
+
+def test_an_expected_line_on_a_claimless_stub_does_not_count():
+    """Diff audit NOTE 2: the Expected line must sit on a block that has
+    claims; a trailing verdict-plus-Expected stub does not carry it."""
+    text = _block(between=()) + "\nDesign-premise: SOUND\nExpected before checking: x\n"
+    got = rr.premise_block(text)
+    assert got[0] is None and "Expected before checking" in got[2], got
+
+
+def test_the_block_begins_at_its_verdict_line():
+    """Diff audit NOTE 3, a stated residual: the paragraph is closed downward
+    from the verdict line. Lines above it are prose, so the doc asks for a
+    blank line above the verdict line; a claim-like line there is not read."""
+    text = "P3 FALSE — c\n" + _block()
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+
+
+def test_a_headline_summary_block_need_not_repeat_the_expected_line():
+    text = _block(between=()) + "\n" + _block()
+    assert rr.premise_block(text) == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None)
+
+
+@pytest.mark.parametrize(
+    "line, refused",
+    [
+        # #3238 item 3: a heading or list item is a verdict only by its uppercase token
+        ("1. Design-premise: what evidence would make this sound?", False),
+        ("## Design-premise: compare sound and broken shapes", False),
+        ("## Design-premise: Sound reasoning, weak evidence", False),
+        ("- Design-premise: Broken", False),  # title case: stated residual, prose
+        ("> Design-premise: BROKEN", False),  # the doc's quote form
+        ("## Design-premise: BROKEN", True),
+        ("- Design-premise: `BROKEN`", True),
+        ('- Design-premise: "BROKEN"', True),
+        ("- Design-premise: verdict BROKEN", True),
+        ("1) Design-premise: SOUND-BUT-INFERIOR", True),
+        ("| Design-premise: | BROKEN |", True),  # diff audit NOTE 4: a table row
+    ],
+)
+def test_a_marked_verdict_line_is_judged_by_its_uppercase_token(line, refused):
+    got = rr.premise_block(line + "\n\n" + _block())
+    if refused:
+        assert got[0] is None and "line 1 gives a 'Design-premise:' verdict" in got[2], got
+    else:
+        assert got == ("SOUND", {"1": "TRUE", "2": "FALSE"}, None), got
 
 
 def test_a_wrapped_claim_is_refused_rather_than_dropping_the_rest():
     """#3127 round 1 class audit C8: a wrapped claim ended the run and every
-    claim after it was silently dropped."""
+    claim after it was silently dropped. #3238 closes the paragraph, so the
+    wrapped tail of the LAST claim (once accepted, C9) is refused too."""
     text = _block("Design-premise: SOUND", "P1 TRUE \u2014 a", "P2 FALSE \u2014 b is long", "and wraps", "P3 FALSE \u2014 c")
     got = rr.premise_block(text)
-    assert got[0] is None, got
-    assert "line 4 breaks the claim lines under line 1" in got[2], got
-    assert "claim at line 5 is cut off" in got[2], got
+    assert got[0] is None and "line 5 is inside the premise block" in got[2], got
     tail = _block("Design-premise: SOUND", "P1 TRUE \u2014 a", "P2 FALSE \u2014 b is long", "and wraps")
-    assert rr.premise_block(tail)[:2] == ("SOUND", {"1": "TRUE", "2": "FALSE"})
+    got = rr.premise_block(tail)
+    assert got[0] is None and "line 5 is inside the premise block" in got[2], got
 
 
 def test_repeated_blocks_must_agree():

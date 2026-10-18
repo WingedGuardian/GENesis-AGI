@@ -1144,9 +1144,12 @@ _NET_LINES="$(build_network_identity_block \
 # Target: ~/.claude/CLAUDE.md (user-level, not tracked in repo).
 # Seed the file on first run; on subsequent runs only replace the
 # network-identity sentinel block. <<\SEED prevents expansion inside
-# the single-quoted bash -c.
+# the single-quoted bash -c. The block is replaced by the lib's
+# write_sentinel_block, shipped into the container with `declare -f` so
+# there is one implementation: it refuses (file untouched, reason on stderr)
+# when the markers are unbalanced, where an inline sed range deleted to EOF.
 echo "$_NET_LINES" | incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
-    --env "HOME=/home/ubuntu" -- bash -c '
+    --env "HOME=/home/ubuntu" -- bash -c "$(declare -f write_sentinel_block)"'
     _claude="$HOME/.claude/CLAUDE.md"
     mkdir -p "$HOME/.claude"
     # Seed file on first run (placeholder sections filled by later scripts)
@@ -1182,14 +1185,10 @@ section is safe to hand-edit; install scripts preserve it.
 reminders here.)
 SEED
     fi
-    # Replace network-identity sentinel block with fresh data from stdin
-    sed -i "/<!-- begin:network-identity -->/,/<!-- end:network-identity -->/d" "$_claude"
-    {
-        echo "<!-- begin:network-identity -->"
-        cat   # consume stdin — _NET_LINES includes heading + content
-        echo "<!-- end:network-identity -->"
-    } >> "$_claude"
-' 2>/dev/null && echo "  + Network identity written to ~/.claude/CLAUDE.md" || \
+    # Replace the network-identity block with stdin (_NET_LINES: heading +
+    # content). Its status is the script status; a refusal prints why.
+    write_sentinel_block "$_claude" network-identity
+' && echo "  + Network identity written to ~/.claude/CLAUDE.md" || \
     echo "  WARN: Could not write network identity to ~/.claude/CLAUDE.md"
 
 # ── Install Guardian on host ───────────────────────────────────

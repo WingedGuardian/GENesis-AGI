@@ -110,8 +110,8 @@ def test_chromium_versions(tmp_path):
         )
     )
     assert pb.chromium_profile_version(profile) == "145.0.7632.6"
-    assert pb.chromium_engine_version(pkg) == "145.0.7632.6"
-    assert pb.chromium_engine_version(tmp_path / "missing") is None
+    assert pb.chromium.browser_version(pkg) == "145.0.7632.6"
+    assert pb.chromium.browser_version(tmp_path / "missing") is None
 
 
 # ── is another browser using the profile? (same semantics as ProfileManager in #2912) ─
@@ -701,15 +701,6 @@ def test_chromium_entry_point_no_op_on_the_same_version(tmp_path, monkeypatch):
     _fake_package(tmp_path, monkeypatch)
     assert pb.backup_chromium_profile(p, "fakepw") is None
 
-
-def test_chromium_package_dir_never_raises(monkeypatch):
-    """A stubbed module with no spec, or no module at all, reads as unknown."""
-    assert pb.chromium_package_dir("no_such_package_xyz") is None
-    monkeypatch.setitem(sys.modules, "stubbed_pkg_xyz", object())
-    assert pb.chromium_package_dir("stubbed_pkg_xyz") is None
-
-
-# ── round 1 (#3199) ───────────────────────────────────────────────────────────
 
 
 def test_an_untiered_disk_skips_the_copy(tmp_path, monkeypatch):

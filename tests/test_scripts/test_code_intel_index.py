@@ -1082,6 +1082,11 @@ def test_no_raw_index_spawns_outside_entrypoint():
             if "index_repository" in line:
                 violations.append(f"{rel}:{lineno}: raw index_repository spawn")
             elif "gitnexus" in line and "analyze" in line:
+                if (rel, stripped) in {
+                    (Path("tests/test_scripts/test_codebase_managed_uninstall.py"), '(process / "cmdline").write_bytes(b"node\\0/opt/gitnexus/dist/cli/index.js\\0analyze\\0")'),
+                    (Path("tests/test_scripts/test_codebase_managed_uninstall.py"), 'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "/opt/gitnexus/dist/cli/index.js", "analyze"], cwd=transaction / "genesis")'),
+                }:
+                    continue  # exact inert observations and owned Python sleeper
                 violations.append(f"{rel}:{lineno}: raw gitnexus analyze spawn")
     assert not violations, (
         "Raw code-intel index spawn(s) found — route them through "
@@ -1127,6 +1132,16 @@ def test_installer_does_not_claim_queue_success_after_writer_failure():
     assert "index_marker.py\" write" in queue
     assert "|| true" not in queue
     assert "WARNING: could not queue initial code intelligence index" in queue
+
+
+@pytest.mark.parametrize("path", ["scripts/codebase_managed.py", "tests/test_scripts/test_codebase_managed_uninstall.py"])
+def test_observation_exceptions_do_not_exempt_raw_spawns(tmp_path, monkeypatch, path):
+    file = tmp_path / path
+    file.parent.mkdir(parents=True)
+    file.write_text('subprocess.Popen(["gitnexus", "analyze"])\n')
+    monkeypatch.setitem(test_no_raw_index_spawns_outside_entrypoint.__globals__, "_REPO_ROOT", tmp_path)
+    with pytest.raises(AssertionError, match="raw gitnexus analyze spawn"):
+        test_no_raw_index_spawns_outside_entrypoint()
 
 
 # ── Codebase Memory batch admission ───────────────────────────────────────

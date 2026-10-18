@@ -1,0 +1,1 @@
+- Added an opt-in same-owner A2A conversation interface: enrolled agents can ask Genesis to reason with its normal background tools, continue bounded conversations, poll/cancel native turns and retrieve scanned results. Owner approval remains in Telegram/dashboard; no daily peer task quota or new listener.
