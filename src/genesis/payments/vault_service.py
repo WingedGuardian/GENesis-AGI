@@ -298,8 +298,8 @@ class VaultService:
         last, audit_ok = None, self._db is not None
         if audit_ok:
             try:
-                async with self._audit_lock:
-                    rows = await audit.list_recent(self._db, 1)
+                async with self._audit_lock:  # the last KEY event, not an approval row
+                    rows = await audit.list_recent(self._db, 1, events=audit.KEY_EVENTS)
                 last = rows[0] if rows else None
             except Exception:  # noqa: BLE001 - reported as audit unavailable
                 audit_ok = False

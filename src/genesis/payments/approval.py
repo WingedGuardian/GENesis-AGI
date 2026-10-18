@@ -135,7 +135,6 @@ class PaymentApprovalRegistry:
         # finds the nonce and refuses it rather than being answered "unknown"
         # while the request stays open.
         self._pending[nonce] = pending
-        timer = None
         try:
             try:
                 msg = await safe_send_message(
@@ -162,20 +161,19 @@ class PaymentApprovalRegistry:
                 msg.message_id,
                 msg.text,
             )
-            timer = asyncio.get_running_loop().call_later(self._timeout_s, self._expire, nonce)
-            outcome = await pending.future
-            if outcome == EXPIRED:
+            # The deadline belongs to this wait, not to the dict: a tap that
+            # popped the nonce and then died cannot leave it waiting forever.
+            try:
+                return await asyncio.wait_for(asyncio.shield(pending.future), self._timeout_s)
+            except TimeoutError:
+                if not pending.future.done():  # a tap still writing its grant row loses
+                    pending.future.set_result(EXPIRED)
                 await self._record("approval_expired", detail)
-            return outcome
+                return EXPIRED
         finally:
-            if timer is not None:
-                timer.cancel()
             self._pending.pop(nonce, None)
-
-    def _expire(self, nonce: str) -> None:
-        pending = self._pending.pop(nonce, None)
-        if pending is not None and not pending.future.done():
-            pending.future.set_result(EXPIRED)
+            if not pending.future.done():  # the requester was cancelled: no grant can land
+                pending.future.cancel()
 
     def _mismatch(self, pending: _Pending, user_id: int | None, message) -> str | None:
         """Why this tap must not grant, or None."""
@@ -201,16 +199,38 @@ class PaymentApprovalRegistry:
         pending = self._pending.pop(nonce, None)  # before any await: one tap only
         if pending is None:
             return False
-        reason = self._mismatch(pending, user_id, message)
-        if reason is None and pending.future.done():  # the requester stopped waiting
-            reason = "the request is no longer waiting"
-        if reason is None and not await self._record("approval_granted", pending.detail):
-            reason = "the audit write failed"
-        if reason is not None:
+        try:
+            reason = self._mismatch(pending, user_id, message)
+            if reason is None and pending.future.done():  # the requester stopped waiting
+                reason = "the request is no longer waiting"
+            if reason is None:
+                if not await self._record("approval_granted", pending.detail):
+                    reason = "the audit write failed"
+                elif pending.future.done():  # expired or gone while the row was written
+                    reason = "requester gone after grant row"
+            if reason is None:
+                pending.future.set_result(GRANTED)
+                return True
             await self._record(
                 "approval_refused", {**pending.detail, "reason": reason, "tapper": user_id}
             )
-        if pending.future.done():  # cancelled during the audit write: nothing to grant
             return False
-        pending.future.set_result(GRANTED if reason is None else REFUSED)
-        return reason is None
+        finally:
+            # A cancelled or failed tap still settles the request it consumed.
+            if not pending.future.done():
+                pending.future.set_result(REFUSED)
+
+
+async def start_payment_services(runtime):
+    """For ``serve()``: the registry, then the vault service whose connection audits it."""
+    from genesis.payments.vault_service import start_vault_service
+
+    registry = PaymentApprovalRegistry()
+    return registry, await start_vault_service(runtime, registry)
+
+
+def attach_telegram(registry: PaymentApprovalRegistry | None, adapter, config: dict) -> None:
+    """After Telegram starts: attach its bot, with the owner = first allowlist id as written."""
+    owner = (config.get("allowed_users_ordered") or (None,))[0]
+    if registry is not None and owner is not None and getattr(adapter, "_app", None) is not None:
+        registry.attach_bot(adapter._app.bot, owner)

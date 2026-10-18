@@ -359,6 +359,13 @@ async def test_approval_rows_do_not_hide_an_unlock_left_open(db, tmp_path):
     assert (await audit.list_recent(db, 1))[0]["event"] == "lock"
 
 
+async def test_status_last_event_is_the_last_key_event(db, tmp_path):
+    await audit.record_event(db, "lock")
+    await audit.record_event(db, "approval_requested", {"nonce": "n"})
+    svc = VaultService(db, vault_path=tmp_path / "v", socket_path=tmp_path / "s")
+    assert (await svc.status())["last_event"]["event"] == "lock"
+
+
 async def test_start_vault_service_attaches_the_registry_audit(db, monkeypatch):
     from genesis.payments import vault_service as vsvc
 
@@ -367,6 +374,154 @@ async def test_start_vault_service_attaches_the_registry_audit(db, monkeypatch):
     registry = PaymentApprovalRegistry()
     service = await vsvc.start_vault_service(MagicMock(), registry)
     assert registry._audit == service._audit
+
+
+# -- cancellation and the deadline ---------------------------------------------------
+
+
+def _gated_audit(svc_audit):
+    """The real audit, held at the grant row until ``release`` is set."""
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def audit_fn(event, detail):
+        if event == "approval_granted":
+            entered.set()
+            await release.wait()
+        return await svc_audit(event, detail)
+
+    return audit_fn, entered, release
+
+
+async def test_a_tap_cancelled_during_its_grant_row_settles_the_request(make):
+    registry, bot, _ctx = make(timeout_s=60)
+    audit_fn, entered, _release = _gated_audit(registry._audit)
+    registry.attach_audit(audit_fn)
+    task = asyncio.create_task(registry.request(FIELDS))
+    nonce = await _wait_recorded(registry)
+    tap = asyncio.create_task(registry.handle_tap(nonce, OWNER, _msg(bot.sent[0], bot)))
+    await asyncio.wait_for(entered.wait(), 2)
+    tap.cancel()
+    assert await asyncio.wait_for(task, 2) == ap.REFUSED  # not the 60 s deadline
+
+
+async def test_the_deadline_does_not_depend_on_the_pending_dict(make):
+    registry, _bot, _ctx = make(timeout_s=0.2)
+    task = asyncio.create_task(registry.request(FIELDS))
+    await _wait_recorded(registry)
+    registry._pending.clear()  # a consumer that took the nonce and never settled it
+    assert await asyncio.wait_for(task, 2) == ap.EXPIRED
+
+
+async def test_a_grant_row_then_expiry_records_the_refusal(make, db):
+    registry, bot, _ctx = make(timeout_s=0.2)
+    audit_fn, entered, release = _gated_audit(registry._audit)
+    registry.attach_audit(audit_fn)
+    task = asyncio.create_task(registry.request(FIELDS))
+    nonce = await _wait_recorded(registry)
+    tap = asyncio.create_task(registry.handle_tap(nonce, OWNER, _msg(bot.sent[0], bot)))
+    await asyncio.wait_for(entered.wait(), 2)
+    assert await asyncio.wait_for(task, 2) == ap.EXPIRED
+    release.set()
+    assert await tap is False
+    rows = list(reversed(await audit.list_recent(db, 100)))
+    assert [r["event"] for r in rows] == [
+        "approval_requested",
+        "approval_expired",
+        "approval_granted",
+        "approval_refused",
+    ]
+    assert rows[-1]["detail"]["reason"] == "requester gone after grant row"
+
+
+async def test_a_cancelled_requester_gets_no_grant(make, db):
+    registry, bot, _ctx = make(timeout_s=60)
+    audit_fn, entered, release = _gated_audit(registry._audit)
+    registry.attach_audit(audit_fn)
+    task = asyncio.create_task(registry.request(FIELDS))
+    nonce = await _wait_recorded(registry)
+    tap = asyncio.create_task(registry.handle_tap(nonce, OWNER, _msg(bot.sent[0], bot)))
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    assert await tap is False
+    assert (await _events(db))[-1] == "approval_refused"
+
+
+# -- production wiring ------------------------------------------------------------
+
+
+async def test_start_payment_services_builds_the_registry_the_vault_audits(db, monkeypatch):
+    from genesis.payments import vault_service as vsvc
+
+    monkeypatch.setattr("genesis.db.connection.get_db", AsyncMock(return_value=db))
+    monkeypatch.setattr(vsvc.VaultService, "start", AsyncMock())
+    registry, service = await ap.start_payment_services(MagicMock())
+    assert isinstance(registry, PaymentApprovalRegistry) and registry._audit == service._audit
+
+
+async def test_adapter_start_hands_the_registry_to_the_callback_handler(monkeypatch):
+    """The real TelegramAdapterV2.start -> make_handlers_v2 -> HandlerContext path."""
+    from genesis.channels.telegram import adapter_v2
+    from genesis.channels.telegram.handlers_v2 import make_handlers_v2
+
+    captured = {}
+
+    class Stop(Exception):
+        pass
+
+    def capture(*args, **kw):
+        captured["handlers"] = make_handlers_v2(*args, **kw)
+        raise Stop
+
+    monkeypatch.setattr(adapter_v2, "make_handlers_v2", capture)
+    adapter = adapter_v2.TelegramAdapterV2(token="t", conversation_loop=MagicMock())
+    registry = MagicMock(spec=PaymentApprovalRegistry)
+    registry.handle_tap = AsyncMock(return_value=False)
+    adapter.payment_approvals = registry
+    with pytest.raises(Stop):
+        await adapter.start()
+    bot = FakeBot()
+    query = CallbackQuery(
+        id="q", from_user=User(id=OWNER, first_name="u", is_bot=False), chat_instance="c",
+        data="payapprove:n",
+    )
+    query.set_bot(bot)
+    await captured["handlers"]["callback_query"](Update(update_id=1, callback_query=query), None)
+    registry.handle_tap.assert_awaited_once_with("n", OWNER, None)
+
+
+async def test_start_telegram_attaches_the_bot_and_owner_after_start(monkeypatch):
+    from genesis.channels.bridge_config import build_bridge_config
+    from genesis.hosting.standalone import StandaloneAdapter
+
+    monkeypatch.setenv("TTS_ENABLED", "false")
+    config = build_bridge_config({"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_ALLOWED_USERS": "300,100"})
+    host = StandaloneAdapter()
+    host._runtime = MagicMock()
+    host._payment_approvals = registry = PaymentApprovalRegistry()
+    bot = FakeBot()
+    seen = {}
+
+    class Adapter:
+        payment_approvals = None
+        _app = None
+        _stopping = False
+
+        async def start(self):
+            seen["registry"] = self.payment_approvals
+            seen["bot_before_start"] = registry._bot
+            self._app = MagicMock(bot=bot)
+
+    with (
+        patch("genesis.util.process_lock.ProcessLock.is_locked", return_value=False),
+        patch("genesis.channels.bridge._load_bridge_config", return_value=config),
+        patch("genesis.channels.bridge.create_telegram_adapter", return_value=Adapter()),
+    ):
+        await host._start_telegram()
+    assert seen == {"registry": registry, "bot_before_start": None}
+    assert registry._bot is bot and registry._owner == 300
 
 
 # -- registration: never resolvable generically ---------------------------------
