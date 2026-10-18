@@ -1427,7 +1427,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: e943bc114 2026-10-16
+verified: 96e0a4de3 2026-10-18
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1657,6 +1657,11 @@ the shared banner is not an assertion about all concurrent sessions.
   reclaim); a click that opens a new tab switches the tools to it. `browser_fill` refuses a payment card number
   as the value and `browser_run_js` one in its script (the value check only:
   telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
+  Every `_impl_browser_*` result and error passes `@_redacted` (card numbers in
+  snapshots, script results, urls, titles and exception text become
+  `[card redacted]`; a contract test requires the decorator on each), and
+  `_CardRedactingFilter` on the browser, FastMCP and MCP SDK loggers redacts
+  log lines and tracebacks.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
