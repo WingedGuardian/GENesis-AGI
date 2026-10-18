@@ -1423,7 +1423,8 @@ verified: 637f7f7bb679 2026-10-05
   control, because a page can aim a request at an IP address), and
   `auth.check_api_network_scope` refuses an untrusted TCP peer (loopback and
   the tailnet are trusted, and the host's proxy delivers LAN traffic as
-  loopback). Both are registered by `auth.apply_dashboard_gates`. The
+  loopback). Both are registered by `auth.apply_dashboard_gates`, which the
+  standalone host and the Agent Zero server-startup extension both call. The
   credential hooks leave a gap: `auth._check_auth` is blueprint-level and gates HTML
   pages only, returning None for any `/api/` or `/v1/` path;
   `auth.check_api_mutation_auth` is app-level and returns None for

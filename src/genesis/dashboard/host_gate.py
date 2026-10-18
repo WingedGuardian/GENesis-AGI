@@ -49,8 +49,12 @@ _HOST_GATED_EXACT = ("/ws/terminal", "/genesis")
 _HOST_SHAPE = re.compile(r"(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(:[0-9]{1,5})?")
 
 # How long a FAILED MagicDNS lookup is remembered before the next request may
-# try again. A success is cached for the life of the process.
+# try again.
 _MAGICDNS_RETRY_SECONDS = 300.0
+# How long a SUCCESSFUL lookup is trusted before the next request re-reads it,
+# so a renamed tailnet device is accepted without a server restart. The old
+# names keep answering while a refresh runs or if it fails.
+_MAGICDNS_REFRESH_SECONDS = 600.0
 # `tailscale status --self --json` is a local socket query: measured 23-79 ms
 # over 5 runs on a live install. It runs inside an HTTP request (the first one
 # addressed by a DNS name we do not otherwise know), so a wedged tailscaled must
@@ -62,6 +66,7 @@ _REFUSAL_LOG_INTERVAL_S = 60.0
 
 _lock = threading.Lock()
 _magicdns_names: tuple[str, ...] | None = None
+_magicdns_read_at: float | None = None
 _magicdns_failed_at: float | None = None
 _magicdns_inflight = False
 _machine_names: tuple[str, ...] | None = None
@@ -76,10 +81,11 @@ _REFUSAL = (
 
 def _reset_cache() -> None:
     """Forget every cached lookup and the refusal-log throttle (tests only)."""
-    global _magicdns_names, _magicdns_failed_at, _magicdns_inflight, _machine_names
-    global _refusal_logged_at, _refusals_suppressed
+    global _magicdns_names, _magicdns_read_at, _magicdns_failed_at, _magicdns_inflight
+    global _machine_names, _refusal_logged_at, _refusals_suppressed
     with _lock:
         _magicdns_names = None
+        _magicdns_read_at = None
         _magicdns_failed_at = None
         _magicdns_inflight = False
         _machine_names = None
@@ -145,6 +151,7 @@ def _run_tailscale_status() -> str | None:
             ["tailscale", "status", "--self", "--json"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=_TAILSCALE_STATUS_TIMEOUT_S,
             check=False,
         )
@@ -171,32 +178,41 @@ def _parse_magicdns(raw: str | None) -> tuple[str, ...] | None:
 def _magicdns() -> tuple[str, ...]:
     """This machine's Tailscale names, looked up lazily and cached.
 
-    The subprocess runs outside the lock; concurrent callers that arrive while
-    a lookup is in flight get no names for that request rather than queueing.
+    A successful read is re-read after ``_MAGICDNS_REFRESH_SECONDS``; a failed
+    one is retried after ``_MAGICDNS_RETRY_SECONDS``. The subprocess runs outside
+    the lock; callers that arrive while a lookup is in flight, or while a failure
+    is being waited out, get the last names read (none, before the first
+    success) rather than queueing.
     """
-    global _magicdns_names, _magicdns_failed_at, _magicdns_inflight
+    global _magicdns_names, _magicdns_read_at, _magicdns_failed_at, _magicdns_inflight
     with _lock:
-        if _magicdns_names is not None:
-            return _magicdns_names
+        now = time.monotonic()
+        known = _magicdns_names or ()
+        if _magicdns_read_at is not None and now - _magicdns_read_at < _MAGICDNS_REFRESH_SECONDS:
+            return known
         if _magicdns_inflight:
-            return ()
-        if (
-            _magicdns_failed_at is not None
-            and time.monotonic() - _magicdns_failed_at < _MAGICDNS_RETRY_SECONDS
-        ):
-            return ()
+            return known
+        if _magicdns_failed_at is not None and now - _magicdns_failed_at < _MAGICDNS_RETRY_SECONDS:
+            return known
         _magicdns_inflight = True
+    names = None
     try:
         names = _parse_magicdns(_run_tailscale_status())
     finally:
+        # One critical section clears the in-flight flag AND records the
+        # outcome, so no caller sees "not in flight" with nothing recorded. An
+        # unexpected exception is recorded as a failure, so it is retried after
+        # the interval rather than on every request.
         with _lock:
             _magicdns_inflight = False
-    with _lock:
-        if names is None:
-            _magicdns_failed_at = time.monotonic()
-            return ()
-        _magicdns_names = names
-        return names
+            if names is None:
+                _magicdns_failed_at = time.monotonic()
+            else:
+                _magicdns_names = names
+                _magicdns_read_at = time.monotonic()
+                _magicdns_failed_at = None
+            result = _magicdns_names or ()
+    return result
 
 
 def _machine_hostnames() -> tuple[str, ...]:

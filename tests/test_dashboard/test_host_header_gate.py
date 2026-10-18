@@ -331,6 +331,58 @@ def test_magicdns_failure_retries_after_interval(gate, monkeypatch):
     assert len(calls) == 2
 
 
+def test_renamed_device_is_accepted_after_refresh(gate, monkeypatch):
+    # A tailnet rename must not need a server restart: the success cache has a
+    # lifetime, and the new name passes once it is re-read.
+    clock = [1000.0]
+    current = ["box.tail0000.ts.net."]
+    monkeypatch.setattr(hg.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(hg, "_run_tailscale_status", lambda: _ts_json(current[0]))
+    hg._reset_cache()
+    assert _get(gate, "/genesis", "box.tail0000.ts.net").status_code == 200
+    current[0] = "desk.tail0000.ts.net."
+    assert _get(gate, "/genesis", "desk.tail0000.ts.net").status_code == 403  # not re-read yet
+    clock[0] += hg._MAGICDNS_REFRESH_SECONDS + 1
+    assert _get(gate, "/genesis", "desk.tail0000.ts.net").status_code == 200
+    assert _get(gate, "/genesis", "box.tail0000.ts.net").status_code == 403
+
+
+def test_unexpected_lookup_error_is_remembered_as_a_failure(gate, monkeypatch):
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(hg, "_run_tailscale_status", boom)
+    hg._reset_cache()
+    with pytest.raises(RuntimeError):
+        hg._magicdns()
+    assert hg._magicdns() == ()  # not retried on the next request
+    assert calls == [1]
+    assert hg._magicdns_inflight is False
+
+
+def test_failed_refresh_keeps_the_last_names(gate, monkeypatch):
+    clock = [1000.0]
+    reply = [_ts_json("box.tail0000.ts.net.")]
+    calls = []
+
+    def fake():
+        calls.append(1)
+        return reply[0]
+
+    monkeypatch.setattr(hg.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(hg, "_run_tailscale_status", fake)
+    hg._reset_cache()
+    assert _get(gate, "/genesis", "box.tail0000.ts.net").status_code == 200
+    reply[0] = None  # tailscaled stops answering
+    clock[0] += hg._MAGICDNS_REFRESH_SECONDS + 1
+    assert _get(gate, "/genesis", "box.tail0000.ts.net").status_code == 200
+    assert _get(gate, "/genesis", "box.tail0000.ts.net").status_code == 200
+    assert len(calls) == 2  # the failure is remembered, not retried per request
+
+
 @pytest.mark.parametrize(
     "payload", [None, "not json", "[]", '{"Self": {}}', '{"Self": {"DNSName": 7}}']
 )
