@@ -9,8 +9,11 @@ The function is sourced from the REAL lib and run under host-setup's
 ``set -euo pipefail``, with a stub ``incus`` on PATH: ``incus query`` answers
 fixture JSON shaped like ``/1.0/instances/<name>`` (measured shape on incus
 6.0.0: ``devices`` holds the instance's own devices, ``expanded_devices`` adds
-the profile's), and ``incus exec <c> -T -- python3 …`` runs the local python3
-with the same arguments and stdin, standing in for the container's interpreter.
+the profile's), ``incus query /1.0/instances/<name>/state`` answers the
+container's addresses (measured shape: ``network.<iface>.addresses[]`` with
+``family`` and ``address``), and ``incus exec <c> -T -- python3 …`` runs the
+local python3 with the same arguments and stdin, standing in for the
+container's interpreter.
 """
 
 from __future__ import annotations
@@ -29,6 +32,11 @@ _INCUS_STUB = r"""#!/bin/bash
 echo "$*" >> "$INCUS_LOG"
 case "$1" in
   query)
+    case "$2" in
+      */state)
+        [ -n "${INCUS_STATE_FILE:-}" ] || exit 1
+        cat "$INCUS_STATE_FILE"; exit 0 ;;
+    esac
     [ "${INCUS_QUERY_RC:-0}" != "0" ] && exit "$INCUS_QUERY_RC"
     cat "$INCUS_QUERY_FILE"; exit 0 ;;
   exec)
@@ -41,13 +49,20 @@ exit 0
 """
 
 LAN = "198.51.100.7"  # TEST-NET-2
+OWN = "10.0.0.5"  # the container's own bridge address in the state fixture
+
+
+def _state(*inet):
+    addrs = [{"family": "inet", "address": a, "scope": "global"} for a in inet]
+    addrs.append({"family": "inet6", "address": "fd00::5", "scope": "global"})
+    return {"network": {"eth0": {"addresses": addrs}}}
 
 
 def _proxy(listen, connect="tcp:127.0.0.1:5000", **extra):
     return {"type": "proxy", "listen": listen, "connect": connect, **extra}
 
 
-def _run(tmp_path, devices, *, local=None, query_rc=0, raw=None):
+def _run(tmp_path, devices, *, local=None, query_rc=0, raw=None, state=None, raw_state=None):
     """Run the check; return (verdict, first line, fix line or None)."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -62,6 +77,11 @@ def _run(tmp_path, devices, *, local=None, query_rc=0, raw=None):
     )
     qfile = tmp_path / "query.json"
     qfile.write_text(payload)
+    sfile = tmp_path / "state.json"
+    if raw_state is not None:
+        sfile.write_text(raw_state)
+    elif state is not None:
+        sfile.write_text(json.dumps(state))
     env = {
         "PATH": f"{bindir}:/usr/bin:/bin",
         "INCUS_LOG": str(tmp_path / "incus.log"),
@@ -69,6 +89,8 @@ def _run(tmp_path, devices, *, local=None, query_rc=0, raw=None):
         "INCUS_QUERY_RC": str(query_rc),
         "HOME": str(tmp_path),
     }
+    if raw_state is not None or state is not None:
+        env["INCUS_STATE_FILE"] = str(sfile)
     script = (
         f'set -euo pipefail; source "{LIB}"; '
         'if out=$(dashboard_proxy_check c1 5000); then printf "OK\\n%s\\n" "$out"; '
@@ -90,16 +112,16 @@ def test_lib_parses():
     "devices",
     [
         {"dashboard-proxy": _proxy("tcp:0.0.0.0:5000")},  # host-setup's own default
-        {"dashboard-proxy": _proxy("tcp:[::]:5000")},  # IPv6 wildcard
+        {"dashboard-proxy": _proxy("tcp:0.0.0.0:5000", "tcp:127.0.0.2:5000")},  # any loopback
         {
-            "web": _proxy("tcp:0.0.0.0:5000", connect="tcp:10.0.0.5:5000")
-        },  # other name, bridge connect
+            "web": _proxy("tcp:0.0.0.0:5000", connect=f"tcp:{OWN}:5000")
+        },  # other name, connect to the container's own address
         {"dashboard-proxy": _proxy("tcp:0.0.0.0:5000", bind="host", proxy_protocol="false")},
         {"dashboard-proxy": _proxy("tcp:0.0.0.0:5000", proxy_protocol="0")},
     ],
 )
 def test_serving_device_passes(tmp_path, devices):
-    verdict, first, fix = _run(tmp_path, devices)
+    verdict, first, fix = _run(tmp_path, devices, state=_state(OWN))
     assert verdict == "OK", first
     assert "listen=" in first and "connect=" in first
     assert fix is None
@@ -130,10 +152,22 @@ def test_serving_device_passes(tmp_path, devices):
             "connect=tcp:127.0.0.1:8080",
         ),
         ({"eth0": {"type": "nic", "network": "br0"}}, "no proxy device listens"),
+        # [::] is the IPv6 wildcard; the routes setup prints are IPv4.
+        ({"dashboard-proxy": _proxy("tcp:[::]:5000")}, "listens on the IPv6 wildcard only"),
+        # Same port on an address that is not this container: another service.
+        (
+            {"web": _proxy("tcp:0.0.0.0:5000", connect="tcp:203.0.113.9:5000")},
+            "connect=tcp:203.0.113.9:5000 is not this container",
+        ),
+        # The server listens on IPv4 0.0.0.0, so an IPv6 target reaches nothing.
+        (
+            {"web": _proxy("tcp:0.0.0.0:5000", connect="tcp:[::1]:5000")},
+            "connect=tcp:[::1]:5000 is not this container",
+        ),
     ],
 )
 def test_non_serving_device_fails_with_reason(tmp_path, devices, why):
-    verdict, first, fix = _run(tmp_path, devices)
+    verdict, first, fix = _run(tmp_path, devices, state=_state(OWN))
     assert verdict == "NO"
     assert why in first
     assert fix, "a failed check must say how to fix it"
@@ -163,8 +197,27 @@ def test_fix_adds_a_device_when_none_listens(tmp_path):
 def test_fix_sets_listen_on_an_existing_local_device(tmp_path):
     # `device add` would fail here: the device already exists. Only `listen` is
     # changed; the device's own connect target is left alone.
-    _, _, fix = _run(tmp_path, {"web": _proxy(f"tcp:{LAN}:5000", connect="tcp:10.0.0.5:5000")})
+    _, _, fix = _run(
+        tmp_path, {"web": _proxy(f"tcp:{LAN}:5000", connect=f"tcp:{OWN}:5000")}, state=_state(OWN)
+    )
     assert fix == "incus config device set c1 web listen=tcp:0.0.0.0:5000"
+
+
+@pytest.mark.parametrize(
+    "state, raw_state",
+    [(None, None), (None, "not json"), ({"network": "x"}, None), (_state(), None)],
+)
+def test_container_address_unknown_only_loopback_verifies(tmp_path, state, raw_state):
+    # Without the container's addresses, a non-loopback target cannot be shown
+    # to be this container: it fails and the fix points at loopback.
+    devices = {"web": _proxy("tcp:0.0.0.0:5000", connect=f"tcp:{OWN}:5000")}
+    verdict, _, fix = _run(tmp_path, devices, state=state, raw_state=raw_state)
+    assert verdict == "NO"
+    assert fix == "incus config device set c1 web connect=tcp:127.0.0.1:5000"
+    verdict, _, _ = _run(
+        tmp_path, {"d": _proxy("tcp:0.0.0.0:5000")}, state=state, raw_state=raw_state
+    )
+    assert verdict == "OK"
 
 
 @pytest.mark.parametrize(
@@ -190,6 +243,44 @@ def test_fix_sets_every_failing_key(tmp_path, dev, keys):
     assert fix == f"incus config device set c1 dashboard-proxy {keys}"
 
 
+@pytest.mark.parametrize(
+    ("extra", "keys"),
+    [
+        ({}, "listen=tcp:0.0.0.0:5000 connect=tcp:127.0.0.1:5000"),
+        (
+            {"bind": "instance", "proxy_protocol": "true"},
+            "listen=tcp:0.0.0.0:5000 bind=host proxy_protocol=false connect=tcp:127.0.0.1:5000",
+        ),
+    ],
+)
+def test_reused_default_name_gets_every_failing_key(tmp_path, extra, keys):
+    # Reusing the off-port dashboard-proxy must repair bind and proxy_protocol
+    # too, or the repaired device still fails this check.
+    dev = _proxy("tcp:0.0.0.0:6000", "tcp:127.0.0.1:6000", **extra)
+    _, _, fix = _run(tmp_path, {"dashboard-proxy": dev})
+    assert fix == f"incus config device set c1 dashboard-proxy {keys}"
+
+
+@pytest.mark.parametrize("connect", ["tcp:127.0.0.1:5000", f"tcp:{OWN}:5000"])
+def test_nat_mode_is_not_verified_and_the_fix_turns_it_off(tmp_path, connect):
+    # NAT mode starts only with a connect address that is a static NIC address
+    # of the instance, which this check cannot confirm; without NAT the
+    # loopback or own-address target works.
+    dev = _proxy("tcp:0.0.0.0:5000", connect, nat="true")
+    verdict, first, fix = _run(tmp_path, {"dashboard-proxy": dev}, state=_state(OWN))
+    assert verdict == "NO"
+    assert "nat mode is on" in first
+    assert fix == "incus config device set c1 dashboard-proxy nat=false"
+
+
+def test_leading_whitespace_in_the_device_list_is_tolerated(tmp_path):
+    raw = "  \n" + json.dumps(
+        {"devices": {}, "expanded_devices": {"d": _proxy("tcp:0.0.0.0:5000")}}
+    )
+    verdict, _, _ = _run(tmp_path, {}, raw=raw)
+    assert verdict == "OK"
+
+
 def test_fix_reuses_the_default_name_when_it_is_a_proxy_on_another_port(tmp_path):
     # `device add dashboard-proxy` would fail: the name exists (as a proxy on 6000).
     _, first, fix = _run(
@@ -206,12 +297,15 @@ def test_fix_picks_another_name_when_the_default_name_is_not_a_proxy(tmp_path):
     assert fix.startswith("incus config device add c1 genesis-dashboard-proxy proxy ")
 
 
-def test_fix_points_at_the_profile_for_an_inherited_device(tmp_path):
-    devices = {"dashboard-proxy": _proxy("tcp:127.0.0.1:5000")}
+def test_fix_overrides_an_inherited_device_for_this_instance_only(tmp_path):
+    # Editing the profile would change every instance that uses it; `override`
+    # copies the device onto this instance with the new keys.
+    devices = {"dashboard-proxy": _proxy("tcp:127.0.0.1:5000", bind="instance")}
     _, _, fix = _run(tmp_path, devices, local={})
-    assert "comes from a profile" in fix
-    assert "incus profile device set" in fix
-    assert "incus config device" not in fix
+    assert fix == (
+        "incus config device override c1 dashboard-proxy listen=tcp:0.0.0.0:5000 bind=host"
+    )
+    assert "profile" not in fix
 
 
 def test_container_python_failure_is_reported_not_fatal(tmp_path):
@@ -247,6 +341,7 @@ def test_container_python_gets_json_non_interactively(tmp_path):
     _run(tmp_path, {"d": _proxy("tcp:0.0.0.0:5000")})
     log = (tmp_path / "incus.log").read_text()
     assert "query /1.0/instances/c1" in log
+    assert "query /1.0/instances/c1/state" in log
     assert "exec c1 -T -- python3 -c" in log
 
 

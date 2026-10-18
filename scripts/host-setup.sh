@@ -988,16 +988,18 @@ elif [ -n "$LAN_IPV4" ]; then
     ACCESS_METHOD="lan"
 fi
 
-# Advertise a host URL only when a proxy device really serves it (#3161): the
+# Advertise a host URL only when a proxy device is set up to serve it (#3161): the
 # step above accepts an existing dashboard-proxy by name and only warns when
-# `device add` fails, so neither proves anything listens on $HOST_IPV4:5000.
+# `device add` fails, so neither proves a device forwards $HOST_IPV4:5000 to the
+# dashboard. The check reads the device configuration; it does not probe a
+# listener, because the server is not installed yet at this step.
 # shellcheck source=lib/dashboard_proxy.sh
 . "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/dashboard_proxy.sh"
 PROXY_OK=0
 _proxy_report=""
 if _proxy_report=$(dashboard_proxy_check "$CONTAINER_NAME" 5000); then
     PROXY_OK=1
-    echo "  + Dashboard proxy verified ($_proxy_report)"
+    echo "  + Dashboard proxy configuration verified ($_proxy_report)"
 else
     # The check prints what it found, then a "fix: <command>" line.
     _nl='
