@@ -955,50 +955,69 @@ class TestPatternsStayPortable:
 
 
 class TestHttpCredentialHeaders:
-    """HTTP credential headers: the label, the scheme word and the bare value.
+    """HTTP credential headers: the whole header value is the secret.
 
-    A header value is ``<scheme> <credential>``, so a label pattern that wants
-    the credential straight after the colon sees only the scheme word. Each
-    shape here passed through whole before the header labels and the bearer
-    value pattern existed.
+    A header value is a scheme plus a token, a parameter list (Digest, AWS
+    SigV4) or cookie pairs, so any rule that parses it misses some shape. The
+    whole value is withheld instead, up to its closing quote or the end of the
+    line, wherever the label appears: a raw header, a curl argument, a dict or
+    JSON key, or an escaped key inside a serialized string.
     """
 
     TOKEN = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MA"  # pragma: allowlist secret
 
     @pytest.mark.parametrize(
-        "text",
+        "text, secret",
         [
-            f"Authorization: Bearer {TOKEN}",
-            f"authorization: bearer {TOKEN}",
-            f"Proxy-Authorization: Bearer {TOKEN}",
-            f"Authorization: Token {TOKEN}",
-            f"Authorization: {TOKEN}",
-            f'curl -H "Authorization: Bearer {TOKEN}" https://api.example.com/v1',
-            f"Bearer {TOKEN}",
-            f"headers={{'authorization': 'Bearer {TOKEN}'}}",
+            (f"Authorization: Bearer {TOKEN}", TOKEN),
+            (f"authorization: bearer {TOKEN}", TOKEN),
+            (f"Proxy-Authorization: Bearer {TOKEN}", TOKEN),
+            (f"Authorization: {TOKEN}", TOKEN),
+            ("Authorization: Basic YTpi", "YTpi"),
+            ("Authorization: Basic YWI6Y2Q=", "YWI6Y2Q="),
+            ("Authorization: MyVeryLongScheme abcdefghijklmnop", "abcdefghijklmnop"),
+            (
+                'Authorization: Digest username="alice", response="0123456789abcdef0123456789abcdef"',
+                "0123456789abcdef0123456789abcdef",
+            ),
+            (
+                "Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261018/us-east-1/s3/aws4_request, "
+                "SignedHeaders=host, Signature=fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024",
+                "fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024",
+            ),
+            ("Cookie: SID=31d4d96e407aad42", "31d4d96e407aad42"),
+            ("Cookie: session=abcdefghijklmnop", "abcdefghijklmnop"),
+            ("Set-Cookie: SID=31d4d96e407aad42; Path=/; HttpOnly", "31d4d96e407aad42"),
+            (f'curl -H "Authorization: Bearer {TOKEN}" https://api.example.com/v1', TOKEN),
+            ("headers={'authorization': 'Basic dXNlcjpwYXNz'}", "dXNlcjpwYXNz"),
+            ('{"authorization": "Basic dXNlcjpwYXNz"}', "dXNlcjpwYXNz"),
+            ('"{\\"cookie\\": \\"SID=31d4d96e407aad42\\"}"', "31d4d96e407aad42"),
+            (f"Bearer {TOKEN}", TOKEN),
+            ("Bearer station-token", "station-token"),
+            ("Bearer secret", "secret"),
+            ("Bearer abcdefghijklmno", "abcdefghijklmno"),
         ],
     )
-    def test_the_credential_is_redacted(self, text):
+    def test_the_credential_is_redacted(self, text, secret):
         out = s.scrub(text)
-        assert self.TOKEN not in out
+        assert secret not in out
         assert R in out
 
-    def test_a_short_basic_credential_is_redacted(self):
-        basic = "dXNlcjpwYXNz"  # base64("user:pass"), 12 characters
-        out = s.scrub(f"Authorization: Basic {basic}")
-        assert basic not in out
-        assert out.startswith("Authorization: Basic ")
-
-    def test_the_label_and_scheme_survive(self):
-        assert s.scrub(f"Authorization: Bearer {self.TOKEN}") == "Authorization: Bearer " + R
+    def test_the_label_and_quoting_survive(self):
+        assert s.scrub("Authorization: Basic YTpi") == "Authorization: " + R
+        assert s.scrub("headers={'authorization': 'Basic YTpi'}") == "headers={'authorization': '" + R + "'}"
+        assert s.scrub('curl -H "Cookie: SID=abc" url') == 'curl -H "Cookie: ' + R + '" url'
 
     @pytest.mark.parametrize(
         "text",
         [
             "the request needs a bearer token",
             "Bearer tokens are documented in RFC 6750",
+            "Bearer authentication is the default",
             "authorization is checked by the gateway",
             "set an Authorization header",
+            "cookies: 3 stored",
+            "bearer_token() returns the configured value",
         ],
     )
     def test_prose_is_kept(self, text):
@@ -1010,6 +1029,8 @@ class TestHttpCredentialHeaders:
             "Bearer " * 20000,
             "Authorization: " + " " * 40000 + "x",
             ("authorization: Basic " + "A" * 7 + "\n") * 6000,
+            '\\"cookie\\": \\"' + "a\\x" * 20000,
+            "Cookie: " + '"' * 40000,
         ],
     )
     def test_header_shapes_complete_promptly(self, shape):

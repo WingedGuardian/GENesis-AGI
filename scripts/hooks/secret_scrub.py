@@ -265,17 +265,10 @@ _STRUCTURED_CREDENTIAL_PATTERN = re.compile(
 # Labeled API/access/secret tokens — keep the label, redact the value.
 # ``secret[_\s-]?access[_\s-]?key`` is listed explicitly (before the shorter
 # ``secret[_\s-]?key``) so the AWS secret-key label is caught.
-# HTTP credential headers are labels too: ``Authorization`` and
-# ``Proxy-Authorization`` carry a credential after a scheme word, and
-# ``Cookie``/``Set-Cookie`` carry session tokens. Listing them here also makes
-# ``credential_label_kind`` treat a structured ``{"authorization": ...}`` or
-# ``{"cookie": ...}`` member as a token, whatever its value looks like.
-_AUTH_HEADER_LABEL = r"(?:proxy[_\s-]?)?authorization"
 _TOKEN_LABEL = (  # noqa: S105 - credential label regex, not a value
     r"(?<![A-Za-z])(?:api[_\s-]?key|access[_\s-]?token|bearer[_\s-]?token|"  # noqa: S105
     r"secret[_\s-]?access[_\s-]?key|secret[_\s-]?key|auth[_\s-]?token|"
-    r"refresh[_\s-]?token|api[_\s-]?secret|private[_\s-]?key|"
-    rf"{_AUTH_HEADER_LABEL}|(?:set[_\s-]?)?cookie)"
+    r"refresh[_\s-]?token|api[_\s-]?secret|private[_\s-]?key)"
 )
 _CREDENTIAL_TOKEN_PATTERN = re.compile(
     # (?<![A-Za-z]) (not \b) so an underscore-joined prefix still matches, e.g.
@@ -284,25 +277,68 @@ _CREDENTIAL_TOKEN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# ``Authorization: <scheme> <credential>``. The label pattern above wants the
-# value straight after the separator, so a scheme word (``Basic``, ``Bearer``,
-# ``Token``, ``Digest`` ...) would hide the credential behind it. The label is
-# high-confidence, so the value floor is lower than the prose floor: a Basic
-# credential for a short user:password pair is only a dozen characters.
-_AUTH_HEADER_PATTERN = re.compile(
-    rf"(?<![A-Za-z]){_AUTH_HEADER_LABEL}\s*[:=]\s*"
-    r"(?:[A-Za-z][A-Za-z0-9\-]{0,31}\s+)?"
-    r"(?P<token>[A-Za-z0-9_\-\./+~]{8,}=*)",
+# HTTP credential headers. Their VALUE is the secret, whatever its shape: a
+# scheme plus a token (``Bearer x``, ``Basic YTpi``), a parameter list
+# (``Digest username=..., response=...``, ``AWS4-HMAC-SHA256 Credential=...``)
+# or cookie pairs (``SID=...; HttpOnly``). So the whole value is redacted, up
+# to its closing quote or the end of the line, never parsed: a value grammar is
+# the thing that kept missing shapes. The label may sit in a quoted key
+# (``'authorization': ...``, ``"cookie": ...``, or an escaped ``\"cookie\"``
+# inside a serialized string), and the value may be quoted the same ways.
+# ``credential_label_kind`` also treats these names as token labels, so a
+# structured member is withheld whatever its value looks like.
+_HEADER_LABEL = r"(?<![A-Za-z])(?:(?:proxy[_\s-]?)?authorization|(?:set[_\s-]?)?cookie)"
+_HEADER_PATTERN = re.compile(
+    # ``open``: the quote (possibly escaped) that opened a string the whole
+    # header sits in, as in ``curl -H "Authorization: ..."``. An unquoted value
+    # then ends at that same quote; with no opening quote it runs to the end of
+    # the line, so quotes INSIDE the value (Digest parameters) cannot cut it short.
+    r"(?P<open>\\?[\"'])?" + _HEADER_LABEL + r"(?:\\?[\"'])?[ \t]*[:=][ \t]*"
+    r"(?P<value>"
+    r"\\\"(?:[^\"\\\n]|\\[^\"\n])*\\\""  # an escaped-quoted value: \"...\"
+    r"|\\'(?:[^'\\\n]|\\[^'\n])*\\'"
+    r"|\"[^\"\n]*\""
+    r"|'[^'\n]*'"
+    r"|(?(open)(?:(?!(?P=open))[^\r\n])+|[^\r\n]+)"
+    r")",
     re.IGNORECASE,
 )
 
-# A bearer credential wherever it appears (RFC 6750 ``b64token`` characters),
-# with or without a header label in front: a curl command line, a log line or a
-# copied header. The 16-character floor keeps prose like "bearer token" intact.
+# A bearer credential wherever it appears, with no header label in front: a
+# curl command line, a log line, a copied value. Any length counts, because a
+# configured bearer secret needs only to be non-empty, so prose is told apart
+# by the WORD that follows "bearer", not by the length of what follows it.
+_BEARER_PROSE_WORDS = (
+    r"tokens?|auth\w*|scheme|schemes|header|headers|credentials?|value|values|"
+    r"string|prefix|keyword|format|type|check|checks|checked|predicates?|reads?|"
+    r"slot|path|paths|gates?|compares?|tests?|and|or|the|a|an|is|are|in|on|for|"
+    r"with|to|of|from|so|here|there|only"
+)
 _BEARER_VALUE_PATTERN = re.compile(
-    r"(?<![A-Za-z])bearer\s+(?P<token>[A-Za-z0-9_\-\./+~]{16,}=*)",
+    r"(?<![A-Za-z])bearer[ \t]+"
+    rf"(?!(?:{_BEARER_PROSE_WORDS})\b)"
+    r"(?P<token>[A-Za-z0-9_\-\./+~]+=*)",
     re.IGNORECASE,
 )
+
+
+def _redact_header_value(text: str) -> str:
+    """Replace a credential header's whole value, keeping its quoting."""
+
+    def _repl(m: re.Match) -> str:
+        value = m.group("value")
+        for quote in ('\\"', "\\'", '"', "'"):
+            if len(value) >= 2 * len(quote) and value.startswith(quote) and value.endswith(quote):
+                replacement = f"{quote}{_REDACTED}{quote}"
+                break
+        else:
+            trailing = value[len(value.rstrip()):]
+            replacement = _REDACTED + trailing
+        start = m.start("value") - m.start()
+        return m.group(0)[:start] + replacement
+
+    return _HEADER_PATTERN.sub(_repl, text)
+
 
 # password/passphrase/pin values — keep the label, redact the value. A quoted
 # value is captured whole (the quote alternatives let the value contain spaces);
@@ -417,7 +453,11 @@ def credential_label_kind(label: str) -> str | None:
     Structured values have no prose length floor. Environment labels retain
     uppercase/key-shape constraints; the secret hint alone is insufficient.
     """
-    for kind, pattern in (("token", _TOKEN_LABEL), ("password", _PASSWORD_LABEL)):
+    for kind, pattern in (
+        ("token", _TOKEN_LABEL),
+        ("token", _HEADER_LABEL),
+        ("password", _PASSWORD_LABEL),
+    ):
         if re.search(pattern + r"\s*\Z", label, re.IGNORECASE):
             return kind
     match = re.search(_ENV_LABEL + r"\s*\Z", label)
@@ -480,9 +520,9 @@ def scrub(text: str) -> str:
         text = _redact_pem_blocks(text)
         text = _KNOWN_KEY_PREFIX_PATTERN.sub(_REDACTED, text)
         text = _STRUCTURED_CREDENTIAL_PATTERN.sub(_REDACTED, text)
-        text = _redact_value_group(_CREDENTIAL_TOKEN_PATTERN, text, "token")
-        text = _redact_value_group(_AUTH_HEADER_PATTERN, text, "token")
+        text = _redact_header_value(text)
         text = _redact_value_group(_BEARER_VALUE_PATTERN, text, "token")
+        text = _redact_value_group(_CREDENTIAL_TOKEN_PATTERN, text, "token")
         text = _redact_value_group(_SINGLE_CREDENTIAL_PATTERN, text, "value")
         text = _redact_value_group(_URL_CREDENTIAL_PATTERN, text, "pw")
         text = _redact_env(text)
