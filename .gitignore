@@ -54,6 +54,8 @@ firebase-debug.log
 scripts/cc_cli_output/
 .firecrawl/
 .mcp.json
+# A half-written render a killed bootstrap left behind (temp file + rename).
+.mcp.json.*
 config/.generated/
 # Auto-generated identity files (runtime-regenerated, seeds in .example)
 src/genesis/identity/TRIAGE_CALIBRATION.md

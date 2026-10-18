@@ -509,6 +509,7 @@ _FRESH = (
     "scripts/hooks/hook_output.py",
     "scripts/lib/disk_guardian.sh",
     "scripts/tmp_watchgod.sh",
+    "scripts/lib/serving_commit.py",
     ".claude/hooks/genesis-hook",
 )
 
