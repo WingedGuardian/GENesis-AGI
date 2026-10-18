@@ -5,8 +5,8 @@
 ``SO_PEERCRED``). The service unwraps ``identity.age`` and keeps the X25519
 identity in memory. It relocks on ``vault lock``, after ``IDLE_RELOCK_S``
 idle, when the held key no longer matches ``recipient.txt``, and on every
-restart (the key is never written anywhere). Nothing decrypts a card yet; the
-first user of the key is the card-fill flow, which approval gates.
+restart (the key is never written anywhere). The key's one user is a card
+release (``payments/release.py``), which the owner's Telegram tap gates.
 
 The unwrap (age scrypt, about 1-2 s of CPU) runs in a short-lived subprocess
 that imports only pyrage, so the event loop never waits on it. MEASURED on
@@ -22,14 +22,18 @@ with no audit log, or if the audit write fails, the key is not held. Lock
 always drops the key, whatever happens to its audit row.
 
 Protocol: one JSON line in (at most 4096 bytes), one JSON line out, then the
-connection closes. Ops: ``status``, ``unlock`` (``passphrase``), ``lock``.
-Responses never echo a request.
+connection closes. Ops: ``status``, ``unlock`` (``passphrase``), ``lock``, and
+the release ops ``release_request``, ``release_status``, ``release_claim`` and
+``release_cancel``. The first three need only the peer's uid, so the owner's
+CLI works; a release op also needs a peer that ``peer_check`` verifies as the
+genesis-health MCP server. Responses never echo a request.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import importlib.util
 import json
 import logging
@@ -44,6 +48,8 @@ from pathlib import Path
 from genesis.db.crud import payment_vault_events as audit
 from genesis.env import vault_socket_path
 from genesis.payments import vault_store as vs
+from genesis.payments.peer_check import PeerPolicy, PeerRefused, accept_ticks, check_release_peer
+from genesis.payments.release import ReleaseManager
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +147,8 @@ class VaultService:
         idle_check_s: float = _IDLE_CHECK_S,
         clock=None,
         python: str = sys.executable,
+        approvals=None,
+        release_peer=None,
     ) -> None:
         self._db = db
         self._vault = vault_path or vs.vault_dir()
@@ -167,6 +175,13 @@ class VaultService:
         self._socket_ino: int | None = None
         self._writers: set[asyncio.StreamWriter] = set()
         self._tasks: set[asyncio.Task] = set()
+        # (pid, *, accept_ticks) -> Peer, raising PeerRefused. genesis-server's
+        # own pid is passed explicitly: the ancestor walk looks for it to tell
+        # a session it launched from a foreground one.
+        self._release_peer = release_peer or functools.partial(
+            check_release_peer, policy=PeerPolicy.default(), server_pid=os.getpid()
+        )
+        self._release = ReleaseManager(self, approvals)
 
     @property
     def unlocked(self) -> bool:
@@ -404,6 +419,7 @@ class VaultService:
         self._epoch += 1
         was_unlocked = self.unlocked
         self._drop()
+        await self._release.abort("the vault was locked")
         if not was_unlocked:
             if peer:  # every lock request is on the trail, even one with nothing to drop
                 await self._audit(event, {"peer": peer, "state": "already locked"})
@@ -434,6 +450,9 @@ class VaultService:
         self._epoch += 1
         was_unlocked = self.unlocked
         self._drop()
+        # Before the tasks are cancelled: the approval task is one of them.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._release.abort("the vault service stopped"), _STOP_WAIT_S)
         for task in list(self._tasks):
             task.cancel()
         if self._server is not None:
@@ -461,6 +480,7 @@ class VaultService:
         await writer.drain()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        accepted = accept_ticks()  # first: a pid reused after connect() started later
         self._writers.add(writer)
         try:
             peer = peer_of(writer)
@@ -474,7 +494,18 @@ class VaultService:
                 await self._respond(writer, {"ok": False, "error": "bad request"})
                 return
             op = request.get("op") if isinstance(request, dict) else None
-            if op == "status":
+            if isinstance(op, str) and op.startswith("release_"):
+                try:
+                    verified = self._release_peer(peer["pid"], accept_ticks=accepted)
+                except PeerRefused as exc:
+                    await self._audit(
+                        "release_refused",
+                        {"reason": "peer not allowed", "peer": {**peer, **exc.detail}},
+                    )
+                    reply = {"ok": False, "error": "peer not allowed"}
+                else:
+                    reply = await self._release.handle(op, request, verified)
+            elif op == "status":
                 reply = await self.status()
             elif op == "lock":
                 reply = await self.lock(peer)
@@ -519,7 +550,7 @@ async def start_vault_service(runtime, approvals=None) -> VaultService | None:
         db = await get_db(genesis_db_path())
     except Exception as exc:  # noqa: BLE001 - unlock then refuses (fail closed)
         logger.error("payment vault audit connection did not open (%s)", type(exc).__name__)
-    service = VaultService(db)
+    service = VaultService(db, approvals=approvals)
     service.owned_db = db
     try:
         await service.start()

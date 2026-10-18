@@ -122,6 +122,7 @@ def _audit_detail(detail: Mapping | None) -> dict:
     and the requesting process. Free text (a page title) does not belong here;
     the shown fields are recorded only as lengths.
     """
+
     def clean(value, depth=0):
         if value is None or isinstance(value, bool | int):
             return value
@@ -162,11 +163,18 @@ class PaymentApprovalRegistry:
             logger.error("payment approval audit failed (%s)", type(exc).__name__)
             return False
 
-    async def request(self, fields: Mapping[str, str], *, audit_detail: Mapping | None = None) -> str:
+    async def request(
+        self,
+        fields: Mapping[str, str],
+        *,
+        audit_detail: Mapping | None = None,
+        timeout_s: float | None = None,
+    ) -> str:
         """Ask the owner; return ``granted``, ``refused`` or ``expired``.
 
         ``fields`` are shown in the message; ``audit_detail`` is recorded (see
         ``_audit_detail``). Both pass the digit-run guard or the request is refused.
+        ``timeout_s`` replaces the registry's deadline for this request.
         """
         nonce = secrets.token_urlsafe(16)
         detail: dict = {"nonce": nonce}
@@ -227,7 +235,10 @@ class PaymentApprovalRegistry:
             # The deadline belongs to this wait, not to the dict: a tap that
             # popped the nonce and then died cannot leave it waiting forever.
             try:
-                return await asyncio.wait_for(asyncio.shield(pending.future), self._timeout_s)
+                return await asyncio.wait_for(
+                    asyncio.shield(pending.future),
+                    self._timeout_s if timeout_s is None else timeout_s,
+                )
             except TimeoutError:
                 if pending.future.done():  # a tap settled it as the deadline fired
                     return pending.future.result()
@@ -239,6 +250,32 @@ class PaymentApprovalRegistry:
             if not pending.future.done():  # the requester was cancelled: no grant can land
                 pending.future.cancel()
                 await self._record("approval_refused", {**detail, "reason": "requester cancelled"})
+
+    async def notify(self, text: str) -> bool:
+        """Tell the owner something, with no button: True if Telegram took the message.
+
+        For the release flow's own fixed texts. The same guards as a request:
+        one plain-text message to the owner, nothing with a long digit run.
+        """
+        if self._bot is None or self._owner is None:
+            return False
+        if holds_long_digit_run(text) or _utf16_len(text) > _TG_MAX_UTF16:
+            return False
+        from genesis.channels.telegram.transport.send import (
+            safe_send_message,
+            send_with_client_heal,
+        )
+
+        try:
+            msg = await send_with_client_heal(
+                self._bot,
+                lambda: safe_send_message(self._bot, self._owner, text, parse_mode=None),
+                stopping=self._stopping,
+            )
+        except Exception as exc:  # noqa: BLE001 - a lost notice is logged, never raised
+            logger.error("payment notice send failed (%s)", type(exc).__name__)
+            return False
+        return msg is not None
 
     def _mismatch(self, pending: _Pending, user_id: int | None, message) -> str | None:
         """Why this tap must not grant, or None."""
