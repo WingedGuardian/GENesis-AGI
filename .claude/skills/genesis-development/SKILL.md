@@ -50,8 +50,10 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   public repo in its own VM, with no access to an install: no running Genesis, no
   `~/.genesis/`, none of an install's hooks or local reviewers. Hand it only
   self-contained, spec-complete work whose tests run in CI, off the enforcement-hook
-  surface, as a public issue. Only the owner applies the `devin-ready` label that
-  hands it over: the label starts a paid session, so a session never applies it.
+  surface, as a public issue. The `devin-ready` label hands it over and starts a
+  paid session, so a session applies it only after the owner explicitly approves
+  that issue in conversation. Once approved, the session applies the label itself;
+  the owner does not apply it by hand.
   Its PRs join the same queue (closing-session, "Devin-built PRs").
 
 The handoff between them is **the PR itself** — a durable artifact that survives

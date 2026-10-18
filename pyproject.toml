@@ -247,8 +247,9 @@ asyncio_mode = "auto"
 # --basetemp and `-o tmp_path_retention_policy=all`.
 # Pinned by tests/test_pytest_retention_policy.py.
 tmp_path_retention_policy = "failed"
-# PER-TEST ceiling (pytest-timeout), not a suite budget — a hung test is killed
-# and the suite carries on.
+# PER-TEST ceiling (pytest-timeout), not a suite budget. With the thread method
+# below, a test that exceeds it dumps every thread's stack and ENDS THE RUN: the
+# suite does not carry on.
 #
 # It applies wherever pytest-timeout is installed: always in CI (the test job
 # installs the [test] extra), and locally only in a venv where someone
@@ -264,3 +265,13 @@ tmp_path_retention_policy = "failed"
 # lowering it further. Raising it again costs every session on a shared box
 # the full value per hung test.
 timeout = 600
+# "thread", not the default "signal". MEASURED 2026-10: two CI test jobs
+# (38948727801, 39044594350) froze at the same point, just after
+# tests/test_peers/test_cli.py, for over two hours until the 180-minute job limit
+# cancelled them; the signal method never fired. A signal handler runs only when
+# the main thread executes Python code, and its exception can be absorbed by the
+# code it interrupts. The thread method uses a watchdog thread that dumps all
+# stacks and exits the process, so a hang fails in 600 s with the stack trace
+# that names it. Cost: one hang ends the whole run instead of failing one test.
+# The box-wide pytest lock is an flock, released when the process dies.
+timeout_method = "thread"
