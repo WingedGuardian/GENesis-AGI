@@ -132,6 +132,12 @@ class FakeRegistry:
 
     async def request(self, fields, *, audit_detail=None, timeout_s=None) -> str:
         self.calls.append((dict(fields), dict(audit_detail or {}), timeout_s))
+        # The real registry's guards: what it would refuse, this refuses too.
+        try:
+            ap.build_text(fields)
+            ap._audit_detail(audit_detail)
+        except ValueError:
+            return ap.REFUSED
         fut = asyncio.get_running_loop().create_future()
         self.futures.append(fut)
         if self.fail is not None:
@@ -182,9 +188,9 @@ class Ctx:
     async def cancel(self, nonce: str) -> dict:
         return await self.ask({"op": "release_cancel", "nonce": nonce})
 
-    async def granted(self) -> str:
+    async def granted(self, **over) -> str:
         """Request, tap Approve, and wait for the grant; the nonce."""
-        nonce = (await self.request())["nonce"]
+        nonce = (await self.request(**over))["nonce"]
         await _until(lambda: self.reg.futures)
         self.reg.futures[-1].set_result(ap.GRANTED)
         await _until(lambda: self.slot() is not None and self.slot().state == rl.GRANTED)
@@ -693,6 +699,195 @@ async def test_a_claim_killed_mid_flight_frees_the_slot(ctx, gate):
     assert ctx.slot() is None
     assert (await ctx.status(nonce))["state"] == "refused"
     assert (await ctx.request())["ok"]
+
+
+# -- the requester gone mid-claim --------------------------------------------------
+
+
+def _card_row(ctx, ref: str):
+    with sqlite3.connect(ctx.svc._vault / vs.CARDS) as conn:
+        return conn.execute(
+            "SELECT status, blob IS NULL FROM cards WHERE card_ref = ?", (ref,)
+        ).fetchone()
+
+
+def _record_replies(ctx, monkeypatch) -> list[dict]:
+    """Every reply the service writes, with the card's state when it was written."""
+    sent: list[dict] = []
+    real = ctx.svc._respond
+
+    async def recorder(writer, reply):
+        sent.append({"reply": reply, "row": _card_row(ctx, ctx.refs["both"])})
+        await real(writer, reply)
+
+    monkeypatch.setattr(ctx.svc, "_respond", recorder)
+    return sent
+
+
+async def _send_claim(ctx, nonce: str):
+    reader, writer = await asyncio.open_unix_connection(str(ctx.svc._socket_path))
+    payload = {"op": "release_claim", "nonce": nonce, "claim": SECRET}
+    writer.write((json.dumps(payload) + "\n").encode())
+    await writer.drain()
+    return reader, writer
+
+
+async def _assert_kept(ctx, nonce: str, sent: list[dict]) -> None:
+    """The single-use card is still active, no reply carried values, the slot ended."""
+    await _until(lambda: ctx.slot() is None)
+    await _until(lambda: sent)
+    assert _card_row(ctx, ctx.refs["both"]) == ("active", 0)
+    assert all("card" not in s["reply"] for s in sent)
+    assert sent[-1]["reply"] == {"ok": False, "error": "requester gone"}
+    assert (await ctx.status(nonce))["state"] == "refused"
+    reasons = [(e["detail"] or {}).get("reason") for e in await ctx.events()]
+    assert "requester gone" in reasons
+    assert (await ctx.request())["ok"]  # the slot is free
+
+
+async def test_a_requester_that_exits_during_open_card_keeps_the_card(ctx, gate, monkeypatch):
+    entered, release = gate
+    nonce = await ctx.granted(card_ref=ctx.refs["both"])
+    sent = _record_replies(ctx, monkeypatch)
+    reader, writer = await _send_claim(ctx, nonce)
+    await _until(entered.is_set)
+    monkeypatch.setattr(ctx.svc._release, "_alive", lambda pid, start: False)
+    release.set()
+    assert json.loads(await reader.readline()) == {"ok": False, "error": "requester gone"}
+    writer.close()
+    await _assert_kept(ctx, nonce, sent)
+    assert "release_claimed" not in await ctx.names()
+
+
+async def test_a_socket_closed_during_open_card_keeps_the_card(ctx, gate, monkeypatch):
+    entered, release = gate
+    nonce = await ctx.granted(card_ref=ctx.refs["both"])
+    sent = _record_replies(ctx, monkeypatch)
+    _reader, writer = await _send_claim(ctx, nonce)
+    await _until(entered.is_set)
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)  # the server's reader takes the EOF
+    release.set()
+    await _assert_kept(ctx, nonce, sent)
+    assert "release_claimed" not in await ctx.names()
+
+
+async def test_a_socket_closed_during_the_claimed_row_keeps_the_card(ctx, monkeypatch):
+    nonce = await ctx.granted(card_ref=ctx.refs["both"])
+    sent = _record_replies(ctx, monkeypatch)
+    real = ctx.svc._audit
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def held(event, detail=None):
+        if event == "release_claimed":
+            entered.set()
+            await release.wait()
+        return await real(event, detail)
+
+    monkeypatch.setattr(ctx.svc, "_audit", held)
+    _reader, writer = await _send_claim(ctx, nonce)
+    await asyncio.wait_for(entered.wait(), 3)
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.sleep(0.05)
+    release.set()
+    await _assert_kept(ctx, nonce, sent)
+    names = [n for n in await ctx.names() if n.startswith("release_")]
+    assert names[2:4] == ["release_claimed", "release_refused"]
+
+
+async def test_a_requester_that_exits_during_the_claimed_row_keeps_the_card(ctx, monkeypatch):
+    nonce = await ctx.granted(card_ref=ctx.refs["both"])
+    sent = _record_replies(ctx, monkeypatch)
+    real = ctx.svc._audit
+
+    async def held(event, detail=None):
+        if event == "release_claimed":
+            monkeypatch.setattr(ctx.svc._release, "_alive", lambda pid, start: False)
+        return await real(event, detail)
+
+    monkeypatch.setattr(ctx.svc, "_audit", held)
+    reader, writer = await _send_claim(ctx, nonce)
+    assert json.loads(await reader.readline()) == {"ok": False, "error": "requester gone"}
+    writer.close()
+    await _assert_kept(ctx, nonce, sent)
+    names = [n for n in await ctx.names() if n.startswith("release_")]
+    assert names[2:4] == ["release_claimed", "release_refused"]
+
+
+async def test_a_liveness_check_that_raises_counts_as_gone(ctx, monkeypatch):
+    nonce = await ctx.granted(card_ref=ctx.refs["both"])
+    sent = _record_replies(ctx, monkeypatch)
+    calls = []
+
+    def broken(pid, start):
+        calls.append(pid)
+        if len(calls) > 1:  # the claim's own expiry sweep passes; the handover check raises
+            raise OSError("proc unreadable")
+        return True
+
+    monkeypatch.setattr(ctx.svc._release, "_alive", broken)
+    reader, writer = await _send_claim(ctx, nonce)
+    assert json.loads(await reader.readline()) == {"ok": False, "error": "requester gone"}
+    writer.close()
+    monkeypatch.setattr(ctx.svc._release, "_alive", lambda pid, start: True)
+    await _assert_kept(ctx, nonce, sent)
+
+
+async def test_a_half_closed_client_is_refused_and_keeps_the_card(ctx, monkeypatch):
+    """The documented contract: a client keeps its write side open for the reply."""
+    nonce = await ctx.granted(card_ref=ctx.refs["both"])
+    sent = _record_replies(ctx, monkeypatch)
+    reader, writer = await _send_claim(ctx, nonce)
+    writer.write_eof()
+    assert json.loads(await reader.readline()) == {"ok": False, "error": "requester gone"}
+    writer.close()
+    await _assert_kept(ctx, nonce, sent)
+
+
+async def test_a_live_claim_still_retires_before_the_reply(ctx, monkeypatch):
+    nonce = await ctx.granted(card_ref=ctx.refs["both"])
+    sent = _record_replies(ctx, monkeypatch)
+    reply = await ctx.claim(nonce)
+    assert reply["ok"]
+    del reply
+    assert len(sent) == 1 and sent[0]["reply"]["ok"]
+    assert sent[0]["row"] == ("retired", 1)  # retired before the reply was written
+
+
+# -- a card ref whose 12 hex characters are all digits ---------------------------------
+
+
+@pytest.fixture
+def digit_ref(vault, monkeypatch):
+    """A card whose generated ref is ``card_`` and 12 digits (about 0.36% of cards)."""
+    path, refs = vault
+    digits = "".join(str((i * 7 + 3) % 10) for i in range(12))  # built at run time
+    card = vs.parse_card(VISA, f"12/{_exp_year()}", CVC)
+    with monkeypatch.context() as m:
+        m.setattr(vs.secrets, "token_hex", lambda n: digits)
+        ref = vs.add_card(
+            card,
+            label="Digit ref card",
+            merchant="example.com",
+            single_use=False,
+            name=NAME,
+            postal_code=POSTAL,
+            path=path,
+        )
+    assert ref == "card_" + digits and ap.holds_long_digit_run(ref)
+    return ref
+
+
+async def test_an_all_digit_card_ref_is_requested_sent_and_claimed(ctx, digit_ref):
+    nonce = await ctx.granted(card_ref=digit_ref)
+    assert ctx.reg.calls[-1][1]["card_ref"] == digit_ref
+    reply = await ctx.claim(nonce)
+    assert reply["ok"] and reply["card"]["label"] == "Digit ref card"
+    del reply
+    claimed = [e for e in await ctx.events() if e["event"] == "release_claimed"]
+    assert claimed[0]["detail"]["card_ref"] == digit_ref
 
 
 # -- unknown nonces -------------------------------------------------------------------

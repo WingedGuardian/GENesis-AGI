@@ -30,6 +30,15 @@ later does not take back values already decided. A single-use card is retired
 after the ``release_claimed`` row and before the reply; if that fails nothing
 is returned.
 
+The requester is checked again at the handover: after the decrypt and again
+after the ``release_claimed`` row, the claim is refused ("requester gone"), with
+nothing retired and no values sent, if the requesting process has exited
+(pid and start time) or its connection has closed (``vault_service``'s
+docstring says what a client must do for that check to see it). One window is left: a
+connection that closes after the second check, during the retire or the reply
+itself, still burns a single-use card whose values never arrive. That fails
+safe (a lost card, never a card handed to someone else).
+
 Every request, grant, claim, refusal and cancel is a value-free row in
 ``payment_vault_events``: nonce, card ref, host, the amount and title as shown,
 the field-origin hosts, the verified peer and a fixed reason. A refused request
@@ -242,13 +251,16 @@ class ReleaseManager:
 
     # -- the ops -------------------------------------------------------------
 
-    async def handle(self, op: str, request: dict, peer: Peer) -> dict:
+    async def handle(
+        self, op: str, request: dict, peer: Peer, client_gone: Callable[[], bool] | None = None
+    ) -> dict:
+        """``client_gone`` says whether the requester's connection has closed."""
         if op == "release_request":
             return await self.request(request, peer)
         if op == "release_status":
             return await self.status(request)
         if op == "release_claim":
-            return await self.claim(request, peer)
+            return await self.claim(request, peer, client_gone or (lambda: False))
         if op == "release_cancel":
             return await self.cancel(request, peer)
         return {"ok": False, "error": "bad request"}
@@ -434,7 +446,9 @@ class ReleaseManager:
             return rel
         return None
 
-    async def claim(self, request: dict, peer: Peer) -> dict:
+    async def claim(
+        self, request: dict, peer: Peer, client_gone: Callable[[], bool] = lambda: False
+    ) -> dict:
         await self._expire_if_due()
         nonce, claim = request.get("nonce"), request.get("claim")
         shown = nonce if isinstance(nonce, str) and _NONCE.fullmatch(nonce) else None
@@ -456,7 +470,7 @@ class ReleaseManager:
             return {"ok": False, "error": "the vault is locked"}
         rel.state = CLAIMING
         try:
-            return await self._hand_over(rel, identity, epoch)
+            return await self._hand_over(rel, identity, epoch, client_gone)
         finally:
             # Every return of _hand_over ends the slot; only a coroutine killed outright
             # (loop teardown) gets here with it still claiming. Nothing was sent.
@@ -464,7 +478,17 @@ class ReleaseManager:
                 logger.error("payment release claim ended without settling")
                 self._end(rel, REFUSED)
 
-    async def _hand_over(self, rel: _Release, identity, epoch: int) -> dict:
+    def _gone(self, rel: _Release, client_gone: Callable[[], bool]) -> bool:
+        """The requester exited, or closed the connection the reply would go to."""
+        try:
+            return bool(client_gone()) or not self._alive(rel.peer.pid, rel.peer.start)
+        except Exception as exc:  # noqa: BLE001 - an unanswerable check counts as gone
+            logger.error("payment release liveness check failed (%s)", type(exc).__name__)
+            return True
+
+    async def _hand_over(
+        self, rel: _Release, identity, epoch: int, client_gone: Callable[[], bool]
+    ) -> dict:
         """Decrypt, decide, record, retire if single-use, and return the fields once."""
         svc = self._svc
         try:
@@ -479,6 +503,10 @@ class ReleaseManager:
         if self._slot is not rel or epoch != svc._epoch or svc._stopped:
             del card
             return {"ok": False, "error": "the release was refused"}
+        if self._gone(rel, client_gone):  # nothing decided yet: the card stays as it was
+            del card
+            await self._refuse_slot(rel, "requester gone")
+            return {"ok": False, "error": "requester gone"}
         rel.decided = True
         if not _in_scope(rel.host, card["merchant"], card["single_use"]):
             del card
@@ -490,6 +518,12 @@ class ReleaseManager:
             del card
             await self._refuse_slot(rel, "the audit write failed")
             return {"ok": False, "error": "the audit write failed"}
+        # Checked again after the row's await and before the retire: the last
+        # point where a gone requester leaves a single-use card unspent.
+        if self._gone(rel, client_gone):
+            del card
+            await self._refuse_slot(rel, "requester gone")
+            return {"ok": False, "error": "requester gone"}
         if card["single_use"]:
             try:
                 await asyncio.to_thread(vrs.retire_released, rel.card_ref, svc._vault)

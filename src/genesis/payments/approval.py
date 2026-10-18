@@ -41,6 +41,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from genesis.payments.vault_store import CARD_REF
+
 logger = logging.getLogger(__name__)
 
 PAYMENT_APPROVAL_ACTION_TYPE = "payment_card_release"
@@ -119,6 +121,11 @@ def build_text(fields: Mapping[str, str]) -> str:
     return text
 
 
+def _is_card_ref(value) -> bool:
+    """A plain str shaped exactly like a vault card ref (see ``_audit_detail``)."""
+    return type(value) is str and CARD_REF.fullmatch(value) is not None
+
+
 def _audit_detail(detail: Mapping | None) -> dict:
     """The caller's value-light audit facts: plain values, one level of dict.
 
@@ -129,6 +136,12 @@ def _audit_detail(detail: Mapping | None) -> dict:
     a pid passes, an int or float card number does not). Any other type is
     refused, and so are NaN, infinities, a Decimal beyond 64 digits of
     exponent, and two keys that stringify alike.
+
+    One exemption: the top-level ``card_ref`` key, when its value is a plain str
+    that fullmatches the vault's ``CARD_REF`` (``card_`` and 12 hex characters).
+    A generated ref is all digits about 0.36% of the time, and 12 digits cannot
+    hold a card number (13 to 19). Any other key, a nested ``card_ref``, or a
+    value of any other shape still passes the guard.
     """
     def number(value):
         # The exact base type first, so a subclass's __str__ cannot hide its digits.
@@ -151,7 +164,10 @@ def _audit_detail(detail: Mapping | None) -> dict:
             key = _safe_str(str(k))
             if key in out:
                 raise ValueError("two audit keys collide")
-            out[key] = clean(v, depth)
+            if depth == 0 and type(k) is str and k == "card_ref" and _is_card_ref(v):
+                out[key] = v
+            else:
+                out[key] = clean(v, depth)
         return out
 
     def clean(value, depth):

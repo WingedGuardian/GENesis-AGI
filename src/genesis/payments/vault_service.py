@@ -27,6 +27,13 @@ the release ops ``release_request``, ``release_status``, ``release_claim`` and
 ``release_cancel``. The first three need only the peer's uid, so the owner's
 CLI works; a release op also needs a peer that ``peer_check`` verifies as the
 genesis-health MCP server. Responses never echo a request.
+
+A client keeps its write side open until the reply arrives and sends nothing
+after the request line. The service cannot tell a half-close (``shutdown``
+of the write side) from a close: both read as EOF, and an ``unlock`` or
+``release_claim`` whose client reads as closed is refused. Bytes sent after
+the request line hide a later close from that check (``at_eof`` stays False
+while they sit unread), so a claim then relies on the requester's pid check.
 """
 
 from __future__ import annotations
@@ -494,6 +501,12 @@ class VaultService:
                 await self._respond(writer, {"ok": False, "error": "bad request"})
                 return
             op = request.get("op") if isinstance(request, dict) else None
+
+            def client_gone() -> bool:
+                # The peer closing leaves the transport half-open, so
+                # is_closing() stays False; the reader sees the EOF.
+                return reader.at_eof() or writer.is_closing()
+
             if isinstance(op, str) and op.startswith("release_"):
                 try:
                     verified = self._release_peer(peer["pid"], accept_ticks=accepted)
@@ -504,7 +517,7 @@ class VaultService:
                     )
                     reply = {"ok": False, "error": "peer not allowed"}
                 else:
-                    reply = await self._release.handle(op, request, verified)
+                    reply = await self._release.handle(op, request, verified, client_gone)
             elif op == "status":
                 reply = await self.status()
             elif op == "lock":
@@ -517,9 +530,7 @@ class VaultService:
                 reply = await self.unlock(
                     request["passphrase"],
                     peer,
-                    # The peer closing leaves the transport half-open, so
-                    # is_closing() stays False; the reader sees the EOF.
-                    client_gone=lambda: reader.at_eof() or writer.is_closing(),
+                    client_gone=client_gone,
                 )
             else:
                 reply = {"ok": False, "error": "bad request"}
