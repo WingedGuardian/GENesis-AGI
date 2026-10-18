@@ -20,8 +20,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
-import functools
-import inspect
 import json
 import logging
 import math
@@ -40,7 +38,9 @@ from fastmcp import Context
 from genesis.browser import chromium, engine, packages, profile_backup
 from genesis.browser.types import CAMOUFOX_PROFILE_DIR, BrowserLayer
 from genesis.mcp.health import mcp
-from genesis.security.card_shapes import REDACTED, contains_card_number, redact
+from genesis.security.card_redaction import CARD_FILTER
+from genesis.security.card_redaction import redacted as _redacted
+from genesis.security.card_shapes import contains_card_number, redact
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,8 @@ if _mcp_log_dir.is_dir():
     _mcp_fh.setLevel(logging.DEBUG)
     # Attach to root logger so ALL genesis.* logs are captured
     logging.getLogger("genesis").addHandler(_mcp_fh)
+    # On the handler: records propagated from any genesis.* logger are redacted.
+    _mcp_fh.addFilter(CARD_FILTER)
 
 # Direct file-write debug log for Turnstile — bypasses logging framework
 # entirely to guarantee output is visible. The logging.FileHandler approach
@@ -111,152 +113,14 @@ _ts_log = _TsLog()
 # ---------------------------------------------------------------------------
 # Card-number redaction of tool output and logs
 # ---------------------------------------------------------------------------
-# A page can show a card number (a saved-card page, a receipt, a test form). The
-# tools hand page text to the model and write it to logs, so every
-# _impl_browser_* result passes through _redacted, and the loggers that see tool
-# text carry _CardRedactingFilter. The detector is card_shapes: what it does not
-# recognise (other brands and lengths, numbers split by other characters) is not
-# redacted, by design.
-
-
-def _redact_text(text: str) -> str:
-    """``text`` with card numbers redacted, inside JSON text too.
-
-    The plain pass catches a number written out. A JSON string can also spell
-    the digits as ``\\u`` escapes, which only parsing reveals; when parsing
-    finds a number the plain pass missed, the JSON is re-serialised redacted.
-    """
-    out = redact(text)
-    if out.lstrip()[:1] not in ("{", "["):
-        return out
-    try:
-        parsed = json.loads(out)
-    except ValueError:
-        return out
-    walked = _redact_value(parsed)
-    return out if walked == parsed else json.dumps(walked, ensure_ascii=False)
-
-
-def _redact_number(value: int | float) -> int | float | str:
-    whole = value if isinstance(value, int) else (
-        int(value) if math.isfinite(value) and value.is_integer() and abs(value) < 1e20 else None
-    )
-    return REDACTED if whole is not None and contains_card_number(str(whole)) else value
-
-
-def _redact_value(value):
-    """``value`` with card numbers redacted in every string, key and number.
-
-    Covers what the tools return: dicts, lists, tuples, strings, numbers (a
-    page's script can return a card number as a number). Anything else is
-    returned as it is.
-    """
-    if isinstance(value, str):
-        return _redact_text(value)
-    if isinstance(value, bool) or value is None:
-        return value
-    if isinstance(value, int | float):
-        return _redact_number(value)
-    if isinstance(value, dict):
-        return {
-            (_redact_value(k) if isinstance(k, str) else k): _redact_value(v)
-            for k, v in value.items()
-        }
-    if isinstance(value, list | tuple):
-        return type(value)(_redact_value(v) for v in value)
-    return value
-
-
-def _redacted_result(name: str, result):
-    try:
-        return _redact_value(result)
-    except Exception:  # RecursionError on a deeply nested script result
-        logger.warning("%s: the result could not be checked for card numbers", name)
-        return {"error": f"{name}: the result could not be checked for card numbers, so it is withheld."}
-
-
-def _failed(name: str, exc: Exception) -> dict:
-    # Same shape as every other tool error. The traceback goes to the log,
-    # where _CardRedactingFilter redacts it.
-    logger.error("%s raised %s", name, type(exc).__name__, exc_info=True)
-    return {"error": f"{name} failed: {type(exc).__name__}: {redact(str(exc))}"}
-
-
-def _redacted(fn):
-    """Redact card numbers from a tool implementation's result and errors.
-
-    An exception becomes an ``{"error": ...}`` result with its message
-    redacted, so its text never reaches FastMCP's error result. Two kinds still
-    propagate: BaseExceptions such as cancellation, and the built-in
-    TimeoutError, which _with_tool_timeout turns into its own fixed timeout
-    result (its message is redacted first).
-    """
-    name = fn.__name__.removeprefix("_impl_")
-
-    if inspect.iscoroutinefunction(fn):
-
-        @functools.wraps(fn)
-        async def run_async(*args, **kwargs):
-            try:
-                result = await fn(*args, **kwargs)
-            except TimeoutError as e:
-                raise TimeoutError(redact(str(e))) from None
-            except Exception as e:
-                return _failed(name, e)
-            return _redacted_result(name, result)
-
-        return run_async
-
-    @functools.wraps(fn)
-    def run(*args, **kwargs):
-        try:
-            result = fn(*args, **kwargs)
-        except TimeoutError as e:
-            raise TimeoutError(redact(str(e))) from None
-        except Exception as e:
-            return _failed(name, e)
-        return _redacted_result(name, result)
-
-    return run
-
-
-class _CardRedactingFilter(logging.Filter):
-    """Rewrite a record as its redacted text, traceback included.
-
-    The message, the formatted exception and the stack are joined into the
-    message and redacted; ``exc_info``, ``exc_text`` and ``stack_info`` are
-    cleared so no handler formats the raw traceback again. Attached to LOGGERS,
-    not handlers: FastMCP's configure_logging replaces the handlers of the
-    ``fastmcp`` logger, and a logger's filters survive that. A logger filter
-    applies only to records created on that logger, so each emitting logger is
-    named in _REDACTED_LOGGERS.
-    """
-
-    _formatter = logging.Formatter()
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            parts = [record.getMessage()]
-        except Exception:
-            parts = [str(record.msg)]
-        if record.exc_info:
-            parts.append(self._formatter.formatException(record.exc_info))
-        elif record.exc_text:
-            parts.append(record.exc_text)
-        if record.stack_info:
-            parts.append(record.stack_info)
-        record.msg = redact("\n".join(parts))
-        record.args = None
-        record.exc_info = None
-        record.exc_text = None
-        record.stack_info = None
-        return True
-
-
-# The loggers that can carry page text or tool errors in this process: this
-# module, the genesis.browser modules it calls, FastMCP's tool and server
-# loggers (tool_manager logs a tool exception with its traceback), and the MCP
-# SDK's server loggers (debug-level request logging, stream exceptions).
+# A page can show a card number. Every _impl_browser_* result passes through
+# @_redacted, and CARD_FILTER (security/card_redaction.py) sits on the loggers
+# below and on the mcp_health.log handler. A logger filter sees only records
+# created on that logger, so each emitting logger is named: this module, the
+# genesis.browser modules it calls, FastMCP's tool and server loggers
+# (tool_manager logs a tool exception with its traceback, server logs call
+# arguments at debug) and the MCP SDK's lowlevel server logger. Logger-level,
+# because FastMCP's configure_logging replaces the fastmcp handlers.
 _REDACTED_LOGGERS = (
     __name__,
     "genesis.browser.engine",
@@ -267,11 +131,9 @@ _REDACTED_LOGGERS = (
     "fastmcp.tools.tool",
     "fastmcp.server.server",
     "mcp.server.lowlevel.server",
-    "mcp.server.exception_handler",
 )
-_card_filter = _CardRedactingFilter()
 for _name in _REDACTED_LOGGERS:
-    logging.getLogger(_name).addFilter(_card_filter)
+    logging.getLogger(_name).addFilter(CARD_FILTER)
 
 # Prevents concurrent browser init/cleanup races across tool calls.
 _browser_lock = asyncio.Lock()
@@ -1908,8 +1770,9 @@ async def _with_tool_timeout(
         global _active_page
         logger.warning("%s timed out after %.0fs — resetting active page", operation, timeout_s)
         _active_page = None
+        # Outside @_redacted: the operation names the caller's selector or key.
         return {
-            "error": (
+            "error": redact(
                 f"{operation} timed out after {timeout_s:.0f}s. {note}"
                 "Browser state was reset — call browser_navigate to resume."
             )
@@ -2643,14 +2506,14 @@ async def _send_turnstile_alert(page_url: str) -> None:
             severity=AlertSeverity.WARNING,
             title="CAPTCHA Challenge Detected",
             body=(
-                f"Browser at {page_url} hit a Cloudflare challenge. "
+                f"Browser at {redact(page_url)} hit a Cloudflare challenge. "
                 f"Auto-resolve and VNC click both failed after multiple attempts. "
                 f"Genesis will retry on next navigation.\n\n"
                 f"VNC available at: {vnc_url}"
             ),
         )
         await channel.send(alert)
-        logger.info("CAPTCHA alert sent to Telegram for %s", page_url)
+        logger.info("CAPTCHA alert sent to Telegram for %s", redact(page_url))
     except Exception:
         logger.warning("Failed to send CAPTCHA Telegram alert", exc_info=True)
 

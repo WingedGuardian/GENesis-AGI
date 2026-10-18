@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from genesis.mcp.health import browser
+from genesis.security.card_redaction import CARD_FILTER
+from genesis.security.card_shapes import REDACTED
 
 
 def _clear_all_browser_state():
@@ -6901,7 +6903,7 @@ def _assert_redacted(result) -> None:
 
     text = json.dumps(result, default=str)
     assert _CARD not in text and _CARD_SPACED not in text, text
-    assert browser.REDACTED in text, text
+    assert REDACTED in text, text
 
 
 def _card_page(url=f"https://shop.example/receipt/{_CARD}"):
@@ -6996,7 +6998,7 @@ class TestToolOutputIsRedacted:
         browser._active_page = _card_page()
         result = await browser._impl_browser_snapshot()
         _assert_redacted(result)
-        assert result["snapshot"] == f"- text: Card {browser.REDACTED} order 12345"
+        assert result["snapshot"] == f"- text: Card {REDACTED} order 12345"
 
     @pytest.mark.asyncio
     async def test_run_js_result_numbers_strings_keys_and_json(self):
@@ -7014,8 +7016,8 @@ class TestToolOutputIsRedacted:
         result = await browser._impl_browser_run_js("collect()")
         _assert_redacted(result)
         got = result["result"]
-        assert got["as_number"] == browser.REDACTED
-        assert got["as_float"] == browser.REDACTED
+        assert got["as_number"] == REDACTED
+        assert got["as_float"] == REDACTED
         assert got["count"] == 3
         assert "4242" not in got["json"]
 
@@ -7064,7 +7066,7 @@ class TestToolOutputIsRedacted:
         _assert_redacted(result)
 
 
-class TestRedactedDecorator:
+class TestRedactedOutsideTheResult:
     @pytest.mark.asyncio
     async def test_an_exception_becomes_a_redacted_error_result(self):
         with patch.object(
@@ -7075,37 +7077,35 @@ class TestRedactedDecorator:
         _assert_redacted(result)
 
     @pytest.mark.asyncio
-    async def test_timeout_and_cancellation_still_propagate(self):
-        @browser._redacted
-        async def _impl_x():
-            raise TimeoutError(f"slow {_CARD}")
+    async def test_the_tool_timeout_text_is_redacted(self):
+        result = await browser._with_tool_timeout(
+            asyncio.sleep(5), 0.01, f"browser_click('[data-pan=\"{_CARD}\"]')",
+        )
+        assert "timed out after" in result["error"]
+        _assert_redacted(result)
 
-        with pytest.raises(TimeoutError) as err:
-            await _impl_x()
-        assert _CARD not in str(err.value)
+    @pytest.mark.asyncio
+    async def test_the_captcha_alert_redacts_the_page_url(self, tmp_path):
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=1\n")
+        sent = []
 
-        @browser._redacted
-        async def _impl_y():
-            raise asyncio.CancelledError
+        class _Channel:
+            def __init__(self, *_a):
+                pass
 
-        with pytest.raises(asyncio.CancelledError):
-            await _impl_y()
+            async def send(self, alert):
+                sent.append(alert)
 
-    def test_a_result_too_deep_to_check_is_withheld(self):
-        deep: list = []
-        for _ in range(5000):
-            deep = [deep]
-
-        @browser._redacted
-        def _impl_z():
-            return {"result": deep}
-
-        result = _impl_z()
-        assert "could not be checked" in result["error"]
-
-    def test_wrapping_keeps_the_function_kind(self):
-        assert inspect.iscoroutinefunction(browser._impl_browser_snapshot)
-        assert not inspect.iscoroutinefunction(browser._impl_browser_collaborate)
+        with (
+            patch("genesis.env.secrets_path", return_value=secrets),
+            patch("genesis.guardian.alert.telegram.TelegramAlertChannel", _Channel),
+            patch.object(browser, "_get_vnc_url", return_value="http://vnc.example"),
+        ):
+            await browser._send_turnstile_alert(f"https://shop.example/pay/{_CARD}")
+        assert len(sent) == 1
+        assert _CARD not in sent[0].body
+        assert REDACTED in sent[0].body
 
 
 def test_every_impl_browser_function_is_redacted():
@@ -7165,7 +7165,41 @@ class TestLogsAreRedacted:
         assert "browser_navigate failed" in logged and "Traceback" in logged
         for text in (logged, ts_logged):
             assert text.count(_CARD) == 0
-            assert browser.REDACTED in text
+            assert REDACTED in text
+
+    def test_the_real_mcp_health_log_redacts_any_genesis_logger(self, tmp_path):
+        """mcp_health.log takes every propagated genesis.* record, not only the
+        named loggers', so its handler carries the filter. Run the import in a
+        child with a scratch HOME, so the handler the module attaches is the
+        real one and no shared log is opened."""
+        import subprocess
+
+        home = tmp_path / "home"
+        (home / "tmp").mkdir(parents=True)
+        script = (
+            "import logging\n"
+            "import genesis.mcp.health.browser\n"
+            "log = logging.getLogger('genesis.some.other')\n"
+            "log.setLevel(logging.INFO)\n"
+            "try:\n"
+            f"    raise RuntimeError('boom {_CARD}')\n"
+            "except RuntimeError:\n"
+            f"    log.warning('saw {_CARD_SPACED}', exc_info=True)\n"
+        )
+        src = Path(browser.__file__).resolve().parents[3]
+        out = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            env={"PATH": os.defpath, "HOME": str(home), "PYTHONPATH": str(src)},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert out.returncode == 0, out.stderr
+        logged = (home / "tmp" / "mcp_health.log").read_text()
+        assert "[genesis.some.other]" in logged and "Traceback" in logged
+        assert _CARD not in logged and _CARD_SPACED not in logged
+        assert REDACTED in logged
 
     @pytest.mark.parametrize("name", browser._REDACTED_LOGGERS)
     def test_each_named_logger_redacts(self, name):
@@ -7207,7 +7241,7 @@ class TestLogsAreRedacted:
         saved = (root.handlers[:], root.level, root.propagate)
         try:
             configure_logging(level="DEBUG")
-            assert browser._card_filter in logging.getLogger("fastmcp.tools.tool_manager").filters
+            assert CARD_FILTER in logging.getLogger("fastmcp.tools.tool_manager").filters
             server = FastMCP("redaction-test")
 
             @server.tool()
@@ -7224,4 +7258,4 @@ class TestLogsAreRedacted:
         err = "".join(capsys.readouterr().err.split())
         assert "Errorcallingtool" in err and "Traceback" in err
         assert _CARD not in err
-        assert "".join(browser.REDACTED.split()) in err
+        assert "".join(REDACTED.split()) in err

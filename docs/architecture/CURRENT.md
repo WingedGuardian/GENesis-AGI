@@ -1659,9 +1659,11 @@ the shared banner is not an assertion about all concurrent sessions.
   telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
   Every `_impl_browser_*` result and error passes `@_redacted` (card numbers in
   snapshots, script results, urls, titles and exception text become
-  `[card redacted]`; a contract test requires the decorator on each), and
-  `_CardRedactingFilter` on the browser, FastMCP and MCP SDK loggers redacts
-  log lines and tracebacks.
+  `[card redacted]`; a contract test requires the decorator on each), and the
+  `security/card_redaction` log filter sits on the `mcp_health.log` handler
+  (every propagated `genesis.*` record) and on the browser, FastMCP and MCP
+  SDK lowlevel-server loggers, redacting log lines and tracebacks. The tool
+  timeout text and the CAPTCHA Telegram alert's page URL are redacted too.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
@@ -3582,7 +3584,9 @@ tool-disabled CC probe without changing its schedule or routing authority.
   detector (ASCII digits, alphanumeric boundary, standard groupings, brand
   prefix + length, Luhn, UUID groups skipped; stdlib-only so scripts load it
   by path), used by the browser tool guards, `reference_store`, reference
-  extraction and `output_scanner`; `skill_scan`
+  extraction and `output_scanner`; `card_redaction` = redaction built on it
+  (result walker incl. JSON text and numbers, the `redacted` tool decorator,
+  the `CARD_FILTER` log filter), used by the browser tools; `skill_scan`
   shells to external NVIDIA SkillSpector. NOT auth or secrets storage (that's
   `runtime/init/secrets.py` + `env.py`). **`immunity.py` = the WS-3 kill
   switch + gate policy**: `gate_mode()` re-reads `config/ws3_immunity.yaml` +
