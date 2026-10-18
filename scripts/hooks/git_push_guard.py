@@ -12760,17 +12760,27 @@ def _first_close_reason(segs) -> str | None:
     return None
 
 
-def _review_request_compound_is_inert(segs, review_seg) -> bool:
+def _review_request_compound_is_inert(segs, review_seg, command: str) -> bool:
     """Whether every neighbor of a review request is on its inert allowlist.
 
-    A redirected neighbor is not inert, even when its executable would
-    otherwise be allowlisted. Input belonging to the review request itself
-    does not change the neighbor decision. Known residue: ``git log`` accepts
-    ``--output=<file>`` and so can write a file; it is on the owner's inert
-    list anyway, because this gate is about bundling approvals, not file writes.
+    The structural checks are ``_neighbours_are_inert``'s: the parse drops
+    redirects from a segment's ``raw``, so a redirect is tested on the raw
+    COMMAND, and any ``<`` or ``>`` in a command with a neighbor refuses —
+    including one belonging to the review request itself (an accepted
+    over-block, as in the push arm). A ``gh`` neighbor must resolve, through
+    ``gh_command``, to exactly ``pr view`` or ``pr checks`` with no unmodelled
+    flag; ``gh_pr_subcommand`` finds ``pr`` anywhere in argv, which reads
+    ``gh alias set pv -- pr view`` as a read. A neighbor must be spelled with
+    the bare program name, and a git neighbor carrying ``--output``, ``-o``,
+    ``--ext-diff`` or ``--textconv`` is refused, since those write a file or
+    run a program.
     """
 
     def review_neighbour_is_inert(s: Segment) -> bool:
+        # The bare name only: `exe` is a basename, so `./gh` or `/tmp/x/git`
+        # would otherwise pass as the real program.
+        if not s.argv or s.argv[0] != s.exe:
+            return False
         if s.exe in {"cd", "sleep"}:
             return True
         if s.exe == "git":
@@ -12779,24 +12789,25 @@ def _review_request_compound_is_inert(segs, review_seg) -> bool:
                 if s.argv[i] != "-C":
                     return False
                 i += 2
+            # `git log --output=<file>` writes a file, the same effect as the
+            # redirect refused above; `--ext-diff`/`--textconv` run programs.
+            if any(
+                a == "-o" or a.startswith(("--output", "--ext-diff", "--textconv"))
+                for a in s.argv[i:]
+            ):
+                return False
             return git_subcommand(s.argv) in {"status", "log"}
         if s.exe == "gh":
-            return gh_pr_subcommand(s.argv) in {"view", "checks"}
+            inv = gh_command(s.argv)
+            return (
+                inv is not None
+                and inv.group == "pr"
+                and inv.subcommand in {"view", "checks"}
+                and not inv.unmodelled
+            )
         return False
 
-    for seg in segs:
-        if seg is review_seg:
-            continue
-        raw = seg.raw or ""
-        if "<(" in raw or ">(" in raw or "<" in raw or ">" in raw:
-            return False
-        try:
-            words = shlex.split(raw, comments=True)
-        except ValueError:
-            return False
-        if words != list(seg.argv or []) or not review_neighbour_is_inert(seg):
-            return False
-    return True
+    return _neighbours_are_inert(segs, review_seg, command, review_neighbour_is_inert)
 
 
 def _push_seg_has_no_prefix(seg) -> bool:
@@ -14679,7 +14690,7 @@ def _run_merge_and_push_gates() -> int:
             review_triggers = _review_request_triggers(segs)
             review_seg = review_triggers[0][0] if len(review_triggers) == 1 else None
             if review_seg is not None and not _review_request_compound_is_inert(
-                segs, review_seg
+                segs, review_seg, cmd
             ):
                 # Defer this refusal to the tail. Specific hard checks below
                 # (force push, --no-verify, merge gates, sqlite) must retain
@@ -14696,7 +14707,8 @@ def _run_merge_and_push_gates() -> int:
                     round_compound_deny = (
                         "BLOCKED: this review request needs its own fresh user approval, "
                         "but the same command also runs a step that is not on the inert "
-                        "list (cd, sleep, git status/log, gh pr view/checks). "
+                        "list (cd, sleep, git status/log, gh pr view/checks), or "
+                        "carries a redirect. "
                         "Run the review request separately so one approval cannot "
                         "authorize multiple actions."
                     )
