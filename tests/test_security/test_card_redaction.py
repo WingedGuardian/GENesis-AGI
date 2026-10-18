@@ -166,3 +166,40 @@ class TestFilter:
             card_redaction.logger.removeHandler(handler)
         assert len(records) == 1
         assert _CARD not in records[0] and REDACTED in records[0]
+
+
+class TestArmedMode:
+    """While a payment tab is armed (``CardRedactingFilter.armed``), a record
+    keeps only its format string: no args, no traceback."""
+
+    @staticmethod
+    def _record(exc: bool = True) -> logging.LogRecord:
+        try:
+            raise RuntimeError("cvc 739")
+        except RuntimeError:
+            info = __import__("sys").exc_info() if exc else None
+        return logging.LogRecord("t", logging.ERROR, __file__, 1, "filled %s", ("739",), info)
+
+    @pytest.mark.parametrize("probe", [lambda: True, lambda: 1 / 0])
+    def test_args_and_traceback_are_withheld(self, probe):
+        f = CardRedactingFilter()
+        f.armed = probe  # a probe that raises counts as armed
+        record = self._record()
+        assert f.filter(record) is True
+        text = logging.Formatter().format(record)
+        assert "739" not in text and "RuntimeError" not in text
+        assert text == "filled %s [args withheld: payment tab armed]"
+
+    def test_the_format_string_itself_is_still_card_redacted(self):
+        f = CardRedactingFilter()
+        f.armed = lambda: True
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, f"saw {_CARD}", None, None)
+        f.filter(record)
+        assert _CARD not in record.getMessage() and REDACTED in record.getMessage()
+
+    def test_unarmed_keeps_the_ordinary_redaction(self):
+        f = CardRedactingFilter()
+        f.armed = lambda: False
+        record = self._record()
+        f.filter(record)
+        assert "filled 739" in record.getMessage() and "RuntimeError" in record.getMessage()

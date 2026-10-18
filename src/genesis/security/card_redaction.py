@@ -27,6 +27,7 @@ import inspect
 import json
 import logging
 import math
+from collections.abc import Callable
 
 from genesis.security.card_shapes import REDACTED, contains_card_number, redact
 
@@ -155,7 +156,32 @@ class CardRedactingFilter(logging.Filter):
 
     _formatter = logging.Formatter()
 
+    #: Armed mode: while this returns True (a payment tab is armed, see
+    #: ``genesis.mcp.health.payment_tab``) a record keeps only its format
+    #: string. Its args are withheld and its traceback is never formatted, so
+    #: nothing read from a page during a card fill reaches a log. A probe that
+    #: raises counts as armed.
+    armed: Callable[[], bool] | None = None
+
+    def _armed(self) -> bool:
+        if self.armed is None:
+            return False
+        try:
+            return bool(self.armed())
+        except Exception:
+            return True
+
     def filter(self, record: logging.LogRecord) -> bool:
+        if self._armed():
+            withheld = bool(record.args or record.exc_info or record.exc_text or record.stack_info)
+            record.msg = redact(str(record.msg)) + (
+                " [args withheld: payment tab armed]" if withheld else ""
+            )
+            record.args = None
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+            return True
         try:
             parts = [record.getMessage()]
         except Exception:

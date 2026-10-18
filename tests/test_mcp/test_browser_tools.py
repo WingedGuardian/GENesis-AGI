@@ -56,6 +56,8 @@ def _clear_all_browser_state():
     browser._last_dialog.clear()
     # VNC verification flag — FIX 3 tests toggle it; reset to avoid leak
     browser._vnc_verified = False
+    # run_js taints the payment-tab guard's context state
+    browser.payment_tab.TABS.reset()
 
 
 @pytest.fixture(autouse=True)
