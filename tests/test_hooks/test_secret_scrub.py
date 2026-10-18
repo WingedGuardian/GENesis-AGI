@@ -996,6 +996,13 @@ class TestHttpCredentialHeaders:
             ("Bearer station-token", "station-token"),
             ("Bearer secret", "secret"),
             ("Bearer abcdefghijklmno", "abcdefghijklmno"),
+            ("Bearer token", "token"),
+            ("Bearer $ecret", "$ecret"),
+            ("Bearer abc:def", "def"),
+            (
+                'curl -H "Authorization: Digest username=\\"alice\\", response=\\"deadbeef\\"" https://h',
+                "deadbeef",
+            ),
         ],
     )
     def test_the_credential_is_redacted(self, text, secret):
@@ -1011,9 +1018,6 @@ class TestHttpCredentialHeaders:
     @pytest.mark.parametrize(
         "text",
         [
-            "the request needs a bearer token",
-            "Bearer tokens are documented in RFC 6750",
-            "Bearer authentication is the default",
             "authorization is checked by the gateway",
             "set an Authorization header",
             "cookies: 3 stored",
@@ -1022,6 +1026,13 @@ class TestHttpCredentialHeaders:
     )
     def test_prose_is_kept(self, text):
         assert s.scrub(text) == text
+
+    def test_the_word_after_bearer_is_always_withheld(self):
+        # Decision: a configured bearer secret is any non-empty ASCII value, so
+        # no rule can tell "Bearer token" the credential from "Bearer token"
+        # the prose. Prose that names a bearer loses one word.
+        assert s.scrub("Bearer tokens are documented") == "Bearer " + R + " are documented"
+        assert s.scrub('\\"Authorization\\": \\"x\\", \\"b\\": \\"Bearer abc\\"').endswith("Bearer " + R + '\\"')
 
     @pytest.mark.parametrize(
         "shape",

@@ -299,25 +299,25 @@ _HEADER_PATTERN = re.compile(
     r"|\\'(?:[^'\\\n]|\\[^'\n])*\\'"
     r"|\"[^\"\n]*\""
     r"|'[^'\n]*'"
-    r"|(?(open)(?:(?!(?P=open))[^\r\n])+|[^\r\n]+)"
+    # A backslash pair is consumed whole, so an escaped quote inside the value
+    # (`-H "Authorization: Digest username=\"a\", response=\"...\""`) is
+    # content, not the closing quote.
+    r"|(?(open)(?:\\.|(?!(?P=open))[^\r\n])+|[^\r\n]+)"
     r")",
     re.IGNORECASE,
 )
 
 # A bearer credential wherever it appears, with no header label in front: a
-# curl command line, a log line, a copied value. Any length counts, because a
-# configured bearer secret needs only to be non-empty, so prose is told apart
-# by the WORD that follows "bearer", not by the length of what follows it.
-_BEARER_PROSE_WORDS = (
-    r"tokens?|auth\w*|scheme|schemes|header|headers|credentials?|value|values|"
-    r"string|prefix|keyword|format|type|check|checks|checked|predicates?|reads?|"
-    r"slot|path|paths|gates?|compares?|tests?|and|or|the|a|an|is|are|in|on|for|"
-    r"with|to|of|from|so|here|there|only"
-)
+# curl command line, a log line, a copied value. The word after "bearer" is
+# withheld whatever it is. A configured bearer secret only has to be non-empty
+# ASCII, so neither a length floor, nor a character class, nor a list of prose
+# words can tell a credential from text: "Bearer token" may be the token. Prose
+# that mentions a bearer loses the following word, the cheap direction. The
+# value ends at whitespace or a quote, and an escaping backslash before a
+# closing quote stays outside it, so a serialized string keeps its escapes.
 _BEARER_VALUE_PATTERN = re.compile(
     r"(?<![A-Za-z])bearer[ \t]+"
-    rf"(?!(?:{_BEARER_PROSE_WORDS})\b)"
-    r"(?P<token>[A-Za-z0-9_\-\./+~]+=*)",
+    r"(?P<token>[^\s\"']+?)(?=\\[\"']|[\s\"']|\Z)",
     re.IGNORECASE,
 )
 
