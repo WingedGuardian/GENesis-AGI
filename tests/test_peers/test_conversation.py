@@ -133,8 +133,56 @@ async def test_real_sdk_http_bounded_send_poll_full_continuation(http_bridge):
         assert "A considered reply" in b.invoker.run_streaming.call_args.args[0].prompt
 
 
+def _fallback_turn(b, tool_turn, monkeypatch):
+    from dataclasses import replace
+
+    from genesis.cc import roster
+    from genesis.cc.exceptions import CCQuotaExhaustedError
+    from genesis.cc.provider_readiness import READY
+    from genesis.cc.types import StreamEvent
+
+    monkeypatch.setenv("GENESIS_HOME", str(b.registry.path.parent))
+    monkeypatch.setenv("SYNTHETIC_PROVIDER_KEY", "synthetic-key")
+    monkeypatch.setattr(
+        roster,
+        "load_roster",
+        lambda: {
+            "default": "claude",
+            "models": {
+                "claude": {"native_subscription": True},
+                "backup": {
+                    "model_id": "backup-id",
+                    "anthropic_base_url": "https://provider.example.org",
+                    "auth_env": "SYNTHETIC_PROVIDER_KEY",
+                    "failover_order": 1,
+                },
+            },
+        },
+    )
+    build = b.runner._build_invocation
+    b.runner._build_invocation = lambda req, sid: replace(build(req, sid), roster_eligible=True)
+
+    async def selected_turn(invocation, **kwargs):
+        if invocation.disable_tools:
+            if not invocation.anthropic_base_url:
+                raise CCQuotaExhaustedError("synthetic refusal")
+            await kwargs["on_event"](
+                StreamEvent(
+                    "init",
+                    raw={"type": "system", "subtype": "init", "tools": [], "mcp_servers": []},
+                )
+            )
+            return CCOutput("probe", READY, "backup-id", 0, 1, 1, 1, 0, tools_used=())
+        return await tool_turn(invocation, **kwargs)
+
+    return selected_turn
+
+
 @pytest.mark.parametrize("waiting", [True, False])
-async def test_agent_gate_owner_notification_resolution_and_wait_or_hold(http_bridge, waiting):
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_agent_gate_owner_notification_resolution_and_wait_or_hold(
+    http_bridge, waiting, fallback, monkeypatch
+):
     from a2a.types import GetTaskRequest, TaskState
 
     from genesis.autonomy.approval import ApprovalManager
@@ -222,7 +270,9 @@ async def test_agent_gate_owner_notification_resolution_and_wait_or_hold(http_br
             exit_code=0,
         )
 
-    b.invoker.run_streaming.side_effect = tool_turn
+    b.invoker.run_streaming.side_effect = (
+        _fallback_turn(b, tool_turn, monkeypatch) if fallback else tool_turn
+    )
     async with sdk_client(base) as (client, transport):
         task = await sdk_send(transport, message())
         await asyncio.wait_for(sent.wait(), 3)
@@ -264,7 +314,7 @@ async def test_agent_gate_owner_notification_resolution_and_wait_or_hold(http_br
         done = await sdk_settle(transport, task.id)
         assert done.status.state == TaskState.TASK_STATE_COMPLETED
         assert (await client.get(base + ROOT + "/approvals")).json()["approvals"] == []
-        assert b.invoker.run_streaming.await_count == 1  # No generic cognition replay.
+        assert b.invoker.run_streaming.await_count == (3 if fallback else 1)
 
 
 def message(mid=None, context=None, **options):
@@ -641,12 +691,13 @@ async def test_host_bootstrap_records_peer_binding_readiness(bridge, monkeypatch
     monkeypatch.setattr("genesis.runtime._capabilities.write_capabilities_file", write)
     app = Flask(__name__)
     adapter = StandaloneAdapter()
+    app.config.update(GENESIS_PEER_RUNTIME=bridge.runtime, GENESIS_PEER_REGISTRY=bridge.registry)
     monkeypatch.setattr(adapter, "_create_flask_app", lambda: app)
     monkeypatch.setattr(
         adapter, "_register_blueprints", lambda: app.register_blueprint(agent_api_bp)
     )
     await adapter.bootstrap()
-    assert bridge.runtime._bootstrap_manifest["agent_api"] == ("ok" if enabled else "degraded")
+    assert bridge.runtime._bootstrap_manifest["agent_api"] == ("ok" if enabled else "disabled")
     assert "agent_api" in _CAPABILITY_DESCRIPTIONS
     write.assert_called_once_with(bridge.runtime)
 

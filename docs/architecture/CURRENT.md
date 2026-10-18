@@ -393,10 +393,20 @@ reconciliation prevent automatic replay; live registered work is excluded from
 the stale reaper. It is a native primitive, not an enabled peer transport. See
 `docs/reference/native-managed-sessions.md`.
 
+Roster-eligible managed API turns now select a provider through enforced
+tool-disabled, empty-MCP readiness checks before executing their task once.
+Only provider refusals advance the configured roster; post-start failure never
+switches providers or parks work. Preflight consumes the original deadline and
+held native capacity. Selection/endpoint attribution uses one roster snapshot,
+with additional metadata writes on an owned DB connection. The recovery worker
+shares the OAuth-compatible readiness helper. `cc_fallback` is a non-routing
+**Fallback** observation in the neural monitor for conversations and managed
+turns; actual committed outcomes, not readiness alone, establish success.
+
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 6ef113ecd 2026-10-14
+verified: 4606e5969 2026-10-16
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
@@ -1417,8 +1427,13 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: a6d1fa0ec4c2 2026-10-17
+verified: e943bc114 2026-10-16
 ```
+
+The neural monitor includes the non-routing **Fallback** observation, and the
+dashboard labels the shared fallback indicator as last successful/observed use.
+Individual managed provider selection remains scoped to its native receipt;
+the shared banner is not an assertion about all concurrent sessions.
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
   pinned node/realm/principal and scoped credentials. Disabled by default; no
@@ -1431,6 +1446,9 @@ verified: a6d1fa0ec4c2 2026-10-17
   to fallback readiness, while inactive credentials still participate in scope
   collision checks. Scope checks also reject equality with loaded active/fallback
   Flask signing keys, without request-time credential-file reads.
+  Local readiness reads a consistent, read-only registry snapshot and reuses
+  conversation admission's runner/database checks. Intentional disablement has
+  its own startup/capability status and does not count as a deploy regression.
   `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
   existing Flask/runtime loop: it atomically persists native receipts, binds
   contexts and retries to relationship epochs, and admits at most two
@@ -3320,6 +3338,11 @@ modules: [db, runtime, resilience, observability, security, codebase,
           env.py, _config_overlay.py]
 verified: da43da6e4f73 2026-10-17
 ```
+
+`observability` seeds `cc_fallback` idle and reads its content-free last-run
+provider/model/outcome. Failed historical attempts render as a warning, not an
+inferred current provider outage. The readiness worker uses the shared
+tool-disabled CC probe without changing its schedule or routing authority.
 
 - **payments/**: the encrypted card vault, virtual cards only.
   `python -m genesis vault init|add|list|retire|status` (`payments/cli.py`);
