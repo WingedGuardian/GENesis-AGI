@@ -1,0 +1,1 @@
+- Commands after a here-doc whose body breaks the command parse (an unmatched backtick or an apostrophe in the body) are no longer invisible to the safety guards: the parse reports the command as unreadable, and a guard refuses it when it names the operation that guard checks, with a hint to write the body with an editor tool and run the rest as its own step.

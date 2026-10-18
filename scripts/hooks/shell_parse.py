@@ -51,6 +51,7 @@ from __future__ import annotations
 import enum
 import re
 import shlex
+from bisect import bisect_right as _bisect_right
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -842,9 +843,13 @@ def _excised_text(command: str) -> str:
     return excised[0] if excised is not None else command
 
 
-def parse_segments(command: str) -> list[_ParsedSegment]:
+def parse_segments(command: str, *, _splits: list[int] | None = None) -> list[_ParsedSegment]:
     """Split a command line into executed segments, returning per segment BOTH the raw
     text and a redirect-STRIPPED argv source (see ``_ParsedSegment``).
+
+    ``_splits`` is internal: when a list is passed, the offset of every newline this
+    parse SPLIT on is appended to it (see :func:`_heredoc_hidden_suffixes`). It never
+    changes the result.
 
     Quote-aware: an operator inside a quoted string does not split. Splits on ``&&``,
     ``||``, ``;``, ``|``, ``&`` and newlines. A ``#`` comment (opened outside quotes)
@@ -946,6 +951,8 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             i = j
             continue
         if c in (";", "|", "&", "\n"):
+            if c == "\n" and _splits is not None:
+                _splits.append(i)
             pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
             raw_buf, argv_buf, redirs = [], [], []
             i += 1
@@ -1928,17 +1935,170 @@ def has_built_escape(command: str) -> bool:
         return True
 
 
+#: A HERE-DOC BODY THE PARSER READS AS COMMANDS. :func:`parse_segments` has no
+#: here-doc state, so it segments a body like command text. Anything in the body that
+#: leaves the segmenter in an open state carries across the terminator line: an
+#: unmatched backtick or ``$(`` in what reads as a redirect target, or an apostrophe
+#: that opens a quote. The terminator and the commands after it then merge into one
+#: segment, a guard searching the segments for its operation finds none, and the
+#: shell runs it. The root cause is the missing body boundary, not the backtick.
+#:
+#: REPORTED, NOT MODELLED, for the reason :data:`_BLIND_CONTINUATION` is. Modelling
+#: the boundary means the segmentation itself depends on where an opener was
+#: detected, and a mis-detected opener (one inside a comment or a quoted string) can
+#: then HIDE a command that the plain parse sees. Reporting can only ever add a blind
+#: spot. The detector is a check, not a second parse: an opener whose line ends at a
+#: newline the parse split on, paired with a terminator line whose newline the parse
+#: did NOT split on, means the parse is not back in the state the shell is in after
+#: the body (:func:`_heredoc_hidden_suffixes`). It runs at every depth, so a
+#: here-doc inside ``bash -c`` reaches the top level the way a depth bound does.
+#:
+#: ``bounds_induced`` is True because the consequence is the one a bound has: the
+#: segments after the terminator are not what the shell runs, so none are returned,
+#: and every consumer's bounds branch already handles that contract.
+#:
+#: ORDERED AFTER :func:`untokenizable`, unlike the other bounds-type causes. The
+#: discard guard deliberately leaves untokenizable commands alone (its measured cost
+#: of refusing them is written beside that branch), and here-doc prose with an
+#: apostrophe is the commonest untokenizable command. Reporting this cause first
+#: would reclassify those commands to bounds-type and reverse that measured decision.
+#: The deliberate residual: an untokenizable command whose body ALSO hides a suffix
+#: keeps the untokenizable cause, and with it that guard's settled behaviour.
+#:
+#: COST, measured over 138,216 recorded unique commands on one install. At the top
+#: level the check fires on 78 tokenizable commands (0.056%), and an exact bash oracle
+#: (bash parses the command with the suffix replaced by a marker, without running it)
+#: confirms that 77 of them end the body where the parse did not. The 78th is a
+#: ``<<EOF`` inside a string inside a Python here-doc body. 7 of the 78 already had a
+#: blind spot (a continuation or a built escape) and keep it. With the 2 fires that
+#: occur only inside a nested script (both confirmed by the oracle), 73 commands
+#: (0.053%) move from no blind spot to this one, and no command changes cause. Of
+#: those 73, 23 (0.017%) mention, through :func:`mention_views`, an operation a
+#: guard's bounds branch refuses on (push or merge, commit, pytest, a discard). That
+#: is an upper bound on new refusals. The scan is linear: one line index, and one
+#: bisect per candidate terminator. At :data:`MAX_COMMAND_CHARS` on adversarial
+#: shapes, it adds at most 0.06 s to :func:`analyze_checked`.
+_BLIND_HEREDOC_BODY = BlindSpot(
+    bounds_induced=True,
+    cause="has a here-doc body that changes how the lines after its terminator are read",
+    hint=(
+        "write the body with an editor tool, then run the commands after it as "
+        "their own step"
+    ),
+)
+
+#: One here-doc opener: ``<<`` or ``<<-`` (never ``<<<``), then the delimiter word.
+#: The word ends at an unquoted blank or a metacharacter; a carriage return is part
+#: of it, as it is to bash, so a CRLF terminator still matches. Every alternative
+#: starts on a different character, so the match cannot backtrack.
+_HEREDOC_OPENER = re.compile(
+    r"(?<!<)<<(?!<)(-?)[ \t]*((?:'[^'\n]*'|\"[^\"\n]*\"|\\.|[^ \t\n;&|<>()'\"\\])+)"
+)
+_HEREDOC_QUOTING = re.compile(r"['\"\\]")
+
+
+def _heredoc_terminators(text: str) -> list[tuple[int, int]]:
+    """``(opener_newline, terminator_newline)`` offsets for every here-doc opener.
+
+    Each opener gets up to TWO candidate terminators. (a) The first later line equal
+    to the delimiter after quote removal (leading TABs stripped for ``<<-`` only),
+    also accepting ``D)``, which bash ends a body at inside ``$(…)``. That is bash's
+    own rule for one opener, and it does not depend on any other opener, so a fake
+    opener in a comment cannot shift it. (b) The queued-order terminator when one
+    line opens several bodies, each starting after the previous one's end.
+
+    LINEAR, deliberately. Lines are indexed once, in two SEPARATE indexes (exact
+    lines for ``<<``, tab-stripped lines for ``<<-``), so every lookup is one bisect.
+    A single mixed index needed filtering after the bisect and went quadratic on
+    alternating ``<<-`` and tab lines. This runs on a hook path, where a hook killed
+    by its timeout does not refuse.
+    """
+    lines = text.split("\n")
+    ends: list[int] = []
+    pos = -1
+    for line in lines:
+        pos += len(line) + 1
+        ends.append(pos)  # the line's newline; len(text) for the last line
+    exact: dict[str, list[int]] = {}
+    tabbed: dict[str, list[int]] = {}
+    for k, line in enumerate(lines):
+        for index, key in ((exact, line), (tabbed, line.lstrip("\t"))):
+            index.setdefault(key, []).append(k)
+            if key.endswith(")"):
+                index.setdefault(key[:-1], []).append(k)
+
+    def first_after(delim: str, tabs: bool, row: int) -> int | None:
+        rows = (tabbed if tabs else exact).get(delim)
+        if not rows:
+            return None
+        i = _bisect_right(rows, row)
+        return rows[i] if i < len(rows) else None
+
+    pairs: list[tuple[int, int]] = []
+    for k, line in enumerate(lines):
+        if "<<" not in line:
+            continue
+        queued = k
+        for match in _HEREDOC_OPENER.finditer(line):
+            delim = _HEREDOC_QUOTING.sub("", match.group(2))
+            tabs = match.group(1) == "-"
+            first = first_after(delim, tabs, k)
+            if first is not None:
+                pairs.append((ends[k], ends[first]))
+            nxt = first_after(delim, tabs, queued)
+            if nxt is not None:
+                pairs.append((ends[k], ends[nxt]))
+                queued = nxt
+    return pairs
+
+
+def _heredoc_hidden_suffixes(text: str, splits: list[int]) -> list[tuple[int, int]]:
+    """The here-doc candidates after which the parse of ``text`` is not where bash is.
+
+    ``splits`` are the newline offsets :func:`parse_segments` split ``text`` on. An
+    opener whose line ends at a split point began its body from a clean state; if a
+    candidate terminator's newline is NOT a split point, something in the body carried
+    the parse across it, and the text after it is read wrongly.
+
+    Only a suffix that can hold a command counts: one with something other than
+    blanks and ``)`` after the terminator. MEASURED, the plain "anything after it"
+    test fired on 93 real commands at depth 1 and on none of them was anything
+    hidden: a ``"$(cat <<'EOF'`` body with an apostrophe hands the nested parse a
+    script ending ``EOF`` newline ``)``, and a closing paren runs nothing.
+    """
+    if "<<" not in text:
+        return []
+    split = set(splits)
+    last = len(text.rstrip(" \t\r\n)")) - 1  # the last character that can run
+    return [
+        (opener, end)
+        for opener, end in _heredoc_terminators(text)
+        if opener in split and end < last and end not in split
+    ]
+
+
+def _heredoc_hides_suffix(command: str) -> bool:
+    """Whether a here-doc body hides a suffix of ``command`` at any depth (the
+    detector behind :data:`_BLIND_HEREDOC_BODY`, without its untokenizable
+    precedence, and False when a size bound fired instead)."""
+    return "<<" in command and _analyze_bounded(command)[1] == "heredoc"
+
+
 def rewrites_before_running(command: str) -> bool:
     """Whether the parse is withheld because the shell REWRITES the text before it
-    runs it (a line continuation, or a built escape), rather than because the
-    command hit a size bound.
+    runs it (a line continuation, or a built escape), or reads it differently from
+    the parse (a here-doc body), rather than because the command hit a size bound.
 
-    Both are bounds-type blind spots, but only a size bound is measured at 0 real
-    commands; these two are ordinary input. A consumer that treats the two kinds
+    All are bounds-type blind spots, but only a size bound is measured at 0 real
+    commands; these are ordinary input. A consumer that treats the two kinds
     differently (a note given per command, not once per session) asks this, so a
     new cause of the same kind is added here once instead of at every caller.
     """
-    return has_continuation(command) or has_built_escape(command)
+    return (
+        has_continuation(command)
+        or has_built_escape(command)
+        or _heredoc_hides_suffix(command)
+    )
 
 def decode_ansi_c(text: str) -> str:
     """``text`` with every ``$'…'`` string replaced by what bash decodes it to.
@@ -2026,13 +2186,15 @@ def unresolved_verb_programs(command: str) -> frozenset[str]:
     advisory targets) meant re-modelling the join, and review found a new defect in
     that modelling each round; those consumers refuse or give a short note instead.
     Reads the command as written and with continuations folded, and returns the
-    union. Bounded exactly like :func:`analyze_checked`: a reading that trips a bound
-    contributes nothing, and the caller's own bounds branch has already refused.
+    union. Bounded exactly like :func:`analyze_checked`: a reading that trips a SIZE
+    bound contributes nothing, and the caller's own bounds branch has already refused.
+    A here-doc reading (``"heredoc"``) is parsed in full, like a continued one, so its
+    segments still contribute: this fact can only add a refusal.
     """
     programs: set[str] = set()
     for text in dict.fromkeys((command, fold_continuations(command))):
         segments, reason = _analyze_bounded(text)
-        if reason:
+        if reason in _SIZE_BOUND_REASONS:
             continue
         programs.update(_basename(s.argv[0]) for s in segments if _dispatcher_verb_unresolved(s))
     return frozenset(programs)
@@ -2087,6 +2249,7 @@ _ALL_BLIND_SPOTS = (
     _BLIND_UNCLASSIFIED_OPTION,
     _BLIND_CONTINUATION,
     _BLIND_BUILT_ESCAPE,
+    _BLIND_HEREDOC_BODY,
 )
 
 
@@ -2175,6 +2338,14 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     The bounds keep precedence because both are bounds-type — the verdict is the same —
     and the bound's remedy is the one that must be acted on first.
 
+    :data:`_BLIND_HEREDOC_BODY` is the one bounds-type cause ordered AFTER
+    :func:`untokenizable`, and BEFORE the unresolved-verb causes. Here the precedence
+    runs the other way on purpose: the discard guard's exemption for untokenizable
+    commands is a measured decision, and here-doc prose with an apostrophe is the
+    commonest untokenizable command, so reporting this cause first would reverse that
+    decision for every such command. The reasoning and the residual it leaves are
+    written beside the blind spot.
+
     WITHHOLDING SEGMENTS ALSO WITHHOLDS THE FACTS ON THEM, which is how an earlier
     revision of this docstring came to claim the placement "never removes" a refusal
     and was wrong. The push guard refused `git $V …` from the unresolved-verb flag on
@@ -2206,6 +2377,8 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
         return [], _BLIND_BUILT_ESCAPE
     if untokenizable(command):
         return segments, _BLIND_UNTOKENIZABLE
+    if reason == "heredoc":
+        return [], _BLIND_HEREDOC_BODY
     hidden = [s for s in segments if _dispatcher_verb_unresolved(s)]
     if hidden:
         # Two causes reach one predicate, and they need DIFFERENT remedies. The
@@ -3475,13 +3648,24 @@ def analyze(command: str) -> list[Segment]:
     return _analyze_bounded(command)[0]
 
 
+#: The reasons :func:`_analyze_bounded` gives when a SIZE bound cut the parse short.
+#: ``"heredoc"`` is not one: that parse ran in full and reads part of it wrongly.
+_SIZE_BOUND_REASONS = frozenset({"length", "depth"})
+
+
 def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], str | None]:
     """:func:`analyze`, plus which bound (if any) stopped it short of the whole command.
 
-    Returns ``(segments, reason)`` where reason is None, ``"length"`` or ``"depth"``.
-    ``"depth"`` is reported only when there was something left to descend INTO and the
-    bound refused it — reaching the bound with nothing nested below is a complete
-    parse, not a truncated one.
+    Returns ``(segments, reason)`` where reason is None, ``"length"``, ``"depth"`` or
+    ``"heredoc"``. ``"depth"`` is reported only when there was something left to
+    descend INTO and the bound refused it — reaching the bound with nothing nested
+    below is a complete parse, not a truncated one.
+
+    ``"heredoc"`` means the parse is complete but a here-doc body, at this depth or
+    any depth below, carried it across its terminator (see
+    :data:`_BLIND_HEREDOC_BODY`). It propagates up exactly like ``"depth"``, and both
+    size bounds outrank it: a bound is the stronger statement, and its remedy comes
+    first. The segments are returned unchanged, so :func:`analyze` is unaffected.
 
     Both facts come from ONE traversal, on purpose. Answering "did this truncate?"
     with a separate pass means a second model of shell syntax, and any disagreement
@@ -3508,12 +3692,17 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         command = _excised_text(command)
     out: list[Segment] = []
     truncated = False
+    # The newlines this parse split on, from the SAME parse, so the here-doc check
+    # compares bash's body boundary against this parse rather than a second model.
+    splits: list[int] = []
+    parsed = parse_segments(command, _splits=splits)
+    heredoc = bool(_heredoc_hidden_suffixes(command, splits))
     # Subshells opened and not yet closed by earlier segments of this command. A
     # `(` opener counts; a `)` closer (bare or glued) at the end of a segment
     # closes. Counted on the segment SOURCE text outside quotes and comments, so a
     # paren inside a quoted argument is never mistaken for a subshell.
     carried_open = 0
-    for seg in parse_segments(command):
+    for seg in parsed:
         raw = seg.raw
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
@@ -3555,6 +3744,7 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         for script in nested:
             inner_segs, inner_reason = _analyze_bounded(script, _depth=_depth + 1)
             truncated = truncated or inner_reason == "depth"
+            heredoc = heredoc or inner_reason == "heredoc"
             for inner in inner_segs:
                 out.append(
                     Segment(
@@ -3567,7 +3757,9 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
                         verb_unresolved=inner.verb_unresolved,
                     )
                 )
-    return out, ("depth" if truncated else None)
+    if truncated:
+        return out, "depth"
+    return out, ("heredoc" if heredoc else None)
 
 
 def is_pytest_invocation(seg: Segment) -> bool:

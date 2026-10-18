@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import inspect
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1682,3 +1683,268 @@ def test_gh_api_request_is_none_off_the_api_group() -> None:
     assert sp.gh_api_request(["gh", "workflow", "run", "api"]) is None
     assert sp.gh_api_request(["gh", "pr", "view", "5"]) is None
     assert sp.gh_api_request(["git", "push"]) is None
+
+
+# ── a here-doc body that carries the parse across its terminator (#3433) ──────
+#
+# parse_segments has no here-doc state, so a body that leaves the segmenter open (an
+# unmatched backtick in what reads as a redirect target, an apostrophe) merges the
+# terminator and the commands after it into one segment. The fix REPORTS that as a
+# bounds-type blind spot; it never changes the segmentation. Literals are assembled
+# so this file's own text does not carry a gated command.
+
+_HD_GIT = "g" + "it"
+_HD_PUSH = " ".join([_HD_GIT, "pu" + "sh", "--" + "force", "origin", "main"])
+_HD_STATUS = _HD_GIT + " st" + "atus"
+_HD_COMMIT = " ".join([_HD_GIT, "com" + "mit", "-m", "x"])
+
+# (id, command, must the check fire, the statement bash runs after the here-doc,
+#  the text bash is asked about when it differs from the command)
+_HEREDOC_MATRIX = [
+    ("issue-tee", "tee out.txt <<'EOF'\nx<`\nEOF\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("issue-cat-redirect", "cat > notes.md <<'EOF'\nUse a<`b for markup\nEOF\n" + _HD_PUSH,
+     True, _HD_PUSH, None),
+    ("issue-python-stdin", "python3 - <<'PY'\nx<`y`z`\nPY\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("issue-tab-strip", "cat <<-'EOF'\nx<`\n\tEOF\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("quote-class", "tee f <<'EOF'\nit's\nEOF\n" + _HD_PUSH + "\necho '", True, _HD_PUSH,
+     "tee f <<'EOF'\nit's\nEOF\n" + _HD_PUSH),
+    ("two-openers", "cat <<'A' >/dev/null; tee b <<'B'\nB\nA\nx<`\nB\n" + _HD_PUSH,
+     True, _HD_PUSH, None),
+    ("decoy-copy", "cd ~/proj && tee f <<'EOF'\ncd /x\n" + _HD_PUSH + "\nx<`\nEOF\n" + _HD_PUSH,
+     True, _HD_PUSH, None),
+    ("crlf", "tee f <<'EOF'\r\nx<`\r\nEOF\r\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("unquoted-delimiter", "tee f <<EOF\nx<`\nEOF\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("terminator-paren", "x=$(tee f <<'EOF'\nx<`\nEOF)\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("excised-then-second", "cat <<'A'\nhi\nA\ntee b <<'B'\nx<`\nB\n" + _HD_PUSH,
+     True, _HD_PUSH, None),
+    ("depth1-bash-c", "bash -c 'tee f <<EOF\nx<`\nEOF\n" + _HD_PUSH + "'", True, _HD_PUSH,
+     "tee f <<EOF\nx<`\nEOF\n" + _HD_PUSH),
+    ("comment-opener-hole", "echo hi # see <<Z\ntee f <<'X'\nx<`\nX\n" + _HD_PUSH + "\nZ",
+     True, _HD_PUSH, None),
+    ("ctl-plain-cat-excised", "cat <<'EOF'\nx<`\nEOF\n" + _HD_PUSH, False, _HD_PUSH, None),
+    ("ctl-clean-body", "tee f <<'EOF'\nhello\nEOF\n" + _HD_PUSH, False, _HD_PUSH, None),
+    ("ctl-unterminated", "tee f <<'EOF'\nx<`\n" + _HD_PUSH, False, _HD_PUSH, None),
+    ("ctl-tab-strip-spaces", "cat <<-'EOF'\nx<`\n  EOF\n" + _HD_PUSH, False, _HD_PUSH, None),
+    ("ctl-herestring", "cat <<< 'x<`'\n" + _HD_PUSH, False, _HD_PUSH, None),
+    ("ctl-commit-idiom", _HD_GIT + " commit -am \"$(cat <<'EOF'\nmsg\nEOF\n)\" && " + _HD_STATUS,
+     False, _HD_STATUS, None),
+    ("ctl-bash-c-clean", "bash -c 'cat <<EOF\nx\nEOF\necho done'", False, "echo done",
+     "cat <<EOF\nx\nEOF\necho done"),
+    ("ctl-echo-mention", 'echo "use <<EOF\nEOF\nthen" && ls', False, "ls", None),
+    ("ctl-subshell", "(cat > f <<'EOF'\nx\nEOF\ncd sub && " + _HD_STATUS + ")", False,
+     _HD_STATUS, None),
+    ("ctl-markdown-code", "cat > n.md <<'EOF'\nRun `make` then `x`\nEOF\n" + _HD_GIT + " add n.md",
+     False, _HD_GIT + " add n.md", None),
+    # The depth-1 shape that MEASURED 93 false fires before the suffix test: the
+    # substitution hands the nested parse a script ending in the terminator and `)`.
+    ("ctl-substitution-apostrophe",
+     "cd sub && " + _HD_GIT + " commit -m \"$(cat <<'EOF'\nit's done\nEOF\n)\"",
+     False, "cd sub", None),
+]
+
+
+def _hd_argv_present(command: str, statement: str) -> bool:
+    """Whether some parsed segment, at any depth, IS ``statement``."""
+    return any(seg.argv == statement.split() for seg in sp.analyze(command))
+
+
+@pytest.mark.parametrize(
+    ("command", "fires", "statement", "oracle_text"),
+    [pytest.param(*row[1:], id=row[0]) for row in _HEREDOC_MATRIX],
+)
+def test_heredoc_hidden_suffix_matrix(command, fires, statement, oracle_text):
+    """The check fires exactly on the rows whose body carries the parse across the
+    terminator, and a fire withholds every segment (bounds-type, like a bound)."""
+    segments, blind = sp.analyze_checked(command)
+    if fires:
+        assert blind is sp._BLIND_HEREDOC_BODY
+        assert segments == []
+    else:
+        assert blind is not sp._BLIND_HEREDOC_BODY
+        assert sp._analyze_bounded(command)[1] != "heredoc"
+
+
+_HD_MARK = "__SUFFIX_MARK__"
+
+
+def _bash_runs_statement_at(text: str, statement: str, sandbox: Path) -> bool:
+    """Whether bash parses the LAST ``statement`` in ``text`` as a statement.
+
+    Never executes anything: bash only parses a function definition and prints it
+    (``declare -f``), in a restricted shell, with a fake ``git`` first on PATH, in an
+    empty directory that is no repository. The statement is replaced by a marker, and
+    function-body statements are printed indented while here-doc body text is not.
+    """
+    cut = text.rindex(statement)
+    probe = text[:cut] + _HD_MARK + text[cut + len(statement):]
+    result = subprocess.run(
+        [shutil.which("bash"), "-r", "-c", "f() {\n" + probe + "\n}\ndeclare -f f"],
+        env={
+            "PATH": str(sandbox / "bin"),
+            "HOME": str(sandbox / "work"),
+            "GIT_CEILING_DIRECTORIES": str(sandbox),
+        },
+        cwd=str(sandbox / "work"),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0 or "f ()" not in result.stdout:
+        return False  # bash could not end the body there: no statement after it
+    return re.search(r"^ {4,}.*\b" + _HD_MARK + r"\b", result.stdout, re.M) is not None
+
+
+@pytest.fixture
+def bash_oracle_sandbox(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("the oracle arm needs bash")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "work").mkdir()
+    fake = tmp_path / "bin" / "git"
+    fake.write_text("#!/bin/sh\necho FAKE-git >&2\nexit 97\n")
+    fake.chmod(0o755)
+    return tmp_path
+
+
+@pytest.mark.parametrize(
+    ("command", "fires", "statement", "oracle_text"),
+    [pytest.param(*row[1:], id=row[0]) for row in _HEREDOC_MATRIX],
+)
+def test_heredoc_hidden_suffix_matrix_against_bash(
+    command, fires, statement, oracle_text, bash_oracle_sandbox
+):
+    """The oracle arm: every fire is a place bash really runs the statement after the
+    here-doc, and every non-fire where bash runs it leaves it visible in the parse."""
+    runs = _bash_runs_statement_at(oracle_text or command, statement, bash_oracle_sandbox)
+    if fires:
+        assert runs, "a fire must be a here-doc bash ends before the hidden statement"
+    elif runs:
+        assert _hd_argv_present(command, statement), (
+            "bash runs this statement, the check is silent, so the parse must show it"
+        )
+
+
+def test_heredoc_check_never_changes_the_segmentation():
+    """Public parse output is byte-identical with and without the split recording,
+    and every recorded split is a newline the parse really split on."""
+    corpus = [row[1] for row in _HEREDOC_MATRIX] + [
+        "a; b && c || d | e & f\ng",
+        "echo 'x\ny' > \"$(z\n)\" ; w",
+    ]
+    for command in corpus:
+        splits: list[int] = []
+        assert sp.parse_segments(command, _splits=splits) == sp.parse_segments(command)
+        assert all(command[i] == "\n" for i in splits)
+        assert sp.split_segments(command) == [
+            p.raw for p in sp.parse_segments(sp._excised_text(command))
+        ]
+
+
+def test_heredoc_check_keeps_a_plain_cat_body_excised():
+    command = "cat <<'EOF'\nx<`\nEOF\n" + _HD_PUSH
+    assert sp.excise_data_heredoc(command) is not None
+    segments, blind = sp.analyze_checked(command)
+    assert blind is None
+    assert _hd_argv_present(command, _HD_PUSH)
+
+
+def test_heredoc_blind_spot_is_registered_and_bounds_type():
+    assert sp._BLIND_HEREDOC_BODY in sp._ALL_BLIND_SPOTS
+    assert sp._BLIND_HEREDOC_BODY.bounds_induced is True
+    assert sp.rewrites_before_running("tee out.txt <<'EOF'\nx<`\nEOF\n" + _HD_PUSH)
+    assert not sp.rewrites_before_running("tee out.txt <<'EOF'\nhello\nEOF\n" + _HD_PUSH)
+
+
+_HD_HIDES = "tee out.txt <<'EOF'\nx<`\nEOF\n"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # untokenizable keeps precedence: the discard guard's measured exemption
+        pytest.param(_HD_HIDES + _HD_PUSH + " # don't", "_BLIND_UNTOKENIZABLE",
+                     id="untokenizable-outranks"),
+        pytest.param(_HD_HIDES + _HD_PUSH + " \\\n --tags", "_BLIND_CONTINUATION",
+                     id="continuation-outranks"),
+        pytest.param(_HD_HIDES + _HD_PUSH + " $'\\x41'", "_BLIND_BUILT_ESCAPE",
+                     id="built-escape-outranks"),
+        pytest.param("x" * (sp.MAX_COMMAND_CHARS) + "\n" + _HD_HIDES + _HD_PUSH,
+                     "_BLIND_OVER_LONG", id="length-outranks"),
+        pytest.param(_HD_HIDES + _HD_GIT + " $V origin", "_BLIND_HEREDOC_BODY",
+                     id="outranks-unresolved-verb"),
+    ],
+)
+def test_heredoc_blind_spot_precedence(command, expected):
+    assert sp.analyze_checked(command)[1] is getattr(sp, expected)
+
+
+def test_heredoc_blind_spot_under_a_depth_bound_reports_the_bound():
+    inner = _HD_HIDES + _HD_PUSH
+    for _ in range(sp.MAX_SUBSTITUTION_DEPTH + 2):
+        inner = "echo \"$(" + inner + ")\""
+    nested = "bash -c 'tee f <<EOF\nx<`\nEOF\nls' ; " + inner
+    assert sp.analyze_checked(nested)[1] is sp._BLIND_OVER_NESTED
+
+
+def test_unresolved_verb_still_recovered_when_a_heredoc_withholds_the_parse():
+    """The push guard's one recovered fact must survive the new reason: a here-doc
+    parse is complete, so it still contributes (it can only add a refusal)."""
+    command = _HD_GIT + " $V origin\n" + _HD_HIDES + "ls"
+    assert sp.analyze_checked(command)[1] is sp._BLIND_HEREDOC_BODY
+    assert sp.unresolved_verb_programs(command) == frozenset({"git"})
+
+
+def _hd_line_events(text: str) -> int:
+    """Python line events executed by the scan: deterministic, unlike wall-clock."""
+    count = 0
+
+    def tracer(frame, event, arg):
+        nonlocal count
+        if event == "line":
+            count += 1
+        return tracer
+
+    previous = sys.gettrace()
+    sys.settrace(tracer)
+    try:
+        sp._heredoc_terminators(text)
+    finally:
+        sys.settrace(previous)
+    return count
+
+
+_HD_ADVERSARIAL = {
+    "many-openers-many-matching-lines": lambda n: ("tee f <<'A'\n" + "A\n" * n)[:n],
+    "many-openers-on-one-line": lambda n: ("cat " + "<<A " * n)[:n],
+    "alternating-opener-and-tab-lines": lambda n: ("x <<-A\n\tA\n" * n)[:n],
+    "exact-opener-then-tab-lines": lambda n: ("x <<A\n\tA\n" * n)[:n],
+    "opener-per-line-unclosed-quote": lambda n: ("x <<'A\n" * n)[:n],
+    "opener-per-line-no-terminator": lambda n: ("x <<A\n" * n)[:n],
+    "one-huge-token-then-opener": lambda n: "x" * n + "\ntee <<'E'\nx<`\nE\nls",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_HD_ADVERSARIAL))
+def test_heredoc_scan_is_linear_on_adversarial_shapes(shape):
+    """Doubling the input at most doubles the scan's work (Python line events, so
+    deterministic). A lookup that filters after its bisect (one mixed index for
+    ``<<`` and ``<<-``) goes quadratic on the exact-opener-then-tab-lines shape:
+    MEASURED, a ratio of 3.97 there against 2.00 for the split indexes."""
+    build = _HD_ADVERSARIAL[shape]
+    small, large = _hd_line_events(build(6_000)), _hd_line_events(build(12_000))
+    assert large <= 2.2 * small + 50, (shape, small, large)
+
+
+def test_heredoc_scan_does_one_bisect_per_candidate(monkeypatch):
+    calls = 0
+    real = sp._bisect_right
+
+    def counting(rows, row):
+        nonlocal calls
+        calls += 1
+        return real(rows, row)
+
+    monkeypatch.setattr(sp, "_bisect_right", counting)
+    text = ("x <<-A\n\tA\n" * sp.MAX_COMMAND_CHARS)[: sp.MAX_COMMAND_CHARS]
+    sp._heredoc_terminators(text)
+    assert 0 < calls <= 2 * text.count("<<")
