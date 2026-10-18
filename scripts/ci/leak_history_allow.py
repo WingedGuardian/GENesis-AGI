@@ -81,10 +81,19 @@ def read_allowlist() -> str | None:
     return shown.stdout
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    """json.loads keeps the LAST of a repeated key, so a merge leftover could apply
+    a value no reviewer saw; any repeat rejects the whole list."""
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise AllowlistError(f"{ALLOW_PATH} repeats a key in one object")
+    return dict(pairs)
+
+
 def parse_allowlist(text: str) -> list[dict]:
     """Validate every entry; any malformed entry rejects the whole list."""
     try:
-        data = json.loads(text)
+        data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
     except json.JSONDecodeError as exc:
         raise AllowlistError(f"{ALLOW_PATH} is not valid JSON: {exc.msg}") from None
     if (

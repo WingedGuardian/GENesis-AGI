@@ -741,3 +741,29 @@ def test_with_paths_mode_from_the_command_line(tmp_path: Path, monkeypatch, caps
     out = capsys.readouterr().out
     assert f":{PR_ADDED}" in out
     assert all(line.count(":") >= 2 for line in out.splitlines() if line)
+
+
+def test_a_mode_only_commit_does_not_take_the_next_commits_lines(tmp_path: Path):
+    """A commit whose last diff is header-only (an empty file) must not swallow the
+    next `commit` line: the older commit's additions keep their own id (#3420)."""
+    repo = tmp_path / "m"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    base = _commit(repo, "README", "base\n", "base")
+    older = _commit(repo, "a.py", f"{PR_ADDED}\n", "add value")
+    (repo / "empty.py").write_text("", encoding="utf-8")
+    _git(repo, "add", "empty.py")
+    _git(repo, "commit", "-q", "-m", "empty file")
+    rows = list(lsa._added_rows(("range", f"{base}..HEAD"), cwd=str(repo)))
+    assert rows == [("a.py", older[:12], PR_ADDED)]
+
+
+def test_a_non_ascii_path_keeps_its_repository_spelling(tmp_path: Path):
+    """Git quotes non-ASCII paths by default; the scan reads them unquoted (#3420)."""
+    repo = tmp_path / "u"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    base = _commit(repo, "README", "base\n", "base")
+    _commit(repo, "café.py", f"{PR_ADDED}\n", "add value")
+    rows = list(lsa._added_rows(("range", f"{base}..HEAD"), cwd=str(repo)))
+    assert [r[0] for r in rows] == ["café.py"]
