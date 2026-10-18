@@ -2917,7 +2917,7 @@ verified: 788a6d75c178 2026-10-17
   repeated checks with matching caches.
   The runner recomputes it before credentials. See
   `docs/reference/qualification-preflight.md`.
-  The isolated serial CLI supports Flash-only or historical paired execution
+  The isolated serial CLI supports Flash-only, explicit Pro–Flash or historical MiMo–Flash execution
   under an exact frozen operating plan and a separate local spending assertion.
   A credential-scoped lock precedes journal writers and credential reads. The
   actual pre-dispatch key snapshot must fund the whole selected pending
