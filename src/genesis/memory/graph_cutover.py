@@ -99,13 +99,27 @@ def _load(metrics_json: str | None) -> dict | None:
     return m if isinstance(m, dict) else None
 
 
+def _is_count(n: object) -> bool:
+    """A non-negative ``int``, and not a ``bool`` (which ``isinstance`` would
+    accept: ``True`` sums as 1 and matches schema 1). A negative count could
+    cancel against an inflated one and still add up to ``traversals``."""
+    return type(n) is int and n >= 0
+
+
 def census_dirt(m: dict | None) -> str | None:
     """Why a census row is NOT clean, or ``None`` when it is."""
     if m is None:
         return "unreadable census row"
-    if m.get("v") not in KNOWN_CENSUS_SCHEMAS:
-        return f"unknown census schema {m.get('v')!r}"
-    if "telemetry_disabled" in (m.get("reasons") or []):
+    schema, reasons = m.get("v"), m.get("reasons")
+    # Shapes first: an unhashable schema or a non-list ``reasons`` would raise
+    # below, aborting the whole report instead of holding the clock.
+    if not _is_count(schema) or not (
+        reasons is None or (isinstance(reasons, list) and all(isinstance(r, str) for r in reasons))
+    ):
+        return "unreadable census row"
+    if schema not in KNOWN_CENSUS_SCHEMAS:
+        return f"unknown census schema {schema!r}"
+    if "telemetry_disabled" in (reasons or []):
         return _DISABLED
     if m.get("complete") is not True:
         return f"incomplete census ({', '.join(m.get('reasons') or []) or 'no reason'})"
@@ -138,16 +152,16 @@ def traversal_breaks_clock(m: dict) -> str | None:
     traversals = m.get("traversals")
     if not all(isinstance(x, dict) for x in (outcomes, served, configured)):
         raise ValueError("missing counters")
-    if not isinstance(traversals, int) or not all(
-        isinstance(n, int) for c in (outcomes, served, configured) for n in c.values()
+    if not _is_count(traversals) or not all(
+        _is_count(n) for c in (outcomes, served, configured) for n in c.values()
     ):
-        raise ValueError("a count is not an integer")
+        raise ValueError("a count is not a non-negative integer")
     for name, counter in (("outcome", outcomes), ("served", served), ("configured", configured)):
         if sum(counter.values()) != traversals:
             raise ValueError(f"{name} counts do not add up to traversals")
     pwf = m.get("prior_write_failures", 0)
-    if not isinstance(pwf, int):
-        raise ValueError("prior_write_failures is not an integer")
+    if not _is_count(pwf):
+        raise ValueError("prior_write_failures is not a non-negative integer")
     bad = set(outcomes) - _CLEAN_OUTCOMES - _NEUTRAL_OUTCOMES
     if bad:
         return "outcome " + ", ".join(sorted(bad))

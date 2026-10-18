@@ -176,3 +176,55 @@ def test_another_installs_database_needs_its_own_lost_writes_file(tmp_path):
     assert r.returncode == 3
     assert "--db needs --lost-writes" in r.stderr
 
+
+
+def test_a_lost_writes_file_without_its_database_is_refused(tmp_path):
+    lost = tmp_path / "lost.jsonl"
+    lost.write_text("")
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--lost-writes", str(lost)], capture_output=True, text=True
+    )
+    assert r.returncode == 3
+    assert "--lost-writes needs --db" in r.stderr
+
+
+def test_the_lost_writes_file_is_read_under_a_shared_lock(tmp_path, monkeypatch):
+    import fcntl
+
+    lost = tmp_path / "lost.jsonl"
+    lost.write_text('{"ts": "2026-10-31T00:00:00.000000Z"}\n')
+    seen: list[int] = []
+    real = fcntl.flock
+
+    def spy(fd, op):
+        seen.append(op)
+        return real(fd, op)
+
+    monkeypatch.setattr(fcntl, "flock", spy)
+    assert _rep.read_lost_writes(lost) == ['{"ts": "2026-10-31T00:00:00.000000Z"}']
+    assert fcntl.LOCK_SH in seen
+
+
+def test_the_read_waits_for_an_exclusive_writer(tmp_path):
+    import fcntl
+    import threading
+
+    lost = tmp_path / "lost.jsonl"
+    lost.write_text("old\n")
+    result: list[list[str]] = []
+    with lost.open("r+", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        reader = threading.Thread(target=lambda: result.append(_rep.read_lost_writes(lost)))
+        reader.start()
+        reader.join(0.5)
+        assert reader.is_alive(), "the read did not wait for the writer's lock"
+        fh.seek(0)
+        fh.write("new\n")
+        fh.truncate()
+        fh.flush()
+    reader.join(10)
+    assert result == [["new"]]
+
+
+def test_a_missing_lost_writes_file_reads_as_empty(tmp_path):
+    assert _rep.read_lost_writes(tmp_path / "absent.jsonl") == []

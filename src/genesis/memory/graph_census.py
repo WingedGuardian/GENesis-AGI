@@ -324,7 +324,9 @@ def effective_telemetry_off(proc: dict, default_secrets: Path) -> bool | None:
     environment value wins; otherwise the value its secrets file held when it
     loaded it. ``None`` when that cannot be proven, which the verdict treats as
     not clean: the file changed after the process started (it read the old
-    contents), the path is relative, or the file cannot be read."""
+    contents), it is missing from a directory that changed after the process
+    started (it may have been deleted), the path is relative, or the file
+    cannot be read."""
     if proc["env_switch"] is not None:
         return proc["env_switch"] == "1"
     raw = proc.get("secrets_path")
@@ -334,7 +336,14 @@ def effective_telemetry_off(proc: dict, default_secrets: Path) -> bool | None:
     try:
         changed = path.stat().st_mtime
     except FileNotFoundError:
-        return False  # no file, nothing loaded
+        # Absent now proves absent at start only if the directory has not
+        # changed since: deleting or renaming the file updates its mtime. A
+        # file that was there, was loaded, and is gone cannot be read back.
+        try:
+            dir_changed = path.parent.stat().st_mtime
+        except OSError:
+            return None
+        return False if dir_changed < proc["start"] else None
     except OSError:
         return None
     if changed >= proc["start"]:

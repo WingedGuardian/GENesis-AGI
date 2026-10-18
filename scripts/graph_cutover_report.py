@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import json
 import sqlite3
 import sys
@@ -58,8 +59,13 @@ def read_rows(db_path: Path, event_type: str) -> list[tuple[str, str | None]]:
 
 
 def read_lost_writes(path: Path) -> list[str]:
+    """The file's lines, read under a shared ``flock``: appends and the in-place
+    prune (``graph_telemetry``) hold it exclusively, so the read never sees a
+    rewrite half done."""
     try:
-        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            fcntl.flock(fh, fcntl.LOCK_SH)
+            return fh.read().splitlines()
     except FileNotFoundError:
         return []
 
@@ -104,10 +110,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--now", default=None, help="evaluate as of this ISO-8601 time")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args(argv)
+    # The defaults are THIS install's database and lost-writes file; overriding
+    # one alone would mix two installs' evidence, in either direction.
     if args.db is not None and args.lost_writes is None:
-        # The default lost-writes file belongs to THIS install; pairing it with
-        # another install's database would mix two installs' evidence.
         ap.error("--db needs --lost-writes (the lost-writes file of the same install)")
+    if args.lost_writes is not None and args.db is None:
+        ap.error("--lost-writes needs --db (the database of the same install)")
 
     now = graph_cutover.parse_ts(args.now) if args.now else datetime.now(UTC)
     if now is None:

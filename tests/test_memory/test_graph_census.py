@@ -469,10 +469,6 @@ def test_a_per_process_secrets_path_is_the_one_read(tmp_path):
     assert census.effective_telemetry_off(_scanned(secrets_path="rel/secrets.env"), default) is None
 
 
-def test_no_secrets_file_means_nothing_was_loaded(tmp_path):
-    assert census.effective_telemetry_off(_scanned(), tmp_path / "absent.env") is False
-
-
 def test_a_tilde_db_path_is_expanded_before_the_foreign_check(proc_root, repo, tmp_path, monkeypatch):
     r, _, _ = repo
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -481,3 +477,21 @@ def test_a_tilde_db_path_is_expanded_before_the_foreign_check(proc_root, repo, t
     [p] = census.build_census(r, proc_root=proc_root, live_db=tmp_path / "live.db")["procs"]
     assert p["foreign"] is True
 
+
+
+def test_no_secrets_file_in_an_unchanged_directory_means_nothing_was_loaded(tmp_path):
+    os.utime(tmp_path, (500.0, 500.0))
+    assert census.effective_telemetry_off(_scanned(), tmp_path / "absent.env") is False
+
+
+def test_a_secrets_file_deleted_after_start_is_unknown(tmp_path):
+    # The directory changed after the process started: the file may have been
+    # there (and loaded) then, and its contents can no longer be read.
+    gone = _secrets(tmp_path / "secrets.env", "GENESIS_GRAPH_TELEMETRY_DISABLED=1\n", 500.0)
+    gone.unlink()
+    os.utime(tmp_path, (2000.0, 2000.0))
+    assert census.effective_telemetry_off(_scanned(), gone) is None
+
+
+def test_a_missing_secrets_directory_is_unknown(tmp_path):
+    assert census.effective_telemetry_off(_scanned(), tmp_path / "nope" / "s.env") is None

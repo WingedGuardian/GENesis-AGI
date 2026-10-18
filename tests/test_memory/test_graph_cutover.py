@@ -407,3 +407,43 @@ def test_resets_before_the_window_are_labelled():
     [old] = cut.evaluate(trav, census, [], NOW).resets
     assert old["in_window"] is False
 
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"v": []},
+        {"v": True},
+        {"reasons": 5},
+        {"reasons": "telemetry_disabled"},
+        {"complete": False, "reasons": [3]},
+    ],
+)
+def test_a_census_row_with_malformed_fields_is_unreadable_not_a_crash(over):
+    census = _census(NOW - timedelta(days=20), NOW - timedelta(days=5))
+    census += _census(NOW - timedelta(days=5) + timedelta(hours=1), NOW, **over)
+    v = cut.evaluate(_daily_traffic(14), census, [], NOW)
+    assert v.status == "NOT_YET"
+    assert v.clock_start is None
+    assert "census not clean yet: unreadable census row" in v.reasons, v.reasons
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"traversals": 1, "outcomes": {"primary": 1}, "served": {"falkordb": 100, "none": -99},
+         "configured": {"falkordb": 1}},
+        {"traversals": True, "outcomes": {"primary": True}, "served": {"falkordb": True},
+         "configured": {"falkordb": True}},
+        {"traversals": -1, "outcomes": {"primary": -1}, "served": {"falkordb": -1},
+         "configured": {"falkordb": -1}},
+        {"prior_write_failures": -1},
+        {"prior_write_failures": True},
+    ],
+)
+def test_negative_or_boolean_counts_are_unreadable(over):
+    trav, census = _passing_inputs()
+    trav.append(_trav(NOW - timedelta(days=1), **over))
+    v = cut.evaluate(trav, census, [], NOW)
+    assert v.status == "INCONCLUSIVE"
+    assert any(r.startswith("unreadable traversal row") for r in v.reasons), v.reasons
