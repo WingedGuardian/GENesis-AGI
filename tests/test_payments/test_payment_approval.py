@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
@@ -29,6 +30,15 @@ MIG = importlib.import_module("genesis.db.migrations.20261011060631_payment_vaul
 OWNER, OTHER, STRANGER = 1001, 1002, 1003
 FIELDS = {"Merchant": "example.test", "Amount": "12.00 USD"}
 BOT_USER = User(id=9, first_name="bot", is_bot=True)
+
+
+def _luhn_complete(body: str) -> str:
+    """``body`` plus its Luhn check digit: card-shaped test values built at run time."""
+    total = 0
+    for i, ch in enumerate(reversed(body)):
+        d = int(ch) * (2 if i % 2 == 0 else 1)
+        total += d - 9 if d > 9 else d
+    return body + str((10 - total % 10) % 10)
 
 
 class FakeBot:
@@ -347,6 +357,15 @@ def test_allowlist_keeps_written_order_and_its_set():
     assert cfg["allowed_users"] == {100, 200, 300}
 
 
+@pytest.mark.parametrize("raw", ["300x,100", ",100", " ,100,200"])
+def test_a_malformed_first_entry_leaves_no_owner(raw):
+    from genesis.channels.bridge_config import build_bridge_config
+
+    cfg = build_bridge_config({"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_ALLOWED_USERS": raw})
+    assert cfg["allowed_users_ordered"] == ()
+    assert 100 in cfg["allowed_users"]  # the set, for every other caller, is unchanged
+
+
 # -- audit trail interleaving -----------------------------------------------------
 
 
@@ -392,9 +411,9 @@ def _gated_audit(svc_audit):
     return audit_fn, entered, release
 
 
-async def test_a_tap_cancelled_during_its_grant_row_settles_the_request(make):
+async def test_a_tap_cancelled_during_its_grant_row_settles_the_request(make, db):
     registry, bot, _ctx = make(timeout_s=60)
-    audit_fn, entered, _release = _gated_audit(registry._audit)
+    audit_fn, entered, release = _gated_audit(registry._audit)
     registry.attach_audit(audit_fn)
     task = asyncio.create_task(registry.request(FIELDS))
     nonce = await _wait_recorded(registry)
@@ -402,6 +421,14 @@ async def test_a_tap_cancelled_during_its_grant_row_settles_the_request(make):
     await asyncio.wait_for(entered.wait(), 2)
     tap.cancel()
     assert await asyncio.wait_for(task, 2) == ap.REFUSED  # not the 60 s deadline
+    for _ in range(100):  # the closing row is written as the cancelled tap unwinds
+        if tap.done():
+            break
+        await asyncio.sleep(0.01)
+    last = (await audit.list_recent(db, 1))[0]
+    assert (last["event"], last["detail"]["reason"]) == ("approval_refused", "tap interrupted")
+    release.set()  # the shielded grant row, which the cancel did not stop, now finishes
+    await asyncio.wait_for(asyncio.gather(*registry._writes), 2)
 
 
 async def test_the_deadline_does_not_depend_on_the_pending_dict(make):
@@ -455,10 +482,10 @@ async def test_a_cancelled_requester_gets_no_grant(make, db):
 @pytest.mark.parametrize(
     "value",
     [
-        "4111\u20131111\u20131111\u20131111",  # en dash
-        "4111\u20141111\u20141111\u20141111",  # em dash
+        "4242\u20134242\u20134242\u20134242",  # en dash
+        "4242\u20144242\u20144242\u20144242",  # em dash
         "4242\u00a04242\u00a04242\u00a04242",  # no-break space
-        "4222222222222",  # 13-digit Visa, outside the detector's grammar
+        _luhn_complete("4" + "0" * 11),  # a 13-digit Visa shape, outside the detector's grammar
         "\uff14\uff12\uff14\uff12" * 3,  # fullwidth digits: str.isdigit is True
         "4242 4242 4242 4242",  # Stripe's public test number
         "Order 1234-5678-9012",  # 12 digits in a run: refused on purpose (fails safe)
@@ -494,6 +521,143 @@ async def test_the_audit_row_is_value_light(make, db):
     assert "Checkout - Example Store" not in json.dumps(row)
     assert row["detail"]["field_lengths"] == {"Merchant": 12, "Page": 24}
     assert {k: row["detail"][k] for k in facts} == facts
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        4242424242424242,  # an int card number (Stripe test number)
+        -4242424242424242,
+        4242424242424242.0,
+        4.1e16,  # str() is "4.1e+16"; only the fixed-point form shows the digits
+        Decimal("4.1E+15"),  # likewise "4.1E+15" against "4100000000000000"
+        Decimal("4242424242424242"),
+        {"nested": 4242424242424242},
+        {"nested": "4242\u20134242\u20134242\u20134242"},
+        ["4242"],  # unsupported type
+        {"deeper": {"x": 1}},  # nesting below one level
+        b"4242424242424242",
+    ],
+)
+async def test_every_audit_value_type_passes_the_digit_guard(make, db, value):
+    registry, bot, _ctx = make(timeout_s=0.05)
+    assert await registry.request(FIELDS, audit_detail={"v": value}) == ap.REFUSED
+    assert bot.sent == []
+    assert "4242424242424242" not in json.dumps(await audit.list_recent(db, 100))
+
+
+async def test_short_numbers_stay_in_the_audit_row(make, db):
+    registry, _bot, _ctx = make(timeout_s=0.05)
+    facts = {"requester": {"pid": 4242, "start": 123456789}, "amount": Decimal("12.00"), "x": 1.5}
+    assert await registry.request(FIELDS, audit_detail=facts) == ap.EXPIRED
+    row = (await audit.list_recent(db, 100))[-1]["detail"]
+    assert row["requester"] == {"pid": 4242, "start": 123456789}
+    assert (row["amount"], row["x"]) == ("12.00", 1.5)
+
+
+async def test_a_requester_cancelled_during_its_request_row_is_closed(make, db):
+    """The approval_requested write is held; the requester is cancelled mid-write."""
+    registry, bot, _ctx = make()
+    real = registry._audit
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def held(event, detail):
+        if event == "approval_requested":
+            entered.set()
+            await release.wait()
+        return await real(event, detail)
+
+    registry.attach_audit(held)
+    task = asyncio.create_task(registry.request(FIELDS))
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(100):  # the shielded write may finish after the cancel lands
+        if len(await _events(db)) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    rows = list(reversed(await audit.list_recent(db, 100)))
+    assert [r["event"] for r in rows] == ["approval_requested", "approval_refused"]
+    assert rows[-1]["detail"]["reason"] == "requester cancelled"
+    assert bot.sent == []
+
+
+class _QuietInt(int):
+    def __str__(self):
+        return "7"
+
+    __repr__ = __format__ = lambda self, *a: "7"  # noqa: E731
+
+
+class _QuietFloat(float):
+    def __str__(self):
+        return "7.0"
+
+    __repr__ = __format__ = lambda self, *a: "7.0"  # noqa: E731
+
+
+class _QuietStr(str):
+    def __str__(self):
+        return "short"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        _QuietInt(4242424242424242),
+        _QuietFloat(4242424242424242.0),
+        _QuietStr("4242 4242 4242 4242"),
+        float("nan"),
+        float("inf"),
+        Decimal("NaN"),
+        Decimal("1E+20000000"),  # formatting it would allocate tens of MB
+    ],
+)
+async def test_odd_numbers_and_subclasses_are_refused(make, db, value):
+    registry, bot, _ctx = make(timeout_s=0.05)
+    assert await registry.request(FIELDS, audit_detail={"v": value}) == ap.REFUSED
+    assert bot.sent == []
+    assert "4242424242424242" not in json.dumps(await audit.list_recent(db, 100))
+
+
+async def test_colliding_audit_keys_are_refused(make):
+    registry, _bot, _ctx = make(timeout_s=0.05)
+    assert await registry.request(FIELDS, audit_detail={1: "a", "1": "b"}) == ap.REFUSED
+
+
+def test_a_digit_run_across_lines_is_refused():
+    with pytest.raises(ValueError, match="12 or more digits"):
+        ap.build_text({"a": "x 4242 4242", "4242 4242": "y"})
+
+
+async def test_a_cancel_during_the_expiry_row_still_lands_it(make, db):
+    """The row is shielded: the requester's cancel cannot drop it."""
+    registry, _bot, _ctx = make(timeout_s=0.1)
+    real = registry._audit
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def held(event, detail):
+        if event == "approval_expired":
+            entered.set()
+            await release.wait()
+        return await real(event, detail)
+
+    registry.attach_audit(held)
+    task = asyncio.create_task(registry.request(FIELDS))
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(100):
+        if "approval_expired" in await _events(db):
+            break
+        await asyncio.sleep(0.01)
+    assert await _events(db) == ["approval_requested", "approval_expired"]
 
 
 async def test_free_text_is_not_a_plain_audit_value(make):
