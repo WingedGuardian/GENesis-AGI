@@ -7364,3 +7364,72 @@ class TestLogsAreRedacted:
         assert "Errorcallingtool" in err and "Traceback" in err
         assert _CARD not in err
         assert "".join(REDACTED.split()) in err
+
+
+_RENDERED_SOURCES = (
+    "innerText", "'placeholder'", "'value'", "'aria-label'", "'aria-placeholder'",
+    "'aria-valuetext'", "'title'", "'alt'", "matches('option')", "pseudo(el, '::before')",
+    "pseudo(el, '::after')", "attr\\(", "SVGElement", "el.shadowRoot", "el.value",
+)
+
+
+def test_the_screenshot_check_reads_every_rendered_text_source():
+    """Contract: the frame read covers each source of rendered text that is
+    not innerText. Removing one fails here; the real-browser test below shows
+    each one actually reaching the check."""
+    missing = [s for s in _RENDERED_SOURCES if s not in browser._PAGE_TEXT_JS]
+    assert missing == []
+
+
+_RENDERED_CARD_PAGES = {
+    "placeholder": f'<input placeholder="{_CARD_SPACED}">',
+    "aria-label": f'<button aria-label="Pay with {_CARD_SPACED}">Pay</button>',
+    "title": f'<span title="{_CARD}">card</span>',
+    "alt": f'<img alt="card {_CARD_SPACED}">',
+    "option": f"<select><option>x</option><option>{_CARD_SPACED}</option></select>",
+    "value": f'<input value="{_CARD}">',
+    "before": f'<style>#c::before{{content:"{_CARD_SPACED}"}}</style><span id="c"></span>',
+    "attr": f'<style>#d::after{{content:attr(data-pan)}}</style><span id="d" data-pan="{_CARD}"></span>',
+    "svg": f'<svg><text x="0" y="15">{_CARD_SPACED}</text></svg>',
+    "shadow": (
+        '<div id="h"></div><script>document.getElementById("h")'
+        f'.attachShadow({{mode:"open"}}).innerHTML="<p>{_CARD_SPACED}</p>"</script>'
+    ),
+    "segmented": '<input value="4242" aria-label="Card">' * 4,
+    "iframe": f'<iframe srcdoc="<input value={_CARD}>"></iframe>',
+}
+
+
+@pytest.mark.asyncio
+async def test_the_screenshot_check_on_a_real_browser():
+    """Runs the frame read in a fresh headless Chromium, no profile. Skipped
+    where no Playwright Chromium is installed (the contract test above still
+    applies there)."""
+    from genesis.security.card_redaction import contains_card_text
+
+    try:
+        from playwright.async_api import async_playwright
+
+        pw = await async_playwright().start()
+    except Exception as e:  # noqa: BLE001 - no driver on this machine
+        pytest.skip(f"playwright unavailable: {e}")
+    try:
+        try:
+            chromium = await pw.chromium.launch(headless=True)
+        except Exception as e:  # noqa: BLE001 - browser not downloaded
+            pytest.skip(f"chromium unavailable: {e}")
+        page = await chromium.new_page()
+        found = {}
+        for name, html in {
+            **_RENDERED_CARD_PAGES,
+            "clean": '<input placeholder="1234 1234 1234 1234"><p>Order 100234567</p>',
+        }.items():
+            await page.set_content(f"<html><body>{html}</body></html>")
+            await page.wait_for_timeout(50)
+            texts = [await f.evaluate(browser._PAGE_TEXT_JS) for f in page.frames]
+            found[name] = contains_card_text("\n".join(texts))
+        await chromium.close()
+    finally:
+        await pw.stop()
+    assert found.pop("clean") is False
+    assert [n for n, hit in found.items() if not hit] == []

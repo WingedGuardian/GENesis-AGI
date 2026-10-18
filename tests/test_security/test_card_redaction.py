@@ -256,7 +256,7 @@ class TestSplitAcrossStructure:
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             [2019, 2020, 2021, 2022, 2023, 2024],
             {"x": 120, "y": 340, "w": 800, "h": 600},
-            ["12", "34", "56", "78", "90", "12", "34", "56", "78", "90"],
+            ["10", "11", "12", "13", "14", "15", "16", "17", "18"],
         ],
     )
     def test_containers_of_ordinary_numbers_stay(self, value):
@@ -273,3 +273,41 @@ class TestSplitAcrossStructure:
             return {"a": "4242", "b": "4242", "c": "4242", "d": "4242"}
 
         assert "spelled a card number" in _impl_tool()["error"]
+
+
+class TestSubrunsAndKeys:
+    """Round 3: every contiguous subrun of digit strings, and mapping keys."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            # a trailing number joins the run; the card is a subrun of it
+            {"p1": "42424242", "p2": "42424242", "count": 1},
+            # unequal widths (7 + 9) inside a longer run of digit strings
+            ["100", "4000002", "500003155", "7"],
+            # chunk widths 6-6-4, nested
+            {"a": [{"x": "424242"}, "424242"], "b": "4242"},
+            # keys only, in order
+            {"4000002500": "first", "003155": "second"},
+            # a key followed by its value
+            {"42424242": "42424242"},
+        ],
+    )
+    def test_split_card_is_withheld(self, value):
+        assert redact_value(value) == REDACTED
+
+    def test_the_smallest_container_holding_the_split_is_withheld(self):
+        assert redact_value([{"4242424242": 1, "424242": 2}, "ok"]) == [REDACTED, "ok"]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"id": "12345678", "ref": "87654321", "count": 3},
+            ["2019", "2020", "2021", "2022", "2023"],
+            {"10001": "NY", "94110": "SF"},
+            # numbers are not read as chunks of arbitrary width (stated limit)
+            [42424242, 42424242],
+        ],
+    )
+    def test_non_cards_and_number_chunks_stay(self, value):
+        assert redact_value(value) == value

@@ -4274,15 +4274,38 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
 
 
 # A screenshot is pixels: text redaction cannot reach a card number drawn in
-# it. Before capturing, the visible text and the form-field values of every
-# frame are read (open shadow roots included) and checked, split readings
-# too; a card number anywhere refuses the capture and no file is written. A
+# it. Before capturing, every frame is read for the text a page can RENDER:
+# innerText, every element's placeholder, value, aria-label, aria-placeholder,
+# aria-valuetext, title and alt attributes, <option> text, form-field values,
+# CSS ::before/::after content (an attr() there is resolved), SVG text, and
+# the same inside open shadow roots. The pieces go through the split-aware card
+# check; a card number anywhere refuses the capture and no file is written. A
 # frame that cannot be read refuses it as well, except one already detached.
-_PAGE_TEXT_JS = """() => {
+# Not read: text drawn into a canvas or an image, closed shadow roots, and a
+# change to the page between this read and the capture.
+_PAGE_TEXT_JS = r"""() => {
   const out = [document.body ? document.body.innerText : ''];
+  const ATTRS = ['placeholder', 'value', 'aria-label', 'aria-placeholder',
+                 'aria-valuetext', 'title', 'alt'];
+  const pseudo = (el, which) => {
+    const c = getComputedStyle(el, which).content;
+    if (!c || c === 'none' || c === 'normal') return;
+    out.push(c.replace(/attr\(([^)]+)\)/g, (_, n) => el.getAttribute(n.trim()) || ''));
+  };
   const visit = (root) => {
     for (const el of root.querySelectorAll('*')) {
-      if (el.matches('input, textarea, select')) out.push(String(el.value || ''));
+      // A field's live value replaces its value attribute: reading both would
+      // repeat each group and hide a segmented card from the split check.
+      const field = el.matches('input, textarea, select');
+      for (const a of ATTRS) {
+        const v = a === 'value' && field ? null : el.getAttribute(a);
+        if (v) out.push(v);
+      }
+      if (field) out.push(String(el.value || ''));
+      if (el.matches('option')) out.push(el.text || '');
+      if (el instanceof SVGElement && el.matches('text, tspan')) out.push(el.textContent || '');
+      pseudo(el, '::before');
+      pseudo(el, '::after');
       if (el.shadowRoot) {
         for (const child of el.shadowRoot.children) out.push(child.innerText || '');
         visit(el.shadowRoot);
@@ -4290,7 +4313,7 @@ _PAGE_TEXT_JS = """() => {
     }
   };
   visit(document);
-  return out.join('\\n');
+  return out.join('\n');
 }"""
 _SCREENSHOT_FRAME_READ_S: float = 5.0
 _REFUSE_CARD_SCREENSHOT = (
@@ -4877,8 +4900,10 @@ async def browser_screenshot() -> dict:
     another and sort chronologically) and returns the path. Always read the
     returned "path" — never reconstruct it. Use the Read tool to view it.
 
-    Refused, with no file written, when the page's text or form values show a
-    payment card number (in any frame), or a frame cannot be read to check.
+    Refused, with no file written, when the text the page renders in any
+    frame (visible text, form values, placeholders, labels, titles, alt text,
+    CSS-generated content) shows a payment card number, or a frame cannot be
+    read to check.
     """
     return await _with_tool_timeout(
         _impl_browser_screenshot(), 30.0, "browser_screenshot"

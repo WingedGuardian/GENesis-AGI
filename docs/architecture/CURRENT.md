@@ -1667,7 +1667,8 @@ the shared banner is not an assertion about all concurrent sessions.
   Results are also checked for a card SPLIT across structure (digit groups on
   separate snapshot lines, list items or dict values; a container that spells
   one is withheld whole), and `browser_screenshot` refuses to capture a page
-  whose frames' text or field values show a card.
+  whose frames render a card in text, field values, placeholders, labels,
+  titles, alt text, options or CSS-generated content.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
