@@ -48,7 +48,7 @@ async def _observe_home(runner, home, provider, error=None):
 
 async def select_provider(runner, request, sid, invocation):
     if not invocation.roster_eligible and request.roster_model is None:
-        return "", invocation  # Explicit routing opt-out remains authoritative.
+        return "", invocation, None  # Explicit routing opt-out remains authoritative.
     from genesis.cc.managed_session import metadata
 
     config = roster.load_roster()
@@ -114,7 +114,7 @@ async def select_provider(runner, request, sid, invocation):
                 raise ValueError("Managed receipt is unavailable")
         if attempt["outcome"] == "ready":
             await _observe_home(runner, home, name)
-            return name, selected
+            return name, selected, home
     raise CCProcessError("No configured provider established readiness")
 
 
@@ -135,12 +135,10 @@ async def execute_selected(runner, request, sid, invocation, on_event):
     from genesis.cc.invoker import CCInvoker
     from genesis.cc.provider_readiness import isolated_provider
 
-    provider, selected = await select_provider(runner, request, sid, invocation)
+    # The home selection resolved is returned, never re-read: the runtime
+    # connection may hold an older snapshot than selection's owned writes.
+    provider, selected, home = await select_provider(runner, request, sid, invocation)
     db = runner._session_manager.db
-    row = await cc_sessions.get_by_id(db, sid)
-    from genesis.cc.managed_session import metadata
-
-    home = metadata(row).get("home_provider")
     last_limit = None
     launched = False
 

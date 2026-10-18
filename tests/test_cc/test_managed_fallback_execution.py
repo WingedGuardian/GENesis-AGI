@@ -24,6 +24,44 @@ from tests.test_cc.test_managed_fallback import answer, readiness, settle, start
 from tests.test_cc.test_managed_fallback import managed as managed
 
 
+async def test_home_identity_comes_from_selection_not_a_stale_runtime_read(managed, monkeypatch):
+    """The runtime connection can hold a snapshot older than selection's owned
+    writes; a home refusal must still update home health, never peer health."""
+    import json
+
+    from genesis.db.crud import cc_sessions
+
+    status = AsyncMock()
+    managed.runner._rt._cc_invoker = CCInvoker(on_cc_status_change=status)
+    original = cc_sessions.get_by_id
+
+    async def stale_on_runtime_connection(db, sid):
+        row = await original(db, sid)
+        if db is managed.db and row is not None:
+            row = dict(row)
+            meta = json.loads(row.get("metadata") or "{}")
+            meta.pop("home_provider", None)
+            row["metadata"] = json.dumps(meta)
+        return row
+
+    monkeypatch.setattr(cc_sessions, "get_by_id", stale_on_runtime_connection)
+    failures = []
+    monkeypatch.setattr(peer_availability, "note_failure", lambda name, exc: failures.append(name))
+
+    async def run(invocation, on_event=None):
+        if invocation.disable_tools:
+            return await readiness(on_event)
+        managed.tasks.append(invocation)
+        await invocation.on_spawn(424215)
+        raise CCQuotaExhaustedError()
+
+    managed.invoker.run_streaming.side_effect = run
+    row, _ = await settle(managed, await start(managed))
+    assert row["status"] == "failed" and len(managed.tasks) == 1
+    assert status.call_args.args == ("UNAVAILABLE",)
+    assert "claude" not in failures
+
+
 @pytest.mark.parametrize("provider", ["claude", "backup"])
 @pytest.mark.parametrize("kind", ["quota", "rate", "credit", "wrapped", "mcp", "local"])
 async def test_actual_refusal_updates_only_attributable_health(managed, provider, kind):
