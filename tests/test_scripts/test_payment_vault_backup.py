@@ -1388,8 +1388,10 @@ def test_a_relative_genesis_home_still_finds_the_vault(_sealed, backup_env, tmp_
     assert (dated._repo(backup_env) / "creds" / ARCHIVE).is_file()
 
 
-def test_a_tilde_genesis_home_finds_the_vault(_sealed, backup_env, tmp_path):
+def test_a_tilde_genesis_home_finds_the_vault(_sealed, backup_env, tmp_path, monkeypatch):
     """GENESIS_HOME=~/x names $HOME/x for the runtime (Path.expanduser); so here."""
+    # dr_lock.sh still reads GENESIS_HOME literally (#3438): keep its "~" dir out of the repo.
+    monkeypatch.chdir(tmp_path)
     _place_vault(_sealed, backup_env["home"] / "custom" / "payment_vault")
     offsite = tmp_path / "offsite"
     offsite.mkdir()
@@ -1472,8 +1474,10 @@ def test_restore_names_the_servers_vault_when_secrets_set_another_home(tmp_path)
     )
 
 
-def test_a_stage_on_a_tilde_genesis_home_is_refused(tmp_path):
+def test_a_stage_on_a_tilde_genesis_home_is_refused(tmp_path, monkeypatch):
     """A literal ~ in GENESIS_HOME still names the live vault for the overlap check."""
+    # restore's lock paths still read GENESIS_HOME literally (#3438): keep "~" out of the repo.
+    monkeypatch.chdir(tmp_path)
     bind = _bind(tmp_path)
     fresh = tmp_path / "fresh"
     live = fresh / "custom" / "payment_vault"
