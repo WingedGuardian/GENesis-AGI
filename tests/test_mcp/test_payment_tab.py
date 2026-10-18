@@ -51,6 +51,8 @@ SNAPSHOT = (
     "- iframe"
 )
 STATES = ("awaiting_tap", "filling", "armed", "crashed")
+# The test card's digit groups with the filled name between each pair.
+SPLIT_BY_NAME = "4242 Pat Tester 4242 Pat Tester 4242 Pat Tester 4242"
 # Read at import, before tests/conftest.py points it at a tmp dir.
 _REAL_PENDING_PATH = getattr(env, "payment_tab_pending_path", None)
 
@@ -181,21 +183,22 @@ class TestHideFormValues:
 
 class TestRedactSnapshot:
     @pytest.mark.asyncio
-    async def test_armed_page_hides_controls_then_tokens_then_cards(self, monkeypatch):
+    async def test_armed_page_hides_cards_then_controls_then_tokens(self, monkeypatch):
         page = _page()
         await _arm_in("armed", page)
         seen = []
-        real = payment_tab.redact
+        real = payment_tab.redact_cards
 
         def card_redact(text):
             seen.append(text)
             return real(text)
 
-        monkeypatch.setattr(payment_tab, "redact", card_redact)
-        out = TABS.redact_snapshot(page, SNAPSHOT + f"\n- text: {OTHER_PAN}", True, TABS.epoch)
-        # card_shapes runs last: its input already has the controls and the
-        # matching tokens hidden.
-        assert len(seen) == 1 and PAN not in seen[0] and CVC not in seen[0]
+        monkeypatch.setattr(payment_tab, "redact_cards", card_redact)
+        raw = SNAPSHOT + f"\n- text: {OTHER_PAN}"
+        out = TABS.redact_snapshot(page, raw, True, TABS.epoch)
+        # The card pass runs first, on the text as read: a value swapped for
+        # the longer HIDDEN marker could widen a split card's gaps past its limit.
+        assert seen == [raw]
         assert REDACTED in out and OTHER_PAN not in out
         _no_secret(out)
         assert f"Paying with card {HIDDEN} of {HIDDEN} {HIDDEN}" in out
@@ -268,6 +271,32 @@ class TestHmacTokens:
         _no_secret(out)
         _drive(page)
         _no_secret(await browser._impl_browser_snapshot())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("name", "shown", "gone"),
+        [
+            # _TEXT_TOKEN splits on the apostrophe: "Brien" is its own token.
+            ("Pat O'Brien", "Thanks, Pat O'Brien.", "brien"),
+            # Card-preview widgets render the holder name in capitals.
+            (NAME, "Card holder PAT TESTER", "tester"),
+            ("Pat O'Brien", "Card holder PAT O'BRIEN", "brien"),
+            # A page may echo the name decomposed (NFD) or in full-width forms.
+            ("José Tester", "Thanks, José Tester", "jos"),
+            (NAME, "Card holder ＰＡＴ ＴＥＳＴＥＲ", "ｔｅｓ"),
+        ],
+    )
+    async def test_name_parts_match_across_apostrophes_and_case(self, name, shown, gone):
+        page = _page(snapshot=f"- paragraph: {shown}")
+        await payment_tab.arm(page)
+        payment_tab.begin_fill(page, (PAN, EXP, CVC, name))
+        payment_tab.mark_filled(page)
+        assert gone not in TABS.redact_text(shown).lower()
+        record = logging.LogRecord("x", logging.INFO, __file__, 1, f"typed {shown}", None, None)
+        CARD_FILTER.filter(record)
+        assert gone not in logging.Formatter().format(record).lower()
+        _drive(page)
+        assert gone not in (await browser._impl_browser_snapshot())["snapshot"].lower()
 
     @pytest.mark.asyncio
     async def test_mark_filled_needs_begin_fill_first(self):
@@ -567,6 +596,38 @@ class TestReaderMatrix:
         text = logging.Formatter().format(record)
         _no_secret(text)
         assert "args withheld" in text and "ValueError" not in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ("filling", "armed", "crashed"))
+    async def test_card_filter_hides_filled_values_in_the_format_string(self, state):
+        # An f-string message puts page text in the format string, which armed
+        # mode keeps: the filled values and a split card are hidden in it.
+        await _arm_in(state, _page())
+        split = "\n".join(PAN[i : i + 4] for i in range(0, 16, 4))
+        msg = f"typed {NAME} {EXP} cvc={CVC} into {split}"
+        record = logging.LogRecord("x", logging.INFO, __file__, 1, msg, None, None)
+        CARD_FILTER.filter(record)
+        text = logging.Formatter().format(record)
+        _no_secret(text)
+        assert PAN not in "".join(c for c in text if c.isdigit())
+
+    @pytest.mark.asyncio
+    async def test_a_card_split_by_filled_values_is_redacted_in_logs(self):
+        # Hiding "Pat" and "Tester" first would widen each gap between the
+        # digit groups past the split-card limit and keep the card.
+        await _arm_in("armed", _page())
+        record = logging.LogRecord("x", logging.INFO, __file__, 1, SPLIT_BY_NAME, None, None)
+        CARD_FILTER.filter(record)
+        text = logging.Formatter().format(record)
+        assert "4242" not in text and REDACTED in text
+
+    @pytest.mark.asyncio
+    async def test_a_card_split_by_filled_values_is_redacted_in_snapshots(self):
+        page = _page(snapshot=f"- paragraph: {SPLIT_BY_NAME}")
+        await _arm_in("armed", page)
+        _drive(page)
+        result = await browser._impl_browser_snapshot()
+        assert "4242" not in result["snapshot"] and REDACTED in result["snapshot"]
 
     @pytest.mark.asyncio
     async def test_a_second_payment_tab_is_refused(self):

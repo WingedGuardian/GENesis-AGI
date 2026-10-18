@@ -9,7 +9,8 @@ host or timer, and the browser tools (``browser.py``) consult it:
 * the armed tab refuses screenshot, fill, upload and navigate, and press_key
   takes only the keys in :data:`ALLOWED_KEYS`;
 * every page snapshot goes through :meth:`PaymentTabs.redact_snapshot`;
-* ``_ts_log`` writes nothing and ``CARD_FILTER`` withholds log arguments.
+* ``_ts_log`` writes nothing and ``CARD_FILTER`` withholds log arguments and
+  hides filled values in the format string it keeps.
 
 Back restores filled values from session history in every pref configuration
 (measured), so the flow ends by CLOSING the tab (:meth:`PaymentTabs.finish`),
@@ -45,6 +46,7 @@ import os
 import re
 import secrets
 import tempfile
+import unicodedata
 import weakref
 from dataclasses import dataclass, field
 from urllib.parse import unquote_plus, urlsplit
@@ -54,7 +56,7 @@ import yaml
 from genesis import env
 from genesis.browser.types import BrowserLayer
 from genesis.security.card_redaction import CARD_FILTER
-from genesis.security.card_shapes import redact
+from genesis.security.card_redaction import redact_text as redact_cards
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +212,14 @@ _CONTROL_LINE = re.compile(
 _CONTROL_START = re.compile(r"^\s*- (?:" + "|".join(_CONTROL_ROLES) + r")\b")
 _OPTION_START = re.compile(r"^\s*- option\b")
 _TEXT_TOKEN = re.compile(r"[^\s\"'`<>()\[\]{}:;,|]+")
-_ALNUM_RUN = re.compile(r"[0-9A-Za-z]+")
+_ALNUM_RUN = re.compile(r"[^\W_]+")  # letters and digits, any script
+
+
+def _nfkc(text: str) -> str:
+    """One spelling per character: composed accents, ASCII for full-width forms."""
+    return unicodedata.normalize("NFKC", text)
+
+
 _MIN_PART = 3  # shorter value parts are not matched: too common to redact on sight
 
 
@@ -219,7 +228,7 @@ def _indent(line: str) -> int:
 
 
 def hide_form_values(text: str) -> str:
-    """Steps 1 and 2 of the armed-snapshot redaction: every textbox, searchbox,
+    """The form-value step of the armed-snapshot redaction: every textbox, searchbox,
     spinbutton and combobox value becomes :data:`HIDDEN` (with whatever is
     nested under it), and every option is dropped with its children. A line
     whose shape is not recognised keeps only its role."""
@@ -409,12 +418,17 @@ class PaymentTabs:
 
     def _register(self, entry: _Arming, values) -> None:
         """Record HMACs of ``values`` (never the values). Each is matched
-        whole, as digits only, and by its whitespace-separated parts of at
-        least three characters."""
+        whole, as digits only, by its whitespace-separated parts, and by the
+        letter-or-digit runs of those parts (``Brien`` of ``O'Brien``, which
+        :data:`_TEXT_TOKEN` splits at the apostrophe), each of at least
+        :data:`_MIN_PART` characters. Values are NFKC-normalised and parts
+        casefolded, as are the candidates :meth:`_matches` checks, so
+        ``PAT TESTER``, a decomposed ``José`` and full-width letters match too."""
         for value in values:
-            v = str(value).strip()
+            v = _nfkc(str(value)).strip()
             digits = "".join(c for c in v if c.isdigit())
-            for part in {v, digits, *v.split()}:
+            for part in {v, digits, *v.split(), *_ALNUM_RUN.findall(v)}:
+                part = part.casefold()
                 if len(part) >= _MIN_PART:
                     entry.digests.add(self._mac(entry.key, part))
                     entry.lengths.add(len(part))
@@ -587,35 +601,55 @@ class PaymentTabs:
 
     def _matches(self, token: str) -> bool:
         """The token, its digits, and each letter-or-digit run of its URL-decoded
-        form (so ``Tester.`` and ``?cvc=739&n=Pat+Tester`` match too)."""
-        decoded = unquote_plus(token)
+        form (so ``Tester.`` and ``?cvc=739&n=Pat+Tester`` match too), all
+        NFKC-normalised and casefolded as :meth:`_register` stores them."""
+        token = _nfkc(token)
+        decoded = _nfkc(unquote_plus(token))
         cands = {token, "".join(c for c in token if c.isdigit()), *_ALNUM_RUN.findall(decoded)}
+        cands = {c.casefold() for c in cands}
         for entry in self._tabs.values():
             for cand in cands:
                 if len(cand) in entry.lengths and self._mac(entry.key, cand) in entry.digests:
                     return True
         return False
 
-    def redact_text(self, text):
-        """Step 3 then 4: tokens whose HMAC matches a filled value, then card
-        numbers (card_shapes). Anything but a string is returned unchanged."""
-        if not isinstance(text, str):
-            return text
+    @staticmethod
+    def _redact_cards(text: str) -> str:
+        """Card numbers in ``text`` (card_redaction.redact_text: split across
+        separators and JSON escapes included). It runs BEFORE any value is
+        swapped for :data:`HIDDEN`: the longer marker can widen the gaps
+        between a split card's digit groups past the split-card limit. A text
+        it cannot walk (a JSON text too deep) is hidden whole."""
+        try:
+            return redact_cards(text)
+        except Exception:
+            return HIDDEN
+
+    def _hide_tokens(self, text: str) -> str:
         if any(e.digests for e in self._tabs.values()):
             text = _TEXT_TOKEN.sub(
                 lambda m: HIDDEN if self._matches(m.group(0)) else m.group(0), text
             )
-        return redact(text)
+        return text
+
+    def redact_text(self, text):
+        """Card numbers, then tokens whose HMAC matches a filled value.
+        Anything but a string is returned unchanged."""
+        if not isinstance(text, str):
+            return text
+        return self._hide_tokens(self._redact_cards(text))
 
     def redact_snapshot(self, page, text, armed_before: bool, epoch_before: int):
         """A snapshot of ``page``, read while ``armed_before`` held and the
-        epoch was ``epoch_before``. Arming is checked again now: a page armed
+        epoch was ``epoch_before``: card numbers, then (armed) form values,
+        then filled-value tokens. Arming is checked again now: a page armed
         during the read counts as armed."""
         if not isinstance(text, str):
             return text
+        text = self._redact_cards(text)
         if armed_before or self.is_armed(page) or self.epoch != epoch_before:
             text = hide_form_values(text)
-        return self.redact_text(text)
+        return self._hide_tokens(text)
 
     def path_only(self, url):
         """``url`` without query, fragment or userinfo, redacted."""
@@ -833,6 +867,7 @@ async def clear_site_storage(context, origins: set[str]) -> bool:
 
 TABS = PaymentTabs()
 CARD_FILTER.armed = TABS.any_armed
+CARD_FILTER.redact_armed = TABS.redact_text  # an f-string message can carry a filled value
 
 
 # The arming API the card-fill flow calls (and the tests).

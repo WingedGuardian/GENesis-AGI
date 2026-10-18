@@ -65,8 +65,16 @@ def redact_text(text: str) -> str:
         parsed = json.loads(out)
     except ValueError:
         return out
-    walked = redact_value(parsed)
+    except RecursionError:  # too deep to parse, so \\u-escaped digits stay unchecked
+        return _TOO_DEEP
+    try:
+        walked = redact_value(parsed)
+    except RecursionError:
+        return _TOO_DEEP
     return out if walked == parsed else json.dumps(walked, ensure_ascii=False)
+
+
+_TOO_DEEP = "[withheld: nested too deeply to check for card numbers]"
 
 
 # The split pass. A card can render as several digit groups with other text
@@ -349,7 +357,7 @@ class CardRedactingFilter(logging.Filter):
     """Rewrite a record as its redacted text, traceback included.
 
     The message, the formatted exception and the stack are joined into the
-    message and redacted; ``exc_info``, ``exc_text`` and ``stack_info`` are
+    message and redacted with :func:`redact_text`; ``exc_info``, ``exc_text`` and ``stack_info`` are
     cleared so no handler formats the raw traceback again.
 
     Works on a logger or a handler. A LOGGER filter sees only records created
@@ -367,6 +375,13 @@ class CardRedactingFilter(logging.Filter):
     #: raises counts as armed.
     armed: Callable[[], bool] | None = None
 
+    #: Armed mode also passes the kept format string through this (the
+    #: payment-tab guard sets it to hide the armed tab's filled values, which an
+    #: f-string message can carry). One that raises withholds the message.
+    redact_armed: Callable[[str], str] | None = None
+
+    _WITHHELD = "[log record withheld: it could not be checked for card numbers]"
+
     def _armed(self) -> bool:
         if self.armed is None:
             return False
@@ -375,10 +390,35 @@ class CardRedactingFilter(logging.Filter):
         except Exception:
             return True
 
+    def _redact(self, text: str, armed: bool) -> str:
+        """``text`` through :func:`redact_text` (a card split across
+        separators, or spelled as JSON escapes, included), then through
+        :attr:`redact_armed` when armed. The card pass runs first: the armed
+        redactor swaps values for a longer marker, which can widen the gaps
+        between a split card's digit groups past the split-card limit. A
+        redactor that fails (a JSON text too deep to walk) withholds the whole
+        text."""
+        try:
+            text = redact_text(text)
+            if armed and self.redact_armed is not None:
+                text = self.redact_armed(text)
+            return text
+        except Exception:
+            return self._WITHHELD
+
+    def _msg_text(self, record: logging.LogRecord) -> str:
+        """``record.msg`` as text, or the withheld text when its ``__str__``
+        raises (a filter runs outside ``Handler.handleError``, so the raise
+        would reach the caller of the log call)."""
+        try:
+            return str(record.msg)
+        except Exception:
+            return self._WITHHELD
+
     def filter(self, record: logging.LogRecord) -> bool:
         if self._armed():
             withheld = bool(record.args or record.exc_info or record.exc_text or record.stack_info)
-            record.msg = redact(str(record.msg)) + (
+            record.msg = self._redact(self._msg_text(record), armed=True) + (
                 " [args withheld: payment tab armed]" if withheld else ""
             )
             record.args = None
@@ -389,14 +429,14 @@ class CardRedactingFilter(logging.Filter):
         try:
             parts = [record.getMessage()]
         except Exception:
-            parts = [str(record.msg)]
+            parts = [self._msg_text(record)]
         if record.exc_info:
             parts.append(self._formatter.formatException(record.exc_info))
         elif record.exc_text:
             parts.append(record.exc_text)
         if record.stack_info:
             parts.append(record.stack_info)
-        record.msg = redact("\n".join(parts))
+        record.msg = self._redact("\n".join(parts), armed=False)
         record.args = None
         record.exc_info = None
         record.exc_text = None

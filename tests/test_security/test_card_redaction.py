@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 
 import pytest
 
@@ -191,6 +192,22 @@ class TestFilter:
         assert _CARD not in records[0] and REDACTED in records[0]
 
 
+def _digits(text: str) -> str:
+    return "".join(c for c in text if c.isdigit())
+
+
+# One card in shapes card_shapes.redact misses and redact_text catches: digit
+# groups on separate lines or between other separators, and one digit per box.
+_SPLIT_SPELLINGS = [
+    "\n".join([_CARD[i : i + 4] for i in range(0, 16, 4)]),
+    " / ".join([_CARD[i : i + 4] for i in range(0, 16, 4)]),
+    " | ".join(_CARD),
+]
+# A whole-record JSON text whose digits are \u escapes (redact_text parses
+# text that starts with "{", "[" or a quote).
+_JSON_ESCAPED = '{"n": "' + "".join(f"\\u{ord(c):04x}" for c in _CARD) + '"}'
+
+
 class TestArmedMode:
     """While a payment tab is armed (``CardRedactingFilter.armed``), a record
     keeps only its format string: no args, no traceback."""
@@ -226,6 +243,135 @@ class TestArmedMode:
         record = self._record()
         f.filter(record)
         assert "filled 739" in record.getMessage() and "RuntimeError" in record.getMessage()
+
+    @pytest.mark.parametrize("spelled", _SPLIT_SPELLINGS)
+    def test_a_split_card_in_the_format_string_is_redacted(self, spelled):
+        # An f-string message carries page text in the format string itself.
+        f = CardRedactingFilter()
+        f.armed = lambda: True
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, f"saw {spelled}", None, None)
+        f.filter(record)
+        assert _CARD not in _digits(record.getMessage())
+        assert REDACTED in record.getMessage()
+
+    def test_a_json_escaped_card_format_string_is_redacted(self):
+        f = CardRedactingFilter()
+        f.armed = lambda: True
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, _JSON_ESCAPED, None, None)
+        f.filter(record)
+        assert "\\u0034" not in record.getMessage() and REDACTED in record.getMessage()
+
+    def test_armed_values_are_hidden_by_the_armed_redactor(self):
+        f = CardRedactingFilter()
+        f.armed = lambda: True
+        f.redact_armed = lambda text: text.replace("Tester", "[hidden]")
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, "typed Tester", None, None)
+        f.filter(record)
+        assert record.getMessage() == "typed [hidden]"
+
+    def test_an_armed_redactor_that_raises_withholds_the_message(self):
+        f = CardRedactingFilter()
+        f.armed = lambda: True
+
+        def broken(_text):
+            raise RuntimeError("no")
+
+        f.redact_armed = broken
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, "typed Tester", None, None)
+        assert f.filter(record) is True
+        assert "Tester" not in record.getMessage()
+
+    def test_the_split_card_pass_runs_before_the_armed_redactor(self):
+        # The armed redactor swaps each name part for a longer marker, which
+        # widens the gaps between the digit groups past the split-card limit:
+        # the card pass must read the text before that happens.
+        f = CardRedactingFilter()
+        f.armed = lambda: True
+        f.redact_armed = lambda text: re.sub(r"\b(Pat|Tester)\b", "[hidden: payment tab]", text)
+        msg = "4242 Pat Tester 4242 Pat Tester 4242 Pat Tester 4242"
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, msg, None, None)
+        f.filter(record)
+        assert "4242" not in record.getMessage() and REDACTED in record.getMessage()
+
+
+class _Unprintable:
+    def __str__(self) -> str:
+        raise RuntimeError("no text")
+
+
+class TestTooDeep:
+    def test_json_too_deep_to_parse_is_withheld_not_raised(self):
+        # Parsing or walking deep nesting raises RecursionError (not ValueError); a
+        # \u-escaped card inside it could not be checked, so the text is withheld.
+        deep = "[" * 5000 + '"\\u0034242424242424242"' + "]" * 5000
+        assert card_redaction.redact_text(deep) == card_redaction._TOO_DEEP
+
+
+class TestUnprintableMessage:
+    """A record whose msg object cannot be turned into text: Filterer.filter
+    runs outside Handler.handleError, so a raise here would reach the caller
+    of logger.x(). The message is withheld instead."""
+
+    @pytest.mark.parametrize("armed", (False, True))
+    def test_the_log_call_does_not_raise_and_the_message_is_withheld(self, armed):
+        f = CardRedactingFilter()
+        f.armed = lambda: armed
+        records: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        log = logging.getLogger(f"test.card_redaction.unprintable.{armed}")
+        log.propagate = False
+        log.addFilter(f)
+        log.addHandler(handler)
+        try:
+            log.warning(_Unprintable())
+        finally:
+            log.removeHandler(handler)
+            log.removeFilter(f)
+        assert len(records) == 1
+        assert records[0].getMessage() == CardRedactingFilter._WITHHELD
+
+
+class TestFilterReadsSplitCards:
+    """Unarmed, the whole record text (message, args, traceback) goes through
+    redact_text, so a card split across separators is redacted."""
+
+    @pytest.mark.parametrize("spelled", _SPLIT_SPELLINGS)
+    def test_a_split_card_in_the_args_is_redacted(self, spelled):
+        f = CardRedactingFilter()
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, "page said %s", (spelled,), None)
+        f.filter(record)
+        assert _CARD not in _digits(record.getMessage())
+        assert REDACTED in record.getMessage()
+
+    def test_a_json_escaped_card_record_is_redacted(self):
+        f = CardRedactingFilter()
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, "%s", (_JSON_ESCAPED,), None)
+        f.filter(record)
+        assert "\\u0034" not in record.getMessage() and REDACTED in record.getMessage()
+
+    @pytest.mark.parametrize("spelled", _SPLIT_SPELLINGS)
+    def test_a_split_card_in_a_traceback_is_redacted(self, spelled):
+        f = CardRedactingFilter()
+        try:
+            raise RuntimeError(spelled)
+        except RuntimeError:
+            info = __import__("sys").exc_info()
+        record = logging.LogRecord("t", logging.ERROR, __file__, 1, "failed", None, info)
+        f.filter(record)
+        # Not the digits of the whole text: the traceback's line numbers are digits too.
+        assert spelled not in record.getMessage()
+        assert "Traceback" in record.getMessage() and REDACTED in record.getMessage()
+
+    def test_a_record_redact_text_cannot_walk_is_withheld(self, monkeypatch):
+        def deep(_text):
+            raise RecursionError
+
+        monkeypatch.setattr(card_redaction, "redact_text", deep)
+        f = CardRedactingFilter()
+        record = logging.LogRecord("t", logging.INFO, __file__, 1, "said %s", ("x",), None)
+        assert f.filter(record) is True
+        assert "said" not in record.getMessage()
 
 
 class TestSplitAcrossStructure:
