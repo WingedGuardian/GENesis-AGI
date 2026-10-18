@@ -300,6 +300,7 @@ async def qualify(alias, cases, params, campaign, temp_root, *, reference_policy
                   dispatch=False, config=None, transport=None, operating=None):
     """Recompute complete admission; no caller-supplied prepared plan is authority."""
     cases, params, source_files = deepcopy(cases), deepcopy(params), deepcopy(source_files)
+    reference_approval = deepcopy(reference_approval)
     config = deepcopy(config or pinned.routing())
     checked = await preflight.check(
         cases, temp_root, reference_policy=reference_policy, current_policy=current_reference_policy,
@@ -325,7 +326,9 @@ async def qualify(alias, cases, params, campaign, temp_root, *, reference_policy
     else:
         records, clamped = await score(cases, router, temp_root)
     try:
-        if (preflight.source_evidence(cases, source_files) != checked["reference_sources"]
+        if (preflight.source_evidence(cases, source_files,
+                                     retention=reference_approval.get("source_retention"))
+            != checked["reference_sources"]
             or preflight.production_source_inventory(preflight.production_modules())
                != checked["production_sources"]
             or admission_identity(checked) != admission):

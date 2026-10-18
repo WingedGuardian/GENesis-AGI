@@ -2932,6 +2932,10 @@ verified: 788a6d75c178 2026-10-17
   repeated checks with matching caches.
   The runner recomputes it before credentials. See
   `docs/reference/qualification-preflight.md`.
+  Complete admission requires exact source archives in durable private storage
+  and separately restored bytes bound by human approval. Original paths remain
+  logical provenance identities; archive creation supplies no approval or
+  independent-backup claim. Missing retained evidence refuses before rendering.
   The isolated serial CLI supports Flash-only or historical paired execution
   under an exact frozen operating plan and a separate local spending assertion.
   A credential-scoped lock precedes journal writers and credential reads. The
@@ -3329,7 +3333,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 4606e5969 2026-10-16
+verified: da43da6e4f73 2026-10-17
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3783,6 +3787,11 @@ tool-disabled CC probe without changing its schedule or routing authority.
   outside the checkout at the end of every run, a failed one included. A
   symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
   `--take-templates`.
+- **Deployment status** (`scripts/lib/deploy_status.sh`): status captures the
+  MainPID, invocation, runtime edits and runtime overrides once for its printed
+  fields and bracket calculation. This keeps those fields aligned with the
+  token; it does not make separate systemd/git/file reads an atomic snapshot.
+  Direct `_bracket` calls without captured arguments retain their own reads.
 - **The restart guard, `~/.genesis/update_state.json`** (deploy scripts and the
   dashboard update routes, #3139): `update.sh` writes it at each phase; an
   update that merged code and never activated it, or that stopped on merge

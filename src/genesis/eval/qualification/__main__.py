@@ -27,6 +27,9 @@ def parser():
             command.add_argument("--spending-approval", type=Path)
     review = commands.add_parser("review-references")
     review.add_argument("--spec", type=Path, required=True)
+    archive = commands.add_parser("archive-sources")
+    archive.add_argument("--source-files", type=Path, required=True)
+    archive.add_argument("--generation", required=True)
     return result
 
 
@@ -73,6 +76,12 @@ async def run(args):
     def read(name):
         path = getattr(args, name, None)
         return load_json(path.read_bytes()) if path else None
+
+    if args.command == "archive-sources":
+        from genesis.eval.qualification.sources import archive
+
+        archive(read("source_files"), args.generation)
+        return {"status": "pass", "scope": "source retention only; no approval or backup claim"}
 
     if args.command == "review-references":
         reviewed = references.review(read("spec"), corpus.versions())

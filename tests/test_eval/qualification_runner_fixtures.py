@@ -137,7 +137,7 @@ def report_cli(data, monkeypatch, *extra):
     # This subset fixture measures CLI plumbing, never complete admission.
     monkeypatch.setattr(corpus, "coverage", lambda *_args, **_kwargs: [])
     inputs = {"params": {a: data.params for a in ("openrouter-mimo", "openrouter-deepseek-flash")}, "reference-policy": data.policy,
-              "current-reference-policy": data.policy, "reference-approval": None,
+              "current-reference-policy": data.policy, "reference-approval": {},
               "source-files": data.source_files}
     arguments = []
     for name, value in inputs.items():
