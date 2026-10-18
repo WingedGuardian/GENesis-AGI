@@ -690,15 +690,17 @@ _INFRA_POSTURE_DETAIL = {
         "next reboot. " + _FALKORDB_STAND_DOWN
     ),
     _CODEBASE_MCP_SLUG: (
-        "codebase-memory-mcp is registered in this checkout's .mcp.json, but its "
-        "managed setup is incomplete — the settings file "
-        "~/.genesis/config/codebase-managed.json is missing, or the query unit "
-        "genesis-cbm-query.service is not enabled — so its launcher refuses and "
+        "codebase-memory-mcp is registered (this checkout's .mcp.json or the "
+        "user-scope ~/.claude.json), but its managed setup is incomplete — the "
+        "settings file ~/.genesis/config/codebase-managed.json is missing or fails "
+        "validation (`scripts/codebase_managed.py status` names the error), or the "
+        "query unit genesis-cbm-query.service is not enabled — so its launcher refuses and "
         "every Claude Code session shows the server as failed to connect. Fix: "
         "run `configure` (with an already obtained pinned binary) and then "
         "`enable`, per docs/reference/codebase-managed.md, section \"If you see "
         "the 'registered but unconfigured' alert\". Not wanted? Create the "
-        "kill-switch file (~/.genesis/codebase-memory-mcp.disabled, or the path "
+        "kill-switch file (the `sentinel` path in the settings file if one exists, "
+        "else ~/.genesis/codebase-memory-mcp.disabled or the path "
         "CODEBASE_MEMORY_MCP_DISABLE_FILE names) and this alert stops. It reads "
         "the infrastructure profile, so after either fix take a refresh "
         "(`infrastructure_profile(refresh=true)`)"

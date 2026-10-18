@@ -23,10 +23,12 @@ runtime off-switch; masking may refuse when a local regular unit already exists.
 
 The health alert `codebase_mcp_registered_unconfigured`, and the matching
 `Codebase: NOT SET UP` line that bootstrap, install and update print, mean that
-this checkout's `.mcp.json` registers `codebase-memory-mcp` but its launcher
-will refuse. Either `~/.genesis/config/codebase-managed.json` is missing or
-`genesis-cbm-query.service` is not persistently enabled. Every Claude Code
-session then shows the server as failed to connect.
+`codebase-memory-mcp` is registered (the checkout's `.mcp.json` or the
+user-scope `~/.claude.json`) but its launcher will refuse. Either
+`~/.genesis/config/codebase-managed.json` is missing, it fails validation (the
+`status` command below names the error), or `genesis-cbm-query.service` is not
+persistently enabled. Every Claude Code session then shows the server as failed
+to connect.
 
 To set it up, obtain the pinned binary, then run from the primary checkout (see
 [Configure](#configure) for what each argument must be):
@@ -40,9 +42,11 @@ To set it up, obtain the pinned binary, then run from the primary checkout (see
 python3 -I scripts/codebase_managed.py enable
 ```
 
-If the settings file already exists, run only `enable`. To opt out instead,
-create the kill-switch file (`~/.genesis/codebase-memory-mcp.disabled`, or the
-path `CODEBASE_MEMORY_MCP_DISABLE_FILE` names):
+If a valid settings file already exists, run only `enable`; for an invalid one,
+follow "Diagnose and recover" below. To opt out instead, create the kill-switch
+file. If a settings file exists, that is its configured `sentinel` path;
+otherwise it is `~/.genesis/codebase-memory-mcp.disabled`, or the path
+`CODEBASE_MEMORY_MCP_DISABLE_FILE` names:
 
 ```bash
 touch "$HOME/.genesis/codebase-memory-mcp.disabled"

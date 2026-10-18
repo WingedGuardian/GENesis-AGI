@@ -1622,9 +1622,13 @@ if [[ "${_mu_kept_count:-0}" -gt 0 ]]; then
     echo "  ${_mu_kept_count} systemd unit(s) KEPT, not overwritten: edited by hand or not a regular file."
 fi
 # codebase-memory-mcp: one line only when it is registered but not set up (or OK).
-# shellcheck source=lib/cbm_setup_notice.sh
-. "$SCRIPT_DIR/lib/cbm_setup_notice.sh"
-genesis_cbm_setup_notice "$VENV_DIR/bin/python" "$GENESIS_ROOT" "  "
+# Run by hand only: under update.sh (which hands us its summary) update.sh prints
+# the same line in its own end-of-run summary, so printing here would duplicate it.
+if [[ "${_bootstrap_owns_summary:-0}" = "1" ]]; then
+    # shellcheck source=lib/cbm_setup_notice.sh
+    . "$SCRIPT_DIR/lib/cbm_setup_notice.sh"
+    genesis_cbm_setup_notice "$VENV_DIR/bin/python" "$GENESIS_ROOT" "  "
+fi
 
 # setup-complete written only now that all bootstrap work has finished (B1) — the
 # marker gates the fresh-install onboarding prompt + ego cadence, so an interrupted

@@ -1,8 +1,9 @@
 """Is codebase-memory-mcp registered but not set up? — ONE answer, two readers.
 
-The repo's ``.mcp.json`` registers ``codebase-memory-mcp`` on every install, and
-its launcher (``.claude/mcp/run-codebase-memory``) refuses until an operator has
-run the managed ``configure`` and ``enable`` steps by hand
+``codebase-memory-mcp`` is registered on every install (the checkout's
+``.mcp.json`` and the user-scope ``~/.claude.json``), and its launcher
+(``.claude/mcp/run-codebase-memory``) refuses until an operator has run the
+managed ``configure`` and ``enable`` steps by hand
 (docs/reference/codebase-managed.md). Nothing automates that on purpose:
 configure needs an already obtained, digest-pinned binary and never downloads.
 So an install that never did it shows the server as "failed to connect" in
@@ -20,11 +21,18 @@ Both read the facts through :func:`read_facts` and judge them with
 :func:`needs_setup`. Stdlib only, so the scripts can run it from a checkout
 without the runtime's dependency graph.
 
+Nothing the managed tool already decides is re-derived here. Once a settings
+file exists, its validity, its configured kill-switch path and the query unit's
+state all come from ``scripts/codebase_managed.py status`` — the tool's own
+validation, and its own normalized user-manager environment. Only when no
+settings file exists is the kill switch resolved by the default resolver
+(``scripts/lib/cbm_disable_file.sh``), the one the installers and indexer use.
+
 The verdict is tri-state on purpose. ``True`` = registered, not opted out, and
-not working (the managed settings file is missing, or the query unit is not
-persistently enabled). ``False`` = nothing to say (not registered, opted out
-with the disable sentinel, or configured and enabled). ``None`` = the question
-could not be answered, which must read neither as fine nor as an alert.
+not working (the managed settings file is missing or invalid, or the query unit
+is not persistently enabled). ``False`` = nothing to say (not registered, opted
+out with the kill-switch file, or configured and enabled). ``None`` = the
+question could not be answered, which must read neither as fine nor as an alert.
 """
 
 from __future__ import annotations
@@ -33,9 +41,9 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 SERVER = "codebase-memory-mcp"
@@ -44,6 +52,9 @@ SLUG = "codebase_mcp_registered_unconfigured"
 DOC = "docs/reference/codebase-managed.md"
 DOC_SECTION = "If you see the 'registered but unconfigured' alert"
 _TIMEOUT = 10.0
+# `status` bounds each of its own systemctl calls at 30s; this is the outer bound.
+_STATUS_TIMEOUT = 90.0
+_MAX_JSON_BYTES = 16 * 1024 * 1024
 
 
 class Unanswerable(RuntimeError):
@@ -55,34 +66,48 @@ def managed_config_path(home: Path) -> Path:
     return home / ".genesis" / "config" / "codebase-managed.json"
 
 
-def registered(repo_root: Path) -> bool:
-    """Does the checkout's .mcp.json register the server?
+def _servers(path: Path) -> dict:
+    """The mcpServers mapping of one registration file; {} when it is absent.
 
-    An absent file is an answer (no registration). A file that exists but cannot
-    be read or parsed is not: Claude Code cannot load it either, and guessing
-    either way would be a fact nobody verified.
+    Opened non-blocking and checked with fstat before any read, so a FIFO (or
+    any non-regular file) at the path is refused instead of hanging the refresh
+    — the same "not a regular file" rule setup_claude_config.py applies to
+    .mcp.json. Unreadable or unparseable means "could not check", never "not
+    registered".
     """
-    path = repo_root / ".mcp.json"
     try:
-        text = path.read_text(encoding="utf-8")
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
-        return False
-    except (OSError, UnicodeDecodeError) as exc:
-        raise Unanswerable(f"cannot read {path.name}: {exc}") from exc
+        return {}
+    except OSError as exc:
+        raise Unanswerable(f"cannot open {path.name}: {exc}") from exc
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Unanswerable(f"{path.name} is not a regular file")
+        payload = stream.read(_MAX_JSON_BYTES + 1)
+    if len(payload) > _MAX_JSON_BYTES:
+        raise Unanswerable(f"{path.name} is too large to check")
     try:
-        servers = json.loads(text).get("mcpServers")
-    except (ValueError, AttributeError) as exc:
+        servers = json.loads(payload).get("mcpServers")
+    except (ValueError, AttributeError, RecursionError) as exc:
         raise Unanswerable(f"{path.name} is not a JSON object: {exc}") from exc
-    return isinstance(servers, dict) and SERVER in servers
+    return servers if isinstance(servers, dict) else {}
+
+
+def registrations(repo_root: Path, home: Path) -> dict[str, bool]:
+    """Where the server is registered: the checkout (.mcp.json) and user scope
+    (~/.claude.json, written by scripts/lib/mcp_register.sh)."""
+    return {
+        "project": SERVER in _servers(repo_root / ".mcp.json"),
+        "user": SERVER in _servers(home / ".claude.json"),
+    }
 
 
 def disable_file(repo_root: Path) -> Path | None:
-    """The kill-switch path, resolved by the ONE shell resolver every other
-    consumer uses (scripts/lib/cbm_disable_file.sh), so the override, the ``~/``
-    expansion and the fail-closed rules cannot drift here. None = the resolver
-    reports no absolute path can be produced (or is missing from the checkout),
-    which is a standing property of this environment, not a transient failure.
-    """
+    """The DEFAULT kill-switch path, resolved by the ONE shell resolver the
+    installers and indexer use (scripts/lib/cbm_disable_file.sh). None = the
+    resolver reports no absolute path can be produced (or is missing), which is
+    a standing property of this environment, not a transient failure."""
     lib = repo_root / "scripts" / "lib" / "cbm_disable_file.sh"
     bash = shutil.which("bash")
     if bash is None or not lib.is_file():
@@ -103,51 +128,90 @@ def disable_file(repo_root: Path) -> Path | None:
     return Path(value)
 
 
-def unit_file_state() -> str | None:
-    """UnitFileState of the query unit. None = no systemctl on this box (an
-    answer). A unit that does not exist reads "not-found". A systemctl that
-    exists and then fails raises Unanswerable."""
-    systemctl = shutil.which("systemctl")
-    if systemctl is None:
-        return None
+def managed_status(repo_root: Path, config: Path) -> dict:
+    """``codebase_managed.py status`` for the launcher's settings path, run
+    isolated with this interpreter (the checkout's venv: the bash helper passes
+    it, and the server runs under it). Its failure is "could not check"."""
+    script = repo_root / "scripts" / "codebase_managed.py"
     try:
         proc = subprocess.run(
-            [systemctl, "--user", "show", UNIT, "-p", "LoadState", "-p", "UnitFileState"],
+            [sys.executable, "-I", str(script), "--config", str(config), "status"],
             capture_output=True,
             text=True,
-            timeout=_TIMEOUT,
+            timeout=_STATUS_TIMEOUT,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise Unanswerable(f"systemctl show {UNIT} failed: {exc}") from exc
+        raise Unanswerable(f"managed status failed: {exc}") from exc
     if proc.returncode != 0:
-        raise Unanswerable(f"systemctl show {UNIT} exited {proc.returncode}")
-    props = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
-    if props.get("LoadState") == "not-found":
-        return "not-found"
-    return props.get("UnitFileState") or None
+        raise Unanswerable(f"managed status exited {proc.returncode}")
+    try:
+        value = json.loads(proc.stdout)
+    except ValueError as exc:
+        raise Unanswerable(f"managed status printed no JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise Unanswerable("managed status printed no JSON object")
+    return value
 
 
-def read_facts(
-    repo_root: Path,
-    home: Path,
-    *,
-    unit_state: Callable[[], str | None] = unit_file_state,
-) -> dict:
-    """The facts both readers judge. Raises Unanswerable when one cannot be read."""
-    sentinel = disable_file(repo_root)
+def _opt_out(facts: dict, sentinel: Path | None) -> None:
+    facts["disable_file"] = str(sentinel) if sentinel is not None else None
+    # lexists: anything placed there, even a dangling link, is the owner's
+    # opt-out — the launcher's sentinel_armed test is lstat-based too.
+    facts["disabled"] = os.path.lexists(sentinel) if sentinel is not None else None
+
+
+def read_facts(repo_root: Path, home: Path, *, strict_manager: bool = False) -> dict:
+    """The facts both readers judge. Raises Unanswerable when one cannot be read.
+
+    Ordered so each answer is reached with the fewest probes: unregistered stops
+    first; a missing settings file needs only the default kill switch; an armed
+    kill switch stops before any unit state is consulted. ``strict_manager``:
+    raise when status could not reach the user manager (the collector, which
+    must not hash a guess) instead of recording the unit state as unknown.
+    """
+    where = registrations(repo_root, home)
     config = managed_config_path(home)
-    return {
-        "registered": registered(repo_root),
-        "config_present": config.is_file(),
+    facts: dict = {
+        "registered": where["project"] or where["user"],
+        "registered_project": where["project"],
+        "registered_user": where["user"],
         "config_path": str(config),
         "unit": UNIT,
-        "unit_file_state": unit_state(),
-        "disable_file": str(sentinel) if sentinel is not None else None,
-        # lexists: anything placed there, even a dangling link, is the owner's
-        # opt-out — the same "something is at the path" test the installer uses.
-        "disabled": os.path.lexists(sentinel) if sentinel is not None else None,
     }
+    if not facts["registered"]:
+        return facts
+    facts["config_present"] = os.path.lexists(config)
+    if not facts["config_present"]:
+        _opt_out(facts, disable_file(repo_root))
+        return facts
+
+    status = managed_status(repo_root, config)
+    settings = status.get("settings") if isinstance(status.get("settings"), dict) else {}
+    configured = settings.get("sentinel")
+    if isinstance(configured, str) and configured.startswith("/"):
+        _opt_out(facts, Path(configured))  # what the launcher enforces
+    else:
+        _opt_out(facts, disable_file(repo_root))
+    if facts["disabled"] is True:
+        return facts
+    error = status.get("settings_error")
+    facts["settings_error"] = error if isinstance(error, str) else None
+    facts["config_valid"] = facts["settings_error"] is None
+    if not facts["config_valid"]:
+        return facts
+
+    service = status.get("service")
+    if not isinstance(service, dict):
+        if strict_manager:
+            raise Unanswerable(f"managed status: {status.get('manager_error')}")
+        facts["unit_file_state"] = None
+        return facts
+    if service.get("LoadState") == "not-found":
+        facts["unit_file_state"] = "not-found"
+    else:
+        facts["unit_file_state"] = service.get("UnitFileState") or None
+    return facts
 
 
 def needs_setup(facts: dict) -> bool | None:
@@ -164,6 +228,11 @@ def needs_setup(facts: dict) -> bool | None:
         return True
     if config is not True:
         return None
+    valid = facts.get("config_valid")
+    if valid is False:
+        return True
+    if valid is not True:
+        return None
     state = facts.get("unit_file_state")
     if not isinstance(state, str):
         return None  # no unit manager to ask
@@ -175,6 +244,11 @@ def missing_parts(facts: dict) -> list[str]:
     parts = []
     if facts.get("config_present") is False:
         parts.append(f"the managed settings file {facts.get('config_path')} is missing")
+    elif facts.get("config_valid") is False:
+        parts.append(
+            f"the managed settings file {facts.get('config_path')} is invalid "
+            f"({facts.get('settings_error')})"
+        )
     state = facts.get("unit_file_state")
     if isinstance(state, str) and state != "enabled":
         parts.append(f"{facts.get('unit', UNIT)} is not enabled (state: {state})")
@@ -186,7 +260,7 @@ def notice(facts: dict) -> str:
     verdict = needs_setup(facts)
     if verdict is True:
         return (
-            f"Codebase: NOT SET UP — {SERVER} is registered in .mcp.json but "
+            f"Codebase: NOT SET UP — {SERVER} is registered but "
             f"{' and '.join(missing_parts(facts))}, so every session shows it as "
             f'failed to connect. Fix: {DOC}, section "{DOC_SECTION}" '
             f"(configure, then enable). Not wanted? Create {facts.get('disable_file')}"
@@ -205,18 +279,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m genesis.infra_profile.codebase_mcp")
     parser.add_argument("--repo", required=True, help="the checkout whose .mcp.json to read")
     args = parser.parse_args(argv)
-
-    def unit_state_or_unknown() -> str | None:
-        # Unlike the collector, a printed line hashes nothing, so an unanswerable
-        # unit probe is simply "unknown": a missing settings file still decides
-        # the verdict, and a present one yields the "could not be checked" line.
-        try:
-            return unit_file_state()
-        except Unanswerable:
-            return None
-
     try:
-        facts = read_facts(Path(args.repo), Path.home(), unit_state=unit_state_or_unknown)
+        # Not strict: a printed line hashes nothing, so an unreachable manager is
+        # simply "unknown" — a missing or invalid settings file still decides it.
+        facts = read_facts(Path(args.repo), Path.home())
     except Unanswerable as exc:
         print(
             f"Codebase: setup state could not be checked ({exc}); run "
