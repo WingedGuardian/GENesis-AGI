@@ -2011,18 +2011,20 @@ def has_built_escape(command: str) -> bool:
 #: keeps the untokenizable cause, and with it that guard's settled behaviour.
 #:
 #: COST, measured over 138,216 recorded unique commands on one install (the 15,488
-#: that contain ``<<``, so every command the check can touch). 110 commands (0.080%)
+#: that contain ``<<``, so every command the check can touch). 101 commands (0.073%)
 #: report this blind spot. 71 are carried-state reports an earlier, emulating version
 #: also made (at the top level an exact bash oracle, which parses the command with the
 #: suffix replaced by a marker and runs nothing, confirms every one of the 77
 #: carried-state fires there); the other 2 it made are the message idiom, where
-#: every statement bash runs is a segment of the parse. 39 are new, none changing
-#: another cause: 17 bodies bash expands that hold a command substitution, 7 from
-#: nested scripts, 5 words that do not resolve or cannot be delimited, 5 unterminated
-#: bodies, 4 lines that may end a body inside a substitution and 1 opener line whose
-#: quote spans lines. 15 of the 39 (0.011%) mention an operation a guard's bounds
-#: branch refuses on: an upper bound on new refusals, which the fail-closed ruling
-#: accepts. No ``git commit`` or ``gh`` message written with the quoted
+#: every statement bash runs is a segment of the parse. 30 are new, none changing
+#: another cause: 17 bodies bash expands that hold a command substitution, 5
+#: unterminated bodies, 4 lines that may end a body inside a substitution, 3 words
+#: that do not resolve or cannot be delimited and 1 opener line whose quote spans
+#: lines. 9 of the 30 (0.007%) mention an operation a guard's bounds branch refuses
+#: on: an upper bound on new refusals, which the fail-closed ruling accepts. An opener
+#: with no newline after its word is no body at all, and bash reads the rest of that
+#: line as the segmenter does, so it is not reported for that alone
+#: (``echo $((1<<2)) x`` once was). No ``git commit`` or ``gh`` message written with the quoted
 #: ``"$(cat <<'EOF'`` idiom is reported. A bash-oracle fuzz of 65,591 generated
 #: commands (36,096 where bash runs the gated command, after a body, inside a
 #: substitution after a body, or expanded inside one), built from quoted ``<<``
@@ -2225,6 +2227,36 @@ class _HeredocLines:
         return max(table[level][lo], table[level][hi - (1 << level)])
 
 
+def _word_left_open(word: str) -> bool:
+    """Whether the word scanner (:func:`_redirect_target_end`) ran to the end of the
+    text INSIDE a quote or a ``$(`` it opened in ``word``: what it swallowed is not one
+    word to bash. Read with the scanner's own rules, so the answer is about the span
+    it actually consumed."""
+    n = len(word)
+    i = 0
+    while i < n:
+        c = word[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c in "'\"":
+            close = i + 1
+            while close < n and word[close] != c:
+                close += 2 if c == '"' and word[close] == "\\" else 1
+            if close >= n:
+                return True
+            i = close + 1
+            continue
+        if word.startswith("$(", i):
+            end = _command_sub_end(word, i, n)
+            if end >= n and not word.endswith(")"):
+                return True
+            i = end
+            continue
+        i += 1
+    return False
+
+
 def _heredoc_hidden_suffixes(
     text: str,
     splits: list[int],
@@ -2313,21 +2345,28 @@ def _heredoc_hidden_suffixes(
         while j < n and text[j] in " \t":
             j += 1
         end = _redirect_target_end(text, j, n) if j < n and text[j] not in _TARGET_STOP else j
-        # A word the scanner could not delimit normally is never skipped silently.
-        # The scanner reads a backtick as the START of a substitution, so a word that
-        # runs into the backtick CLOSING an enclosing one swallows the rest of the
-        # text (``echo `cat <<EOF`; …``), where bash ends the word at that backtick
-        # and runs what follows. So: no word, a backtick or newline in it, or no
-        # newline after it, and anything runnable follows where bash may end the
-        # word, is reported.
+        # A word the scanner SWALLOWED is never skipped silently. The scanner reads a
+        # backtick as the START of a substitution, so a word that runs into the
+        # backtick CLOSING an enclosing one swallows the rest of the text
+        # (``echo `cat <<EOF`; …``), where bash ends the word at that backtick and
+        # runs what follows. So a backtick or newline inside the word, with anything
+        # runnable after it, is reported, and so is a word that will not resolve
+        # after running to the end of the text (an open quote or substitution).
         cut = min(
             (k for k in (text.find("`", j, end), text.find("\n", j, end)) if k >= 0),
             default=end,
         )
-        newline = text.find("\n", end) if cut == end else -1
-        if end == j or newline < 0:
+        if cut < end:
             if cut <= last_run:
                 found.append((opener, "delimiter", cut))
+            continue
+        newline = text.find("\n", end)
+        if end == j or newline < 0:
+            # No word (bash refuses the line, or this is an arithmetic shift such as
+            # ``$((1<<(2)))``), or no newline after it: no body follows, and bash
+            # reads the rest of the line as the segmenter does (``echo $((1<<2)) x``).
+            if end == n and _word_left_open(text[j:end]):
+                found.append((opener, "delimiter", j))
             continue
         if newline != group_newline:
             group_newline = newline

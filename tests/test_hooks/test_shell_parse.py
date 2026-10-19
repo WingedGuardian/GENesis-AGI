@@ -2206,6 +2206,51 @@ def test_heredoc_word_closed_by_a_backtick_with_nothing_after_is_quiet():
     assert sp.analyze_checked("echo `cat <<EOF`")[1] is None
 
 
+# With no newline after the opener's word there is no body, and bash reads the rest
+# of the line as the segmenter does, so nothing can hide there (#3433: an arithmetic
+# shift was reported, and the secrets.env guard read that as touching the file).
+# (id, command, what bash is shown: an opener with no body would eat the wrapper's
+# closing brace as its body, so its empty body's terminator is supplied)
+_HD_SINGLE_LINE = [
+    ("arithmetic-then-argument", "echo $((1<<2)) 'notes.txt'; " + _HD_STATUS, ""),
+    ("arithmetic-then-command", "echo $((1<<2)); " + _HD_STATUS, ""),
+    ("opener-then-command", "cat <<EOF; " + _HD_STATUS, "\nEOF"),
+    ("quoted-opener-then-command", "cat <<'EOF' && " + _HD_STATUS, "\nEOF"),
+]
+
+
+@pytest.mark.parametrize(
+    ("command", "frame"), [pytest.param(c, f, id=i) for i, c, f in _HD_SINGLE_LINE]
+)
+def test_heredoc_opener_with_no_newline_after_is_quiet(command, frame, bash_oracle_sandbox):
+    assert sp.analyze_checked(command)[1] is None
+    assert _hd_argv_present(command, _HD_STATUS)
+    sandbox = bash_oracle_sandbox
+    out = subprocess.run(
+        [shutil.which("bash"), "-r", "-c", "f() {\n" + command + frame + "\n}\ndeclare -f f"],
+        env={"PATH": str(sandbox / "bin"), "HOME": str(sandbox / "work"),
+             "GIT_CEILING_DIRECTORIES": str(sandbox)},
+        cwd=str(sandbox / "work"), capture_output=True, text=True, timeout=30,
+    ).stdout
+    # a statement: indented, after any (empty) body bash prints at column 0
+    assert re.search(r"^ +.*" + re.escape(_HD_STATUS), out, re.M), out
+
+
+def test_heredoc_word_ending_the_text_without_an_open_quote_is_quiet():
+    """Prose quoting the idiom with escaped backticks inside a double-quoted
+    argument: the extractor hands the nested parse ``bash <<'EOF'\\``, whose word
+    ends the text but leaves nothing open, and nothing follows it."""
+    command = ('gh pr comment 1 --body "e.g. \\`bash <<\'EOF\'\\` runs its body" && '
+               + _HD_STATUS)
+    assert sp.analyze_checked(command)[1] is None
+
+
+def test_heredoc_word_swallowed_to_the_end_of_the_text_is_reported():
+    """An open quote in the word runs the scanner to the end of the text, where
+    the word cannot be delimited at all: still reported."""
+    assert sp.analyze_checked("cat <<'EOF; " + _HD_G)[1] is not None
+
+
 # The fourth review's classes (#3433). C1: inside `$(…)` or `<(…)` bash ends a body
 # on a line that STARTS with the delimiter and holds a later `)`, and runs what follows
 # the delimiter on it. C2: the substitution extractor ends a `$(` at a `)` inside a
