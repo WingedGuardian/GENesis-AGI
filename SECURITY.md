@@ -191,8 +191,9 @@ you open the dashboard by another name (a custom DNS record, the host VM's own
 name or Tailscale name), list it in
 `GENESIS_DASHBOARD_ALLOWED_HOSTS` (comma-separated; a leading dot such as
 `.home.example` matches every name under it), or open it by IP. Requests
-carrying the internal bearer, the bearer-authenticated `/v1/*` routes and the
-supervisor's health/heartbeat/pause reads are not affected.
+carrying the internal bearer and the bearer-authenticated `/v1/*` routes are
+not affected; the supervisor's health/heartbeat/pause reads pass because it
+addresses the container by IP.
 `GENESIS_DASHBOARD_HOSTNAME_CHECK=off` disables the check. This check is about
 the NAME a request is addressed to; it does not decide which page sent the
 request, so it is not a cross-site (CSRF / cross-site WebSocket) control.

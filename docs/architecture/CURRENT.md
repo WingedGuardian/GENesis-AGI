@@ -1538,8 +1538,8 @@ the shared banner is not an assertion about all concurrent sessions.
   keep rediscovering.** Two app-level hooks act on API reads, and neither
   authenticates: `host_gate.check_host_header` refuses a request whose Host header
   does not name this machine (IP literal, `localhost`, its hostnames, its
-  Tailscale name, or `GENESIS_DASHBOARD_ALLOWED_HOSTS`; `/v1/*` and the
-  supervisor's network-open routes are out of scope; it is not a cross-site
+  Tailscale name, or `GENESIS_DASHBOARD_ALLOWED_HOSTS`; `/v1/*` is out of
+  scope, and the supervisor's network-open routes pass by IP; it is not a cross-site
   control, because a page can aim a request at an IP address), and
   `auth.check_api_network_scope` refuses an untrusted TCP peer (loopback and
   the tailnet are trusted, and the host's proxy delivers LAN traffic as

@@ -15,9 +15,10 @@ WebSocket or a form POST, which a page can aim at an IP address directly;
 those need an Origin check (the terminal WebSocket has its own).
 
 Out of scope: ``/v1/*`` (every route carries its own bearer, which a page
-cannot present), static assets (no stored content), and the supervisor's
-network-open routes (``auth._OPEN_FROM_ANY_NETWORK``), which anyone who can
-reach the port can already use.
+cannot present) and static assets (no stored content). The supervisor's
+network-open routes (``auth._OPEN_FROM_ANY_NETWORK``) stay gated: under
+rebinding the visitor's browser is the peer that reaches them, and the
+supervisor addresses the container by IP literal, which passes.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ import time
 from flask import Response, jsonify, request
 from werkzeug.sansio.utils import host_is_trusted
 
-from genesis.dashboard.auth import _OPEN_FROM_ANY_NETWORK, has_internal_bearer
+from genesis.dashboard.auth import has_internal_bearer
 
 logger = logging.getLogger(__name__)
 
@@ -135,13 +136,16 @@ def _matchable(name: str) -> bool:
     ``host_is_trusted`` IDNA-encodes each trusted entry and catches only
     ``UnicodeEncodeError``; an empty or over-long label raises a plain
     ``UnicodeError`` instead, which would turn every request into a 500. Every
-    list the gate builds goes through this, whatever its source.
+    list the gate builds goes through this, whatever its source. werkzeug strips
+    ONE leading dot (the suffix form), so only one is stripped here: ``..x``
+    leaves an empty label, exactly as it would there.
     """
+    bare = name.removeprefix(".")
     try:
-        name.lstrip(".").encode("idna")
+        bare.encode("idna")
     except UnicodeError:
         return False
-    return bool(name.lstrip("."))
+    return bool(bare)
 
 
 def _run_tailscale_status() -> str | None:
@@ -226,6 +230,9 @@ def _machine_hostnames() -> tuple[str, ...]:
         name = _normalise_name(raw or "")
         if name:
             names.add(name)
+            # An FQDN kernel hostname makes both calls return the FQDN, so the
+            # short name is added here rather than assumed.
+            names.add(name.split(".")[0])
             names.add(name.split(".")[0] + ".local")
     with _lock:
         _machine_names = tuple(sorted(n for n in names if _matchable(n)))
@@ -285,7 +292,7 @@ def check_host_header():
     Tailscale MagicDNS name (full and short), names in
     ``GENESIS_DASHBOARD_ALLOWED_HOSTS``, and requests carrying the internal
     bearer. A malformed Host is refused. Out of scope: everything outside
-    ``_gate_applies`` and the ``_OPEN_FROM_ANY_NETWORK`` pairs.
+    ``_gate_applies``.
     ``GENESIS_DASHBOARD_HOSTNAME_CHECK=off`` disables the gate. Everything else
     gets 403.
     """
@@ -296,8 +303,6 @@ def check_host_header():
         return None
     path = request.path
     if not _gate_applies(path):
-        return None
-    if (request.method, path) in _OPEN_FROM_ANY_NETWORK:
         return None
     # The raw header, never ``request.host``: that falls back to SERVER_NAME
     # when Host is absent, which would let a configured name decide.
@@ -312,6 +317,10 @@ def check_host_header():
     name, port = parsed
     if _is_ip_literal(name) or name == "localhost":
         return None
+    if not _matchable(name):
+        # DNS-shaped but not a usable name (``a..b``, a label over 63
+        # characters): refused here, whatever the matcher would do with it.
+        return _refuse(raw, path)
     # werkzeug's matcher is case-sensitive and treats an EMPTY list as "allow
     # all": ``name`` is already lowercased and dot-stripped, and every list
     # passed here is non-empty (the machine list always holds "localhost").

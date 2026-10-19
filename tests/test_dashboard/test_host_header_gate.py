@@ -7,9 +7,10 @@ Tailscale MagicDNS name, or a name the operator listed in
 the dashboard's address still sends ITS name as ``Host``, so the server refuses
 it, while every real way of addressing the box keeps working.
 
-Out of scope by design: ``/v1/*`` (every route carries its own bearer), static
-assets (no stored content), and the supervisor's network-open routes
-(``_OPEN_FROM_ANY_NETWORK``), which are reachable from anywhere already.
+Out of scope by design: ``/v1/*`` (every route carries its own bearer) and
+static assets (no stored content). The supervisor's network-open routes
+(``_OPEN_FROM_ANY_NETWORK``) stay gated: a rebinding page reads them through
+the visitor's browser, and the supervisor addresses the box by IP literal.
 """
 
 from __future__ import annotations
@@ -210,19 +211,31 @@ def test_ws_scope_is_terminal_only(gate):
         ("/js/app.js", "GET"),
         ("/", "GET"),
         ("/genesis-ui/x.js", "GET"),
-        ("/api/genesis/health", "GET"),
-        ("/api/genesis/heartbeat", "GET"),
-        ("/api/genesis/pause", "GET"),
-        ("/api/genesis/guardian-dialogue", "POST"),
     ],
 )
 def test_out_of_scope_routes_ignore_host(gate, path, method):
     assert _get(gate, path, "evil.example:5000", method=method).status_code == 200
 
 
-def test_supervisor_exemption_is_method_scoped(gate):
-    # POST /pause (the kill switch) is not in the open set, so it IS gated.
-    assert _get(gate, "/api/genesis/pause", "evil.example:5000", method="POST").status_code == 403
+_SUPERVISOR_OPEN = [
+    ("/api/genesis/health", "GET"),
+    ("/api/genesis/heartbeat", "GET"),
+    ("/api/genesis/pause", "GET"),
+    ("/api/genesis/guardian-dialogue", "POST"),
+]
+
+
+@pytest.mark.parametrize(("path", "method"), _SUPERVISOR_OPEN)
+def test_network_open_routes_still_refuse_a_foreign_host(gate, path, method):
+    # Reachable from any network by peer address, but a rebinding page reads
+    # them through the visitor's browser, so the Host check still applies.
+    assert _get(gate, path, "evil.example:5000", method=method).status_code == 403
+
+
+@pytest.mark.parametrize(("path", "method"), _SUPERVISOR_OPEN)
+def test_network_open_routes_answer_the_supervisor_ip_literal(gate, path, method):
+    # The supervisor's health_url is http://<container ip>:<port>.
+    assert _get(gate, path, "192.0.2.10:5000", method=method).status_code == 200
 
 
 def test_internal_bearer_passes(gate):
@@ -263,6 +276,30 @@ def test_invalid_allowlist_entry_is_skipped_not_fatal(gate, monkeypatch, caplog)
         assert _get(gate, "/genesis", "genesis-box").status_code == 200
         assert _get(gate, "/genesis", "evil.example").status_code == 403
     assert any("ignoring invalid entry" in r.getMessage() for r in caplog.records)
+
+
+def test_double_dot_allowlist_entry_is_skipped_not_fatal(gate, monkeypatch):
+    # werkzeug strips ONE leading dot, so "..home.example" leaves ".home.example",
+    # whose empty first label raises UnicodeError inside its matcher.
+    monkeypatch.setenv("GENESIS_DASHBOARD_ALLOWED_HOSTS", "..home.example, myname.example")
+    assert _get(gate, "/genesis", "box.home.example").status_code == 403
+    assert _get(gate, "/genesis", "myname.example").status_code == 200
+
+
+@pytest.mark.parametrize("host", ["a..b", "a..b:5000", "x" * 64 + ".example"])
+def test_unusable_dns_name_host_is_refused(gate, host):
+    assert _get(gate, "/genesis", host).status_code == 403
+
+
+def test_short_name_of_an_fqdn_kernel_hostname_passes(gate, monkeypatch):
+    # Both socket calls return the FQDN when the kernel hostname is configured
+    # as one, so the short name must be derived, not read.
+    monkeypatch.setattr(hg.socket, "gethostname", lambda: "box.example.com")
+    monkeypatch.setattr(hg.socket, "getfqdn", lambda: "box.example.com")
+    hg._reset_cache()
+    for host in ("box", "box:5000", "box.example.com", "box.local"):
+        assert _get(gate, "/genesis", host).status_code == 200, host
+    assert _get(gate, "/genesis", "example.com").status_code == 403
 
 
 @pytest.mark.parametrize("val", ["off", "OFF", "0", "false", "no"])
