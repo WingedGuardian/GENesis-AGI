@@ -42,6 +42,10 @@ def test_classifier_boundary_classes():
         ("secret key\u200b", None), ("api_key\0", None),
         ("password\u00a0", "password"), ("somePassword", None),
         ("123password", "password"), ("", None),
+        ("authorization", "token"), ("Authorization", "token"),
+        ("Proxy-Authorization", "token"), ("x-api-key", "token"),
+        ("cookie", "token"), ("Set-Cookie", "token"),
+        ("authorized", None), ("cookies_enabled", None),
     ]
     for label, expected in cases:
         assert helper(label) == expected, repr(label)

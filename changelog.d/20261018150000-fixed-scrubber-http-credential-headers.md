@@ -1,0 +1,1 @@
+- The telemetry secret scrubber also redacts HTTP credential headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`) and bearer credentials wherever they appear.

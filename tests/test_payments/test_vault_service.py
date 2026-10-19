@@ -538,7 +538,7 @@ class TestFailClosed:
         assert "wrong passphrase" not in result["error"]
 
     async def test_an_unreadable_audit_log_is_reported(self, service, monkeypatch):
-        async def broken(db, limit=20):
+        async def broken(db, limit=20, **_kw):
             raise RuntimeError("no such table")
 
         monkeypatch.setattr(audit, "list_recent", broken)

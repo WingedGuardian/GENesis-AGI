@@ -143,6 +143,7 @@ class TestAdd:
         assert _run(["add", "--label", "bills", "--merchant", "shop.example.com"]) == 0
         out = capsys.readouterr()
         assert "ending 4242" in out.out and VISA not in out.out + out.err
+        assert "scripts/backup.sh" in out.out  # the next scheduled backup may be hours away
         assert getpass.call_count == 5  # number, expiry, code, name and postal code
         [card] = vs.list_cards()
         assert card["label"] == "bills" and card["merchant"] == "shop.example.com"
@@ -200,7 +201,12 @@ class TestRetire:
         _answers(monkeypatch, [PASSPHRASE])
         assert _run(["retire", card]) == 0
         assert vs.list_cards()[0]["status"] == "retired"
-        assert "close the virtual card with its issuer" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "close the virtual card with its issuer" in out
+        # Until the next backup, a restore would bring the retired card's details back.
+        assert "scripts/backup.sh" in out
+        # A new backup does not erase the card from the backups already taken.
+        assert "earlier backups still hold the card" in out
 
     def test_bad_ref_is_refused_before_the_passphrase_prompt(self, card, monkeypatch, capsys):
         getpass = _answers(monkeypatch, [])

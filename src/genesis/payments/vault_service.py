@@ -266,7 +266,7 @@ class VaultService:
             async with self._audit_lock:
                 if self._db is None:
                     return
-                rows = await audit.list_recent(self._db, 1)
+                rows = await audit.list_recent(self._db, 1, events=audit.KEY_EVENTS)
         except Exception:  # noqa: BLE001 - status reports the audit log as unavailable
             return
         if not self.unlocked and rows and rows[0]["event"] == "unlock":
@@ -363,9 +363,12 @@ class VaultService:
         last, audit_ok = None, self._db is not None
         if audit_ok:
             try:
-                async with self._audit_lock:
+                async with self._audit_lock:  # the last KEY event, not an approval row
                     audit_ok = self._db is not None
-                    rows = await audit.list_recent(self._db, 1) if audit_ok else []
+                    rows = (
+                        await audit.list_recent(self._db, 1, events=audit.KEY_EVENTS)
+                        if audit_ok else []
+                    )
                 last = rows[0] if rows else None
             except Exception:  # noqa: BLE001 - reported as audit unavailable
                 audit_ok = False
@@ -578,13 +581,15 @@ class VaultService:
             writer.close()
 
 
-async def start_vault_service(runtime) -> VaultService | None:
+async def start_vault_service(runtime, approvals=None) -> VaultService | None:
     """Start the vault service for genesis-server; None (logged) if it cannot start.
 
     The audit log gets the service's OWN database connection, never the
     runtime's shared one: a failed audit commit is rolled back, and a rollback
     on the shared connection would discard other subsystems' pending writes.
     If it cannot open, the service still runs (status, lock) and refuses unlock.
+    ``approvals`` (a ``PaymentApprovalRegistry``) gets its audit rows written
+    through the same connection; with no service it refuses every request.
     """
     from genesis.db.connection import get_db
     from genesis.env import genesis_db_path
@@ -608,6 +613,8 @@ async def start_vault_service(runtime) -> VaultService | None:
             with contextlib.suppress(Exception):
                 await asyncio.shield(closing)
         return None
+    if approvals is not None:
+        approvals.attach_audit(service._audit)
     return service
 
 
