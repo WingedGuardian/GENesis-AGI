@@ -180,16 +180,7 @@ async def test_the_health_server_peer_claims_once(rig):
         "request": "ok",
         "status": "granted",
         "claim_ok": True,
-        "fields": [
-            "cvc",
-            "exp_month",
-            "exp_year",
-            "label",
-            "last4",
-            "name",
-            "number",
-            "postal_code",
-        ],
+        "fields": ["label", "last4", "number"],  # only what field_origins named
         "after": "expired",
         "second": "no such release",
     }

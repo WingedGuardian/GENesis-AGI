@@ -12,7 +12,9 @@ genesis-health MCP server (``vault_service._handle`` runs that check):
 - ``release_claim {nonce, claim}`` -> the card's fields, once: only after a
   grant, within ``CLAIM_WINDOW_S`` of it, from the requesting process (same
   pid and start time), and only when ``sha256(claim)`` is the request's
-  ``claim_hash``.
+  ``claim_hash``. Only the fields ``field_origins`` named (and the tap's
+  "Fields" line showed) are returned, ``expiry`` as ``exp_month`` and
+  ``exp_year``, plus the label and last four.
 - ``release_cancel {nonce}``, from the requesting process.
 
 There is one slot for the whole service. A second request while one is
@@ -43,10 +45,16 @@ itself, still burns a single-use card whose values never arrive. That fails
 safe (a lost card, never a card handed to someone else).
 
 Every request, grant, claim, refusal and cancel is a value-free row in
-``payment_vault_events``: nonce, card ref, host, the amount and title as shown,
-the field-origin hosts, the verified peer and a fixed reason. A refused request
-records only ``{reason, peer}``, never the input it rejected. Card values exist
-only inside the claim's reply. Memory residue is not claimed away: pyrage's
+``payment_vault_events``: nonce, card ref, host, the field-origin hosts, the
+verified peer and a fixed reason. The amount and page title are the
+requester's free text: the tap shows them, and the request row records only
+their lengths. A refused request records only ``{reason, peer}``, never the
+input it rejected, and a nonce is recorded only when this service issued it.
+Every row also passes ``vault_service``'s one guard, which withholds any
+string with a run of 12 or more digits. The vault never writes a card value it
+holds; what it cannot promise is that requester text it must show (the host,
+the origins, a process name) holds no short value such as a security code.
+Card values exist only inside the claim's reply. Memory residue is not claimed away: pyrage's
 plaintext, the decoded strings and the reply buffers stay in the process heap
 until reused.
 """
@@ -85,6 +93,7 @@ _AMOUNT_CHARS = 32
 _ORIGIN_KEYS = frozenset(
     {"number", "expiry", "exp_month", "exp_year", "cvc", "name", "postal_code"}
 )
+_EXPIRY_KEYS = ("exp_month", "exp_year")  # one "expiry" field is both
 _CLAIM_HASH = re.compile(r"[0-9a-f]{64}")
 _NONCE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _ORIGIN = re.compile(r"(https?)://([^/:?#@]+)(?::([0-9]{1,5}))?")
@@ -108,6 +117,7 @@ class _Release:
     epoch: int
     deadline: float  # on the service clock
     card_shown: tuple[str, str]  # (label, last4) as the tap showed them
+    fields: frozenset[str]  # the card fields the tap named: the claim returns only these
     state: str = PENDING
     decided: bool = False  # a claim past its epoch check completes
     task: asyncio.Task | None = None
@@ -363,7 +373,13 @@ class ReleaseManager:
         facts = {"nonce": nonce, "card_ref": card_ref, "host": host, "peer": peer.detail()}
         if not await self._row(
             "release_requested",
-            {**facts, "amount": amount, "page_title": title, "field_origins": origins},
+            {
+                **facts,
+                # Requester-supplied free text, shown in the tap: recorded only as
+                # lengths, as the approval registry does (it can hold a short card value).
+                "field_lengths": {"amount": len(amount), "page_title": len(title)},
+                "field_origins": origins,
+            },
         ):
             return {"ok": False, "error": "the audit write failed"}
         rel = _Release(
@@ -375,6 +391,9 @@ class ReleaseManager:
             epoch=epoch,
             deadline=svc._clock() + PENDING_BACKSTOP_S,
             card_shown=(row["label"], row["last4"]),
+            fields=frozenset(
+                k for key in origins for k in (_EXPIRY_KEYS if key == "expiry" else (key,))
+            ),
             row=facts,
         )
         if svc._stopped or epoch != svc._epoch or not svc.unlocked:  # locked during the row
@@ -461,8 +480,11 @@ class ReleaseManager:
     ) -> dict:
         await self._expire_if_due()
         nonce, claim = request.get("nonce"), request.get("claim")
-        shown = nonce if isinstance(nonce, str) and _NONCE.fullmatch(nonce) else None
         rel = self._mine(nonce)
+        # Only a nonce this service issued goes in a row: unmatched input is the
+        # requester's free text (it could be anything, a card number included).
+        known = rel is not None or (isinstance(nonce, str) and nonce in self._recent)
+        shown = nonce if known else None
         if rel is None or rel.state == CLAIMING or not isinstance(claim, str):
             return await self._refuse("no such release", peer, shown)
         if (peer.pid, peer.start) != (rel.peer.pid, rel.peer.start):
@@ -551,8 +573,10 @@ class ReleaseManager:
                 del card
                 await self._refuse_slot(rel, "retire failed")
                 return {"ok": False, "error": "retire failed"}
-        self._end(rel, CLAIMED)
-        keys = ("number", "exp_month", "exp_year", "cvc", "name", "postal_code", "label", "last4")
+        if not self._end(rel, CLAIMED):  # settled elsewhere meanwhile: nothing is returned
+            del card
+            return {"ok": False, "error": "the release was refused"}
+        keys = sorted(rel.fields) + ["label", "last4"]
         reply = {"ok": True, "card": {k: card[k] for k in keys}}
         del card
         return reply

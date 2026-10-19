@@ -55,6 +55,7 @@ from pathlib import Path
 from genesis.db.crud import payment_vault_events as audit
 from genesis.env import vault_socket_path
 from genesis.payments import vault_store as vs
+from genesis.payments.approval import holds_long_digit_run
 from genesis.payments.peer_check import PeerPolicy, PeerRefused, accept_ticks, check_release_peer
 from genesis.payments.release import ReleaseManager
 
@@ -136,6 +137,31 @@ def peer_of(writer: asyncio.StreamWriter) -> dict:
     return info
 
 
+WITHHELD = "(withheld: 12 or more digits)"
+
+
+def _withhold_long_runs(value, key: str | None = None):
+    """``value`` with every str that holds a 12+ digit run replaced by ``WITHHELD``.
+
+    The one guard every audit row passes, whoever wrote it: requester and /proc
+    text (a host, field origins, process names, an exe path, env var names) is
+    recorded as it came, so a card number in any of it must stop here. The same
+    rule as the approval registry (``approval.holds_long_digit_run``), with the
+    same one exemption: a ``card_ref`` value shaped exactly like a vault card ref.
+    Shorter values (a CVC, an expiry) cannot be told apart from ordinary text;
+    the fields that could carry one as free text are recorded only as lengths.
+    """
+    if isinstance(value, str):
+        if key == "card_ref" and vs.CARD_REF.fullmatch(value):
+            return value
+        return WITHHELD if holds_long_digit_run(value) else value
+    if isinstance(value, dict):
+        return {k: _withhold_long_runs(v, k) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_withhold_long_runs(v) for v in value]
+    return value
+
+
 class VaultService:
     """The in-memory vault state and the socket that drives it.
 
@@ -201,7 +227,7 @@ class VaultService:
             return False
         async with self._audit_lock:
             try:
-                await audit.record_event(self._db, event, detail)
+                await audit.record_event(self._db, event, _withhold_long_runs(detail))
             except Exception as exc:  # noqa: BLE001 - the caller decides what a lost row means
                 logger.error("payment vault audit write failed (%s)", type(exc).__name__)
                 # A failed COMMIT leaves the INSERT pending; a later commit would

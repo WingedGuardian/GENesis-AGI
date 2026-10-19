@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 from datetime import UTC, datetime
@@ -471,7 +472,8 @@ async def test_stop_refuses_a_pending_release(db, vault, tmp_path, _sealed):
 
 
 async def test_a_granted_claim_returns_the_card_once(ctx):
-    nonce = await ctx.granted()
+    every = ("number", "expiry", "cvc", "name", "postal_code")
+    nonce = await ctx.granted(field_origins={k: "https://js.stripe.com" for k in every})
     status = await ctx.status(nonce)
     assert status == {"ok": True, "state": "granted", "expires_in_s": rl.CLAIM_WINDOW_S}
     reply = await ctx.claim(nonce)
@@ -1057,6 +1059,25 @@ async def test_origins_show_the_scheme_unless_https_and_any_port(ctx):
     assert row["field_origins"]["expiry"] == "http://shop.genesis.test:8080"
 
 
+async def test_the_amount_and_title_reach_the_rows_only_as_lengths(ctx):
+    short = "4321"  # a CVC-shaped value, made per run; never one a row holds anyway
+    while short in {"4321", str(os.getpid())}:  # claude_pid and pid are in every row
+        short = str(secrets.randbelow(9000) + 1000)
+    amount, title = f"{short} USD", f"Pay {short} now"
+    nonce = await ctx.granted(amount=amount, page_title=title)
+    assert ctx.reg.calls[-1][0]["Amount"].startswith(amount)  # the tap is unchanged
+    assert ctx.reg.calls[-1][0]["Page title"] == title
+    assert (await ctx.claim(nonce))["ok"]
+    bounded = re.compile(rf"(?<![0-9A-Za-z_-]){short}(?![0-9A-Za-z_-])")
+    for event in await ctx.events():
+        assert not bounded.search(json.dumps(event)), event["event"]
+    row = [e for e in await ctx.events() if e["event"] == "release_requested"][0]["detail"]
+    assert row["field_lengths"] == {"amount": len(amount), "page_title": len(title)}
+    assert "amount" not in row and "page_title" not in row
+    assert (row["host"], row["card_ref"]) == (HOST, ctx.refs["scoped"])
+    assert row["field_origins"] == {"cvc": "js.stripe.com", "number": "js.stripe.com"}
+
+
 @pytest.mark.parametrize(
     ("title", "shown"),
     [
@@ -1153,6 +1174,72 @@ async def test_a_refused_peer_gets_a_fixed_error_and_a_row(ctx, monkeypatch):
     # The owner's CLI ops keep the uid-only check.
     assert (await ctx.ask({"op": "status"}))["ok"]
     assert (await ctx.ask({"op": "lock"}))["ok"]
+
+
+def _long_digits() -> str:
+    """A 16-digit run made per run (never a fixture literal)."""
+    return str(secrets.randbelow(9 * 10**15) + 10**15)
+
+
+async def test_a_refused_peer_with_a_long_digit_run_is_withheld_from_the_row(ctx, monkeypatch):
+    digits = _long_digits()
+
+    def refuse(pid, **_k):
+        detail = {"check": "exe mismatch", "exe": f"/tmp/{digits}", "python_env": [f"X{digits}"]}
+        raise PeerRefused("exe mismatch", detail)
+
+    monkeypatch.setattr(ctx.svc, "_release_peer", refuse)
+    assert (await ctx.ask({"op": "release_status", "nonce": "n"}))["error"] == "peer not allowed"
+    row = (await ctx.events())[-1]
+    assert digits not in json.dumps(row)
+    assert row["detail"]["peer"]["exe"] == row["detail"]["peer"]["python_env"][0]
+    assert row["detail"]["peer"]["check"] == "exe mismatch"  # the rest is kept
+
+
+async def test_an_unmatched_nonce_is_not_recorded(ctx):
+    digits = _long_digits()
+    assert (await ctx.claim(digits))["error"] == "no such release"
+    nonce = await ctx.granted()
+    assert (await ctx.claim(nonce))["ok"]
+    assert (await ctx.claim(nonce))["error"] == "no such release"  # ended: still recorded
+    refused = [e["detail"] for e in await ctx.events() if e["event"] == "release_refused"]
+    assert digits not in json.dumps(refused)
+    assert [d.get("nonce") for d in refused] == [None, nonce]
+
+
+@pytest.mark.parametrize(
+    ("origins", "keys"),
+    [
+        ({"postal_code": "https://shop.example.com"}, {"postal_code"}),
+        ({"expiry": "https://shop.example.com"}, {"exp_month", "exp_year"}),
+        ({"number": "https://a.example.com", "cvc": "https://a.example.com"}, {"number", "cvc"}),
+        (
+            {"exp_year": "https://a.example.com", "name": "https://a.example.com"},
+            {"exp_year", "name"},
+        ),
+    ],
+)
+async def test_the_claim_returns_only_the_fields_the_tap_named(ctx, origins, keys):
+    nonce = await ctx.granted(field_origins=origins)
+    reply = await ctx.claim(nonce)
+    assert set(reply["card"]) == keys | {"label", "last4"}
+    del reply
+
+
+async def test_a_slot_ended_before_the_claim_settles_returns_nothing(ctx, monkeypatch):
+    nonce = await ctx.granted()
+    mgr = ctx.svc._release
+    real = mgr._end
+
+    def ended(rel, state):
+        if state == rl.CLAIMED:
+            real(rel, rl.REFUSED)  # something else settled it first
+            return False
+        return real(rel, state)
+
+    monkeypatch.setattr(mgr, "_end", ended)
+    reply = await ctx.claim(nonce)
+    assert reply == {"ok": False, "error": "the release was refused"}
 
 
 async def test_the_peer_check_gets_the_pid_and_accept_time(ctx, monkeypatch):
