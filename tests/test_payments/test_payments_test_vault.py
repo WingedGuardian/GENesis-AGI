@@ -520,13 +520,16 @@ def test_r10_the_overlay_is_only_in_the_worktree(tmp_path, checkouts, built):
     os.symlink(tmp_path / "other-config", elsewhere / "config")
     with pytest.raises(H.Refused, match="^R10: .* outside the worktree's config/"):
         H.overlay_path(elsewhere, main)  # not the main checkout, still not the worktree's
-    nested = main / "nestedwt"
+    with pytest.raises(H.Refused, match="^R10: .* in the main checkout"):
+        H.overlay_path(main, main)
+    # A worktree inside the main checkout (the repo keeps them in .claude/worktrees/)
+    # is not the main checkout: its own config/ is where the overlay belongs.
+    nested = main / ".claude" / "worktrees" / "b1"
     (nested / "config").mkdir(parents=True)
     try:
-        with pytest.raises(H.Refused, match="^R10: .* in the main checkout"):
-            H.overlay_path(nested, main)
+        assert H.overlay_path(nested, main) == nested / H.OVERLAY
     finally:
-        shutil.rmtree(nested)
+        shutil.rmtree(main / ".claude")
 
 
 async def test_the_telegram_side_polls_callbacks_only(monkeypatch):
@@ -1106,15 +1109,17 @@ def test_setup_refuses_a_home_the_trash_cannot_take(
     tmp_path, tmp_path_factory, checkouts, own_overlay, monkeypatch
 ):
     monkeypatch.setattr("genesis.trash.home_trash_root", lambda: Path("/proc/genesis-trash"))
+    root = tmp_path_factory.mktemp("v") / "testvault"
     with pytest.raises(H.Refused, match="^R2: .* another volume than the Genesis trash"):
-        _setup_fast(tmp_path_factory.mktemp("v") / "testvault", checkouts, tmp_path / "fakehome")
-    assert not (tmp_path / "testvault").exists() and not own_overlay.exists()
+        _setup_fast(root, checkouts, tmp_path / "fakehome")
+    assert not root.exists() and not own_overlay.exists()
     monkeypatch.setattr("genesis.trash.home_trash_root", lambda: tmp_path / "genesis-trash")
     monkeypatch.setattr("genesis.env.genesis_home", lambda: tmp_path / "gh")
     (tmp_path / "gh" / "cc-tmp").mkdir(parents=True)
+    root = tmp_path / "gh" / "cc-tmp" / "testvault"
     with pytest.raises(H.Refused, match="^R2: .* Claude Code temp volume"):
-        _setup_fast(tmp_path / "gh" / "cc-tmp" / "testvault", checkouts, tmp_path / "fakehome")
-    assert not own_overlay.exists()
+        _setup_fast(root, checkouts, tmp_path / "fakehome")
+    assert not root.exists() and not own_overlay.exists()
 
 
 def test_setup_refuses_a_socket_path_too_long_to_bind(tmp_path, checkouts, own_overlay):
@@ -1135,10 +1140,18 @@ def test_serve_refuses_an_overlay_missing_changed_or_replaced(
     )
     H.check_overlay(state, wt, main)
     text = own_overlay.read_text()
+    os.chmod(own_overlay, 0o600)  # a chmod or touch changes nothing that is compared
+    os.utime(own_overlay)
+    H.check_overlay(state, wt, main)
     for change in ("edited", "replaced", "deleted"):
-        own_overlay.unlink()
-        if change != "deleted":
-            own_overlay.write_text(text + "# edited\n" if change == "edited" else text)
+        if change == "replaced":  # another file with the same text: a different inode
+            spare = own_overlay.with_name("spare.yaml")
+            spare.write_text(text)
+            os.replace(spare, own_overlay)
+        else:
+            own_overlay.unlink()
+        if change == "edited":
+            own_overlay.write_text(text + "# edited\n")
         with pytest.raises(H.Refused, match="^R10: .* missing or changed since setup"):
             H.check_overlay(state, wt, main)
 
@@ -1179,9 +1192,9 @@ def test_one_serve_or_teardown_at_a_time(tmp_path, tmp_path_factory, checkouts, 
     )
     held = H.hold_lifecycle_lock(layout)
     try:
-        with pytest.raises(H.Refused, match="another serve"):
+        with pytest.raises(H.Refused, match="already running"):
             os.close(H.hold_lifecycle_lock(layout))
-        with pytest.raises(H.Refused, match="another serve"):
+        with pytest.raises(H.Refused, match="already running"):
             H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
         assert layout.root.exists() and own_overlay.exists()
     finally:
@@ -1221,3 +1234,62 @@ def test_teardown_never_removes_another_checkouts_overlay(
         assert theirs.exists() and any("left" in line for line in done)
     finally:
         _git(main, "worktree", "remove", "--force", str(other))
+
+
+def test_teardown_removes_an_overlay_a_stopped_setup_never_recorded(
+    tmp_path, tmp_path_factory, checkouts, own_overlay
+):
+    main, _wt = checkouts
+    layout, state = _setup_fast(
+        tmp_path_factory.mktemp("v") / "testvault", checkouts, tmp_path / "fakehome"
+    )
+    # As left by a setup stopped between writing the overlay and recording its inode.
+    del state["overlay_id"]
+    state["phase"] = "setup"
+    layout.state.write_text(json.dumps(state))
+    H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
+    assert not own_overlay.exists() and not layout.root.exists()
+
+
+def test_setup_names_a_leftover_and_serve_refuses_an_incomplete_state(
+    tmp_path, tmp_path_factory, checkouts, own_overlay
+):
+    layout, state = _setup_fast(
+        tmp_path_factory.mktemp("v") / "testvault", checkouts, tmp_path / "fakehome"
+    )
+    with pytest.raises(H.Refused, match="previous setup left it; run teardown first"):
+        H.check_placement(layout, _live(tmp_path / "fakehome"), new=True)
+    layout.state.write_text(json.dumps({k: v for k, v in state.items() if k != "worktree"}))
+    with pytest.raises(H.Refused, match="state file is incomplete"):
+        H.read_marker(layout)
+    layout.state.write_text(json.dumps([state["marker"]]))
+    with pytest.raises(H.Refused, match="does not match its state file"):
+        H.read_marker(layout)
+
+
+def test_a_rejected_bot_token_is_never_printed(monkeypatch, capsys, tmp_path):
+    from telegram.error import InvalidToken
+
+    secret = "123456:" + "q" * 35
+
+    def rejected(_layout, _cap):
+        raise InvalidToken(f"The token `{secret}` was rejected by the server.")
+
+    monkeypatch.setattr(H, "_serve", rejected)
+    assert H.main(["serve", "--home", str(tmp_path / "t")]) == 1
+    err = capsys.readouterr().err
+    assert "InvalidToken" in err and secret not in err
+
+
+def test_options_are_never_abbreviated():
+    with pytest.raises(SystemExit):
+        H.build_parser().parse_args(["serve", "--ho", "/x"])
+
+
+def test_a_state_replace_is_atomic(tmp_path):
+    path = tmp_path / "state.json"
+    H._write_private_replace(path, "one")
+    H._write_private_replace(path, "two")
+    assert path.read_text() == "two" and sorted(p.name for p in tmp_path.iterdir()) == [
+        "state.json"
+    ]

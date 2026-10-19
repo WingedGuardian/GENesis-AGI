@@ -307,7 +307,12 @@ def check_placement(layout: Layout, live: Live, *, new: bool) -> None:
             raise Refused(f"R2: {layout.root} overlaps a live Genesis home ({home})")
     if new:
         if os.path.lexists(layout.root):
-            raise Refused(f"R2: {layout.root} already exists; setup makes a new directory")
+            hint = (
+                " (a previous setup left it; run teardown first)"
+                if os.path.lexists(layout.marker)
+                else ""
+            )
+            raise Refused(f"R2: {layout.root} already exists; setup makes a new directory{hint}")
         return
     if root != layout.root:
         raise Refused(f"R2: {layout.root} is a symlink; use its real path")
@@ -346,9 +351,11 @@ def check_trashable(layout: Layout) -> None:
 def hold_lifecycle_lock(layout: Layout) -> int:
     """An exclusive lock on the directory's lifecycle: one serve, or one teardown, at a time.
 
-    Held from before the socket check until the serve's cleanup is done, so two
-    serves cannot both pass the check and race to bind, and a teardown cannot
-    trash a directory a serve still uses. The fd is the caller's to close.
+    A serve holds it from before the socket check until its cleanup is done, so two
+    serves cannot both pass the check and race to bind. Teardown takes it to prove
+    no serve holds it, then releases it before the trash (whose own scan refuses a
+    directory any process has open, ours included); a serve starting in that gap is
+    left to the trash's in-use scan. The fd is the caller's to close.
     """
     import fcntl
 
@@ -361,7 +368,7 @@ def hold_lifecycle_lock(layout: Layout) -> int:
     except OSError:
         os.close(fd)
         raise Refused(
-            "serve: another serve (or a teardown) holds this test directory; stop it first"
+            "R2: a serve or a teardown is already running on this test directory; stop it first"
         ) from None
     return fd
 
@@ -377,8 +384,12 @@ def read_marker(layout: Layout) -> str:
         raise Refused(
             f"R2: {layout.root} has no harness marker; not a test-vault directory"
         ) from None
-    if not marker or state.get("marker") != marker:
+    if not isinstance(state, dict) or not marker or state.get("marker") != marker:
         raise Refused(f"R2: {layout.root}'s marker does not match its state file")
+    if state.get("phase") == "ready" and not all(
+        isinstance(state.get(k), str) for k in ("worktree", "merchant", "overlay")
+    ):
+        raise Refused(f"R2: {layout.root}'s state file is incomplete; run teardown and setup again")
     return marker
 
 
@@ -535,7 +546,10 @@ def overlay_path(worktree: Path, main_root: Path) -> Path:
     lands = Path(os.path.realpath(path.parent))
     if lands != Path(os.path.realpath(worktree)) / "config":
         raise Refused("R10: the card-fill overlay would land outside the worktree's config/")
-    if _inside(lands, Path(os.path.realpath(main_root))):
+    # Worktrees usually live under the main checkout (.claude/worktrees/), so only
+    # the main checkout's own config/ is refused; the check above already pins it
+    # to this worktree's config/ (a symlinked config/ cannot pass).
+    if lands == Path(os.path.realpath(main_root)) / "config":
         raise Refused("R10: the card-fill overlay would land in the main checkout")
     return path
 
@@ -543,12 +557,15 @@ def overlay_path(worktree: Path, main_root: Path) -> Path:
 def overlay_is_ours(state: dict) -> bool:
     """The file at the recorded overlay path is the one setup wrote: same inode, same text.
 
-    The inode and its change time pin the file itself (a freed inode number can
-    be reused), so a state file edited to name another checkout's overlay, or a
-    file put back in its place, does not match even when the text does.
+    The text carries this run's random marker. The inode pins the file itself, so
+    a state file edited to name another checkout's overlay does not match even when
+    that file's text does. A setup stopped between writing the overlay and recording
+    its inode leaves no ``overlay_id``; then the marker-bearing text alone decides,
+    so teardown can still remove what that setup wrote. (A chmod or touch changes
+    nothing that is compared.)
     """
     ident = state.get("overlay_id")
-    if not state.get("overlay") or not ident:
+    if not state.get("overlay"):
         return False
     try:
         fd = os.open(state["overlay"], os.O_RDONLY | os.O_NOFOLLOW)
@@ -556,9 +573,9 @@ def overlay_is_ours(state: dict) -> bool:
         return False
     with os.fdopen(fd) as f:
         info = os.fstat(f.fileno())
-        if not stat.S_ISREG(info.st_mode) or [info.st_dev, info.st_ino, info.st_ctime_ns] != list(
-            ident
-        ):
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        if ident is not None and [info.st_dev, info.st_ino] != list(ident)[:2]:
             return False
         try:
             return f.read() == overlay_text(state["marker"])
@@ -571,7 +588,7 @@ def check_overlay(state: dict, worktree: Path, main_root: Path) -> None:
     path = overlay_path(worktree, main_root)
     if str(path) != state.get("overlay"):
         raise Refused("R10: the state file names an overlay that is not the worktree's")
-    if not overlay_is_ours(state):
+    if not state.get("overlay_id") or not overlay_is_ours(state):
         raise Refused(
             f"R10: {path} is missing or changed since setup, so the run would not test "
             "card fill as setup configured it; run teardown and setup again"
@@ -718,11 +735,7 @@ def setup(
     _write_private_replace(layout.state, json.dumps(state, indent=2) + "\n")
     _write_private(overlay, overlay_text(marker))
     info = os.lstat(overlay)
-    state["overlay_id"] = [
-        info.st_dev,
-        info.st_ino,
-        info.st_ctime_ns,
-    ]  # what teardown may remove (overlay_is_ours)
+    state["overlay_id"] = [info.st_dev, info.st_ino]  # what teardown may remove (overlay_is_ours)
     _write_private_replace(layout.state, json.dumps(state, indent=2) + "\n")
     check_vault_content(layout, merchant)
     state["phase"] = "ready"
@@ -986,15 +999,15 @@ async def run_serve(
     release_peer = release_peer or make_release_peer(layout, worktree, server_pid=os.getpid())
     check_test_db(layout, live)
     db = await get_db(layout.db)
-    service = VaultService(
-        db,
-        vault_path=layout.vault,
-        socket_path=layout.socket,
-        approvals=registry,
-        release_peer=release_peer,
-    )
     started = False
     try:
+        service = VaultService(
+            db,
+            vault_path=layout.vault,
+            socket_path=layout.socket,
+            approvals=registry,
+            release_peer=release_peer,
+        )
         check_socket(layout, live)  # again, right before the bind
         await service.start()
         started = True
@@ -1119,8 +1132,12 @@ def teardown(
         raise Refused(f"teardown: the trash refused {layout.root} ({exc})") from None
     done = [f"moved {layout.root} to the Genesis trash"]
     if overlay is not None and overlay_is_ours(state):
-        overlay.unlink()
-        done.append(f"removed {overlay}")
+        try:
+            overlay.unlink()
+        except OSError as exc:
+            done.append(f"could NOT remove {overlay} ({exc.strerror}); delete it by hand")
+        else:
+            done.append(f"removed {overlay}")
     elif overlay is not None and os.path.lexists(overlay):
         done.append(
             f"left {overlay} in place: it changed since setup or is not the file setup wrote"
@@ -1229,17 +1246,20 @@ def _serve_locked(layout: Layout, live: Live, timeout_cap_s: float) -> None:
 
 
 def _write_private_replace(path: Path, text: str) -> None:
-    path.unlink(missing_ok=True)
-    _write_private(path, text)
+    """Replace ``path`` atomically: a kill leaves the old file or the new one, never none."""
+    tmp = path.with_name(f".{path.name}.new")
+    tmp.unlink(missing_ok=True)
+    _write_private(tmp, text)
+    os.replace(tmp, path)
 
 
 def build_parser() -> argparse.ArgumentParser:
     """The whole command line. No option takes card data (R5)."""
-    parser = argparse.ArgumentParser(
-        prog="payments_test_vault.py", description=__doc__.split("\n")[0]
+    parser = argparse.ArgumentParser(  # no abbreviations: teardown matches serve's argv
+        prog="payments_test_vault.py", description=__doc__.split("\n")[0], allow_abbrev=False
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("setup", help="build a new test-vault directory")
+    p = sub.add_parser("setup", allow_abbrev=False, help="build a new test-vault directory")
     p.add_argument("--worktree", required=True, help="the branch worktree the test MCP runs")
     p.add_argument("--home", required=True, help="a NEW directory for the test vault")
     p.add_argument(
@@ -1247,7 +1267,9 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="the registrable domain the test checkout's PAYMENT page shows",
     )
-    p = sub.add_parser("serve", help="run the test vault and the test bot (foreground)")
+    p = sub.add_parser(
+        "serve", allow_abbrev=False, help="run the test vault and the test bot (foreground)"
+    )
     p.add_argument("--home", required=True)
     p.add_argument(
         "--approval-timeout-s",
@@ -1255,7 +1277,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=APPROVAL_TIMEOUT_MAX_S,
         help=f"cap the approval wait ({APPROVAL_TIMEOUT_MIN_S}-{APPROVAL_TIMEOUT_MAX_S})",
     )
-    p = sub.add_parser("teardown", help="stop a serve, remove the overlay, trash the directory")
+    p = sub.add_parser(
+        "teardown", allow_abbrev=False, help="stop a serve, remove the overlay, trash the directory"
+    )
     p.add_argument("--home", required=True)
     return parser
 
@@ -1292,6 +1316,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except (vs.VaultError, subprocess.SubprocessError, OSError) as exc:  # never a card value
         print(f"refused: {args.cmd}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # a Telegram error can quote the bot token: the type only
+        if type(exc).__module__.split(".")[0] != "telegram":
+            raise
+        print(f"refused: {args.cmd}: the test bot failed ({type(exc).__name__})", file=sys.stderr)
         return 1
     return 0
 

@@ -73,7 +73,9 @@ send any text without the `TEST:` line.
     `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py teardown --home ~/tmp/payment-test-vault`.
     It stops a running serve and moves the directory to the Genesis trash, then
     removes the overlay if it is still the file setup wrote. If the trash
-    refuses the directory, nothing is removed and teardown can be run again.
+    refuses the directory, nothing is removed and teardown can be run again. (A
+    bind mount can pass setup's same-disk check and still be refused here; keep
+    `--home` on a plain directory of the same disk.)
 
 ## Refusals
 
@@ -90,7 +92,7 @@ Each refusal prints its code.
 | R7 | A release from a test MCP whose `HOME`, `GENESIS_HOME`, `GENESIS_DB_PATH`, `XDG_CACHE_HOME` or `SECRETS_PATH` is outside the test directory, whose `GENESIS_REPO_ROOT` is not the worktree, or that has a session bus, a `PYTHON*` variable or a bot token |
 | R8 | A test peer policy that names the main venv python or the main server script |
 | R9 | A worktree that is the main checkout, on `main`, the copy the harness itself imports, or nested with the test directory |
-| R10 | A card-fill overlay outside the worktree's `config/`, or over an existing file; a serve whose overlay is missing, changed, or not the file setup wrote (setup records its inode and change time). Teardown removes only that file |
+| R10 | A card-fill overlay outside the worktree's `config/` (or in the main checkout's own `config/`; a worktree under `.claude/worktrees/` is fine), or over an existing file; a serve whose overlay is missing, changed, or not the file setup wrote (setup records its inode). Teardown removes only that file, and says when it leaves one for you to delete |
 | Q16 | A serve or a release while a browser not started by the test MCP runs |
 
 Also refused: a test bot token whose bot id matches any other `*BOT_TOKEN*`
