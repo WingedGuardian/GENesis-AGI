@@ -243,7 +243,9 @@ def _connect_rw(db_path: Path | str):
     return connect_aiosqlite_rw(db_path, timeout=10)
 
 
-async def _record_telemetry(db_path: Path | str, status: str, detail: str) -> bool:
+async def _record_telemetry(
+    db_path: Path | str, status: str, detail: str, model: str | None = None
+) -> bool:
     """Best-effort call_site_last_run row for the neural monitor."""
     try:
         from genesis.observability.call_site_recorder import record_last_run_detached
@@ -252,7 +254,7 @@ async def _record_telemetry(db_path: Path | str, status: str, detail: str) -> bo
             str(db_path),
             "repo_pulse",
             provider="cc",
-            model_id=PULSE_MODEL,
+            model_id=model or PULSE_MODEL,
             response_text=f"status={status}|{detail}"[:200],
             success=status in ("ok", "no_new_prs"),
         )
@@ -1350,7 +1352,7 @@ async def _run_locked(
             )
             if recorded:
                 _write_cursor(root, cursor, merged_at=None)
-            await _record_telemetry(db_path, status, str(reason)[:120])
+            await _record_telemetry(db_path, status, str(reason)[:120], model=served)
             return {"status": status, "detail": reason, "n_exact": n_exact}
         cap = knob_int(cfg, "max_proposals_per_run")
         for m in sorted(matches, key=lambda x: -x["confidence"])[:cap]:
@@ -1411,6 +1413,7 @@ async def _run_locked(
         db_path,
         "ok" if recorded else "failed",
         f"repo={repo}|prs={len(prs)}|exact={n_exact}|fuzzy={n_fuzzy}|recorded={recorded}",
+        model=served if fuzzy_ran else None,
     )
     return {
         "status": "ok" if recorded else "failed",

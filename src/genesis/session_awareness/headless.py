@@ -26,7 +26,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from genesis.cc.child_env import pin_dispatched_env
-from genesis.cc.roster import apply_routing_env
+from genesis.cc.gmodel_routes import strip_route_env
 from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 # The model every headless judge (arbiter, ledger extractor, repo-pulse) runs
@@ -240,11 +240,12 @@ async def _run_in_cwd(
         env = dict(os.environ)
         env["GENESIS_CC_SESSION"] = "1"  # never re-enter Genesis hooks
         pin_dispatched_env(env)  # shared dispatched pins (genesis.cc.child_env)
-        # Judges always run NATIVE (the subscription): a parent launched through
+        # Judges always run NATIVE (the subscription). A parent launched through
         # a peer route carries ANTHROPIC_BASE_URL and the ANTHROPIC_DEFAULT_*_MODEL
-        # slots, and under the ``haiku`` alias those would silently re-point the
-        # judge at the peer's model instead of failing.
-        apply_routing_env(env, base_url=None, auth_token=None, model_id=None)
+        # slots, which under the ``haiku`` alias would silently re-point the judge
+        # at the peer's model, plus empty credential pins that would leave it no
+        # login at all. strip_route_env undoes every pin the route set.
+        strip_route_env(env)
         # WS-3: never leak a session origin into the nested claude
         # subprocess (mirrors CCInvoker._build_env's pop invariant).
         env.pop("GENESIS_SESSION_ORIGIN", None)

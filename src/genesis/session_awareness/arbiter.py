@@ -150,7 +150,8 @@ async def judge_candidates(
     """Run one arbiter call. Returns a verdict fragment, never raises.
 
     ``{"arbiter": "ok"|"failed"|"timeout", "picks": [...],
-    "prompt_version": ...}`` — picks are 1-based candidate numbers.
+    "prompt_version": ..., "served_model": ...}`` — picks are 1-based candidate
+    numbers; ``served_model`` (when the call answered) is the id CC reports.
     """
     if not candidates:
         return {"arbiter": "ok", "picks": [], "prompt_version": PROMPT_VERSION}
@@ -176,6 +177,7 @@ async def judge_candidates(
                 "reason": str(result.get("reason", "unknown")),
                 "prompt_version": PROMPT_VERSION,
             }
+        served = result.get("served_model")
         picks = parse_verdict(result["stdout"], len(candidates))
         if picks is None:
             return {
@@ -183,8 +185,14 @@ async def judge_candidates(
                 "picks": [],
                 "reason": "unparseable",
                 "prompt_version": PROMPT_VERSION,
+                "served_model": served,
             }
-        return {"arbiter": "ok", "picks": picks, "prompt_version": PROMPT_VERSION}
+        return {
+            "arbiter": "ok",
+            "picks": picks,
+            "prompt_version": PROMPT_VERSION,
+            "served_model": served,
+        }
     except Exception as exc:
         return {
             "arbiter": "failed",

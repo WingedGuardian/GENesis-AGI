@@ -133,7 +133,9 @@ def _advance_cursor(session_dir: Path, end_byte: int, prior: dict) -> None:
     )
 
 
-async def _record_telemetry(db_path: Path | str, status: str, detail: str) -> bool:
+async def _record_telemetry(
+    db_path: Path | str, status: str, detail: str, model: str | None = None
+) -> bool:
     """Best-effort call_site_last_run row for the neural monitor."""
     try:
         from genesis.observability.call_site_recorder import record_last_run_detached
@@ -142,7 +144,7 @@ async def _record_telemetry(db_path: Path | str, status: str, detail: str) -> bo
             str(db_path),
             "ambient_ledger_extractor",
             provider="cc",
-            model_id=EXTRACTOR_MODEL,
+            model_id=model or EXTRACTOR_MODEL,
             response_text=f"status={status}|{detail}"[:200],
             success=status in ("ok", "empty_delta"),
         )
@@ -879,7 +881,7 @@ async def _run_locked(
             db_path,
             **_base_row(status=status, n_user_turns=len(included), truncated=truncated),
         )
-        await _record_telemetry(db_path, status, str(result.get("reason") or ""))
+        await _record_telemetry(db_path, status, str(result.get("reason") or ""), model=served)
         return {"status": status, "detail": result.get("reason")}
 
     verdict = parse_verdict(result["stdout"], len(included))
@@ -889,7 +891,7 @@ async def _run_locked(
             db_path,
             **_base_row(status="failed", n_user_turns=len(included), truncated=truncated),
         )
-        await _record_telemetry(db_path, "failed", "unparseable")
+        await _record_telemetry(db_path, "failed", "unparseable", model=served)
         return {"status": "failed", "detail": "unparseable"}
 
     ledger_items, prior_events, match_read_ok = await _load_match_context(
@@ -1003,6 +1005,7 @@ async def _run_locked(
         f"|promotion_failed={promotion.get('failed_rows', 0)}"
         f"|sweep_error={int(bool(promotion.get('sweep_error')))}"
         + (f"|{'; '.join(detail_notes)}" if detail_notes else ""),
+        model=served,
     )
     return {
         "status": "failed" if _write_failed else "ok",

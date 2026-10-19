@@ -118,13 +118,20 @@ async def test_judge_never_inherits_a_peer_route(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "peer-token")
     monkeypatch.setenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", "peer-model")
     monkeypatch.setenv("ANTHROPIC_MODEL", "peer-model")
+    # A gmodel launch also pins the native credentials EMPTY (and marks itself),
+    # which would leave a "native" judge with no login at all.
+    monkeypatch.setenv("GENESIS_ROSTER_MODEL", "peer")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "low")
     fake = _fake_claude(
         tmp_path,
         """
         import json, os, sys
         sys.stdin.read()
         keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_MODEL")
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_MODEL",
+                "GENESIS_ROSTER_MODEL", "CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_CODE_EFFORT_LEVEL")
         print(json.dumps({k: os.environ.get(k) for k in keys}))
         """,
     )
