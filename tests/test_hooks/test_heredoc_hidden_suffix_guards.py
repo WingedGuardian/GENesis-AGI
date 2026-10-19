@@ -133,3 +133,23 @@ def test_a_hiding_body_before_a_harmless_command_is_not_refused(sandbox, guard):
     cwd, env = sandbox
     res = _run(guard, HIDING + "ls -la", cwd, env)
     assert not _refused(res), (res.returncode, res.stdout, res.stderr)
+
+
+# A quoted `<<` earlier on the line is not an opener (#3433 review). The first version
+# found openers with a raw-text pattern, which took the quoted one for an opener and
+# let its quoted-delimiter alternative swallow the real opener, so the push ran with
+# no blind spot and no segment. Openers now come from the segmenter's quote state.
+DECOY = "grep '<<' f; tee out.txt <<'EOF'\nx<`\nEOF\n"
+
+
+def test_a_push_hidden_behind_a_quoted_heredoc_decoy_is_refused(sandbox):
+    cwd, env = sandbox
+    res = _run(_PUSH_GUARD, DECOY + FORCE_PUSH, cwd, env)
+    assert res.returncode == 2, (res.returncode, res.stdout, res.stderr)
+    assert _says_heredoc(res), res.stderr + res.stdout
+
+
+def test_the_decoy_before_a_harmless_command_is_not_refused(sandbox):
+    cwd, env = sandbox
+    res = _run(_PUSH_GUARD, DECOY + "ls -la", cwd, env)
+    assert not _refused(res), (res.returncode, res.stdout, res.stderr)

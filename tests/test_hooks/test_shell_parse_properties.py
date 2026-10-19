@@ -399,3 +399,127 @@ def test_a_hidden_git_clean_is_a_bound_type_blind_spot(
         return
     assert blind is not None
     assert blind.bounds_induced or blind is sp._BLIND_UNTOKENIZABLE, blind.cause
+
+
+# Shapes a second review used to hide a push behind a here-doc (#3433): a `#` that is
+# not a comment, an unbalanced `((` (in a body or in backticks), a decoy `X)` line
+# among several openers on one line, and an unterminated body inside backticks or a
+# process substitution. Each piece goes BEFORE a here-doc whose body hides the push.
+_HD_DECOYS = [
+    "echo a \\ # ; ",
+    "[[ a =~ (#) ]] && ",
+    "echo hi # see <<Z\n",
+    "cat <<'P'\n((\nP\n",
+    "echo `echo ((`; ",
+    "echo $((1<<2)); ",
+    "(( a <<= 1 )); ",
+    "x=`cat <<'Q'\nq<$(b\n`\n",
+    "cat <(cat <<''\nq\nQ\n); ",
+    "cat <<'A' <<'B'\nA)\nB\nA\n",
+    "x=$(cat <<'R'\nR)\n",
+]
+_HD_HIDERS = [
+    "tee o <<'EOF'\nx<`\nEOF\n",
+    "cat <<'A' <<'B'\nA)\nB\nA\nx<`\nB\n",
+    "x=`cat <<'EOF'\nx<$(b\n`\n",
+    "cat <<E2\n'$(" + " ".join(_PUSH) + ")'\nE2\n",
+]
+
+
+@PROFILE
+@given(st.lists(st.sampled_from(_HD_DECOYS), max_size=3), st.sampled_from(_HD_HIDERS))
+@example(decoys=["echo a \\ # ; "], hider="tee o <<'EOF'\nx<`\nEOF\n")
+@example(decoys=["cat <<'P'\n((\nP\n"], hider="tee o <<'EOF'\nx<`\nEOF\n")
+def test_a_push_after_a_heredoc_decoy_is_visible_or_bound_type(
+    decoys: list[str], hider: str
+) -> None:
+    command = "".join(decoys) + hider + shlex.join(_PUSH)
+    segments, blind = sp.analyze_checked(command)
+    if _PUSH in [s.argv for s in segments]:
+        return
+    assert blind is not None
+    if blind is sp._BLIND_UNTOKENIZABLE:
+        assert sp.untokenizable(command)
+        return
+    assert blind.bounds_induced, blind.cause
+
+
+# A here-doc opener inside a backtick substitution whose delimiter word runs straight
+# into the closing backtick (#3433, third review): the word scanner reads that
+# backtick as a new substitution and swallows the rest of the text.
+_BT_WORDS = ["EOF", "'EOF'", '"EOF"', "E\\OF", "EO''F", "-EOF", "- EOF", "$'EOF'"]
+_BT_WRAPS = [("echo `cat <<{}`", ""), ("x=`cat 2<<{}`", ""), ("echo ${{x:-`cat <<{}`}}", ""),
+             ("echo $(echo `cat <<{}`)", ""), ("echo `cat <<{}` y=1", "")]
+_BT_SEPS = ["; ", "\n", " && ", "; echo `x`; "]
+
+
+@PROFILE
+@given(st.sampled_from(_BT_WORDS), st.sampled_from(_BT_WRAPS), st.sampled_from(_BT_SEPS))
+@example(word="EOF", wrap=("echo `cat <<{}`", ""), sep="; ")
+def test_a_push_after_a_backtick_closed_heredoc_word_is_visible_or_bound_type(
+    word: str, wrap: tuple[str, str], sep: str
+) -> None:
+    command = wrap[0].format(word) + sep + shlex.join(_PUSH)
+    segments, blind = sp.analyze_checked(command)
+    if _PUSH in [s.argv for s in segments]:
+        return
+    assert blind is not None
+    if blind is sp._BLIND_UNTOKENIZABLE:
+        assert sp.untokenizable(command)
+        return
+    assert blind.bounds_induced, blind.cause
+
+
+# A body that ends inside a substitution (#3433, fourth review). C1: a line STARTING
+# with the delimiter that holds a later `)` ends it inside `$(`/`<(`. C2: the
+# extractor ends a `$(` at a `)` in the body, so the nested script stops short of the
+# terminator. Either way a push follows, and bash runs it.
+_SUB_OPENERS = ["echo $(cat ", "cat <(cat ", 'echo "$(cat ', "x=$(cat "]
+_SUB_WORDS = [("<<EOF", "EOF"), ("<<'EOF'", "EOF"), ("<<-EOF", "\tEOF"), ('<<"EOF"', "EOF")]
+_SUB_BODIES = ["x", ")", "1) a", "it's (b", "a)\nb)", "", '"\n"', 'say "hi"']
+_SUB_C1_GLUE = [" ", "\t", "", "  "]
+
+
+@PROFILE
+@given(
+    st.sampled_from(_SUB_OPENERS),
+    st.sampled_from(_SUB_WORDS),
+    st.sampled_from(_SUB_BODIES),
+    st.sampled_from(_SUB_C1_GLUE),
+    st.booleans(),
+)
+@example(head="echo $(cat ", word=("<<EOF", "EOF"), body="x", glue=" ", c1=True)
+@example(head='echo "$(cat ', word=("<<'EOF'", "EOF"), body=")", glue=" ", c1=False)
+def test_a_push_after_a_body_ended_inside_a_substitution_is_visible_or_bound_type(
+    head: str, word: tuple[str, str], body: str, glue: str, c1: bool
+) -> None:
+    opener, terminator = word
+    close = ')"' if head.startswith('echo "') else ")"
+    push = shlex.join(_PUSH)
+    if c1:
+        command = f"{head}{opener}\n{body}\n{terminator}{glue}{push}{close}\n{terminator}"
+    else:
+        command = f"{head}{opener}\n{body}\n{terminator}\n{push}\n{close}"
+    segments, blind = sp.analyze_checked(command)
+    if _PUSH in [s.argv for s in segments]:
+        return
+    assert blind is not None, command
+    if blind is sp._BLIND_UNTOKENIZABLE:
+        assert sp.untokenizable(command)
+        return
+    assert blind.bounds_induced, blind.cause
+
+
+@PROFILE
+@given(
+    st.sampled_from(["cd sub && git commit -q -m", "cd sub && gh pr create --body"]),
+    st.lists(st.sampled_from(["1) a", "it's", "(x", "y)", "plain", "## h", "`code`"]),
+             min_size=1, max_size=5),
+)
+def test_a_quoted_message_body_alone_in_its_substitution_is_never_reported(
+    receiver: str, body: list[str]
+) -> None:
+    """The exemption's other direction: a quoted body, its exact terminator, then
+    only the closing paren, is no here-doc blind spot whatever the body holds."""
+    command = receiver + " \"$(cat <<'EOF'\n" + "\n".join(body) + "\nEOF\n)\""
+    assert sp.analyze_checked(command)[1] is not sp._BLIND_HEREDOC_BODY, command
