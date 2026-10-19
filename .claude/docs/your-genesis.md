@@ -35,13 +35,13 @@ Never push custom commits to the public repo's `main`.
 
 Operational backup of everything your Genesis has accumulated: SQLite DB,
 Qdrant snapshots, memory files, CC transcripts, local config overlays,
-and GPG-encrypted secrets. Written every 6 hours by `scripts/backup.sh`.
+GPG-encrypted secrets and credentials, and the card vault (if you created
+one). Written every 6 hours by `scripts/backup.sh`.
 
 **All PII-bearing payloads are encrypted** with `GENESIS_BACKUP_PASSPHRASE`
 before push: SQLite dump, memory files, transcripts, and secrets. The
 private repo is defense in depth; encryption is the primary defense.
-(Qdrant snapshots are opaque binary blobs and ship unencrypted; encrypting
-them is tracked as a follow-up.)
+Qdrant snapshots, credentials and the card vault are encrypted the same way.
 
 ## Recovery
 

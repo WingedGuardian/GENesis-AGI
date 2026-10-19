@@ -434,9 +434,28 @@ class TestWorkflowContract:
         diff = run.index('git diff --quiet "$BASE" "$HEAD_SHA" -- pyproject.toml')
         checkout = run.index('git checkout --quiet --force --detach "$BASE"')
         venv = run.index('python -m venv "$RUNNER_TEMP/venv-base"', checkout)
-        install = run.index('"$base_py" -m pip install --quiet -e ".[test]"', venv)
+        install = run.index('"$base_py" -m pip install --quiet -e ".[', venv)
         assert diff < checkout < venv < install < run.index('collect base "$base_py"')
         assert "collect pr python" in run and '"$2" -m pytest' in run
+
+    @staticmethod
+    def _extras(job) -> list[str]:
+        import re
+
+        text = "\n".join(str(s.get("run", "")) for s in job["steps"])
+        return re.findall(r'pip install (?:--quiet )?-e "\.\[([^\]]*)\]"', text)
+
+    def test_both_trees_install_the_test_jobs_extras(self):
+        # A module that imports an optional extra at collection time cannot be
+        # collected without it, and a new collection error on the PR tree
+        # fails this job. The PR tree gets the test job's extras; the base's
+        # fresh venv gets them too, so a later PR that edits pyproject.toml
+        # still collects the base's extra-dependent tests (pip only warns
+        # about an extra the base tree does not declare).
+        jobs = self._jobs()
+        (test_extras,) = self._extras(jobs["test"])
+        assert "test" in test_extras.split(","), "precondition: the test job's install was found"
+        assert self._extras(jobs["collected-floor"]) == [test_extras, test_extras]
 
     def test_job_runs_on_pull_requests_and_pushes_only(self):
         cond = self._jobs()["collected-floor"]["if"]

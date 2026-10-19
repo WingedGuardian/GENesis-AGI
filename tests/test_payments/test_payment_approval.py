@@ -697,6 +697,85 @@ async def test_a_cancel_during_the_expiry_row_still_lands_it(make, db):
     assert await _events(db) == ["approval_requested", "approval_expired"]
 
 
+def _held_at(registry, event: str, reason: str | None = None):
+    """The real audit, held on one row; records whether a cancel ever reached that write."""
+    real = registry._audit
+    entered, release, reached = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def held(ev, detail):
+        if ev == event and (reason is None or (detail or {}).get("reason") == reason):
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                reached.set()
+                raise
+        return await real(ev, detail)
+
+    registry.attach_audit(held)
+    return entered, release, reached
+
+
+async def _cancel_twice(task, entered, release):
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    task.cancel()  # the second cancel lands while the cleanup write is in flight
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not task.done(), "the cleanup gave up before its write finished"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+
+
+async def _drained(registry):
+    await asyncio.wait_for(asyncio.gather(*registry._writes), 2)
+
+
+async def test_a_second_cancel_during_the_request_row_reaches_no_write(make, db):
+    registry, bot, _ctx = make()
+    entered, release, reached = _held_at(registry, "approval_requested")
+    task = asyncio.create_task(registry.request(FIELDS))
+    await _cancel_twice(task, entered, release)
+    await _drained(registry)
+    assert not reached.is_set(), "a cancel reached the approval_requested write"
+    rows = list(reversed(await audit.list_recent(db, 100)))
+    assert [r["event"] for r in rows] == ["approval_requested", "approval_refused"]
+    assert rows[-1]["detail"]["reason"] == "requester cancelled"
+    assert bot.sent == []
+
+
+async def test_a_second_cancel_during_the_closing_row_reaches_no_write(make, db):
+    registry, bot, _ctx = make()
+    entered, release, reached = _held_at(registry, "approval_refused", "requester cancelled")
+    task = asyncio.create_task(registry.request(FIELDS))
+    await _wait_recorded(registry)
+    task.cancel()  # after the send: the closing row is written in the finally
+    await _cancel_twice(task, entered, release)
+    await _drained(registry)
+    assert not reached.is_set(), "a cancel reached the closing refusal write"
+    assert await _events(db) == ["approval_requested", "approval_refused"]
+
+
+async def test_a_second_cancel_during_a_taps_closing_row_reaches_no_write(make, db):
+    registry, bot, _ctx = make()
+    gate_entered, gate_release, _ = _held_at(registry, "approval_granted")
+    task = asyncio.create_task(registry.request(FIELDS))
+    nonce = await _wait_recorded(registry)
+    tap = asyncio.create_task(registry.handle_tap(nonce, OWNER, _msg(bot.sent[0], bot)))
+    await asyncio.wait_for(gate_entered.wait(), 2)
+    entered, release, reached = _held_at(registry, "approval_refused", "tap interrupted")
+    tap.cancel()
+    await _cancel_twice(tap, entered, release)
+    assert await asyncio.wait_for(task, 2) == ap.REFUSED
+    gate_release.set()
+    await _drained(registry)
+    assert not reached.is_set(), "a cancel reached the tap-interrupted write"
+    assert "approval_refused" in await _events(db)
+
+
 async def test_free_text_is_not_a_plain_audit_value(make):
     registry, _bot, _ctx = make()
     assert await registry.request(FIELDS, audit_detail={"page": ["a", "b"]}) == ap.REFUSED

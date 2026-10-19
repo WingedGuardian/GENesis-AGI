@@ -1449,7 +1449,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: e943bc114 2026-10-16
+verified: 96e0a4de3 2026-10-18
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1532,7 +1532,8 @@ the shared banner is not an assertion about all concurrent sessions.
   `per_device` scope; default `global`.
 - **dashboard/**: Flask blueprint at `/genesis` (~53 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
-  thread detects degraded-but-alive Flask; web terminal.
+  thread detects degraded-but-alive Flask; web terminal (its WebSocket accepts
+  same-origin handshakes only: `routes/terminal._refuse_cross_origin_terminal`).
   **Auth posture — API READS ARE OPEN BY DEFAULT, and this is the fact auditors
   keep rediscovering.** Exactly two `before_request` hooks exist, and between
   them they leave a gap: `auth._check_auth` is blueprint-level and gates HTML
@@ -1687,6 +1688,18 @@ the shared banner is not an assertion about all concurrent sessions.
   reclaim); a click that opens a new tab switches the tools to it. `browser_fill` refuses a payment card number
   as the value and `browser_run_js` one in its script (the value check only:
   telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
+  Every `_impl_browser_*` result and error passes `@_redacted` (card numbers in
+  snapshots, script results, urls, titles and exception text become
+  `[card redacted]`; a contract test requires the decorator on each), and the
+  `security/card_redaction` log filter sits on the `mcp_health.log` handler
+  (every propagated `genesis.*` record) and on the browser, FastMCP and MCP
+  SDK lowlevel-server loggers, redacting log lines and tracebacks. The tool
+  timeout text and the CAPTCHA Telegram alert's page URL are redacted too.
+  Results are also checked for a card SPLIT across structure (digit groups on
+  separate snapshot lines, list items or dict values; a container that spells
+  one is withheld whole), and `browser_screenshot` refuses to capture a page
+  whose frames render a card in text, field values, placeholders, labels,
+  titles, alt text, options or CSS-generated content.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
@@ -2763,9 +2776,25 @@ Self-improvement loops and the instrumentation that keeps them honest.
 
 ```yaml subsystem-map
 entry: learning-evaluation
-modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 788a6d75c178 2026-10-17
+modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
+verified: 368be0b0a2a2 2026-10-18
 ```
+
+- **transcript_analytics/**: optional local transcript parser library. It
+  extracts physical records, preserves unresolved identity and usage, and
+  applies the shared credential scrubber to structured content. Schema5 records
+  distinguish executor identity from delegation evidence. This development
+  candidate adds the parser and optional DuckDB/Parquet dependencies; storage,
+  queries, CLI, scheduling and encrypted recovery arrive in dependent changes.
+  It does not describe a deployed capability.
+  Hook names are limited to literal command targets and option-free supported
+  interpreter operands; ambiguous commands report `<unknown>` while preserving
+  their scrubbed command. Invalid negative durations/counts and reversed call
+  timestamps remain unknown; signed exit codes remain signed. Both model-refusal
+  subtypes retain selected scrubbed diagnostics. Recursive JSON is treated as a
+  malformed record, and chronology is evaluated against the captured byte limit,
+  including an incomplete suffix in its fingerprint. Dependent query views must
+  preserve those unknown-duration semantics when deriving fallback latency.
 
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
@@ -3406,7 +3435,18 @@ tool-disabled CC probe without changing its schedule or routing authority.
   bot or audit, or 10 minutes without a tap refuses. Nonces live in memory
   only; no `approval_requests` row is written, and the type is in the gate's
   approve-all denylist, `refuse_generic` and both dashboard filters. Nothing
-  calls it or decrypts a card yet, and the vault directory is not backed up.
+  calls it or decrypts a card yet.
+  Backup: `scripts/lib/payment_vault_backup.sh` from
+  backup.sh §8 writes the three files as ONE GPG-encrypted tar,
+  `creds/payment_vault.tar.gpg`, renamed into place once (cards.db via SQLite
+  online backup, under the vault's directory lock, only when the set passes the
+  check restore reruns), so no reader can mix files from two backups;
+  `payment_vault` in `backup_status.json` is ok/absent/skipped (not
+  attempted)/failed/missing, and failed or missing fails the run (non_db).
+  restore.sh decrypts it only when it comes from the selected off-site snapshot
+  (or Tier-1 when none was selected), checks member types and the vault, and
+  stages it fresh in `~/.genesis/restore-creds/payment_vault/` (an earlier copy
+  is moved aside); it never places it.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;
@@ -3616,7 +3656,9 @@ tool-disabled CC probe without changing its schedule or routing authority.
   detector (ASCII digits, alphanumeric boundary, standard groupings, brand
   prefix + length, Luhn, UUID groups skipped; stdlib-only so scripts load it
   by path), used by the browser tool guards, `reference_store`, reference
-  extraction and `output_scanner`; `skill_scan`
+  extraction and `output_scanner`; `card_redaction` = redaction built on it
+  (result walker incl. JSON text, numbers and cards split across lines or
+  values, the `redacted` tool decorator, the `CARD_FILTER` log filter), used by the browser tools; `skill_scan`
   shells to external NVIDIA SkillSpector. NOT auth or secrets storage (that's
   `runtime/init/secrets.py` + `env.py`). **`immunity.py` = the WS-3 kill
   switch + gate policy**: `gate_mode()` re-reads `config/ws3_immunity.yaml` +
