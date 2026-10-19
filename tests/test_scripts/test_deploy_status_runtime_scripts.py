@@ -510,6 +510,11 @@ _FRESH = (
     "scripts/lib/disk_guardian.sh",
     "scripts/tmp_watchgod.sh",
     "scripts/lib/serving_commit.py",
+    "scripts/codebase_managed.py",
+    "scripts/lib/codebase_managed_unit.py",
+    "scripts/lib/code_intel_cbm_admission.py",
+    "scripts/lib/code_intel_cbm_worker.py",
+    "scripts/lib/cbm_disable_file.sh",
     ".claude/hooks/genesis-hook",
 )
 

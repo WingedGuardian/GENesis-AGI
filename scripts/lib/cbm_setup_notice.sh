@@ -9,7 +9,7 @@
 # alert cannot disagree. Output:
 #   - registered but not set up, not opted out: one line naming what is missing
 #     and the doc section with the configure/enable commands;
-#   - configured and enabled: "Codebase: OK";
+#   - configured and enabled: "Codebase: OK (configured and enabled)";
 #   - not registered, or opted out with the kill-switch file: nothing;
 #   - the check itself could not run: a "could not be checked" line, never
 #     silence, so an unverified state never reads as fine.

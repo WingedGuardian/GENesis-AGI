@@ -101,7 +101,7 @@ def test_configured_but_not_enabled_names_only_the_unit(box):
 
 
 def test_configured_and_enabled_prints_ok(box):
-    assert box(config=True, unit="enabled").stdout == "  Codebase: OK\nrc=0\n"
+    assert box(config=True, unit="enabled").stdout == "  Codebase: OK (configured and enabled)\nrc=0\n"
 
 
 def test_opt_out_sentinel_prints_nothing(box):

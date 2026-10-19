@@ -66,6 +66,10 @@ def managed_config_path(home: Path) -> Path:
     return home / ".genesis" / "config" / "codebase-managed.json"
 
 
+def _reject_constant(name: str) -> None:
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
 def _servers(path: Path) -> dict:
     """The mcpServers mapping of one registration file; {} when it is absent.
 
@@ -88,26 +92,45 @@ def _servers(path: Path) -> dict:
     if len(payload) > _MAX_JSON_BYTES:
         raise Unanswerable(f"{path.name} is too large to check")
     try:
-        servers = json.loads(payload).get("mcpServers")
+        # Read as scripts/setup_claude_config.py reads these files: strict UTF-8
+        # (no BOM or UTF-16 sniffing) and JSON.parse's rejection of NaN/Infinity.
+        text = payload.decode("utf-8")
+        servers = json.loads(text, parse_constant=_reject_constant).get("mcpServers")
     except (ValueError, AttributeError, RecursionError) as exc:
         raise Unanswerable(f"{path.name} is not a JSON object: {exc}") from exc
     return servers if isinstance(servers, dict) else {}
 
 
-def registrations(repo_root: Path, home: Path) -> dict[str, bool]:
+def registrations(repo_root: Path, home: Path) -> dict[str, bool | None]:
     """Where the server is registered: the checkout (.mcp.json) and user scope
-    (~/.claude.json, written by scripts/lib/mcp_register.sh)."""
-    return {
-        "project": SERVER in _servers(repo_root / ".mcp.json"),
-        "user": SERVER in _servers(home / ".claude.json"),
-    }
+    (~/.claude.json, written by scripts/lib/mcp_register.sh).
+
+    Only a truthy entry counts, as mcp_register.sh treats it: ``null`` is not a
+    registration. When one scope registers the server, an unreadable other
+    scope cannot change the answer, so it is recorded as unknown (None); only
+    when no readable scope registers it is the question unanswerable.
+    """
+    where: dict[str, bool | None] = {}
+    unreadable: Unanswerable | None = None
+    for scope, path in (("project", repo_root / ".mcp.json"), ("user", home / ".claude.json")):
+        try:
+            where[scope] = bool(_servers(path).get(SERVER))
+        except Unanswerable as exc:
+            where[scope], unreadable = None, exc
+    if unreadable is not None and not any(where.values()):
+        raise unreadable
+    return where
 
 
-def disable_file(repo_root: Path) -> Path | None:
+def disable_file(repo_root: Path) -> str | None:
     """The DEFAULT kill-switch path, resolved by the ONE shell resolver the
     installers and indexer use (scripts/lib/cbm_disable_file.sh). None = the
     resolver reports no absolute path can be produced (or is missing), which is
-    a standing property of this environment, not a transient failure."""
+    a standing property of this environment, not a transient failure.
+
+    Returned as the raw string the shell consumers see: the output is read as
+    bytes (no newline translation, so a CR survives) and only trailing newlines
+    are removed, exactly what their ``$(...)`` removes."""
     lib = repo_root / "scripts" / "lib" / "cbm_disable_file.sh"
     bash = shutil.which("bash")
     if bash is None or not lib.is_file():
@@ -116,16 +139,15 @@ def disable_file(repo_root: Path) -> Path | None:
         proc = subprocess.run(
             [bash, "-c", '. "$1" && genesis_cbm_disable_file', "_", str(lib)],
             capture_output=True,
-            text=True,
             timeout=_TIMEOUT,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise Unanswerable(f"kill-switch resolver failed: {exc}") from exc
-    value = proc.stdout.strip()
+    value = os.fsdecode(proc.stdout.rstrip(b"\n"))
     if proc.returncode != 0 or not value.startswith("/"):
         return None
-    return Path(value)
+    return value
 
 
 def managed_status(repo_root: Path, config: Path) -> dict:
@@ -151,14 +173,41 @@ def managed_status(repo_root: Path, config: Path) -> dict:
         raise Unanswerable(f"managed status printed no JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise Unanswerable("managed status printed no JSON object")
+    # The contract of codebase_managed.py `status` (it always prints these four).
+    # A renamed or retyped key must read as "could not check", never as a valid,
+    # configured install.
+    missing = {"settings", "settings_error", "service", "manager_error"} - value.keys()
+    if missing:
+        raise Unanswerable(f"managed status lacks {', '.join(sorted(missing))}")
+    if not isinstance(value["settings_error"], (str, type(None))):
+        raise Unanswerable("managed status settings_error is not a string or null")
+    for key in ("settings", "service"):
+        if not isinstance(value[key], (dict, type(None))):
+            raise Unanswerable(f"managed status {key} is not an object or null")
     return value
 
 
-def _opt_out(facts: dict, sentinel: Path | None) -> None:
-    facts["disable_file"] = str(sentinel) if sentinel is not None else None
-    # lexists: anything placed there, even a dangling link, is the owner's
-    # opt-out — the launcher's sentinel_armed test is lstat-based too.
-    facts["disabled"] = os.path.lexists(sentinel) if sentinel is not None else None
+def sentinel_armed(raw: str) -> bool:
+    """The launcher's predicate, verbatim (scripts/lib/codebase_managed_unit.py
+    ``sentinel_armed``; a test holds the two equal). Anything at the path, a
+    dangling parent link, or an unprobeable path all count as opted out."""
+    try:
+        os.lstat(raw)
+    except FileNotFoundError:
+        return any(os.path.lexists(p) and not os.path.exists(p) for p in Path(raw).parents)
+    except OSError:
+        return True
+    return True
+
+
+def _opt_out(facts: dict, sentinel: str | None) -> None:
+    # The raw string, never a Path: Path() folds a trailing slash or "//", and
+    # the launcher judges the string it was given.
+    facts["disable_file"] = sentinel
+    try:
+        facts["disabled"] = sentinel_armed(sentinel) if sentinel is not None else None
+    except ValueError as exc:  # an embedded NUL: no such path can be probed
+        raise Unanswerable(f"kill-switch path cannot be probed: {exc}") from exc
 
 
 def read_facts(repo_root: Path, home: Path, *, strict_manager: bool = False) -> dict:
@@ -173,7 +222,7 @@ def read_facts(repo_root: Path, home: Path, *, strict_manager: bool = False) -> 
     where = registrations(repo_root, home)
     config = managed_config_path(home)
     facts: dict = {
-        "registered": where["project"] or where["user"],
+        "registered": bool(where["project"] or where["user"]),
         "registered_project": where["project"],
         "registered_user": where["user"],
         "config_path": str(config),
@@ -187,30 +236,33 @@ def read_facts(repo_root: Path, home: Path, *, strict_manager: bool = False) -> 
         return facts
 
     status = managed_status(repo_root, config)
-    settings = status.get("settings") if isinstance(status.get("settings"), dict) else {}
+    settings = status["settings"] or {}
     configured = settings.get("sentinel")
     if isinstance(configured, str) and configured.startswith("/"):
-        _opt_out(facts, Path(configured))  # what the launcher enforces
+        _opt_out(facts, configured)  # what the launcher enforces, as it reads it
     else:
         _opt_out(facts, disable_file(repo_root))
     if facts["disabled"] is True:
         return facts
-    error = status.get("settings_error")
-    facts["settings_error"] = error if isinstance(error, str) else None
+    facts["settings_error"] = status["settings_error"]
     facts["config_valid"] = facts["settings_error"] is None
     if not facts["config_valid"]:
         return facts
 
-    service = status.get("service")
-    if not isinstance(service, dict):
+    service = status["service"]
+    if service is None:
         if strict_manager:
             raise Unanswerable(f"managed status: {status.get('manager_error')}")
         facts["unit_file_state"] = None
         return facts
-    if service.get("LoadState") == "not-found":
+    load, unit_file = service.get("LoadState"), service.get("UnitFileState")
+    if load == "not-found":
         facts["unit_file_state"] = "not-found"
+    elif isinstance(load, str) and isinstance(unit_file, str) and unit_file:
+        facts["unit_file_state"] = unit_file
     else:
-        facts["unit_file_state"] = service.get("UnitFileState") or None
+        # The manager answered, but not with a unit state: not "unknown".
+        raise Unanswerable("managed status reported no unit state")
     return facts
 
 
@@ -271,7 +323,7 @@ def notice(facts: dict) -> str:
             ".venv/bin/python -I scripts/codebase_managed.py status"
         )
     if facts.get("registered") is True and facts.get("disabled") is False:
-        return "Codebase: OK"
+        return "Codebase: OK (configured and enabled)"
     return ""
 
 

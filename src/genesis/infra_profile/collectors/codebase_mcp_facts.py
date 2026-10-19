@@ -15,12 +15,15 @@ enable, created the sentinel), so it is all facts, none of it metrics.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from genesis.env import repo_root
 from genesis.infra_profile import codebase_mcp
 from genesis.infra_profile.types import SectionResult
 from genesis.util.systemd import systemctl_env
+
+logger = logging.getLogger(__name__)
 
 
 def _user_manager_present() -> bool:
@@ -39,9 +42,24 @@ def _read() -> dict:
 
 
 async def collect_codebase_mcp() -> SectionResult:
-    """Never raises; an unanswerable probe degrades the section to error."""
+    """Never raises; an unanswerable probe degrades the section to error.
+
+    So does a registered server whose opt-out path cannot be resolved: that
+    verdict is "could not tell", and an ok section carrying it would RESOLVE an
+    open alert while nothing has been fixed. As an error, the refresh retains
+    the previous facts and the posture check holds its all-clear. (No user
+    manager is the one "could not tell" that stays ok: it is a standing answer
+    about this box, which strict_manager has already separated out.)
+    """
     try:
         facts = await asyncio.to_thread(_read)
-        return SectionResult(name="codebase_mcp", facts=facts)
     except Exception as exc:  # a collector must never take down the refresh
+        logger.warning("codebase_mcp facts unavailable", exc_info=True)
         return SectionResult.failed("codebase_mcp", f"codebase-memory-mcp facts unavailable: {exc}")
+    if facts.get("registered") is True and facts.get("disabled") is None:
+        return SectionResult.failed(
+            "codebase_mcp",
+            "codebase-memory-mcp opt-out path could not be resolved "
+            "(CODEBASE_MEMORY_MCP_DISABLE_FILE must be an absolute path)",
+        )
+    return SectionResult(name="codebase_mcp", facts=facts)
