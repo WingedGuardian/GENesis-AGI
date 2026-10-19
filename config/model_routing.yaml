@@ -272,6 +272,13 @@ providers:
       # Haiku 5.5 still accepts sampling parameters, but newer Claude models
       # reject them; drop them so a family release cannot break this route.
       additional_drop_params: [temperature, top_p, top_k]
+      # Haiku 5.5 reasons by default on OpenRouter (catalog default_effort:
+      # medium). Its callers are short graders with tight budgets
+      # (contribution_gate caps output at 500 tokens; crag_grade has an 8 s
+      # deadline), so keep the route's prior non-thinking behaviour.
+      extra_body:
+        reasoning:
+          effort: none
   openrouter-sonnet:
     type: openrouter
     model: ~anthropic/claude-sonnet-latest

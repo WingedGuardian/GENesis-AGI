@@ -41,12 +41,15 @@ def _config(
     )
 
 
-def _mock_response(content="Hello", prompt_tokens=10, completion_tokens=5):
-    """Build a fake litellm response."""
+def _mock_response(content="Hello", prompt_tokens=10, completion_tokens=5, model=None):
+    """Build a fake litellm response (``model`` = the served id, when given)."""
     usage = SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
     message = SimpleNamespace(content=content)
     choice = SimpleNamespace(message=message)
-    return SimpleNamespace(choices=[choice], usage=usage)
+    resp = SimpleNamespace(choices=[choice], usage=usage)
+    if model is not None:
+        resp.model = model
+    return resp
 
 
 def _install_litellm_exceptions(mock_litellm):
@@ -149,7 +152,10 @@ def test_resolve_api_key_not_found():
 async def test_call_success():
     config = _config(is_free=False)
     delegate = LiteLLMDelegate(config)
-    mock_resp = _mock_response(content="Test output", prompt_tokens=15, completion_tokens=8)
+    mock_resp = _mock_response(
+        content="Test output", prompt_tokens=15, completion_tokens=8,
+        model="llama-3.3-70b-versatile",
+    )
 
     with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
         mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
@@ -165,6 +171,7 @@ async def test_call_success():
     assert result.input_tokens == 15
     assert result.output_tokens == 8
     assert result.cost_usd == 0.0003
+    assert result.served_model == "llama-3.3-70b-versatile"
 
 
 async def test_free_provider_always_zero_cost():
