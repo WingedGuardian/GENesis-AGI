@@ -43,6 +43,12 @@ logger = logging.getLogger(__name__)
 
 # Confidence threshold for cancelling a contribution. Calibrated in the
 # spike. Lower = more cancellations; higher = more duplicate PRs.
+# Re-checked 2026-10-18 when the route moved to Haiku 5.5 (reasoning off), two
+# passes over scripts/phase6_version_gate_fixtures.json: 0/14 false
+# cancellations (every negative came back already_fixed=false, so the threshold
+# never decided them), 5/6 true cancellations at 85-92; the one miss was a
+# "not fixed" verdict at confidence 40, which no threshold would catch. Haiku
+# 4.5 on the same run: 0/14 false, 6/6 true. Kept at 75.
 CONFIDENCE_THRESHOLD = 75
 
 # Fallback model chain when routing config is unavailable.
@@ -55,7 +61,17 @@ CONFIDENCE_THRESHOLD = 75
 # than the router would make. gemini pinned to the currently-recommended 3.x
 # (docs/reference/gemini-routing.md: 2.0 = "Do not use", being phased out).
 _FALLBACK_MODELS = [
-    ("openrouter/anthropic/claude-haiku-4.5", "openrouter", None),
+    # Mirrors openrouter-haiku in model_routing.yaml: sampling params dropped
+    # (newer Claude releases reject them) and reasoning off (Haiku 5.5 reasons
+    # by default, which the gate's 500-token cap cannot afford).
+    (
+        "openrouter/~anthropic/claude-haiku-latest",
+        "openrouter",
+        {
+            "additional_drop_params": ["temperature", "top_p", "top_k"],
+            "extra_body": {"reasoning": {"effort": "none"}},
+        },
+    ),
     ("groq/openai/gpt-oss-120b", "groq", {"extra_body": {"reasoning_effort": "low"}}),
     # Mirrors the canonical gemini-free provider in model_routing.yaml: the GA
     # gemini-3.5-flash (Google's replacement for the deprecated 3-flash-preview)

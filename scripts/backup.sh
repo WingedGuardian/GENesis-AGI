@@ -7,7 +7,7 @@
 # All PII-bearing payloads are GPG-encrypted with GENESIS_BACKUP_PASSPHRASE.
 #
 # Backs up: SQLite DB, Qdrant snapshots, CC transcripts, auto-memory,
-# local config overlays, secrets.
+# local config overlays, secrets, credentials and the card vault (§8).
 #
 # Restore via scripts/restore.sh or `python -m genesis restore`.
 #
@@ -79,7 +79,15 @@ fi
 # pre-deploy backup while update.sh prints "Backup complete".
 # shellcheck source=scripts/lib/dr_lock.sh
 source "$_SCRIPT_DIR/lib/dr_lock.sh"
-_GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
+# Absolute from the start: §8 runs after `cd "$BACKUP_DIR"`, so a relative
+# GENESIS_HOME would otherwise resolve against the backups clone. -s keeps a
+# symlinked component as written, so the card vault step can still refuse a
+# symlinked vault directory (#3245 tracks where GENESIS_HOME is read from). A
+# leading ~ is expanded first, as the runtime's Path.expanduser does: the lib is
+# sourced here, before any cd, so its home rule is the one both scripts use.
+# shellcheck source=scripts/lib/backup_core_paths.sh
+source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
+_GENESIS_HOME="$(realpath -s -m -- "$(_backup_core_home)")"
 _STATUS_FILE="$_GENESIS_HOME/backup_status.json"
 _RUN_ID="${GENESIS_BACKUP_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 _TRIGGER="${GENESIS_BACKUP_TRIGGER:-timer}"
@@ -125,6 +133,7 @@ _extras_gap_fingerprint() {
     } | LC_ALL=C sort -u | sha1sum | cut -c1-12
 }
 _SECRETS_OK=false
+_PV_STATUS="skipped"   # card vault in §8: ok/failed/absent/missing/skipped (see payment_vault_backup.sh)
 _SUCCESS=false
 _FAILURE_REASON=""
 _FAILURE_CLASS="none"
@@ -171,7 +180,7 @@ _write_status() {
     if [ $((${_EXTRA_SKIPPED:-0} + ${_EXTRA_UPLOAD_FAILED:-0} + ${_EXTRA_PARTIAL:-0})) -gt 0 ]; then _extras_complete=false; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -225,8 +234,9 @@ BACKUP_DIR="$HOME/backups/genesis-backups"
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
-# shellcheck source=scripts/lib/backup_core_paths.sh
-source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
+# (backup_core_paths.sh is sourced above, before _GENESIS_HOME.)
+# shellcheck source=scripts/lib/payment_vault_backup.sh
+source "$_SCRIPT_DIR/lib/payment_vault_backup.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-backup]"
@@ -1208,6 +1218,28 @@ if $_ENCRYPT_READY; then
         fi
     done
     log "Creds: $_CREDS_COUNT files (encrypted)"
+    # The card vault → creds/payment_vault.tar.gpg (scripts/lib/payment_vault_backup.sh).
+    # A failure or a vanished vault fails the run like a Qdrant gap: the rest of
+    # the backup still lands, and update.sh continues degraded on non_db.
+    _PV_OUT="$(backup_payment_vault "$_GENESIS_HOME/payment_vault" creds "$GENESIS_BIG_TMP")" \
+        || _PV_OUT="failed the vault step aborted"
+    read -r _PV_STATUS _PV_WHY <<< "$_PV_OUT"
+    case "$_PV_STATUS" in
+        ok | absent | missing | failed) ;;
+        *) _PV_STATUS="failed"; _PV_WHY="the vault step returned no known state" ;;
+    esac
+    if [ "$_PV_STATUS" = ok ]; then
+        log "Payment vault: 1 archive (encrypted)"
+    elif [ "$_PV_STATUS" = absent ]; then
+        log "Payment vault: none"
+    else
+        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }payment vault backup $_PV_STATUS: ${_PV_WHY:-no reason given} (any earlier backed-up set is kept)"
+        if [ "$_FAILURE_CLASS" = "none" ]; then
+            _FAILURE_CLASS="non_db"
+            _FAILURE_STAGE="payment_vault"
+        fi
+        log "WARNING: payment vault backup $_PV_STATUS: ${_PV_WHY:-no reason given}"
+    fi
 else
     log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping creds backup (refusing plaintext)"
 fi
@@ -1406,13 +1438,21 @@ else
 
     # Upload creds (encrypted credential + wiring files) so the COMPLETE snapshot
     # genuinely includes them — a no-git fresh box pulls them from here (restore
-    # §8). One level of nesting: creds/*.gpg + creds/ssh/*.gpg; a failed upload of
-    # a present file flips _T2_OK, same contract as the payloads above.
+    # §8). One level of nesting: creds/*.gpg + creds/ssh/*.gpg (the card vault is
+    # the flat creds/payment_vault.tar.gpg); a failed upload of a present file
+    # flips _T2_OK, same contract as the payloads above.
     if [ -d creds ]; then
         backend_mkdir "${_T2_DIR}/creds"
         [ -d creds/ssh ] && backend_mkdir "${_T2_DIR}/creds/ssh"
         while IFS= read -r -d '' f; do
             rel="${f#creds/}"
+            # The clone keeps the last good vault archive when this run's vault step
+            # did not succeed. The snapshot carries it under another name, so it is
+            # never presented as this run's vault, and never lost to GFS pruning of
+            # the earlier snapshot that holds it; COMPLETE records the gap.
+            if [ "$rel" = "$PAYMENT_VAULT_ARCHIVE" ] && [ "$_PV_STATUS" != ok ]; then
+                rel="$PAYMENT_VAULT_LAST_GOOD"
+            fi
             if backend_put "$f" "${_T2_DIR}/creds/${rel}"; then
                 log "  off-site: uploaded creds/${rel}"
             else
@@ -1442,6 +1482,10 @@ else
             for _n in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do
                 printf 'partial %s\n' "$_n"
             done
+            case "$_PV_STATUS" in
+                ok | absent) ;;
+                *) printf 'payment_vault %s\n' "$_PV_STATUS" ;;
+            esac
         } > "$_T2_MARKER"
         if ! backend_put "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
             log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"
@@ -1537,6 +1581,13 @@ if ! grep -qx '.extra-manifest' .gitignore 2>/dev/null; then
     if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
     printf '.extra-manifest\n.extra-manifest.tmp\n' >> .gitignore
     log "Added .extra-manifest to the .gitignore exclusions"
+fi
+# The card vault's staging names (§8): a run killed between copy and rename must
+# never commit a half-written set.
+if ! grep -qx 'creds/\*\*/\.\*\.tmp' .gitignore 2>/dev/null; then
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
+    printf 'creds/**/.*.tmp\n' >> .gitignore
+    log "Added the credential staging names to the .gitignore exclusions"
 fi
 
 # --- Commit and push (Tier 1 only) ---

@@ -334,6 +334,13 @@ artifact, so the update may continue, but it prints an untruncated
 `BACKUP FAILED — UPDATE CONTINUING IN DEGRADED MODE` banner and records
 `backup:<failure_stage>` in update history.
 
+The card vault (`~/.genesis/payment_vault`, if you created one) rides the
+encrypted credentials and reports `payment_vault`: `ok`, `absent` (no vault),
+`skipped` (not attempted: no passphrase, or the run stopped first), `failed` (no fresh copy written; the previous one is
+kept) or `missing` (a backed-up vault is gone). `failed` and `missing` fail the
+run (stage `payment_vault`). Restore stages the vault and never places it; see
+`docs/reference/recovery-and-portability-workflow.md`.
+
 If SQLite is corrupt, backup preserves the last-known-good artifacts, writes
 `~/.genesis/db_quarantine.json`, and stops both long-lived database writers.
 New canonical read/write connections and the watchdog honor that quarantine.
