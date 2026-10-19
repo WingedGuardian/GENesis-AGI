@@ -1000,6 +1000,10 @@ async def test_recent_outcomes_are_bounded(ctx):
         ({"button_label": 5}, "bad button_label"),
         ({"button_label": ["Pay"]}, "bad button_label"),
         ({"button_label": "(not given)"}, "bad button_label"),  # posing as an absent label
+        # ... with an invisible mark the sanitiser used to keep (Mn default-ignorables)
+        ({"button_label": "(not given)️"}, "bad button_label"),
+        ({"button_label": "(not͏ given)"}, "bad button_label"),
+        ({"button_label": "\U000e0041(not given)"}, "bad button_label"),
         ({"button_label": " (not​ given) "}, "bad button_label"),
         ({"also_filled": "email"}, "bad also_filled"),
         ({"also_filled": ["password"]}, "bad also_filled"),

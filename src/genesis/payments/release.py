@@ -118,6 +118,12 @@ _ORIGIN_KEYS = frozenset(
     {"number", "expiry", "exp_month", "exp_year", "cvc", "name", "postal_code"}
 )
 _EXPIRY_KEYS = ("exp_month", "exp_year")  # one "expiry" field is both
+#: Unicode Default_Ignorable_Code_Point (DerivedCoreProperties.txt), the ranges
+#: that render as nothing. Most are category Cf/Cn and dropped anyway; this
+#: catches the rest (Mn variation selectors, U+034F, Hangul fillers, U+115F/60).
+_DEFAULT_IGNORABLE = re.compile(
+    "[­͏؜ᅟᅠ឴឵᠋-᠏​-‏‪-‮⁠-⁯ㅤ︀-️﻿ﾠ￰-￸\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+)
 _CLAIM_HASH = re.compile(r"[0-9a-f]{64}")
 _NONCE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _ORIGIN = re.compile(r"(https?)://([^/:?#@]+)(?::([0-9]{1,5}))?")
@@ -153,11 +159,14 @@ def _sanitise_shown(raw: str, *, empty: str, cap: int) -> str:
     """Page-supplied text as the tap shows it: one printable line, at most ``cap`` long."""
     text = unicodedata.normalize("NFC", raw)
     # Drops controls, format characters (bidi overrides, zero-width joiners),
-    # surrogates, private-use and unassigned code points.
+    # surrogates, private-use and unassigned code points, and the Unicode
+    # default-ignorable code points that are not in those categories (variation
+    # selectors and the combining grapheme joiner are Mn): they render as nothing,
+    # so a label carrying one could pass as text it merely looks like.
     # A newline or tab separates words; it becomes a space, then whitespace collapses.
     text = "".join(
         " " if ch.isspace() else ch
-        for ch in text
+        for ch in _DEFAULT_IGNORABLE.sub("", text)
         if ch.isspace() or not unicodedata.category(ch).startswith("C")
     )
     return (" ".join(text.split()) or empty)[:cap].rstrip()  # a cut can end on a space
