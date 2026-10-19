@@ -607,6 +607,41 @@ async def test_the_claim_rechecks_the_host_against_the_blob(ctx, monkeypatch):
     assert reply == {"ok": False, "error": "the host is outside the card's merchant"}
 
 
+async def test_a_card_past_its_expiry_month_is_refused_at_claim(ctx, monkeypatch):
+    nonce = await ctx.granted(card_ref=ctx.refs["both"])
+    monkeypatch.setattr(rl, "_now", lambda: datetime(_exp_year() + 1, 1, 1, tzinfo=UTC))
+    assert await ctx.claim(nonce) == {"ok": False, "error": "the card has expired"}
+    assert (await ctx.status(nonce))["state"] == "refused"
+    assert _card_row(ctx, ctx.refs["both"]) == ("active", 0)  # nothing retired
+    assert "release_claimed" not in await ctx.names()
+    reasons = [(e["detail"] or {}).get("reason") for e in await ctx.events()]
+    assert "the card has expired" in reasons
+
+
+async def test_a_card_in_its_expiry_month_is_still_released(ctx, monkeypatch):
+    nonce = await ctx.granted()
+    monkeypatch.setattr(rl, "_now", lambda: datetime(_exp_year(), 12, 31, 23, 59, tzinfo=UTC))
+    assert (await ctx.claim(nonce))["ok"]
+
+
+async def test_last4_altered_in_the_clear_is_refused_at_claim(ctx):
+    with sqlite3.connect(ctx.svc._vault / vs.CARDS) as conn:
+        conn.execute("UPDATE cards SET last4 = '0000' WHERE card_ref = ?", (ctx.refs["scoped"],))
+    nonce = await ctx.granted()
+    assert ctx.reg.calls[-1][0]["Card"] == "Test card ending 0000"
+    assert await ctx.claim(nonce) == {"ok": False, "error": "the card could not be opened"}
+    assert (await ctx.status(nonce))["state"] == "refused"
+
+
+async def test_a_card_whose_shown_label_changed_after_the_tap_is_refused(ctx):
+    nonce = await ctx.granted()
+    with sqlite3.connect(ctx.svc._vault / vs.CARDS) as conn:
+        conn.execute("UPDATE cards SET label = 'Other' WHERE card_ref = ?", (ctx.refs["scoped"],))
+    reply = await ctx.claim(nonce)
+    assert reply == {"ok": False, "error": "the card is not the one shown in the approval"}
+    assert "release_claimed" not in await ctx.names()
+
+
 async def test_a_row_rescoped_in_the_clear_is_refused_at_claim(ctx):
     nonce = await ctx.granted()
     with sqlite3.connect(ctx.svc._vault / vs.CARDS) as conn:
@@ -1221,6 +1256,8 @@ def test_open_card_returns_the_fields_and_the_row_names(vault, _sealed):
         {"extra": "x"},
         {"cvc": _DROP},
         {"exp_month": "12"},
+        {"exp_month": 0},
+        {"exp_month": 13},
         {"single_use": 0},
         {"single_use": True},
         {"merchant": "other.example"},
@@ -1246,6 +1283,15 @@ def test_open_card_refuses_a_blob_copied_from_another_row(vault, _sealed):
         )
     with pytest.raises(vs.VaultError, match="damaged or not this row"):
         vrs.open_card(refs["scoped"], x25519.Identity.from_str(_sealed[1]), path)
+
+
+def test_open_card_refuses_a_last4_that_is_not_the_sealed_number(vault, _sealed):
+    path, refs = vault
+    with sqlite3.connect(path / vs.CARDS) as conn:
+        conn.execute("UPDATE cards SET last4 = '0000' WHERE card_ref = ?", (refs["scoped"],))
+    with pytest.raises(vs.VaultError, match="damaged or not this row") as info:
+        vrs.open_card(refs["scoped"], x25519.Identity.from_str(_sealed[1]), path)
+    assert info.value.__cause__ is None and info.value.__context__ is None
 
 
 def test_open_card_with_the_wrong_key_says_nothing_of_the_card(vault):

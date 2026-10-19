@@ -24,7 +24,10 @@ never returns, and every op first settles a release that is due or whose
 requester has exited.
 
 The claim decrypts the card in a thread (``vault_store.open_card``) and
-re-checks the host rule against the blob's authenticated merchant. Once it
+re-checks the host rule against the blob's authenticated merchant. It refuses
+a card past its sealed expiry month (UTC, the rule ``vault add`` applies), and
+a card whose label and last four are no longer the ones the tap showed
+(``open_card`` binds the last four to the sealed number). Once it
 passes the epoch check after the decrypt, the claim completes: a lock landing
 later does not take back values already decided. A single-use card is retired
 after the ``release_claimed`` row and before the reply; if that fails nothing
@@ -60,6 +63,7 @@ import unicodedata
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis.payments import approval
@@ -103,6 +107,7 @@ class _Release:
     peer: Peer
     epoch: int
     deadline: float  # on the service clock
+    card_shown: tuple[str, str]  # (label, last4) as the tap showed them
     state: str = PENDING
     decided: bool = False  # a claim past its epoch check completes
     task: asyncio.Task | None = None
@@ -152,6 +157,10 @@ def _origins(value) -> dict[str, str]:
         text = host if scheme == "https" else f"{scheme}://{host}"
         shown[key] = text + (f":{int(port)}" if port else "")
     return shown
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _in_scope(host: str, merchant: str | None, single_use: bool) -> bool:
@@ -365,6 +374,7 @@ class ReleaseManager:
             peer=peer,
             epoch=epoch,
             deadline=svc._clock() + PENDING_BACKSTOP_S,
+            card_shown=(row["label"], row["last4"]),
             row=facts,
         )
         if svc._stopped or epoch != svc._epoch or not svc.unlocked:  # locked during the row
@@ -512,6 +522,15 @@ class ReleaseManager:
             del card
             await self._refuse_slot(rel, "the host is outside the card's merchant")
             return {"ok": False, "error": "the host is outside the card's merchant"}
+        refusal, now = None, _now()
+        if (card["exp_year"], card["exp_month"]) < (now.year, now.month):
+            refusal = "the card has expired"  # valid through its expiry month, as add_card has it
+        elif (card["label"], card["last4"]) != rel.card_shown:
+            refusal = "the card is not the one shown in the approval"
+        if refusal is not None:
+            del card
+            await self._refuse_slot(rel, refusal)
+            return {"ok": False, "error": refusal}
         if not await self._row(
             "release_claimed", {**rel.row, "pending_retire": card["single_use"]}
         ):

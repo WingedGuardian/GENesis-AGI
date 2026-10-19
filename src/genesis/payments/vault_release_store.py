@@ -37,7 +37,9 @@ def open_card(card_ref: str, identity, path: Path | None = None) -> dict:
     Returns the blob's fields plus the row's label and last four. The blob must
     be version ``vault_store.BLOB_VERSION``, hold exactly the keys ``add_card`` seals, and
     name this row's card_ref, merchant and single-use flag (a blob copied to
-    another row, or a row re-scoped in the clear, is refused). Every error is a
+    another row, or a row re-scoped in the clear, is refused); its expiry month
+    must be 1-12, and the row's clear last four must be its number's last four
+    (the label is not sealed and is not checked). Every error is a
     fixed-text VaultError: never pyrage's or json's message, never a value.
     """
     from pyrage import decrypt
@@ -73,10 +75,15 @@ def open_card(card_ref: str, identity, path: Path | None = None) -> dict:
         or isinstance(secret["v"], bool)
         or isinstance(secret["exp_month"], bool)
         or isinstance(secret["exp_year"], bool)
+        # Value checks only after the type checks above: a TypeError here
+        # would carry the plaintext in its __context__.
+        or not 1 <= secret["exp_month"] <= 12
         or secret["v"] != vs.BLOB_VERSION
         or secret["card_ref"] != card_ref
         or secret["merchant"] != merchant
         or secret["single_use"] is not bool(single_use)
+        # The clear last four are what the approval shows: they must be the sealed number's.
+        or secret["number"][-4:] != last4
     ):
         del secret
         raise vs.VaultError(_DAMAGED_BLOB) from None
