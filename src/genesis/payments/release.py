@@ -122,7 +122,9 @@ _EXPIRY_KEYS = ("exp_month", "exp_year")  # one "expiry" field is both
 #: that render as nothing. Most are category Cf/Cn and dropped anyway; this
 #: catches the rest (Mn variation selectors, U+034F, Hangul fillers, U+115F/60).
 _DEFAULT_IGNORABLE = re.compile(
-    "[­͏؜ᅟᅠ឴឵᠋-᠏​-‏‪-‮⁠-⁯ㅤ︀-️﻿ﾠ￰-￸\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+    r"[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f"
+    r"\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8"
+    r"\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
 )
 _CLAIM_HASH = re.compile(r"[0-9a-f]{64}")
 _NONCE = re.compile(r"[A-Za-z0-9_-]{1,64}")
