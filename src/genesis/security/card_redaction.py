@@ -370,12 +370,19 @@ class CardRedactingFilter(logging.Filter):
 
     _WITHHELD = "[log record withheld: it could not be checked for card numbers]"
 
+    #: A JSON or Python escape of an ASCII digit (``4``, ``\\u0034``).
+    #: :func:`redact_text` parses JSON only when the whole text is JSON, so a
+    #: log line that PREFIXES JSON (``payload: {...}``) would keep escaped
+    #: card digits. A log line is read by people, so the digits are unescaped
+    #: before the check: the line reads the same and the card pass sees them.
+    _DIGIT_ESCAPE = re.compile(r"\\+u003([0-9])")
+
     def _redact(self, text: str) -> str:
         """``text`` through :func:`redact_text` (a card split across
-        separators, or spelled as JSON escapes, included). A redactor that
+        separators, or spelled as digit escapes, included). A redactor that
         raises withholds the whole text."""
         try:
-            return redact_text(text)
+            return redact_text(self._DIGIT_ESCAPE.sub(r"\1", text))
         except Exception:
             return self._WITHHELD
 

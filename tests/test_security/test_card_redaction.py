@@ -284,6 +284,20 @@ class TestFilterReadsSplitCards:
         f.filter(record)
         assert "\\u0034" not in record.getMessage() and REDACTED in record.getMessage()
 
+    @pytest.mark.parametrize("backslashes", [1, 2])
+    def test_escaped_card_digits_after_a_prefix_are_redacted(self, backslashes):
+        # redact_text parses JSON only when the whole text is JSON; a log line
+        # that prefixes it ("payload: {...}") must not keep escaped digits.
+        esc = "".join("\\" * backslashes + f"u{ord(c):04x}" for c in _CARD)
+        f = CardRedactingFilter()
+        record = logging.LogRecord(
+            "t", logging.INFO, __file__, 1, 'payload: {"n": "%s"}', (esc,), None
+        )
+        f.filter(record)
+        text = record.getMessage()
+        assert _CARD not in _digits(text), text
+        assert "u003" not in text and REDACTED in text
+
     @pytest.mark.parametrize("spelled", _SPLIT_SPELLINGS)
     def test_a_split_card_in_a_traceback_is_redacted(self, spelled):
         f = CardRedactingFilter()
