@@ -201,6 +201,27 @@ class PaymentApprovalRegistry:
             return False
         return await asyncio.shield(self._spawn(event, detail))
 
+    async def _complete(self, *writes: asyncio.Task | tuple[str, dict]) -> bool:
+        """Cleanup writes, in order, run to the end; True if a cancel arrived meanwhile.
+
+        For a cleanup or cancel path. Each write is a held task (or an
+        ``(event, detail)`` pair, spawned only when its turn comes) awaited
+        through a shield in a loop, so a further cancel never reaches the write
+        and never skips the next one. The caller re-raises once afterwards.
+        """
+        cancelled = False
+        for write in writes:
+            if isinstance(write, tuple):
+                if self._audit is None:
+                    continue
+                write = self._spawn(*write)
+            while not write.done():
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    cancelled = True
+        return cancelled
+
     def _spawn(self, event: str, detail: dict) -> asyncio.Task:
         task = asyncio.ensure_future(self._write(event, detail))
         self._writes.add(task)  # held, so a write its caller abandoned is not collected
@@ -239,8 +260,9 @@ class PaymentApprovalRegistry:
         try:
             requested = bool(write) and await asyncio.shield(write)
         except asyncio.CancelledError:
-            await write
-            await self._record("approval_refused", {**detail, "reason": "requester cancelled"})
+            await self._complete(
+                write, ("approval_refused", {**detail, "reason": "requester cancelled"})
+            )
             raise
         if not requested:
             return REFUSED  # no trail, no request: nothing was sent
@@ -299,7 +321,10 @@ class PaymentApprovalRegistry:
             self._pending.pop(nonce, None)
             if not pending.future.done():  # the requester was cancelled: no grant can land
                 pending.future.cancel()
-                await self._record("approval_refused", {**detail, "reason": "requester cancelled"})
+                if await self._complete(
+                    ("approval_refused", {**detail, "reason": "requester cancelled"})
+                ):
+                    raise asyncio.CancelledError  # a further cancel, re-raised once
 
     def _mismatch(self, pending: _Pending, user_id: int | None, message) -> str | None:
         """Why this tap must not grant, or None."""
@@ -356,10 +381,10 @@ class PaymentApprovalRegistry:
             # and closes its trail.
             if not pending.future.done():
                 pending.future.set_result(REFUSED)
-                if not closed:
-                    await self._record(
-                        "approval_refused", {**pending.detail, "reason": "tap interrupted"}
-                    )
+                if not closed and await self._complete(
+                    ("approval_refused", {**pending.detail, "reason": "tap interrupted"})
+                ):
+                    raise asyncio.CancelledError  # a further cancel, re-raised once
 
 
 async def start_payment_services(runtime):
