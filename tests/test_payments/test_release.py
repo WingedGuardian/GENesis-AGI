@@ -45,6 +45,8 @@ SECRET = "claim-secret-for-tests"
 CLAIM_HASH = hashlib.sha256(SECRET.encode()).hexdigest()
 HOST = "shop.example.com"
 ORIGINS = {"number": "https://js.stripe.com", "cvc": "https://js.stripe.com"}
+AMOUNT, TITLE, BUTTON = "12.00 USD", "Checkout", "Pay 12.00 USD"
+ALSO = ["name", "email"]  # out of the allowlist's order: the tap shows it in that order
 
 
 def _exp_year() -> int:
@@ -172,10 +174,12 @@ class Ctx:
             "op": "release_request",
             "card_ref": self.refs["scoped"],
             "host": HOST,
-            "page_title": "Checkout",
-            "amount": "12.00 USD",
+            "page_title": TITLE,
+            "amount": AMOUNT,
             "claim_hash": CLAIM_HASH,
             "field_origins": ORIGINS,
+            "button_label": BUTTON,
+            "also_filled": ALSO,
         }
         payload.update(over)
         return await self.ask({k: v for k, v in payload.items() if v is not _DROP})
@@ -241,9 +245,14 @@ async def ctx(db, vault, tmp_path, _sealed, caplog):
 
 
 async def _sweep(c: Ctx, log_text: str) -> None:
-    """No card value in any row, log line, non-claim reply, tap field or notice."""
+    """No card value in any row, log line, non-claim reply, tap field or notice.
+
+    Rows also never hold the request's free text (amount, title, button label).
+    """
     year = str(_exp_year())
     texts = [json.dumps(e) for e in await c.events()]
+    for text in texts:
+        assert AMOUNT not in text and BUTTON not in text and TITLE not in text, text[:200]
     texts += [log_text, json.dumps(c.replies)]
     texts += [json.dumps(call) for call in c.reg.calls] + c.reg.notices
     bounded = [
@@ -265,14 +274,26 @@ async def test_a_request_shows_the_tap_and_reads_pending(ctx):
     assert reply["ok"] and re.fullmatch(r"[A-Za-z0-9_-]{22}", reply["nonce"])
     await _until(lambda: ctx.reg.calls)
     fields, detail, timeout_s = ctx.reg.calls[0]
-    assert list(fields) == ["Site", "Amount", "Card", "Requester", "Page title", "Fields"]
+    assert list(fields) == [
+        "Site",
+        "Amount",
+        "Card",
+        "Requester",
+        "Page title",
+        "Button",
+        "Fields",
+        "Also filled",
+    ]
     assert fields["Site"] == HOST
     assert fields["Amount"] == "12.00 USD (as stated by Genesis)"
     assert fields["Card"] == "Test card ending 4242"
     assert fields["Requester"] == (
         f"python pid {os.getpid()}, foreground session (claude pid 4321)"
     )
+    assert fields["Page title"] == TITLE
+    assert fields["Button"] == BUTTON
     assert fields["Fields"] == "cvc=js.stripe.com, number=js.stripe.com"
+    assert fields["Also filled"] == "email, name"
     assert detail == {"release": reply["nonce"], "card_ref": ctx.refs["scoped"], "host": HOST}
     assert timeout_s == rl.APPROVAL_TIMEOUT_S == ap.DEFAULT_TIMEOUT_S
     status = await ctx.status(reply["nonce"])
@@ -976,6 +997,18 @@ async def test_recent_outcomes_are_bounded(ctx):
         ({"amount": "12\n00"}, "bad amount"),
         ({"amount": 12}, "bad amount"),
         ({"page_title": None}, "bad page_title"),
+        ({"button_label": 5}, "bad button_label"),
+        ({"button_label": ["Pay"]}, "bad button_label"),
+        ({"button_label": "(not given)"}, "bad button_label"),  # posing as an absent label
+        ({"button_label": " (not​ given) "}, "bad button_label"),
+        ({"also_filled": "email"}, "bad also_filled"),
+        ({"also_filled": ["password"]}, "bad also_filled"),
+        ({"also_filled": ["Email"]}, "bad also_filled"),
+        ({"also_filled": ["email", "email"]}, "bad also_filled"),
+        ({"also_filled": [5]}, "bad also_filled"),
+        ({"also_filled": {"email": "x"}}, "bad also_filled"),
+        ({"also_filled": ["cvc"]}, "bad also_filled"),
+        ({"also_filled": ["email", VISA]}, "bad also_filled"),
         ({"field_origins": {}}, "bad field_origins"),
         ({"field_origins": {"pin": "https://a.example.com"}}, "bad field_origins"),
         ({"field_origins": {"number": "ftp://a.example.com"}}, "bad field_origins"),
@@ -991,6 +1024,11 @@ async def test_recent_outcomes_are_bounded(ctx):
         ({"page_title": "Pay " + VISA}, "the approval text was refused"),
         (
             {"page_title": "Order " + "-".join(THREEDS[i : i + 4] for i in range(0, 16, 4))},
+            "the approval text was refused",
+        ),
+        ({"button_label": "Pay " + VISA}, "the approval text was refused"),
+        (
+            {"button_label": " ".join(THREEDS[i : i + 4] for i in range(0, 16, 4))},
             "the approval text was refused",
         ),
     ],
@@ -1063,17 +1101,23 @@ async def test_the_amount_and_title_reach_the_rows_only_as_lengths(ctx):
     short = "4321"  # a CVC-shaped value, made per run; never one a row holds anyway
     while short in {"4321", str(os.getpid())}:  # claude_pid and pid are in every row
         short = str(secrets.randbelow(9000) + 1000)
-    amount, title = f"{short} USD", f"Pay {short} now"
-    nonce = await ctx.granted(amount=amount, page_title=title)
+    amount, title, button = f"{short} USD", f"Pay {short} now", f"Pay {short}"
+    nonce = await ctx.granted(amount=amount, page_title=title, button_label=button)
     assert ctx.reg.calls[-1][0]["Amount"].startswith(amount)  # the tap is unchanged
     assert ctx.reg.calls[-1][0]["Page title"] == title
+    assert ctx.reg.calls[-1][0]["Button"] == button
     assert (await ctx.claim(nonce))["ok"]
     bounded = re.compile(rf"(?<![0-9A-Za-z_-]){short}(?![0-9A-Za-z_-])")
     for event in await ctx.events():
         assert not bounded.search(json.dumps(event)), event["event"]
     row = [e for e in await ctx.events() if e["event"] == "release_requested"][0]["detail"]
-    assert row["field_lengths"] == {"amount": len(amount), "page_title": len(title)}
-    assert "amount" not in row and "page_title" not in row
+    assert row["field_lengths"] == {
+        "amount": len(amount),
+        "page_title": len(title),
+        "button_label": len(button),
+    }
+    assert "amount" not in row and "page_title" not in row and "button_label" not in row
+    assert row["also_filled"] == ["email", "name"]  # names only, never values
     assert (row["host"], row["card_ref"]) == (HOST, ctx.refs["scoped"])
     assert row["field_origins"] == {"cvc": "js.stripe.com", "number": "js.stripe.com"}
 
@@ -1094,6 +1138,76 @@ async def test_the_title_is_sanitised(ctx, title, shown):
     assert (await ctx.request(page_title=title))["ok"]
     await _until(lambda: ctx.reg.calls)
     assert ctx.reg.calls[0][0]["Page title"] == shown
+
+
+@pytest.mark.parametrize(
+    ("label", "shown"),
+    [
+        ("Pay $999.00", "Pay $999.00"),
+        ("Pay\u202e999", "Pay999"),
+        ("Sub\u200dscr\u200bibe", "Subscribe"),
+        ("Pay\n now\t", "Pay now"),
+        ("", "(no label)"),
+        ("  \n\u200b ", "(no label)"),
+        ("Pay now \x85x", "Pay now x"),  # line and paragraph separators, NEL
+        ("x" * 200, "x" * 40),
+        ("x" * 41, "x" * 40),
+        ("x" * 40, "x" * 40),
+        ("x" * 39 + " yz", "x" * 39),  # a cut that ends on a space drops it
+        ("Payer \u00e9", "Payer \u00e9"),
+    ],
+)
+async def test_the_button_label_is_sanitised_and_capped(ctx, label, shown):
+    assert rl._BUTTON_CHARS == 40
+    assert (await ctx.request(button_label=label))["ok"]
+    await _until(lambda: ctx.reg.calls)
+    assert ctx.reg.calls[0][0]["Button"] == shown
+    row = [e for e in await ctx.events() if e["event"] == "release_requested"][0]["detail"]
+    assert row["field_lengths"]["button_label"] == len(shown)
+
+
+@pytest.mark.parametrize("absent", [_DROP, None])
+async def test_a_button_label_not_given_says_so_in_the_tap(ctx, absent):
+    assert (await ctx.request(button_label=absent))["ok"]
+    await _until(lambda: ctx.reg.calls)
+    assert ctx.reg.calls[0][0]["Button"] == "(not given)"
+    row = [e for e in await ctx.events() if e["event"] == "release_requested"][0]["detail"]
+    assert row["field_lengths"]["button_label"] is None
+
+
+@pytest.mark.parametrize(
+    ("names", "shown"),
+    [
+        (_DROP, "none"),
+        (None, "none"),
+        ([], "none"),
+        (["country", "email"], "email, country"),
+        (
+            ["company", "country", "postal_code", "region", "city"]
+            + ["address_line2", "address_line1", "phone", "name", "email"],
+            "email, name, phone, address_line1, address_line2, city, region,"
+            " postal_code, country, company",
+        ),
+    ],
+)
+async def test_the_also_filled_line_names_the_extra_fields(ctx, names, shown):
+    assert rl.FILL_NAMES == (
+        "email",
+        "name",
+        "phone",
+        "address_line1",
+        "address_line2",
+        "city",
+        "region",
+        "postal_code",
+        "country",
+        "company",
+    )
+    assert (await ctx.request(also_filled=names))["ok"]
+    await _until(lambda: ctx.reg.calls)
+    assert ctx.reg.calls[0][0]["Also filled"] == shown
+    row = [e for e in await ctx.events() if e["event"] == "release_requested"][0]["detail"]
+    assert row["also_filled"] == ([] if shown == "none" else shown.split(", "))
 
 
 @pytest.mark.parametrize(
