@@ -54,8 +54,10 @@ send any text without the `TEST:` line.
        --merchant <domain from step 4>
    ```
 
-   `--home` must be new and on the same disk as `~/.genesis` (teardown uses
-   the Genesis trash).
+   `--home` must be new, on the same disk as `~/.genesis` and not under the
+   Claude Code temp directory (teardown uses the Genesis trash), and short
+   enough that `<home>/home/.genesis/run/payment_vault.sock` can be bound (a
+   Unix socket path is limited to about 108 bytes). Setup refuses otherwise.
 6. Close any browser another session has open (or wait for its idle reclaim):
    `serve` refuses while one runs, and a release is refused while one runs.
 7. In one terminal: `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py serve --home ~/tmp/payment-test-vault`.
@@ -69,8 +71,9 @@ send any text without the `TEST:` line.
 9. Approve in the **test bot's** chat. Check the `TEST:` line is there.
 10. Ctrl-C the serve, then
     `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py teardown --home ~/tmp/payment-test-vault`.
-    It stops a running serve, removes the overlay if unchanged, and moves the
-    directory to the Genesis trash.
+    It stops a running serve and moves the directory to the Genesis trash, then
+    removes the overlay if it is still the file setup wrote. If the trash
+    refuses the directory, nothing is removed and teardown can be run again.
 
 ## Refusals
 
@@ -79,15 +82,15 @@ Each refusal prints its code.
 | Code | Refuses |
 |---|---|
 | R1 | (computes the live paths: `~/.genesis`, the operator's and genesis-server's `GENESIS_HOME`, every listening `payment_vault.sock`) |
-| R2 | A test directory equal to, inside, or holding a live Genesis home; an existing one at setup; one without the harness marker later; a teardown of one holding entries setup never made; a test audit database (or its `-wal`/`-shm`) that is a link, has a second hard link, or is a live database |
-| R3 | A test socket whose directory resolves outside the test directory or to a live run directory, a file there sharing a live socket's inode, or a listener already there |
+| R2 | A test directory equal to, inside, or holding a live Genesis home; an existing one at setup; one without the harness marker later; a teardown of one holding entries setup never made; a new one on another volume than the Genesis trash or on the Claude Code temp volume; a serve while another serve or a teardown holds the directory's lifecycle lock (and a teardown while a serve holds it); a test audit database (or its `-wal`/`-shm`) that is a link, has a second hard link, or is a live database |
+| R3 | A test socket whose directory resolves outside the test directory or to a live run directory, a file there sharing a live socket's inode, or a listener already there; at setup, a socket path that cannot be bound |
 | R4 | A test vault holding anything but the one `TEST 4242` card setup added |
 | R5 | (by construction: no option, stdin or file takes card data) |
 | R6 | A passphrase file that is a symlink or not 0600 |
 | R7 | A release from a test MCP whose `HOME`, `GENESIS_HOME`, `GENESIS_DB_PATH`, `XDG_CACHE_HOME` or `SECRETS_PATH` is outside the test directory, whose `GENESIS_REPO_ROOT` is not the worktree, or that has a session bus, a `PYTHON*` variable or a bot token |
 | R8 | A test peer policy that names the main venv python or the main server script |
 | R9 | A worktree that is the main checkout, on `main`, the copy the harness itself imports, or nested with the test directory |
-| R10 | A card-fill overlay outside the worktree's `config/`, or over an existing file |
+| R10 | A card-fill overlay outside the worktree's `config/`, or over an existing file; a serve whose overlay is missing, changed, or not the file setup wrote (setup records its inode and change time). Teardown removes only that file |
 | Q16 | A serve or a release while a browser not started by the test MCP runs |
 
 Also refused: a test bot token whose bot id matches any other `*BOT_TOKEN*`

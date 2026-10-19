@@ -135,6 +135,10 @@ class Layout:
         return self.root / "serve.pid"
 
     @property
+    def lock(self) -> Path:
+        return self.root / "serve.lock"
+
+    @property
     def mcp_json(self) -> Path:
         return self.root / "mcp.json"
 
@@ -157,6 +161,12 @@ class Layout:
     @property
     def genesis_home(self) -> Path:
         return self.home / ".genesis"
+
+    @property
+    def cc_flag(self) -> Path:
+        # The health MCP serves its tools only when $HOME/.genesis/cc_context_enabled
+        # exists (scripts/genesis_mcp_server.py is_genesis_enabled), else a stub.
+        return self.genesis_home / "cc_context_enabled"
 
     @property
     def vault(self) -> Path:
@@ -304,6 +314,58 @@ def check_placement(layout: Layout, live: Live, *, new: bool) -> None:
     read_marker(layout)
 
 
+def check_trashable(layout: Layout) -> None:
+    """R2 at setup: teardown can move the new directory into the Genesis trash.
+
+    The trash renames, never copies: an item on another volume, or on the Claude
+    Code temp volume, is refused (genesis.trash), so teardown could never remove it.
+    """
+    import genesis.trash as gt
+    from genesis.env import genesis_home
+
+    parent = layout.root.parent
+    trash_parent = gt.home_trash_root().parent
+    try:
+        same = os.stat(parent).st_dev == os.stat(trash_parent).st_dev
+    except OSError as exc:
+        raise Refused(
+            f"R2: {parent} cannot be compared with the Genesis trash ({exc.strerror})"
+        ) from None
+    if not same:
+        raise Refused(
+            f"R2: {layout.root} would be on another volume than the Genesis trash "
+            f"({trash_parent}), so teardown could not remove it"
+        )
+    if _inside(parent, Path(os.path.realpath(genesis_home() / "cc-tmp"))):
+        raise Refused(
+            f"R2: {layout.root} would be on the Claude Code temp volume, which the "
+            "Genesis trash refuses, so teardown could not remove it"
+        )
+
+
+def hold_lifecycle_lock(layout: Layout) -> int:
+    """An exclusive lock on the directory's lifecycle: one serve, or one teardown, at a time.
+
+    Held from before the socket check until the serve's cleanup is done, so two
+    serves cannot both pass the check and race to bind, and a teardown cannot
+    trash a directory a serve still uses. The fd is the caller's to close.
+    """
+    import fcntl
+
+    try:
+        fd = os.open(layout.lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        raise Refused(f"R2: the lifecycle lock cannot be opened ({exc.strerror})") from None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise Refused(
+            "serve: another serve (or a teardown) holds this test directory; stop it first"
+        ) from None
+    return fd
+
+
 def read_marker(layout: Layout) -> str:
     try:
         info = os.lstat(layout.marker)
@@ -344,6 +406,25 @@ def check_socket(layout: Layout, live: Live) -> None:
             raise Refused("R3: the file at the test socket path is a live vault socket")
     if not stat.S_ISSOCK(here.st_mode):
         raise Refused("R3: something other than a socket is at the test socket path")
+
+
+def check_socket_bindable(layout: Layout) -> None:
+    """R3 at setup: the socket path binds (AF_UNIX paths are short), so serve can start."""
+    import socket
+
+    vs.ensure_private_dir(layout.socket.parent)
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.bind(str(layout.socket))
+    except OSError as exc:
+        raise Refused(
+            f"R3: the test socket path ({len(os.fsencode(layout.socket))} bytes) cannot be "
+            f"bound ({exc}); run teardown, then setup with a shorter --home"
+        ) from None
+    else:
+        os.unlink(layout.socket)
+    finally:
+        probe.close()
 
 
 def check_vault_content(layout: Layout, merchant: str) -> str:
@@ -459,6 +540,44 @@ def overlay_path(worktree: Path, main_root: Path) -> Path:
     return path
 
 
+def overlay_is_ours(state: dict) -> bool:
+    """The file at the recorded overlay path is the one setup wrote: same inode, same text.
+
+    The inode and its change time pin the file itself (a freed inode number can
+    be reused), so a state file edited to name another checkout's overlay, or a
+    file put back in its place, does not match even when the text does.
+    """
+    ident = state.get("overlay_id")
+    if not state.get("overlay") or not ident:
+        return False
+    try:
+        fd = os.open(state["overlay"], os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    with os.fdopen(fd) as f:
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode) or [info.st_dev, info.st_ino, info.st_ctime_ns] != list(
+            ident
+        ):
+            return False
+        try:
+            return f.read() == overlay_text(state["marker"])
+        except (OSError, ValueError):
+            return False
+
+
+def check_overlay(state: dict, worktree: Path, main_root: Path) -> None:
+    """R10 at serve: the overlay setup wrote is still in place and unchanged."""
+    path = overlay_path(worktree, main_root)
+    if str(path) != state.get("overlay"):
+        raise Refused("R10: the state file names an overlay that is not the worktree's")
+    if not overlay_is_ours(state):
+        raise Refused(
+            f"R10: {path} is missing or changed since setup, so the run would not test "
+            "card fill as setup configured it; run teardown and setup again"
+        )
+
+
 # -- setup --------------------------------------------------------------------
 
 
@@ -550,6 +669,7 @@ def setup(
     venv=make_venv,
 ) -> dict:
     check_placement(layout, live, new=True)
+    check_trashable(layout)
     wt = check_worktree(worktree, layout, main_root=main_root, running=running)
     try:
         merchant = vs.normalise_merchant(merchant)
@@ -565,6 +685,8 @@ def setup(
     venv(layout, wt)
     for d in (layout.home, layout.genesis_home, layout.cache):
         d.mkdir(mode=0o700)
+    check_socket_bindable(layout)
+    _write_private(layout.cc_flag, "")
     passphrase = secrets.token_urlsafe(32)
     _write_private(layout.passphrase, passphrase + "\n")
     vs.init_vault(passphrase, layout.vault)
@@ -595,6 +717,13 @@ def setup(
     # Recorded before it is written, so teardown finds an overlay a failed setup left.
     _write_private_replace(layout.state, json.dumps(state, indent=2) + "\n")
     _write_private(overlay, overlay_text(marker))
+    info = os.lstat(overlay)
+    state["overlay_id"] = [
+        info.st_dev,
+        info.st_ino,
+        info.st_ctime_ns,
+    ]  # what teardown may remove (overlay_is_ours)
+    _write_private_replace(layout.state, json.dumps(state, indent=2) + "\n")
     check_vault_content(layout, merchant)
     state["phase"] = "ready"
     _write_private_replace(layout.state, json.dumps(state, indent=2) + "\n")
@@ -879,10 +1008,16 @@ async def run_serve(
             await on_ready(service, registry)
         await stop.wait()
     finally:
-        await telegram.stop()
-        if started:
-            await service.stop()
-        await db.close()
+        # Each step runs whatever the one before raised: the vault is locked and
+        # its socket gone even when the bot's shutdown fails.
+        try:
+            await telegram.stop()
+        finally:
+            try:
+                if started:
+                    await service.stop()
+            finally:
+                await db.close()
 
 
 # -- teardown -------------------------------------------------------------------
@@ -939,7 +1074,17 @@ def stop_running_serve(
 
 
 _ROOT_ENTRIES = frozenset(
-    {MARKER, "state.json", "passphrase", "serve.pid", "mcp.json", "venv", "cache", "home"}
+    {
+        MARKER,
+        "state.json",
+        "passphrase",
+        "serve.pid",
+        "serve.lock",
+        "mcp.json",
+        "venv",
+        "cache",
+        "home",
+    }
 )
 
 
@@ -954,27 +1099,32 @@ def teardown(
     if extra:
         raise Refused(f"R2: {layout.root} holds entries setup never made ({', '.join(extra)})")
     stop_running_serve(layout, server_pid=server_pid)
-    done = []
+    # A serve that left no pidfile still holds the lock. It is released before the
+    # trash, whose own scan refuses a directory any process has open (ours included).
+    os.close(hold_lifecycle_lock(layout))
+    overlay = None
     if state.get("overlay"):
         overlay = Path(state["overlay"])
         if overlay != overlay_path(Path(state["worktree"]), main_root):  # R10 again
             raise Refused("R10: the state file names an overlay that is not the worktree's")
-        try:
-            ours = overlay.read_text() == overlay_text(state["marker"])
-        except OSError:
-            ours = False
-        if ours:
-            overlay.unlink()
-            done.append(f"removed {overlay}")
-        elif overlay.exists():
-            done.append(f"left {overlay} in place: it changed since setup")
+    # The directory goes first: when the trash refuses it, nothing has been
+    # removed yet and teardown can simply be run again.
     try:
         trash(
-            layout.root, reason="payment test-vault harness teardown", caller="payments_test_vault"
+            layout.root,
+            reason="payment test-vault harness teardown",
+            caller="payments_test_vault",
         )
     except TrashRefused as exc:
         raise Refused(f"teardown: the trash refused {layout.root} ({exc})") from None
-    done.append(f"moved {layout.root} to the Genesis trash")
+    done = [f"moved {layout.root} to the Genesis trash"]
+    if overlay is not None and overlay_is_ours(state):
+        overlay.unlink()
+        done.append(f"removed {overlay}")
+    elif overlay is not None and os.path.lexists(overlay):
+        done.append(
+            f"left {overlay} in place: it changed since setup or is not the file setup wrote"
+        )
     return done
 
 
@@ -1011,17 +1161,25 @@ def _cli_live(layout: Layout, *, exclude: bool) -> tuple[Live, int | None]:
 
 
 def _serve(layout: Layout, timeout_cap_s: float) -> None:
-    from genesis.env import secrets_path
-
     live, _server = _cli_live(layout, exclude=True)
     check_placement(layout, live, new=False)
+    lock = hold_lifecycle_lock(layout)
+    try:
+        _serve_locked(layout, live, timeout_cap_s)
+    finally:
+        os.close(lock)
+
+
+def _serve_locked(layout: Layout, live: Live, timeout_cap_s: float) -> None:
+    from genesis.env import secrets_path
+
     state = json.loads(layout.state.read_text())
     if state.get("phase") != "ready":
         raise Refused("serve: setup did not finish; run teardown and setup again")
     worktree = check_worktree(
         Path(state["worktree"]), layout, main_root=_main_root(), running=_running()
     )
-    overlay_path(worktree, _main_root())
+    check_overlay(state, worktree, _main_root())
     check_vault_content(layout, state["merchant"])
     check_socket(layout, live)
     check_test_db(layout, live)
@@ -1035,7 +1193,8 @@ def _serve(layout: Layout, timeout_cap_s: float) -> None:
     # Belt and braces: any default path the vault code resolves is the test home's.
     os.environ["GENESIS_HOME"] = str(layout.genesis_home)
     os.environ["GENESIS_DB_PATH"] = str(layout.db)
-    _write_private_replace(layout.pidfile, f"{os.getpid()} {start_of(os.getpid())}\n")
+    mine = f"{os.getpid()} {start_of(os.getpid())}\n"
+    _write_private_replace(layout.pidfile, mine)
 
     async def ready(_service, _registry) -> None:
         print(
@@ -1064,7 +1223,9 @@ def _serve(layout: Layout, timeout_cap_s: float) -> None:
     try:
         asyncio.run(run())
     finally:
-        layout.pidfile.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            if layout.pidfile.read_text() == mine:  # never another process's pidfile
+                layout.pidfile.unlink()
 
 
 def _write_private_replace(path: Path, text: str) -> None:

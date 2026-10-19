@@ -945,13 +945,15 @@ async def test_end_to_end_a_test_mcp_with_a_live_home_is_refused(built):
 # -- teardown ----------------------------------------------------------------------
 
 
-def test_teardown_removes_the_overlay_and_trashes_the_dir(tmp_path, checkouts, built):
+def test_teardown_removes_the_overlay_and_trashes_the_dir(
+    tmp_path, tmp_path_factory, checkouts, built
+):
     main, _wt = checkouts
     overlay = Path(built[1]["overlay"])
     kept = overlay.read_text()
     overlay.unlink()  # the module's run owns it; this test makes its own
     try:
-        layout, _state = _setup(tmp_path, checkouts)
+        layout, _state = _setup(tmp_path_factory.mktemp("td"), checkouts)
         done = H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
         assert not layout.root.exists() and not overlay.exists()
         assert any("trash" in line for line in done)
@@ -961,13 +963,15 @@ def test_teardown_removes_the_overlay_and_trashes_the_dir(tmp_path, checkouts, b
         overlay.write_text(kept)
 
 
-def test_teardown_leaves_a_changed_overlay_and_refuses_an_unmarked_dir(tmp_path, checkouts, built):
+def test_teardown_leaves_a_changed_overlay_and_refuses_an_unmarked_dir(
+    tmp_path, tmp_path_factory, checkouts, built
+):
     main, _wt = checkouts
     overlay = Path(built[1]["overlay"])
     kept = overlay.read_text()
     overlay.unlink()
     try:
-        layout, _state = _setup(tmp_path, checkouts)
+        layout, _state = _setup(tmp_path_factory.mktemp("td"), checkouts)
         overlay.write_text(kept + "# edited\n")
         done = H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
         assert overlay.exists() and any("changed since setup" in line for line in done)
@@ -1041,3 +1045,179 @@ def test_teardown_refuses_a_dir_holding_more_than_setup_made(built):
         assert layout.root.exists() and Path(state["overlay"]).exists()
     finally:
         stray.unlink()
+
+
+# -- review round 1 (Codex, Devin) ----------------------------------------------------
+
+
+@pytest.fixture
+def own_overlay(built):
+    """The worktree's overlay slot, free for this test's own setup; the module's put back."""
+    overlay = Path(built[1]["overlay"])
+    kept = overlay.read_text()
+    overlay.unlink()
+    yield overlay
+    overlay.unlink(missing_ok=True)
+    overlay.write_text(kept)
+
+
+def _setup_fast(root: Path, checkouts, fakehome: Path):
+    """The real setup without the venv build (nothing here imports through it)."""
+    main, wt = checkouts
+    layout = H.layout_for(root)
+    state = H.setup(
+        wt,
+        layout,
+        MERCHANT,
+        main_root=main,
+        running=Path(H.__file__),
+        live=_live(fakehome),
+        engine=fakehome / "camoufox-bin",
+        venv=lambda _layout, _wt: None,
+    )
+    return layout, state
+
+
+def test_setup_enables_the_health_mcp_tools_under_the_test_home(built):
+    """The health MCP serves its tools only when its flag exists under $HOME (else a stub)."""
+    layout, state = built
+    server = Path(__file__).resolve().parents[2] / H.SERVER_SCRIPT
+    probe = (
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('mcp_server_probe', sys.argv[1])\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n"
+        "print(m.is_genesis_enabled())\n"
+    )
+    env = {**os.environ, **H.mcp_env(layout, Path(state["worktree"]), Path("/x/camoufox-bin"))}
+    res = subprocess.run(
+        [sys.executable, "-c", probe, str(server)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == "True"
+
+
+def test_setup_refuses_a_home_the_trash_cannot_take(
+    tmp_path, tmp_path_factory, checkouts, own_overlay, monkeypatch
+):
+    monkeypatch.setattr("genesis.trash.home_trash_root", lambda: Path("/proc/genesis-trash"))
+    with pytest.raises(H.Refused, match="^R2: .* another volume than the Genesis trash"):
+        _setup_fast(tmp_path_factory.mktemp("v") / "testvault", checkouts, tmp_path / "fakehome")
+    assert not (tmp_path / "testvault").exists() and not own_overlay.exists()
+    monkeypatch.setattr("genesis.trash.home_trash_root", lambda: tmp_path / "genesis-trash")
+    monkeypatch.setattr("genesis.env.genesis_home", lambda: tmp_path / "gh")
+    (tmp_path / "gh" / "cc-tmp").mkdir(parents=True)
+    with pytest.raises(H.Refused, match="^R2: .* Claude Code temp volume"):
+        _setup_fast(tmp_path / "gh" / "cc-tmp" / "testvault", checkouts, tmp_path / "fakehome")
+    assert not own_overlay.exists()
+
+
+def test_setup_refuses_a_socket_path_too_long_to_bind(tmp_path, checkouts, own_overlay):
+    root = tmp_path / ("d" * 120) / "testvault"
+    root.parent.mkdir()
+    with pytest.raises(H.Refused, match="^R3: the test socket path .* cannot be bound"):
+        _setup_fast(root, checkouts, tmp_path / "fakehome")
+    assert not own_overlay.exists()
+    assert json.loads((root / "state.json").read_text())["phase"] == "setup"
+
+
+def test_serve_refuses_an_overlay_missing_changed_or_replaced(
+    tmp_path, tmp_path_factory, checkouts, own_overlay
+):
+    main, wt = checkouts
+    _layout, state = _setup_fast(
+        tmp_path_factory.mktemp("v") / "testvault", checkouts, tmp_path / "fakehome"
+    )
+    H.check_overlay(state, wt, main)
+    text = own_overlay.read_text()
+    for change in ("edited", "replaced", "deleted"):
+        own_overlay.unlink()
+        if change != "deleted":
+            own_overlay.write_text(text + "# edited\n" if change == "edited" else text)
+        with pytest.raises(H.Refused, match="^R10: .* missing or changed since setup"):
+            H.check_overlay(state, wt, main)
+
+
+async def test_a_failing_bot_shutdown_still_stops_the_vault(built):
+    layout, state = built
+
+    class BrokenStop(FakeTelegram):
+        async def stop(self) -> None:
+            raise RuntimeError("updater stop failed")
+
+    stop = asyncio.Event()
+
+    async def on_ready(_service, _registry):
+        stop.set()
+
+    before = len(await _rows(layout))
+    with pytest.raises(RuntimeError, match="updater stop failed"):
+        await H.run_serve(
+            layout,
+            state,
+            live=_live(layout.root.parent / "fakehome"),
+            telegram=BrokenStop(),
+            owner=OWNER,
+            timeout_cap_s=30,
+            stop=stop,
+            release_peer=lambda *_a, **_k: None,
+            on_ready=on_ready,
+        )
+    assert not layout.socket.exists()
+    assert "service_stop" in [r["event"] for r in (await _rows(layout))[before:]]
+
+
+def test_one_serve_or_teardown_at_a_time(tmp_path, tmp_path_factory, checkouts, own_overlay):
+    main, _wt = checkouts
+    layout, _state = _setup_fast(
+        tmp_path_factory.mktemp("v") / "testvault", checkouts, tmp_path / "fakehome"
+    )
+    held = H.hold_lifecycle_lock(layout)
+    try:
+        with pytest.raises(H.Refused, match="another serve"):
+            os.close(H.hold_lifecycle_lock(layout))
+        with pytest.raises(H.Refused, match="another serve"):
+            H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
+        assert layout.root.exists() and own_overlay.exists()
+    finally:
+        os.close(held)
+    H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
+    assert not layout.root.exists() and not own_overlay.exists()
+
+
+def test_teardown_removes_nothing_when_the_trash_refuses(
+    tmp_path, tmp_path_factory, checkouts, own_overlay, monkeypatch
+):
+    main, _wt = checkouts
+    layout, _state = _setup_fast(
+        tmp_path_factory.mktemp("v") / "testvault", checkouts, tmp_path / "fakehome"
+    )
+    monkeypatch.setattr("genesis.trash.home_trash_root", lambda: Path("/proc/genesis-trash"))
+    with pytest.raises(H.Refused, match="^teardown: the trash refused"):
+        H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
+    assert layout.root.exists() and own_overlay.exists()
+
+
+def test_teardown_never_removes_another_checkouts_overlay(
+    tmp_path, tmp_path_factory, checkouts, own_overlay
+):
+    main, _wt = checkouts
+    layout, state = _setup_fast(
+        tmp_path_factory.mktemp("v") / "testvault", checkouts, tmp_path / "fakehome"
+    )
+    other = tmp_path / "wt2"
+    _git(main, "worktree", "add", "-q", "-b", f"feat/other-{tmp_path.name}", str(other))
+    try:
+        theirs = other / H.OVERLAY
+        theirs.write_text(H.overlay_text(state["marker"]))  # even the same text
+        edited = {**state, "worktree": str(other), "overlay": str(theirs)}
+        layout.state.write_text(json.dumps(edited))
+        done = H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
+        assert theirs.exists() and any("left" in line for line in done)
+    finally:
+        _git(main, "worktree", "remove", "--force", str(other))
