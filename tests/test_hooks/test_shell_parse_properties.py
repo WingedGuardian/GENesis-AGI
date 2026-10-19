@@ -367,11 +367,6 @@ _BODY_LINE = st.lists(
 ).map("".join)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#3433: a stray backtick in a non-excised quoted heredoc body hides later commands",
-)
 @PROFILE
 @given(st.sampled_from(_HEREDOC_HEADS), st.lists(_BODY_LINE, max_size=6))
 @example(head=("tee out.txt <<'EOF'", "EOF"), body=["x<`"])
@@ -381,3 +376,26 @@ def test_a_command_after_a_quoted_heredoc_stays_visible(
     opener, delimiter = head
     assume(all(line.lstrip("\t") != delimiter for line in body))
     assert _pushes("\n".join([opener, *body, delimiter, shlex.join(_PUSH)]))
+
+
+_CLEAN = ["git", "clean", "-fd"]
+
+
+@PROFILE
+@given(st.sampled_from(_HEREDOC_HEADS), st.lists(_BODY_LINE, max_size=6))
+@example(head=("tee out.txt <<'EOF'", "EOF"), body=["x<`"])
+def test_a_hidden_git_clean_is_a_bound_type_blind_spot(
+    head: tuple[str, str], body: list[str]
+) -> None:
+    """The discard guard refuses only a BOUND-type blind spot, so a command a
+    here-doc body hides must stay visible or be reported as bound-type. The one
+    deliberate exception is a command that does not tokenize at all: that cause
+    is reported first and stays allowed by the discard guard (#2945's measured
+    cost), so it is the only non-bound verdict accepted here."""
+    opener, delimiter = head
+    assume(all(line.lstrip("\t") != delimiter for line in body))
+    segments, blind = sp.analyze_checked("\n".join([opener, *body, delimiter, shlex.join(_CLEAN)]))
+    if _CLEAN in [s.argv for s in segments]:
+        return
+    assert blind is not None
+    assert blind.bounds_induced or blind is sp._BLIND_UNTOKENIZABLE, blind.cause
