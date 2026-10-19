@@ -40,7 +40,17 @@ def main() -> int:
         from genesis.infra_profile import claude_md, store
 
         profile = store.load_profile()
-        changed = claude_md.update_block(profile, ignore_update_gate=True)
+        try:
+            changed = claude_md.update_block(profile, ignore_update_gate=True)
+        except claude_md.MalformedBlockError as exc:
+            # Non-zero, so update.sh prints this instead of "refreshed".
+            print(
+                f"{claude_md.BLOCK_NAME} block left unchanged in "
+                f"{claude_md.CLAUDE_MD_PATH}: {exc}. Each begin marker needs one "
+                "end marker on a later line; fix the markers by hand.",
+                file=sys.stderr,
+            )
+            return 1
         print(json.dumps({"ok": True, "changed": changed}))
         return 0
 

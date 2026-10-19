@@ -1,0 +1,1 @@
+- The PID/task budget alert now names what is holding the budget: the Claude Code sessions, services and cgroups with the most tasks, and a full per-tick breakdown saved under `~/.genesis/logs/pid_snapshots/` while the budget stays at or above 80%.

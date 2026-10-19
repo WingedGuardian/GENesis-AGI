@@ -358,13 +358,13 @@ class TestPrCreateWouldPublish:
             assert guard_module._pr_create_would_publish(["gh", "pr", "create"]) is True
 
 
-# ── _remote_branch_sha / _push_is_republish (first-push gate) ────────
+# ── _remote_branch_sha (pr-create gate) ─────────────────────────────
 
 
 class TestRemoteBranchSha:
     """_remote_branch_sha queries the LIVE remote (git ls-remote) and returns the
-    tip sha for EXACTLY refs/heads/<branch>, else None (fail-safe). Shared by the
-    pr-create gate and the first-push republish gate."""
+    tip sha for EXACTLY refs/heads/<branch>, else None (fail-safe). Used by the
+    pr-create gate."""
 
     def test_exact_ref_returns_sha(self, guard_module):
         with patch.object(
@@ -421,34 +421,6 @@ class TestRemoteBranchSha:
         assert argv[0] == "git" and argv[1] == "ls-remote"
 
 
-class TestPushIsRepublish:
-    """_push_is_republish: True iff the branch is already on the remote (published
-    and approved on its first push). Fail-safe to False (→ prompt) on any
-    uncertainty — an unresolved remote/branch never triggers a network call."""
-
-    def test_present_is_republish(self, guard_module):
-        with patch.object(guard_module, "_remote_branch_sha", return_value="abc123"):
-            assert guard_module._push_is_republish("origin", "feat") is True
-
-    def test_absent_is_not_republish(self, guard_module):
-        with patch.object(guard_module, "_remote_branch_sha", return_value=None):
-            assert guard_module._push_is_republish("origin", "feat") is False
-
-    def test_none_remote_short_circuits(self, guard_module):
-        # unresolved remote → never republish; must NOT touch the remote.
-        with patch.object(guard_module, "_remote_branch_sha", side_effect=AssertionError):
-            assert guard_module._push_is_republish(None, "feat") is False
-
-    def test_none_branch_short_circuits(self, guard_module):
-        with patch.object(guard_module, "_remote_branch_sha", side_effect=AssertionError):
-            assert guard_module._push_is_republish("origin", None) is False
-
-    def test_cwd_forwarded(self, guard_module):
-        with patch.object(guard_module, "_remote_branch_sha", return_value="x") as srch:
-            guard_module._push_is_republish("origin", "feat", cwd="/wt")
-        assert srch.call_args_list[0].kwargs.get("cwd") == "/wt"
-
-
 class TestPushPositionals:
     """_push_positionals extracts [remote, refspec, ...] from a quote-stripped push
     argv, correctly skipping no-value flags (-u/--set-upstream — which do NOT eat
@@ -493,10 +465,7 @@ class TestPushPositionals:
 
 
 class TestPushConfigIsSimple:
-    """_push_config_is_simple: True only when NO config broadens a bare/remote-only
-    push — no `remote.<remote>.push` refspec, push.default in {unset, simple,
-    current}, and no submodule push-recursion. Fail-CLOSED on any config-read
-    error / unresolved remote."""
+    """The full offline predicate retained from origin/main."""
 
     def test_all_unset_is_simple(self, guard_module):
         with patch.object(guard_module.subprocess, "run", side_effect=_config_run({})):
@@ -533,8 +502,8 @@ class TestPushConfigIsSimple:
             assert guard_module._push_config_is_simple("origin") is False
 
     def test_push_default_upstream_not_simple(self, guard_module):
-        # Regression (round-3 BLOCKER): upstream pushes cur to a possibly
-        # differently-named upstream branch (e.g. feat → origin/main).
+        # Upstream pushes can target a differently named branch (for example
+        # feat/x -> origin/main).
         with patch.object(
             guard_module.subprocess,
             "run",
@@ -558,6 +527,14 @@ class TestPushConfigIsSimple:
         ):
             assert guard_module._push_config_is_simple("origin") is False
 
+    def test_empty_recurse_is_safe(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.recurseSubmodules": (0, "")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is True
+
     def test_recurse_submodules_check_ok(self, guard_module):
         with patch.object(
             guard_module.subprocess,
@@ -576,7 +553,6 @@ class TestPushConfigIsSimple:
             assert guard_module._push_config_is_simple("origin") is True
 
     def test_push_default_case_insensitive(self, guard_module):
-        # git enum values are case-insensitive — Matching must still be rejected.
         with patch.object(
             guard_module.subprocess,
             "run",
@@ -585,7 +561,6 @@ class TestPushConfigIsSimple:
             assert guard_module._push_config_is_simple("origin") is False
 
     def test_mirror_true_not_simple(self, guard_module):
-        # P1: remote.<remote>.mirror=true → a bare push mirrors ALL refs → not simple.
         with patch.object(
             guard_module.subprocess,
             "run",
@@ -619,32 +594,126 @@ class TestPushConfigIsSimple:
             assert guard_module._push_config_is_simple("origin") is False
 
 
+class TestAdditionalPushConfigIsSimpleCases:
+    """Additional cases for the full push-config gate."""
+
+    def test_all_unset_is_simple(self, guard_module):
+        with patch.object(guard_module.subprocess, "run", side_effect=_config_run({})):
+            assert guard_module._push_config_is_simple("origin") is True
+
+    @pytest.mark.parametrize("value", ["HEAD:main"])
+    def test_custom_push_refspec_not_simple(self, guard_module, value):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"remote.origin.push": (0, value)}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    @pytest.mark.parametrize("key", ["remote.origin.push", "remote.origin.receivepack"])
+    def test_empty_remote_values_match_offline_predicate(self, guard_module, key):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({key: (0, "")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is True
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({key: (0, "")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is True
+
+    def test_mirror_true_not_simple(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"remote.origin.mirror": (0, "true")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    def test_receivepack_set_not_simple(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"remote.origin.receivepack": (0, "/x/helper")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    @pytest.mark.parametrize("value", ["on-demand", "only", "true"])
+    def test_recurse_submodules_unsafe_not_simple(self, guard_module, value):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.recurseSubmodules": (0, value)}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    @pytest.mark.parametrize("value", ["no", "false", "off", "0", "check", ""])
+    def test_recurse_submodules_safe_values_match_offline(self, guard_module, value):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.recurseSubmodules": (0, value)}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is True
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.recurseSubmodules": (0, value)}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is True
+
+    def test_submodule_recurse_true_not_simple(self, guard_module):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"submodule.recurse": (0, "true")}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    @pytest.mark.parametrize("value", ["true", "if-asked", ""])
+    def test_gpg_sign_set_not_simple(self, guard_module, value):
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.gpgSign": (0, value)}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+        with patch.object(
+            guard_module.subprocess,
+            "run",
+            side_effect=_config_run({"push.gpgSign": (0, value)}),
+        ):
+            assert guard_module._push_config_is_simple("origin") is False
+
+    @pytest.mark.parametrize("value", ["false", "no", "off", "0"])
+    def test_gpg_sign_false_values_match_offline(self, guard_module, value):
+        with patch.object(
+            guard_module.subprocess, "run", side_effect=_config_run({"push.gpgSign": (0, value)})
+        ):
+            assert guard_module._push_config_is_simple("origin") is True
+        with patch.object(
+            guard_module.subprocess, "run", side_effect=_config_run({"push.gpgSign": (0, value)})
+        ):
+            assert guard_module._push_config_is_simple("origin") is True
+
+
 class TestPushTargetsCurrentBranch:
-    """_push_targets_current_branch(seg, cur, remote) (ALLOWLIST posture) is True
-    ONLY for a plain current-branch update: bare / `<remote>` (with simple config)
-    or explicit `<remote> <cur>`, carrying only ref-neutral flags. `remote` is the
-    caller-resolved effective push remote. Every cross-name / delete / broadening /
-    unknown-flag / bundled-delete form is False."""
+    """The full config gate and local shape recognize plain current-branch pushes."""
 
     def _t(self, guard_module, cmd, cur):
         return guard_module._push_targets_current_branch(_push_seg(cmd), cur, "origin")
 
-    # ── explicit `<remote> <cur>` → gated on the same config check as bare ──
-    # git remaps a colon-free local-branch refspec through remote.<r>.push and
-    # push.default=upstream, so the explicit form is not config-immune. Pinned
-    # simple here so these rows do not depend on the host repo's own config;
-    # the bare/remote-only rows below patch it themselves.
+    # ── explicit `<remote> <cur>` → local shape and full config gate ──
 
     @pytest.fixture(autouse=True)
-    def _simple_config(self, request, guard_module):
-        name = request.node.name
-        if name.startswith("test_bare_") or "remote_only" in name:
-            yield
-            return
+    def _full_config(self, guard_module):
         with patch.object(guard_module, "_push_config_is_simple", return_value=True):
             yield
 
-    def test_explicit_current_branch_needs_simple_config(self, guard_module):
+    def test_explicit_current_branch_needs_full_config_gate(self, guard_module):
         with patch.object(guard_module, "_push_config_is_simple", return_value=False):
             assert self._t(guard_module, "git push origin feat", "feat") is False
 
@@ -707,7 +776,7 @@ class TestPushTargetsCurrentBranch:
         for cmd in ("git push -ud origin feat", "git push -du origin feat", "git push -qd origin feat"):
             assert self._t(guard_module, cmd, "feat") is False, cmd
 
-    # ── bare / remote-only → gated on _push_config_is_simple (mocked) ──
+    # ── bare / remote-only → gated on the full config predicate ──
 
     def test_bare_push_simple_config_true(self, guard_module):
         with patch.object(guard_module, "_push_config_is_simple", return_value=True):

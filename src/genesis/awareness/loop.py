@@ -172,8 +172,15 @@ async def _persist_health_alerts(db) -> None:
     try:
         from genesis.db.crud import alert_events as _ae
         from genesis.mcp.health.errors import _compute_alerts
+        from genesis.observability.agent_api_alerts import ALERT_ID, active_alerts, notify_pending
+        from genesis.runtime import GenesisRuntime
 
-        alerts, _current_ids = await _compute_alerts()
+        observation = {}
+        alerts, _current_ids = await _compute_alerts(agent_api_observation=observation)
+        # Also preserve an open API incident if the health service itself could
+        # not initialize and _compute_alerts returned before taking a snapshot.
+        alerts = [a for a in alerts if a.get("id") != ALERT_ID]
+        alerts.extend(await active_alerts(db, observation))
         active = [
             {
                 "alert_id": a["id"],
@@ -184,7 +191,12 @@ async def _persist_health_alerts(db) -> None:
             for a in alerts
             if a.get("id")
         ]
-        await _ae.reconcile_open_set(db, active=active, now=datetime.now(UTC).isoformat())
+        state = observation.get("status")
+        reasons = {ALERT_ID: state} if state in {"healthy", "disabled"} else None
+        await _ae.reconcile_open_set(db, active=active, now=datetime.now(UTC).isoformat(),
+                                     resolution_reasons=reasons)
+        runtime = GenesisRuntime.peek()
+        await notify_pending(db, getattr(runtime, "_outreach_pipeline", None))
     except Exception:
         logger.debug("alert_events persistence failed (best-effort)", exc_info=True)
 
@@ -598,8 +610,9 @@ _INFRA_POSTURE_DETAIL = {
         "(scripts/host-setup.sh prints the swapfile recipe)"
     ),
     "container_swap_knob_off": (
-        "incus limits.memory.swap is explicitly false — swap stays disabled "
-        "across container restarts. On the host: incus config set <container> "
+        "incus limits.memory.swap holds an Incus false value (false/0/no/off, "
+        "any case, or a zero byte size) — swap stays disabled across container "
+        "restarts. On the host: incus config set <container> "
         "limits.memory.swap true (scripts/host-setup.sh sets this; the host "
         "guardian also reconciles it when healthy)"
     ),
@@ -796,12 +809,17 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     # container (meminfo swap isn't virtualized; verified live 2026-07-16).
     if _explicit_zero(_facts("host_system").get("swap_total_kb")):
         missing.append("host_swap_absent")
-    # Persistent incus knob, visible container-side. Explicit "false" only —
-    # the incus default is true, so absent/unset is healthy. Covers installs
-    # WITHOUT a working guardian (the guardian reconciles this knob itself).
+    # Persistent incus knob, visible container-side. Any nonempty Incus false
+    # value is off; the Incus default is true, so absent/unset is healthy.
+    # Covers installs WITHOUT a working guardian (the guardian reconciles this
+    # knob itself).
     limits = _facts("host_virt").get("container_limits")
-    if isinstance(limits, dict) and limits.get("limits.memory.swap") == "false":
-        missing.append("container_swap_knob_off")
+    raw = limits.get("limits.memory.swap") if isinstance(limits, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        from genesis.guardian.swap_watch import is_swap_on
+
+        if not is_swap_on(raw):
+            missing.append("container_swap_knob_off")
     # Network plane, gated on networkd actually managing the default route
     # (collectors/container.py::_networkd_manages_link). On a NetworkManager
     # box the fact is False/absent, so these rules stay silent — the
@@ -2960,6 +2978,24 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
     status = budget.get("status")
     if status not in ("degraded", "error"):
         return  # healthy / no sub-cap (pids.max="max") / unavailable → nothing to alert
+    # Record WHO holds the budget on every low tick, cooldown or not: the holders
+    # may be gone by the next alert, and the count alone cannot name them.
+    breakdown = None
+    if budget.get("path"):
+        from genesis.observability import pid_breakdown
+
+        try:
+            try:
+                breakdown = await asyncio.to_thread(pid_breakdown.snapshot_for, budget)
+            except RuntimeError:
+                # No worker thread could start: the budget itself is exhausted,
+                # the tick this exists for. The collector's finite work limits
+                # also apply inline. (The executor queued the work before failing
+                # to start a thread, so a later worker may take a second,
+                # harmless snapshot file.)
+                breakdown = pid_breakdown.snapshot_for(budget)
+        except Exception:
+            logger.warning("pid budget breakdown could not run", exc_info=True)
     scope = budget.get("scope")
     now = time.monotonic()
     # Per-scope cooldown with escalation bypass: fire when the scope is new, its
@@ -3026,6 +3062,13 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
                 f"{where} at {pct:.0f}% ({current}/{maximum} tasks). When it fills, new "
                 f"processes fail with 'Cannot fork' even though memory/CPU/disk are fine. "
                 f"Each Claude Code session spawns MCP subprocess trees. {remedy}"
+                + (f" {breakdown['text']}" if breakdown else "")
+                + (
+                    " Full breakdown: "
+                    + str(breakdown["file"]).encode("utf-8", "backslashreplace").decode("utf-8")
+                    if breakdown and breakdown.get("file")
+                    else ""
+                )
             ),
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),

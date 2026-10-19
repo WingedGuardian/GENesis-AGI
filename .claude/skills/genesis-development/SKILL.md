@@ -50,8 +50,10 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   public repo in its own VM, with no access to an install: no running Genesis, no
   `~/.genesis/`, none of an install's hooks or local reviewers. Hand it only
   self-contained, spec-complete work whose tests run in CI, off the enforcement-hook
-  surface, as a public issue. Only the owner applies the `devin-ready` label that
-  hands it over: the label starts a paid session, so a session never applies it.
+  surface, as a public issue. The `devin-ready` label hands it over and starts a
+  paid session, so a session applies it only after the owner explicitly approves
+  that issue in conversation. Once approved, the session applies the label itself;
+  the owner does not apply it by hand.
   Its PRs join the same queue (closing-session, "Devin-built PRs").
 
 The handoff between them is **the PR itself** — a durable artifact that survives
@@ -230,7 +232,9 @@ own `TASK_INTAKE.md` section contract instead):
    read-only, or by a probe that changes nothing beyond scratch state, using
    tools it already holds. It is owed whenever its answer could change a decision. That covers: the code and every caller the change touches,
    its `CURRENT.md` entry, recent commits and PRs in the area, overlapping open
-   PRs and issues, peer sessions, code intelligence, an API or renderer probe,
+   PRs and issues, existing implementations outside the repo (public repos,
+   grep.app, and the Claude Code mods catalogue for anything that runs inside
+   a CC session), peer sessions, code intelligence, an API or renderer probe,
    and a corpus measurement. "I did not verify X, but it should be fine" is not
    an answer for an X like that: verify it, or name it as a residual with the
    reason no read or probe settles it.
@@ -295,7 +299,19 @@ no substitute checklist.
 - **Before any done / fixed / passing claim** →
   `superpowers:verification-before-completion`, if installed.
 - **An external tool or repo surfaces as a candidate** → the `evaluate`
-  skill; on an ADOPT verdict, `integrate-module`.
+  skill; on an ADOPT verdict, `integrate-module`; on an ADAPT verdict,
+  reverse-engineer the reference before writing code (`evaluate`, Decision
+  Protocol step 4).
+- **About to build anything that runs inside a Claude Code session** — a hook
+  or guard, status line, prompt or context injection, tool interception, a
+  notification, an in-terminal pane → search Claude Code mods and plugins
+  first (`evaluate` workflow step 2 names the sources per session context).
+  From CC 2.1.287 mods can carry UI, tools, agents and model calls; below that
+  version they need the early-access flag, so check the pin in
+  `docs/reference/cc-compatibility.md`. Genesis has already shipped one
+  (`plugins/genesis-web-override/`). A mod may AUGMENT an enforcement guard
+  but never replace it: a mod that denied a tool call ran before the classic
+  `PreToolUse` chain and suppressed it when measured (#2260).
 - **A diff touches dashboard or other UI** → `/qa-only` or `/qa`, plus
   `/design-review`, if installed.
 
@@ -516,8 +532,10 @@ INT/TERM as it starts, so a second signal lands mid-rollback with default
 disposition, and the rollback has failure exits that report `ROLLBACK INCOMPLETE`.
 Either way: verify state (server active, no mid-rebase, pin, both CC versions)
 before re-running; it is idempotent. (A non-blocking PreToolUse advisory hook,
-`.claude/hooks/cc-deploy-timeout-guard`, nudges toward this on any deploy — it does
-not check whether you already detached, which is tracked in issue #2088.)
+`scripts/hooks/deploy_timeout_advisory.py`, nudges toward this whenever a command
+can run `update.sh`, and stays quiet on reads of it. It deliberately does not
+check whether you already detached: that needs systemd-run's option grammar, an
+open set, so a detached launch still gets the note.)
 
 **Why this paragraph is worded so defensively:** PR #1221 shipped both this policy
 and that hook on 2026-07-22 prescribing `run_in_background`, from a CC memory
@@ -1241,6 +1259,17 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   action itself. (Origin: the fence test in PR #2935, for issue #2863: its verify-RED ran a real
   `systemctl --user stop genesis-server` and took a live server down for about
   3.5 minutes.)
+- **Bound every mutant run with its own short timeout.** A mutation often turns
+  a test into a HANG rather than a failure (a mutant that never sets an event,
+  never cancels a task), and a hung run holds the box-wide test lock for the
+  whole per-test timeout while every other session waits. MEASURED: one sweep's
+  hung mutant held it for 53 minutes. Pass `-p timeout -o timeout=<N>` to each
+  mutant run, with N = max(60, 10 × the baseline run's slowest test). Spell it
+  `-p timeout`, never `-p pytest_timeout`: the plugin registers under the name
+  `timeout`, and the module name aborts pytest with "Plugin already registered"
+  (MEASURED, pytest 9.0.2 with pytest-timeout 2.4.0). And read the test result,
+  not the exit code: a missing plugin also exits 1, which a sweep would count
+  as a killed mutant.
 - **Never edit a shell script while a test that runs it is in progress.** bash
   reads a script as it executes it, so an edit mid-run yields bogus syntax
   errors that look like real failures. Wait for the run to finish, or test a
@@ -2988,7 +3017,14 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   cannot read, and any top-level comment from a reviewer with no known format, DOES
   count. Humans, workflow bots and CodeQL never open a round. A clean review, a Codex
   clean comment and the configured identity template CONFIRM a head; they never add a
-  round. Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
+  round. A round advances only on the newest reviewed head (owner ruling, 2026-10-12):
+  every review MARKS the head it reviewed, clean ones too, and a finding review that
+  lands on a head after one of that head's descendants was marked is a LATE review. It
+  opens no round; `review_budget`'s `findings` list keeps it with the round it belongs
+  to, for the round reflection to owe: `scripts/review_late.py` owes it from `REFLECTION_CUTOVER_ISO` (`scripts/review_reflection.py`) on, and credits it only by a reflection judged under its own round. The cutover stays None (nothing more owed) until the commit gate enforces reflections; `review_reflection.py status --cutover <iso>` reports what it would owe.
+  Each entry says whether it was late (`late`) and each round when it opened
+  (`opened_at`, None when unknown); read those, never membership in `rounds[].reviews`, which also lists
+  late reviews of a head that already is a round. Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
   keeps the old rule (every head Codex reviewed, clean included), so no PR's count
   moved at the cutover. The rule lives in `review_findings.is_finding` and
   `review_budget.evaluate_evidence`; read those, not this paragraph, for an edge case.
@@ -3416,8 +3452,7 @@ git add <files>                                   # STAGE FIRST — mark hashes 
 python3 scripts/review_state.py mark              # INTERNAL genesis-architect audit — plain mark, never counts
 git commit -F <msg-file>                          # bare, not piped (see below)
 # (a non-Anthropic cross-model round would instead be: mark --source external --defects|--clean)
-git push                                          # approve the dialog on a branch's first push
-gh pr create ...
+git push -u origin HEAD && gh pr create --title "..." --body-file <file>   # first push: ONE command (approve the dialog)
 gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
 python3 scripts/hooks/git_push_guard.py --check-pr <N>
 gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --check-pr
@@ -3478,11 +3513,15 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   same no-decision-plus-note shape; `hook_ask_policy.py` holds the exact scope
   of each. `push_publish` silences only the first push of the CURRENT branch, and only when the
   whole command is exactly one plain `git push` (e.g. `git push -u origin
-  HEAD`) — a chained command still asks, so run the first push as its own
-  command. Two spellings also qualify: `git -C <path> push …` when `<path>` is
-  the literal, symlink-free top of a worktree of the SAME repository as the
-  session's cwd, and a trailing `2>&1` and/or `| tail -N` / `| head -N`. The
-  remote git really pushes to must resolve (rewrites applied) to
+  HEAD`), or that push followed by `&&` and one ready `gh pr create`. Two
+  spellings also qualify for the lone push: `git -C <path> push …` when
+  `<path>` is the literal, symlink-free top of a worktree of the SAME
+  repository as the session's cwd, and a trailing `2>&1` and/or `| tail -N` /
+  `| head -N`; the chained form allows neither. On the public repo only the
+  chained form can be silenced, because of the rule below: a lone plain first
+  push of the current branch there is denied, not silenced (other spellings
+  keep their ask). Any other compound still asks. The remote git
+  really pushes to must resolve (rewrites applied) to
   exactly `https://github.com/<public repo>` — ssh/scp forms always ask — with
   simple push config, no `http.*` config, no proxy/TLS/ssh/config env var in
   the hook's environment, and a live probe confirming the branch is absent
@@ -3492,6 +3531,45 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   without a TTY aborts rather than pushing. Force pushes, other destinations,
   close-then-push, the no-open-PR block, round-cap asks and the dispatched deny
   are untouched, and any doubt about the destination keeps the prompt.
+- **A FIRST push of the CURRENT branch to the configured public repo must open
+  its PR in the same command — otherwise it is DENIED, whatever `push_publish`
+  says.** The re-push no-open-PR block only catches a branch on its NEXT push,
+  so a session that stopped after one push left the branch public with no PR.
+  The one accepted shape is
+  `git push -u origin HEAD && gh pr create --title "..." --body-file <file>`:
+  one plain `git push` of the current branch (no `cd`, `git -C`, prefix,
+  output filter or earlier step), `&&`, and one ready `gh pr create` using only
+  title/body/body-file/fill/no-maintainer-edit options — never `--draft`/`-d`,
+  `--web`, `--dry-run`, `--head`, `--repo` or `--base`, and no
+  `--label`/`--assignee`/`--reviewer`/`--milestone`/`--project` (gh resolves
+  those names before creating the PR and fails the whole create on one it
+  cannot resolve, after the push; add them with `gh pr edit` once the PR
+  exists). Its values must be LITERAL: no `$`, backtick, backslash, `*`, `?`,
+  `[`, `{` or `~` anywhere in the create, quoted or not. The create must be one
+  gh accepts with no terminal (MEASURED, gh 2.101): a non-empty title AND a
+  body (`--body`, or `--body-file` naming a regular file in the push's
+  directory that the hook can actually open and read as UTF-8, never `-`; not
+  both, and at most 65,536 characters of body either way), OR exactly one of `--fill`/`-f`, `--fill-first`,
+  `--fill-verbose`. A short value flag is read as gh reads it: `-F=body.md`
+  names `body.md`, and `-t=` is an empty title. `||`, `;`, `&`, a newline, or a `#` before the `&&` all
+  deny. Work not ready for a PR stays committed locally, unpushed. Scope is
+  the re-push block's predicate (`_no_pr_block_applies`): another destination,
+  or no declared public repo, keeps the old behaviour; a dry run publishes
+  nothing and is not denied, and after a dry-run push a chained create keeps
+  its own would-publish probe.
+  **This is deliberately the client half only — what a hook can read from the
+  command text.** It does not model other push spellings (another branch, a
+  refspec, `--all`, an unresolvable `cd`): those keep their ask, as before. Nor
+  does it model what gh resolves at RUN time — the base repository
+  (`gh repo set-default`, `GH_REPO`/`GH_HOST` in the environment), the base
+  branch (`branch.<b>.gh-merge-base`), whether the branch has commits ahead of
+  it — or a create that fails for auth/network reasons; any of those can still
+  leave a branch public with no PR until its next push, which the re-push block
+  then refuses. Modelling git/gh semantics from shell text is the open-set
+  trap described under "Never hand-roll `gh`/bash/CLI argv parsing" (and in
+  `scripts/hooks/pr_close_advisory.py`'s docstring). **The guarantee that no
+  branch reaches the public repo unchecked is the SERVER-SIDE leak scan that
+  runs on every branch push, not this hook.**
 - **Only the main session publishes.** An Agent-tool worker (the hook input
   carries `agent_id`) may run git and gh only from an ALLOWLIST, whatever
   `push_publish` says (owner policy 2026-10-05; an allowlist since 2026-10-10,
@@ -4905,19 +4983,27 @@ Standard open-source workflow: PRs go directly to the public repo.
   deletion in the PR body; if you suspect main's change is a bug rather than
   policy, file that before merging. A deleted test with no filed disagreement
   is how coverage disappears.
-- **The CI collected-test floor conflicts whenever main moved it while your
-  branch added tests.** `.github/workflows/ci.yml` carries one hand-maintained
-  `--min-collected` number, and both sides have raised it from a shared base.
-  Picking either side under-counts. The merged floor is MAIN's floor plus YOUR
-  branch's delta, and the delta is measured, never recalled. Run
-  `--collect-only` on main's version of each test file your branch changes and on
-  the merged version, after your LAST test-adding edit. A file new to the branch
-  counts in full. Keep main's comment block and add one paragraph showing your
-  per-file counts. The `--ceiling` on the same line merges the same way: main's
-  ceiling plus your branch's skip delta, counted on the CI runner from the junit
-  report, never locally (installed tools differ, so local skip counts are the
-  wrong denominator). Issue #2743 tracks replacing the hand-maintained number. A test path held in a shell variable reads to
-  `full_suite_guard` as a whole-suite run, so write the count as a script.
+- **Adding tests no longer touches `ci.yml`.** The collected-test count is
+  checked by the `collected-floor` CI job (#2743), which compares the test ids
+  your change collects against the commit it lands on. It is a required check
+  once `.github/rulesets/checks.json` is applied (`scripts/apply_rulesets.py`).
+  It goes red (exit 1) when ids vanish from test files your change did not
+  touch (a `conftest.py` edit does not count as touching the files below it),
+  or when your tree has a collection error the base does not. It refuses
+  (exit 2) when it cannot measure: a base it cannot resolve (not a 2-parent
+  merge, or an unreadable pre-push commit), base dependencies that would not
+  install, pytest exiting other than 0, 1 or 5, a collection that did not
+  finish or collected nothing, malformed collection output, an unreadable
+  changed-file list, a PR-body scanner that would not load, or an unexplained
+  drop whose PR body could not be read. Read the
+  step summary first; it names every vanished id. If a drop is deliberate, put
+  a line `Collected-drop: <reason>` in the PR body and re-run the job (or push,
+  if a re-run no longer clears it: #2624). A branch cut before #2743 that still edits the old
+  `--min-collected` line resolves that conflict by taking main's side and
+  deleting its own floor paragraph. The `--ceiling` (skip count) still lives on
+  the dormancy-guard line: raise it only in the commit that adds the skip,
+  counted on the CI runner from the junit report, never locally (installed
+  tools differ, so local skip counts are the wrong denominator).
 - **README is public-authoritative** — the public repo's `README.md` is
   hand-crafted and must NEVER be overwritten.
 - **Never edit `CHANGELOG.md` in an ordinary PR — add a `changelog.d/`

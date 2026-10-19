@@ -29,6 +29,68 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _VALID_SERVERS = {"health", "memory", "outreach", "recon", "discord-bot"}
+
+_SERVER_DECLARED_VARS: dict[str, frozenset[str]] = {
+    "health": frozenset(
+        {
+            "FIRECRAWL_API_KEY",  # mcp/health/web_tools.py: _SEARCH_BACKEND_KEYS
+            "API_KEY_TINYFISH",  # mcp/health/web_tools.py: _SEARCH_BACKEND_KEYS
+            "API_KEY_TAVILY",  # mcp/health/web_tools.py: _SEARCH_BACKEND_KEYS
+            "API_KEY_EXA",  # mcp/health/web_tools.py: _SEARCH_BACKEND_KEYS
+            "API_KEY_PERPLEXITY",  # mcp/health/web_tools.py: _SEARCH_BACKEND_KEYS
+            "API_KEY_BRAVE",  # web/search.py: WebSearcher, reached via web_tools.py
+            "GENESIS_BACKUP_REPO",  # mcp/health/errors.py
+            "GENESIS_VNC_PASSWORD",  # mcp/health/browser.py
+        }
+    ),
+    "memory": frozenset(
+        {
+            "API_KEY_VOYAGE",  # memory/reranker.py, constructed in _bootstrap_memory
+        }
+    ),
+    "outreach": frozenset(
+        {
+            "DISCORD_WEBHOOK_URL",  # mcp/outreach_mcp.py via _discord_webhook_env
+            "OUTREACH_RECIPIENT_DISCORD",  # mcp/outreach_mcp.py
+        }
+    ),
+    "recon": frozenset(),  # No additional secret reads beyond _MCP_VARS.
+    "discord-bot": frozenset(),  # DISCORD_BOT_TOKEN is already in _MCP_VARS.
+}
+
+_SERVER_DECLARED_PREFIXES: dict[str, tuple[str, ...]] = {
+    "health": (),  # No dynamic key families beyond the declared health keys.
+    "memory": (),  # No dynamic key families beyond the declared memory key.
+    "outreach": ("DISCORD_WEBHOOK_",),  # mcp/outreach_mcp.py via _discord_webhook_env
+    "recon": (),  # No additional dynamic key families.
+    "discord-bot": (),  # No additional dynamic key families.
+}
+
+_STANDALONE_ROUTER_SERVERS = frozenset({"health", "memory", "outreach", "recon"})
+
+
+def _standalone_routing_env_names(server: str) -> frozenset[str]:
+    if server not in _STANDALONE_ROUTER_SERVERS:
+        return frozenset()
+
+    try:
+        from genesis.env import repo_root
+        from genesis.routing.config import load_config
+        from genesis.routing.litellm_delegate import api_key_env_names
+
+        config = load_config(
+            repo_root() / "config" / "model_routing.yaml",
+            check_api_keys=False,
+        )
+        return frozenset(
+            name
+            for provider in config.providers.values()
+            for name in api_key_env_names(provider.provider_type)
+        )
+    except Exception:
+        return frozenset()
+
+
 _DEFAULT_FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _DEFAULT_STATUS = Path.home() / ".genesis" / "status.json"
 
@@ -58,8 +120,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Genesis MCP Server (standalone)")
     parser.add_argument(
         "--external-client",
-        action="store_true",
-        help="Disable Claude session bookmark processing for external MCP clients",
+        nargs="?", const="external", choices=["external", "validator"],
+        help="Enforce an external tool profile and disable Claude bookmark processing",
     )
     parser.add_argument(
         "--server",
@@ -89,7 +151,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Bearer token for HTTP auth (default: GENESIS_MCP_HTTP_TOKEN env var)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.external_client and args.server not in {"health", "memory"}:
+        parser.error("External client profiles support only health and memory servers")
+    return args
 
 
 def is_genesis_enabled(*, flag_path: Path = _DEFAULT_FLAG) -> bool:
@@ -123,7 +188,58 @@ def _run_disabled_stub(transport_kwargs: dict) -> None:
     _run_mcp(stub, transport_kwargs)
 
 
-def _bootstrap_health(transport_kwargs: dict) -> None:
+def _init_standalone_health_router() -> None:
+    """Initialize the router needed by ordinary standalone health actions."""
+    # Bootstrap standalone router for LLM-dependent tools
+    try:
+        from genesis.routing.standalone import create_standalone_router
+    except ImportError:
+        logger.warning("genesis.routing.standalone not available", exc_info=True)
+    else:
+        create_standalone_router()
+
+
+async def _init_standalone_health_actions(db) -> None:
+    """Wire dispatch and campaign actions only for ordinary standalone clients."""
+    # Wire direct session tools with DB-only access.
+    # Standalone MCP enqueues to direct_session_queue;
+    # the Genesis server's poll loop handles dispatch.
+    # Ensure queue table exists (standalone doesn't call db.init()).
+    try:
+        from genesis.db.schema import INDEXES, TABLES
+
+        await db.execute(TABLES["direct_session_queue"])
+        for idx_ddl in INDEXES:
+            if "direct_session_queue" in idx_ddl:
+                await db.execute(idx_ddl)
+        await db.commit()
+
+        from genesis.mcp.health.direct_session_tools import (
+            init_direct_session_tools,
+        )
+
+        init_direct_session_tools(db=db)
+    except Exception:
+        logger.warning(
+            "Direct session tools not available in standalone MCP",
+            exc_info=True,
+        )
+
+    # Wire campaign tools with DB-only access.
+    # Standalone MCP provides read/update access to campaigns;
+    # trigger and schedule hot-reload require the main server.
+    try:
+        from genesis.mcp.health.campaign_tools import init_campaign_tools
+
+        init_campaign_tools(runner=None, db=db)
+    except Exception:
+        logger.warning(
+            "Campaign tools not available in standalone MCP",
+            exc_info=True,
+        )
+
+
+def _bootstrap_health(transport_kwargs: dict, *, external_profile: str | None = None) -> None:
     """Bootstrap and run the health MCP server.
 
     Uses StandaloneHealthDataService which reads ~/.genesis/status.json
@@ -134,6 +250,11 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
     from genesis.mcp.health_mcp import init_health_mcp, mcp
     from genesis.mcp.standalone_health import StandaloneHealthDataService
     from genesis.observability.provider_activity import ProviderActivityTracker
+
+    if external_profile is not None:
+        from genesis.mcp.external_profiles import ExternalProfileMiddleware
+
+        mcp.add_middleware(ExternalProfileMiddleware("health", external_profile))
 
     if not _DEFAULT_DB.exists():
         # No DB — run without heartbeat/event queries (graceful degradation)
@@ -154,13 +275,8 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
         db = await get_db(_DEFAULT_DB, foreign_keys=False)
         try:
 
-            # Bootstrap standalone router for LLM-dependent tools
-            try:
-                from genesis.routing.standalone import create_standalone_router
-            except ImportError:
-                logger.warning("genesis.routing.standalone not available", exc_info=True)
-            else:
-                create_standalone_router()
+            if external_profile is None:
+                _init_standalone_health_router()
 
             svc = StandaloneHealthDataService(
                 status_path=_DEFAULT_STATUS,
@@ -170,42 +286,8 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
             tracker.set_db(db)
             init_health_mcp(svc, activity_tracker=tracker)
 
-            # Wire direct session tools with DB-only access.
-            # Standalone MCP enqueues to direct_session_queue;
-            # the Genesis server's poll loop handles dispatch.
-            # Ensure queue table exists (standalone doesn't call db.init()).
-            try:
-                from genesis.db.schema import INDEXES, TABLES
-
-                await db.execute(TABLES["direct_session_queue"])
-                for idx_ddl in INDEXES:
-                    if "direct_session_queue" in idx_ddl:
-                        await db.execute(idx_ddl)
-                await db.commit()
-
-                from genesis.mcp.health.direct_session_tools import (
-                    init_direct_session_tools,
-                )
-
-                init_direct_session_tools(db=db)
-            except Exception:
-                logger.warning(
-                    "Direct session tools not available in standalone MCP",
-                    exc_info=True,
-                )
-
-            # Wire campaign tools with DB-only access.
-            # Standalone MCP provides read/update access to campaigns;
-            # trigger and schedule hot-reload require the main server.
-            try:
-                from genesis.mcp.health.campaign_tools import init_campaign_tools
-
-                init_campaign_tools(runner=None, db=db)
-            except Exception:
-                logger.warning(
-                    "Campaign tools not available in standalone MCP",
-                    exc_info=True,
-                )
+            if external_profile is None:
+                await _init_standalone_health_actions(db)
 
             clear_mcp_crash("health")
             yield
@@ -220,6 +302,7 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
 
 def _bootstrap_memory(
     transport_kwargs: dict, *, process_pending_bookmarks: bool = True,
+    external_profile: str | None = None,
 ) -> None:
     """Bootstrap and run the memory MCP server.
 
@@ -228,6 +311,12 @@ def _bootstrap_memory(
     """
     from genesis.env import qdrant_url
     from genesis.mcp.memory_mcp import mcp
+
+    if external_profile is not None:
+        from genesis.mcp.external_profiles import ExternalProfileMiddleware
+
+        mcp.add_middleware(ExternalProfileMiddleware("memory", external_profile))
+        process_pending_bookmarks = False
 
     @asynccontextmanager
     async def _lifespan(server) -> AsyncIterator[None]:
@@ -701,6 +790,7 @@ def main(argv: list[str] | None = None) -> None:
         # memory server makes most traversals, so a secrets.env setting that never
         # reached it would leave the documented switch inert where it matters.
         "GENESIS_GRAPH_TELEMETRY_DISABLED",
+        "GENESIS_MCP_ENV_RECORDER",  # File-only opt-out must precede installation.
     }
     import os
 
@@ -726,6 +816,28 @@ def main(argv: list[str] | None = None) -> None:
     # SerializedConnection retry holds its asyncio lock throughout) — accepted:
     # failing that write faster would help nothing.
     os.environ.setdefault("GENESIS_DB_BUSY_TIMEOUT_MS", "15000")
+
+    try:
+        from dotenv import dotenv_values
+
+        from genesis.env import genesis_home
+        from genesis.observability.mcp_env_reads import install
+
+        secret_keys = frozenset(dotenv_values(secrets)) if secrets.is_file() else frozenset()
+        declared = (
+            frozenset(_MCP_VARS)
+            | _SERVER_DECLARED_VARS[args.server]
+            | _standalone_routing_env_names(args.server)
+        )
+        install(
+            args.server,
+            declared=declared,
+            declared_prefixes=_SERVER_DECLARED_PREFIXES[args.server],
+            secret_keys=secret_keys,
+            log_path=genesis_home() / "logs" / "mcp_env_reads.jsonl",
+        )
+    except Exception:
+        logger.warning("Could not install MCP environment read recorder", exc_info=True)
 
     transport_kwargs = _build_transport_kwargs(args)
 
@@ -758,7 +870,7 @@ def main(argv: list[str] | None = None) -> None:
     capture_spawn_identity()
 
     bootstrapper = _BOOTSTRAPPERS[args.server]
-    options = {"process_pending_bookmarks": not args.external_client} if args.server == "memory" else {}
+    options = {"external_profile": args.external_client} if args.external_client else {}
     try:
         bootstrapper(transport_kwargs, **options)
     except Exception:

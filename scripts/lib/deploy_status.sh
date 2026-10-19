@@ -12,6 +12,8 @@
 #   _git_dir             its git directory (the reflog is <that>/logs/HEAD)
 #   _SERVING_COMMIT_PY   the source of scripts/lib/serving_commit.py, read at
 #                        the caller's start so a merge cannot swap it mid-run
+#   _server_outside_unit succeeds (setting _OUTSIDE_PID) when a server runs
+#                        outside the unit; defined by deploy_code_only.sh
 #
 # The files under scripts/ the server itself consumes, in two kinds, each with
 # the call site that consumes it. tests/test_scripts/
@@ -21,6 +23,7 @@
 #
 # Imported once and kept, so a new copy loads only with a restart:
 _RUNTIME_RELOAD_SCRIPTS=(
+    scripts/hooks/secret_scrub.py    # retained by transcript_analytics.scrub
     scripts/lib/index_marker.py      # imported by surplus/jobs/gitnexus.py (and disk_reclaim.py)
     scripts/hooks/worktree_claim.py  # loaded at import by observability/worktree_ownership_config.py
 )
@@ -28,13 +31,18 @@ _RUNTIME_RELOAD_SCRIPTS=(
 _RUNTIME_FRESH_SCRIPTS=(
     scripts/disk_reclaim.py               # run by autonomy/remediation.py
     scripts/lib/live_checkout.py          # run by dashboard/routes/updates.py before an update
+    scripts/lib/managed_units.py          # run by dashboard/routes/updates.py for the update status card
+    scripts/lib/update_state_guard.py     # loaded by dashboard/routes/updates.py for /apply and the progress poll
     scripts/hooks/bash_allowlist_guard.sh # run through .claude/hooks/genesis-hook by cc/invoker.py
     scripts/hooks/bash_allowlist_lib.sh   # sourced by bash_allowlist_guard.sh on every run
     scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot
-    scripts/lib/deploy_checkout.sh        # sourced by the same probe (its dirty-tree predicate)
+    scripts/lib/deploy_checkout.sh        # sourced by the same probe (its dirty-tree predicate), and by update_state_guard.py
     scripts/hooks/main_checkout_guard.py  # registered by cc/invoker.py for dispatched sessions
     scripts/hooks/hook_input.py           # imported by main_checkout_guard.py on every run
     scripts/hooks/hook_output.py          # imported by main_checkout_guard.py to emit a note
+    scripts/lib/disk_guardian.sh          # sourced by util/disk_headroom.py on every free-space check
+    scripts/tmp_watchgod.sh               # sourced by util/disk_headroom.py for the watchdog's tiers
+    scripts/lib/serving_commit.py         # loaded afresh by memory/graph_census.py on every hourly census
     # Not under scripts/, but the same kind: cc/invoker.py runs the allowlist
     # guard through this launcher in the server, and reads its exit code.
     .claude/hooks/genesis-hook
@@ -280,6 +288,9 @@ _runtime_overrides() {
 # files in ~/.genesis/config, an edit undone without moving HEAD, a rewritten or
 # backdated reflog) reads valid.
 # Sets BRACKET, or empty with BRACKET_WHY. Expects _read_serving to have run.
+# Status passes its captured MainPID, invocation, edits and overrides so the
+# token describes the fields it prints. Omitted arguments retain direct-call
+# reads; explicitly empty arguments must not cause a second read.
 _bracket() {
     local mainpid inv edits overrides fresh rc=0
     BRACKET=""
@@ -288,13 +299,13 @@ _bracket() {
         BRACKET_WHY="the boot commit is unknown: $SERVING_WHY"
         return 0
     fi
-    mainpid="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)"
-    inv="$(systemctl --user show genesis-server -p InvocationID --value 2>/dev/null || true)"
+    mainpid="${1-$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)}"
+    inv="${2-$(systemctl --user show genesis-server -p InvocationID --value 2>/dev/null || true)}"
     case "$mainpid" in ''|0|*[!0-9]*) BRACKET_WHY="the server's MainPID is unreadable"; return 0 ;; esac
     [ -n "$inv" ] || { BRACKET_WHY="the server's invocation id is unreadable"; return 0; }
-    edits="$(_runtime_edits)"
+    edits="${3-$(_runtime_edits)}"
     [ "$edits" = none ] || { BRACKET_WHY="uncommitted runtime edits: $edits"; return 0; }
-    overrides="$(_runtime_overrides)"
+    overrides="${4-$(_runtime_overrides)}"
     [ "$overrides" != unreadable ] || { BRACKET_WHY="the ignored runtime overrides are unreadable"; return 0; }
     # The scripts run afresh count as they stand at HEAD, not as at the boot.
     fresh="$(_git_ro ls-tree -r HEAD -- "${_RUNTIME_FRESH_SCRIPTS[@]}" 2>/dev/null)" \
@@ -314,19 +325,39 @@ _bracket() {
     BRACKET="b1-$(printf '%s\n' "$SERVING" "$mainpid" "$inv" "$overrides" "$fresh" | sha256sum | cut -c1-24)"
 }
 
+# ActiveState of one user unit, or "unknown" when systemd does not say.
+_unit_active_state() {
+    local s
+    s="$(systemctl --user show "$1" -p ActiveState --value 2>/dev/null || true)"
+    printf '%s' "${s:-unknown}"
+}
+
 # `status [--verify <token>]`. Prints the fields a human reads and the bracket;
 # with --verify, exits 0 when the token still holds and 1 when it does not.
 _status_main() {
-    local verify="$1" inv
+    local verify="$1" mainpid inv edits overrides
     _read_serving
     echo "serving: ${SERVING:-unknown ($SERVING_WHY)}"
+    # For scripts/deploy_candidates: with nothing running Genesis's code (the
+    # server, and the bridge that runs the full stack while the server is down),
+    # readiness judges the code the next start runs instead. A server outside the
+    # unit (update.sh's degraded fallback) runs while both units read stopped: it
+    # adds a third word, and a line of any other length never reads as stopped.
+    local outside=""
+    if _server_outside_unit; then
+        outside=" outside:$_OUTSIDE_PID"
+    fi
+    echo "server-state: $(_unit_active_state genesis-server) $(_unit_active_state genesis-bridge)$outside"
     echo "head: $(_git_ro rev-parse HEAD)"
-    echo "mainpid: $(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || echo unknown)"
+    mainpid="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || echo unknown)"
     inv="$(systemctl --user show genesis-server -p InvocationID --value 2>/dev/null || true)"
+    edits="$(_runtime_edits)"
+    overrides="$(_runtime_overrides)"
+    echo "mainpid: $mainpid"
     echo "invocation: ${inv:-unknown}"
-    echo "runtime-edits: $(_runtime_edits)"
-    echo "runtime-overrides: $(_runtime_overrides)"
-    _bracket
+    echo "runtime-edits: $edits"
+    echo "runtime-overrides: $overrides"
+    _bracket "$mainpid" "$inv" "$edits" "$overrides"
     if [ -z "$verify" ]; then
         echo "bracket: ${BRACKET:-unknown ($BRACKET_WHY)}"
         _report_pending

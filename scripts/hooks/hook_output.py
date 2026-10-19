@@ -132,6 +132,20 @@ def clip_to_cost(text: str, max_units: int) -> str:
     return text
 
 
+def clip_final_notice(text: str, *, emitted_units: int) -> str | None:
+    """Size a hard-stop notice from the stream's locked UTF-16 count.
+
+    The deadline writer may add a leading and trailing newline. Keep the
+    existing three-unit margin, including one spare unit, under the harness
+    cap. Unlike BoundedStdout's logical counter, this count includes writes
+    whose accounting was interrupted by the timer. Call under the stream lock.
+    """
+    room = HOOK_STDOUT_CAP - emitted_units - 3
+    if room <= 0:
+        return None
+    return clip_to_cost(text, room)
+
+
 #: Default headroom under the cap. The cap is the cliff, not the target: a
 #: hook that lands exactly on it has no room for a version that lowers it
 #: slightly, and none for the closing line most emitters append.

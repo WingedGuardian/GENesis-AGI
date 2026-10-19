@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from genesis.mcp.health import browser
+from genesis.security.card_redaction import CARD_FILTER
+from genesis.security.card_shapes import REDACTED
 
 
 def _clear_all_browser_state():
@@ -57,10 +59,24 @@ def _clear_all_browser_state():
 
 
 @pytest.fixture(autouse=True)
-def _reset_browser_state(monkeypatch):
+def _reset_browser_state(monkeypatch, tmp_path):
     """Reset module-level browser state before and after each test."""
     from genesis.browser import packages
 
+    # A launch copies the profile aside when the engine differs from the one that
+    # last opened it; the tests' stub engines always differ, so they must never
+    # point at the live profiles.
+    monkeypatch.setattr(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile")
+    monkeypatch.setattr(browser, "_CHROMIUM_PROFILE_DIR", tmp_path / "browser-profile")
+    # The Chromium fallback prefers patchright when it is installed; tests run the
+    # same path everywhere, patchright absent unless a test installs a stub.
+    monkeypatch.setattr(browser, "_patchright_installed", lambda: False)
+    monkeypatch.setattr(browser, "_warned_no_patchright", False)
+    # Whether this machine has that package's Chromium downloaded is not what the
+    # tests are about; the launch check has its own tests.
+    from genesis.browser import chromium
+
+    monkeypatch.setattr(chromium, "not_ready_at", lambda package, build, path: None)
     # The stale-module guard records which browser modules were loaded; a test
     # that stubs one in sys.modules must not leave its record behind.
     monkeypatch.setattr(packages, "_loaded", dict(packages._loaded))
@@ -136,6 +152,257 @@ class TestEnsureBrowserRecovery:
 
         assert result is new_page
         assert browser._stealth_page is new_page
+
+
+class TestProfileBackupBeforeLaunch:
+    """Each local launch copies its profile aside first when a different build is
+    about to open it (genesis.browser.profile_backup), off the event loop, and
+    under the browser lock so two launches never copy at once."""
+
+    @pytest.mark.asyncio
+    async def test_camoufox_backs_up_with_the_resolved_engine_before_launch(self, monkeypatch):
+        import threading
+
+        from genesis.browser import engine, profile_backup
+
+        order = []
+        loop_thread = threading.get_ident()
+        binary = Path("/engines/camoufox-bin")
+
+        def backup(profile, engine_binary):
+            order.append(("backup", profile, engine_binary, threading.get_ident() != loop_thread))
+
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=MagicMock(pages=[_alive_page()]))
+        api = MagicMock(AsyncCamoufox=MagicMock(side_effect=lambda **kw: order.append(("launch",)) or cm))
+        ready = engine.EngineStatus(engine.READY, "Camoufox", binary)
+        monkeypatch.setattr(profile_backup, "backup_camoufox_profile", backup)
+        with (
+            patch.object(engine, "resolve_camoufox_engine", return_value=ready),
+            patch.dict(sys.modules, {"camoufox": MagicMock(async_api=api), "camoufox.async_api": api}),
+        ):
+            await browser._ensure_browser()
+        assert order == [("backup", browser._PROFILE_DIR, binary, True), ("launch",)]
+
+    @pytest.mark.asyncio
+    async def test_camoufox_refusal_copies_nothing(self, monkeypatch):
+        from genesis.browser import engine, profile_backup
+
+        backup = MagicMock()
+        monkeypatch.setattr(profile_backup, "backup_camoufox_profile", backup)
+        missing = engine.EngineStatus(engine.NOT_INSTALLED, "no engine")
+        with (
+            patch.object(engine, "resolve_camoufox_engine", return_value=missing),
+            pytest.raises(engine.CamoufoxNotReady),
+        ):
+            await browser._ensure_browser()
+        backup.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_chromium_backs_up_before_launch(self, monkeypatch):
+        import threading
+
+        from genesis.browser import profile_backup
+
+        order = []
+        loop_thread = threading.get_ident()
+
+        def backup(profile, package):
+            order.append(("backup", profile, package, threading.get_ident() != loop_thread))
+
+        pw = MagicMock()
+        # The driver starts first (the install check asks it where Chromium is);
+        # the copy must come before the browser opens the profile.
+        pw.chromium.launch_persistent_context = AsyncMock(
+            side_effect=lambda **kw: order.append(("launch",)) or MagicMock(pages=[_alive_page()])
+        )
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=pw)
+        monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+        with _stub_playwright(starter):
+            await browser._ensure_chromium_fallback()
+        assert order == [("backup", browser._CHROMIUM_PROFILE_DIR, "playwright", True), ("launch",)]
+
+
+class TestPatchrightChromium:
+    """The Chromium fallback runs through patchright, which hides the automation
+    signals plain Playwright leaves, whenever patchright is installed."""
+
+    @staticmethod
+    def _starter(order=None):
+        pw = MagicMock()
+        pw.chromium.launch_persistent_context = AsyncMock(return_value=MagicMock(pages=[_alive_page()]))
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=pw)
+        return starter, pw
+
+    @staticmethod
+    def _stub(name, starter):
+        api = MagicMock(async_playwright=MagicMock(return_value=starter))
+        return patch.dict(sys.modules, {name: MagicMock(async_api=api), f"{name}.async_api": api})
+
+    @pytest.mark.asyncio
+    async def test_patchright_is_used_when_installed(self, monkeypatch):
+        from genesis.browser import packages, profile_backup
+
+        monkeypatch.setattr(browser, "_patchright_installed", lambda: True)
+        backup = MagicMock()
+        monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+        guard = MagicMock()
+        monkeypatch.setattr(packages, "check_loaded_browser_modules", guard)
+        starter, pw = self._starter()
+        with self._stub("patchright", starter):
+            await browser._ensure_chromium_fallback()
+        starter.start.assert_awaited_once()
+        assert backup.call_args.args == (browser._CHROMIUM_PROFILE_DIR, "patchright")
+        assert guard.call_args.args == (("patchright",),)  # patchright never imports playwright
+        kw = pw.chromium.launch_persistent_context.call_args.kwargs
+        assert kw["no_viewport"] is True and "viewport" not in kw
+
+    @pytest.mark.asyncio
+    async def test_plain_playwright_only_without_patchright(self, monkeypatch, caplog):
+        from genesis.browser import profile_backup
+
+        backup = MagicMock()
+        monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+        starter, _ = self._starter()
+        with self._stub("playwright", starter):
+            await browser._ensure_chromium_fallback()
+        starter.start.assert_awaited_once()
+        assert backup.call_args.args[1] == "playwright"
+        assert "patchright is not installed" in caplog.text
+        # The browser extra carries patchright, so installing it is the step.
+        assert browser.engine.PACKAGE_HINT in caplog.text
+        caplog.clear()
+        browser._stealth_page = None
+        await browser._cleanup_chromium()
+        with self._stub("playwright", self._starter()[0]):
+            await browser._ensure_chromium_fallback()
+        assert "patchright is not installed" not in caplog.text  # once per process
+
+    @pytest.mark.asyncio
+    async def test_the_driver_starts_with_the_display_set(self, monkeypatch):
+        """The driver copies the environment when it starts and the headed browser
+        inherits the driver's: a DISPLAY set after start() never reaches the first
+        launch (MEASURED: it fails, and only the second launch works)."""
+        monkeypatch.delenv("DISPLAY", raising=False)
+        seen = []
+        starter, pw = self._starter()
+
+        async def start():
+            seen.append(os.environ.get("DISPLAY"))
+            return pw
+
+        starter.start = AsyncMock(side_effect=start)
+        with self._stub("playwright", starter):
+            await browser._ensure_chromium_fallback()
+        assert seen == [browser._VNC_DISPLAY]
+
+    @pytest.mark.asyncio
+    async def test_a_missing_chromium_is_refused_before_the_launch(self, monkeypatch):
+        """Playwright's own error would tell the reader to run `patchright install`,
+        a download a session must never start; the check names the operator step. It
+        is judged where the started driver launches from, then the driver is stopped:
+        no profile copy, no launch, no driver left running."""
+        from genesis.browser import chromium, profile_backup
+
+        monkeypatch.setattr(browser, "_patchright_installed", lambda: True)
+        seen = []
+
+        def not_ready_at(package, build, path):
+            seen.append((package, build, path))
+            return f"{package} Chromium missing; STEP"
+
+        monkeypatch.setattr(chromium, "not_ready_at", not_ready_at)
+        backup = MagicMock()
+        monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+        starter, pw = self._starter()
+        pw.chromium.executable_path = "/pw/chromium-1234/chrome-linux64/chrome"
+        pw.stop = AsyncMock()
+        with self._stub("patchright", starter), pytest.raises(chromium.ChromiumNotReady) as err:
+            await browser._ensure_chromium_fallback()
+        assert str(err.value) == "patchright Chromium missing; STEP"
+        assert seen == [("patchright", "chromium", "/pw/chromium-1234/chrome-linux64/chrome")]
+        pw.chromium.launch_persistent_context.assert_not_awaited()
+        backup.assert_not_called()
+        pw.stop.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_navigate_returns_the_chromium_refusal(self, monkeypatch):
+        from genesis.browser import chromium
+
+        async def refuse(*a, **k):
+            raise chromium.ChromiumNotReady("patchright's Chromium is not installed; STEP")
+
+        monkeypatch.setattr(browser, "_get_page", refuse)
+        result = await browser._impl_browser_navigate("https://example.com", stealth=False)
+        assert result == {
+            "error": "Chromium is not ready: patchright's Chromium is not installed; STEP"
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_broken_patchright_is_reported_not_swapped(self, monkeypatch):
+        """Switching silently to the detectable Chromium would hide the broken install."""
+        monkeypatch.setattr(browser, "_patchright_installed", lambda: True)
+        starter, _ = self._starter()
+        with (
+            patch.dict(sys.modules, {"patchright": None, "patchright.async_api": None}),
+            self._stub("playwright", starter),
+            pytest.raises(ImportError) as exc,
+        ):
+            await browser._ensure_chromium_fallback()
+        starter.start.assert_not_awaited()
+        # Its repair is the browser extra, which carries patchright.
+        assert isinstance(exc.value, browser.PatchrightBroken)
+        assert browser.engine.PACKAGE_HINT in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_navigate_names_patchrights_step_for_a_broken_patchright(self):
+        err = browser.PatchrightBroken("patchright is installed but cannot be imported (x)")
+        with patch.object(browser, "_get_page", new=AsyncMock(side_effect=err)):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"] == str(err)
+        assert "browser` extra" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_navigate_says_restart_first_when_packages_changed(self, monkeypatch):
+        """An upgrade under the session can be why patchright no longer imports: a
+        reinstall would not help the running process, a restart would."""
+        changed = "Browser packages changed since startup (patchright 1.62.1 -> 1.62.3)"
+        weighed = []
+        monkeypatch.setattr(browser, "_patchright_installed", lambda: True)
+        monkeypatch.setattr(
+            browser.packages,
+            "stale_loaded_modules",
+            lambda dists: weighed.append(dists) or ["patchright"],
+        )
+        monkeypatch.setattr(
+            browser.packages, "packages_changed_message", lambda stale: changed if stale else None
+        )
+        err = browser.PatchrightBroken("patchright is installed but cannot be imported (x)")
+        with patch.object(browser, "_get_page", new=AsyncMock(side_effect=err)):
+            result = await browser._impl_browser_navigate("https://example.com")
+        assert result["error"].startswith(changed)
+        assert "cannot be imported (x)" in result["error"]
+        # The Chromium layer's own package is what is weighed, not every browser package.
+        assert weighed and all(d == ("patchright",) for d in weighed)
+
+    @pytest.mark.asyncio
+    async def test_run_js_runs_in_the_main_world_on_patchright(self):
+        """patchright evaluates in an isolated world by default (isolated_context=True,
+        READ in patchright 1.62.3), where the page's own globals are invisible."""
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=1)
+        type(page).__module__ = "patchright.async_api._generated"
+        assert await browser._evaluate_main_world(page, "1") == 1
+        page.evaluate.assert_awaited_once_with("1", isolated_context=False)
+
+    @pytest.mark.asyncio
+    async def test_run_js_is_unchanged_on_other_pages(self):
+        page = AsyncMock()
+        page.evaluate = AsyncMock(return_value=2)
+        assert await browser._evaluate_main_world(page, "2") == 2
+        page.evaluate.assert_awaited_once_with("2")
 
 
 class TestExplicitEngine:
@@ -272,15 +539,15 @@ class TestExplicitEngine:
     @pytest.mark.parametrize(
         "launch",
         [
-            lambda: browser._ensure_chromium_fallback(),
             lambda: browser._ensure_remote_cdp("http://127.0.0.1:9222"),
             lambda: browser._ensure_tinyfish_browser("https://example.com"),
         ],
-        ids=["chromium", "remote_cdp", "tinyfish"],
+        ids=["remote_cdp", "tinyfish"],
     )
     @pytest.mark.asyncio
     async def test_playwright_layers_check_only_playwright(self, launch):
-        """A camoufox-only upgrade must not refuse a layer that never imports it."""
+        """A camoufox-only upgrade must not refuse a layer that never imports it.
+        (The Chromium fallback also imports patchright: TestPatchrightChromium.)"""
         from genesis.browser import packages
 
         stub = {
@@ -4025,6 +4292,7 @@ class TestBrowserScreenshotUniquePath:
                 fh.write(b"\x89PNG")
 
         page.screenshot = AsyncMock(side_effect=_write)
+        page.frames = [_text_frame("Example")]  # the card check reads each frame
         return page
 
     @pytest.mark.asyncio
@@ -5843,6 +6111,53 @@ class TestRecheckAfterLateImport:
 
 
 # ---------------------------------------------------------------------------
+# Card-number guards (fill, run_js)
+# ---------------------------------------------------------------------------
+
+# Stripe's public test number, built from parts so no card literal is in the file.
+_TEST_CARD = "4242" * 4
+
+
+class TestCardNumberGuards:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "value",
+        [_TEST_CARD, f"{_TEST_CARD[:4]} {_TEST_CARD[4:8]} {_TEST_CARD[8:12]} {_TEST_CARD[12:]}"],
+    )
+    async def test_fill_refuses_a_card_value_before_touching_the_page(self, value):
+        page, calls = _typing_page()
+        with patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_fill("#note", value)
+        assert result == {"error": browser._REFUSE_CARD_VALUE}
+        assert calls["down"] == 0
+        page.fill.assert_not_awaited()
+        page.click.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_js_refuses_a_card_number_before_logging_it(self, caplog):
+        page = MagicMock()
+        page.url = "https://shop.example"
+        page.evaluate = AsyncMock(return_value=None)
+        browser._active_page = page
+        with caplog.at_level("DEBUG", logger="genesis"):
+            result = await browser._impl_browser_run_js(
+                f"document.querySelector('#cc').value = '{_TEST_CARD}'"
+            )
+        assert result == {"error": browser._REFUSE_CARD_RUN_JS}
+        page.evaluate.assert_not_awaited()
+        assert _TEST_CARD not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_run_js_runs_ordinary_scripts(self):
+        page = MagicMock()
+        page.url = "https://shop.example"
+        page.evaluate = AsyncMock(return_value="Checkout")
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("document.title")
+        assert result["result"] == "Checkout"
+
+
+# ---------------------------------------------------------------------------
 # Input-stall diagnostics: a click or fill focus click whose call log reached
 # "performing click action" carries a snapshot taken at that moment, so the
 # candidate causes (a JS dialog, lost focus or visibility, a navigation, the
@@ -6019,7 +6334,9 @@ class TestInputStallDiagnostics:
 
     @pytest.mark.asyncio
     async def test_a_stalled_fill_focus_click_carries_no_input_value(self, caplog):
-        secret = "4111111111111111"
+        # Not a card number: browser_fill refuses one before any click (#3188),
+        # so a card value could never reach the stalled-click path tested here.
+        secret = "pass-phrase-7731"
         page, _ = _typing_page()
         page.click = AsyncMock(side_effect=Exception(_STALL_LOG))  # raw: _human_type marks it
         page.context.pages = [page]
@@ -6483,3 +6800,636 @@ console.log(JSON.stringify([TARGET(E, [5, 5]), TARGET(E, null), at(N), at(M), TA
         assert result["diagnostics"]["navigated"] is False  # the watch was armed
         assert original.listeners("framenavigated") == []
         assert original.listeners("popup") == []
+
+
+
+@pytest.mark.asyncio
+async def test_every_chromium_guard_checks_the_package_this_launch_selected(monkeypatch):
+    """The package is selected once; a removal or install between the checks must
+    not switch them to a package the launch is not using."""
+    from genesis.browser import packages, profile_backup
+
+    picks = iter(["patchright", "playwright", "playwright", "playwright"])
+    monkeypatch.setattr(browser, "_chromium_package", lambda: next(picks))
+    checked = []
+    monkeypatch.setattr(packages, "check_loaded_browser_modules", checked.append)
+    monkeypatch.setattr(profile_backup, "backup_chromium_profile", lambda *a: None)
+    monkeypatch.setattr(browser.chromium, "not_ready_at", lambda *a: None)
+    # The driver starts before the copy (it names the Chromium to check), so the
+    # last guard runs after it; stop at the launch itself.
+    pw = MagicMock()
+    pw.chromium.launch_persistent_context = AsyncMock(
+        side_effect=RuntimeError("stop at the launch")
+    )
+    pw.stop = AsyncMock()
+    starter = MagicMock()
+    starter.start = AsyncMock(return_value=pw)
+    monkeypatch.setattr(browser, "_chromium_async_playwright", lambda package: lambda: starter)
+    with pytest.raises(RuntimeError, match="stop at the launch"):
+        await browser._ensure_chromium_fallback()
+    assert checked == [("patchright",)] * 4  # import, past it, driver start, copy
+
+
+@pytest.mark.asyncio
+async def test_chromium_rechecks_packages_after_the_backup(monkeypatch):
+    """The copy can wait up to ten minutes for another session's: an upgrade in that
+    window must be caught before the launch. The driver starts before the copy (it
+    names the Chromium to check), so the one this launch started is stopped."""
+    from genesis.browser import packages, profile_backup
+
+    state = {"backed_up": False}
+
+    def check(dists):
+        if state["backed_up"]:
+            raise packages.BrowserPackagesChanged("changed during the backup")
+
+    def backup(*a):
+        state["backed_up"] = True
+
+    monkeypatch.setattr(packages, "check_loaded_browser_modules", check)
+    monkeypatch.setattr(profile_backup, "backup_chromium_profile", backup)
+    monkeypatch.setattr(browser.chromium, "not_ready_at", lambda *a: None)
+    pw = MagicMock()
+    pw.chromium.launch_persistent_context = AsyncMock()
+    pw.stop = AsyncMock()
+    starter = MagicMock()
+    starter.start = AsyncMock(return_value=pw)
+    monkeypatch.setattr(browser, "_chromium_async_playwright", lambda package: lambda: starter)
+    with pytest.raises(packages.BrowserPackagesChanged):
+        await browser._ensure_chromium_fallback()
+    pw.chromium.launch_persistent_context.assert_not_awaited()
+    pw.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_an_upgrade_during_the_driver_start_says_restart_not_provision(monkeypatch):
+    """pip replacing the package while the driver starts can delete the old
+    Chromium revision; the old loaded driver then needs a restart, which no
+    provisioning can stand in for."""
+    from genesis.browser import packages
+
+    state = {"started": False}
+
+    def check(dists):
+        if state["started"]:
+            raise packages.BrowserPackagesChanged("changed during the driver start")
+
+    monkeypatch.setattr(packages, "check_loaded_browser_modules", check)
+    monkeypatch.setattr(browser.chromium, "not_ready_at", lambda *a: "chromium is not installed")
+    pw = MagicMock()
+    pw.stop = AsyncMock()
+    starter = MagicMock()
+
+    async def start():
+        state["started"] = True
+        return pw
+
+    starter.start = start
+    monkeypatch.setattr(browser, "_chromium_async_playwright", lambda package: lambda: starter)
+    with pytest.raises(packages.BrowserPackagesChanged):
+        await browser._ensure_chromium_fallback()
+    pw.stop.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Card-number redaction of tool output and logs
+# ---------------------------------------------------------------------------
+# Stripe's public test number; no other card number may appear in tests.
+_CARD = "4242424242424242"
+_CARD_SPACED = "4242 4242 4242 4242"
+
+
+def _assert_redacted(result) -> None:
+    import json
+
+    text = json.dumps(result, default=str)
+    assert _CARD not in text and _CARD_SPACED not in text, text
+    assert REDACTED in text, text
+
+
+def _text_frame(text="", fails=False, detached=False):
+    """A frame whose visible text and field values read as ``text``."""
+    frame = MagicMock()
+    frame.evaluate = AsyncMock(
+        side_effect=RuntimeError("frame unreadable") if fails else None,
+        return_value=text,
+    )
+    frame.is_detached.return_value = detached
+    return frame
+
+
+def _card_page(url=f"https://shop.example/receipt/{_CARD}"):
+    page = MagicMock()
+    page.frames = [_text_frame("")]
+    page.url = url
+    page.title = AsyncMock(return_value=f"Receipt for {_CARD_SPACED}")
+    page.goto = AsyncMock()
+    page.is_closed.return_value = False
+    page.wait_for_load_state = AsyncMock()
+    locator = MagicMock()
+    locator.aria_snapshot = AsyncMock(return_value=f"- text: Card {_CARD_SPACED} order 12345")
+    page.locator.return_value = locator
+    return page
+
+
+class TestToolOutputIsRedacted:
+    """Every tool, through its real _impl_* path, returns [card redacted] for a
+    card number in its snapshot, result, url, title or error."""
+
+    @pytest.mark.asyncio
+    async def test_navigate(self):
+        page = _card_page()
+
+        async def _ensure():
+            browser._stealth_cm = MagicMock()
+            browser._stealth_page = page
+            return page
+
+        with (
+            patch.object(browser, "_ensure_browser", new=_ensure),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+            patch.object(browser, "_wait_for_turnstile", new=AsyncMock(return_value=None)),
+        ):
+            result = await browser._impl_browser_navigate("https://shop.example/")
+        _assert_redacted(result)
+        assert "order 12345" in result["snapshot"]  # other numbers are kept
+
+    @pytest.mark.asyncio
+    async def test_click(self):
+        browser._active_page = _card_page()
+        with (
+            patch.object(browser, "_stealth_click", new=AsyncMock()),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch.object(browser, "_NEW_TAB_WAIT_S", 0.0),
+        ):
+            result = await browser._impl_browser_click("#go")
+        assert result["clicked"] == "#go"
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_fill_error(self):
+        browser._active_page = _card_page()
+        with (
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch.object(
+                browser, "_human_type",
+                new=AsyncMock(side_effect=RuntimeError(f"field shows {_CARD}")),
+            ),
+            patch.object(
+                browser, "_with_stall_diagnostics",
+                new=AsyncMock(side_effect=lambda failed, *a, **k: failed),
+            ),
+        ):
+            result = await browser._impl_browser_fill("#name", "hello")
+        assert result["error"].startswith("Fill failed on '#name': ")
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_upload_error(self, tmp_path):
+        page = _card_page()
+        page.set_input_files = AsyncMock(side_effect=RuntimeError(f"rejected near {_CARD}"))
+        browser._active_page = page
+        f = tmp_path / "doc.pdf"
+        f.write_bytes(b"%PDF")
+        with patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_upload("input", str(f))
+        assert result["error"].startswith("Upload failed on 'input': ")
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_screenshot_metadata(self, tmp_path):
+        page = _card_page()
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert result["path"].startswith(str(tmp_path))  # the path is untouched
+        _assert_redacted(result)
+
+    @pytest.mark.parametrize(
+        ("frames", "refusal"),
+        [
+            # the main frame shows a card
+            ([f"Saved card {_CARD_SPACED}"], "_REFUSE_CARD_SCREENSHOT"),
+            # one digit group per element: innerText puts each on its own line
+            (["Card\n4242\n4242\n4242\n4242\nPay"], "_REFUSE_CARD_SCREENSHOT"),
+            # a cross-origin payment iframe holds the field value
+            (["Checkout", _CARD], "_REFUSE_CARD_SCREENSHOT"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_screenshot_refuses_a_page_showing_a_card(self, tmp_path, frames, refusal):
+        page = _card_page()
+        page.frames = [_text_frame(t) for t in frames]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert result["error"] == getattr(browser, refusal)
+        page.screenshot.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_screenshot_refuses_when_a_frame_cannot_be_read(self, tmp_path):
+        page = _card_page()
+        page.frames = [_text_frame("ok"), _text_frame(fails=True)]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert result["error"] == browser._REFUSE_UNREAD_SCREENSHOT
+        page.screenshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_screenshot_skips_a_detached_frame_and_allows_ordinary_numbers(self, tmp_path):
+        page = _card_page()
+        page.frames = [
+            _text_frame("Order 100234567, call +1 555 123 4567, total 12.50, 2019 2020 2021"),
+            _text_frame(fails=True, detached=True),
+        ]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert "error" not in result, result
+        page.screenshot.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_snapshot(self):
+        browser._active_page = _card_page()
+        result = await browser._impl_browser_snapshot()
+        _assert_redacted(result)
+        assert result["snapshot"] == f"- text: Card {REDACTED} order 12345"
+
+    @pytest.mark.asyncio
+    async def test_run_js_result_numbers_strings_keys_and_json(self):
+        page = _card_page()
+        page.evaluate = AsyncMock(return_value={
+            "as_number": int(_CARD),
+            "as_float": float(_CARD),
+            "nested": [{"text": f"pan {_CARD_SPACED}"}],
+            _CARD: "key",
+            # JSON text spelling the digits as escapes: only parsing shows them.
+            "json": '{"pan": "\\u0034242424242424242"}',
+            "count": 3,
+        })
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("collect()")
+        _assert_redacted(result)
+        got = result["result"]
+        assert got["as_number"] == REDACTED
+        assert got["as_float"] == REDACTED
+        assert got["count"] == 3
+        assert "4242" not in got["json"]
+
+    @pytest.mark.asyncio
+    async def test_snapshot_with_a_segmented_card_field(self):
+        page = _card_page(url="https://shop.example/pay")
+        page.title = AsyncMock(return_value="Pay")
+        page.locator.return_value.aria_snapshot = AsyncMock(return_value=(
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- button "Pay"'
+        ))
+        browser._active_page = page
+        result = await browser._impl_browser_snapshot()
+        assert "4242" not in result["snapshot"]
+        assert REDACTED in result["snapshot"] and '- button "Pay"' in result["snapshot"]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            ["4242", "4242", "4242", "4242"],
+            {"p1": "4242", "p2": "4242", "p3": "4242", "p4": "4242"},
+            [["4242", "4242"], {"rest": ["4242", "4242"]}],
+            list(_CARD),
+            [_CARD[:8], _CARD[8:]],
+            [4242, 4242, 4242, 4242],
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_run_js_card_split_across_values(self, value):
+        page = _card_page()
+        page.evaluate = AsyncMock(return_value=value)
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("parts()")
+        assert result["result"] == REDACTED
+        assert "4242" not in str(result)
+
+    @pytest.mark.asyncio
+    async def test_run_js_colliding_keys_withhold_the_mapping(self):
+        page = _card_page()
+        page.evaluate = AsyncMock(return_value={_CARD: "a", REDACTED: "b"})
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("keys()")
+        assert result["result"] == REDACTED
+
+    @pytest.mark.asyncio
+    async def test_run_js_error(self):
+        page = _card_page()
+        page.evaluate = AsyncMock(side_effect=RuntimeError(f"Error: {_CARD}"))
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("boom()")
+        assert result["error"].startswith("JS execution failed: ")
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_sessions(self):
+        _live_camoufox_ctx([{"domain": f".{_CARD}.example", "value": "v"}])
+        result = await browser._impl_browser_sessions()
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_clear_domain_error(self):
+        ctx = MagicMock()
+        ctx.cookies = AsyncMock(return_value=[{"name": "a", "domain": "example.com", "path": "/"}])
+        ctx.add_cookies = AsyncMock(side_effect=RuntimeError(f"rejected {_CARD}"))
+        browser._stealth_browser = ctx
+        browser._stealth_cm = MagicMock()
+        result = await browser._impl_browser_clear_domain("example.com")
+        camoufox = next(p for p in result["profiles"] if p["browser"] == "camoufox")
+        assert camoufox["error"].startswith("Failed to clear camoufox cookies: ")
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_press_key_error(self):
+        page = _card_page()
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock(side_effect=RuntimeError(f"page said {_CARD}"))
+        browser._active_page = page
+        result = await browser._impl_browser_press_key("Tab")
+        assert result["error"].startswith("Key press failed for 'Tab': ")
+        _assert_redacted(result)
+
+    def test_collaborate_stays_sync(self):
+        with patch.object(browser, "_get_vnc_url", return_value=f"http://vnc.example/{_CARD}"):
+            result = browser._impl_browser_collaborate(True)
+        assert not inspect.iscoroutine(result)
+        assert result["mode"] == "collaborate"
+        _assert_redacted(result)
+
+
+class TestRedactedOutsideTheResult:
+    @pytest.mark.asyncio
+    async def test_an_exception_becomes_a_redacted_error_result(self):
+        with patch.object(
+            browser, "_requested_layer", side_effect=RuntimeError(f"bad {_CARD}"),
+        ):
+            result = await browser._impl_browser_navigate("https://shop.example/")
+        assert result["error"].startswith("browser_navigate failed: RuntimeError: ")
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_the_tool_timeout_text_is_redacted(self):
+        result = await browser._with_tool_timeout(
+            asyncio.sleep(5), 0.01, f"browser_click('[data-pan=\"{_CARD}\"]')",
+        )
+        assert "timed out after" in result["error"]
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_the_captcha_alert_redacts_the_page_url(self, tmp_path):
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=1\n")
+        sent = []
+
+        class _Channel:
+            def __init__(self, *_a):
+                pass
+
+            async def send(self, alert):
+                sent.append(alert)
+
+        with (
+            patch("genesis.env.secrets_path", return_value=secrets),
+            patch("genesis.guardian.alert.telegram.TelegramAlertChannel", _Channel),
+            patch.object(browser, "_get_vnc_url", return_value="http://vnc.example"),
+        ):
+            await browser._send_turnstile_alert(f"https://shop.example/pay/{_CARD}")
+        assert len(sent) == 1
+        assert _CARD not in sent[0].body
+        assert REDACTED in sent[0].body
+
+
+def test_every_impl_browser_function_is_redacted():
+    """Contract: every _impl_browser_* in browser.py carries @_redacted. A new
+    tool implementation without it fails here; the count proves the scan saw
+    the functions at all (update it when a tool is added)."""
+    import ast
+
+    tree = ast.parse(Path(browser.__file__).read_text())
+    impls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+        and n.name.startswith("_impl_browser_")
+    ]
+    unwrapped = [
+        n.name for n in impls
+        if not any(isinstance(d, ast.Name) and d.id == "_redacted" for d in n.decorator_list)
+    ]
+    assert unwrapped == []
+    assert len(impls) == 11
+    for n in impls:
+        assert hasattr(getattr(browser, n.name), "__wrapped__"), n.name
+
+
+class TestLogsAreRedacted:
+    @pytest.mark.asyncio
+    async def test_the_log_file_and_turnstile_log_hold_no_card(self, tmp_path):
+        import logging
+
+        log_file = tmp_path / "mcp_health.log"
+        ts_file = tmp_path / "turnstile_debug.log"
+        # The same attachment the module makes for ~/tmp/mcp_health.log.
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s"))
+        genesis_logger = logging.getLogger("genesis")
+        genesis_logger.addHandler(fh)
+        page = _card_page()
+        page.goto = AsyncMock(side_effect=RuntimeError(f"net error at ?n={_CARD}"))
+
+        async def _ensure():
+            browser._stealth_cm = MagicMock()
+            browser._stealth_page = page
+            return page
+
+        try:
+            with (
+                patch.object(browser, "_TS_LOG_PATH", ts_file),
+                patch.object(browser, "_ensure_browser", new=_ensure),
+                patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+            ):
+                result = await browser._impl_browser_navigate(f"https://shop.example/?c={_CARD}")
+        finally:
+            genesis_logger.removeHandler(fh)
+            fh.close()
+        _assert_redacted(result)
+        logged, ts_logged = log_file.read_text(), ts_file.read_text()
+        assert "browser_navigate failed" in logged and "Traceback" in logged
+        for text in (logged, ts_logged):
+            assert text.count(_CARD) == 0
+            assert REDACTED in text
+
+    def test_the_real_mcp_health_log_redacts_any_genesis_logger(self, tmp_path):
+        """mcp_health.log takes every propagated genesis.* record, not only the
+        named loggers', so its handler carries the filter. Run the import in a
+        child with a scratch HOME, so the handler the module attaches is the
+        real one and no shared log is opened."""
+        import subprocess
+
+        home = tmp_path / "home"
+        (home / "tmp").mkdir(parents=True)
+        script = (
+            "import logging\n"
+            "import genesis.mcp.health.browser\n"
+            "log = logging.getLogger('genesis.some.other')\n"
+            "log.setLevel(logging.INFO)\n"
+            "try:\n"
+            f"    raise RuntimeError('boom {_CARD}')\n"
+            "except RuntimeError:\n"
+            f"    log.warning('saw {_CARD_SPACED}', exc_info=True)\n"
+        )
+        src = Path(browser.__file__).resolve().parents[3]
+        out = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            env={"PATH": os.defpath, "HOME": str(home), "PYTHONPATH": str(src)},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert out.returncode == 0, out.stderr
+        logged = (home / "tmp" / "mcp_health.log").read_text()
+        assert "[genesis.some.other]" in logged and "Traceback" in logged
+        assert _CARD not in logged and _CARD_SPACED not in logged
+        assert REDACTED in logged
+
+    @pytest.mark.parametrize("name", browser._REDACTED_LOGGERS)
+    def test_each_named_logger_redacts(self, name):
+        import logging
+
+        records: list[str] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(self.format(record))
+
+        target = logging.getLogger(name)
+        handler = _Capture()
+        target.addHandler(handler)
+        old_level = target.level
+        target.setLevel(logging.DEBUG)
+        try:
+            try:
+                raise RuntimeError(f"boom {_CARD}")
+            except RuntimeError:
+                target.error("failed on %s", _CARD_SPACED, exc_info=True, stack_info=True)
+        finally:
+            target.removeHandler(handler)
+            target.setLevel(old_level)
+        assert len(records) == 1
+        assert _CARD not in records[0] and _CARD_SPACED not in records[0]
+        assert "Traceback" in records[0]
+
+    @pytest.mark.asyncio
+    async def test_fastmcp_tool_error_log_after_configure_logging(self, capsys):
+        """FastMCP's configure_logging replaces the fastmcp handlers; the filter
+        sits on the logger, so a tool exception's traceback is still redacted."""
+        import logging
+
+        from fastmcp import FastMCP
+        from fastmcp.utilities.logging import configure_logging
+
+        root = logging.getLogger("fastmcp")
+        saved = (root.handlers[:], root.level, root.propagate)
+        try:
+            configure_logging(level="DEBUG")
+            assert CARD_FILTER in logging.getLogger("fastmcp.tools.tool_manager").filters
+            server = FastMCP("redaction-test")
+
+            @server.tool()
+            def boom() -> str:
+                raise RuntimeError(f"page text {_CARD}")
+
+            with pytest.raises(Exception):  # noqa: B017 - FastMCP's ToolError
+                await server._tool_manager.call_tool("boom", {})
+        finally:
+            root.handlers[:] = saved[0]
+            root.setLevel(saved[1])
+            root.propagate = saved[2]
+        # Rich wraps lines to the console width, so compare without whitespace.
+        err = "".join(capsys.readouterr().err.split())
+        assert "Errorcallingtool" in err and "Traceback" in err
+        assert _CARD not in err
+        assert "".join(REDACTED.split()) in err
+
+
+_RENDERED_SOURCES = (
+    "innerText", "'placeholder'", "'value'", "'aria-label'", "'aria-placeholder'",
+    "'aria-valuetext'", "'title'", "'alt'", "matches('option')", "pseudo(el, '::before')",
+    "pseudo(el, '::after')", "attr\\(", "SVGElement", "el.shadowRoot", "el.value",
+)
+
+
+def test_the_screenshot_check_reads_every_rendered_text_source():
+    """Contract: the frame read covers each source of rendered text that is
+    not innerText. Removing one fails here; the real-browser test below shows
+    each one actually reaching the check."""
+    missing = [s for s in _RENDERED_SOURCES if s not in browser._PAGE_TEXT_JS]
+    assert missing == []
+
+
+_RENDERED_CARD_PAGES = {
+    "placeholder": f'<input placeholder="{_CARD_SPACED}">',
+    "aria-label": f'<button aria-label="Pay with {_CARD_SPACED}">Pay</button>',
+    "title": f'<span title="{_CARD}">card</span>',
+    "alt": f'<img alt="card {_CARD_SPACED}">',
+    "option": f"<select><option>x</option><option>{_CARD_SPACED}</option></select>",
+    "value": f'<input value="{_CARD}">',
+    "before": f'<style>#c::before{{content:"{_CARD_SPACED}"}}</style><span id="c"></span>',
+    "attr": f'<style>#d::after{{content:attr(data-pan)}}</style><span id="d" data-pan="{_CARD}"></span>',
+    "svg": f'<svg><text x="0" y="15">{_CARD_SPACED}</text></svg>',
+    "shadow": (
+        '<div id="h"></div><script>document.getElementById("h")'
+        f'.attachShadow({{mode:"open"}}).innerHTML="<p>{_CARD_SPACED}</p>"</script>'
+    ),
+    "segmented": '<input value="4242" aria-label="Card">' * 4,
+    "iframe": f'<iframe srcdoc="<input value={_CARD}>"></iframe>',
+}
+
+
+@pytest.mark.asyncio
+async def test_the_screenshot_check_on_a_real_browser():
+    """Runs the frame read in a fresh headless Chromium, no profile. Skipped
+    where no Playwright Chromium is installed (the contract test above still
+    applies there)."""
+    from genesis.security.card_redaction import contains_card_text
+
+    try:
+        from playwright.async_api import async_playwright
+
+        pw = await async_playwright().start()
+    except Exception as e:  # noqa: BLE001 - no driver on this machine
+        pytest.skip(f"playwright unavailable: {e}")
+    try:
+        try:
+            chromium = await pw.chromium.launch(headless=True)
+        except Exception as e:  # noqa: BLE001 - browser not downloaded
+            pytest.skip(f"chromium unavailable: {e}")
+        page = await chromium.new_page()
+        found = {}
+        for name, html in {
+            **_RENDERED_CARD_PAGES,
+            "clean": '<input placeholder="1234 1234 1234 1234"><p>Order 100234567</p>',
+        }.items():
+            await page.set_content(f"<html><body>{html}</body></html>")
+            await page.wait_for_timeout(50)
+            texts = [await f.evaluate(browser._PAGE_TEXT_JS) for f in page.frames]
+            found[name] = contains_card_text("\n".join(texts))
+        await chromium.close()
+    finally:
+        await pw.stop()
+    assert found.pop("clean") is False
+    assert [n for n, hit in found.items() if not hit] == []

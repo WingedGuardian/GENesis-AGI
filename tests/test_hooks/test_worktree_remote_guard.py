@@ -43,6 +43,12 @@ from shell_parse import analyze, git_subcommand  # noqa: E402
 _FORCE = "--fo" + "rce"  # split so this file's own text never trips a host push-guard
 
 
+@pytest.fixture(autouse=True)
+def _isolate_git_config(monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
 @pytest.fixture(scope="module")
 def guard_module():
     import importlib.util
@@ -945,6 +951,24 @@ class TestForcePushRemoteAware:
         out = capsys.readouterr().out
         assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "ask"
         assert "myfork" in json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+class TestDataHeredocExcision:
+    def test_commit_message_body_does_not_trigger_force_push_block(self, feature_repo):
+        command = (
+            "git commit -F - <<'EOF'\n"
+            "release notes mention git push --force origin main\n"
+            "EOF"
+        )
+        res = _run_cwd(command, str(feature_repo))
+        assert res.returncode == 0, res.stderr
+        assert "Force push to origin" not in res.stderr
+
+    def test_writer_heredoc_body_force_push_remains_visible(self, feature_repo):
+        command = "cat > f <<'EOF'\ngit push --force origin main\nEOF"
+        res = _run_cwd(command, str(feature_repo))
+        assert res.returncode == 2, res.stderr
+        assert "Force push to origin" in res.stderr
 
 
 # ── _resolve_push_remote unit tests ──────────────────────────────────────

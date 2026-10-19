@@ -6,6 +6,21 @@
 
 # Model Pool
 
+## Automated CC fallback
+
+The automated roster is configured in `config/cc_roster.yaml` plus the local
+`cc_roster.local.yaml` overlay. Only credentialed roster members enter failover;
+the foreground-only `gmodel.models` catalog is separate. Model catalog presence
+does not prove current credentials, entitlement, quota, or tool compatibility.
+
+Managed agent turns use tool-disabled readiness checks to select a provider
+before executing work once. Ordinary background parking and conversation
+failover retain their existing policies. Checks consume quota and may incur
+provider fees; actual task failure after selection does not trigger replay.
+The **Fallback** neural-monitor entry shows observed execution provider/model
+and outcome without private response content. See
+[managed-session selection](native-managed-sessions.md#provider-selection-before-work).
+
 ## THE HEAVY LIFTERS
 
 Specialized for reasoning, systems architecture, and deep technical logic.

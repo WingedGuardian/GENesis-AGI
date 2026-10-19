@@ -6,6 +6,7 @@
 #
 # Usage:
 #   scripts/restore.sh [--from <backup-repo-url>] [--dry-run] [--force] [--database-only]
+#                     [--refresh-snapshot] [--transcript-preference PATH=legacy|legacy-plain|legacy-encrypted|v2] (repeatable)
 #
 # Environment variables (match backup.sh):
 #   GENESIS_BACKUP_REPO        — Git URL (used when a fresh clone is needed)
@@ -50,17 +51,28 @@ fi
 _SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/backup_backends.sh
 source "$_SCRIPT_DIR/lib/backup_backends.sh"
+# Load definitions before the off-site credential lease and its RETURN cleanup.
+# shellcheck source=scripts/lib/transcript_pool.sh
+source "$_SCRIPT_DIR/lib/transcript_pool.sh"
 
 # ── Args ─────────────────────────────────────────────────────────────
 BACKUP_REPO_OVERRIDE=""
 DRY_RUN=false
 FORCE=false
+REFRESH_SNAPSHOT=false
+_RESTORE_MANAGED=false
+_PV_GAP=""  # set from the selected snapshot's COMPLETE marker (payment_vault <status>)
 DATABASE_ONLY=false
+_TRANSCRIPT_PREFERENCES=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --from) BACKUP_REPO_OVERRIDE="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         --force) FORCE=true; shift ;;
+        --refresh-snapshot) REFRESH_SNAPSHOT=true; shift ;;
+        --transcript-preference)
+            [ $# -ge 2 ] || { echo "Missing transcript preference" >&2; exit 2; }
+            _TRANSCRIPT_PREFERENCES+=("--preference=$2"); shift 2 ;;
         --database-only) DATABASE_ONLY=true; shift ;;
         -h|--help)
             grep -E '^#( |$)' "$0" | sed 's/^# //; s/^#//'
@@ -70,12 +82,20 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Input-only validation must precede locks, epoch changes and all recovery writes.
+if ! python3 "$_SCRIPT_DIR/lib/transcript_archive.py" validate-preferences . --root "$HOME/.claude/projects" "${_TRANSCRIPT_PREFERENCES[@]}"; then
+    echo "Invalid transcript preferences; recovery has not started" >&2
+    exit 2
+fi
+
 # ── Status tracking ──────────────────────────────────────────────────
 _STATUS_FILE="$HOME/.genesis/restore_status.json"
 _STARTED_AT=$(date +%s)
 _SQLITE_RESTORED=false
 _QDRANT_RESTORED=0
 _TRANSCRIPT_RESTORED=0
+_TRANSCRIPTS_FROM_SNAPSHOT=false
+_TRANSCRIPTS_PULLED=""
 _MEMORY_RESTORED=0
 _EVAL_RESTORED=0
 _EXTRA_RESTORED=0
@@ -132,6 +152,17 @@ _cleanup_plaintext() {
     if [ -n "${_DB_STAGE:-}" ]; then
         rm -f "$_DB_STAGE" "$_DB_STAGE-journal" "$_DB_STAGE-wal" "$_DB_STAGE-shm" 2>/dev/null || true
     fi
+    # §8 card vault: once staging began, every .payment_vault.* temp under
+    # CREDS_STAGE (the decrypted tar, the unpacked set) is this run's or an
+    # earlier killed run's, never a placed set (payment_vault) or an aside
+    # (payment_vault.pre-restore-*); the run holds the restore lock. A glob, not
+    # recorded names: the unpack creates its directory inside a subshell.
+    if [ -n "${_PV_STAGING:-}" ] && [ -n "${CREDS_STAGE:-}" ]; then
+        for _pv_tmp in "${CREDS_STAGE%/}"/.payment_vault.*; do
+            [ -e "$_pv_tmp" ] || [ -L "$_pv_tmp" ] || continue
+            rm -rf -- "$_pv_tmp" 2>/dev/null || true
+        done
+    fi
 }
 trap '_cleanup_plaintext; _write_status; _release_deploy_marker; backend_cleanup' EXIT
 
@@ -143,6 +174,8 @@ MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
 # shellcheck source=scripts/lib/backup_core_paths.sh
 source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
+# shellcheck source=scripts/lib/payment_vault_backup.sh
+source "$_SCRIPT_DIR/lib/payment_vault_backup.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-restore]"
@@ -175,6 +208,9 @@ if ! flock -w "$_LOCK_WAIT" "$DR_LOCK_FD"; then
     die "backup-restore lock still held by ${_holder:-unknown} after ${_LOCK_WAIT}s — a backup is likely running; wait for it to finish and re-run (or set GENESIS_RESTORE_LOCK_WAIT higher)"
 fi
 dr_lock_stamp restore
+
+
+
 
 # Private-by-default for every plaintext this restore writes (SF7): gpg -d and
 # cp otherwise honor the inherited umask (typically 0022 → world-readable), so a
@@ -268,6 +304,7 @@ fi
 # each picking the first candidate that carries ITS OWN payload — so a partial
 # mirror (e.g. creds present but secrets lost) never masks a complete archive.
 _cred_fallback_sources() {
+    $_RESTORE_MANAGED && return 0
     printf '%s\n' \
         "${GENESIS_CREDS_MIRROR:-}" \
         "$HOME/.genesis/shared/guardian/creds-mirror" \
@@ -281,6 +318,94 @@ decrypt_file() {
     backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
     printf '%s' "$_BACKUP_PASSPHRASE" | python3 \
         "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup "$src" "$dst" 2>/dev/null
+}
+
+# _pv_overlaps <a> <b>: true when the two paths are the same or one holds the
+# other. Staging the card vault must never land on (or over) the live vault,
+# which a GENESIS_CREDS_STAGE pointed at GENESIS_HOME would do with no symlink.
+_pv_overlaps() {
+    local a b
+    # The staging path's own last component stays literal: an earlier staged
+    # copy that is a symlink is moved aside (never followed) by _pv_stage_vault.
+    a="$(realpath -m -- "$(dirname -- "$1")")/$(basename -- "$1")"
+    b="$(realpath -m -- "$2")"
+    case "$a/" in "$b/"*) return 0 ;; esac
+    case "$b/" in "$a/"*) return 0 ;; esac
+    return 1
+}
+
+# The live vault under every resolution of GENESIS_HOME: the value now, the one
+# the core-path lib took when sourced (the shell's, which the vault CLI uses), and
+# the one secrets.env sets (the server's), read on its own because restore loads
+# secrets.env wholesale only when GENESIS_MERGE_OVERRIDE_DIR is unset.
+# _PV_OVERLAP names the one that matched.
+_pv_overlaps_live() {
+    local live
+    for live in "$_PV_LIVE" "$_BACKUP_CORE_VAULT" ${_PV_SECRETS_VAULT:+"$_PV_SECRETS_VAULT"} \
+        "$HOME/.genesis/payment_vault"; do
+        if _pv_overlaps "$1" "$live"; then
+            _PV_OVERLAP="$live"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# _pv_stage_vault: decrypt $_PV_ARCHIVE into a private temp file, unpack it into
+# a NEW directory (payment_vault_unpack checks member types, names and the
+# vault itself), move any earlier staged vault aside (never deleted), then
+# rename the new one into place and print how to use it. Never places it.
+_pv_stage_vault() {
+    local tarf dir why aside
+    _PV_STAGING=1  # from here on, the EXIT trap removes any .payment_vault.* temp
+    tarf="$(umask 077 && mktemp -p "$CREDS_STAGE" .payment_vault.tar.XXXXXX 2>/dev/null)" || {
+        warn "Payment vault: cannot create a temp file in $CREDS_STAGE; not staged"
+        return 1
+    }
+    if ! decrypt_file "$_PV_ARCHIVE" "$tarf"; then
+        rm -f -- "$tarf"
+        warn "Payment vault: decrypting $PAYMENT_VAULT_ARCHIVE failed; not staged"
+        return 1
+    fi
+    if ! dir="$(payment_vault_unpack "$tarf" "$CREDS_STAGE")"; then
+        why="$dir"
+        rm -f -- "$tarf"
+        warn "Payment vault: the archive failed its check ($why); not staged, do not use it"
+        return 1
+    fi
+    rm -f -- "$tarf"
+    if [ -e "$_PV_STAGE" ] || [ -L "$_PV_STAGE" ]; then
+        aside="$_PV_STAGE.pre-restore-$(date -u +%Y%m%dT%H%M%SZ).$$"
+        if ! mv -T -- "$_PV_STAGE" "$aside"; then
+            rm -rf -- "$dir"
+            warn "Payment vault: could not move the earlier staged vault aside; not staged"
+            return 1
+        fi
+        log "Payment vault: the earlier staged copy was moved aside to $aside"
+    fi
+    if ! mv -T -- "$dir" "$_PV_STAGE"; then
+        rm -rf -- "$dir"
+        warn "Payment vault: could not rename the staged vault into place; not staged"
+        return 1
+    fi
+    log "Payment vault: staged at $_PV_STAGE (NOT placed). To use it, on a box with no vault:"
+    log "      1. confirm $_PV_LIVE does not exist (placing it over a live vault would bring"
+    log "         back retired cards or replace a newer key)"
+    log "      2. systemctl --user stop genesis-server"
+    log "      3. mv -T \"$_PV_STAGE\" \"$_PV_LIVE\""
+    log "      4. systemctl --user start genesis-server, then: python -m genesis vault unlock"
+    log "         (a successful unlock proves the passphrase and the key match)"
+    if [ -n "$_PV_SECRETS_VAULT" ] \
+        && [ "$(realpath -m -- "$_PV_SECRETS_VAULT")" != "$(realpath -m -- "$_PV_LIVE")" ]; then
+        log "      NOTE: genesis-server reads the vault at $_PV_SECRETS_VAULT (GENESIS_HOME in"
+        log "      secrets.env), not $_PV_LIVE: use that path in steps 1 and 3"
+    fi
+    log "      Until it is placed (or retired: git rm creds/$PAYMENT_VAULT_ARCHIVE in the backups"
+    log "      repo), every backup reports payment_vault: missing and fails."
+    if [ "$CREDS_SRC_DIR" != "$BACKUP_DIR/creds" ]; then
+        warn "Payment vault: it came from the fallback copy $CREDS_SRC_DIR (the host mirror or its never-pruned archive), which may hold a vault since retired"
+    fi
+    return 0
 }
 
 # read_payload <path-without-.gpg> → echo resolved path and whether decryption needed.
@@ -323,215 +448,254 @@ if [ -n "$BACKUP_REPO_OVERRIDE" ]; then
         BACKUP_DIR="$BACKUP_REPO_OVERRIDE"
         _EXPLICIT_LOCAL_SOURCE=true
         log "Using backup source: $BACKUP_DIR"
+    elif [ "$(_backend_resolve)" != none ] && ! $DATABASE_ONLY; then
+        log "Off-site recovery does not require a Tier-1 clone"
     else
         log "Cloning backup repo from $BACKUP_REPO_OVERRIDE..."
         mkdir -p "$(dirname "$BACKUP_DIR")"
         $DRY_RUN || git clone "$BACKUP_REPO_OVERRIDE" "$BACKUP_DIR"
     fi
 elif [ ! -d "$BACKUP_DIR/.git" ] && [ ! -d "$BACKUP_DIR" ]; then
-    BACKUP_REPO="${GENESIS_BACKUP_REPO:-}"
-    if [ -z "$BACKUP_REPO" ]; then
-        die "Backup not found at $BACKUP_DIR and GENESIS_BACKUP_REPO unset. Pass --from <url-or-path>."
+    if [ "$(_backend_resolve)" != none ] && ! $DATABASE_ONLY; then
+        log "Off-site recovery does not require a Tier-1 clone"
+    else
+        BACKUP_REPO="${GENESIS_BACKUP_REPO:-}"
+        if [ -z "$BACKUP_REPO" ]; then
+            die "Backup not found at $BACKUP_DIR and GENESIS_BACKUP_REPO unset. Pass --from <url-or-path>."
+        fi
+        log "Cloning backup repo..."
+        mkdir -p "$(dirname "$BACKUP_DIR")"
+        $DRY_RUN || git clone "$BACKUP_REPO" "$BACKUP_DIR"
     fi
-    log "Cloning backup repo..."
-    mkdir -p "$(dirname "$BACKUP_DIR")"
-    $DRY_RUN || git clone "$BACKUP_REPO" "$BACKUP_DIR"
 fi
 
-if [ -d "$BACKUP_DIR/.git" ]; then
+if [ -d "$BACKUP_DIR/.git" ] && { [ "$(_backend_resolve)" = none ] || $DATABASE_ONLY; }; then
     (cd "$BACKUP_DIR" && git pull --rebase --quiet 2>/dev/null) || log "git pull failed, continuing with local backup state"
 fi
 
 # ── Off-site (backend) pull ──────────────────────────────────────────
+_AUDIT_SRC="$BACKUP_DIR/audit/merge_overrides"
 # The large binaries (SQLite dump, Qdrant snapshots, transcripts) live ONLY on the
 # off-site backend — gitignored from Tier-1 — so on a fresh DR box they must be
 # pulled from the latest dated COMPLETE snapshot before the restore sections below
 # can find them. Destination is the pluggable backend (none/local/smb).
 _pull_from_offsite() {
     backend_init
-    # Clean the backend's transient creds when this function returns (tighter than
-    # the script-wide EXIT trap, which also calls it — backend_cleanup is idempotent).
     trap 'backend_cleanup' RETURN
-    local be
+    local be identity workspace_root pinned snap host_dir off_host latest hosts names rc marker component destination fname listing stage
     be="$(backend_name)"
-    [ "$be" = "none" ] && return 0
-    if $DRY_RUN; then log "off-site: (dry-run) would pull the latest snapshot via the $be backend"; return 0; fi
-    backend_available || { log "off-site: backend '$be' is not available — skipping off-site pull"; return 0; }
-    # Don't clobber a payload already staged locally (same-box re-run) unless
-    # forced — the off-site pull is for fresh-box DR.
-    if [ -f "$BACKUP_DIR/data/genesis.sql.gpg" ] && ! $FORCE; then
-        log "off-site: local payload already present — skipping off-site pull (use --force to override)"
-        return 0
+    [ "$be" = none ] && return 0
+    # Hook audit records are self-contained Tier-1 payloads, not snapshot state.
+    # Only an independently identified repository may supplement off-site restore.
+    _AUDIT_SRC=""
+    local tier1_root backup_root
+    tier1_root=$(git -C "$BACKUP_DIR" rev-parse --show-toplevel 2>/dev/null) || tier1_root=""
+    backup_root=$(realpath -- "$BACKUP_DIR" 2>/dev/null) || backup_root=""
+    if [ -n "$tier1_root" ] && [ "$tier1_root" = "$backup_root" ]; then
+        _AUDIT_SRC="$BACKUP_DIR/audit/merge_overrides"
+        log "Audit source: separate Tier-1 repository $BACKUP_DIR"
     fi
-
-    local host_dir off_host latest snap fname dst hosts n
-
-    # Latest snapshot under host dir $1 that is COMPLETE — a marker backup.sh writes
-    # only after every file uploaded — so a half-uploaded snapshot from a crashed
-    # backup is never selected. Echoes the stamp; returns 1 if none. Newest first.
+    _RESTORE_MANAGED=true
+    _TRANSCRIPTS_FROM_SNAPSHOT=true
+    _EXTRA_FROM_SNAPSHOT=true
+    _TRANSCRIPTS_PULLED=""
+    _EXTRA_PULLED=""
+    if $DRY_RUN; then log "off-site: (dry-run) would resume or select a snapshot via $be"; return 0; fi
+    workspace_root="$HOME/backups/.genesis-restore"
+    python3 - "$workspace_root" "$BACKUP_DIR" "$GENESIS_DIR" "${_BACKEND_LOCAL_ROOT:-}" <<'PYBOUNDARY' || die "restore workspace overlaps a backup or recovery target"
+import pathlib
+import sys
+workspace = pathlib.Path(sys.argv[1]).resolve()
+for raw in sys.argv[2:]:
+    if not raw:
+        continue
+    other = pathlib.Path(raw).resolve()
+    if workspace == other or workspace in other.parents or other in workspace.parents:
+        raise SystemExit(1)
+PYBOUNDARY
+    identity="$be:${_BACKEND_LOCAL_ROOT:-${_BACKEND_NAS:-}}"
+    pinned=$(python3 "$_SCRIPT_DIR/lib/restore_selection.py" pinned "$workspace_root") || die "damaged restore selection; no local fallback permitted"
     _latest_complete() {
-        local hd="$1" st
-        while read -r st; do
-            [ -n "$st" ] || continue
-            backend_exists "$hd/$st/COMPLETE" && { echo "$st"; return 0; }
-        done < <(backend_list_dirs "$hd" | grep -oE '[0-9]{8}T[0-9]{6}Z' | sort -ru)
-        return 1
+        local hd="$1" entries st children
+        entries=$(backend_list_dirs_strict "$hd") || return 1
+        while IFS= read -r st; do
+            [[ "$st" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || continue
+            children=$(backend_list_strict "$hd/$st") || return 1
+            if grep -Fxq COMPLETE <<<"$children"; then printf '%s\n' "$st"; return 0; fi
+        done < <(printf '%s\n' "$entries" | sort -ru)
+        return 3
     }
-
-    # The snapshot was written under the SOURCE host's name. On a fresh DR box the
-    # hostname differs, so honour an explicit override (GENESIS_BACKUP_NAS_HOST),
-    # and otherwise fall back to the sole host dir when there's exactly one.
-    off_host="${GENESIS_BACKUP_NAS_HOST:-$(hostname)}"
-    host_dir="Genesis/$off_host"
-    latest="$(_latest_complete "$host_dir" || true)"
-    if [ -z "$latest" ]; then
-        hosts=$(backend_list_dirs "Genesis" || true)
-        n=$(printf '%s' "$hosts" | grep -c . || true)
-        if [ "$n" = 1 ]; then
+    marker=""
+    if [ -n "$pinned" ] && ! $REFRESH_SNAPSHOT; then
+        snap="$pinned"
+        log "off-site: resuming pinned snapshot ${snap##*/} (backend: $be)"
+    else
+        backend_available || die "off-site backend unavailable; no local fallback permitted"
+        off_host="${GENESIS_BACKUP_NAS_HOST:-$(hostname)}"
+        hosts=$(backend_list_dirs_strict Genesis) || die "off-site: cannot list source hosts"
+        host_dir="Genesis/$off_host"
+        latest=""
+        if grep -Fxq "$off_host" <<<"$hosts"; then
+            rc=0
+            latest=$(_latest_complete "$host_dir") || rc=$?
+            [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || die "off-site: cannot inspect source snapshots"
+        elif [ "$(grep -c . <<<"$hosts")" = 1 ]; then
             host_dir="Genesis/$hosts"
             log "off-site: no snapshots under host '$off_host' — using the only host: $hosts"
-            latest="$(_latest_complete "$host_dir" || true)"
+            rc=0
+            latest=$(_latest_complete "$host_dir") || rc=$?
+            [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || die "off-site: cannot inspect source snapshots"
         fi
+        if [ -z "$latest" ]; then die "off-site: no COMPLETE dated snapshot; no restorable payloads found"; fi
+        snap="$host_dir/$latest"
+        # Validate the selected marker before publishing selection, including refresh.
+        marker=$(mktemp -p "$GENESIS_BIG_TMP" selected-complete.XXXXXX)
+        if ! backend_get "$snap/COMPLETE" "$marker"; then rm -f "$marker"; die "off-site: cannot validate selected COMPLETE marker"; fi
+        log "off-site: pulling latest snapshot $latest (backend: $be)"
     fi
-    if [ -z "$latest" ]; then
-        log "off-site: no COMPLETE dated snapshot found (set GENESIS_BACKUP_NAS_HOST to the source host name) — skipping off-site pull"
-        return 0
-    fi
-    log "off-site: pulling latest snapshot $latest (backend: $be)"
-    snap="$host_dir/$latest"
+    _RESTORE_WORKSPACE=$(python3 "$_SCRIPT_DIR/lib/restore_selection.py" open "$workspace_root" "$identity" "$snap" "$REFRESH_SNAPSHOT" "$marker") || die "cannot open private restore selection"
+    [ -z "$marker" ] || rm -f "$marker"
+    BACKUP_DIR="$_RESTORE_WORKSPACE/view"
+    host_dir="${snap%/*}"
 
-    # SQLite dump.
-    mkdir -p "$BACKUP_DIR/data"
-    if backend_get "$snap/data/genesis.sql.gpg" "$BACKUP_DIR/data/genesis.sql.gpg"; then
-        log "  off-site: pulled data/genesis.sql.gpg"
-    else
-        warn "off-site: failed to pull genesis.sql.gpg from snapshot $latest — the database will not be restored from off-site"
-    fi
-    # Qdrant snapshots + transcripts: list the subdir, then get each *.gpg.
-    # Process substitution (not `list | grep | while`): a failed backend_get of
-    # these — the two LARGEST DR payloads (vectors + the "permanent archive"
-    # transcripts) — must `warn` (→ _FAILURES → non-zero restore), matching the
-    # memory/config/secrets pulls below. A pipe-into-while runs the body in a
-    # SUBSHELL where the _FAILURES append is lost, and its `|| true` masked the
-    # failure entirely — the silent-DR-footgun this converts away from. The
-    # `|| true` on the process-substitution input still absorbs an empty-subdir
-    # grep-miss (staging dir created only when something is actually pulled).
-    for sub in qdrant transcripts; do
-        dst="$BACKUP_DIR/data/qdrant"
-        [ "$sub" = transcripts ] && dst="$BACKUP_DIR/transcripts"
-        while read -r fname; do
-            mkdir -p "$dst"
-            if backend_get "$snap/$sub/$fname" "$dst/$fname"; then
-                log "  off-site: pulled $sub/$fname"
-            else
-                warn "off-site: failed to pull $sub/$fname from snapshot $latest"
+    # Successful parent listings establish optional-directory absence. A failed
+    # listing remains unknown/failed and never authorizes ambient cached files.
+    _selected_list() {
+        local path="$1" parent children
+        parent="${path%/*}"
+        if [ "$parent" = "$snap" ]; then
+            children=$(backend_list_strict "$parent") || return 1
+        else
+            local parent_rc=0
+            children=$(_selected_list "$parent") || parent_rc=$?
+            [ "$parent_rc" -eq 0 ] || return "$parent_rc"
+        fi
+        if ! grep -Fxq "${path##*/}" <<<"$children"; then return 3; fi
+        backend_list_strict "$path"
+    }
+    _selected_pull_component() {
+        local remote="$1" target="$2" pattern="$3" entries status=0 name temporary
+        entries=$(python3 "$_SCRIPT_DIR/lib/restore_selection.py" inventory "$_RESTORE_WORKSPACE" "$target") || status=$?
+        if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then die "damaged selected inventory: $target"; fi
+        if [ "$status" -eq 3 ]; then
+            status=0
+            entries=$(_selected_list "$snap/$remote") || status=$?
+            if [ "$status" -eq 3 ]; then
+                python3 "$_SCRIPT_DIR/lib/restore_selection.py" state "$_RESTORE_WORKSPACE" "$target" empty || die "cannot record empty inventory"
+                return
+            elif [ "$status" -ne 0 ]; then
+                python3 "$_SCRIPT_DIR/lib/restore_selection.py" state "$_RESTORE_WORKSPACE" "$target" failed || die "cannot record failed inventory"
+                warn "off-site: failed to list $remote in selected snapshot"
+                return
             fi
-        done < <(backend_list "$snap/$sub" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u || true)
-    done
+            entries=$(printf '%s\n' "$entries" | grep -E "$pattern" | sort -u || true)
+            local -a inventory=()
+            while IFS= read -r name; do [ -n "$name" ] && inventory+=("$name"); done <<<"$entries"
+            if [ "${#inventory[@]}" -eq 0 ]; then
+                python3 "$_SCRIPT_DIR/lib/restore_selection.py" state "$_RESTORE_WORKSPACE" "$target" empty || die "cannot record inventory"
+            else
+                python3 "$_SCRIPT_DIR/lib/restore_selection.py" state "$_RESTORE_WORKSPACE" "$target" expected "${inventory[@]}" || die "cannot record inventory"
+            fi
+        fi
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            status=0
+            python3 "$_SCRIPT_DIR/lib/restore_selection.py" cached "$_RESTORE_WORKSPACE" "$target" "$name" || status=$?
+            if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then die "unsafe selected cache payload: $target/$name"; fi
+            if [ "$status" -eq 3 ]; then
+                temporary=$(mktemp -p "$_RESTORE_WORKSPACE" .payload.XXXXXX)
+                if backend_get "$snap/$remote/$name" "$temporary" && python3 "$_SCRIPT_DIR/lib/restore_selection.py" publish "$_RESTORE_WORKSPACE" "$target" "$name" "$temporary"; then :
+                else warn "off-site: failed to pull $remote/$name from selected snapshot"; fi
+                rm -f "$temporary"
+            fi
+        done <<<"$entries"
+    }
+    marker="$_RESTORE_WORKSPACE/COMPLETE"
+    python3 "$_SCRIPT_DIR/lib/restore_selection.py" marker "$_RESTORE_WORKSPACE" "$marker" || die "selected COMPLETE cache failed validation"
+    _selected_pull_component data data '^(genesis\.sql(\.gpg)?)$'
+    if [ ! -f "$BACKUP_DIR/data/genesis.sql.gpg" ] && [ ! -f "$BACKUP_DIR/data/genesis.sql" ]; then
+        warn "off-site: selected snapshot has no verified SQLite payload; database not recovered"
+    fi
+    _selected_pull_component qdrant data/qdrant '^[A-Za-z0-9._-]+\.snapshot(\.gpg)?$'
+    _selected_pull_component memory memory '^[A-Za-z0-9._-]+\.gpg$'
+    _selected_pull_component config_overrides config_overrides '^[A-Za-z0-9._-]+\.local\.yaml$'
+    _selected_pull_component secrets secrets '^secrets\.env\.gpg$'
+    _selected_pull_component eval eval '^[A-Za-z0-9._-]+\.gpg$'
+    _selected_pull_component eval/golden eval/golden '^[A-Za-z0-9._-]+\.gpg$'
+    _selected_pull_component creds creds '^[A-Za-z0-9._-]+\.gpg$'
+    _selected_pull_component creds/ssh creds/ssh '^[A-Za-z0-9._-]+\.gpg$'
 
-    # memory / config overlays / secrets — previously only in the Tier-1 git clone. Pull
-    # them from the snapshot too so a no-git fresh box can rehydrate them (the §4/§6/§7
-    # restore sections read from these BACKUP_DIR subdirs). memory is flat; config overlays
-    # are plaintext .local.yaml; secrets is the encrypted blob. Staging dirs are created
-    # only when there's something to pull.
-    #
-    # Process substitution (not a `… | while`) is deliberate: a failed pull of these
-    # payloads is the silent DR footgun this PR exists to prevent, so a failed get must
-    # `warn` (→ _FAILURES → non-zero restore). A pipe-into-while runs the body in a
-    # SUBSHELL where _FAILURES appends are lost; `done < <(…)` runs it in THIS shell.
-    while read -r fname; do
-        mkdir -p "$BACKUP_DIR/memory"
-        if backend_get "$snap/memory/$fname" "$BACKUP_DIR/memory/$fname"; then
-            log "  off-site: pulled memory/$fname"
-        else
-            warn "off-site: failed to pull memory/$fname from snapshot $latest"
+    # Persist classification only after successful inventory/format evidence.
+    # Retry paths can then authenticate a selected cached pool manifest without
+    # requiring a fresh directory listing before the helper gets to run.
+    local transcript_mode mode_rc=0 pool_expected=false root_children classification_known=true
+    transcript_mode=$(python3 "$_SCRIPT_DIR/lib/restore_selection.py" mode "$_RESTORE_WORKSPACE") || mode_rc=$?
+    if grep -Fxq 'transcript-pool 1' "$marker"; then pool_expected=true; fi
+    if [ "$mode_rc" -ne 0 ] && [ "$mode_rc" -ne 3 ]; then die "damaged transcript classification"; fi
+    if [ "$transcript_mode" = legacy ] && $pool_expected; then
+        warn "off-site: transcript classification contradicts selected COMPLETE marker"
+        return
+    fi
+    if [ "$mode_rc" -eq 3 ]; then
+        if root_children=$(backend_list_strict "$snap"); then
+            if grep -Fxq TRANSCRIPT_POOL <<<"$root_children"; then pool_expected=true; fi
+        elif ! $pool_expected; then
+            classification_known=false
+            warn "off-site: cannot inspect selected snapshot root inventory"
         fi
-    done < <(backend_list "$snap/memory" | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
-    while read -r fname; do
-        mkdir -p "$BACKUP_DIR/config_overrides"
-        if backend_get "$snap/config_overrides/$fname" "$BACKUP_DIR/config_overrides/$fname"; then
-            log "  off-site: pulled config_overrides/$fname"
-        else
-            warn "off-site: failed to pull config_overrides/$fname from snapshot $latest"
+        if $classification_known; then
+        rc=0
+        listing=$(_selected_list "$snap/transcripts") || rc=$?
+        if $pool_expected; then
+            transcript_mode=pooled
+            [ "$rc" -ne 3 ] || warn "off-site: required pooled transcript inventory missing"
+        elif [ "$rc" -eq 0 ]; then
+            if grep -Fxq POOLED <<<"$listing" || grep -Fxq manifest-v1.json.gpg <<<"$listing"; then
+                transcript_mode=pooled
+            else transcript_mode=legacy; fi
+        elif [ "$rc" -eq 3 ]; then transcript_mode=legacy
+        else warn "off-site: failed to list transcripts in selected snapshot"; fi
+        if [ -n "$transcript_mode" ]; then
+            python3 "$_SCRIPT_DIR/lib/restore_selection.py" mode "$_RESTORE_WORKSPACE" "$transcript_mode" >/dev/null || die "cannot pin transcript classification"
         fi
-    done < <(backend_list "$snap/config_overrides" | grep -oE '[A-Za-z0-9._-]+\.local\.yaml' | sort -u)
-    if backend_exists "$snap/secrets/secrets.env.gpg"; then
-        mkdir -p "$BACKUP_DIR/secrets"
-        if backend_get "$snap/secrets/secrets.env.gpg" "$BACKUP_DIR/secrets/secrets.env.gpg"; then
-            log "  off-site: pulled secrets/secrets.env.gpg"
-        else
-            warn "off-site: failed to pull secrets.env.gpg from snapshot $latest — secrets will not be restored"
         fi
     fi
-    # eval golden sets — a no-git fresh box needs them from the snapshot too
-    # (restore §4b reads $BACKUP_DIR/eval). backend_list is single-level, so
-    # iterate eval/ and eval/golden/ separately; the .gpg filter drops the
-    # `golden` subdir entry so it is not mis-fetched as a flat file.
-    for _sub in eval eval/golden; do
-        while read -r fname; do
-            mkdir -p "$BACKUP_DIR/$_sub"
-            if backend_get "$snap/$_sub/$fname" "$BACKUP_DIR/$_sub/$fname"; then
-                log "  off-site: pulled $_sub/$fname"
-            else
-                warn "off-site: failed to pull $_sub/$fname from snapshot $latest"
-            fi
-        done < <(backend_list "$snap/$_sub" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
-    done
-    # opt-in extra-directory archives (backup.sh §6f) — flat by construction, one
-    # <name>.tar.gpg per directory. Only names pulled from THIS snapshot are restored
-    # (§4c), so an archive a previous run left in $BACKUP_DIR/extra cannot come back
-    # from another point in time. The snapshot's COMPLETE marker lists the archives
-    # it holds (backup.sh writes it last). That list is authoritative: a failed
-    # off-site LISTING is indistinguishable from an empty one, while a failed
-    # download of the marker is detectable. An empty marker predates extra
-    # directories and means the snapshot holds none.
-    _EXTRA_FROM_SNAPSHOT=true
-    _EXTRA_PULLED=""
-    _xt_names=""
-    _xt_marker="$(mktemp -p "$GENESIS_BIG_TMP" complete.XXXXXX)" || _xt_marker=""
-    if [ -n "$_xt_marker" ] && backend_get "$snap/COMPLETE" "$_xt_marker"; then
-        if [ "$(head -1 "$_xt_marker")" = "genesis-snapshot 1" ]; then
-            _xt_names="$(awk '$1 == "extra" {print $2}' "$_xt_marker" | grep -E '^[A-Za-z0-9._-]+\.tar\.gpg$' || true)"
-            # Directories the source listed but could not back up in that run.
-            while IFS= read -r _xt_sk; do
-                warn "off-site: snapshot $latest does not hold extra directory ${_xt_sk:-(unnamed entry)} (backup skipped it that run); it is not restored"
-            done < <(awk '$1 == "skipped" {$1 = ""; sub(/^ /, ""); print}' "$_xt_marker" | tr -cd '[:print:]\n')
-        elif [ -s "$_xt_marker" ]; then
-            warn "off-site: snapshot $latest has a COMPLETE marker in an unknown format; its extra directories are not restored"
-        fi
-        # An empty marker predates extra directories: that snapshot holds none.
-    else
-        warn "off-site: could not read the COMPLETE marker of snapshot $latest — its extra directories cannot be verified or restored"
+    if [ "$transcript_mode" = pooled ]; then
+        mkdir -p "$BACKUP_DIR/transcripts" "$_RESTORE_WORKSPACE/cache/transcripts"
+        if ! _TRANSCRIPTS_PULLED=$(transcript_pool_pull "$host_dir" "$snap" "$BACKUP_DIR/transcripts" "$_RESTORE_WORKSPACE/cache/transcripts"); then warn "off-site: transcript pooled inventory/object recovery incomplete"; fi
+    elif [ "$transcript_mode" = legacy ]; then
+        _selected_pull_component transcripts transcripts '^[A-Za-z0-9._-]+\.gpg$'
+        if [ -d "$BACKUP_DIR/transcripts" ]; then _TRANSCRIPTS_PULLED=$(find "$BACKUP_DIR/transcripts" -maxdepth 1 -type f -name '*.gpg' -printf '%f\n'); fi
     fi
-    [ -n "$_xt_marker" ] && rm -f "$_xt_marker"
-    while read -r fname; do
-        [ -n "$fname" ] || continue
-        mkdir -p "$BACKUP_DIR/extra" 2>/dev/null || true  # a failed get below warns per file
-        if backend_get "$snap/extra/$fname" "$BACKUP_DIR/extra/$fname"; then
-            _EXTRA_PULLED+="$fname"$'\n'
-            log "  off-site: pulled extra/$fname"
-        else
-            warn "off-site: failed to pull extra/$fname from snapshot $latest"
-        fi
-    done <<< "$_xt_names"
-    # creds — Tier-1 git normally carries these; a no-git box needs them from the
-    # snapshot too (restore §8 reads $BACKUP_DIR/creds). backend_list is
-    # single-level, so iterate creds/ and creds/ssh/ separately; the .gpg filter
-    # drops the `ssh` subdir entry so it is not mis-fetched as a flat file.
-    for _sub in creds creds/ssh; do
-        while read -r fname; do
-            mkdir -p "$BACKUP_DIR/$_sub"
-            if backend_get "$snap/$_sub/$fname" "$BACKUP_DIR/$_sub/$fname"; then
-                log "  off-site: pulled $_sub/$fname"
-            else
-                warn "off-site: failed to pull $_sub/$fname from snapshot $latest"
+    if [ "$(python3 "$_SCRIPT_DIR/lib/restore_selection.py" format "$_RESTORE_WORKSPACE")" = 'genesis-snapshot 1' ]; then
+        names=$(awk '$1 == "extra" {print $2}' "$marker")
+        local -a extra_names=()
+        while IFS= read -r fname; do
+            [ -n "$fname" ] || continue
+            [[ "$fname" =~ ^[A-Za-z0-9._-]+\.tar\.gpg$ ]] || { warn "off-site: invalid extra inventory"; continue; }
+            extra_names+=("$fname")
+        done <<<"$names"
+        if [ "${#extra_names[@]}" -gt 0 ]; then
+            if ! python3 "$_SCRIPT_DIR/lib/restore_selection.py" inventory "$_RESTORE_WORKSPACE" extra >/dev/null; then
+                python3 "$_SCRIPT_DIR/lib/restore_selection.py" state "$_RESTORE_WORKSPACE" extra expected "${extra_names[@]}" || die "cannot record extra inventory"
             fi
-        done < <(backend_list "$snap/$_sub" 2>/dev/null | grep -oE '[A-Za-z0-9._-]+\.gpg' | sort -u)
-    done
+            _selected_pull_component extra extra '^[A-Za-z0-9._-]+\.tar\.gpg$'
+            [ ! -d "$BACKUP_DIR/extra" ] || _EXTRA_PULLED=$(find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -printf '%f\n')
+        fi
+        while IFS= read -r fname; do warn "off-site: snapshot does not hold extra directory $fname (backup skipped it that run)"; done < <(awk '$1 == "skipped" {$1=""; sub(/^ /, ""); print}' "$marker" | tr -cd '[:print:]\n')
+        # The run that wrote this snapshot did not back up the card vault (§8 says so).
+        if grep -q '^payment_vault' "$marker"; then
+            _PV_GAP="$(awk '$1 == "payment_vault" {print $2; exit}' "$marker" | tr -cd 'a-z')"
+            _PV_GAP="${_PV_GAP:-unknown}"  # a malformed line still means a gap
+        fi
+    elif [ -s "$marker" ]; then warn "off-site: unknown COMPLETE format; extra recovery withheld"; fi
 }
-if $DATABASE_ONLY && $_EXPLICIT_LOCAL_SOURCE \
-    && { [ -f "$BACKUP_DIR/data/genesis.sql.gpg" ] || [ -f "$BACKUP_DIR/data/genesis.sql" ]; }; then
-    log "database-only: using explicit local SQL payload without off-site replacement"
+
+if $_EXPLICIT_LOCAL_SOURCE; then
+    log "Using explicit local source without off-site replacement"
+    if $REFRESH_SNAPSHOT; then
+        log "--refresh-snapshot applies only to off-site recovery; local source remains selected"
+    fi
 else
     _pull_from_offsite
 fi
@@ -568,7 +732,7 @@ _backup_has_payload() {
     # mirror copy and sweeping leaves a `.<name>.partial.<pid>` scrap, and a mirror
     # holding zero restorable records would otherwise satisfy this guard and let the
     # run report success having restored nothing.
-    find "$d/audit/merge_overrides" -maxdepth 1 -type f -name '*.jsonl' -print -quit \
+    find "$_AUDIT_SRC" -maxdepth 1 -type f -name '*.jsonl' -print -quit \
         2>/dev/null | grep -q . && return 0
     [ -f "$d/secrets/secrets.env.gpg" ] && return 0
     find "$d/config_overrides" -type f -name '*.local.yaml' -print -quit 2>/dev/null | grep -q . && return 0
@@ -597,12 +761,13 @@ _has_encrypted=false
 for candidate in "$BACKUP_DIR"/data/genesis.sql.gpg "$BACKUP_DIR"/secrets/secrets.env.gpg; do
     [ -f "$candidate" ] && _has_encrypted=true
 done
-if find "$BACKUP_DIR"/transcripts "$BACKUP_DIR"/memory "$BACKUP_DIR"/data/qdrant "$BACKUP_DIR"/extra -name '*.gpg' -print -quit 2>/dev/null | grep -q .; then
+if find "$BACKUP_DIR"/transcripts "$BACKUP_DIR"/memory "$BACKUP_DIR"/data/qdrant "$BACKUP_DIR"/extra "$BACKUP_DIR"/analytics -name '*.gpg' -print -quit 2>/dev/null | grep -q .; then
     _has_encrypted=true
 fi
 if $_has_encrypted && [ -z "$_BACKUP_PASSPHRASE" ]; then
     die "Backup contains encrypted payloads but GENESIS_BACKUP_PASSPHRASE is unset"
 fi
+
 
 log "Mode: $( $DRY_RUN && echo dry-run || echo apply )  Force: $FORCE"
 
@@ -1178,27 +1343,21 @@ fi
 # ── 3. CC transcripts ────────────────────────────────────────────────
 log "--- Transcripts ---"
 if [ -d "$BACKUP_DIR/transcripts" ]; then
-    mkdir -p "$TRANSCRIPT_DIR"
-    while IFS= read -r -d '' src; do
-        name=$(basename "$src")
-        # Strip .gpg if present to get dest name
-        dst_name="${name%.gpg}"
-        dst="$TRANSCRIPT_DIR/$dst_name"
-        if [ -f "$dst" ] && [ "$dst" -nt "$src" ] && ! $FORCE; then
-            continue
-        fi
-        if $DRY_RUN; then
-            log "Transcripts: would restore $name → $dst"
-            _TRANSCRIPT_RESTORED=$(( _TRANSCRIPT_RESTORED + 1 ))
-            continue
-        fi
-        if [[ "$name" == *.gpg ]]; then
-            decrypt_file "$src" "$dst" || { warn "transcript decrypt failed: $name"; continue; }
-        else
-            cp "$src" "$dst"
-        fi
-        _TRANSCRIPT_RESTORED=$(( _TRANSCRIPT_RESTORED + 1 ))
-    done < <(find "$BACKUP_DIR/transcripts" -maxdepth 1 \( -name '*.jsonl' -o -name '*.jsonl.gpg' \) -print0 2>/dev/null)
+    _v2_flags=("${_TRANSCRIPT_PREFERENCES[@]}")
+    $FORCE && _v2_flags+=(--force)
+    $DRY_RUN && _v2_flags+=(--dry-run)
+    if $_TRANSCRIPTS_FROM_SNAPSHOT; then
+        _selected_transcripts=$(mktemp -p "$GENESIS_BIG_TMP" selected-transcripts.XXXXXX)
+        printf '%s' "$_TRANSCRIPTS_PULLED" >"$_selected_transcripts"
+        _v2_flags+=(--selected "$_selected_transcripts")
+    fi
+    _v2_rc=0
+    _v2_count=$(printf '%s' "$_BACKUP_PASSPHRASE" | python3 "$_SCRIPT_DIR/lib/transcript_archive.py" restore-set \
+        "$BACKUP_DIR/transcripts" --root "$HOME/.claude/projects" "--project=$_CC_PROJECT_ID" \
+        --scratch "$GENESIS_BIG_TMP" "${_v2_flags[@]}") || _v2_rc=$?
+    [[ "$_v2_count" =~ ^[0-9]+$ ]] && _TRANSCRIPT_RESTORED=$_v2_count
+    [ "$_v2_rc" -eq 0 ] || warn "transcript restore incomplete (invalid captures or unresolved freshness)"
+    rm -f "${_selected_transcripts:-}"
     log "Transcripts: $_TRANSCRIPT_RESTORED restored"
 else
     log "Transcripts: no backup directory"
@@ -1320,6 +1479,10 @@ elif find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit
             fi
             continue
         fi
+        if [ "$name" = transcript-analytics-v1.tar.gpg ]; then
+            warn "analytics data requires settings recovery support; archive retained"
+            continue
+        fi
         if $DRY_RUN; then
             log "Extra: would restore archive $name (one directory under \$HOME)"
             _EXTRA_RESTORED=$(( _EXTRA_RESTORED + 1 ))
@@ -1365,8 +1528,15 @@ elif find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit
             _xt_skip "extra archive refused: $name: the destination ~/$_xt_root is a symlink (not replaced; restore it by hand)"
             continue
         fi
-        if _xt_core="$(backup_core_overlap "$(realpath -m -- "$_xt_target")")"; then
+        if ! backup_capture_path _xt_resolved realpath -m -- "$_xt_target"; then
+            _xt_skip "extra archive refused: $name: cannot normalize destination"
+            continue
+        fi
+        if _xt_core="$(backup_core_overlap "$_xt_resolved")"; then
             _xt_skip "extra archive refused: $name: ~/$_xt_root overlaps $_xt_core, which the core restore owns"
+            continue
+        elif [ "$?" -ne 1 ]; then
+            _xt_skip "extra archive refused: $name: cannot establish core path separation"
             continue
         fi
         _xt_aside=""
@@ -1418,7 +1588,7 @@ log "--- CC memory (in-repo) ---"
 # The backup.sh stores this under $GENESIS_DIR/data/cc-memory-backup (gitignored).
 # There's a narrow restore_cc_memory.sh already — delegate to it if present.
 CC_MEM_BACKUP="$GENESIS_DIR/data/cc-memory-backup"
-if [ -x "$GENESIS_DIR/scripts/restore_cc_memory.sh" ] && [ -d "$CC_MEM_BACKUP" ]; then
+if ! $_RESTORE_MANAGED && [ -x "$GENESIS_DIR/scripts/restore_cc_memory.sh" ] && [ -d "$CC_MEM_BACKUP" ]; then
     if $DRY_RUN; then
         log "CC memory: would run restore_cc_memory.sh"
         _CCMEM_RESTORED=true
@@ -1437,6 +1607,7 @@ if [ -d "$BACKUP_DIR/config_overrides" ]; then
     while IFS= read -r -d '' src; do
         name=$(basename "$src")
         dst="$GENESIS_DIR/config/$name"
+
         if [ -f "$dst" ] && [ "$dst" -nt "$src" ] && ! $FORCE; then
             continue
         fi
@@ -1497,7 +1668,6 @@ fi
 # written since — deliberately not `cp -n`, whose skip is indistinguishable from a
 # copy in its exit status and which coreutils warns may change behaviour.
 log "--- Hook audit stores ---"
-_AUDIT_SRC="$BACKUP_DIR/audit/merge_overrides"
 # ASK, do not assume — same resolver the writer and the pruner use. Restoring to
 # the hardcoded default put an install with a custom GENESIS_MERGE_OVERRIDE_DIR
 # back together with its audit trail in a directory nothing reads (Codex P2,
@@ -1596,11 +1766,95 @@ if [ -d "$CREDS_SRC_DIR" ]; then
         else
             warn "Creds: decrypt failed for $_rel"
         fi
-    done < <(find "$CREDS_SRC_DIR" -type f -name '*.gpg' -print0)
+    done < <(find "$CREDS_SRC_DIR" -type f -name '*.gpg' ! -name "$PAYMENT_VAULT_ARCHIVE" ! -name "$PAYMENT_VAULT_LAST_GOOD" -print0)
     umask "$_prev_umask"
     if ! $DRY_RUN; then
         log "Creds: $_CREDS_STAGED file(s) decrypted → $CREDS_STAGE (staged, NOT auto-placed)"
         log "      Move into place manually (ssh/ → ~/.ssh/, gh_hosts.yml → ~/.config/gh/hosts.yml, etc.)."
+    fi
+    # The card vault: one archive, decrypted here (never by the loop above) and
+    # only after its checks, so a refused archive never leaves a plaintext copy
+    # behind. It comes from this restore's source: an off-site pull reads the
+    # selected snapshot's private view (CREDS_SRC_DIR is under it), never the
+    # checkout, so an archive left there by an older backup cannot be staged.
+    # A DRY RUN of an off-site restore is the exception: it selects and pulls
+    # nothing, so CREDS_SRC_DIR is still the checkout, and what is there says
+    # nothing about the snapshot a real run would select.
+    _PV_ARCHIVE="$CREDS_SRC_DIR/$PAYMENT_VAULT_ARCHIVE"
+    _PV_STAGE="$CREDS_STAGE/payment_vault"
+    _PV_LIVE="$(_backup_core_home)/payment_vault"
+    # The vault genesis-server uses when secrets.env sets GENESIS_HOME: read with
+    # the server's own parser (python-dotenv, which interpolates ${VAR}), an empty
+    # value meaning the default as in genesis.env.genesis_home(), and a relative
+    # one anchored at the repo, the unit's WorkingDirectory. Only that key leaves
+    # the file.
+    _PV_SECRETS_VAULT=""
+    if [ -f "$SECRETS_FILE" ]; then
+        _pv_py="$_SCRIPT_DIR/../.venv/bin/python"
+        [ -x "$_pv_py" ] || _pv_py="$(command -v python3.12 || command -v python3 || true)"
+        if [ -n "$_pv_py" ] && _PV_SECRETS_VAULT="$("$_pv_py" -I -c '
+import os, sys
+try:
+    from dotenv import dotenv_values
+except ImportError:
+    sys.exit(3)
+value = dotenv_values(sys.argv[1]).get("GENESIS_HOME")
+if value is not None:
+    home = os.path.expanduser(value) if value else os.path.expanduser("~/.genesis")
+    print(os.path.join(sys.argv[2], home, "payment_vault"))
+' "$SECRETS_FILE" "$GENESIS_DIR" 2>/dev/null)"; then
+            :
+        else
+            # No python-dotenv: the shell parser (no ${VAR} interpolation).
+            _PV_SECRETS_VAULT="$(
+                unset GENESIS_HOME
+                # shellcheck source=scripts/lib/load_secrets.sh
+                source "$_SCRIPT_DIR/lib/load_secrets.sh" >/dev/null 2>&1 \
+                    && load_secrets_file "$SECRETS_FILE" >/dev/null 2>&1
+                # A ${VAR} value needs dotenv's interpolation: no guess here.
+                if [ -n "${GENESIS_HOME+x}" ] && [[ "$GENESIS_HOME" != *'$'* ]]; then
+                    _BACKUP_CORE_CWD="$GENESIS_DIR"
+                    printf '%s/payment_vault' "$(_backup_core_home)"
+                fi
+            )"
+        fi
+    fi
+    _PV_STAGED=false
+    if $DRY_RUN && $_RESTORE_MANAGED; then
+        # The refusals that do not depend on the snapshot still apply, so a dry
+        # run never predicts a stage the real run would refuse.
+        if ! command -v realpath >/dev/null 2>&1; then
+            warn "Payment vault: not staged. realpath is not installed, so the staging path cannot be checked against the live vault"
+        elif _pv_overlaps_live "$_PV_STAGE"; then
+            warn "Payment vault: not staged. Its staging path $_PV_STAGE overlaps the live vault $_PV_OVERLAP (check GENESIS_CREDS_STAGE)"
+        else
+            log "Creds: would stage the card vault only if the selected off-site snapshot holds $PAYMENT_VAULT_ARCHIVE (a dry run pulls nothing, so it cannot tell)"
+        fi
+    elif [ -n "${_PV_GAP:-}" ]; then
+        # The selected snapshot's run did not back up the vault. What it carries is
+        # an earlier run's archive, which is not staged as if it were this snapshot's.
+        if [ -f "$CREDS_SRC_DIR/$PAYMENT_VAULT_LAST_GOOD" ] && [ ! -L "$CREDS_SRC_DIR/$PAYMENT_VAULT_LAST_GOOD" ]; then
+            warn "Payment vault: not staged. The selected snapshot's backup did not capture the vault (vault step: $_PV_GAP). It carries the last good archive from an earlier run at $CREDS_SRC_DIR/$PAYMENT_VAULT_LAST_GOOD. To stage that one, make a new empty directory <dir>, copy the file to <dir>/creds/$PAYMENT_VAULT_ARCHIVE, and run restore.sh --from <dir>"
+        else
+            warn "Payment vault: not staged. The selected snapshot's backup did not capture the vault (vault step: $_PV_GAP), and no earlier archive was pulled from it (see any off-site pull warning above)"
+        fi
+    elif [ -L "$_PV_ARCHIVE" ]; then
+        warn "Payment vault: not staged. $PAYMENT_VAULT_ARCHIVE in the backup source is a symlink"
+    elif [ -f "$_PV_ARCHIVE" ]; then
+        if ! command -v realpath >/dev/null 2>&1; then
+            warn "Payment vault: not staged. realpath is not installed, so the staging path cannot be checked against the live vault"
+        elif _pv_overlaps_live "$_PV_STAGE"; then
+            warn "Payment vault: not staged. Its staging path $_PV_STAGE overlaps the live vault $_PV_OVERLAP (check GENESIS_CREDS_STAGE)"
+        elif $DRY_RUN; then
+            log "Creds: would stage the card vault from $PAYMENT_VAULT_ARCHIVE"
+            _PV_STAGED=true
+        else
+            _pv_stage_vault && _PV_STAGED=true
+        fi
+    fi
+    # Whatever is still at the staging path was not written by this restore.
+    if ! $_PV_STAGED && ! $DRY_RUN && [ -e "$_PV_STAGE/identity.age" ]; then
+        log "NOTE: $_PV_STAGE holds a vault from an EARLIER restore, not from this backup"
     fi
 else
     log "Creds: no backup payload at $CREDS_SRC_DIR"

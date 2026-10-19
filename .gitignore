@@ -54,6 +54,8 @@ firebase-debug.log
 scripts/cc_cli_output/
 .firecrawl/
 .mcp.json
+# A half-written render a killed bootstrap left behind (temp file + rename).
+.mcp.json.*
 config/.generated/
 # Auto-generated identity files (runtime-regenerated, seeds in .example)
 src/genesis/identity/TRIAGE_CALIBRATION.md
@@ -68,6 +70,7 @@ config/*.local.yaml
 # / the procedure promoter; must not ship a stale cache whose IDs aren't DB rows.
 config/procedure_triggers.yaml
 config/procedure_triggers.json
+config/procedure_triggers.lock
 .gstack/
 .context/
 .playwright-mcp/

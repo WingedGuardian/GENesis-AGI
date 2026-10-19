@@ -21,7 +21,8 @@ from genesis.browser.engine import PACKAGE_HINT
 BROWSER_DISTS = ("camoufox", "playwright", "patchright")
 # What each layer imports, so one layer's stale package never refuses another:
 # camoufox drives Firefox through playwright and never loads patchright; the
-# Chromium fallback, remote CDP and TinyFish import playwright only.
+# Chromium fallback imports the one package it runs (patchright when installed);
+# remote CDP and TinyFish import playwright only.
 CAMOUFOX_DISTS = ("camoufox", "playwright")
 PLAYWRIGHT_ONLY = ("playwright",)
 
@@ -35,7 +36,9 @@ def installed_versions() -> dict[str, str | None]:
     found: dict[str, str | None] = {}
     for dist in BROWSER_DISTS:
         try:
-            found[dist] = metadata.version(dist)
+            # A dist-info with no Version (a half-removed install) answers None on
+            # Python 3.12: present but unreadable, never absent.
+            found[dist] = metadata.version(dist) or UNREADABLE
         except metadata.PackageNotFoundError:
             found[dist] = None
         except Exception:  # noqa: BLE001 - a damaged install, reported as one

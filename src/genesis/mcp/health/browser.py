@@ -35,11 +35,26 @@ from pathlib import Path
 
 from fastmcp import Context
 
-from genesis.browser import engine, packages
-from genesis.browser.types import BrowserLayer
+from genesis.browser import chromium, engine, packages, profile_backup
+from genesis.browser.types import CAMOUFOX_PROFILE_DIR, BrowserLayer
 from genesis.mcp.health import mcp
+from genesis.security.card_redaction import CARD_FILTER, contains_card_text, redact_text
+from genesis.security.card_redaction import redacted as _redacted
+from genesis.security.card_shapes import contains_card_number
 
 logger = logging.getLogger(__name__)
+
+# Fixed texts: a refusal never echoes the value it refused.
+_REFUSE_CARD_VALUE = (
+    "Refused: the value looks like a payment card number. Card numbers are never "
+    "typed with the general browser tools; hand card entry to the user (see the "
+    "browser-automation skill, Safety gates)."
+)
+_REFUSE_CARD_RUN_JS = (
+    "Refused: the script contains what looks like a payment card number. Card "
+    "numbers never go through browser_run_js; hand card entry to the user (see the "
+    "browser-automation skill, Safety gates)."
+)
 
 # File-based logging for the entire MCP health server — routes ALL log
 # output to ~/tmp/mcp_health.log so it's readable after timeouts.
@@ -53,6 +68,8 @@ if _mcp_log_dir.is_dir():
     _mcp_fh.setLevel(logging.DEBUG)
     # Attach to root logger so ALL genesis.* logs are captured
     logging.getLogger("genesis").addHandler(_mcp_fh)
+    # On the handler: records propagated from any genesis.* logger are redacted.
+    _mcp_fh.addFilter(CARD_FILTER)
 
 # Direct file-write debug log for Turnstile — bypasses logging framework
 # entirely to guarantee output is visible. The logging.FileHandler approach
@@ -73,7 +90,7 @@ def _ts_log_write(msg: str) -> None:
 
         ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         with open(_TS_LOG_PATH, "a") as f:
-            f.write(f"{ts} {msg}\n")
+            f.write(f"{ts} {redact_text(msg)}\n")
             f.flush()
     except Exception:
         pass  # debug logging must never crash the tool
@@ -92,10 +109,36 @@ class _TsLog:
 
 _ts_log = _TsLog()
 
+
+# ---------------------------------------------------------------------------
+# Card-number redaction of tool output and logs
+# ---------------------------------------------------------------------------
+# A page can show a card number. Every _impl_browser_* result passes through
+# @_redacted, and CARD_FILTER (security/card_redaction.py) sits on the loggers
+# below and on the mcp_health.log handler. A logger filter sees only records
+# created on that logger, so each emitting logger is named: this module, the
+# genesis.browser modules it calls, FastMCP's tool and server loggers
+# (tool_manager logs a tool exception with its traceback, server logs call
+# arguments at debug) and the MCP SDK's lowlevel server logger. Logger-level,
+# because FastMCP's configure_logging replaces the fastmcp handlers.
+_REDACTED_LOGGERS = (
+    __name__,
+    "genesis.browser.engine",
+    "genesis.browser.profile",
+    "genesis.browser.profile_backup",
+    "genesis.browser.provision",
+    "fastmcp.tools.tool_manager",
+    "fastmcp.tools.tool",
+    "fastmcp.server.server",
+    "mcp.server.lowlevel.server",
+)
+for _name in _REDACTED_LOGGERS:
+    logging.getLogger(_name).addFilter(CARD_FILTER)
+
 # Prevents concurrent browser init/cleanup races across tool calls.
 _browser_lock = asyncio.Lock()
 
-_PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
+_PROFILE_DIR = CAMOUFOX_PROFILE_DIR
 _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
 # Module-level browser state — persists across tool calls within a session.
@@ -456,6 +499,8 @@ async def _ensure_browser():
         status = engine.resolve_camoufox_engine()
         if not status.ready:
             raise engine.CamoufoxNotReady(status.detail)
+        # A different engine upgrades the profile on first open; keep the way back.
+        await asyncio.to_thread(profile_backup.backup_camoufox_profile, _PROFILE_DIR, status.path)
 
         from camoufox.async_api import AsyncCamoufox
         # Again past the import: an upgrade that began after the first check
@@ -502,8 +547,56 @@ async def _ensure_browser():
         return _stealth_page
 
 
+def _patchright_installed() -> bool:
+    # Package metadata, not an import: a half-removed patchright whose metadata
+    # remains still counts as installed, so its import failure is reported.
+    return packages.installed_versions().get("patchright") is not None
+
+
+_warned_no_patchright = False
+# The browser extra carries patchright, pinned beside the playwright it pairs with.
+_PATCHRIGHT_STEP = engine.PACKAGE_HINT
+
+
+class PatchrightBroken(ImportError):
+    """patchright is installed but cannot be imported; the message is the repair."""
+
+
+def _chromium_package() -> str:
+    """The package the Chromium fallback runs through: patchright, which hides the
+    automation signals plain Playwright leaves, whenever it is installed."""
+    global _warned_no_patchright
+    if _patchright_installed():
+        return "patchright"
+    if not _warned_no_patchright:
+        _warned_no_patchright = True
+        logger.warning(
+            "patchright is not installed; the Chromium fallback uses plain Playwright, "
+            "which sites can detect. Operator step: %s",
+            _PATCHRIGHT_STEP,
+        )
+    return "playwright"
+
+
+def _chromium_async_playwright(package: str):
+    """``async_playwright`` from ``package``. An installed patchright whose import
+    fails is re-raised: switching silently to the detectable Chromium would hide
+    the broken install."""
+    if package == "patchright":
+        try:
+            from patchright.async_api import async_playwright
+        except ImportError as exc:
+            raise PatchrightBroken(
+                f"patchright is installed but cannot be imported ({exc}); tell the user; "
+                f"operator step: reinstall it ({_PATCHRIGHT_STEP})"
+            ) from exc
+    else:
+        from playwright.async_api import async_playwright
+    return async_playwright
+
+
 async def _ensure_chromium_fallback():
-    """Lazily initialize Playwright Chromium as fallback browser.
+    """Lazily initialize the Chromium fallback browser (patchright when installed).
 
     Use only when Camoufox fails on a specific site. Persistent profile at
     ~/.genesis/browser-profile/ (separate from Camoufox profile).
@@ -519,25 +612,46 @@ async def _ensure_chromium_fallback():
             logger.warning("Chromium page is stale — restarting Chromium")
             await _cleanup_chromium()
 
-        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
-        from playwright.async_api import async_playwright
+        package = _chromium_package()
+        # Selected once: every check below guards the package this launch imports,
+        # even if one is installed or removed meanwhile.
+        dists = (package,)
+        packages.check_loaded_browser_modules(dists)
+        async_playwright = _chromium_async_playwright(package)
         # Again past the import: an upgrade that began after the first check
         # would have mixed old loaded modules with new files.
-        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CHROMIUM))
-
-        _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-
-        # Always headed — Xvfb :99 is always running.
+        packages.check_loaded_browser_modules(dists)
+        # Always headed — Xvfb :99 is always running. Set before the driver starts:
+        # it copies the environment then, and the browser inherits the driver's.
         os.environ["DISPLAY"] = _VNC_DISPLAY
-
         pw = await async_playwright().start()
         try:
+            # An upgrade while the driver started can remove the revision this
+            # loaded driver launches: that needs a restart, not provisioning.
+            packages.check_loaded_browser_modules(dists)
+            # Before the profile copy and the launch: Playwright's own error for a
+            # missing browser tells the reader to run `<package> install`, a download
+            # no session may start. Judged where the driver itself will launch from.
+            missing = chromium.not_ready_at(package, "chromium", pw.chromium.executable_path)
+            if missing:
+                raise chromium.ChromiumNotReady(missing)
+
+            await asyncio.to_thread(
+                profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, package
+            )
+            # And after the copy, which can wait minutes for another session's: an
+            # upgrade in that window must not reach the launch.
+            packages.check_loaded_browser_modules(dists)
+            _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
             ctx = await pw.chromium.launch_persistent_context(
                 user_data_dir=str(_CHROMIUM_PROFILE_DIR),
                 headless=False,
                 args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
                       "--start-maximized"],
-                viewport={"width": 1280, "height": 720},
+                # patchright's guidance: a fixed viewport is a fingerprint; the
+                # page follows the (maximized) window instead.
+                no_viewport=True,
             )
         except BaseException:
             # Stop the driver this launch started; left running, the next
@@ -1423,7 +1537,11 @@ async def _get_page(
 def _layer_dists(layer: BrowserLayer) -> tuple[str, ...]:
     """The browser packages ``layer`` imports: what its launch guard checks and its
     import-error advice weighs. One answer, so the two cannot drift apart."""
-    return packages.CAMOUFOX_DISTS if layer is BrowserLayer.CAMOUFOX else packages.PLAYWRIGHT_ONLY
+    if layer is BrowserLayer.CAMOUFOX:
+        return packages.CAMOUFOX_DISTS
+    if layer is BrowserLayer.CHROMIUM:
+        return (_chromium_package(),)  # the one package the fallback runs
+    return packages.PLAYWRIGHT_ONLY
 
 
 def _requested_layer(stealth: bool, remote: bool, tinyfish: bool) -> BrowserLayer:
@@ -1652,8 +1770,9 @@ async def _with_tool_timeout(
         global _active_page
         logger.warning("%s timed out after %.0fs — resetting active page", operation, timeout_s)
         _active_page = None
+        # Outside @_redacted: the operation names the caller's selector or key.
         return {
-            "error": (
+            "error": redact_text(
                 f"{operation} timed out after {timeout_s:.0f}s. {note}"
                 "Browser state was reset — call browser_navigate to resume."
             )
@@ -2387,14 +2506,14 @@ async def _send_turnstile_alert(page_url: str) -> None:
             severity=AlertSeverity.WARNING,
             title="CAPTCHA Challenge Detected",
             body=(
-                f"Browser at {page_url} hit a Cloudflare challenge. "
+                f"Browser at {redact_text(page_url)} hit a Cloudflare challenge. "
                 f"Auto-resolve and VNC click both failed after multiple attempts. "
                 f"Genesis will retry on next navigation.\n\n"
                 f"VNC available at: {vnc_url}"
             ),
         )
         await channel.send(alert)
-        logger.info("CAPTCHA alert sent to Telegram for %s", page_url)
+        logger.info("CAPTCHA alert sent to Telegram for %s", redact_text(page_url))
     except Exception:
         logger.warning("Failed to send CAPTCHA Telegram alert", exc_info=True)
 
@@ -3153,6 +3272,7 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
 # ---------------------------------------------------------------------------
 
 
+@_redacted
 async def _impl_browser_navigate(
     url: str,
     stealth: bool = True,
@@ -3195,7 +3315,16 @@ async def _impl_browser_navigate(
         )
         lead = f"{changed} " if changed else ""
         return {"error": f"{lead}Camoufox is not ready: {e}"}
+    except chromium.ChromiumNotReady as e:
+        return {"error": f"Chromium is not ready: {e}"}
     except packages.BrowserPackagesChanged as e:
+        return {"error": str(e)}
+    except PatchrightBroken as e:
+        # Restarting comes first when a package changed under this session, as for
+        # any import error; otherwise the message is patchright's own repair.
+        dists = _layer_dists(BrowserLayer.CHROMIUM)
+        if packages.packages_changed_message(packages.stale_loaded_modules(dists)):
+            return {"error": packages.import_error_message(e, dists)}
         return {"error": str(e)}
     except ImportError as e:
         return {"error": packages.import_error_message(e, _layer_dists(layer))}
@@ -3515,6 +3644,7 @@ async def _follow_new_page(old, new) -> str | None:
     return None
 
 
+@_redacted
 async def _impl_browser_click(selector: str) -> dict:
     """Click an element on the current page.
 
@@ -4028,8 +4158,23 @@ async def _with_stall_diagnostics(
     return result
 
 
+@_redacted
 async def _impl_browser_fill(selector: str, value: str) -> dict:
-    """Fill a form field on the current page."""
+    """Fill a form field on the current page.
+
+    A value containing a payment card number is refused before anything is
+    typed or logged.
+
+    Known limit: the check reads the VALUE. Whether the target field is a card
+    field is not judged here; deciding that from page attributes misses labels
+    in other languages, placeholders and frames, so it is not judged anywhere
+    yet; the planned card-fill flow (#3172) owns it, where a field it fails to
+    find fails the fill (safe). A model already holding a card could type it in
+    pieces; the planned card vault and input and output redaction (#3172) are
+    what keep real numbers out of its context.
+    """
+    if contains_card_number(value):
+        return {"error": _REFUSE_CARD_VALUE}
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -4092,6 +4237,7 @@ async def _fill(page, selector: str, value: str) -> dict:
             nav.stop()
 
 
+@_redacted
 async def _impl_browser_upload(selector: str, file_path: str) -> dict:
     """Upload a file to a file input element on the current page.
 
@@ -4127,6 +4273,81 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
             return {"error": f"Upload failed on '{selector}': {e}"}
 
 
+# A screenshot is pixels: text redaction cannot reach a card number drawn in
+# it. Before capturing, every frame is read for the text a page can RENDER:
+# innerText, every element's placeholder, value, aria-label, aria-placeholder,
+# aria-valuetext, title and alt attributes, <option> text, form-field values,
+# CSS ::before/::after content (an attr() there is resolved), SVG text, and
+# the same inside open shadow roots. The pieces go through the split-aware card
+# check; a card number anywhere refuses the capture and no file is written. A
+# frame that cannot be read refuses it as well, except one already detached.
+# Not read: text drawn into a canvas or an image, closed shadow roots, and a
+# change to the page between this read and the capture.
+_PAGE_TEXT_JS = r"""() => {
+  const out = [document.body ? document.body.innerText : ''];
+  const ATTRS = ['placeholder', 'value', 'aria-label', 'aria-placeholder',
+                 'aria-valuetext', 'title', 'alt'];
+  const pseudo = (el, which) => {
+    const c = getComputedStyle(el, which).content;
+    if (!c || c === 'none' || c === 'normal') return;
+    out.push(c.replace(/attr\(([^)]+)\)/g, (_, n) => el.getAttribute(n.trim()) || ''));
+  };
+  const visit = (root) => {
+    for (const el of root.querySelectorAll('*')) {
+      // A field's live value replaces its value attribute: reading both would
+      // repeat each group and hide a segmented card from the split check.
+      const field = el.matches('input, textarea, select');
+      for (const a of ATTRS) {
+        const v = a === 'value' && field ? null : el.getAttribute(a);
+        if (v) out.push(v);
+      }
+      if (field) out.push(String(el.value || ''));
+      if (el.matches('option')) out.push(el.text || '');
+      if (el instanceof SVGElement && el.matches('text, tspan')) out.push(el.textContent || '');
+      pseudo(el, '::before');
+      pseudo(el, '::after');
+      if (el.shadowRoot) {
+        for (const child of el.shadowRoot.children) out.push(child.innerText || '');
+        visit(el.shadowRoot);
+      }
+    }
+  };
+  visit(document);
+  return out.join('\n');
+}"""
+_SCREENSHOT_FRAME_READ_S: float = 5.0
+_REFUSE_CARD_SCREENSHOT = (
+    "Refused: the page shows what looks like a payment card number, so no "
+    "screenshot was taken. Use browser_snapshot, which redacts it."
+)
+_REFUSE_UNREAD_SCREENSHOT = (
+    "Refused: a frame of the page could not be read to check it for a payment "
+    "card number, so no screenshot was taken."
+)
+
+
+async def _screenshot_refusal(page) -> str | None:
+    """A fixed refusal when the page may show a card number, else None."""
+    texts = []
+    for frame in list(page.frames):
+        try:
+            text = await asyncio.wait_for(
+                frame.evaluate(_PAGE_TEXT_JS), timeout=_SCREENSHOT_FRAME_READ_S
+            )
+        except Exception:
+            if frame.is_detached():
+                continue
+            logger.warning("Screenshot card check could not read a frame", exc_info=True)
+            return _REFUSE_UNREAD_SCREENSHOT
+        texts.append(text if isinstance(text, str) else str(text))
+    if not texts:
+        return _REFUSE_UNREAD_SCREENSHOT
+    if contains_card_text("\n".join(texts)):
+        return _REFUSE_CARD_SCREENSHOT
+    return None
+
+
+@_redacted
 async def _impl_browser_screenshot() -> dict:
     """Take a screenshot of the current page."""
     _touch()
@@ -4138,6 +4359,9 @@ async def _impl_browser_screenshot() -> dict:
             return health
         page = _active_page
     try:
+        refusal = await _screenshot_refusal(page)
+        if refusal:
+            return {"error": refusal, "url": page.url}
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         # Unique per call: consecutive captures must not overwrite one another
         # (a session capturing 8 pages kept only the last one). The timestamp
@@ -4161,6 +4385,7 @@ async def _impl_browser_screenshot() -> dict:
         return {"error": f"Screenshot failed: {e}"}
 
 
+@_redacted
 async def _impl_browser_snapshot() -> dict:
     """Return the accessibility tree snapshot of the current page."""
     global _remote_last_url
@@ -4196,12 +4421,36 @@ async def _impl_browser_snapshot() -> dict:
         return {"error": f"Snapshot failed: {e}"}
 
 
+def _is_patchright_page(page) -> bool:
+    return type(page).__module__.startswith("patchright")
+
+
+async def _evaluate_main_world(page, expression: str):
+    """``page.evaluate`` in the page's own JavaScript world. patchright evaluates
+    in an isolated world by default (``isolated_context=True``), where the page's
+    own globals are invisible; browser_run_js is the DevTools console, so it asks
+    for the main world on patchright pages. DOM reads elsewhere work in either."""
+    if _is_patchright_page(page):
+        return await page.evaluate(expression, isolated_context=False)
+    return await page.evaluate(expression)
+
+
+@_redacted
 async def _impl_browser_run_js(expression: str) -> dict:
     """Execute JavaScript on the current page and return the result.
 
     Runs JS in the browser's V8 engine via Playwright page.evaluate().
-    Equivalent to Chrome DevTools console. Expressions are logged for audit.
+    Equivalent to Chrome DevTools console. Expressions are logged for audit,
+    so one containing a card number is refused before that log line.
+
+    Known limit (a documented residual, by owner decision): the check reads the
+    expression's TEXT, so a script that computes a number at runtime
+    (``'4242'+'4242'+…``) is not caught. No text check can close that for an
+    arbitrary evaluator; the guard catches the accidental literal, and the
+    planned card vault (#3172) keeps real numbers out of the agent's context.
     """
+    if contains_card_number(expression):
+        return {"error": _REFUSE_CARD_RUN_JS}
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -4215,7 +4464,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
             return refused
         try:
             logger.info("browser_run_js: %s", expression[:200])
-            result = await page.evaluate(expression)
+            result = await _evaluate_main_world(page, expression)
             _update_remote_url()  # JS may cause navigation
             return {"result": result, "url": page.url}
         except Exception as e:
@@ -4297,6 +4546,7 @@ def _cookie_key(cookie: dict) -> tuple:
     )
 
 
+@_redacted
 async def _impl_browser_sessions() -> dict:
     """List cookie counts per domain in both local browser profiles.
 
@@ -4353,6 +4603,7 @@ async def _impl_browser_sessions() -> dict:
     return {"profiles": profiles}
 
 
+@_redacted
 async def _impl_browser_clear_domain(domain: str) -> dict:
     """Clear the cookies of a domain and its subdomains in both profiles.
 
@@ -4433,6 +4684,7 @@ async def _impl_browser_clear_domain(domain: str) -> dict:
     return {"domain": d, "cookies_removed": total, "profiles": profiles}
 
 
+@_redacted
 async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
     """Press a keyboard key on the current page."""
     _touch()
@@ -4590,6 +4842,9 @@ async def browser_fill(selector: str, value: str, ctx: Context | None = None) ->
     keystroke) makes no progress for 30 s, and then the page is reset if it
     is still the active page. Progress is reported as the fill advances, so
     the MCP client's idle timeout does not cancel a long fill.
+
+    A value containing a payment card number is refused; card entry is handed
+    to the user.
     """
     steps = 0
     last_sent = time.monotonic()
@@ -4644,6 +4899,11 @@ async def browser_screenshot() -> dict:
     call gets its own file, so consecutive screenshots don't overwrite one
     another and sort chronologically) and returns the path. Always read the
     returned "path" — never reconstruct it. Use the Read tool to view it.
+
+    Refused, with no file written, when the text the page renders in any
+    frame (visible text, form values, placeholders, labels, titles, alt text,
+    CSS-generated content) shows a payment card number, or a frame cannot be
+    read to check.
     """
     return await _with_tool_timeout(
         _impl_browser_screenshot(), 30.0, "browser_screenshot"
@@ -4670,6 +4930,8 @@ async def browser_run_js(expression: str) -> dict:
     Chrome DevTools console. Returns the expression result.
 
     Example: browser_run_js('document.title')
+
+    An expression containing a payment card number is refused.
     """
     return await _with_tool_timeout(
         _impl_browser_run_js(expression), _TOOL_TIMEOUT_S, "browser_run_js"
@@ -4740,6 +5002,7 @@ async def browser_collaborate(enable: bool = True) -> dict:
     return _impl_browser_collaborate(enable)
 
 
+@_redacted
 def _impl_browser_collaborate(enable: bool = True) -> dict:
     """Set the timing profile explicitly (see browser_collaborate)."""
     global _collaborate_mode

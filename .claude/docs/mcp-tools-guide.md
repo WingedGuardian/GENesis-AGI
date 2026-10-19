@@ -10,7 +10,7 @@ trees to pick the right one.
 | `memory_store` | Cross-session knowledge, syntheses, learnings | Sessions, extractions | "User prefers X approach" |
 | `observation_write` | Findings, task detections, reflections | Perception pipeline | "Found stale alert from Apr 17" |
 | `knowledge_ingest` | Authoritative external sources (docs, articles) | Knowledge base | "Ingest this API reference" |
-| `reference_store` | Credentials, URLs, IPs, identifiers | Reference ledger | "API key for service X" |
+| `reference_store` | Credentials, URLs, IPs, identifiers (never payment card numbers: refused) | Reference ledger | "API key for service X" |
 | `procedure_store` | Reusable multi-step workflows with confidence | Procedural memory | "Deploy pattern: steps 1-5" |
 | `follow_up_create` | Deferred USER-OWNED work needing tracking + completion | Follow-up ledger | "Finish the deck I asked for" |
 | `gh issue create` | Deferred GENESIS-REPO work (code, tests, docs, infra) | Public GitHub tracker | "Adapter for provider X is hardcoded" |
@@ -87,6 +87,22 @@ live in code with `tests/test_scripts/test_file_tracker_issue.py` pinning each o
 - **Validates both labels against the real sets.** `area:docs` and `area:infra` do
   not exist; a nonexistent mandatory label makes `gh issue create` fail. Use
   `area:other` when nothing fits.
+
+**A raw `gh issue create` gets a near-match note right after it files.** The advisory
+hook `scripts/hooks/issue_dup_advisory.py` reads the new issue's URL from the command's
+output, runs GitHub's semantic search on its title, and lists up to three of the closest
+existing issues: open ones, plus ones closed in the last 30 days (labelled with their
+close date). It runs after the call because a note given before it would reach you only
+with the result anyway, and it never blocks. The results are the nearest matches by
+meaning, not confirmed duplicates. If your new issue duplicates one, close it with the
+`gh issue close <new> --duplicate-of <N>` command the note gives and put anything new in
+a comment on the older issue. An issue counts as yours only if GitHub says it was
+created during that call (or within 30 s before it, for clock skew), and the newest
+such issue wins, so another step's issue URL in the same output is normally not named
+as your filing. If your create failed or printed no URL, an issue created in that
+window by something else can be; check the title it quotes. When it cannot check (no such URL in the output, an issue on a
+host other than github.com, gh older than 2.98, the 10-a-minute search rate limit), it
+says why. It does not cover the script above, which keeps its exact-title check.
 
 Exit codes: `0` filed (or dry-run clean) · `2` refused — **nothing was posted**, that
 is a hard guarantee · `3` an identical title already exists · `4` **INDETERMINATE** ·

@@ -77,13 +77,18 @@ def test_backup_sql_tmp_trap_cleaned():
 
 
 def test_restore_offsite_pull_warns_on_failure():
-    """SF6: the qdrant/transcripts pull uses process-substitution + warn (not the
-    silent `list | while | done || true`)."""
+    """Selected Qdrant and legacy transcript pulls retain failure warnings."""
     text = _RESTORE.read_text()
-    seg = text.split("for sub in qdrant transcripts", 1)[1].split("_pull_from_offsite", 1)[0]
-    assert 'warn "off-site: failed to pull $sub/$fname' in seg
-    assert "done < <(backend_list" in seg  # process substitution, runs in THIS shell
-    assert "| while read -r fname; do" not in seg  # the old subshell form is gone
+    pull = text.split("_pull_from_offsite() {", 1)[1].split("\nif $_EXPLICIT_LOCAL_SOURCE;", 1)[0]
+    component = pull.split("_selected_pull_component() {", 1)[1].split(
+        '    marker="$_RESTORE_WORKSPACE/COMPLETE"', 1
+    )[0]
+    assert 'else warn "off-site: failed to pull $remote/$name from selected snapshot"' in component
+    assert 'done <<<"$entries"' in component
+    assert "| while read -r" not in component
+    assert "_selected_pull_component qdrant data/qdrant" in pull
+    legacy = pull.split('elif [ "$transcript_mode" = legacy ]; then', 1)[1].split("\n    fi", 1)[0]
+    assert "_selected_pull_component transcripts transcripts" in legacy
 
 
 def test_restore_sets_umask_before_writes():

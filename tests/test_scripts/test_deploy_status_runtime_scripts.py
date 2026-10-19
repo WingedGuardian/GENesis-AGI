@@ -97,6 +97,10 @@ EXEMPT: dict[tuple[str, str], str] = {
     ("util/pytest_lock.py", "scripts/pytest_lock_wait.py"): (
         "named in the advice a blocked pytest prints; never executed"
     ),
+    ("browser/engine.py", "scripts/install_browser_stack.sh"): (
+        "named in the operator step an unready engine reports; an operator or the "
+        "browser-stack unit runs it, never the server"
+    ),
     ("surplus/jobs/gitnexus.py", "scripts/lib"): (
         "put on sys.path to import index_marker; every bare import of a scripts/ "
         "module is checked on its own below"
@@ -490,10 +494,16 @@ def test_the_scan_sees_each_shape_it_claims(tmp_path):
 # ── behaviour, through the deploy script ────────────────────────────────────
 # Named here so a parametrization cannot come up empty (an empty list would
 # collect no case and read as a pass); a test keeps them equal to the lists.
-_RELOAD = ("scripts/lib/index_marker.py", "scripts/hooks/worktree_claim.py")
+_RELOAD = (
+    "scripts/lib/index_marker.py",
+    "scripts/hooks/worktree_claim.py",
+    "scripts/hooks/secret_scrub.py",
+)
 _FRESH = (
     "scripts/disk_reclaim.py",
     "scripts/lib/live_checkout.py",
+    "scripts/lib/managed_units.py",
+    "scripts/lib/update_state_guard.py",
     "scripts/hooks/bash_allowlist_guard.sh",
     "scripts/hooks/bash_allowlist_lib.sh",
     "scripts/lib/deploy_marker.sh",
@@ -501,6 +511,9 @@ _FRESH = (
     "scripts/hooks/main_checkout_guard.py",
     "scripts/hooks/hook_input.py",
     "scripts/hooks/hook_output.py",
+    "scripts/lib/disk_guardian.sh",
+    "scripts/tmp_watchgod.sh",
+    "scripts/lib/serving_commit.py",
     ".claude/hooks/genesis-hook",
 )
 

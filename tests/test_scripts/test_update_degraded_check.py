@@ -81,6 +81,23 @@ def _doc(manifest: dict, pid: str = _PID) -> dict:
     }
 
 
+@pytest.mark.parametrize("before,after,expected", [
+    ({}, {"agent_api": "disabled"}, ""),
+    ({"agent_api": "ok"}, {"agent_api": "disabled"}, ""),
+    ({"agent_api": "disabled"}, {}, ""),
+    ({"agent_api": "disabled"}, {"agent_api": "degraded"}, "agent_api"),
+    ({"agent_api": "disabled"}, {"agent_api": "failed: broken"}, "agent_api"),
+    ({"agent_api": "ok"}, {}, "agent_api:gone"),
+])
+def test_deliberate_disablement(tmp_path, text, before, after, expected):
+    # Keep both manifests nonempty: empty payloads deliberately fail closed.
+    actual, _, rc = _run(tmp_path, text,
+                         before=_doc({"db": "ok", **before}, _OLD_PID),
+                         after=_doc({"db": "ok", **after}))
+    assert rc == 0
+    assert actual == expected
+
+
 def _run(
     tmp_path: Path,
     text: str,

@@ -13,12 +13,14 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(_SCRIPTS / "hooks"))
+import pr_close_predicate as pcp  # noqa: E402
 import shell_parse as sp  # noqa: E402
 
 NV = "--no" + "-verify"  # keep the literal out of this file's own text
@@ -1474,6 +1476,185 @@ def test_sh_carries_the_union_because_the_allowlist_is_keyed_on_a_basename():
     assert "git" not in [seg.exe for seg in sp.analyze("dash -ch 'git push origin main'")]
 
 
+_UNPROVEN_DATA_HEREDOC_CASES = [
+    ("parameter-expansion", "cat ${x:-<<'EOF'}", "EOF", (), (), True, True),
+    ("file-descriptor", "cat <<'EOF' >&file", "EOF", (), (), True, True),
+    ("fd-number", "cat <<'EOF' 01>file", "EOF", (), (), True, True),
+    ("writer-substitution", "x=$(cat <<'EOF' > f", "EOF", (), (")",), True, True),
+    ("path-cat", "./cat <<'EOF'", "EOF", (), (), True, True),
+    ("process-substitution", "cat <<'EOF' > >(bash)", "EOF", (), (), True, True),
+    ("function-definition", "cat() { bash; }; cat <<'EOF'", "EOF", (), (), True, True),
+    ("path-assignment", "PATH=/tmp cat <<'EOF'", "EOF", (), (), True, True),
+    ("sudo", "sudo cat <<'EOF'", "EOF", (), (), True, True),
+    ("env", "env cat <<'EOF'", "EOF", (), (), True, True),
+    ("second-line-open-quote", "echo \"x\ncat <<'EOF'", "EOF", (), (), False, False),
+    ("body-delimiter-prefix", "git commit -m \"$(cat <<'EOF'", "EOF", ("EOF)",), (')"',), False, True),
+    ("body-delimiter-space", "cat <<'EOF'", "EOF", ("EOF ",), (), True, True),
+    ("body-delimiter-cr", "cat <<'EOF'", "EOF", ("EOF\r",), (), True, True),
+    ("body-delimiter-tab", "cat <<'EOF'", "EOF", ("\tEOF",), (), True, True),
+    ("strip-tabs", "cat <<-'EOF'", "EOF", (), (), True, True),
+    ("unquoted", "cat <<EOF", "EOF", (), (), True, True),
+    ("double-quoted", 'cat <<"EOF"', "EOF", (), (), True, True),
+    ("two-openers", "cat <<'EOF' <<'BAR'", "EOF", (), (), True, True),
+    ("pipe", "cat <<'EOF' | bash", "EOF", (), (), True, True),
+    ("writer", "cat > f <<'EOF'", "EOF", (), (), True, True),
+    ("trailing-backslash", "cat <<'EOF'\\", "EOF", (), (), False, True),
+    ("rebase-exec", "git rebase --exec \"$(cat <<'EOF'", "EOF", (), (')"',), True, True),
+    ("git-global-option", "git -c x=y commit -F - <<'EOF'", "EOF", (), (), True, True),
+    ("python", "python3 - <<'PY'", "PY", (), (), True, True),
+    ("tail-glued-digit-2", "cat <<'EOF' >/dev/null2>/dev/null", "EOF", (), (), True, True),
+    ("tail-glued-digit-1", "cat <<'EOF' >/dev/null1>/dev/null", "EOF", (), (), True, True),
+    ("tail-glued-chain", "cat <<'EOF' >/dev/null1>/dev/null2>/dev/null", "EOF", (), (), True, True),
+    (
+        "second-data-heredoc",
+        "git commit -F - <<'ONE'",
+        "ONE",
+        (),
+        ("git tag -F - t <<'TWO'", "message", "TWO"),
+        True,
+        True,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "head", "delimiter", "body_prefix", "after_terminator", "body_visible", "after_visible"),
+    _UNPROVEN_DATA_HEREDOC_CASES,
+    ids=[case[0] for case in _UNPROVEN_DATA_HEREDOC_CASES],
+)
+@pytest.mark.parametrize("push_location", ["body", "after"])
+def test_unproven_data_heredocs_stay_visible(
+    name,
+    head,
+    delimiter,
+    body_prefix,
+    after_terminator,
+    body_visible,
+    after_visible,
+    push_location,
+):
+    body_lines = list(body_prefix)
+    body_lines.append(
+        "git push --force origin main" if push_location == "body" else "ordinary prose"
+    )
+    lines = [head, *body_lines, delimiter, *after_terminator]
+    if push_location == "after":
+        lines.append("git push --force origin main")
+    command = "\n".join(lines)
+
+    assert sp.excise_data_heredoc(command) is None, name
+    visible = any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+    assert visible is (body_visible if push_location == "body" else after_visible), command
+
+
+def test_unterminated_data_heredoc_is_not_excised_and_keeps_main_visibility():
+    command = "cat <<'EOF'\ngit push --force origin main"
+    assert sp.excise_data_heredoc(command) is None
+    assert any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+
+
+def test_the_exact_review_corpus_keeps_its_post_heredoc_push_visible():
+    command = (
+        "python3 - <<'PY'\n"
+        "# It feeds the reviewer's answer into this gate. `cmd`\n"
+        "'''\n"
+        "PY\n"
+        "git push --force origin main"
+    )
+    assert sp.excise_data_heredoc(command) is None
+    assert any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+
+
+_DATA_HEREDOC_RELIEF_CASES = [
+    ("cat", "cat <<'EOF'", ""),
+    ("cat-dash", "cat - <<'EOF'", ""),
+    ("cat-redirects", "cat <<'EOF' >/dev/null 2>/dev/null", ""),
+    ("git-commit-short-file", "git commit -F - <<'EOF'", ""),
+    ("git-commit-file", "git commit --file - <<'EOF'", ""),
+    ("git-commit-file-equals", "git commit --file=- <<'EOF'", ""),
+    ("git-tag", "git tag -a v1 -F - <<'EOF'", ""),
+    ("git-notes", "git notes add -F - <<'EOF'", ""),
+    ("git-notes-append", "git notes append -F - <<'EOF'", ""),
+    ("gh-pr-create", 'gh pr create --title "x y" --body-file - <<\'EOF\'', ""),
+    ("gh-issue-comment", "gh issue comment 5 -F - <<'EOF'", ""),
+    ("gh-issue-create", "gh issue create --title x --body-file - <<'EOF'", ""),
+    ("gh-issue-edit", "gh issue edit 5 --body-file=- <<'EOF'", ""),
+    ("gh-pr-edit", "gh pr edit 5 --body-file=- <<'EOF'", ""),
+    ("gh-pr-comment", "gh pr comment 5 --body-file - <<'EOF'", ""),
+    ("git-commit-message", 'git commit -m "$(cat <<\'EOF\'', ')"'),
+    ("git-commit-message-equals", 'git commit --message="$(cat <<\'EOF\'', ')"'),
+    ("gh-pr-body", 'gh pr create --title t -b "$(cat <<\'EOF\'', ')"'),
+    ("gh-pr-comment-body", 'gh pr comment 5 --body "$(cat <<\'EOF\'', ')"'),
+]
+
+_DATA_HEREDOC_BODY = (
+    "it's prose with an apostrophe\n"
+    "`a backtick`\n"
+    "$(git push --force origin main)\n"
+    "# don't treat this as a command\n"
+    "line ending in \\\n"
+    "git push --force origin main"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "head", "closing"),
+    _DATA_HEREDOC_RELIEF_CASES,
+    ids=[case[0] for case in _DATA_HEREDOC_RELIEF_CASES],
+)
+def test_proven_data_heredocs_are_excised_and_idempotent(name, head, closing):
+    command = f"{head}\n{_DATA_HEREDOC_BODY}\nEOF\n{closing}"
+    excised = sp.excise_data_heredoc(command)
+    assert excised is not None, name
+    excised_text, body = excised
+    assert "git push --force origin main" in body
+    assert sp._excised_text(command) == excised_text
+    assert sp._excised_text(excised_text) == excised_text
+    assert not any(
+        sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command)
+    )
+    assert not any(
+        "git push --force origin main" in segment
+        for segment in sp.split_segments(command)
+    )
+    assert not sp.untokenizable(command)
+    assert sp.analyze_checked(command)[1] is None
+
+
+def test_plain_data_heredoc_preserves_a_later_push():
+    command = "cat <<'EOF'\nprose\nEOF\ngit push --force origin main"
+    excised = sp.excise_data_heredoc(command)
+    assert excised is not None
+    assert excised[0].endswith("git push --force origin main")
+    assert any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+
+
+def test_data_heredoc_excision_rejects_unbounded_or_single_line_commands():
+    assert sp.excise_data_heredoc("cat <<'EOF'") is None
+    assert (
+        sp.excise_data_heredoc(
+            "cat <<'EOF'\n" + "x" * (sp.MAX_COMMAND_CHARS + 1) + "\nEOF"
+        )
+        is None
+    )
+
+
+def test_data_heredoc_excision_is_linear_on_long_first_lines():
+    # Guards against super-linear backtracking, which at these lengths costs
+    # seconds; the bound is loose so shared CI runners don't flake on it.
+    commands = [
+        "cat " + "\\" * 16_000 + " <<'EOF'\nbody\nEOF",
+        "cat " + "x" * 48_000 + " <<'EOF'\nbody\nEOF",
+    ]
+    for command in commands:
+        best = float("inf")
+        for _ in range(5):
+            started = time.perf_counter()
+            assert sp.excise_data_heredoc(command) is None
+            best = min(best, time.perf_counter() - started)
+        assert best < 0.5, (len(command), best)
+
+
 @pytest.mark.parametrize(
     ("argv", "method", "endpoint"),
     [
@@ -1502,3 +1683,135 @@ def test_gh_api_request_is_none_off_the_api_group() -> None:
     assert sp.gh_api_request(["gh", "workflow", "run", "api"]) is None
     assert sp.gh_api_request(["gh", "pr", "view", "5"]) is None
     assert sp.gh_api_request(["git", "push"]) is None
+class TestPrCloseReason:
+    @pytest.mark.parametrize(
+        ("argv", "reason"),
+        [
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-separated-field",
+            ),
+            pytest.param(
+                [
+                    "gh",
+                    "api",
+                    "--method",
+                    "PATCH",
+                    "repos/o/r/pulls/5",
+                    "--raw-field",
+                    "state=closed",
+                ],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-long-separated-values",
+            ),
+            pytest.param(
+                ["gh", "api", "-XPATCH", "repos/o/r/pulls/5", "-fstate=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-glued-values",
+            ),
+            pytest.param(
+                ["gh", "api", "--method=PATCH", "repos/o/r/pulls/5", "--field=state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-long-glued-values",
+            ),
+            pytest.param(
+                ["gh", "api", "-f", "state=closed", "-X", "PATCH", "repos/o/r/pulls/5"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-fields-before-method",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "patch", "repos/o/r/pulls/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-method-case-insensitive",
+            ),
+            pytest.param(
+                ["/usr/bin/gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-absolute-gh",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-F", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-typed-field",
+            ),
+            pytest.param(["gh", "pr", "close", "5"], "`gh pr close`", id="gh-pr-close"),
+            pytest.param(
+                # Deliberate safe-side over-match; this placement is not relied on.
+                ["gh", "-R", "o/r", "pr", "close", "5"],
+                "`gh pr close`",
+                id="gh-pr-close-separated-repo",
+            ),
+            pytest.param(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    'query=mutation { closePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }',
+                ],
+                "a `closePullRequest` GraphQL mutation",
+                id="graphql-close-mutation",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/issues/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to an issue-or-pull-request endpoint",
+                id="rest-issues-endpoint",
+            ),
+            pytest.param(
+                ["gh", "--repo", "api", "pr", "close", "5"],
+                "`gh pr close`",
+                id="gh-repo-value-before-pr-close",
+            ),
+        ],
+    )
+    def test_text_visible_closes_have_reasons(self, argv, reason):
+        assert pcp.pr_close_reason(argv) == reason
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            pytest.param(
+                ["gh", "api", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="rest-default-post",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "POST", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="rest-post",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "DELETE", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="rest-delete",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=open"],
+                id="rest-open",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=draft"],
+                id="rest-draft",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "pulls", "-f", "state=closed"],
+                id="rest-incomplete-path",
+            ),
+            pytest.param(["gh", "repo", "view", "o/r"], id="not-api"),
+            pytest.param(
+                ["git", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="not-gh",
+            ),
+            pytest.param(["gh", "pr", "close", "5", "--help"], id="terminal-help"),
+            pytest.param(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    'query=query { closePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }',
+                ],
+                id="graphql-name-without-mutation",
+            ),
+        ],
+    )
+    def test_non_closes_have_no_reason(self, argv):
+        assert pcp.pr_close_reason(argv) is None

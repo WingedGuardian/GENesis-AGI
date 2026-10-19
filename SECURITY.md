@@ -164,7 +164,11 @@ isolation is still load-bearing for you — it is:
 - It covers state-changing HTTP requests under the API prefixes, and nothing
   else. The interactive terminal runs over a WebSocket and the noVNC console
   over its own port; neither is behind this gate, so for those the control is
-  still network isolation and the dashboard password on the UI.
+  still network isolation and the dashboard password on the UI. The terminal
+  WebSocket accepts same-origin connections only. A plain-HTTP reverse proxy in
+  front of the dashboard must pass the original Host header (nginx:
+  `proxy_set_header Host $host`), or the terminal refuses its connections;
+  refusals are logged with the Origin and Host seen.
 
 This is safe **only under the assumed deployment model: the host is not
 publicly exposed.** The dashboard is meant to be reachable through one of:

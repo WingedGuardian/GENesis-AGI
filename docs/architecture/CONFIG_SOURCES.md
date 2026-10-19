@@ -10,6 +10,8 @@ right and this page is stale.
 | API keys, tokens, env-style toggles | `secrets.env` (repo root) | process environment |
 | Per-install identity (timezone, GitHub, local-inference URLs, a few flags) | `~/.genesis/config/genesis.yaml` | `genesis.env` helpers |
 | Subsystem policy (levers, modes, knobs) | `config/<name>.yaml` + a `<name>.local.yaml` overlay | per-domain config modules |
+| Peer mode, identities, grants, legacy allowance field and service URL | `genesis.db` peer tables | local `genesis peers` CLI / `genesis.peers.registry` |
+| Peer messages awaiting collection and ACK anchors | `genesis.db` `peer_outbox` | governed agent channel / authenticated peer polling; normal SQLite backup, no automatic purge |
 | Model routing | `config/model_routing.yaml` + `config/model_routing.local.yaml` | `genesis.routing.config` |
 | Paths, tuning, kill switches | process environment only | `genesis.env`, per-domain modules |
 | Prompts and persona | `src/genesis/identity/*.md` | identity loader, CC prompt assembly |
@@ -32,10 +34,14 @@ lives in, never the CWD. Gitignored; seeded from `secrets.env.example`.
 | `genesis-bridge` (legacy fallback) | no `EnvironmentFile=`; runtime `load_dotenv(override=True)` | file wins |
 | MCP children (`scripts/genesis_mcp_server.py`) | `main()` copies an **allowlist** (`_MCP_VARS`) and only for keys NOT already in the env; then the health/memory/outreach/recon lifespans call `create_standalone_router()`, whose builder runs `load_dotenv(override=True)` on the **whole** file (`src/genesis/routing/standalone.py`) | net effect: **file wins, whole file** (discord-bot: allowlist only) — EXCEPT values read at module import, before either load: the database path (`_DEFAULT_DB` via `genesis_db_path()`) is fixed then, so a `GENESIS_DB_PATH` that exists only in `secrets.env` never reaches the MCP servers of a foreground session (an MCP child of a server-dispatched session inherits it from the server's environment) |
 | Dispatched CC sessions | `CCInvoker._build_env` (`src/genesis/cc/invoker.py`) copies the server's `os.environ` | inherit the server's snapshot |
-| CC hooks (`proactive_memory_hook.py`, `genesis_session_context.py`, `genesis_urgent_alerts.py`) | `load_dotenv(<main checkout>/secrets.env)`, default `override=False`; path hardcoded, ignores `SECRETS_PATH` | **inherited env wins** |
+| CC hooks (`proactive_memory_hook.py`, `genesis_session_context.py`, `genesis_urgent_alerts.py`) and `scripts/gmodel` | at import, before `genesis` is importable: `load_dotenv($SECRETS_PATH or <their own checkout>/secrets.env)`, default `override=False` | **inherited env wins** |
+| `eval` harnesses (`reflection_golden_set`, `longmemeval.client`) | `secrets_path()`, then `~/genesis/secrets.env` as a worktree fallback that is skipped when `SECRETS_PATH` is set; `os.environ.setdefault` | inherited env wins |
 | One-off scripts (`reindex_fts_to_qdrant`, `backfill_session_memories`, `migrate_reference_data`, `mine_references_from_history`, `eval` CLI) | `load_dotenv(override=True)` | file wins |
 | `wing_backfill`, `wing_payload_resync`, `ambient_replay` | `load_dotenv(...)`, default | inherited env wins |
 | Shell (`backup.sh`, `restore.sh`) | `scripts/lib/load_secrets.sh` — literal, never expanded or executed | exported |
+| Guardian credential bridge (`credential_bridge.py`, awareness tick) | reads `secrets_path()` by name to propagate the Telegram, provisioning and backup credentials to the shared mount | not loaded into the env |
+| Credential-integrity check (`guardian/cred_integrity.py`, `cred_selfheal.py`) | `$HOME/genesis/secrets.env`, home-relative **by design** (the targets are shared with the host Guardian); isolate it with `HOME` / `--home`, not `SECRETS_PATH` | not loaded into the env |
+| `scripts/disk_hygiene.sh` store knobs (`_load_store_knob`) | the checkout's `secrets.env` by name; only the browser settings follow `SECRETS_PATH` | exported to that run |
 | `python -m genesis.db.migrations --apply` (update path) | does **not** load it (see `db/migrations/0086_seed_timezone_config.py` docstring) | — |
 | Host guardian | its own file: `GUARDIAN_SECRETS` (`src/genesis/guardian/config.py`) | separate |
 
@@ -197,6 +203,13 @@ names, so an overlay of a read-only file is editable (#2446).
   (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`,
   `GENESIS_SQLITE_SLOW_MS` (slow-statement log threshold, default 1000, `0` = off).
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
+- **The update remote** — which git remote `scripts/update.sh` fetches `main` from, and
+  which the version collector compares against. Chosen by `src/genesis/util/update_remote.py`:
+  env `GENESIS_UPDATE_REMOTE` (one run), then the checkout's own git config
+  `genesis.updateRemote` (read with `--local`; a global or system entry is ignored), then
+  `origin`. `update.sh` pins `origin` there on first use, so a remote added later (a
+  contributor's fork fetched for review) cannot move it. When `origin` does not name
+  `github.public_repo` but another remote does, it refuses until that key is set by hand.
 - **`~/.genesis/resource-budget.env`** — optional `KEY=VALUE` file for the resource-budget
   levers (`GENESIS_RB_*`), read by `genesis.hostmetrics`; the process environment wins over
   it. Details: `docs/reference/resource-budget.md`.
@@ -220,9 +233,22 @@ names, so an overlay of a read-only file is editable (#2446).
   `config/mcp.json.template` by `scripts/setup_claude_config.py`, minus the servers only a
   dispatch profile uses (`INTERACTIVE_EXCLUDED_SERVERS` there, today `discord-bot`): the
   template stays the single source, and dispatched sessions get their servers from it
-  through `cc/session_config._MCP_PROFILES`. `install.sh` leaves an existing file alone, but
-  `scripts/bootstrap.sh` runs the same script, which REWRITES it whenever
-  it differs from that render, so custom entries do not survive a bootstrap. Its Genesis servers carry
+  through `cc/session_config._MCP_PROFILES`. `install.sh` leaves an existing file alone;
+  `scripts/bootstrap.sh` runs the same script, which MERGES by server name: the servers the
+  template defines (plus `INTERACTIVE_EXCLUDED_SERVERS` and `RETIRED_SERVERS`) belong to
+  Genesis and are replaced by the render, while every other server (your own, and the
+  `serena` entry bootstrap registers) and every other top-level key is kept. When the file
+  changes, the old one is saved under `~/.genesis/deploy-backups/<UTC time>/` and the run
+  names the servers it updated, added, removed or kept. The rewrite goes through a symlink
+  and keeps the file's mode, owner, group and ACL. A changed file with multiple hard links
+  is left unchanged so every alias keeps the same contents. The file
+  is left as it was, and the run says so, when it cannot keep those, cannot make a backup,
+  cannot read or write it, finds something other than a regular file, or the file changed
+  while the merge ran; `--mcp-only` then exits 1. A file that is not valid JSON is
+  backed up and replaced by the render. Edit a Genesis server in place and the next
+  bootstrap puts the template's version back (from the backup you can recover the edit);
+  give a changed copy its own name instead. A Genesis server you delete comes back at the
+  next bootstrap; to drop one for good, remove it from the template. Its Genesis servers carry
   no `env` block, so they get env from the CC process plus `secrets.env` (section 1).
 
 ---
@@ -246,7 +272,12 @@ names, so an overlay of a read-only file is editable (#2446).
    routing reads only `config/model_routing.local.yaml`; outreach may read a whole-file
    `~/.genesis/config/outreach.yaml`. `settings_get` shows the domain-standard merge, which
    for `model_routing` and `outreach` is not necessarily what the runtime loads.
-5. **`GENESIS_HOME` does not move config.** `genesis.yaml`, the overlay user dir, and the
+5. **`GENESIS_HOME` does not move config.** Host `scripts/uninstall.sh` uses the
+   container user's default `HOME/.genesis` unless `--container-genesis-home`
+   explicitly designates an external container coordination namespace. Host
+   `GENESIS_HOME` is not copied across login; the explicit path is assigned after
+   login initialization. Direct container cleanup retains its process environment.
+   `genesis.yaml`, the overlay user dir, and the
    settings writer all use `Path.home()/.genesis/config`.
 6. **The health, memory, outreach and recon MCP children get the whole file.** Their
    `_MCP_VARS` allowlist in `scripts/genesis_mcp_server.py` is superseded by the
@@ -254,7 +285,10 @@ names, so an overlay of a read-only file is editable (#2446).
    child's env is overwritten by any same-named key in `secrets.env`. The discord-bot
    child never builds that router and keeps the allowlist, and neither does the
    health child when its database is missing: that degraded path returns before the
-   router is built, so file-only keys are absent there.
+   router is built, so file-only keys are absent there. An observe-only recorder logs
+   names-only reads of undeclared `secrets.env` keys to
+   `genesis_home()/logs/mcp_env_reads.jsonl` as evidence for narrowing the allowlist;
+   set `GENESIS_MCP_ENV_RECORDER=0` to disable it.
 7. **`EnvironmentFile=` beats `Environment=`** regardless of order (measured note in
    `scripts/systemd/genesis-disk-hygiene.service.template`): a `PATH` or `TMPDIR` in
    `secrets.env` replaces the server unit's pinned value.
@@ -262,3 +296,18 @@ names, so an overlay of a read-only file is editable (#2446).
    session via the server's env; it has its own file (`src/genesis/guardian/credential_bridge.py`).
 9. **The raw config-file editor edits tracked files.** Prefer `settings_update`, which
    writes an overlay that survives `git pull`.
+
+## Peer front door
+
+`genesis peers configure` explicitly selects disabled, fallback or SAM mode and
+persists the owner-configured HTTPS service URL. SAM pins the local realm; each
+relationship pins a remote node and optionally its delegated principal. Registry
+changes take effect on the next request. Tokens use `genesis.env.bearer_token`
+against the server environment; no endpoint loads `secrets.env` or credential
+files. A cleared value refuses access; file edits require the approved restart
+path. Backend and peer values must differ from other surface credentials,
+the dashboard password and the app's loaded active/fallback session-signing
+keys. Request checks use loaded signing authority without reading its file;
+boot diagnostics receive the actual app explicitly.
+Authenticated health is available in the registry foundation; the Agent Card
+returns `503 not_ready` until the task transport is installed.
