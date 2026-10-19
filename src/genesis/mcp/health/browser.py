@@ -82,14 +82,66 @@ _PAYMENT_TAB_FAILED = (
 )
 
 
+_REFUSE_PAYMENT_UNCLEARED = (
+    "Refused: site data a closed payment tab showed is not yet cleared, so no "
+    "script runs in this browser until it is. A clear that failed is retried at "
+    "the next browser launch."
+)
+# A click on a payment tab takes a plain CSS selector only. A text, attribute,
+# xpath or pseudo-class selector can test a filled value (input[value^="4"]
+# where a framework mirrors the value attribute, text=/^4242/ on a card
+# preview), and whether the click landed answers the test, one bit per call.
+_PLAIN_SELECTOR = re.compile(r"[A-Za-z0-9_\-#.\s>+~*]+")
+_REFUSE_PAYMENT_SELECTOR = (
+    "Refused: a click on a payment tab takes only a plain CSS selector (ids, classes, "
+    "tag names and combinators). Text, attribute and xpath selectors can test a "
+    "filled value."
+)
+
+
 def _run_js_refusal() -> dict:
     tabs = payment_tab.TABS
-    return {"error": _REFUSE_PAYMENT_STORE if tabs.store_broken() else _REFUSE_PAYMENT_RUN_JS}
+    if tabs.store_broken():
+        return {"error": _REFUSE_PAYMENT_STORE}
+    if tabs.any_armed():
+        return {"error": _REFUSE_PAYMENT_RUN_JS}
+    return {"error": _REFUSE_PAYMENT_UNCLEARED}
+
+
+def _click_refusal(page, selector) -> dict | None:
+    if payment_tab.TABS.is_armed(page) and not (
+        isinstance(selector, str) and _PLAIN_SELECTOR.fullmatch(selector)
+    ):
+        return {"error": _REFUSE_PAYMENT_SELECTOR}
+    return None
 
 
 def _armed_refusal(page) -> dict | None:
     """The refusal for an action that reads or types into an armed tab."""
     return {"error": _REFUSE_PAYMENT_TAB} if payment_tab.TABS.is_armed(page) else None
+
+
+_REFUSE_PAYMENT_PENDING = (
+    "Refused: this page is at a site whose data from a payment tab is not yet "
+    "cleared, so its content and screenshots are withheld. The next browser launch "
+    "retries the clear."
+)
+_SNAPSHOT_PENDING = "(snapshot unavailable: site data from a payment tab is not yet cleared)"
+
+
+def _shows_pending(page) -> bool:
+    """A Camoufox page (or one no layer drives: a Camoufox popup) that may
+    render site storage a payment tab left uncleared (payment_tab.shows_pending)."""
+    if _layer_of(page) not in (None, BrowserLayer.CAMOUFOX):
+        return False  # another profile: none of a payment tab's storage is in it
+    return payment_tab.TABS.shows_pending(page)
+
+
+def _pending_refusal(page) -> dict | None:
+    if not _shows_pending(page):
+        return None
+    tabs = payment_tab.TABS
+    return {"error": _REFUSE_PAYMENT_STORE if tabs.store_broken() else _REFUSE_PAYMENT_PENDING}
 
 
 def _shown_url(page, url, armed: bool = False):
@@ -100,7 +152,11 @@ def _shown_url(page, url, armed: bool = False):
     return payment_tab.TABS.redact_text(url)
 
 
-def _shown_title(title):
+def _shown_title(title, page):
+    """A title for a tool result: filled-value tokens hidden, and hidden whole
+    on a page that may render a payment tab's uncleared site storage."""
+    if _shows_pending(page):
+        return payment_tab.HIDDEN
     return payment_tab.TABS.redact_text(title)
 
 
@@ -355,13 +411,15 @@ def _layer_open(layer: BrowserLayer) -> bool:
     )
 
 
-def _forget_layer(layer: BrowserLayer, page) -> None:
+def _forget_layer(layer: BrowserLayer, page, payment: bool = True) -> None:
     """Bookkeeping shared by every layer's cleanup: drop its idle clock, and
-    stop the tools pointing at its page."""
+    stop the tools pointing at its page. ``payment=False`` leaves the layer's
+    payment tabs armed, for a caller that drops them once the close is done."""
     global _active_page
     _layer_last_used.pop(layer, None)
     _layer_launched.pop(layer, None)
-    payment_tab.TABS.forget_layer(layer)
+    if payment:
+        payment_tab.TABS.forget_layer(layer)
     for tab in [t for t, entry in _opened_by.items() if entry[3] is layer]:
         _opened_by.pop(tab, None)
     if page is not None and _active_page is page:
@@ -426,10 +484,15 @@ async def _cleanup_camoufox() -> None:
     _stealth_cm = None
     _stealth_browser = None
     _stealth_page = None
-    _forget_layer(BrowserLayer.CAMOUFOX, page)
+    # Its payment tabs stay armed until the close is done: while the browser
+    # still holds them, logs stay in armed mode and their values stay hidden.
+    _forget_layer(BrowserLayer.CAMOUFOX, page, payment=False)
     payment_tab.TABS.on_camoufox_closed()  # the context taint ends with the context
-    if cm is not None:
-        await _run_close(_close_camoufox(cm))
+    try:
+        if cm is not None:
+            await _run_close(_close_camoufox(cm))
+    finally:
+        payment_tab.TABS.forget_layer(BrowserLayer.CAMOUFOX)
 
 
 async def _cleanup_chromium() -> None:
@@ -559,8 +622,18 @@ async def _ensure_browser():
         status = engine.resolve_camoufox_engine()
         if not status.ready:
             raise engine.CamoufoxNotReady(status.detail)
-        # A different engine upgrades the profile on first open; keep the way back.
-        await asyncio.to_thread(profile_backup.backup_camoufox_profile, _PROFILE_DIR, status.path)
+        # A different engine upgrades the profile on first open; keep the way
+        # back. Not while the profile may hold a payment tab's uncleared site
+        # storage: the copy would keep it for the backup's whole retention,
+        # and the clear at this launch never reaches the copy.
+        if payment_tab.TABS.profile_may_hold_card_data():
+            logger.warning(
+                "Camoufox profile backup skipped: a payment tab's site storage is not yet cleared"
+            )
+        else:
+            await asyncio.to_thread(
+                profile_backup.backup_camoufox_profile, _PROFILE_DIR, status.path
+            )
 
         from camoufox.async_api import AsyncCamoufox
         # Again past the import: an upgrade that began after the first check
@@ -1270,6 +1343,11 @@ async def _reclaim_idle_layers(now: float) -> None:
         last = _layer_last_used.setdefault(layer, now)
         if now - last < _IDLE_TIMEOUT_S:
             continue
+        if layer is BrowserLayer.CAMOUFOX and payment_tab.TABS.any_armed():
+            # Finished while the browser is still up, so its storage clear runs
+            # now, not after a close that drops the tab with its values in it.
+            # Outside _browser_lock: finish takes it to move the tools off.
+            await payment_tab.TABS.finish_all()
         async with _browser_lock:
             last = _layer_last_used.get(layer, now)
             if _layer_open(layer) and now - last >= _IDLE_TIMEOUT_S:
@@ -1634,9 +1712,11 @@ async def _snapshot_page(page) -> str:
     values are hidden. Arming is read before AND after the read, so a fill
     that lands while the snapshot is in flight still hides its values."""
     tabs = payment_tab.TABS
-    armed, epoch = tabs.is_armed(page), tabs.epoch
+    armed, epoch, finished = tabs.is_armed(page), tabs.epoch, tabs.finished
     if armed and tabs.crashed(page):
         return _SNAPSHOT_PLACEHOLDERS[1] + ": the payment tab crashed)"
+    if _shows_pending(page):
+        return _SNAPSHOT_PENDING
     try:
         text = await asyncio.wait_for(
             page.locator("body").aria_snapshot(), timeout=15.0
@@ -1652,6 +1732,12 @@ async def _snapshot_page(page) -> str:
     # are gone, so text it showed could no longer be matched. Nothing is shown.
     if (armed or tabs.epoch != epoch) and not tabs.is_armed(page) and payment_tab.is_closed(page):
         return _SNAPSHOT_PLACEHOLDERS[1] + ": the payment tab closed)"
+    # Any page: another tab can mirror what the payment tab held, and once
+    # that tab closed during the read its keyed hashes are gone.
+    if tabs.finished != finished:
+        return _SNAPSHOT_PLACEHOLDERS[1] + ": a payment tab closed during the read; retry)"
+    if _shows_pending(page):  # it moved to such a site, or a clear failed, during the read
+        return _SNAPSHOT_PENDING
     return tabs.redact_snapshot(page, text, armed, epoch)
 
 
@@ -3424,9 +3510,17 @@ async def _impl_browser_navigate(
         return {"error": str(e)}
     except ImportError as e:
         return {"error": packages.import_error_message(e, _layer_dists(layer))}
-    if refused := _armed_refusal(page):
-        return refused
+    # Held through the goto and the read: payment_tab.arm waits for a
+    # navigation already under way instead of arming a tab it is still moving.
+    with payment_tab.TABS.acting(page):
+        if refused := _armed_refusal(page):
+            return refused
+        return await _navigate_page(page, url, layer, remote, tinyfish, is_new_tinyfish)
 
+
+async def _navigate_page(page, url, layer, remote, tinyfish, is_new_tinyfish) -> dict:
+    """browser_navigate's goto, challenge handling and read on ``page``."""
+    global _remote_last_url
     try:
         # Skip goto only when TinyFish session was JUST created with this URL
         # (it already navigated on creation). Subsequent navigations must goto.
@@ -3453,7 +3547,7 @@ async def _impl_browser_navigate(
         snapshot = await _snapshot_page(page)
         result = {
             "url": _shown_url(page, page.url),
-            "title": _shown_title(await page.title()),
+            "title": _shown_title(await page.title(), page),
             "snapshot": snapshot,
             "layer": layer.value,
         }
@@ -3637,7 +3731,10 @@ async def _page_action(page):
         yield dict(_PAGE_BUSY)
         return
     try:
-        yield None if page is _active_page else dict(_PAGE_MOVED)
+        # Entered before the caller's arming check (no await between them):
+        # payment_tab.arm waits for this action rather than arming under it.
+        with payment_tab.TABS.acting(page):
+            yield None if page is _active_page else dict(_PAGE_MOVED)
     finally:
         lock.release()
 
@@ -3786,10 +3883,12 @@ async def _impl_browser_click(selector: str) -> dict:
                 "recommendation": "Call browser_snapshot() to see current page state before acting.",
             }
         page = _active_page
+    if refused := _click_refusal(page, selector):
+        return refused
     # Its tab watch must see only what this click opens, so no other click,
     # key press or script runs on this page meanwhile (_page_action).
     async with _page_action(page) as refused:
-        return refused or await _click_and_follow(page, selector)
+        return refused or _click_refusal(page, selector) or await _click_and_follow(page, selector)
 
 
 async def _click_and_follow(page, selector: str) -> dict:
@@ -3879,7 +3978,7 @@ async def _click_and_follow(page, selector: str) -> dict:
             title = ""
             with contextlib.suppress(Exception):
                 title = await new.title()
-            result["new_page"] = {"url": _shown_url(new, new.url, armed), "title": _shown_title(title)}
+            result["new_page"] = {"url": _shown_url(new, new.url, armed), "title": _shown_title(title, new)}
             also = [_shown_url(p, p.url, armed) for p in new_pages if p is not new and not p.is_closed()]
             if also:
                 result["new_page"]["also_opened"] = also
@@ -4490,10 +4589,14 @@ async def _impl_browser_screenshot() -> dict:
         if health:
             return health
         page = _active_page
+    # Before the card check below: its refusal reports the URL, which on a
+    # payment tab can carry what a GET form sent.
+    if refused := _armed_refusal(page) or _pending_refusal(page):
+        return refused
     try:
         refusal = await _screenshot_refusal(page)
         if refusal:
-            return {"error": refusal, "url": page.url}
+            return {"error": refusal, "url": _shown_url(page, page.url)}
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         # Unique per call: consecutive captures must not overwrite one another
         # (a session capturing 8 pages kept only the last one). The timestamp
@@ -4507,15 +4610,17 @@ async def _impl_browser_screenshot() -> dict:
             _SCREENSHOT_DIR
             / f"genesis_browser_screenshot_{stamp}_{uuid.uuid4().hex}.png"
         )
-        # Checked with no await between it and the capture.
-        if refused := _armed_refusal(page):
-            return refused
-        await page.screenshot(path=str(screenshot_path))
-        return {
-            "path": str(screenshot_path),
-            "url": _shown_url(page, page.url),
-            "title": _shown_title(await page.title()),
-        }
+        # Held through the capture (payment_tab.arm waits for it), and checked
+        # with no await between it and the capture.
+        with payment_tab.TABS.acting(page):
+            if refused := _armed_refusal(page) or _pending_refusal(page):
+                return refused
+            await page.screenshot(path=str(screenshot_path))
+            return {
+                "path": str(screenshot_path),
+                "url": _shown_url(page, page.url),
+                "title": _shown_title(await page.title(), page),
+            }
     except Exception as e:
         return {"error": f"Screenshot failed: {e}"}
 
@@ -4542,7 +4647,7 @@ async def _impl_browser_snapshot() -> dict:
         # if the tab was finished meanwhile (its keyed hashes are gone).
         result = {
             "url": _shown_url(page, url_now, armed or tabs.epoch != epoch),
-            "title": _shown_title(await page.title()),
+            "title": _shown_title(await page.title(), page),
             "snapshot": snapshot,
         }
         # Remote: the caller is about to see this page, so it becomes the

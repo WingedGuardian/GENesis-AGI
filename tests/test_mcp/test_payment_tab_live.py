@@ -49,7 +49,8 @@ FRAME_PAN = "4000002500003155"
 EXP = "12/34"
 CVC = "739"
 NAME = "Pat Tester"
-SECRETS = (PAN, FRAME_PAN, EXP, CVC, "Tester")
+# "12 / 34" and "7 3 9": the respaced forms the checkout's card preview shows.
+SECRETS = (PAN, FRAME_PAN, EXP, CVC, "Tester", "12 / 34", "7 3 9")
 DISPLAY = ":99"
 PROD_PROFILE = Path.home() / ".genesis" / "camoufox-profile"
 WORK = Path.home() / "tmp" / "payment-tab-live"
@@ -68,12 +69,30 @@ _FIELDS = (
     "<input id=cvc name=cvc autocomplete=cc-csc aria-label='CVC'>"
 )
 _PROBE = "<script>localStorage.setItem('genesis_probe','1')</script>"
+# What a checkout draws besides its inputs: a card preview mirroring the number
+# and a respaced expiry into plain text, the CVC drawn on a canvas, and the
+# holder name typed into an input inside an open shadow root.
+_MIRRORS = (
+    "<div id=preview style='font:28px monospace;color:#000;height:40px'></div>"
+    "<canvas id=cv width=300 height=44></canvas><div id=sh></div>"
+    "<script>"
+    "const $ = (i) => document.getElementById(i);"
+    "const show = () => { $('preview').textContent = $('num').value.replace(/(\\d{4})/g, '$1 ')"
+    " + ' ' + $('exp').value.replace('/', ' / '); };"
+    "$('num').addEventListener('input', show); $('exp').addEventListener('input', show);"
+    "$('cvc').addEventListener('input', (e) => { const c = $('cv').getContext('2d');"
+    " c.clearRect(0, 0, 300, 44); c.font = '28px monospace';"
+    " c.fillText(e.target.value.split('').join(' '), 4, 32); });"
+    "$('sh').attachShadow({mode: 'open'}).innerHTML = \"<input id=shname aria-label=Holder"
+    " style='font:28px monospace;color:#000;width:420px;height:44px;border:0'>\";"
+    "</script>"
+)
 
 
 def _checkout(frame_port: int) -> str:
     return (
         f"<!doctype html><title>checkout</title>{_STYLE}<div id=mark></div>"
-        f"<form id=f action=/done method=get>{_FIELDS}<button id=pay>Pay</button></form>"
+        f"<form id=f action=/done method=get>{_FIELDS}<button id=pay>Pay</button></form>{_MIRRORS}"
         f"<iframe id=card src='http://127.0.0.2:{frame_port}/frame'></iframe>"
         f"<p><a id=away href=/away>away</a></p>{_PROBE}"
     )
@@ -193,6 +212,7 @@ def _no_secret(blob) -> None:
 async def _fill(page) -> None:
     """The harness's fill (PR7b-2's job): top level and the card iframe."""
     payment_tab.begin_fill(page, (NAME, PAN, FRAME_PAN, EXP, CVC))
+    await page.locator("#shname").fill(NAME)  # in the shadow root
     frame = page.frame_locator("#card")
     for target, pan in ((page, PAN), (frame, FRAME_PAN)):
         await target.locator("#name").fill(NAME)
@@ -274,6 +294,13 @@ async def test_l1_l2_l3_back_restores_values_and_no_tool_shows_them(site, monkey
 # ---------------------------------------------------------------------------
 
 
+# The control's way to lift the mask: its stylesheet and its inline opacity.
+_UNMASK_JS = (
+    "() => { const s = document.getElementById('__genesis_payment_mask__');"
+    " if (s) s.remove(); document.documentElement.style.removeProperty('opacity'); }"
+)
+
+
 def _scrot(path: Path) -> object:
     from PIL import Image
 
@@ -321,23 +348,59 @@ async def test_l7_the_screen_after_back_shows_no_glyphs(site, monkeypatch):
             "top_cvc": await page.locator("#cvc").bounding_box(),
             "frame_num": await frame.locator("#num").bounding_box(),
             "frame_cvc": await frame.locator("#cvc").bounding_box(),
+            # The preview, canvas and shadow input are L7b's: Back restores
+            # input values without the input events that draw them (MEASURED:
+            # 0 dark pixels in the control after Back).
         }
         mark = await page.locator("#mark").bounding_box()
         masked_img = _scrot(WORK / "l7-masked.png")
-        off = _offset(masked_img, mark)
-        masked = {k: _dark(masked_img, b, off) for k, b in boxes.items()}
         # Control: the same screen with the mask removed must show glyphs.
         for f in page.frames:
-            await f.evaluate(
-                "() => { const s = document.getElementById('__genesis_payment_mask__'); if (s) s.remove(); }"
-            )
+            await f.evaluate(_UNMASK_JS)
         await asyncio.sleep(1.0)
         control_img = _scrot(WORK / "l7-control.png")
-        control = {k: _dark(control_img, b, _offset(control_img, mark)) for k, b in boxes.items()}
+        # The marker is hidden with the rest of the masked document, so both
+        # captures are placed by the control's (the window did not move).
+        off = _offset(control_img, mark)
+        masked = {k: _dark(masked_img, b, off) for k, b in boxes.items()}
+        control = {k: _dark(control_img, b, off) for k, b in boxes.items()}
         print(f"\nL7 dark pixels in field boxes: masked={masked} control={control}")
         assert all(v > 50 for v in control.values()), (
             f"control shows no glyphs: instrument void {control}"
         )
+        assert all(v == 0 for v in masked.values()), f"glyph pixels under the mask: {masked}"
+
+
+async def test_l7b_mirrors_canvas_and_shadow_inputs_show_no_glyphs(site, monkeypatch):
+    """What a checkout draws besides its form controls (a text preview of the
+    number and a respaced expiry, the CVC on a canvas, a name typed into a
+    shadow-root input) is hidden with the rest of the armed document, and the
+    tool snapshot carries none of it."""
+    profile = _fresh_profile("l7b")
+    async with _browser(monkeypatch, profile):
+        page = await _open_checkout(site)
+        assert await payment_tab.arm(page) is True
+        await _fill(page)
+        await asyncio.sleep(1.0)  # paint
+        snap = await browser._impl_browser_snapshot()
+        _no_secret(snap)
+        boxes = {
+            "preview": await page.locator("#preview").bounding_box(),
+            "canvas": await page.locator("#cv").bounding_box(),
+            "shadow_name": await page.locator("#shname").bounding_box(),
+            "top_num": await page.locator("#num").bounding_box(),
+        }
+        mark = await page.locator("#mark").bounding_box()
+        masked_img = _scrot(WORK / "l7b-masked.png")
+        for f in page.frames:
+            await f.evaluate(_UNMASK_JS)
+        await asyncio.sleep(1.0)
+        control_img = _scrot(WORK / "l7b-control.png")
+        off = _offset(control_img, mark)
+        masked = {k: _dark(masked_img, b, off) for k, b in boxes.items()}
+        control = {k: _dark(control_img, b, off) for k, b in boxes.items()}
+        print(f"\nL7b dark pixels: masked={masked} control={control}")
+        assert all(v > 50 for v in control.values()), f"instrument void: {control}"
         assert all(v == 0 for v in masked.values()), f"glyph pixels under the mask: {masked}"
 
 

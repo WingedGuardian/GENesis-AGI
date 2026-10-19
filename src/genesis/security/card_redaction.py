@@ -306,13 +306,43 @@ def _redacted_result(name: str, result):
         return {
             "error": f"{name}: the result spelled a card number across its values, so it is withheld."
         }
+    if CARD_FILTER.redact_armed is not None and CARD_FILTER._armed():
+        # One chokepoint behind the per-call-site payment-tab redaction: every
+        # string of every result, whichever tab and path it came from.
+        try:
+            walked = _armed_walk(walked, CARD_FILTER.redact_armed)
+        except Exception:
+            return {
+                "error": f"{name}: the result could not be checked for payment-tab values, "
+                "so it is withheld."
+            }
     return walked
+
+
+def _armed_walk(value, redact):
+    """``value`` with ``redact`` applied to every string in it, keys included."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {
+            (_armed_walk(k, redact) if isinstance(k, str) else k): _armed_walk(v, redact)
+            for k, v in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return type(value)(_armed_walk(v, redact) for v in value)
+    return value
 
 
 def _failed(name: str, exc: Exception) -> dict:
     # The traceback goes to this module's logger, which carries CARD_FILTER.
     logger.error("%s raised %s", name, type(exc).__name__, exc_info=True)
-    return {"error": f"{name} failed: {type(exc).__name__}: {redact_text(str(exc))}"}
+    return {"error": f"{name} failed: {type(exc).__name__}: {_error_text(exc)}"}
+
+
+def _error_text(exc: BaseException) -> str:
+    """An exception's message for a tool result: card numbers redacted, and
+    while a payment tab is armed its filled values hidden too."""
+    return CARD_FILTER._redact(str(exc), armed=CARD_FILTER._armed())
 
 
 def redacted(fn):
@@ -333,7 +363,7 @@ def redacted(fn):
             try:
                 result = await fn(*args, **kwargs)
             except TimeoutError as e:
-                raise TimeoutError(redact(str(e))) from None
+                raise TimeoutError(_error_text(e)) from None
             except Exception as e:
                 return _failed(name, e)
             return _redacted_result(name, result)
@@ -345,7 +375,7 @@ def redacted(fn):
         try:
             result = fn(*args, **kwargs)
         except TimeoutError as e:
-            raise TimeoutError(redact(str(e))) from None
+            raise TimeoutError(_error_text(e)) from None
         except Exception as e:
             return _failed(name, e)
         return _redacted_result(name, result)

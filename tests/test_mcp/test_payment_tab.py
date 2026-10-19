@@ -55,6 +55,8 @@ STATES = ("awaiting_tap", "filling", "armed", "crashed")
 SPLIT_BY_NAME = "4242 Pat Tester 4242 Pat Tester 4242 Pat Tester 4242"
 # Read at import, before tests/conftest.py points it at a tmp dir.
 _REAL_PENDING_PATH = getattr(env, "payment_tab_pending_path", None)
+# Before the autouse fixture turns it on for arm(): TestCardFillFlag reads it.
+_REAL_CARD_FILL_ENABLED = payment_tab.card_fill_enabled
 
 
 def _no_secret(blob) -> None:
@@ -116,6 +118,7 @@ async def _arm_in(state: str, page):
 def _clean(monkeypatch, tmp_path):
     TABS.reset()
     TABS.prefs_pinned = True  # a Camoufox launched with card fill on
+    monkeypatch.setattr(payment_tab, "card_fill_enabled", lambda: True)  # arm re-reads it
     monkeypatch.setattr(browser, "_active_page", None)
     monkeypatch.setattr(browser, "_stealth_page", None)
     monkeypatch.setattr(browser, "_stealth_cm", None)
@@ -845,7 +848,10 @@ class TestPendingFile:
         # A failed clear keeps the entry, and run_js stays refused.
         assert TABS.run_js_blocked() and path.exists()
         _drive(_page("https://other.example/"))
-        assert await browser._impl_browser_run_js("1") == {"error": browser._REFUSE_PAYMENT_RUN_JS}
+        # Nothing armed: the refusal names the uncleared site data and its retry.
+        assert await browser._impl_browser_run_js("1") == {
+            "error": browser._REFUSE_PAYMENT_UNCLEARED
+        }
         clear.return_value = True
         await TABS.clear_pending(MagicMock(), BrowserLayer.CAMOUFOX)
         assert not TABS.run_js_blocked() and not path.exists()
@@ -1238,6 +1244,7 @@ class TestFinish:
 class TestCardFillFlag:
     @pytest.fixture
     def repo(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(payment_tab, "card_fill_enabled", _REAL_CARD_FILL_ENABLED)
         monkeypatch.setenv("GENESIS_REPO_ROOT", str(tmp_path))
         monkeypatch.delenv("GENESIS_CARD_FILL_DISABLED", raising=False)
         from genesis import _config_overlay
@@ -1275,11 +1282,13 @@ class TestCardFillFlag:
 
 
 class TestLaunchPrefs:
-    async def _launch(self, monkeypatch, tmp_path, enabled: bool) -> dict:
+    async def _launch(self, monkeypatch, tmp_path, enabled: bool, backup=None) -> dict:
         from genesis.browser import engine, packages, profile_backup
 
         monkeypatch.setattr(payment_tab, "card_fill_enabled", lambda: enabled)
-        monkeypatch.setattr(profile_backup, "backup_camoufox_profile", lambda *a: None)
+        monkeypatch.setattr(
+            profile_backup, "backup_camoufox_profile", backup or (lambda *a: None)
+        )
         monkeypatch.setattr(packages, "check_loaded_browser_modules", lambda *a: None)
         monkeypatch.setattr(browser, "_PROFILE_DIR", tmp_path / "camoufox-profile")
         seen = {}
@@ -1302,7 +1311,7 @@ class TestLaunchPrefs:
         return seen
 
     @pytest.mark.asyncio
-    async def test_on_pins_all_eight(self, monkeypatch, tmp_path):
+    async def test_on_pins_every_card_fill_pref(self, monkeypatch, tmp_path):
         prefs = await self._launch(monkeypatch, tmp_path, True)
         for k, v in payment_tab.CARD_FILL_PREFS.items():
             assert prefs[k] == v
@@ -1322,8 +1331,8 @@ class TestLaunchPrefs:
         }
         assert TABS.prefs_pinned is False
 
-    def test_eight_prefs(self):
-        assert len(payment_tab.CARD_FILL_PREFS) == 8
+    def test_thirteen_prefs(self):
+        assert len(payment_tab.CARD_FILL_PREFS) == 13
 
 
 # ---------------------------------------------------------------------------
@@ -1494,3 +1503,698 @@ async def test_no_filled_value_reaches_any_tool_result_or_log(tmp_path, monkeypa
     _no_secret(records)
     assert records  # the log line above was captured, args withheld
     assert not browser._TS_LOG_PATH.exists()
+
+
+# ---------------------------------------------------------------------------
+# Codex round 2: the classes behind each finding
+# ---------------------------------------------------------------------------
+
+# The real _MASK_CHECK_JS, run by node against a document whose card inputs
+# sit in a shadow root (no document query finds them) and whose root element
+# computes the given opacity.
+_FAKE_MASK_DOC = """
+const rootOpacity = process.argv[1];
+const root = { tag: 'html' };
+globalThis.document = { documentElement: root, querySelectorAll: () => [] };
+globalThis.getComputedStyle = (e) => (e === root ? { opacity: rootOpacity } : {});
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+@pytest.mark.parametrize(("opacity", "ok"), [("1", False), ("0.5", False), ("0", True)])
+def test_the_mask_check_needs_the_whole_document_hidden(opacity, ok):
+    # A card-preview widget, a canvas, or inputs in a shadow root are not form
+    # controls a document query sees: only a hidden root covers them.
+    script = _FAKE_MASK_DOC + "console.log(JSON.stringify((" + payment_tab._MASK_CHECK_JS + ")()));"
+    out = subprocess.run(
+        ["node", "-e", script, opacity], capture_output=True, text=True, timeout=60, check=True
+    )
+    assert json.loads(out.stdout) is ok
+
+
+def test_the_mask_hides_the_root_by_rule_and_inline():
+    assert ":root { opacity: 0 !important }" in payment_tab.MASK_CSS
+    assert "root.style.setProperty('opacity', '0', 'important')" in payment_tab._MASK_JS
+
+
+# The real _CLEAR_STORAGE_JS against storage that holds an origin-private
+# file system with two entries.
+_FAKE_OPFS = """
+const outcome = process.argv[1];
+globalThis.self = globalThis;
+globalThis.localStorage = { clear() {} };
+globalThis.sessionStorage = { clear() {} };
+globalThis.indexedDB = { databases: async () => [] };
+const removed = [];
+const entries = ['cart', 'draft'];
+const dir = {
+  async *keys() { for (const n of entries) yield n; },
+  async removeEntry(name, opts) {
+    if (outcome === 'remove_error') throw new Error('locked');
+    removed.push([name, !!(opts && opts.recursive)]);
+  },
+};
+const storage = {};
+if (outcome !== 'unsupported') {
+  storage.getDirectory = async () => {
+    if (outcome === 'getdir_error') throw new Error('denied');
+    return dir;
+  };
+}
+Object.defineProperty(globalThis, 'navigator', { value: { storage }, configurable: true });
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+@pytest.mark.parametrize(
+    ("outcome", "ok", "removed"),
+    [
+        ("ok", True, [["cart", True], ["draft", True]]),
+        ("remove_error", False, []),
+        ("getdir_error", False, []),
+        ("unsupported", True, []),  # no origin-private file system: nothing in it
+    ],
+)
+def test_the_storage_clear_empties_the_origin_private_file_system(outcome, ok, removed):
+    script = (
+        _FAKE_OPFS
+        + "("
+        + payment_tab._CLEAR_STORAGE_JS
+        + ")().then((v) => console.log(JSON.stringify([v, removed])));"
+    )
+    out = subprocess.run(
+        ["node", "-e", script, outcome], capture_output=True, text=True, timeout=60, check=True
+    )
+    assert json.loads(out.stdout) == [ok, removed]
+
+
+class TestPendingOriginReaders:
+    """A site whose storage clear has not succeeded is not read by any tool:
+    what a payment tab left in its storage could render on a later page."""
+
+    async def _left_pending(self, monkeypatch):
+        monkeypatch.setattr(payment_tab, "clear_site_storage", AsyncMock(return_value=False))
+        page = _page()
+        page.context.new_page = AsyncMock(return_value=_page("about:blank"))
+        await _arm_in("armed", page)
+        assert (await payment_tab.finish(page))["storage_cleared"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_page_at_a_pending_origin_shows_nothing(self, monkeypatch):
+        await self._left_pending(monkeypatch)
+        # Restored from storage, with the arming (and its keyed hashes) gone.
+        later = _page(
+            "https://shop.example/account",
+            snapshot="- paragraph: Saved for Pat Tester",
+            title="Pat Tester",
+        )
+        _drive(later)
+        snap = await browser._impl_browser_snapshot()
+        assert snap["snapshot"] == browser._SNAPSHOT_PENDING
+        assert snap["title"] == HIDDEN
+        assert await browser._impl_browser_screenshot() == {
+            "error": browser._REFUSE_PAYMENT_PENDING
+        }
+        later.screenshot.assert_not_called()
+        with (
+            patch.object(browser, "_get_page", AsyncMock(return_value=(later, False))),
+            patch.object(browser, "_wait_for_turnstile", AsyncMock(return_value=None)),
+        ):
+            nav = await browser._impl_browser_navigate("https://shop.example/account")
+        assert nav["snapshot"] == browser._SNAPSHOT_PENDING
+        _no_secret([snap, nav])
+
+    @pytest.mark.asyncio
+    async def test_a_frame_at_a_pending_origin_counts(self, monkeypatch):
+        await self._left_pending(monkeypatch)
+        later = _page("https://news.example/", snapshot="- paragraph: Pat Tester")
+        later.frames.append(MagicMock(url="https://shop.example/widget"))
+        _drive(later)
+        assert (await browser._impl_browser_snapshot())["snapshot"] == browser._SNAPSHOT_PENDING
+
+    @pytest.mark.asyncio
+    async def test_other_sites_are_read_normally(self, monkeypatch):
+        await self._left_pending(monkeypatch)
+        other = _page("https://news.example/", snapshot="- paragraph: headline", title="News")
+        _drive(other)
+        snap = await browser._impl_browser_snapshot()
+        assert snap["snapshot"] == "- paragraph: headline" and snap["title"] == "News"
+
+    @pytest.mark.asyncio
+    async def test_reading_resumes_once_the_clear_succeeds(self, monkeypatch):
+        await self._left_pending(monkeypatch)
+        monkeypatch.setattr(payment_tab, "clear_site_storage", AsyncMock(return_value=True))
+        await TABS.clear_pending(MagicMock(), BrowserLayer.CAMOUFOX)
+        _drive(_page("https://shop.example/account", snapshot="- paragraph: hi"))
+        assert (await browser._impl_browser_snapshot())["snapshot"] == "- paragraph: hi"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_pending_file_withholds_every_camoufox_page(self):
+        env.payment_tab_pending_path().write_text("{not json")
+        await TABS.clear_pending(MagicMock(), BrowserLayer.CAMOUFOX)
+        _drive(_page("https://news.example/", snapshot="- paragraph: headline"))
+        assert (await browser._impl_browser_snapshot())["snapshot"] == browser._SNAPSHOT_PENDING
+        assert await browser._impl_browser_screenshot() == {"error": browser._REFUSE_PAYMENT_STORE}
+
+
+class TestArmingWaitsForRunningActions:
+    """An action that passed its arming check before arm() ran is waited for:
+    nothing it does lands on the armed tab."""
+
+    @pytest.mark.asyncio
+    async def test_a_key_press_under_way_finishes_before_the_arming(self):
+        page = _page()
+        _drive(page)
+        gate = asyncio.Event()
+        pressed_while_armed = []
+
+        async def press(key):
+            await gate.wait()
+            pressed_while_armed.append(TABS.is_armed(page) and TABS._tabs[page].masked)
+
+        page.keyboard.press = AsyncMock(side_effect=press)
+        keys = asyncio.ensure_future(browser._impl_browser_press_key("ArrowDown", count=3))
+        await asyncio.sleep(0.01)
+        arming = asyncio.ensure_future(payment_tab.arm(page))
+        await asyncio.sleep(0.05)
+        assert not arming.done()  # held by the key press under way
+        gate.set()
+        assert (await keys)["pressed"] == "ArrowDown"
+        assert await arming is True
+        assert pressed_while_armed == [False, False, False]
+        # A press that begins now meets the arming.
+        assert await browser._impl_browser_press_key("ArrowDown") == {
+            "error": browser._REFUSE_PAYMENT_KEY
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_navigation_under_way_finishes_before_the_arming(self):
+        page = _page()
+        _drive(page)
+        gate = asyncio.Event()
+
+        async def goto(url, **_kw):
+            await gate.wait()
+
+        page.goto = AsyncMock(side_effect=goto)
+        with (
+            patch.object(browser, "_get_page", AsyncMock(return_value=(page, False))),
+            patch.object(browser, "_wait_for_turnstile", AsyncMock(return_value=None)),
+        ):
+            nav = asyncio.ensure_future(browser._impl_browser_navigate("https://shop.example/"))
+            await asyncio.sleep(0.01)
+            arming = asyncio.ensure_future(payment_tab.arm(page))
+            await asyncio.sleep(0.05)
+            assert not arming.done()
+            gate.set()
+            await nav
+        assert await arming is True
+
+    @pytest.mark.asyncio
+    async def test_a_fill_under_way_finishes_before_the_arming(self, monkeypatch):
+        page = _page()
+        _drive(page)
+        gate = asyncio.Event()
+
+        async def typing(*_a):
+            await gate.wait()
+
+        monkeypatch.setattr(browser, "_human_type", AsyncMock(side_effect=typing))
+        fill = asyncio.ensure_future(browser._impl_browser_fill("#q", "shoes"))
+        await asyncio.sleep(0.01)
+        arming = asyncio.ensure_future(payment_tab.arm(page))
+        await asyncio.sleep(0.05)
+        assert not arming.done()
+        gate.set()
+        await fill
+        assert await arming is True
+
+    @pytest.mark.asyncio
+    async def test_an_action_that_will_not_end_refuses_the_arming(self, monkeypatch):
+        monkeypatch.setattr(payment_tab, "_ARM_IDLE_WAIT_S", 0.05)
+        page = _page()
+        with TABS.acting(page), pytest.raises(PaymentTabError) as e:
+            await payment_tab.arm(page)
+        assert e.value.code == "page_busy"
+        assert not TABS.is_armed(page)
+        assert not env.payment_tab_pending_path().exists()
+        assert await payment_tab.arm(page) is True  # idle now
+
+
+class TestNoFilledTabWithoutCrashCoverage:
+    """Once values may be typed, an origin that cannot be written to the
+    pending file closes the tab (and clears its storage) at once."""
+
+    def _unwritable(self, monkeypatch, tmp_path):
+        (tmp_path / "not-a-dir").write_text("")
+        monkeypatch.setattr(
+            env, "payment_tab_pending_path", lambda: tmp_path / "not-a-dir" / "pending.json"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["filling", "armed"])
+    async def test_a_redirect_that_cannot_be_written_closes_the_tab(
+        self, state, monkeypatch, tmp_path
+    ):
+        clear = AsyncMock(return_value=True)
+        monkeypatch.setattr(payment_tab, "clear_site_storage", clear)
+        page = _page()
+        page.context.new_page = AsyncMock(return_value=_page("about:blank"))
+        await _arm_in(state, page)
+        self._unwritable(monkeypatch, tmp_path)
+        for fn in page.handlers["framenavigated"]:
+            fn(MagicMock(url="https://pay.hosted.example/s/1", evaluate=AsyncMock()))
+        await TABS.drain()
+        assert page.is_closed() and not TABS.is_armed(page)
+        clear.assert_awaited_once_with(ANY, {"https://shop.example", "https://pay.hosted.example"})
+
+    @pytest.mark.asyncio
+    async def test_before_any_fill_it_only_blocks_begin_fill(self, monkeypatch, tmp_path):
+        page = _page()
+        await payment_tab.arm(page)
+        self._unwritable(monkeypatch, tmp_path)
+        for fn in page.handlers["framenavigated"]:
+            fn(MagicMock(url="https://pay.hosted.example/s/1", evaluate=AsyncMock()))
+        await TABS.drain()
+        assert TABS.is_armed(page) and not page.is_closed()
+        await TABS.verify_mask(page)
+        with pytest.raises(PaymentTabError) as e:
+            payment_tab.begin_fill(page, FILLED)
+        assert e.value.code == "pending_store_failed"
+
+    @pytest.mark.asyncio
+    async def test_mark_filled_that_cannot_be_written_refuses_and_closes(
+        self, monkeypatch, tmp_path
+    ):
+        page = _page()
+        page.context.new_page = AsyncMock(return_value=_page("about:blank"))
+        await _arm_in("filling", page)
+        self._unwritable(monkeypatch, tmp_path)
+        page.frames[0].url = "https://pay.hosted.example/s/1"
+        with pytest.raises(PaymentTabError) as e:
+            payment_tab.mark_filled(page)
+        assert e.value.code == "pending_store_failed"
+        await TABS.drain()
+        assert page.is_closed() and not TABS.is_armed(page)
+
+
+class TestReformattedValues:
+    """A page re-spacing or re-punctuating a filled value still has it hidden,
+    in snapshots and in log messages."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "shown",
+        [
+            "Expires 12 / 34",
+            "Expires 12 /34",
+            "Expires 12 - 34",
+            "Expires 12 / 2034",
+            "Expires 12/2034",
+            "Expires 2034-12",
+            "Expires 12\u00a0/\u00a034",
+            "Expires \uff11\uff12\uff0f\uff13\uff14",
+            "CVC 7 3 9",
+            "CVC 7-3-9",
+            "CVC 7\u200b3\u200b9",
+            "Card holder P A T  T E S T E R",
+        ],
+    )
+    async def test_a_respaced_value_is_hidden(self, shown):
+        page = _page(snapshot=f"- paragraph: {shown}")
+        await _arm_in("armed", page)
+        digits = "".join(c for c in payment_tab._nfkc(shown) if c.isdigit())
+        out = TABS.redact_text(shown)
+        assert HIDDEN in out
+        if digits:
+            assert digits not in "".join(c for c in payment_tab._nfkc(out) if c.isdigit())
+        assert "tester" not in "".join(c for c in out.lower() if c.isalpha())
+        record = logging.LogRecord("x", logging.INFO, __file__, 1, f"page says {shown}", None, None)
+        CARD_FILTER.filter(record)
+        assert HIDDEN in logging.Formatter().format(record)
+        _drive(page)
+        assert HIDDEN in (await browser._impl_browser_snapshot())["snapshot"]
+
+    @pytest.mark.asyncio
+    async def test_a_postal_code_written_without_its_space_is_hidden(self):
+        page = _page()
+        await payment_tab.arm(page)
+        payment_tab.begin_fill(page, (PAN, EXP, CVC, NAME, "SW1A 1AA"))
+        assert TABS.redact_text("Billing SW1A1AA") == f"Billing {HIDDEN}"
+
+    @pytest.mark.asyncio
+    async def test_unrelated_short_numbers_stay(self):
+        await _arm_in("armed", _page())
+        assert TABS.redact_text("Qty 1 2 items, step 3 of 4") == "Qty 1 2 items, step 3 of 4"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("name", "shown", "gone"),
+        [
+            ("José Tester", "Card holder JOSE TESTER", "jose"),  # accents dropped
+            ("Li Yu", "Card holder Li Yu", "liyu"),  # every part under 3 letters
+            ("Pat Tester", "Card holder Pat Tes\u200bter", "tester"),  # zero-width join
+        ],
+    )
+    async def test_names_the_page_reshapes_are_hidden(self, name, shown, gone):
+        page = _page()
+        await payment_tab.arm(page)
+        payment_tab.begin_fill(page, (PAN, EXP, CVC, name))
+        out = TABS.redact_text(shown)
+        assert gone not in "".join(c for c in out.lower() if c.isalpha())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shown", ["Expires Dec 2034", "Expires December 34", "Exp DEC-34"])
+    async def test_an_expiry_with_a_month_name_is_hidden(self, shown):
+        await _arm_in("armed", _page())
+        out = TABS.redact_text(shown)
+        assert "34" not in out and HIDDEN in out
+
+    @pytest.mark.asyncio
+    async def test_a_card_preview_mid_typing_is_hidden(self):
+        # A live preview during FILLING shows a prefix: neither the full value
+        # nor a whole card number, so no other pass sees it.
+        await _arm_in("filling", _page())
+        out = TABS.redact_text("Card 4242 4242 42")
+        assert out == f"Card {HIDDEN}"
+
+
+# ---------------------------------------------------------------------------
+# Class audit of round 2: the rest of the classes behind the findings
+# ---------------------------------------------------------------------------
+
+
+class TestQuotedAriaKeys:
+    """Playwright single-quotes an aria key whose name holds ': ', ' #',
+    braces or a backtick; the line still names a control."""
+
+    @pytest.mark.parametrize(
+        ("line", "head"),
+        [
+            ("- 'textbox \"Expiry: MM / YY\"': 12 / 34", "- 'textbox \"Expiry: MM / YY\"'"),
+            ("- 'textbox \"Card #\" [required]': 4242", "- 'textbox \"Card #\" [required]'"),
+            ('  - \'spinbutton "CVC {3}"\': "739"', "  - 'spinbutton \"CVC {3}\"'"),
+            ("- 'textbox \"O''Brien: name\"': Pat Tester", "- 'textbox \"O''Brien: name\"'"),
+            ("- 'searchbox \"Find `x`\"': Pat", "- 'searchbox \"Find `x`\"'"),
+        ],
+    )
+    def test_a_quoted_control_line_keeps_only_its_key(self, line, head):
+        assert payment_tab.hide_form_values(line) == f"{head}: {HIDDEN}"
+
+    def test_a_quoted_combobox_and_its_options_are_dropped(self):
+        text = (
+            "- 'combobox \"Month: MM\"':\n"
+            "  - 'option \"Dec: 12\"' [selected]\n"
+            '  - option "01"\n'
+            "- paragraph: after"
+        )
+        assert (
+            payment_tab.hide_form_values(text)
+            == f"- 'combobox \"Month: MM\"': {HIDDEN}\n- paragraph: after"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_screenshot_of_an_armed_tab_showing_a_card_reports_no_url_values():
+    page = _page(url=f"https://shop.example/pay?exp={EXP}&cvc={CVC}&n=Pat+Tester")
+    _drive(page)
+    await _arm_in("armed", page)
+    page.frames[0].evaluate = AsyncMock(return_value=f"card {PAN}")  # the card check fires
+    page.frames[0].is_detached = MagicMock(return_value=False)
+    result = await browser._impl_browser_screenshot()
+    assert result == {"error": browser._REFUSE_PAYMENT_TAB}
+    _no_secret(result)
+
+
+class TestPopupsOfAnArmedTab:
+    """A page the armed tab opens (a wallet or 3-D Secure window, a
+    same-origin popup with a copy of sessionStorage) is guarded as the tab is."""
+
+    async def _with_popup(self, state="armed"):
+        page = _page()
+        page.context.new_page = AsyncMock(return_value=_page("about:blank"))
+        await _arm_in(state, page)
+        popup = _page("https://wallet.example/approve", title=f"Pay {CVC}")
+        popup.context = page.context
+        for fn in page.handlers["popup"]:
+            fn(popup)
+        await TABS.drain()
+        return page, popup
+
+    @pytest.mark.asyncio
+    async def test_the_popup_is_armed_masked_and_its_origin_tracked(self):
+        page, popup = await self._with_popup()
+        assert TABS.is_armed(popup)
+        popup.add_init_script.assert_awaited_once_with(payment_tab._MASK_INIT_JS)
+        assert json.loads(env.payment_tab_pending_path().read_text()) == [
+            "https://shop.example",
+            "https://wallet.example",
+        ]
+        _drive(popup)
+        assert await browser._impl_browser_screenshot() == {"error": browser._REFUSE_PAYMENT_TAB}
+        snap = await browser._impl_browser_snapshot()
+        _no_secret(snap)
+        assert HIDDEN in snap["snapshot"]
+        assert await browser._impl_browser_press_key("ArrowDown") == {
+            "error": browser._REFUSE_PAYMENT_KEY
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_popup_of_the_popup_is_armed_too(self):
+        page, popup = await self._with_popup()
+        child = _page("https://bank.example/3ds")
+        for fn in popup.handlers["popup"]:
+            fn(child)
+        assert TABS.is_armed(child)
+
+    @pytest.mark.asyncio
+    async def test_finish_closes_the_popup_and_clears_its_origin(self, monkeypatch):
+        clear = AsyncMock(return_value=True)
+        monkeypatch.setattr(payment_tab, "clear_site_storage", clear)
+        page, popup = await self._with_popup()
+        result = await payment_tab.finish(page)
+        assert result == {"closed": True, "storage_cleared": True}
+        popup.close.assert_awaited_once_with(run_before_unload=False)
+        assert not TABS.any_armed() and not TABS.run_js_blocked()
+        clear.assert_awaited_once_with(ANY, {"https://shop.example", "https://wallet.example"})
+
+    @pytest.mark.asyncio
+    async def test_a_tab_closed_by_the_user_closes_its_popup_and_clears_both(self, monkeypatch):
+        clear = AsyncMock(return_value=True)
+        monkeypatch.setattr(payment_tab, "clear_site_storage", clear)
+        page, popup = await self._with_popup()
+        await page.close()  # the VNC user closed it
+        await TABS.drain()
+        assert popup.is_closed() and not TABS.any_armed()
+        assert clear.await_count == 2  # the tab's clear, then the popup's
+
+
+class TestResultChokepoint:
+    """While a tab is armed, every string of every tool result passes the
+    filled-value redaction, whichever page or error path produced it."""
+
+    @pytest.mark.asyncio
+    async def test_an_error_quoting_another_page_s_markup_is_redacted(self, tmp_path):
+        await _arm_in("armed", _page())
+        other = _page("https://news.example/")
+        other.set_input_files = AsyncMock(side_effect=RuntimeError(f"<b>{NAME} {CVC}</b>"))
+        _drive(other)
+        f = tmp_path / "d.txt"
+        f.write_text("x")
+        result = await browser._impl_browser_upload("#f", str(f))
+        assert "error" in result
+        _no_secret(result)
+
+    @pytest.mark.asyncio
+    async def test_a_raised_error_is_redacted(self):
+        await _arm_in("armed", _page())
+
+        async def _impl_tool():
+            raise RuntimeError(f"saw {NAME} and {CVC}")
+
+        async def _impl_slow():
+            raise TimeoutError(f"waited on {NAME}")
+
+        _no_secret(await browser._redacted(_impl_tool)())
+        with pytest.raises(TimeoutError) as e:
+            await browser._redacted(_impl_slow)()
+        _no_secret(str(e.value))
+
+    @pytest.mark.asyncio
+    async def test_nothing_changes_while_no_tab_is_armed(self):
+        other = _page("https://news.example/", snapshot=f"- paragraph: {NAME}")
+        _drive(other)
+        assert NAME in (await browser._impl_browser_snapshot())["snapshot"]
+
+
+class TestClickSelectorsOnAnArmedTab:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            "text=/^4242/",
+            'input[value^="4"]',
+            "#num:has-text('42')",
+            "//input[starts-with(@value,'4')]",
+            'internal:attr=[value="4"]',
+        ],
+    )
+    async def test_a_selector_that_can_test_a_value_is_refused(self, selector, monkeypatch):
+        page = _page()
+        _drive(page)
+        await _arm_in("armed", page)
+        click = AsyncMock()
+        monkeypatch.setattr(browser, "_stealth_click", click)
+        assert await browser._impl_browser_click(selector) == {
+            "error": browser._REFUSE_PAYMENT_SELECTOR
+        }
+        click.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("selector", ["#pay", "form#f > button.submit", "button"])
+    async def test_a_plain_selector_is_allowed(self, selector, monkeypatch):
+        page = _page()
+        _drive(page)
+        await _arm_in("armed", page)
+        monkeypatch.setattr(browser, "_declares_new_tab", AsyncMock(return_value=False))
+        monkeypatch.setattr(browser, "_stealth_click", AsyncMock())
+        assert "error" not in await browser._impl_browser_click(selector)
+
+    @pytest.mark.asyncio
+    async def test_any_selector_on_an_unarmed_tab(self, monkeypatch):
+        _drive(_page())
+        monkeypatch.setattr(browser, "_declares_new_tab", AsyncMock(return_value=False))
+        monkeypatch.setattr(browser, "_stealth_click", AsyncMock())
+        assert "error" not in await browser._impl_browser_click("text=Pay")
+
+
+class TestLifecycleEdges:
+    @pytest.mark.asyncio
+    async def test_the_kill_switch_refuses_arming_in_a_running_browser(self, monkeypatch):
+        monkeypatch.setattr(payment_tab, "card_fill_enabled", lambda: False)
+        page = _page()
+        with pytest.raises(PaymentTabError) as e:
+            await payment_tab.arm(page)
+        assert e.value.code == "card_fill_off" and not TABS.is_armed(page)
+
+    @pytest.mark.asyncio
+    async def test_a_document_arriving_during_the_mask_check_voids_it(self):
+        page = _page()
+        await payment_tab.arm(page)
+
+        async def check(_js):
+            for fn in page.handlers["framenavigated"]:
+                fn(MagicMock(url="https://shop.example/next", evaluate=AsyncMock()))
+            return True
+
+        page.frames[0].evaluate = AsyncMock(side_effect=check)
+        assert await TABS.verify_mask(page) is False
+        with pytest.raises(PaymentTabError) as e:
+            payment_tab.begin_fill(page, FILLED)
+        assert e.value.code == "mask_unverified"
+
+    @pytest.mark.asyncio
+    async def test_a_snapshot_of_another_tab_spanning_a_finish_shows_nothing(self):
+        page = _page()
+        page.context.new_page = AsyncMock(return_value=_page("about:blank"))
+        await _arm_in("armed", page)
+        mirror = _page("https://shop.example/summary")
+
+        async def read():
+            await payment_tab.finish(page)  # lands while the other tab is read
+            return f"- paragraph: {NAME} {CVC}"
+
+        mirror.locator.return_value.aria_snapshot = AsyncMock(side_effect=read)
+        out = await browser._snapshot_page(mirror)
+        assert out.startswith("(snapshot unavailable")
+        _no_secret(out)
+
+    @pytest.mark.asyncio
+    async def test_the_idle_reaper_finishes_an_armed_tab_before_closing_camoufox(self, monkeypatch):
+        order = []
+
+        async def clear(context, origins):
+            order.append("cleared")
+            return True
+
+        async def close_camoufox():
+            order.append("camoufox closed")
+
+        monkeypatch.setattr(payment_tab, "clear_site_storage", clear)
+        monkeypatch.setattr(browser, "_stealth_cm", MagicMock())
+        monkeypatch.setitem(browser._LAYER_CLEANUP, BrowserLayer.CAMOUFOX, close_camoufox)
+        page = _page()
+        page.context.new_page = AsyncMock(return_value=_page("about:blank"))
+        _drive(page)
+        await _arm_in("armed", page)
+        browser._layer_last_used[BrowserLayer.CAMOUFOX] = 0.0
+        await browser._reclaim_idle_layers(browser._IDLE_TIMEOUT_S + 1.0)
+        assert order == ["cleared", "camoufox closed"]
+
+    @pytest.mark.asyncio
+    async def test_a_tab_stays_armed_while_camoufox_closes(self, monkeypatch):
+        seen = []
+
+        async def close(cm):
+            seen.append(TABS.any_armed())
+
+        monkeypatch.setattr(browser, "_close_camoufox", close)
+        monkeypatch.setattr(browser, "_stealth_cm", MagicMock())
+        page = _page()
+        _drive(page)
+        await _arm_in("armed", page)
+        await browser._cleanup_camoufox()
+        assert seen == [True]  # logs stay in armed mode until the browser is gone
+        assert not TABS.any_armed() and TABS.run_js_blocked()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pending", [True, False])
+    async def test_no_profile_backup_while_payment_storage_is_uncleared(
+        self, pending, monkeypatch, tmp_path
+    ):
+        if pending:
+            env.payment_tab_pending_path().write_text(json.dumps(["https://shop.example"]))
+        backups = []
+        monkeypatch.setattr(TABS, "clear_pending", AsyncMock())
+        await TestLaunchPrefs()._launch(
+            monkeypatch, tmp_path, True, backup=lambda *a: backups.append(a)
+        )
+        assert len(backups) == (0 if pending else 1)  # the control arm backs up
+
+    def test_the_card_fill_prefs_pin_what_camoufox_only_defaults(self):
+        prefs = payment_tab.CARD_FILL_PREFS
+        assert prefs["browser.sessionstore.resume_from_crash"] is False
+        assert prefs["signon.rememberSignons"] is False
+        assert prefs["signon.formlessCapture.enabled"] is False
+        assert prefs["places.history.enabled"] is False
+        assert prefs["browser.cache.disk.enable"] is False
+
+
+_FAKE_SW = """
+const outcome = process.argv[1];
+globalThis.self = globalThis;
+globalThis.localStorage = { clear() {} };
+globalThis.sessionStorage = { clear() {} };
+globalThis.indexedDB = { databases: async () => [] };
+const unregistered = [];
+const reg = (id) => ({ async unregister() { unregistered.push(id); return outcome !== 'refused'; } });
+Object.defineProperty(globalThis, 'navigator', {
+  value: { serviceWorker: { getRegistrations: async () => [reg('a'), reg('b')] } },
+  configurable: true,
+});
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+@pytest.mark.parametrize(("outcome", "ok"), [("ok", True), ("refused", False)])
+def test_the_storage_clear_unregisters_service_workers(outcome, ok):
+    script = (
+        _FAKE_SW
+        + "("
+        + payment_tab._CLEAR_STORAGE_JS
+        + ")().then((v) => console.log(JSON.stringify([v, unregistered])));"
+    )
+    out = subprocess.run(
+        ["node", "-e", script, outcome], capture_output=True, text=True, timeout=60, check=True
+    )
+    assert json.loads(out.stdout) == [ok, ["a", "b"]]

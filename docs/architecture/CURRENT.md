@@ -1702,12 +1702,17 @@ the shared banner is not an assertion about all concurrent sessions.
   `mcp/health/payment_tab.py` is the payment-tab guard for the card-fill flow
   (#3172): a tab is armed by Page (not host or timer) until it closes, and the
   browser tools consult it (run_js refused everywhere; screenshot, fill, upload
-  and navigate refused on the armed tab; press_key allowlisted; snapshots
-  redact form values and keyed-hash matches; `_ts_log` silent; `CARD_FILTER`
-  armed mode). Any run_js or non-http(s) navigation taints the Camoufox context
-  until restart, which refuses arming. `finish` closes the tab and clears its
-  origins' site storage. Contract tests: every `_impl_browser_*` checks arming
-  or is exempt with a reason, and every page script is a module constant.
+  and navigate refused on the armed tab and its popups; press_key allowlisted;
+  click plain-CSS only; snapshots redact form values and keyed-hash matches,
+  respaced forms included; every `redacted` result walked in armed mode;
+  `_ts_log` silent; `CARD_FILTER` armed mode). Arming waits for tool actions in
+  flight (`TABS.acting`). The mask hides the whole document (root opacity) in
+  every frame. Any run_js or non-http(s) navigation taints the Camoufox context
+  until restart, which refuses arming. `finish` closes the tab and its popups
+  and clears their origins' site storage; until a clear succeeds, pages at
+  those origins are not read and the profile is not backed up. Contract tests:
+  every `_impl_browser_*` checks arming or is exempt with a reason, and every
+  page script is a module constant.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
