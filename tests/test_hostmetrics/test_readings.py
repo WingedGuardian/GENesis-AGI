@@ -292,3 +292,12 @@ def test_proc_stat_steal_time_is_not_counted_as_busy(cg, proc):
         lambda: _tree(proc, {"stat": f"cpu  {tck} 0 0 {51 * tck} 0 0 0 {4 * tck} 0 0\n"})
     )
     assert r.read_cpu_used(1.0, cg, proc, sleep=fake.sleep, clock=fake.clock) == 0.0
+
+
+def test_psi_totals_cgroup_only_never_reads_the_host_wide_file(cg, proc):
+    """A container's /proc/pressure is host-wide; a caller that books the stall
+    as its own must not mix scopes."""
+    line = "some avg10=0.00 avg60=0.00 avg300=0.00 total=999\n"
+    _tree(proc, {"pressure/io": line})
+    assert r.read_psi_totals(cg, proc) == {"io_some": 999}
+    assert r.read_psi_totals(cg, proc, cgroup_only=True) is None

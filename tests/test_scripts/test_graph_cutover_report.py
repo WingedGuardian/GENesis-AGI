@@ -243,6 +243,7 @@ def test_a_reset_prints_the_cause_its_event_recorded(tmp_path, capsys):
             "budget_ms": 500.0,
             "elapsed_ms": 501.2,
             "late_ms": 1.2,
+            "cancel_ms": 0.4,
             "frames": ["query", "readuntil", "_wait_for_data"],
             "psi_stall_us": {"cpu_some": 0, "io_full": 3000},
         },
@@ -251,7 +252,7 @@ def test_a_reset_prints_the_cause_its_event_recorded(tmp_path, capsys):
     assert _run(tmp_path, db) == 1
     out = capsys.readouterr().out
     assert "pid 4242, age 12.5s" in out
-    assert "late 1.2ms" in out and "budget 500.0ms" in out
+    assert "late 1.2ms" in out and "budget 500.0ms" in out and "cancel 0.4ms" in out
     assert "at query>readuntil>_wait_for_data" in out
     assert "stall io_full=3000us" in out
     assert "cpu_some" not in out  # a zero stall is not news

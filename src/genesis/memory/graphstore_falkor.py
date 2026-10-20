@@ -109,19 +109,26 @@ _DIAG_FRAMES = 4
 
 
 def _psi_totals() -> dict[str, int] | None:
-    """This container's cumulative stall counters (µs), or None. Read at the
-    start of every bounded call and again at its timeout: 3 cgroupfs reads."""
+    """This container's cumulative cgroup stall counters (µs), or None. Read at
+    the start of every bounded call and again at its timeout: 3 cgroupfs reads.
+    cgroup files ONLY: the ``/proc/pressure`` fallback is host-wide inside a
+    container, and host pressure must never be booked as this read's cause."""
     try:
         from genesis.hostmetrics.readings import read_psi_totals
 
-        return read_psi_totals()
+        return read_psi_totals(cgroup_only=True)
     except Exception:
         logger.debug("PSI totals unreadable for the timeout diagnosis", exc_info=True)
         return None
 
 
 def _timeout_diag(
-    exc: BaseException, *, timeout: float, started: float, psi_before: dict[str, int] | None
+    exc: BaseException,
+    *,
+    timeout: float,
+    started: float,
+    fired_at: float | None,
+    psi_before: dict[str, int] | None,
 ) -> dict[str, Any]:
     """What a deadline that fired can say about its own cause. Never raises.
 
@@ -129,24 +136,30 @@ def _timeout_diag(
       last (the TimeoutError's cause is that CancelledError). Names only: no
       paths, no arguments. A connect shows ``_graph``; a reply never sent shows
       the client's reader.
-    - ``late_ms``: how long after its deadline the timeout fired. The deadline
-      runs on the event loop, so a loop held by synchronous work fires it late:
-      large means THIS process stalled, about zero means the engine did not
-      answer within the budget.
-    - ``psi_stall_us``: the container's stall time (µs) accumulated across the
-      wait, per resource. ``avg10`` cannot see a sub-second stall.
+    - ``late_ms``: how long after the deadline the event loop got to run it,
+      read from a marker timer due at the same instant. The deadline runs on the
+      loop, so a loop held by synchronous work runs it late: large means THIS
+      process stalled, about zero means the engine did not answer in time.
+    - ``cancel_ms``: from that moment until the timeout surfaced. ``wait_for``
+      raises only once the cancelled operation finishes its own cleanup, so slow
+      cleanup lands here and never in ``late_ms``.
+    - ``psi_stall_us``: the container's cgroup stall time (µs) across the wait,
+      per resource. ``avg10`` cannot see a sub-second stall.
     """
     diag: dict[str, Any] = {
         "budget_ms": round(timeout * 1000, 1),
         "elapsed_ms": None,
         "late_ms": None,
+        "cancel_ms": None,
         "frames": None,
         "psi_stall_us": None,
     }
     try:
-        elapsed_ms = (time.monotonic() - started) * 1000
-        diag["elapsed_ms"] = round(elapsed_ms, 1)
-        diag["late_ms"] = round(elapsed_ms - timeout * 1000, 1)
+        now = time.monotonic()
+        diag["elapsed_ms"] = round((now - started) * 1000, 1)
+        if fired_at is not None:
+            diag["late_ms"] = round((fired_at - started - timeout) * 1000, 1)
+            diag["cancel_ms"] = round((now - fired_at) * 1000, 1)
         cancelled = exc.__cause__
         tb = cancelled.__traceback__ if cancelled is not None else None
         if tb is not None:
@@ -478,15 +491,30 @@ class FalkorGraphStore:
         because the deadline has to cover connecting as well as the operation
         and the connect happens inside it.
         """
-        psi_before = _psi_totals()  # before the clock, so late_ms excludes it
+        # The budget starts BEFORE the diagnosis's own read, so that read spends
+        # it rather than extending it: the call stays bounded by `timeout`.
         started = time.monotonic()
+        psi_before = _psi_totals()
+        remaining = max(0.0, started + timeout - time.monotonic())
+        # A marker due at the same instant as the deadline: when it ran is when
+        # the loop got to the deadline, apart from any cancellation cleanup after.
+        fired: list[float] = []
+        marker = asyncio.get_running_loop().call_later(
+            remaining, lambda: fired.append(time.monotonic())
+        )
         try:
-            return await asyncio.wait_for(factory(), timeout=timeout)
+            return await asyncio.wait_for(factory(), timeout=remaining)
         except TimeoutError as exc:
             err = GraphUnavailableError(f"{what} exceeded {timeout}s — the engine is not answering")
             # Read by the traversal telemetry: every cutover-clock reset was one
             # of these, and the class name alone named no cause.
-            err.diag = _timeout_diag(exc, timeout=timeout, started=started, psi_before=psi_before)
+            err.diag = _timeout_diag(
+                exc,
+                timeout=timeout,
+                started=started,
+                fired_at=fired[0] if fired else None,
+                psi_before=psi_before,
+            )
             raise err from exc
         except GraphUnavailableError:
             # Already the right type and already carries the better message
@@ -499,6 +527,8 @@ class FalkorGraphStore:
             # returning [] would tell dream-centrality there are no bridges and
             # let it wipe the shield's thresholds.
             raise GraphUnavailableError(f"{what} failed: {exc}") from exc
+        finally:
+            marker.cancel()
 
     async def _query(
         self,
@@ -826,8 +856,8 @@ class FalkorGraphStore:
                     "late_ms": round(-timeout * 1000, 1),
                     "frames": None,
                     "psi_stall_us": None,
+                    # The marker query was never issued: the first used the budget.
                     "budget_spent": True,
-                    "query": "marker",
                 }
                 raise err
         with _labelled("marker"):

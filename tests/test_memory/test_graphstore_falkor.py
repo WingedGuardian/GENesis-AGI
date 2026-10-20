@@ -1871,4 +1871,81 @@ async def test_a_spent_budget_reports_the_traversal_budget_not_zero():
     with pytest.raises(GraphUnavailableError) as caught:
         await store._assert_projection_exists(deadline=time.monotonic() - 0.1)
     assert caught.value.diag["budget_ms"] == falkor_mod._READ_TIMEOUT_S * 1000
-    assert caught.value.diag["query"] == "marker"
+    # The marker query was never issued, so the diag must not blame it.
+    assert "query" not in caught.value.diag
+
+
+
+async def test_slow_cancellation_cleanup_is_not_reported_as_a_late_loop(tmp_path):
+    """wait_for raises only after the cancelled operation finishes cleaning up,
+    so that time must land in cancel_ms, never in late_ms (round 1, PR review)."""
+    import asyncio as _asyncio
+
+    class _SlowCleanupGraph:
+        async def query(self, cypher, params):
+            try:
+                await _asyncio.sleep(5)
+            finally:
+                await _asyncio.sleep(0.25)  # cleanup after the cancel arrives
+
+    class _Client(_FastClient):
+        def select_graph(self, key):
+            return _SlowCleanupGraph()
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    diag = caught.value.diag
+    assert diag["late_ms"] < 40.0, diag
+    assert diag["cancel_ms"] >= 200.0, diag
+
+
+async def test_a_slow_diagnostic_read_spends_the_budget_not_extends_it(tmp_path):
+    """The budget starts before the pressure read, so the call stays bounded:
+    measured from OUTSIDE, since the read shifts any clock started after it."""
+    import asyncio as _asyncio
+
+    calls = []
+
+    def _slow_first_psi():
+        calls.append(1)
+        if len(calls) == 1:
+            time.sleep(0.1)  # only the read before the wait is slow
+        return {"cpu_some": 1}
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    loop = _asyncio.get_running_loop()
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _FastClient),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.3),
+        patch.object(falkor_mod, "_psi_totals", _slow_first_psi),
+        pytest.raises(GraphUnavailableError),
+    ):
+        t0 = loop.time()
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+    total = loop.time() - t0
+    # Bounded: the 100 ms read is spent out of the 300 ms budget (~300 total);
+    # extending would give ~400.
+    assert total < 0.36, total
+
+
+async def test_the_pressure_read_is_container_scoped_only():
+    """Host-wide /proc/pressure must never be booked as this read's stall."""
+    import genesis.hostmetrics.readings as readings
+
+    seen = {}
+
+    def _record(*a, **k):
+        seen.update(k)
+        return None
+
+    with patch.object(readings, "read_psi_totals", _record):
+        falkor_mod._psi_totals()
+    assert seen == {"cgroup_only": True}

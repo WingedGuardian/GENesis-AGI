@@ -81,7 +81,7 @@ def _cause(event: dict) -> str:
     diag = event.get("diag") if isinstance(event.get("diag"), dict) else {}
     if diag.get("budget_spent"):
         parts.append("budget spent before the second query")
-    for key in ("budget_ms", "elapsed_ms", "late_ms"):
+    for key in ("budget_ms", "elapsed_ms", "late_ms", "cancel_ms"):
         if diag.get(key) is not None:
             parts.append(f"{key.removesuffix('_ms')} {diag[key]}ms")
     if diag.get("query"):

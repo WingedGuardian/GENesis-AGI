@@ -527,9 +527,10 @@ def test_unit_keeps_the_engines_own_record_of_slow_moments():
     """A read that times out client-side is otherwise news with no cause: the
     engine's slowlog (deep enough to outlast the hourly projection's batches)
     and its latency monitor are what say whether the engine itself stalled."""
-    argv = _exec_argv(UNIT_TEMPLATE.read_text())
-    assert "--slowlog-max-len 4096" in argv
-    assert "--latency-monitor-threshold 100" in argv
+    # Whole tokens, so 40960 or 1000 cannot pass for 4096 or 100.
+    tokens = _exec_argv(UNIT_TEMPLATE.read_text()).split()
+    assert tokens[tokens.index("--slowlog-max-len") + 1] == "4096"
+    assert tokens[tokens.index("--latency-monitor-threshold") + 1] == "100"
 
 
 def test_start_limit_directives_are_in_the_unit_section():

@@ -218,15 +218,22 @@ def read_psi(resource: str, root: Path = CGROUP_ROOT, proc: Path = PROC_ROOT) ->
     return None
 
 
-def read_psi_totals(root: Path = CGROUP_ROOT, proc: Path = PROC_ROOT) -> dict[str, int] | None:
+def read_psi_totals(
+    root: Path = CGROUP_ROOT, proc: Path = PROC_ROOT, *, cgroup_only: bool = False
+) -> dict[str, int] | None:
     """Cumulative stall time in microseconds (the ``total=`` counter) for cpu,
     io and memory, keyed ``<resource>_<some|full>``; cgroup files first, as in
     ``read_psi``. The difference of two readings is the stall time between them,
     which no ``avg10`` can show for a sub-second wait. None when nothing reads.
+    ``cgroup_only`` drops the ``/proc/pressure`` fallback, which is host-wide
+    inside a container, for a caller that must not mix the two scopes.
     """
     out: dict[str, int] = {}
     for resource in ("cpu", "io", "memory"):
-        for path in (root / f"{resource}.pressure", proc / "pressure" / resource):
+        paths = [root / f"{resource}.pressure"]
+        if not cgroup_only:
+            paths.append(proc / "pressure" / resource)
+        for path in paths:
             text = _read_text(path)
             if not text:
                 continue
