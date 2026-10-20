@@ -116,9 +116,12 @@ class PhaseClock:
 
     def line(self, *, cut: bool = False, **extra: object) -> str:
         """The ``[hook-phases] {json}`` line, newline-terminated, under MAX_LINE_BYTES."""
-        now = self._clock()
+        # Copy BEFORE reading the clock: a mark the main thread appends after the
+        # copy is simply not in this line, while one appended between a clock
+        # read and the copy would be later than `now` and render negative.
         marks = self._marks[:]
         fields = dict(self._fields)
+        now = self._clock()
         fields.update(extra)
         phases: list[list[object]] = []
         for i, (name, started) in enumerate(marks):

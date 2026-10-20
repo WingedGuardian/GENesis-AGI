@@ -179,3 +179,26 @@ def test_a_folded_line_keeps_its_content_when_phases_are_long(tmp_path) -> None:
                 p = _payload(line)
                 assert "truncated" not in p, (n, ms, width)
                 assert p["running"] == f"{n - 1:0{width}d}"
+
+
+def test_a_mark_landing_during_render_never_yields_a_negative_phase(tmp_path) -> None:
+    """Round 2 (Codex P2): line() read the clock, then copied the marks, so a mark
+    the main thread appended in between was later than `now` and its phase (and a
+    cut line's running_ms) came out negative. Reproduced deterministically: the
+    render's own clock read appends a mark, as a concurrent mark() would."""
+    state = {"t": 100.0, "inject": False}
+    pc: hp.PhaseClock
+
+    def clock() -> float:
+        state["t"] += 0.001
+        if state["inject"]:
+            state["inject"] = False
+            pc._marks.append(("late_step", state["t"] + 0.5))  # lands after `now`
+        return state["t"]
+
+    pc = hp.PhaseClock(clock=clock, psi_root=tmp_path)
+    pc.mark("heartbeat_write")
+    state["inject"] = True
+    p = _payload(pc.line(cut=True))
+    assert all(ms >= 0 for _, ms in p["phases"]), p["phases"]
+    assert p["running_ms"] >= 0
