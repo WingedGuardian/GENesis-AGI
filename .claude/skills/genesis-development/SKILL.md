@@ -1411,8 +1411,8 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   the box, pick the winner, move on. That answers the pass and leaves the
   mechanism, because both reviewers are usually right about the environment
   each has in mind — which means the code depends on something that is not
-  invariant. MEASURED: one reviewer moved a parse to field `$4`, the next moved
-  it to `$5`, and both were correct, for different releases of the tool being
+  invariant. MEASURED: one reviewer moved a parse to field 4, the next moved
+  it to field 5, and both were correct, for different releases of the tool being
   parsed. The value was never the defect; depending on column POSITION was.
   Remove the dependency — match the field by what it IS, derive the index, or
   read a named output format — which is usually cheaper than a third pass of
