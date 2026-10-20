@@ -349,8 +349,29 @@ def parse(
 
 # -- git and the network -----------------------------------------------------
 
-#: ``git replace`` could swap a fix commit for an empty one in every read.
-_GIT_ENV = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
+#: ``git replace`` or a graft could swap a fix commit, or its parents, in
+#: every read; a graft file that does not exist turns grafts off.
+_GIT_ENV = {
+    **os.environ,
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_GRAFT_FILE": os.devnull + ".no-grafts",
+}
+
+_TREE_ID = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
+_INJECTED_CONFIG = re.compile(r"GIT_CONFIG_(PARAMETERS|COUNT|KEY_\d+|VALUE_\d+)")
+
+
+def _merge_env() -> dict[str, str]:
+    """For the merge exemption, whose answer credits: no global or system
+    config or attributes, and none of the config a ``git -c`` caller passes
+    down to its hooks through the environment. The global attributes file,
+    which git reads even with no config naming it, is cut by ``-c``."""
+    return {
+        **{k: v for k, v in _GIT_ENV.items() if not _INJECTED_CONFIG.fullmatch(k)},
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
+    }
 
 
 #: A ``time.monotonic()`` bound on every command this module runs, set by
@@ -386,30 +407,43 @@ def _timeout() -> float:
     return min(_COMMAND_TIMEOUT, left)
 
 
-def _run(argv: Sequence[str], cwd: str | None = None) -> tuple[int, str, str]:
+def _run(
+    argv: Sequence[str], cwd: str | None = None, *, env: Mapping[str, str] | None = None
+) -> tuple[int, str, str]:
     """Run a command. Output is decoded with replacement, so a commit message
     in a legacy encoding is read (and then refused by the grammar), never a
     crash. Under a deadline, a command that does not finish in time raises
     ``Refused``: its non-zero exit would otherwise read as an answer."""
+    code, out, err = _run_bytes(argv, cwd, env=env)
+    return code, _text(out), _text(err)
+
+
+def _text(raw: bytes) -> str:
+    # What ``text=True`` gave: replacement decoding and universal newlines.
+    return raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _run_bytes(
+    argv: Sequence[str], cwd: str | None = None, *, env: Mapping[str, str] | None = None
+) -> tuple[int, bytes, bytes]:
+    """``_run`` with the output left as bytes, for paths compared as sets: two
+    paths that are not UTF-8 can decode to the same text."""
     timeout = _timeout()
     try:
         done = subprocess.run(
             list(argv),
             cwd=cwd,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=timeout,
             check=False,
-            env=_GIT_ENV,
+            env=dict(env if env is not None else _GIT_ENV),
         )
     except subprocess.TimeoutExpired as exc:
         if _DEADLINE.get() is not None:
             raise Refused("the reflection check ran out of time") from exc
-        return 1, "", str(exc)
+        return 1, b"", str(exc).encode()
     except OSError as exc:
-        return 1, "", str(exc)
+        return 1, b"", str(exc).encode()
     return done.returncode, done.stdout, done.stderr
 
 
@@ -959,8 +993,18 @@ def _merge_is_no_fix(
     default branch's first-parent line (``mainline``), and its tree is git's
     own merge result, or differs from it only in the files that conflicted
     (the resolution). Anything else a merge carries is content like any
-    commit's. An octopus merge, or a git that cannot say (``merge-tree
-    --write-tree`` needs git 2.38), is never exempt."""
+    commit's. An octopus merge, or a git that cannot say, is never exempt:
+    ``--attr-source`` needs git 2.41, and ``merge-tree`` crashed with it until
+    2.43, so on an older git a merge it cannot compute is judged by its time.
+
+    Both trees are compared by plumbing, as bytes: paths that are not UTF-8
+    stay distinct, and no ``diff.*`` setting (ignored submodules, relative
+    paths) can hide a change. Attributes come from the first parent, files
+    without a merge attribute merge as text, and global, system and
+    environment-injected config is cut off. Residual: the repository's own
+    ``.git/config`` (a ``merge.text.driver``) and ``.git/info/attributes``
+    (a ``-merge``) have no off switch and can widen the conflicted set; like
+    the local refs above, that takes deliberate tampering."""
     if len(parents) != 2:
         return False
     # A merge bringing nothing new is git-merged to its first parent's tree,
@@ -972,21 +1016,27 @@ def _merge_is_no_fix(
     if first not in on_path or later not in mainline:
         return False
     # Attributes (and so merge drivers) come from the first parent's commit,
-    # never from whatever the checking machine has uncommitted.
+    # and a file with no merge attribute merges as text whatever the config
+    # says (the docstring's residuals aside).
+    git = ["git", "-C", cwd, "-c", f"core.attributesFile={os.devnull}", "-c", "merge.default=text"]
     merge_tree = ["merge-tree", "--write-tree", "--name-only", "--no-messages", "-z"]
-    attrs = f"--attr-source={first}"
-    code, out, _ = _run(["git", "-C", cwd, attrs, *merge_tree, first, later])
+    code, out, _ = _run_bytes(
+        [*git, f"--attr-source={first}", *merge_tree, first, later], env=_merge_env()
+    )
     if code not in (0, 1):
         return False
-    merged, *conflicted = out.split("\0")
+    merged, *conflicted = out.split(b"\0")
+    # A timeout reads as exit 1 with no output: only a real tree id is a merge.
+    if not _TREE_ID.fullmatch(merged.strip()):
+        return False
     if code == 0:
-        return merged.strip() == tree
-    code, out, _ = _run(
-        ["git", "-C", cwd, "diff", "--no-renames", "--name-only", "-z", merged.strip(), tree]
-    )
+        return merged.strip().decode() == tree
+    # A committed .gitmodules "ignore = all" hides a gitlink even from diff-tree.
+    diff_tree = ["diff-tree", "-r", "--no-renames", "--ignore-submodules=none", "--name-only", "-z"]
+    code, out, _ = _run_bytes([*git, *diff_tree, merged.strip().decode(), tree], env=_merge_env())
     if code != 0:
         return False
-    changed = {path for path in out.split("\0") if path}
+    changed = {path for path in out.split(b"\0") if path}
     return changed <= {path for path in conflicted if path}
 
 

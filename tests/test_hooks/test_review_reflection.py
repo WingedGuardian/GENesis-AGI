@@ -670,6 +670,181 @@ def test_a_resolution_reaching_other_files_is_judged_by_its_time(repo, tmp_path)
     assert _covered(path, head, reviewed_at={"c1": _at(40), "c2": _at(40)}) == {"c1", "c2"}
 
 
+def _write(repo: Path, name: bytes, data: bytes) -> None:
+    with open(bytes(repo) + b"/" + name, "wb") as f:
+        f.write(data)
+
+
+def _smuggling_merge(
+    repo: Path, conflict: bytes, extra: bytes, *, gitlink: bool = False, gitmodules: str = ""
+) -> str:
+    """A main merge that resolves ``conflict`` and also edits ``extra``, a file
+    git merged cleanly (or, with ``gitlink``, adds a submodule entry instead):
+    content beyond the resolution. Returns the round head, the branch tip just
+    before the merge."""
+    _git(repo, "checkout", "-q", "main")
+    for name in (conflict, extra):
+        _write(repo, name, b"1\n2\n3\n4\n5\n")
+    if gitmodules:
+        (repo / ".gitmodules").write_text(gitmodules)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add both files")
+    _git(repo, "checkout", "-q", "feat/x")
+    _git(repo, "merge", "-q", "--no-edit", "main")
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, conflict, b"main\n2\n3\n4\n5\n")
+    _write(repo, extra, b"1\n2\n3\n4\nmain\n")
+    _git(repo, "commit", "-q", "-am", "main edits")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "main")
+    _git(repo, "checkout", "-q", "feat/x")
+    _write(repo, conflict, b"feat\n2\n3\n4\n5\n")
+    _write(repo, extra, b"feat\n2\n3\n4\n5\n")
+    _git(repo, "commit", "-q", "-am", "feat edits")
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    done = subprocess.run(["git", "-C", str(repo), "merge", "-q", "main"], capture_output=True)
+    assert done.returncode != 0, "the fixture must really conflict"
+    _write(repo, conflict, b"resolved\n2\n3\n4\n5\n")
+    if not gitlink:
+        _write(repo, extra, b"feat\n2\nA FIX RIDING THE MERGE\n4\nmain\n")
+    _git(repo, "add", "-A")
+    if gitlink:  # after `add -A`, which would drop an entry with no directory
+        _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},sub")
+        assert "160000" in _git(repo, "ls-files", "-s", "sub")
+    _dated(repo, "commit", "-q", "--no-edit", when=_at(30))
+    return head
+
+
+def _smuggled_is_a_fix(path: Path, tmp_path: Path, head: str, cwd: Path | None = None) -> None:
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    got = rr.covered_keys(
+        str(cwd or path),
+        head,
+        round_number=1,
+        gate_lane=False,
+        prior_heads=[],
+        acceptance=None,
+        round_started=T0 - timedelta(days=3650),
+        reviewed_at={"c1": _at(0), "c2": _at(0)},
+    )
+    assert got == set()
+
+
+def test_the_smuggling_fixture_is_a_fix_with_no_tricks(repo, tmp_path):
+    """Control for the four round-2 cases below: plain names, no config."""
+    path, _ = repo
+    _smuggled_is_a_fix(path, tmp_path, _smuggling_merge(path, b"c.txt", b"e.txt"))
+
+
+def test_paths_that_are_not_utf8_cannot_hide_an_extra_edit(repo, tmp_path):
+    """Round 2 of #3493 (Codex c4328462308): decoded with replacement, both
+    names read as U+FFFD, so the extra edit looked like the conflicted file."""
+    path, _ = repo
+    _smuggled_is_a_fix(path, tmp_path, _smuggling_merge(path, b"\xff", b"\xfe"))
+
+
+def test_an_ignored_submodule_change_still_counts(repo, tmp_path):
+    """Round 2 of #3493 (Codex c4328462312): porcelain git diff honours
+    diff.ignoreSubmodules=all and dropped a gitlink the merge carried."""
+    path, _ = repo
+    head = _smuggling_merge(path, b"c.txt", b"e.txt", gitlink=True)
+    _git(path, "config", "diff.ignoreSubmodules", "all")
+    _smuggled_is_a_fix(path, tmp_path, head)
+
+
+def test_a_committed_submodule_ignore_cannot_hide_a_gitlink(repo, tmp_path):
+    """Found while fixing round 2: a committed .gitmodules "ignore = all"
+    hides a gitlink change from plumbing diff-tree too, not only from git diff."""
+    path, _ = repo
+    gitmodules = '[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n\tignore = all\n'
+    head = _smuggling_merge(path, b"c.txt", b"e.txt", gitlink=True, gitmodules=gitmodules)
+    _smuggled_is_a_fix(path, tmp_path, head)
+
+
+def test_a_repo_merge_default_cannot_widen_the_conflicted_set(repo, tmp_path):
+    """Round-2 fix audit: merge.default=binary makes every file without a merge
+    attribute conflict, so a fix inside a cleanly merging file was exempt."""
+    path, _ = repo
+    head = _smuggling_merge(path, b"c.txt", b"e.txt")
+    _git(path, "config", "merge.default", "binary")
+    _smuggled_is_a_fix(path, tmp_path, head)
+
+
+def test_a_global_merge_default_cannot_widen_the_conflicted_set(repo, tmp_path, monkeypatch):
+    """The same through the user's global ~/.gitconfig."""
+    path, _ = repo
+    head = _smuggling_merge(path, b"c.txt", b"e.txt")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text("[merge]\n\tdefault = binary\n")
+    env = {k: v for k, v in rr._GIT_ENV.items() if k not in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME")}
+    monkeypatch.setattr(rr, "_GIT_ENV", {**env, "HOME": str(home)})
+    _smuggled_is_a_fix(path, tmp_path, head)
+
+
+def test_a_relative_diff_from_a_subdirectory_still_sees_the_whole_tree(repo, tmp_path):
+    """The round-2 premise check's unreported member: diff.relative=true, with
+    the check run from a subdirectory, limited porcelain diff to that directory."""
+    path, _ = repo
+    head = _smuggling_merge(path, b"c.txt", b"e.txt")
+    (path / "sub").mkdir()
+    _git(path, "config", "diff.relative", "true")
+    _smuggled_is_a_fix(path, tmp_path, head, cwd=path / "sub")
+
+
+def test_a_machine_attribute_cannot_widen_the_conflicted_set(repo, tmp_path):
+    """The round-2 premise check's unreported member: core.attributesFile with
+    `-merge` made a cleanly merging file conflict, so a fix inside it was
+    exempt. (.git/info/attributes has no off switch: a stated residual.)"""
+    path, _ = repo
+    head = _smuggling_merge(path, b"c.txt", b"e.txt")
+    attrs = tmp_path / "attributes"
+    attrs.write_text("e.txt -merge\n")
+    _git(path, "config", "core.attributesFile", str(attrs))
+    _smuggled_is_a_fix(path, tmp_path, head)
+
+
+def test_a_merge_tree_that_says_nothing_is_no_exemption(monkeypatch):
+    """CodeRabbit c4328380094: a timed-out merge-tree reads as exit 1 with no
+    output. It must not pass as a conflicted merge even if the next call
+    happens to answer with nothing changed."""
+    calls = []
+
+    def fake(argv, cwd=None, *, env=None):
+        calls.append(argv)
+        return (1, b"", b"timed out") if "merge-tree" in argv else (0, b"", b"")
+
+    monkeypatch.setattr(rr, "_run_bytes", fake)
+    assert rr._merge_is_no_fix("/r", "t" * 40, ["a", "b"], {"b"}, {"a"}) is False
+    assert len(calls) == 1
+
+
+def test_the_merge_exemption_runs_git_with_injected_config_cut_off(monkeypatch):
+    """A hook under `git -c ... commit` inherits that config through
+    GIT_CONFIG_*: none of it, no system attributes and no grafts reach the
+    exemption's git calls, and the global attributes file is cut too."""
+    seen = []
+
+    def fake(argv, cwd=None, *, env=None):
+        seen.append((list(argv), env))
+        return 1, b"", b""
+
+    env = {
+        "GIT_CONFIG_PARAMETERS": "'diff.ignoresubmodules'='all'",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "merge.default",
+        "GIT_CONFIG_VALUE_0": "binary",
+    }
+    monkeypatch.setattr(rr, "_GIT_ENV", {**rr._GIT_ENV, **env})
+    monkeypatch.setattr(rr, "_run_bytes", fake)
+    rr._merge_is_no_fix("/r", "t" * 40, ["a", "b"], {"b"}, {"a"})
+    argv, used = seen[0]
+    assert not set(env) & set(used)
+    assert used["GIT_CONFIG_GLOBAL"] == os.devnull and used["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert used["GIT_ATTR_NOSYSTEM"] == "1" and used["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert not os.path.exists(used["GIT_GRAFT_FILE"])
+    assert f"core.attributesFile={os.devnull}" in argv and "merge.default=text" in argv
+
+
 def test_a_clean_main_merge_with_extra_changes_is_judged_by_its_time(repo, tmp_path):
     """An edited merge (30 of 494 local main merges, 2026-10-20) is content."""
     path, head = repo
