@@ -312,9 +312,9 @@ def test_r5_no_argument_can_bring_a_card_in():
     }
     assert {o for a in parser._actions for o in a.option_strings} == {"-h", "--help"}
     assert parser_opts == {
-        "setup": {"-h", "--help", "--worktree", "--home", "--merchant"},
-        "serve": {"-h", "--help", "--home", "--approval-timeout-s"},
-        "teardown": {"-h", "--help", "--home"},
+        "setup": {"-h", "--help", "--worktree", "--merchant"},
+        "serve": {"-h", "--help", "--approval-timeout-s"},
+        "teardown": {"-h", "--help"},
     }
 
 
@@ -1008,7 +1008,7 @@ def test_teardown_never_signals_a_process_that_is_not_this_serve(tmp_path):
     _pidfile(layout, os.getpid())
     with pytest.raises(H.Refused, match="not this directory's serve"):
         H.stop_running_serve(layout)
-    other = _fake_serve(tmp_path, "serve", "--home", str(tmp_path / "another"))
+    other = _fake_serve(tmp_path, "setup", "--worktree", str(tmp_path))  # not a serve
     try:
         _pidfile(layout, other.pid)
         with pytest.raises(H.Refused, match="not this directory's serve"):
@@ -1023,7 +1023,7 @@ def test_teardown_never_signals_a_process_that_is_not_this_serve(tmp_path):
 
 def test_teardown_stops_this_directorys_serve(tmp_path):
     layout = _test_root(tmp_path)
-    mine = _fake_serve(tmp_path, "serve", "--home", str(layout.root))
+    mine = _fake_serve(tmp_path, "serve")
     try:
         _pidfile(layout, mine.pid)
         H.stop_running_serve(layout)
@@ -1276,14 +1276,14 @@ def test_a_rejected_bot_token_is_never_printed(monkeypatch, capsys, tmp_path):
         raise InvalidToken(f"The token `{secret}` was rejected by the server.")
 
     monkeypatch.setattr(H, "_serve", rejected)
-    assert H.main(["serve", "--home", str(tmp_path / "t")]) == 1
+    assert H.main(["serve"]) == 1
     err = capsys.readouterr().err
     assert "InvalidToken" in err and secret not in err
 
 
 def test_options_are_never_abbreviated():
     with pytest.raises(SystemExit):
-        H.build_parser().parse_args(["serve", "--ho", "/x"])
+        H.build_parser().parse_args(["serve", "--approval", "60"])
 
 
 def test_a_state_replace_is_atomic(tmp_path):
@@ -1362,3 +1362,16 @@ def test_teardown_removes_nothing_when_the_overlay_cannot_be_removed(
         os.chmod(own_overlay.parent, 0o755)
     H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
     assert not layout.root.exists() and not own_overlay.exists()
+
+
+# -- review cap redesign: one fixed test directory -------------------------------------
+
+
+def test_the_test_directory_is_fixed_and_short(monkeypatch):
+    import pwd
+
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    monkeypatch.setenv("HOME", "/somewhere/else")  # the passwd home decides, not $HOME
+    layout = H.default_layout()
+    assert layout.root == Path(os.path.realpath(home / "tmp")) / "payment-test-vault"
+    assert len(os.fsencode(layout.socket)) < 100  # no option picks another (R5 test pins them)

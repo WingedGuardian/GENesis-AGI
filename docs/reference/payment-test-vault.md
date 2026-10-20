@@ -6,7 +6,7 @@ socket, its cards and the main Telegram bot are never used.
 
 ## What it builds
 
-`setup` makes a new directory (`--home`) holding:
+`setup` makes one fixed directory, `~/tmp/payment-test-vault` (under the account's home), holding:
 
 | Path | What it is |
 |---|---|
@@ -50,17 +50,16 @@ send any text without the `TEST:` line.
 
    ```bash
    ~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py setup \
-       --worktree <card-fill branch worktree> --home ~/tmp/payment-test-vault \
-       --merchant <domain from step 4>
+       --worktree <card-fill branch worktree> --merchant <domain from step 4>
    ```
 
-   `--home` must be new, on the same disk as `~/.genesis` and not under the
-   Claude Code temp directory (teardown uses the Genesis trash), and short
-   enough that `<home>/home/.genesis/run/payment_vault.sock` can be bound (a
-   Unix socket path is limited to about 108 bytes). Setup refuses otherwise.
+   The directory must not exist yet. Setup also refuses when it would not be
+   on the same mount as the Genesis trash (teardown moves it there) or when its
+   socket path cannot be bound; with the fixed short path neither happens on a
+   standard install.
 6. Close any browser another session has open (or wait for its idle reclaim):
    `serve` refuses while one runs, and a release is refused while one runs.
-7. In one terminal: `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py serve --home ~/tmp/payment-test-vault`.
+7. In one terminal: `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py serve`.
    `--approval-timeout-s 60` shortens the approval wait for an expiry test.
    The test vault relocks after 30 minutes idle, like the live one; restart
    `serve` to unlock it again.
@@ -71,14 +70,12 @@ send any text without the `TEST:` line.
 9. Approve in the **test bot's** chat. Check the `TEST:` line is there.
 10. Exit the test Claude session first (its health MCP keeps the test database
     open, and the trash refuses a directory in use). Ctrl-C the serve, then
-    `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py teardown --home ~/tmp/payment-test-vault`.
+    `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py teardown`.
     It stops a running serve and moves the directory to the Genesis trash, then
     removes the overlay if it is still the file setup wrote. If the trash
-    refuses the directory, nothing is removed and teardown can be run again. (A
-    bind mount can pass setup's same-disk check and still be refused here; keep
-    `--home` on a plain directory of the same mount; setup refuses another mount.)
+    refuses the directory, nothing is removed and teardown can be run again.
     The lifecycle lock is a file beside the directory
-    (`.<name>.serve.lock`); teardown removes it.
+    (`~/tmp/.payment-test-vault.serve.lock`); teardown removes it.
 
 ## Refusals
 
@@ -102,7 +99,7 @@ Also refused: a test bot token whose bot id matches any other `*BOT_TOKEN*`
 value in `secrets.env` or the environment, or a run where `TELEGRAM_BOT_TOKEN`
 cannot be found at all (the check could not tell the bots apart). Teardown
 signals only a process whose own command line is
-`payments_test_vault.py serve --home <this directory>`, never genesis-server or
+`payments_test_vault.py serve` (one test directory per account), never genesis-server or
 itself, and refuses otherwise without removing anything.
 
 The harness and every Genesis process run as one user, so a same-user process

@@ -4,9 +4,9 @@
 Run it with the MAIN venv's python (the vault side is main's code)::
 
     ~/genesis/.venv/bin/python scripts/payments_test_vault.py setup \
-        --worktree <branch worktree> --home <new dir> --merchant <payment host>
-    ~/genesis/.venv/bin/python scripts/payments_test_vault.py serve --home <dir>
-    ~/genesis/.venv/bin/python scripts/payments_test_vault.py teardown --home <dir>
+        --worktree <branch worktree> --merchant <payment host>
+    ~/genesis/.venv/bin/python scripts/payments_test_vault.py serve
+    ~/genesis/.venv/bin/python scripts/payments_test_vault.py teardown
 
 ``setup`` builds the directory: a venv whose ``import genesis`` is the branch
 worktree's, a vault holding one card (Stripe's public test Visa, labelled with
@@ -187,6 +187,18 @@ class Layout:
     @property
     def secrets(self) -> Path:
         return self.home / "secrets.env"  # never created: the test MCP reads no secrets
+
+
+HOME_NAME = "payment-test-vault"
+
+
+def default_layout() -> Layout:
+    """The harness's one test directory, ``~/tmp/payment-test-vault`` (the passwd home).
+
+    Fixed rather than chosen, so every run has the same short socket path on the
+    same mount as the Genesis trash; setup still checks both before creating it.
+    """
+    return layout_for(Path(pwd.getpwuid(os.getuid()).pw_dir) / "tmp" / HOME_NAME)
 
 
 def layout_for(home: str | Path) -> Layout:
@@ -462,7 +474,7 @@ def check_socket_bindable(layout: Layout) -> None:
     except OSError as exc:
         raise Refused(
             f"R3: the test socket path ({len(os.fsencode(layout.socket))} bytes) cannot be "
-            f"bound ({exc}); run teardown, then setup with a shorter --home"
+            f"bound ({exc}); run teardown, and report it: the harness picks this path itself"
         ) from None
     else:
         os.unlink(layout.socket)
@@ -718,6 +730,7 @@ def setup(
     venv=make_venv,
 ) -> dict:
     check_placement(layout, live, new=True)
+    layout.root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     check_trashable(layout)
     wt = check_worktree(worktree, layout, main_root=main_root, running=running)
     try:
@@ -1069,29 +1082,22 @@ async def run_serve(
 
 
 def _is_this_serve(pid: int, layout: Layout, proc_root: Path) -> bool:
-    """Whether ``pid``'s own command line is ``payments_test_vault.py serve --home <this root>``.
+    """Whether ``pid``'s own command line is ``payments_test_vault.py serve``.
 
     serve.pid sits in a directory the code under test can write, so the pid it
     names is checked against the process itself before anything is signalled.
+    There is one test directory per user (``default_layout``), so a serve of this
+    script is this directory's serve.
     """
     try:
         argv = [
             os.fsdecode(a) for a in (proc_root / str(pid) / "cmdline").read_bytes().split(b"\0")
         ]
-        cwd = os.readlink(proc_root / str(pid) / "cwd")
     except OSError:
         return False
     argv = [a for a in argv if a]
     script = next((i for i, a in enumerate(argv) if Path(a).name == Path(__file__).name), None)
-    if script is None or argv[script + 1 : script + 2] != ["serve"]:
-        return False
-    rest = argv[script + 2 :]
-    homes = [rest[i + 1] for i, a in enumerate(rest[:-1]) if a == "--home"]
-    homes += [a.split("=", 1)[1] for a in rest if a.startswith("--home=")]
-    if len(homes) != 1:
-        return False
-    home = Path(homes[0]).expanduser()
-    return layout_for(home if home.is_absolute() else Path(cwd) / home).root == layout.root
+    return script is not None and argv[script + 1 : script + 2] == ["serve"]
 
 
 def stop_running_serve(
@@ -1305,7 +1311,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("setup", allow_abbrev=False, help="build a new test-vault directory")
     p.add_argument("--worktree", required=True, help="the branch worktree the test MCP runs")
-    p.add_argument("--home", required=True, help="a NEW directory for the test vault")
     p.add_argument(
         "--merchant",
         required=True,
@@ -1314,7 +1319,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "serve", allow_abbrev=False, help="run the test vault and the test bot (foreground)"
     )
-    p.add_argument("--home", required=True)
     p.add_argument(
         "--approval-timeout-s",
         type=int,
@@ -1324,13 +1328,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "teardown", allow_abbrev=False, help="stop a serve, remove the overlay, trash the directory"
     )
-    p.add_argument("--home", required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    layout = layout_for(args.home)
+    layout = default_layout()
     try:
         if args.cmd == "setup":
             live, _server = _cli_live(layout, exclude=False)
@@ -1345,7 +1348,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(
                 f"Test vault ready in {layout.root} (card {TEST_LABEL}, merchant "
-                f"{state['merchant']}). Next: serve --home {layout.root}"
+                f"{state['merchant']}). Next: serve"
             )
         elif args.cmd == "serve":
             if not APPROVAL_TIMEOUT_MIN_S <= args.approval_timeout_s <= APPROVAL_TIMEOUT_MAX_S:
