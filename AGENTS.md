@@ -30,6 +30,15 @@ deploys from. Do not mutate it in place.
   local `live` integration branch — running unmerged candidate branches on this
   install before their PRs merge — not a development action.
 
+## Reading a merge record
+
+A self-authored PR merges through the maintainer's admin bypass of GitHub's
+approval rule (CLAUDE.md, "Code review after code changes"), so GitHub records
+every such merge as a bypass. That record is expected and is not a skipped
+review. Report GitHub's native review state as it is, never call a bot comment
+an approval, and never judge a past merge's readiness from the bypass record or
+from a merge-gate run that finished after the merge.
+
 ## Rebuilding a PR that was sent back
 
 A `needs-rework` PR, or a `needs-architecture-session` PR whose owner decision
