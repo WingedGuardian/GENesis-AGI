@@ -1,0 +1,1 @@
+- Dashboard: the web terminal now accepts same-origin connections only.

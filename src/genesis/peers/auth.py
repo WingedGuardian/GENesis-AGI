@@ -73,16 +73,9 @@ def credential_conflicts(names: tuple[str, ...], *, app: Flask | None = None) ->
 async def authenticate(registry: PeerRegistry, *, allow_probe: bool = False) -> PeerIdentity:
     settings = await registry.settings()
     mode = settings["mode"]
-    if mode == "disabled" or not settings.get("service_url"):
-        raise PeerRefusal("not_configured", 503)
     rows = await registry.rows()
-    all_names = tuple(row["token_name"] for row in rows if row["token_name"])
-    accepted = (
-        (BACKEND_TOKEN,)
-        if mode == "sam"
-        else tuple(row["token_name"] for row in rows if row["active"] and row["token_name"])
-    )
-    if not accepted or credential_conflicts((*all_names, BACKEND_TOKEN)):
+    reason, accepted = configuration_state(settings, rows)
+    if reason:
         raise PeerRefusal("not_configured", 503)
     failure = check_bearer_token("peer API", accept=accepted)
     if failure:
@@ -113,20 +106,31 @@ async def authenticate(registry: PeerRegistry, *, allow_probe: bool = False) -> 
     return PeerIdentity(name, peer)
 
 
+def configuration_state(
+    settings: dict, rows: list[dict], *, app: Flask | None = None,
+) -> tuple[str | None, tuple[str, ...]]:
+    """Shared configuration classification; never returns credential values."""
+    mode = settings["mode"]
+    if mode == "disabled":
+        return "disabled", ()
+    if not settings.get("service_url"):
+        return "missing_service_url", ()
+    all_names = tuple(row["token_name"] for row in rows if row["token_name"])
+    accepted = (
+        (BACKEND_TOKEN,)
+        if mode == "sam"
+        else tuple(row["token_name"] for row in rows if row["active"] and row["token_name"])
+    )
+    if credential_conflicts((*all_names, BACKEND_TOKEN), app=app):
+        return "credential_conflict", accepted
+    if not accepted or not any(bearer_token(name) for name in accepted):
+        return "missing_credentials", accepted
+    return None, accepted
+
+
 async def configuration_warning(registry: PeerRegistry, *, app: Flask | None = None) -> str | None:
     """Boot diagnostics without credential values or request-side file access."""
     settings = await registry.settings()
-    if settings["mode"] == "disabled":
-        return "Peer API disabled: configure peers explicitly; scoped GENESIS_PEER_<ID>_TOKEN or GENESIS_PEER_BACKEND_TOKEN required."
     rows = await registry.rows()
-    names = tuple(row["token_name"] for row in rows if row["token_name"])
-    if credential_conflicts((*names, BACKEND_TOKEN), app=app):
-        return "Peer API disabled: peer credential equals another surface credential; configure distinct scoped values."
-    accepted = (
-        (BACKEND_TOKEN,)
-        if settings["mode"] == "sam"
-        else tuple(row["token_name"] for row in rows if row["active"] and row["token_name"])
-    )
-    if not accepted or not any(bearer_token(name) for name in accepted):
-        return "Peer API disabled: selected scoped peer credentials are unconfigured."
-    return None
+    reason, _ = configuration_state(settings, rows, app=app)
+    return None if reason in (None, "disabled") else f"Peer API unavailable: {reason}"

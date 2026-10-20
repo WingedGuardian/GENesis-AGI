@@ -1,0 +1,1 @@
+- genesis-server can now ask the owner to approve a card release with one Telegram button tap. The tap counts only from the first id in `TELEGRAM_ALLOWED_USERS`, on the exact message it sent, unedited, and only once; anything else, or no tap within 10 minutes, refuses. Every request and outcome is recorded in the vault audit log. Nothing asks for an approval yet.

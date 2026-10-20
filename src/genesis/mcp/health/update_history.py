@@ -167,10 +167,12 @@ async def _impl_update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
 async def update_history_recent(limit: int = _DEFAULT_LIMIT) -> dict:
     """Recent Genesis self-update attempts + success rate over the window.
 
-    Reads the update_history table written by scripts/update.sh. Each
-    entry records an update attempt — success, failure, or rolled_back
-    — with before/after versions, timing, and failure context when
-    applicable. Each entry also carries deploy facts — code_applied,
+    Reads the update_history table written by scripts/update.sh (and by
+    bootstrap.sh's crash recovery). Each entry records an update attempt —
+    success, failed, rolled_back, conflicts_pending, or crashed_recovered
+    (an interrupted update that bootstrap undid; it counts against the
+    success rate) — with before/after versions, timing, and failure
+    context when applicable. Each entry also carries deploy facts — code_applied,
     activation_applied, server_restarted — so a success row whose server
     did not restart is not read as a plain live success. Use this to
     diagnose update issues or verify recent update history.

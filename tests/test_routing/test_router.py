@@ -1040,3 +1040,23 @@ def test_a_long_chain_summarises_instead_of_flooding_one_log_line():
     assert "+3 more" in clause, "the trimmed count is what stops it reading as complete"
     assert names[-1] not in clause
     assert names[0] in clause, "the FIRST provider tried is the one to keep"
+
+
+@pytest.mark.asyncio
+async def test_served_model_is_reported_and_model_id_stays_configured(
+    sample_config, breakers, cost_tracker, degradation,
+):
+    """A floating route reports the model that actually answered, while
+    ``model_id`` stays the configured id that identity checks compare against."""
+    delegate = MockDelegate(responses={
+        "free-1": CallResult(success=True, content="ok", served_model="vendor/model-9.9"),
+    })
+    router = Router(
+        config=sample_config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    result = await router.route_call("test_mixed", [{"role": "user", "content": "hi"}])
+    assert result.success is True
+    assert result.provider_used == "free-1"
+    assert result.served_model == "vendor/model-9.9"
+    assert result.model_id == sample_config.providers["free-1"].model_id

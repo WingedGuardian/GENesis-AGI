@@ -128,7 +128,8 @@ async def test_judge_ok_with_fake_claude(tmp_path):
     fake = _fake_claude(tmp_path, """
         import json, sys
         sys.stdin.read()
-        print(json.dumps({"result": '```json\\n{"picks": [2]}\\n```'}))
+        print(json.dumps({"result": '```json\\n{"picks": [2]}\\n```',
+                          "modelUsage": {"claude-haiku-5-5": {}}}))
     """)
     verdict = await judge_candidates(
         {"ema_turns": 4}, "q", CANDS,
@@ -136,6 +137,7 @@ async def test_judge_ok_with_fake_claude(tmp_path):
     )
     assert verdict == {
         "arbiter": "ok", "picks": [2], "prompt_version": PROMPT_VERSION,
+        "served_model": "claude-haiku-5-5",
     }
 
 

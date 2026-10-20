@@ -536,7 +536,8 @@ class Router:
                 if self.cost_tracker and self.cost_tracker.db:
                     await record_last_run(
                         self.cost_tracker.db, call_site_id,
-                        provider=provider_name, model_id=provider_cfg.model_id,
+                        provider=provider_name,
+                        model_id=result.served_model or provider_cfg.model_id,
                         response_text=result.content,
                         input_tokens=result.input_tokens,
                         output_tokens=result.output_tokens,
@@ -556,6 +557,7 @@ class Router:
                     output_tokens=result.output_tokens,
                     cost_usd=result.cost_usd,
                     cost_known=result.cost_known,
+                    served_model=result.served_model,
                 )
             else:
                 failed_providers.append(provider_name)

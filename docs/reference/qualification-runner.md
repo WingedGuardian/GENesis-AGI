@@ -17,6 +17,49 @@ Keep the corpus, policies, approval and original source bytes in durable private
 storage before admission. The source map records hashes and locations; it does
 not back up those files or make a missing source recoverable.
 
+Use `archive-sources --source-files <map.json> --generation <new-name>` to retain
+the exact mapped bytes under `~/.genesis/qualification-sources/<new-name>`.
+The resolved HOME must already exist as a directory; durable HOME initialization
+belongs to the caller/platform. Every invocation synchronizes the store,
+`.genesis` and HOME before creating a generation, including after a failed
+initialization left directories behind.
+This writes a private canonical manifest and copied content-addressed blobs;
+it changes no source, reference decision or approval. For SQLite, supply an
+already frozen, consistent standalone snapshot: this
+command does not create a live database snapshot or collect WAL sidecars.
+Existing generations,
+including partial generations, are never overwritten or repaired. Failure after
+manifest publication reports failure and uncertain durability while preserving
+evidence; readable complete bytes do not retroactively establish a successful
+durable publication.
+The blob directory and each new blob entry are synchronized before copying.
+Copied bytes are flushed and synchronized even when a source read aborts, so
+later read or validation failures preserve completed blobs and copied prefixes
+when those operations succeed. Failed flush, synchronization or close still
+reports failure with uncertain durability and retains the normal Python
+exception chain; it never establishes successful publication.
+
+Complete admission requires genuine human approval metadata `source_retention`
+with `primary_generation`, `restored_backup_generation` and `backup_evidence`.
+Both generation paths must contain the exact manifest and complete copied blob
+set; missing, corrupt, foreign, symlinked or hardlinked members refuse. The
+primary uses the fixed durable source store; the separately restored generation
+must be under `~/.genesis/qualification-source-restores/`. Both store directories
+are private and cannot have symlinked ancestors. Originals may then disappear without
+changing their logical origin identities. This does not recover a source that
+was already missing, authenticate its historical origin or transfer approval.
+
+Use the existing encrypted backup extra-directory mechanism to retain this
+store, preserving all other configured extra directories. Verify this exact
+generation was included and restore into isolation, never over the primary.
+Only then record genuine restore evidence and approve the exact new approval
+identity. A second local copy or a generic successful backup is not proof of an
+independent retained backup. The CLI checks actual restored bytes; operator
+assertions are not authenticated. No backup configuration is changed by the
+archive command. There is no automatic archive expiry: retire only after
+checking dependent approvals/campaigns and a verified recoverable copy, using
+the existing recoverable trash workflow.
+
 `review-references --spec <JSON>` returns aggregate admission counts offline.
 It publishes no case IDs, prompts, raw judgments or exception text.
 

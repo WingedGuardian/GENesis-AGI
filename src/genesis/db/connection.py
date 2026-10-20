@@ -744,6 +744,7 @@ async def open_ro_connection(
     path: str | Path = DEFAULT_DB_PATH,
     *,
     cache_size_kib: int = RO_CACHE_SIZE_KIB,
+    busy_timeout_ms: int | None = None,
 ) -> aiosqlite.Connection:
     """Open a standalone READ-ONLY aiosqlite connection (``mode=ro``, WAL-aware).
 
@@ -772,9 +773,14 @@ async def open_ro_connection(
     assert_admitted(Path(path))
     uri = f"file:{Path(path)}?mode=ro"
     conn = await aiosqlite.connect(uri, uri=True)
-    conn.row_factory = aiosqlite.Row
-    await conn.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
-    await conn.execute(f"PRAGMA cache_size={cache_size_kib}")
+    try:
+        conn.row_factory = aiosqlite.Row
+        timeout = db_busy_timeout_ms() if busy_timeout_ms is None else busy_timeout_ms
+        await conn.execute(f"PRAGMA busy_timeout={int(timeout)}")
+        await conn.execute(f"PRAGMA cache_size={cache_size_kib}")
+    except BaseException:
+        await conn.close()
+        raise
     return conn
 
 

@@ -275,7 +275,10 @@ Two rules from that work, because both are the kind you get wrong while
 believing otherwise. **A size bound must be measured in the unit the harness
 bills** (UTF-16 code units, via `utf16_len`/`clip_to_cost`) — mixing units does
 not loosen a bound, it SKIPS it, and the extremes hide that, so sweep a range
-rather than trying one huge value. A bound on MEANING (is this token a word?)
+rather than trying one huge value. Those units are counted on the text AS
+WRITTEN: the writers escape a lone surrogate to `\udXXX` (`printable`), so it
+costs six, and a size check done outside the module must use `utf16_len` rather
+than encode the raw text itself. A bound on MEANING (is this token a word?)
 stays in codepoints; say which you are writing. And **a bound must not decide
 eligibility** — filtering what gets rendered is not a judgement about whether the
 work is worth doing, and conflating them silently skipped recall for a whole

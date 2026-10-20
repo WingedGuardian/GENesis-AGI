@@ -1,0 +1,1 @@
+- The deep reflection's intelligence digest now counts the knowledge items ingested since the last deep cycle, grouped by pipeline, instead of always reporting that none were ingested; if the count cannot be read, the digest says it is unavailable rather than zero.
