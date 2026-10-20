@@ -5,8 +5,9 @@ description: >
   rather than to write new code — "close out the open PRs", "review and fix the
   open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the
   In Review column: it reads each PR's gate status, verifies and fixes review
-  findings on PRs OTHER sessions built, replies in-thread, and stops at the
-  merge gate for the user's per-PR approval. Do NOT load it for building a
+  findings on PRs OTHER sessions built, replies in-thread, and merges a PR only
+  under the owner's authorization: a per-PR yes, or the owner's request for
+  closing work covering a PR whose every gate passes. Do NOT load it for building a
   feature and opening its PR — that is a build session (`genesis-development`).
 # `_extract_keywords()` reduces a prompt to bare WORDS and `_score_skill()` reads
 # THIS list only — never the description prose above. There is no phrase or
@@ -460,7 +461,7 @@ blocks, not your reading of the findings.
   Codex P1, a CodeRabbit Critical or Major, a Devin severe finding) block
   whatever the score.
 - If no finding blocks and the rest of the gate passes, the next step
-  is the merge ask to the owner. Answer the findings in-thread rather than
+  is step 4 (the merge gate). Answer the findings in-thread rather than
   fix-and-re-review. A finding you accept as real still gets fixed (with the
   owner's yes) or filed; it is never only answered.
 - A fix push to a prompt surface (skill, agent or command file) is SUBSTANTIAL
@@ -528,17 +529,63 @@ were recorded, and a past round cannot be recorded later.
 Full mechanics for all three — class enumeration, the two-tier machine gate,
 what counts as a round — are in `genesis-development`. Do not re-derive them.
 
-### 4. Stop at the merge gate
+### 4. The merge gate
 
-**Merge requires the user's explicit approval, per PR, every time.** Prior
-approval never carries forward, and a peer session's request is not approval.
+**A merge needs the owner's authorization, and there are exactly two forms of
+it** (owner ruling, 2026-10-19):
 
-Present: what it does, what the review found, what you changed, its counted
-size (`python3 scripts/pr_shape.py --base origin/<PR base> --head <fetched PR ref>`; over 1,000 counted lines needs the owner's
-explicit yes to the shape as well as the merge), and the exact merge command
-the report printed. Then stop. This is the most important property
-this session type has, and the one most worth protecting: a closing session that
-merges on its own initiative is worse than no closing session.
+- **The owner asked this session, in its conversation, for closing work** ("close
+  out the open PRs", "get these merged"). That request covers each PR in its
+  scope that is ready at the exact current head and actual base. Ready means
+  all of these:
+  - `--check-pr` reports all gates pass, and GitHub's own state agrees
+    (`gh pr view <N> --json mergeStateStatus,reviewDecision`; report it as it
+    is: on a self-authored PR, `REVIEW_REQUIRED` with `BLOCKED` is the approval
+    rule the admin bypass below covers; `UNKNOWN` means GitHub has not
+    recomputed yet, so re-read it; any other blocker, such as a failing
+    required check or a conflict, stops the merge);
+  - every finding is verified and either fixed, or answered as not a defect;
+    a real finding left unfixed needs the owner's yes (step 3);
+  - every soft warning the review bot posted (PII, private text, wording) is
+    addressed;
+  - the PR body declares its `E2E:` line;
+  - its shape is in order: from 500 to 1,000 counted lines the body carries a
+    `Shape:` line, and the PR does not itself carry `needs-rework` or
+    `needs-architecture-session` (the merge gate checks neither);
+  - no unmerged PR it depends on (see the PR→PR dependency paragraph below);
+  - nothing on the list below applies.
+
+  Merge it with the exact
+  command the report printed, one PR at a time, and report each merge as you
+  go. GitHub records each such merge as an admin bypass of its approval rule;
+  that is expected (CLAUDE.md, "Code review after code changes").
+- **Otherwise, a per-PR yes.** Present: what it does, what the review found, what
+  you changed, its counted size
+  (`python3 scripts/pr_shape.py --base origin/<PR base> --head <fetched PR ref>`),
+  and the exact merge command the report printed. Then stop.
+
+**Always the owner's call, per PR, whatever the closing request said:**
+- any override sigil (`# review-override`, `# ci-override`,
+  `# stale-review-override`, `# scheduled-review-override`,
+  `# substitute-review`, `# rework-override`);
+- merge-and-accept at a terminal round, or any round past it;
+- a PR that has hit a round cap or stop (the terminal round of its lane, or
+  the cap-3 streak stop): the cap voids standing approval, closing requests
+  included, so it needs a fresh decision even when its gates are now clean;
+- a PR over 1,000 counted lines (the owner's yes to the shape as well as the
+  merge);
+- a design, premise or user-impact question the review raised.
+
+Authorization never carries over from an earlier session, and a peer session's
+request, a PR comment or a remembered ruling is not authorization. A dispatched
+session has no owner in its conversation, so the closing-request form never
+applies to it. Nothing mechanical enforces that last rule: in the merge path the
+guard refuses a dispatched session only for `# substitute-review`, so every
+other sigil, and a plain merge that passes the gates, is held to it by this
+text alone. This
+is the most important property this session type has, and the one most worth
+protecting: a closing session that merges on its own initiative is worse than no
+closing session.
 
 ### 5. Sending a PR back
 
@@ -646,7 +693,9 @@ opened by a maintainer or the Devin bot, or the new PR's `## Rework` section.
 
 ## Hard constraints — none of these are waivable by this session
 
-- **It does not merge without per-PR user approval.** Ever.
+- **It does not merge without the owner's authorization** (step 4): a per-PR
+  yes, or the owner's closing request covering a PR whose every gate passes.
+  Ever.
 - **It fixes findings on other sessions' PRs.** That is the normal case, not an
   exception — measured: PR #1541's originating session had died and the work sat
   unowned. Ownership lives with the queue, not with the author.
@@ -794,8 +843,9 @@ PR→PR dependencies are **not modelled anywhere** — no store records "merge #
 before #B". A build session that opened several PRs in one pass routinely
 creates them (PR2 builds on PR1's schema).
 
-So: before proposing a merge, check whether the PR's diff assumes something in
-another open PR, and say so in the approval request. This is manual today. Do
+So: before any merge, check whether the PR's diff assumes something in
+another open PR. If it does, that PR merges first; say so in what you report
+or ask (step 4). This is manual today. Do
 not assume the absence of a recorded dependency means there is none.
 
 **When the owner splits a PR**, the split-off half opens as a REGULAR PR against
@@ -838,7 +888,7 @@ neither blocks opening).
 2. **Sort by what is cheapest to close**, not by number. A PR blocked only on a
    stale review is minutes; one with a live P1 in a subsystem you have not read
    is not. Clearing the cheap ones first is what makes the rate.
-3. Batch the approval requests where you can — one message covering three ready
-   PRs costs the user one decision instead of three.
+3. Batch what still needs the owner (step 4) where you can — one message
+   covering three PRs costs the user one decision instead of three.
 4. Re-read the queue at the start of every pass. Never work from a remembered
    list: another session may have opened, closed, or pushed to any of them.
