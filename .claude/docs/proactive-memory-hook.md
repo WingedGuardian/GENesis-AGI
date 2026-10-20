@@ -127,7 +127,10 @@ fallback rate is directly observable. The health dashboard reads this file.
 **Phase line (stderr).** Every run writes one `[hook-phases] {json}` line to
 stderr as it exits (`scripts/hooks/hook_phases.py`), on every path: an empty or
 unparseable input, off mode, a short prompt, the server and degraded paths, and
-a crash, after its traceback. Claude Code never shows an exit-0 hook's stderr to
+a crash inside the run, after its traceback. A crash while the module is still
+loading (a missing dependency, say) happens before `main()` exists: the hook
+exits 1 with only the traceback. If loading instead stalls past the hard stop,
+the stop's cut line still lands. Claude Code never shows an exit-0 hook's stderr to
 the model; it stores it in the transcript's `hook_success` attachment
 (`stderr`), next to the run's `durationMs`. A dispatched session
 (`GENESIS_CC_SESSION=1`) exits before any of this and writes nothing. The line
