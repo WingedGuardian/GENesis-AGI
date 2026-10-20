@@ -57,6 +57,7 @@ import json
 import logging
 import os
 import pwd
+import re
 import secrets
 import signal
 import stat
@@ -98,7 +99,8 @@ BROWSER_COMMS = frozenset(
         "chrome",
         "chromium",
         "chromium-browse",
-        "headless_shell",
+        "headless_shell",  # arm64 headless shell
+        "chrome-headless",  # x64 chrome-headless-shell, as comm truncates it (15 chars)
     }
 )
 APPROVAL_TIMEOUT_MAX_S = 600
@@ -136,7 +138,9 @@ class Layout:
 
     @property
     def lock(self) -> Path:
-        return self.root / "serve.lock"
+        # Beside the directory, not in it: teardown holds it through the trash
+        # move, and the trash refuses a directory any process has a file open in.
+        return self.root.parent / f".{self.root.name}.serve.lock"
 
     @property
     def mcp_json(self) -> Path:
@@ -341,6 +345,11 @@ def check_trashable(layout: Layout) -> None:
             f"R2: {layout.root} would be on another volume than the Genesis trash "
             f"({trash_parent}), so teardown could not remove it"
         )
+    if _mount_id(parent) != _mount_id(trash_parent):  # a bind mount: same device, EXDEV
+        raise Refused(
+            f"R2: {layout.root} would be on another mount than the Genesis trash "
+            f"({trash_parent}), so teardown could not remove it"
+        )
     if _inside(parent, Path(os.path.realpath(genesis_home() / "cc-tmp"))):
         raise Refused(
             f"R2: {layout.root} would be on the Claude Code temp volume, which the "
@@ -348,14 +357,37 @@ def check_trashable(layout: Layout) -> None:
         )
 
 
+def _mount_id(path: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> str | None:
+    """The id of the mount ``path`` is on (the longest mount point above it), or None.
+
+    rename(2) fails with EXDEV across mounts even on one device (a bind mount), and
+    the trash only renames. Mount points in mountinfo escape space, tab, newline
+    and backslash as octal.
+    """
+    real = Path(os.path.realpath(path))
+    best, best_len = None, -1
+    try:
+        lines = mountinfo.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        fields = line.split(" ")
+        if len(fields) < 5:
+            continue
+        point = Path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4]))
+        if _inside(real, point) and len(str(point)) > best_len:
+            best, best_len = fields[0], len(str(point))
+    return best
+
+
 def hold_lifecycle_lock(layout: Layout) -> int:
     """An exclusive lock on the directory's lifecycle: one serve, or one teardown, at a time.
 
     A serve holds it from before the socket check until its cleanup is done, so two
-    serves cannot both pass the check and race to bind. Teardown takes it to prove
-    no serve holds it, then releases it before the trash (whose own scan refuses a
-    directory any process has open, ours included); a serve starting in that gap is
-    left to the trash's in-use scan. The fd is the caller's to close.
+    serves cannot both pass the check and race to bind. Teardown holds it through
+    the trash move and the overlay removal, so no serve can start in between. The
+    file sits beside the test directory (``Layout.lock``). The fd is the caller's
+    to close.
     """
     import fcntl
 
@@ -1092,7 +1124,6 @@ _ROOT_ENTRIES = frozenset(
         "state.json",
         "passphrase",
         "serve.pid",
-        "serve.lock",
         "mcp.json",
         "venv",
         "cache",
@@ -1112,37 +1143,51 @@ def teardown(
     if extra:
         raise Refused(f"R2: {layout.root} holds entries setup never made ({', '.join(extra)})")
     stop_running_serve(layout, server_pid=server_pid)
-    # A serve that left no pidfile still holds the lock. It is released before the
-    # trash, whose own scan refuses a directory any process has open (ours included).
-    os.close(hold_lifecycle_lock(layout))
-    overlay = None
-    if state.get("overlay"):
-        overlay = Path(state["overlay"])
-        if overlay != overlay_path(Path(state["worktree"]), main_root):  # R10 again
-            raise Refused("R10: the state file names an overlay that is not the worktree's")
-    # The directory goes first: when the trash refuses it, nothing has been
-    # removed yet and teardown can simply be run again.
+    lock = hold_lifecycle_lock(layout)  # a serve that left no pidfile still holds it
     try:
-        trash(
-            layout.root,
-            reason="payment test-vault harness teardown",
-            caller="payments_test_vault",
-        )
-    except TrashRefused as exc:
-        raise Refused(f"teardown: the trash refused {layout.root} ({exc})") from None
-    done = [f"moved {layout.root} to the Genesis trash"]
-    if overlay is not None and overlay_is_ours(state):
+        overlay = None
+        if state.get("overlay"):
+            overlay = Path(state["overlay"])
+            if overlay != overlay_path(Path(state["worktree"]), main_root):  # R10 again
+                raise Refused("R10: the state file names an overlay that is not the worktree's")
+        # Removing the overlay comes after the trash move, when the state is gone,
+        # so check first that it will be removable.
+        if (
+            overlay is not None
+            and overlay_is_ours(state)
+            and not os.access(overlay.parent, os.W_OK | os.X_OK)
+        ):
+            raise Refused(
+                f"teardown: {overlay.parent} is not writable, so the overlay could not be "
+                "removed; nothing was removed"
+            )
+        # The directory goes first: when the trash refuses it, nothing has been
+        # removed yet and teardown can simply be run again.
         try:
-            overlay.unlink()
-        except OSError as exc:
-            done.append(f"could NOT remove {overlay} ({exc.strerror}); delete it by hand")
-        else:
-            done.append(f"removed {overlay}")
-    elif overlay is not None and os.path.lexists(overlay):
-        done.append(
-            f"left {overlay} in place: it changed since setup or is not the file setup wrote"
-        )
-    return done
+            trash(
+                layout.root,
+                reason="payment test-vault harness teardown",
+                caller="payments_test_vault",
+            )
+        except TrashRefused as exc:
+            raise Refused(f"teardown: the trash refused {layout.root} ({exc})") from None
+        done = [f"moved {layout.root} to the Genesis trash"]
+        if overlay is not None and overlay_is_ours(state):
+            try:
+                overlay.unlink()
+            except OSError as exc:
+                done.append(f"could NOT remove {overlay} ({exc.strerror}); delete it by hand")
+            else:
+                done.append(f"removed {overlay}")
+        elif overlay is not None and os.path.lexists(overlay):
+            done.append(
+                f"left {overlay} in place: it changed since setup or is not the file setup "
+                "wrote; delete it by hand if it holds card_fill"
+            )
+        layout.lock.unlink(missing_ok=True)  # still held, so no serve can be waiting on it
+        return done
+    finally:
+        os.close(lock)
 
 
 # -- command line -------------------------------------------------------------------
@@ -1246,11 +1291,10 @@ def _serve_locked(layout: Layout, live: Live, timeout_cap_s: float) -> None:
 
 
 def _write_private_replace(path: Path, text: str) -> None:
-    """Replace ``path`` atomically: a kill leaves the old file or the new one, never none."""
-    tmp = path.with_name(f".{path.name}.new")
-    tmp.unlink(missing_ok=True)
-    _write_private(tmp, text)
-    os.replace(tmp, path)
+    """Replace ``path`` atomically (a 0600 temp file, then rename): never left missing."""
+    from genesis.util.atomic import atomic_write_text
+
+    atomic_write_text(path, text)
 
 
 def build_parser() -> argparse.ArgumentParser:

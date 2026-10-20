@@ -1293,3 +1293,72 @@ def test_a_state_replace_is_atomic(tmp_path):
     assert path.read_text() == "two" and sorted(p.name for p in tmp_path.iterdir()) == [
         "state.json"
     ]
+
+
+# -- review round 2 (Codex) ------------------------------------------------------------
+
+
+def test_q16_finds_the_x64_headless_shell(tmp_path):
+    # chrome-headless-shell, as /proc comm truncates it to 15 characters.
+    proc = _proc_tree(tmp_path, {30: ("python", 1), 31: ("chrome-headless", 30)})
+    assert H.other_browsers(proc) == [31]
+
+
+def test_mount_ids_tell_a_bind_mount_apart(tmp_path):
+    info = tmp_path / "mountinfo"
+    info.write_text(
+        "20 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+        "30 20 8:1 /data /srv/with\\040space rw - ext4 /dev/sda1 rw\n"
+    )
+    assert H._mount_id(Path("/srv/with space/x"), info) == "30"
+    assert H._mount_id(Path("/srv/other"), info) == "20"
+
+
+def test_setup_refuses_a_home_on_another_mount_of_the_same_disk(
+    tmp_path, tmp_path_factory, checkouts, own_overlay, monkeypatch
+):
+    root = tmp_path_factory.mktemp("v") / "testvault"
+    monkeypatch.setattr(H, "_mount_id", lambda p: "bind" if p == root.parent else "trash")
+    with pytest.raises(H.Refused, match="^R2: .* another mount than the Genesis trash"):
+        _setup_fast(root, checkouts, tmp_path / "fakehome")
+    assert not root.exists() and not own_overlay.exists()
+
+
+def test_teardown_holds_the_lock_through_the_trash_move(
+    tmp_path, tmp_path_factory, checkouts, own_overlay, monkeypatch
+):
+    import genesis.trash as gt
+
+    main, _wt = checkouts
+    layout, _state = _setup_fast(
+        tmp_path_factory.mktemp("v") / "testvault", checkouts, tmp_path / "fakehome"
+    )
+    real, seen = gt.trash, []
+
+    def trash_while_checking(path, **kw):
+        with pytest.raises(H.Refused, match="already running"):
+            os.close(H.hold_lifecycle_lock(layout))  # a serve starting now is refused
+        seen.append(path)
+        return real(path, **kw)
+
+    monkeypatch.setattr(gt, "trash", trash_while_checking)
+    H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
+    assert seen and not layout.root.exists() and not layout.lock.exists()
+
+
+def test_teardown_removes_nothing_when_the_overlay_cannot_be_removed(
+    tmp_path, tmp_path_factory, checkouts, own_overlay
+):
+    main, _wt = checkouts
+    layout, _state = _setup_fast(
+        tmp_path_factory.mktemp("v") / "testvault", checkouts, tmp_path / "fakehome"
+    )
+    os.chmod(own_overlay.parent, 0o500)
+    try:
+        with pytest.raises(H.Refused, match="not writable, so the overlay could not be removed"):
+            H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
+        assert layout.root.exists() and own_overlay.exists()
+    finally:
+        os.chmod(own_overlay.parent, 0o755)
+    H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
+    assert not layout.root.exists() and not own_overlay.exists()

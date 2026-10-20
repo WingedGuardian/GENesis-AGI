@@ -69,13 +69,16 @@ send any text without the `TEST:` line.
    `cd <worktree> && claude --strict-mcp-config --mcp-config ~/tmp/payment-test-vault/mcp.json`.
    Only the test MCP is loaded in that session. The browser shows on `:99`.
 9. Approve in the **test bot's** chat. Check the `TEST:` line is there.
-10. Ctrl-C the serve, then
+10. Exit the test Claude session first (its health MCP keeps the test database
+    open, and the trash refuses a directory in use). Ctrl-C the serve, then
     `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py teardown --home ~/tmp/payment-test-vault`.
     It stops a running serve and moves the directory to the Genesis trash, then
     removes the overlay if it is still the file setup wrote. If the trash
     refuses the directory, nothing is removed and teardown can be run again. (A
     bind mount can pass setup's same-disk check and still be refused here; keep
-    `--home` on a plain directory of the same disk.)
+    `--home` on a plain directory of the same mount; setup refuses another mount.)
+    The lifecycle lock is a file beside the directory
+    (`.<name>.serve.lock`); teardown removes it.
 
 ## Refusals
 
