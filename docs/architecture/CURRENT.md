@@ -2786,8 +2786,22 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 368be0b0a2a2 2026-10-18
+verified: b066be8d2fdc 2026-10-20
 ```
+
+- **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
+  glue over Claude Code transcripts and `cc_sessions.skill_tags`. Per skill:
+  tool loads, slash loads, SKILL.md reads (not counted in a session that edits
+  that file), skill-injection nudges, dispatched injections, agent-frontmatter
+  preloads and nudge-to-use conversion, with a state (active / zombie / dead /
+  not_nudgeable). The state counts only CHOSEN uses (loads, slash loads,
+  reads); injections and preloads are configured deliveries, shown as columns
+  and never deciding it (owner ruling, 2026-10-20). Every
+  transcript count is split interactive (`entrypoint: cli`) vs headless, since
+  headless dispatch, SDK and test runs outnumber interactive sessions many times.
+  Exposed as the `skill_usage_status` health MCP tool (single-flight, progress
+  per file) and `python -m genesis.learning.skills.usage`. A zero means none
+  found in the scanned sessions; the window and denominators are in the output.
 
 - **transcript_analytics/**: optional local transcript parser library. It
   extracts physical records, preserves unresolved identity and usage, and
