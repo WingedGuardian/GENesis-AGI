@@ -1107,14 +1107,16 @@ async def test_not_started_retry_logs_error_type_without_private_values(bridge, 
     async def flaky_update(*args, **kwargs):
         nonlocal attempts
         attempts += 1
-        if attempts == 1:
+        if attempts <= 2:
             raise error
         await original(*args, **kwargs)
 
     monkeypatch.setattr(bridge.runner, "adopt", AsyncMock(side_effect=ValueError("not adopted")))
     monkeypatch.setattr(conversation, "update_state", flaky_update)
     row = await asyncio.wait_for(bridge.service.send(bridge.identities["alpha"], incoming()), 3)
-    assert attempts == 2
+    assert attempts == 3
     assert row["status"] == "failed"
-    assert "exception=OperationalError, sqlite_errorname=SQLITE_BUSY_SNAPSHOT" in caplog.text
+    # Two failures ~0.1s apart emit one warning; retries stay unlogged inside
+    # the throttle window.
+    assert caplog.text.count("exception=OperationalError, sqlite_errorname=SQLITE_BUSY_SNAPSHOT") == 1
     assert str(error) not in caplog.text
