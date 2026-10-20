@@ -413,6 +413,30 @@ library operations available on the supported Python 3.10 platform. It does not
 perform the native binary hash/launch acceptance used by the installed query
 runtime. Current-install tests are not a separate Python 3.10 runtime qualification.
 
+## Queued indexing
+
+The existing idle-gated runner probes managed availability before and after
+claiming a Codebase-only request. Unavailability leaves the pending generation
+uncharged; a post-claim refusal durably restores it. A combined request can
+complete GitNexus and retain its unfinished Codebase leg. Attempts are never reset.
+The runner records availability errors in its log; the index entry point includes
+the final refusal line in its skip diagnostic.
+
+The adapter executes the accepted native inode inside the admitted 8 GiB,
+zero-swap scope with a 6 GiB native budget. Its supervisor retains a nonmaximum
+OOM adjustment; only the native child receives 1000. The validated physical main
+path supplies both the native payload and working directory. Final admission
+rechecks managed settings, cache, native readiness and enablement under the
+lifecycle lock, which closes after child creation. Repository/runner locks and
+the scope watchdog retain execution ownership. Missing canonical repository
+locks refuse Codebase; GitNexus retains its independent handling.
+
+This wiring merged in #3012. Read-only availability/access repairs remain tracked
+in #3464. Neither fixture acceptance nor a successful probe grants permission to
+clear the sentinel, release the freeze or retry unattended after resource failures.
+Follow the supervised production acceptance and resource gates in
+`../architecture/codebase-managed-runtime.md`.
+
 ## Verification
 
 The configuration test suite uses synthetic paths and fixtures. Native staging

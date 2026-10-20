@@ -1,9 +1,10 @@
 # Managed Codebase runtime: implementation and acceptance gates
 
-Status: **six-part rebuild in review; production acceptance remains pending**.
+Status: **the six implementation concerns have landed; follow-up fixes and
+production acceptance remain pending**.
 This plan does not authorize deployment or re-enabling Codebase MCP.
 
-## Current delivery and operational plan (2026-10-07)
+## Current delivery and operational plan (2026-10-20)
 
 The accepted replacement for the broker investigation below uses the pinned
 v0.11.0 native executable, immutable schema-2 settings, and the existing durable
@@ -11,10 +12,18 @@ index queue. It introduces neither a broker nor a second queue. The operator
 commands and exact containment settings are documented in
 [the managed Codebase guide](../reference/codebase-managed.md).
 
-The six concerns are configuration publication (#2909), native runtime (#3000),
-guarded uninstall (#3006), lifecycle (#3007), frontend (#3011), and queued-worker
-integration (#3012). Successors are stacked for review; each must reconcile and target
-main after its predecessor lands. All six are required before activation.
+The six concerns landed through configuration publication (#2909), native runtime
+(#3000), guarded uninstall (#3209, replacing #3006), lifecycle (#3007), frontend
+(#3011), and queued-worker integration (#3012). The worker contribution merged on
+October 20 as `76a531718`. Runtime provider-path guards (#3463) and read-only
+availability/access repairs (#3464) remain separate open follow-ups. Reconcile
+those contributions against actual main, preserving its supported Python 3.10
+streamed binary hashing and the existing worker/queue contract. An older local
+worker branch is not evidence that another worker implementation PR is needed.
+
+Merged implementation does not establish deployment, current production capacity
+or permission to lift the freeze. Verify every remaining fix at its actual head
+and base, then complete the separately authorized operational acceptance below.
 
 The query daemon has a 2 GiB, zero-swap service cap. Readers have individual
 256 MiB caps and a shared 2 GiB, zero-swap slice. The worker requires the full
