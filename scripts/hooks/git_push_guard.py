@@ -1819,10 +1819,27 @@ def _pr_ci_status(pr_num: str, repo: str | None = None) -> tuple[str, list[str]]
 
 # Patterns that indicate blocking review findings.
 # Matches structural review ERRORs, gstack [P1] markers, and PII hard blocks.
+_HARD_BLOCK_PATTERN = re.compile(r"HARD\s+BLOCK", re.IGNORECASE)
 _BLOCKING_PATTERNS = [
     re.compile(r"^#{2,3}\s*(?:🔴\s*)?ERROR\b", re.MULTILINE),
     re.compile(r"\[P1\](?!\d)"),
-    re.compile(r"HARD\s+BLOCK", re.IGNORECASE),
+    _HARD_BLOCK_PATTERN,
+]
+
+# Only these bounded legacy negatives suppress their own HARD BLOCK occurrence.
+# They are not clean verdicts and cannot settle another finding or an earlier review.
+_NEGATIVE_HARD_BLOCK_PATTERNS = [
+    re.compile(
+        r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?hard[ \t]+blocks?"
+        r"(?:\*\*|__)?[ \t]*:[ \t]*(?:\*\*|__)?[ \t]*"
+        r"(?:\*\*|__)?none(?:\*\*|__)?(?=[ \t]*(?:\.(?:[ \t]|\r?$)|\r?$))",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    re.compile(
+        r"(?:^|[,;])[ \t]*no[ \t]+(?:PII[ \t]+)?hard[ \t]+blocks?"
+        r"(?=[ \t]*(?:[,;]|\.(?:[ \t]|\r?$)|\r?$))",
+        re.IGNORECASE | re.MULTILINE,
+    ),
 ]
 
 # Patterns that indicate the review was clean (no real findings).
@@ -1834,6 +1851,25 @@ _CLEAN_PATTERNS = [
     re.compile(r"^Pre-Landing Review:\s*No issues found", re.IGNORECASE | re.MULTILINE),
     re.compile(r"VERDICT:\s*PASS", re.IGNORECASE),
 ]
+
+
+def _review_body_findings(body: str) -> tuple[bool, list[str]]:
+    """Explicit clean verdict and blocking patterns, excluding bounded negatives."""
+    negative_spans = [
+        match.span()
+        for pattern in _NEGATIVE_HARD_BLOCK_PATTERNS
+        for match in pattern.finditer(body)
+    ]
+    blocking = [
+        pattern.pattern
+        for pattern in _BLOCKING_PATTERNS
+        if any(
+            pattern is not _HARD_BLOCK_PATTERN
+            or not any(start <= match.start() and match.end() <= end for start, end in negative_spans)
+            for match in pattern.finditer(body)
+        )
+    ]
+    return any(pattern.search(body) for pattern in _CLEAN_PATTERNS), blocking
 
 
 def _enforced_logins_or_block() -> tuple[dict[str, frozenset[str]], str]:
@@ -4559,14 +4595,10 @@ def _check_pr_review_findings(
         # Only recognized review bots set a verdict, and only their NEWEST one.
         if login not in review_bots or login in settled:
             continue
+        is_clean, blocking_matches = _review_body_findings(body)
         # Codex quota-exhausted messages are not a review.
-        if "reached your Codex usage limits" in body and not any(
-            p.search(body) for p in _BLOCKING_PATTERNS
-        ):
+        if "reached your Codex usage limits" in body and not blocking_matches:
             continue
-
-        is_clean = any(p.search(body) for p in _CLEAN_PATTERNS)
-        blocking_matches = [p.pattern for p in _BLOCKING_PATTERNS if p.search(body)]
 
         if blocking_matches and not is_clean:
             # A seen finding stands even on an incomplete read (fail-closed on an
@@ -8179,8 +8211,8 @@ def _scheduled_review_marker_scan(
         # measured 2026-08-28: those two produced the identical `present: none` line, and
         # the only signal distinguishing an accepted marker from a rejected one was
         # whether its prose happened to contain a _CLEAN_PATTERNS phrase.
-        has_clean = any(c.search(body) for c in _CLEAN_PATTERNS)
-        not_clean = any(p.search(body) for p in _BLOCKING_PATTERNS) and not has_clean
+        has_clean, blocking_matches = _review_body_findings(body)
+        not_clean = bool(blocking_matches) and not has_clean
         verdict = "refused" if not_clean else ("clean" if has_clean else "plain")
         # Defense-in-depth follow-up: for rows from /pulls/N/reviews we could ALSO
         # cross-check GitHub's authoritative `commit_id` vs the marker sha (issue comments

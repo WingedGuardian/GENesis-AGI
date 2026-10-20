@@ -890,6 +890,84 @@ class TestEffectivePushRemote:
 # ── _check_pr_review_findings tests ─────────────────────────────────
 
 
+class TestLegacyNegativeReviewProse:
+    @staticmethod
+    def _scan(guard_module, monkeypatch, *bodies):
+        comments = [
+            {"login": "chatgpt-codex-connector[bot]", "body": body} for body in bodies
+        ]
+        monkeypatch.setattr(
+            guard_module, "_fetch_comments_paged", lambda *a, **kw: (comments, True)
+        )
+        return guard_module._check_pr_review_findings("1495", repo="acme/pub")
+
+    def test_historical_leak_scan_is_nonblocking(self, guard_module, monkeypatch):
+        # The captured comment was owner-authored; this replays its body as a bot.
+        body = (Path(__file__).parents[1] / "fixtures/legacy-leaks-pr1495.md").read_text()
+        assert len(guard_module._BLOCKING_PATTERNS[-1].findall(body)) == 2
+        assert not any(p.search(body) for p in guard_module._CLEAN_PATTERNS)
+        assert self._scan(guard_module, monkeypatch, body) == (False, "")
+
+    @pytest.mark.parametrize("body", [
+        "**Hard blocks:** None.",
+        "**Hard blocks**: None",
+        "### HARD BLOCKS: none.",
+        "  __Hard block:__ **None**. No private values found.",
+        "Hard\tblocks :\tNone\r\n",
+        "no PII hard blocks, no wording issues.",
+        "No hard blocks.",
+        "**Verdict:** No structural ERRORs, no PII hard blocks, no wording issues.",
+    ])
+    def test_bounded_negative_forms(self, guard_module, monkeypatch, body):
+        assert self._scan(guard_module, monkeypatch, body) == (False, "")
+
+    @pytest.mark.parametrize("body", [
+        "Hard blocks: None of these were fixed.",
+        "Hard blocks: None except the credential below.",
+        "Hard blocks: None, except one.",
+        "Hard blocks: Noneish",
+        "Hard blocks:\nNone.",
+        "No PII hard blocks were fixed.",
+        "No PII hard blocks: credential exposed.",
+        "There is no fix for this HARD BLOCK.",
+        "Hard blocks: 1",
+        "HARD BLOCK: synthetic credential",
+    ])
+    def test_ambiguous_or_positive_forms_still_block(self, guard_module, monkeypatch, body):
+        block, msg = self._scan(guard_module, monkeypatch, body)
+        assert block
+        assert r"HARD\s+BLOCK" in msg
+
+    @pytest.mark.parametrize("finding", [
+        "HARD BLOCK: synthetic credential",
+        "[P1] unresolved finding",
+        "### ERROR unresolved finding",
+    ])
+    @pytest.mark.parametrize("first", [True, False])
+    def test_negative_section_does_not_hide_other_findings(
+        self, guard_module, monkeypatch, finding, first
+    ):
+        negative = "**Hard blocks:** None.\nNo PII hard blocks."
+        body = f"{finding}\n{negative}" if first else f"{negative}\n{finding}"
+        assert self._scan(guard_module, monkeypatch, body)[0]
+
+    def test_plain_negative_does_not_clear_earlier_finding(self, guard_module, monkeypatch):
+        assert self._scan(
+            guard_module, monkeypatch, "HARD BLOCK: unresolved", "**Hard blocks:** None."
+        )[0]
+
+    @pytest.mark.parametrize("clean", ["PII scan: CLEAN", "VERDICT: PASS"])
+    def test_explicit_clean_wins_unchanged(self, guard_module, monkeypatch, clean):
+        body = f"**Hard blocks:** None.\nHARD BLOCK: category\n{clean}"
+        assert self._scan(guard_module, monkeypatch, body) == (False, "")
+
+    def test_negative_quota_notice_does_not_settle_author(self, guard_module, monkeypatch):
+        assert self._scan(
+            guard_module, monkeypatch, "[P1] unresolved",
+            "reached your Codex usage limits\n**Hard blocks:** None.",
+        )[0]
+
+
 class TestCheckPrReviewFindings:
     """Unit tests for _check_pr_review_findings()."""
 

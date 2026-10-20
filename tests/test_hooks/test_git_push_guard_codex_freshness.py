@@ -75,6 +75,76 @@ def _scheduled_marker(head=HEAD, *, login="owner", author_association="OWNER"):
     return json.dumps({"login": login, "author_association": author_association, "body": body})
 
 
+class TestLegacyNegativeScheduledReview:
+    _head = "89c695d701135b537c5ebd1bc892a2ed6d526223"
+
+    @staticmethod
+    def _body():
+        return (Path(__file__).parents[1] / "fixtures/legacy-leaks-pr1495.md").read_text()
+
+    def _row(self, body, **fields):
+        return {
+            "login": "owner", "author_association": "OWNER", "body": body, **fields,
+        }
+
+    def _gate(self, monkeypatch, *rows, head=None):
+        monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "acme/pub")
+        monkeypatch.setenv("_TEST_REQUIRED_SCHEDULED_REVIEWS", "leaks")
+        monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", "\n".join(map(json.dumps, rows)))
+        return _mod._check_scheduled_claude_reviewed_head(
+            "1495", head_sha=head or self._head, repo="acme/pub"
+        )
+
+    def test_historical_leak_scan_is_accepted(self, monkeypatch):
+        body = self._body()
+        assert len(_mod._BLOCKING_PATTERNS[-1].findall(body)) == 2
+        assert not any(p.search(body) for p in _mod._CLEAN_PATTERNS)
+        assert self._gate(monkeypatch, self._row(body)) is None
+
+    @pytest.mark.parametrize("finding", [
+        "HARD BLOCK: synthetic credential",
+        "[P1] unresolved finding",
+        "### ERROR unresolved finding",
+    ])
+    @pytest.mark.parametrize("first", [True, False])
+    def test_historical_scan_with_real_finding_is_refused(self, monkeypatch, finding, first):
+        body = self._body()
+        body = f"{finding}\n{body}" if first else f"{body}\n{finding}"
+        assert self._gate(monkeypatch, self._row(body))
+
+    def test_plain_negative_does_not_clear_earlier_refusal(self, monkeypatch):
+        marker = f"<!-- genesis-scheduled-review: head={self._head} kind=leaks -->"
+        assert self._gate(
+            monkeypatch,
+            self._row("HARD BLOCK: unresolved\n" + marker, stamp="2026-01-01T00:00:00Z"),
+            self._row(self._body(), stamp="2026-01-02T00:00:00Z"),
+        )
+
+    @pytest.mark.parametrize("clean", ["PII scan: CLEAN", "VERDICT: PASS"])
+    def test_explicit_clean_wins_unchanged(self, monkeypatch, clean):
+        body = self._body() + f"\nHARD BLOCK: category\n{clean}"
+        assert self._gate(monkeypatch, self._row(body)) is None
+
+    def test_wrong_head_is_not_accepted(self, monkeypatch):
+        assert self._gate(monkeypatch, self._row(self._body()), head="a" * 40)
+
+    def test_non_owner_is_not_accepted(self, monkeypatch):
+        row = self._row(self._body(), login="someone-else", author_association="NONE")
+        assert self._gate(monkeypatch, row)
+
+    @pytest.mark.parametrize("finding", ["", "\nHARD BLOCK: unresolved"])
+    def test_malformed_marker_residue_uses_same_classifier(self, monkeypatch, finding):
+        body = self._body().replace("kind=leaks", "kind=leak") + finding
+        self._gate(monkeypatch, self._row(body))
+        accepted, rejected, unusable, residue = _mod._scheduled_review_marker_scan(
+            "1495", repo="acme/pub", head_sha=self._head
+        )
+        assert not accepted and not rejected
+        assert unusable
+        assert bool(residue) == bool(finding)
+        assert ("carrying a blocking finding" in unusable[0][1]) == bool(finding)
+
+
 class TestReviewedCommitParsing:
     def test_parses_commit_id(self, monkeypatch):
         monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(HEAD))
