@@ -437,7 +437,7 @@ def test_orphan_output_fails(repo, capsys):
     (repo / ".claude/skills/small/OLD.md").write_text("left behind\n")
     assert _run(repo, "--check") == 1
     assert (
-        ".claude/skills/small/OLD.md: added since HEAD under a destination directory"
+        ".claude/skills/small/OLD.md: added since HEAD beside a destination"
         in capsys.readouterr().err
     )
 
@@ -731,7 +731,296 @@ def test_rewrites_must_be_a_list(repo, capsys):
     assert "rewrites must be a list" in capsys.readouterr().err
 
 
-def test_an_unexpected_error_exits_2_not_1(repo, capsys):
-    (repo / "scripts/hdr/small.md").write_bytes(b"\xff\xfe not utf-8\n")
+def test_an_unexpected_error_exits_2_not_1(repo, capsys, monkeypatch):
+    def boom(*_args):
+        raise KeyError("x")
+
+    monkeypatch.setattr(sm, "_frontmatter_problem", boom)
     assert _run(repo) == 2
-    assert "unexpected UnicodeDecodeError" in capsys.readouterr().err
+    assert "unexpected KeyError" in capsys.readouterr().err
+
+
+# --- round-1 review fixes ---------------------------------------------------------------
+
+
+def test_a_crlf_source_is_refused_not_converted(repo, capsys):
+    (repo / ".claude/skills/big/SKILL.md").write_bytes(BIG.replace("\n", "\r\n").encode())
+    _commit(repo, "crlf", ".claude/skills/big/SKILL.md")
+    assert _run(repo) == 2
+    assert "has a CR at line 1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [(SMALL_FRONT.replace("\n", "\r\n").encode(), "has a CR"), (b"\xff\xfe x\n", "is not UTF-8")],
+    ids=["crlf", "not-utf8"],
+)
+def test_an_authored_piece_must_be_lf_utf8(repo, capsys, data, message):
+    (repo / "scripts/hdr/small.md").write_bytes(data)
+    assert _run(repo) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_a_destination_inside_another_destination_is_refused(repo, capsys):
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / "scripts/rows.yaml").write_text(
+        rows.replace(
+            "  ref: .claude/skills/big/references/moved.md\n",
+            "  ref: .claude/skills/big/references/moved.md\n  dirdest: .claude/skills/big/references\n",
+        )
+    )
+    assert _run(repo) == 2
+    assert "is a directory of destination ref" in capsys.readouterr().err
+
+
+def test_non_ascii_destinations_are_outputs_not_orphans(repo, capsys):
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / "scripts/rows.yaml").write_text(
+        rows.replace(
+            "  ref: .claude/skills/big/references/moved.md",
+            '  ref: ".claude/skills/big/references/movéd\\tx.md"',  # YAML \t: a real tab
+        )
+    )
+    assert _run(repo) == 0
+    assert _run(repo, "--check") == 0
+    (repo / ".claude/skills/small/ÖLD.md").write_text("left behind\n")
+    assert _run(repo, "--check") == 1
+    assert ".claude/skills/small/ÖLD.md: added since HEAD" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("link", "ok"),
+    [("[e](existing.md)", True), ("[e](references/existing.md)", False)],
+    ids=["file-relative", "skill-root-relative"],
+)
+def test_markdown_links_in_a_reference_file_resolve_from_that_file(repo, capsys, link, ok):
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / "scripts/hdr/refnote.md").write_text(f"See {link}.\n")
+    (repo / "scripts/rows.yaml").write_text(
+        rows + "  - row: note\n    dest: ref\n    file: scripts/hdr/refnote.md\n"
+    )
+    assert _run(repo) == (0 if ok else 1)
+    if not ok:
+        assert "path (references/existing.md) does not resolve" in capsys.readouterr().err
+
+
+def _with_move_in_ref(repo: Path, ref_path: str) -> None:
+    """Route the '## Move' section (a 3-line paragraph) to the ref destination,
+    placed at ``ref_path``."""
+    rows = ROWS.replace('  - row: "2"\n    dest: small', '  - row: "2"\n    dest: ref')
+    rows = rows.replace("  ref: .claude/skills/big/references/moved.md", f"  ref: {ref_path}")
+    (repo / "scripts/rows.yaml").write_text(rows)
+
+
+def test_a_destination_renamed_into_another_skill_leaves_a_caught_orphan(repo, capsys):
+    # Old and new directories are both outside every current destination's own
+    # directory, so only the content rule can find the old output.
+    _with_move_in_ref(repo, ".claude/skills/big/references/moved.md")
+    assert _run(repo) == 0
+    _with_move_in_ref(repo, ".claude/skills/small/references/moved.md")
+    assert _run(repo) == 1
+    err = capsys.readouterr().err
+    assert ".claude/skills/big/references/moved.md:" in err
+    assert "repeats text of .claude/skills/big/SKILL.md" in err
+
+
+def test_a_committed_non_ascii_output_is_not_an_orphan(repo):
+    # The `git diff --diff-filter=A` listing (outputs committed since the ref),
+    # as opposed to the untracked listing the test above exercises.
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / "scripts/rows.yaml").write_text(
+        rows.replace("references/moved.md", "references/movéd.md")
+    )
+    assert _run(repo) == 0
+    _commit(repo, "outputs", ".claude/skills")
+    args = ["--rows", str(repo / "scripts/rows.yaml"), "--source-ref", base, "--check"]
+    assert sm.main(args) == 0
+
+
+def test_a_destination_moved_out_of_a_non_skill_directory_leaves_a_caught_orphan(repo, capsys):
+    _with_move_in_ref(repo, ".claude/skills/aux/notes.md")
+    assert _run(repo) == 0
+    _with_move_in_ref(repo, ".claude/skills/small/references/notes.md")
+    assert _run(repo) == 1
+    assert ".claude/skills/aux/notes.md:" in capsys.readouterr().err
+
+
+# --- round-2 class audit -----------------------------------------------------------------
+
+
+def test_an_unrelated_file_added_elsewhere_is_not_an_orphan(repo):
+    other = repo / ".claude/skills/other/SKILL.md"
+    other.parent.mkdir(parents=True)
+    other.write_text("---\nname: other\n---\n\nUnrelated line one.\nUnrelated two.\nAnd three.\n")
+    assert _run(repo) == 0
+
+
+def test_an_authored_piece_kept_beside_a_destination_is_an_input_not_an_orphan(repo):
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / ".claude/skills/small").mkdir(parents=True, exist_ok=True)
+    (repo / "scripts/hdr/small.md").rename(repo / ".claude/skills/small/_hdr.md")
+    (repo / "scripts/rows.yaml").write_text(
+        rows.replace("file: scripts/hdr/small.md", "file: .claude/skills/small/_hdr.md")
+    )
+    assert _run(repo) == 0
+    assert _run(repo, "--check") == 0
+
+
+def test_a_rename_paired_committed_orphan_is_still_found(repo, capsys):
+    # git's rename detection pairs a committed old output with an identical file
+    # deleted since the ref; --no-renames keeps it an addition.
+    _with_move_in_ref(repo, ".claude/skills/big/references/moved.md")
+    assert _run(repo) == 0
+    old = repo / ".claude/skills/big/references/moved.md"
+    legacy = repo / "docs/legacy.md"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(old.read_text())
+    _commit(repo, "legacy copy at the ref", "docs/legacy.md")
+    ref = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "rm", "-q", "docs/legacy.md")
+    _commit(repo, "the old output, committed", ".claude/skills/big/references/moved.md")
+    _with_move_in_ref(repo, ".claude/skills/small/references/moved.md")
+    assert sm.main(["--rows", str(repo / "scripts/rows.yaml"), "--source-ref", ref]) == 1
+    assert ".claude/skills/big/references/moved.md:" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        ("file: scripts/hdr/small.md", "file: .claude/skills/small/SKILL.md", "is destination"),
+        (
+            "  ref: .claude/skills/big/references/moved.md",
+            "  ref: scripts/rows.yaml",
+            "the row file scripts/rows.yaml is a destination",
+        ),
+        ('new: "as shown in the next section"', 'new: "as shown\\r\\nhere"', "new text has a CR"),
+        (
+            '    source: .claude/skills/big/SKILL.md\n    from: "## Gone"',
+            '    source: .claude/skills/big/references\n    from: "## Gone"',
+            "is a tree, not a file",
+        ),
+    ],
+    ids=["authored-is-dest", "rows-is-dest", "cr-in-rewrite", "tree-source"],
+)
+def test_round_two_row_file_refusals(repo, capsys, old, new, message):
+    rows = (repo / "scripts/rows.yaml").read_text()
+    assert rows.count(old) == 1
+    (repo / "scripts/rows.yaml").write_text(rows.replace(old, new))
+    assert _run(repo) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_a_source_that_is_no_destination_must_leave_the_tree(repo, capsys):
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / "scripts/rows.yaml").write_text(
+        rows + "  - row: ex\n    dest: ref\n    source: .claude/skills/big/references/existing.md\n"
+        '    from: "@start"\n    until: "@end"\n'
+    )
+    assert _run(repo) == 1
+    assert (
+        ".claude/skills/big/references/existing.md: a source that is no destination is still in the index"
+        in capsys.readouterr().err
+    )
+
+
+def test_a_crlf_output_on_disk_is_named_as_line_endings(repo, capsys):
+    assert _run(repo) == 0
+    out = repo / ".claude/skills/small/SKILL.md"
+    out.write_bytes(out.read_bytes().replace(b"\n", b"\r\n"))
+    assert _run(repo, "--check") == 1
+    assert "line endings (CR on disk)" in capsys.readouterr().err
+
+
+def test_a_committed_non_ascii_orphan_is_found_by_its_real_name(repo, capsys):
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    stale = repo / ".claude/skills/zz/ölD.md"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(
+        "**Move lead.** moved text one.\nmoved text two, as shown below.\nDetail in `references/existing.md`.\n"
+    )
+    _commit(repo, "a stale copy", ".claude/skills/zz")
+    assert sm.main(["--rows", str(repo / "scripts/rows.yaml"), "--source-ref", base]) == 1
+    assert ".claude/skills/zz/ölD.md:1: added since" in capsys.readouterr().err
+
+
+# --- round-3 re-review: each orphan-scan guard pinned ------------------------------------
+
+_MOVED = "**Move lead.** moved text one.\nmoved text two, as shown below.\nDetail in `references/existing.md`.\n"
+
+
+def _plant(repo: Path, rel: str, text: str) -> None:
+    path = repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def test_two_repeated_lines_are_not_a_paragraph(repo):
+    _plant(
+        repo, "docs/quote.md", "**Move lead.** moved text one.\nmoved text two, as shown below.\n"
+    )
+    assert _run(repo) == 0
+
+
+def test_a_new_skill_sharing_frontmatter_fields_is_not_an_orphan(repo):
+    front = "---\nname: big\ndescription: Big skill.\nkeywords: [big]\n---\n"
+    _plant(repo, "docs/newskill/SKILL.md", front + "\nAn unrelated body.\n")
+    assert _run(repo) == 0
+
+
+@pytest.mark.parametrize(
+    ("rel", "setup"),
+    [("docs/stale.txt", None), ("docs/link.md", "symlink"), ("docs/big.md", "size")],
+    ids=["other-suffix", "symlink", "over-size"],
+)
+def test_orphan_scan_guards(repo, capsys, monkeypatch, rel, setup):
+    if setup == "symlink":
+        _plant(repo, ".claude/skills/stale-target.txt", _MOVED)
+        (repo / "docs").mkdir(exist_ok=True)
+        (repo / rel).symlink_to(repo / ".claude/skills/stale-target.txt")
+    else:
+        _plant(repo, rel, _MOVED)
+    if setup == "size":
+        monkeypatch.setattr(sm, "_ORPHAN_MAX_BYTES", 10)
+    assert _run(repo) == 0
+    if setup == "size":
+        assert "note: orphan scan skipped docs/big.md (over 10 bytes)" in capsys.readouterr().out
+
+
+def test_the_row_file_kept_beside_a_destination_is_an_input(repo):
+    (repo / "scripts/rows.yaml").rename(repo / ".claude/skills/big/rows.yaml")
+    assert _run(repo, rows=".claude/skills/big/rows.yaml") == 0
+
+
+def test_a_symlinked_row_file_is_an_input_too(repo):
+    (repo / ".claude/skills/big/rows-link.yaml").symlink_to(repo / "scripts/rows.yaml")
+    assert _run(repo, rows=".claude/skills/big/rows-link.yaml") == 0
+
+
+def test_a_source_removed_from_the_tree_but_not_the_index_still_fails(repo, capsys):
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / "scripts/rows.yaml").write_text(
+        rows + "  - row: ex\n    dest: ref\n    source: .claude/skills/big/references/existing.md\n"
+        '    from: "@start"\n    until: "@end"\n'
+    )
+    (repo / ".claude/skills/big/references/existing.md").unlink()
+    assert _run(repo) == 1
+    assert "is still in the index; git rm it" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(__import__("os").geteuid() == 0, reason="root reads mode-000 files")
+def test_an_unreadable_added_file_is_noted_not_silent(repo, capsys):
+    _plant(repo, "docs/locked.md", _MOVED)
+    (repo / "docs/locked.md").chmod(0)
+    try:
+        assert _run(repo) == 0
+    finally:
+        (repo / "docs/locked.md").chmod(0o644)
+    assert "note: orphan scan skipped docs/locked.md (PermissionError)" in capsys.readouterr().out
+
+
+def test_a_crlf_file_at_a_destination_path_gets_the_exists_at_ref_error(repo, capsys):
+    (repo / ".claude/skills/big/references/moved.md").write_bytes(b"someone's\r\nfile\r\n")
+    _commit(repo, "a crlf file at the destination path", ".claude/skills/big/references/moved.md")
+    assert _run(repo) == 2
+    assert "exists at HEAD but is no piece's source" in capsys.readouterr().err

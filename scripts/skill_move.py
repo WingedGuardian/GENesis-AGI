@@ -10,7 +10,9 @@ Sources come from ``--source-ref`` (default ``origin/main``), never the working
 tree, because a destination can be its own source: the generated core
 overwrites the file it was cut from. To regenerate after main moves (a
 conflict in a generated file), take either side, rerun with
-``--source-ref origin/main``, ``git add`` the outputs and continue.
+``--source-ref origin/main``, ``git add`` the outputs and continue. A source
+that is no destination must be ``git rm``'d (index and tree) before the first
+write: every check runs before anything is written.
 
 Anchors match a line by PREFIX and must match exactly one line of their
 source; ``@start``/``@end`` are line 1 and end of file. ``until`` is the first
@@ -27,14 +29,22 @@ Every run checks, before writing anything:
      outside .git, one path per destination);
   3. (``--check``) each output on disk equals its assembly, byte for byte;
   4. paths in outputs resolve: backticked ``references/...md`` from the skill
-     root, ``.claude/...`` from the repo root, ``../...`` and markdown link
-     targets from the output's directory (a path already unresolvable in its
-     source at the ref is reported, not failed);
-  5. no output replaces a file that exists at the ref but is no source, and no
-     file added since the ref sits under a destination's directory unless it
-     is an output (an orphan of a renamed destination);
+     root, backticked ``.claude/...`` from the repo root, backticked ``../...``
+     and every markdown link target from the output's own directory (a path
+     already unresolvable in its source at the ref is reported, not failed);
+  5. no output replaces a file that exists at the ref but is no source; no
+     file added since the ref (committed or untracked) that is no output and
+     no input sits in a destination's directory, or, anywhere in the repo with
+     a destination's suffix, repeats three adjacent non-blank lines of a
+     source or authored piece, frontmatter aside: the old output of a renamed
+     or dropped destination (an old output elsewhere with no such paragraph is
+     not found); and no source that is no destination is still in the tree or
+     the index;
   6. each output ``SKILL.md`` has frontmatter with ``name`` = its directory,
      ``description`` and ``keywords``; a piece's ``must_end_before`` holds.
+
+Sources and authored pieces must be UTF-8 with LF line endings (every skill
+file is): a CR is refused rather than silently converted.
 
 Run it in a worktree: sessions in the primary checkout load what it writes.
 Exit 0 ok, 1 a check failed, 2 the row file, git or the file system is unusable.
@@ -43,6 +53,7 @@ Exit 0 ok, 1 a check failed, 2 the row file, git or the file system is unusable.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import posixpath
 import re
@@ -113,13 +124,43 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
 
 
+def _lf_text(data: bytes, what: str) -> str:
+    """``data`` as UTF-8 text, byte for byte: never newline-translated, and a CR
+    refused, since joining pieces with LF would silently change its endings."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RowError(f"{what} is not UTF-8 ({exc.reason} at byte {exc.start})") from exc
+    if "\r" in text:
+        line = text[: text.index("\r")].count("\n") + 1
+        raise RowError(f"{what} has a CR at line {line}; only LF line endings are supported")
+    return text
+
+
 def _at_ref(root: Path, ref: str, path: str) -> str | None:
-    if _git(root, "cat-file", "-e", f"{ref}:{path}").returncode != 0:
+    kind = _git(root, "cat-file", "-t", f"{ref}:{path}")
+    if kind.returncode != 0:
         return None
-    shown = _git(root, "show", f"{ref}:{path}")
+    if kind.stdout.strip() != "blob":
+        raise RowError(f"{path} at {ref} is a {kind.stdout.strip()}, not a file")
+    # Bytes, not text=True: universal newlines would turn CRLF into LF unseen.
+    shown = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "blob", f"{ref}:{path}"], capture_output=True
+    )
     if shown.returncode != 0:
-        raise RowError(f"git show {ref}:{path}: {shown.stderr.strip()}")
-    return shown.stdout
+        raise RowError(
+            f"git cat-file {ref}:{path}: {shown.stderr.decode(errors='replace').strip()}"
+        )
+    return _lf_text(shown.stdout, f"{path} at {ref}")
+
+
+def _git_paths(root: Path, *args: str) -> list[str]:
+    """Paths a git listing prints with ``-z``: NUL-separated and never C-quoted,
+    so a non-ASCII, tab or newline name is the real name."""
+    out = subprocess.run(["git", "-C", str(root), *args], capture_output=True)
+    if out.returncode != 0:
+        raise RowError(f"git {args[0]}: {out.stderr.decode(errors='replace').strip()}")
+    return [os.fsdecode(raw) for raw in out.stdout.split(b"\0") if raw]
 
 
 def _text(value, what: str, *, empty_ok: bool = False) -> str:
@@ -186,6 +227,13 @@ def load_rows(path: Path) -> tuple[dict[str, str], list[Piece]]:
         if dpath in seen:
             raise RowError(f"destinations {seen[dpath]} and {name} share the path {dpath}")
         seen[dpath] = name
+    for dpath, name in seen.items():
+        for parent in PurePosixPath(dpath).parents:
+            if parent.as_posix() in seen:
+                raise RowError(
+                    f"destination {seen[parent.as_posix()]} ({parent}) is a directory of "
+                    f"destination {name} ({dpath}); a path cannot be both"
+                )
     pieces = []
     raw_pieces = data.get("pieces") or []
     if not isinstance(raw_pieces, list):
@@ -220,6 +268,8 @@ def load_rows(path: Path) -> tuple[dict[str, str], list[Piece]]:
                 or set(rw) != {"kind", "old", "new"}
             ):
                 raise RowError(f"{what}: needs exactly kind (one of {sorted(_KINDS)}), old and new")
+            if "\r" in str(rw["new"]):
+                raise RowError(f"{what}: new text has a CR; only LF line endings are supported")
             p.rewrites.append(
                 {
                     "kind": rw["kind"],
@@ -227,6 +277,8 @@ def load_rows(path: Path) -> tuple[dict[str, str], list[Piece]]:
                     "new": _text(rw["new"], f"{what} new", empty_ok=rw["kind"] == "edit"),
                 }
             )
+        if p.file in seen:
+            raise RowError(f"{where}: authored file {p.file} is destination {seen[p.file]}")
         if "must_end_before" in raw:
             meb = raw["must_end_before"]
             if type(meb) is not int or meb <= 0:
@@ -299,11 +351,18 @@ class _Resolver:
             self._at_ref[rel] = probe.returncode == 0
         return self._at_ref[rel]
 
-    def target(self, token: str, rel: str, *, at_ref: bool = False) -> str | None:
+    def target(
+        self, token: str, rel: str, *, at_ref: bool = False, link: bool = False
+    ) -> str | None:
+        """Where ``token`` in file ``rel`` points. A markdown ``link`` resolves
+        from the file's own directory, as a renderer reads it; only a backticked
+        path gets the skill-root and repo-root conventions."""
         token = token.split("#", 1)[0].rstrip("/")
         if not token or re.match(r"[a-z][a-z0-9+.-]*:", token) or token.startswith("/"):
             return None  # an anchor, a URL or an absolute path: not checked
-        if token.startswith(".claude/"):
+        if link:
+            base = PurePosixPath(rel).parent.as_posix()
+        elif token.startswith(".claude/"):
             base = ""
         elif token.startswith("references/"):
             base = self.skill_root(rel, at_ref=at_ref)
@@ -313,12 +372,14 @@ class _Resolver:
         return joined if not joined.startswith("..") else "<outside the repo>"
 
     def unresolved(self, text: str, rel: str, *, at_ref: bool = False) -> list[str]:
-        tokens = _BACKTICKED.findall(text) + _MD_LINK.findall(text)
+        """Tokens that do not resolve, a markdown link shown as ``(token)``."""
+        tokens = [(t, False) for t in _BACKTICKED.findall(text)]
+        tokens += [(t, True) for t in _MD_LINK.findall(text)]
         bad = []
-        for tok in tokens:
-            tgt = self.target(tok, rel, at_ref=at_ref)
+        for tok, link in tokens:
+            tgt = self.target(tok, rel, at_ref=at_ref, link=link)
             if tgt is not None and (tgt.startswith("<") or not self.exists(tgt, at_ref=at_ref)):
-                bad.append(tok)
+                bad.append(f"({tok})" if link else tok)
         return bad
 
 
@@ -355,7 +416,10 @@ def _cut(
                 raise RowError(f"source {p.source} does not exist at {ref}")
             sources[p.source] = text.split("\n")[:-1] if text.endswith("\n") else text.split("\n")
     for name, dpath in dests.items():
-        if dpath not in sources and _at_ref(root, commit, dpath) is not None:
+        if (
+            dpath not in sources
+            and _git(root, "cat-file", "-e", f"{commit}:{dpath}").returncode == 0
+        ):
             raise RowError(
                 f"destination {name} ({dpath}) exists at {ref} but is no piece's source: "
                 "name it as a source or choose another path"
@@ -367,7 +431,11 @@ def _cut(
             fp = _confined(root, p.file, f"{where} file")
             if not fp.is_file():
                 raise RowError(f"{where}: authored file {p.file} not found")
-            p.text = p.original = fp.read_text(encoding="utf-8")
+            try:
+                data = fp.read_bytes()
+            except OSError as exc:
+                raise RowError(f"{where}: cannot read {p.file}: {exc.strerror}") from exc
+            p.text = p.original = _lf_text(data, f"{where} file {p.file}")
             continue
         lines = sources[p.source]
         start, end = _find(lines, p.frm, where), _find(lines, p.until, where)
@@ -424,7 +492,8 @@ def _assemble(name, dpath, mine, res: _Resolver, failures, report):
         for rw in p.rewrites:
             lines_out.append(f"      {rw['kind']}: {rw['old']!r} -> {rw['new']!r}")
             if rw["kind"] == "path":
-                tgt = res.target(_PATH_TOKEN.findall(rw["new"])[0], dpath)
+                tok = _PATH_TOKEN.findall(rw["new"])[0]
+                tgt = res.target(tok, dpath, link=f"]({tok}" in rw["new"])
                 if tgt is not None and (tgt.startswith("<") or not res.exists(tgt)):
                     failures.append(
                         f"{dpath}: row {p.row}: path rewrite target {rw['new']!r} does not resolve"
@@ -457,6 +526,13 @@ def build(
 ) -> tuple[dict[str, str], list[str], list[str]]:
     """Return (outputs path -> text, failures, report lines). Raises RowError."""
     dests, pieces = load_rows(rows)
+    rows_rel = rows.resolve().relative_to(root.resolve()).as_posix()
+    rows_names = {rows_rel}
+    # The path as given too, when it is a symlink to the row file.
+    with contextlib.suppress(ValueError):
+        rows_names.add(rows.absolute().relative_to(root).as_posix())
+    if rows_names & set(dests.values()):
+        raise RowError(f"the row file {rows_rel} is a destination")
     commit = _resolve_ref(root, ref)
     for name, dpath in dests.items():
         target = _confined(root, dpath, f"destination {name}")
@@ -479,20 +555,16 @@ def build(
         covered = sum(1 for n in marks if n is not None) - deleted
         report.append(f"source {src}: {len(marks)} lines, {covered} moved, {deleted} deleted")
 
-    # An orphan: a file ADDED since the ref under a destination's directory that
-    # is no output (an old output left behind by a renamed destination). Edits to
-    # existing files there are ordinary changes and are not this check's business.
-    dirs = sorted({PurePosixPath(d).parent.as_posix() for d in dests.values()})
-    added = _git(root, "diff", "--name-only", "--diff-filter=A", commit, "--", *dirs)
-    untracked = _git(root, "ls-files", "--others", "--exclude-standard", "--", *dirs)
-    if added.returncode or untracked.returncode:
-        raise RowError(
-            f"git diff/ls-files against {ref}: {(added.stderr or untracked.stderr).strip()}"
-        )
-    for rel in sorted(set(added.stdout.splitlines()) | set(untracked.stdout.splitlines())):
-        if rel not in res.outputs:
+    inputs = {p.file for p in pieces if p.file} | rows_names
+    failures.extend(_orphans(root, commit, ref, sources, pieces, res.outputs, inputs, report))
+    for src in sources:
+        if src in res.outputs:
+            continue
+        indexed = _git(root, "ls-files", "--error-unmatch", "--", src).returncode == 0
+        if indexed or (root / src).exists():
             failures.append(
-                f"{rel}: added since {ref} under a destination directory but is not an output"
+                f"{src}: a source that is no destination is still in the "
+                f"{'index' if indexed else 'tree'}; git rm it, its lines are all in pieces now"
             )
     if check:
         for dpath, want in outputs.items():
@@ -503,14 +575,86 @@ def build(
     return outputs, failures, report
 
 
+# A stale copy: any added file in a destination's own directory, and, anywhere
+# else, a file whose CONTENT repeats a moved paragraph, since a destination
+# renamed into another directory or dropped can leave its old output anywhere,
+# while an unrelated file added elsewhere is not one. Three adjacent non-blank
+# lines is a paragraph, which an old output repeats and a mention of a moved
+# section does not (45 of 46 sections of the largest skill carry one).
+_ORPHAN_RUN = 3
+_ORPHAN_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _body(lines: list[str]) -> list[str]:
+    """``lines`` without a leading ``---`` frontmatter block: skills share its
+    fields (2 of 15 repo skills share a 3-line tail), so it proves nothing."""
+    if lines and lines[0] == "---":
+        end = next((i for i, line in enumerate(lines[1:], 1) if line == "---"), None)
+        if end is not None:
+            return lines[end + 1 :]
+    return lines
+
+
+def _runs(lines: list[str]):
+    for i in range(len(lines) - _ORPHAN_RUN + 1):
+        window = lines[i : i + _ORPHAN_RUN]
+        if all(line.strip() for line in window):
+            yield i, tuple(line.strip() for line in window)
+
+
+def _orphans(root, commit, ref, sources, pieces, outputs, inputs, report) -> list[str]:
+    known: dict[tuple[str, ...], str] = {}
+    for src, lines in sources.items():
+        for _, run in _runs(_body(lines)):
+            known.setdefault(run, src)
+    for p in pieces:  # the text as written too: a rewrite changes what an old output holds
+        for _, run in _runs(_body(p.text.split("\n"))):
+            known.setdefault(run, p.file or p.source)
+    suffixes = {PurePosixPath(d).suffix for d in outputs}
+    added = _git_paths(root, "diff", "-z", "--no-renames", "--name-only", "--diff-filter=A", commit)
+    untracked = _git_paths(root, "ls-files", "-z", "--others", "--exclude-standard")
+    dest_dirs = {PurePosixPath(d).parent for d in outputs}
+    found = []
+    for rel in sorted(set(added) | set(untracked)):
+        if rel in outputs or rel in inputs:
+            continue
+        if PurePosixPath(rel).parent in dest_dirs:
+            found.append(f"{rel}: added since {ref} beside a destination but is not an output")
+            continue
+        if PurePosixPath(rel).suffix not in suffixes:
+            continue
+        path = root / rel
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue  # a symlink's target is checked under its own name
+            if path.stat().st_size > _ORPHAN_MAX_BYTES:
+                report.append(f"note: orphan scan skipped {rel} (over {_ORPHAN_MAX_BYTES} bytes)")
+                continue
+            lines = path.read_bytes().decode("utf-8").split("\n")
+        except (OSError, UnicodeDecodeError) as exc:
+            report.append(f"note: orphan scan skipped {rel} ({type(exc).__name__})")
+            continue
+        body = _body(lines)
+        offset = len(lines) - len(body)
+        hit = next(((i + offset, known[run]) for i, run in _runs(body) if run in known), None)
+        if hit:
+            found.append(
+                f"{rel}:{hit[0] + 1}: added since {ref} and repeats text of {hit[1]}, "
+                "but is not an output (an old output of a renamed or dropped destination?)"
+            )
+    return found
+
+
 def _mismatch(dpath: str, have: bytes | None, want: str, starts: list[tuple[int, str]]) -> str:
     hint = "(if main moved, regenerate with --source-ref origin/main)"
     if have is None:
         return f"{dpath}: missing; generate it {hint}"
     h, w = have.decode("utf-8", "replace").split("\n"), want.split("\n")
     n = next((k for k in range(min(len(h), len(w))) if h[k] != w[k]), min(len(h), len(w)))
-    if n == len(h) == len(w) and h == w:
-        return f"{dpath}: differs from its assembly in line endings or encoding {hint}"
+    if n < len(h) and n < len(w) and h[n].rstrip("\r") == w[n]:
+        return f"{dpath}: differs from its assembly in line endings (CR on disk) {hint}"
+    if n == len(h) == len(w):
+        return f"{dpath}: differs from its assembly in encoding {hint}"
     row = next((r for s, r in reversed(starts) if s <= n + 1), "?")
     got = h[n][:60] if n < len(h) else "<end>"
     exp = w[n][:60] if n < len(w) else "<end>"
@@ -573,7 +717,7 @@ def main(argv: list[str] | None = None) -> int:
         if top.returncode != 0:
             raise RowError(f"{args.rows} is not inside a git repository")
         root = Path(top.stdout.strip())
-        outputs, failures, report = build(root, args.rows.resolve(), args.source_ref, args.check)
+        outputs, failures, report = build(root, args.rows.absolute(), args.source_ref, args.check)
         print("\n".join(report))
         if failures:
             print(f"\n{len(failures)} check failure(s); nothing written:", file=sys.stderr)
