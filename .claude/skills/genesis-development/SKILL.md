@@ -213,12 +213,6 @@ shorter than 3 characters and does no stemming, so `pr` can never match and
 `merge` will not match "merging" — declare the surface forms. Verify a new
 skill by scoring it against the phrasings a user would really type, in BOTH
 directions.
-### GROUNDWORK Code Is NOT Dead Code
-
-Code tagged `# GROUNDWORK(feature-id): why` is intentional future
-investment. Never delete or refactor it as dead code. Only remove when
-the feature is fully active or the user explicitly cancels it.
-
 ### Due diligence before building (standing owner rule, 2026-10-04)
 
 **Get it right the first time. On everything that could change the plan, the
@@ -1149,7 +1143,7 @@ classify it:
   written. Label it "data repair" explicitly, and in the same session
   either fix the mechanism or get the user's explicit deferral (the mechanism
   fix recorded as an ISSUE; a local row only if the deferral itself needs
-  tracking). Never report a data repair as "fixed".
+  tracking).
 - **Class fix** — you changed the mechanism so the artifact is written
   correctly on every install, going forward, with a test proving it.
 
@@ -1543,31 +1537,11 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   types — import them). Test setup so complex it needs its own debugging =
   the design is too coupled; fix the design.
 
-### Code Intelligence — pick the right lane
+### Code Intelligence
 
-**Serena (Python LSP) is always live** — it parses current files per query, so
-it's the default for symbol/reference/impact questions ("who calls X", "what
-breaks if I change Z") and never goes stale. CBM gives the architecture/graph
-overview. GitNexus does what neither can — multi-hop blast radius, execution
-flows, route/tool maps, coupling/community analysis — but it is **snapshot-
-based**: its answers are only correct when the index matches the working tree,
-and it drifts after you pull merged PRs (its reindex fires on local commit, not
-on pull). So reach for GitNexus deliberately for its unique views, and run
-**from the main checkout, run `scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` first** when freshness matters. Linked worktrees deliberately skip indexing; for live "who calls this"
-during active editing, prefer Serena. There is no "always run impact before
-every edit" mandate — that just gates work behind a tool that's stale-by-design.
-
-- **Blast radius / impact:** Serena `find_referencing_symbols` (live) for the
-  direct caller set; GitNexus `impact <symbol>` (reindex first) for multi-hop +
-  affected processes/risk. Use the full UID if ambiguous
-  (`Method:path/file.py:Class.method#N`).
-- **Unfamiliar code:** `gitnexus context <symbol>` or browse
-  `gitnexus://repo/GENesis-AGI/processes` (when fresh).
-- **Custom questions:** `gitnexus cypher` — LadybugDB uses `CodeRelation` with a
-  `type` property for edges, not Neo4j-style named edge labels.
-
-Full syntax and Cypher examples: `.claude/docs/code-intelligence-guide.md`;
-tool-selection decision matrix: `.claude/docs/code-intelligence.md`
+CLAUDE.md "Code Intelligence" picks the tool by the question. The decision
+matrix and freshness model: `.claude/docs/code-intelligence.md`; syntax, the
+`CodeRelation` edge model and Cypher examples: `.claude/docs/code-intelligence-guide.md`.
 
 ### Advisory is the default; a BLOCK is what needs the argument
 
@@ -1930,25 +1904,6 @@ Four rules follow, each cheap:
   running Node before installing the intended version, the uninstall terminated
   the agent session executing it, and the machine was left with neither. Before
   touching any runtime, inventory what is running on it.
-- **Ego sessions are ACTIVE.** `src/genesis/ego/` is live (v3.0a11).
-  Two egos: user ego (CEO, Opus) and Genesis ego (COO, Sonnet). Both
-  run on adaptive cadence via the awareness loop. Changes here are
-  production changes.
-- **DB path confusion.** `genesis.db` is at `~/genesis/data/genesis.db`,
-  NOT `~/genesis/genesis.db`. Use `genesis.env.genesis_db_path()`.
-- **Column names.** Use `db_schema` MCP before assuming column names.
-  The DB has 60+ tables.
-- **Signal collectors.** Phase 1 built stubs; Phase 6 replaced some with
-  real implementations. Code that looks complete may not produce signals.
-- **Capabilities manifest.** `~/.genesis/capabilities.json` is write-once
-  at bootstrap, not dynamic. New capabilities need registration in
-  `_CAPABILITY_DESCRIPTIONS` in `src/genesis/runtime/_capabilities.py`
-  AND a bootstrap init step.
-- **APScheduler IntervalTrigger resets on restart.** `IntervalTrigger`
-  counts from server startup, not from last successful run. If the
-  server restarts more frequently than the interval, the job never
-  fires. Use `CronTrigger` for anything longer than a few hours.
-  Bit us with `user_model_evolution` (48h interval, daily restarts).
 - **Silent skips are banned (provision-or-surface).** A setup/resilience
   feature that gracefully skips on a missing prerequisite (a package, a
   host knob) must either PROVISION the prerequisite (bootstrap.sh /
@@ -2147,28 +2102,14 @@ Four rules follow, each cheap:
   Deliberately stated without the triggering shapes. A guard's defeat
   conditions are not a teaching aid, and this file is public.
 
-  **(b) When the parse is unreliable, ASK — do not BLOCK.** A hard block forces
-  a surgically precise trigger, and precision is exactly what an unreliable
-  parse cannot deliver. Measured over five review rounds: every narrowing
-  conjunct became a new way to STARVE the trigger (an over-strip that ate the
-  evidence; a decoy segment that stood the net down), while every widening
-  hard-blocked benign shapes (`git status # don't commit yet` was refused).
-  Emitting a PreToolUse `ask` inverts the cost of being wrong — a false
-  positive is one confirmation, a miss is the pre-existing status quo — which
-  is what lets the trigger stay broad instead of clever. Measured prompt rate
-  after widening: 0.43% of ~19k real commands.
-
-  **SUPERSEDED for the git-operation net by owner ruling 2026-09-08 (re-checked
-  against the code 2026-09-27).** That net no longer asks in any session type:
-  the commit gate and the push guard REFUSE an unreadable command that names a
-  gated operation, with a message giving the cause and a rewrite the session can
-  perform — both cite the ruling at their blind branch. The reasoning here still
-  prices the TRIGGER (a broad predicate remains right); what changed is the cost
-  of a false positive, now an agent rewrite rather than a human confirmation. So
-  wherever this passage and the paragraphs below say `ask` for that net, read
-  "refuse with an actionable message". A line continuation joined the same path
-  when the parser began REPORTING it as a blind spot (`_BLIND_CONTINUATION`)
-  instead of modelling the join: refused, never parsed around.
+  **(b) When the parse is unreliable, keep the trigger BROAD.** Every narrowing
+  conjunct became a new way to starve the trigger (measured; `git_push_guard.py`,
+  the comment above `_GATED_MENTION`). Since the owner ruling of 2026-09-08 the
+  git-operation net REFUSES an unreadable command that names a gated operation,
+  with a message giving the cause and a rewrite; it no longer asks. A line
+  continuation is reported as a blind spot (`_BLIND_CONTINUATION`) and refused,
+  never parsed around. Wherever the paragraphs below say `ask` or "one
+  confirmation" for this net, read "refuse with an actionable message".
 
   This does NOT loosen the fail-closed mandate above, and the two are easy to
   read as contradicting each other. Rule (b) is scoped to the git-operation
@@ -2237,8 +2178,9 @@ Four rules follow, each cheap:
   invariant it is false unscoped, and (c) below replaces it.
 
   **(c) The ask-cost argument does NOT survive the move to a refusal.** Rule (b)
-  buys its broad trigger with "a false positive costs one confirmation" — and
-  that is true only where someone can confirm. An unattended session has nobody
+  originally bought its broad trigger with "a false positive costs one
+  confirmation" (the retired ask; git history) — and that is true only where
+  someone can confirm. An unattended session has nobody
   to answer, so the obvious completion of (b) is a deny leg for that path, and
   that is where it goes wrong: the SAME broad predicate whose errors were cheap
   now produces unappealable refusals of ordinary work. MEASURED: sharing one
@@ -2369,8 +2311,6 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | Rationalization | Why it's wrong |
 |---|---|
 | "This is just a simple fix, no tests needed" | Simple fixes break complex systems. The Qdrant regression was a "simple fix." Write the test. |
-| "I already know what this function does" | You haven't read the implementation. Docstrings lie. Read the actual code. |
-| "Tests pass, so we're done" | Tests verify what they cover, not the outcome. Verify actual end-to-end behavior. |
 | "I'll clean this up in the next commit" | Next commit never comes in autonomous sessions. Do it now, or file it — Genesis-repo work is a GitHub issue, not a local row. |
 | "This file is too large to read fully" | Read the relevant section. Partial reads lead to partial understanding and wrong fixes. |
 | "The linter is happy, ship it" | Linters catch syntax, not logic. Clean lint with broken behavior is worse than a warning with correct behavior. |
@@ -2381,21 +2321,7 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "I don't need a skill for this" | If a skill exists, use it. The using-superpowers Red Flags table exists for this exact rationalization. |
 | "This review round is the same class, it doesn't really count" | For an EXTERNAL cross-model round, the counter decides, not you — a repeat-class external round still counts; update it every external cycle and STOP at the cap. (Internal same-model reviews are never rounds.) |
 | "The user already said proceed, so I can keep looping" | The escalation/fix-attempt caps CONSUME standing approval. Round 4+ (or fix #4) on an old instruction is a violation, not obedience. |
-| "I can read the summary instead of the source" | Summaries lose context. If you're about to change code, read the code, not the description of it. |
-| "The missing data was the problem — I wrote it, so it's fixed" | The mechanism that failed to write it is the problem. Hand-written artifacts are data repair, not a fix (see Instance-Fix vs Class-Fix Gate). |
 | "I'll just add the field the reviewer flagged" | A spec's required-set is closed — derive and enforce ALL of it at once, with one test locking the whole set, or the next round finds the next missing field (see Debugging Discipline: spec required-sets). |
-
-### Code Discovery
-
-Use the right tool for how you're exploring:
-
-- **Architecture overview** — CBM `get_architecture(aspects=["overview"])`
-- **Finding symbols** — CBM `search_graph(name_pattern="...")` or Serena `find_symbol`
-- **Call tracing** — CBM `trace_path(function_name="...")` or Serena `find_referencing_symbols`
-- **Impact / blast radius** — Serena `find_referencing_symbols` (live caller set); GitNexus `impact` (reindex first) for multi-hop + affected processes
-- **Config/doc/non-code files** — Grep/Read directly
-
-Full decision matrix: `.claude/docs/code-intelligence.md`
 
 ### Auditing Existing Capabilities — enumerate, don't spot-check
 
@@ -2539,32 +2465,8 @@ NOTE-level and carries neither marker — it fails on the ladder test before the
 other two are reached. So run the real recall-tuned audit (`genesis-architect` /
 `CODE_AUDITOR.md`); do not hand-write a soft prompt.
 
-**Honest enforcement model — VERIFY IT, do not assume it.** This section used to
-claim the enforcing teeth were "the independent cloud reviewer + a required human
-approval, gated by **branch protection**", and that the local hook was merely
-advisory friction. **Measured on a live deploy (2026-08-27), that was false in
-both halves**, and the correction matters because it inverts which layer you can
-actually rely on:
-
-- `GET /repos/{owner}/{repo}/branches/main/protection` → **404, not protected**.
-  The protection the claim rested on did not exist. A *ruleset* did — a different
-  API, invisible to the branch-protection endpoint.
-- That ruleset required **one status check** (`test`), not the other CI jobs that
-  blocked AT THE TIME. This whole bullet is a dated measurement, not current
-  state; see the CI paragraph below. Lint, leak-detector and the rest were never
-  server-side required.
-- It carried `bypass_actors: [{actor_type: RepositoryRole, actor_id: 5 (admin),
-  bypass_mode: always}]`. **A bypass entry voids the rule for that actor.** The
-  sole author is the repo admin, and the merge command this skill mandates
-  carries `--admin`.
-
-⇒ For the actor who merges, the server-side backstop was **void**, and the local
-`git_push_guard.py` merge gate was the *only* real enforcement — precisely the
-layer the old text told you to discount.
-
-**⇒ THAT MEASUREMENT IS NOW HISTORY, and this is what the rules below are for.**
-Since PR #1907 (applied 2026-09-10) the rules are SPLIT into two rulesets, and
-the split is exactly the property the 2026-08-27 measurement found missing:
+**Honest enforcement model — VERIFY IT, do not assume it.** Since PR #1907
+(applied 2026-09-10) the rules are SPLIT into two rulesets:
 `.github/rulesets/checks.json` carries `"bypass_actors": []` and requires `test`,
 `leak-detector` and `lint`, so **those three now bind an `--admin` merge
 server-side** — GitHub reports `current_user_can_bypass: "never"` for the owner
@@ -2572,10 +2474,11 @@ on that ruleset. `approvals.json` keeps the admin bypass deliberately, because a
 sole maintainer cannot approve their own pull request; it carries `pull_request`,
 `update` and `creation` only. Rationale and the accepted residual:
 `.github/rulesets/README.md`.
-Kept rather than rewritten, because the reasoning is the lesson and the state is
-the perishable part. Do not read the paragraph above as current — read it as what
-you find when you finally query, and note that this correction itself has a date
-on it.
+Before the split (measured 2026-08-27) `branches/main/protection` returned 404
+(no branch protection; the one ruleset is a separate API that endpoint cannot
+see), and that ruleset carried an admin bypass, so for the merging admin the local merge gate was the
+only enforcement. Rule 1 below is that lesson; the full measurement is in git
+history.
 
 **Two rules follow.**
 
@@ -3084,12 +2987,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   fields for stale-worktree compatibility. Current authorization uses
   `scripts/review_budget.py`; the commit gate reads the local streak from one snapshot
   only for the round-2/round-3 interventions. The old lifetime APIs remain
-  import-compatible but current gates do not consult them. `FINAL_ROUND_CAP` is
-  **DELETED** (2026-09-25) — it was consulted by no gate, in zero conditionals, while
-  its value had been picked to avoid colliding with the four-head boundary, so a
-  retired tier was still shaping the live one and reading as though a seventh round
-  were real. The `final-round-accept` SIGIL is still parsed and loudly refused, so a
-  stale worktree is still told it is dead.
+  import-compatible but current gates do not consult them. The
+  `final-round-accept` SIGIL is still parsed and loudly refused, so a stale
+  worktree is still told it is dead.
 
   **THE COUNTER IS CROSS-MODEL ONLY.** The streak exists to catch *cross-model
   non-convergence* — an EXTERNAL reviewer finding NEW defects round after round. It does
@@ -3191,6 +3091,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   head that drew findings itself is a round, never a fix to confirm, so it gets no free
   request. (Residual, by owner ruling: an approved UNMARKED request that comes back
   clean leaves the marked one unspent.)
+  Past the limit both gates ASK the owner at the action and REFUSE in a
+  dispatched session: the push guard for a further review request
+  (`review_budget.py` `approval_required`; `git_push_guard.py`, the
+  `_is_dispatched()` check after `_check_codex_round_escalation`), and the commit
+  gate for a fix commit once a third round is recorded, or at two rounds once
+  the confirmation is spent (`commit_approval_required`;
+  `review_enforcement_commit.py` `_allow`). Unreadable round evidence takes the
+  same ask/deny path at any count. The
+  round-2 merge-or-abandon decision (rule 4 below) is doctrine; no gate makes it.
 
   **Scope: any PR whose diff touches the enforcement-hook surface** —
   `HOOK_SURFACE_PREFIXES` + `HOOK_SURFACE_FILES` in `scripts/review_budget.py`.
@@ -3787,25 +3696,18 @@ Verify before any commit:
   mention WITHOUT the `Ledger:` marker is context, not completion (the pulse
   only proposes it). Find ids via `session_charter` or the charter injection
   block.
-- **Anything a hook prints to CC's context has a hard, measured ceiling.**
-  The harness FILES a hook's stdout above **10,000 characters per hook entry**
-  (CC 2.1.246; undocumented, version-volatile — see
-  `docs/reference/cc-compatibility.md`) and shows the model a 2 KB preview;
-  the rest silently never arrives. The SessionStart injection is therefore
+- **Anything a hook prints to CC's context has a hard, measured ceiling**
+  (CLAUDE.md "Hook Output Persistence"). The SessionStart injection is therefore
   four `--part` entries with per-part budgets, CI ceilings on every tracked
   identity file (`tests/test_scripts/test_context_injection_budget.py`), and a
   watcher over the harness's own filings. Adding protocol text to an identity
   file is a budget decision: put DETAIL in a reference doc and a pointer in the
   injected file. If you add or grow a hook's stdout, measure it against the
-  cap; after a CC bump, re-run the probe (`GENESIS_CTX_PROBE_BYTES`).
-  **Emit through `scripts/hooks/hook_output.py`** — the single home of the
-  measured constant, whose `BoundedStdout` enforces the budget at the WRITER so
-  a block that forgets to check cannot overrun (2 of 12 blocks checked when the
-  budget was per-caller), and whose `print_json_bounded` trims named free-text
-  fields while never sacrificing the JSON envelope — an oversized advisory must
-  lose prose, never its `permissionDecision`. Only SessionStart,
-  UserPromptSubmit and UserPromptExpansion carry bare stdout to the model; a
-  Stop hook that `print`s on exit 0 is INERT.
+  cap; after a CC bump, re-run the probe (`GENESIS_CTX_PROBE_BYTES`; procedure:
+  `docs/reference/cc-compatibility.md`).
+  `hook_output.py`'s `BoundedStdout` enforces the budget at the WRITER, so a
+  block that forgets to check cannot overrun (2 of 12 blocks checked when the
+  budget was per-caller). A Stop hook that `print`s on exit 0 is INERT.
 
   **NEVER compute characters at the call site — say what the DEGRADE looks
   like.** `out.emit_or_degrade(text, block=…, pointer=…, notice=…, reserve=…)`
@@ -4075,8 +3977,8 @@ builder's debt.
   gate un-green creates a `ready` follow-up naming the PR and the event it
   awaits, BEFORE stopping. That row is the drain's intake — an un-driven
   open PR without its row IS a stranded artifact under the zero-drop rule,
-  never "the normal flow". Until a dedicated closing station exists, the
-  queue drains through those rows under the project's ≈51/49 lean.
+  never "the normal flow". The queue drains through those rows under the
+  project's ≈51/49 lean (a dispatched session's rows land in `tabled`: #2857).
 
 Scope against CLAUDE.md's ≈51/49 close-before-open lean: unchanged for
 closing-shaped work (answering, merging green PRs, the handoff row). What
