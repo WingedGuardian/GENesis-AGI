@@ -414,10 +414,11 @@ if sys.argv[1] == "rebuild":
             record("f" * 40 if mode in ("foreign", "foreign-success") else head(),
                    "moving" if mode in ("move-signal", "move-moving") else
                    "ref" if mode == "move-ref" else "done")
-    if mode in ("partial", "garbage"):
-        # git wrote part of the new tree (an untracked file) and failed; HEAD stayed.
+    if mode in ("partial", "garbage", "interrupted"):
+        # git wrote part of the new tree (an untracked file) and failed, or was
+        # killed mid-switch (the record still says "moving"); HEAD stayed.
         open(os.path.join(root, "half-written.py"), "w").write("x = 1\\n")
-        record("e" * 40, mode)
+        record("e" * 40, "moving" if mode == "interrupted" else mode)
     if mode == "move-signal":
         os.kill(os.getppid(), signal.SIGTERM)
     sys.exit(0 if mode in ("", "move", "foreign-success", "unrecorded-success",
@@ -549,11 +550,11 @@ def test_success_adopts_only_the_unchanged_or_recorded_tip(plain_live, mode):
     assert not _move_record(home).exists()
 
 
-@pytest.mark.parametrize("mode", ["partial", "garbage"])
+@pytest.mark.parametrize("mode", ["partial", "garbage", "interrupted"])
 def test_a_partly_written_tree_is_never_restarted(plain_live, mode):
     """Codex P2: git wrote part of the new tree (here an untracked file, which
-    no tracked-dirt check sees) and failed with HEAD unmoved; or the record
-    cannot be read. The rollback restarts nothing and says the tree may be mixed."""
+    no tracked-dirt check sees) and failed with HEAD unmoved; or it was killed
+    mid-switch (record "moving", HEAD unmoved); or the record cannot be read. The rollback restarts nothing and says the tree may be mixed."""
     root, home, stub, env, log = plain_live
     old = _git(root, "rev-parse", "HEAD")
     r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": mode})

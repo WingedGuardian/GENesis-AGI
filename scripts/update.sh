@@ -332,7 +332,7 @@ import json, re, sys
 with open(sys.argv[1], encoding="utf-8") as fh:
     d = json.load(fh)
 to, phase = d.get("to"), d.get("phase")
-if not (isinstance(to, str) and re.fullmatch("[0-9a-f]{40}", to)
+if not (isinstance(to, str) and re.fullmatch("[0-9a-f]{40}(?:[0-9a-f]{24})?", to)
         and phase in ("ref", "moving", "partial", "clean", "done")):
     raise SystemExit(1)
 print(to, phase)
