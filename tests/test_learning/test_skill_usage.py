@@ -301,7 +301,7 @@ def test_invoked_skills_reinjection_is_ignored(env):
 
 
 def test_skill_md_read_under_worktree_counts_but_editing_session_does_not(env):
-    wt = "/home/u/genesis/.claude/worktrees/x/.claude/skills/alpha/SKILL.md"
+    wt = "/srv/checkout/.claude/worktrees/x/.claude/skills/alpha/SKILL.md"
     write_transcript(env["projects"], "p", "s1", [tool_use("s1", "Read", wt)])
     write_transcript(
         env["projects"],
