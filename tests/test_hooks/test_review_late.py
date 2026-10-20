@@ -787,7 +787,7 @@ def test_an_unreadable_commit_time_credits_nothing_on_the_late_path(tmp_path, mo
 
     def blank_times(argv, cwd=None):
         code, out, err = real(argv, cwd)
-        if "--no-show-signature" in argv and "--ancestry-path" in argv:
+        if "--format=%H %T %P|%at %ct" in argv:  # fix_clock's walk only
             out = "\n".join(row.split("|")[0] + "|" for row in out.split("\n") if row.strip())
         return code, out, err
 
@@ -800,6 +800,61 @@ def test_owed_from_budget_with_a_cutover_refuses_past_its_deadline(tmp_path):
     _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
     with pytest.raises(rr.Refused, match="ran out of time"):
         rr.owed_from_budget(str(path), budget, "o/r", 7, now=T0, cutover=CUT, deadline=0.0)
+
+
+def test_a_main_merge_after_the_review_is_no_fix_on_the_way_to_a_later_head(tmp_path):
+    """GLM secondary P2: a fix F, then review c9 of H, then a clean merge of
+    main, then a reflection naming the merged head N. The latest fix on the way
+    from H to N is F (before c9), not the merge, so c9 is answered at N."""
+    path = tmp_path / "repo"
+    path.mkdir()
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.name", "t")
+    _git(path, "config", "user.email", "t@example.com")
+    (path / "f.txt").write_text("x\n")
+    _git(path, "add", "f.txt")
+    _git(path, "commit", "-q", "-m", "base", when=T0 - timedelta(days=2))
+    base = _git(path, "rev-parse", "HEAD")
+    _git(path, "checkout", "-q", "-b", "feat/x")
+    head = _change(path, "y\n", T0 - timedelta(minutes=10))
+    _change(path, "fixed\n", T0 + timedelta(minutes=5))
+    _git(path, "checkout", "-q", "main")
+    (path / "g.txt").write_text("main\n")
+    _git(path, "add", "g.txt")
+    _git(path, "commit", "-q", "-m", "main moves", when=T0 + timedelta(minutes=22))
+    _git(path, "update-ref", "refs/remotes/origin/main", "main")
+    _git(path, "checkout", "-q", "feat/x")
+    _git(path, "merge", "-q", "--no-edit", "main", when=T0 + timedelta(minutes=25))
+    merged = _git(path, "rev-parse", "HEAD")
+    budget = _late_budget(path, base, merged, [_rv(head, _at(0), 1), _rv(head, _at(20), 9)])
+    reader = rl.fix_time_reader(str(path), merged)
+    assert [i["key"] for i in rl.late_findings(budget, CUT, reader)] == ["c9"]
+    _reflect(path, tmp_path, _block(["c9"], merged), T0 + timedelta(minutes=30))
+    assert _credit(path, budget) == {"c9"}
+    # The owe side still counts the merge: owing stays early, never late.
+    assert rl._fix_times(str(path), head, merged)[-1] == T0 + timedelta(minutes=25)
+
+
+def test_covered_late_keys_bounds_its_own_git_calls(pr, tmp_path, monkeypatch):
+    """GLM secondary P3: the deadline argument scopes every git call, not
+    only the top of each reflection's turn."""
+    path, base, head, fix = pr
+    budget = _late_budget(path, base, fix, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])
+    _reflect(path, tmp_path, _block(["c9"], fix), T0 + timedelta(minutes=120))
+    late = rl.late_findings(budget, CUT, rl.fix_time_reader(str(path), fix))
+    seen = []
+    real = rr.fix_clock
+
+    def spy(*args):
+        seen.append(rr._DEADLINE.get())
+        return real(*args)
+
+    monkeypatch.setattr(rr, "fix_clock", spy)
+    far = 10**12
+    assert rl.covered_late_keys(
+        str(path), budget, late, gate_lane=False, acceptance=None, deadline=far
+    ) == {"c9"}
+    assert seen and all(bound == far for bound in seen)
 
 
 def test_a_main_merge_between_the_head_and_the_answer_is_no_fix(pr, tmp_path):

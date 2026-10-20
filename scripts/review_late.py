@@ -270,7 +270,7 @@ def late_owed(
     return keys, [key for key in keys if key not in done]
 
 
-def _fixes(cwd: str, base: str, head: str) -> dict[str, datetime]:
+def _fixes(cwd: str, base: str, head: str, *, credit: bool = False) -> dict[str, datetime]:
     """Every fix after ``base`` on the way to ``head``, with its author time:
     each descendant of ``base`` that ``head`` reaches (``--ancestry-path``)
     and that is a merge or changes the tree (an empty reflection commit is no
@@ -280,24 +280,38 @@ def _fixes(cwd: str, base: str, head: str) -> dict[str, datetime]:
     a stale worktree reverses it), so no reading of one line is safe. Reading
     every path can only owe early and credit less, never the reverse. The
     AUTHOR time, the earlier of the two: amending a fix rewrites only its
-    committer time (owner ruling 2026-10-13). Raises ``Refused`` when git
-    cannot say."""
-    code, out, _ = rr._run(
-        ["git", "-C", cwd, "log", "--ancestry-path", "--format=%H %T %P|%at", f"{base}..{head}"]
-    )
+    committer time (owner ruling 2026-10-13). With ``credit`` (the credit
+    side only; owing stays early), a merge of the default branch that holds
+    only git's merge and its conflict resolution is no fix either
+    (``review_reflection._merge_is_no_fix``, owner ruling 2026-10-20). Raises
+    ``Refused`` when git cannot say."""
+    walk = ["--no-show-signature", "--ancestry-path", "--format=%H %T %P|%at"]
+    code, out, _ = rr._run(["git", "-C", cwd, "log", *walk, f"{base}..{head}"])
     if code != 0:
         raise rr.Refused(f"git log {base[:12]}..{head[:12]} failed")
-    found: dict[str, datetime] = {}
+    rows = []
     for row in out.split("\n"):
         if not row.strip():
             continue
         names, _, stamp = row.partition("|")
-        sha, tree, *parents = names.split()
+        fields = names.split()
+        if len(fields) < 2:
+            raise rr.Refused(f"git log printed an unreadable row: {row[:80]!r}")
+        rows.append((fields[0], fields[1], fields[2:], stamp))
+    on_path = {base, *(sha for sha, _, _, _ in rows)}
+    default: str | None | bool = False  # resolved on the first merge only
+    found: dict[str, datetime] = {}
+    for sha, tree, parents, stamp in rows:
         if (
             len(parents) == 1
             and tree == rr._git(cwd, "rev-parse", f"{parents[0]}^{{tree}}").strip()
         ):
             continue
+        if credit and len(parents) > 1:
+            if default is False:
+                default = rr._default_branch(cwd)
+            if rr._merge_is_no_fix(cwd, tree, parents, default or None, on_path):
+                continue
         if not stamp.strip().isdigit():
             raise rr.Refused(f"a fix after {base[:12]} has no readable author time")
         try:
@@ -307,13 +321,14 @@ def _fixes(cwd: str, base: str, head: str) -> dict[str, datetime]:
     return found
 
 
-def _fix_times(cwd: str, base: str, head: str) -> list[datetime]:
+def _fix_times(cwd: str, base: str, head: str, *, credit: bool = False) -> list[datetime]:
     """The author times of ``_fixes``. The owe rule (earliest fix to the
-    current head) and the credit rule (latest fix to the reflection's head)
-    read the same set, so a key owed is answerable until the next fix lands.
-    A fix committed while a key is owed leaves it owed for good: the commit
-    gate that sets the cutover must stop that commit."""
-    return sorted(_fixes(cwd, base, head).values())
+    current head) and the credit rule (latest fix to the reflection's head,
+    ``credit``: main merges excepted) read the same commits, so a key owed is
+    answerable until the next fix lands. A fix committed while a key is owed
+    leaves it owed for good: the commit gate that sets the cutover must stop
+    that commit."""
+    return sorted(_fixes(cwd, base, head, credit=credit).values())
 
 
 def fix_time_reader(cwd: str, current: str) -> Callable[[str], datetime | None]:
@@ -389,8 +404,10 @@ def covered_late_keys(
       side branch forked from N carries a fix merged in after it;
     - S is no later than T: an answer cannot predate its finding;
     - when N is not H, S is after the LATEST fix on the way from H to N (author
-      time). A review that arrived before a fix was owed before it, and a
-      reflection made after that fix is a rationalisation, not a reflection;
+      time; a merge of the default branch holding only git's merge and its
+      conflict resolution is no fix). A review that arrived before a fix was
+      owed before it, and a reflection made after that fix is a
+      rationalisation, not a reflection;
     - ``check`` passes R under k's own round's context (every candidate round
       when k's round is ambiguous): that round's number, the classes of the
       reflections that are git ancestors of R and name an earlier round, the
@@ -398,9 +415,25 @@ def covered_late_keys(
       T. Round 0 (a late review with no earlier round) owes the grammar only.
 
     Returns only keys from ``late``; the open round's coverage is never mixed
-    in. ``deadline`` is a ``time.monotonic()`` bound; past it the check
+    in. ``deadline`` is a ``time.monotonic()`` bound on the whole check, every
+    git call included (``review_reflection.deadline_scope``); past it the check
     refuses. Raises ``Refused`` when git cannot be read: unknown, never
     nothing owed."""
+    with rr.deadline_scope(deadline):
+        return _covered_late_keys(
+            cwd, budget, late, gate_lane=gate_lane, acceptance=acceptance, deadline=deadline
+        )
+
+
+def _covered_late_keys(
+    cwd: str,
+    budget: Mapping[str, Any],
+    late: Sequence[Mapping[str, Any]],
+    *,
+    gate_lane: bool,
+    acceptance: Sequence[str] | None,
+    deadline: float | None,
+) -> set[str]:
     current = budget.get("current_head")
     in_graph, ancestors = _ancestry(budget)
     log = rr._log_reflections(cwd)
@@ -448,7 +481,7 @@ def covered_late_keys(
                 continue
             if head != reviewed:
                 if (reviewed, head) not in fix_times:
-                    found = _fix_times(cwd, reviewed, head)
+                    found = _fix_times(cwd, reviewed, head, credit=True)
                     fix_times[(reviewed, head)] = max(found) if found else None
                 fixed = fix_times[(reviewed, head)]
                 if fixed is not None and item["at"] <= fixed:
