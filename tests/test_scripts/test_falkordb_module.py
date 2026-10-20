@@ -523,6 +523,15 @@ def test_unit_is_socket_only_and_bounded():
     assert "MemoryMax=1G" in unit
 
 
+def test_unit_keeps_the_engines_own_record_of_slow_moments():
+    """A read that times out client-side is otherwise news with no cause: the
+    engine's slowlog (deep enough to outlast the hourly projection's batches)
+    and its latency monitor are what say whether the engine itself stalled."""
+    argv = _exec_argv(UNIT_TEMPLATE.read_text())
+    assert "--slowlog-max-len 4096" in argv
+    assert "--latency-monitor-threshold 100" in argv
+
+
 def test_start_limit_directives_are_in_the_unit_section():
     """StartLimit* in [Service] is HALF-silently ignored by systemd.
 

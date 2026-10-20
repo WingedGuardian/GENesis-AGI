@@ -218,6 +218,28 @@ def read_psi(resource: str, root: Path = CGROUP_ROOT, proc: Path = PROC_ROOT) ->
     return None
 
 
+def read_psi_totals(root: Path = CGROUP_ROOT, proc: Path = PROC_ROOT) -> dict[str, int] | None:
+    """Cumulative stall time in microseconds (the ``total=`` counter) for cpu,
+    io and memory, keyed ``<resource>_<some|full>``; cgroup files first, as in
+    ``read_psi``. The difference of two readings is the stall time between them,
+    which no ``avg10`` can show for a sub-second wait. None when nothing reads.
+    """
+    out: dict[str, int] = {}
+    for resource in ("cpu", "io", "memory"):
+        for path in (root / f"{resource}.pressure", proc / "pressure" / resource):
+            text = _read_text(path)
+            if not text:
+                continue
+            for line in text.splitlines():
+                kind, _, rest = line.partition(" ")
+                for field in rest.split():
+                    key, _, value = field.partition("=")
+                    if key == "total" and value.isdigit():
+                        out[f"{resource}_{kind}"] = int(value)
+            break
+    return out or None
+
+
 def existing_parent(path: Path | str) -> Path:
     """``path`` or its nearest existing ancestor: a job often writes into a
     directory it has yet to create, on the filesystem of its parent."""

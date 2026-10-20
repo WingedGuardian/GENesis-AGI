@@ -279,7 +279,16 @@ enrichment (MCP, and genesis-server's tool API), `memory_expand`, and
 (`event_type="graph_traverse"`, `dimension="system"`) built by
 `memory/graph_telemetry.py`, one per caller call, with the configured mode, the
 store that answered, and the exception class of any fallback, selection failure
-or error. A call's first fallback, selection failure or error is also written as
+or error. Each such event also names the process at that moment (pid, start
+ticks, age) and, for a read that timed out, the store's own account
+(`GraphUnavailableError.diag` from `graphstore_falkor._bounded`): its budget,
+how far past the deadline it fired (`late_ms` — large means the caller's event
+loop was held, about zero means the engine did not answer), the function names
+of the awaits it cancelled, and the container's PSI stall time across the wait.
+Rows carry `primary_ms`, a latency spread of answered traversals per store, and
+the report prints each reset's cause. The engine unit keeps its own record of
+slow moments (`--slowlog-max-len 4096`, `--latency-monitor-threshold 100`).
+A call's first fallback, selection failure or error is also written as
 its own row the moment it happens, so a process killed mid-request cannot lose the
 evidence that the clock broke. A row that fails to write is carried as
 `prior_write_failures` on the next row and appended to

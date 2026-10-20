@@ -1661,3 +1661,214 @@ async def test_the_visibility_choice_reaches_the_ENGINE_not_just_the_signature(
     # predicate it feeds is short-circuited by the flag.
     assert "now" in params, "the single-query-string design requires now bound in BOTH modes"
     assert "$now" in seen["cypher"]
+
+
+# ── A timeout records its own cause (T1: the cutover-clock resets) ─────────
+#
+# Every reset of the cutover clock since 2026-10-13 was a read TimeoutError, and
+# the row said only that. These pin what a timeout now carries on `.diag`, so the
+# next one names WHERE the wait was (frame names), WHETHER our own loop was late
+# at the deadline (`late_ms`), and the box's stall time across the wait.
+
+
+class _HangingGraph:
+    async def query(self, cypher, params):
+        await _hang_in_query()
+
+
+async def _hang_in_query():
+    import asyncio as _asyncio
+
+    await _asyncio.sleep(5)
+
+
+class _FastClient:
+    def __init__(self, *a, **k):
+        pass
+
+    def select_graph(self, key):
+        return _HangingGraph()
+
+
+async def test_a_query_timeout_names_the_awaits_it_cancelled(tmp_path):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _FastClient),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        pytest.raises(GraphUnavailableError, match="exceeded") as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    diag = caught.value.diag
+    assert diag["budget_ms"] == 50.0
+    # Deepest last; the innermost is the library await the fake sits in, as the
+    # client's reader (`readuntil`) is for a real engine that never replies.
+    assert diag["frames"][-2:] == ["_hang_in_query", "sleep"], diag["frames"]
+    # A responsive loop fires the deadline on time.
+    assert diag["elapsed_ms"] >= 50.0
+    assert diag["late_ms"] < 40.0, diag
+
+
+async def test_a_connect_timeout_is_told_apart_from_a_query_timeout(tmp_path):
+    import threading
+
+    release = threading.Event()
+
+    class _SlowClient:
+        def __init__(self, *a, **k):
+            release.wait(timeout=5)
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    try:
+        with (
+            patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+            patch.object(falkor_mod, "_FalkorDB", _SlowClient),
+            patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+            pytest.raises(GraphUnavailableError) as caught,
+        ):
+            await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+    finally:
+        release.set()
+
+    frames = caught.value.diag["frames"]
+    assert "_graph" in frames, frames
+    assert "_hang_in_query" not in frames
+
+
+async def test_a_loop_blocked_past_the_deadline_shows_as_late(tmp_path):
+    """The discriminator for "our process stalled" vs "the engine was slow": the
+    deadline can only fire when the loop runs, so a blocked loop makes it late."""
+    import asyncio as _asyncio
+
+    class _BlockingGraph:
+        async def query(self, cypher, params):
+            await _asyncio.sleep(0.01)  # a real suspension first
+            time.sleep(0.3)  # then hold the loop well past the 50 ms deadline
+            await _asyncio.sleep(5)
+
+    class _Client(_FastClient):
+        def select_graph(self, key):
+            return _BlockingGraph()
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    assert caught.value.diag["late_ms"] >= 150.0, caught.value.diag
+
+
+async def test_a_spent_budget_says_so_instead_of_naming_frames():
+    store = FalkorGraphStore(socket_path="/nonexistent.sock")
+    with pytest.raises(GraphUnavailableError, match="budget was spent") as caught:
+        await store._assert_projection_exists(deadline=time.monotonic() - 0.1)
+
+    diag = caught.value.diag
+    assert diag["budget_spent"] is True
+    assert diag["frames"] is None
+    assert diag["late_ms"] >= 100.0
+
+
+async def test_a_timeout_records_the_stall_time_across_its_wait(tmp_path):
+    reads = iter(
+        [
+            {"cpu_some": 1_000, "io_full": 50},
+            {"cpu_some": 251_000, "io_full": 50},
+        ]
+    )
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _FastClient),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        patch.object(falkor_mod, "_psi_totals", lambda: next(reads)),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    assert caught.value.diag["psi_stall_us"] == {"cpu_some": 250_000, "io_full": 0}
+
+
+async def test_an_unreadable_pressure_file_never_costs_the_diagnosis(tmp_path):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _FastClient),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        patch.object(falkor_mod, "_psi_totals", lambda: None),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    diag = caught.value.diag
+    assert diag["psi_stall_us"] is None
+    assert "_hang_in_query" in diag["frames"]
+
+
+async def test_a_raising_pressure_reader_never_costs_the_error(tmp_path):
+    """The reader runs before the deadline's try, on every bounded call: if its
+    guard were lost, a reader fault would escape as something other than the
+    seam's error and turn a fallback into a failed recall."""
+    import genesis.hostmetrics.readings as readings
+
+    def _boom(*a, **k):
+        raise ValueError("unparseable pressure file")
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(readings, "read_psi_totals", _boom),
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _FastClient),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    assert caught.value.diag["psi_stall_us"] is None
+    assert caught.value.diag["query"] == "traverse"
+
+
+async def test_a_marker_query_timeout_is_named_as_the_marker(tmp_path):
+    """The second query of an empty traversal runs on what the first left of the
+    budget; its frames alone would look like a main-query timeout."""
+    import asyncio as _asyncio
+
+    class _EmptyThenHang:
+        async def query(self, cypher, params):
+            if "ProjectionMeta" in cypher:
+                await _asyncio.sleep(5)
+
+            class _R:
+                result_set: list = []
+
+            return _R()
+
+    class _Client(_FastClient):
+        def select_graph(self, key):
+            return _EmptyThenHang()
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    diag = caught.value.diag
+    assert diag["query"] == "marker"
+    assert diag["budget_ms"] <= 50.0
+
+
+async def test_a_spent_budget_reports_the_traversal_budget_not_zero():
+    store = FalkorGraphStore(socket_path="/nonexistent.sock")
+    with pytest.raises(GraphUnavailableError) as caught:
+        await store._assert_projection_exists(deadline=time.monotonic() - 0.1)
+    assert caught.value.diag["budget_ms"] == falkor_mod._READ_TIMEOUT_S * 1000
+    assert caught.value.diag["query"] == "marker"
