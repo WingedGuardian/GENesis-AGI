@@ -330,15 +330,6 @@ def fix_time_reader(cwd: str, current: str) -> Callable[[str], datetime | None]:
     return fix_time
 
 
-def _is_ancestor(cwd: str, sha: str, of: str) -> bool:
-    """Whether commit ``sha`` is an ancestor of ``of`` (git's exit 0 or 1).
-    Any other exit refuses: an unreadable history is unknown, never "no"."""
-    code, _, _ = rr._run(["git", "-C", cwd, "merge-base", "--is-ancestor", sha, of])
-    if code in (0, 1):
-        return code == 0
-    raise rr.Refused(f"git merge-base --is-ancestor {sha[:12]} {of[:12]} failed")
-
-
 def _descendants(cwd: str, sha: str, current: str) -> set[str]:
     """Every commit after ``sha`` that ``current`` reaches through it
     (``rev-list --ancestry-path``). Raises ``Refused`` when git cannot say."""
@@ -362,7 +353,7 @@ def _prior_labels(
     rows = [
         row
         for row in log
-        if row[0] != sha and rr.parse(row[2]).head in wanted and _is_ancestor(cwd, row[0], sha)
+        if row[0] != sha and rr.parse(row[2]).head in wanted and rr._is_ancestor(cwd, row[0], sha)
     ]
     return rr._class_labels(rows, prior_heads)
 
@@ -380,7 +371,10 @@ def covered_late_keys(
     N, committed at T, credits late key k (reviewed on head H at time S) only
     when ALL hold:
 
-    - R is an empty commit made before any fix to N (``before_any_fix``);
+    - R is an empty commit made before any fix, on the way from N, of k: a
+      commit made before S is no fix of k, nor is a merge of the default
+      branch holding only git's merge and its conflict resolution
+      (``review_reflection.fix_clock``, owner rulings 2026-10-20);
     - N is the current head or in its history, and N is H or descends from it
       (from the budget's commit graph; unknown ancestry never credits);
     - R came before every fix that reached the current head: each fix after
@@ -424,10 +418,13 @@ def covered_late_keys(
             continue
         if not (head == current or _descends(ancestors, str(current), head)):
             continue
-        if not rr.before_any_fix(cwd, head, sha):
+        # Judged per key below: a commit between N and R made before a key's
+        # review is no fix of it.
+        clock = rr.fix_clock(cwd, head, sha)
+        if clock is rr.NEVER:
             continue
-        if not _is_ancestor(cwd, str(current), sha):
-            if not _is_ancestor(cwd, sha, str(current)):
+        if not rr._is_ancestor(cwd, str(current), sha):
+            if not rr._is_ancestor(cwd, sha, str(current)):
                 continue
             if head not in fix_sets:
                 fix_sets[head] = _fixes(cwd, head, str(current))
@@ -446,6 +443,8 @@ def covered_late_keys(
             if reviewed not in in_graph or not _descends(ancestors, head, reviewed):
                 continue
             if item["at"] > made_at + rr._COMMIT_CLOCK_SLACK:
+                continue
+            if not rr.clears(clock, item["at"]):
                 continue
             if head != reviewed:
                 if (reviewed, head) not in fix_times:
@@ -508,8 +507,23 @@ def late_status(
     """``review_reflection.status`` with a cutover: the open round judged as
     without one, plus the late keys from ``cutover`` on, each credited only
     under its own round; owed is unknown whenever the late debt is.
-    ``deadline`` (``time.monotonic()``) bounds the late-credit walk. Raises
-    ``Refused`` when git cannot be read."""
+    ``deadline`` (``time.monotonic()``) bounds every git and network call made
+    here (``review_reflection.deadline_scope``); past it, as when git cannot be
+    read, this raises ``Refused``."""
+    with rr.deadline_scope(deadline):
+        return _late_status(cwd, budget, repo, number, now=now, cutover=cutover, deadline=deadline)
+
+
+def _late_status(
+    cwd: str,
+    budget: Mapping[str, Any],
+    repo: str,
+    number: int,
+    *,
+    now: datetime,
+    cutover: str,
+    deadline: float | None,
+) -> dict[str, Any]:
     ok = budget.get("status") == "ok"
     fix_time = fix_time_reader(cwd, str(budget.get("current_head"))) if ok else None
     state = rr.owed_state(budget, (), now=now, cutover=cutover, fix_time=fix_time)
@@ -523,7 +537,7 @@ def late_status(
     acceptance = (
         rr._acceptance(budget, repo, number) if is_open or _needs_acceptance(budget, late) else None
     )
-    covered = rr._open_covered(cwd, budget, state, acceptance) if is_open else set()
+    covered = rr._open_covered(cwd, budget, state, acceptance, deadline) if is_open else set()
     late_covered = (
         covered_late_keys(
             cwd,

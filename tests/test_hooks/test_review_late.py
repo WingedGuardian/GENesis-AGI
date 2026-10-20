@@ -681,6 +681,142 @@ def test_a_review_between_two_fixes_is_owed_from_the_first(pr, tmp_path):
     assert [i["key"] for i in rl.late_findings(budget, CUT, reader)] == ["c9"]
 
 
+def test_a_commit_pushed_before_its_review_landed_leaves_the_key_answerable(tmp_path):
+    """The architect's blocker on the 2026-10-20 plan: H is pushed and opens a
+    round, C is committed and pushed before review c9 of H lands, so c9 is
+    owed (it arrived after a fix existed, ruling e70d4934). A reflection naming
+    H, made after C, used to be refused for good because C sits between them.
+    C predates c9, so it is no fix of it (owner ruling 2026-10-20)."""
+    path = tmp_path / "repo"
+    path.mkdir()
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.name", "t")
+    _git(path, "config", "user.email", "t@example.com")
+    (path / "f.txt").write_text("x\n")
+    _git(path, "add", "f.txt")
+    _git(path, "commit", "-q", "-m", "base", when=T0 - timedelta(days=2))
+    base = _git(path, "rev-parse", "HEAD")
+    _git(path, "checkout", "-q", "-b", "feat/x")
+    head = _change(path, "y\n", T0 - timedelta(minutes=10))
+    pushed = _change(path, "local\n", T0 + timedelta(minutes=5))
+    reviews = [_rv(head, _at(0), 1), _rv(head, _at(20), 9)]
+    budget = _late_budget(path, base, pushed, reviews)
+    reader = rl.fix_time_reader(str(path), pushed)
+    assert [i["key"] for i in rl.late_findings(budget, CUT, reader)] == ["c9"]
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
+    assert _credit(path, budget) == {"c9"}
+
+
+def test_a_commit_after_the_review_still_refuses_an_answer_naming_the_head(tmp_path):
+    """The control: a commit between H and the reflection made after c9 landed
+    is a fix of c9, so the reflection naming H is refused."""
+    path = tmp_path / "repo"
+    path.mkdir()
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.name", "t")
+    _git(path, "config", "user.email", "t@example.com")
+    (path / "f.txt").write_text("x\n")
+    _git(path, "add", "f.txt")
+    _git(path, "commit", "-q", "-m", "base", when=T0 - timedelta(days=2))
+    base = _git(path, "rev-parse", "HEAD")
+    _git(path, "checkout", "-q", "-b", "feat/x")
+    head = _change(path, "y\n", T0 - timedelta(minutes=10))
+    pushed = _change(path, "local\n", T0 + timedelta(minutes=5))
+    reviews = [_rv(head, _at(0), 1), _rv(head, _at(20), 9)]
+    budget = _late_budget(path, base, pushed, reviews)
+    _change(path, "fixes c9\n", T0 + timedelta(minutes=25))
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
+    assert _credit(path, budget) == set()
+
+
+def _pushed_before_review(tmp_path):
+    """H opens a round with c1, C is committed and pushed at +5, review c9 of H
+    lands at +20: c9 is owed (e70d4934)."""
+    path = tmp_path / "repo"
+    path.mkdir()
+    _git(path, "init", "-q", "-b", "main")
+    _git(path, "config", "user.name", "t")
+    _git(path, "config", "user.email", "t@example.com")
+    (path / "f.txt").write_text("x\n")
+    _git(path, "add", "f.txt")
+    _git(path, "commit", "-q", "-m", "base", when=T0 - timedelta(days=2))
+    base = _git(path, "rev-parse", "HEAD")
+    _git(path, "checkout", "-q", "-b", "feat/x")
+    head = _change(path, "y\n", T0 - timedelta(minutes=10))
+    pushed = _change(path, "local\n", T0 + timedelta(minutes=5))
+    budget = _late_budget(path, base, pushed, [_rv(head, _at(0), 1), _rv(head, _at(20), 9)])
+    return path, head, pushed, budget
+
+
+def test_a_pre_review_commit_amended_after_the_review_is_a_fix(tmp_path):
+    """The later of author and committer time decides on this path too."""
+    path, head, _, _ = _pushed_before_review(tmp_path)
+    stamp = (T0 + timedelta(minutes=25)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-q", "--amend", "--no-edit"],
+        check=True,
+        env={**os.environ, "GIT_COMMITTER_DATE": stamp},
+    )
+    amended = _git(path, "rev-parse", "HEAD")
+    base = _git(path, "rev-list", "--max-parents=0", "HEAD")
+    budget = _late_budget(path, base, amended, [_rv(head, _at(0), 1), _rv(head, _at(20), 9)])
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
+    assert _credit(path, budget) == set()
+
+
+def test_a_side_merge_on_the_late_path_is_judged_by_its_time(tmp_path):
+    path, head, pushed, budget = _pushed_before_review(tmp_path)
+    _git(path, "checkout", "-q", "-b", "side", "main")
+    _git(path, "commit", "-q", "--allow-empty", "-m", "side", when=T0)
+    _git(path, "update-ref", "refs/remotes/origin/main", "main")  # side is not in it
+    _git(path, "checkout", "-q", "feat/x")
+    _git(path, "merge", "-q", "--no-ff", "--no-edit", "side", when=T0 + timedelta(minutes=10))
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
+    assert _credit(path, budget) == {"c9"}
+    _git(path, "reset", "-q", "--hard", pushed)
+    _git(path, "merge", "-q", "--no-ff", "--no-edit", "side", when=T0 + timedelta(minutes=25))
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
+    assert _credit(path, budget) == set()
+
+
+def test_an_unreadable_commit_time_credits_nothing_on_the_late_path(tmp_path, monkeypatch):
+    path, head, _, budget = _pushed_before_review(tmp_path)
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
+    assert _credit(path, budget) == {"c9"}
+    real = rr._run
+
+    def blank_times(argv, cwd=None):
+        code, out, err = real(argv, cwd)
+        if "--no-show-signature" in argv and "--ancestry-path" in argv:
+            out = "\n".join(row.split("|")[0] + "|" for row in out.split("\n") if row.strip())
+        return code, out, err
+
+    monkeypatch.setattr(rr, "_run", blank_times)
+    assert _credit(path, budget) == set()
+
+
+def test_owed_from_budget_with_a_cutover_refuses_past_its_deadline(tmp_path):
+    path, head, _, budget = _pushed_before_review(tmp_path)
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
+    with pytest.raises(rr.Refused, match="ran out of time"):
+        rr.owed_from_budget(str(path), budget, "o/r", 7, now=T0, cutover=CUT, deadline=0.0)
+
+
+def test_a_main_merge_between_the_head_and_the_answer_is_no_fix(pr, tmp_path):
+    path, base, head, fix = pr
+    reviews = [_rv(head, _at(0), 1), _rv(head, _at(90), 9)]
+    budget = _late_budget(path, base, fix, reviews)
+    _git(path, "checkout", "-q", "main")
+    (path / "g.txt").write_text("main\n")
+    _git(path, "add", "g.txt")
+    _git(path, "commit", "-q", "-m", "main moves", when=T0 + timedelta(minutes=100))
+    _git(path, "update-ref", "refs/remotes/origin/main", "main")
+    _git(path, "checkout", "-q", "feat/x")
+    _git(path, "merge", "-q", "--no-edit", "main", when=T0 + timedelta(minutes=110))
+    _reflect(path, tmp_path, _block(["c9"], fix), T0 + timedelta(minutes=120))
+    assert _credit(path, budget) == {"c9"}
+
+
 def test_two_reflections_credit_the_union(pr, tmp_path):
     path, base, head, fix = pr
     reviews = [_rv(head, _at(0), 1), _rv(head, _at(85), 8), _rv(head, _at(90), 9)]
@@ -988,9 +1124,9 @@ def test_an_unreadable_ancestry_probe_refuses(monkeypatch):
     """S3: git's exit 0 is an ancestor, 1 is not; anything else is unknown."""
     monkeypatch.setattr(rr, "_run", lambda argv, cwd=None: (128, "", "fatal"))
     with pytest.raises(rr.Refused):
-        rl._is_ancestor("/nowhere", H1, H2)
+        rr._is_ancestor("/nowhere", H1, H2)
     monkeypatch.setattr(rr, "_run", lambda argv, cwd=None: (1, "", ""))
-    assert rl._is_ancestor("/nowhere", H1, H2) is False
+    assert rr._is_ancestor("/nowhere", H1, H2) is False
 
 
 # -- status, end to end -----------------------------------------------------------
