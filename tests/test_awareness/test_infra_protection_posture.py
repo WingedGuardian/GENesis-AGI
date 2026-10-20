@@ -799,6 +799,13 @@ def test_every_rule_slug_has_detail_text():
             _profile(falkordb_active="inactive", falkordb_mode="falkordb")
         )
     )
+    # codebase-memory-mcp registered but not set up (its own section).
+    prof_cbm = _profile()
+    prof_cbm["sections"]["codebase_mcp"] = {
+        "status": "ok",
+        "facts": {"registered": True, "disabled": False, "config_present": False},
+    }
+    producible |= set(_infra_missing_protections(prof_cbm))
     assert producible == set(_loop._INFRA_POSTURE_DETAIL)
 
 
@@ -921,3 +928,51 @@ def test_tailscale_watchdog_rule_silent_otherwise(tailscaled, state):
     assert "tailscale_watchdog_absent" not in _infra_missing_protections(
         _profile(tailscaled=tailscaled, ts_watchdog=state)
     )
+
+
+# ── codebase-memory-mcp: a tooling gap, not a crash-resilience one ────────────
+
+_CBM_UNSET = {"registered": True, "disabled": False, "config_present": False}
+
+
+def _with_cbm(profile: dict, facts: dict) -> dict:
+    profile["sections"]["codebase_mcp"] = {"status": "ok", "facts": facts}
+    return profile
+
+
+@pytest.mark.asyncio
+async def test_codebase_alert_alone_does_not_claim_crash_resilience(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _with_cbm(_profile(), _CBM_UNSET))
+        await _check_infra_protection_posture(db)
+        (alert,) = await _alerts(db)
+        assert "codebase_mcp_registered_unconfigured" in alert["content"]
+        assert "crash-resilience guarantee" not in alert["content"]
+        assert "developer-tooling gap" in alert["content"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_codebase_alert_beside_a_real_protection_keeps_both_trailers(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _with_cbm(_profile(swap_max=0), _CBM_UNSET))
+        await _check_infra_protection_posture(db)
+        (alert,) = await _alerts(db)
+        assert "crash-resilience guarantee" in alert["content"]
+        assert "codebase_mcp_registered_unconfigured: a developer-tooling gap" in alert["content"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_codebase_opt_out_is_silent(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _with_cbm(_profile(), {**_CBM_UNSET, "disabled": True}))
+        await _check_infra_protection_posture(db)
+        assert await _alerts(db) == []
+    finally:
+        await db.close()

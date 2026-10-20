@@ -1203,3 +1203,114 @@ def test_update_records_its_own_head_the_moment_it_adopts_the_merge():
     between = code[adopt:record]
     assert "\nfi" not in between, "the state write must sit inside the adoption branch"
     assert code.count('_write_state "merging"') == 2
+
+
+# ── Crash recovery is RECORDED in update_history (#2631) ─────────────
+
+
+def _migrated_genesis_root(tmp_path: Path, root: Path) -> Path:
+    """Give the recovery fixture a database built by the real migration chain.
+
+    The recording step runs ``PYTHONPATH=$GENESIS_ROOT/src python3`` against
+    ``$GENESIS_ROOT/data/genesis.db``, so the fixture root gets this checkout's
+    ``src`` (a git-excluded symlink: untracked, so recovery never sees it as an
+    edit) and a database that every shipped migration has run on — with HOME and
+    secrets sandboxed, since 0086 seeds a user config file.
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from genesis.db.migrations.runner import MigrationRunner
+
+    (root / "src").symlink_to(REPO_ROOT / "src")
+    with (root / ".git" / "info" / "exclude").open("a") as fh:
+        fh.write("/src\n/data/\n")
+    db = root / "data" / "genesis.db"
+    db.parent.mkdir(parents=True)
+
+    async def _migrate() -> None:
+        async with aiosqlite.connect(str(db)) as conn:
+            results = await MigrationRunner(conn).run_pending()
+            assert results and all(r.success for r in results)
+
+    sandbox = tmp_path / "migrate-home"
+    sandbox.mkdir()
+    saved = {k: os.environ.get(k) for k in ("HOME", "SECRETS_PATH", "USER_TIMEZONE")}
+    os.environ["HOME"] = str(sandbox)
+    os.environ["SECRETS_PATH"] = str(sandbox / "isolated-secrets.env")
+    os.environ.pop("USER_TIMEZONE", None)
+    try:
+        asyncio.run(_migrate())
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return db
+
+
+def _history(db: Path) -> list[tuple]:
+    import sqlite3
+
+    con = sqlite3.connect(db)
+    try:
+        return con.execute(
+            "SELECT status, old_tag, new_tag, rollback_tag, failure_reason FROM update_history"
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def test_crash_recovery_records_a_crashed_recovered_row(tmp_path):
+    """The recovery's INSERT lands on a database built by the real migrations.
+
+    Before the fix the 0024 CHECK rejected 'crashed_recovered', the IntegrityError
+    was swallowed, and the table stayed empty."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    db = _migrated_genesis_root(tmp_path, root)
+    proc, state_path = _recover(tmp_path, root, own_head=deploy, deploy_head=deploy)
+
+    _assert_recovered(proc, state_path, root, rollback)
+    assert _history(db) == [
+        ("crashed_recovered", "", "", "rollback", "Crashed in phase: merging")
+    ]
+    assert "WARNING" not in proc.stdout + proc.stderr
+
+
+def test_a_failed_crash_record_is_reported_on_stderr_and_stays_non_fatal(tmp_path):
+    """A refused INSERT names its error on stderr; recovery still completes."""
+    import sqlite3
+
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    db = _migrated_genesis_root(tmp_path, root)
+    con = sqlite3.connect(db)
+    con.execute("DROP TABLE update_history")
+    con.commit()
+    con.close()
+    proc, state_path = _recover(tmp_path, root, own_head=deploy, deploy_head=deploy)
+
+    _assert_recovered(proc, state_path, root, rollback)
+    assert "failed to record crash recovery" in proc.stderr
+    assert "no such table: update_history" in proc.stderr
+
+
+def test_a_crash_recovered_twice_from_the_same_state_is_recorded_once(tmp_path):
+    """A bootstrap killed after the INSERT commits but before the state file is
+    removed re-reads the same state; the row id is derived from that run, so the
+    second recovery adds nothing. A different run still gets its own row."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    db = _migrated_genesis_root(tmp_path, root)
+    run = {"own_head": deploy, "deploy_head": deploy, "started_at": "2026-10-18T20:00:00+00:00"}
+    first, _ = _recover(tmp_path, root, **run)
+    assert first.returncode == 0, first.stderr
+    again, state_path = _recover(tmp_path, root, **run)  # same state, as if re-read
+    _assert_recovered(again, state_path, root, rollback)
+    assert len(_history(db)) == 1
+    other, _ = _recover(tmp_path, root, **{**run, "started_at": "2026-10-18T21:00:00+00:00"})
+    assert other.returncode == 0, other.stderr
+    assert len(_history(db)) == 2

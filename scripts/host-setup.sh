@@ -869,7 +869,7 @@ incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
 # internal container IP.
 echo "  Setting up dashboard port forwarding..."
 if incus config device get "$CONTAINER_NAME" dashboard-proxy listen &>/dev/null; then
-    echo "  + Dashboard proxy already configured"
+    echo "  + Dashboard proxy device present (its settings are checked below)"
 else
     if incus config device add "$CONTAINER_NAME" dashboard-proxy proxy \
         listen=tcp:0.0.0.0:5000 connect=tcp:127.0.0.1:5000 2>/dev/null; then
@@ -988,7 +988,30 @@ elif [ -n "$LAN_IPV4" ]; then
     ACCESS_METHOD="lan"
 fi
 
-if [ -n "$HOST_IPV4" ]; then
+# Advertise a host URL only when a proxy device is set up to serve it (#3161): the
+# step above accepts an existing dashboard-proxy by name and only warns when
+# `device add` fails, so neither proves a device forwards $HOST_IPV4:5000 to the
+# dashboard. The check reads the device configuration; it does not probe a
+# listener, because the server is not installed yet at this step.
+# shellcheck source=lib/dashboard_proxy.sh
+. "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/dashboard_proxy.sh"
+PROXY_OK=0
+_proxy_report=""
+if _proxy_report=$(dashboard_proxy_check "$CONTAINER_NAME" 5000); then
+    PROXY_OK=1
+    echo "  + Dashboard proxy configuration verified ($_proxy_report)"
+else
+    # The check prints what it found, then a "fix: <command>" line.
+    _nl='
+'
+    echo "  WARN: Cannot confirm the dashboard is reachable through the host: ${_proxy_report%%"$_nl"*}"
+    echo "        Until fixed, setup offers only the container address."
+    case "$_proxy_report" in
+        *"$_nl"fix:*) echo "        Fix: ${_proxy_report#*"$_nl"fix: }" ;;
+    esac
+fi
+
+if [ "$PROXY_OK" = "1" ] && [ -n "$HOST_IPV4" ]; then
     echo "  + Host IP: $HOST_IPV4 (dashboard: http://$HOST_IPV4:5000)"
 fi
 
@@ -1586,7 +1609,19 @@ echo "    If onboarding doesn't start, run:  /setup"
 echo ""
 echo "  STEP 3 — Dashboard:"
 echo ""
-if [ "$ACCESS_METHOD" = "tailscale" ]; then
+if [ "$PROXY_OK" != "1" ]; then
+    # No verified host proxy: every host-side route below (localhost, the
+    # host-IP SSH tunnel, the Tailscale URL) rides that proxy, so offer only
+    # routes that reach the container directly, and say why.
+    echo "    Host routes are not offered: ${_proxy_report%%"$_nl"*}"
+    case "$_proxy_report" in
+        *"$_nl"fix:*) echo "    To enable them: ${_proxy_report#*"$_nl"fix: }" ;;
+    esac
+    echo ""
+    echo "    From this host:    http://$CONTAINER_IP:5000/genesis  (container IP)"
+    echo "    From elsewhere:    ssh -L 5000:$CONTAINER_IP:5000 <your-user>@${HOST_IPV4:-<host>}"
+    echo "                       Then open: http://localhost:5000/genesis"
+elif [ "$ACCESS_METHOD" = "tailscale" ]; then
     echo "    $DASHBOARD_URL/genesis  (via Tailscale)"
 elif [ -n "$DASHBOARD_URL" ]; then
     echo "    From this host:    http://localhost:5000/genesis"

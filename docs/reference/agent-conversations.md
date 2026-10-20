@@ -93,6 +93,21 @@ rechecks its existing breaker and ceiling before hooks or execution. Native
 profile/roster model selection still applies; interact currently pins Opus before
 normal roster handling, so a requested tier is not a guaranteed provider/model.
 
+Managed turns now perform provider readiness selection before executing the
+task: a home-provider rate/quota refusal can select a configured roster backup.
+Preflight remains inside the existing task deadline and concurrency reservation;
+it does not execute the peer's prompt. The chosen provider retains the same
+background profile, authority ceiling and owner approval gates. See
+[native provider selection](native-managed-sessions.md#provider-selection-before-work).
+
+After task execution starts, a later limit fails the task without another
+provider attempt. Failed turns are not waiting for a quota reset. An exact
+message-ID retry returns the original receipt, including a terminal failure;
+an intentional new turn needs a new message ID. **Fallback** on the neural
+monitor reports the last actual fallback outcome, and the dashboard's last
+successful fallback indicator is historical rather than a claim that all
+concurrent tasks use that model.
+
 Send returns the A2A `SendMessageResponse` task. Persist its task/context IDs.
 Reuse `messageId` and identical parsed request semantics for retry: one receipt,
 one adoption. Changing that message's content/options conflicts. Context IDs are

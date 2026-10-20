@@ -50,8 +50,10 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   public repo in its own VM, with no access to an install: no running Genesis, no
   `~/.genesis/`, none of an install's hooks or local reviewers. Hand it only
   self-contained, spec-complete work whose tests run in CI, off the enforcement-hook
-  surface, as a public issue. Only the owner applies the `devin-ready` label that
-  hands it over: the label starts a paid session, so a session never applies it.
+  surface, as a public issue. The `devin-ready` label hands it over and starts a
+  paid session, so a session applies it only after the owner explicitly approves
+  that issue in conversation. Once approved, the session applies the label itself;
+  the owner does not apply it by hand.
   Its PRs join the same queue (closing-session, "Devin-built PRs").
 
 The handoff between them is **the PR itself** — a durable artifact that survives
@@ -230,7 +232,9 @@ own `TASK_INTAKE.md` section contract instead):
    read-only, or by a probe that changes nothing beyond scratch state, using
    tools it already holds. It is owed whenever its answer could change a decision. That covers: the code and every caller the change touches,
    its `CURRENT.md` entry, recent commits and PRs in the area, overlapping open
-   PRs and issues, peer sessions, code intelligence, an API or renderer probe,
+   PRs and issues, existing implementations outside the repo (public repos,
+   grep.app, and the Claude Code mods catalogue for anything that runs inside
+   a CC session), peer sessions, code intelligence, an API or renderer probe,
    and a corpus measurement. "I did not verify X, but it should be fine" is not
    an answer for an X like that: verify it, or name it as a residual with the
    reason no read or probe settles it.
@@ -295,7 +299,19 @@ no substitute checklist.
 - **Before any done / fixed / passing claim** →
   `superpowers:verification-before-completion`, if installed.
 - **An external tool or repo surfaces as a candidate** → the `evaluate`
-  skill; on an ADOPT verdict, `integrate-module`.
+  skill; on an ADOPT verdict, `integrate-module`; on an ADAPT verdict,
+  reverse-engineer the reference before writing code (`evaluate`, Decision
+  Protocol step 4).
+- **About to build anything that runs inside a Claude Code session** — a hook
+  or guard, status line, prompt or context injection, tool interception, a
+  notification, an in-terminal pane → search Claude Code mods and plugins
+  first (`evaluate` workflow step 2 names the sources per session context).
+  From CC 2.1.287 mods can carry UI, tools, agents and model calls; below that
+  version they need the early-access flag, so check the pin in
+  `docs/reference/cc-compatibility.md`. Genesis has already shipped one
+  (`plugins/genesis-web-override/`). A mod may AUGMENT an enforcement guard
+  but never replace it: a mod that denied a tool call ran before the classic
+  `PreToolUse` chain and suppressed it when measured (#2260).
 - **A diff touches dashboard or other UI** → `/qa-only` or `/qa`, plus
   `/design-review`, if installed.
 

@@ -283,7 +283,7 @@ def _apply_ongoing_duration(
             logger.debug("ongoing-duration decoration failed", exc_info=True)
 
 
-async def _compute_alerts() -> tuple[list[dict], set[str]]:
+async def _compute_alerts(*, agent_api_observation: dict | None = None) -> tuple[list[dict], set[str]]:
     """Pure alert computation — recompute the firing alert set from live health.
 
     Returns ``(alerts, current_ids)`` and carries NO ``_alert_history`` state.
@@ -298,6 +298,8 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
     _service = health_mcp_mod._service
     _activity_tracker = health_mcp_mod._activity_tracker
     _job_retry_registry = health_mcp_mod._job_retry_registry
+    if agent_api_observation is not None:
+        agent_api_observation.update(status="unknown")
 
     # WS-2 P1b: ledger writer-hook failures — checked BEFORE the
     # uninitialized-service early return because the counter needs no health
@@ -428,6 +430,23 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
         return alerts, current_ids
 
     snap = await _service.snapshot()
+
+    from genesis.observability.agent_api_alerts import active_alerts, alert_observation
+    from genesis.runtime import GenesisRuntime
+
+    runtime = GenesisRuntime.peek()
+    observation = alert_observation(
+        snap.get("agent_api"), boot_at=getattr(runtime, "_bootstrap_completed_at", None),
+    )
+    if agent_api_observation is not None:
+        agent_api_observation.clear()
+        agent_api_observation.update(observation)
+    try:
+        api_alerts = await active_alerts(_service._db, observation)
+        alerts.extend(api_alerts)
+        current_ids.update(a["id"] for a in api_alerts)
+    except Exception:
+        logger.warning("Peer API incident read unavailable", exc_info=True)
 
     # Import lazily to avoid circular imports in hook/test paths
     from genesis.observability._call_site_meta import _CALL_SITE_META

@@ -223,27 +223,60 @@ PY
         echo "  Recording crash recovery in update_history..."
         DB_PATH="$GENESIS_ROOT/data/genesis.db"
         if [ -f "$DB_PATH" ]; then
-            PYTHONPATH="$GENESIS_ROOT/src" python3 -c "
-import sqlite3, uuid, json
+            # Non-fatal, but never silent: a refused INSERT (a CHECK the database
+            # has not been migrated past, a missing table, a quarantine) names its
+            # error on stderr. Paths travel as argv/env, never spliced into source.
+            if ! GENESIS_RECOVERY_DB="$DB_PATH" PYTHONPATH="$GENESIS_ROOT/src" \
+                python3 - "$UPDATE_STATE" <<'PY'
+import json
+import os
+import sqlite3
+import sys
+import uuid
 from datetime import datetime, timezone
-from genesis.db.integrity import assert_not_quarantined
-state = json.load(open('$UPDATE_STATE'))
+
 try:
-    assert_not_quarantined('$DB_PATH')
-    con = sqlite3.connect('$DB_PATH', timeout=5)
-    con.execute(
-        'INSERT INTO update_history (id, old_tag, new_tag, old_commit, new_commit, status, '
-        'rollback_tag, failure_reason, started_at, completed_at) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (str(uuid.uuid4()), state.get('old_tag',''), '', state.get('old_commit',''), '',
-         'crashed_recovered', state.get('rollback_tag',''),
-         f\"Crashed in phase: {state.get('phase','unknown')}\",
-         state.get('started_at',''), datetime.now(timezone.utc).isoformat()))
-    con.commit()
-    con.close()
+    from genesis.db.integrity import assert_not_quarantined
+
+    db_path = os.environ["GENESIS_RECOVERY_DB"]
+    with open(sys.argv[1], encoding="utf-8") as f:
+        state = json.load(f)
+    assert_not_quarantined(db_path)
+    # One row per crashed update: the id is derived from what identifies that
+    # run in its state, so a bootstrap killed after this commit but before the
+    # state file is removed records nothing new when it re-reads the same state.
+    # ON CONFLICT(id) only, never INSERT OR IGNORE: OR IGNORE would also swallow
+    # a status CHECK this database has not been migrated past.
+    run_key = json.dumps(
+        [state.get(k) for k in ("pid", "started_at", "rollback_tag", "old_commit")]
+    )
+    row_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "genesis:update-crash:" + run_key))
+    con = sqlite3.connect(db_path, timeout=5)
+    try:
+        with con:
+            con.execute(
+                "INSERT INTO update_history (id, old_tag, new_tag, old_commit, new_commit, "
+                "status, rollback_tag, failure_reason, started_at, completed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+                (
+                    row_id, state.get("old_tag", ""), "", state.get("old_commit", ""), "",
+                    "crashed_recovered", state.get("rollback_tag", ""),
+                    f"Crashed in phase: {state.get('phase', 'unknown')}",
+                    state.get("started_at", ""), datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+    finally:
+        con.close()
 except Exception as e:
-    print(f'  WARNING: failed to record crash recovery: {e}')
-" 2>/dev/null || echo "  WARNING: could not record crash in update_history"
+    print(
+        f"  WARNING: failed to record crash recovery in update_history: {type(e).__name__}: {e}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+            then
+                echo "  WARNING: this crash recovery is NOT recorded in update_history (see the error above)." >&2
+            fi
         fi
 
         rm -f "$UPDATE_STATE"
@@ -568,7 +601,8 @@ if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
     . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
     _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
 fi
-echo "  Codebase: explicit pinned setup required; see docs/reference/codebase-managed.md"
+# Setup is deliberately manual (configure needs a pinned binary); whether it is
+# still owed is reported at the end of this run, after .mcp.json is rendered.
 
 # GitNexus (blast radius, impact analysis, execution flows)
 # Exact, shared pin — GitNexus index storage formats can change between
@@ -1619,6 +1653,14 @@ if [[ "${_bootstrap_owns_summary:-0}" = "1" ]]; then
 fi
 if [[ "${_mu_kept_count:-0}" -gt 0 ]]; then
     echo "  ${_mu_kept_count} systemd unit(s) KEPT, not overwritten: edited by hand or not a regular file."
+fi
+# codebase-memory-mcp: one line only when it is registered but not set up (or OK).
+# Run by hand only: under update.sh (which hands us its summary) update.sh prints
+# the same line in its own end-of-run summary, so printing here would duplicate it.
+if [[ "${_bootstrap_owns_summary:-0}" = "1" ]]; then
+    # shellcheck source=lib/cbm_setup_notice.sh
+    . "$SCRIPT_DIR/lib/cbm_setup_notice.sh"
+    genesis_cbm_setup_notice "$VENV_DIR/bin/python" "$GENESIS_ROOT" "  "
 fi
 
 # setup-complete written only now that all bootstrap work has finished (B1) — the
