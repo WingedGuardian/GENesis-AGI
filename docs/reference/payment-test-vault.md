@@ -85,7 +85,7 @@ Each refusal prints its code.
 | R4 | A test vault holding anything but the one `TEST 4242` card setup added |
 | R5 | (by construction: no option, stdin or file takes card data) |
 | R6 | A passphrase file that is a symlink or not 0600 |
-| R7 | A release from a test MCP whose `HOME`, `GENESIS_HOME`, `GENESIS_DB_PATH`, `XDG_CACHE_HOME` or `SECRETS_PATH` is outside the test directory, whose `GENESIS_REPO_ROOT` is not the worktree, or that has a session bus, a `PYTHON*` variable or a bot token |
+| R7 | A release from a test MCP whose `HOME`, `GENESIS_HOME`, `GENESIS_DB_PATH`, `XDG_CACHE_HOME` or `SECRETS_PATH` is outside the test directory, whose `GENESIS_REPO_ROOT` is not the worktree, or that has a session bus, a `PYTHON*` variable or a bot token. The test MCP starts through `launch.py`, which removes those three classes from the environment it inherits before it execs the server. Serve refuses an `mcp.json` or `launch.py` that changed since setup |
 | R8 | A test peer policy that names the main venv python or the main server script |
 | R9 | A worktree that is the main checkout, on `main`, the copy the harness itself imports, or nested with the test directory |
 | R10 | A card-fill overlay outside the worktree's `config/` (or in the main checkout's own `config/`; a worktree under `.claude/worktrees/` is fine), or over an existing file; a serve whose overlay is missing, changed, or not the file setup wrote (setup records its inode). Teardown removes only that file, and says when it leaves one for you to delete |

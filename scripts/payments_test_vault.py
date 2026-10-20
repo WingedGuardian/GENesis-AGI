@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import pwd
@@ -145,6 +146,10 @@ class Layout:
     @property
     def mcp_json(self) -> Path:
         return self.root / "mcp.json"
+
+    @property
+    def launcher(self) -> Path:
+        return self.root / "launch.py"
 
     @property
     def venv(self) -> Path:
@@ -639,6 +644,35 @@ def check_overlay(state: dict, worktree: Path, main_root: Path) -> None:
         )
 
 
+def launcher_text(python: Path, script: Path) -> str:
+    """The test MCP's start: R7's refused variables removed, then the real server exec'd.
+
+    Run as ``python -I`` (PYTHON* ignored for this step); the server it execs keeps
+    the pid, so the peer check sees the real python and script.
+    """
+    return (
+        "# Written by payments_test_vault.py setup: scrub what R7 refuses, then exec.\n"
+        "import os\n"
+        "env = {k: v for k, v in os.environ.items()\n"
+        "       if not k.startswith('PYTHON') and not ('BOT_TOKEN' in k and v)\n"
+        "       and not (k == 'DBUS_SESSION_BUS_ADDRESS' and v)}\n"
+        f"os.execve({str(python)!r}, [{str(python)!r}, {str(script)!r}, '--server', 'health'], env)\n"
+    )
+
+
+def check_mcp_config(layout: Layout, state: dict) -> None:
+    """R7 at serve: mcp.json and the launcher are exactly what setup wrote."""
+    for path, key in ((layout.mcp_json, "mcp_sha256"), (layout.launcher, "launcher_sha256")):
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            digest = None
+        if not state.get(key) or digest != state[key]:
+            raise Refused(
+                f"R7: {path.name} is missing or changed since setup; run teardown and setup again"
+            )
+
+
 # -- setup --------------------------------------------------------------------
 
 
@@ -741,7 +775,7 @@ def setup(
         raise Refused(f"R10: {overlay} already exists; it is not the harness's to replace")
     layout.root.mkdir(mode=0o700)
     marker = secrets.token_hex(16)
-    _write_private(layout.marker, marker + "\n")
+    _write_private(layout.marker, marker + "\n")  # a stop before both exist: see teardown
     _write_private(layout.state, json.dumps({"marker": marker, "phase": "setup"}))
     venv(layout, wt)
     for d in (layout.home, layout.genesis_home, layout.cache):
@@ -762,18 +796,22 @@ def setup(
         path=layout.vault,
     )
     asyncio.run(_init_db(layout.db))
+    _write_private(layout.launcher, launcher_text(layout.venv_python, wt / SERVER_SCRIPT))
     server = {
         "command": str(layout.venv_python),
-        "args": [str(wt / SERVER_SCRIPT), "--server", "health"],
+        "args": ["-I", str(layout.launcher)],
         "env": mcp_env(layout, wt, engine),
     }
-    _write_private(layout.mcp_json, json.dumps({"mcpServers": {MCP_NAME: server}}, indent=2) + "\n")
+    mcp_text = json.dumps({"mcpServers": {MCP_NAME: server}}, indent=2) + "\n"
+    _write_private(layout.mcp_json, mcp_text)
     state = {
         "marker": marker,
         "phase": "setup",
         "worktree": str(wt),
         "merchant": merchant,
         "overlay": str(overlay),
+        "mcp_sha256": hashlib.sha256(mcp_text.encode()).hexdigest(),
+        "launcher_sha256": hashlib.sha256(layout.launcher.read_bytes()).hexdigest(),
     }
     # Recorded before it is written, so teardown finds an overlay a failed setup left.
     _write_private_replace(layout.state, json.dumps(state, indent=2) + "\n")
@@ -1132,6 +1170,9 @@ def stop_running_serve(
     raise Refused(f"teardown: the serve (pid {pid}) did not stop; nothing was removed")
 
 
+# genesis.util.atomic's temporaries (mkstemp, suffix .tmp), left only by a kill
+# between write and rename; the state or pid file itself is still whole.
+_ATOMIC_TEMP = re.compile(r"tmp[A-Za-z0-9_]{6,}\.tmp")
 _ROOT_ENTRIES = frozenset(
     {
         MARKER,
@@ -1139,6 +1180,7 @@ _ROOT_ENTRIES = frozenset(
         "passphrase",
         "serve.pid",
         "mcp.json",
+        "launch.py",
         "venv",
         "cache",
         "home",
@@ -1146,14 +1188,51 @@ _ROOT_ENTRIES = frozenset(
 )
 
 
+def _stopped_bootstrap(layout: Layout) -> bool:
+    """The fixed test directory as a setup stopped before its marker and state were
+    both written leaves it: a real directory holding the marker file and at most a
+    state file, and nothing else. (An empty directory is never taken for one.)"""
+    try:
+        if os.path.islink(layout.root) or not layout.root.is_dir():
+            return False
+        entries = list(layout.root.iterdir())
+    except OSError:
+        return False
+    names = {e.name for e in entries}
+    if (
+        MARKER not in names
+        or not names <= {MARKER, "state.json"}
+        or any(e.is_symlink() or not e.is_file() for e in entries)
+    ):
+        return False
+    try:
+        read_marker(layout)
+    except Refused:
+        return True  # no complete marker/state pair: setup never got past its first step
+    return False
+
+
 def teardown(
     layout: Layout, *, live: Live, main_root: Path, server_pid: int | None = None
 ) -> list[str]:
     from genesis.trash import TrashRefused, trash
 
+    if _stopped_bootstrap(layout):
+        try:
+            trash(
+                layout.root, reason="payment test-vault stopped setup", caller="payments_test_vault"
+            )
+        except TrashRefused as exc:
+            raise Refused(f"teardown: the trash refused {layout.root} ({exc})") from None
+        return [f"moved {layout.root} (a setup stopped before its state was written) to the trash"]
     check_placement(layout, live, new=False)
     state = json.loads(layout.state.read_text())
-    extra = sorted(e.name for e in layout.root.iterdir() if e.name not in _ROOT_ENTRIES)
+    extra = sorted(
+        e.name
+        for e in layout.root.iterdir()
+        if e.name not in _ROOT_ENTRIES
+        and not (_ATOMIC_TEMP.fullmatch(e.name) and e.is_file() and not e.is_symlink())
+    )
     if extra:
         raise Refused(f"R2: {layout.root} holds entries setup never made ({', '.join(extra)})")
     stop_running_serve(layout, server_pid=server_pid)
@@ -1254,6 +1333,7 @@ def _serve_locked(layout: Layout, live: Live, timeout_cap_s: float) -> None:
         Path(state["worktree"]), layout, main_root=_main_root(), running=_running()
     )
     check_overlay(state, worktree, _main_root())
+    check_mcp_config(layout, state)
     check_vault_content(layout, state["merchant"])
     check_socket(layout, live)
     check_test_db(layout, live)

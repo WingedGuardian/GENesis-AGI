@@ -431,7 +431,10 @@ def test_r7_mcp_json_overrides_every_checked_name(built):
     assert env["GENESIS_REPO_ROOT"] == state["worktree"]
     assert env["DBUS_SESSION_BUS_ADDRESS"] == env["TELEGRAM_BOT_TOKEN"] == ""
     assert server["command"] == str(layout.venv_python)
-    assert server["args"] == [str(Path(state["worktree"]) / H.SERVER_SCRIPT), "--server", "health"]
+    assert server["args"] == ["-I", str(layout.launcher)]
+    assert layout.launcher.read_text() == H.launcher_text(
+        layout.venv_python, Path(state["worktree"]) / H.SERVER_SCRIPT
+    )
     assert oct(os.stat(layout.mcp_json).st_mode & 0o777) == "0o600"
 
 
@@ -795,11 +798,11 @@ async def _serve_and_run(layout, state, child_env: dict, *, answer: str | None):
             await ready.wait()
         request = {**_request(), "card_ref": H.check_vault_content(layout, state["merchant"])}
         env = {**child_env, "REQUEST": json.dumps(request), "CLAIM": CLAIM}
+        # Started exactly as mcp.json says, so the launcher's scrub is in the path.
+        server = json.loads(layout.mcp_json.read_text())["mcpServers"][H.MCP_NAME]
         child = await asyncio.create_subprocess_exec(
-            str(layout.venv_python),
-            str(wt / H.SERVER_SCRIPT),
-            "--server",
-            "health",
+            server["command"],
+            *server["args"],
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -830,6 +833,9 @@ def _child_env(layout, state) -> dict:
     return {
         **H.mcp_env(layout, Path(state["worktree"]), Path("/x/camoufox-bin")),
         "PATH": os.environ.get("PATH", ""),
+        # What a real shell often passes through; the launcher must scrub them (R7).
+        "PYTHONUNBUFFERED": "1",
+        "DISCORD_BOT_TOKEN": "1:x",
     }
 
 
@@ -1372,3 +1378,87 @@ async def test_the_console_refuses_text_without_the_test_line():
     finally:
         await console.approver.stop()
         console.close()
+
+
+# -- review round 3 (Codex) ------------------------------------------------------------
+
+
+def test_the_launcher_scrubs_what_r7_refuses_and_execs_the_server(built, tmp_path):
+    layout, state = built
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import json, os, sys\nprint(json.dumps({'argv': sys.argv, 'env': sorted(os.environ)}))\n"
+    )
+    launch = tmp_path / "launch.py"
+    launch.write_text(H.launcher_text(Path(sys.executable), probe))
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": "/nowhere",
+        "DISCORD_BOT_TOKEN": "1:x",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/x",
+        "KEEP_ME": "1",
+    }
+    out = subprocess.run(
+        [sys.executable, "-I", str(launch)], env=env, capture_output=True, text=True, timeout=60
+    )
+    got = json.loads(out.stdout)
+    assert got["argv"][1:] == ["--server", "health"] and Path(got["argv"][0]) == probe
+    assert "KEEP_ME" in got["env"] and "PATH" in got["env"]
+    assert not [n for n in got["env"] if n.startswith("PYTHON") or "BOT_TOKEN" in n]
+    assert "DBUS_SESSION_BUS_ADDRESS" not in got["env"]
+
+
+def test_serve_refuses_an_edited_mcp_config_or_launcher(built, tmp_path):
+    layout, state = built
+    H.check_mcp_config(layout, state)
+    for path in (layout.mcp_json, layout.launcher):
+        kept = path.read_bytes()
+        try:
+            path.write_bytes(kept.replace(b"health", b"memory"))
+            with pytest.raises(H.Refused, match=f"^R7: {path.name} is missing or changed"):
+                H.check_mcp_config(layout, state)
+        finally:
+            path.write_bytes(kept)
+    H.check_mcp_config(layout, state)
+
+
+def test_teardown_removes_a_setup_stopped_at_its_first_step(
+    tmp_path, tmp_path_factory, checkouts, own_overlay, monkeypatch
+):
+    main, _wt = checkouts
+    root = tmp_path_factory.mktemp("v") / "testvault"
+    real = H._write_private
+
+    def dies_on_state(path, text):
+        if path.name == "state.json":
+            raise OSError("disk full")
+        real(path, text)
+
+    monkeypatch.setattr(H, "_write_private", dies_on_state)
+    with pytest.raises(OSError, match="disk full"):
+        _setup_fast(root, checkouts, tmp_path / "fakehome")
+    monkeypatch.undo()
+    layout = H.layout_for(root)
+    assert sorted(p.name for p in root.iterdir()) == [H.MARKER]
+    done = H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
+    assert not root.exists() and "stopped before its state" in done[0]
+    # A directory holding anything else is never taken for a stopped setup.
+    root.mkdir()
+    (root / H.MARKER).write_text("x\n")
+    (root / "notes.txt").write_text("mine")
+    with pytest.raises(H.Refused, match="^R2: "):
+        H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
+    assert (root / "notes.txt").exists()
+
+
+def test_teardown_accepts_a_left_atomic_temporary(
+    tmp_path, tmp_path_factory, checkouts, own_overlay
+):
+    main, _wt = checkouts
+    layout, _state = _setup_fast(
+        tmp_path_factory.mktemp("v") / "testvault", checkouts, tmp_path / "fakehome"
+    )
+    (layout.root / "tmpab12_xyz.tmp").write_text("{}")  # a kill between write and rename
+    H.teardown(layout, live=_live(tmp_path / "fakehome"), main_root=main)
+    assert not layout.root.exists()
