@@ -1535,8 +1535,17 @@ the shared banner is not an assertion about all concurrent sessions.
   thread detects degraded-but-alive Flask; web terminal (its WebSocket accepts
   same-origin handshakes only: `routes/terminal._refuse_cross_origin_terminal`).
   **Auth posture — API READS ARE OPEN BY DEFAULT, and this is the fact auditors
-  keep rediscovering.** Exactly two `before_request` hooks exist, and between
-  them they leave a gap: `auth._check_auth` is blueprint-level and gates HTML
+  keep rediscovering.** Two app-level hooks act on API reads, and neither
+  authenticates: `host_gate.check_host_header` refuses a request whose Host header
+  does not name this machine (IP literal, `localhost`, its hostnames, its
+  Tailscale name, or `GENESIS_DASHBOARD_ALLOWED_HOSTS`; `/v1/*` is out of
+  scope, and the supervisor's network-open routes pass by IP; it is not a cross-site
+  control, because a page can aim a request at an IP address), and
+  `auth.check_api_network_scope` refuses an untrusted TCP peer (loopback and
+  the tailnet are trusted, and the host's proxy delivers LAN traffic as
+  loopback). Both are registered by `auth.apply_dashboard_gates`, which the
+  standalone host and the Agent Zero server-startup extension both call. The
+  credential hooks leave a gap: `auth._check_auth` is blueprint-level and gates HTML
   pages only, returning None for any `/api/` or `/v1/` path;
   `auth.check_api_mutation_auth` is app-level and returns None for
   GET/HEAD/OPTIONS. So a dashboard password does protect the blueprint's HTML
@@ -1546,8 +1555,8 @@ the shared banner is not an assertion about all concurrent sessions.
   anyone (a static shell whose data comes from the open API reads below). It
   protects the MUTATION routes only while the `GENESIS_DASHBOARD_API_AUTH` kill
   switch is on (the default); set to off, `check_api_mutation_auth` returns
-  before any credential check. And **no request hook gates an API read on any
-  install, configured or not.** A GET under the API prefixes (`/api/genesis/`
+  before any credential check. And **no request hook requires a credential for
+  an API read on any install, configured or not.** A GET under the API prefixes (`/api/genesis/`
   and `/api/t/`) is therefore anonymous unless its own handler adds a
   predicate, and only a small minority do (`routes/references.py` is one: its
   `_auth_or_403` does refuse an anonymous caller once a password is set).

@@ -500,6 +500,43 @@ async def test_a_digit_run_is_refused_in_fields_and_audit_detail(make, db, value
     assert value not in json.dumps(await audit.list_recent(db, 100), ensure_ascii=False)
 
 
+def _digit_card_ref() -> str:
+    """A well-formed vault card ref whose 12 hex characters are all digits."""
+    return "card_" + "".join(str((i * 3 + 1) % 10) for i in range(12))
+
+
+async def test_an_all_digit_card_ref_passes_only_as_the_card_ref(make, db):
+    ref = _digit_card_ref()
+    assert ap.holds_long_digit_run(ref)
+    registry, bot, _ctx = make(timeout_s=0.05)
+    assert await registry.request(FIELDS, audit_detail={"card_ref": ref}) == ap.EXPIRED
+    assert len(bot.sent) == 1
+    row = [e for e in await audit.list_recent(db, 100) if e["event"] == "approval_requested"]
+    assert row[0]["detail"]["card_ref"] == ref
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        {"page": _digit_card_ref()},  # the same value under any other key
+        {"card_ref": _digit_card_ref() + "0"},  # not a card ref's shape
+        {"card_ref": "card " + _digit_card_ref()[5:]},
+        {"card_ref": "0" * 16},
+        {"x": {"card_ref": _digit_card_ref()}},  # only the top-level key
+    ],
+)
+async def test_the_card_ref_exemption_is_exact(make, db, detail):
+    registry, bot, _ctx = make(timeout_s=0.05)
+    assert await registry.request(FIELDS, audit_detail=detail) == ap.REFUSED
+    assert bot.sent == []
+
+
+async def test_an_all_digit_card_ref_in_the_shown_text_is_still_refused(make):
+    registry, bot, _ctx = make(timeout_s=0.05)
+    assert await registry.request({"Card": _digit_card_ref()}) == ap.REFUSED
+    assert bot.sent == []
+
+
 @pytest.mark.parametrize("value", ["12.00 USD", "card 4242", "2026-10-18", "ab12345678901cd"])
 def test_short_or_letter_broken_digits_pass(value):
     assert not ap.holds_long_digit_run(value)

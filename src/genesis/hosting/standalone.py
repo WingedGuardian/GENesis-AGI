@@ -702,10 +702,11 @@ class StandaloneAdapter:
         # (mode 0600) so trusted loopback/host callers can authenticate to /api
         # mutations when a dashboard password is set. The gate is registered
         # APP-LEVEL (not blueprint-level) so it covers every blueprint uniformly —
-        # the dashboard blueprint AND the separate outreach_api blueprint.
-        from genesis.dashboard.auth import apply_api_mutation_gate
+        # the dashboard blueprint AND the separate outreach_api blueprint. The
+        # Host-header gate (DNS-rebinding defence) is registered first.
+        from genesis.dashboard.auth import apply_dashboard_gates
 
-        apply_api_mutation_gate(app)
+        apply_dashboard_gates(app)
 
         # Login page (on app, not blueprint — must be reachable before auth)
         @app.route("/genesis/login")

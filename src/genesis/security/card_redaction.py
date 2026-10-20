@@ -64,8 +64,16 @@ def redact_text(text: str) -> str:
         parsed = json.loads(out)
     except ValueError:
         return out
-    walked = redact_value(parsed)
+    except RecursionError:  # too deep to parse, so \\u-escaped digits stay unchecked
+        return _TOO_DEEP
+    try:
+        walked = redact_value(parsed)
+    except RecursionError:
+        return _TOO_DEEP
     return out if walked == parsed else json.dumps(walked, ensure_ascii=False)
+
+
+_TOO_DEEP = "[withheld: nested too deeply to check for card numbers]"
 
 
 # The split pass. A card can render as several digit groups with other text
@@ -348,8 +356,9 @@ class CardRedactingFilter(logging.Filter):
     """Rewrite a record as its redacted text, traceback included.
 
     The message, the formatted exception and the stack are joined into the
-    message and redacted; ``exc_info``, ``exc_text`` and ``stack_info`` are
-    cleared so no handler formats the raw traceback again.
+    message and redacted with :func:`redact_text`; ``exc_info``, ``exc_text``
+    and ``stack_info`` are cleared so no handler formats the raw traceback
+    again. A record that cannot be turned into text or checked is withheld.
 
     Works on a logger or a handler. A LOGGER filter sees only records created
     on that logger, not ones propagated from its children, but survives code
@@ -359,18 +368,45 @@ class CardRedactingFilter(logging.Filter):
 
     _formatter = logging.Formatter()
 
+    _WITHHELD = "[log record withheld: it could not be checked for card numbers]"
+
+    #: A JSON or Python escape of an ASCII digit (``4``, ``\\u0034``).
+    #: :func:`redact_text` parses JSON only when the whole text is JSON, so a
+    #: log line that PREFIXES JSON (``payload: {...}``) would keep escaped
+    #: card digits. A log line is read by people, so the digits are unescaped
+    #: before the check: the line reads the same and the card pass sees them.
+    _DIGIT_ESCAPE = re.compile(r"\\+u003([0-9])")
+
+    def _redact(self, text: str) -> str:
+        """``text`` through :func:`redact_text` (a card split across
+        separators, or spelled as digit escapes, included). A redactor that
+        raises withholds the whole text."""
+        try:
+            return redact_text(self._DIGIT_ESCAPE.sub(r"\1", text))
+        except Exception:
+            return self._WITHHELD
+
+    def _msg_text(self, record: logging.LogRecord) -> str:
+        """``record.msg`` as text, or the withheld text when its ``__str__``
+        raises (a filter runs outside ``Handler.handleError``, so the raise
+        would reach the caller of the log call)."""
+        try:
+            return str(record.msg)
+        except Exception:
+            return self._WITHHELD
+
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             parts = [record.getMessage()]
         except Exception:
-            parts = [str(record.msg)]
+            parts = [self._msg_text(record)]
         if record.exc_info:
             parts.append(self._formatter.formatException(record.exc_info))
         elif record.exc_text:
             parts.append(record.exc_text)
         if record.stack_info:
             parts.append(record.stack_info)
-        record.msg = redact("\n".join(parts))
+        record.msg = self._redact("\n".join(parts))
         record.args = None
         record.exc_info = None
         record.exc_text = None

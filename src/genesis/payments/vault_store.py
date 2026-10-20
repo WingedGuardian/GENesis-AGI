@@ -23,8 +23,8 @@ Layout of ``~/.genesis/payment_vault/`` (directory 0700, every file 0600):
   card is sealed to a key that cannot open it.
 
 Only virtual cards go in: every card is scoped to one merchant, or marked
-single-use, or both. Decryption of cards is not here; the vault service that
-unlocks the identity and fills a card comes later.
+single-use, or both. Decrypting a card for a release the owner approved is in
+``vault_release_store``.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import time
 import unicodedata
 from contextlib import closing, contextmanager, suppress
 from datetime import UTC, datetime
@@ -198,13 +199,17 @@ def _read_small(file: Path, limit: int = 4096) -> bytes:
 
 
 @contextmanager
-def _dir_lock(path: Path):
+def _dir_lock(path: Path, *, tries: int | None = None, pause_s: float = 0.1):
     """Hold an exclusive lock on the vault directory (one writer at a time).
 
     Yields the directory's file descriptor. Init, add and retire write through
     it, so everything they touch lands in the directory they locked even if
-    another directory is moved onto the path meanwhile.
+    another directory is moved onto the path meanwhile. With ``tries``, the
+    lock is tried that many times ``pause_s`` apart and then refused, so a
+    caller in a thread is never left waiting on it for good.
     """
+    if tries is not None and tries < 1:
+        raise ValueError("tries must be at least 1")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
@@ -214,7 +219,19 @@ def _dir_lock(path: Path):
     except OSError as exc:
         raise VaultError(f"the vault directory cannot be opened ({exc.strerror})") from None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if tries is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            for attempt in range(tries):
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if attempt + 1 == tries:
+                        raise VaultError(
+                            "the vault is busy (another vault command holds it)"
+                        ) from None
+                    time.sleep(pause_s)
         yield fd
     finally:
         os.close(fd)

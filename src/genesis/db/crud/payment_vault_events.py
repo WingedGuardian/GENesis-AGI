@@ -28,10 +28,17 @@ EVENTS = frozenset(
         "approval_granted",
         "approval_refused",
         "approval_expired",
+        # A card release (payments/release.py).
+        "release_requested",
+        "release_granted",
+        "release_claimed",
+        "release_refused",
+        "release_cancelled",
     }
 )
-# The events that say whether the key is held; approval rows interleave with them.
-KEY_EVENTS = EVENTS - {e for e in EVENTS if e.startswith("approval_")}
+# The events that say whether the key is held; approval and release rows
+# interleave with them.
+KEY_EVENTS = EVENTS - {e for e in EVENTS if e.startswith(("approval_", "release_"))}
 
 
 async def record_event(db: aiosqlite.Connection, event: str, detail: dict | None = None) -> None:

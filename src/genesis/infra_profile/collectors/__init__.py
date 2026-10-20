@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
+from genesis.infra_profile.collectors.codebase_mcp_facts import collect_codebase_mcp
 from genesis.infra_profile.collectors.container import (
     collect_cpu,
     collect_kernel,
@@ -40,6 +41,7 @@ CONTAINER_COLLECTORS: list[Callable[[], Awaitable[SectionResult]]] = [
     collect_sqlite,
     collect_qdrant,
     collect_falkordb,
+    collect_codebase_mcp,
     collect_network,
     collect_systemd,
     collect_versions,

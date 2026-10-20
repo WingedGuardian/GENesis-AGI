@@ -182,6 +182,29 @@ you run Genesis on a host reachable from the public internet, you must restrict
 the management ports yourself; Genesis does not assume an authenticating
 gateway in front of them.
 
+**Host name check.** The dashboard's content routes (`/api/genesis/*`, the tool
+API `/api/t/*`, the terminal WebSocket and the `/genesis` pages) answer only to requests
+addressed to this machine: by IP address, as `localhost`, by the machine's own
+hostname (or `<hostname>.local`), or by its Tailscale MagicDNS name (full or
+short) when Tailscale runs where the dashboard runs. Anything else gets 403. If
+you open the dashboard by another name (a custom DNS record, the host VM's own
+name or Tailscale name), list it in
+`GENESIS_DASHBOARD_ALLOWED_HOSTS` (comma-separated; a leading dot such as
+`.home.example` matches every name under it), or open it by IP. Requests
+carrying the internal bearer and the bearer-authenticated `/v1/*` routes are
+not affected; the supervisor's health/heartbeat/pause reads pass because it
+addresses the container by IP.
+`GENESIS_DASHBOARD_HOSTNAME_CHECK=off` disables the check. This check is about
+the NAME a request is addressed to; it does not decide which page sent the
+request, so it is not a cross-site (CSRF / cross-site WebSocket) control.
+
+The same gates (this check, the network-scope check and the `/api` mutation
+check) apply in Agent Zero hosting mode. The network-scope check trusts
+loopback and the Tailscale ranges by default; if requests reach the server from
+another address, such as a Docker bridge gateway, add that network to
+`GENESIS_DASHBOARD_TRUSTED_NETWORKS` (comma-separated CIDRs; it replaces the
+default list, and loopback stays trusted).
+
 **Operator checklist:**
 - Do **not** port-forward the dashboard or console ports from a public router.
 - Bind or firewall the management ports to your private/overlay network — e.g.

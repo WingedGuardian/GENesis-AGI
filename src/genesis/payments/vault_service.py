@@ -5,8 +5,8 @@
 ``SO_PEERCRED``). The service unwraps ``identity.age`` and keeps the X25519
 identity in memory. It relocks on ``vault lock``, after ``IDLE_RELOCK_S``
 idle, when the held key no longer matches ``recipient.txt``, and on every
-restart (the key is never written anywhere). Nothing decrypts a card yet; the
-first user of the key is the card-fill flow, which approval gates.
+restart (the key is never written anywhere). The key's one user is a card
+release (``payments/release.py``), which the owner's Telegram tap gates.
 
 The unwrap (age scrypt, about 1-2 s of CPU) runs in a short-lived subprocess
 that imports only pyrage, so the event loop never waits on it. MEASURED on
@@ -22,14 +22,25 @@ with no audit log, or if the audit write fails, the key is not held. Lock
 always drops the key, whatever happens to its audit row.
 
 Protocol: one JSON line in (at most 4096 bytes), one JSON line out, then the
-connection closes. Ops: ``status``, ``unlock`` (``passphrase``), ``lock``.
-Responses never echo a request.
+connection closes. Ops: ``status``, ``unlock`` (``passphrase``), ``lock``, and
+the release ops ``release_request``, ``release_status``, ``release_claim`` and
+``release_cancel``. The first three need only the peer's uid, so the owner's
+CLI works; a release op also needs a peer that ``peer_check`` verifies as the
+genesis-health MCP server. Responses never echo a request.
+
+A client keeps its write side open until the reply arrives and sends nothing
+after the request line. The service cannot tell a half-close (``shutdown``
+of the write side) from a close: both read as EOF, and an ``unlock`` or
+``release_claim`` whose client reads as closed is refused. Bytes sent after
+the request line hide a later close from that check (``at_eof`` stays False
+while they sit unread), so a claim then relies on the requester's pid check.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import importlib.util
 import json
 import logging
@@ -44,6 +55,9 @@ from pathlib import Path
 from genesis.db.crud import payment_vault_events as audit
 from genesis.env import vault_socket_path
 from genesis.payments import vault_store as vs
+from genesis.payments.approval import holds_long_digit_run
+from genesis.payments.peer_check import PeerPolicy, PeerRefused, accept_ticks, check_release_peer
+from genesis.payments.release import ReleaseManager
 from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
@@ -124,6 +138,31 @@ def peer_of(writer: asyncio.StreamWriter) -> dict:
     return info
 
 
+WITHHELD = "(withheld: 12 or more digits)"
+
+
+def _withhold_long_runs(value, key: str | None = None):
+    """``value`` with every str that holds a 12+ digit run replaced by ``WITHHELD``.
+
+    The one guard every audit row passes, whoever wrote it: requester and /proc
+    text (a host, field origins, process names, an exe path, env var names) is
+    recorded as it came, so a card number in any of it must stop here. The same
+    rule as the approval registry (``approval.holds_long_digit_run``), with the
+    same one exemption: a ``card_ref`` value shaped exactly like a vault card ref.
+    Shorter values (a CVC, an expiry) cannot be told apart from ordinary text;
+    the fields that could carry one as free text are recorded only as lengths.
+    """
+    if isinstance(value, str):
+        if key == "card_ref" and vs.CARD_REF.fullmatch(value):
+            return value
+        return WITHHELD if holds_long_digit_run(value) else value
+    if isinstance(value, dict):
+        return {k: _withhold_long_runs(v, k) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_withhold_long_runs(v) for v in value]
+    return value
+
+
 class VaultService:
     """The in-memory vault state and the socket that drives it.
 
@@ -143,6 +182,8 @@ class VaultService:
         idle_check_s: float = _IDLE_CHECK_S,
         clock=None,
         python: str = sys.executable,
+        approvals=None,
+        release_peer=None,
     ) -> None:
         self._db = db
         self._vault = vault_path or vs.vault_dir()
@@ -171,6 +212,13 @@ class VaultService:
         self._tasks: set[asyncio.Task] = set()
         self._audit_owners: set[asyncio.Task] = set()
         self._audit_close: asyncio.Task | None = None
+        # (pid, *, accept_ticks) -> Peer, raising PeerRefused. genesis-server's
+        # own pid is passed explicitly: the ancestor walk looks for it to tell
+        # a session it launched from a foreground one.
+        self._release_peer = release_peer or functools.partial(
+            check_release_peer, policy=PeerPolicy.default(), server_pid=os.getpid()
+        )
+        self._release = ReleaseManager(self, approvals)
 
     @property
     def unlocked(self) -> bool:
@@ -242,7 +290,7 @@ class VaultService:
                 return False
             db = self._db
             try:
-                await audit.record_event(db, event, detail)
+                await audit.record_event(db, event, _withhold_long_runs(detail))
             except asyncio.CancelledError:
                 await self._rollback_audit(db)
                 raise
@@ -477,6 +525,7 @@ class VaultService:
         self._epoch += 1
         was_unlocked = self.unlocked
         self._drop()
+        await self._release.abort("the vault was locked")
         if not was_unlocked:
             if peer:  # every lock request is on the trail, even one with nothing to drop
                 await self._audit(event, {"peer": peer, "state": "already locked"})
@@ -507,6 +556,11 @@ class VaultService:
         self._epoch += 1
         was_unlocked = self.unlocked
         self._drop()
+        # Before the tasks are cancelled: the approval task is one of them.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(
+                self._release.abort("the vault service stopped", stopping=True), _STOP_WAIT_S
+            )
         for task in list(self._tasks):
             task.cancel()
         try:
@@ -541,6 +595,7 @@ class VaultService:
         await writer.drain()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        accepted = accept_ticks()  # first: a pid reused after connect() started later
         self._writers.add(writer)
         try:
             peer = peer_of(writer)
@@ -554,7 +609,24 @@ class VaultService:
                 await self._respond(writer, {"ok": False, "error": "bad request"})
                 return
             op = request.get("op") if isinstance(request, dict) else None
-            if op == "status":
+
+            def client_gone() -> bool:
+                # The peer closing leaves the transport half-open, so
+                # is_closing() stays False; the reader sees the EOF.
+                return reader.at_eof() or writer.is_closing()
+
+            if isinstance(op, str) and op.startswith("release_"):
+                try:
+                    verified = self._release_peer(peer["pid"], accept_ticks=accepted)
+                except PeerRefused as exc:
+                    await self._audit(
+                        "release_refused",
+                        {"reason": "peer not allowed", "peer": {**peer, **exc.detail}},
+                    )
+                    reply = {"ok": False, "error": "peer not allowed"}
+                else:
+                    reply = await self._release.handle(op, request, verified, client_gone)
+            elif op == "status":
                 reply = await self.status()
             elif op == "lock":
                 reply = await self.lock(peer)
@@ -566,9 +638,7 @@ class VaultService:
                 reply = await self.unlock(
                     request["passphrase"],
                     peer,
-                    # The peer closing leaves the transport half-open, so
-                    # is_closing() stays False; the reader sees the EOF.
-                    client_gone=lambda: reader.at_eof() or writer.is_closing(),
+                    client_gone=client_gone,
                 )
             else:
                 reply = {"ok": False, "error": "bad request"}
@@ -599,7 +669,7 @@ async def start_vault_service(runtime, approvals=None) -> VaultService | None:
         db = await get_db(genesis_db_path())
     except Exception as exc:  # noqa: BLE001 - unlock then refuses (fail closed)
         logger.error("payment vault audit connection did not open (%s)", type(exc).__name__)
-    service = VaultService(db)
+    service = VaultService(db, approvals=approvals)
     service.owned_db = db
     try:
         await service.start()
