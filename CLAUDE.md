@@ -607,8 +607,11 @@ gate works, its exemption categories, and the unit rules for size bounds:
   skill, Pre-Merge Gate.
   A PR whose diff touches the
   enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
-  a hard stop at 2 rounds that is doctrine you keep, not a gate that stops you. Both
-  protocols: genesis-development skill.
+  a 2-round limit: after round 2, fix commits and one marked confirmation request
+  proceed; any further review request, and any fix commit once the confirmation is
+  spent, needs the owner's approval at the action (refused in a dispatched session).
+  The round-2 merge-or-abandon call is doctrine you keep. Both protocols:
+  genesis-development skill.
 - **Commit continuously**: uncommitted = invisible = lost.
 - **Bias toward closing open work before opening new — softly (≈51/49).** Not a
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
