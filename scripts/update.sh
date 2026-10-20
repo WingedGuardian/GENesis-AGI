@@ -2752,7 +2752,10 @@ if [ "$_mu_rc" -ne 0 ]; then
     _do_rollback "the rebuilt live's systemd units were refused (exit $_mu_rc)"
     # 4 promises the old tip is back; a rollback that did not complete is a failure,
     # and leaves no refusal record (the dashboard reads its presence as exit 4's).
-    if [ "$_mu_rc" -eq 4 ] && [ "${_ROLLBACK_CLEAN:-0}" = 1 ]; then
+    # _start_genesis_server's fallback returns 0 whether or not the server came
+    # back, so a server that was running must also answer its health endpoint.
+    if [ "$_mu_rc" -eq 4 ] && [ "${_ROLLBACK_CLEAN:-0}" = 1 ] \
+        && { [[ " ${WERE_RUNNING[*]} " != *" genesis-server "* ]] || _server_health_ok; }; then
         # deploy_head = the commit judged: here the rebuilt tip (candidates
         # included). Nothing may merge it; the orchestrator reads only the
         # record's presence.

@@ -169,6 +169,7 @@ _SERVICE_STUBS = (
     '_stop_genesis_server() { echo "stop-server" >> "$CALLS"; }\n'
     "_ensure_server_down() { return 0; }\n"
     '_start_genesis_server() { echo "restart-server" >> "$CALLS"; }\n'
+    '_server_health_ok() { echo "health-probe" >> "$CALLS"; return 0; }\n'
     'systemctl() { echo "systemctl $*" >> "$CALLS"; }\n'
     '_record_update_history() { echo "history $1" >> "$CALLS"; }\n'
 )
@@ -574,8 +575,9 @@ _REFUSE_UNITS = 'import sys\nprint("REFUSED: demo.service (edited by hand)")\nsy
         ("0", "", 4),
         ("1", "", 1),
         ("0", '_start_genesis_server() { echo "restart-server" >> "$CALLS"; return 1; }\n', 1),
+        ("0", "_server_health_ok() { return 1; }\n", 1),
     ],
-    ids=["clean", "hook-restore-fails", "restart-fails"],
+    ids=["clean", "hook-restore-fails", "restart-fails", "restarted-but-unhealthy"],
 )
 def test_exit_4_needs_a_rollback_that_completed(plain_live, hooks_fail, pre, rc):
     """Codex P2 (F5, F6): exit 4 promises the old tip is back with its hooks and
