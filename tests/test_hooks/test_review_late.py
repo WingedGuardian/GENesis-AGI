@@ -880,7 +880,7 @@ def test_owed_from_budget_with_a_cutover_refuses_past_its_deadline(tmp_path):
 
 
 def test_a_main_merge_after_the_review_is_no_fix_on_the_way_to_a_later_head(tmp_path):
-    """GLM secondary P2: a fix F, then review c9 of H, then a clean merge of
+    """Secondary review P2: a fix F, then review c9 of H, then a clean merge of
     main, then a reflection naming the merged head N. The latest fix on the way
     from H to N is F (before c9), not the merge, so c9 is answered at N."""
     path = tmp_path / "repo"
@@ -913,7 +913,7 @@ def test_a_main_merge_after_the_review_is_no_fix_on_the_way_to_a_later_head(tmp_
 
 
 def test_covered_late_keys_bounds_its_own_git_calls(pr, tmp_path, monkeypatch):
-    """GLM secondary P3: the deadline argument scopes every git call, not
+    """Secondary review P3: the deadline argument scopes every git call, not
     only the top of each reflection's turn."""
     path, base, head, fix = pr
     budget = _late_budget(path, base, fix, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])

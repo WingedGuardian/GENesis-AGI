@@ -1756,7 +1756,7 @@ def test_an_acceptance_point_maps_within_one_covered_scope_line(scopes, ok):
 
 
 def test_an_open_round_with_unknown_keys_still_reports_its_timing():
-    """GLM secondary P3: owed stays unknown, but the settle window is still
+    """Secondary review P3: owed stays unknown, but the settle window is still
     reported, so a reader can tell when the round settles."""
     got = rr.owed_state(_budget(reflection_keys="unknown"), (), now=T0 + timedelta(hours=1))
     assert got["owed"] is None
