@@ -30,13 +30,22 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import private_module
+
 _ROOT = Path(__file__).resolve().parent.parent
 
-#: (glob root, pattern, the fewest files the root may hold).
+# The instruction-file names a skill directory may use, in precedence order,
+# imported from the catalog generator rather than restated (its own comment
+# asks consumers to import it).
+_MARKERS = private_module(
+    "generate_skill_catalog_for_substitution_test", _ROOT / "scripts" / "generate_skill_catalog.py"
+).SKILL_MARKERS
+
+#: (root, "skills" or a glob, the fewest files the root may hold).
 _ROOTS = (
-    (".claude/skills", "**/SKILL.md", 20),
-    ("src/genesis/skills", "**/SKILL.md", 15),
-    (".agents/skills", "*/SKILL.md", 1),
+    (".claude/skills", "skills", 20),
+    ("src/genesis/skills", "skills", 15),
+    (".agents/skills", "skills", 1),
     (".claude/commands", "*.md", 10),
 )
 
@@ -52,7 +61,19 @@ _FIX = "write `$ 0` in awk, `${N}` in shell, words in prose, and prices as 'N US
 
 
 def _files(root: str, pattern: str) -> list[Path]:
-    return sorted((_ROOT / root).glob(pattern))
+    if pattern != "skills":
+        return sorted((_ROOT / root).glob(pattern))
+    # Each skill directory, at any depth, contributes the instruction file the
+    # catalog would pick: the first marker present. A references/ directory
+    # holds a skill's reference files, never a skill.
+    found = []
+    for d in sorted(p for p in (_ROOT / root).rglob("*") if p.is_dir()):
+        if "references" in d.relative_to(_ROOT / root).parts:
+            continue
+        marker = next((d / m for m in _MARKERS if (d / m).is_file()), None)
+        if marker is not None:
+            found.append(marker)
+    return found
 
 
 @pytest.mark.parametrize(("root", "pattern", "floor"), _ROOTS, ids=[r[0] for r in _ROOTS])
@@ -113,3 +134,16 @@ def test_every_allowlist_entry_still_points_at_a_dollar_digit():
 )
 def test_the_rule_matches_the_measured_renderer(text, flagged):
     assert bool(_SUBSTITUTED.search(text)) is flagged
+
+
+def test_every_skill_marker_spelling_is_covered(tmp_path, monkeypatch):
+    # A skill whose instruction file is skill.md or README.md is checked too.
+    assert set(_MARKERS) >= {"SKILL.md", "skill.md", "README.md"}
+    for i, marker in enumerate(_MARKERS):
+        (tmp_path / "skills" / f"s{i}").mkdir(parents=True)
+        (tmp_path / "skills" / f"s{i}" / marker).write_text("cost $1 here\n")
+    (tmp_path / "skills" / "s0" / "references").mkdir()
+    (tmp_path / "skills" / "s0" / "references" / "README.md").write_text("not a skill $1\n")
+    monkeypatch.setitem(globals(), "_ROOT", tmp_path)
+    found = [p.relative_to(tmp_path).as_posix() for p in _files("skills", "skills")]
+    assert found == [f"skills/s{i}/{m}" for i, m in enumerate(_MARKERS)]
