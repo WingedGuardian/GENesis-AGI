@@ -2226,12 +2226,19 @@ _do_rollback() {
         echo "  NOT restarted: ${WERE_RUNNING[*]}. Verify the checkout and database recovery before starting them."
     fi
 
-    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then
+    # ONE verdict for every report of this rollback: the message, the history
+    # row, the failure file, the closing summary and exit 4's gate. A rollback
+    # whose hooks or services did not come back is not complete, whatever the code
+    # and database did.
+    local rollback_ok=false
+    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ] \
+        && [ "$hooks_ok" = true ] && [ "$svc_ok" = true ]; then
+        rollback_ok=true
+    fi
+    if [ "$rollback_ok" = true ]; then
         echo "  Rolled back to $ROLLBACK_TAG (code, deps$([ "${MIGRATIONS_RAN:-0}" = "1" ] && echo ", database"))."
         echo "  NOT reverted: installed systemd units and hooks (self-heal on the next update)."
-        if [ "$hooks_ok" = true ] && [ "$svc_ok" = true ]; then
-            _ROLLBACK_CLEAN=1
-        fi
+        _ROLLBACK_CLEAN=1
         _record_update_history "rolled_back" "$reason" "$degraded"
     else
         echo "  ROLLBACK INCOMPLETE — manual intervention required"
@@ -2269,7 +2276,7 @@ with open(sys.argv[11], 'w') as f:
     json.dump(data, f, indent=4)
 " "$OLD_TAG" "$NEW_TAG" "$OLD_COMMIT" "$NEW_COMMIT" "$ROLLBACK_TAG" \
   "$reason" "${degraded:-}" "$ORIGINAL_BRANCH" \
-  "$([ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && echo true || echo false)" \
+  "$rollback_ok" \
   "$(date -Iseconds)" \
   "$HOME/.genesis/last_update_failure.json"
 
@@ -2292,7 +2299,7 @@ with open(sys.argv[11], 'w') as f:
 
     echo ""
     echo "  ──────────────────────────────────────"
-    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then
+    if [ "$rollback_ok" = true ]; then
         echo "  Rolled back: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"
     else
         echo "  NOT fully rolled back — see CRITICAL above. Pre-update state: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"

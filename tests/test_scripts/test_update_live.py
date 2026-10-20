@@ -592,6 +592,14 @@ def test_exit_4_needs_a_rollback_that_completed(plain_live, hooks_fail, pre, rc)
     assert any(c.startswith("restore-hooks ") for c in _engine_calls(log))
     refused = home / ".genesis" / "update_refused.json"
     assert refused.exists() is (rc == 4), "a refusal record without exit 4 (or the reverse)"
+    # One verdict for every report: a rollback whose hooks or services did not
+    # come back is recorded as incomplete, not "rolled_back" (Devin/CodeRabbit).
+    complete = hooks_fail == "0" and "_start_genesis_server" not in pre
+    calls = _calls(home)
+    assert ("history rolled_back" in calls) is complete, calls
+    assert ("history failed" in calls) is (not complete), calls
+    failure = json.loads((home / ".genesis" / "last_update_failure.json").read_text())
+    assert failure["rollback_complete"] is complete, failure
 
 
 def test_u5_order_snapshot_stop_merging_engine_bootstrap():
