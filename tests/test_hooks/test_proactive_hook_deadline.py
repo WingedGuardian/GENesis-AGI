@@ -795,7 +795,7 @@ async def test_a_run_records_its_steps_path_and_flags(
     assert run == [
         "heartbeat_write", "heartbeat_read", "trail", "activity", "recent_files",
         "gates", "migration", "suppress", "server", "fts5", "code_index", "degraded_emit",
-        "shadow", "ws_measure", "activity_row", "metrics", "fold", "finish",
+        "flush", "shadow", "ws_measure", "activity_row", "metrics", "fold", "finish",
     ]  # fmt: skip
     assert line["path"] == "degraded"
     assert line["server_reason"] == "server unreachable"
@@ -873,3 +873,111 @@ def test_a_stop_during_a_stuck_step_names_that_step(tmp_path: Path) -> None:
     assert cut["running"] == "heartbeat_write"
     assert cut["running_ms"] >= 500
     assert "[Memory: the hook ran out" in proc.stdout  # the notice still lands
+
+
+@pytest.mark.asyncio
+async def test_off_mode_books_its_flush_and_metrics_write_to_their_own_steps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review round 1 (Codex P2, Devin): the closing flush and off mode's metrics
+    write were charged to `gates`, so a stall there named the wrong step."""
+    import json
+
+    writer = _RecordingWriter()
+    _quiet_run_body(monkeypatch, tmp_path, writer)
+    monkeypatch.setattr(hook, "_HOOK_MODE", "off")
+    hook._PHASES.reset_run()
+    await hook._run("what did we decide", session_id="s")
+    line = json.loads(hook._phase_line()[len("[hook-phases] ") :])
+    names = [name for name, _ in line["phases"]]
+    assert names[names.index("gates") :] == ["gates", "flush", "metrics", "finish"]
+    assert line["path"] == "off"
+
+
+def test_deadline_hit_is_judged_when_the_line_is_written(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review round 1 (Devin): recorded before the closing flush, deadline_hit read
+    False for a run whose flush crossed the deadline. It is now derived at render."""
+    import json
+
+    def _hit() -> object:
+        return json.loads(hook._phase_line()[len("[hook-phases] ") :])["deadline_hit"]
+
+    monkeypatch.setattr(hook, "_RUN_DEADLINE_AT", time.monotonic() - 0.01)
+    assert _hit() is True
+    monkeypatch.setattr(hook, "_RUN_DEADLINE_AT", time.monotonic() + 60)
+    assert _hit() is False
+    monkeypatch.setattr(hook, "_RUN_DEADLINE_AT", None)
+    assert _hit() is None  # no run yet: unknown, not "on time"
+
+
+def test_a_crash_while_the_module_loads_still_writes_a_phase_line() -> None:
+    """Review round 1 (Codex P2, GLM P3): a load-time crash happens before main()
+    exists. The hook's excepthook writes the line after Python's traceback."""
+    import json
+    import os
+    import subprocess
+
+    child = (
+        "import runpy, sys, io;"
+        "sys.modules['dotenv'] = None;"  # `from dotenv import ...` now raises
+        "sys.argv = [sys.argv[1]];"
+        "sys.stdin = io.StringIO('');"
+        "runpy.run_path(sys.argv[0], run_name='__main__')"
+    )
+    env = dict(os.environ)
+    env.pop("GENESIS_CC_SESSION", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", child, str(_SCRIPTS_DIR / "proactive_memory_hook.py")],
+        capture_output=True, text=True, timeout=60, env=env,
+    )  # fmt: skip
+    assert proc.returncode == 1
+    err = proc.stderr
+    assert "Traceback" in err
+    assert err.index("Traceback") < err.index("[hook-phases] ")
+    lines = [ln for ln in err.splitlines() if ln.startswith("[hook-phases] ")]
+    assert len(lines) == 1
+    p = json.loads(lines[0][len("[hook-phases] ") :])
+    assert p["startup_error"] in ("ImportError", "ModuleNotFoundError")
+    assert p["phases"][-1][0] == "imports"  # the open step is where it crashed
+
+
+def test_a_dispatched_session_exit_writes_no_line_even_with_the_excepthook() -> None:
+    """The GENESIS_CC_SESSION early exit is a SystemExit, not a crash: no line."""
+    import os
+    import subprocess
+
+    env = dict(os.environ)
+    env["GENESIS_CC_SESSION"] = "1"
+    proc = subprocess.run(
+        [sys.executable, str(_SCRIPTS_DIR / "proactive_memory_hook.py")],
+        input='{"prompt": "x", "session_id": "s"}', capture_output=True, text=True,
+        timeout=60, env=env,
+    )  # fmt: skip
+    assert proc.returncode == 0
+    assert "[hook-phases]" not in proc.stderr
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_run_books_its_closing_flush_before_finish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fix-delta audit SF-1: on a timeout the body never flushed, so the finally's
+    flush (and the notice) must land under `flush`, with `finish` after them."""
+    import json
+
+    writer = _RecordingWriter()
+    _quiet_run_body(monkeypatch, tmp_path, writer)
+
+    async def _slow_server(*_a, **_k):
+        await asyncio.sleep(5)
+        return None, "slow"
+
+    monkeypatch.setattr(hook, "_call_server", _slow_server)
+    monkeypatch.setattr(hook, "_RUN_DEADLINE_S", 0.2)
+    hook._PHASES.reset_run()
+    await hook._run("what did we decide", session_id="s")
+    line = json.loads(hook._phase_line()[len("[hook-phases] ") :])
+    names = [name for name, _ in line["phases"]]
+    assert names[-3:] == ["server", "flush", "finish"]
+    assert line["timed_out"] is True
+    assert line["deadline_hit"] is True

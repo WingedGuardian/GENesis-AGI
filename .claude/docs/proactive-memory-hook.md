@@ -127,10 +127,11 @@ fallback rate is directly observable. The health dashboard reads this file.
 **Phase line (stderr).** Every run writes one `[hook-phases] {json}` line to
 stderr as it exits (`scripts/hooks/hook_phases.py`), on every path: an empty or
 unparseable input, off mode, a short prompt, the server and degraded paths, and
-a crash inside the run, after its traceback. A crash while the module is still
-loading (a missing dependency, say) happens before `main()` exists: the hook
-exits 1 with only the traceback. If loading instead stalls past the hard stop,
-the stop's cut line still lands. Claude Code never shows an exit-0 hook's stderr to
+a crash, after its traceback. A crash while the module is still loading (a
+missing dependency, say) happens before `main()` exists, so once its two helper
+modules (`hook_deadline`, `hook_phases`) load, the hook installs a
+`sys.excepthook` that writes the line after Python's traceback, with `startup_error` naming the exception and the open step naming
+where it happened; the hook still exits 1. Claude Code never shows an exit-0 hook's stderr to
 the model; it stores it in the transcript's `hook_success` attachment
 (`stderr`), next to the run's `durationMs`. A dispatched session
 (`GENESIS_CC_SESSION=1`) exits before any of this and writes nothing. The line
@@ -142,20 +143,25 @@ carries:
   `recent_files`, `gates` (the off-mode, short-prompt and database checks),
   `migration`, `suppress`, `server`, the path's own steps
   (`server_emit`, `code_hints` / `fts5`, `code_index`, `degraded_emit`,
-  `shadow`), `ws_measure`, `activity_row`, `metrics`, `fold`, and `finish` (the
-  closing flush and exit). Under its 1,000-byte cap the oldest steps fold into one
+  `shadow`), `flush` (writing the deferred session lines, wherever a path does
+  it; off mode then `metrics`), `ws_measure`, `activity_row`, `metrics`, `fold`,
+  and `finish` (cleanup and exit). Under its 1,000-byte cap the oldest steps fold into one
   `["+N", ms]` entry.
 - `age0_s` (process age when timing started, null if unreadable), `total_s`,
   `path` (`off`, `short`, `no_db`, `server`, `degraded`, `local`; absent when the
-  run stopped before deciding), `server_reason`, `timed_out`, `deadline_hit`,
-  `recall_landed`, `flushed`.
+  run stopped before deciding), `server_reason`, `timed_out`, `deadline_hit`
+  (judged when the line is written, so work that crossed the 8 s deadline after
+  the run's own checks still counts; null before the run started),
+  `recall_landed`, `flushed`, and `startup_error` on a load-time crash.
 - `psi`: pressure stall averages for the whole container, read from the
   container-root cgroup (`/sys/fs/cgroup/{io,cpu,memory}.pressure`): `io_some10`,
   `io_some60`, `io_full10`, `io_full60`, `cpu_some10`, `mem_full10`. Null when a
   file cannot be read.
 
 When the hard stop fires, it writes the stack and then a phase line with
-`"cut": true`, whose `running` and `running_ms` name the step it cut. A stop
+`"cut": true`, whose `running` and `running_ms` name the step it cut. The line
+is built on its own thread, which the stop waits for at most 0.3 s
+(`DIAG_BUDGET_S`), so a stuck read can cost this line but never the exit. A stop
 that fires after the run wrote its own line adds no second line; only in the
 narrow window where both write at once can two lines appear, and then the one
 with `"cut": true` is the one that counts. A run Claude Code kills anyway leaves a

@@ -392,3 +392,19 @@ def test_locked_stdout_counts_utf16_units(monkeypatch: pytest.MonkeyPatch, capsy
     out.write("\n")
     assert hd.written_units() == 5
     capsys.readouterr()
+
+
+def test_a_diag_that_blocks_cannot_hold_the_exit() -> None:
+    """Review round 1 (Codex P2): diag ran inline, so a diag stuck on a read held
+    os._exit back until Claude Code's kill discarded the notice and the stack."""
+    proc, elapsed = _run_child(
+        """
+        hd.arm(0.3, lambda: "NOTICE-LINE", label="t", diag=lambda: time.sleep(30) or "never")
+        time.sleep(30)
+        """
+    )
+    assert proc.returncode == 0
+    assert elapsed < 0.3 + hd.DIAG_BUDGET_S + 3.0, f"a blocked diag held the stop ({elapsed:.1f}s)"
+    assert proc.stdout.splitlines() == ["NOTICE-LINE"]
+    assert "hard stop fired" in proc.stderr
+    assert "never" not in proc.stderr

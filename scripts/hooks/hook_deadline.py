@@ -19,8 +19,9 @@ memory-hook kills (10.0, 10.6 and 12.5 s), each after the hook had passed its ow
 4. writes the main thread's stack (``co_name:lineno``, no file I/O) to stderr,
    which Claude Code keeps in the transcript's ``hook_success`` row;
 5. writes ``diag()`` to stderr, when one was given (a hook's per-step timing
-   line). It runs AFTER the stack, so a ``diag`` that fails or stalls costs only
-   its own line, never the stack;
+   line). It runs AFTER the stack, on its own daemon thread that the stop waits
+   for at most ``DIAG_BUDGET_S``, so a ``diag`` that fails or stalls costs only
+   its own line, never the stack and never the exit;
 6. calls ``os._exit(0)``.
 
 Why this works while the main thread is blocked: CPython releases the GIL around
@@ -95,6 +96,14 @@ _LINE_OPEN = False  # the last write to stdout did not end with a newline
 #: section as the write, so the timer, which reads it while holding the lock,
 #: always sees every byte that reached the stream.
 _WRITTEN_UNITS = 0
+
+
+#: How long the stop waits for ``diag()`` before exiting anyway. The stop fires
+#: 8.5 s after spawn and Claude Code kills at 10 s; the notice and stack are
+#: already written when diag starts, so this only bounds an extra diagnostic.
+#: A phase line renders in about 0.3 ms (MEASURED 2026-10-20), so 0.3 s is three
+#: orders of magnitude of headroom while keeping the exit near 8.8 s.
+DIAG_BUDGET_S = 0.3
 
 
 def written_units() -> int:
@@ -184,14 +193,22 @@ def _fire(
             ),
         )
         if diag is not None:
-            try:
-                extra = diag()
-            except Exception:
-                extra = None
-            if extra:
-                _write_all(2, extra.encode("utf-8", "replace"))
+            # Bounded: a diag stuck on a read is abandoned, and os._exit ends its
+            # thread with the process.
+            worker = threading.Thread(target=_run_diag, args=(diag,), daemon=True)
+            worker.start()
+            worker.join(DIAG_BUDGET_S)
     finally:
         os._exit(0)
+
+
+def _run_diag(diag: Callable[[], str | None]) -> None:
+    try:
+        extra = diag()
+    except Exception:
+        return
+    if extra:
+        _write_all(2, extra.encode("utf-8", "replace"))
 
 
 def arm(

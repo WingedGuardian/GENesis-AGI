@@ -55,13 +55,42 @@ from hook_phases import PhaseClock  # noqa: E402
 # the one still open as `running`.
 _PHASES = PhaseClock(age_s=process_age_s())
 _PHASE_LINE_WRITTEN = False  # set once main() has written this run's line
+_RUN_DEADLINE_AT: float | None = None  # this run's soft deadline (monotonic), once _run sets it
 
 
-def _phase_line(*, cut: bool = False) -> str:
+def _phase_line(*, cut: bool = False, **extra: object) -> str:
     """The run's phase line. Reads the run flags by name because a hard stop can
-    fire before the module has defined them."""
+    fire before the module has defined them. ``deadline_hit`` is judged now, at
+    render time, so work that crossed the deadline after the run's own checks (the
+    closing flush, a step the hard stop cut) is still reported as late."""
     g = globals()
-    return _PHASES.line(cut=cut, recall_landed=g.get("_RECALL_LANDED"), flushed=g.get("_FLUSHED"))
+    deadline_at = g.get("_RUN_DEADLINE_AT")
+    return _PHASES.line(
+        cut=cut,
+        recall_landed=g.get("_RECALL_LANDED"),
+        flushed=g.get("_FLUSHED"),
+        deadline_hit=None if deadline_at is None else time.monotonic() >= deadline_at,
+        **extra,
+    )
+
+
+if __name__ == "__main__":
+    # A crash while this module loads (a missing dependency, a broken genesis.env)
+    # happens before main() and its finally exist. Python prints the traceback,
+    # then this writes the phase line, whose open step names where it crashed. A
+    # deliberate sys.exit (a dispatched session) is not an uncaught exception, so
+    # it never reaches here and writes nothing, as documented.
+    _prior_excepthook = sys.excepthook
+
+    def _startup_excepthook(exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
+        _prior_excepthook(exc_type, exc, tb)
+        if _PHASE_LINE_WRITTEN:
+            return
+        with contextlib.suppress(Exception):
+            sys.stderr.flush()
+            os.write(2, _phase_line(startup_error=exc_type.__name__).encode("utf-8", "replace"))
+
+    sys.excepthook = _startup_excepthook
 
 
 # The process-level hard stop (hook_deadline.py), armed as early as possible
@@ -2140,7 +2169,7 @@ async def _run(prompt: str, session_id: str = "", *, process_age_s: float = 0.0)
     shrinks by it, because Claude Code's 10 s limit counts from the spawn, not
     from here. main() passes it; a direct caller (a test) gets the full budget.
     """
-    global _RECALL_LANDED, _FLUSHED
+    global _RECALL_LANDED, _FLUSHED, _RUN_DEADLINE_AT
     _RECALL_LANDED = False
     _FLUSHED = False
     deferred_lines: list[str] = []
@@ -2151,11 +2180,13 @@ async def _run(prompt: str, session_id: str = "", *, process_age_s: float = 0.0)
         if _FLUSHED:
             return
         _FLUSHED = True
+        _PHASES.mark("flush")
         out = _writer()
         for line in deferred_lines:
             out.emit(line, block="session-metadata")
 
     deadline = time.monotonic() + max(0.0, _RUN_DEADLINE_S - process_age_s)
+    _RUN_DEADLINE_AT = deadline
     timed_out = False
     loop_deadline = asyncio.get_running_loop().time() + max(
         0.0,
@@ -2174,8 +2205,7 @@ async def _run(prompt: str, session_id: str = "", *, process_age_s: float = 0.0)
         timed_out = True
         return
     finally:
-        _PHASES.mark("finish")
-        _PHASES.set(timed_out=timed_out, deadline_hit=_deadline_expired(deadline))
+        _PHASES.set(timed_out=timed_out)
         # Owed only when the run had NOT reached its own output decision: every
         # path that decides (off mode, a short prompt, the server and degraded
         # paths) flushes first, so an expired deadline after that owes nothing.
@@ -2193,6 +2223,10 @@ async def _run(prompt: str, session_id: str = "", *, process_age_s: float = 0.0)
             _writer().emit_final(
                 _out_of_time_notice(process_age_s), fallback=_OUT_OF_TIME_SHORT
             )
+        # After the closing flush and the notice, so a run that never flushed in
+        # its body (a timeout, an early deadline return) books that write to
+        # `flush`, and `finish` is only the cleanup and exit that follow.
+        _PHASES.mark("finish")
 
 
 async def _run_body(
@@ -2267,6 +2301,7 @@ async def _run_body(
         _flush_deferred()
         # Record the turn so off-mode is observable in proactive_metrics.json
         # (how often recall is silenced) rather than a blind spot.
+        _PHASES.mark("metrics")
         _record_detail(
             fts_count=0,
             vector_count=0,
@@ -2668,7 +2703,9 @@ def main() -> None:
     stderr write can never land inside it. Inside main(), so the hard stop
     still bounds it.
     """
+    global _RUN_DEADLINE_AT
     _PHASES.reset_run()
+    _RUN_DEADLINE_AT = None  # one run per process; reset for callers that run main() again
     _PHASES.mark("stdin")
     try:
         _main()
