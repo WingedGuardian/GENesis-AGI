@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -904,7 +905,7 @@ class TestLegacyNegativeReviewProse:
     def test_historical_leak_scan_is_nonblocking(self, guard_module, monkeypatch):
         # The captured comment was owner-authored; this replays its body as a bot.
         body = (Path(__file__).parents[1] / "fixtures/legacy-leaks-pr1495.md").read_text()
-        assert len(guard_module._BLOCKING_PATTERNS[-1].findall(body)) == 2
+        assert len(guard_module._HARD_BLOCK_PATTERN.findall(body)) == 2
         assert not any(p.search(body) for p in guard_module._CLEAN_PATTERNS)
         assert self._scan(guard_module, monkeypatch, body) == (False, "")
 
@@ -937,6 +938,40 @@ class TestLegacyNegativeReviewProse:
         block, msg = self._scan(guard_module, monkeypatch, body)
         assert block
         assert r"HARD\s+BLOCK" in msg
+
+    @pytest.mark.parametrize("body", [
+        "no hard blocks, except the token left",
+        "**Hard blocks:** None. Except the API key committed in config.py.",
+        "No hard blocks. However an AWS key is committed in settings.py.",
+        "no PII hard blocks; a credential leak was found in env.example",
+    ])
+    def test_negative_tail_exceptions_still_block(self, guard_module, monkeypatch, body):
+        block, msg = self._scan(guard_module, monkeypatch, body)
+        assert block
+        assert r"HARD\s+BLOCK" in msg
+
+    def test_hard_block_exemption_uses_pattern_identity(self, guard_module, monkeypatch):
+        error_pattern, p1_pattern, hard_block_pattern = guard_module._BLOCKING_PATTERNS
+        reordered = [error_pattern, hard_block_pattern, p1_pattern]
+        monkeypatch.setattr(guard_module, "_BLOCKING_PATTERNS", reordered)
+
+        assert guard_module._review_body_findings("Hard blocks: None.") == (False, [])
+        clean, blocking = guard_module._review_body_findings(
+            "HARD BLOCK: unresolved\n[P1] unresolved\n### ERROR unresolved"
+        )
+        assert not clean
+        assert set(blocking) == {pattern.pattern for pattern in reordered}
+
+        non_hard_overlap = re.compile("blocks", re.IGNORECASE)
+        monkeypatch.setattr(
+            guard_module,
+            "_BLOCKING_PATTERNS",
+            [error_pattern, non_hard_overlap, hard_block_pattern, p1_pattern],
+        )
+        assert guard_module._review_body_findings("Hard blocks: None.") == (
+            False,
+            [non_hard_overlap.pattern],
+        )
 
     @pytest.mark.parametrize("finding", [
         "HARD BLOCK: synthetic credential",

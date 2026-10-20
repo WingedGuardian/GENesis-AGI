@@ -1828,16 +1828,18 @@ _BLOCKING_PATTERNS = [
 
 # Only these bounded legacy negatives suppress their own HARD BLOCK occurrence.
 # They are not clean verdicts and cannot settle another finding or an earlier review.
+_NEG_TAIL = r"(?=[ \t]*(?:\r?$|[.,;][ \t]*(?:\r?$|no\b)))"
 _NEGATIVE_HARD_BLOCK_PATTERNS = [
     re.compile(
         r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?hard[ \t]+blocks?"
         r"(?:\*\*|__)?[ \t]*:[ \t]*(?:\*\*|__)?[ \t]*"
-        r"(?:\*\*|__)?none(?:\*\*|__)?(?=[ \t]*(?:\.(?:[ \t]|\r?$)|\r?$))",
+        r"(?:\*\*|__)?none(?:\*\*|__)?"
+        + _NEG_TAIL,
         re.IGNORECASE | re.MULTILINE,
     ),
     re.compile(
         r"(?:^|[,;])[ \t]*no[ \t]+(?:PII[ \t]+)?hard[ \t]+blocks?"
-        r"(?=[ \t]*(?:[,;]|\.(?:[ \t]|\r?$)|\r?$))",
+        + _NEG_TAIL,
         re.IGNORECASE | re.MULTILINE,
     ),
 ]

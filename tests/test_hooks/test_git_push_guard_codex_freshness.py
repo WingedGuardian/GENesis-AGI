@@ -97,9 +97,19 @@ class TestLegacyNegativeScheduledReview:
 
     def test_historical_leak_scan_is_accepted(self, monkeypatch):
         body = self._body()
-        assert len(_mod._BLOCKING_PATTERNS[-1].findall(body)) == 2
+        assert len(_mod._HARD_BLOCK_PATTERN.findall(body)) == 2
         assert not any(p.search(body) for p in _mod._CLEAN_PATTERNS)
         assert self._gate(monkeypatch, self._row(body)) is None
+
+    @pytest.mark.parametrize("finding", [
+        "no hard blocks, except the token left",
+        "**Hard blocks:** None. Except the API key committed in config.py.",
+        "No hard blocks. However an AWS key is committed in settings.py.",
+        "no PII hard blocks; a credential leak was found in env.example",
+    ])
+    def test_negative_tail_exceptions_are_refused(self, monkeypatch, finding):
+        marker = f"<!-- genesis-scheduled-review: head={self._head} kind=leaks -->"
+        assert self._gate(monkeypatch, self._row(f"{finding}\n{marker}"))
 
     @pytest.mark.parametrize("finding", [
         "HARD BLOCK: synthetic credential",
