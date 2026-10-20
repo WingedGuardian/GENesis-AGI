@@ -76,6 +76,7 @@ class TelegramAdapterV2(ChannelAdapter):
         self._engagement_tracker = engagement_tracker
         self._autonomous_cli_gate = autonomous_cli_gate
         self._proposal_workflow = proposal_workflow
+        self.payment_approvals = None  # set by genesis-server before start()
         self._app = None
         # Set True at the top of stop() so background senders healing a
         # shutdown-closed httpx client don't resurrect a client the process
@@ -146,6 +147,7 @@ class TelegramAdapterV2(ChannelAdapter):
             dedupe=self._dedupe,
             autonomous_cli_gate=self._autonomous_cli_gate,
             proposal_workflow=self._proposal_workflow,
+            payment_approvals=self.payment_approvals,
         )
 
         self._app = (

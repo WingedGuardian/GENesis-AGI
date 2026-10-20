@@ -282,6 +282,34 @@ def route_env_pins(selected: SelectedRoute, token: str) -> dict[str, str]:
     return pins
 
 
+def strip_route_env(env: dict[str, str]) -> dict[str, str]:
+    """Undo a routed parent's pins so a child can run native (the subscription).
+
+    A child spawned from a session launched through a route inherits everything
+    :func:`route_env_pins` set: the endpoint, token and model slots, credential
+    variables pinned EMPTY to suppress the saved login, and the route's context,
+    effort and feature switches. Removing only the endpoint leaves the empty
+    credential pins in force, and the child cannot authenticate at all. This
+    removes every variable a route pins; a credential or provider selector that
+    holds a real (non-empty) value was not set by a route and is kept.
+    """
+    roster.apply_routing_env(env, base_url=None, auth_token=None, model_id=None)
+    if not env.get("GENESIS_ROSTER_MODEL"):
+        return env
+    for variable in (*EMPTY_CREDENTIAL_PINS, *PROVIDER_SELECTORS):
+        if env.get(variable) == "":
+            env.pop(variable)
+    for variable in (
+        *_CONTEXT_VARS,
+        *FEATURE_SWITCH_PINS,
+        "CLAUDE_CODE_EFFORT_LEVEL",
+        "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT",
+        "GENESIS_ROSTER_MODEL",
+    ):
+        env.pop(variable, None)
+    return env
+
+
 def apply_route_env(env: dict[str, str], selected: SelectedRoute) -> dict[str, str]:
     """Apply the resolved route to a child; the caller passes an isolated copy."""
     pins = route_env_pins(selected, env.get(selected.auth_env, ""))

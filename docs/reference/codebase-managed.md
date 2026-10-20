@@ -19,6 +19,44 @@ Install always keeps existing links. Directories and FIFOs at these two
 destinations remain errors. Use the configured disablement sentinel for the
 runtime off-switch; masking may refuse when a local regular unit already exists.
 
+## If you see the 'registered but unconfigured' alert
+
+The health alert `codebase_mcp_registered_unconfigured`, and the matching
+`Codebase: NOT SET UP` line that bootstrap, install and update print, mean that
+`codebase-memory-mcp` is registered (the checkout's `.mcp.json` or the
+user-scope `~/.claude.json`) but its launcher will refuse. Either
+`~/.genesis/config/codebase-managed.json` is missing, it fails validation (the
+`status` command below names the error), or `genesis-cbm-query.service` is not
+persistently enabled. Every Claude Code session then shows the server as failed
+to connect.
+
+To set it up, obtain the pinned binary, then run from the primary checkout (see
+[Configure](#configure) for what each argument must be):
+
+```bash
+.venv/bin/python -I scripts/codebase_managed.py configure \
+  --main "$PWD" \
+  --binary "$HOME/tmp/codebase-memory-mcp" \
+  --state "$HOME/.genesis/cbm" \
+  --sentinel "$HOME/.genesis/codebase-memory-mcp.disabled"
+python3 -I scripts/codebase_managed.py enable
+```
+
+If a valid settings file already exists, run only `enable`; for an invalid one,
+follow "Diagnose and recover" below. To opt out instead, create the kill-switch
+file. If a settings file exists, that is its configured `sentinel` path;
+otherwise it is `~/.genesis/codebase-memory-mcp.disabled`, or the path
+`CODEBASE_MEMORY_MCP_DISABLE_FILE` names:
+
+```bash
+touch "$HOME/.genesis/codebase-memory-mcp.disabled"
+```
+
+The alert reads the infrastructure profile, which refreshes at boot and daily.
+After either fix, run `infrastructure_profile(refresh=true)` and the alert
+clears at the next hourly posture check. Both the alert and the installer line
+come from `genesis.infra_profile.codebase_mcp`, so they always agree.
+
 ## Native lifecycle
 
 After staging and ordinary template rendering, deliberately use:

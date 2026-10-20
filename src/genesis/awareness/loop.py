@@ -33,6 +33,8 @@ from genesis.awareness.signals import SignalCollector, collect_all
 from genesis.awareness.types import Depth, TickResult
 from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.db.crud import awareness_ticks, observations
+from genesis.infra_profile.codebase_mcp import SLUG as _CODEBASE_MCP_SLUG
+from genesis.infra_profile.codebase_mcp import needs_setup as codebase_mcp_needs_setup
 from genesis.infra_profile.store import load_profile
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.failure_details import failure_details
@@ -687,7 +689,33 @@ _INFRA_POSTURE_DETAIL = {
         "back; `systemctl --user enable genesis-falkordb` makes it survive the "
         "next reboot. " + _FALKORDB_STAND_DOWN
     ),
+    _CODEBASE_MCP_SLUG: (
+        "codebase-memory-mcp is registered (this checkout's .mcp.json or the "
+        "user-scope ~/.claude.json), but its managed setup is incomplete — the "
+        "settings file ~/.genesis/config/codebase-managed.json is missing or fails "
+        "validation (`scripts/codebase_managed.py status` names the error), or the "
+        "query unit genesis-cbm-query.service is not enabled — so its launcher refuses and "
+        "every Claude Code session shows the server as failed to connect. Fix: "
+        "run `configure` (with an already obtained pinned binary) and then "
+        "`enable`, per docs/reference/codebase-managed.md, section \"If you see "
+        "the 'registered but unconfigured' alert\". Not wanted? Create the "
+        "kill-switch file (the `sentinel` path in the settings file if one exists, "
+        "else ~/.genesis/codebase-memory-mcp.disabled or the path "
+        "CODEBASE_MEMORY_MCP_DISABLE_FILE names) and this alert stops. It reads "
+        "the infrastructure profile, so after either fix take a refresh "
+        "(`infrastructure_profile(refresh=true)`)"
+    ),
 }
+
+# Slugs that are a developer-tooling gap rather than a crash-resilience one, so
+# the alert's crash-resilience trailer does not claim otherwise for them.
+_INFRA_POSTURE_TOOLING_SLUGS = frozenset({_CODEBASE_MCP_SLUG})
+
+
+def _codebase_mcp_could_alert(section: dict) -> bool:
+    """Whether retained codebase_mcp facts could have fed its posture rule."""
+    facts = section.get("facts")
+    return isinstance(facts, dict) and codebase_mcp_needs_setup(facts) is True
 
 # UnitFileState values that mean an operator ENABLED the graph engine.
 _FALKORDB_ENABLED_STATES = frozenset({"enabled", "enabled-runtime"})
@@ -884,6 +912,12 @@ def _infra_missing_protections(profile: dict) -> list[str]:
         or (falkordb_state is None and falkordb.get("socket_present") is False)
     ):
         missing.append("falkordb_selected_not_running")
+    # codebase-memory-mcp registered (so every session tries it) but not set up,
+    # and the owner has not opted out with the kill-switch file. The verdict is
+    # the SAME function the installers' notice runs; None (could not tell)
+    # stays silent, per this function's contract.
+    if codebase_mcp_needs_setup(_facts("codebase_mcp")) is True:
+        missing.append(_CODEBASE_MCP_SLUG)
     return sorted(missing)
 
 
@@ -898,12 +932,17 @@ _POSTURE_PLANES = (
     # make the rules fall silent AND leave `unverifiable` empty — resolving an
     # open engine alert while the engine is still broken and unobservable.
     "falkordb",
+    # Same reason: the codebase-memory-mcp rule's only input.
+    "codebase_mcp",
 )
 
 # Planes whose retained facts are non-empty even when they could never have fed
 # a rule. For these, "retained facts" is not evidence of a prior posture, so the
 # hold applies only when the retained state could actually have alerted.
-_POSTURE_PLANE_RELEVANT = {"falkordb": _falkordb_could_alert}
+_POSTURE_PLANE_RELEVANT = {
+    "falkordb": _falkordb_could_alert,
+    "codebase_mcp": _codebase_mcp_could_alert,
+}
 
 
 def _infra_unverifiable_planes(profile: dict) -> list[str]:
@@ -978,9 +1017,19 @@ async def _check_infra_protection_posture(db) -> None:
             content = (
                 f"Infra protection posture: {len(missing)} protection(s) "
                 f"missing on this install (profile collected {collected_at}): "
-                f"{details}. Each missing protection removes a crash-resilience "
-                f"guarantee this box relies on (2026-07 incident class)."
+                f"{details}."
             )
+            if any(slug not in _INFRA_POSTURE_TOOLING_SLUGS for slug in missing):
+                content += (
+                    " Each missing protection removes a crash-resilience "
+                    "guarantee this box relies on (2026-07 incident class)."
+                )
+            tooling = [slug for slug in missing if slug in _INFRA_POSTURE_TOOLING_SLUGS]
+            if tooling:
+                content += (
+                    f" {', '.join(tooling)}: a developer-tooling gap, not a "
+                    f"crash-resilience one."
+                )
             if unverifiable:
                 content += (
                     f" Additionally unverifiable (section collector failing, "

@@ -662,7 +662,8 @@ if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
     . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
     _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
 fi
-echo "    Codebase: explicit pinned setup required; see docs/reference/codebase-managed.md"
+# Setup is deliberately manual (configure needs a pinned binary); whether it is
+# still owed is reported under "Next steps", after .mcp.json is rendered.
 
 _GITNEXUS_PIN_READY=0
 _gitnexus_pin_file="$SCRIPT_DIR/lib/gitnexus_version.sh"
@@ -2025,6 +2026,10 @@ echo "    Genesis will guide you through first-time setup."
 if [ "$_final_keys" = "0" ] 2>/dev/null; then
     echo "    (API keys, user profile, channels — all handled interactively)"
 fi
+# codebase-memory-mcp: one line only when it is registered but not set up (or OK).
+# shellcheck source=lib/cbm_setup_notice.sh
+. "$SCRIPT_DIR/lib/cbm_setup_notice.sh"
+genesis_cbm_setup_notice "$VENV_PYTHON" "$REPO_DIR" "    "
 # Clarify what the skipped smoke tests mean so new users aren't confused
 if [ "${SMOKE_SKIP:-0}" -gt 0 ] && [ "${SMOKE_FAIL:-0}" = "0" ]; then
     echo ""

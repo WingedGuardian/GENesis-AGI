@@ -178,6 +178,10 @@ class CallResult:
     # must not count those: the vendor never saw the request. Defaults True so
     # every existing construction keeps its meaning (Codex P2, PR #1624).
     reached_provider: bool = True
+    # The model id the provider reports having served (``response.model``).
+    # Differs from the configured id on floating routes (e.g. an OpenRouter
+    # ``~…-latest`` alias), and for dated snapshots; None when not reported.
+    served_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +202,10 @@ class RoutingResult:
     # Whether cost_usd is a measured value (litellm priced it) vs unknown.
     # Lets a trace span distinguish a genuine $0 (free tier) from unmeasured.
     cost_known: bool = True
+    # The model the provider reports having served. ``model_id`` stays the
+    # CONFIGURED id, which identity checks compare against (e.g. the procedure
+    # extractor's validated-model gate); this field records what actually ran.
+    served_model: str | None = None
 
 
 @dataclass(frozen=True)

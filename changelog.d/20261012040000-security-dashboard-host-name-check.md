@@ -1,0 +1,1 @@
+- The dashboard's content routes now answer only to requests addressed to this machine: by IP address, `localhost`, the machine's own hostname, or its Tailscale name. If you open the dashboard by another name, add it to `GENESIS_DASHBOARD_ALLOWED_HOSTS` or use the IP address; `GENESIS_DASHBOARD_HOSTNAME_CHECK=off` turns the check off.
