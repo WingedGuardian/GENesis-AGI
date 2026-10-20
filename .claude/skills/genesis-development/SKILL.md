@@ -3097,7 +3097,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `_is_dispatched()` check after `_check_codex_round_escalation`), and the commit
   gate for a fix commit once a third round is recorded, or at two rounds once
   the confirmation is spent (`commit_approval_required`;
-  `review_enforcement_commit.py` `_allow`). Unreadable round evidence takes the
+  `review_enforcement_commit.py` `_allow`). Once the local streak holds three
+  consecutive defect-bearing external rounds, the escalation cap refuses that
+  commit before `_allow` can ask (the local-streak table above; `# escalation-ack`
+  records a fresh decision). Unreadable round evidence takes the
   same ask/deny path at any count, with one install-local exception: with
   `hooks.asks.review_request: off`, a transient read failure on a lone review
   request becomes a note instead of an ask (a dispatched session is still
