@@ -1040,7 +1040,7 @@ class TestAuditCancellation:
         monkeypatch.setattr(db, "commit", hold_commit)
         caller = asyncio.create_task(service.unlock(PASSPHRASE, None))
         try:
-            await asyncio.wait_for(inserted.wait(), 5)
+            await asyncio.wait_for(inserted.wait(), 30)  # the real unwrap child runs scrypt
             caller.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(caller, 1)

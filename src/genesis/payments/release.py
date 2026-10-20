@@ -244,12 +244,11 @@ class ReleaseManager:
         self._slot: _Release | None = None
         self._recent: OrderedDict[str, str] = OrderedDict()
         self._request_lock = asyncio.Lock()
-        self._stopping = False  # set while stop() aborts: its refusal rows still land
 
     # -- rows, tasks, endings ------------------------------------------------
 
-    async def _row(self, event: str, detail: dict) -> bool:
-        if self._stopping:
+    async def _row(self, event: str, detail: dict, *, stopping: bool = False) -> bool:
+        if stopping:  # only stop()'s own abort row passes the stopped-service guard
             return await self._svc._audit(event, detail, _stopping=True)
         return await self._svc._audit(event, detail)
 
@@ -284,9 +283,11 @@ class ReleaseManager:
         while len(self._recent) > _RECENT:
             self._recent.popitem(last=False)
 
-    async def _refuse_slot(self, rel: _Release, reason: str, state: str = REFUSED) -> None:
+    async def _refuse_slot(
+        self, rel: _Release, reason: str, state: str = REFUSED, *, stopping: bool = False
+    ) -> None:
         if self._end(rel, state):
-            await self._row("release_refused", {**rel.row, "reason": reason})
+            await self._row("release_refused", {**rel.row, "reason": reason}, stopping=stopping)
 
     async def abort(self, reason: str, *, stopping: bool = False) -> None:
         """Refuse the release in the slot (lock, relock, stop). A decided claim completes.
@@ -296,11 +297,7 @@ class ReleaseManager:
         """
         rel = self._slot
         if rel is not None and not rel.decided:
-            self._stopping = stopping
-            try:
-                await self._refuse_slot(rel, reason)
-            finally:
-                self._stopping = False
+            await self._refuse_slot(rel, reason, stopping=stopping)
 
     def _arm(self, rel: _Release) -> None:
         if rel.timer is not None:

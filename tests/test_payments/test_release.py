@@ -489,6 +489,35 @@ async def test_stop_refuses_a_pending_release(db, vault, tmp_path, _sealed):
     assert names[-2:] == ["release_refused", "service_stop"]
 
 
+async def test_only_the_stop_abort_row_passes_the_stopped_guard(db, vault, tmp_path, _sealed):
+    """A release write racing stop()'s abort row is still refused once stopped."""
+    reg = FakeRegistry()
+    svc = VaultService(
+        db,
+        vault_path=vault[0],
+        socket_path=tmp_path / "s" / "v.sock",
+        approvals=reg,
+        release_peer=lambda pid, **_k: _me(),
+    )
+    svc._identity = x25519.Identity.from_str(_sealed[1])
+    await svc.start()
+    c = Ctx(svc, reg, vault[1], [0.0], db)
+    await c.request()
+    await _until(lambda: reg.futures)
+    real, raced = svc._audit, []
+
+    async def audit(event, detail=None, **kw):
+        if kw.get("_stopping") and event == "release_refused" and not raced:
+            raced.append(await svc._release._row("release_cancelled", {"nonce": "x"}))
+        return await real(event, detail, **kw)
+
+    svc._audit = audit
+    await svc.stop()
+    assert raced == [False]
+    names = await c.names()
+    assert "release_cancelled" not in names and names[-2:] == ["release_refused", "service_stop"]
+
+
 # -- GRANTED ------------------------------------------------------------------------
 
 
