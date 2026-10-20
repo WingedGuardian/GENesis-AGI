@@ -18,7 +18,10 @@ memory-hook kills (10.0, 10.6 and 12.5 s), each after the hook had passed its ow
    returns text);
 4. writes the main thread's stack (``co_name:lineno``, no file I/O) to stderr,
    which Claude Code keeps in the transcript's ``hook_success`` row;
-5. calls ``os._exit(0)``.
+5. writes ``diag()`` to stderr, when one was given (a hook's per-step timing
+   line). It runs AFTER the stack, so a ``diag`` that fails or stalls costs only
+   its own line, never the stack;
+6. calls ``os._exit(0)``.
 
 Why this works while the main thread is blocked: CPython releases the GIL around
 sqlite3 open/prepare/step/commit and around blocking file and pipe reads, so the
@@ -140,7 +143,12 @@ def _write_all(fd: int, data: bytes) -> None:
         os.write(fd, data)
 
 
-def _fire(seconds: float, label: str, notice: Callable[[], str | None]) -> None:
+def _fire(
+    seconds: float,
+    label: str,
+    notice: Callable[[], str | None],
+    diag: Callable[[], str | None] | None = None,
+) -> None:
     if _DONE.is_set():
         return
     got = STDOUT_LOCK.acquire(timeout=0.2)
@@ -175,6 +183,13 @@ def _fire(seconds: float, label: str, notice: Callable[[], str | None]) -> None:
                 "utf-8", "replace"
             ),
         )
+        if diag is not None:
+            try:
+                extra = diag()
+            except Exception:
+                extra = None
+            if extra:
+                _write_all(2, extra.encode("utf-8", "replace"))
     finally:
         os._exit(0)
 
@@ -184,11 +199,13 @@ def arm(
     notice: Callable[[], str | None],
     *,
     label: str = "hook",
+    diag: Callable[[], str | None] | None = None,
 ) -> threading.Timer:
     """Start the hard stop. ``notice`` runs on the timer thread at fire time and
-    returns the stdout line to add, or None for none. It must not import."""
+    returns the stdout line to add, or None for none. ``diag``, if given, returns
+    extra stderr text written after the stack sample. Neither may import."""
     _DONE.clear()
-    timer = threading.Timer(max(0.0, seconds), _fire, args=(seconds, label, notice))
+    timer = threading.Timer(max(0.0, seconds), _fire, args=(seconds, label, notice, diag))
     timer.daemon = True
     timer.start()
     return timer
@@ -199,13 +216,14 @@ def arm_from_spawn(
     notice: Callable[[], str | None],
     *,
     label: str = "hook",
+    diag: Callable[[], str | None] | None = None,
 ) -> threading.Timer:
     """Arm the hard stop to fire ``budget_s`` after this PROCESS started.
 
     An unreadable age counts as zero: the timer then fires ``budget_s`` from now,
     which is never earlier than intended.
     """
-    return arm(budget_s - (process_age_s() or 0.0), notice, label=label)
+    return arm(budget_s - (process_age_s() or 0.0), notice, label=label, diag=diag)
 
 
 def disarm(timer: threading.Timer | None) -> None:

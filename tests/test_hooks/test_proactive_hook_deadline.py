@@ -691,3 +691,185 @@ async def test_the_notice_survives_a_flush_that_used_up_the_budget(
     # BOTH closing lines land whole: the reserve holds the cut notice AND this one.
     assert hook._out_of_time_notice(hook._RUN_DEADLINE_S - 0.05) in printed
     assert "output was CUT at 'session-metadata'" in printed
+
+
+# ── PR-2: the per-step phase line (hook_phases.py) ──
+
+
+class _Stderr:
+    """One ordered record of both stderr channels: sys.stderr text and os.write(2)."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.parts: list[str] = []
+        real_write = hook.os.write
+
+        def _write(fd: int, data: bytes) -> int:
+            if fd == 2:
+                self.parts.append(data.decode())
+                return len(data)
+            return real_write(fd, data)
+
+        monkeypatch.setattr(hook.os, "write", _write)
+        monkeypatch.setattr(sys, "stderr", self)
+
+    def write(self, text: str) -> int:
+        self.parts.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    @property
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+def _phase_lines(err: str) -> list[dict]:
+    import json
+
+    prefix = "[hook-phases] "
+    return [json.loads(ln[len(prefix) :]) for ln in err.splitlines() if ln.startswith(prefix)]
+
+
+@pytest.mark.parametrize(
+    "stdin_text",
+    ["", "{not json", '{"session_id": "s"}'],
+    ids=["empty", "bad-json", "no-prompt"],
+)
+def test_every_early_exit_writes_exactly_one_phase_line(
+    monkeypatch: pytest.MonkeyPatch, stdin_text: str
+) -> None:
+    """Architect SF-1: the line comes from main()'s OUTERMOST finally, so the exits
+    before the inner try (empty stdin, bad JSON) write it too."""
+    import io
+
+    err = _Stderr(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(stdin_text))
+    hook.main()
+    lines = _phase_lines(err.text)
+    assert len(lines) == 1
+    assert lines[0]["cut"] is False
+    assert [name for name, _ in lines[0]["phases"]][-1] == "stdin"
+
+
+def test_a_crash_writes_its_traceback_then_the_phase_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    import json
+
+    async def _boom(*_a, **_k) -> None:
+        raise RuntimeError("run broke")
+
+    monkeypatch.setattr(hook, "_run", _boom)
+    capture = _Stderr(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"prompt": "hi", "session_id": "s"})))
+    hook.main()
+    err = capture.text
+    assert "RuntimeError: run broke" in err
+    assert err.index("RuntimeError: run broke") < err.index("[hook-phases] ")
+    assert len(_phase_lines(err)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_run_records_its_steps_path_and_flags(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The degraded path's steps are marked in order and its run facts are set."""
+    writer = _RecordingWriter()
+    _quiet_run_body(monkeypatch, tmp_path, writer)
+
+    async def _down(*_a, **_k):
+        return None, "server unreachable"
+
+    monkeypatch.setattr(hook, "_call_server", _down)
+    monkeypatch.setattr(hook, "_search_fts5", lambda *_a, **_k: [])
+    monkeypatch.setattr(hook, "_ambient_fold", lambda *_a, **_k: None)
+    hook._PHASES.reset_run()
+    await hook._run("what did we decide", session_id="s")
+    import json
+
+    line = json.loads(hook._phase_line()[len("[hook-phases] ") :])
+    names = [name for name, _ in line["phases"]]
+    run = names[names.index("heartbeat_write") :]
+    assert run == [
+        "heartbeat_write", "heartbeat_read", "trail", "activity", "recent_files",
+        "gates", "migration", "suppress", "server", "fts5", "code_index", "degraded_emit",
+        "shadow", "ws_measure", "activity_row", "metrics", "fold", "finish",
+    ]  # fmt: skip
+    assert line["path"] == "degraded"
+    assert line["server_reason"] == "server unreachable"
+    assert line["timed_out"] is False
+    assert line["deadline_hit"] is False
+    assert line["flushed"] is True
+
+
+def test_the_running_hook_arms_its_stop_with_the_phase_line() -> None:
+    """Run as a script, the hard stop carries a diag that renders a CUT phase line."""
+    import os
+    import subprocess
+
+    probe = (
+        "import runpy, sys, io, json;"
+        "sys.argv=[sys.argv[1]];"
+        "sys.stdin=io.StringIO('');"
+        "g = runpy.run_path(sys.argv[0], run_name='__main__');"
+        "diag = g['_HARD_STOP'].args[3];"
+        "after_main = diag();"
+        "diag.__globals__['_PHASE_LINE_WRITTEN'] = False;"
+        "line = diag();"
+        "p = json.loads(line[len('[hook-phases] '):]);"
+        "print('RESULT', p['cut'], p['phases'][0][0], 'psi' in p, after_main)"
+    )
+    env = dict(os.environ)
+    env.pop("GENESIS_CC_SESSION", None)
+    out = subprocess.run(
+        [sys.executable, "-c", probe, str(_SCRIPTS_DIR / "proactive_memory_hook.py")],
+        capture_output=True, text=True, timeout=60, check=True, env=env,
+    ).stdout  # fmt: skip
+    # main() already wrote this run's line, so the stop's diag stands down (None);
+    # before that, it renders a CUT line from the first module mark on.
+    assert [ln for ln in out.splitlines() if ln.startswith("RESULT")] == [
+        "RESULT True imports True None"
+    ]
+
+
+def test_a_stop_during_a_stuck_step_names_that_step(tmp_path: Path) -> None:
+    """A REAL process: the heartbeat write blocks, the hard stop fires, and the cut
+    line names heartbeat_write as running, after the stack sample."""
+    import json
+    import os
+    import subprocess
+    import textwrap
+
+    child = textwrap.dedent(
+        f"""
+        import io, json, sys, time
+        sys.path.insert(0, {str(_SCRIPTS_DIR)!r})
+        sys.path.insert(0, {str(_SCRIPTS_DIR / "hooks")!r})
+        import proactive_memory_hook as hook
+        import hook_deadline as hd
+        hook._heartbeat_write = lambda *a, **k: time.sleep(30)
+        hook._DB_PATH = __import__("pathlib").Path({str(tmp_path / "genesis.db")!r})
+        hd.arm(0.8, lambda: hook._hard_stop_notice(), label="t",
+               diag=lambda: hook._phase_line(cut=True))
+        sys.stdin = io.StringIO(json.dumps({{"prompt": "what did we decide", "session_id": "s"}}))
+        hook.main()
+        """
+    )
+    env = dict(os.environ)
+    env.pop("GENESIS_CC_SESSION", None)
+    env["HOME"] = str(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-c", child], capture_output=True, text=True, timeout=60, env=env
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    lines = proc.stderr.splitlines()
+    stack_at = next(i for i, ln in enumerate(lines) if "hard stop fired" in ln)
+    phase_at = next(i for i, ln in enumerate(lines) if ln.startswith("[hook-phases] "))
+    assert stack_at < phase_at
+    cut = json.loads(lines[phase_at][len("[hook-phases] ") :])
+    assert cut["cut"] is True
+    assert cut["running"] == "heartbeat_write"
+    assert cut["running_ms"] >= 500
+    assert "[Memory: the hook ran out" in proc.stdout  # the notice still lands

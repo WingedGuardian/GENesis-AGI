@@ -93,7 +93,8 @@ as the hook, never on import), ends the process 8.5 s after spawn: it flushes
 what was printed, adds the out-of-time notice when no output had been
 finalised, writes the main thread's stack to stderr (Claude Code keeps hook
 stderr in the transcript's `hook_success` row, so every hard stop records the
-step that overran), and calls `os._exit(0)`. CPython releases the GIL inside
+step that overran), then the cut phase line (see Observability), and calls
+`os._exit(0)`. CPython releases the GIL inside
 sqlite3 calls and blocking reads, which is what lets the timer run while the
 main thread is stuck. Measured on the real hook with every database connect
 stalled for 30 s: the branch hook exited at 8.53 s with the notice and the
@@ -122,6 +123,40 @@ that holds the GIL (a regex or JSON parse over a huge prompt) delays the timer.
 `~/.genesis/proactive_metrics.json` records the latest invocation, including
 `mode` (`server`/`degraded`/`local`/`off`) and `server_ms`, so the server-path
 fallback rate is directly observable. The health dashboard reads this file.
+
+**Phase line (stderr).** Every run writes one `[hook-phases] {json}` line to
+stderr as it exits (`scripts/hooks/hook_phases.py`), on every path: an empty or
+unparseable input, off mode, a short prompt, the server and degraded paths, and
+a crash, after its traceback. Claude Code never shows an exit-0 hook's stderr to
+the model; it stores it in the transcript's `hook_success` attachment
+(`stderr`), next to the run's `durationMs`. A dispatched session
+(`GENESIS_CC_SESSION=1`) exits before any of this and writes nothing. The line
+carries:
+
+- `phases`: `[name, ms]` per step, in order. A step starts at its mark and runs
+  until the next one: `imports`, `dotenv`, `genesis_env` and `module` at load,
+  then `stdin`, `heartbeat_write`, `heartbeat_read`, `trail`, `activity`,
+  `recent_files`, `gates` (the off-mode, short-prompt and database checks),
+  `migration`, `suppress`, `server`, the path's own steps
+  (`server_emit`, `code_hints` / `fts5`, `code_index`, `degraded_emit`,
+  `shadow`), `ws_measure`, `activity_row`, `metrics`, `fold`, and `finish` (the
+  closing flush and exit). Under its 1,000-byte cap the oldest steps fold into one
+  `["+N", ms]` entry.
+- `age0_s` (process age when timing started, null if unreadable), `total_s`,
+  `path` (`off`, `short`, `no_db`, `server`, `degraded`, `local`; absent when the
+  run stopped before deciding), `server_reason`, `timed_out`, `deadline_hit`,
+  `recall_landed`, `flushed`.
+- `psi`: pressure stall averages for the whole container, read from the
+  container-root cgroup (`/sys/fs/cgroup/{io,cpu,memory}.pressure`): `io_some10`,
+  `io_some60`, `io_full10`, `io_full60`, `cpu_some10`, `mem_full10`. Null when a
+  file cannot be read.
+
+When the hard stop fires, it writes the stack and then a phase line with
+`"cut": true`, whose `running` and `running_ms` name the step it cut. A stop
+that fires after the run wrote its own line adds no second line; only in the
+narrow window where both write at once can two lines appear, and then the one
+with `"cut": true` is the one that counts. A run Claude Code kills anyway leaves a
+`hook_cancelled` attachment and no stderr at all, so count those separately.
 
 The server response carries `timings_ms` with a per-stage breakdown —
 `embed`, `recall`, and (since ac27b693) the recall sub-stages `vector`,

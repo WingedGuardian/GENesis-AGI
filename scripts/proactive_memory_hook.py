@@ -47,6 +47,22 @@ from hook_deadline import (  # noqa: E402
     process_age_s,
     written_units,
 )
+from hook_phases import PhaseClock  # noqa: E402
+
+# Per-step timings, written to stderr once per run (hook_phases.py). Created
+# before the hard stop is armed so a stop that fires during the imports below
+# still names the step it cut: each mark() starts a step, and a cut line names
+# the one still open as `running`.
+_PHASES = PhaseClock(age_s=process_age_s())
+_PHASE_LINE_WRITTEN = False  # set once main() has written this run's line
+
+
+def _phase_line(*, cut: bool = False) -> str:
+    """The run's phase line. Reads the run flags by name because a hard stop can
+    fire before the module has defined them."""
+    g = globals()
+    return _PHASES.line(cut=cut, recall_landed=g.get("_RECALL_LANDED"), flushed=g.get("_FLUSHED"))
+
 
 # The process-level hard stop (hook_deadline.py), armed as early as possible
 # and ONLY when this file runs as the hook: an import (a test, ambient_replay)
@@ -56,11 +72,19 @@ from hook_deadline import (  # noqa: E402
 # during the imports below still works (it prints no notice).
 _HARD_STOP_S = 8.5
 _HARD_STOP = (
-    arm_from_spawn(_HARD_STOP_S, lambda: _hard_stop_notice(), label="proactive_memory_hook")
+    arm_from_spawn(
+        _HARD_STOP_S,
+        lambda: _hard_stop_notice(),
+        label="proactive_memory_hook",
+        # A run that already wrote its own line has finished: a stop landing
+        # between that write and disarm() adds nothing, rather than a second line.
+        diag=lambda: None if _PHASE_LINE_WRITTEN else _phase_line(cut=True),
+    )
     if __name__ == "__main__"
     else None
 )
 
+_PHASES.mark("imports")
 from hook_input import session_path  # noqa: E402
 from hook_output import (  # noqa: E402
     DEFAULT_BUDGET,
@@ -87,6 +111,7 @@ if str(SRC_DIR) not in sys.path:
 from dotenv import load_dotenv  # noqa: E402
 
 # SECRETS_PATH wins, as in genesis.env.secrets_path().
+_PHASES.mark("dotenv")
 load_dotenv(
     Path(os.environ["SECRETS_PATH"]).expanduser()
     if os.environ.get("SECRETS_PATH")
@@ -102,7 +127,9 @@ def _genesis_db_path() -> Path:
     return importlib.import_module("genesis.env").genesis_db_path()
 
 
+_PHASES.mark("genesis_env")
 _DB_PATH = _genesis_db_path()
+_PHASES.mark("module")
 _MAX_RESULTS = 3  # Degraded-fallback result cap (the server owns the live budget).
 _MIN_PROMPT_WORDS = 1  # Stop words already filter greetings to 0 keywords
 _METRICS_PATH = Path.home() / ".genesis" / "proactive_metrics.json"
@@ -2147,6 +2174,8 @@ async def _run(prompt: str, session_id: str = "", *, process_age_s: float = 0.0)
         timed_out = True
         return
     finally:
+        _PHASES.mark("finish")
+        _PHASES.set(timed_out=timed_out, deadline_hit=_deadline_expired(deadline))
         # Owed only when the run had NOT reached its own output decision: every
         # path that decides (off mode, a short prompt, the server and degraded
         # paths) flushes first, so an expired deadline after that owes nothing.
@@ -2179,6 +2208,7 @@ async def _run_body(
 
     # ── Heartbeat ops (BEFORE memory recall — always complete) ─────
     heartbeat_ms = 0.0
+    _PHASES.mark("heartbeat_write")
     heartbeat_ms += _heartbeat_write(
         _DB_PATH,
         session_id,
@@ -2187,6 +2217,7 @@ async def _run_body(
     )
     if _deadline_expired(deadline):
         return
+    _PHASES.mark("heartbeat_read")
     heartbeat_ms += _heartbeat_read_and_inject(
         _DB_PATH,
         session_id,
@@ -2195,6 +2226,7 @@ async def _run_body(
     if _deadline_expired(deadline):
         return
 
+    _PHASES.mark("trail")
     keywords = _extract_keywords(prompt)
 
     # ── Session intent trail (runs on every message, even short ones) ─
@@ -2212,6 +2244,7 @@ async def _run_body(
         pass  # Intent trail must never block the hook
 
     # ── Recent tool activity (self-awareness for post-compaction context) ─
+    _PHASES.mark("activity")
     try:
         activity = _extract_genesis_summary(session_id)
         if activity:
@@ -2221,13 +2254,16 @@ async def _run_body(
 
     # File-context keywords (PostToolUse tracking): sent to the server as extra
     # FTS terms; merged into the local keyword set for the degraded fallback.
+    _PHASES.mark("recent_files")
     recent_files = _load_recent_files(session_id)
     file_keywords = _keywords_from_files(recent_files) if recent_files else []
     if _deadline_expired(deadline):
         return
 
     # off mode: session-local awareness only (heartbeat/trail already ran).
+    _PHASES.mark("gates")
     if _HOOK_MODE == "off":
+        _PHASES.set(path="off")
         _flush_deferred()
         # Record the turn so off-mode is observable in proactive_metrics.json
         # (how often recall is silenced) rather than a blind spot.
@@ -2255,14 +2291,17 @@ async def _run_body(
     # that already walks it; the alternative is deriving eligibility from a list
     # that was filtered for a different purpose.
     if len(_extract_keywords(prompt, window=False)) < _MIN_PROMPT_WORDS and not file_keywords:
+        _PHASES.set(path="short")
         _flush_deferred()
         return
 
     if not _DB_PATH.exists():
+        _PHASES.set(path="no_db")
         _flush_deferred()
         return
 
     # Self-heal: ensure knowledge_units has retrieved_count column (once)
+    _PHASES.mark("migration")
     _SENTINEL = Path.home() / ".genesis" / ".knowledge_retrieved_count_migrated"
     if not _SENTINEL.exists():
         try:
@@ -2277,6 +2316,7 @@ async def _run_body(
     if _deadline_expired(deadline):
         return
 
+    _PHASES.mark("suppress")
     suppress_ids = _compute_suppress_ids(session_id)
     now_iso = datetime.now(UTC).isoformat()
 
@@ -2285,10 +2325,12 @@ async def _run_body(
     server_ms: float | None = None
     server_reason: str | None = None
     if _HOOK_MODE != "local":
+        _PHASES.mark("server")
         _t_srv = time.monotonic()
         server_data, server_reason = await _call_server(
             prompt, session_id, file_keywords, suppress_ids
         )
+        _PHASES.set(server_reason=server_reason)
         server_ms = (time.monotonic() - _t_srv) * 1000
         # An answer that already arrived is printed even when the budget ran out
         # while waiting for it: printing costs microseconds, and the steps after
@@ -2306,6 +2348,8 @@ async def _run_body(
         # clamp, so `budgets.max` can be raised arbitrarily by a .local.yaml
         # overlay. The gate's rule is that a structural exemption may only cite a
         # bound configuration cannot change — this is the opposite of that.
+        _PHASES.set(path="server")
+        _PHASES.mark("server_emit")
         out = _writer()
         server_lines_landed = True
         for line in server_data.get("lines") or []:
@@ -2319,6 +2363,7 @@ async def _run_body(
         # recall. Best-effort; empty when the code index hasn't been built.
         # Suppressed when the engine is deliberately silenced (status "disabled" =
         # config kill switch → inject NOTHING), so code hints don't leak past it.
+        _PHASES.mark("code_hints")
         code_hits: list[dict] = []
         if server_data.get("status") != "disabled":
             code_keywords = keywords + [k for k in file_keywords if k not in keywords]
@@ -2362,10 +2407,12 @@ async def _run_body(
         if _deadline_expired(deadline):
             return
 
+        _PHASES.mark("ws_measure")
         ws_stats = _ws_measure(fused, session_id, surfaced_proc_id, now_iso, shadow=shadow)
         if _deadline_expired(deadline):
             return
         total_ms = (time.monotonic() - start) * 1000
+        _PHASES.mark("activity_row")
         _record_activity(
             _DB_PATH,
             total_ms,
@@ -2374,6 +2421,7 @@ async def _run_body(
         )
         if _deadline_expired(deadline):
             return
+        _PHASES.mark("metrics")
         _record_detail(
             # On the server path the HOOK does zero local fts/vector search — the
             # server owns retrieval. Report 0/0 (fused_count + mode carry meaning);
@@ -2400,6 +2448,7 @@ async def _run_body(
         # Ambient fold on the server-returned prompt embedding (None-safe).
         if _deadline_expired(deadline):
             return
+        _PHASES.mark("fold")
         _ambient_fold(embedding, session_id, prompt, recent_files)
         return
 
@@ -2407,7 +2456,9 @@ async def _run_body(
     # Reached when the server is unreachable/slow (mode "server") or when the
     # operator forced local recall (GENESIS_PROACTIVE_HOOK_MODE=local).
     fallback_mode = "local" if _HOOK_MODE == "local" else "degraded"
+    _PHASES.set(path=fallback_mode)
     fallback_keywords = keywords + [k for k in file_keywords if k not in keywords]
+    _PHASES.mark("fts5")
     fts_results = _search_fts5(
         _DB_PATH,
         fallback_keywords,
@@ -2417,6 +2468,7 @@ async def _run_body(
     )
     if _deadline_expired(deadline):
         return
+    _PHASES.mark("code_index")
     from genesis.memory.provenance import is_garbage
 
     code_results = _search_code_index(
@@ -2426,6 +2478,7 @@ async def _run_body(
     )
     if _deadline_expired(deadline):
         return
+    _PHASES.mark("degraded_emit")
     fused = [r for r in fts_results if not is_garbage(r.get("content", ""))][:_MAX_RESULTS]
     if len(fused) < _MAX_RESULTS and code_results:
         fused += code_results[: _MAX_RESULTS - len(fused)]
@@ -2452,6 +2505,7 @@ async def _run_body(
     # injects FTS5 content locally, so it must record blockable external-world
     # hits that reach the prompt itself. Fire-and-forget after flush; the items
     # were enriched with origin_class by _format_degraded above.
+    _PHASES.mark("shadow")
     if fused:
         try:
             from genesis.security.immunity_shadow import (
@@ -2485,10 +2539,12 @@ async def _run_body(
 
     if _deadline_expired(deadline):
         return
+    _PHASES.mark("ws_measure")
     ws_stats = _ws_measure(fused, session_id, None, now_iso, shadow=None)
     if _deadline_expired(deadline):
         return
     total_ms = (time.monotonic() - start) * 1000
+    _PHASES.mark("activity_row")
     _record_activity(
         _DB_PATH,
         total_ms,
@@ -2497,6 +2553,7 @@ async def _run_body(
     )
     if _deadline_expired(deadline):
         return
+    _PHASES.mark("metrics")
     _record_detail(
         fts_count=len(fts_results),
         vector_count=0,
@@ -2517,6 +2574,7 @@ async def _run_body(
     # No embedding on the fallback path — the ambient fold degrades silently.
     if _deadline_expired(deadline):
         return
+    _PHASES.mark("fold")
     _ambient_fold(None, session_id, prompt, recent_files)
 
 
@@ -2601,7 +2659,34 @@ def _spawn_ambient_worker(session_id: str) -> None:
 
 
 def main() -> None:
-    """Hook entry point."""
+    """Hook entry point: one run, then its phase line on stderr.
+
+    The line is written from this outermost ``finally`` so every exit writes it:
+    an empty or unparseable stdin, an early gate, the crash path (after its
+    traceback), and the ordinary return. One ``os.write`` of at most
+    ``MAX_LINE_BYTES`` is a single atomic write on a pipe, so a hard stop's own
+    stderr write can never land inside it. Inside main(), so the hard stop
+    still bounds it.
+    """
+    _PHASES.reset_run()
+    _PHASES.mark("stdin")
+    try:
+        _main()
+    finally:
+        _write_phase_line()
+
+
+def _write_phase_line() -> None:
+    """Write the phase line to stderr. Best-effort: it must never cost the prompt."""
+    global _PHASE_LINE_WRITTEN
+    with contextlib.suppress(Exception):
+        sys.stderr.flush()  # anything printed earlier (a traceback) stays first
+        os.write(2, _phase_line().encode("utf-8", "replace"))
+        _PHASE_LINE_WRITTEN = True
+
+
+def _main() -> None:
+    """Read the hook input and run."""
     try:
         raw = sys.stdin.read()
         if not raw.strip():
@@ -2628,6 +2713,10 @@ def main() -> None:
         import traceback
 
         print(traceback.format_exc(), file=sys.stderr)
+
+
+# Marks made so far belong to module load and survive PhaseClock.reset_run().
+_PHASES.freeze_module()
 
 
 if __name__ == "__main__":

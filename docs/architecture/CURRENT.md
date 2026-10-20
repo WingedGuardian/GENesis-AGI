@@ -148,7 +148,10 @@ Easy-to-forget mechanisms:
   that ceiling with an 8s soft deadline counted from process start and a
   process-level hard stop at 8.5s (`scripts/hooks/hook_deadline.py`) that
   ends a run stuck inside one step, with a one-line out-of-time notice and the
-  blocked frame on stderr, instead of being killed silently. The
+  blocked frame on stderr, instead of being killed silently. Every run also
+  writes one `[hook-phases]` stderr line (`scripts/hooks/hook_phases.py`): the
+  milliseconds each step took, the container's pressure stall averages, and,
+  on a hard stop, the step that was cut. The
   `memory_proactive` MCP tool shares the engine but stays unfiltered/
   un-reranked.
 - **FTS term counts are bounded** (`db/crud/_fts.py` `bounded_terms`,
