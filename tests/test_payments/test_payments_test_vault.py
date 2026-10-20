@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -328,9 +330,29 @@ def test_r5_the_only_card_shaped_literal_is_the_stripe_test_card():
         and ap.holds_long_digit_run(node.value)
     }
     assert runs == {H.TEST_NUMBER}
-    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-    assert "input" not in names and not {"stdin", "getpass"} & attrs  # nothing is read in
+    # Only the console approver reads the terminal, and what it reads is only ever
+    # compared with "y": no typed line reaches the vault or any other call.
+    console = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ConsoleApprover"
+    )
+    inside = {id(n) for n in ast.walk(console)}
+    outside = [n for n in ast.walk(tree) if id(n) not in inside]
+    names = {n.id for n in outside if isinstance(n, ast.Name)}
+    attrs = {n.attr for n in outside if isinstance(n, ast.Attribute)}
+    assert "input" not in names and not {"stdin", "getpass", "add_reader"} & attrs
+    answer = next(n for n in console.body if isinstance(n, ast.FunctionDef) and n.name == "answer")
+    uses = [n for n in ast.walk(answer) if isinstance(n, ast.Name) and n.id == "word"]
+    compared = [
+        n
+        for n in ast.walk(answer)
+        if isinstance(n, ast.Compare)
+        and isinstance(n.left, ast.Call)
+        and isinstance(n.left.func, ast.Attribute)
+        and isinstance(n.left.func.value, ast.Name)
+        and n.left.func.value.id == "word"
+        and [c.value for c in n.comparators if isinstance(c, ast.Constant)] == ["y"]
+    ]
+    assert len(uses) == 1 and len(compared) == 1  # its one use: word.lower() == "y"
 
 
 # -- R6 ------------------------------------------------------------------------
@@ -408,7 +430,6 @@ def test_r7_mcp_json_overrides_every_checked_name(built):
         assert Path(env[name]).is_relative_to(layout.root)
     assert env["GENESIS_REPO_ROOT"] == state["worktree"]
     assert env["DBUS_SESSION_BUS_ADDRESS"] == env["TELEGRAM_BOT_TOKEN"] == ""
-    assert env[H.BOT_TOKEN_KEY] == ""
     assert server["command"] == str(layout.venv_python)
     assert server["args"] == [str(Path(state["worktree"]) / H.SERVER_SCRIPT), "--server", "health"]
     assert oct(os.stat(layout.mcp_json).st_mode & 0o777) == "0o600"
@@ -532,35 +553,6 @@ def test_r10_the_overlay_is_only_in_the_worktree(tmp_path, checkouts, built):
         shutil.rmtree(main / ".claude")
 
 
-async def test_the_telegram_side_polls_callbacks_only(monkeypatch):
-    from telegram.ext import Application, CallbackQueryHandler, Updater
-
-    for owner, name in (
-        (Application, "initialize"),
-        (Application, "start"),
-        (Application, "stop"),
-        (Application, "shutdown"),
-        (Updater, "start_polling"),
-        (Updater, "stop"),
-    ):
-        monkeypatch.setattr(owner, name, AsyncMock())
-    side = H.TelegramSide("901:test-token")
-
-    async def handler(update, context):
-        return None
-
-    bot = await side.start(handler)
-    assert bot is side.app.bot and bot.token == "901:test-token"
-    handlers = [h for group in side.app.handlers.values() for h in group]
-    assert len(handlers) == 1 and isinstance(handlers[0], CallbackQueryHandler)
-    assert handlers[0].callback is handler and handlers[0].pattern.pattern == "^payapprove:"
-    Updater.start_polling.assert_awaited_once_with(
-        allowed_updates=["callback_query"], drop_pending_updates=True
-    )
-    await side.stop()
-    assert side.stopping
-
-
 def test_r10_setup_never_replaces_an_existing_overlay(tmp_path, checkouts, built):
     with pytest.raises(H.Refused, match="^R10: .* already exists"):
         _setup(tmp_path, checkouts)  # the module's setup left its overlay in place
@@ -645,51 +637,6 @@ async def test_the_approval_wait_is_capped():
 
 
 # -- the test bot's secrets ---------------------------------------------------------
-
-
-LIVE = "TELEGRAM_BOT_TOKEN=900:live\n"
-OWNERS = "TELEGRAM_ALLOWED_USERS=111,222\n"
-
-
-@pytest.mark.parametrize(
-    ("text", "env", "match"),
-    [
-        (LIVE + OWNERS, {}, "is not set to a bot token"),
-        (f"{LIVE}{H.BOT_TOKEN_KEY}=900:other\n{OWNERS}", {}, "is another bot's token"),
-        (
-            f"{LIVE}GUARDIAN_BOT_TOKEN=901:g\n{H.BOT_TOKEN_KEY}=901:t\n{OWNERS}",
-            {},
-            "is another bot's token",
-        ),
-        (
-            f"{LIVE}{H.BOT_TOKEN_KEY}=902:t\n{OWNERS}",
-            {"OTHER_BOT_TOKEN": "902:e"},
-            "is another bot's token",
-        ),
-        (f"{H.BOT_TOKEN_KEY}=901:t\n{OWNERS}", {}, "TELEGRAM_BOT_TOKEN was not found"),
-        (
-            f"{H.BOT_TOKEN_KEY}=901:t\n{OWNERS}",
-            {"TELEGRAM_BOT_TOKEN": "901:x"},
-            "is another bot's token",
-        ),
-        (f"{LIVE}{H.BOT_TOKEN_KEY}=901:t\nTELEGRAM_ALLOWED_USERS=x,111\n", {}, "no owner id first"),
-    ],
-)
-def test_bot_secrets_refusals(tmp_path, text, env, match):
-    path = tmp_path / "secrets.env"
-    path.write_text(text)
-    with pytest.raises(H.Refused, match=match):
-        H.read_bot_secrets(path, env)
-
-
-def test_bot_secrets_read_the_test_token_and_the_owner(tmp_path):
-    path = tmp_path / "secrets.env"
-    path.write_text(f"{LIVE}{H.BOT_TOKEN_KEY}=901:t\n{OWNERS}")
-    assert H.read_bot_secrets(path, {}) == ("901:t", 111)
-    assert H.read_bot_secrets(tmp_path / "secrets.env", {"TELEGRAM_BOT_TOKEN": "900:x"})[1] == 111
-
-
-# -- the test audit database (review W2) --------------------------------------------
 
 
 def test_the_test_db_must_be_its_own_file(built, tmp_path):
@@ -777,18 +724,33 @@ def test_q16_a_release_is_refused_while_another_browser_runs(built, monkeypatch)
 # -- end to end: request, tap, claim, against the TEST vault ---------------------------
 
 
-class FakeTelegram:
+class Console:
+    """The harness's real ConsoleApprover, reading a pipe and printing to a buffer."""
+
     def __init__(self) -> None:
-        self.stopping = False
-        self.bot = FakeBot()
-        self.handler = None
+        self.read_fd, self.write_fd = os.pipe()
+        self.out = io.StringIO()
+        self.approver = H.ConsoleApprover(out=self.out, read_fd=self.read_fd)
 
-    async def start(self, handler):
-        self.handler = handler
-        return self.bot
+    @property
+    def text(self) -> str:
+        return self.out.getvalue()
 
-    async def stop(self) -> None:
-        self.stopping = True
+    def type(self, line: str) -> None:
+        os.write(self.write_fd, line.encode() + b"\n")
+
+    async def wait_for(self, needle: str, count: int = 1) -> None:
+        async with asyncio.timeout(30):
+            while self.text.count(needle) < count:
+                await asyncio.sleep(0.02)
+
+    def close(self) -> None:
+        for fd in (self.read_fd, self.write_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+ASK = "Approve this TEST release?"
 
 
 def _request() -> dict:
@@ -805,9 +767,9 @@ def _request() -> dict:
     }
 
 
-async def _serve_and_run(layout, state, child_env: dict, *, tap: bool):
+async def _serve_and_run(layout, state, child_env: dict, *, answer: str | None):
     wt = Path(state["worktree"])
-    telegram = FakeTelegram()
+    console = Console()
     stop = asyncio.Event()
     ready = asyncio.Event()
 
@@ -821,8 +783,7 @@ async def _serve_and_run(layout, state, child_env: dict, *, tap: bool):
             layout,
             state,
             live=live,
-            telegram=telegram,
-            owner=OWNER,
+            approver=console.approver,
             timeout_cap_s=30,
             stop=stop,
             release_peer=peer,
@@ -843,28 +804,16 @@ async def _serve_and_run(layout, state, child_env: dict, *, tap: bool):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        if tap:
-            async with asyncio.timeout(30):
-                while not telegram.bot.sent:
-                    await asyncio.sleep(0.02)
-            msg, markup = telegram.bot.sent[0]
-            query = SimpleNamespace(
-                data=markup.inline_keyboard[0][0].callback_data,
-                message=msg,
-                answer=AsyncMock(),
-                edit_message_reply_markup=AsyncMock(),
-            )
-            await telegram.handler(
-                SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=OWNER)),
-                None,
-            )
-            query.answer.assert_awaited_once_with("Approved", show_alert=False)
+        if answer is not None:
+            await console.wait_for(ASK)
+            console.type(answer)
         out, err = await asyncio.wait_for(child.communicate(), 60)
         assert child.returncode == 0, err.decode()
     finally:
         stop.set()
         await asyncio.wait_for(serve, 30)
-    return json.loads(out), out + err, telegram
+        console.close()
+    return json.loads(out), out + err, console
 
 
 async def _rows(layout) -> list[dict]:
@@ -887,8 +836,8 @@ def _child_env(layout, state) -> dict:
 async def test_end_to_end_request_tap_claim_is_value_free(built):
     layout, state = built
     before = len(await _rows(layout))
-    out, child_bytes, telegram = await _serve_and_run(
-        layout, state, _child_env(layout, state), tap=True
+    out, child_bytes, console = await _serve_and_run(
+        layout, state, _child_env(layout, state), answer="y"
     )
     assert out == {
         "request": "ok",
@@ -920,12 +869,12 @@ async def test_end_to_end_request_tap_claim_is_value_free(built):
         "service_stop",
     ):
         assert e in events
-    text = telegram.bot.sent[0][0].text
-    lines = text.split("\n")
+    message = console.text.split(ASK)[0].strip("\n")  # what a tap would have shown
+    lines = message.split("\n")
     assert lines[1] == H.TEST_LINE and f"Card: {CARD_LINE}" in lines
     # The value-free sweep: audit rows, every message, the child's output, every file.
     passphrase = H.read_passphrase(layout)
-    shown = json.dumps(rows) + "".join(m.text for m, _ in telegram.bot.sent)
+    shown = json.dumps(rows) + console.text
     assert H.TEST_NUMBER not in shown and passphrase not in shown
     assert not ap.holds_long_digit_run(shown)
     assert H.TEST_NUMBER.encode() not in child_bytes and passphrase.encode() not in child_bytes
@@ -938,9 +887,9 @@ async def test_end_to_end_a_test_mcp_with_a_live_home_is_refused(built):
     layout, state = built
     before = len(await _rows(layout))
     env = {**_child_env(layout, state), "HOME": "/home/someone-else"}
-    out, _bytes, telegram = await _serve_and_run(layout, state, env, tap=False)
+    out, _bytes, console = await _serve_and_run(layout, state, env, answer=None)
     assert out == {"request": "peer not allowed"}
-    assert telegram.bot.sent == []
+    assert ASK not in console.text
     refused = [r for r in (await _rows(layout))[before:] if r["event"] == "release_refused"]
     assert refused[0]["detail"]["peer"]["problem"] == "HOME outside the test directory"
 
@@ -1156,12 +1105,14 @@ def test_serve_refuses_an_overlay_missing_changed_or_replaced(
             H.check_overlay(state, wt, main)
 
 
-async def test_a_failing_bot_shutdown_still_stops_the_vault(built):
+async def test_a_failing_approver_shutdown_still_stops_the_vault(built):
     layout, state = built
 
-    class BrokenStop(FakeTelegram):
+    console = Console()
+
+    class BrokenStop(H.ConsoleApprover):
         async def stop(self) -> None:
-            raise RuntimeError("updater stop failed")
+            raise RuntimeError("approver stop failed")
 
     stop = asyncio.Event()
 
@@ -1169,18 +1120,18 @@ async def test_a_failing_bot_shutdown_still_stops_the_vault(built):
         stop.set()
 
     before = len(await _rows(layout))
-    with pytest.raises(RuntimeError, match="updater stop failed"):
+    with pytest.raises(RuntimeError, match="approver stop failed"):
         await H.run_serve(
             layout,
             state,
             live=_live(layout.root.parent / "fakehome"),
-            telegram=BrokenStop(),
-            owner=OWNER,
+            approver=BrokenStop(out=console.out, read_fd=console.read_fd),
             timeout_cap_s=30,
             stop=stop,
             release_peer=lambda *_a, **_k: None,
             on_ready=on_ready,
         )
+    console.close()
     assert not layout.socket.exists()
     assert "service_stop" in [r["event"] for r in (await _rows(layout))[before:]]
 
@@ -1265,20 +1216,6 @@ def test_setup_names_a_leftover_and_serve_refuses_an_incomplete_state(
     layout.state.write_text(json.dumps([state["marker"]]))
     with pytest.raises(H.Refused, match="does not match its state file"):
         H.read_marker(layout)
-
-
-def test_a_rejected_bot_token_is_never_printed(monkeypatch, capsys, tmp_path):
-    from telegram.error import InvalidToken
-
-    secret = "123456:" + "q" * 35
-
-    def rejected(_layout, _cap):
-        raise InvalidToken(f"The token `{secret}` was rejected by the server.")
-
-    monkeypatch.setattr(H, "_serve", rejected)
-    assert H.main(["serve"]) == 1
-    err = capsys.readouterr().err
-    assert "InvalidToken" in err and secret not in err
 
 
 def test_options_are_never_abbreviated():
@@ -1375,3 +1312,63 @@ def test_the_test_directory_is_fixed_and_short(monkeypatch):
     layout = H.default_layout()
     assert layout.root == Path(os.path.realpath(home / "tmp")) / "payment-test-vault"
     assert len(os.fsencode(layout.socket)) < 100  # no option picks another (R5 test pins them)
+
+
+# -- approvals in the serve terminal (owner ruling: no test bot) -----------------------
+
+
+async def _console_request(console: Console, registry, *, timeout_s: float = 5):
+    registry.attach_audit(_audit_sink)
+    bot = await console.approver.start(registry)
+    registry.attach_bot(bot, H.CONSOLE_OWNER, stopping=lambda: console.approver.stopping)
+    fields = {"Site": "checkout.stripe.dev", "Card": CARD_LINE}
+    return asyncio.create_task(registry.request(fields, timeout_s=timeout_s))
+
+
+@pytest.mark.parametrize(
+    ("typed", "result"), [("y", ap.GRANTED), ("n", ap.REFUSED), ("", ap.REFUSED)]
+)
+async def test_the_terminal_answer_settles_the_request(typed, result):
+    console = Console()
+    registry = H.TestApprovalRegistry(timeout_cap_s=30)
+    try:
+        request = await _console_request(console, registry)
+        await console.wait_for(ASK)
+        message = console.text.split(ASK)[0].strip("\n").split("\n")
+        assert message[1] == H.TEST_LINE and f"Card: {CARD_LINE}" in message
+        console.type(typed)
+        assert await asyncio.wait_for(request, 10) == result
+    finally:
+        await console.approver.stop()
+        console.close()
+
+
+async def test_an_answer_never_settles_an_expired_request():
+    console = Console()
+    registry = H.TestApprovalRegistry(timeout_cap_s=30)
+    try:
+        first = await _console_request(console, registry, timeout_s=0.2)
+        assert await asyncio.wait_for(first, 10) == ap.EXPIRED
+        second = await _console_request(console, registry)
+        await console.wait_for(ASK, count=2)
+        console.type("y")  # goes to the request still waiting, not the expired one
+        assert await asyncio.wait_for(second, 10) == ap.GRANTED
+        console.type("y")
+        await console.wait_for("(no approval is waiting)")
+    finally:
+        await console.approver.stop()
+        console.close()
+
+
+async def test_the_console_refuses_text_without_the_test_line():
+    console = Console()
+    registry = H.TestApprovalRegistry(timeout_cap_s=30)
+    try:
+        await console.approver.start(registry)
+        registry.attach_bot(console.approver, H.CONSOLE_OWNER)
+        with pytest.raises(RuntimeError, match="without the TEST line"):
+            await registry._bot.send_message(chat_id=H.CONSOLE_OWNER, text="Payment approval\nx")
+        assert console.text == ""
+    finally:
+        await console.approver.stop()
+        console.close()

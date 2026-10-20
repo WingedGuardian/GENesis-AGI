@@ -13,8 +13,9 @@ worktree's, a vault holding one card (Stripe's public test Visa, labelled with
 ``TEST_LABEL``) unlocked by a passphrase the harness generated, an audit
 database, and ``mcp.json`` for a test health MCP that runs the worktree's
 server. ``serve`` runs a vault service on that directory's own socket with its
-own approval registry, whose taps go through a SECOND, test-only Telegram bot
-(``BOT_TOKEN_KEY`` in secrets.env) and the tap handler genesis-server uses. The
+own approval registry. Its approvals are asked in the serve terminal, not on
+Telegram (owner ruling): the terminal shows the text a tap would show, and a
+typed ``y`` settles the request through the registry's own ``handle_tap``. The
 owner starts the test session (``claude --strict-mcp-config --mcp-config
 <dir>/mcp.json``); the harness never starts one. ``teardown`` stops this
 directory's serve and moves the directory to the Genesis trash.
@@ -36,10 +37,9 @@ table is in docs/reference/payment-test-vault.md.
 
 The TEST label cannot be dropped: every approval shows ``TEST_LINE`` first
 (added by the registry here, which also refuses any card line but the test
-card's), and the bot object the registry holds refuses to send any text
-without it. A serve, and every release, is refused while a browser not started
-by the test MCP runs (owner ruling Q16), and a test bot token that matches any
-other bot's is refused.
+card's), and the console the registry sends through refuses any text without
+it. A serve, and every release, is refused while a browser not started by the
+test MCP runs (owner ruling Q16). No Telegram bot is involved at all.
 
 Residual: the harness and every Genesis process run as one user, so a
 same-user process can get past all of this. These refusals stop mistakes, not
@@ -54,7 +54,6 @@ import argparse
 import asyncio
 import contextlib
 import json
-import logging
 import os
 import pwd
 import re
@@ -67,9 +66,10 @@ import sysconfig
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 from genesis.payments import vault_store as vs
-from genesis.payments.approval import REFUSED, PaymentApprovalRegistry
+from genesis.payments.approval import CALLBACK_PREFIX, REFUSED, PaymentApprovalRegistry
 from genesis.payments.peer_check import PeerPolicy, PeerRefused, check_release_peer, start_of
 
 # Stripe's public test Visa. The only card this harness can put in a vault (R5).
@@ -82,8 +82,8 @@ TEST_LABEL = "TEST 4242"
 TEST_KEY, TEST_VALUE = "TEST", "test vault, Stripe test card only"
 TEST_LINE = f"{TEST_KEY}: {TEST_VALUE}"
 
-BOT_TOKEN_KEY = "PAYMENT_TEST_VAULT_BOT_TOKEN"  # noqa: S105 - a key name; nothing else reads it
-LIVE_BOT_TOKEN_KEY = "TELEGRAM_BOT_TOKEN"  # noqa: S105 - a key name, read only for its bot id
+LIVE_BOT_TOKEN_KEY = "TELEGRAM_BOT_TOKEN"  # noqa: S105 - a key name, blanked for the test MCP
+CONSOLE_OWNER = 1  # the registry's owner id; only the serve terminal answers as it
 MARKER = ".genesis-test-vault"
 MCP_NAME = "genesis-health-b1test"
 OVERLAY = Path("config") / "payments.local.yaml"
@@ -106,7 +106,7 @@ BROWSER_COMMS = frozenset(
 APPROVAL_TIMEOUT_MAX_S = 600
 APPROVAL_TIMEOUT_MIN_S = 30
 # Teardown waits this long for a serve to stop after SIGINT: its vault stop is
-# bounded at a few 5 s waits and the Telegram poller's shutdown at one long poll.
+# bounded at a few 5 s waits, and the console approver stops at once.
 _SERVE_STOP_WAIT_S = 60.0
 # The venv check imports one package; a hung child must not hold setup forever.
 _SUBPROCESS_TIMEOUT_S = 120
@@ -654,7 +654,6 @@ def mcp_env(layout: Layout, worktree: Path, engine: Path) -> dict[str, str]:
         "CAMOUFOX_EXECUTABLE_PATH": str(engine),
         "DBUS_SESSION_BUS_ADDRESS": "",
         LIVE_BOT_TOKEN_KEY: "",
-        BOT_TOKEN_KEY: "",
     }
 
 
@@ -926,101 +925,111 @@ class TestApprovalRegistry(PaymentApprovalRegistry):
     async def notify(self, text: str) -> bool:
         return await super().notify(f"{TEST_LINE}\n{text}")
 
+    def is_waiting(self, nonce: str) -> bool:
+        return nonce in self._pending
 
-def read_bot_secrets(path: Path, env: dict | None = None) -> tuple[str, int]:
-    """The test bot's token and the owner id; refused when it is any other bot's token.
+    async def refuse(self, nonce: str, reason: str) -> None:
+        """Settle a waiting request as refused (an ``n`` at the console)."""
+        pending = self._pending.pop(nonce, None)  # before any await: one answer only
+        if pending is None or pending.future.done():
+            return
+        pending.future.set_result(REFUSED)
+        await self._record("approval_refused", {**pending.detail, "reason": reason})
 
-    Every other ``*BOT_TOKEN*`` value, in secrets.env or the environment, is
-    compared by bot id (only the id is kept), and the live bot's token must be
-    found: a check that cannot see it cannot tell the two bots apart.
+
+class _ConsoleMessage:
+    """What the registry checks an answer against: the chat, the id, the text, unedited."""
+
+    def __init__(self, message_id: int, text: str) -> None:
+        self.chat = SimpleNamespace(id=CONSOLE_OWNER)
+        self.message_id = message_id
+        self.text = text
+        self.is_accessible = True
+        self.edit_date = None
+
+
+async def _no_client_to_heal() -> None:
+    return None
+
+
+class ConsoleApprover:
+    """The test vault's approvals in the serve terminal, in place of a Telegram bot.
+
+    The registry sends to it exactly as it sends to Telegram, so the terminal shows
+    the text a tap would show. A line ``y`` settles the oldest waiting request
+    through the registry's own ``handle_tap``; any other line refuses it.
     """
-    env = os.environ if env is None else env
-    from genesis.channels.bridge_config import build_bridge_config, parse_secrets_env_text
 
-    try:
-        values = parse_secrets_env_text(path.read_text())
-    except OSError as exc:
-        raise Refused(f"serve: secrets.env cannot be read ({exc.strerror})") from None
-    token = values.get(BOT_TOKEN_KEY, "")
-    bot_id, sep, rest = token.partition(":")
-    if not (bot_id.isdigit() and sep and rest):
-        raise Refused(f"serve: {BOT_TOKEN_KEY} is not set to a bot token in secrets.env")
-    others = [
-        (k, v)
-        for src in (values, env)
-        for k, v in src.items()
-        if "BOT_TOKEN" in k and k != BOT_TOKEN_KEY
-    ]
-    if not any(k == LIVE_BOT_TOKEN_KEY and v for k, v in others):
-        raise Refused(
-            f"serve: {LIVE_BOT_TOKEN_KEY} was not found, so the test bot cannot be told apart"
-        )
-    other_ids = {v.partition(":")[0] for _k, v in others}
-    del others
-    for key in [k for k in values if "BOT_TOKEN" in k and k != BOT_TOKEN_KEY]:
-        values.pop(key)
-    if bot_id in other_ids:
-        raise Refused(f"serve: {BOT_TOKEN_KEY} is another bot's token; create a separate test bot")
-    config = build_bridge_config(
-        {
-            "TELEGRAM_BOT_TOKEN": token,
-            "TELEGRAM_ALLOWED_USERS": values.get("TELEGRAM_ALLOWED_USERS", ""),
-        }
-    )
-    owner = (config or {}).get("allowed_users_ordered") or ()
-    if not owner:
-        raise Refused("serve: TELEGRAM_ALLOWED_USERS has no owner id first")
-    return token, owner[0]
-
-
-def make_tap_handler(registry):
-    """The callback handler: genesis-server's own routing, for this registry only."""
-    from genesis.channels.telegram._handler_context import HandlerContext
-    from genesis.channels.telegram._handler_messages import handle_callback_query
-
-    ctx = HandlerContext(
-        loop=None, allowed_users=set(), whisper_model="", payment_approvals=registry
-    )
-
-    async def on_callback(update, context) -> None:
-        await handle_callback_query(ctx, update, context)
-
-    return on_callback
-
-
-class TelegramSide:
-    """A python-telegram-bot Application for the TEST bot: one callback handler, polled."""
-
-    def __init__(self, token: str) -> None:
-        self._token = token
-        self.app = None
+    def __init__(self, *, out=None, read_fd: int | None = None) -> None:
         self.stopping = False
+        self.request = SimpleNamespace(initialize=_no_client_to_heal)  # send_with_client_heal
+        self._out = sys.stdout if out is None else out
+        self._fd = sys.stdin.fileno() if read_fd is None else read_fd
+        self._registry: TestApprovalRegistry | None = None
+        self._waiting: list[tuple[str, _ConsoleMessage]] = []
+        self._buffer = b""
+        self._sent = 0
+        self._answers: set[asyncio.Task] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
-    async def start(self, handler) -> object:
-        from telegram.ext import Application, CallbackQueryHandler
+    async def start(self, registry: TestApprovalRegistry) -> ConsoleApprover:
+        self._registry = registry
+        self._loop = asyncio.get_running_loop()
+        try:
+            self._loop.add_reader(self._fd, self._on_input)
+        except (OSError, ValueError):
+            self._loop = None
+            raise Refused("serve: approvals are typed in this terminal; run serve in one") from None
+        return self
 
-        # httpx logs each Bot API URL, token included, at INFO.
-        for name in ("httpx", "httpcore"):
-            logging.getLogger(name).setLevel(logging.WARNING)
+    def _say(self, text: str) -> None:
+        print(text, file=self._out, flush=True)
 
-        self.app = Application.builder().token(self._token).build()
-        self.app.add_handler(CallbackQueryHandler(handler, pattern=r"^payapprove:"))
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling(
-            allowed_updates=["callback_query"], drop_pending_updates=True
-        )
-        return self.app.bot
+    async def send_message(self, *, chat_id, text, reply_markup=None, **_kw) -> _ConsoleMessage:
+        self._sent += 1
+        msg = _ConsoleMessage(self._sent, text)
+        self._say(f"\n{text}")
+        if reply_markup is not None:
+            data = reply_markup.inline_keyboard[0][0].callback_data
+            self._waiting.append((data.removeprefix(CALLBACK_PREFIX), msg))
+            self._say("Approve this TEST release? Type y and Enter (anything else refuses).")
+        return msg
+
+    def _on_input(self) -> None:
+        try:
+            chunk = os.read(self._fd, 1024)
+        except OSError:
+            chunk = b""
+        if not chunk:  # end of input: nothing more can be answered here
+            self._loop.remove_reader(self._fd)
+            return
+        self._buffer += chunk
+        while b"\n" in self._buffer:
+            line, self._buffer = self._buffer.split(b"\n", 1)
+            self.answer(line.decode("utf-8", "replace").strip())
+
+    def answer(self, word: str) -> None:
+        """Settle the oldest request still waiting: ``y`` grants, anything else refuses."""
+        self._waiting = [(n, m) for n, m in self._waiting if self._registry.is_waiting(n)]
+        if not self._waiting:
+            self._say("(no approval is waiting)")
+            return
+        nonce, msg = self._waiting.pop(0)
+        if word.lower() == "y":
+            work = self._registry.handle_tap(nonce, CONSOLE_OWNER, msg)
+        else:
+            work = self._registry.refuse(nonce, "refused at the console")
+        task = asyncio.ensure_future(work)
+        self._answers.add(task)  # held until it settles; stop() waits for it
+        task.add_done_callback(self._answers.discard)
 
     async def stop(self) -> None:
         self.stopping = True
-        if self.app is None:
-            return
-        if self.app.updater.running:
-            await self.app.updater.stop()
-        if self.app.running:
-            await self.app.stop()
-        await self.app.shutdown()
+        if self._loop is not None:
+            self._loop.remove_reader(self._fd)
+            self._loop = None
+        if self._answers:
+            await asyncio.gather(*self._answers, return_exceptions=True)
 
 
 async def run_serve(
@@ -1028,14 +1037,13 @@ async def run_serve(
     state: dict,
     *,
     live: Live,
-    telegram,
-    owner: int,
+    approver,
     timeout_cap_s: float,
     stop: asyncio.Event,
     release_peer=None,
     on_ready=None,
 ) -> None:
-    """The test vault service and its bot, until ``stop`` is set."""
+    """The test vault service and its console approvals, until ``stop`` is set."""
     from genesis.db.connection import get_db
     from genesis.payments.vault_service import VaultService
 
@@ -1060,16 +1068,16 @@ async def run_serve(
         unlocked = await service.unlock(read_passphrase(layout), None)
         if not unlocked.get("ok"):
             raise Refused(f"serve: the test vault did not unlock ({unlocked.get('error')})")
-        bot = await telegram.start(make_tap_handler(registry))
-        registry.attach_bot(bot, owner, stopping=lambda: telegram.stopping)
+        bot = await approver.start(registry)
+        registry.attach_bot(bot, CONSOLE_OWNER, stopping=lambda: approver.stopping)
         if on_ready is not None:
             await on_ready(service, registry)
         await stop.wait()
     finally:
         # Each step runs whatever the one before raised: the vault is locked and
-        # its socket gone even when the bot's shutdown fails.
+        # its socket gone even when the approver's shutdown fails.
         try:
-            await telegram.stop()
+            await approver.stop()
         finally:
             try:
                 if started:
@@ -1239,8 +1247,6 @@ def _serve(layout: Layout, timeout_cap_s: float) -> None:
 
 
 def _serve_locked(layout: Layout, live: Live, timeout_cap_s: float) -> None:
-    from genesis.env import secrets_path
-
     state = json.loads(layout.state.read_text())
     if state.get("phase") != "ready":
         raise Refused("serve: setup did not finish; run teardown and setup again")
@@ -1257,7 +1263,6 @@ def _serve_locked(layout: Layout, live: Live, timeout_cap_s: float) -> None:
             "Q16: a browser is open in another session; close it (or wait for its "
             "idle reclaim) before a test run"
         )
-    token, owner = read_bot_secrets(secrets_path())
     # Belt and braces: any default path the vault code resolves is the test home's.
     os.environ["GENESIS_HOME"] = str(layout.genesis_home)
     os.environ["GENESIS_DB_PATH"] = str(layout.db)
@@ -1266,8 +1271,9 @@ def _serve_locked(layout: Layout, live: Live, timeout_cap_s: float) -> None:
 
     async def ready(_service, _registry) -> None:
         print(
-            f"Test vault serving on {layout.socket} (approvals by the TEST bot, "
-            f"wait capped at {int(timeout_cap_s)} s). Start the test session yourself:"
+            f"Test vault serving on {layout.socket}. Approvals are asked HERE, in this "
+            f"terminal (wait capped at {int(timeout_cap_s)} s). Start the test session "
+            "yourself, in another terminal:"
         )
         print(f"  cd {worktree} && claude --strict-mcp-config --mcp-config {layout.mcp_json}")
         print("Ctrl-C stops the test vault.")
@@ -1281,8 +1287,7 @@ def _serve_locked(layout: Layout, live: Live, timeout_cap_s: float) -> None:
             layout,
             state,
             live=live,
-            telegram=TelegramSide(token),
-            owner=owner,
+            approver=ConsoleApprover(),
             timeout_cap_s=timeout_cap_s,
             stop=stop,
             on_ready=ready,
@@ -1363,11 +1368,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except (vs.VaultError, subprocess.SubprocessError, OSError) as exc:  # never a card value
         print(f"refused: {args.cmd}: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
-    except Exception as exc:  # a Telegram error can quote the bot token: the type only
-        if type(exc).__module__.split(".")[0] != "telegram":
-            raise
-        print(f"refused: {args.cmd}: the test bot failed ({type(exc).__name__})", file=sys.stderr)
         return 1
     return 0
 

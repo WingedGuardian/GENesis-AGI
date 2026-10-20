@@ -21,10 +21,11 @@ socket, its cards and the main Telegram bot are never used.
 It also writes `config/payments.local.yaml` (`card_fill.enabled: true`) in the
 **worktree**, never in the main checkout, and only if no such file exists.
 
-`serve` runs the test vault service and a Telegram poller for the **test bot**
-only. Approval taps use the same registry and the same tap handler as
-genesis-server (`payments/approval.py`, `handle_callback_query`). Every
-approval message starts with:
+`serve` runs the test vault service. Its approvals are asked **in the serve
+terminal**, not on Telegram: the same registry as genesis-server
+(`payments/approval.py`) sends the text a tap would show to the terminal, and a
+typed `y` settles it through the registry's own `handle_tap` (anything else
+refuses). No Telegram bot is involved. Every approval starts with:
 
 ```
 Payment approval
@@ -33,42 +34,37 @@ TEST: test vault, Stripe test card only
 Card: TEST 4242 ending 4242
 ```
 
-The registry refuses any other card line, and the bot object it holds refuses to
-send any text without the `TEST:` line.
+The registry refuses any other card line, and the console it sends through
+refuses any text without the `TEST:` line. A typed line is only ever compared
+with `y`; it reaches no other code.
 
 ## Owner steps
 
-1. In Telegram, open BotFather, send `/newbot`, and name the test bot (for
-   example "Genesis payment TEST"). Copy its token.
-2. Open the new bot from your own account (the first id in
-   `TELEGRAM_ALLOWED_USERS`) and send `/start`, so it may message you.
-3. Add the token to the main checkout's `secrets.env`:
-   `PAYMENT_TEST_VAULT_BOT_TOKEN=<token>`. `serve` refuses the main bot's token.
-4. Find the merchant: the registrable domain the test checkout's **payment**
+1. Find the merchant: the registrable domain the test checkout's **payment**
    page shows after redirects (a navigate-only dry run).
-5. Set up, with the main venv's python, from the main checkout:
+2. Set up, with the main venv's python, from the main checkout:
 
    ```bash
    ~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py setup \
-       --worktree <card-fill branch worktree> --merchant <domain from step 4>
+       --worktree <card-fill branch worktree> --merchant <domain from step 1>
    ```
 
    The directory must not exist yet. Setup also refuses when it would not be
    on the same mount as the Genesis trash (teardown moves it there) or when its
    socket path cannot be bound; with the fixed short path neither happens on a
    standard install.
-6. Close any browser another session has open (or wait for its idle reclaim):
+3. Close any browser another session has open (or wait for its idle reclaim):
    `serve` refuses while one runs, and a release is refused while one runs.
-7. In one terminal: `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py serve`.
+4. In one terminal: `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py serve`.
    `--approval-timeout-s 60` shortens the approval wait for an expiry test.
    The test vault relocks after 30 minutes idle, like the live one; restart
    `serve` to unlock it again.
-8. In another terminal, start the test session yourself, with the command
+5. In another terminal, start the test session yourself, with the command
    `serve` prints:
    `cd <worktree> && claude --strict-mcp-config --mcp-config ~/tmp/payment-test-vault/mcp.json`.
    Only the test MCP is loaded in that session. The browser shows on `:99`.
-9. Approve in the **test bot's** chat. Check the `TEST:` line is there.
-10. Exit the test Claude session first (its health MCP keeps the test database
+6. Approve in the **serve terminal** (type `y`, Enter). Check the `TEST:` line is there.
+7. Exit the test Claude session first (its health MCP keeps the test database
     open, and the trash refuses a directory in use). Ctrl-C the serve, then
     `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py teardown`.
     It stops a running serve and moves the directory to the Genesis trash, then
@@ -95,9 +91,7 @@ Each refusal prints its code.
 | R10 | A card-fill overlay outside the worktree's `config/` (or in the main checkout's own `config/`; a worktree under `.claude/worktrees/` is fine), or over an existing file; a serve whose overlay is missing, changed, or not the file setup wrote (setup records its inode). Teardown removes only that file, and says when it leaves one for you to delete |
 | Q16 | A serve or a release while a browser not started by the test MCP runs |
 
-Also refused: a test bot token whose bot id matches any other `*BOT_TOKEN*`
-value in `secrets.env` or the environment, or a run where `TELEGRAM_BOT_TOKEN`
-cannot be found at all (the check could not tell the bots apart). Teardown
+Teardown
 signals only a process whose own command line is
 `payments_test_vault.py serve` (one test directory per account), never genesis-server or
 itself, and refuses otherwise without removing anything.
