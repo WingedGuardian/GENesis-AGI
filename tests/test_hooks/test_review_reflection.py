@@ -713,6 +713,30 @@ def test_a_merge_that_brings_nothing_new_is_judged_by_its_time(repo, tmp_path):
     assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
 
 
+def test_a_topic_later_merged_into_main_is_still_judged_by_its_time(repo, tmp_path):
+    """Round 1 of #3493 (Codex c4326223553): the branch merges a topic after
+    the review; main later merges that same topic with a merge commit, so the
+    topic becomes reachable from main through a SECOND parent. It was never
+    main's tip, so the earlier merge is still the branch's own content."""
+    path, head = repo
+    _git(path, "checkout", "-q", "-b", "topic", "main")
+    (path / "t.txt").write_text("the fix\n")
+    _git(path, "add", "t.txt")
+    _git(path, "commit", "-q", "-m", "topic")
+    _git(path, "checkout", "-q", "feat/x")
+    _dated(path, "merge", "-q", "--no-ff", "--no-edit", "topic", when=_at(10))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    _git(path, "checkout", "-q", "main")
+    _git(path, "commit", "-q", "--allow-empty", "-m", "main moves")
+    _git(path, "merge", "-q", "--no-ff", "--no-edit", "topic")
+    _git(path, "update-ref", "refs/remotes/origin/main", "main")
+    _git(path, "checkout", "-q", "feat/x")
+    topic = _git(path, "rev-parse", "topic").strip()
+    done = subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", topic, "main"])
+    assert done.returncode == 0, "the fixture must put the topic in main"
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+
+
 def test_a_fix_cannot_ride_in_through_a_merges_first_parent(repo, tmp_path):
     """Fix-code audit N1: when the head is already in main, a branch forked
     elsewhere can merge main in and reach the reflection with its fix on the
@@ -729,6 +753,16 @@ def test_a_fix_cannot_ride_in_through_a_merges_first_parent(repo, tmp_path):
     _dated(path, "merge", "-q", "--no-edit", "origin/main", when=_at(40))
     _commit_reflection(path, tmp_path, _reflection(head=head))
     assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+
+
+def test_an_unfetched_head_is_unknown_on_the_open_path(repo, tmp_path):
+    """Fix-code audit NOTE 1: a round head this clone lacks refuses (status
+    reports it could not be checked); it never reads as every key owed or as
+    nothing owed."""
+    path, head = repo
+    _commit_reflection(path, tmp_path, _reflection(head="e" * 40))
+    with pytest.raises(rr.Refused, match="not fetched"):
+        _covered(path, "e" * 40)
 
 
 def test_a_dangling_remote_head_falls_back_to_origin_main(repo, tmp_path):

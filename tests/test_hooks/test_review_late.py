@@ -748,6 +748,76 @@ def _pushed_before_review(tmp_path):
     return path, head, pushed, budget
 
 
+def test_a_credit_survives_pushing_the_reflection_and_moving_past_it(tmp_path):
+    """Round 1 of #3493 (Codex c4326223562, Devin c4326186666): credited while
+    the reflection R was ahead of the tip, then R and a commit D after it are
+    pushed. The pre-review commit C between H and R is no fix of c9 however far
+    the tip has moved, so the answer stands."""
+    path, head, _, budget = _pushed_before_review(tmp_path)
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
+    assert _credit(path, budget) == {"c9"}
+    base = _git(path, "rev-list", "--max-parents=0", "HEAD")
+    tip = _change(path, "after the answer\n", T0 + timedelta(minutes=40))
+    pushed = _late_budget(path, base, tip, [_rv(head, _at(0), 1), _rv(head, _at(20), 9)])
+    assert _credit(path, pushed) == {"c9"}
+
+
+def test_a_credit_across_a_main_merge_survives_moving_past_it(pr, tmp_path):
+    """The class audit's unreported variant: a merge of main between the head
+    and R, then a commit after R pushed as the tip."""
+    path, base, head, fix = pr
+    reviews = [_rv(head, _at(0), 1), _rv(head, _at(90), 9)]
+    _git(path, "checkout", "-q", "main")
+    (path / "g.txt").write_text("main\n")
+    _git(path, "add", "g.txt")
+    _git(path, "commit", "-q", "-m", "main moves", when=T0 + timedelta(minutes=100))
+    _git(path, "update-ref", "refs/remotes/origin/main", "main")
+    _git(path, "checkout", "-q", "feat/x")
+    _git(path, "merge", "-q", "--no-edit", "main", when=T0 + timedelta(minutes=110))
+    _reflect(path, tmp_path, _block(["c9"], fix), T0 + timedelta(minutes=120))
+    tip = _change(path, "after the answer\n", T0 + timedelta(minutes=130))
+    assert _credit(path, _late_budget(path, base, tip, reviews)) == {"c9"}
+
+
+def test_a_post_review_fix_after_the_answer_does_not_withdraw_it(tmp_path):
+    """The tip moving past R with a real fix of c9 AFTER R is the normal order
+    (reflect, then fix): it descends from R and was authored after it."""
+    path, head, _, _ = _pushed_before_review(tmp_path)
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
+    base = _git(path, "rev-list", "--max-parents=0", "HEAD")
+    tip = _change(path, "the fix of c9\n", T0 + timedelta(minutes=40))
+    budget = _late_budget(path, base, tip, [_rv(head, _at(0), 1), _rv(head, _at(20), 9)])
+    assert _credit(path, budget) == {"c9"}
+
+
+def test_a_fix_on_a_side_branch_merged_in_after_the_answer_refuses(tmp_path):
+    """The stated residual, failing closed: a fix of c9 authored after R, but
+    on a side branch forked from H and merged in, does not descend from R, so
+    R cannot be shown to have come first and it credits nothing."""
+    path, head, _, _ = _pushed_before_review(tmp_path)
+    _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
+    line = _git(path, "rev-parse", "HEAD")
+    _git(path, "checkout", "-q", "-b", "side", head)
+    (path / "g.txt").write_text("the fix of c9\n")
+    _git(path, "add", "g.txt")
+    _git(path, "commit", "-q", "-m", "side fix", when=T0 + timedelta(minutes=40))
+    _git(path, "checkout", "-q", "feat/x")
+    assert _git(path, "rev-parse", "HEAD") == line
+    _git(path, "merge", "-q", "--no-ff", "--no-edit", "side", when=T0 + timedelta(minutes=50))
+    tip = _git(path, "rev-parse", "HEAD")
+    base = _git(path, "rev-list", "--max-parents=0", "HEAD")
+    budget = _late_budget(path, base, tip, [_rv(head, _at(0), 1), _rv(head, _at(20), 9)])
+    assert _credit(path, budget) == set()
+
+
+def test_a_missing_head_object_refuses_the_owe_side(pr):
+    """Owing must never read "git cannot say" as "no fix": a head object the
+    clone lacks refuses (unknown), it does not owe nothing."""
+    path, _, _, fix = pr
+    with pytest.raises(rr.Refused):
+        rl._fixes(str(path), "e" * 40, fix)
+
+
 def test_a_pre_review_commit_amended_after_the_review_is_a_fix(tmp_path):
     """The later of author and committer time decides on this path too."""
     path, head, _, _ = _pushed_before_review(tmp_path)
@@ -780,19 +850,26 @@ def test_a_side_merge_on_the_late_path_is_judged_by_its_time(tmp_path):
 
 
 def test_an_unreadable_commit_time_credits_nothing_on_the_late_path(tmp_path, monkeypatch):
-    path, head, _, budget = _pushed_before_review(tmp_path)
+    """The owed list is read first; then every fix walk (the one shared
+    reading) returns no times: the credit side credits nothing, and the owe
+    side refuses rather than owing nothing."""
+    path, head, pushed, budget = _pushed_before_review(tmp_path)
     _reflect(path, tmp_path, _block(["c9"], head), T0 + timedelta(minutes=30))
+    late = rl.late_findings(budget, CUT, rl.fix_time_reader(str(path), pushed))
     assert _credit(path, budget) == {"c9"}
     real = rr._run
 
     def blank_times(argv, cwd=None):
         code, out, err = real(argv, cwd)
-        if "--format=%H %T %P|%at %ct" in argv:  # fix_clock's walk only
+        if "--format=%H %T %P|%at %ct" in argv:  # the shared fix walk
             out = "\n".join(row.split("|")[0] + "|" for row in out.split("\n") if row.strip())
         return code, out, err
 
     monkeypatch.setattr(rr, "_run", blank_times)
-    assert _credit(path, budget) == set()
+    got = rl.covered_late_keys(str(path), budget, late, gate_lane=False, acceptance=None)
+    assert got == set()
+    with pytest.raises(rr.Refused, match="no readable author time"):
+        rl.fix_time_reader(str(path), pushed)(head)
 
 
 def test_owed_from_budget_with_a_cutover_refuses_past_its_deadline(tmp_path):
@@ -843,13 +920,13 @@ def test_covered_late_keys_bounds_its_own_git_calls(pr, tmp_path, monkeypatch):
     _reflect(path, tmp_path, _block(["c9"], fix), T0 + timedelta(minutes=120))
     late = rl.late_findings(budget, CUT, rl.fix_time_reader(str(path), fix))
     seen = []
-    real = rr.fix_clock
+    real = rr.fix_rows
 
-    def spy(*args):
+    def spy(*args, **kwargs):
         seen.append(rr._DEADLINE.get())
-        return real(*args)
+        return real(*args, **kwargs)
 
-    monkeypatch.setattr(rr, "fix_clock", spy)
+    monkeypatch.setattr(rr, "fix_rows", spy)
     far = 10**12
     assert rl.covered_late_keys(
         str(path), budget, late, gate_lane=False, acceptance=None, deadline=far
@@ -978,10 +1055,52 @@ def test_a_reflection_on_a_fork_never_credits(pr, tmp_path):
     assert _credit(path, budget) == set()
 
 
+def _late_review_then_fix(path, tmp_path, head):
+    """H, an empty commit E (reviewed clean at +10, which makes the review of H
+    at +20 late), then the fix F at +60: F is a fix of c9."""
+    _git(path, "reset", "-q", "--hard", head)
+    empty = _reflect(path, tmp_path, "wip\n", T0 + timedelta(minutes=5))
+    _change(path, "z\n", T0 + timedelta(minutes=60))
+    return [_rv(empty, _at(10)), _rv(head, _at(20), 9)]
+
+
 def test_a_fork_reflection_merged_in_still_never_credits(pr, tmp_path):
     """Merged in as a second parent, the fork's reflection becomes an ancestor
-    of the tip, which an ancestor-either-way check would accept; the fix F
-    still does not descend from it, so it credits nothing."""
+    of the tip, which an ancestor-either-way check would accept; the fix F of
+    c9 still does not descend from it, so it credits nothing."""
+    path, base, head, _ = pr
+    reviews = _late_review_then_fix(path, tmp_path, head)
+    _fork_reflection(path, tmp_path, head)
+    _git(path, "checkout", "-q", "feat/x")
+    _git(
+        path, "merge", "-q", "--no-ff", "-m", "merge fork", "fork", when=T0 + timedelta(minutes=130)
+    )
+    merged = _git(path, "rev-parse", "HEAD")
+    budget = _late_budget(path, base, merged, reviews)
+    late = rl.late_findings(budget, CUT, rl.fix_time_reader(str(path), merged))
+    assert [i["key"] for i in late] == ["c9"]
+    assert rl.covered_late_keys(str(path), budget, late, gate_lane=False, acceptance=None) == set()
+
+
+def test_a_fork_reflection_that_pulls_the_fix_in_still_never_credits(pr, tmp_path):
+    """The other orientation: the fork merges the PR branch into itself, so
+    the reflection is on the merge's FIRST parent; F still does not descend
+    from it, so it credits nothing."""
+    path, base, head, _ = pr
+    reviews = _late_review_then_fix(path, tmp_path, head)
+    _fork_reflection(path, tmp_path, head)
+    _git(path, "merge", "-q", "--no-ff", "-m", "pull", "feat/x", when=T0 + timedelta(minutes=130))
+    merged = _git(path, "rev-parse", "HEAD")
+    budget = _late_budget(path, base, merged, reviews)
+    late = rl.late_findings(budget, CUT, rl.fix_time_reader(str(path), merged))
+    assert [i["key"] for i in late] == ["c9"]
+    assert rl.covered_late_keys(str(path), budget, late, gate_lane=False, acceptance=None) == set()
+
+
+def test_a_fork_reflection_merged_in_after_a_pre_review_commit_credits(pr, tmp_path):
+    """The per-key rule (owner ruling 2026-10-20): F was committed before
+    review c9 landed, so F is no fix of c9, and a reflection made after F, on
+    a fork of H merged into the line, answers c9."""
     path, base, head, fix = pr
     _fork_reflection(path, tmp_path, head)
     _git(path, "checkout", "-q", "feat/x")
@@ -992,21 +1111,7 @@ def test_a_fork_reflection_merged_in_still_never_credits(pr, tmp_path):
     budget = _late_budget(path, base, merged, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])
     late = rl.late_findings(budget, CUT, rl.fix_time_reader(str(path), merged))
     assert [i["key"] for i in late] == ["c9"]
-    assert rl.covered_late_keys(str(path), budget, late, gate_lane=False, acceptance=None) == set()
-
-
-def test_a_fork_reflection_that_pulls_the_fix_in_still_never_credits(pr, tmp_path):
-    """The other orientation: the fork merges the PR branch into itself, so
-    the reflection is on the merge's FIRST parent; F still does not descend
-    from it, so it credits nothing."""
-    path, base, head, fix = pr
-    _fork_reflection(path, tmp_path, head)
-    _git(path, "merge", "-q", "--no-ff", "-m", "pull", "feat/x", when=T0 + timedelta(minutes=130))
-    merged = _git(path, "rev-parse", "HEAD")
-    budget = _late_budget(path, base, merged, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])
-    late = rl.late_findings(budget, CUT, rl.fix_time_reader(str(path), merged))
-    assert [i["key"] for i in late] == ["c9"]
-    assert rl.covered_late_keys(str(path), budget, late, gate_lane=False, acceptance=None) == set()
+    assert rl.covered_late_keys(str(path), budget, late, gate_lane=False, acceptance=None) == {"c9"}
 
 
 def test_a_reflection_the_tip_never_reached_never_credits(pr, tmp_path):

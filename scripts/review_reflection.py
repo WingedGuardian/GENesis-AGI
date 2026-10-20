@@ -935,17 +935,33 @@ def _default_branch(cwd: str) -> str | None:
     return None
 
 
+def _mainline(cwd: str) -> frozenset[str]:
+    """Every commit on the default branch's FIRST-PARENT line. Empty when there
+    is no default branch. Reachability through any parent would let a topic
+    merged into main later make an earlier merge of that topic read as a merge
+    of main (round 1 of #3493). Residual, failing open: a topic FAST-FORWARDED
+    into main puts all its commits on this line, so an earlier merge of that
+    topic reads as a merge of main afterwards (never on a squash-only repo)."""
+    default = _default_branch(cwd)
+    if default is None:
+        return frozenset()
+    code, out, err = _run(["git", "-C", cwd, "rev-list", "--first-parent", default])
+    if code != 0:
+        raise Refused(f"git rev-list --first-parent {default} failed: {err.strip()[:300]}")
+    return frozenset(out.split())
+
+
 def _merge_is_no_fix(
-    cwd: str, tree: str, parents: Sequence[str], default: str | None, on_path: Iterable[str]
+    cwd: str, tree: str, parents: Sequence[str], mainline: Iterable[str], on_path: Iterable[str]
 ) -> bool:
     """Whether a two-parent merge is just merging the default branch in (owner
-    ruling 2026-10-20, narrowed the same day): its later parent is in the
-    default branch, and its tree is git's own merge
-    result, or differs from it only in the files that conflicted (the
-    resolution). Anything else a merge carries is content like any commit's.
-    An octopus merge, or a git that cannot say (``merge-tree --write-tree``
-    needs git 2.38), is never exempt."""
-    if default is None or len(parents) != 2:
+    ruling 2026-10-20, narrowed the same day): its later parent is on the
+    default branch's first-parent line (``mainline``), and its tree is git's
+    own merge result, or differs from it only in the files that conflicted
+    (the resolution). Anything else a merge carries is content like any
+    commit's. An octopus merge, or a git that cannot say (``merge-tree
+    --write-tree`` needs git 2.38), is never exempt."""
+    if len(parents) != 2:
         return False
     # A merge bringing nothing new is git-merged to its first parent's tree,
     # so any content it carries fails the tree comparison below. The first
@@ -953,7 +969,7 @@ def _merge_is_no_fix(
     # itself already in the default branch could otherwise bring a fix in
     # through the first parent unexamined.
     first, later = parents
-    if first not in on_path or not _is_ancestor(cwd, later, default):
+    if first not in on_path or later not in mainline:
         return False
     # Attributes (and so merge drivers) come from the first parent's commit,
     # never from whatever the checking machine has uncommitted.
@@ -974,37 +990,67 @@ def _merge_is_no_fix(
     return changed <= {path for path in conflicted if path}
 
 
-def fix_clock(cwd: str, head: str, sha: str) -> datetime | None:
-    """When the latest fix between round ``head`` and reflection ``sha`` was
-    made: None when there was none, ``NEVER`` when no finding can be credited.
+def _stamp(raw: str) -> datetime | None:
+    if not raw.isdigit():
+        return None
+    try:
+        return datetime.fromtimestamp(int(raw), UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
 
-    The commits read are those on the way from the head to the reflection
+
+@dataclass(frozen=True)
+class Fix:
+    """A commit that changes something on the way from a head: what it is and
+    when it was made. A time git could not read is None."""
+
+    sha: str
+    authored: datetime | None
+    committed: datetime | None
+    orphan: bool = False  # parentless after the head: a graft, never honest
+
+    @property
+    def clock(self) -> datetime:
+        """When this fix was made, for the credit rule: the LATER of its author
+        and committer times (an amend or a rebase moves only the committer
+        time, so a fix cannot be laundered backwards). ``NEVER`` when either is
+        unreadable or the commit is an orphan."""
+        if self.orphan or self.authored is None or self.committed is None:
+            return NEVER
+        return max(self.authored, self.committed)
+
+
+def fix_rows(cwd: str, head: str, tip: str, *, main_merges: bool = True) -> list[Fix] | None:
+    """Every fix on the way from round ``head`` to ``tip``: the ONE reading of
+    "what is a fix" both credit paths and the owe side share. None when ``tip``
+    does not descend from ``head``.
+
+    The commits read are those on the way from the head to the tip
     (``--ancestry-path``), so what a merge brings in from elsewhere is not one
     of them. Of those (owner rulings 2026-10-20):
 
     - a commit that keeps its parent's tree (another reflection) is no fix;
-    - a merge of the default branch is no fix while it holds only git's own
-      merge result plus the resolution of the files that conflicted
-      (``_merge_is_no_fix``);
-    - every other commit, merges included, is a fix made at the LATER of its
-      author and committer times. An amend or a rebase moves the committer
-      time and keeps the author time, so the later one cannot be laundered
-      backwards; the cost is that a commit made before a review and amended
-      or rebased after it counts as a fix of that review's findings, so
-      reflect before rewriting. An unreadable time is a fix that credits
-      nothing.
+    - with ``main_merges`` (the credit side), a merge of the default branch is
+      no fix while it holds only git's own merge result plus the resolution
+      of the files that conflicted (``_merge_is_no_fix``); the owe side passes
+      False, so it owes early, never late;
+    - every other commit, merges included, is a fix.
 
-    ``NEVER`` too when ``sha`` does not descend from ``head``."""
-    code, _, _ = _run(["git", "-C", cwd, "merge-base", "--is-ancestor", head, sha])
+    Raises ``Refused`` when git cannot say, a head this clone has not fetched
+    included: the owe side reading that as "no fix" would owe too little, so
+    both sides answer "unknown" until a fetch."""
+    code, _, _ = _run(["git", "-C", cwd, "merge-base", "--is-ancestor", head, tip])
+    if code == 1:
+        return None
     if code != 0:
-        return NEVER
+        raise Refused(f"git cannot relate {head[:12]} to {tip[:12]} (not fetched?)")
     walk = ["--no-show-signature", "--ancestry-path", "--format=%H %T %P|%at %ct"]
-    code, out, err = _run(["git", "-C", cwd, "log", *walk, f"{head}..{sha}"])
+    code, out, err = _run(["git", "-C", cwd, "log", *walk, f"{head}..{tip}"])
     if code != 0:
-        raise Refused(f"git log {head[:12]}..{sha[:12]} failed: {err.strip()[:300]}")
+        raise Refused(f"git log {head[:12]}..{tip[:12]} failed: {err.strip()[:300]}")
     rows = [row for row in out.split("\n") if row.strip()]
     if not rows:
-        return None
+        return []
     trees = {head: _git(cwd, "rev-parse", f"{head}^{{tree}}").strip()}
     parsed = []
     for row in rows:
@@ -1012,31 +1058,42 @@ def fix_clock(cwd: str, head: str, sha: str) -> datetime | None:
         fields = names.split()
         if len(fields) < 2:
             raise Refused(f"git log printed an unreadable row: {row[:80]!r}")
-        if len(fields) == 2:
-            return NEVER  # a parentless commit after the head: a graft, never honest
-        commit, tree, *parents = fields
-        trees[commit] = tree
-        parsed.append((tree, parents, stamps.split()))
-    default: str | None | bool = False  # resolved on the first merge only
-    latest: datetime | None = None
-    for tree, parents, stamps in parsed:
+        times = stamps.split()
+        if len(times) != 2:
+            times = ["", ""]
+        trees[fields[0]] = fields[1]
+        parsed.append((fields[0], fields[1], fields[2:], times))
+    mainline: frozenset[str] | None = None  # read on the first merge only
+    found = []
+    for sha, tree, parents, (authored, committed) in parsed:
+        if not parents:
+            found.append(Fix(sha, _stamp(authored), _stamp(committed), orphan=True))
+            continue
         if len(parents) == 1:
             # One parent: on the way from the head, so its tree was read above.
             if trees.get(parents[0]) == tree:
                 continue
-        else:
-            if default is False:
-                default = _default_branch(cwd)
-            if _merge_is_no_fix(cwd, tree, parents, default or None, trees):
+        elif main_merges:
+            if mainline is None:
+                mainline = _mainline(cwd)
+            if _merge_is_no_fix(cwd, tree, parents, mainline, trees):
                 continue
-        if len(stamps) != 2 or not all(s.isdigit() for s in stamps):
-            return NEVER
-        try:
-            when = datetime.fromtimestamp(max(int(s) for s in stamps), UTC)
-        except (ValueError, OverflowError, OSError):
-            return NEVER
-        latest = when if latest is None else max(latest, when)
-    return latest
+        found.append(Fix(sha, _stamp(authored), _stamp(committed)))
+    return found
+
+
+def fix_clock(cwd: str, head: str, sha: str) -> datetime | None:
+    """When the latest fix between round ``head`` and reflection ``sha`` was
+    made (``fix_rows``, ``Fix.clock``): None when there was none, ``NEVER``
+    when no finding can be credited (``sha`` does not descend from ``head``,
+    or a fix's time could not be read). A commit made before a review and
+    amended or rebased after it counts as a fix of that review's findings, so
+    reflect before rewriting. Raises ``Refused`` when git cannot relate the two
+    (an unfetched head): unknown, never "nothing owed"."""
+    found = fix_rows(cwd, head, sha)
+    if found is None:
+        return NEVER
+    return max((fix.clock for fix in found), default=None)
 
 
 def clears(clock: datetime | None, reviewed_at: datetime | None) -> bool:

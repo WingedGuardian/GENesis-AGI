@@ -285,39 +285,11 @@ def _fixes(cwd: str, base: str, head: str, *, credit: bool = False) -> dict[str,
     only git's merge and its conflict resolution is no fix either
     (``review_reflection._merge_is_no_fix``, owner ruling 2026-10-20). Raises
     ``Refused`` when git cannot say."""
-    walk = ["--no-show-signature", "--ancestry-path", "--format=%H %T %P|%at"]
-    code, out, _ = rr._run(["git", "-C", cwd, "log", *walk, f"{base}..{head}"])
-    if code != 0:
-        raise rr.Refused(f"git log {base[:12]}..{head[:12]} failed")
-    rows = []
-    for row in out.split("\n"):
-        if not row.strip():
-            continue
-        names, _, stamp = row.partition("|")
-        fields = names.split()
-        if len(fields) < 2:
-            raise rr.Refused(f"git log printed an unreadable row: {row[:80]!r}")
-        rows.append((fields[0], fields[1], fields[2:], stamp))
-    on_path = {base, *(sha for sha, _, _, _ in rows)}
-    default: str | None | bool = False  # resolved on the first merge only
     found: dict[str, datetime] = {}
-    for sha, tree, parents, stamp in rows:
-        if (
-            len(parents) == 1
-            and tree == rr._git(cwd, "rev-parse", f"{parents[0]}^{{tree}}").strip()
-        ):
-            continue
-        if credit and len(parents) > 1:
-            if default is False:
-                default = rr._default_branch(cwd)
-            if rr._merge_is_no_fix(cwd, tree, parents, default or None, on_path):
-                continue
-        if not stamp.strip().isdigit():
+    for fix in rr.fix_rows(cwd, base, head, main_merges=credit) or []:
+        if fix.authored is None:
             raise rr.Refused(f"a fix after {base[:12]} has no readable author time")
-        try:
-            found[sha] = datetime.fromtimestamp(int(stamp), UTC)
-        except (ValueError, OverflowError, OSError) as exc:
-            raise rr.Refused(f"a fix after {base[:12]} has an unusable author time") from exc
+        found[fix.sha] = fix.authored
     return found
 
 
@@ -386,22 +358,28 @@ def covered_late_keys(
     N, committed at T, credits late key k (reviewed on head H at time S) only
     when ALL hold:
 
-    - R is an empty commit made before any fix, on the way from N, of k: a
-      commit made before S is no fix of k, nor is a merge of the default
-      branch holding only git's merge and its conflict resolution
-      (``review_reflection.fix_clock``, owner rulings 2026-10-20);
-    - N is the current head or in its history, and N is H or descends from it
-      (from the budget's commit graph; unknown ancestry never credits);
-    - R came before every fix that reached the current head: each fix after
-      N on the way to the tip descends from R and was authored no earlier
-      than R (or R is ahead of the tip locally). This never reads a merge's
-      parent order, so a reflection made on a fork of N after a fix credits
-      nothing, whichever way the fork was merged, and a fix reordered after R
-      by a rebase still counts as before it. Stated residuals, both failing
-      closed because local git records no push order: a reflection already
-      pushed and then put on a merge's second parent by a pull from a stale
-      worktree is refused, and so is a reflection made before any fix when a
-      side branch forked from N carries a fix merged in after it;
+    - R is an empty commit on the tip's line (at, ahead of or behind the
+      current head), and N is the current head or in its history, and N is H
+      or descends from it (from the budget's commit graph; unknown ancestry
+      never credits);
+    - R came before every fix of k on the way from N to R and to the tip
+      (``_before_every_fix``, judged per key from the one shared reading
+      ``review_reflection.fix_rows``, owner rulings 2026-10-20): a commit
+      made before S is no fix of k, nor is a merge of the default branch
+      holding only git's merge and its conflict resolution; every other fix
+      must descend from R and be authored no earlier than R. This never reads
+      a merge's parent order, so a reflection made on a fork of N after a fix
+      credits nothing, whichever way the fork was merged; a fix reordered
+      after R by a rebase still counts as before it; and pushing R and moving
+      the tip past it never turns a credited key back into an owed one
+      (round 1 of #3493). Stated residuals, both failing closed because local
+      git records no push order: a reflection already pushed and then put on
+      a merge's second parent by a pull from a stale worktree is refused, and
+      so is a reflection made before a fix of k that a side branch forked from
+      N carries and merges in after it. One residual fails OPEN: a fix made on
+      a branch forked BEFORE N lies on neither walk, so it is dated at the
+      merge that brings it in (as the owe side dates it), and a reflection
+      made between that fix and its merge credits;
     - S is no later than T: an answer cannot predate its finding;
     - when N is not H, S is after the LATEST fix on the way from H to N (author
       time; a merge of the default branch holding only git's merge and its
@@ -425,6 +403,25 @@ def covered_late_keys(
         )
 
 
+def _before_every_fix(
+    fixes: Iterable[rr.Fix], reviewed_at: datetime, made_at: datetime, after_r: set[str]
+) -> bool:
+    """Whether reflection R (made at ``made_at``) came before every fix of a
+    finding reviewed at ``reviewed_at``. A fix made before the review is no
+    fix of it (``rr.clears``). Every other fix, on the way from N to R or to
+    the tip, must come after R: descend from it (``after_r``) and be authored
+    no earlier than it, so a fix reordered after R by a rebase or cherry-pick
+    still counts as before it, and a fix reaching the tip around R (a fork
+    merged in either parent order) refuses. A fix whose time is unreadable
+    refuses."""
+    for fix in fixes:
+        if rr.clears(fix.clock, reviewed_at):
+            continue
+        if fix.sha not in after_r or fix.authored is None or fix.authored < made_at:
+            return False
+    return True
+
+
 def _covered_late_keys(
     cwd: str,
     budget: Mapping[str, Any],
@@ -440,7 +437,7 @@ def _covered_late_keys(
     labels: dict[tuple[tuple[str, ...], str], list[str]] = {}
     checked: dict[tuple[str, RoundContext], bool] = {}
     fix_times: dict[tuple[str, str], datetime | None] = {}
-    fix_sets: dict[str, dict[str, datetime]] = {}
+    tip_rows: dict[str, list[rr.Fix]] = {}
     covered: set[str] = set()
     for sha, kind, body, made_at in log:
         if deadline is not None and time.monotonic() > deadline:
@@ -451,23 +448,27 @@ def _covered_late_keys(
             continue
         if not (head == current or _descends(ancestors, str(current), head)):
             continue
-        # Judged per key below: a commit between N and R made before a key's
-        # review is no fix of it.
-        clock = rr.fix_clock(cwd, head, sha)
-        if clock is rr.NEVER:
+        # Every fix on the way from N, to R and to the tip, from the one shared
+        # reading (``rr.fix_rows``); each key then judges them by its own
+        # review time (``_before_every_fix``), so pushing R and moving the tip
+        # past it never turns a credited key back into an owed one.
+        r_fixes = rr.fix_rows(cwd, head, sha)
+        if r_fixes is None:
             continue
-        if not rr._is_ancestor(cwd, str(current), sha):
-            if not rr._is_ancestor(cwd, sha, str(current)):
-                continue
-            if head not in fix_sets:
-                fix_sets[head] = _fixes(cwd, head, str(current))
-            if not set(fix_sets[head]) <= _descendants(cwd, sha, str(current)):
-                continue
-            # By time as well as by graph: a fix authored before R and then
-            # reordered after it (a rebase or cherry-pick, force-pushed)
-            # descends from R yet is the fix the owe rule dates.
-            if any(when < made_at for when in fix_sets[head].values()):
-                continue
+        if rr._is_ancestor(cwd, str(current), sha):
+            tip_fixes: list[rr.Fix] = []  # R at or ahead of the tip
+            after_r: set[str] = set()
+        elif rr._is_ancestor(cwd, sha, str(current)):
+            if head not in tip_rows:
+                walked = rr.fix_rows(cwd, head, str(current))
+                if walked is None:  # cannot happen (N..R..tip), but never "no fixes"
+                    continue
+                tip_rows[head] = walked
+            tip_fixes = tip_rows[head]
+            after_r = _descendants(cwd, sha, str(current))
+        else:
+            continue  # R is off the tip's line
+        fixes = list({fix.sha: fix for fix in (*r_fixes, *tip_fixes)}.values())
         for item in late:
             key = item["key"]
             if key in covered or key not in parsed.keys:
@@ -477,7 +478,7 @@ def _covered_late_keys(
                 continue
             if item["at"] > made_at + rr._COMMIT_CLOCK_SLACK:
                 continue
-            if not rr.clears(clock, item["at"]):
+            if not _before_every_fix(fixes, item["at"], made_at, after_r):
                 continue
             if head != reviewed:
                 if (reviewed, head) not in fix_times:
