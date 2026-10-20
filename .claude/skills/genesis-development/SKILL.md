@@ -3098,8 +3098,11 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   gate for a fix commit once a third round is recorded, or at two rounds once
   the confirmation is spent (`commit_approval_required`;
   `review_enforcement_commit.py` `_allow`). Unreadable round evidence takes the
-  same ask/deny path at any count. The
-  round-2 merge-or-abandon decision (rule 4 below) is doctrine; no gate makes it.
+  same ask/deny path at any count, with one install-local exception: with
+  `hooks.asks.review_request: off`, a transient read failure on a lone review
+  request becomes a note instead of an ask (a dispatched session is still
+  refused; the commit gate still asks). The round-2 merge-or-abandon decision
+  (rule 4 below) is doctrine; no gate makes it.
 
   **Scope: any PR whose diff touches the enforcement-hook surface** —
   `HOOK_SURFACE_PREFIXES` + `HOOK_SURFACE_FILES` in `scripts/review_budget.py`.
