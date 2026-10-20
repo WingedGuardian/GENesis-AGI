@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -58,6 +59,8 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 INTERACTIVE_ENTRYPOINTS = frozenset({"cli"})
 
@@ -78,8 +81,17 @@ _EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 
 _INJECTED_SQL = (
     "SELECT metadata, status FROM cc_sessions "
-    "WHERE metadata LIKE '%skill_tags%' AND started_at >= ?"
+    "WHERE metadata LIKE '%skill_tags%' AND started_at >= ? AND started_at <= ?"
 )
+
+# Where the nudge hook reads its catalog and the generator writes it
+# (scripts/hooks/skill_injection_hook.py and scripts/generate_skill_catalog.py,
+# both CATALOG_PATH). Neither honors GENESIS_HOME, so neither does this.
+CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
+
+# Longest path value kept from a transcript (Linux PATH_MAX). A longer one is
+# not a real skill path; it is counted in names_invalid and never retained.
+_MAX_PATH_CHARS = 4096
 _STATE_ORDER = {"active": 0, "zombie": 1, "dead": 2, "not_nudgeable": 3}
 
 # A skill name taken from a transcript or a skill_tags row is model- or
@@ -154,6 +166,30 @@ class Population:
         return os.path.basename(d)
 
 
+def _json_file(path: Path) -> object:
+    """Parsed JSON, or None when the file is missing, unreadable or malformed."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def _entries(directory: Path, *, skills: bool) -> Iterator[os.DirEntry]:
+    """Skill directories (holding a SKILL.md) or ``*.md`` files, by name. An
+    entry that cannot be stat'ed (a symlink loop) is skipped; an unreadable
+    directory raises OSError to its caller."""
+    for entry in sorted(os.scandir(directory), key=lambda e: e.name):
+        try:
+            if skills:
+                ok = entry.is_dir() and os.path.isfile(os.path.join(entry.path, "SKILL.md"))
+            else:
+                ok = entry.is_file() and entry.name.endswith(".md")
+        except OSError:
+            continue
+        if ok:
+            yield entry
+
+
 def load_population(
     *,
     catalog_path: Path,
@@ -163,74 +199,131 @@ def load_population(
 ) -> Population:
     """The nudge catalog (nudge-eligible), user-level skills, plugin skills and
     slash commands (the Skill tool loads commands too). Each source reports how
-    many NEW names it added, so a name shared by two sources counts once."""
+    many NEW names it added, so a name shared by two sources counts once.
+
+    These are files other programs write, so a wrong shape anywhere is skipped,
+    and a source that cannot be read at all carries an ``error`` instead of
+    aborting the report."""
     pop = Population()
 
-    found = 0
-    try:
-        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        catalog = {}
-    for tier in ("tier1", "tier2"):
-        for entry in catalog.get(tier) or []:
-            name, path = entry.get("name"), str(entry.get("path") or "")
-            if not name:
-                continue
-            found += pop._add(name, f"catalog-{tier}", nudge_eligible=True)
-            if path.startswith("/"):
-                pop._abs_dirs[path.rstrip("/")] = name
-            elif path:
-                pop._rel_dirs.append((path.rstrip("/"), name))
-    pop.sources.append({"source": "catalog", "path": str(catalog_path), "skills": found})
+    errors: list[str] = []
 
-    found = 0
-    if user_skills_dir.is_dir():
-        for entry in sorted(os.scandir(user_skills_dir), key=lambda e: e.name):
-            if entry.is_dir() and os.path.isfile(os.path.join(entry.path, "SKILL.md")):
+    def source(kind: str, path: object, read) -> None:
+        # Counted by difference, so names added before a failure still count.
+        entry: dict = {"source": kind, "path": str(path)}
+        before = len(pop.skills)
+        errors.clear()
+        try:
+            read()
+        except OSError as exc:
+            errors.append(f"{type(exc).__name__}: {exc.strerror or exc}")
+        entry["skills"] = len(pop.skills) - before
+        if errors:
+            entry["error"] = "; ".join(errors)
+        pop.sources.append(entry)
+
+    def catalog() -> int:
+        found = 0
+        data = _dict(_json_file(catalog_path))
+        for tier in ("tier1", "tier2"):
+            entries = data.get(tier)
+            for item in entries if isinstance(entries, list) else []:
+                item = _dict(item)
+                name, path = item.get("name"), item.get("path")
+                if not isinstance(name, str) or not name:
+                    continue
+                found += pop._add(name, f"catalog-{tier}", nudge_eligible=True)
+                if isinstance(path, str) and path.startswith("/"):
+                    pop._abs_dirs[path.rstrip("/")] = name
+                elif isinstance(path, str) and path:
+                    pop._rel_dirs.append((path.rstrip("/"), name))
+        return found
+
+    def user() -> int:
+        found = 0
+        if user_skills_dir.is_dir():
+            for entry in _entries(user_skills_dir, skills=True):
                 found += pop._add(entry.name, "user", nudge_eligible=False)
                 pop._abs_dirs.setdefault(entry.path.rstrip("/"), entry.name)
-    pop.sources.append({"source": "user", "path": str(user_skills_dir), "skills": found})
+        return found
 
-    found = 0
-    try:
-        plugins = json.loads(plugins_manifest.read_text(encoding="utf-8")).get("plugins") or {}
-    except (OSError, ValueError, AttributeError):
-        plugins = {}
-    for key, installs in plugins.items():
-        plugin = str(key).split("@", 1)[0]
-        for install in installs if isinstance(installs, list) else [installs]:
-            root = isinstance(install, dict) and install.get("installPath")
-            if not root:
-                continue
-            pop._plugin_roots.append((root, plugin))
-            skills_dir = Path(root) / "skills"
-            if not skills_dir.is_dir():
-                continue
-            for entry in sorted(os.scandir(skills_dir), key=lambda e: e.name):
-                if entry.is_dir() and os.path.isfile(os.path.join(entry.path, "SKILL.md")):
-                    found += pop._add(f"{plugin}:{entry.name}", "plugin", nudge_eligible=False)
-    pop.sources.append({"source": "plugins", "path": str(plugins_manifest), "skills": found})
-    for name in PROCESS_NUDGE_TARGETS & pop.skills.keys():
-        pop.skills[name]["nudge_eligible"] = True
-
-    for commands_dir in commands_dirs:
+    def plugins() -> int:
         found = 0
-        if commands_dir.is_dir():
-            for entry in sorted(os.scandir(commands_dir), key=lambda e: e.name):
-                if entry.is_file() and entry.name.endswith(".md"):
+        installed = _dict(_dict(_json_file(plugins_manifest)).get("plugins"))
+        for key, installs in installed.items():
+            plugin = str(key).split("@", 1)[0]
+            for install in installs if isinstance(installs, list) else [installs]:
+                root = _dict(install).get("installPath")
+                if not isinstance(root, str) or not root:
+                    continue
+                pop._plugin_roots.append((root, plugin))
+                # One unreadable install costs that install, not the manifest.
+                for sub, kind, skills in (
+                    ("skills", "plugin", True),
+                    ("commands", "plugin-command", False),
+                ):
+                    directory = Path(root) / sub
+                    try:
+                        if not directory.is_dir():
+                            continue
+                        for entry in _entries(directory, skills=skills):
+                            name = entry.name if skills else entry.name[:-3]
+                            found += pop._add(f"{plugin}:{name}", kind, nudge_eligible=False)
+                    except OSError as exc:
+                        errors.append(f"{directory}: {type(exc).__name__}: {exc.strerror or exc}")
+        return found
+
+    def process_nudges() -> int:
+        # The hook emits these whether or not the plugin manifest lists them, so
+        # every one is nudge-eligible and has a row even in a quiet window.
+        found = 0
+        for name in sorted(PROCESS_NUDGE_TARGETS):
+            if name in pop.skills:
+                pop.skills[name]["nudge_eligible"] = True
+            else:
+                found += pop._add(name, "process-nudge", nudge_eligible=True)
+        return found
+
+    def commands(directory: Path):
+        def read() -> int:
+            found = 0
+            if directory.is_dir():
+                for entry in _entries(directory, skills=False):
                     found += pop._add(entry.name[:-3], "command", nudge_eligible=False)
-        pop.sources.append({"source": "commands", "path": str(commands_dir), "skills": found})
+            return found
+
+        return read
+
+    source("catalog", catalog_path, catalog)
+    source("user", user_skills_dir, user)
+    source("plugins", plugins_manifest, plugins)
+    source("process-nudge", "scripts/hooks/skill_injection_hook.py", process_nudges)
+    for commands_dir in commands_dirs:
+        source("commands", commands_dir, commands(commands_dir))
     return pop
 
 
-def _default_population() -> Population:
-    from genesis.env import claude_home, genesis_home, repo_root
+def claude_root() -> Path:
+    """The Claude Code config root that holds ``projects/``, ``skills/`` and
+    ``plugins/``: ``CLAUDE_HOME`` first (Genesis's explicit override, the one
+    ``genesis.env.claude_home`` reads), else ``CLAUDE_CONFIG_DIR`` (where Claude
+    Code itself writes when relocated; ``session_awareness.peer_address`` reads
+    it too), else ``~/.claude``."""
+    for var in ("CLAUDE_HOME", "CLAUDE_CONFIG_DIR"):
+        if value := os.environ.get(var):
+            return Path(value).expanduser()
+    return Path.home() / ".claude"
 
+
+def _default_population() -> Population:
+    from genesis.env import repo_root
+
+    root = claude_root()
     return load_population(
-        catalog_path=genesis_home() / "skill_catalog.json",
-        user_skills_dir=claude_home() / "skills",
-        plugins_manifest=claude_home() / "plugins" / "installed_plugins.json",
-        commands_dirs=(repo_root() / ".claude" / "commands", claude_home() / "commands"),
+        catalog_path=CATALOG_PATH,
+        user_skills_dir=root / "skills",
+        plugins_manifest=root / "plugins" / "installed_plugins.json",
+        commands_dirs=(repo_root() / ".claude" / "commands", root / "commands"),
     )
 
 
@@ -318,17 +411,31 @@ def _text_of(content: object) -> str:
         return content
     if isinstance(content, list):
         return "".join(
-            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+            t
+            for b in content
+            if isinstance(b, dict)
+            and b.get("type") == "text"
+            and isinstance(t := b.get("text"), str)
         )
     return ""
 
 
+def _dict(value: object) -> dict:
+    """``value`` if it is a dict, else empty: a schema-drifted record is a
+    non-signal, never an exception that aborts the scan."""
+    return value if isinstance(value, dict) else {}
+
+
 @dataclass
 class _Session:
+    """Per-session aggregates, never raw occurrences, so memory grows with the
+    distinct skills a session touched, not with how often it touched them."""
+
     kind: str | None = None
-    kind_from_parent: bool = False
-    uses: list[tuple[datetime, str, str]] = field(default_factory=list)  # (ts, signal, value)
-    nudges: list[tuple[datetime, str, str]] = field(default_factory=list)  # (ts, form, value)
+    # (signal, value) -> [count, latest timestamp]
+    uses: dict[tuple[str, str], list] = field(default_factory=dict)
+    # (form, value) -> [count, earliest timestamp]
+    nudges: dict[tuple[str, str], list] = field(default_factory=dict)
     edited: set[str] = field(default_factory=set)
 
 
@@ -345,8 +452,21 @@ class Scanner:
         self.lines_untimestamped = 0
         self.nudges_unparsed = 0
         self.lines_oversized = 0
+        self.names_invalid = 0
+        self.files_failed = 0
 
     def scan_file(self, path: Path, is_subagent: bool = False) -> None:
+        """Scan one transcript. Known bad shapes are skipped where they are read;
+        anything else that raises is counted in ``files_failed`` and logged, so
+        one file can cost its own signals but never the whole report."""
+        try:
+            self._scan_file(path, is_subagent)
+        except Exception:
+            self.files_failed += 1
+            # A systematic bug fails every file: one traceback, then one line each.
+            logger.warning("skill usage: scanning %s failed", path, exc_info=self.files_failed == 1)
+
+    def _scan_file(self, path: Path, is_subagent: bool) -> None:
         try:
             # O_NONBLOCK: a FIFO named *.jsonl must not block the scan (and with it
             # the MCP tool's single-flight lock) forever; only regular files are read.
@@ -365,9 +485,11 @@ class Scanner:
         fh = os.fdopen(fd, "rb")
         self.files_scanned += 1
         self.subagent_files += int(is_subagent)
-        file_sid: str | None = None
+        # A subagent transcript (<parent>/subagents/*.jsonl) belongs to the
+        # session whose directory holds it, as transcript_analytics reads it.
+        file_sid: str | None = path.parent.parent.name if is_subagent else None
         consumed = 0
-        kind_seen = False
+        kind_seen = registered = False
         with fh:
             while (remaining := budget - consumed) > 0:
                 line = fh.readline(min(remaining, MAX_LINE_BYTES))  # never past the budget
@@ -385,30 +507,53 @@ class Scanner:
                 consumed += len(line)
                 self.bytes_scanned += len(line)
                 if file_sid is None and (m := _SESSION_RE.search(line)):
-                    file_sid = m.group(1).decode()
+                    file_sid = m.group(1).decode(errors="replace")
+                if file_sid is not None and not registered:
+                    registered = True
                     self.sessions[file_sid]  # register the session even if it holds no signal
                 if file_sid is not None and not kind_seen and (m := _ENTRYPOINT_RE.search(line)):
                     kind_seen = True
                     session = self.sessions[file_sid]
                     # The parent transcript decides; a subagent file only fills a gap.
-                    if not is_subagent:
-                        session.kind, session.kind_from_parent = m.group(1).decode(), True
-                    elif session.kind is None:
-                        session.kind = m.group(1).decode()
+                    if not is_subagent or session.kind is None:
+                        session.kind = m.group(1).decode(errors="replace")
                 if not any(token in line for token in _PREFILTER):
                     continue
                 try:
                     record = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):  # RecursionError: deeply nested JSON
                     self.lines_unparsed += 1
                     continue
                 if isinstance(record, dict):
-                    self._record(record, file_sid or path.stem)
+                    self._record(record, file_sid or path.stem, owned=is_subagent)
         if file_sid is None:
             self.sessions[path.stem]
 
-    def _record(self, record: dict, default_sid: str) -> None:
+    def _keep(self, signal: str, value: str) -> bool:
+        """Drop a value that cannot be a skill name or path before it is
+        retained, counting it in names_invalid."""
+        if signal in ("load", "named", "process"):
+            ok = bool(_NAME_RE.fullmatch(value))
+        else:
+            ok = 0 < len(value) <= _MAX_PATH_CHARS
+        self.names_invalid += not ok
+        return ok
+
+    def _record(self, record: dict, default_sid: str, *, owned: bool = False) -> None:
+        """``owned``: the file decides the session (a subagent transcript belongs
+        to the parent session whose directory holds it, whatever its records say)."""
         signals = list(self._signals(record))
+        if not signals:
+            return
+        sid = record.get("sessionId")
+        if owned or not isinstance(sid, str) or not sid:
+            sid = default_sid
+        # An edit excludes that session's reads whenever it happened, so it is
+        # kept before the window filter, timestamped or not.
+        for signal, value in signals:
+            if signal == "edit" and self._keep(signal, value):
+                self.sessions[sid].edited.add(value)
+        signals = [s for s in signals if s[0] != "edit"]
         if not signals:
             return
         stamp = _parse_ts(record.get("timestamp"))
@@ -417,27 +562,35 @@ class Scanner:
             return
         if not (self.since <= stamp <= self.until):
             return
-        session = self.sessions[str(record.get("sessionId") or default_sid)]
+        session = self.sessions[sid]
         for signal, value in signals:
-            if signal == "edit":
-                session.edited.add(value)
-            elif signal == "nudge":
+            if signal == "nudge":
+                if not isinstance(value, str):
+                    self.nudges_unparsed += 1
+                    continue
                 found, unparsed = parse_nudges(value)
                 self.nudges_unparsed += unparsed
-                session.nudges.extend((stamp, form, name) for name, form in found)
-            else:
-                session.uses.append((stamp, signal, value))
+                for name, form in found:
+                    if self._keep(form, name):
+                        agg = session.nudges.setdefault((form, name), [0, stamp])
+                        agg[0] += 1
+                        agg[1] = min(agg[1], stamp)
+            elif self._keep(signal, value):
+                agg = session.uses.setdefault((signal, value), [0, stamp])
+                agg[0] += 1
+                agg[1] = max(agg[1], stamp)
 
     @staticmethod
-    def _signals(record: dict) -> Iterator[tuple[str, str]]:
+    def _signals(record: dict) -> Iterator[tuple[str, object]]:
         kind = record.get("type")
+        message = _dict(record.get("message"))
         if kind == "assistant":
-            content = (record.get("message") or {}).get("content")
+            content = message.get("content")
             for block in content if isinstance(content, list) else []:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
                     continue
                 tool, data = block.get("name"), block.get("input") or {}
-                if not isinstance(data, dict):
+                if not isinstance(tool, str) or not isinstance(data, dict):
                     continue
                 if tool == "Skill" and isinstance(data.get("skill"), str):
                     yield "load", data["skill"]
@@ -449,15 +602,15 @@ class Scanner:
                     elif tool in _EDIT_TOOLS:
                         yield "edit", os.path.normpath(file_path)
         elif kind == "user" and record.get("isMeta") and "sourceToolUseID" not in record:
-            text = _text_of((record.get("message") or {}).get("content"))
+            text = _text_of(message.get("content"))
             if text.startswith(_BASE_DIR):
                 yield "slash", text[len(_BASE_DIR) :].split("\n", 1)[0].strip()
             elif _PRELOAD_MARK in text and _BASE_DIR in text:
                 yield "preload", text.split(_BASE_DIR, 1)[1].split("\n", 1)[0].strip()
         elif kind == "attachment":
-            attachment = record.get("attachment") or {}
+            attachment = _dict(record.get("attachment"))
             if "skill_injection_hook" in str(attachment.get("command") or ""):
-                yield "nudge", str(attachment.get("stdout") or attachment.get("content") or "")
+                yield "nudge", attachment.get("stdout") or attachment.get("content") or ""
 
 
 # --- dispatched injections (cc_sessions) --------------------------------------------
@@ -471,8 +624,10 @@ def count_injected(rows: Iterable[tuple[str | None, str | None]]) -> dict:
     sessions = 0
     for metadata, status in rows:
         try:
-            tags = json.loads(metadata or "").get("skill_tags") or []
-        except (ValueError, AttributeError):
+            tags = _dict(json.loads(metadata or "")).get("skill_tags")
+        except (ValueError, TypeError, RecursionError):
+            continue
+        if not isinstance(tags, list):  # as loop_closure.skill_funnel checks it
             continue
         tags = [t for t in tags if isinstance(t, str) and t]
         if not tags:
@@ -485,7 +640,7 @@ def count_injected(rows: Iterable[tuple[str | None, str | None]]) -> dict:
     return {"per_skill": dict(per_skill), "sessions": sessions}
 
 
-def read_injected_sync(db_path: Path, since: datetime) -> dict | None:
+def read_injected_sync(db_path: Path, since: datetime, until: datetime) -> dict | None:
     """``count_injected`` over the live DB, read-only; None if it cannot be read."""
     if not Path(db_path).is_file():
         return None
@@ -494,7 +649,7 @@ def read_injected_sync(db_path: Path, since: datetime) -> dict | None:
         # change the URI's meaning or drop mode=ro.
         con = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
         try:
-            rows = con.execute(_INJECTED_SQL, (since.isoformat(),)).fetchall()
+            rows = con.execute(_INJECTED_SQL, (since.isoformat(), until.isoformat())).fetchall()
         finally:
             con.close()
     except sqlite3.Error:
@@ -502,9 +657,9 @@ def read_injected_sync(db_path: Path, since: datetime) -> dict | None:
     return count_injected(rows)
 
 
-async def read_injected(db, since: datetime) -> dict:
+async def read_injected(db, since: datetime, until: datetime) -> dict:
     """``count_injected`` over an open aiosqlite connection."""
-    cursor = await db.execute(_INJECTED_SQL, (since.isoformat(),))
+    cursor = await db.execute(_INJECTED_SQL, (since.isoformat(), until.isoformat()))
     return count_injected(await cursor.fetchall())
 
 
@@ -526,15 +681,17 @@ def build_report(
     injected: dict | None,
     *,
     duration_s: float,
+    db_source: str | None = None,
 ) -> dict:
     rows: dict[str, dict] = {}
-    names_invalid = 0
+    # One unit throughout: occurrences dropped (a population name counts once).
+    names_invalid = scanner.names_invalid
 
-    def valid(name: str) -> bool:
+    def valid(name: str, occurrences: int = 1) -> bool:
         nonlocal names_invalid
         if _NAME_RE.fullmatch(name):
             return True
-        names_invalid += 1
+        names_invalid += occurrences
         return False
 
     def row(name: str) -> dict:
@@ -560,7 +717,8 @@ def build_report(
         return rows[name]
 
     for name in population.skills:
-        row(name)
+        if valid(name):  # catalog and directory names are third-party text too
+            row(name)
 
     sessions = _triple()
     unknown_entrypoint = 0
@@ -570,13 +728,13 @@ def build_report(
         kind = "interactive" if session.kind in INTERACTIVE_ENTRYPOINTS else "headless"
         _bump(sessions, kind)
 
-        used_at: dict[str, list[datetime]] = defaultdict(list)
-        for stamp, signal, value in session.uses:
+        last_use: dict[str, datetime] = {}
+        for (signal, value), (count, stamp) in session.uses.items():
             if signal == "read" and value in session.edited:
                 continue  # editing a skill is not using it
             if signal == "preload":  # configured, not chosen: counted, never a use
-                if valid(name := population.resolve_dir(value)):
-                    _bump(row(name)["preloads"], kind)
+                if valid(name := population.resolve_dir(value), count):
+                    _bump(row(name)["preloads"], kind, count)
                 continue
             if signal == "load":
                 name, counter = value, "loads"
@@ -584,35 +742,36 @@ def build_report(
                 name, counter = population.resolve_dir(value), "slash_loads"
             else:
                 name, counter = population.resolve_dir(os.path.dirname(value)), "reads"
-            if not valid(name):
+            if not valid(name, count):
                 continue
             r = row(name)
-            _bump(r[counter], kind)
-            used_at[name].append(stamp)
+            _bump(r[counter], kind, count)
+            if name not in last_use or stamp > last_use[name]:
+                last_use[name] = stamp
             if r["_last"] is None or stamp > r["_last"]:
                 r["_last"] = stamp
 
         first_nudge: dict[str, datetime] = {}
-        for stamp, form, value in session.nudges:
+        for (form, value), (count, stamp) in session.nudges.items():
             name = population.resolve_dir(value) if form == "path" else value
-            if not valid(name):
+            if not valid(name, count):
                 continue
-            _bump(row(name)["nudges"], kind)
+            _bump(row(name)["nudges"], kind, count)
             if name not in first_nudge or stamp < first_nudge[name]:
                 first_nudge[name] = stamp
 
-        for name in used_at:
+        for name in last_use:
             _bump(rows[name]["sessions_used"], kind)
         for name, nudged_at in first_nudge.items():
             r = rows[name]
             _bump(r["sessions_nudged"], kind)
-            if any(t >= nudged_at for t in used_at.get(name, ())):
+            if name in last_use and last_use[name] >= nudged_at:
                 _bump(r["_converted"], kind)
 
     uncatalogued_tags: dict[str, int] = {}
     if injected is not None:
         for tag, counts in injected["per_skill"].items():
-            if not valid(tag):
+            if not valid(tag, counts["injected"]):
                 continue
             if tag in population.skills or tag in rows:
                 r = row(tag)
@@ -657,15 +816,18 @@ def build_report(
         "lines_untimestamped": scanner.lines_untimestamped,
         "nudges_unparsed": scanner.nudges_unparsed,
         "lines_oversized": scanner.lines_oversized,
+        "files_failed": scanner.files_failed,
         "names_invalid": names_invalid,
         "duration_s": round(duration_s, 2),
         "db_join": "ok" if injected is not None else "unavailable",
+        "db_source": db_source,
         "injected_sessions": injected["sessions"] if injected is not None else "unavailable",
         "uncatalogued_tags": uncatalogued_tags,
         "catalog_sources": population.sources,
         "skills": out,
         "note": (
-            "A zero means none found in the scanned sessions, within the window. "
+            "A zero means none found in the scanned sessions, within the window; "
+            "files_failed counts transcripts whose signals may be partial or missing. "
             "interactive = entrypoint 'cli'; headless = dispatched, SDK and test runs. "
             "The nudge hook nudges a skill at most once per session, so nudges ~= "
             "sessions_nudged. State counts only chosen uses (tool loads, slash loads, "
@@ -684,19 +846,26 @@ def run_scan(
     until: datetime,
     population: Population,
     injected: dict | None,
+    db_source: str | None = None,
 ) -> dict:
     started = time.monotonic()
     scanner = Scanner(since, until)
     for path, is_subagent in iter_transcript_files(projects_root, since):
         scanner.scan_file(path, is_subagent)
-    return build_report(scanner, population, injected, duration_s=time.monotonic() - started)
+    return build_report(
+        scanner,
+        population,
+        injected,
+        duration_s=time.monotonic() - started,
+        db_source=db_source,
+    )
 
 
 # --- CLI ------------------------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None) -> int:
-    from genesis.env import claude_home, genesis_db_path
+    from genesis.env import genesis_db_path
 
     parser = argparse.ArgumentParser(
         prog="python -m genesis.learning.skills.usage", description=__doc__.split("\n", 1)[0]
@@ -715,12 +884,14 @@ def main(argv: list[str] | None = None) -> int:
 
     until = datetime.now(UTC)
     since = until - timedelta(days=args.days)
+    db = args.db or genesis_db_path()
     report = run_scan(
-        projects_root=args.projects_root or claude_home() / "projects",
+        projects_root=args.projects_root or claude_root() / "projects",
         since=since,
         until=until,
         population=_default_population(),
-        injected=read_injected_sync(args.db or genesis_db_path(), since),
+        injected=read_injected_sync(db, since, until),
+        db_source=str(db),
     )
     text = json.dumps(report, indent=2)
     if args.out:

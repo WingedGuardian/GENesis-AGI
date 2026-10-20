@@ -2802,6 +2802,9 @@ verified: b066be8d2fdc 2026-10-20
   Exposed as the `skill_usage_status` health MCP tool (single-flight, progress
   per file) and `python -m genesis.learning.skills.usage`. A zero means none
   found in the scanned sessions; the window and denominators are in the output.
+  It parses transcripts itself; `transcript_analytics/extract.py` also reads
+  `Skill` tool_use records, so once that library's storage ships this report
+  should become a query over it rather than a second parser.
 
 - **transcript_analytics/**: optional local transcript parser library. It
   extracts physical records, preserves unresolved identity and usage, and

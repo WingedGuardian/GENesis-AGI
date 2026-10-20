@@ -138,3 +138,63 @@ async def test_tool_is_registered():
 
     tools = await mcp.get_tools()
     assert "skill_usage_status" in tools
+
+
+@pytest.mark.asyncio
+async def test_cancelled_call_holds_the_lock_until_its_worker_thread_ends(home, monkeypatch):
+    import asyncio
+    import threading
+
+    _transcript(home, "s0", "alpha")
+    entered, release = threading.Event(), threading.Event()
+
+    def blocking_scan(self, path, is_subagent=False):
+        entered.set()
+        release.wait(30)
+
+    monkeypatch.setattr(usage.Scanner, "scan_file", blocking_scan)
+    svc = MagicMock()
+    svc._db = None
+    with patch("genesis.mcp.health_mcp._service", svc):
+        task = asyncio.create_task(tool._impl_skill_usage_status(14))
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert tool._scan_lock.locked()  # the worker is still reading
+        assert (await tool._impl_skill_usage_status(14))["status"] == "scan_in_progress"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert not tool._scan_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_a_worker_failing_after_cancel_still_raises_the_cancellation(home, monkeypatch):
+    import asyncio
+    import threading
+
+    _transcript(home, "s0", "alpha")
+    entered, release = threading.Event(), threading.Event()
+
+    def failing_scan(self, path, is_subagent=False):
+        entered.set()
+        release.wait(30)
+        raise RuntimeError("worker failed")
+
+    monkeypatch.setattr(usage.Scanner, "scan_file", failing_scan)
+    svc = MagicMock()
+    svc._db = None
+    with patch("genesis.mcp.health_mcp._service", svc):
+        task = asyncio.create_task(tool._impl_skill_usage_status(14))
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        task.cancel()  # a second cancel during the wait
+        await asyncio.sleep(0.05)
+        assert tool._scan_lock.locked()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert not tool._scan_lock.locked()

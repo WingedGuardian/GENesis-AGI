@@ -37,8 +37,31 @@ _PROGRESS_SEND_S = 1.0
 _scan_lock = asyncio.Lock()
 
 
+async def _in_thread(fn, *args):
+    """``fn(*args)`` in a worker thread, returning only once that thread is done.
+
+    Cancelling ``asyncio.to_thread`` does not stop its thread, so a plain await
+    would release ``_scan_lock`` while the worker is still reading and let a
+    second scan start beside it. On cancel, wait for the worker to end (further
+    cancels included), then re-raise the cancellation, never the worker's result.
+    """
+    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                continue
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning(
+                "skill_usage_status: worker failed after cancel", exc_info=task.exception()
+            )
+        raise
+
+
 async def _impl_skill_usage_status(days: float = 14.0, ctx: Context | None = None) -> dict:
-    from genesis.env import claude_home
     from genesis.learning.skills import usage
 
     try:
@@ -56,25 +79,26 @@ async def _impl_skill_usage_status(days: float = 14.0, ctx: Context | None = Non
         until = datetime.now(UTC)
         since = until - timedelta(days=days)
 
-        injected = None
+        injected, db_source = None, None
         import genesis.mcp.health_mcp as health_mcp_mod
 
         service = health_mcp_mod._service
         if service is not None and getattr(service, "_db", None) is not None:
+            db_source = "genesis-server database connection"
             try:
-                injected = await usage.read_injected(service._db, since)
+                injected = await usage.read_injected(service._db, since, until)
             except Exception:
                 logger.warning("skill_usage_status: cc_sessions read failed", exc_info=True)
 
-        population = await asyncio.to_thread(usage._default_population)
+        population = await _in_thread(usage._default_population)
         scanner = usage.Scanner(since, until)
-        files = await asyncio.to_thread(
-            lambda: list(usage.iter_transcript_files(claude_home() / "projects", since))
+        files = await _in_thread(
+            lambda: list(usage.iter_transcript_files(usage.claude_root() / "projects", since))
         )
         last_sent = time.monotonic()
         report_failed = False
         for done, (path, is_subagent) in enumerate(files, 1):
-            await asyncio.to_thread(scanner.scan_file, path, is_subagent)
+            await _in_thread(scanner.scan_file, path, is_subagent)
             if ctx is None or time.monotonic() - last_sent < _PROGRESS_EVERY_S:
                 continue
             last_sent = time.monotonic()
@@ -91,7 +115,11 @@ async def _impl_skill_usage_status(days: float = 14.0, ctx: Context | None = Non
                 report_failed = True
 
         return usage.build_report(
-            scanner, population, injected, duration_s=time.monotonic() - started
+            scanner,
+            population,
+            injected,
+            duration_s=time.monotonic() - started,
+            db_source=db_source,
         )
 
 
