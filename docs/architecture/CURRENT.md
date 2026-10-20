@@ -3424,7 +3424,9 @@ tool-disabled CC probe without changing its schedule or routing authority.
   database takes nothing. `add` needs no passphrase and requires a merchant
   scope or `--single-use`; init/add/retire need a TTY that can hide input (every
   answer is hidden) and refuse inside a coding agent's session, Claude Code or
-  Codex (accident guard). Needs the `payments` extra.
+  Codex (accident guard). Needs the `payments` extra, which bootstrap and
+  install.sh install on every install as a non-fatal step after the core
+  (`venv_setup.sh` `install_runtime_extras`, with the `test` extra).
   `vault_service.py` runs inside genesis-server (started from
   `StandaloneAdapter.serve()`, never the bridge or terminal): after
   `vault unlock` it holds the X25519 identity in memory and relocks on
