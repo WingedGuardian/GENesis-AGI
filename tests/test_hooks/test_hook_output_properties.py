@@ -8,7 +8,6 @@ import io
 import json
 from pathlib import Path
 
-import pytest
 from hypothesis import HealthCheck, assume, example, given, settings
 from hypothesis import strategies as st
 
@@ -78,8 +77,16 @@ def _permission_decision(payload: dict[str, object]) -> object:
 
 
 def _clip_char_cost(text: str) -> int:
-    """clip_to_cost's own unit: 2 for astral, 1 otherwise (including lone surrogates)."""
-    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
+    """clip_to_cost's unit: 2 for astral, 6 for a surrogate code point, else 1.
+
+    Six because that is what the writers emit for one (``printable`` escapes it
+    as ``\\udXXX``), and the clip must bill what ``utf16_len`` bills (#3237).
+    This helper used to bill a lone surrogate as 1, pinning the very disagreement
+    between the clip and the measurement that the fix removes.
+    """
+    return sum(
+        2 if ord(ch) > 0xFFFF else 6 if 0xD800 <= ord(ch) <= 0xDFFF else 1 for ch in text
+    )
 
 
 _NONEMPTY_TEXT = st.text(alphabet=st.one_of(_ASCII, _UNICODE_EDGE), min_size=1, max_size=180)
@@ -223,11 +230,6 @@ def test_print_json_bounded_true_means_the_emitted_stream_fits(
         assert _stream_cost(sink) <= budget
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#3255: print_json_bounded can return False when the emptied envelope fits",
-)
 @_PROPERTY_SETTINGS
 @given(case=_ordinary_boundary_case())
 @example(
@@ -258,7 +260,7 @@ def test_print_json_bounded_true_means_the_emitted_stream_fits(
         _TWO_KEY_BOUNDARY_ENVELOPE_COST + 1,
     )
 )
-def test_xfail_print_json_bounded_false_when_emptied_envelope_fits(
+def test_print_json_bounded_true_whenever_the_emptied_envelope_fits(
     case: tuple[dict[str, object], tuple[str, ...], int],
 ):
     payload, text_keys, budget = case
@@ -384,11 +386,6 @@ def test_print_bounded_never_emits_over_budget(text: str, budget: int, mirror_hi
     assert out.emitted_chars <= budget
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="#3236: non-ASCII trimming leaves avoidable budget unused",
-)
 @_PROPERTY_SETTINGS
 @given(
     filler=st.sampled_from(_ESCAPE_CLASS_FILLERS),
@@ -399,7 +396,7 @@ def test_print_bounded_never_emits_over_budget(text: str, budget: int, mirror_hi
 @example(filler="é", size=80, over=1, nested=False)
 @example(filler="🎯", size=80, over=1, nested=True)
 @example(filler="—", size=80, over=1, nested=True)
-def test_xfail_3236_non_ascii_trimming_uses_the_available_budget(
+def test_non_ascii_trimming_uses_the_available_budget(
     filler: str,
     size: int,
     over: int,
@@ -454,26 +451,16 @@ def test_clip_to_cost_handles_lone_surrogates(text: str, budget: int):
         assert _clip_char_cost(clipped + next_char) > budget
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=UnicodeEncodeError,
-    reason="#3237: lone surrogate accounting can raise UnicodeEncodeError",
-)
 @_PROPERTY_SETTINGS
 @given(text=_LONE_SURROGATE_TEXT)
-def test_xfail_3237_lone_surrogate_accounting_does_not_raise(text: str):
+def test_lone_surrogate_accounting_does_not_raise(text: str):
     _ho.emit_cost(text)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=UnicodeEncodeError,
-    reason="#3237: lone surrogate writes can raise UnicodeEncodeError",
-)
 @_PROPERTY_SETTINGS
 @given(text=_LONE_SURROGATE_TEXT, budget=st.integers(min_value=1, max_value=80))
 @example(text="\ud800", budget=2)
-def test_xfail_3237_lone_surrogate_writer_does_not_raise(text: str, budget: int):
+def test_lone_surrogate_writer_does_not_raise(text: str, budget: int):
     buf = io.BytesIO()
     encoded_stream = io.TextIOWrapper(
         buf, encoding="utf-8", errors="strict", newline="\n", write_through=True

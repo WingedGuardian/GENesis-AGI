@@ -288,6 +288,28 @@ process. `graph_traverse_prune` deletes rows, and file lines, older than 30 days
 kill switch `GENESIS_GRAPH_TELEMETRY_DISABLED=1`.
 The fallback WARNINGs alone could never answer this: MCP servers log to stderr,
 which never reaches the journal.
+A memory server started before that code was deployed traverses without writing
+anything, so genesis-server also runs an **hourly census** (`graph_traverse_census`
+job, `:45`, `memory/graph_census.py`): one `eval_events` row
+(`event_type="graph_traverse_census"`) listing each live
+`genesis_mcp_server.py --server memory` process with its start time, every
+commit the main checkout has held since it started (read by
+`scripts/lib/serving_commit.py`, the reader the deploy scripts use, which refuses
+on a reflog gap, a move in the start second, a clock step back or git's expiry
+cutoff), whether ALL of them contain the telemetry module (a module imported
+after start loads whatever is on disk then), its exec-time kill switch and DB
+path, plus whether HEAD has the module and whether `src/genesis/memory/` is
+dirty. Git runs with `--no-optional-locks`, so the hourly read never takes the
+index lock a deploy needs. The cutover clock can only start at a census with no
+server that could be running older code. Pruned with the telemetry rows.
+**The verdict** is `scripts/graph_cutover_report.py` over the pure
+`memory/graph_cutover.py`: PASS needs 14 days on the clock, at least 100
+falkordb-served traversals and falkordb traffic on at least 10 UTC days in the
+last 14. Outcomes are an allowlist (`primary` counts, `cancelled` is neutral but
+reported, anything else restarts the clock, as do a non-falkordb `configured` or
+`served`, a dirty census row and a census gap over 2h15m). Lost writes, an
+unreadable row, a stale or missing census, or telemetry switched off make it
+INCONCLUSIVE. Exit 0/1/2 = PASS/NOT_YET/INCONCLUSIVE, 3 = the report failed.
 
 Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
 `memory_links` writers, while the visibility predicate below reads
@@ -393,10 +415,20 @@ reconciliation prevent automatic replay; live registered work is excluded from
 the stale reaper. It is a native primitive, not an enabled peer transport. See
 `docs/reference/native-managed-sessions.md`.
 
+Roster-eligible managed API turns now select a provider through enforced
+tool-disabled, empty-MCP readiness checks before executing their task once.
+Only provider refusals advance the configured roster; post-start failure never
+switches providers or parks work. Preflight consumes the original deadline and
+held native capacity. Selection/endpoint attribution uses one roster snapshot,
+with additional metadata writes on an owned DB connection. The recovery worker
+shares the OAuth-compatible readiness helper. `cc_fallback` is a non-routing
+**Fallback** observation in the neural monitor for conversations and managed
+turns; actual committed outcomes, not readiness alone, establish success.
+
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 6ef113ecd 2026-10-14
+verified: 4606e5969 2026-10-16
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
@@ -1417,8 +1449,13 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: cfbb876243f2 2026-10-07
+verified: 96e0a4de3 2026-10-18
 ```
+
+The neural monitor includes the non-routing **Fallback** observation, and the
+dashboard labels the shared fallback indicator as last successful/observed use.
+Individual managed provider selection remains scoped to its native receipt;
+the shared banner is not an assertion about all concurrent sessions.
 
 - **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
   pinned node/realm/principal and scoped credentials. Disabled by default; no
@@ -1431,6 +1468,17 @@ verified: cfbb876243f2 2026-10-07
   to fallback readiness, while inactive credentials still participate in scope
   collision checks. Scope checks also reject equality with loaded active/fallback
   Flask signing keys, without request-time credential-file reads.
+  Local readiness reads a consistent, read-only registry snapshot and reuses
+  conversation admission's runner/database checks. Intentional disablement has
+  its own startup/capability status and does not count as a deploy regression.
+  Health snapshots and the existing minute status writer report current readiness
+  independently of the boot manifest. External health accepts only a sample from
+  the active primary server's MainPID observed within 90 seconds. Authenticated
+  health probes return 503 with readiness details when enabled but unready.
+  The existing awareness tick records readiness incidents and sends ordered
+  outage/recovery Telegram notices. Unknown readings preserve an open incident;
+  deliberate disablement closes it quietly. Incident/phase delivery history
+  supplies durable retry deduplication without a second queue.
   `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
   existing Flask/runtime loop: it atomically persists native receipts, binds
   contexts and retries to relationship epochs, and admits at most two
@@ -1484,10 +1532,20 @@ verified: cfbb876243f2 2026-10-07
   `per_device` scope; default `global`.
 - **dashboard/**: Flask blueprint at `/genesis` (~53 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
-  thread detects degraded-but-alive Flask; web terminal.
+  thread detects degraded-but-alive Flask; web terminal (its WebSocket accepts
+  same-origin handshakes only: `routes/terminal._refuse_cross_origin_terminal`).
   **Auth posture — API READS ARE OPEN BY DEFAULT, and this is the fact auditors
-  keep rediscovering.** Exactly two `before_request` hooks exist, and between
-  them they leave a gap: `auth._check_auth` is blueprint-level and gates HTML
+  keep rediscovering.** Two app-level hooks act on API reads, and neither
+  authenticates: `host_gate.check_host_header` refuses a request whose Host header
+  does not name this machine (IP literal, `localhost`, its hostnames, its
+  Tailscale name, or `GENESIS_DASHBOARD_ALLOWED_HOSTS`; `/v1/*` is out of
+  scope, and the supervisor's network-open routes pass by IP; it is not a cross-site
+  control, because a page can aim a request at an IP address), and
+  `auth.check_api_network_scope` refuses an untrusted TCP peer (loopback and
+  the tailnet are trusted, and the host's proxy delivers LAN traffic as
+  loopback). Both are registered by `auth.apply_dashboard_gates`, which the
+  standalone host and the Agent Zero server-startup extension both call. The
+  credential hooks leave a gap: `auth._check_auth` is blueprint-level and gates HTML
   pages only, returning None for any `/api/` or `/v1/` path;
   `auth.check_api_mutation_auth` is app-level and returns None for
   GET/HEAD/OPTIONS. So a dashboard password does protect the blueprint's HTML
@@ -1497,8 +1555,8 @@ verified: cfbb876243f2 2026-10-07
   anyone (a static shell whose data comes from the open API reads below). It
   protects the MUTATION routes only while the `GENESIS_DASHBOARD_API_AUTH` kill
   switch is on (the default); set to off, `check_api_mutation_auth` returns
-  before any credential check. And **no request hook gates an API read on any
-  install, configured or not.** A GET under the API prefixes (`/api/genesis/`
+  before any credential check. And **no request hook requires a credential for
+  an API read on any install, configured or not.** A GET under the API prefixes (`/api/genesis/`
   and `/api/t/`) is therefore anonymous unless its own handler adds a
   predicate, and only a small minority do (`routes/references.py` is one: its
   `_auth_or_403` does refuse an anonymous caller once a password is set).
@@ -1520,8 +1578,9 @@ verified: cfbb876243f2 2026-10-07
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`. Install and
   bootstrap render disabled query/client-slice templates without auto-upgrading
-  a PATH provider. Staging does not activate it; MCP registration and indexing
-  retain their existing routes until their integration concerns land. See
+  a PATH provider. Staging does not activate it; MCP registration always uses
+  the managed launcher, including absent PATH binaries. Index queue integration
+  remains a separate concern. See
   `docs/reference/codebase-managed.md`.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
@@ -1544,8 +1603,15 @@ verified: cfbb876243f2 2026-10-07
   selected interpreter, proves actual quiescence and preserves immutable state.
   Remove unlinks fixed artifacts only after validating the full population;
   partial unlink failures refresh only after proving quiescence and accepted
-  remaining sources. Frontend and queued-worker admission integration
-  remain separate concerns.
+  remaining sources. Managed frontends use the installed interpreter and
+  normalized HOME, preserve literal paths through a fixed environment bridge,
+  and prove shared admission and kernel caps inside the transient child:
+  256 MiB/zero swap/Tasks32 under a 2 GiB/zero-swap/Tasks512 aggregate. They
+  retain fixed analysis tools, permanent PID readiness and native stop
+  propagation without backend activation or a raw fallback. Their own-cap OOMs
+  use the existing counted containment policy; uncertain or ancestor-limit
+  events still page, and explicit operator overrides remain. Queued-worker
+  admission integration remains separate.
 - **hosting/**: the OUTER layer that calls the runtime. Standalone's scoped peer
   request-input handler provides a trusted 256 KiB body reader with a five-second
   absolute deadline on peer send/cancel POST paths. It bounds framing and refusal
@@ -1631,6 +1697,18 @@ verified: cfbb876243f2 2026-10-07
   reclaim); a click that opens a new tab switches the tools to it. `browser_fill` refuses a payment card number
   as the value and `browser_run_js` one in its script (the value check only:
   telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
+  Every `_impl_browser_*` result and error passes `@_redacted` (card numbers in
+  snapshots, script results, urls, titles and exception text become
+  `[card redacted]`; a contract test requires the decorator on each), and the
+  `security/card_redaction` log filter sits on the `mcp_health.log` handler
+  (every propagated `genesis.*` record) and on the browser, FastMCP and MCP
+  SDK lowlevel-server loggers, redacting log lines and tracebacks. The tool
+  timeout text and the CAPTCHA Telegram alert's page URL are redacted too.
+  Results are also checked for a card SPLIT across structure (digit groups on
+  separate snapshot lines, list items or dict values; a container that spells
+  one is withheld whole), and `browser_screenshot` refuses to capture a page
+  whose frames render a card in text, field values, placeholders, labels,
+  titles, alt text, options or CSS-generated content.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
@@ -2707,9 +2785,25 @@ Self-improvement loops and the instrumentation that keeps them honest.
 
 ```yaml subsystem-map
 entry: learning-evaluation
-modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: adc15e37ff5a 2026-10-16
+modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
+verified: 368be0b0a2a2 2026-10-18
 ```
+
+- **transcript_analytics/**: optional local transcript parser library. It
+  extracts physical records, preserves unresolved identity and usage, and
+  applies the shared credential scrubber to structured content. Schema5 records
+  distinguish executor identity from delegation evidence. This development
+  candidate adds the parser and optional DuckDB/Parquet dependencies; storage,
+  queries, CLI, scheduling and encrypted recovery arrive in dependent changes.
+  It does not describe a deployed capability.
+  Hook names are limited to literal command targets and option-free supported
+  interpreter operands; ambiguous commands report `<unknown>` while preserving
+  their scrubbed command. Invalid negative durations/counts and reversed call
+  timestamps remain unknown; signed exit codes remain signed. Both model-refusal
+  subtypes retain selected scrubbed diagnostics. Recursive JSON is treated as a
+  malformed record, and chronology is evaluated against the captured byte limit,
+  including an incomplete suffix in its fingerprint. Dependent query views must
+  preserve those unknown-duration semantics when deriving fallback latency.
 
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
@@ -2850,8 +2944,8 @@ verified: adc15e37ff5a 2026-10-16
   and recovery state. Incremental publication follows durable append; uncertain
   publication stops derived-state reading until reconstruction. Historical
   reading never creates or truncates files; version-1 evidence cannot execute.
-  No CLI, automatic execution or qualification verdict is wired yet;
-  subsequent replacement PRs supply those callers. Production credentials and
+  The isolated qualification CLI supplies explicit execution and reporting
+  callers; it does not schedule automatic execution. Production credentials and
   accounting stores are outside this boundary. See
   `docs/reference/qualification-journal.md`. Offline reference admission also
   binds current policy, source-labelled decisions and whole-corpus feedback
@@ -2868,7 +2962,7 @@ verified: adc15e37ff5a 2026-10-16
   standalone adapters run production relevance and novelty judgments with
   synthetic routers or caller-provided transport. Novelty uses disposable
   full-schema SQLite fixtures and observes the actual rendered candidate IDs.
-  Execution/reporting orchestration lands later.
+  The isolated runner supplies execution/reporting orchestration.
   See `docs/reference/qualification-corpus.md`.
   Qualification's pinned transport supplies a caller-provided adapter router
   through the production delegate, a shared one-egress wire guard, response-hook
@@ -2889,8 +2983,7 @@ verified: adc15e37ff5a 2026-10-16
   Credential lending preserves known redaction values while keeping production
   aliases hidden from the SDK, including log calls on SDK threads.
   These checks do not
-  establish provider spend bounds or owner approval. The isolated runner remains
-  a later replacement. This verification refresh covers the qualification slice;
+  establish provider spend bounds or owner approval. This verification refresh covers the qualification slice;
   other learning/evaluation entries retain their previous verification scope.
   See `docs/reference/qualification-transport.md`.
   Complete offline preflight checks all registered corpus floors, current
@@ -2908,8 +3001,31 @@ verified: adc15e37ff5a 2026-10-16
   paid eligibility, model quality or promotion follows from this evidence.
   A fresh interpreter follows checkout changes; unchanged checkouts permit
   repeated checks with matching caches.
-  The later runner must recompute it before credentials. See
+  The runner recomputes it before credentials. See
   `docs/reference/qualification-preflight.md`.
+  Complete admission requires exact source archives in durable private storage
+  and separately restored bytes bound by human approval. Original paths remain
+  logical provenance identities; archive creation supplies no approval or
+  independent-backup claim. Missing retained evidence refuses before rendering.
+  The isolated serial CLI supports Flash-only or historical paired execution
+  under an exact frozen operating plan and a separate local spending assertion.
+  A credential-scoped lock precedes journal writers and credential reads. The
+  actual pre-dispatch key snapshot must fund the whole selected pending
+  population, including effective/member headroom; uncertain evidence stops
+  acquisition without resending dispatched coordinates. Observed expenses and
+  unresolved liability remain distinct; operating allowances are not guaranteed
+  invoice ceilings. Source population/cache checks at admission and completion
+  invalidate scoring on detected drift, without a per-request source-integrity
+  guarantee. Detached reports score retained snapshots under current admission,
+  read no credentials and do not authenticate current external spending consent.
+  No paid quality, promotion or live activation follows from synthetic wiring.
+  After source review, the integrated runner passed 1,777 affected tests and a
+  complete synthetic 750-case/2,250-request actual-CLI run plus credential-free
+  detached report. Independent readback reconciled all 9,001 journal rows and
+  531 frozen source/test inputs. Current-main database schema and test controls
+  were included in acceptance; the E2E observed no Python network attempts.
+  This is synthetic wiring evidence, not real
+  model quality, provider billing or deployment. See `docs/reference/qualification-runner.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
@@ -3288,8 +3404,13 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: ba9dd8a37 2026-10-09
+verified: 96e0a4de31a8 2026-10-18
 ```
+
+`observability` seeds `cc_fallback` idle and reads its content-free last-run
+provider/model/outcome. Failed historical attempts render as a warning, not an
+inferred current provider outage. The readiness worker uses the shared
+tool-disabled CC probe without changing its schedule or routing authority.
 
 - **payments/**: the encrypted card vault, virtual cards only.
   `python -m genesis vault init|add|list|retire|status` (`payments/cli.py`);
@@ -3313,8 +3434,28 @@ verified: ba9dd8a37 2026-10-09
   short-lived subprocess so the event loop never waits on it (a thread stalled
   the loop for the whole decrypt here). Every unlock, lock,
   refusal and relock lands in `payment_vault_events` with the requesting pid
-  and process names; unlock fails closed without that audit row. Nothing
-  decrypts a card yet, and the vault directory is not backed up.
+  and process names; unlock fails closed without that audit row.
+  `approval.py` `PaymentApprovalRegistry` (created in `serve()`, audited
+  through the vault service's own connection, bot attached after Telegram
+  starts) asks the owner to approve a card release: a code-built,
+  `parse_mode=None` message with one `payapprove:<nonce>` button. A tap
+  grants only from the first `TELEGRAM_ALLOWED_USERS` id, on that exact chat,
+  message id and text, unedited and accessible, once; anything else, a missing
+  bot or audit, or 10 minutes without a tap refuses. Nonces live in memory
+  only; no `approval_requests` row is written, and the type is in the gate's
+  approve-all denylist, `refuse_generic` and both dashboard filters. Nothing
+  calls it or decrypts a card yet.
+  Backup: `scripts/lib/payment_vault_backup.sh` from
+  backup.sh §8 writes the three files as ONE GPG-encrypted tar,
+  `creds/payment_vault.tar.gpg`, renamed into place once (cards.db via SQLite
+  online backup, under the vault's directory lock, only when the set passes the
+  check restore reruns), so no reader can mix files from two backups;
+  `payment_vault` in `backup_status.json` is ok/absent/skipped (not
+  attempted)/failed/missing, and failed or missing fails the run (non_db).
+  restore.sh decrypts it only when it comes from the selected off-site snapshot
+  (or Tier-1 when none was selected), checks member types and the vault, and
+  stages it fresh in `~/.genesis/restore-creds/payment_vault/` (an earlier copy
+  is moved aside); it never places it.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;
@@ -3524,7 +3665,9 @@ verified: ba9dd8a37 2026-10-09
   detector (ASCII digits, alphanumeric boundary, standard groupings, brand
   prefix + length, Luhn, UUID groups skipped; stdlib-only so scripts load it
   by path), used by the browser tool guards, `reference_store`, reference
-  extraction and `output_scanner`; `skill_scan`
+  extraction and `output_scanner`; `card_redaction` = redaction built on it
+  (result walker incl. JSON text, numbers and cards split across lines or
+  values, the `redacted` tool decorator, the `CARD_FILTER` log filter), used by the browser tools; `skill_scan`
   shells to external NVIDIA SkillSpector. NOT auth or secrets storage (that's
   `runtime/init/secrets.py` + `env.py`). **`immunity.py` = the WS-3 kill
   switch + gate policy**: `gate_mode()` re-reads `config/ws3_immunity.yaml` +
@@ -3752,6 +3895,12 @@ verified: ba9dd8a37 2026-10-09
   file does not make the update refuse yet: each has had one Genesis content
   version, so keeping it loses nothing; the refusal comes with the first content
   change (#3282).
+  `--take-templates`.
+- **Deployment status** (`scripts/lib/deploy_status.sh`): status captures the
+  MainPID, invocation, runtime edits and runtime overrides once for its printed
+  fields and bracket calculation. This keeps those fields aligned with the
+  token; it does not make separate systemd/git/file reads an atomic snapshot.
+  Direct `_bracket` calls without captured arguments retain their own reads.
 - **The restart guard, `~/.genesis/update_state.json`** (deploy scripts and the
   dashboard update routes, #3139): `update.sh` writes it at each phase; an
   update that merged code and never activated it, or that stopped on merge

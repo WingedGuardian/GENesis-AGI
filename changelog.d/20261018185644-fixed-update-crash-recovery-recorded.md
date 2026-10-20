@@ -1,0 +1,1 @@
+- When bootstrap recovers from an interrupted update, the recovery is now recorded in the update history as `crashed_recovered` (previously the database rejected that status and the record was silently lost), and the dashboard flags it. If the record still cannot be written, bootstrap prints the error instead of hiding it.

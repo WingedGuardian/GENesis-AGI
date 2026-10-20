@@ -3720,4 +3720,11 @@ _clear_deploy_state
 echo "  ──────────────────────────────────────"
 _flush_deploy_summary "Changed outside the checkout:"
 echo "  Updated: $OLD_TAG ($OLD_COMMIT) → $NEW_TAG ($NEW_COMMIT)"
+# codebase-memory-mcp: one line only when it is registered but not set up (or OK).
+# Guarded: a deploy to a target that predates the helper must not fail here.
+if [ -r "$SCRIPT_DIR/lib/cbm_setup_notice.sh" ]; then
+    # shellcheck source=lib/cbm_setup_notice.sh
+    . "$SCRIPT_DIR/lib/cbm_setup_notice.sh"
+    genesis_cbm_setup_notice "$VENV_DIR/bin/python" "$GENESIS_ROOT" "  "
+fi
 echo ""

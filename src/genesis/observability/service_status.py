@@ -84,7 +84,7 @@ def query_systemd_unit(unit_name: str) -> dict:
         result = subprocess.run(
             [
                 "systemctl", "--user", "show", unit_name,
-                "--property=ActiveState,SubState,NRestarts,ExecMainStartTimestamp",
+                "--property=ActiveState,SubState,NRestarts,ExecMainStartTimestamp,MainPID",
             ],
             capture_output=True, text=True, timeout=5, env=systemctl_env(),
         )
@@ -255,6 +255,7 @@ def collect_service_status() -> dict:
         "active_state": svc_props.get("ActiveState", "unknown"),
         "sub_state": svc_props.get("SubState", "unknown"),
         "pid": bridge_pid,
+        "main_pid": svc_props.get("MainPID"),
         "pid_alive": pid_alive,
         "uptime_seconds": compute_uptime_seconds(start_ts),
         "restart_count": int(svc_props.get("NRestarts", 0)),

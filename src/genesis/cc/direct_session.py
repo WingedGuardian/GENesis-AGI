@@ -1276,6 +1276,10 @@ class DirectSessionRunner:
         if invocation.claude_code_tmpdir:
             Path(invocation.claude_code_tmpdir).mkdir(parents=True, exist_ok=True)
         try:
+            if request.managed:
+                from genesis.cc.managed_fallback import execute_selected
+
+                return await execute_selected(self, request, session_id, invocation, on_event)
             return await self._invoker.run_streaming(invocation, on_event=on_event)
         except ProcessCleanupUncertain:
             if not request.managed:
@@ -2074,7 +2078,11 @@ class DirectSessionRunner:
         # so a future resume can target the same provider. No-op for native Claude.
         # Token never stored (NAME only).
         if result.roster_model and result.roster_model != roster.CLAUDE:
-            payload = roster.endpoint_payload(result.roster_model)
+            payload = (
+                existing["execution_endpoint"]
+                if request.managed and "execution_endpoint" in existing
+                else roster.endpoint_payload(result.roster_model)
+            )
             if payload:
                 existing["roster_endpoint"] = payload
 

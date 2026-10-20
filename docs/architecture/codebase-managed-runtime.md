@@ -1,7 +1,79 @@
 # Managed Codebase runtime: implementation and acceptance gates
 
-Status: **in development; not an authorization to re-enable Codebase MCP**.
-The emergency disabled launcher must remain in place until runtime acceptance.
+Status: **six-part rebuild in review; production acceptance remains pending**.
+This plan does not authorize deployment or re-enabling Codebase MCP.
+
+## Current delivery and operational plan (2026-10-07)
+
+The accepted replacement for the broker investigation below uses the pinned
+v0.11.0 native executable, immutable schema-2 settings, and the existing durable
+index queue. It introduces neither a broker nor a second queue. The operator
+commands and exact containment settings are documented in
+[the managed Codebase guide](../reference/codebase-managed.md).
+
+The six concerns are configuration publication (#2909), native runtime (#3000),
+guarded uninstall (#3006), lifecycle (#3007), frontend (#3011), and queued-worker
+integration (#3012). Successors are stacked for review; each must reconcile and target
+main after its predecessor lands. All six are required before activation.
+
+The query daemon has a 2 GiB, zero-swap service cap. Readers have individual
+256 MiB caps and a shared 2 GiB, zero-swap slice. The worker requires the full
+8 GiB, zero-swap scope and verifies physical placement before native execution.
+These ceilings do not establish production capacity: host and effective ancestor
+headroom must still fit the worker plus reader, query, sibling and cache reserves.
+The worker coordinator retains its inherited nonmaximum OOM adjustment; only
+its accepted native exec child is promoted to1000. That preference does not
+guarantee immunity or change group-kill policy. A failed canonical lock namespace
+refuses managed work even if a temporary fallback opens.
+
+Queue prerequisite #2023 [merged on September 15](https://github.com/WingedGuardian/GENesis-AGI/pull/2023).
+Its existing generation and attempt accounting is retained. Resource/OOM
+quarantine across new commit generations remains a separate work package;
+successful fixture acceptance does not establish unattended indexing readiness.
+
+### One supervised production acceptance, after separate merge/deploy approval
+
+1. Check for an existing deployment; deploy only through the approved scripts
+   and verify the serving commit. Preserve other sessions' checkout work.
+2. Stop the indexing timer before releasing the freeze. Inspect existing writers
+   first: starting the freeze can terminate index scopes. Prove the current
+   freeze invocation owns both locks and no writer remains.
+3. Preserve queue state, prior graph and artifacts, settings, the disable sentinel
+   and incident stub. Record host swap activity, PSI, OOM counters and dashboard
+   and query latency. Treat a forced full rebuild as possible.
+4. Require stable capacity for the full worker cap and reserves using reclaimable
+   cache-aware accounting; uncertainty leaves the freeze armed.
+5. Keep the timer stopped while releasing the freeze for exactly one invocation
+   of the existing queued runner. Never reset attempts or use a raw provider
+   command. Verify physical containment and the durable queue outcome.
+6. Verify publication, representative queries from fresh readers, old-index
+   recoverability, and no new OOM kills or sustained pressure/dashboard failures.
+   Preserve evidence on refusal or failure. Restore Codebase disablement and the
+   recorded freeze/timer posture, proving current ownership of both freeze locks.
+
+Existing readers are recorded rather than killed for publication. The fixture
+E2E verifies wiring and recovery; production-corpus acceptance remains distinct.
+This is one run, not permission for unattended indexing.
+
+### Remaining resource work
+
+- Persist resource-failure quarantine across commit generations.
+- Measure a representative rebuild alongside ordinary sessions and authorized
+  deployment peaks; audit refusal reasons and effective ancestor limits before
+  proposing RAM or reserve changes.
+- Retain the assessed host swap policy unless new measurements justify a proposal
+  with tested rollback.
+- Prove OOM selection and exclusions in disposable systemd-255 infrastructure
+  before changing live monitoring topology.
+- Keep unknown-process discovery observation-only; broader process termination
+  requires its own explicit policy.
+
+## Historical investigation through September 26 (superseded design)
+
+The sections below record the earlier broker proposal, provisional limits and
+test receipts. Their next steps and unmerged-queue status are historical, not
+the current implementation or operational authorization. The current plan above
+and operator guide supersede them.
 
 ## Why a larger per-client limit is insufficient
 

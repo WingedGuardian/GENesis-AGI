@@ -662,7 +662,8 @@ if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
     . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
     _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
 fi
-echo "    Codebase: explicit pinned setup required; see docs/reference/codebase-managed.md"
+# Setup is deliberately manual (configure needs a pinned binary); whether it is
+# still owed is reported under "Next steps", after .mcp.json is rendered.
 
 _GITNEXUS_PIN_READY=0
 _gitnexus_pin_file="$SCRIPT_DIR/lib/gitnexus_version.sh"
@@ -992,11 +993,11 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
-        # The managed Codebase units must be regular files Genesis renders: a
-        # link or other non-regular path there is refused, not kept.
+        # Keep links (including masks) through the ordinary policy below, without
+        # writing through them. Other nonregular Codebase destinations refuse.
         case "$svc_name" in
             genesis-cbm-query.service | genesis-cbm-query-clients.slice)
-                if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+                if [[ ! -L "$target" && -e "$target" && ! -f "$target" ]]; then
                     echo "    ERROR: refusing nonregular managed Codebase unit: $target" >&2
                     exit 1
                 fi ;;
@@ -1125,25 +1126,8 @@ if command -v claude &>/dev/null; then
     . "$SCRIPT_DIR/lib/mcp_register.sh"
     [ -x "$REPO_DIR/.claude/mcp/run-gitnexus" ] && \
         _register_mcp "gitnexus" "user" "$REPO_DIR/.claude/mcp/run-gitnexus" "mcp"
-    # Via the repo launcher (NOT the bare binary): wraps the server in a
-    # systemd scope with MemoryMax=2G to contain upstream's unbounded memory
-    # leak (DeusData/codebase-memory-mcp#581). Rationale in the launcher.
-    if command -v codebase-memory-mcp &>/dev/null; then
-        # REGISTERED EVEN WHEN THE KILL SWITCH IS ACTIVE, deliberately. Registration
-        # does not start anything, and the launcher is fail-closed on the sentinel
-        # (.claude/mcp/run-codebase-memory exits 1 with "disabled by <file>"), so
-        # writing the registration while disabled cannot run the server.
-        #
-        # Skipping preserved the exact drift this helper exists to repair: a
-        # PRE-EXISTING registration pointing at the bare `codebase-memory-mcp`
-        # binary survives untouched, bypasses the launcher entirely, and starts the
-        # uncapped raw server in the next session — and stays uncapped after the
-        # sentinel is removed until somebody runs this again.
-        _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
-        if [ -n "${_cbm_disable:-}" ] && [ -e "$_cbm_disable" ]; then
-            echo "    . codebase-memory-mcp registered to the launcher; kill switch active, so it will refuse to start"
-        fi
-    fi
+    # Register managed setup on every install; registration never activates CBM.
+    _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
     _serena_registration_available && \
         _register_serena "$REPO_DIR"
     # grep-app (grep.app) — literal/regex code search over ~1M public GitHub
@@ -2042,6 +2026,10 @@ echo "    Genesis will guide you through first-time setup."
 if [ "$_final_keys" = "0" ] 2>/dev/null; then
     echo "    (API keys, user profile, channels — all handled interactively)"
 fi
+# codebase-memory-mcp: one line only when it is registered but not set up (or OK).
+# shellcheck source=lib/cbm_setup_notice.sh
+. "$SCRIPT_DIR/lib/cbm_setup_notice.sh"
+genesis_cbm_setup_notice "$VENV_PYTHON" "$REPO_DIR" "    "
 # Clarify what the skipped smoke tests mean so new users aren't confused
 if [ "${SMOKE_SKIP:-0}" -gt 0 ] && [ "${SMOKE_FAIL:-0}" = "0" ]; then
     echo ""

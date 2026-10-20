@@ -63,6 +63,7 @@ def make_handlers_v2(
     dedupe: TelegramUpdateDedupe | None = None,
     autonomous_cli_gate: object | None = None,
     proposal_workflow: object | None = None,
+    payment_approvals: object | None = None,
 ):
     """Return V2 handler callbacks."""
     draft_streaming_enabled = os.environ.get(
@@ -83,6 +84,7 @@ def make_handlers_v2(
         draft_streaming_enabled=draft_streaming_enabled,
         autonomous_cli_gate=autonomous_cli_gate,
         proposal_workflow=proposal_workflow,
+        payment_approvals=payment_approvals,
     )
 
     def _wrap(cmd_fn):

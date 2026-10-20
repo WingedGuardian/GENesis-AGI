@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import os
 import re
 import stat
 import subprocess
+from contextlib import suppress
 from pathlib import Path
 
+from code_intel_cbm_admission import _mount_path, number, resolve_cgroup
 from managed_units import stamp
 
 
@@ -333,3 +336,241 @@ def parent_identity(path: Path):
     if not stat.S_ISDIR(value.st_mode):
         raise ValueError(f"refusing non-directory managed unit parent: {path}")
     return value.st_dev, value.st_ino
+
+
+def _writable_path(path: Path, *, directory: bool) -> None:
+    """Observe this caller's namespace without creating a probe or directory."""
+    target = path
+    while True:
+        try:
+            info = target.stat()
+            break
+        except FileNotFoundError:
+            if target.is_symlink() or target == target.parent:
+                raise
+            target = target.parent
+    if (directory or target != path) and not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"managed worker requires a directory: {path}")
+    if target == path and not directory and not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"managed worker requires a regular file: {path}")
+    permission = os.W_OK | (os.X_OK if stat.S_ISDIR(info.st_mode) else 0)
+    if (os.statvfs(target).f_flag & os.ST_RDONLY
+            or not os.access(target, permission, effective_ids=True)):
+        raise ValueError(
+            f"managed worker write path unavailable: {path}; check permissions and the "
+            "runner's operator-owned ReadWritePaths allowlist"
+        )
+
+
+def verify_worker_writes(config: dict, persistence: bool) -> None:
+    """Advisory write prerequisites; real IO failures retain their classification."""
+    state = absolute(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
+    cache = Path(config["cache"])
+    for path in (cache, Path(config["runtime"]), state / "locks", state / "index-requests"):
+        _writable_path(path, directory=True)
+    for path in (state / "code-intelligence-runner.log", state / "index-requests/queue.sqlite3"):
+        _writable_path(path, directory=False)
+    for database in cache.glob("*.db"):
+        if database.name == "_config.db":
+            continue  # immutable configuration is validated through the RO reader
+        for path in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm")):
+            _writable_path(path, directory=False)
+    if persistence:
+        _writable_path(Path("/tmp"), directory=True)  # noqa: S108 - observe pinned root; no creation
+        _writable_path(Path(config["main"]) / ".codebase-memory", directory=True)
+
+
+def absolute(raw: str) -> Path:
+    if not isinstance(raw, str) or not raw or any(c in raw for c in "\n\r\x00"):
+        raise ValueError("invalid managed path")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise ValueError("managed path must be absolute")
+    return path
+
+
+def units_dir() -> Path:
+    return Path.home() / ".config/systemd/user"
+
+
+def config_path(raw: str) -> Path:
+    path = absolute(raw)
+    if not path.name:
+        raise ValueError("settings path must name a file")
+    return absolute(str(path.parent.resolve() / path.name))
+
+
+def cgroup_empty(control: str) -> None:
+    if not control:
+        return
+    path = absolute(control)
+    if ".." in path.parts:
+        raise ValueError("invalid managed ControlGroup")
+    mountinfo = Path("/proc/self/mountinfo")
+    _, root, version = resolve_cgroup(Path("/proc/self/cgroup"), mountinfo)
+    if version != 2:
+        raise ValueError("uninstall requires visible cgroup v2 state")
+    mappings = []
+    for row in mountinfo.read_text().splitlines():
+        left, separator, right = row.partition(" - ")
+        fields = left.split()
+        if (
+            separator
+            and right.split()[:1] == ["cgroup2"]
+            and len(fields) >= 5
+            and _mount_path(fields[4]) == root
+        ):
+            mappings.append(_mount_path(fields[3]))
+    if len(set(mappings)) != 1:
+        raise ValueError("ambiguous managed cgroup mount")
+    mounted = mappings[0]
+    relative = path.relative_to(mounted) if path.is_relative_to(mounted) else path.relative_to("/")
+    group = root / relative
+    try:
+        values = dict(line.split() for line in (group / "cgroup.events").read_text().splitlines())
+    except FileNotFoundError:
+        if group.exists():
+            raise
+        return  # stopped group has been removed from the visible hierarchy
+    if values.get("populated") != "0":
+        raise ValueError("managed cgroup still contains processes (including descendants)")
+
+
+def index_writer_targets_main(argv: list[str], cwd: Path, main: Path) -> bool:
+    """Recognize repository targets of the existing wrapper and native modes."""
+    entrypoint = main / "scripts/lib/code_intel_index.sh"
+    for index, arg in enumerate(argv[:-1]):
+        if Path(arg).name != "code_intel_index.sh":
+            continue
+        candidate = Path(arg) if Path(arg).is_absolute() else cwd / arg
+        if candidate.resolve() == entrypoint and (cwd / argv[index + 1]).resolve() == main:
+            return True
+    # GITNEXUS_BIN permits arbitrary executable names. Exact analyze arguments
+    # targeting main are possible writers, including after the wrapper exits.
+    # Skip argv[0]; an executable itself can be named analyze.
+    for index, arg in enumerate(argv[1:], 1):
+        if arg != "analyze":
+            continue
+        tail = argv[index + 1 :]
+        target = cwd / tail[0] if tail and not tail[0].startswith("-") else cwd
+        if target.resolve() == main:
+            return True
+    return False
+
+
+def sentinel_armed(raw: str) -> bool:
+    try:
+        os.lstat(raw)
+    except FileNotFoundError:
+        return any(os.path.lexists(p) and not os.path.exists(p) for p in Path(raw).parents)
+    except OSError:
+        return True
+    return True
+
+
+def validate_provider_paths(config: dict) -> None:
+    """The pinned POSIX provider folds backslashes before native storage use."""
+    for key in ("main", "cache"):
+        path = absolute(config[key])
+        physical = path.resolve()
+        # Python 3.13+ non-strict resolve leaves symlink loops unresolved.
+        # Let the kernel reject loops in both the literal and resolved paths;
+        # missing staging directories remain supported.
+        for candidate in (path, physical):
+            with suppress(FileNotFoundError):
+                candidate.stat()
+        if "\\" in str(path) or "\\" in str(physical):
+            raise ValueError(f"pinned provider does not support backslash in {key} paths")
+
+
+def native_env(config: dict) -> dict[str, str]:
+    validate_provider_paths(config)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CBM_")}
+    env.update(
+        CBM_CACHE_DIR=config["cache"],
+        CBM_RUNTIME_DIR=config["runtime"],
+        CBM_ALLOWED_ROOT=config["main"],
+    )
+    return env
+
+
+def verify_memory_ancestors(leaf: Path, root: Path) -> None:
+    """Every visible finite ancestor must admit the full query aggregate."""
+    cursor = leaf.parent
+    while cursor == root or root in cursor.parents:
+        try:
+            limit = (cursor / "memory.max").read_text().strip()
+        except FileNotFoundError:
+            if cursor != root:
+                raise
+            limit = "max"  # true cgroup filesystem root has no memory.max
+        if limit != "max" and number(limit, "ancestor memory.max") < 2 * 1024**3:
+            raise ValueError("ancestor cap is smaller than managed query budget")
+        if cursor == root:
+            break
+        cursor = cursor.parent
+
+
+def validate_frontend_boundary(unit: str, leaf: Path, root: Path, version: int, slice_name: str) -> None:
+    if not re.fullmatch(r"genesis-cbm-query-client-[0-9a-f]{32}\.service", unit):
+        raise ValueError("invalid managed frontend unit")
+    if version != 2 or leaf == root or leaf.name != unit or leaf.parent.name != slice_name:
+        raise ValueError("managed frontend is outside its capped client slice")
+    for node, memory, tasks in ((leaf, 256 * 1024**2, 32), (leaf.parent, 2 * 1024**3, 512)):
+        if (
+            (node / "memory.max").read_text().strip() != str(memory)
+            or (node / "memory.swap.max").read_text().strip() != "0"
+            or (node / "pids.max").read_text().strip() != str(tasks)
+        ):
+            raise ValueError("managed frontend lacks exact memory/swap/task caps")
+    verify_memory_ancestors(leaf, root)
+
+
+def frontend_command(main: Path, settings: Path, unit: str, backend: str, slice_name: str) -> list[str]:
+    """Build the native frontend transport from validated literal parameters."""
+    venv = os.environ.get("VENV_PATH") or str(main) + "/.venv"
+    absolute(venv)
+    interpreter = venv + "/bin/python"
+    if not Path(interpreter).is_file() or not os.access(interpreter, os.X_OK):
+        raise ValueError("selected installed interpreter is unavailable")
+    helper = str(main / "scripts/codebase_managed.py")
+    command = ["/usr/bin/systemd-run", "--user", "--pipe", "--quiet", "--collect", "--wait",
+               "--unit=" + unit, "--slice=" + slice_name, "--working-directory=/",
+               "--setenv=HOME=" + os.environ["HOME"], "--setenv=VENV_PATH=" + venv]
+    for key, value in (("PYTHON", interpreter), ("HELPER", helper),
+                       ("CONFIG", str(settings)), ("UNIT", unit)):
+        if key != "UNIT":
+            absolute(value)
+        command.append("--setenv=CBM_CLIENT_" + key + "=" + value)
+    for value in ("Requisite=" + backend, "After=" + backend, "StopPropagatedFrom=" + backend,
+                  "KillMode=control-group", "MemoryMax=256M", "MemorySwapMax=0",
+                  "TasksMax=32", "OOMScoreAdjust=500"):
+        command.extend(("-p", value))
+    bridge = 'exec "$$CBM_CLIENT_PYTHON" -I "$$CBM_CLIENT_HELPER" --config "$$CBM_CLIENT_CONFIG" client --unit "$$CBM_CLIENT_UNIT"'
+    command.extend(("--", "/bin/sh", "-c", bridge))
+    return command
+
+
+def parse_arguments(argv: list[str] | None, description: str | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--config", default=None)
+    commands = parser.add_subparsers(dest="command", required=True)
+    setup = commands.add_parser("configure")
+    for key in ("main", "binary", "state", "sentinel"):
+        setup.add_argument("--" + key, required=True)
+    commands.add_parser("status")
+    commands.add_parser("serve")
+    commands.add_parser("ready")
+    commands.add_parser("launch")
+    child = commands.add_parser("client")
+    child.add_argument("--unit", required=True)
+    availability = commands.add_parser("available")
+    availability.add_argument("--repo", required=True)
+    availability.add_argument("--persistence", choices=("true", "false"), default="true")
+    for command in ("enable", "disable", "remove"):
+        commands.add_parser(command)
+    teardown = commands.add_parser("uninstall")
+    teardown.add_argument("arguments", nargs=argparse.REMAINDER)
+    verification = commands.add_parser("verify-uninstall-locks")
+    verification.add_argument("fds", type=int, nargs=3)
+    return parser.parse_args(argv)

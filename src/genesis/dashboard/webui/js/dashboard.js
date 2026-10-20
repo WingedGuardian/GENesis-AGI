@@ -4007,7 +4007,7 @@
           // Fallback is more specific than the rate-limit that triggered it, so it
           // takes precedence over the RATE_LIMITED/THROTTLED branch below.
           if (cc.fallback?.is_fallback) {
-            return { state: "fallback", reason: `running on ${cc.fallback.fallback || 'a roster peer'} (Claude ${(cc.fallback.reason || 'unavailable').replace(/_/g, ' ')})` };
+            return { state: "fallback", reason: `last fallback: ${cc.fallback.fallback || 'a roster peer'} (home model ${(cc.fallback.reason || 'unavailable').replace(/_/g, ' ')})` };
           }
           if (rt === "RATE_LIMITED" || rt === "THROTTLED") {
             return { state: "degraded", reason: `CC is ${rt.toLowerCase().replace('_', '-')}` };
@@ -5009,6 +5009,9 @@
           }
           if (this.updateStatus?.last_update?.status === "rolled_back" || this.updateStatus?.last_update?.status === "failed") {
             items.push({ level: "warning", title: "Last update failed", detail: this.updateStatus.last_update.failure_reason || "check Backup & Updates tab", href: "#update-section", tab: "backup", anchor: "update-section" });
+          }
+          if (this.updateStatus?.last_update?.status === "crashed_recovered") {
+            items.push({ level: "warning", title: "Last update crashed (recovered by bootstrap)", detail: this.updateStatus.last_update.failure_reason || "check Backup & Updates tab", href: "#update-section", tab: "backup", anchor: "update-section" });
           }
           for (const [name, state] of Object.entries(this.fetchState)) {
             if (state.state === "stale" || state.state === "error") {

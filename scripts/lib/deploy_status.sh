@@ -23,6 +23,7 @@
 #
 # Imported once and kept, so a new copy loads only with a restart:
 _RUNTIME_RELOAD_SCRIPTS=(
+    scripts/hooks/secret_scrub.py    # retained by transcript_analytics.scrub
     scripts/lib/index_marker.py      # imported by surplus/jobs/gitnexus.py (and disk_reclaim.py)
     scripts/hooks/worktree_claim.py  # loaded at import by observability/worktree_ownership_config.py
 )
@@ -41,6 +42,12 @@ _RUNTIME_FRESH_SCRIPTS=(
     scripts/hooks/hook_output.py          # imported by main_checkout_guard.py to emit a note
     scripts/lib/disk_guardian.sh          # sourced by util/disk_headroom.py on every free-space check
     scripts/tmp_watchgod.sh               # sourced by util/disk_headroom.py for the watchdog's tiers
+    scripts/lib/serving_commit.py         # loaded afresh by memory/graph_census.py on every hourly census
+    scripts/codebase_managed.py           # run by infra_profile/codebase_mcp.py (`status`) on every profile refresh
+    scripts/lib/codebase_managed_unit.py  # imported by codebase_managed.py on every run
+    scripts/lib/code_intel_cbm_admission.py # imported by codebase_managed.py and codebase_managed_unit.py
+    scripts/lib/code_intel_cbm_worker.py  # imported by codebase_managed.py (the pinned BUILD)
+    scripts/lib/cbm_disable_file.sh       # run by infra_profile/codebase_mcp.py to resolve the opt-out path
     # Not under scripts/, but the same kind: cc/invoker.py runs the allowlist
     # guard through this launcher in the server, and reads its exit code.
     .claude/hooks/genesis-hook
@@ -286,6 +293,9 @@ _runtime_overrides() {
 # files in ~/.genesis/config, an edit undone without moving HEAD, a rewritten or
 # backdated reflog) reads valid.
 # Sets BRACKET, or empty with BRACKET_WHY. Expects _read_serving to have run.
+# Status passes its captured MainPID, invocation, edits and overrides so the
+# token describes the fields it prints. Omitted arguments retain direct-call
+# reads; explicitly empty arguments must not cause a second read.
 _bracket() {
     local mainpid inv edits overrides fresh rc=0
     BRACKET=""
@@ -294,13 +304,13 @@ _bracket() {
         BRACKET_WHY="the boot commit is unknown: $SERVING_WHY"
         return 0
     fi
-    mainpid="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)"
-    inv="$(systemctl --user show genesis-server -p InvocationID --value 2>/dev/null || true)"
+    mainpid="${1-$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || true)}"
+    inv="${2-$(systemctl --user show genesis-server -p InvocationID --value 2>/dev/null || true)}"
     case "$mainpid" in ''|0|*[!0-9]*) BRACKET_WHY="the server's MainPID is unreadable"; return 0 ;; esac
     [ -n "$inv" ] || { BRACKET_WHY="the server's invocation id is unreadable"; return 0; }
-    edits="$(_runtime_edits)"
+    edits="${3-$(_runtime_edits)}"
     [ "$edits" = none ] || { BRACKET_WHY="uncommitted runtime edits: $edits"; return 0; }
-    overrides="$(_runtime_overrides)"
+    overrides="${4-$(_runtime_overrides)}"
     [ "$overrides" != unreadable ] || { BRACKET_WHY="the ignored runtime overrides are unreadable"; return 0; }
     # The scripts run afresh count as they stand at HEAD, not as at the boot.
     fresh="$(_git_ro ls-tree -r HEAD -- "${_RUNTIME_FRESH_SCRIPTS[@]}" 2>/dev/null)" \
@@ -330,7 +340,7 @@ _unit_active_state() {
 # `status [--verify <token>]`. Prints the fields a human reads and the bracket;
 # with --verify, exits 0 when the token still holds and 1 when it does not.
 _status_main() {
-    local verify="$1" inv
+    local verify="$1" mainpid inv edits overrides
     _read_serving
     echo "serving: ${SERVING:-unknown ($SERVING_WHY)}"
     # For scripts/deploy_candidates: with nothing running Genesis's code (the
@@ -344,12 +354,15 @@ _status_main() {
     fi
     echo "server-state: $(_unit_active_state genesis-server) $(_unit_active_state genesis-bridge)$outside"
     echo "head: $(_git_ro rev-parse HEAD)"
-    echo "mainpid: $(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || echo unknown)"
+    mainpid="$(systemctl --user show genesis-server -p MainPID --value 2>/dev/null || echo unknown)"
     inv="$(systemctl --user show genesis-server -p InvocationID --value 2>/dev/null || true)"
+    edits="$(_runtime_edits)"
+    overrides="$(_runtime_overrides)"
+    echo "mainpid: $mainpid"
     echo "invocation: ${inv:-unknown}"
-    echo "runtime-edits: $(_runtime_edits)"
-    echo "runtime-overrides: $(_runtime_overrides)"
-    _bracket
+    echo "runtime-edits: $edits"
+    echo "runtime-overrides: $overrides"
+    _bracket "$mainpid" "$inv" "$edits" "$overrides"
     if [ -z "$verify" ]; then
         echo "bracket: ${BRACKET:-unknown ($BRACKET_WHY)}"
         _report_pending

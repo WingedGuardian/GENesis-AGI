@@ -14,6 +14,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from genesis.observability.agent_api_health import from_status_file
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,6 +57,7 @@ class StandaloneHealthDataService:
         if not self._status_path.exists():
             return {
                 "status": "unavailable",
+                "agent_api": from_status_file(None, {}),
                 "message": f"Status file not found: {self._status_path}",
             }
 
@@ -64,13 +67,18 @@ class StandaloneHealthDataService:
         except json.JSONDecodeError as e:
             return {
                 "status": "unavailable",
+                "agent_api": from_status_file(None, {}),
                 "message": f"Failed to parse status JSON: {e}",
             }
         except OSError as e:
             return {
                 "status": "unavailable",
+                "agent_api": from_status_file(None, {}),
                 "message": f"Failed to read status file: {e}",
             }
+
+        if not isinstance(data, dict):
+            return {"status": "unavailable", "agent_api": from_status_file(None, {})}
 
         # Map status.json format to HealthDataService.snapshot() format
         result = {
@@ -111,6 +119,7 @@ class StandaloneHealthDataService:
             result["services"] = {}
 
         # MCP server crash status — surface failed-to-start servers
+        result["agent_api"] = from_status_file(data.get("agent_api"), result["services"])
         result["mcp_servers"] = _load_mcp_crash_status()
 
         return result

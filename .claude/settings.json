@@ -594,6 +594,11 @@
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/main_checkout_guard.py",
                         "timeout": 30
+                    },
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/issue_dup_advisory.py",
+                        "timeout": 10
                     }
                 ]
             },
@@ -655,6 +660,11 @@
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/main_checkout_guard.py",
                         "timeout": 30
+                    },
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/issue_dup_advisory.py",
+                        "timeout": 10
                     }
                 ]
             }

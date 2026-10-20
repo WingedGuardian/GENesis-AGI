@@ -30,6 +30,15 @@ deploys from. Do not mutate it in place.
   local `live` integration branch — running unmerged candidate branches on this
   install before their PRs merge — not a development action.
 
+## Reading a merge record
+
+A self-authored PR merges through the maintainer's admin bypass of GitHub's
+approval rule (CLAUDE.md, "Code review after code changes"), so GitHub records
+every such merge as a bypass. That record is expected and is not a skipped
+review. Report GitHub's native review state as it is, never call a bot comment
+an approval, and never judge a past merge's readiness from the bypass record or
+from a merge-gate run that finished after the merge.
+
 ## Rebuilding a PR that was sent back
 
 A `needs-rework` PR, or a `needs-architecture-session` PR whose owner decision
@@ -250,7 +259,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - **aws-fde-delivery** (`src/genesis/skills/aws-fde-delivery/SKILL.md`) — Forward Deployed Engineer delivery contract for AWS engagements, build-first artifacts, grounded cost estimates, Well-Architected review, evolution roadmap
 - **browser-automation** (`src/genesis/skills/browser-automation/SKILL.md`) — Canonical guide to Genesis browser automation - layers (Camoufox, Chromium, the user's Chrome over CDP, TinyFish, desktop), per-tool timeouts, safety gates, verify-after-act, what a click checks (scroll, hit test, covered targets), overlays, iframes, tabs, and failure diagnosis
 - **cc-update** (`.claude/skills/cc-update/SKILL.md`) — Update Claude Code (the CC CLI / "clog code") to a new version, or bump the pinned CC version. Use when the user asks to update Claude Code, bump the CC pin, evaluate a new CC release, or says "clog code update". Routes to the canonical, standardized process in docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every time. Do NOT use for general "what changed in CC" trivia with no intent to update.
-- **closing-session** (`.claude/skills/closing-session/SKILL.md`) — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "close out the open PRs", "review and fix the open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and stops at the merge gate for the user's per-PR approval. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
+- **closing-session** (`.claude/skills/closing-session/SKILL.md`) — This skill should be used when a session's job is to DRIVE OPEN PRs TO MERGE rather than to write new code — "close out the open PRs", "review and fix the open PRs", "what's blocking our PRs", "which PRs are mergeable". It owns the In Review column: it reads each PR's gate status, verifies and fixes review findings on PRs OTHER sessions built, replies in-thread, and merges a PR only under the owner's authorization: a per-PR yes, or the owner's request for closing work covering a PR whose every gate passes. Do NOT load it for building a feature and opening its PR — that is a build session (`genesis-development`).
 - **code-intelligence** (`.claude/skills/code-intelligence/SKILL.md`) — Code understanding tool selection. Use when exploring architecture, finding definitions, tracing call chains, assessing blast radius of changes, or debugging code paths in the Genesis codebase.
 - **content-publish** (`.claude/skills/content-publish/SKILL.md`) — End-to-end content creation and publishing. Takes a topic (or generates one), drafts in the user's voice, gets approval via Telegram, and publishes to Medium via browser automation. Invoke with "publish a post about X", "write and publish to Medium", "content-publish", or when an ego-dispatched session needs to create and distribute content.
 - **debugging** (`src/genesis/skills/debugging/SKILL.md`) — Systematic debugging of issues — use when a test fails, runtime error occurs, unexpected behavior is reported, or an awareness tick produces anomalous results
@@ -375,6 +384,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 
 **genesis-outreach**
 
+- `agent_send` — Send a conversation message to an explicitly enrolled same-owner peer.
 - `marketing_prospects_list` — List the ACTIVE, non-opted-out marketing prospects — the cold-outreach targets the campaign may pitch — so it can enumerate → personalise a pitch → call ``marketing_send(prospect_id, subject, body)``.
 - `marketing_send` — Stage a COLD marketing email to a curated prospect. Returns a neutral queued/refused JSON status.
 - `outreach_cancel` — Cancel a queued, not-yet-sent message by its pending id.

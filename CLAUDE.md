@@ -589,6 +589,14 @@ gate works, its exemption categories, and the unit rules for size bounds:
   score; under the shipped `doc_findings: skip`, documentation findings do not
   score either. `codex-at-head: ok` is not "review is clear": read the
   `inline-findings` row, not just the Codex row.
+  A self-authored PR merges through the maintainer's admin bypass of GitHub's
+  one-approval rule, because a sole maintainer cannot approve their own pull
+  request (`.github/rulesets/README.md`; genesis-development skill, "Honest
+  enforcement model"). GitHub's rule evaluation therefore records every such merge as a
+  bypass, with the approval and update rules failed: that is the designed route,
+  not a skipped review. The required status checks have no bypass and bind the
+  admin too. Never infer whether a past merge was ready from that bypass record,
+  or from a merge-gate run that finished after the merge.
   **Below the floor, how much a change can afford depends on its LANE** — a
   consequence class computed from the diff, not chosen by the author. Two P2s
   block a `critical` change (enforcement hooks, `.github/**`, api/migration
