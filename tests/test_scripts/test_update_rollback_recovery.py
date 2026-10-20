@@ -80,10 +80,16 @@ def test_rollback_restores_db_only_when_migrated(text: str) -> None:
 def test_recovery_detection_forces_server_restart(text: str) -> None:
     # Between health_check state and the restart block.
     seg = text[text.find('_write_state "health_check"') : text.find("# ── Restart services")]
-    assert "last_update_failure.json" in seg, "recovery detection checks the failure artifact"
-    assert "rolled_back | failed)" in seg, "and the last update_history status"
-    assert 'WERE_RUNNING+=("genesis-server")' in seg, (
-        "a recovery run forces genesis-server to restart"
+    # The evidence lives in the one predicate shared with the no-delta dispatch.
+    owed = re.search(r"# BEGIN restart-owed[^\n]*\n(.*?)# END restart-owed", text, re.DOTALL)
+    assert owed, "restart-owed block not found"
+    pending = owed.group(1)
+    assert "_server_recovery_pending" in seg, "recovery detection asks the shared predicate"
+    assert '[ -e "$SERVER_RESTART_OWED" ]' in pending, "it checks the restart an update owes"
+    assert "last_update_failure.json" in pending, "and the failure artifact"
+    assert "rolled_back | failed)" in pending, "and the last update_history status"
+    assert 'WERE_RUNNING=("genesis-server" "${WERE_RUNNING[@]}")' in seg, (
+        "a recovery run forces genesis-server to restart, ahead of a running bridge"
     )
     assert "_OPERATOR_STOP=true" in seg, (
         "an operator-stop (no artifact) is recorded, not force-started"
@@ -130,7 +136,11 @@ def _extract_recovery_block(text: str) -> str:
     assert helpers, "deploy-outcome-probes block not found in update.sh"
     start = text.index("_metadata_python() {")
     selector = text[start : text.index("\n}\n", start) + 3]
-    return selector + helpers.group(1) + seg
+    # The restart obligation (#3451) the block also reads: its file and the
+    # shared pending-recovery reader. Optional, so the slice still runs against a
+    # script from before it existed (how the #3451 tests were seen to fail first).
+    owed = re.search(r"# BEGIN restart-owed[^\n]*\n(.*?)# END restart-owed", text, re.DOTALL)
+    return selector + helpers.group(1) + (owed.group(1) if owed else "") + seg
 
 
 def _run_recovery(tmp_path: Path, text: str, *, artifact: bool, last_status: str | None) -> bool:

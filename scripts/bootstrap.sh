@@ -92,6 +92,10 @@ try:
         text_field("own_head"),
         text_field("deploy_head"),
         "1" if "original_branch" in state else "0",
+        # Did the crashed update stop the server? (update.sh's _write_state
+        # records the services it stopped; absent in old-format states.)
+        "1" if isinstance(state.get("services_stopped"), list)
+        and "genesis-server" in state["services_stopped"] else "0",
     ]
     if any(ord(char) < 0x20 for value in fields for char in value):
         raise ValueError("control character in state field")
@@ -103,7 +107,7 @@ PY
         _crash_recovery_refuse "update state is unreadable"
     fi
     IFS=$'\x1f' read -r STATE_PHASE STATE_PID ROLLBACK_TAG ORIGINAL_BRANCH OWN_HEAD DEPLOY_HEAD ORIGINAL_BRANCH_PRESENT \
-        <<< "$_state_fields"
+        STATE_SERVER_STOPPED <<< "$_state_fields"
 
     # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
     # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
@@ -187,6 +191,8 @@ PY
                 printf '%s\n' "$dirty_paths" | sed 's/^/    /'
             fi
             echo "  The checkout is already at $ROLLBACK_TAG on $recovery_branch; nothing to undo."
+            _crash_code_action="unmoved"
+            [ -z "$dirty_paths" ] || _crash_code_action="unmoved-dirty"
         elif [ "$ORIGINAL_BRANCH_PRESENT" != "1" ]; then
             _crash_recovery_refuse "old-format update state and the checkout has moved from its rollback tag"
         else
@@ -217,6 +223,7 @@ PY
                 _crash_recovery_refuse "the non-forced rollback checkout was refused; code was left in place"
             fi
             echo "  Recovery checkout returned $ORIGINAL_BRANCH to $ROLLBACK_TAG."
+            _crash_code_action="returned"
         fi
 
         # Record crash recovery
@@ -276,6 +283,138 @@ except Exception as e:
 PY
             then
                 echo "  WARNING: this crash recovery is NOT recorded in update_history (see the error above)." >&2
+            fi
+        fi
+
+        # bootstrap never starts genesis-server. What restores a server the crashed
+        # update stopped is the restart that update recorded it owed, before the
+        # stop (update.sh, restart-owed; written below when the crashed update left
+        # none), which only update.sh retires (#3451).
+        # This reports the crash: update.sh's own failure record,
+        # last_update_failure.json in its writer's format, which the dashboard
+        # shows and the version collector alerts on (and then archives; the
+        # restart does not depend on it). update.sh's recovery detection also reads
+        # it, which an update.sh from before restart-owed relies on. Only when the
+        # state says the server was stopped: a crash before the stop leaves an
+        # operator's stop alone. An existing file (update.sh's own rollback record)
+        # is never replaced.
+        FAILURE_FILE="$HOME/.genesis/last_update_failure.json"
+        if [ "$STATE_SERVER_STOPPED" = "1" ] && [ ! -e "$FAILURE_FILE" ]; then
+            _crash_new_tag="untagged"
+            _crash_new_commit=""
+            if [ -n "$DEPLOY_HEAD" ]; then
+                _crash_new_tag="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$DEPLOY_HEAD" 2>/dev/null || echo "untagged")"
+                _crash_new_commit="$(git -C "$GENESIS_ROOT" rev-parse --short "$DEPLOY_HEAD" 2>/dev/null || true)"
+            fi
+            if python3 -I - "$UPDATE_STATE" "$FAILURE_FILE" "$_crash_new_tag" "$_crash_new_commit" \
+                "$recovery_branch" "${_crash_code_action:-returned}" <<'PY'
+import json
+import sys
+from datetime import datetime
+
+state_path, failure_path, new_tag, new_commit, branch, action = sys.argv[1:]
+with open(state_path, encoding="utf-8") as f:
+    state = json.load(f)
+phase = state.get("phase", "unknown")
+rollback_tag = state.get("rollback_tag", "")
+# What the recovery above did to the code: moved it back to the tag, found it
+# there already, or found it there with tracked paths changed (left as they are).
+done = {
+    "returned": f"which returned the code to {rollback_tag}",
+    "unmoved": f"which found the code still at {rollback_tag}",
+    "unmoved-dirty": (
+        f"which found the code at {rollback_tag} with tracked files changed, "
+        "and left them as they are"
+    ),
+}[action]
+# The keys and value types of update.sh's writer (its _do_rollback).
+data = {
+    "old_tag": state.get("old_tag", ""),
+    "new_tag": new_tag,
+    "old_commit": state.get("old_commit", ""),
+    "new_commit": new_commit,
+    "rollback_tag": rollback_tag,
+    "reason": (
+        f"Update crashed in phase '{phase}' after stopping genesis-server; "
+        f"recovered by bootstrap.sh, {done}. "
+        "genesis-server was not restarted; the next update restarts and health-checks it."
+    ),
+    "degraded_subsystems": "",
+    "original_branch": branch,
+    # The checkout is at the rollback tag (recovered above), and the rest of this
+    # bootstrap reinstalls that code; not complete when tracked files differ.
+    "rollback_complete": action != "unmoved-dirty",
+    "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+}
+# "x": never replace a file another writer created since the check above.
+with open(failure_path, "x", encoding="utf-8") as f:
+    json.dump(data, f, indent=4)
+PY
+            then
+                # Dated to the crash, not to this run (see below).
+                touch -r "$UPDATE_STATE" "$FAILURE_FILE" 2>/dev/null || true
+                echo "  genesis-server was stopped by the crashed update; the next update.sh run restarts and health-checks it."
+            else
+                echo "  WARNING: could not write $FAILURE_FILE; this crash is not reported as an update failure. genesis-server may still be down; start it with: systemctl --user start genesis-server.service" >&2
+            fi
+        fi
+
+        # The restart the crashed update owes the server, when it left none: an
+        # update.sh from before restart-owed writes none, and this recovery is then
+        # the only thing that knows the server was stopped (the failure record above
+        # is archived by the version collector; crashed_recovered is deliberately not
+        # a recovery status, because a crash before the stop must not start a server
+        # the operator stopped). Same file and format as update.sh's
+        # _owe_server_restart, which retires it. Dated to the crashed state's last
+        # write, which came before any restart since the crash: update.sh treats
+        # evidence older than the unit's last activation as paid, so a server the
+        # watchdog revived and the operator then stopped, before this ran, stays
+        # stopped.
+        OWED_FILE="$HOME/.genesis/server_restart_owed.json"
+        if [ "$STATE_SERVER_STOPPED" = "1" ] && [ ! -e "$OWED_FILE" ]; then
+            # A "fetching" state was written before the stop, so its time does not
+            # mark a CONFIRMED stop: "stopping", which no activation pays (the stop's
+            # own kill can let systemd restart the server). Every later phase is
+            # written after the confirmed stop: "stopped".
+            _owed_stage="stopped"
+            [ "$STATE_PHASE" != "fetching" ] || _owed_stage="stopping"
+            # Durable, as update.sh's writer is: the temporary file is fsynced
+            # before the rename and the directory after it. Its mtime is the
+            # state's, to the nanosecond (update.sh compares at that precision).
+            if python3 -I - "$OWED_FILE" "$UPDATE_STATE" "$STATE_PID" "$_owed_stage" 2>/dev/null <<'PY'
+import json
+import os
+import sys
+from datetime import datetime
+
+path, state_path, pid, stage = sys.argv[1:]
+tmp = path + ".tmp"
+data = {
+    "pid": int(pid),
+    "started_at": "",
+    "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+    "stage": stage,
+}
+crashed_ns = os.stat(state_path).st_mtime_ns
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    os.write(fd, (json.dumps(data) + "\n").encode())
+    os.utime(fd, ns=(crashed_ns, crashed_ns))
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.replace(tmp, path)
+dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+try:
+    os.fsync(dfd)
+finally:
+    os.close(dfd)
+PY
+            then
+                echo "  Recorded the restart the crashed update owes genesis-server."
+            else
+                rm -f "$OWED_FILE.tmp" 2>/dev/null || true
+                echo "  WARNING: could not write $OWED_FILE; if genesis-server is still down, the next update.sh may read it as operator-stopped. Start it with: systemctl --user start genesis-server.service" >&2
             fi
         fi
 
