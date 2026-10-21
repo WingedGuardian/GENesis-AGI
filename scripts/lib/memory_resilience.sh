@@ -67,7 +67,7 @@ _memres_install_dropin() {
         written|taken) _MEMRES_CHANGED=1 ;;
         migrated) _MEMRES_RELOAD=1 ;;
         kept-edited) _MEMRES_KEPT=1 ;;
-        kept-nonregular|failed) _MEMRES_FAILED=1 ;;
+        kept-nonregular|uninspected|failed) _MEMRES_FAILED=1 ;;
     esac
     return 0
 }

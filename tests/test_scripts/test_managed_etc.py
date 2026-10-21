@@ -177,7 +177,7 @@ def test_a_sudo_that_cannot_inspect_never_writes_an_edited_file(tmp_path):
     result, out, calls, lines = _put_logged(tmp_path, target, "[X]\nY=1", {"FAIL_INSPECT": "1"})
     assert target.read_text() == "[X]\nMine=1\n"
     assert not any(c.startswith("tee") for c in calls.splitlines())
-    assert result == "kept-nonregular"
+    assert result == "uninspected"
     assert f"kept-etc {target}: could not be inspected" in lines
     assert "left as it is" in out
 
@@ -209,7 +209,7 @@ def test_a_sudo_that_cannot_read_never_writes(tmp_path):
     result, _, calls, lines = _put_logged(tmp_path, target, "[X]\nY=1", {"FAIL_CAT": "1"})
     assert target.read_text() == "[X]\nMine=1\n"
     assert not any(c.startswith("tee") for c in calls.splitlines())
-    assert result == "kept-nonregular"
+    assert result == "uninspected"
     assert f"kept-etc {target}: could not be inspected" in lines
 
 

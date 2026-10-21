@@ -31,6 +31,10 @@ _SUDO_STUB = """#!/bin/bash
 # Passthrough; SUDO_FAIL_TEE=1 makes a write fail, as a sudo that needs a password
 # and has no terminal would.
 if [ "$1" = "tee" ] && [ -n "${SUDO_FAIL_TEE:-}" ]; then exit 1; fi
+# SUDO_FAIL_ALL=1: every call fails, as a sudo that cannot authenticate does.
+if [ -n "${SUDO_FAIL_ALL:-}" ]; then exit 1; fi
+# SUDO_FAIL_INSPECT_SSHD=1: only the sshd drop-in cannot be classified.
+if [ "$1" = "/bin/sh" ] && [ -n "${SUDO_FAIL_INSPECT_SSHD:-}" ] && [[ "${*: -1}" == */00-genesis-clientalive.conf ]]; then exit 1; fi
 if [ "$1" = "tee" ] && [[ "$2" == */00-genesis-clientalive.conf ]]; then
     if [ -n "${PARTIAL_WRITE_ONCE_MARKER:-}" ] && [ ! -e "$PARTIAL_WRITE_ONCE_MARKER" ]; then
         : > "$PARTIAL_WRITE_ONCE_MARKER"
@@ -198,6 +202,20 @@ def test_a_sudo_that_cannot_write_still_stops_bootstrap(tmp_path):
     result = _run(env)
     assert result.returncode == 1
     assert "bootstrap stops here" in result.stdout
+
+
+@pytest.mark.parametrize("knob", ["SUDO_FAIL_ALL", "SUDO_FAIL_INSPECT_SSHD"])
+def test_a_sudo_that_cannot_inspect_still_stops_bootstrap(tmp_path, knob):
+    """A sudo that cannot authenticate now fails at the inspection, before any
+    write. That must abort as the failed write always did, not read as a kept file."""
+    env = _stage(tmp_path)
+    env[knob] = "1"
+    result = _run(env)
+    journald, sshd = _paths(env)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "bootstrap stops here" in result.stdout
+    assert not sshd.exists()
+    assert ("sshd -t" in _calls(env)) is False
 
 
 @pytest.mark.parametrize("existing", ["missing", "legacy", "legacy-trailing", "older-stamp", "taken"])

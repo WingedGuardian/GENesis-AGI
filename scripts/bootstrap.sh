@@ -1081,7 +1081,8 @@ echo
 GENESIS_ETC_SUMMARY_OK=1
 
 # genesis_etc_put never aborts; these two steps always did when sudo could not
-# write (e.g. sudo needs a password and there is no terminal). Keep that.
+# write (e.g. sudo needs a password and there is no terminal). Keep that: such a
+# sudo now fails at the inspection, so `uninspected` aborts like `failed`.
 _bootstrap_etc_failed() {
     echo "ERROR: could not write $1 with sudo (see above); bootstrap stops here."
     exit 1
@@ -1096,7 +1097,7 @@ case "$GENESIS_ETC_RESULT" in
         sudo systemctl restart systemd-journald 2>/dev/null || true
         echo "  Journal capped at 200MB (~7 days rolling)" ;;
     unchanged|migrated) echo "  Journal cap already set (200MB)" ;;
-    failed) _bootstrap_etc_failed "$JOURNALD_DROP_IN" ;;
+    failed|uninspected) _bootstrap_etc_failed "$JOURNALD_DROP_IN" ;;
     *) ;;  # kept: genesis_etc_put said why
 esac
 echo
@@ -1121,7 +1122,7 @@ if ! command -v sshd >/dev/null 2>&1 && [[ ! -x /usr/sbin/sshd ]]; then
 else
     genesis_etc_put "$SSHD_DROP_IN" "$SSHD_CONTENT" "" sshd validate
     _sshd_result="$GENESIS_ETC_RESULT"
-    if [[ "$_sshd_result" == failed ]]; then
+    if [[ "$_sshd_result" == failed || "$_sshd_result" == uninspected ]]; then
         if [[ "$GENESIS_ETC_ATTEMPTED" == 1 ]]; then
             genesis_etc_rollback "$SSHD_DROP_IN" "sshd drop-in write failed" || _bootstrap_etc_failed "$SSHD_DROP_IN"
         else

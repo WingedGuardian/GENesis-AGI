@@ -32,10 +32,12 @@
 # Callers run it after their own `sudo -n true` gate (or, in bootstrap.sh, with
 # the bare sudo the step always used), so it uses plain `sudo` like they do.
 # Always returns 0; sets GENESIS_ETC_RESULT to one of: written, migrated,
-# unchanged, taken, kept-edited, kept-nonregular, failed. kept-nonregular also
-# covers a path sudo could not inspect or read. Callers treat kept-nonregular as
-# NOT applied (a masked unit means the protection is off) and kept-edited as
-# applied by the operator's own hand. A path containing whitespace cannot be
+# unchanged, taken, kept-edited, kept-nonregular, uninspected, failed.
+# uninspected is a path sudo could not classify or read: nothing was written
+# (a path whose snapshot could not be taken locally is kept-nonregular).
+# Callers treat kept-nonregular and uninspected as NOT applied (a masked unit
+# means the protection is off) and kept-edited as applied by the operator's own
+# hand; bootstrap.sh aborts on uninspected as it does on failed. A path containing whitespace cannot be
 # taken (the take list is space-separated), so its kept message omits the hint.
 
 # Pure parameter expansion, not dirname: callers may run with a minimal PATH.
@@ -77,11 +79,14 @@ _genesis_etc_remedy() {
 }
 
 # A path the run could not classify or read is never written. Reported as
-# kept-nonregular: callers then neither reload nor (in bootstrap) abort, and the
-# resilience libs report their policy as NOT applied.
+# uninspected, not kept-nonregular: a sudo that cannot authenticate lands here
+# before any write, and bootstrap.sh must still abort on it as it did when that
+# sudo failed at the write. The resilience libs report it as NOT applied.
+# A local failure (no temp file for the snapshot) passes kept-nonregular as $3:
+# sudo works there, so bootstrap keeps going, as it always has.
 _genesis_etc_uninspected() {
     echo "  WARNING: $2 $1 with sudo — left as it is, not written."
-    GENESIS_ETC_RESULT="kept-nonregular"
+    GENESIS_ETC_RESULT="${3:-uninspected}"
     _genesis_etc_summary "kept-etc $1: could not be inspected"
 }
 
@@ -206,7 +211,7 @@ _genesis_etc_put_impl() {
         GENESIS_ETC_EXISTED=1
         verb="updated-etc"
         if ! GENESIS_ETC_SNAPSHOT="$(mktemp)"; then
-            _genesis_etc_uninspected "$path" "could not snapshot"
+            _genesis_etc_uninspected "$path" "could not snapshot" kept-nonregular
             return 0
         fi
         if ! sudo cat "$path" > "$GENESIS_ETC_SNAPSHOT" 2>/dev/null; then

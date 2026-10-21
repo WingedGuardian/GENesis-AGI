@@ -112,7 +112,7 @@ _netres_put_file() {
             written|taken) _NETRES_WROTE=$((_NETRES_WROTE + 1)) ;;
             migrated) _NETRES_STAMPED=$((_NETRES_STAMPED + 1)) ;;
             kept-edited) _NETRES_KEPT=1 ;;
-            kept-nonregular|failed) _NETRES_FAILED=1 ;;
+            kept-nonregular|uninspected|failed) _NETRES_FAILED=1 ;;
         esac
         return 0
     fi
