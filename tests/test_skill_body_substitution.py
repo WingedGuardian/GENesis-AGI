@@ -117,7 +117,7 @@ def _hits(path: Path) -> list[tuple[int, str]]:
 
 def test_no_skill_or_command_body_carries_a_dollar_digit():
     bad = [
-        f"{path.relative_to(_ROOT).as_posix()}:{n}: {text[:100]}"
+        f"{path.relative_to(_ROOT).as_posix()}:{n}: {text}"
         for root, pattern, _ in _ROOTS
         for path in _files(root, pattern)
         for n, text in _hits(path)
