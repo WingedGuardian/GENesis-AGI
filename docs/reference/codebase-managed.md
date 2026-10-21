@@ -5,8 +5,9 @@ a pinned provider and publishes immutable settings; `status` diagnoses settings
 and native service state. The ordinary install/bootstrap loops render disabled
 query service/client slice templates on every install and do not automatically
 install, upgrade or version-probe a PATH Codebase binary. Registration always
-uses the managed launcher, including when no PATH provider exists. The index
-queue remains on its previous route until its separate integration lands.
+uses the managed launcher, including when no PATH provider exists. The existing
+index queue now uses managed admission and the contained native worker described
+under "Queued indexing" below.
 Staging and rendering alone do not make Codebase available.
 
 Existing symlinks at either managed query unit destination, including `/dev/null`
