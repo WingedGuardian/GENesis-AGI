@@ -798,6 +798,11 @@ fi
 echo "  Syncing browser packages..."
 install_browser_extra "$GENESIS_ROOT" "$VENV_DIR" \
     || echo "  WARNING: browser packages incomplete (non-fatal; the browser tools say what to repair)"
+# The test and payments extras, the same way: after the core, never fatal. An
+# install runs its own test suite, and the card vault needs the payments packages.
+echo "  Syncing test and payments packages..."
+install_runtime_extras "$GENESIS_ROOT" "$VENV_DIR" \
+    || echo "  WARNING: test/payments packages incomplete (non-fatal; see above)"
 echo
 
 # --- Skill-security trusted baseline ---

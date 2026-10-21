@@ -104,6 +104,94 @@ GRAPH_KEY = "genesis_memory"
 #: an unbounded wait. Do not read it as "falling back is free".
 _READ_TIMEOUT_S = 0.5
 
+#: How many innermost frame NAMES a timeout's diagnosis keeps (see `_timeout_diag`).
+_DIAG_FRAMES = 4
+
+
+def _psi_totals() -> dict[str, int] | None:
+    """This container's cumulative cgroup stall counters (µs), or None. Read at
+    the start of every bounded call and again at its timeout: 3 cgroupfs reads.
+    cgroup files ONLY: the ``/proc/pressure`` fallback is host-wide inside a
+    container, and host pressure must never be booked as this read's cause."""
+    try:
+        from genesis.hostmetrics.readings import read_psi_totals
+
+        return read_psi_totals(cgroup_only=True)
+    except Exception:
+        logger.debug("PSI totals unreadable for the timeout diagnosis", exc_info=True)
+        return None
+
+
+def _timeout_diag(
+    exc: BaseException,
+    *,
+    timeout: float,
+    started: float,
+    fired_at: float | None,
+    psi_before: dict[str, int] | None,
+) -> dict[str, Any]:
+    """What a deadline that fired can say about its own cause. Never raises.
+
+    - ``frames``: function names of the awaits the deadline cancelled, deepest
+      last (the TimeoutError's cause is that CancelledError). Names only: no
+      paths, no arguments. A connect shows ``_graph``; a reply never sent shows
+      the client's reader.
+    - ``late_ms``: how long after the deadline the event loop got to run it,
+      read from a marker timer due at the same instant. The deadline runs on the
+      loop, so a loop held by synchronous work runs it late: large means THIS
+      process stalled, about zero means the engine did not answer in time.
+    - ``cancel_ms``: from that moment until the timeout surfaced. ``wait_for``
+      raises only once the cancelled operation finishes its own cleanup, so slow
+      cleanup lands here and never in ``late_ms``.
+    - ``psi_stall_us``: the container's cgroup stall time (µs) across the wait,
+      per resource. ``avg10`` cannot see a sub-second stall.
+    """
+    diag: dict[str, Any] = {
+        "budget_ms": round(timeout * 1000, 1),
+        "elapsed_ms": None,
+        "late_ms": None,
+        "cancel_ms": None,
+        "frames": None,
+        "psi_stall_us": None,
+    }
+    try:
+        now = time.monotonic()
+        diag["elapsed_ms"] = round((now - started) * 1000, 1)
+        if fired_at is not None:
+            diag["late_ms"] = round((fired_at - started - timeout) * 1000, 1)
+            diag["cancel_ms"] = round((now - fired_at) * 1000, 1)
+        cancelled = exc.__cause__
+        tb = cancelled.__traceback__ if cancelled is not None else None
+        if tb is not None:
+            names: list[str] = []
+            while tb is not None:
+                names.append(tb.tb_frame.f_code.co_name)
+                tb = tb.tb_next
+            diag["frames"] = names[-_DIAG_FRAMES:]
+        after = _psi_totals()
+        if psi_before and after:
+            diag["psi_stall_us"] = {
+                k: after[k] - psi_before[k] for k in sorted(psi_before) if k in after
+            }
+    except Exception:  # a diagnosis must never cost the error it describes
+        logger.debug("timeout diagnosis incomplete", exc_info=True)
+    return diag
+
+
+@contextlib.contextmanager
+def _labelled(query: str):
+    """Name which of a traversal's two queries a timeout's ``.diag`` belongs to.
+    The marker query runs on what the first one left of the budget, so its frames
+    alone look identical to a main-query timeout."""
+    try:
+        yield
+    except GraphUnavailableError as exc:
+        diag = getattr(exc, "diag", None)
+        if isinstance(diag, dict):
+            diag.setdefault("query", query)
+        raise
+
+
 #: PROJECT bounds a batch job with no reader waiting on it, so it is sized to
 #: catch a HUNG engine and nothing else — 90x the slowest measured batch.
 _PROJECT_TIMEOUT_S = 30.0
@@ -403,12 +491,31 @@ class FalkorGraphStore:
         because the deadline has to cover connecting as well as the operation
         and the connect happens inside it.
         """
+        # The budget starts BEFORE the diagnosis's own read, so that read spends
+        # it rather than extending it: the call stays bounded by `timeout`.
+        started = time.monotonic()
+        psi_before = _psi_totals()
+        remaining = max(0.0, started + timeout - time.monotonic())
+        # A marker due at the same instant as the deadline: when it ran is when
+        # the loop got to the deadline, apart from any cancellation cleanup after.
+        fired: list[float] = []
+        marker = asyncio.get_running_loop().call_later(
+            remaining, lambda: fired.append(time.monotonic())
+        )
         try:
-            return await asyncio.wait_for(factory(), timeout=timeout)
+            return await asyncio.wait_for(factory(), timeout=remaining)
         except TimeoutError as exc:
-            raise GraphUnavailableError(
-                f"{what} exceeded {timeout}s — the engine is not answering"
-            ) from exc
+            err = GraphUnavailableError(f"{what} exceeded {timeout}s — the engine is not answering")
+            # Read by the traversal telemetry: every cutover-clock reset was one
+            # of these, and the class name alone named no cause.
+            err.diag = _timeout_diag(
+                exc,
+                timeout=timeout,
+                started=started,
+                fired_at=fired[0] if fired else None,
+                psi_before=psi_before,
+            )
+            raise err from exc
         except GraphUnavailableError:
             # Already the right type and already carries the better message
             # (e.g. "cannot reach the graph engine at ..."). Re-wrapping would
@@ -420,6 +527,8 @@ class FalkorGraphStore:
             # returning [] would tell dream-centrality there are no bridges and
             # let it wipe the shield's thresholds.
             raise GraphUnavailableError(f"{what} failed: {exc}") from exc
+        finally:
+            marker.cancel()
 
     async def _query(
         self,
@@ -633,22 +742,23 @@ class FalkorGraphStore:
         # multi-second NetworkX rebuild on top. The budget belongs to the
         # TRAVERSAL, so it is stamped once here and spent down.
         deadline = time.monotonic() + _READ_TIMEOUT_S
-        result = await self._query(
-            _TRAVERSE.replace("{depth}", str(int(max_depth))),
-            {
-                "root": root_id,
-                "min_strength": float(min_strength),
-                # FLOAT, not int. Truncating both sides to whole seconds hides a
-                # memory for up to a second before it actually expires: with now
-                # at T.100 and invalid_at at T.900, `invalid_epoch > now` is
-                # T > T -> False here while SQLite and NetworkX both still say
-                # visible. Genesis's timestamps carry microseconds
-                # (`db/timeutil.py`), so the precision is real data, not a
-                # theoretical tail.
-                "now": time.time(),
-                "include_deprecated": bool(include_deprecated),
-            },
-        )
+        with _labelled("traverse"):
+            result = await self._query(
+                _TRAVERSE.replace("{depth}", str(int(max_depth))),
+                {
+                    "root": root_id,
+                    "min_strength": float(min_strength),
+                    # FLOAT, not int. Truncating both sides to whole seconds hides a
+                    # memory for up to a second before it actually expires: with now
+                    # at T.100 and invalid_at at T.900, `invalid_epoch > now` is
+                    # T > T -> False here while SQLite and NetworkX both still say
+                    # visible. Genesis's timestamps carry microseconds
+                    # (`db/timeutil.py`), so the precision is real data, not a
+                    # theoretical tail.
+                    "now": time.time(),
+                    "include_deprecated": bool(include_deprecated),
+                },
+            )
         nodes = [
             GraphNode(
                 memory_id=row[0],
@@ -733,12 +843,27 @@ class FalkorGraphStore:
         else:
             timeout = deadline - time.monotonic()
             if timeout <= 0:
-                raise GraphUnavailableError(
+                err = GraphUnavailableError(
                     "the traversal budget was spent before the projection could be "
                     "confirmed — the engine is not answering fast enough to tell an "
                     "empty graph from an unbuilt one"
                 )
-        result = await self._query("MATCH (m:ProjectionMeta) RETURN count(m)", {}, timeout=timeout)
+                # No await was cancelled, so no frames: the first query used the
+                # whole budget. late_ms is how far past the deadline this is.
+                err.diag = {
+                    "budget_ms": round(_READ_TIMEOUT_S * 1000, 1),
+                    "elapsed_ms": None,
+                    "late_ms": round(-timeout * 1000, 1),
+                    "frames": None,
+                    "psi_stall_us": None,
+                    # The marker query was never issued: the first used the budget.
+                    "budget_spent": True,
+                }
+                raise err
+        with _labelled("marker"):
+            result = await self._query(
+                "MATCH (m:ProjectionMeta) RETURN count(m)", {}, timeout=timeout
+            )
         rows = result.result_set or []
         if not (rows and rows[0] and rows[0][0]):
             raise GraphUnavailableError(

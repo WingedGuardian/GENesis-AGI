@@ -247,7 +247,9 @@ class ReleaseManager:
 
     # -- rows, tasks, endings ------------------------------------------------
 
-    async def _row(self, event: str, detail: dict) -> bool:
+    async def _row(self, event: str, detail: dict, *, stopping: bool = False) -> bool:
+        if stopping:  # only stop()'s own abort row passes the stopped-service guard
+            return await self._svc._audit(event, detail, _stopping=True)
         return await self._svc._audit(event, detail)
 
     def _spawn(self, coro, name: str) -> asyncio.Task:
@@ -281,15 +283,21 @@ class ReleaseManager:
         while len(self._recent) > _RECENT:
             self._recent.popitem(last=False)
 
-    async def _refuse_slot(self, rel: _Release, reason: str, state: str = REFUSED) -> None:
+    async def _refuse_slot(
+        self, rel: _Release, reason: str, state: str = REFUSED, *, stopping: bool = False
+    ) -> None:
         if self._end(rel, state):
-            await self._row("release_refused", {**rel.row, "reason": reason})
+            await self._row("release_refused", {**rel.row, "reason": reason}, stopping=stopping)
 
-    async def abort(self, reason: str) -> None:
-        """Refuse the release in the slot (lock, relock, stop). A decided claim completes."""
+    async def abort(self, reason: str, *, stopping: bool = False) -> None:
+        """Refuse the release in the slot (lock, relock, stop). A decided claim completes.
+
+        ``stopping`` is the service's stop: the service already refuses late audit
+        writes, so the refusal row is written as part of the stop.
+        """
         rel = self._slot
         if rel is not None and not rel.decided:
-            await self._refuse_slot(rel, reason)
+            await self._refuse_slot(rel, reason, stopping=stopping)
 
     def _arm(self, rel: _Release) -> None:
         if rel.timer is not None:

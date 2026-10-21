@@ -457,8 +457,8 @@ async def test_a_grant_landing_after_a_lock_is_refused(ctx, monkeypatch):
 async def test_a_lost_grant_row_refuses(ctx, monkeypatch):
     real = ctx.svc._audit
 
-    async def failing(event, detail=None):
-        return False if event == "release_granted" else await real(event, detail)
+    async def failing(event, detail=None, **kw):
+        return False if event == "release_granted" else await real(event, detail, **kw)
 
     monkeypatch.setattr(ctx.svc, "_audit", failing)
     nonce = (await ctx.request())["nonce"]
@@ -487,6 +487,35 @@ async def test_stop_refuses_a_pending_release(db, vault, tmp_path, _sealed):
     assert reg.futures[0].cancelled()
     names = await c.names()
     assert names[-2:] == ["release_refused", "service_stop"]
+
+
+async def test_only_the_stop_abort_row_passes_the_stopped_guard(db, vault, tmp_path, _sealed):
+    """A release write racing stop()'s abort row is still refused once stopped."""
+    reg = FakeRegistry()
+    svc = VaultService(
+        db,
+        vault_path=vault[0],
+        socket_path=tmp_path / "s" / "v.sock",
+        approvals=reg,
+        release_peer=lambda pid, **_k: _me(),
+    )
+    svc._identity = x25519.Identity.from_str(_sealed[1])
+    await svc.start()
+    c = Ctx(svc, reg, vault[1], [0.0], db)
+    await c.request()
+    await _until(lambda: reg.futures)
+    real, raced = svc._audit, []
+
+    async def audit(event, detail=None, **kw):
+        if kw.get("_stopping") and event == "release_refused" and not raced:
+            raced.append(await svc._release._row("release_cancelled", {"nonce": "x"}))
+        return await real(event, detail, **kw)
+
+    svc._audit = audit
+    await svc.stop()
+    assert raced == [False]
+    names = await c.names()
+    assert "release_cancelled" not in names and names[-2:] == ["release_refused", "service_stop"]
 
 
 # -- GRANTED ------------------------------------------------------------------------
@@ -602,8 +631,8 @@ async def test_a_lost_claimed_row_returns_nothing(ctx, monkeypatch):
     nonce = await ctx.granted()
     real = ctx.svc._audit
 
-    async def failing(event, detail=None):
-        return False if event == "release_claimed" else await real(event, detail)
+    async def failing(event, detail=None, **kw):
+        return False if event == "release_claimed" else await real(event, detail, **kw)
 
     monkeypatch.setattr(ctx.svc, "_audit", failing)
     assert await ctx.claim(nonce) == {"ok": False, "error": "the audit write failed"}
@@ -726,11 +755,11 @@ async def test_a_lock_after_the_decision_point_does_not_take_values_back(ctx, mo
     real = ctx.svc._audit
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def held(event, detail=None):
+    async def held(event, detail=None, **kw):
         if event == "release_claimed":
             entered.set()
             await release.wait()
-        return await real(event, detail)
+        return await real(event, detail, **kw)
 
     monkeypatch.setattr(ctx.svc, "_audit", held)
     claim = asyncio.create_task(ctx.claim(nonce))
@@ -837,11 +866,11 @@ async def test_a_socket_closed_during_the_claimed_row_keeps_the_card(ctx, monkey
     real = ctx.svc._audit
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def held(event, detail=None):
+    async def held(event, detail=None, **kw):
         if event == "release_claimed":
             entered.set()
             await release.wait()
-        return await real(event, detail)
+        return await real(event, detail, **kw)
 
     monkeypatch.setattr(ctx.svc, "_audit", held)
     _reader, writer = await _send_claim(ctx, nonce)
@@ -860,10 +889,10 @@ async def test_a_requester_that_exits_during_the_claimed_row_keeps_the_card(ctx,
     sent = _record_replies(ctx, monkeypatch)
     real = ctx.svc._audit
 
-    async def held(event, detail=None):
+    async def held(event, detail=None, **kw):
         if event == "release_claimed":
             monkeypatch.setattr(ctx.svc._release, "_alive", lambda pid, start: False)
-        return await real(event, detail)
+        return await real(event, detail, **kw)
 
     monkeypatch.setattr(ctx.svc, "_audit", held)
     reader, writer = await _send_claim(ctx, nonce)
@@ -1235,8 +1264,8 @@ async def test_a_request_needs_an_unlocked_running_service_with_approvals(ctx, s
 async def test_a_lost_requested_row_means_no_request(ctx, monkeypatch):
     real = ctx.svc._audit
 
-    async def failing(event, detail=None):
-        return False if event == "release_requested" else await real(event, detail)
+    async def failing(event, detail=None, **kw):
+        return False if event == "release_requested" else await real(event, detail, **kw)
 
     monkeypatch.setattr(ctx.svc, "_audit", failing)
     assert await ctx.request() == {"ok": False, "error": "the audit write failed"}
@@ -1246,8 +1275,8 @@ async def test_a_lost_requested_row_means_no_request(ctx, monkeypatch):
 async def test_a_lock_during_the_requested_row_refuses(ctx, monkeypatch):
     real = ctx.svc._audit
 
-    async def locking(event, detail=None):
-        ok = await real(event, detail)
+    async def locking(event, detail=None, **kw):
+        ok = await real(event, detail, **kw)
         if event == "release_requested":
             ctx.svc._epoch += 1
         return ok

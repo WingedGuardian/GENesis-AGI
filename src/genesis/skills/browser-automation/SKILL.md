@@ -106,9 +106,9 @@ so after a failure take the layer from the call you made.
   on. `browser_sessions` and `browser_clear_domain` reset only the clock of a
   Camoufox or Chromium browser running in this session whose cookies they
   read, and `browser_collaborate` resets none. Use TinyFish last in a task.
-- `web_agent(url, goal)` is the goal-driven TinyFish agent, about $0.015 per
+- `web_agent(url, goal)` is the goal-driven TinyFish agent, about 0.015 USD per
   step. The daily budget is checked and only logged, never enforced, and the
-  default `max_steps=100` can cost about $1.50 per call: pass a small
+  default `max_steps=100` can cost about 1.50 USD per call: pass a small
   `max_steps`. Same approval rule.
 
 ### Layer 5: Desktop (non-web windows)

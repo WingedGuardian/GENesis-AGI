@@ -101,6 +101,10 @@ EXEMPT: dict[tuple[str, str], str] = {
         "the expected argv of the genesis-health MCP server, compared against a "
         "socket peer's /proc cmdline; never imported, run or read"
     ),
+    ("memory/graph_census.py", "scripts/genesis_mcp_server.py"): (
+        "the entry script a memory server must run, compared against its /proc "
+        "argv by the census; never imported, run or read"
+    ),
     ("browser/engine.py", "scripts/install_browser_stack.sh"): (
         "named in the operator step an unready engine reports; an operator or the "
         "browser-stack unit runs it, never the server"
