@@ -5068,7 +5068,7 @@ def _unresolvable_identity(argv: list[str]) -> str | None:
         repo = url.group(1)
     if repo is not None and not _LITERAL_REPO_RE.match(repo):
         return repo or "--repo (empty value)"
-    if repo is not None and repo.count("/") == 2 and not repo.startswith("github.com/"):
+    if repo is not None and repo.count("/") == 2 and repo.split("/", 1)[0] != "github.com":
         return repo
     return None
 
