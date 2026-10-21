@@ -1261,7 +1261,9 @@ def test_no_residual_window_warning_on_an_ordinary_move(dc, dc_ready, capsys):
         w.write_manifest([w.entry(b) for b in listed])
         assert w.run(dc, "rebuild") == 0
         out = capsys.readouterr().out
-        assert "checkout: moved to" in out and "live was at" not in out, out
+        assert "checkout: moved to" in out and "live was at" not in out and "HEAD was" not in out, (
+            out
+        )
 
 
 def test_a_tracked_edit_before_the_lock_refuses_even_when_nothing_would_move(
@@ -1324,7 +1326,7 @@ def test_no_residual_window_warning_from_main_when_live_already_sat_at_the_tip(
     assert w.run(dc, "rebuild") == 0
     out = capsys.readouterr().out
     assert w.rev("refs/heads/live") == live_before and "checkout: moved to" in out, out
-    assert "live was at" not in out, out
+    assert "live was at" not in out and "HEAD was" not in out, out
 
 
 def test_no_residual_window_warning_from_main_over_an_existing_live(dc, dc_ready, capsys):
@@ -1341,7 +1343,7 @@ def test_no_residual_window_warning_from_main_over_an_existing_live(dc, dc_ready
     assert w.run(dc, "rebuild") == 0
     out = capsys.readouterr().out
     assert w.rev("refs/heads/live") != old_live and "checkout: moved to" in out, out
-    assert "live was at" not in out, out
+    assert "live was at" not in out and "HEAD was" not in out, out
 
 
 def test_a_tracked_edit_after_the_lock_refuses_the_ref_only_move(dc, dc_ready, capsys, monkeypatch):
@@ -1390,13 +1392,15 @@ def test_an_empty_expected_source_value_is_a_usage_error(dc, dc_ready, capsys, f
 def test_a_drop_whose_move_finds_a_moved_source_names_the_rebuild_not_a_retry(
     dc, dc_ready, capsys, monkeypatch
 ):
-    """The manifest change is saved by then, so running the drop again would only
-    say it is not a candidate: the outer text (rebuild) is the one to follow."""
+    """A move refused once the manifest is saved (here: its record cannot be
+    written): running the drop again would only say it is not a candidate, so the
+    outer text (rebuild) is the one to follow."""
     w = dc_ready
     _second_rebuild_world(dc, w, capsys)
     assert w.run(dc, "rebuild") == 0, capsys.readouterr()
-    _before_the_lock(dc, monkeypatch, lambda: (w.root / "a.txt").write_text("a session's edit\n"))
-    assert w.run(dc, "drop", "feat/b") == 1
+    rec = w.home / "no-such-dir" / "live_move.json"
+    env = {"DEPLOY_CANDIDATES_MOVE_RECORD": str(rec)}
+    assert w.run(dc, "drop", "feat/b", extra_env=env) == 1
     err = capsys.readouterr().err
     assert "WAS saved" in err and "deploy_candidates rebuild" in err, err
     assert "run this again" not in err, err
@@ -1550,3 +1554,190 @@ def test_a_raced_creation_of_live_is_warned(dc, dc_ready, capsys, monkeypatch):
     assert w.run(dc, "rebuild") == 0
     out = capsys.readouterr().out
     assert f"WARNING: live was at {other[:12]}, not absent" in out, out
+
+
+def _after_the_preflight_check(dc, monkeypatch, act) -> list[int]:
+    """``act`` runs right after preflight judged the checkout safe to move: the
+    gap where a baseline read separately from that judgment would adopt it."""
+    fired: list[int] = []
+    real = dc.Engine._move_refusals
+
+    def refusals(self, *a, **kw):
+        reasons = real(self, *a, **kw)
+        if not reasons and not fired:
+            fired.append(1)
+            act()
+        return reasons
+
+    monkeypatch.setattr(dc.Engine, "_move_refusals", refusals)
+    return fired
+
+
+@pytest.mark.parametrize("command", ["rebuild", "drop"])
+def test_a_tracked_edit_after_the_preflight_judgment_refuses(
+    dc, dc_ready, capsys, monkeypatch, command
+):
+    w = dc_ready
+    head = _second_rebuild_world(dc, w, capsys)
+    if command == "drop":
+        assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+        head = w.rev("HEAD")
+    before = w.manifest_path.read_text()
+    fired = _after_the_preflight_check(
+        dc, monkeypatch, lambda: (w.root / "a.txt").write_text("a session's edit\n")
+    )
+    argv = ["rebuild"] if command == "rebuild" else ["drop", "feat/b"]
+    assert w.run(dc, *argv) == 1
+    err = capsys.readouterr().err
+    assert fired == [1], "the edit never landed"
+    assert "not where its caller left it" in err and "a.txt" in err, err
+    assert w.rev("HEAD") == head and w.manifest_path.read_text() == before
+    assert (w.root / "a.txt").read_text() == "a session's edit\n"
+
+
+def test_a_linked_worktree_on_live_after_the_preflight_judgment_refuses(
+    dc, dc_ready, capsys, monkeypatch
+):
+    w = dc_ready
+    head = _second_rebuild_world(dc, w, capsys)
+    other = w.tmp / "other-live"
+    fired = _after_the_preflight_check(
+        dc, monkeypatch, lambda: w.git(w.root, "worktree", "add", "-q", "-f", str(other), "live")
+    )
+    assert w.run(dc, "rebuild") == 1
+    err = capsys.readouterr().err
+    assert fired == [1], "the worktree was never added"
+    assert "another worktree" in err, err
+    assert w.rev("refs/heads/live") == head
+
+
+def test_a_drop_on_live_refuses_a_switch_to_main_after_it_decided(
+    dc, dc_ready, capsys, monkeypatch
+):
+    """The drop decided "on `live`" from its one baseline; a clean switch to main
+    after that must not let the move switch the checkout back to `live`."""
+    w = dc_ready
+    _second_rebuild_world(dc, w, capsys)
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    before = w.manifest_path.read_text()
+    real = dc.Engine._move_preflight
+
+    def switch_then_preflight(self, *a, **kw):
+        w.git(w.root, "switch", "-q", "main")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(dc.Engine, "_move_preflight", switch_then_preflight)
+    assert w.run(dc, "drop", "feat/b") == 1
+    err = capsys.readouterr().err
+    assert "not where its caller left it" in err, err
+    assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
+    assert w.manifest_path.read_text() == before
+
+
+def test_a_moved_source_refuses_before_preflight_retires_a_leftover_state(
+    dc, dc_ready, capsys, monkeypatch
+):
+    """Preflight's own first write is removing a harmless update_state.json: it
+    happens only while the checkout still matches the baseline."""
+    w = dc_ready
+    head = _second_rebuild_world(dc, w, capsys)
+    w.git(w.root, "tag", "-f", "pre")
+    state = w.home / ".genesis" / "update_state.json"
+    state.write_text(
+        json.dumps(
+            {"phase": "fetching", "rollback_tag": "pre", "deploy_head": head, "post_merge": False}
+        )
+    )
+    other = w.tmp / "other-live"
+    fired = _after_the_preflight_check(
+        dc, monkeypatch, lambda: w.git(w.root, "worktree", "add", "-q", "-f", str(other), "live")
+    )
+    assert w.run(dc, "rebuild") == 1
+    err = capsys.readouterr().err
+    assert fired == [1] and "another worktree" in err, err
+    assert state.exists(), "the leftover was retired after the checkout moved"
+
+
+def test_a_branch_switch_during_the_lock_wait_leaves_the_drop_manifest_unchanged(
+    dc, dc_ready, capsys, monkeypatch
+):
+    """The on-live drop saves the manifest under the checkout lock, after the
+    last re-check: a switch while it waited for the lock changes nothing."""
+    w = dc_ready
+    _second_rebuild_world(dc, w, capsys)
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    before = w.manifest_path.read_text()
+    _before_the_lock(dc, monkeypatch, lambda: w.git(w.root, "switch", "-q", "main"))
+    assert w.run(dc, "drop", "feat/b") == 1
+    err = capsys.readouterr().err
+    assert "not where its caller left it" in err and "manifest is unchanged" in err, err
+    assert "WAS saved" not in err, err
+    assert w.manifest_path.read_text() == before
+
+
+def test_an_unrelated_tracked_edit_does_not_refuse_a_manifest_only_drop(
+    dc, dc_ready, capsys, monkeypatch
+):
+    """Off `live` the drop writes only the manifest: it re-checks the branch, HEAD
+    and `live`, not the tracked tree it never touches."""
+    w = dc_ready
+    _second_rebuild_world(dc, w, capsys)
+    w.git(w.root, "switch", "-q", "main")
+    real = dc.Engine._off_live_hook_refusal
+
+    def edit_then_judge(self, *a, **kw):
+        (w.root / "a.txt").write_text("a session's edit\n")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(dc.Engine, "_off_live_hook_refusal", edit_then_judge)
+    assert w.run(dc, "drop", "feat/b") == 0, capsys.readouterr()
+    assert [c["branch"] for c in w.manifest()["candidates"]] == ["feat/a"]
+
+
+def test_a_failed_compare_and_swap_on_the_ref_only_move_is_a_moved_source(
+    dc, dc_ready, capsys, monkeypatch
+):
+    """`live` moved between the last re-check and the ref update: the update-ref
+    compare-and-swap fails, the record says "clean", and nothing moved."""
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    w.advance_main({"x.txt": "x\n"}, "squash of feat/a")
+    head = w.rev("HEAD")
+    other = w.git(w.root, "commit-tree", w.rev("HEAD^{tree}"), "-p", head, "-m", "a session's")
+    other_sha = other.stdout.strip()
+    real = dc.plan._write_move_record
+
+    def record(repo, to, phase, *, before):
+        if phase == "ref":
+            w.git(w.root, "update-ref", "refs/heads/live", other_sha, head)
+        return real(repo, to, phase, before=before)
+
+    monkeypatch.setattr(dc.plan, "_write_move_record", record)
+    rc, rec = _rebuild_with_record(dc, w)
+    err = capsys.readouterr().err
+    assert rc == 1 and "not where its caller left it" in err and "nothing moved" in err, err
+    assert json.loads(rec.read_text())["phase"] == "clean"
+    assert w.rev("refs/heads/live") == other_sha
+
+
+def test_a_session_branch_switch_inside_the_residual_window_is_warned(
+    dc, dc_ready, capsys, monkeypatch
+):
+    """HEAD's reflog shows the switch ran from another branch: the session's
+    branch keeps its commits, and the engine names where HEAD was."""
+    w = dc_ready
+    head = _second_rebuild_world(dc, w, capsys)
+    w.git(w.root, "branch", "feat-s", head)
+    real_git = dc.Engine.git
+
+    def git(self, *args, **kw):
+        if args and args[0] == "switch":
+            real_git(self, "switch", "-q", "feat-s")
+        return real_git(self, *args, **kw)
+
+    monkeypatch.setattr(dc.Engine, "git", git)
+    assert w.run(dc, "rebuild") == 0
+    out = capsys.readouterr().out
+    assert "WARNING: HEAD was on feat-s" in out, out

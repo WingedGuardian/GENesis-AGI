@@ -52,9 +52,10 @@ Commands:
         Both or neither. The checkout must be on B at C (update.sh passes where
         it verified it), or nothing changes. With or without them, the branch,
         HEAD, `live`, another worktree on `live` and the tracked tree it read
-        are re-checked once the move holds genesis-checkout.lock, and again
-        before its first write or its "unchanged" result; drop also re-checks
-        them before it writes the manifest.
+        are re-checked under genesis-checkout.lock just before the move's
+        first write or its "unchanged" result; an on-`live` drop writes the
+        manifest right after that check, and a manifest-only drop re-checks
+        the branch, HEAD and `live` before writing it.
   list  The manifest as written (checked to be this repository's). No network.
   status
         READINESS, and per candidate: whether it is in `live` now, what the next
@@ -242,23 +243,24 @@ class Engine(Repo):
             raise Refusal(f"update.lock is held by another process; {hint}.") from exc
         self._update_lock_held = True
 
-    def _move_preflight(
-        self, need_manifest: bool, expect: tuple[str, str] | None = None
-    ) -> tuple[dict | None, plan.Source]:
-        """Every refusal before a checkout move, in order. Returns the manifest
-        and the source the move must still find under its lock (#3492)."""
+    def _move_preflight(self, need_manifest: bool, source: plan.Source) -> dict | None:
+        """Every refusal before a checkout move, in order. Returns the manifest.
+        ``source`` is the command's one baseline (#3492), read once at its start:
+        the branch, worktree and tracked-change refusals judge THAT read, so what
+        was judged safe is exactly what every later re-check compares to, and
+        the checkout must still match it here. It is never read again."""
         self.require_main_checkout()
         data = self.store.load()
         if need_manifest and data is None:
             raise Refusal(
                 f"no deploy manifest ({self.store.path}): nothing to rebuild. Add a candidate first."
             )
-        reasons = self._move_refusals()
+        reasons = self._move_refusals(source)
         if reasons:
             raise Refusal(reasons[0])
-        source = self._expected_source(expect)
+        plan.refuse_moved_source(self, source, "nothing changed")
         self._retire_harmless_update_state()
-        return data, source
+        return data
 
     def _expected_source(self, expect: tuple[str, str] | None) -> plan.Source:
         """The checkout's source now. With ``expect`` (--expect-branch and
@@ -360,27 +362,29 @@ class Engine(Repo):
                 "remove it, then run this again."
             ) from exc
 
-    def _move_refusals(self) -> list[str]:
+    def _move_refusals(self, source: plan.Source | None = None) -> list[str]:
         """Every reason the checkout must not move now, in the order rebuild and
         drop check them, WITHOUT raising: rebuild and drop refuse on the first,
         and status reports them all, so status never predicts a rebuild that
-        would refuse."""
+        would refuse. The checkout is judged from ``source`` (a move's baseline),
+        or from a fresh read (status)."""
         reasons: list[str] = []
         state_refusal = self._update_state_refusal()
         if state_refusal:
             reasons.append(state_refusal)
-        branch = self.current_branch()
+        source = plan.read_source(self) if source is None else source
+        branch = (source.branch_ref or "").removeprefix("refs/heads/") or None
         if branch not in (LIVE_BRANCH, BASE_BRANCH):
             reasons.append(
                 f"{self.root} is on {branch or 'a detached HEAD'}; `live` is built from main or `live`."
             )
-        elsewhere = self.live_checked_out_elsewhere()
+        elsewhere = source.elsewhere
         if elsewhere:
             reasons.append(
                 f"`live` is checked out in another worktree ({elsewhere}); moving it would change the files under "
                 "that worktree. Switch that worktree to another branch first."
             )
-        dirty = self.dirty_lines()
+        dirty = source.dirty
         if dirty:
             reasons.append(
                 f"{self.root} has uncommitted tracked changes; a rebuild never stashes or discards them. "
@@ -705,8 +709,9 @@ class Engine(Repo):
             refusal = None if on_live else self._off_live_hook_refusal(branch, data)
             if refusal:
                 raise Refusal(refusal)
-            # Decided on `source`: the manifest changes only while it still holds.
-            plan.refuse_moved_source(self, source, "nothing changed")
+            # Decided on `source`: the manifest changes only while the branch,
+            # HEAD and `live` still hold (it never touches the working tree).
+            plan.refuse_moved_source(self, source, "nothing changed", plan.REF_FIELDS)
             after = self.store.update(remove)
             out(f"{branch} dropped from {self.store.path}.")
             core.after_move(
@@ -721,7 +726,7 @@ class Engine(Repo):
             return 0
         # On `live`: subtract-only, offline. Every refusal comes before the manifest
         # changes, so a drop that cannot take the code out never reports it gone.
-        _, source = self._move_preflight(need_manifest=True, expect=expect)
+        self._move_preflight(need_manifest=True, source=source)
         walk_base = self.resolve(BASE_REF)
         if not walk_base:
             raise Refusal(f"{BASE_REF} does not resolve.")
@@ -753,16 +758,24 @@ class Engine(Repo):
         )
         self._print_plan(p)
         self._refuse_blockers(p.tip, "the manifest still lists " + branch)
-        plan.refuse_moved_source(self, source, "nothing changed")
-        after = self.store.update(remove)
-        out(f"  {branch} dropped from {self.store.path}.")
+        saved: list[dict | None] = []
+
+        def save() -> None:  # under the checkout lock, after the move's last re-check
+            saved.append(self.store.update(remove))
+            out(f"  {branch} dropped from {self.store.path}.")
+
         try:
-            moved = plan.move_checkout(self, p, source)
+            moved = plan.move_checkout(self, p, source, save)
         except Refusal as exc:
+            if not saved:
+                raise Refusal(
+                    f"{exc}\nThe manifest is unchanged: {branch} is still a candidate."
+                ) from exc
             raise Refusal(
                 f"{exc}\nThe manifest change WAS saved ({branch} is no longer a candidate), but `live` still "
                 "runs it: fix the above, then run scripts/deploy_candidates rebuild."
             ) from exc
+        after = saved[0]
         state = f"{branch} WAS dropped from the manifest and from `live`"
         if moved.files:
             # A dropped candidate's approved git hook is still installed; put
@@ -859,7 +872,8 @@ class Engine(Repo):
 
     def cmd_rebuild(self, expect: tuple[str, str] | None = None) -> int:
         self.require_update_lock()
-        data, source = self._move_preflight(need_manifest=True, expect=expect)
+        source = self._expected_source(expect)
+        data = self._move_preflight(need_manifest=True, source=source)
         rebuild_id = core.now().strftime("%Y%m%dT%H%M%SZ")
         out(f"deploy_candidates rebuild {rebuild_id}")
         ok, why = self.fetch(f"+refs/heads/{BASE_BRANCH}:{BASE_REF}")

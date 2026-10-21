@@ -3933,16 +3933,24 @@ tool-disabled CC probe without changing its schedule or routing authority.
   rebuild runs the normal rollback. `update.sh` names the branch and commit it
   verified (`rebuild --expect-branch --expect-head`, #3492); the engine records
   that source (branch ref, HEAD, the `live` ref, no other worktree on `live`, a
-  clean tracked tree) before it fetches, and re-checks all of it once its move
-  holds genesis-checkout.lock and again just before its first write or its
-  "unchanged" result (`drop` also re-checks before it writes the manifest). A
-  session commit, switch or tracked edit in that window refuses the move with
-  nothing moved and no move record (a hand `rebuild`/`drop` without the flags
-  checks the source it read itself). A commit that still slips in after the last
-  re-check is reset over by the switch; the engine then prints a WARNING naming
-  what `live@{1}` was, kept in live's reflog (not when `live` already sat at the
-  tip, from main: git logs nothing then). A tracked edit in that last window,
-  before git takes index.lock, is not warned about. What the engine did to the checkout is read
+  clean tracked tree) once, at the command's start, judges the move's safety
+  from that same read (never re-reading it as a new baseline) before it
+  fetches, and re-checks all of it in preflight and again under
+  genesis-checkout.lock just before its move's first write or its "unchanged"
+  result. An on-`live` `drop` writes the manifest under that lock, right after
+  that last re-check; a manifest-only `drop` (off `live`, `--no-rebuild`)
+  re-checks the branch, HEAD and `live` before writing it. A session commit,
+  switch or tracked edit in that window refuses the move with nothing moved
+  and no move record (a hand `rebuild`/`drop` without the flags checks the
+  source it read itself); a `live` ref update that loses its compare-and-swap
+  records `clean` and refuses the same way. Through `update.sh`, a refused
+  branch switch is then switched back by the rollback (the session's commits
+  survive on their branch; only HEAD moves). A commit or branch switch that
+  still slips in after the last re-check is named by a WARNING read from the
+  reflogs of `live` and HEAD and kept there (a direct `live` ref update from
+  main while `live` already sat at the tip is not seen: git logs nothing
+  then). A tracked edit in that last window, before git takes index.lock, is
+  not warned about. What the engine did to the checkout is read
   from its move record (`DEPLOY_CANDIDATES_MOVE_RECORD`, here
   `~/.genesis/live_move.json`: `{"to", "phase"}` with phase `ref` / `moving` /
   `partial` / `clean` / `done`, written by `deploy_candidates_plan.py` before and

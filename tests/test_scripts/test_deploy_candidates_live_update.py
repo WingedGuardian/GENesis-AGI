@@ -357,7 +357,8 @@ def test_a_harmless_leftover_is_removed_before_a_move_and_kept_by_status(dc, dc_
     assert _engine_state(w, dc, content) == []
     state = w.home / ".genesis" / "update_state.json"
     assert state.exists(), "status (_move_refusals) only reports"
-    dc.Engine(w.root, w.env)._move_preflight(need_manifest=False)
+    engine = dc.Engine(w.root, w.env)
+    engine._move_preflight(need_manifest=False, source=dc.plan.read_source(engine))
     assert not state.exists()
 
 
@@ -365,8 +366,9 @@ def test_a_guarding_state_is_never_removed_before_a_move(dc, dc_ready):
     w = dc_ready
     _engine_state(w, dc, {"phase": "bootstrap", "rollback_tag": "pre"})
     state = w.home / ".genesis" / "update_state.json"
+    engine = dc.Engine(w.root, w.env)
     with pytest.raises(dc.Refusal):
-        dc.Engine(w.root, w.env)._move_preflight(need_manifest=False)
+        engine._move_preflight(need_manifest=False, source=dc.plan.read_source(engine))
     assert state.exists()
 
 
