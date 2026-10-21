@@ -31,7 +31,8 @@ grown to 16 with 6 unnamed here, and nothing marked the list partial.)
 
 **Absence from this file is never absence in Genesis.** The map is deliberately
 incomplete. Verify by enumeration before any "Genesis lacks X" claim — the
-audit-by-enumeration protocol in the genesis-development skill.
+audit-by-enumeration protocol in the spec-session skill ("Auditing Existing
+Capabilities").
 
 **How this file stays honest.** Every entry claims its top-level
 `src/genesis` modules in a fenced `yaml subsystem-map` block and carries a
@@ -3940,6 +3941,22 @@ tool-disabled CC probe without changing its schedule or routing authority.
   before tier 1 and never escalates while it stands. `update.sh` prints what bootstrap changed
   outside the checkout at the end of every run, a failed one included. A
   symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
+  `--take-templates`. The root-owned files the deploy writes under `/etc`
+  (bootstrap's journald and sshd drop-ins, and the memory and network resilience
+  drop-ins and watchdog units) carry the same stamp through
+  `scripts/lib/managed_etc.sh`: one edited by hand (or a symlink) is KEPT and
+  named in the run summary as `kept-etc <path>` (so is one sudo could not
+  inspect or read, which is never written), a file from before stamps is
+  stamped once without restarting anything (the networkd keep-config drop-in
+  and journald: nothing else runs; the memory-resilience drop-ins, oomd's
+  config included, and the network watchdog units: a `systemctl daemon-reload`
+  only; sshd: `sshd -t` only), and `--take-template <full path>` (or `etc:*`,
+  never a bare `*`) replaces one after copying it, mode 0600, to the same path
+  under the run's `~/.genesis/deploy-backups/<time>/`. A taken sshd drop-in that
+  `sshd -t` rejects is put back from that copy. Unlike units, an edited `/etc`
+  file does not make the update refuse yet: each has had one Genesis content
+  version, so keeping it loses nothing; the refusal comes with the first content
+  change (#3282).
   `--take-templates`.
 - **Deployment status** (`scripts/lib/deploy_status.sh`): status captures the
   MainPID, invocation, runtime edits and runtime overrides once for its printed

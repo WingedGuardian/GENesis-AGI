@@ -45,7 +45,13 @@ per systemd.network(5)): the address and routes provided by DHCP are **never**
 dropped even if the lease expires or the daemon stops, and static/foreign
 config is kept too. It is exactly what netplan `critical: true` renders to, so
 one drop-in delivers the full protection. Written under `/etc` (not the
-`/run`-rendered unit), so it survives `netplan apply` regeneration.
+`/run`-rendered unit), so it survives `netplan apply` regeneration. This file and
+the watchdog units below end with a `# genesis-managed` stamp line: if you edit
+one, updates keep your version and name it rather than overwrite it (see
+`scripts/lib/managed_etc.sh`). Put changes in a later-sorting `.conf` in the same
+directory instead (for a watchdog unit, `<unit>.d/override.conf`), or let the
+Genesis version replace yours with `update.sh --take-template <full path>`, which
+backs yours up first.
 
 *Cost, by design:* re-addressing that interface then requires a full networkd
 restart (or manual flush) — a reconfigure request alone won't tear down kept

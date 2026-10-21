@@ -1115,7 +1115,7 @@ def test_every_documented_validation_hold_uses_the_scripts_lock_path():
     root = SCRIPT.parent.parent
     docs = [
         SCRIPT,
-        root / ".claude" / "skills" / "genesis-development" / "SKILL.md",
+        root / ".claude" / "skills" / "build-session" / "SKILL.md",
         root / "changelog.d" / "20260927020000-added-deploy-code-only.md",
     ]
     found = 0
