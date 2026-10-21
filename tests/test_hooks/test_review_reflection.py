@@ -355,7 +355,11 @@ def test_round_one_with_nobody_expected_waits_the_whole_window():
 
 
 def test_no_readable_review_time_never_settles():
-    got = rr.owed_state(_budget(rounds=[{"reviews": [{"submitted_at": None}]}]), [], now=T0)
+    # The head's OWN round, so this reaches the unreadable-time path, not the
+    # "no entry for the head" one (GLM P3 on #3302-A).
+    budget = _budget(rounds=[{"head": HEAD, "reviews": [{"submitted_at": None}]}])
+    got = rr.owed_state(budget, [], now=T0)
+    assert got["round_head"] == HEAD and got["owed"] == ["c1", "c2", "r5:1"]
     assert not got["settled"] and got["settle_until"] is None
 
 
