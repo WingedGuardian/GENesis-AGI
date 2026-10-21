@@ -176,6 +176,13 @@ Genesis to research, summarize, write content, or do non-Genesis tasks).
   weeks-to-build is a first-class factor beside cost and quality. Run
   `/evaluate` when any candidate tool surfaces; the disposition is the user's
   call, not one to preempt.
+- **Genesis heals itself; no human operator** — No failure, edge case or
+  recovery path may depend on a person logging in to the machine to do manual
+  work. The user supplies input and decisions; Genesis does the work,
+  including repairing itself (the Sentinel, Guardian, watchdog and boot-time
+  repair exist for this). A design whose fallback is "a human resolves it" is
+  unfinished: make the recovery automatic and lossless (back up, then repair,
+  then report), and ask the user only for a decision.
 - **Flexibility > lock-in** — Adapter patterns, generic interfaces, pluggable
   components. Every external dependency should be swappable.
 - **LLM-first solutions** — Code handles structure (timeouts, validation, event
