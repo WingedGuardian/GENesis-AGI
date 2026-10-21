@@ -3932,9 +3932,10 @@ tool-disabled CC probe without changing its schedule or routing authority.
   engine's move takes that lock itself). A refusal, failure or interrupt of the
   rebuild runs the normal rollback. `update.sh` names the branch and commit it
   verified (`rebuild --expect-branch --expect-head`, #3492); the engine records
-  that source (branch ref, HEAD, the `live` ref, a clean tracked tree) before it
-  fetches, re-checks it in full once its move holds genesis-checkout.lock, and
-  re-checks branch, HEAD and tracked dirt again just before its first write. A
+  that source (branch ref, HEAD, the `live` ref, no other worktree on `live`, a
+  clean tracked tree) before it fetches, and re-checks all of it once its move
+  holds genesis-checkout.lock and again just before its first write or its
+  "unchanged" result (`drop` also re-checks before it writes the manifest). A
   session commit, switch or tracked edit in that window refuses the move with
   nothing moved and no move record (a hand `rebuild`/`drop` without the flags
   checks the source it read itself). A commit that still slips in after the last

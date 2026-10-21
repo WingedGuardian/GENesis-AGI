@@ -256,15 +256,19 @@ class Move(NamedTuple):
 
 
 class Source(NamedTuple):
-    """Where the checkout was when the move was planned (#3492): the ref HEAD is
-    on (None: detached), the commit HEAD names, and the commit `live` names. The
-    tracked tree was clean: preflight refuses one that is not. The move re-checks
-    all of it once it holds genesis-checkout.lock, because a session can commit,
-    switch or edit during the fetch and planning, and takes no Genesis lock."""
+    """Where the checkout was when the command read it (#3492): the ref HEAD is
+    on (None: detached), the commit HEAD names, the commit `live` names, another
+    worktree with `live` checked out (None: none), and the tracked changes
+    (dirty_lines: the excused paths stay excused). Before a move, preflight has
+    refused any tracked change and another worktree on `live`, so the last two
+    are empty. Every write and every success return re-checks all five, because
+    a session can commit, switch or edit at any time and takes no Genesis lock."""
 
     branch_ref: str | None
     head: str | None
     live_ref: str | None
+    elsewhere: str | None
+    dirty: tuple[str, ...]
 
 
 def read_source(repo: Repo) -> Source:
@@ -272,32 +276,33 @@ def read_source(repo: Repo) -> Source:
     if p.returncode not in (0, 1):  # 1: a detached HEAD; anything else: git cannot say
         raise repo._unknown("which branch is checked out", p)
     ref = p.stdout.strip() if p.returncode == 0 else ""
-    return Source(ref or None, repo.resolve("HEAD"), repo.resolve(LIVE_REF))
+    return Source(
+        ref or None,
+        repo.resolve("HEAD"),
+        repo.resolve(LIVE_REF),
+        repo.live_checked_out_elsewhere(),
+        tuple(repo.dirty_lines()),
+    )
 
 
-def source_mismatch(repo: Repo, source: Source, *, full: bool) -> str | None:
-    """How the checkout now differs from ``source``, or None. ``full`` also
-    re-checks the `live` ref and another worktree on `live`; tracked dirt is
-    always re-checked (dirty_lines: the excused paths stay excused)."""
+def source_mismatch(repo: Repo, source: Source) -> str | None:
+    """How the checkout now differs from ``source``, or None."""
     now = read_source(repo)
-    for name, was, is_ in zip(("HEAD's branch", "HEAD", "`live`"), source, now, strict=True):
-        if was != is_ and (full or name != "`live`"):
+    names = ("HEAD's branch", "HEAD", "`live`", "another worktree with `live`")
+    for name, was, is_ in zip(names, source[:4], now[:4], strict=True):
+        if was != is_:
             return f"{name} is now {is_ or 'none'}, not {was or 'none'}"
-    elsewhere = repo.live_checked_out_elsewhere() if full else None
-    if elsewhere:
-        return f"`live` is now checked out in another worktree ({elsewhere})"
-    dirty = repo.dirty_lines()
-    if dirty:
-        return "tracked files changed:\n" + "\n".join("  " + ln for ln in dirty)
+    if now.dirty != source.dirty:
+        return "tracked files changed:\n" + "\n".join("  " + ln for ln in now.dirty)
     return None
 
 
-def _refuse_moved_source(repo: Repo, source: Source, *, full: bool) -> None:
-    why = source_mismatch(repo, source, full=full)
+def refuse_moved_source(repo: Repo, source: Source, unchanged: str = "nothing moved") -> None:
+    why = source_mismatch(repo, source)
     if why:
         raise Refusal(
             f"the checkout is not where its caller left it ({why}); someone else changed it "
-            "while it was planned; nothing moved. Keep that work, then retry."
+            f"meanwhile; {unchanged}. Keep that work, then retry."
         )
 
 
@@ -386,9 +391,9 @@ def _move_checkout_locked(repo: Repo, plan: Plan, source: Source) -> Move:
     written only after the move succeeded, so a refused move writes nothing; a
     failure after the move is a WARNING (core.after_move), never a refusal.
     The checkout must still be at ``source``: checked in full on taking the
-    lock, and its branch, head and tracked tree again just before the first
-    write (a move record, the ref or the switch). A mismatch writes nothing."""
-    _refuse_moved_source(repo, source, full=True)
+    lock, and again just before the first write (a move record, the ref or
+    the switch) or the unchanged result. A mismatch writes nothing."""
+    refuse_moved_source(repo, source)
     branch = source.branch_ref.removeprefix("refs/heads/") if source.branch_ref else None
     live_base, live_merged = repo.live_chain(plan.base)
     cur_tip = repo.resolve(LIVE_REF)
@@ -403,11 +408,12 @@ def _move_checkout_locked(repo: Repo, plan: Plan, source: Source) -> Move:
         # driver changed: MEASURED, git 2.43), so the tree decides, not the list.
         and repo.tree(cur_tip) == repo.tree(plan.tip)
     ):
+        refuse_moved_source(repo, source)  # update.sh restarts on this tree
         at = cur_tip  # nothing moves: `live` stays where it is
         out(f"  checkout: unchanged ({cur_tip[:12]}): same origin/main, same candidate heads.")
     elif branch == LIVE_BRANCH and cur_tip and repo.tree(cur_tip) == repo.tree(plan.tip):
         # Same files under new commits: move the ref, not the working tree.
-        _refuse_moved_source(repo, source, full=False)
+        refuse_moved_source(repo, source)
         _write_move_record(repo, plan.tip, "ref", before=True)
         repo.git(
             "update-ref",
@@ -441,7 +447,7 @@ def _move_checkout_locked(repo: Repo, plan: Plan, source: Source) -> Move:
             else None
         )
         before = _worktree_status(repo, move_paths)
-        _refuse_moved_source(repo, source, full=False)
+        refuse_moved_source(repo, source)
         _write_move_record(repo, plan.tip, "moving", before=True)
         p = repo.git("switch", "--no-overwrite-ignore", "-C", LIVE_BRANCH, plan.tip, check=False)
         if p.returncode != 0:
@@ -512,12 +518,20 @@ def _warn_live_slipped(repo: Repo, source: Source, tip: str) -> None:
     `live` that tip would be the unchanged path), `switch -C live <tip>` logs
     nothing, so `live@{1}` is an older value and a slip there cannot be told
     from it; that case is not checked. A tracked edit in the window is not
-    seen at all: only a commit leaves a reflog entry."""
-    if source.live_ref is None or source.live_ref == tip:
-        return  # created, or reset to itself: git logged nothing to compare
+    seen at all: only a commit leaves a reflog entry. When `live` did not exist,
+    the switch's own creation is its only entry: an older one means a session
+    created it in the window."""
+    if source.live_ref == tip:
+        return  # reset to itself: git logged nothing to compare
     p = repo.git("rev-parse", "--verify", "-q", f"{LIVE_REF}@{{1}}^{{commit}}", check=False)
     was = p.stdout.strip()
-    if p.returncode != 0 or not was:
+    if source.live_ref is None:
+        if p.returncode == 0 and was:
+            out(
+                f"  WARNING: live was at {was[:12]}, not absent, when the move ran; "
+                f"{was[:12]} is kept in live's reflog."
+            )
+    elif p.returncode != 0 or not was:
         out(
             f"  NOTE: the reflog of `live` could not be read; it was {source.live_ref[:12]} before."
         )

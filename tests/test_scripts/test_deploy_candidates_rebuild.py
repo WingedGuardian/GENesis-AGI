@@ -1417,3 +1417,136 @@ def test_a_git_that_cannot_say_which_branch_is_checked_out_is_unknown(dc, dc_rea
     repo.git = git
     with pytest.raises(dc.core.Unknown, match="which branch"):
         dc.plan.read_source(repo)
+
+
+def _after_the_lock(dc, monkeypatch, act) -> list[int]:
+    """``act`` runs on the first tree comparison inside the locked move: after
+    the lock-time check, before any write or success return. Returns a list
+    holding 2 once it fired."""
+    armed: list[int] = []
+    real_lock, real_tree = dc.plan._acquire_checkout_lock, dc.Engine.tree
+
+    def lock(repo):
+        fd = real_lock(repo)
+        armed.append(1)
+        return fd
+
+    def tree(self, *a, **kw):
+        if len(armed) == 1:
+            armed.append(2)
+            act()
+        return real_tree(self, *a, **kw)
+
+    monkeypatch.setattr(dc.plan, "_acquire_checkout_lock", lock)
+    monkeypatch.setattr(dc.Engine, "tree", tree)
+    return armed
+
+
+def test_a_tracked_edit_after_the_lock_refuses_the_unchanged_result(
+    dc, dc_ready, capsys, monkeypatch
+):
+    """Nothing would move, but update.sh restarts on whatever tree this run
+    reports as its own: an edit made inside the locked move is refused."""
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    head = w.rev("HEAD")
+    armed = _after_the_lock(
+        dc, monkeypatch, lambda: (w.root / "a.txt").write_text("a session's edit\n")
+    )
+    assert w.run(dc, "rebuild") == 1
+    err = capsys.readouterr().err
+    assert armed == [1, 2], "the edit never landed inside the locked move"
+    assert "a.txt" in err and "not where its caller left it" in err, err
+    assert w.rev("HEAD") == head
+
+
+@pytest.mark.parametrize("path", ["ref", "switch"])
+def test_live_checked_out_in_a_linked_worktree_inside_the_move_refuses(
+    dc, dc_ready, capsys, monkeypatch, path
+):
+    """`switch -C` and `update-ref` both move `live` under a worktree that has it
+    checked out: the re-check before each write includes that worktree."""
+    w = dc_ready
+    if path == "ref":
+        w.candidate("feat/a", {"x.txt": "x\n"})
+        w.write_manifest([w.entry("feat/a")])
+        assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+        w.advance_main({"x.txt": "x\n"}, "squash of feat/a")
+    else:
+        _second_rebuild_world(dc, w, capsys)
+    tip = w.rev("refs/heads/live")
+    other = w.tmp / "other-live"
+    armed = _after_the_lock(
+        dc, monkeypatch, lambda: w.git(w.root, "worktree", "add", "-q", "-f", str(other), "live")
+    )
+    rc, rec = _rebuild_with_record(dc, w)
+    err = capsys.readouterr().err
+    assert armed == [1, 2], "the worktree was never added inside the locked move"
+    assert rc == 1 and "another worktree" in err, err
+    assert w.rev("refs/heads/live") == tip and not rec.exists()
+
+
+def test_a_drop_off_live_refuses_a_branch_switch_before_the_manifest_write(
+    dc, dc_ready, capsys, monkeypatch
+):
+    """Off `live` the drop only edits the manifest; a switch onto `live` in
+    between would leave the dropped code running with no rebuild: refuse."""
+    w = dc_ready
+    _second_rebuild_world(dc, w, capsys)
+    w.git(w.root, "switch", "-q", "main")
+    before = w.manifest_path.read_text()
+    real = dc.Engine._off_live_hook_refusal
+
+    def switch_then_judge(self, *a, **kw):
+        w.git(w.root, "switch", "-q", "live")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(dc.Engine, "_off_live_hook_refusal", switch_then_judge)
+    assert w.run(dc, "drop", "feat/b") == 1
+    err = capsys.readouterr().err
+    assert "not where its caller left it" in err and "nothing changed" in err, err
+    assert w.manifest_path.read_text() == before
+
+
+def test_a_drop_on_live_refuses_a_moved_source_before_the_manifest_write(
+    dc, dc_ready, capsys, monkeypatch
+):
+    w = dc_ready
+    _second_rebuild_world(dc, w, capsys)
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    before = w.manifest_path.read_text()
+    real = dc.Engine._refuse_blockers
+
+    def edit_then_check(self, *a, **kw):
+        (w.root / "a.txt").write_text("a session's edit\n")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(dc.Engine, "_refuse_blockers", edit_then_check)
+    assert w.run(dc, "drop", "feat/b") == 1
+    err = capsys.readouterr().err
+    assert "not where its caller left it" in err and "a.txt" in err, err
+    assert w.manifest_path.read_text() == before
+
+
+def test_a_raced_creation_of_live_is_warned(dc, dc_ready, capsys, monkeypatch):
+    """`live` did not exist when the move was planned, but a session created it
+    in the residual window: `switch -C` resets it, the reflog keeps it."""
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    base = w.rev("HEAD")
+    other = w.git(w.root, "commit-tree", w.rev("HEAD^{tree}"), "-p", base, "-m", "raced").stdout
+    other = other.strip()
+    real_git = dc.Engine.git
+
+    def git(self, *args, **kw):
+        if args and args[0] == "switch":
+            real_git(self, "update-ref", "refs/heads/live", other, "")
+        return real_git(self, *args, **kw)
+
+    monkeypatch.setattr(dc.Engine, "git", git)
+    assert w.run(dc, "rebuild") == 0
+    out = capsys.readouterr().out
+    assert f"WARNING: live was at {other[:12]}, not absent" in out, out

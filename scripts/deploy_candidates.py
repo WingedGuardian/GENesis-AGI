@@ -50,9 +50,11 @@ Commands:
         next step.
   rebuild / drop [--expect-branch B --expect-head C]
         Both or neither. The checkout must be on B at C (update.sh passes where
-        it verified it), or nothing changes. With or without them, the move
-        re-checks the branch, HEAD, `live` and the tracked tree it planned from
-        once it holds genesis-checkout.lock, and again before its first write.
+        it verified it), or nothing changes. With or without them, the branch,
+        HEAD, `live`, another worktree on `live` and the tracked tree it read
+        are re-checked once the move holds genesis-checkout.lock, and again
+        before its first write or its "unchanged" result; drop also re-checks
+        them before it writes the manifest.
   list  The manifest as written (checked to be this repository's). No network.
   status
         READINESS, and per candidate: whether it is in `live` now, what the next
@@ -682,7 +684,7 @@ class Engine(Repo):
 
     def cmd_drop(self, branch: str, no_rebuild: bool, expect: tuple[str, str] | None = None) -> int:
         self.require_update_lock()
-        self._expected_source(expect)
+        source = self._expected_source(expect)
         # No manifest: nothing to drop, and the manifest is not created.
         if not self.store.exists():
             raise Refusal(
@@ -698,11 +700,13 @@ class Engine(Repo):
             keep = [c for c in d["candidates"] if c["branch"] != branch]
             return None if len(keep) == len(d["candidates"]) else {**d, "candidates": keep}
 
-        on_live = self.current_branch() == LIVE_BRANCH
+        on_live = source.branch_ref == LIVE_REF
         if not on_live or no_rebuild:
             refusal = None if on_live else self._off_live_hook_refusal(branch, data)
             if refusal:
                 raise Refusal(refusal)
+            # Decided on `source`: the manifest changes only while it still holds.
+            plan.refuse_moved_source(self, source, "nothing changed")
             after = self.store.update(remove)
             out(f"{branch} dropped from {self.store.path}.")
             core.after_move(
@@ -749,6 +753,7 @@ class Engine(Repo):
         )
         self._print_plan(p)
         self._refuse_blockers(p.tip, "the manifest still lists " + branch)
+        plan.refuse_moved_source(self, source, "nothing changed")
         after = self.store.update(remove)
         out(f"  {branch} dropped from {self.store.path}.")
         try:
