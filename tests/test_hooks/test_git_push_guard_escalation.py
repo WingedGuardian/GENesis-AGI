@@ -507,6 +507,86 @@ def test_comment_identity_parser_keeps_supported_literal_forms(command, number, 
     assert _mod._comment_target(_argv(command)) == (number, repo)
 
 
+@pytest.mark.parametrize("flag", ["--repo {}", "--repo={}", "-R {}", "-R{}", "-R={}"])
+@pytest.mark.parametrize("repo", ["owner/repo", "other/repo", "github.com/owner/repo"])
+@pytest.mark.parametrize("placement", ["global", "before", "after"])
+def test_mixed_review_selectors_deny_before_budget(monkeypatch, capsys, flag, repo, placement):
+    selector = flag.format(repo)
+    url = "https://github.com/owner/repo/pull/1372"
+    command = {
+        "global": f"gh {selector} pr comment {url}",
+        "before": f"gh pr comment {selector} {url}",
+        "after": f"gh pr comment {url} {selector}",
+    }[placement] + ' --body "@codex review"'
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", lambda *a, **kw: pytest.fail("budget lookup"))
+    monkeypatch.setattr(_mod, "_derive_repo_from_cwd", lambda *a: pytest.fail("cwd fallback"))
+    assert _mod._comment_target(_argv(command)) == (None, None)
+    assert _decision(command)[0] == "deny"
+    _payload(monkeypatch, command)
+    assert _mod.main() == 2
+    assert "Never combine a URL" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("selector", [
+    "https://elsewhere.invalid/owner/repo/pull/1372",
+    "http://elsewhere.invalid/owner/repo/pull/1372",
+    "1372 --repo elsewhere.invalid/owner/repo",
+    "1372 -Relsewhere.invalid/owner/repo",
+    "1372 --repo=elsewhere.invalid/owner/repo",
+    "ssh://github.com/owner/repo/pull/1372",
+])
+def test_unsupported_explicit_review_hosts_deny_before_budget(monkeypatch, capsys, selector):
+    command = f'gh pr comment {selector} --body "@codex review"'
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", lambda *a, **kw: pytest.fail("budget lookup"))
+    assert _mod._comment_target(_argv(command)) == (None, None)
+    _payload(monkeypatch, command)
+    assert _mod.main() == 2
+    assert "Other explicit hosts are unsupported" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags", ['--repo ""', "--repo=", '-R ""', "-R=", "--repo", "-R",
+                                     "--repo owner/repo --repo="])
+def test_empty_repo_flag_does_not_erase_mixed_review_identity(monkeypatch, flags):
+    command = f'gh pr comment https://github.com/owner/repo/pull/1372 --body "@codex review" {flags}'
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", lambda *a, **kw: pytest.fail("budget lookup"))
+    assert _mod._comment_target(_argv(command)) == (None, None)
+    assert _decision(command)[0] == "deny"
+
+
+@pytest.mark.parametrize("selector", [
+    "1372", "'#1372'", "1372 --repo owner/repo", "1372 --repo=owner/repo",
+    "1372 -R owner/repo", "1372 -Rowner/repo", "1372 -R=owner/repo",
+    "1372 --repo github.com/owner/repo", "https://github.com/owner/repo/pull/1372",
+    "http://github.com/owner/repo/pull/1372/files#x", "owner/repo/pull/1372",
+])
+def test_literal_review_identity_queries_intended_budget(monkeypatch, selector):
+    seen = []
+
+    def budget(repo, number, **kwargs):
+        seen.append((repo, number))
+        return {"status": "ok", "approval_required": False}
+
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", budget)
+    monkeypatch.setattr(_mod, "_derive_repo_from_cwd", lambda *a: "owner/repo")
+    assert _decision(f'gh pr comment {selector} --body "@codex review"') == ("allow", "")
+    assert seen == [("owner/repo", "1372")]
+
+
+@pytest.mark.parametrize("body", ['--body "--repo other/repo @codex review"',
+                                 '-b "-Rother/repo @codex review"',
+                                 '--body="--repo=other/repo @codex review"'])
+def test_url_review_body_flags_do_not_create_mixed_selector(monkeypatch, body):
+    seen = []
+
+    def budget(repo, number, **kwargs):
+        seen.append((repo, number))
+        return {"status": "ok", "approval_required": False}
+
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", budget)
+    assert _decision(f"gh pr comment https://github.com/owner/repo/pull/1372 {body}") == ("allow", "")
+    assert seen == [("owner/repo", "1372")]
+
+
 @pytest.mark.parametrize(
     "command",
     [
