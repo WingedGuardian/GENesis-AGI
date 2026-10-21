@@ -1976,6 +1976,12 @@ _server_health_ok() {
 _do_rollback() {
     local reason="$1"
     local degraded="${2:-}"
+    # 1 = a restarted genesis-server must also answer its health endpoint before
+    # the verdict counts the rollback complete. Only the live units refusal asks
+    # (its exit 4 promises the old tip is back and up); every other caller passes
+    # nothing (read as 0, so set -u never trips on it), and main's rollback never
+    # waits on it.
+    local verify_health="${3:-0}"
 
     # Disarm the ERR trap to prevent recursive rollback
     trap - ERR INT TERM
@@ -2234,6 +2240,21 @@ _do_rollback() {
     if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ] \
         && [ "$hooks_ok" = true ] && [ "$svc_ok" = true ]; then
         rollback_ok=true
+    fi
+    # _start_genesis_server's fallback returns 0 whether or not the server came
+    # back, so when asked, health is part of this verdict, decided before anything
+    # is recorded. Asked only of a rollback that is otherwise complete: an
+    # incomplete one is already reported so, and never pays the wait. The traps
+    # are already disarmed: a TERM during this wait (up to _server_health_ok's
+    # 180 s bound) ends the run with no final history row (the run's open row
+    # stays unfinished) and no failure file, and keeps the state file (the clear
+    # below never runs), which is fail-safe: nothing claims the rollback succeeded.
+    if [ "$rollback_ok" = true ] && [ "$verify_health" = 1 ] && [ "$restart_ok" = "true" ] \
+        && [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+        _server_health_ok || {
+            rollback_ok=false
+            echo "  CRITICAL: genesis-server was restarted but did not answer its health endpoint"
+        }
     fi
     if [ "$rollback_ok" = true ]; then
         echo "  Rolled back to $ROLLBACK_TAG (code, deps$([ "${MIGRATIONS_RAN:-0}" = "1" ] && echo ", database"))."
@@ -2756,13 +2777,15 @@ if [ "$_mu_rc" -ne 0 ]; then
         printf '%s\n' "$_mu_out" | sed 's/^/  /'
     fi
     trap - ERR INT TERM
-    _do_rollback "the rebuilt live's systemd units were refused (exit $_mu_rc)"
-    # 4 promises the old tip is back; a rollback that did not complete is a failure,
-    # and leaves no refusal record (the dashboard reads its presence as exit 4's).
-    # _start_genesis_server's fallback returns 0 whether or not the server came
-    # back, so a server that was running must also answer its health endpoint.
-    if [ "$_mu_rc" -eq 4 ] && [ "${_ROLLBACK_CLEAN:-0}" = 1 ] \
-        && { [[ " ${WERE_RUNNING[*]} " != *" genesis-server "* ]] || _server_health_ok; }; then
+    # 4 promises the old tip is back, hooks, services and a healthy server: only
+    # that path asks _do_rollback to put health in its verdict (any other exit
+    # code here is 1 whatever the health, so it never pays the wait).
+    _mu_health=""
+    [ "$_mu_rc" -ne 4 ] || _mu_health=1
+    _do_rollback "the rebuilt live's systemd units were refused (exit $_mu_rc)" "" "$_mu_health"
+    # A rollback that did not complete is a failure, and leaves no refusal record
+    # (the dashboard reads its presence as exit 4's).
+    if [ "$_mu_rc" -eq 4 ] && [ "${_ROLLBACK_CLEAN:-0}" = 1 ]; then
         # deploy_head = the commit judged: here the rebuilt tip (candidates
         # included). Nothing may merge it; the orchestrator reads only the
         # record's presence.

@@ -3938,12 +3938,22 @@ tool-disabled CC probe without changing its schedule or routing authority.
   never inferred from git: a moved checkout is adopted only when HEAD is on
   `live` at exactly the commit the record names, then moved back to the
   rollback tag with its git hooks restored (`restore-hooks`), and the services
-  restart on the old tip. A record that cannot be read, or that says the switch
-  began or wrote part of the tree while HEAD is not at its target, means a
-  possibly mixed working tree: nothing is restarted and the rollback reports
-  itself incomplete. Exit 4 after such a rollback needs it to have completed,
-  hook restore and every service restart included; otherwise the run exits 1
-  and leaves no `update_refused.json`.
+  restart on the old tip. `restore-hooks` exits 1 when a hook could not be
+  restored, the hook list could not be read, `sync-hooks.sh` is missing, fails,
+  times out or exits non-zero, or afterwards any hook the checkout lists is not
+  installed byte-identical and executable (readiness's own check,
+  `hook_install_failures` in `deploy_candidates_gate.py`), a hand-edited hook
+  included; the rollback then reports itself incomplete (a rebuild or drop,
+  past its commit point, only warns). A record that cannot be read, or that
+  says the switch began or wrote part of the tree while HEAD is not at its
+  target, means a possibly mixed working tree: nothing is restarted and the
+  rollback reports itself incomplete. Exit 4 after such a rollback needs it to
+  have completed, hook restore, every service restart and a restarted
+  genesis-server answering its health endpoint included; that health wait (up
+  to 180 s) runs only on the units-refusal path that can exit 4, inside the
+  rollback's single verdict, so the history row, `last_update_failure.json` and
+  the exit code agree. Otherwise the run exits 1 and leaves no
+  `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.

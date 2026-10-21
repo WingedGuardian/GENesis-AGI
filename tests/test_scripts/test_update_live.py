@@ -569,20 +569,36 @@ def test_a_partly_written_tree_is_never_restarted(plain_live, mode):
 _REFUSE_UNITS = 'import sys\nprint("REFUSED: demo.service (edited by hand)")\nsys.exit(4)\n'
 
 
+_UNHEALTHY = '_server_health_ok() { echo "health-probe" >> "$CALLS"; return 1; }\n'
+
+
 @pytest.mark.parametrize(
-    ("hooks_fail", "pre", "rc"),
+    ("hooks_fail", "pre", "rc", "probes"),
     [
-        ("0", "", 4),
-        ("1", "", 1),
-        ("0", '_start_genesis_server() { echo "restart-server" >> "$CALLS"; return 1; }\n', 1),
-        ("0", "_server_health_ok() { return 1; }\n", 1),
+        ("0", "", 4, 1),
+        ("1", "", 1, 0),
+        ("1", _UNHEALTHY, 1, 0),
+        ("0", '_start_genesis_server() { echo "restart-server" >> "$CALLS"; return 1; }\n', 1, 0),
+        ("0", _UNHEALTHY, 1, 1),
     ],
-    ids=["clean", "hook-restore-fails", "restart-fails", "restarted-but-unhealthy"],
+    ids=[
+        "clean",
+        "hook-restore-fails",
+        "hook-restore-fails-never-waits-on-health",
+        "restart-fails",
+        "restarted-but-unhealthy",
+    ],
 )
-def test_exit_4_needs_a_rollback_that_completed(plain_live, hooks_fail, pre, rc):
+def test_exit_4_needs_a_rollback_that_completed(plain_live, hooks_fail, pre, rc, probes):
     """Codex P2 (F5, F6): exit 4 promises the old tip is back with its hooks and
     its services; a failed hook restore or service restart exits 1 instead, and
-    only an exit 4 leaves the refusal record the dashboard reads."""
+    only an exit 4 leaves the refusal record the dashboard reads.
+
+    #3492 gap 3: a server that was restarted but never answers its health
+    endpoint is part of the same single verdict, decided BEFORE anything is
+    recorded: the history row, the failure file and the exit code agree, and
+    the health endpoint is asked once, and only of a rollback that is otherwise
+    complete (an incomplete one never pays the wait)."""
     root, home, stub, env, log = plain_live
     r = _bash(
         _plain_script(root, stub, _REFUSE_UNITS, pre),
@@ -594,12 +610,44 @@ def test_exit_4_needs_a_rollback_that_completed(plain_live, hooks_fail, pre, rc)
     assert refused.exists() is (rc == 4), "a refusal record without exit 4 (or the reverse)"
     # One verdict for every report: a rollback whose hooks or services did not
     # come back is recorded as incomplete, not "rolled_back" (Devin/CodeRabbit).
-    complete = hooks_fail == "0" and "_start_genesis_server" not in pre
+    complete = rc == 4
     calls = _calls(home)
     assert ("history rolled_back" in calls) is complete, calls
     assert ("history failed" in calls) is (not complete), calls
     failure = json.loads((home / ".genesis" / "last_update_failure.json").read_text())
     assert failure["rollback_complete"] is complete, failure
+    assert calls.count("health-probe") == probes, calls
+    if probes:
+        history = next(i for i, c in enumerate(calls) if c.startswith("history "))
+        assert calls.index("health-probe") < history, "health was asked after the verdict"
+
+
+def test_a_units_check_that_could_not_run_never_waits_on_health(plain_live):
+    """Only exit 4's promise needs a healthy server: a units check that failed
+    to run (exit 2) exits 1 whatever the health, so it never pays the wait."""
+    root, home, stub, env, log = plain_live
+    r = _bash(
+        _plain_script(root, stub, "import sys\nsys.exit(2)\n", _UNHEALTHY),
+        {**env, "STUB_MODE": "move"},
+    )
+    assert r.returncode == 1, _out(r)
+    calls = _calls(home)
+    assert "health-probe" not in calls and "history rolled_back" in calls, calls
+
+
+def test_a_rollback_called_main_s_way_never_waits_on_health(plain_live):
+    """Main's callers pass no third argument: no health wait, even with a stray
+    variable of the old global's shape in the environment."""
+    root, home, stub, env, log = plain_live
+    main_call = 'ON_LIVE=0\n_do_rollback "a main-shaped failure" "some-subsystem"\nexit 0\n'
+    r = _bash(
+        _plain_script(root, stub, "import sys\n", _UNHEALTHY + main_call),
+        {**env, "_ROLLBACK_HEALTH": "1", "VERIFY_HEALTH": "1"},
+    )
+    assert r.returncode == 0, _out(r)
+    calls = _calls(home)
+    assert "restart-server" in calls and "history rolled_back" in calls, calls
+    assert "health-probe" not in calls, calls
 
 
 def test_u5_order_snapshot_stop_merging_engine_bootstrap():

@@ -56,6 +56,8 @@ REQUIRED_MERGED: tuple[tuple[str, str], ...] = (
 PR_C_MARKER = "scripts/lib/deploy_live.sh"
 SYNC_HOOKS = "scripts/hooks/sync-hooks.sh"
 _SYNC_ARRAYS = ("HOOKS_TO_SYNC", "HELPERS_TO_SYNC")
+# The helpers: sync-hooks.sh overwrites these whatever their bytes.
+HELPER_ARRAYS = ("HELPERS_TO_SYNC",)
 
 # ── Admission (v1) ────────────────────────────────────────────────────────
 # Migrations are refused (owner, 2026-09-27); the boot-time schema files carry
@@ -143,13 +145,13 @@ ENGINE_PREFIX = "scripts/deploy_candidates"
 
 
 # ── readiness ─────────────────────────────────────────────────────────────
-def sync_hook_names(text: str) -> list[str]:
-    """Every name in sync-hooks.sh's HOOKS_TO_SYNC and HELPERS_TO_SYNC arrays
-    (one quoted name per line). Strict: an append (`+=`), a second assignment,
+def sync_hook_names(text: str, arrays: tuple[str, ...] = _SYNC_ARRAYS) -> list[str]:
+    """Every name in sync-hooks.sh's HOOKS_TO_SYNC and HELPERS_TO_SYNC arrays, or
+    in ``arrays`` only (one quoted name per line). Strict: an append (`+=`), a second assignment,
     an unquoted or one-line array refuses, since a list read short would pass
     over hooks nobody checked."""
     names: list[str] = []
-    for array in _SYNC_ARRAYS:
+    for array in arrays:
         if re.search(rf"^\s*{array}\+=", text, re.MULTILINE):
             raise Refusal(f"{SYNC_HOOKS} appends to {array}; the readiness check cannot read it")
         blocks = re.findall(rf"^{array}=\(\n(.*?)^\)", text, re.MULTILINE | re.DOTALL)
@@ -238,6 +240,16 @@ def readiness_failures(repo: Repo, base: str) -> list[str]:
                     f"PR C (the wipers rebuild `live`) is not in {judged} {mb[:12]}: "
                     f"{PR_C_MARKER} does not exist there (it has not merged, or is not deployed)"
                 )
+    return fails + hook_install_failures(repo)
+
+
+def hook_install_failures(repo: Repo) -> list[str]:
+    """Why the installed git hooks are not the ones sync-hooks.sh installs from
+    HEAD ([] when they are): every hook HEAD's list names must be installed,
+    byte-identical to scripts/hooks/<name> at HEAD and executable, in the
+    directory git runs hooks from. Readiness's hook check, and restore-hooks'
+    post-condition (sync-hooks.sh exits 0 even when one of its copies failed)."""
+    fails: list[str] = []
     text = repo.show("HEAD", SYNC_HOOKS)
     if text is None:
         fails.append(f"cannot read {SYNC_HOOKS} at HEAD")
