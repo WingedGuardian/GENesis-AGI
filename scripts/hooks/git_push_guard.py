@@ -5253,10 +5253,16 @@ def _format_rounds(result: dict) -> str:
     )
     parts = [f"{count} ({'gate' if gate else 'ordinary'} lane, terminal at {limit})"]
     rounds = result.get("rounds") or []
-    if result.get("round_state") == "open" and rounds:
-        newest = rounds[-1]
-        who = ", ".join(newest.get("reviewers") or []) or "pre-cutover rule"
-        parts.append(f"open at {str(newest.get('head'))[:10]} ({who})")
+    if result.get("round_state") == "open":
+        # The head's own round, by identity: ``rounds`` is in commit-list (date)
+        # order, so its last entry need not be the head's (#3302).
+        head = result.get("current_head")
+        own = next((r for r in rounds if r.get("head") == head), None)
+        if own is None:
+            who = "no round entry for the head"
+        else:
+            who = ", ".join(own.get("reviewers") or []) or "pre-cutover rule"
+        parts.append(f"open at {str(head)[:10]} ({who})")
     elif result.get("round_state") == "complete":
         parts.append("complete (a commit has landed since the last round)")
     counts = [r.get("findings") for r in rounds if r.get("findings") is not None]
