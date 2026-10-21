@@ -93,7 +93,9 @@ async def _impl_skill_usage_status(days: float = 14.0, ctx: Context | None = Non
         population = await _in_thread(usage._default_population)
         scanner = usage.Scanner(since, until)
         files = await _in_thread(
-            lambda: list(usage.iter_transcript_files(usage.claude_root() / "projects", since))
+            lambda: list(
+                usage.iter_transcript_files(usage.claude_root() / "projects", since, scanner.issues)
+            )
         )
         last_sent = time.monotonic()
         report_failed = False

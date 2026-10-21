@@ -448,8 +448,8 @@ def test_conversion_counts_a_use_after_the_nudge_in_the_same_session(env):
         ],
     )
     r = row(report(env), "alpha")
-    assert r["sessions_nudged"] == {"interactive": 2, "headless": 1, "total": 3}
-    assert r["conversion"] == {"interactive": 0.5, "headless": 1.0, "total": 0.667}
+    assert r["sessions_nudged"] == {"interactive": 2, "headless": 1, "unknown": 0, "total": 3}
+    assert r["conversion"] == {"interactive": 0.5, "headless": 1.0, "unknown": None, "total": 0.667}
     assert r["sessions_used"]["total"] == 3
 
 
@@ -473,6 +473,7 @@ def test_never_nudged_skill_has_null_conversion(env):
     assert row(report(env), "alpha")["conversion"] == {
         "interactive": None,
         "headless": None,
+        "unknown": None,
         "total": None,
     }
 
@@ -504,9 +505,9 @@ def test_subagent_records_credit_parent_and_kinds_split(env):
     write_transcript(env["projects"], "bg", "h1", [skill_load("h1", "alpha", kind="sdk-cli")])
     rep = report(env)
     assert rep["subagent_files"] == 1
-    assert rep["sessions_scanned"] == {"interactive": 1, "headless": 1, "total": 2}
+    assert rep["sessions_scanned"] == {"interactive": 1, "headless": 1, "unknown": 0, "total": 2}
     assert row(rep, "beta")["sessions_used"]["interactive"] == 1
-    assert row(rep, "alpha")["loads"] == {"interactive": 1, "headless": 1, "total": 2}
+    assert row(rep, "alpha")["loads"] == {"interactive": 1, "headless": 1, "unknown": 0, "total": 2}
 
 
 def test_malformed_and_half_written_lines_are_counted_not_raised(env):
@@ -663,7 +664,7 @@ def test_parent_transcript_decides_session_kind(env):
     )
     write_transcript(env["projects"], "p", "s1", [skill_load("s1", "alpha")])
     rep = report(env)
-    assert rep["sessions_scanned"] == {"interactive": 1, "headless": 0, "total": 1}
+    assert rep["sessions_scanned"] == {"interactive": 1, "headless": 0, "unknown": 0, "total": 1}
     assert row(rep, "beta")["loads"]["interactive"] == 1
 
 
@@ -779,7 +780,7 @@ def test_wrong_shaped_records_are_non_signals_not_errors(env, build, bad):
     record is skipped and the scan still reports the good record after it."""
     # Every prefilter token, so the mangled record reaches the parser rather
     # than being skipped as a line that cannot hold a signal.
-    pad = {"Skill": "SKILL.md Base directory for this skill skill_injection_hook"}
+    pad = {"Skill": "SKILL.md skill.md Base directory for this skill skill_injection_hook"}
     record = build(bad) | {"pad": pad}
     assert all(t in json.dumps(record).encode() for t in usage._PREFILTER)
     write_transcript(env["projects"], "p", "s1", [record, skill_load("s1", "alpha")])
@@ -934,7 +935,9 @@ def test_a_wrong_shaped_catalog_never_aborts_the_report(tmp_path, catalog):
         catalog_path=path, user_skills_dir=tmp_path / "n", plugins_manifest=tmp_path / "n.json"
     )
     rep = usage.build_report(usage.Scanner(SINCE, NOW), pop, None, duration_s=0)
-    assert rep["status"] == "ok"
+    assert rep["status"] == "partial"  # no DB here; never an exception
+    if isinstance(catalog, list):
+        assert {"input": "catalog", "path": str(path), "mode": "malformed"} in rep["input_issues"]
 
 
 @pytest.mark.parametrize(
@@ -958,7 +961,7 @@ def test_a_wrong_shaped_plugin_manifest_never_aborts_the_report(env, tmp_path, m
     rep = usage.run_scan(
         projects_root=env["projects"], since=SINCE, until=NOW, population=pop, injected=None
     )
-    assert rep["status"] == "ok"
+    assert rep["status"] == "partial"  # missing catalog, no DB; never an exception
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 directory")
@@ -978,7 +981,10 @@ def test_an_unreadable_source_directory_is_an_error_entry_not_a_crash(tmp_path):
             (tmp_path / name).chmod(0o755)
     errors = {s["source"]: s.get("error", "") for s in pop.sources}
     assert errors["user"].startswith("PermissionError") and errors["commands"]
-    assert usage.build_report(usage.Scanner(SINCE, NOW), pop, None, duration_s=0)["status"] == "ok"
+    rep = usage.build_report(usage.Scanner(SINCE, NOW), pop, None, duration_s=0)
+    assert rep["status"] == "partial"
+    modes = {(i["input"], i["mode"]) for i in rep["input_issues"]}
+    assert {("user", "unreadable"), ("commands", "unreadable")} <= modes
 
 
 def test_a_non_string_tool_name_and_bad_utf8_ids_are_skipped(env):
@@ -1087,3 +1093,268 @@ def test_one_bad_entry_costs_only_itself_and_counts_stay_true(tmp_path):
     assert "good:s1" in pop.skills and by["plugins"]["skills"] == 1
     assert "PermissionError" in by["plugins"]["error"]
     assert sum(s["skills"] for s in pop.sources) == len(pop.skills)
+
+
+# --- round 4: every input failure is an issue, and the run says partial -----------------
+
+_NOT_ROOT = pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 paths")
+
+
+def _modes(rep: dict) -> set[tuple[str, str]]:
+    return {(i["input"], i["mode"]) for i in rep["input_issues"]}
+
+
+def test_a_clean_run_is_ok_with_no_issues(env):
+    write_transcript(env["projects"], "p", "s1", [skill_load("s1", "alpha")])
+    rep = report(env, injected=usage.count_injected([]))
+    assert rep["status"] == "ok" and rep["input_issues"] == []
+
+
+def test_a_missing_projects_root_is_partial_not_an_empty_ok(env):
+    rep = usage.run_scan(
+        projects_root=env["tmp"] / "nowhere",
+        since=SINCE,
+        until=NOW,
+        population=env["population"],
+        injected=usage.count_injected([]),
+    )
+    assert rep["status"] == "partial" and ("projects_root", "missing") in _modes(rep)
+
+
+@_NOT_ROOT
+@pytest.mark.parametrize("target", ["root", "project", "subagents", "transcript"])
+def test_an_unreadable_transcript_location_is_an_issue(env, target):
+    write_transcript(env["projects"], "p", "s1", [skill_load("s1", "alpha")])
+    write_transcript(env["projects"], "p", "a1", [skill_load("s1", "beta")], subagent_of="s1")
+    path = {
+        "root": env["projects"],
+        "project": env["projects"] / "p",
+        "subagents": env["projects"] / "p" / "s1" / "subagents",
+        "transcript": env["projects"] / "p" / "s1.jsonl",
+    }[target]
+    path.chmod(0)
+    try:
+        rep = report(env, injected=usage.count_injected([]))
+    finally:
+        path.chmod(0o755)
+    expected = {
+        "root": "projects_root",
+        "project": "project_dir",
+        "subagents": "transcript_dir",
+        "transcript": "transcript",
+    }[target]
+    assert rep["status"] == "partial"
+    assert (expected, "unreadable") in _modes(rep)
+
+
+@pytest.mark.parametrize(
+    ("content", "mode"),
+    [(None, "missing"), ("{not json", "malformed"), ("[1, 2]", "malformed")],
+    ids=["missing", "bad-json", "not-an-object"],
+)
+def test_a_catalog_that_cannot_be_used_is_an_issue(tmp_path, content, mode):
+    path = tmp_path / "c.json"
+    if content is not None:
+        path.write_text(content)
+    pop = usage.load_population(
+        catalog_path=path, user_skills_dir=tmp_path / "n", plugins_manifest=tmp_path / "n.json"
+    )
+    assert ("catalog", mode) in {(i["input"], i["mode"]) for i in pop.issues}
+
+
+def test_a_missing_plugin_manifest_is_no_plugins_but_a_malformed_one_is_an_issue(tmp_path):
+    kw = {"catalog_path": tmp_path / "c.json", "user_skills_dir": tmp_path / "n"}
+    pop = usage.load_population(plugins_manifest=tmp_path / "none.json", **kw)
+    assert not [i for i in pop.issues if i["input"] == "plugins"]
+    (tmp_path / "m.json").write_text("{nope")
+    pop = usage.load_population(plugins_manifest=tmp_path / "m.json", **kw)
+    assert ("plugins", "malformed") in {(i["input"], i["mode"]) for i in pop.issues}
+
+
+@_NOT_ROOT
+def test_an_unreadable_catalog_file_is_an_issue(tmp_path):
+    path = tmp_path / "c.json"
+    path.write_text("{}")
+    path.chmod(0)
+    try:
+        pop = usage.load_population(
+            catalog_path=path, user_skills_dir=tmp_path / "n", plugins_manifest=tmp_path / "n.json"
+        )
+    finally:
+        path.chmod(0o644)
+    assert ("catalog", "unreadable") in {(i["input"], i["mode"]) for i in pop.issues}
+
+
+@_NOT_ROOT
+def test_an_unreadable_skill_dir_is_an_issue_not_a_vanished_skill(tmp_path):
+    user = tmp_path / "user"
+    (user / "locked").mkdir(parents=True)
+    (user / "locked" / "SKILL.md").write_text("x")
+    (user / "locked").chmod(0)
+    try:
+        pop = usage.load_population(
+            catalog_path=tmp_path / "c.json", user_skills_dir=user, plugins_manifest=tmp_path / "n"
+        )
+    finally:
+        (user / "locked").chmod(0o755)
+    assert ("skill_dir", "unreadable") in {(i["input"], i["mode"]) for i in pop.issues}
+
+
+def test_lowercase_skill_md_is_a_skill_and_reading_it_is_a_use(tmp_path, env):
+    user = tmp_path / "lower"
+    (user / "quiet").mkdir(parents=True)
+    (user / "quiet" / "skill.md").write_text("x")
+    pop = usage.load_population(
+        catalog_path=tmp_path / "c.json", user_skills_dir=user, plugins_manifest=tmp_path / "n"
+    )
+    assert "quiet" in pop.skills
+    write_transcript(
+        env["projects"], "p", "s1", [tool_use("s1", "Read", str(user / "quiet" / "skill.md"))]
+    )
+    rep = usage.run_scan(
+        projects_root=env["projects"], since=SINCE, until=NOW, population=pop, injected=None
+    )
+    assert row(rep, "quiet")["reads"]["total"] == 1
+
+
+def test_a_session_without_an_entrypoint_is_unknown_not_headless(env):
+    r = skill_load("s1", "alpha")
+    del r["entrypoint"]
+    write_transcript(env["projects"], "p", "s1", [r])
+    rep = report(env)
+    assert rep["sessions_scanned"] == {"interactive": 0, "headless": 0, "unknown": 1, "total": 1}
+    assert row(rep, "alpha")["loads"]["unknown"] == 1
+
+
+def test_state_is_given_per_kind(env):
+    write_transcript(env["projects"], "bg", "h1", [skill_load("h1", "alpha", kind="sdk-py")])
+    write_transcript(
+        env["projects"], "p", "s1", [nudge("s1", "[Skill] The 'alpha' skill is relevant here.")]
+    )
+    r = row(report(env), "alpha")
+    assert r["state"] == "active"
+    assert r["state_by_kind"] == {"interactive": "zombie", "headless": "active"}
+
+
+def test_many_interactive_sessions_with_no_use_at_all_raise_the_canary(env, monkeypatch):
+    monkeypatch.setattr(usage, "_NO_SIGNAL_SESSIONS", 3)
+    for i in range(3):
+        write_transcript(
+            env["projects"], "p", f"s{i}", [rec(f"s{i}", type="user", message={"content": "hi"})]
+        )
+    rep = report(env, injected=usage.count_injected([]))
+    assert ("transcripts", "no_signal") in _modes(rep) and rep["status"] == "partial"
+
+
+# --- round 4 review: the gaps the ledger still had ------------------------------------------
+
+
+@_NOT_ROOT
+def test_an_unreadable_session_dir_is_an_issue_not_lost_subagents(env):
+    write_transcript(env["projects"], "p", "s1", [skill_load("s1", "alpha")])
+    write_transcript(env["projects"], "p", "a1", [skill_load("s1", "beta")], subagent_of="s1")
+    session_dir = env["projects"] / "p" / "s1"
+    session_dir.chmod(0o600)
+    try:
+        rep = report(env, injected=usage.count_injected([]))
+    finally:
+        session_dir.chmod(0o755)
+    assert rep["status"] == "partial" and ("transcript_dir", "unreadable") in _modes(rep)
+
+
+@pytest.mark.parametrize(
+    ("catalog", "expected"),
+    [
+        ({"skills": [{"name": "a"}]}, ("catalog", "malformed")),
+        ({"tier1": [{"path": "x"}]}, ("catalog_entries", "malformed")),
+        ({"tier1": [], "tier2": "alpha"}, ("catalog_entries", "malformed")),
+    ],
+    ids=["no-tier-list", "nameless-entry", "tier-not-a-list"],
+)
+def test_a_catalog_of_the_wrong_shape_is_an_issue(tmp_path, catalog, expected):
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps(catalog))
+    pop = usage.load_population(
+        catalog_path=path, user_skills_dir=tmp_path / "n", plugins_manifest=tmp_path / "n.json"
+    )
+    assert expected in {(i["input"], i["mode"]) for i in pop.issues}
+
+
+@pytest.mark.parametrize(
+    ("manifest", "expected"),
+    [
+        ({"plugins": [1]}, ("plugins", "malformed")),
+        ({"plugins": {"p@m": [{"version": "1"}]}}, ("plugin_install", "malformed")),
+    ],
+    ids=["plugins-list", "install-without-path"],
+)
+def test_a_plugin_manifest_of_the_wrong_shape_is_an_issue(tmp_path, manifest, expected):
+    path = tmp_path / "m.json"
+    path.write_text(json.dumps(manifest))
+    pop = usage.load_population(
+        catalog_path=tmp_path / "c.json", user_skills_dir=tmp_path / "n", plugins_manifest=path
+    )
+    assert expected in {(i["input"], i["mode"]) for i in pop.issues}
+
+
+def test_sessions_with_no_entrypoint_raise_the_unclassified_canary(env):
+    r = skill_load("s1", "alpha")
+    del r["entrypoint"]
+    write_transcript(env["projects"], "p", "s1", [r])
+    rep = report(env, injected=usage.count_injected([]))
+    assert ("entrypoint", "unclassified") in _modes(rep) and rep["status"] == "partial"
+
+
+def test_the_no_signal_canary_reads_interactive_use(env, monkeypatch):
+    monkeypatch.setattr(usage, "_NO_SIGNAL_SESSIONS", 3)
+    for i in range(3):
+        write_transcript(
+            env["projects"], "p", f"s{i}", [rec(f"s{i}", type="user", message={"content": "hi"})]
+        )
+    write_transcript(env["projects"], "bg", "h1", [skill_load("h1", "alpha", kind="sdk-cli")])
+    rep = report(env, injected=usage.count_injected([]))
+    assert ("transcripts", "no_signal") in _modes(rep)
+
+
+@_NOT_ROOT
+def test_issues_are_bounded_and_counted(env, monkeypatch):
+    monkeypatch.setattr(usage, "_MAX_ISSUES", 3)
+    for i in range(5):
+        path = write_transcript(env["projects"], "p", f"s{i}", [skill_load(f"s{i}", "alpha")])
+        path.chmod(0)
+    try:
+        rep = report(env, injected=usage.count_injected([]))
+    finally:
+        for path in (env["projects"] / "p").iterdir():
+            path.chmod(0o644)
+    assert len(rep["input_issues"]) == 3
+    assert rep["input_issues_total"] == 5
+    assert rep["input_issue_counts"] == {"transcript/unreadable": 5}
+
+
+def test_an_issue_path_is_bounded_and_always_encodable():
+    issues: list[dict] = []
+    usage.issue(issues, "transcript", "/x/" + "\udcff" + "y" * 10_000, "unreadable")
+    # As the MCP response serializes: real UTF-8, where a lone surrogate raises.
+    json.dumps(issues, ensure_ascii=False).encode("utf-8")
+    assert len(issues[0]["path"]) == usage._MAX_PATH_CHARS
+
+
+def test_a_directory_named_skill_md_does_not_make_a_skill(tmp_path):
+    user = tmp_path / "user"
+    (user / "fake" / "SKILL.md").mkdir(parents=True)
+    pop = usage.load_population(
+        catalog_path=tmp_path / "c.json", user_skills_dir=user, plugins_manifest=tmp_path / "n"
+    )
+    assert "fake" not in pop.skills
+
+
+def test_a_failed_file_is_listed_as_an_issue(env, monkeypatch):
+    write_transcript(env["projects"], "p", "s1", [skill_load("s1", "alpha")])
+
+    def boom(self, record, default_sid, *, owned=False):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(usage.Scanner, "_record", boom)
+    rep = report(env, injected=usage.count_injected([]), allow_failed=True)
+    assert ("transcript", "failed") in _modes(rep)

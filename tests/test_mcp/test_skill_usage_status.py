@@ -77,8 +77,11 @@ async def test_scans_without_db_and_reports_progress(home, monkeypatch):
     svc._db = None
     with patch("genesis.mcp.health_mcp._service", svc):
         rep = await tool._impl_skill_usage_status(14, ctx)
-    assert rep["status"] == "ok"
+    assert rep["status"] == "partial"  # no DB: the injected columns are missing
     assert rep["db_join"] == "unavailable"
+    assert {"input": "db", "path": "no database connection", "mode": "unavailable"} in rep[
+        "input_issues"
+    ]
     alpha = next(r for r in rep["skills"] if r["name"] == "alpha")
     assert alpha["loads"]["interactive"] == 3
     assert ctx.calls and ctx.calls[-1][:2] == (3, 3)

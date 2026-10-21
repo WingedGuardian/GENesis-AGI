@@ -66,7 +66,15 @@ INTERACTIVE_ENTRYPOINTS = frozenset({"cli"})
 
 # A line is parsed only if it holds one of these. Spacing-tolerant on purpose:
 # CC writes compact JSON, other writers may not.
-_PREFILTER = (b'"Skill"', b"Base directory for this skill", b"skill_injection_hook", b"SKILL.md")
+# The files that make a directory a skill, as scripts/generate_skill_catalog.py
+# _SELF_MARKERS spells them; used for population, prefilter and Read signals.
+SKILL_FILES = ("SKILL.md", "skill.md")
+_PREFILTER = (
+    b'"Skill"',
+    b"Base directory for this skill",
+    b"skill_injection_hook",
+    *(m.encode() for m in SKILL_FILES),
+)
 _ENTRYPOINT_RE = re.compile(rb'"entrypoint":\s*"([^"]+)"')
 _SESSION_RE = re.compile(rb'"sessionId":\s*"([^"]+)"')
 
@@ -115,6 +123,15 @@ PROCESS_NUDGE_TARGETS = frozenset(
     {"superpowers:brainstorming", "superpowers:test-driven-development"}
 )
 
+# Interactive sessions in a window above which "no interactive use of any
+# skill" is treated as a recording-format change rather than a quiet fortnight
+# (the live 14-day window holds 19 interactive sessions and 11 skills active
+# interactively).
+_NO_SIGNAL_SESSIONS = 10
+
+# Issues listed in full; the rest are only counted.
+_MAX_ISSUES = 50
+
 # Longest accepted window. Ten years is far past any transcript retention, so it
 # never limits a real question; it exists to reject nonsense (1e7 overflows).
 MAX_DAYS = 3650.0
@@ -140,6 +157,7 @@ class Population:
 
     skills: dict[str, dict] = field(default_factory=dict)
     sources: list[dict] = field(default_factory=list)
+    issues: list[dict] = field(default_factory=list)
     _abs_dirs: dict[str, str] = field(default_factory=dict)
     _rel_dirs: list[tuple[str, str]] = field(default_factory=list)
     _plugin_roots: list[tuple[str, str]] = field(default_factory=list)
@@ -166,25 +184,64 @@ class Population:
         return os.path.basename(d)
 
 
-def _json_file(path: Path) -> object:
-    """Parsed JSON, or None when the file is missing, unreadable or malformed."""
+def issue(issues: list[dict] | None, kind: str, path: object, mode: str, exc=None) -> None:
+    """Record why an input could not be read in full. Every input failure the
+    report survives lands here, so ``status`` can say ``partial``; modes are
+    missing, unreadable, malformed and no_signal."""
+    if issues is None:
+        return
+    # A filesystem name is third-party text: bounded, and made encodable (a
+    # surrogate-escaped non-UTF-8 name would fail the MCP response).
+    text = str(path).encode("utf-8", "backslashreplace").decode("utf-8")
+    entry = {"input": kind, "path": text[:_MAX_PATH_CHARS], "mode": mode}
+    if exc is not None:
+        entry["detail"] = f"{type(exc).__name__}: {getattr(exc, 'strerror', None) or exc}"
+    issues.append(entry)
+
+
+def _mode(exc: BaseException) -> str:
+    return "missing" if isinstance(exc, FileNotFoundError) else "unreadable"
+
+
+def _json_file(path: Path, issues: list[dict], kind: str, *, required: bool) -> dict:
+    """The JSON object in ``path``; an empty dict, with an issue recorded, when
+    it is unreadable, malformed or not an object (missing is an issue only for
+    a ``required`` file)."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
-        return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        if required or not isinstance(exc, FileNotFoundError):
+            issue(issues, kind, path, _mode(exc), exc)
+        return {}
+    except (ValueError, RecursionError) as exc:
+        issue(issues, kind, path, "malformed", exc)
+        return {}
+    if not isinstance(data, dict):
+        issue(issues, kind, path, "malformed")
+        return {}
+    return data
 
 
-def _entries(directory: Path, *, skills: bool) -> Iterator[os.DirEntry]:
-    """Skill directories (holding a SKILL.md) or ``*.md`` files, by name. An
-    entry that cannot be stat'ed (a symlink loop) is skipped; an unreadable
+def _entries(directory: Path, issues: list[dict], *, skills: bool) -> Iterator[os.DirEntry]:
+    """Skill directories (holding a skill file) or ``*.md`` files, by name. An
+    entry that cannot be stat'ed is skipped and recorded; an unreadable
     directory raises OSError to its caller."""
     for entry in sorted(os.scandir(directory), key=lambda e: e.name):
         try:
-            if skills:
-                ok = entry.is_dir() and os.path.isfile(os.path.join(entry.path, "SKILL.md"))
-            else:
+            if not skills:
                 ok = entry.is_file() and entry.name.endswith(".md")
-        except OSError:
+            elif ok := entry.is_dir():
+                ok = False
+                for marker in SKILL_FILES:
+                    try:
+                        info = os.stat(os.path.join(entry.path, marker))
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISREG(info.st_mode):  # as the catalog's is_file()
+                        ok = True
+                        break
+        except OSError as exc:
+            issue(issues, "skill_dir" if skills else "entry", entry.path, "unreadable", exc)
             continue
         if ok:
             yield entry
@@ -217,6 +274,7 @@ def load_population(
             read()
         except OSError as exc:
             errors.append(f"{type(exc).__name__}: {exc.strerror or exc}")
+            issue(pop.issues, kind, path, _mode(exc), exc)
         entry["skills"] = len(pop.skills) - before
         if errors:
             entry["error"] = "; ".join(errors)
@@ -224,37 +282,53 @@ def load_population(
 
     def catalog() -> int:
         found = 0
-        data = _dict(_json_file(catalog_path))
-        for tier in ("tier1", "tier2"):
-            entries = data.get(tier)
+        data = _json_file(catalog_path, pop.issues, "catalog", required=True)
+        skipped = 0
+        tiers = [data.get(tier) for tier in ("tier1", "tier2")]
+        if data and not any(isinstance(e, list) for e in tiers):
+            issue(pop.issues, "catalog", catalog_path, "malformed")  # no tier list at all
+        for tier, entries in zip(("tier1", "tier2"), tiers, strict=True):
+            if entries is not None and not isinstance(entries, list):
+                skipped += 1
             for item in entries if isinstance(entries, list) else []:
                 item = _dict(item)
                 name, path = item.get("name"), item.get("path")
                 if not isinstance(name, str) or not name:
+                    skipped += 1
                     continue
                 found += pop._add(name, f"catalog-{tier}", nudge_eligible=True)
                 if isinstance(path, str) and path.startswith("/"):
                     pop._abs_dirs[path.rstrip("/")] = name
                 elif isinstance(path, str) and path:
                     pop._rel_dirs.append((path.rstrip("/"), name))
+        if skipped:
+            issue(pop.issues, "catalog_entries", catalog_path, "malformed")
         return found
 
     def user() -> int:
         found = 0
-        if user_skills_dir.is_dir():
-            for entry in _entries(user_skills_dir, skills=True):
+        try:
+            exists = stat.S_ISDIR(os.stat(user_skills_dir).st_mode)
+        except FileNotFoundError:
+            exists = False  # no user skills: legitimately empty
+        if exists:
+            for entry in _entries(user_skills_dir, pop.issues, skills=True):
                 found += pop._add(entry.name, "user", nudge_eligible=False)
                 pop._abs_dirs.setdefault(entry.path.rstrip("/"), entry.name)
         return found
 
     def plugins() -> int:
         found = 0
-        installed = _dict(_dict(_json_file(plugins_manifest)).get("plugins"))
+        manifest = _json_file(plugins_manifest, pop.issues, "plugins", required=False)
+        if "plugins" in manifest and not isinstance(manifest["plugins"], dict):
+            issue(pop.issues, "plugins", plugins_manifest, "malformed")
+        installed = _dict(manifest.get("plugins"))
         for key, installs in installed.items():
             plugin = str(key).split("@", 1)[0]
             for install in installs if isinstance(installs, list) else [installs]:
                 root = _dict(install).get("installPath")
                 if not isinstance(root, str) or not root:
+                    issue(pop.issues, "plugin_install", plugins_manifest, "malformed")
                     continue
                 pop._plugin_roots.append((root, plugin))
                 # One unreadable install costs that install, not the manifest.
@@ -266,11 +340,12 @@ def load_population(
                     try:
                         if not directory.is_dir():
                             continue
-                        for entry in _entries(directory, skills=skills):
+                        for entry in _entries(directory, pop.issues, skills=skills):
                             name = entry.name if skills else entry.name[:-3]
                             found += pop._add(f"{plugin}:{name}", kind, nudge_eligible=False)
                     except OSError as exc:
                         errors.append(f"{directory}: {type(exc).__name__}: {exc.strerror or exc}")
+                        issue(pop.issues, "plugin_dir", directory, _mode(exc), exc)
         return found
 
     def process_nudges() -> int:
@@ -288,7 +363,7 @@ def load_population(
         def read() -> int:
             found = 0
             if directory.is_dir():
-                for entry in _entries(directory, skills=False):
+                for entry in _entries(directory, pop.issues, skills=False):
                     found += pop._add(entry.name[:-3], "command", nudge_eligible=False)
             return found
 
@@ -355,45 +430,59 @@ def parse_nudges(stdout: str) -> tuple[list[tuple[str, str]], int]:
 # --- transcript scan ----------------------------------------------------------------
 
 
-def iter_transcript_files(projects_root: Path, since: datetime) -> Iterator[tuple[Path, bool]]:
+def iter_transcript_files(
+    projects_root: Path, since: datetime, issues: list[dict] | None = None
+) -> Iterator[tuple[Path, bool]]:
     """``(path, is_subagent)`` for transcripts modified at or after ``since``.
 
     One ``scandir`` per directory, never a recursive walk: top-level
-    ``*.jsonl`` and ``<session>/subagents/*.jsonl``.
+    ``*.jsonl`` and ``<session>/subagents/*.jsonl``. A directory or entry that
+    cannot be read is recorded in ``issues``, never silently dropped.
     """
     cutoff = since.timestamp()
     try:
         projects = sorted(os.scandir(projects_root), key=lambda e: e.name)
-    except OSError:
+    except OSError as exc:
+        issue(issues, "projects_root", projects_root, _mode(exc), exc)
         return
     for project in projects:
-        if not project.is_dir():
-            continue
         try:
+            if not project.is_dir():
+                continue
             entries = sorted(os.scandir(project.path), key=lambda e: e.name)
-        except OSError:
+        except OSError as exc:
+            issue(issues, "project_dir", project.path, "unreadable", exc)
             continue
         for entry in entries:
-            try:
-                if entry.is_file() and entry.name.endswith(".jsonl"):
-                    if entry.stat().st_mtime >= cutoff:
+            if entry.name.endswith(".jsonl"):
+                try:
+                    if entry.is_file() and entry.stat().st_mtime >= cutoff:
                         yield Path(entry.path), False
-                elif entry.is_dir():
-                    sub = os.path.join(entry.path, "subagents")
-                    if not os.path.isdir(sub):
-                        continue
-                    for agent in sorted(os.scandir(sub), key=lambda e: e.name):
-                        try:
-                            if (
-                                agent.name.endswith(".jsonl")
-                                and agent.is_file()
-                                and agent.stat().st_mtime >= cutoff
-                            ):
-                                yield Path(agent.path), True
-                        except OSError:
-                            continue
-            except OSError:
+                except OSError as exc:
+                    issue(issues, "transcript", entry.path, _mode(exc), exc)
                 continue
+            try:
+                if not entry.is_dir():
+                    continue
+                # scandir, not isdir: isdir swallows a permission error.
+                agents = sorted(
+                    os.scandir(os.path.join(entry.path, "subagents")), key=lambda e: e.name
+                )
+            except (FileNotFoundError, NotADirectoryError):
+                continue  # a session without subagents
+            except OSError as exc:
+                issue(issues, "transcript_dir", entry.path, "unreadable", exc)
+                continue
+            for agent in agents:
+                try:
+                    if (
+                        agent.name.endswith(".jsonl")
+                        and agent.is_file()
+                        and agent.stat().st_mtime >= cutoff
+                    ):
+                        yield Path(agent.path), True
+                except OSError as exc:
+                    issue(issues, "transcript", agent.path, _mode(exc), exc)
 
 
 def _parse_ts(value: object) -> datetime | None:
@@ -454,6 +543,7 @@ class Scanner:
         self.lines_oversized = 0
         self.names_invalid = 0
         self.files_failed = 0
+        self.issues: list[dict] = []
 
     def scan_file(self, path: Path, is_subagent: bool = False) -> None:
         """Scan one transcript. Known bad shapes are skipped where they are read;
@@ -471,12 +561,14 @@ class Scanner:
             # O_NONBLOCK: a FIFO named *.jsonl must not block the scan (and with it
             # the MCP tool's single-flight lock) forever; only regular files are read.
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        except OSError:
+        except OSError as exc:
+            issue(self.issues, "transcript", path, _mode(exc), exc)
             return
         try:
             info = os.fstat(fd)
-        except OSError:
+        except OSError as exc:
             os.close(fd)
+            issue(self.issues, "transcript", path, "unreadable", exc)
             return
         if not stat.S_ISREG(info.st_mode):
             os.close(fd)
@@ -596,7 +688,7 @@ class Scanner:
                     yield "load", data["skill"]
                     continue
                 file_path = data.get("file_path")
-                if isinstance(file_path, str) and file_path.endswith("/SKILL.md"):
+                if isinstance(file_path, str) and os.path.basename(file_path) in SKILL_FILES:
                     if tool == "Read":
                         yield "read", os.path.normpath(file_path)
                     elif tool in _EDIT_TOOLS:
@@ -667,7 +759,8 @@ async def read_injected(db, since: datetime, until: datetime) -> dict:
 
 
 def _triple() -> dict[str, int]:
-    return {"interactive": 0, "headless": 0, "total": 0}
+    # "unknown": a session with no entrypoint record, kept out of both buckets.
+    return {"interactive": 0, "headless": 0, "unknown": 0, "total": 0}
 
 
 def _bump(counter: dict[str, int], kind: str, n: int = 1) -> None:
@@ -725,7 +818,10 @@ def build_report(
     for session in scanner.sessions.values():
         if session.kind is None:
             unknown_entrypoint += 1
-        kind = "interactive" if session.kind in INTERACTIVE_ENTRYPOINTS else "headless"
+        if session.kind is None:
+            kind = "unknown"
+        else:
+            kind = "interactive" if session.kind in INTERACTIVE_ENTRYPOINTS else "headless"
         _bump(sessions, kind)
 
         last_use: dict[str, datetime] = {}
@@ -780,16 +876,19 @@ def build_report(
             else:
                 uncatalogued_tags[tag] = counts["injected"]
 
+    def state_of(r: dict, kind: str) -> str:
+        if r["sessions_used"][kind]:
+            return "active"
+        if r["nudges"][kind]:
+            return "zombie"
+        return "dead" if r["nudge_eligible"] else "not_nudgeable"
+
     out = []
     for r in rows.values():
-        if r["sessions_used"]["total"]:
-            state = "active"
-        elif r["nudges"]["total"]:
-            state = "zombie"
-        elif r["nudge_eligible"]:
-            state = "dead"
-        else:
-            state = "not_nudgeable"
+        state = state_of(r, "total")
+        # Per kind too: headless counts test and SDK runs, so a skill used only
+        # there reads active overall and dead or zombie interactively.
+        r["state_by_kind"] = {k: state_of(r, k) for k in ("interactive", "headless")}
         converted, nudged = r.pop("_converted"), r["sessions_nudged"]
         r["conversion"] = {
             k: round(converted[k] / nudged[k], 3) if nudged[k] else None for k in nudged
@@ -800,8 +899,30 @@ def build_report(
         out.append(r)
     out.sort(key=lambda r: (_STATE_ORDER[r["state"]], -r["sessions_used"]["total"], r["name"]))
 
+    issues = [*population.issues, *scanner.issues]
+    if injected is None:
+        issue(issues, "db", db_source or "no database connection", "unavailable")
+    if scanner.files_failed:
+        issue(issues, "transcript", f"{scanner.files_failed} file(s)", "failed")
+    # Canaries for a change in how Claude Code records sessions or skill use: an
+    # entrypoint no longer recorded, or many interactive sessions and not one
+    # interactive use of any skill.
+    if unknown_entrypoint:
+        issue(issues, "entrypoint", f"{unknown_entrypoint} session(s)", "unclassified")
+    if sessions["interactive"] >= _NO_SIGNAL_SESSIONS and not any(
+        r["sessions_used"]["interactive"] for r in out
+    ):
+        issue(issues, "transcripts", "", "no_signal")
+    counts: dict[str, int] = defaultdict(int)
+    for entry in issues:
+        counts[f"{entry['input']}/{entry['mode']}"] += 1
     return {
-        "status": "ok",
+        "status": "partial" if issues else "ok",
+        # Bounded: the report goes back into a model's context; the counts
+        # cover every issue, the list only the first _MAX_ISSUES.
+        "input_issues": issues[:_MAX_ISSUES],
+        "input_issues_total": len(issues),
+        "input_issue_counts": dict(counts),
         "window": {
             "start": scanner.since.isoformat(),
             "end": scanner.until.isoformat(),
@@ -826,6 +947,8 @@ def build_report(
         "catalog_sources": population.sources,
         "skills": out,
         "note": (
+            "status is 'partial' when any input_issues entry exists or a file failed: "
+            "then a zero may be a missing input, not a quiet window. "
             "A zero means none found in the scanned sessions, within the window; "
             "files_failed counts transcripts whose signals may be partial or missing. "
             "interactive = entrypoint 'cli'; headless = dispatched, SDK and test runs. "
@@ -850,7 +973,7 @@ def run_scan(
 ) -> dict:
     started = time.monotonic()
     scanner = Scanner(since, until)
-    for path, is_subagent in iter_transcript_files(projects_root, since):
+    for path, is_subagent in iter_transcript_files(projects_root, since, scanner.issues):
         scanner.scan_file(path, is_subagent)
     return build_report(
         scanner,
