@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -230,12 +231,9 @@ def test_restore_hooks_fails_on_a_hand_edited_hook(dc, dc_ready, capsys):
     assert "ERROR: git hook pre-commit was edited by hand" in err, err
 
 
-def test_restore_hooks_fails_on_a_hand_edited_hook_the_rollback_no_longer_lists(
-    dc, dc_ready, capsys
-):
-    """Only the restore can see this one: sync-hooks.sh and the post-condition
-    look at the names HEAD lists, and the rollback's HEAD no longer lists it."""
-    w = dc_ready
+def _unlisted_after_rollback(w, dc, capsys) -> tuple[str, str, Path]:
+    """An approved pair installs post-merge; the rollback's HEAD no longer
+    lists it. Returns (checkout before, tip, the installed hook)."""
     before = w.rev("HEAD", w.root)
     sync = (w.root / "scripts" / "hooks" / "sync-hooks.sh").read_text()
     listed = sync.replace(
@@ -251,12 +249,37 @@ def test_restore_hooks_fails_on_a_hand_edited_hook_the_rollback_no_longer_lists(
     hook = w.root / ".git" / "hooks" / "post-merge"
     assert hook.is_file(), "the approved pair did not install the hook"
     _roll_back(w, before)
+    return before, tip, hook
+
+
+def test_restore_hooks_fails_on_a_hand_edited_hook_the_rollback_no_longer_lists(
+    dc, dc_ready, capsys
+):
+    """Only the restore can see this one: sync-hooks.sh and the post-condition
+    look at the names HEAD lists, and the rollback's HEAD no longer lists it."""
+    w = dc_ready
+    before, tip, hook = _unlisted_after_rollback(w, dc, capsys)
     hook.write_text("#!/bin/sh\n# edited by hand\nexit 0\n")
     capsys.readouterr()
     assert w.run(dc, "restore-hooks", tip, before, lock=True) == 1
     err = capsys.readouterr().err
     assert hook.is_file(), "a hand-edited hook was removed"
     assert "ERROR: git hook post-merge was edited by hand" in err, err
+
+
+def test_a_shipped_version_the_rollback_no_longer_lists_is_removed(dc, dc_ready, capsys):
+    """A hash .genesis-hook-versions lists is Genesis-written by proof, like the
+    old checkout's copy: an unlisted one is removed, not reported as a hand edit."""
+    w = dc_ready
+    before, tip, hook = _unlisted_after_rollback(w, dc, capsys)
+    shipped = b"#!/bin/sh\n# a shipped prior version\nexit 0\n"
+    hook.write_bytes(shipped)
+    (w.root / ".genesis-hook-versions").write_text(
+        f"post-merge:{hashlib.sha256(shipped).hexdigest()}\n"
+    )
+    capsys.readouterr()
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 0, capsys.readouterr()
+    assert not hook.exists(), "a shipped, unlisted hook stayed installed"
 
 
 def test_a_helper_equal_to_neither_side_is_left_to_sync(dc, dc_ready, capsys):
@@ -277,6 +300,55 @@ def test_a_helper_equal_to_neither_side_is_left_to_sync(dc, dc_ready, capsys):
     capsys.readouterr()
     assert w.run(dc, "restore-hooks", tip, before, lock=True) == 0, capsys.readouterr()
     assert installed.read_text() == (w.root / helper).read_text()
+
+
+def test_a_known_prior_hook_version_is_left_to_sync(dc, dc_ready, capsys):
+    """A hook whose hash .genesis-hook-versions lists is a version Genesis
+    shipped, which sync-hooks.sh replaces: no hand edit, and the run is clean."""
+    w = dc_ready
+    before, tip = _rolled_back(w, dc, capsys)
+    prior = b"#!/bin/sh\n# a shipped prior version\nexit 0\n"
+    (w.root / ".git" / "hooks" / "pre-commit").write_bytes(prior)
+    (w.root / ".genesis-hook-versions").write_text(
+        f"pre-commit:{hashlib.sha256(prior).hexdigest()}\n"
+    )
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 0, capsys.readouterr()
+    assert _installed(w) == BASE_HOOK
+
+
+def _helper_source_deleted(w) -> tuple[str, str, Path]:
+    """HEAD still lists emit_bugfix_audit.py but no longer has its source; the
+    installed copy equals neither side. Returns (moved from, HEAD, installed)."""
+    before = w.rev("HEAD", w.root)
+    w.git(
+        w.root, "-c", "core.hooksPath=/dev/null", "rm", "-q", "scripts/hooks/emit_bugfix_audit.py"
+    )
+    w.git(w.root, "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "drop the helper")
+    installed = w.root / ".git" / "hooks" / "emit_bugfix_audit.py"
+    installed.write_text("# an obsolete helper\n")
+    return before, w.rev("HEAD", w.root), installed
+
+
+def test_a_helper_with_no_source_is_removed(dc, dc_ready, capsys):
+    """Helpers are Genesis's own: one the checkout lists but has no source for
+    is removed (as a hook the moved-to checkout no longer installs is)."""
+    w = dc_ready
+    before, head, installed = _helper_source_deleted(w)
+    assert w.run(dc, "restore-hooks", before, head, lock=True) == 0, capsys.readouterr()
+    assert not installed.exists(), "an obsolete helper stayed installed"
+
+
+def test_a_helper_with_no_source_that_cannot_be_removed_fails(dc, dc_ready, capsys):
+    w = dc_ready
+    before, head, installed = _helper_source_deleted(w)
+    hooks = w.root / ".git" / "hooks"
+    hooks.chmod(0o555)
+    try:
+        assert w.run(dc, "restore-hooks", before, head, lock=True) == 1
+    finally:
+        hooks.chmod(0o755)
+    assert installed.exists()
+    assert "emit_bugfix_audit.py" in capsys.readouterr().err
 
 
 def test_restore_hooks_fails_on_a_hook_list_it_cannot_read(dc, dc_ready, capsys):

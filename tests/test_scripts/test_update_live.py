@@ -622,6 +622,19 @@ def test_exit_4_needs_a_rollback_that_completed(plain_live, hooks_fail, pre, rc,
         assert calls.index("health-probe") < history, "health was asked after the verdict"
 
 
+def test_an_inherited_rollback_clean_never_reaches_exit_4(plain_live):
+    """_ROLLBACK_CLEAN is this rollback's verdict, never the environment's: with
+    an inherited 1, an unhealthy rollback still exits 1 with no refusal record."""
+    root, home, stub, env, log = plain_live
+    r = _bash(
+        _plain_script(root, stub, _REFUSE_UNITS, _UNHEALTHY),
+        {**env, "STUB_MODE": "move", "_ROLLBACK_CLEAN": "1"},
+    )
+    assert r.returncode == 1, _out(r)
+    assert not (home / ".genesis" / "update_refused.json").exists()
+    assert "history failed" in _calls(home)
+
+
 def test_a_units_check_that_could_not_run_never_waits_on_health(plain_live):
     """Only exit 4's promise needs a healthy server: a units check that failed
     to run (exit 2) exits 1 whatever the health, so it never pays the wait."""
@@ -773,6 +786,18 @@ def test_u7_an_inherited_on_live_is_ignored(checkout):
     root, home = checkout
     r = _admit(root, home, ON_LIVE="1", _LIVE_BASE="deadbeef")
     assert r.returncode == 0 and "ON_LIVE=0" in r.stdout, _out(r)
+
+
+def test_u7_the_rollback_flags_are_never_inherited(checkout):
+    """The flags that decide a rollback's checkout lock and exit 4 start at 0."""
+    root, home = checkout
+    r = _bash(
+        f'GENESIS_ROOT="{root}"\n_LIVE_CHECKOUT_PY="$(cat "{LIVE_PY}")"\n'
+        + _block("branch-admission")
+        + 'echo "CLEAN=$_ROLLBACK_CLEAN BUSY=$_CHECKOUT_LOCK_BUSY"\n',
+        _env(home, _ROLLBACK_CLEAN="1", _CHECKOUT_LOCK_BUSY="1"),
+    )
+    assert r.returncode == 0 and "CLEAN=0 BUSY=0" in r.stdout, _out(r)
 
 
 def test_u7_the_verdict_is_asked_again_under_the_lock(checkout):

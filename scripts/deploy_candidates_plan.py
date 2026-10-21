@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import subprocess
@@ -527,12 +528,24 @@ def _restore_one(
     ``after_listed`` False when the moved-to list no longer names it; ``helper``
     is True for a name in the moved-to HELPERS_TO_SYNC. Returns why the hook was
     left as neither checkout installs it, or None."""
+    new_kind = non_file_kind(repo, after, path)
+    if (
+        helper
+        and dst.is_file()
+        and new_kind != "symbolic link"
+        and (new_kind or repo.blob_at(after, path) is None)
+    ):
+        # A helper is Genesis's own and the moved-to checkout has no source for
+        # it, so sync-hooks.sh skips it: removed here, as a hook the moved-to
+        # list drops is (a failure to remove it is the caller's failure).
+        dst.unlink()
+        out(f"  removed git helper {dst.name}: the moved-to checkout has no source for it.")
+        return None
     if before is None:
         return None
     if non_file_kind(repo, before, path):
         return None  # the old copy came from sync-hooks.sh (a link's target) or nowhere
     old = repo.blob_at(before, path)
-    new_kind = non_file_kind(repo, after, path)
     if new_kind == "symbolic link":
         return None  # sync-hooks.sh installs what a link points at; leave it to sync
     # A directory or submodule installs nothing (sync-hooks.sh skips it), so the
@@ -543,9 +556,14 @@ def _restore_one(
     have = repo.git("hash-object", "--no-filters", "--", str(dst)).stdout.strip()
     if have == new:
         return None  # already the moved-to checkout's copy
-    if have != old and helper:
-        return None  # sync-hooks.sh always overwrites a helper; the post-condition decides
-    if have != old:
+    # A hash .genesis-hook-versions lists is a version Genesis shipped: written
+    # by Genesis, like the old checkout's copy, so never a hand edit.
+    shipped = have != old and _shipped_version(repo, dst)
+    if have != old and new is not None and (helper or shipped):
+        # sync-hooks.sh overwrites a helper always, and a shipped version: the
+        # post-condition decides.
+        return None
+    if have != old and not shipped:
         # Edited by hand (or never synced): left in place, and reported even when
         # the moved-to list no longer names it, which no later check would.
         # Readiness refuses any such hook before a rebuild moves anything.
@@ -566,6 +584,17 @@ def _restore_one(
         raise
     out(f"  restored git hook {dst.name} to the moved-to checkout's version.")
     return None
+
+
+def _shipped_version(repo: Repo, dst: Path) -> bool:
+    """Whether sync-hooks.sh would call the installed hook a stale prior version
+    and replace it: its own test, `name:<sha256>` in the checkout's
+    .genesis-hook-versions."""
+    try:
+        listed = (repo.root / ".genesis-hook-versions").read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return f"{dst.name}:{hashlib.sha256(dst.read_bytes()).hexdigest()}" in listed
 
 
 def sync_git_hooks(repo: Repo) -> str | None:

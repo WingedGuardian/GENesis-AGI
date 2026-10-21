@@ -398,6 +398,10 @@ _LIVE_BASE=""
 _LIVE_ENGINE_RAN=0
 _LIVE_MOVE_REC=""
 _LIVE_TREE_SUSPECT=0
+# Nor these, which decide a rollback's checkout lock and exit 4: only this run
+# sets them.
+_CHECKOUT_LOCK_BUSY=0
+_ROLLBACK_CLEAN=0
 if ! genesis_deploy_branch_ok "$GENESIS_ROOT" --allow-override; then
     _live_rc=1
     if [ "$_branch" = live ]; then
@@ -1986,7 +1990,9 @@ _do_rollback() {
     # Disarm the ERR trap to prevent recursive rollback
     trap - ERR INT TERM
     # A rollback whose live hook restore or service restart failed is not clean
-    # (_ROLLBACK_CLEAN), whatever the summary below prints.
+    # (_ROLLBACK_CLEAN), whatever the summary below prints. Only this rollback's
+    # verdict sets it: exit 4's gate reads it.
+    _ROLLBACK_CLEAN=0
     local hooks_ok=true svc_ok=true
 
     echo ""
