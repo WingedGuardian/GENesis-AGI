@@ -213,6 +213,20 @@ def _err(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _restart_advice(moved: plan.Move) -> None:
+    """The next step after a move. When HEAD left `live` in the last instant
+    (Move.head_left), a restart would load that branch's tree, so the advice is
+    to switch back first."""
+    out("  The server was not restarted: it runs what it loaded until it does. Next step, when no")
+    if moved.head_left:
+        out(
+            f"  validation holds the lock: switch the checkout back to `live` (it is on "
+            f"{moved.head_left}), then scripts/deploy_code_only.sh restart (launch it detached)."
+        )
+        return
+    out("  validation holds the lock: scripts/deploy_code_only.sh restart (launch it detached).")
+
+
 class Engine(Repo):
     def __init__(self, root, env, gh=None, serving=None):
         super().__init__(root, env, gh=gh, serving=serving)
@@ -795,12 +809,7 @@ class Engine(Repo):
                 + " left `live` with it and come back at the next rebuild "
                 "unless their own reason still holds: drop them too to keep that code out."
             )
-        out(
-            "  The server was not restarted: it runs what it loaded until it does. Next step, when no"
-        )
-        out(
-            "  validation holds the lock: scripts/deploy_code_only.sh restart (launch it detached)."
-        )
+        _restart_advice(moved)
         return 0
 
     def _warn_shared(self, branch: str, before: dict, after: dict | None) -> None:
@@ -945,12 +954,7 @@ class Engine(Repo):
         core.after_move(
             state, "fast-forwarding local main", lambda: plan.fast_forward_main(self, base)
         )
-        out(
-            "  The server was not restarted: it runs what it loaded until it does. Next step, when no"
-        )
-        out(
-            "  validation holds the lock: scripts/deploy_code_only.sh restart (launch it detached)."
-        )
+        _restart_advice(moved)
         return 0
 
     def _retirements_held(

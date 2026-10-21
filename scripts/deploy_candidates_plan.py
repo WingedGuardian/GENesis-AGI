@@ -260,6 +260,7 @@ class Move(NamedTuple):
     files: bool
     at: str
     before: str | None
+    head_left: str | None = None  # where HEAD went if it left `live` in the last instant
 
 
 class Source(NamedTuple):
@@ -540,6 +541,7 @@ def _move_checkout_locked(
     # Past the commit point: the checkout has moved (or was already right), so
     # nothing below may raise a refusal that would claim nothing changed.
     state = f"`live` is at {at[:12]}"
+    head_left = after_move(state, "reading where HEAD is", lambda: _head_left_live(repo))
     after_move(state, "keeping the reflog of `live` (git config)", lambda: ensure_reflog_kept(repo))
     up = after_move(
         state,
@@ -552,7 +554,30 @@ def _move_checkout_locked(
         out(
             f"  WARNING: could not set `live` to track {BASE_REMOTE}/{BASE_BRANCH}: {up.stderr.strip()}"
         )
-    return Move(files_moved, at, source.head)
+    return Move(files_moved, at, source.head, head_left or None)
+
+
+def _head_left_live(repo: Repo) -> str:
+    """Every arm leaves HEAD on `live` (#3492): the unchanged and ref-only arms
+    require it at the re-check, the switch puts it there. A session that
+    switched branch after the last re-check moves nothing back (git's
+    update-ref guards only `live` itself, not symbolic HEAD), so it is named,
+    and the caller replaces its restart advice. Returns where HEAD went, or ""
+    when it is on `live`. Never refuses."""
+    p = repo.git("symbolic-ref", "-q", "HEAD", check=False)
+    ref = p.stdout.strip()
+    if ref == LIVE_REF:
+        return ""
+    where = (
+        ref.removeprefix("refs/heads/")
+        if ref
+        else f"a detached {(repo.resolve('HEAD') or 'HEAD')[:12]}"
+    )
+    out(
+        f"  WARNING: HEAD is now on {where}, not `live`: a session switched branch while this "
+        "ran. `live` is as reported; the checkout is not."
+    )
+    return where
 
 
 def _warn_live_slipped(repo: Repo, source: Source, tip: str) -> None:

@@ -1741,3 +1741,55 @@ def test_a_session_branch_switch_inside_the_residual_window_is_warned(
     assert w.run(dc, "rebuild") == 0
     out = capsys.readouterr().out
     assert "WARNING: HEAD was on feat-s" in out, out
+
+
+def test_a_branch_switch_during_the_ref_only_move_is_warned_and_no_restart_is_advised(
+    dc, dc_ready, capsys, monkeypatch
+):
+    """git's update-ref guards only `live`, not symbolic HEAD: a session that
+    switches branch after the last re-check leaves `live` moved and the checkout
+    elsewhere. The run names it and replaces the restart advice."""
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    assert w.run(dc, "rebuild") == 0
+    first = capsys.readouterr().out
+    assert "HEAD is now on" not in first and "switch the checkout back" not in first, first
+    w.advance_main({"x.txt": "x\n"}, "squash of feat/a")
+    w.git(w.root, "branch", "feat-s", w.rev("HEAD"))
+    real = dc.plan._write_move_record
+
+    def record(repo, to, phase, *, before):
+        if phase == "ref":
+            w.git(w.root, "switch", "-q", "feat-s")
+        return real(repo, to, phase, before=before)
+
+    monkeypatch.setattr(dc.plan, "_write_move_record", record)
+    assert w.run(dc, "rebuild") == 0
+    out = capsys.readouterr().out
+    assert "tree unchanged; `live` moved" in out, out
+    assert "WARNING: HEAD is now on feat-s, not `live`" in out, out
+    assert "switch the checkout back to `live` (it is on feat-s)" in out, out
+    assert w.git(w.root, "symbolic-ref", "HEAD").stdout.strip() == "refs/heads/feat-s"
+
+
+def test_a_branch_switch_after_the_unchanged_check_is_warned(dc, dc_ready, capsys, monkeypatch):
+    """The unchanged arm writes nothing, but its restart advice would load the
+    branch a session switched to after the re-check."""
+    w = dc_ready
+    head = _second_rebuild_world(dc, w, capsys)
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    capsys.readouterr()
+    w.git(w.root, "branch", "feat-s", head)
+    real = dc.plan.refuse_moved_source
+
+    def check_then_switch(*a, **kw):
+        real(*a, **kw)
+        if "fields" not in kw and len(a) == 2:  # the move's full re-check, not preflight's
+            w.git(w.root, "switch", "-q", "feat-s")
+
+    monkeypatch.setattr(dc.plan, "refuse_moved_source", check_then_switch)
+    assert w.run(dc, "rebuild") == 0
+    out = capsys.readouterr().out
+    assert "checkout: unchanged" in out, out
+    assert "WARNING: HEAD is now on feat-s" in out and "switch the checkout back" in out, out
