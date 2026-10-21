@@ -46,6 +46,12 @@ Every run checks, before writing anything:
 Sources and authored pieces must be UTF-8 with LF line endings (every skill
 file is): a CR is refused rather than silently converted.
 
+Contract: a single-use tool for the skill split (T-3), run on owner-authored
+inputs in a PR a human reviews. Inputs outside that are refused where it is
+cheap to tell, and otherwise out of contract. After T-3 merges, reproduce its
+``--check`` with ``--source-ref <T-3's base commit>``: the default origin/main
+then already holds the split.
+
 Run it in a worktree: sessions in the primary checkout load what it writes.
 Exit 0 ok, 1 a check failed, 2 the row file, git or the file system is unusable.
 """
@@ -59,7 +65,6 @@ import posixpath
 import re
 import subprocess
 import sys
-import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -151,6 +156,13 @@ def _at_ref(root: Path, ref: str, path: str) -> str | None:
         return None
     if kind.stdout.strip() != "blob":
         raise RowError(f"{path} at {ref} is a {kind.stdout.strip()}, not a file")
+    # A symlink is a blob holding its target text; only the tree mode tells.
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "-z", ref, "--", path], capture_output=True
+    )
+    mode = listed.stdout.split(b" ", 1)[0].decode(errors="replace")
+    if listed.returncode != 0 or mode not in ("100644", "100755"):
+        raise RowError(f"{path} at {ref} has mode {mode or '?'}, not a regular file")
     # Bytes, not text=True: universal newlines would turn CRLF into LF unseen.
     shown = subprocess.run(
         ["git", "-C", str(root), "cat-file", "blob", f"{ref}:{path}"], capture_output=True
@@ -257,7 +269,7 @@ def load_rows(path: Path) -> tuple[dict[str, str], list[Piece]]:
         if (p.dest is None) != ("reason" in raw):
             raise RowError(f"{where}: a reason is required on a DELETE piece and only there")
         if "file" in raw:
-            if "source" in raw or p.dest is None or raw.get("rewrites"):
+            if {"source", "from", "until"} & set(raw) or p.dest is None or raw.get("rewrites"):
                 raise RowError(f"{where}: an authored piece has a file and a destination only")
             p.file = _repo_path(raw["file"], f"{where} file")
         else:
@@ -346,9 +358,9 @@ class _Resolver:
     def skill_root(self, rel: str, *, at_ref: bool = False) -> str:
         parts = PurePosixPath(rel).parent.parts
         for k in range(len(parts), 0, -1):
-            cand = PurePosixPath(*parts[:k], "SKILL.md").as_posix()
-            if self.exists(cand, at_ref=at_ref):
-                return PurePosixPath(*parts[:k]).as_posix()
+            for marker in _SKILL_FILES:
+                if self.exists(PurePosixPath(*parts[:k], marker).as_posix(), at_ref=at_ref):
+                    return PurePosixPath(*parts[:k]).as_posix()
         return PurePosixPath(rel).parent.as_posix()
 
     def exists(self, rel: str, *, at_ref: bool = False) -> bool:
@@ -682,44 +694,21 @@ def _mismatch(dpath: str, have: bytes | None, want: str, starts: list[tuple[int,
 
 
 def _write(root: Path, outputs: dict[str, str]) -> None:
-    targets = [root / rel for rel in outputs]
-    try:
-        for target in targets:
+    """Write each output in place (an existing file keeps its mode).
+
+    No rollback: sources are read at the ref, never from these outputs, so a
+    write that fails part way is finished by running the same command again.
+    """
+    for rel, text in outputs.items():
+        target = root / rel
+        try:
             target.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise RowError(f"cannot create {exc.filename}: {exc.strerror}; nothing written") from exc
-    umask = os.umask(0)
-    os.umask(umask)
-    # Two phases: every temp file is written first, and only when all succeed
-    # are they renamed into place, so a failure leaves no output half-updated.
-    staged: list[tuple[str, Path]] = []
-    try:
-        for target, text in zip(targets, outputs.values(), strict=True):
-            mode = target.stat().st_mode & 0o777 if target.exists() else 0o666 & ~umask
-            fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
-            staged.append((tmp, target))
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-                fh.write(text)
-            os.chmod(tmp, mode)
-    except BaseException as exc:
-        for tmp, _ in staged:
-            Path(tmp).unlink(missing_ok=True)
-        if isinstance(exc, OSError):
+            target.write_bytes(text.encode("utf-8"))
+        except OSError as exc:
             raise RowError(
-                f"writing {exc.filename or 'an output'}: {exc.strerror}; no file written"
+                f"writing {rel}: {exc.strerror}; fix that and rerun to finish "
+                "(sources are read at the ref, so a rerun rewrites every output)"
             ) from exc
-        raise
-    done = 0
-    try:
-        for tmp, target in staged:
-            os.replace(tmp, target)
-            done += 1
-    except OSError as exc:
-        for tmp, _ in staged[done:]:
-            Path(tmp).unlink(missing_ok=True)
-        raise RowError(
-            f"renaming into {exc.filename}: {exc.strerror}; {done} of {len(staged)} outputs were replaced"
-        ) from exc
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -604,23 +604,18 @@ def test_file_modes_follow_the_target_or_the_umask(repo):
     assert (repo / ".claude/skills/small/SKILL.md").stat().st_mode & 0o777 == 0o666 & ~umask
 
 
-def test_an_unwritable_destination_writes_nothing(repo, capsys):
-    # The last output's directory is read-only: the first two must not be
-    # written either (temp files are all written before any rename).
+def test_an_unwritable_destination_fails_and_a_rerun_finishes(repo, capsys):
+    # No rollback by design: outputs never feed the next run (sources are read
+    # at the ref), so the same command run again rewrites every output.
     refs = repo / ".claude/skills/big/references"
     refs.chmod(0o500)
     try:
         assert _run(repo) == 2
     finally:
         refs.chmod(0o700)
-    assert "no file written" in capsys.readouterr().err
-    assert not (repo / ".claude/skills/small/SKILL.md").exists()
-    assert sorted(x.name for x in refs.iterdir()) == ["existing.md"]
-    # The temp files already written for the first two outputs are removed.
-    for d in (repo / ".claude/skills/big", repo / ".claude/skills/small"):
-        assert not [x.name for x in d.iterdir() if x.name.startswith(".SKILL.md.")], d
-    assert (repo / ".claude/skills/big/SKILL.md").read_text() == BIG
-    assert not (repo / ".claude/skills/big/references/moved.md").exists()
+    assert "rerun to finish" in capsys.readouterr().err
+    assert _run(repo) == 0
+    assert _run(repo, "--check") == 0
 
 
 def test_authored_pieces_mid_destination_and_empty_ones(repo, capsys):
@@ -1087,3 +1082,49 @@ def test_comma_string_keywords_are_usable(repo):
         SMALL_FRONT.replace("keywords: [small]", "keywords: small, tiny")
     )
     assert _run(repo) == 0
+
+
+# --- round-4 review fixes -------------------------------------------------------------------
+
+
+def test_a_lowercase_skill_file_marks_the_skill_root(repo):
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / "scripts/hdr/smallref.md").write_text("See `references/notes.md`.\n")
+    (repo / ".claude/skills/small/references").mkdir(parents=True)
+    (repo / ".claude/skills/small/references/notes.md").write_text("notes\n")
+    _commit(repo, "a reference file", ".claude/skills/small/references/notes.md")
+    (repo / "scripts/rows.yaml").write_text(
+        rows.replace(
+            "small: .claude/skills/small/SKILL.md", "small: .claude/skills/small/skill.md"
+        ).replace(
+            "destinations:\n", "destinations:\n  smallref: .claude/skills/small/references/r.md\n"
+        )
+        + "  - row: sref\n    dest: smallref\n    file: scripts/hdr/smallref.md\n"
+    )
+    assert _run(repo) == 0  # references/notes.md resolves from small/, not small/references/
+
+
+@pytest.mark.parametrize("key", ["from", "until"])
+def test_an_authored_piece_refuses_range_keys(repo, capsys, key):
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / "scripts/rows.yaml").write_text(
+        rows.replace(
+            "    file: scripts/hdr/small.md\n",
+            f'    file: scripts/hdr/small.md\n    {key}: "@start"\n',
+        )
+    )
+    assert _run(repo) == 2
+    assert "an authored piece has a file and a destination only" in capsys.readouterr().err
+
+
+def test_a_symlink_source_at_the_ref_is_refused(repo, capsys):
+    link = repo / ".claude/skills/big/references/link.md"
+    link.symlink_to("existing.md")
+    _commit(repo, "a symlink source", ".claude/skills/big/references/link.md")
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / "scripts/rows.yaml").write_text(
+        rows + "  - row: ln\n    dest: ref\n    source: .claude/skills/big/references/link.md\n"
+        '    from: "@start"\n    until: "@end"\n'
+    )
+    assert _run(repo) == 2
+    assert "has mode 120000, not a regular file" in capsys.readouterr().err
