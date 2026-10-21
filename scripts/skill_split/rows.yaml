@@ -56,7 +56,7 @@ pieces:
     until: "@end"
     rewrites:
       - {kind: edit, old: "(genesis-development, \"Some PRs are not a review problem\")", new: "(\"Some PRs are not a review problem\", below)"}
-      - {kind: edit, old: "detail in `genesis-development`. This skill is the QUEUE-level orchestration;\nthat skill is the per-finding authority. Where they overlap, `genesis-development`\nwins.", new: "detail in the sections appended below (moved from `genesis-development`) and in\n`.claude/skills/genesis-development/references/commit-path.md`. The sections\nbefore them are the QUEUE-level orchestration; those are the per-finding\nauthority. Where they overlap, those win."}
+      - {kind: edit, old: "detail in `genesis-development`. This skill is the QUEUE-level orchestration;\nthat skill is the per-finding authority. Where they overlap, `genesis-development`\nwins.", new: "detail in the sections appended below (moved from `genesis-development`), in\n`.claude/skills/genesis-development/references/commit-path.md`, in the\n`genesis-development` core and in the build-session sections named above. This\nskill's own sections are the QUEUE-level orchestration; all of those are the\nper-finding authority, and where they overlap the queue-level text, they win."}
       - {kind: edit, old: "(genesis-development, \"every scheduled Claude\n    review at the current head\")", new: "(\"every scheduled Claude\n    review at the current head\", Pre-Merge Gate below)"}
       - {kind: edit, old: "(genesis-development, the clean-verdict rule)", new: "(the clean-verdict rule, Pre-Merge Gate below)"}
       - {kind: edit, old: "what counts as a round — are in `genesis-development`. Do not re-derive them.", new: "what counts as a round — are in \"Review-loop discipline\" below. Do not re-derive them."}
@@ -165,6 +165,9 @@ pieces:
   - row: h-core-deploy-exception
     dest: core
     file: scripts/skill_split/authored/h-core-deploy-exception.md
+  - row: h-validate-core
+    dest: validate
+    file: scripts/skill_split/authored/h-validate-core.md
   - row: h-validate-deploy
     dest: validate
     file: scripts/skill_split/authored/h-validate-deploy.md
@@ -218,7 +221,7 @@ pieces:
     from: "**One last thing, learned the hard way from this section itself.**"
     until: "### A blocked compound command loses EVERYTHING"
     rewrites:
-      - {kind: pointer, old: 'A draft of the paragraph above', new: 'A draft of the core''s "never about secrecy" paragraph'}
+      - {kind: pointer, old: 'A draft of the paragraph above', new: 'A draft of the core''s "never about secrecy" paragraph (in genesis-development, no longer two paragraphs away)'}
   - row: "16"
     dest: build
     source: .claude/skills/genesis-development/SKILL.md
@@ -504,6 +507,9 @@ pieces:
     source: .claude/skills/genesis-development/SKILL.md
     from: "## Never reinvent what GitHub already does natively"
     until: "## Generalizability Gate"
+  - row: h-build-auditing
+    dest: build
+    file: scripts/skill_split/authored/h-build-auditing.md
   - row: h-build-github-native
     dest: build
     file: scripts/skill_split/authored/h-build-github-native.md

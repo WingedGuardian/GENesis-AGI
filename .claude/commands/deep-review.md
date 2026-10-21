@@ -7,7 +7,7 @@ Why this exists: an internal review-loop analysis of recent PRs found that first
 findings were real, pre-existing bugs — the initial pushes had been self-reviewed with the
 WRONG SHAPE (a pattern/secrets scan), not an adversarial logic audit. This command makes the
 right-shape pass the easy default. (It reliably kills the first round; it is NOT a cure for the
-whole loop — fix-churn and hand-rolled parsing drive the tail. See the Common Traps entry on
+whole loop — fix-churn and hand-rolled parsing drive the tail. See build-session's Common Traps entry on
 CLI parsing.)
 
 Note: `/deep-review` is the LOCAL pre-push adversarial pass (Claude-model reviewers). It does
@@ -96,7 +96,7 @@ Prime each reviewer with the RIGHT SHAPE (what a lint scan misses). Paste this i
 When you fix, fix the mechanism/class — a per-instance patch is what spawns the next review
 round. `git add` the fix, but do NOT commit yet — the commit is the last step, after the marker.
 If you're on your 3rd EXTERNAL cross-model defect-bearing round, STOP at the escalation cap
-(see SKILL.md) — internal self/subagent audits like this one never count toward it.
+(see closing-session's SKILL.md) — internal self/subagent audits like this one never count toward it.
 
 **A fix is not done until you have enumerated the CLASS'S OTHER MEMBERS and said what you
 found there.** The reviewer named the instance it happened to reach; the same defect usually

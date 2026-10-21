@@ -346,6 +346,9 @@ Devin's install and hybrid PRs carry `E2E:` lines written for Genesis to run.
 The validator is their natural consumer — those are the rows where the
 declaration is most likely to be both present and actionable.
 
+**Load `genesis-development` (the shared core) first** if this session has not:
+it holds the review-chain, evidence and private-data rules every session uses.
+
 ## Deploys: detach `update.sh` from the session
 
 **DEPLOYS ARE THE EXCEPTION (to the core's `run_in_background` rule), and this is the one to get right.**

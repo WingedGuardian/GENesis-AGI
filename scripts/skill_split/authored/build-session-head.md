@@ -20,6 +20,9 @@ skill_type: workflow
 
 # Build session
 
+**Load `genesis-development` (the shared core) first** if this session has not:
+it holds the review-chain, evidence and private-data rules every session uses.
+
 **Mandatory read before your first commit:**
 `.claude/skills/genesis-development/references/commit-path.md`. It holds the
 review_state sequence, the sigils, the Pre-Commit Gate, the depth gate and

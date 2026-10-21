@@ -16,6 +16,9 @@ skill_type: workflow
 
 # Spec session
 
+**Load `genesis-development` (the shared core) first** if this session has not:
+it holds the review-chain, evidence and private-data rules every session uses.
+
 A minimal skill for now; its process is designed later. Also read:
 - the core's "Due diligence before building" and "Architecture Review"
   (`.claude/skills/genesis-development/SKILL.md`);

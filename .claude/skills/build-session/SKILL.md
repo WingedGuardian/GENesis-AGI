@@ -20,6 +20,9 @@ skill_type: workflow
 
 # Build session
 
+**Load `genesis-development` (the shared core) first** if this session has not:
+it holds the review-chain, evidence and private-data rules every session uses.
+
 **Mandatory read before your first commit:**
 `.claude/skills/genesis-development/references/commit-path.md`. It holds the
 review_state sequence, the sigils, the Pre-Commit Gate, the depth gate and
@@ -616,7 +619,7 @@ is the easy half, and it is not the half that fails. **State the inference as it
 own claim, and check THAT.**
 
 The sharpest instance is this section committing that error in the sentence next
-to the one warning against it. A draft of the core's "never about secrecy" paragraph cited a real file
+to the one warning against it. A draft of the core's "never about secrecy" paragraph (in genesis-development, no longer two paragraphs away) cited a real file
 that says, correctly, that a particular scrub applies to external audiences and
 not to replies going to the user — and generalised it into "this repo leaves
 owner-facing content untouched", which four other paths contradict. True fact,
@@ -1914,6 +1917,9 @@ python interpreter with an adjacent `-m pytest`.
   chokepoint the callers cannot bypass, then LOCK the chokepoint with a test
   that fails when someone routes around it. A chokepoint nobody is forced
   through is a convention with better documentation.
+
+Before any "X is absent" or "nothing adoptable exists" claim, follow
+"Auditing Existing Capabilities" in `.claude/skills/spec-session/SKILL.md`.
 
 Before writing repo-local code that decides something about a pull request, read
 "Never reinvent what GitHub already does natively" in
