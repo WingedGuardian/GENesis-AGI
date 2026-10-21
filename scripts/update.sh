@@ -2654,6 +2654,8 @@ else
 # holds that lock only while it clears the excused local edits, never across the
 # rebuild. DEPLOY_CANDIDATES_OWN_STATE_PID tells the engine the "merging" row is
 # this run's own, not an unfinished update to refuse or a leftover to retire.
+# --expect-branch/--expect-head name where this run verified the checkout; the
+# engine refuses, moving nothing, if it is elsewhere under its lock (#3492).
 # None of the main path's pre-merge clears ran, so the no-change path has nothing
 # to restore.
 SETTINGS_LOCAL_BAK="" SERENA_YML_BAK="" USER_MD_BAK=""
@@ -2690,7 +2692,8 @@ _LIVE_ENGINE_RAN=1
 _eng_rc=0
 DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" DEPLOY_CANDIDATES_EPHEMERAL_RE="$EPHEMERAL_DIRTY_RE" \
     DEPLOY_CANDIDATES_OWN_STATE_PID="$$" DEPLOY_CANDIDATES_MOVE_RECORD="$_LIVE_MOVE_REC" \
-    python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" rebuild || _eng_rc=$?
+    python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" rebuild \
+    --expect-branch "$ORIGINAL_BRANCH" --expect-head "$UPDATE_OWN_HEAD" || _eng_rc=$?
 # Success must leave the checkout at the exact recorded move, not another
 # actor's valid live tip. An unchanged rebuild writes no record and may retain
 # only the head this updater already owns. Keep the record for rollback until

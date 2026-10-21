@@ -3930,7 +3930,18 @@ tool-disabled CC probe without changing its schedule or routing authority.
   update.lock is handed to the engine; `update.sh` holds genesis-checkout.lock
   only while it clears the excused local edits, never across the rebuild (the
   engine's move takes that lock itself). A refusal, failure or interrupt of the
-  rebuild runs the normal rollback. What the engine did to the checkout is read
+  rebuild runs the normal rollback. `update.sh` names the branch and commit it
+  verified (`rebuild --expect-branch --expect-head`, #3492); the engine records
+  that source (branch ref, HEAD, the `live` ref, a clean tracked tree) before it
+  fetches, re-checks it in full once its move holds genesis-checkout.lock, and
+  re-checks branch, HEAD and tracked dirt again just before its first write. A
+  session commit, switch or tracked edit in that window refuses the move with
+  nothing moved and no move record (a hand `rebuild`/`drop` without the flags
+  checks the source it read itself). A commit that still slips in after the last
+  re-check is reset over by the switch; the engine then prints a WARNING naming
+  what `live@{1}` was, kept in live's reflog (not when `live` already sat at the
+  tip, from main: git logs nothing then). A tracked edit in that last window,
+  before git takes index.lock, is not warned about. What the engine did to the checkout is read
   from its move record (`DEPLOY_CANDIDATES_MOVE_RECORD`, here
   `~/.genesis/live_move.json`: `{"to", "phase"}` with phase `ref` / `moving` /
   `partial` / `clean` / `done`, written by `deploy_candidates_plan.py` before and

@@ -472,7 +472,7 @@ def test_the_engine_gets_the_update_lock_its_own_state_pid_and_a_free_checkout_l
     r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "move"})
     assert r.returncode == 0, _out(r)
     first = _engine_calls(log)[0]
-    fields = dict(kv.split("=", 1) for kv in first.split()[1:])
+    fields = dict(kv.split("=", 1) for kv in first.split() if "=" in kv)
     assert first.startswith("rebuild ") and fields["lockfd"] != "-" and fields["re"] == "yes"
     assert fields["own"] == fields["ppid"], "the engine was not told the row is its caller's"
     assert fields["checkout"] == "free", "update.sh held genesis-checkout.lock across the rebuild"
@@ -480,6 +480,17 @@ def test_the_engine_gets_the_update_lock_its_own_state_pid_and_a_free_checkout_l
     assert state["phase"] == "merging" and state["pid"] == int(fields["own"])
     assert state["own_head"] == _git(root, "rev-parse", "HEAD") != state["rollback_tag"]
     assert not _move_record(home).exists(), "the adopted move's record outlived the adoption"
+
+
+def test_the_engine_is_told_where_update_sh_left_the_checkout(plain_live):
+    """#3492: the engine re-checks the branch and head this run verified, under
+    its own checkout lock, instead of trusting what it reads after its fetch."""
+    root, home, stub, env, log = plain_live
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "move"})
+    assert r.returncode == 0, _out(r)
+    own = _git(root, "rev-parse", TAG)
+    first = _engine_calls(log)[0]
+    assert first.startswith(f"rebuild --expect-branch live --expect-head {own} "), first
 
 
 def test_p2_an_interrupt_during_the_rebuild_rolls_back_onto_the_old_tip(plain_live):

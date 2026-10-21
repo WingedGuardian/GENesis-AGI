@@ -48,6 +48,11 @@ Commands:
         checkout once, and only when something changed; sync the git hooks;
         fast-forward local main. It does NOT restart the server: it prints the
         next step.
+  rebuild / drop [--expect-branch B --expect-head C]
+        Both or neither. The checkout must be on B at C (update.sh passes where
+        it verified it), or nothing changes. With or without them, the move
+        re-checks the branch, HEAD, `live` and the tracked tree it planned from
+        once it holds genesis-checkout.lock, and again before its first write.
   list  The manifest as written (checked to be this repository's). No network.
   status
         READINESS, and per candidate: whether it is in `live` now, what the next
@@ -235,9 +240,11 @@ class Engine(Repo):
             raise Refusal(f"update.lock is held by another process; {hint}.") from exc
         self._update_lock_held = True
 
-    def _move_preflight(self, need_manifest: bool) -> tuple[dict | None, str]:
+    def _move_preflight(
+        self, need_manifest: bool, expect: tuple[str, str] | None = None
+    ) -> tuple[dict | None, plan.Source]:
         """Every refusal before a checkout move, in order. Returns the manifest
-        and the checkout's branch."""
+        and the source the move must still find under its lock (#3492)."""
         self.require_main_checkout()
         data = self.store.load()
         if need_manifest and data is None:
@@ -247,8 +254,26 @@ class Engine(Repo):
         reasons = self._move_refusals()
         if reasons:
             raise Refusal(reasons[0])
+        source = self._expected_source(expect)
         self._retire_harmless_update_state()
-        return data, self.current_branch()
+        return data, source
+
+    def _expected_source(self, expect: tuple[str, str] | None) -> plan.Source:
+        """The checkout's source now. With ``expect`` (--expect-branch and
+        --expect-head: update.sh names the branch and commit it verified before
+        it handed over), the checkout must still be exactly there."""
+        source = plan.read_source(self)
+        if expect is None:
+            return source
+        branch, head = expect
+        want = (f"refs/heads/{branch}", self.resolve(head))
+        if want[1] is None or (source.branch_ref, source.head) != want:
+            raise Refusal(
+                f"the checkout is not where its caller left it: it is on "
+                f"{source.branch_ref or 'a detached HEAD'} at {(source.head or 'nothing')[:12]}, "
+                f"not {want[0]} at {head[:12]}; nothing changed."
+            )
+        return source
 
     def _update_state_refusal(self) -> str | None:
         """Why update_state.json forbids moving the checkout, or None.
@@ -655,8 +680,9 @@ class Engine(Repo):
             "fetch origin first if origin/main does not resolve). Nothing changed."
         )
 
-    def cmd_drop(self, branch: str, no_rebuild: bool) -> int:
+    def cmd_drop(self, branch: str, no_rebuild: bool, expect: tuple[str, str] | None = None) -> int:
         self.require_update_lock()
+        self._expected_source(expect)
         # No manifest: nothing to drop, and the manifest is not created.
         if not self.store.exists():
             raise Refusal(
@@ -691,7 +717,7 @@ class Engine(Repo):
             return 0
         # On `live`: subtract-only, offline. Every refusal comes before the manifest
         # changes, so a drop that cannot take the code out never reports it gone.
-        self._move_preflight(need_manifest=True)
+        _, source = self._move_preflight(need_manifest=True, expect=expect)
         walk_base = self.resolve(BASE_REF)
         if not walk_base:
             raise Refusal(f"{BASE_REF} does not resolve.")
@@ -725,9 +751,8 @@ class Engine(Repo):
         self._refuse_blockers(p.tip, "the manifest still lists " + branch)
         after = self.store.update(remove)
         out(f"  {branch} dropped from {self.store.path}.")
-        before = self.resolve("HEAD")
         try:
-            moved = plan.move_checkout(self, p, LIVE_BRANCH)
+            moved = plan.move_checkout(self, p, source)
         except Refusal as exc:
             raise Refusal(
                 f"{exc}\nThe manifest change WAS saved ({branch} is no longer a candidate), but `live` still "
@@ -741,7 +766,7 @@ class Engine(Repo):
             core.after_move(
                 state,
                 "restoring moved git hooks",
-                lambda: plan.restore_moved_hooks(self, before, moved.at),
+                lambda: plan.restore_moved_hooks(self, moved.before, moved.at),
             )
             core.after_move(state, "syncing the git hooks", lambda: plan.sync_git_hooks(self))
         core.after_move(
@@ -827,9 +852,9 @@ class Engine(Repo):
         out(base)
         return 0
 
-    def cmd_rebuild(self) -> int:
+    def cmd_rebuild(self, expect: tuple[str, str] | None = None) -> int:
         self.require_update_lock()
-        data, branch = self._move_preflight(need_manifest=True)
+        data, source = self._move_preflight(need_manifest=True, expect=expect)
         rebuild_id = core.now().strftime("%Y%m%dT%H%M%SZ")
         out(f"deploy_candidates rebuild {rebuild_id}")
         ok, why = self.fetch(f"+refs/heads/{BASE_BRANCH}:{BASE_REF}")
@@ -870,14 +895,13 @@ class Engine(Repo):
         p = self._attributed_plan(base, cands, rebuild_id, sticky, data)
         self._print_plan(p, sorted(gone))
         self._refuse_blockers(p.tip, "nothing was retired")
-        before = self.resolve("HEAD")
-        moved = plan.move_checkout(self, p, branch)
+        moved = plan.move_checkout(self, p, source)
         state = f"`live` is at {moved.at[:12]}"
         if moved.files:
             core.after_move(
                 state,
                 "restoring moved git hooks",
-                lambda: plan.restore_moved_hooks(self, before, moved.at),
+                lambda: plan.restore_moved_hooks(self, moved.before, moved.at),
             )
             core.after_move(state, "syncing the git hooks", lambda: plan.sync_git_hooks(self))
         # Past the commit point (`live` has moved): every step below is a
@@ -1163,11 +1187,15 @@ def _parser() -> argparse.ArgumentParser:
     d = sub.add_parser("drop")
     d.add_argument("branch")
     d.add_argument("--no-rebuild", action="store_true")
+    rb = sub.add_parser("rebuild")
+    # update.sh names where it left the checkout (#3492); both or neither.
+    for moving in (d, rb):
+        moving.add_argument("--expect-branch", metavar="BRANCH")
+        moving.add_argument("--expect-head", metavar="COMMIT")
     ls = sub.add_parser("list")
     # Machine-readable, for deploy health (observe()); the text form is unchanged.
     ls.add_argument("--json", action="store_true")
     sub.add_parser("status")
-    sub.add_parser("rebuild")
     # For update.sh on `live`: its rollback's hook restore, and the shape check
     # it runs before anything moves.
     r = sub.add_parser("restore-hooks")
@@ -1198,6 +1226,14 @@ def main(
         args = _parser().parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 0) if exc.code in (0, None) else 2
+    expect = (getattr(args, "expect_branch", None), getattr(args, "expect_head", None))
+    if (expect[0] is None) != (expect[1] is None):
+        _err("deploy_candidates: --expect-branch and --expect-head go together")
+        return 2
+    if "" in expect:
+        _err("deploy_candidates: --expect-branch and --expect-head cannot be empty")
+        return 2
+    expect = None if expect[0] is None else expect
     # The checkout this script lives in. `root` is for tests (scratch
     # repositories); nothing in the environment can point the engine elsewhere.
     engine = Engine(
@@ -1213,9 +1249,9 @@ def main(
         if args.cmd == "add":
             return engine.cmd_add(args.branch, args.owner, args.pr, args.approve_hooks)
         if args.cmd == "drop":
-            return engine.cmd_drop(args.branch, args.no_rebuild)
+            return engine.cmd_drop(args.branch, args.no_rebuild, expect)
         if args.cmd == "rebuild":
-            return engine.cmd_rebuild()
+            return engine.cmd_rebuild(expect)
         if args.cmd == "restore-hooks":
             return engine.cmd_restore_hooks(args.before, args.after)
         if args.cmd == "live-shaped":
