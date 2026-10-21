@@ -4405,7 +4405,7 @@ def _check_inline_review_findings(
     # that has always stopped it.
     #
     # WHAT THIS ENFORCES IS NARROWER THAN THE DOCTRINE IT SERVES, and the two
-    # must not be conflated. The genesis-development skill's always-fix floor is
+    # must not be conflated. The closing-session skill's always-fix floor is
     # severity AND KIND — "a P1, a security defect, anything destructive or
     # fail-open". This check can only see the severity LABEL a reviewer attached,
     # so a CodeRabbit MINOR naming a fail-open scores 0.0 and passes here. The
