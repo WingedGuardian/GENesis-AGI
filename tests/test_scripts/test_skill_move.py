@@ -448,12 +448,12 @@ def test_bad_frontmatter_fails(repo, capsys):
     assert "frontmatter name 'tiny' != directory 'small'" in capsys.readouterr().err
     (repo / "scripts/hdr/small.md").write_text(SMALL_FRONT.replace("keywords: [small]\n", ""))
     assert _run(repo) == 1
-    assert "frontmatter lacks keywords" in capsys.readouterr().err
+    assert "frontmatter has no usable keywords" in capsys.readouterr().err
     (repo / "scripts/hdr/small.md").write_text(
         SMALL_FRONT.replace("description: Small skill.\n", "")
     )
     assert _run(repo) == 1
-    assert "frontmatter lacks description" in capsys.readouterr().err
+    assert "frontmatter has no usable description" in capsys.readouterr().err
 
 
 def test_must_end_before_overrun_fails(repo, capsys):
@@ -574,10 +574,14 @@ def test_a_path_rewrite_target_must_resolve(repo, capsys):
 
 def test_joins_that_change_blank_lines_are_reported(repo, capsys):
     assert _run(repo) == 0
-    assert "join row" not in capsys.readouterr().out  # the fixture joins on exactly one blank line
+    out = capsys.readouterr().out
+    # The authored header ends on its frontmatter line and row 2 starts at once:
+    # no blank line between them, normalised to one. Source rows already join on one.
+    assert "join row hdr | row 2: 0 blank line(s) -> 1" in out
+    assert "join row 2" not in out
     (repo / "scripts/hdr/small.md").write_text(SMALL_FRONT + "\n\n")
     assert _run(repo) == 0
-    assert "join row hdr | row 2: 3 blank line(s) -> 1" in capsys.readouterr().out
+    assert "join row hdr | row 2: 2 blank line(s) -> 1" in capsys.readouterr().out
 
 
 def test_check_compares_bytes_not_text(repo, capsys):
@@ -1024,3 +1028,62 @@ def test_a_crlf_file_at_a_destination_path_gets_the_exists_at_ref_error(repo, ca
     _commit(repo, "a crlf file at the destination path", ".claude/skills/big/references/moved.md")
     assert _run(repo) == 2
     assert "exists at HEAD but is no piece's source" in capsys.readouterr().err
+
+
+# --- round-3 review fixes -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "See `references/missing.md#section`.",
+        'See [the guide](missing.md "Guide").',
+        "See [the guide](<missing.md>).",
+    ],
+    ids=["backtick-fragment", "titled-link", "angle-link"],
+)
+def test_fragment_and_titled_link_targets_are_checked(repo, capsys, line):
+    (repo / "scripts/hdr/small.md").write_text(SMALL_FRONT + "\n" + line + "\n")
+    assert _run(repo) == 1
+    assert "does not resolve" in capsys.readouterr().err
+
+
+def test_a_reference_named_like_a_skill_file_is_not_a_skill(repo):
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / "scripts/rows.yaml").write_text(
+        rows.replace("references/moved.md", "references/NOTSKILL.md")
+    )
+    assert _run(repo) == 0
+
+
+def test_a_lowercase_skill_md_destination_gets_the_frontmatter_check(repo, capsys):
+    rows = (repo / "scripts/rows.yaml").read_text()
+    (repo / "scripts/rows.yaml").write_text(
+        rows.replace("small: .claude/skills/small/SKILL.md", "small: .claude/skills/small/skill.md")
+    )
+    (repo / "scripts/hdr/small.md").write_text(SMALL_FRONT.replace("name: small", "name: tiny"))
+    assert _run(repo) == 1
+    assert "frontmatter name 'tiny' != directory 'small'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "field"),
+    [
+        ("description: Small skill.", "description: [Small skill.]", "description"),
+        ("keywords: [small]", "keywords: {topic: small}", "keywords"),
+        ("keywords: [small]", "keywords: [1, 2]", "keywords"),
+        ("description: Small skill.", 'description: "  "', "description"),
+    ],
+    ids=["desc-list", "kw-dict", "kw-non-strings", "desc-blank"],
+)
+def test_frontmatter_values_must_be_usable_by_the_catalog(repo, capsys, old, new, field):
+    (repo / "scripts/hdr/small.md").write_text(SMALL_FRONT.replace(old, new))
+    assert _run(repo) == 1
+    assert f"frontmatter has no usable {field}" in capsys.readouterr().err
+
+
+def test_comma_string_keywords_are_usable(repo):
+    (repo / "scripts/hdr/small.md").write_text(
+        SMALL_FRONT.replace("keywords: [small]", "keywords: small, tiny")
+    )
+    assert _run(repo) == 0

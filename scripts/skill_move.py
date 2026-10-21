@@ -81,8 +81,16 @@ _KINDS = {"path", "pointer", "edit"}
 _POINTER_MAX = 80
 _PATH_TOKEN = re.compile(r"(?<![\w./-])[\w.-]*(?:/[\w.-]+)+\.md")
 _POINTER = re.compile(r"\b(above|below)\b", re.IGNORECASE)
-_BACKTICKED = re.compile(r"`((?:references/|\.claude/|\.\./)[\w./-]+)`")
-_MD_LINK = re.compile(r"\[[^\[\]]*\]\(([^)\s]+)\)")
+# A backticked path may carry a #fragment, and a markdown link an optional
+# <angle> form and "title"; the target is checked either way (target() drops
+# the fragment).
+_BACKTICKED = re.compile(r"`((?:references/|\.claude/|\.\./)[\w./-]+(?:#[\w.-]*)?)`")
+_MD_LINK = re.compile(
+    r"\[[^\[\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)"
+)
+# The files that make a directory a skill (scripts/generate_skill_catalog.py
+# _SELF_MARKERS); a README.md destination is a reference file, not a skill.
+_SKILL_FILES = ("SKILL.md", "skill.md")
 
 
 class RowError(Exception):
@@ -395,8 +403,17 @@ def _frontmatter_problem(rel: str, text: str) -> str | None:
         return (
             f"frontmatter name {meta.get('name')!r} != directory {PurePosixPath(rel).parent.name!r}"
         )
-    missing = [k for k in ("description", "keywords") if not meta.get(k)]
-    return f"frontmatter lacks {', '.join(missing)}" if missing else None
+    # Typed as scripts/generate_skill_catalog.py keeps them: anything else is
+    # catalogued as empty, so it counts as missing.
+    desc, kw = meta.get("description"), meta.get("keywords")
+    if isinstance(kw, str):
+        kw = kw.split(",")
+    missing = []
+    if not (isinstance(desc, str) and desc.strip()):
+        missing.append("description")
+    if not (isinstance(kw, list | tuple) and any(isinstance(k, str) and k.strip() for k in kw)):
+        missing.append("keywords")
+    return f"frontmatter has no usable {' or '.join(missing)}" if missing else None
 
 
 def _cut(
@@ -435,7 +452,10 @@ def _cut(
                 data = fp.read_bytes()
             except OSError as exc:
                 raise RowError(f"{where}: cannot read {p.file}: {exc.strerror}") from exc
-            p.text = p.original = _lf_text(data, f"{where} file {p.file}")
+            text = _lf_text(data, f"{where} file {p.file}")
+            # Its terminal newline ends the last line; it is not a blank line,
+            # so the join report counts it the way it counts a source range.
+            p.text = p.original = text[:-1] if text.endswith("\n") else text
             continue
         lines = sources[p.source]
         start, end = _find(lines, p.frm, where), _find(lines, p.until, where)
@@ -512,7 +532,7 @@ def _assemble(name, dpath, mine, res: _Resolver, failures, report):
         failures.append(f"destination {name} has no non-empty pieces")
         return None, starts
     text += "\n"
-    if dpath.endswith("SKILL.md") and (problem := _frontmatter_problem(dpath, text)):
+    if PurePosixPath(dpath).name in _SKILL_FILES and (problem := _frontmatter_problem(dpath, text)):
         failures.append(f"{dpath}: {problem}")
     report.append(
         f"{name}: {dpath}  {text.count(chr(10))} lines, ~{len(text.encode()) // 4} tokens, {len(mine)} pieces"
