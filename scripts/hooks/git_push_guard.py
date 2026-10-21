@@ -4937,11 +4937,11 @@ def _comment_positional(argv: list[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
-# EXTRACTION patterns — what a target MEANS. `_PR_URL_RE` keeps its original
-# shape (trailing context tolerated, e.g. a `#issuecomment-…` fragment) because
-# it reads the number and OWNER/REPO out of a URL.
+# EXTRACTION patterns — what a target MEANS. `_PR_URL_RE` requires an explicit
+# scheme and host; scheme-less PR-shaped branch names stay branches. It permits
+# trailing context (e.g. a `#issuecomment-…` fragment) when reading a URL.
 _PR_NUMBER_RE = re.compile(r"#?([0-9]+)\Z")
-_PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b")
+_PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)([^/\s]+/[^/\s]+)/pull/(\d+)\b")
 
 # ALLOWLIST patterns — what the gate accepts as unambiguously LITERAL. See
 # `_unresolvable_identity` for why these are allowlists and not screens.
@@ -4951,7 +4951,7 @@ _PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b")
 # comment only at word start). It stops short of `?query`, because `?` is a
 # glob metacharacter and the shell WOULD act on it.
 _LITERAL_URL_RE = re.compile(
-    r"(?:[a-z]+://[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+"
+    r"(?:[a-z]+://[A-Za-z0-9._-]+/)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+"
     r"(?:[/#][A-Za-z0-9._/#-]*)?\Z"
 )
 # A branch name in characters that are both legal in a git ref and inert to the
@@ -5067,7 +5067,7 @@ def _unresolvable_identity(argv: list[str]) -> str | None:
             return tok
         repo = url.group(1)
     if repo is not None and not _LITERAL_REPO_RE.match(repo):
-        return repo
+        return repo or "--repo (empty value)"
     if repo is not None and repo.count("/") == 2 and not repo.startswith("github.com/"):
         return repo
     return None

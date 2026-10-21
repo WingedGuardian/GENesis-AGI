@@ -557,7 +557,7 @@ def test_empty_repo_flag_does_not_erase_mixed_review_identity(monkeypatch, flags
     "1372", "'#1372'", "1372 --repo owner/repo", "1372 --repo=owner/repo",
     "1372 -R owner/repo", "1372 -Rowner/repo", "1372 -R=owner/repo",
     "1372 --repo github.com/owner/repo", "https://github.com/owner/repo/pull/1372",
-    "http://github.com/owner/repo/pull/1372/files#x", "owner/repo/pull/1372",
+    "http://github.com/owner/repo/pull/1372/files#x",
 ])
 def test_literal_review_identity_queries_intended_budget(monkeypatch, selector):
     seen = []
@@ -570,6 +570,45 @@ def test_literal_review_identity_queries_intended_budget(monkeypatch, selector):
     monkeypatch.setattr(_mod, "_derive_repo_from_cwd", lambda *a: "owner/repo")
     assert _decision(f'gh pr comment {selector} --body "@codex review"') == ("allow", "")
     assert seen == [("owner/repo", "1372")]
+
+
+@pytest.mark.parametrize(
+    ("selector", "repo"),
+    [
+        ("owner/repo/pull/1372", None),
+        ("owner/repo/pull/1372 --repo owner/repo", "owner/repo"),
+    ],
+)
+def test_schemeless_pr_shaped_target_uses_literal_branch_policy(monkeypatch, selector, repo):
+    token = "owner/repo/pull/1372"
+    assert _mod._PR_URL_RE.match(token) is None
+    assert _mod._LITERAL_URL_RE.fullmatch(token) is None
+
+    command = f'gh pr comment {selector} --body "@codex review"'
+    monkeypatch.setattr(
+        _mod._review_budget,
+        "evaluate_pr",
+        lambda *a, **kw: pytest.fail("budget lookup"),
+    )
+    monkeypatch.setattr(_mod, "_derive_repo_from_cwd", lambda *a: "owner/repo")
+    assert _mod._comment_target(_argv(command)) == (None, repo)
+    decision, reason = _decision(command)
+    assert decision == "ask"
+    assert "could not be resolved to a literal PR number" in reason
+
+
+@pytest.mark.parametrize("flag", ["--repo=", '-R ""'])
+def test_empty_repo_advisory_names_the_missing_value(monkeypatch, flag):
+    command = f'gh pr comment 1372 {flag} --body "@codex review"'
+    monkeypatch.setattr(
+        _mod._review_budget,
+        "evaluate_pr",
+        lambda *a, **kw: pytest.fail("budget lookup"),
+    )
+    monkeypatch.setattr(_mod, "_derive_repo_from_cwd", lambda *a: "owner/repo")
+    decision, reason = _decision(command)
+    assert decision == "deny"
+    assert "--repo (empty value)" in reason
 
 
 @pytest.mark.parametrize("body", ['--body "--repo other/repo @codex review"',
