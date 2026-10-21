@@ -1829,6 +1829,10 @@ _BLOCKING_PATTERNS = [
 # Only these bounded legacy negatives suppress their own HARD BLOCK occurrence.
 # They are not clean verdicts and cannot settle another finding or an earlier review.
 _NEG_TAIL = r"(?=[ \t]*(?:\r?$|[.,;][ \t]*(?:\r?$|no\b)))"
+_NEG_EXCEPTION = re.compile(
+    r"\b(?:except|but|however|apart\s+from|other\s+than|aside\s+from|save\s+for)\b",
+    re.IGNORECASE,
+)
 _NEGATIVE_HARD_BLOCK_PATTERNS = [
     re.compile(
         r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?hard[ \t]+blocks?"
@@ -1857,11 +1861,14 @@ _CLEAN_PATTERNS = [
 
 def _review_body_findings(body: str) -> tuple[bool, list[str]]:
     """Explicit clean verdict and blocking patterns, excluding bounded negatives."""
-    negative_spans = [
-        match.span()
-        for pattern in _NEGATIVE_HARD_BLOCK_PATTERNS
-        for match in pattern.finditer(body)
-    ]
+    negative_spans = []
+    for pattern in _NEGATIVE_HARD_BLOCK_PATTERNS:
+        for match in pattern.finditer(body):
+            line_end = body.find("\n", match.end())
+            if line_end == -1:
+                line_end = len(body)
+            if _NEG_EXCEPTION.search(body, match.end(), line_end) is None:
+                negative_spans.append(match.span())
     blocking = [
         pattern.pattern
         for pattern in _BLOCKING_PATTERNS

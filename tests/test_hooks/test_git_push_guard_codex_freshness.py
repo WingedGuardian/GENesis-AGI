@@ -106,6 +106,7 @@ class TestLegacyNegativeScheduledReview:
         "**Hard blocks:** None. Except the API key committed in config.py.",
         "No hard blocks. However an AWS key is committed in settings.py.",
         "no PII hard blocks; a credential leak was found in env.example",
+        "no hard blocks, no secrets except the token in config.py",
     ])
     def test_negative_tail_exceptions_are_refused(self, monkeypatch, finding):
         marker = f"<!-- genesis-scheduled-review: head={self._head} kind=leaks -->"
