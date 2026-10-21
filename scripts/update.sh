@@ -3267,7 +3267,7 @@ fi
 # `_apply_direct` (dashboard, supervised=False) does too — see
 # `dashboard/routes/updates.py::_apply_direct`, which probes scope availability
 # before spawning. A manual CLI run must be launched detached the same way (see
-# the genesis-development skill's Timeout Policy).
+# the validating-merges skill, "DEPLOYS ARE THE EXCEPTION").
 #
 # CORRECTED 2026-09-16: this comment previously stated that `_apply_direct` does
 # NOT scope-isolate and called it a pre-existing bug awaiting P5. That is no longer

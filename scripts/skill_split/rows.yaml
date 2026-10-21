@@ -1,0 +1,608 @@
+# Row file for the skill split (T-3), architecture §4. Generated outputs come
+# from `scripts/skill_move.py --rows scripts/skill_split/rows.yaml`.
+# Each destination is its pieces in THIS file's order; coverage of every source
+# line is checked whatever the order. Row ids are §4 row numbers; a letter
+# suffix is a sub-range of that row.
+version: 1
+destinations:
+  core: .claude/skills/genesis-development/SKILL.md
+  build: .claude/skills/build-session/SKILL.md
+  close: .claude/skills/closing-session/SKILL.md
+  validate: .claude/skills/validating-merges/SKILL.md
+  spec: .claude/skills/spec-session/SKILL.md
+  commit: .claude/skills/genesis-development/references/commit-path.md
+  guard_regimes: .claude/skills/genesis-development/references/guard-failure-regimes.md
+  gh_caps: .claude/skills/genesis-development/references/gh-listing-caps.md
+  ask_keys: .claude/skills/genesis-development/references/ask-keys-and-sigils.md
+  merge_findings: .claude/skills/genesis-development/references/merge-gate-findings.md
+pieces:
+  # ---- heads and existing text that open each destination ----
+  - row: build-head
+    dest: build
+    file: scripts/skill_split/authored/build-session-head.md
+  - row: spec-head
+    dest: spec
+    file: scripts/skill_split/authored/spec-session-head.md
+  - row: commit-head
+    dest: commit
+    file: scripts/skill_split/authored/commit-path-head.md
+  - row: guard-regimes-head
+    dest: guard_regimes
+    file: scripts/skill_split/authored/guard-failure-regimes-head.md
+  - row: gh-caps-head
+    dest: gh_caps
+    file: scripts/skill_split/authored/gh-listing-caps-head.md
+  - row: ask-keys-head
+    dest: ask_keys
+    file: scripts/skill_split/authored/ask-keys-and-sigils-head.md
+  - row: merge-findings-head
+    dest: merge_findings
+    file: scripts/skill_split/authored/merge-gate-findings-head.md
+  - row: closing-existing
+    dest: close
+    source: .claude/skills/closing-session/SKILL.md
+    from: "@start"
+    until: "## Why this session type exists"
+    rewrites:
+      - {kind: edit, old: "a build session (`genesis-development`).", new: "a build session (`build-session`)."}
+      - {kind: edit, old: "load `genesis-development` instead.", new: "load `build-session` instead."}
+  - row: close-commit-read
+    dest: close
+    file: scripts/skill_split/authored/closing-commit-read.md
+  - row: closing-existing-b
+    dest: close
+    source: .claude/skills/closing-session/SKILL.md
+    from: "## Why this session type exists"
+    until: "@end"
+    rewrites:
+      - {kind: edit, old: "(genesis-development, \"Some PRs are not a review problem\")", new: "(\"Some PRs are not a review problem\", below)"}
+      - {kind: edit, old: "detail in `genesis-development`. This skill is the QUEUE-level orchestration;\nthat skill is the per-finding authority. Where they overlap, `genesis-development`\nwins.", new: "detail in the sections appended below (moved from `genesis-development`) and in\n`.claude/skills/genesis-development/references/commit-path.md`. The sections\nbefore them are the QUEUE-level orchestration; those are the per-finding\nauthority. Where they overlap, those win."}
+      - {kind: edit, old: "(genesis-development, \"every scheduled Claude\n    review at the current head\")", new: "(\"every scheduled Claude\n    review at the current head\", Pre-Merge Gate below)"}
+      - {kind: edit, old: "(genesis-development, the clean-verdict rule)", new: "(the clean-verdict rule, Pre-Merge Gate below)"}
+      - {kind: edit, old: "what counts as a round — are in `genesis-development`. Do not re-derive them.", new: "what counts as a round — are in \"Review-loop discipline\" below. Do not re-derive them."}
+      - {kind: edit, old: "This is the established disposition in genesis-development, \"Some PRs are not\n  a review problem\".", new: "This is the established disposition in \"Some PRs are not\n  a review problem\" below."}
+      - {kind: edit, old: "(genesis-development, \"Never RETIRE a PR you are not the one\nreviving\")", new: "(\"Never RETIRE a PR you are not the one\nreviving\", below)"}
+      - {kind: edit, old: "(genesis-development's superseded-PR exception, condition 3)", new: "(the superseded-PR exception below, condition 3)"}
+      - {kind: edit, old: "condition 1 of\ngenesis-development's superseded-PR exception", new: "condition 1 of\nthe superseded-PR exception below"}
+      - {kind: edit, old: "(genesis-development,\n\"Building a rework\", item 0)", new: "(build-session,\n\"Building a rework\", item 0)"}
+      - {kind: edit, old: "The section is described in genesis-development,\n\"Building a rework\".", new: "The section is described in build-session,\n\"Building a rework\"."}
+      - {kind: edit, old: "under genesis-development's superseded-PR exception", new: "under the superseded-PR exception below"}
+  - row: validating-existing
+    dest: validate
+    source: .claude/skills/validating-merges/SKILL.md
+    from: "@start"
+    until: "@end"
+    rewrites:
+      - {kind: edit, old: "PR (that is `genesis-development`)", new: "PR (that is `build-session`)"}
+      - {kind: edit, old: "| **build** | an item from Ready until its PR exists | `genesis-development` |", new: "| **build** | an item from Ready until its PR exists | `build-session` |"}
+
+  # ---- genesis-development/SKILL.md, in source order ----
+  - row: "1"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "@start"
+    until: "## On-Load Mindset"
+  - row: router
+    dest: core
+    file: scripts/skill_split/authored/core-router.md
+  - row: "0"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "## On-Load Mindset"
+    until: "### Where your session ENDS"
+  - row: "2"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Where your session ENDS"
+    until: "### PR readiness and mode"
+    rewrites:
+      - {kind: pointer, old: '"When to DRIVE a Merge" below', new: '"When to DRIVE a Merge" (closing-session)'}
+  - row: "3"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### PR readiness and mode"
+    until: "### Wiring Discipline"
+  - row: "4"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Wiring Discipline"
+    until: "### Measure, Do Not Choose"
+  - row: "5"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Measure, Do Not Choose"
+    until: "**A new SKILL has its own version of this"
+  - row: h-build-skill-trigger
+    dest: build
+    file: scripts/skill_split/authored/h-build-skill-trigger.md
+  - row: "5b"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "**A new SKILL has its own version of this"
+    until: "### Due diligence before building"
+    rewrites:
+      - {kind: edit, old: 'its own version of this, and', new: 'its own version of "Measure, Do Not Choose" (genesis-development), and'}
+  - row: "7"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Due diligence before building"
+    until: "### Architecture Review"
+    rewrites:
+      - {kind: pointer, old: '"Verify BEFORE the PR" below', new: '"Verify BEFORE the PR" (build-session)'}
+  - row: "8"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Architecture Review"
+    until: "### Skill invocation points"
+  - row: "9"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Skill invocation points"
+    until: "### Plan documents carry a structured header"
+  - row: "10"
+    dest: spec
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Plan documents carry a structured header"
+    until: "### Timeout Policy"
+    rewrites:
+      - {kind: path, old: "`references/plan-docs.md`", new: "`.claude/skills/genesis-development/references/plan-docs.md`"}
+      - {kind: pointer, old: 'before building" above', new: 'before building" in the core'}
+  - row: "11a"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Timeout Policy"
+    until: "**The Bash TOOL's own timeout is separate"
+  - row: h-core-bash
+    dest: core
+    file: scripts/skill_split/authored/h-core-bash-ceiling.md
+  - row: "11b"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "**The Bash TOOL's own timeout is separate"
+    until: "**DEPLOYS ARE THE EXCEPTION"
+    rewrites:
+      - {kind: edit, old: "**The Bash TOOL's own timeout is separate", new: "**The Bash TOOL's own timeout is separate from the Timeout Policy (build-session)"}
+  - row: h-core-deploy-exception
+    dest: core
+    file: scripts/skill_split/authored/h-core-deploy-exception.md
+  - row: h-validate-deploy
+    dest: validate
+    file: scripts/skill_split/authored/h-validate-deploy.md
+  - row: "11c"
+    dest: validate
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "**DEPLOYS ARE THE EXCEPTION"
+    until: "### Verify Outcomes, Not Just Tests"
+    rewrites:
+      - {kind: edit, old: "**DEPLOYS ARE THE EXCEPTION, and this is the one to get right.**", new: "**DEPLOYS ARE THE EXCEPTION (to the core's `run_in_background` rule), and this is the one to get right.**"}
+  - row: "12"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Verify Outcomes, Not Just Tests"
+    until: "### Verify BEFORE the PR"
+    rewrites:
+      - {kind: path, old: "`references/high-stakes-verification.md`", new: "`.claude/skills/genesis-development/references/high-stakes-verification.md`"}
+  - row: "13"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Verify BEFORE the PR"
+    until: "### Acceptance Bar + Measured Rate"
+    rewrites:
+      - {kind: path, old: "`references/worktrees.md`", new: "`.claude/skills/genesis-development/references/worktrees.md`"}
+      - {kind: pointer, old: '"The Gate Machinery" below', new: '"The Gate Machinery" in commit-path.md'}
+  - row: "14"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Acceptance Bar + Measured Rate"
+    until: "### Select, don't amputate"
+  - row: "15a"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Select, don't amputate"
+    until: "That default is about SIZE, never about secrecy"
+  - row: h-core-secrecy
+    dest: core
+    file: scripts/skill_split/authored/h-core-secrecy.md
+  - row: "15b"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "That default is about SIZE, never about secrecy"
+    until: "**One last thing, learned the hard way from this section itself.**"
+    rewrites:
+      - {kind: edit, old: 'That default is about SIZE', new: 'The truncation default (build-session, "Select, don''t amputate") is about SIZE'}
+      - {kind: edit, old: "as the \"omit\nexplicitly\" rule says", new: "as the \"omit\nexplicitly\" rule (build-session, \"Select, don't amputate\") says"}
+      - {kind: edit, old: "of exactly the kind this section\nexists to surface", new: "of exactly the kind \"Select, don't amputate\" (build-session)\nexists to surface"}
+  - row: "15c"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "**One last thing, learned the hard way from this section itself.**"
+    until: "### A blocked compound command loses EVERYTHING"
+    rewrites:
+      - {kind: pointer, old: 'A draft of the paragraph above', new: 'A draft of the core''s "never about secrecy" paragraph'}
+  - row: "16"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### A blocked compound command loses EVERYTHING"
+    until: "### Editing source in bypass/auto mode"
+  - row: "17"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Editing source in bypass/auto mode"
+    until: "### Instance-Fix vs Class-Fix Gate"
+  - row: "18"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Instance-Fix vs Class-Fix Gate"
+    until: "### Debugging Discipline"
+  - row: "19"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Debugging Discipline"
+    until: "### Test-First Discipline"
+  - row: "20a"
+    dest: commit
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Test-First Discipline"
+    until: "- **A RED that comes back GREEN has AT LEAST six causes"
+  - row: h-build-test-first
+    dest: build
+    file: scripts/skill_split/authored/h-build-test-first.md
+  - row: "20b"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **A RED that comes back GREEN has AT LEAST six causes"
+    until: "- **Two reviewers pushing OPPOSITE values"
+    rewrites:
+      - {kind: edit, old: "The duplicated-layer anecdote in the review-loop section", new: "The duplicated-layer anecdote in the review-loop section (closing-session)"}
+  - row: h-close-opposite
+    dest: close
+    file: scripts/skill_split/authored/h-close-opposite.md
+  - row: "20c"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **Two reviewers pushing OPPOSITE values"
+    until: "- **Vacuous-test shapes to check for by name**"
+    rewrites:
+      - {kind: pointer, old: 'the Timeout Policy above governs', new: 'the Timeout Policy (build-session) governs'}
+  - row: "20d"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **Vacuous-test shapes to check for by name**"
+    until: "### Code Intelligence"
+  - row: "21"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Code Intelligence"
+    until: "### Advisory is the default; a BLOCK"
+  - row: "22"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Advisory is the default; a BLOCK"
+    until: "### Guard failure semantics"
+    rewrites:
+      - {kind: pointer, old: 'New-Store Gate below', new: 'New-Store Gate (commit-path.md)'}
+  - row: "23a"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Guard failure semantics"
+    until: "**SYSTEMIC failure means no usable predicate survives**"
+    rewrites:
+      - {kind: pointer, old: 'the worked example below', new: 'the worked example in guard-failure-regimes.md'}
+  - row: "23b"
+    dest: guard_regimes
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "**SYSTEMIC failure means no usable predicate survives**"
+    until: "**PARTIAL failure means a usable predicate survives**"
+    rewrites:
+      - {kind: pointer, old: 'the rates below are what it', new: 'the rates in build-session ("Guard failure semantics") are what it'}
+  - row: h-build-guard-pointer
+    dest: build
+    file: scripts/skill_split/authored/h-build-guard-pointer.md
+  - row: "23d"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "**PARTIAL failure means a usable predicate survives**"
+    until: "### Common Traps"
+    rewrites:
+      - {kind: edit, old: "`run_guard` is the other merged instance", new: "`run_guard` is the other merged instance (the first, `degraded_exit`'s\npredicate-gated leg, is in guard-failure-regimes.md)"}
+  - row: "24a"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Common Traps"
+    until: "- **A `gh` listing is ALREADY capped"
+  - row: "24b"
+    dest: gh_caps
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **A `gh` listing is ALREADY capped"
+    until: "- **Fail-closed data access.**"
+  - row: h-build-gh-pointer
+    dest: build
+    file: scripts/skill_split/authored/h-build-gh-pointer.md
+  - row: "24c"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **Fail-closed data access.**"
+    until: "### Iterative-Refinement Discipline"
+    rewrites:
+      - {kind: path, old: "`references/high-stakes-verification.md`", new: "`.claude/skills/genesis-development/references/high-stakes-verification.md`"}
+  - row: "25"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Iterative-Refinement Discipline"
+    until: "### Anti-Rationalization"
+    rewrites:
+      - {kind: path, old: "`references/ai-code-audit.md`", new: "`.claude/skills/genesis-development/references/ai-code-audit.md`"}
+  - row: "26"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Anti-Rationalization"
+    until: "### Auditing Existing Capabilities"
+    rewrites:
+      - {kind: edit, old: "(see Debugging Discipline: spec required-sets)", new: "(see build-session, Debugging Discipline: spec required-sets)"}
+  - row: "27"
+    dest: spec
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Auditing Existing Capabilities"
+    until: "## Adaptive Review Protocol"
+    rewrites:
+      - {kind: path, old: "`references/codebase-map.md`", new: "`.claude/skills/genesis-development/references/codebase-map.md`"}
+  - row: "28"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "## Adaptive Review Protocol"
+    until: "### Review depth is machine-checked"
+  - row: h-commit-test-first-more
+    dest: commit
+    file: scripts/skill_split/authored/h-commit-test-first-more.md
+  - row: "29a"
+    dest: commit
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Review depth is machine-checked"
+    until: "**Honest enforcement model"
+    rewrites:
+      - {kind: pointer, old: 'audit" decision above', new: 'audit" decision (build-session, Adaptive Review Protocol)'}
+      - {kind: pointer, old: 'scrutiny" row above', new: 'scrutiny" row (build-session, Adaptive Review Protocol)'}
+      - {kind: pointer, old: "PR-merge sigils\nbelow", new: "PR-merge sigils\nin closing-session's Pre-Merge Gate"}
+  - row: h-close-enforcement
+    dest: close
+    file: scripts/skill_split/authored/h-close-enforcement.md
+  - row: "29b"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "**Honest enforcement model"
+    until: "**Close every review with a verdict.**"
+  - row: h-close-verdict
+    dest: close
+    file: scripts/skill_split/authored/h-close-verdict.md
+  - row: "29b-2"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "**Close every review with a verdict.**"
+    until: "### Review-loop discipline"
+  - row: "30a"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Review-loop discipline"
+    until: "- **Interrogate every MECHANISM you introduce"
+  - row: h-build-mechanism
+    dest: build
+    file: scripts/skill_split/authored/h-build-mechanism.md
+  - row: h-build-review-verdict
+    dest: build
+    file: scripts/skill_split/authored/h-build-review-verdict.md
+  - row: "30b"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **Interrogate every MECHANISM you introduce"
+    until: "- **PR review-findings status ="
+    rewrites:
+      - {kind: pointer, old: 'The two bullets above enumerate', new: "The two bullets \"A review's findings are a SAMPLE\" and \"Fixing the named instance\" (closing-session, \"Review-loop discipline\") enumerate"}
+  - row: "30c"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **PR review-findings status ="
+    until: "- **A different model is the real correctness gate"
+  - row: h-core-review-chain
+    dest: core
+    file: scripts/skill_split/authored/h-core-review-chain.md
+  - row: "30d"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **A different model is the real correctness gate"
+    until: "- **Escalation cap — a HARD BLOCK"
+    rewrites:
+      - {kind: pointer, old: 'see the inline-findings section below', new: 'see the Pre-Merge Gate in closing-session'}
+  - row: "30e"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **Escalation cap — a HARD BLOCK"
+    until: "## The Gate Machinery"
+    rewrites:
+      - {kind: pointer, old: '#1606''s doc-path P1 above', new: '#1606''s doc-path P1 (merge-gate-findings.md)'}
+      - {kind: edit, old: "see \"PR readiness and mode\")", new: "see \"PR readiness and mode\", genesis-development)"}
+      - {kind: edit, old: "(see the acceptance-bar section)", new: "(see the acceptance-bar section, build-session)"}
+      - {kind: edit, old: "that overrides the per-use rule above.**", new: "that overrides the per-use rule (genesis-development, \"The review chain\").**"}
+  - row: "31a"
+    dest: commit
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "## The Gate Machinery"
+    until: "**Traps with a real cost, each one measured:**"
+  - row: h-close-reply
+    dest: close
+    file: scripts/skill_split/authored/h-close-reply.md
+  - row: "31b"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "**Traps with a real cost, each one measured:**"
+    until: "- **A BLOCKED Bash call runs NOTHING**"
+  - row: "31c"
+    dest: ask_keys
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **A BLOCKED Bash call runs NOTHING**"
+    until: "- **A FIRST push of the CURRENT branch"
+    rewrites:
+      - {kind: pointer, old: 'because of the rule below', new: 'because of the first-push rule (build-session)'}
+  - row: h-build-publish
+    dest: build
+    file: scripts/skill_split/authored/h-build-publish.md
+  - row: "31d"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **A FIRST push of the CURRENT branch"
+    until: "- **Ack sigils bind per-guard"
+  - row: h-commit-sigils
+    dest: commit
+    file: scripts/skill_split/authored/h-commit-sigils.md
+  - row: "31e"
+    dest: commit
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **Ack sigils bind per-guard"
+    until: "**CI is not one check.**"
+    rewrites:
+      - {kind: pointer, old: 'verdict?" test above', new: 'verdict?" test (build-session, Common Traps)'}
+  - row: h-build-ci
+    dest: build
+    file: scripts/skill_split/authored/h-build-ci.md
+  - row: "31f"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "**CI is not one check.**"
+    until: "## Pre-Commit Gate"
+  - row: "32a"
+    dest: commit
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "## Pre-Commit Gate"
+    until: "- **Private-data scan before every push"
+    rewrites:
+      - {kind: pointer, old: 'adaptive protocol above', new: 'adaptive protocol (build-session)'}
+  - row: h-core-privacy
+    dest: core
+    file: scripts/skill_split/authored/h-core-privacy.md
+  - row: "32b"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **Private-data scan before every push"
+    until: "- GROUNDWORK-tagged code not accidentally deleted"
+  - row: h-commit-privacy
+    dest: commit
+    file: scripts/skill_split/authored/h-commit-privacy.md
+  - row: "32c"
+    dest: commit
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- GROUNDWORK-tagged code not accidentally deleted"
+    until: "  **NEVER compute characters at the call site"
+  - row: h-build-hook-stdout
+    dest: build
+    file: scripts/skill_split/authored/h-build-hook-stdout.md
+  - row: "32d"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "  **NEVER compute characters at the call site"
+    until: "## Never reinvent what GitHub already does natively"
+  - row: "33"
+    dest: spec
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "## Never reinvent what GitHub already does natively"
+    until: "## Generalizability Gate"
+  - row: h-build-github-native
+    dest: build
+    file: scripts/skill_split/authored/h-build-github-native.md
+  - row: "34"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "## Generalizability Gate"
+    until: "## Host-Deploy Gate"
+    rewrites:
+      - {kind: pointer, old: 'Host-Deploy Gate below', new: 'Host-Deploy Gate, validating-merges'}
+  - row: "35"
+    dest: validate
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "## Host-Deploy Gate"
+    until: "## When to DRIVE a Merge"
+    rewrites:
+      - {kind: pointer, old: 'recipe in the Timeout Policy above', new: 'recipe under "DEPLOYS ARE THE EXCEPTION" above'}
+  - row: "36a"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "## When to DRIVE a Merge"
+    until: "### Which one first"
+    rewrites:
+      - {kind: pointer, old: '"Where your session ENDS" above', new: '"Where your session ENDS" (build-session)'}
+      - {kind: pointer, old: '(Gate Machinery above)', new: '(Gate Machinery, commit-path.md)'}
+  - row: h-close-host-deploy
+    dest: close
+    file: scripts/skill_split/authored/h-close-host-deploy.md
+  - row: "36a-2"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Which one first"
+    until: "### Building a rework"
+    rewrites:
+      - {kind: pointer, old: '("Building a rework" below)', new: '("Building a rework", build-session)'}
+  - row: "36b"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Building a rework"
+    until: "### Keep the PR the PR"
+    rewrites:
+      - {kind: pointer, old: 'the reviving session above', new: 'the reviving session (closing-session, "Never RETIRE a PR")'}
+  - row: "37"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "### Keep the PR the PR"
+    until: "## Pre-Merge Gate"
+    rewrites:
+      - {kind: pointer, old: '**Date the code before classifying a red** above', new: '**Date the code before classifying a red** (build-session)'}
+  - row: "38a"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "## Pre-Merge Gate"
+    until: "   **Devin scores like Codex"
+    rewrites:
+      - {kind: edit, old: "> **This is closing-session territory.** A build session's work ends when the PR\n> is open (see \"Where your session ENDS\" above); driving it through this gate is\n> the **`closing-session`** skill's job. The mechanics below stay here because\n> they are the authority — that skill composes them rather than restating them.\n> Read on when you are the one at the gate.", new: "> **This is closing-session territory.** A build session's work ends when the PR\n> is open (build-session, \"Where your session ENDS\"); driving it through this\n> gate is this skill's job, and the mechanics below are the authority.\n> Read on when you are the one at the gate."}
+  - row: "38b"
+    dest: merge_findings
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "   **Devin scores like Codex"
+    until: "   | lane | blocks at |"
+  - row: h-close-findings-pointer
+    dest: close
+    file: scripts/skill_split/authored/h-close-findings-pointer.md
+  - row: "38c"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "   | lane | blocks at |"
+    until: "   **`auth` is deliberately NOT a critical input**"
+  - row: "38d"
+    dest: merge_findings
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "   **`auth` is deliberately NOT a critical input**"
+    until: "4. **An ABSENT review BLOCKS"
+  - row: "38e"
+    dest: close
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "4. **An ABSENT review BLOCKS"
+    until: "## Reference Router"
+  # Row 40b is listed before row 39 so the core ends with the Reference Router.
+  - row: "40b"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **No sensitive data in commits**"
+    until: "- **Individual campaigns are user data"
+  - row: "39"
+    dest: core
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "## Reference Router"
+    until: "## Public Repo & Release Workflow"
+    rewrites:
+      - {kind: edit, old: "| Which code tool to use (CBM vs Serena vs GitNexus vs Grep) | `.claude/docs/code-intelligence.md` |", new: "| Which code tool to use (CBM vs Serena vs GitNexus vs Grep) | `.claude/docs/code-intelligence.md` |\n| Committing: review_state sequence, sigils, Pre-Commit Gate, depth gate, verify-RED | `references/commit-path.md` (mandatory before a commit) |\n| SYSTEMIC vs PARTIAL guard failure, and the worked example | `references/guard-failure-regimes.md` |\n| What each `gh` listing caps at before you pass a flag | `references/gh-listing-caps.md` |\n| A blocked call, `secrets.env`, ask keys | `references/ask-keys-and-sigils.md` |\n| Merge-gate findings: Devin scoring, `auth`, outside-diff, doc paths | `references/merge-gate-findings.md` |\n| Which session type you are | the router at the top of this file |"}
+  - row: "40a"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "## Public Repo & Release Workflow"
+    until: "- **No sensitive data in commits**"
+  - row: "40c"
+    dest: build
+    source: .claude/skills/genesis-development/SKILL.md
+    from: "- **Individual campaigns are user data"
+    until: "@end"

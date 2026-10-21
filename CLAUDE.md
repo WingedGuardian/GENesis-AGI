@@ -562,9 +562,9 @@ gate works, its exemption categories, and the unit rules for size bounds:
 - **No unsanctioned financial transactions.** Every transaction needs
   explicit user approval, every time. Prior approval does not carry forward.
 - **Timeout policy.** Justify any timeout with a specific failure mode.
-  Default floor: 2 hours (7200s). Full policy in genesis-development skill.
+  Default floor: 2 hours (7200s). Full policy in the build-session skill.
 - **Verify outcomes, not just tests.** "If the system restarts now, will
-  this work?" Built ≠ wired ≠ verified. Details in genesis-development skill.
+  this work?" Built ≠ wired ≠ verified. Details in the build-session skill.
 - **Code review after code changes.** Codex reviews your output — but only
   AUTOMATICALLY WHEN THE PR OPENS. A later push triggers nothing: after any push you
   want reviewed, comment `@codex review`, or the PR waits forever on a review nobody
@@ -591,7 +591,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
   `inline-findings` row, not just the Codex row.
   A self-authored PR merges through the maintainer's admin bypass of GitHub's
   one-approval rule, because a sole maintainer cannot approve their own pull
-  request (`.github/rulesets/README.md`; genesis-development skill, "Honest
+  request (`.github/rulesets/README.md`; closing-session skill, "Honest
   enforcement model"). GitHub's rule evaluation therefore records every such merge as a
   bypass, with the approval and update rules failed: that is the designed route,
   not a skipped review. The required status checks have no bypass and bind the
@@ -603,7 +603,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
   paths); ordinary code takes four; prose-and-tests-only takes six — config is
   NOT prose, so a `.yaml`/`.toml` change is ordinary. The gate prints the
   lane and its threshold whenever a non-zero score passes under one, so "it did
-  not block" never has to be guessed at. Table and rationale: genesis-development
+  not block" never has to be guessed at. Table and rationale: closing-session
   skill, Pre-Merge Gate.
   A PR whose diff touches the
   enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
@@ -611,14 +611,14 @@ gate works, its exemption categories, and the unit rules for size bounds:
   proceed; any further review request, and any fix commit once the confirmation is
   spent, needs the owner's approval at the action (refused in a dispatched session).
   The round-2 merge-or-abandon call is doctrine you keep. Both protocols:
-  genesis-development skill.
+  closing-session skill.
 - **Commit continuously**: uncommitted = invisible = lost.
 - **Bias toward closing open work before opening new — softly (≈51/49).** Not a
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
   everything before starting the next thing. Just lean, gently, toward landing or
   closing open PRs over opening more — so work doesn't pile up and go stale on the
   repo instead of getting done. (Merge-DRIVING specifically — when to actively
-  chase one PR to merged — is scoped by the genesis-development skill's "When to
+  chase one PR to merged — is scoped by the closing-session skill's "When to
   DRIVE a Merge" rule; this lean governs closing-shaped work, not watching.)
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
@@ -643,7 +643,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
   NOT what decides which worktree a script acts on — the PROCESS CWD is, for
   anything that resolves its target from the directory it runs in (e.g.
   `review_state.py` `evidence-path`/`mark`). Run those from the worktree they
-  are about. Detail in the genesis-development skill.
+  are about. Detail in the build-session skill.
 - **AskUserQuestion — always pass ≥2 questions.** Never call `AskUserQuestion`
   with a single question — a Claude Code rendering bug rejects single-question
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
@@ -664,8 +664,8 @@ gate works, its exemption categories, and the unit rules for size bounds:
   decisions. If something goes sideways — STOP and re-plan. A plan-mode
   document under `~/.claude/plans/` that will outlive one session opens with
   the structured header (status, `pinned.main`, `binds`/`prevents`, and the
-  trackers it executes) — format and rationale in the genesis-development
-  skill, `references/plan-docs.md`. Task-executor plans (`/task`,
+  trackers it executes) — format and rationale in the spec-session
+  skill and `.claude/skills/genesis-development/references/plan-docs.md`. Task-executor plans (`/task`,
   `TASK_INTAKE.md`) keep their own section contract and are out of scope.
   **A plan that
   proposes new source files carries an `## Adopt / Adapt / Build` verdict** —
@@ -696,7 +696,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
   (or leaves it open, naming what is uncovered); Devin never closes one, so the
   closing session does that for a Devin rework. Detail:
   `.claude/docs/premise-check.md` ("Handing a verdict to a builder") and
-  genesis-development ("Building a rework").
+  build-session ("Building a rework").
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
@@ -818,7 +818,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
   real-world life — and strip it; an issue carries technical detail only. Borderline,
   either way? Ask. Filing itself needs no per-instance approval: a bug you found while
   reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
-  the PR moving (discriminator + bounds: genesis-development, "Keep the PR the PR").
+  the PR moving (discriminator + bounds: closing-session, "Keep the PR the PR").
   One limit stays absolute, and it turns on **who gains**: a security defect —
   one whose disclosure hands someone a capability they do not already have — is
   NEVER filed publicly before it is fixed, no matter who owns it. Credential
@@ -905,7 +905,8 @@ gate works, its exemption categories, and the unit rules for size bounds:
   the broader class yourself instead of spiking only the named cases —
   "just a couple of examples" is always implied.
 - Dev-specific rules (commit prefixes, targeted tests, push/PR workflow,
-  capability registration) are in the genesis-development skill.
+  capability registration) are in the build-session skill and
+  `.claude/skills/genesis-development/references/commit-path.md`.
 
 ## Advisory Output Standards (all channels)
 

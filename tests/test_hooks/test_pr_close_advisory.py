@@ -247,7 +247,7 @@ def test_the_note_states_the_superseded_pr_exception():
         Path(__file__).resolve().parents[2]
         / ".claude"
         / "skills"
-        / "genesis-development"
+        / "closing-session"
         / "SKILL.md"
     ).read_text(encoding="utf-8")
     assert "**A superseded PR is the one exception" in skill, (
