@@ -372,7 +372,7 @@ def load_population(
     source("catalog", catalog_path, catalog)
     source("user", user_skills_dir, user)
     source("plugins", plugins_manifest, plugins)
-    source("process-nudge", "scripts/hooks/skill_injection_hook.py", process_nudges)
+    source("process-nudge", "skill injection hook [Process] nudges", process_nudges)
     for commands_dir in commands_dirs:
         source("commands", commands_dir, commands(commands_dir))
     return pop
