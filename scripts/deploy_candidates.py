@@ -781,12 +781,7 @@ class Engine(Repo):
             # A dropped candidate's approved git hook is still installed; put
             # back what `live` now holds (drop is the repair path for a hook
             # that blocks every session).
-            core.after_move(
-                state,
-                "restoring moved git hooks",
-                lambda: plan.restore_moved_hooks(self, moved.before, moved.at),
-            )
-            core.after_move(state, "syncing the git hooks", lambda: plan.sync_git_hooks(self))
+            self._sync_moved_hooks(state, moved.before, moved.at)
         core.after_move(
             state,
             "checking which candidates share its commits",
@@ -831,7 +826,9 @@ class Engine(Repo):
         back each installed hook that is exactly the moved-from version, then
         sync, as a rebuild does after its own move. It runs while
         update_state.json records the unfinished update, so it takes none of the
-        move refusals; it changes installed hooks only."""
+        move refusals; it changes installed hooks only. Exits 1 when any step
+        failed or any installed hook is not HEAD's afterwards (a hand-edited one
+        included): update.sh's rollback then reports itself incomplete."""
         self.require_update_lock()
         self.require_main_checkout()
         moved_from, moved_to = self.resolve(before), self.resolve(after)
@@ -845,9 +842,32 @@ class Engine(Repo):
                 f"HEAD is {(head or 'unresolvable')[:12]}, not {moved_to[:12]}: the checkout is not "
                 "where the rollback put it; nothing changed."
             )
-        plan.restore_moved_hooks(self, moved_from, moved_to)
-        plan.sync_git_hooks(self)
-        return 0
+        failures = plan.restore_moved_hooks(self, moved_from, moved_to)
+        synced = plan.sync_git_hooks(self)
+        # sync-hooks.sh exits 0 even when one of its copies failed, so the
+        # result is judged too: every hook HEAD lists, installed as HEAD has it.
+        failures += [synced] if synced else []
+        failures += gate.hook_install_failures(self)
+        for why in dict.fromkeys(failures):
+            _err(f"ERROR: {why}")
+        if failures:
+            _err(
+                "The installed git hooks are not the ones the rollback's checkout installs; "
+                "readiness refuses every rebuild until they are."
+            )
+        return 1 if failures else 0
+
+    def _sync_moved_hooks(self, state: str, before: str | None, at: str) -> None:
+        """A rebuild's or drop's hook steps after its move: past the commit point,
+        so any failure is a WARNING (the next rebuild's readiness refuses until
+        the installed hooks are HEAD's)."""
+        for what, step in (
+            ("restoring moved git hooks", lambda: plan.restore_moved_hooks(self, before, at)),
+            ("syncing the git hooks", lambda: plan.sync_git_hooks(self)),
+        ):
+            failed = core.after_move(state, what, step)
+            for why in [failed] if isinstance(failed, str) else failed or []:
+                out(f"  WARNING: {state}, but {what} failed: {why}")
 
     def cmd_live_shaped(self, commit: str) -> int:
         """Whether ``commit`` is what a rebuild makes: a commit on origin/main's
@@ -917,12 +937,7 @@ class Engine(Repo):
         moved = plan.move_checkout(self, p, source)
         state = f"`live` is at {moved.at[:12]}"
         if moved.files:
-            core.after_move(
-                state,
-                "restoring moved git hooks",
-                lambda: plan.restore_moved_hooks(self, moved.before, moved.at),
-            )
-            core.after_move(state, "syncing the git hooks", lambda: plan.sync_git_hooks(self))
+            self._sync_moved_hooks(state, moved.before, moved.at)
         # Past the commit point (`live` has moved): every step below is a
         # WARNING on failure, never a refusal claiming nothing changed.
         if retire:

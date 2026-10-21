@@ -34,7 +34,13 @@ MIN_DAYS_WITH_TRAFFIC = 10
 #: One missed :45 census slot is tolerated; the jitter margin keeps a single
 #: miss from reading as two.
 CENSUS_GAP = timedelta(hours=2, minutes=15)
-KNOWN_CENSUS_SCHEMAS = frozenset({1})
+#: The census schema whose rows can read clean. An older row lacks the proofs
+#: the current contract requires, so it reads dirty (graph_census.CENSUS_SCHEMA
+#: must equal this; a test pins it).
+CLEAN_CENSUS_SCHEMA = 2
+#: Every schema a row may carry and still be READ (a disabled row of any of them
+#: still says disabled). Derived, so a bump can never strand its own rows.
+KNOWN_CENSUS_SCHEMAS = frozenset(range(1, CLEAN_CENSUS_SCHEMA + 1))
 
 _DISABLED = "telemetry disabled in genesis-server"
 _CLEAN_OUTCOMES = frozenset({"primary"})
@@ -121,6 +127,8 @@ def census_dirt(m: dict | None) -> str | None:
         return f"unknown census schema {schema!r}"
     if "telemetry_disabled" in (reasons or []):
         return _DISABLED
+    if schema != CLEAN_CENSUS_SCHEMA:
+        return f"census row predates the current census contract (schema {schema})"
     if m.get("complete") is not True:
         return f"incomplete census ({', '.join(m.get('reasons') or []) or 'no reason'})"
     if m.get("unclassified"):
@@ -135,10 +143,24 @@ def census_dirt(m: dict | None) -> str | None:
     for p in procs:
         if not isinstance(p, dict):
             return "unreadable census row"
+        unknown_reasons = p.get("unknown_reasons")
+        if not isinstance(unknown_reasons, list) or not all(
+            isinstance(r, str) for r in unknown_reasons
+        ):
+            return "unreadable census row"
         if p.get("foreign") is True:
             continue  # a bench server on a scratch DB: its traversals are not ours
-        if p.get("telemetry_off") is not False:
+        if p.get("telemetry_off") is True:
             return f"memory server pid {p.get('pid')} has the telemetry kill switch on"
+        if p.get("telemetry_off") is not False:
+            return (
+                f"memory server pid {p.get('pid')}: kill-switch state unknown (its secrets "
+                "file is missing or changed since it started, or its launch value and "
+                "file disagree)"
+            )
+        if unknown_reasons or p.get("source") != "main":
+            why = ", ".join(unknown_reasons) or "no source proof"
+            return f"memory server pid {p.get('pid')}: cannot prove its code ({why})"
         if p.get("telemetry") is not True:
             why = p.get("unknown") or "started on, or has seen, code without telemetry"
             return f"memory server pid {p.get('pid')} may run old code ({why})"

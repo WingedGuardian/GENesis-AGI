@@ -34,7 +34,7 @@ def _db(
         " created_at TEXT, prompt_hash TEXT)"
     )
     census = {
-        "v": 1,
+        "v": 2,  # graph_cutover.CLEAN_CENSUS_SCHEMA
         "procs": [],
         "other_servers": {},
         "unclassified": 0,

@@ -309,11 +309,39 @@ commit the main checkout has held since it started (read by
 `scripts/lib/serving_commit.py`, the reader the deploy scripts use, which refuses
 on a reflog gap, a move in the start second, a clock step back or git's expiry
 cutoff), whether ALL of them contain the telemetry module (a module imported
-after start loads whatever is on disk then), its exec-time kill switch and DB
-path, plus whether HEAD has the module and whether `src/genesis/memory/` is
-dirty. Git runs with `--no-optional-locks`, so the hourly read never takes the
-index lock a deploy needs. The cutover clock can only start at a census with no
-server that could be running older code. Pruned with the telemetry rows.
+after start loads whatever is on disk then), plus whether HEAD has the module
+and whether `src/genesis/memory/` is dirty. Git runs with `--no-optional-locks`,
+so the hourly read never takes the index lock a deploy needs. Since schema 2
+("conservative unknowns", rules in `memory/graph_census_proof.py`) a server's row
+is clean only when three more things are PROVEN, each derived the way that
+server derives it, never from the census process's own state: its code source
+(its `argv[0]` is in main's `.venv/bin` and the `pyvenv.cfg` CPython finds from
+that raw path is main's, it runs main's own server script, no
+`PYTHONEXECUTABLE` or dotted `-W`/`PYTHONWARNINGS` category is set, and nothing
+that venv's site-packages, the directories its `.pth` files add (main's `src`
+included, searched for customize modules), `PYTHONPATH`, the script's directory
+or the system `sitecustomize` can load replaces main's `genesis` or any module
+the server imports at runtime), its kill switch (what
+it runs with: the memory lifespan's router reloads its secrets file with
+`override=True`, so a key the file carries beats the exec-time value; the file
+counts only if it and every symlink met resolving it, including links inside a
+link's own target, are unchanged by ctime since the server started, and a
+missing or changed file is unknown), and its database
+scope (the primary database is fixed at import from the exec env or the root
+default, and a path in the file becomes a second one; `foreign` only when every
+one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
+those paths changed since the server started, and none of its open descriptors
+is the live database, since the open handle is what a long-lived connection
+uses; unreadable descriptors are never foreign; and only for a server whose
+code is proven). The census host must also hold the live database it names
+open (`live_db_moved` otherwise). The threat model is accidental drift (owner
+ruling): deliberately constructed inputs, such as a swapped ancestor directory
+or forged bytecode, are documented residuals in the module docstring. Anything unproven
+lands in `unknown_reasons` or `telemetry_off: null`, and the verdict reads the
+row as not clean, so the clock waits for that server to restart. The cutover
+clock can only start at a census with no server that could be running older
+code; a row of an older schema reads dirty ("predates the current census
+contract"). Pruned with the telemetry rows.
 **The verdict** is `scripts/graph_cutover_report.py` over the pure
 `memory/graph_cutover.py`: PASS needs 14 days on the clock, at least 100
 falkordb-served traversals and falkordb traffic on at least 10 UTC days in the
@@ -3958,12 +3986,22 @@ tool-disabled CC probe without changing its schedule or routing authority.
   never inferred from git: a moved checkout is adopted only when HEAD is on
   `live` at exactly the commit the record names, then moved back to the
   rollback tag with its git hooks restored (`restore-hooks`), and the services
-  restart on the old tip. A record that cannot be read, or that says the switch
-  began or wrote part of the tree while HEAD is not at its target, means a
-  possibly mixed working tree: nothing is restarted and the rollback reports
-  itself incomplete. Exit 4 after such a rollback needs it to have completed,
-  hook restore and every service restart included; otherwise the run exits 1
-  and leaves no `update_refused.json`.
+  restart on the old tip. `restore-hooks` exits 1 when a hook could not be
+  restored, the hook list could not be read, `sync-hooks.sh` is missing, fails,
+  times out or exits non-zero, or afterwards any hook the checkout lists is not
+  installed byte-identical and executable (readiness's own check,
+  `hook_install_failures` in `deploy_candidates_gate.py`), a hand-edited hook
+  included; the rollback then reports itself incomplete (a rebuild or drop,
+  past its commit point, only warns). A record that cannot be read, or that
+  says the switch began or wrote part of the tree while HEAD is not at its
+  target, means a possibly mixed working tree: nothing is restarted and the
+  rollback reports itself incomplete. Exit 4 after such a rollback needs it to
+  have completed, hook restore, every service restart and a restarted
+  genesis-server answering its health endpoint included; that health wait (up
+  to 180 s) runs only on the units-refusal path that can exit 4, inside the
+  rollback's single verdict, so the history row, `last_update_failure.json` and
+  the exit code agree. Otherwise the run exits 1 and leaves no
+  `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
