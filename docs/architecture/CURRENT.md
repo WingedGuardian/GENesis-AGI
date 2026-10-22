@@ -4088,6 +4088,19 @@ verified: f9a1d4cb 2026-10-18
   `update.sh` restores AGENTS.md to HEAD before its merge — saving any local
   edits under `~/.genesis/premerge-backups/` first — so the block must live in
   the commit).
+  The skill LISTING Claude Code sends every session has its own budget,
+  `skillListingBudgetFraction` in `.claude/settings.json` (0.02; CC's default is
+  0.01). The budget in characters is the model's context window × the model's
+  characters per token × the fraction, so a smaller window gets a smaller
+  listing. Over budget, CC (2.1.299) keeps every skill's name but drops the lower-
+  priority skills' descriptions, and logs `Skill listing over budget` only in a
+  debug log. MEASURED 2026-10-21 on one install: 122 skills needed 41,712 chars
+  against the default's 30,000 for each of the `sonnet`, `opus` and `haiku`
+  aliases; at 0.02 none of them warns. A model with a 200k-token window gets
+  about a fifth of that, so it still drops descriptions at 0.02. The setting
+  applies only to sessions launched inside the repo (project settings). Re-measure
+  with `claude -p --model <m> --debug-file <f>` when the catalog or installed
+  plugins grow, or for a model with a smaller window.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
   existing commit/request budget decisions, denies approval-required or unknown
