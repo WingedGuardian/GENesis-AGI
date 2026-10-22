@@ -1,0 +1,1 @@
+- Review requests now refuse a PR URL combined with `--repo`/`-R`, even when both name the same repository, and refuse unsupported explicit hosts before checking review capacity. Use a standalone github.com PR URL or a literal PR number with a repository flag; Codex retains its explicit-host requirement.

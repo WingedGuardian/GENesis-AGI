@@ -57,7 +57,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     validate_source_identity,
     verify_worker_writes,
 )
-from codebase_managed_unit import (
+from codebase_managed_unit import (  # noqa: E402
     parse_arguments as native_parse_arguments,
 )
 
@@ -291,6 +291,7 @@ def retire_managed():
 
 def runtime_config(path: Path) -> dict:
     config = read_settings(path)
+    validate_provider_paths(config)
     main = absolute(config["main"]).resolve(strict=True)
     if main != SCRIPT.parent.parent or not (main / ".git").is_dir():
         raise ValueError("managed runtime requires its configured primary checkout")
@@ -302,6 +303,7 @@ def validate_loaded_backend(config: dict) -> None:
 
 
 def runtime_preflight(config: dict) -> None:
+    validate_provider_paths(config)
     verify_cache(config)
     with verified_binary(Path(config["binary"])):
         pass  # fail before changing native state when the accepted inode is invalid
@@ -804,6 +806,7 @@ def verify_frontend_boundary(unit: str) -> None:
 
 def launch(config: dict, path: Path) -> None:
     """Read-only preflight; the actual capped child owns final admission."""
+    validate_provider_paths(config)
     verify_cache(config)
     ready(config)
     main = absolute(config["main"]).resolve(strict=True)
@@ -846,6 +849,7 @@ def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) 
 
 
 def ready(config: dict) -> None:
+    validate_provider_paths(config)
     deadline = time.monotonic() + 120
     native_deadline = None
     require_enabled(config)
@@ -891,6 +895,7 @@ def ready(config: dict) -> None:
 
 
 def serve(config: dict) -> None:
+    validate_provider_paths(config)
     require_enabled(config)
     verify_cache(config)
     verify_query_boundary("self")

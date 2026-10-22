@@ -245,7 +245,7 @@ _MARKER_DIR = Path.home() / ".genesis" / "review_markers"
 # commits between rounds, and the whole point is to notice when that loop runs long.
 _ROUND_DIR = Path.home() / ".genesis" / "review_rounds"
 # After this many CONSECUTIVE review rounds on one change, the commit gate blocks
-# pending an explicit '# escalation-ack'. Mirrors the genesis-development SKILL.md
+# pending an explicit '# escalation-ack'. Mirrors the closing-session SKILL.md
 # prose cap.
 ESCALATION_ROUND_CAP = 3
 # Standing authorization is measured from GitHub-backed review rounds, not
