@@ -4098,7 +4098,11 @@ verified: f9a1d4cb 2026-10-18
   against the default's 30,000 for each of the `sonnet`, `opus` and `haiku`
   aliases; at 0.02 none of them warns. A model with a 200k-token window gets
   about a fifth of that, so it still drops descriptions at 0.02. The setting
-  applies only to sessions launched inside the repo (project settings). Re-measure
+  applies only to sessions launched at a checkout's root (the main checkout or a
+  worktree): CC reads project settings from the launch directory, and a session
+  started in `src/` was measured to keep the default. Most dispatched sessions run
+  outside the repo (`background_session_dir`, see `cc/invoker.py`) and keep 0.01
+  too; `--settings` does not carry this key (#3543). Re-measure
   with `claude -p --model <m> --debug-file <f>` when the catalog or installed
   plugins grow, or for a model with a smaller window.
   Codex's local CLI also has a budget-only shell action hook in
