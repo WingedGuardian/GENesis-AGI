@@ -28,6 +28,25 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO_ROOT / "scripts"
 GUARD_LIB = SCRIPTS / "lib" / "live_system_guard.sh"
 REFUSED = "REFUSED (test fence)"
+BOOTSTRAP_BOUNDARY = 'bootstrap_refuse_if_server_live "$@" || exit 3\n'
+BOOTSTRAP_STOP = 'echo "test fixture: bootstrap startup boundary" >&2\nexit 125\n'
+
+
+def _bootstrap_startup_source() -> str:
+    source = (SCRIPTS / "bootstrap.sh").read_text()
+    assert source.count(BOOTSTRAP_BOUNDARY) == 1
+    return source.split(BOOTSTRAP_BOUNDARY)[0] + BOOTSTRAP_BOUNDARY + BOOTSTRAP_STOP
+
+
+def _assert_bootstrap_contained(script: Path) -> None:
+    # Independently check the builder's output: changing its extraction point
+    # must not change the safety assertion along with it.
+    source = (SCRIPTS / "bootstrap.sh").read_text()
+    assert source.count(BOOTSTRAP_BOUNDARY) == 1
+    prefix, boundary, _rest = source.partition(BOOTSTRAP_BOUNDARY)
+    assert script.read_text() == prefix + boundary + BOOTSTRAP_STOP, (
+        "bootstrap fixture must end at the startup boundary before installation"
+    )
 
 # (script file, extra env mapping the fixture's acting root, argv,
 #  expected rc on the normal path, a marker proving the run got past the guard)
@@ -42,28 +61,31 @@ DEPLOY_SCRIPTS = [
     # GENESIS_DIR names the fixture, which has no data/genesis.db: the first
     # real step fails cleanly after the guard has already run.
     ("backup.sh", {"GENESIS_DIR": "{fixture}"}, [], 1, "SQLite source database not found"),
-    ("restore.sh", {"GENESIS_DIR": "{fixture}"}, ["--help"], 0, ""),
-    # Bootstrap's onward path varies by box (package probes, git checks), so
-    # assert only that it started its normal path: the banner it prints BEFORE
-    # the fence check could pass trivially, so the marker is the managed-units
-    # probe output, which only runs after both guards.
-    ("bootstrap.sh", {}, [], None, "managed_units"),
+    ("restore.sh", {"GENESIS_DIR": "{fixture}"}, ["--help"], 0, "Usage:"),
+    # Exercise the actual startup's existing live-server refusal. The fixture
+    # ends immediately after this guard, before recovery and installation.
+    ("bootstrap.sh", {}, [], 3, "REFUSED: genesis-server is RUNNING"),
     # The fixture has no deploy_candidates.py: the exec fails inside the engine
     # launch, proving the shell wrapper ran past the guard.
     ("deploy_candidates", {}, ["bogus-command"], 2, "deploy_candidates.py"),
 ]
 
 
-def _env(home: Path, fixture: Path | None, log: Path | None, extra: dict) -> dict:
+def _env(home: Path, fixture: Path | None, log: Path | None, extra: dict,
+         *, armed: bool = True) -> dict:
     """A child env: private HOME, fence variables controlled per test."""
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
         "GIT_CONFIG_NOSYSTEM": "1",
     }
+    # Retain the suite's bus fence alongside its PATH/systemctl fence.
+    for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        if key in os.environ:
+            env[key] = os.environ[key]
     for key, value in extra.items():
         env[key] = value.format(fixture=str(fixture), home=str(home))
-    if fixture is not None:
+    if armed and fixture is not None:
         env["GENESIS_TEST_FENCE_LIVE_ROOTS"] = str(fixture)
     if log is not None:
         env["GENESIS_TEST_FENCE_LOG"] = str(log)
@@ -72,21 +94,44 @@ def _env(home: Path, fixture: Path | None, log: Path | None, extra: dict) -> dic
 
 @pytest.fixture()
 def fixture_tree(tmp_path: Path) -> Path:
-    """scripts/<each deploy script> with scripts/lib symlinked to the real lib
-    dir — the guard plus every lib a script sources — so the normal-path tests
-    run the script's own code end to end rather than dying on a missing lib."""
+    """Real scripts/libs; bootstrap is structurally limited to its startup."""
     tree = tmp_path / "fixture"
     (tree / "scripts").mkdir(parents=True)
     (tree / "scripts" / "lib").symlink_to(SCRIPTS / "lib", target_is_directory=True)
     for name, _extra, _argv, _rc, _marker in DEPLOY_SCRIPTS:
-        shutil.copy2(SCRIPTS / name, tree / "scripts" / name)
+        target = tree / "scripts" / name
+        if name == "bootstrap.sh":
+            target.write_text(_bootstrap_startup_source())
+        else:
+            shutil.copy2(SCRIPTS / name, target)
     return tree
 
 
 def _run(argv: list[str], env: dict, **kw) -> subprocess.CompletedProcess:
+    # Check before launch: an accidentally restored full bootstrap is never run.
+    for arg in argv:
+        if Path(arg).name == "bootstrap.sh":
+            _assert_bootstrap_contained(Path(arg))
     return subprocess.run(
         argv, env=env, capture_output=True, text=True, timeout=60, **kw
     )
+
+
+def test_bootstrap_fixture_is_structurally_contained(fixture_tree):
+    _assert_bootstrap_contained(fixture_tree / "scripts" / "bootstrap.sh")
+
+
+@pytest.mark.parametrize("name", ["backup.sh", "restore.sh"])
+def test_normal_path_uses_private_fixture_root(fixture_tree, tmp_path, monkeypatch, name):
+    case = next(case for case in DEPLOY_SCRIPTS if case[0] == name)
+
+    def inspect_only(argv, env, **kw):
+        assert env["GENESIS_DIR"] == str(fixture_tree)
+        assert "GENESIS_TEST_FENCE_LIVE_ROOTS" not in env
+        return subprocess.CompletedProcess(argv, case[3], stdout=case[4], stderr="")
+
+    monkeypatch.setitem(globals(), "_run", inspect_only)
+    test_script_unset_takes_normal_path(fixture_tree, tmp_path, *case)
 
 
 # ── per-script refusal on the fixture ────────────────────────────────
@@ -120,7 +165,16 @@ def test_script_unset_takes_normal_path(fixture_tree, tmp_path, name, extra,
     not pass."""
     home = tmp_path / f"home-normal-{name}"
     home.mkdir()
-    env = _env(home, None, None, extra)
+    env = _env(home, fixture_tree, None, extra, armed=False)
+    if name == "bootstrap.sh":
+        # Controlled positive live detection, without contacting any service.
+        bindir = tmp_path / "live-probe-bin"
+        bindir.mkdir()
+        for command, rc in (("systemctl", 0), ("pgrep", 1)):
+            stub = bindir / command
+            stub.write_text(f"#!/bin/sh\nexit {rc}\n")
+            stub.chmod(0o755)
+        env["PATH"] = str(bindir) + os.pathsep + env["PATH"]
     proc = _run(["bash", str(fixture_tree / "scripts" / name), *argv], env)
     combined = proc.stdout + proc.stderr
     if normal_rc is None:
