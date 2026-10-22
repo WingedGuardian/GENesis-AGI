@@ -1,0 +1,1 @@
+- Safety hooks now see the command that follows a prefix assignment or a wrapper option whose value is a command substitution, instead of a fragment of the substitution.

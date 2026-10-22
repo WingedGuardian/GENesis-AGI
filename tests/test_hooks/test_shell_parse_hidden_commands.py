@@ -23,9 +23,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "hooks"))
 
 from shell_parse import (  # noqa: E402
+    Segment,
     _is_prefix_assignment,
+    _keep_substitutions_whole,
     _net_subshell_depth,
     analyze,
+    analyze_checked,
 )
 
 
@@ -290,3 +293,135 @@ def test_sudo_runs_a_path_that_expands_to_an_absolute_one(command: str) -> None:
 def test_sudo_takes_an_expanded_assignment_without_a_slash() -> None:
     """`sudo $X=1 cmd` with X=A reaches sudo as `A=1` and runs cmd."""
     assert _git_argv("sudo $X=1 git push") == ["git", "push"]
+
+
+# ---------------------------------------------------------------------------
+# A word split by a command substitution. shlex splits inside `$(…)`, bash does
+# not, so a walk that skips a word by position landed on the substitution's tail.
+# The fix reads each segment a second way, with substitutions kept whole, and
+# ADDS what that reading resolves; it never replaces the ordinary reading.
+
+_PUSH = "pu" + "sh"
+
+
+def _pushes(command: str) -> list[Segment]:
+    return [s for s in analyze(command) if s.exe == "git" and s.argv[1:2] == [_PUSH]]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "X=$(id -u) git push origin main",
+        "X+=$(id -u) git push origin main",
+        "X=`id -u` git push origin main",
+        "A=1 X=$(echo a b c) git push origin main",
+        "X=$(echo a $(echo b c)) git push origin main",
+        "env X=$(id x) git push origin main",
+        "sudo X=$(id x) git push origin main",
+        "timeout -s $(echo KILL x) 5 git push origin main",
+        "nice -n $(echo 1 2) git push origin main",
+        "timeout $(echo 5 6) git push origin main",
+        # A quoted `)` inside the body is data; the word ends at the real close.
+        "X=$(echo ')' a) git push origin main",
+        'X=$(echo")" a b) git push origin main',
+        "X=$(echo\\) a b) git push origin main",
+        'env X=$(echo")" a b) git push origin main',
+        '(X=$(echo")" a b) git push origin main)',
+        # An arithmetic expansion is one word as well.
+        "X=$((1 + 2)) git push origin main",
+        "env X=$((1 + 2)) git push origin main",
+        # Both readings name git, with different operations.
+        "X=$(command git rev-parse HEAD) git push origin main",
+        "X=$(echo git status) git push origin main",
+        # Double quotes nested inside a double-quoted substitution.
+        'X="$(echo "a b")" git push origin main',
+    ],
+)
+def test_a_word_split_by_a_substitution_does_not_hide_the_command(command: str) -> None:
+    """`X=$(id -u) git push` resolved to a program named `-u)`: every guard saw
+    no push, and no blind spot was reported. MEASURED on main for each form."""
+    assert len(_pushes(command)) == 1
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A single-quoted `$(` is literal text.
+        "X='$(' git push origin 'x)'",
+        # Constructs the scanner does not model end its span after bash does;
+        # an earlier revision that REPLACED the ordinary reading hid each push.
+        "X=$(:${x:-(})y git push origin main $(:)",
+        "X=$(:${x%(*})y git push origin $(echo main)",
+        "X=$(:${x:-(})y git push origin main ${y%)}",
+        "X=$(:`:\\`(\\``)y git push origin main '`))'\\'",
+        # Case patterns that only look like substitutions once shlex dequotes.
+        "case '$(' in '$(') git push origin main;; esac",
+        "case '`' in '`') git push origin main;; esac",
+    ],
+)
+def test_the_second_reading_never_hides_what_the_first_resolves(command: str) -> None:
+    """Every push the ordinary reading resolves is still there. A mistake in
+    the second reading can only add a segment."""
+    assert _pushes(command)
+
+
+def test_one_push_is_counted_once() -> None:
+    """Where both readings name the same program, the second adds nothing: a
+    duplicate would read as two publish operations in one command."""
+    assert len(_pushes("git push origin $(git branch --show-current)")) == 1
+    assert len(_pushes("X=$(id -u) git push origin main")) == 1
+
+
+def test_the_ordinary_reading_and_its_depth_zero_segments_are_unchanged() -> None:
+    """The second reading is reported nested, so the depth-0 segments still map
+    one to one onto the command's segments, as the cwd consumers require."""
+    segments = analyze("X=$(id -u) git status; echo done")
+    assert [s.depth for s in segments if s.exe in ("-u)", "echo")] == [0, 0]
+    assert any(s.exe == "git" and s.depth == 1 for s in segments)
+
+
+def test_many_prefix_substitutions_stay_within_the_nesting_bound() -> None:
+    command = " ".join(f"V=$(echo {i})" for i in range(6)) + " python -m pytest tests/x.py"
+    segments, blind = analyze_checked(command)
+    assert blind is None
+    assert any(s.exe == "python" for s in segments)
+
+
+def test_an_unterminated_substitution_is_left_as_it_was() -> None:
+    """Bash refuses it as a syntax error and runs none of it."""
+    command = "X=$(id -u git push origin main"
+    assert _keep_substitutions_whole(command) == command
+
+
+def test_a_prefix_substitution_is_not_read_as_a_case_pattern() -> None:
+    """`X=$(id)` ends in its substitution's `)`. Read as a case pattern, the rest
+    was parsed again one level down and one push counted as two."""
+    assert len(_pushes("X=$(id) git push origin feature-x")) == 1
+
+
+_EVERY_FORM = [
+    "X=$(id -u) git push origin main",
+    'X=$(echo")" a b) git push origin main',
+    "X=$(command git rev-parse HEAD) git push origin main",
+    "X=$(:${x:-(})y git push origin main $(:)",
+    "X=$(:`:\\`(\\``)y git push origin main '`))'\\'",
+    "case '$(' in '$(') git push origin main;; esac",
+    "git push origin $(git branch --show-current)",
+    "timeout -s $(echo KILL x) 5 git push origin main",
+    "echo \"$(date) x\" ; rm -rf /tmp/zz",
+]
+
+
+@pytest.mark.parametrize("command", _EVERY_FORM)
+def test_the_second_reading_only_ever_adds(command: str, monkeypatch) -> None:
+    """The property, not an example: with the second reading switched off, every
+    segment the parse produces is still produced with it switched on."""
+    import shell_parse
+
+    with_it = [(s.exe, tuple(s.argv), s.depth) for s in analyze(command)]
+    monkeypatch.setattr(shell_parse, "_whole_word_reading", lambda *a, **k: None)
+    without = [(s.exe, tuple(s.argv), s.depth) for s in analyze(command)]
+    remaining = list(with_it)
+    for seg in without:
+        assert seg in remaining, f"{seg} disappeared"
+        remaining.remove(seg)
