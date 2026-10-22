@@ -311,6 +311,11 @@ async def _finalize(runner, request, result, state):
 
             await record_managed_outcome(runner, result.session_id, result)
             return
-        except Exception:
-            logger.warning("Managed receipt persistence unavailable; capacity retained")
+        except Exception as exc:
+            logger.warning(
+                "Managed receipt persistence unavailable; capacity retained "
+                "(exception=%s, sqlite_errorname=%s)",
+                type(exc).__name__,
+                getattr(exc, "sqlite_errorname", None),
+            )
             await asyncio.sleep(1)

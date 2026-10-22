@@ -447,6 +447,35 @@ profiles:
     last_reviewed: "2026-03-14"
     review_source: manual
 
+  claude-haiku-5.5:
+    display_name: "Claude Haiku 5.5"
+    provider: anthropic
+    api_id: "anthropic/claude-haiku-5.5"
+    # PROVISIONAL quality ratings: copied from claude-haiku-4.5 so the newer
+    # model is never ranked above what has been measured; raise them after an
+    # eval run. Context, max output and pricing are from OpenRouter's model
+    # catalog (2026-10-18).
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 1000000
+    cost_tier: cheap
+    cost_per_mtok_in: 0.10
+    cost_per_mtok_out: 0.50
+    latency: low
+    strengths:
+      - cost/speed ratio
+      - 1M-token context
+    weaknesses:
+      - quality ratings not yet evaluated (copied from Haiku 4.5)
+    best_for: [light_reflection, triage, tagging]
+    avoid_for: [deep_reflection, strategic_reflection, quality_calibration]
+    free_tier:
+      available: false
+    last_reviewed: "2026-10-18"
+    review_source: openrouter_pricing
+
   grok-4:
     display_name: "Grok 4"
     provider: xai

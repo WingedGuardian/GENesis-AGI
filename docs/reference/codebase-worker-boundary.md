@@ -7,9 +7,11 @@ query daemon already exists.
 
 ## Opt-in queued adapter
 
-`CODE_INTEL_CBM_WORKER_BINARY` selects an absolute executable for the stock
-internal worker adapter in `scripts/lib/code_intel_cbm_worker.py`. The existing
-`code_intel_index.sh` entrypoint invokes it inside the admitted batch scope.
+Immutable managed settings select the pinned executable for the stock internal
+worker adapter in `scripts/lib/code_intel_cbm_worker.py`. The existing
+`code_intel_index.sh` entrypoint invokes that fixed adapter with explicit managed
+configuration inside the admitted batch scope. PATH and a worker-binary override
+do not replace this authority.
 The durable queue, worktree skip, single-flight locks, physical resource caps,
 child admission, OOM priority 1000 and cgroup watchdog continue to apply.
 
@@ -19,8 +21,8 @@ It hashes and executes the same opened inode. Unknown builds refuse; there is no
 fallback through PATH to an ordinary daemon-backed CLI. This uses internal ABI,
 not a stable public CLI contract. Re-run acceptance before changing the pin.
 
-Set `CBM_CACHE_DIR` to an existing absolute cache directory. Keep query clients,
-the query daemon and the worker on the same stock cache and IPC namespace. The
+Configure the cache and runtime directories through managed setup. Query clients,
+the query daemon and the worker use the same configured stock cache and IPC namespace. The
 adapter preserves native build-cohort admission, project mutation locks,
 maintenance cancellation, parent-death handling and publication. Its cooperative
 worker budget is three quarters of the admitted physical cap; the physical cap
@@ -42,7 +44,8 @@ lifecycle acceptance. Leave the production sentinel intact during private tests.
 
 Use the existing durable queue and idle-gated runner. Never invoke this helper
 as an alternative index entrypoint. The helper itself refuses without valid
-batch-scope admission and OOM priority. For a shared deployment, include the
+batch-scope admission and a nonmaximum supervisor OOM adjustment; only its native
+child is promoted to 1000. For a shared deployment, include the
 full query-daemon and aggregate frontend ceilings in the capacity envelope,
 plus the existing sibling reserve; current usage alone is insufficient.
 
@@ -66,8 +69,12 @@ not a completed long-run acceptance claim.
 
 ## Rollback
 
-Keep the sentinel armed and remove `CODE_INTEL_CBM_WORKER_BINARY` from the runner
-environment. This restores command selection to the existing CLI path without
-altering graph files or queue attempts. Do not run that daemon-backed path with
-an active shared query daemon under a client-only batch cap. Preserve the last
-usable graph and failed requests when quarantining a run.
+Keep the sentinel armed and disable the managed query service through its
+operator lifecycle. Managed indexing then refuses and preserves queued work;
+there is no fallback to the daemon-backed CLI. Preserve the last usable graph,
+its artifact and failed requests when quarantining a run. Effectively sandboxed
+custom write roots require the operator-owned runner allowlist documented in
+`codebase-managed.md`. Persistent artifact export also requires writable native
+snapshot scratch at `/tmp`; an operator-owned disk-directory bind can supply it
+without changing the host's shared temporary directory or overriding `TMPDIR`.
+Direct shell success does not prove timer writability.

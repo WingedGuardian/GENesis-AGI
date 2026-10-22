@@ -112,6 +112,45 @@ def read_changed(path: str) -> set[str] | str:
     return {os.fsdecode(p) for p in raw.split(b"\0") if p}
 
 
+def structural_moves(base: dict, pr: dict, changed: set[str]) -> list[dict[str, str]]:
+    """Pair unique changed-file deltas; raw losses and floor policy stay intact."""
+    def candidates(tree, delta):
+        keys = tree.get("move_keys")
+        result = {}
+        if not isinstance(keys, dict):
+            return result
+        for nodeid in sorted(delta):
+            path = tree["paths"][nodeid]
+            key = keys.get(nodeid)
+            prefix = path + "::"
+            if (
+                path not in changed
+                or not nodeid.startswith(prefix)
+                or not isinstance(key, list)
+                or len(key) != 2
+                or not all(isinstance(part, str) for part in key)
+                or key[0] != nodeid[len(prefix) :]
+                or not re.fullmatch(r"[0-9a-f]{64}", key[1])
+            ):
+                continue
+            result.setdefault(tuple(key), []).append(nodeid)
+        return result
+
+    base_ids, pr_ids = set(base["ids"]), set(pr["ids"])
+    vanished = candidates(base, base_ids - pr_ids)
+    added = candidates(pr, pr_ids - base_ids)
+    pairs = []
+    for key, sources in vanished.items():
+        targets = added.get(key, [])
+        if len(sources) != 1 or len(targets) != 1:
+            continue
+        old, new = sources[0], targets[0]
+        old_path, new_path = base["paths"][old], pr["paths"][new]
+        if old_path != new_path:
+            pairs.append({"from_id": old, "to_id": new, "from_path": old_path, "to_path": new_path})
+    return pairs
+
+
 def _conftest_dirs(changed: set[str]) -> set[str]:
     return {p.rpartition("/")[0] for p in changed if p.rpartition("/")[2] == "conftest.py"}
 
@@ -246,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
     explained = sorted(vanished - set(unexplained))
     new_errors = sorted(set(pr["errors"]) - set(base["errors"]))
     newly_skipped = sorted(set(pr["skipped"]) - set(base["skipped"]))
+    moves = structural_moves(base, pr, changed)
 
     _say(
         f"base {len(base_ids)}, PR {len(pr_ids)}: +{len(added)} added, "
@@ -301,6 +341,8 @@ def main(argv: list[str] | None = None) -> int:
             )
     if explained:
         print(f"::notice::{TAG}: {len(explained)} test(s) removed from files this change touched")
+    if moves:
+        _say(f"{len(moves)} structural move(s) (not semantic proof); raw vanished IDs retained")
 
     if args.summary:
         summary = _Summary()
@@ -316,6 +358,10 @@ def main(argv: list[str] | None = None) -> int:
         summary.id_block("Unexplained: vanished from files this change did not touch", unexplained)
         summary.id_block("Modules now skipped at import", newly_skipped)
         summary.id_block("Explained: removed from files this change touched", explained)
+        summary.id_block(
+            "Structural moves (not semantic proof; raw vanished IDs retained above)",
+            [f"{pair['from_id']} -> {pair['to_id']}" for pair in moves],
+        )
         try:
             with open(args.summary, "a", encoding="utf-8", errors="backslashreplace") as fh:
                 fh.write("".join(summary.parts))

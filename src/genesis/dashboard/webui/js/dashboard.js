@@ -5010,6 +5010,9 @@
           if (this.updateStatus?.last_update?.status === "rolled_back" || this.updateStatus?.last_update?.status === "failed") {
             items.push({ level: "warning", title: "Last update failed", detail: this.updateStatus.last_update.failure_reason || "check Backup & Updates tab", href: "#update-section", tab: "backup", anchor: "update-section" });
           }
+          if (this.updateStatus?.last_update?.status === "crashed_recovered") {
+            items.push({ level: "warning", title: "Last update crashed (recovered by bootstrap)", detail: this.updateStatus.last_update.failure_reason || "check Backup & Updates tab", href: "#update-section", tab: "backup", anchor: "update-section" });
+          }
           for (const [name, state] of Object.entries(this.fetchState)) {
             if (state.state === "stale" || state.state === "error") {
               items.push({

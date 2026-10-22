@@ -70,7 +70,8 @@ tunnel case):
 ## Deactivation
 
 When done with heavy browser work, remove the `chrome-devtools` entry from
-`.mcp.json` and restart the session. This reclaims the ~17,000 chars of tool
+`.mcp.json` and restart the session. Updates do not remove it for you: they
+replace only Genesis's own servers and keep every other entry. This reclaims the ~17,000 chars of tool
 descriptions that the 29 Chrome DevTools MCP tools add to the context.
 
 ## Token Cost

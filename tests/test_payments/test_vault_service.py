@@ -10,6 +10,7 @@ import shutil
 import socket
 import sqlite3
 import stat
+import threading
 import time
 from pathlib import Path
 
@@ -303,7 +304,16 @@ class TestUnlockAndLock:
         unlock_trail = [
             e["event"] for e in await _events(db) if e["event"] in ("unlock", "unlock_refused")
         ]
-        assert unlock_trail[-2:] == ["unlock", "unlock_refused"], unlock_trail  # ends true
+        if interrupt == "lock":
+            assert unlock_trail[-2:] == ["unlock", "unlock_refused"], unlock_trail
+        else:
+            assert unlock_trail == ["unlock"], unlock_trail
+            events = await _events(db)
+            assert events[-1]["event"] == "service_stop"
+            assert events[-1]["detail"]["was_unlocked"] is False
+            assert [e["event"] for e in events] == [
+                "service_start", "unlock", "service_stop",
+            ]
 
     async def test_stale_identity_relocks(self, service, vault, db):
         assert (await service.unlock(PASSPHRASE, None))["ok"]
@@ -528,7 +538,7 @@ class TestFailClosed:
         assert "wrong passphrase" not in result["error"]
 
     async def test_an_unreadable_audit_log_is_reported(self, service, monkeypatch):
-        async def broken(db, limit=20):
+        async def broken(db, limit=20, **_kw):
             raise RuntimeError("no such table")
 
         monkeypatch.setattr(audit, "list_recent", broken)
@@ -795,3 +805,263 @@ async def test_a_key_file_altered_since_init_is_refused_before_any_unwrap(
     result = await service.unlock(PASSPHRASE, None)
     assert result["ok"] is False and "recipient.txt is not the public key" in result["error"]
     assert (await _events(db))[-1]["event"] == "unlock_refused"
+
+
+class TestAuditCancellation:
+    @pytest.mark.parametrize("wrapped", [False, True])
+    async def test_cancelled_insert_stays_owned_until_sql_and_rollback_finish(
+        self, db, vault, tmp_path, monkeypatch, wrapped,
+    ):
+        from genesis.db.connection import SerializedConnection
+
+        svc = _make(SerializedConnection(db) if wrapped else db, vault, tmp_path)
+        entered, rolling = asyncio.Event(), asyncio.Event()
+        release_sql, release_rollback = threading.Event(), asyncio.Event()
+        loop = asyncio.get_running_loop()
+        rollback = db.rollback
+
+        def hold_insert():
+            loop.call_soon_threadsafe(entered.set)
+            assert release_sql.wait(5)
+            return 0
+
+        async def hold_rollback():
+            rolling.set()
+            await release_rollback.wait()
+            await rollback()
+
+        await db.create_function("hold_insert", 0, hold_insert)
+        await db.execute(
+            "CREATE TEMP TRIGGER hold BEFORE INSERT ON payment_vault_events "
+            "WHEN NEW.event = 'unlock' BEGIN SELECT hold_insert(); END"
+        )
+        monkeypatch.setattr(db, "rollback", hold_rollback)
+        caller = asyncio.create_task(svc._audit("unlock"))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(caller, 1)
+            await asyncio.wait_for(rolling.wait(), 2)
+            assert svc._audit_lock.locked()
+            async with aiosqlite.connect(str(tmp_path / "g.db"), timeout=0.01) as other:
+                with pytest.raises(aiosqlite.OperationalError, match="locked"):
+                    await audit.record_event(other, "peer_refused")
+            status = asyncio.create_task(svc.status())
+            writer = asyncio.create_task(svc._audit("lock"))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not status.done() and not writer.done()
+            # Repeated cancellation of the departed caller cannot touch cleanup.
+            caller.cancel()
+            release_sql.set()
+            release_rollback.set()
+            assert await asyncio.wait_for(writer, 3)
+            result = await status
+            assert result["last_event"] is None or result["last_event"]["event"] != "unlock"
+            assert [e["event"] for e in await _events(db)] == ["lock"]
+            async with aiosqlite.connect(str(tmp_path / "g.db"), timeout=0.1) as other:
+                await audit.record_event(other, "peer_refused")
+            await asyncio.sleep(0)
+            assert not svc._audit_owners
+        finally:
+            release_sql.set()
+            release_rollback.set()
+            await svc.stop()
+
+    async def test_cancellation_while_waiting_for_lock_cannot_rollback_owner(
+        self, service, db, monkeypatch,
+    ):
+        committed, release = asyncio.Event(), asyncio.Event()
+        commit = db.commit
+        rollback = db.rollback
+        rollbacks = 0
+
+        async def hold_commit():
+            committed.set()
+            await release.wait()
+            await commit()
+
+        async def count_rollback():
+            nonlocal rollbacks
+            rollbacks += 1
+            await rollback()
+
+        monkeypatch.setattr(db, "commit", hold_commit)
+        monkeypatch.setattr(db, "rollback", count_rollback)
+        owner = asyncio.create_task(service._audit("lock"))
+        await committed.wait()
+        waiter = asyncio.create_task(service._audit("unlock_refused"))
+        try:
+            for _ in range(3):
+                await asyncio.sleep(0)
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            await asyncio.sleep(0)
+            assert rollbacks == 0 and db.in_transaction
+        finally:
+            release.set()
+            await owner
+        assert (await _events(db))[-1]["event"] == "lock"
+
+    @pytest.mark.parametrize("cancel_first", [False, True])
+    async def test_rollback_is_protected_from_cancellation_and_stop(
+        self, service, db, monkeypatch, cancel_first,
+    ):
+        inserted, release = await _pending_failed_write(monkeypatch)
+        rolling, finish = asyncio.Event(), asyncio.Event()
+        rollback = db.rollback
+
+        async def hold_rollback():
+            rolling.set()
+            await finish.wait()
+            await rollback()
+
+        monkeypatch.setattr(db, "rollback", hold_rollback)
+        monkeypatch.setattr(svc_mod, "_STOP_WAIT_S", 0.01)
+        caller = asyncio.create_task(service._audit("unlock_refused"))
+        await inserted.wait()
+        if cancel_first:
+            caller.cancel()
+        else:
+            release.set()
+        try:
+            await rolling.wait()
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(caller, 1)
+            await asyncio.wait_for(service.stop(), 1)
+            assert service._audit_lock.locked() and service._audit_owners
+            # Even directly repeated owner cancellation cannot release its lock.
+            for owner in service._audit_owners:
+                owner.cancel()
+            await asyncio.sleep(0)
+            assert service._audit_lock.locked()
+        finally:
+            finish.set()
+            release.set()
+            if service._audit_owners:
+                await asyncio.wait(service._audit_owners, timeout=2)
+        assert not service._audit_owners and not db.in_transaction
+        assert "unlock_refused" not in [e["event"] for e in await _events(db)]
+
+    async def test_rollback_failure_retires_connection_and_shares_protected_close(
+        self, service, db, monkeypatch,
+    ):
+        inserted, release = await _pending_failed_write(monkeypatch)
+        closing, finish = asyncio.Event(), asyncio.Event()
+        close = db.close
+        closes = 0
+
+        async def fail_rollback():
+            raise aiosqlite.OperationalError("rollback failed")
+
+        async def hold_close():
+            nonlocal closes
+            closes += 1
+            closing.set()
+            await finish.wait()
+            await close()
+
+        monkeypatch.setattr(db, "rollback", fail_rollback)
+        monkeypatch.setattr(db, "close", hold_close)
+        service.owned_db = db
+        caller = asyncio.create_task(service._audit("unlock_refused"))
+        await inserted.wait()
+        status = asyncio.create_task(service.status())
+        correction = asyncio.create_task(service._correct_trail())
+        writer = asyncio.create_task(service._audit("lock"))
+        release.set()
+        try:
+            assert not await caller
+            await closing.wait()
+            assert service._db is None
+            assert not (await status)["audit"] and not await writer
+            await correction
+            assert not (await service.unlock(PASSPHRASE, None))["ok"]
+            stopping = asyncio.create_task(svc_mod.stop_vault_service(service))
+            for _ in range(3):
+                await asyncio.sleep(0)
+            stopping.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await stopping
+            assert closes == 1 and not service._audit_close.cancelled()
+        finally:
+            finish.set()
+            await svc_mod.stop_vault_service(service)
+        assert closes == 1
+
+    async def test_queued_commit_is_not_promised_to_be_undone(self, service, db, monkeypatch):
+        entered, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        commit = db.commit
+
+        def hold_commit():
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5)
+            return 0
+
+        async def queued_commit():
+            # One real SQLite worker item: cancellation cannot retract COMMIT.
+            def run():
+                hold_commit()
+                db._conn.commit()
+
+            await db._execute(run)
+
+        monkeypatch.setattr(db, "commit", queued_commit)
+        caller = asyncio.create_task(service._audit("unlock"))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(caller, 1)
+        finally:
+            release.set()
+            monkeypatch.setattr(db, "commit", commit)
+            if service._audit_owners:
+                await asyncio.wait(service._audit_owners, timeout=2)
+        assert not db.in_transaction
+        assert (await _events(db))[-1]["event"] == "unlock"
+        assert not service.unlocked
+        await service._correct_trail()
+        assert (await _events(db))[-1]["event"] == "lock"
+
+    async def test_cancelled_unlock_never_holds_key(self, service, db, monkeypatch):
+        inserted, release = asyncio.Event(), asyncio.Event()
+        commit = db.commit
+
+        async def hold_commit():
+            inserted.set()
+            await release.wait()
+            await commit()
+
+        monkeypatch.setattr(db, "commit", hold_commit)
+        caller = asyncio.create_task(service.unlock(PASSPHRASE, None))
+        try:
+            await asyncio.wait_for(inserted.wait(), 30)  # the real unwrap child runs scrypt
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(caller, 1)
+            if service._audit_owners:
+                await asyncio.wait(service._audit_owners, timeout=2)
+            assert not service.unlocked and not db.in_transaction
+            assert "unlock" not in [e["event"] for e in await _events(db)]
+        finally:
+            release.set()
+
+    async def test_queued_correction_rechecks_identity_under_audit_lock(self, service, db):
+        detail = {"correction": "no key is held; an earlier row was lost"}
+        async with service._audit_lock:
+            correction = asyncio.create_task(
+                service._audit("lock", detail, _correction=True)
+            )
+            await asyncio.sleep(0)
+            assert not correction.done()
+            service._identity = x25519.Identity.generate()
+        assert not await correction
+        assert not any(
+            event["event"] == "lock" and event["detail"] == detail
+            for event in await _events(db)
+        )

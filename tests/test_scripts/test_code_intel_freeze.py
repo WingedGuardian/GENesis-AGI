@@ -158,6 +158,11 @@ def test_entrypoint_reaches_scope_admission_after_disarm(tmp_path):
     _write_exec(
         fakebin / "codebase-memory-mcp", f'#!/usr/bin/env bash\necho "ran:$*" >> "{toollog}"\n'
     )
+    from tests.test_scripts.test_code_intel_index import _test_entrypoint
+
+    # Reuse immutable settings/schema/sentinel availability, replacing only
+    # native readiness and manager execution in this owned shell fixture.
+    entrypoint = _test_entrypoint(tmp_path, fakebin)
     # Minimal PATH omits optional utilities; Codebase must still refuse when
     # the real bounded systemd scope is unavailable, never use rlimit fallback.
     minbin = tmp_path / "minbin"
@@ -195,7 +200,7 @@ def test_entrypoint_reaches_scope_admission_after_disarm(tmp_path):
         "CODE_INTEL_FAKE_IOWAIT": "0",
     }
     res = subprocess.run(
-        ["bash", str(_ENTRYPOINT), str(repo), "cbm", "fast"],
+        ["bash", str(entrypoint), str(repo), "cbm", "fast"],
         env=env,
         capture_output=True,
         text=True,

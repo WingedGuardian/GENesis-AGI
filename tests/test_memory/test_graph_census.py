@@ -23,7 +23,11 @@ TCK = os.sysconf("SC_CLK_TCK")
 MCP = ["/venv/bin/python", "/repo/scripts/genesis_mcp_server.py", "--server"]
 
 
-def _proc(root: Path, pid: int, argv: list[str], *, started: float, env=None) -> None:
+def _proc(
+    root: Path, pid: int, argv: list[str], *, started: float, env=None, exe=None,
+    ns="mnt:[1]",
+    fds=None,
+) -> None:
     d = root / str(pid)
     d.mkdir(parents=True)
     d.joinpath("cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
@@ -33,6 +37,12 @@ def _proc(root: Path, pid: int, argv: list[str], *, started: float, env=None) ->
     d.joinpath("stat").write_text(f"{pid} (python3) {' '.join(rest)}\n")
     env = env or {}
     d.joinpath("environ").write_bytes(b"".join(f"{k}={v}\0".encode() for k, v in env.items()))
+    (d / "exe").symlink_to(exe or "/usr/bin/python3.12")
+    (d / "ns").mkdir()
+    (d / "ns" / "mnt").symlink_to(ns)
+    (d / "fd").mkdir()
+    for i, target in enumerate(fds or (), start=3):
+        (d / "fd" / str(i)).symlink_to(target)
 
 
 @pytest.fixture
@@ -40,6 +50,8 @@ def proc_root(tmp_path) -> Path:
     root = tmp_path / "proc"
     root.mkdir()
     (root / "stat").write_text(f"cpu  1 2 3\nbtime {int(BOOT)}\nprocesses 9\n")
+    (root / "self" / "ns").mkdir(parents=True)
+    (root / "self" / "ns" / "mnt").symlink_to("mnt:[1]")
     return root
 
 
@@ -181,6 +193,8 @@ def test_build_census_labels_each_memory_server_by_the_commit_it_started_on(
     [(new_at, new_sha), (old_at, old_sha)] = _reflog_times(r)[:2]
     assert (new_sha, old_sha) == (new, old)
     live_db = tmp_path / "live.db"
+    live_db.write_text("")
+    (tmp_path / "bench.db").write_text("")
     assert new_at - old_at == 600  # reflog times follow the committer dates
     _proc(proc_root, 40, [*MCP, "memory"], started=old_at + 60)  # before the move
     _proc(
@@ -222,7 +236,10 @@ def test_build_census_labels_each_memory_server_by_the_commit_it_started_on(
     )
     assert by_pid[41]["unknown"] is None
     assert by_pid[41]["foreign"] is False
-    assert by_pid[42]["foreign"] is True
+    # A scratch DB never excuses code that is not proven main's (this argv is
+    # not main's venv), so the row is counted, not skipped.
+    assert by_pid[42]["foreign"] is False
+    assert by_pid[42]["unknown_reasons"] == ["not_main_venv"]
     assert by_pid[41]["started_at"].endswith("Z")
     assert m["other_servers"] == {"recon": 1}
     assert m["unclassified"] == 1
@@ -323,9 +340,17 @@ def test_an_edited_memory_package_marks_head_dirty(proc_root, repo):
 @pytest.mark.asyncio
 async def test_record_census_writes_one_row(db, monkeypatch):
     monkeypatch.delenv("GENESIS_GRAPH_TELEMETRY_DISABLED", raising=False)
-    monkeypatch.setattr(census, "build_census", lambda: {"procs": [], "complete": True})
+    seen = {}
+
+    def fake(**kw):
+        seen.update(kw)
+        return {"procs": [], "complete": True}
+
+    monkeypatch.setattr(census, "build_census", fake)
 
     await census.record_census(db)
+    # The live database is the one THIS process's connection holds open.
+    assert seen == {"live_held_by": os.getpid()}
 
     cur = await db.execute(
         "SELECT dimension, metrics_json FROM eval_events WHERE event_type = ?",
@@ -419,7 +444,7 @@ async def test_a_kill_switch_added_to_secrets_env_later_is_seen(db, monkeypatch,
     monkeypatch.delenv("GENESIS_GRAPH_TELEMETRY_DISABLED", raising=False)
     secrets = tmp_path / "secrets.env"
     monkeypatch.setenv("SECRETS_PATH", str(secrets))
-    monkeypatch.setattr(census, "build_census", lambda: {"v": 1, "procs": [], "complete": True})
+    monkeypatch.setattr(census, "build_census", lambda **kw: {"v": 1, "procs": [], "complete": True})
 
     secrets.write_text("OTHER=1\n")
     assert (await census.record_census(db))["complete"] is True
@@ -430,68 +455,218 @@ async def test_a_kill_switch_added_to_secrets_env_later_is_seen(db, monkeypatch,
     assert metrics["complete"] is False
 
 
-def _scanned(**over) -> dict:
-    proc = {"pid": 70, "server": "memory", "start": 1000.0, "env_switch": None,
-            "secrets_path": None, "db_path": None}
-    proc.update(over)
-    return proc
-
-
-def _secrets(path: Path, body: str, mtime: float) -> Path:
-    path.write_text(body)
-    os.utime(path, (mtime, mtime))
-    return path
-
-
-@pytest.mark.parametrize(("value", "off"), [("1", True), ("0", False)])
-def test_an_exec_time_switch_wins(tmp_path, value, off):
-    default = _secrets(tmp_path / "secrets.env", "GENESIS_GRAPH_TELEMETRY_DISABLED=1\n", 500.0)
-    assert census.effective_telemetry_off(_scanned(env_switch=value), default) is off
-
-
-def test_an_unchanged_secrets_file_is_read(tmp_path):
-    on = _secrets(tmp_path / "a.env", "GENESIS_GRAPH_TELEMETRY_DISABLED=1\n", 500.0)
-    off = _secrets(tmp_path / "b.env", "OTHER=1\n", 500.0)
-    assert census.effective_telemetry_off(_scanned(), on) is True
-    assert census.effective_telemetry_off(_scanned(), off) is False
-
-
-def test_a_secrets_file_changed_after_start_is_unknown(tmp_path):
-    later = _secrets(tmp_path / "secrets.env", "OTHER=1\n", 2000.0)
-    assert census.effective_telemetry_off(_scanned(), later) is None
-
-
-def test_a_per_process_secrets_path_is_the_one_read(tmp_path):
-    default = _secrets(tmp_path / "default.env", "OTHER=1\n", 500.0)
-    own = _secrets(tmp_path / "own.env", "GENESIS_GRAPH_TELEMETRY_DISABLED=1\n", 500.0)
-    proc = _scanned(secrets_path=str(own))
-    assert census.effective_telemetry_off(proc, default) is True
-    assert census.effective_telemetry_off(_scanned(secrets_path="rel/secrets.env"), default) is None
-
-
-def test_a_tilde_db_path_is_expanded_before_the_foreign_check(proc_root, repo, tmp_path, monkeypatch):
+@pytest.fixture
+def main_venv(repo, tmp_path) -> list[str]:
+    """Make the fixture checkout a provable main tree (a venv shaped like a live
+    install's) and return a memory server's argv on it."""
     r, _, _ = repo
-    monkeypatch.setenv("HOME", str(tmp_path))
-    _proc(proc_root, 71, [*MCP, "memory"], started=_reflog_times(r)[0][0] + 60,
-          env={"GENESIS_DB_PATH": "~/bench.db"})
-    [p] = census.build_census(r, proc_root=proc_root, live_db=tmp_path / "live.db")["procs"]
-    assert p["foreign"] is True
+    interp = tmp_path / "sys" / "bin" / "python3.12"
+    interp.parent.mkdir(parents=True)
+    interp.write_text("")
+    venv = r / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(interp)
+    (venv / "pyvenv.cfg").write_text(
+        f"home = {interp.parent}\ninclude-system-site-packages = false\n"
+        f"version = 3.12.3\nexecutable = {interp}\n"
+    )
+    site = venv / "lib" / "python3.12" / "site-packages"
+    site.mkdir(parents=True)
+    (r / "src" / "genesis").mkdir(parents=True, exist_ok=True)
+    (site / "__editable__.genesis.pth").write_text(f"{r / 'src'}\n")
+    (r / "scripts").mkdir(exist_ok=True)
+    (r / "scripts" / "genesis_mcp_server.py").write_text("")
+    return [str(venv / "bin" / "python"), str(r / "scripts" / "genesis_mcp_server.py"),
+            "--server", "memory"]
+
+
+def _census_one(proc_root, repo, tmp_path, argv, env, *, started=None, secrets=True) -> dict:
+    """One server's row. By default it gets a proven, empty secrets file of its
+    own: since the router reloads that file with override=True, an unprovable
+    one leaves even an exec-time switch unknown."""
+    import time as _time
+
+    r, _, _ = repo
+    if secrets and "SECRETS_PATH" not in env:
+        own = tmp_path / "proven.env"
+        own.touch()
+        env = {**env, "SECRETS_PATH": str(own)}
+    live = tmp_path / "live.db"
+    live.touch()
+    _proc(proc_root, 80, argv, started=started or _time.time() + 60, env=env,
+          exe=str(tmp_path / "sys" / "bin" / "python3.12"))
+    [p] = census.build_census(r, proc_root=proc_root, live_db=live)["procs"]
+    return p
+
+
+def test_a_fully_proven_server_reads_clean_on_all_four(proc_root, repo, tmp_path, main_venv):
+    live = tmp_path / "live.db"
+    env = {"GENESIS_GRAPH_TELEMETRY_DISABLED": "0", "GENESIS_DB_PATH": str(live)}
+    p = _census_one(proc_root, repo, tmp_path, main_venv, env)
+    assert p["role"] == "mcp-memory"
+    assert (p["source"], p["unknown_reasons"]) == ("main", [])
+    assert p["telemetry"] is True
+    assert p["telemetry_off"] is False
+    assert p["foreign"] is False
+    assert p["db_identity"] == [live.stat().st_dev, live.stat().st_ino]
+
+
+def test_a_server_on_another_venv_is_source_unknown(proc_root, repo, tmp_path, main_venv):
+    argv = ["/venv/bin/python", main_venv[1], "--server", "memory"]
+    p = _census_one(proc_root, repo, tmp_path, argv, {"GENESIS_GRAPH_TELEMETRY_DISABLED": "0"})
+    assert (p["source"], p["unknown_reasons"]) == (None, ["not_main_venv"])
+
+
+def test_a_missing_secrets_file_leaves_the_switch_unknown(proc_root, repo, tmp_path, main_venv):
+    p = _census_one(proc_root, repo, tmp_path, main_venv, {}, secrets=False)
+    assert p["telemetry_off"] is None
+
+
+def test_a_db_named_only_in_the_secrets_file_never_makes_a_server_foreign(
+    proc_root, repo, tmp_path, main_venv
+):
+    """The primary DB is fixed at import, before any secrets load, so a file's
+    GENESIS_DB_PATH only ADDS a database: the live default is still in use."""
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    secrets = tmp_path / "own.env"
+    secrets.write_text(f"GENESIS_DB_PATH={bench}\n")
+    p = _census_one(proc_root, repo, tmp_path, main_venv, {"SECRETS_PATH": str(secrets)})
+    assert p["telemetry_off"] is False
+    assert p["foreign"] is False
+
+
+def test_a_bench_server_whose_file_agrees_is_foreign(proc_root, repo, tmp_path, main_venv):
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    secrets = tmp_path / "own.env"
+    secrets.write_text(f"GENESIS_DB_PATH={bench}\n")
+    env = {"SECRETS_PATH": str(secrets), "GENESIS_DB_PATH": str(bench)}
+    assert _census_one(proc_root, repo, tmp_path, main_venv, env)["foreign"] is True
+
+
+def test_a_scratch_db_does_not_excuse_unproven_code(proc_root, repo, tmp_path, main_venv):
+    """The DB rules model main's own server code; with it unproven, the row is
+    counted (and dirty), never skipped as foreign."""
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    argv = ["/venv/bin/python", main_venv[1], "--server", "memory"]
+    env = {"GENESIS_DB_PATH": str(bench), "GENESIS_GRAPH_TELEMETRY_DISABLED": "0"}
+    p = _census_one(proc_root, repo, tmp_path, argv, env)
+    assert p["unknown_reasons"] == ["not_main_venv"]
+    assert p["foreign"] is False
+
+
+def test_a_hardlink_of_the_live_db_is_not_foreign(proc_root, repo, tmp_path, main_venv):
+    live = tmp_path / "live.db"
+    live.write_text("")
+    alias = tmp_path / "alias.db"
+    os.link(live, alias)
+    env = {"GENESIS_GRAPH_TELEMETRY_DISABLED": "0", "GENESIS_DB_PATH": str(alias)}
+    assert _census_one(proc_root, repo, tmp_path, main_venv, env)["foreign"] is False
+
+
+def test_a_missing_scratch_db_is_counted_not_skipped(proc_root, repo, tmp_path, main_venv):
+    env = {"GENESIS_DB_PATH": str(tmp_path / "never-created.db")}
+    assert _census_one(proc_root, repo, tmp_path, main_venv, env)["foreign"] is False
+
+
+def test_a_tilde_db_path_expands_with_that_processs_home(proc_root, repo, tmp_path, main_venv):
+    (tmp_path / "bench.db").write_text("")
+    env = {"GENESIS_DB_PATH": "~/bench.db", "HOME": str(tmp_path)}
+    assert _census_one(proc_root, repo, tmp_path, main_venv, env)["foreign"] is True
+    # Without its HOME the census cannot expand it: never called foreign.
+    proc_root2 = tmp_path / "proc2"
+    proc_root2.mkdir()
+    (proc_root2 / "stat").write_text((proc_root / "stat").read_text())
+    (proc_root2 / "self" / "ns").mkdir(parents=True)
+    (proc_root2 / "self" / "ns" / "mnt").symlink_to("mnt:[1]")
+    p = _census_one(proc_root2, repo, tmp_path, main_venv, {"GENESIS_DB_PATH": "~/bench.db"})
+    assert p["foreign"] is False
+
+
+def test_a_row_never_carries_another_processs_environment(proc_root, repo, tmp_path, main_venv):
+    import json as _json
+
+    env = {
+        "API_KEY_X": "sekrit-key",
+        "SECRETS_PATH": "/sekrit-dir/s.env",
+        "GENESIS_DB_PATH": "/sekrit-db/x.db",
+        "PYTHONPATH": "/sekrit-pp",
+        "HOME": "/sekrit-home",
+    }
+    row = _census_one(proc_root, repo, tmp_path, main_venv, env)
+    assert "sekrit" not in _json.dumps(row)
+
+
+def test_a_server_running_another_trees_script_is_not_main(proc_root, repo, tmp_path, main_venv):
+    """run-mcp-server can start a worktree's script on main's venv: the package
+    is main's, but the script's own loader and startup are not."""
+    other = tmp_path / "wt" / "scripts" / "genesis_mcp_server.py"
+    other.parent.mkdir(parents=True)
+    other.write_text("")
+    argv = [main_venv[0], str(other), "--server", "memory"]
+    p = _census_one(proc_root, repo, tmp_path, argv, {"GENESIS_GRAPH_TELEMETRY_DISABLED": "0"})
+    assert p["unknown_reasons"] == ["script_not_main"]
 
 
 
-def test_no_secrets_file_in_an_unchanged_directory_means_nothing_was_loaded(tmp_path):
-    os.utime(tmp_path, (500.0, 500.0))
-    assert census.effective_telemetry_off(_scanned(), tmp_path / "absent.env") is False
+def test_the_default_secrets_file_is_main_checkouts(proc_root, repo, tmp_path, main_venv):
+    """No SECRETS_PATH and no GENESIS_REPO_ROOT: the server loads main's own
+    secrets.env, which the census proves by its ctime against the start."""
+    r, _, _ = repo
+    (r / "secrets.env").write_text("OTHER=1\n")
+    env = {"GENESIS_DB_PATH": str(tmp_path / "live.db")}
+    p = _census_one(proc_root, repo, tmp_path, main_venv, env, secrets=False)
+    assert p["telemetry_off"] is False
+    # Changed after the server started (a fresh /proc with an earlier start): unknown.
+    proc_root2 = tmp_path / "proc2"
+    proc_root2.mkdir()
+    (proc_root2 / "stat").write_text((proc_root / "stat").read_text())
+    (proc_root2 / "self" / "ns").mkdir(parents=True)
+    (proc_root2 / "self" / "ns" / "mnt").symlink_to("mnt:[1]")
+    p2 = _census_one(
+        proc_root2, repo, tmp_path, main_venv, env, secrets=False, started=1_700_000_100.0
+    )
+    assert p2["telemetry_off"] is None
 
 
-def test_a_secrets_file_deleted_after_start_is_unknown(tmp_path):
-    # The directory changed after the process started: the file may have been
-    # there (and loaded) then, and its contents can no longer be read.
-    gone = _secrets(tmp_path / "secrets.env", "GENESIS_GRAPH_TELEMETRY_DISABLED=1\n", 500.0)
-    gone.unlink()
-    os.utime(tmp_path, (2000.0, 2000.0))
-    assert census.effective_telemetry_off(_scanned(), gone) is None
+
+def test_a_bench_server_holding_the_live_db_open_is_counted(proc_root, repo, tmp_path, main_venv):
+    """Its path names a scratch DB, but its open descriptors include the live
+    one: that handle is what its long-lived connection uses."""
+    import time as _time
+
+    r, _, _ = repo
+    live = tmp_path / "live.db"
+    live.write_text("")
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    own = tmp_path / "proven.env"
+    own.touch()
+    env = {"GENESIS_DB_PATH": str(bench), "SECRETS_PATH": str(own)}
+    _proc(proc_root, 81, main_venv, started=_time.time() + 60, env=env,
+          exe=str(tmp_path / "sys" / "bin" / "python3.12"), fds=[live])
+    [p] = census.build_census(r, proc_root=proc_root, live_db=live)["procs"]
+    assert p["foreign"] is False
 
 
-def test_a_missing_secrets_directory_is_unknown(tmp_path):
-    assert census.effective_telemetry_off(_scanned(), tmp_path / "nope" / "s.env") is None
+def test_the_census_names_the_live_db_its_writer_holds_open(proc_root, repo, tmp_path):
+    """The row is written through the host's open connection: if the path now
+    names another file (a symlink retargeted since it opened), the census
+    cannot say which database "live" is and reads incomplete."""
+    import time as _time
+
+    r, _, _ = repo
+    live = tmp_path / "live.db"
+    live.write_text("")
+    other = tmp_path / "other.db"
+    other.write_text("")
+    _proc(proc_root, 70, ["sleep", "1"], started=_time.time() - 5, fds=[live])
+    _proc(proc_root, 71, ["sleep", "1"], started=_time.time() - 5, fds=[other])
+    held = census.build_census(r, proc_root=proc_root, live_db=live, live_held_by=70)
+    assert "live_db_moved" not in held["reasons"]
+    moved = census.build_census(r, proc_root=proc_root, live_db=live, live_held_by=71)
+    assert (moved["complete"], "live_db_moved" in moved["reasons"]) == (False, True)
+    gone = census.build_census(r, proc_root=proc_root, live_db=live, live_held_by=99999)
+    assert "live_db_moved" in gone["reasons"]

@@ -53,6 +53,13 @@ TimeoutStartSec=20
 # RSS around the 1G ceiling and is still ~6x the measured peak for this graph's
 # size. noeviction: silently evicting graph keys would corrupt the projection —
 # a write that cannot fit must fail loudly and be repaired by a re-project.
+#
+# --slowlog-max-len and --latency-monitor-threshold keep the engine's own record
+# of a slow moment: a read that times out client-side is otherwise news with no
+# cause. SLOWLOG times each command including its wait for a worker thread;
+# LATENCY catches a stalled main thread, which SLOWLOG cannot see. The default
+# 128 entries held about 2.5 h, nearly all hourly projection batches (MEASURED
+# 2026-10-20: about 47 entries an hour), so 4096 keeps about three days.
 # `+` runs this one command outside the sandbox below: ReadWritePaths names
 # the data dir itself, a missing ReadWritePaths entry fails namespace setup,
 # and under ProtectHome=read-only a sandboxed mkdir could not create it.
@@ -73,6 +80,8 @@ ExecStart="__REDIS_SERVER__" \
     --appendonly no \
     --maxmemory 512mb \
     --maxmemory-policy noeviction \
+    --slowlog-max-len 4096 \
+    --latency-monitor-threshold 100 \
     --supervised systemd
 Restart=always
 RestartSec=5

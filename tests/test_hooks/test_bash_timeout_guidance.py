@@ -46,8 +46,11 @@ _REPO = Path(__file__).resolve().parents[2]
 _CEILING_MS = 600_000
 
 _HOOK = Path("scripts/hooks/deploy_timeout_advisory.py")
-_SKILL = Path(".claude/skills/genesis-development/SKILL.md")
+_SKILL = Path(".claude/skills/validating-merges/SKILL.md")  # the detached-deploy recipe (skill split)
+_CORE = Path(".claude/skills/genesis-development/SKILL.md")  # the Bash-ceiling rule
 _ADVICE_SURFACES = (_HOOK, _SKILL)
+# The Bash-ceiling numbers also live in the core, which carries no deploy recipe.
+_TIMEOUT_SURFACES = (*_ADVICE_SURFACES, _CORE)
 
 # A millisecond-scale number (6+ digits) presented as a timeout value.
 _MS_LITERAL = re.compile(r"\b(\d{6,})\s*ms\b")
@@ -91,8 +94,8 @@ def _one_line(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def _advice_files():
-    for rel in _ADVICE_SURFACES:
+def _advice_files(surfaces=_ADVICE_SURFACES):
+    for rel in surfaces:
         path = _REPO / rel
         assert path.exists(), f"advice surface missing: {rel}"
         yield rel, path.read_text()
@@ -102,7 +105,7 @@ class TestNoUnreachableTimeoutIsRecommended:
     def test_no_millisecond_value_above_the_ceiling(self):
         """The actual defect: '>=900000ms' cannot be satisfied."""
         offenders = []
-        for rel, text in _advice_files():
+        for rel, text in _advice_files(_TIMEOUT_SURFACES):
             for raw in _MS_LITERAL.findall(text):
                 if int(raw) > _CEILING_MS:
                     offenders.append(f"{rel}: {raw}ms > {_CEILING_MS}ms ceiling")
@@ -117,7 +120,7 @@ class TestTheCeilingIsStated:
     def test_surfaces_name_the_real_maximum(self):
         """Naming the default without the ceiling is what let the wrong number
         stand: '120000ms default' reads as 'raise it as needed'."""
-        for rel, text in _advice_files():
+        for rel, text in _advice_files(_TIMEOUT_SURFACES):
             assert "600000" in text or "600,000" in text, (
                 f"{rel} advises on the Bash timeout but never states the 600000ms "
                 "ceiling — without it, 'set the timeout higher' reads as unbounded"
@@ -132,7 +135,7 @@ class TestTheCeilingIsStated:
         NOT the fix"), so it would stay green after the general guidance was deleted
         entirely — leaving the skill telling sessions to detach everything.
         """
-        skill = _one_line((_REPO / _SKILL).read_text())
+        skill = _one_line((_REPO / _CORE).read_text())
         assert "For long or unbounded work generally, use" in skill, (
             "the skill no longer routes ordinary long work to run_in_background; "
             "only the deploy carve-out remains, which over-generalises the ban"

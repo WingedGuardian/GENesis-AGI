@@ -1099,10 +1099,10 @@ def pytest_sessionstart(session):
 
     pytest's own signal for this is ``Unknown config option: timeout`` in the
     warnings summary at the END of the run, which is exactly when it no longer
-    helps. Nothing installs the ``[test]`` extra on an install (bootstrap's
-    editable install names no extras), so the plugin is present only where
-    someone put it, and a hang observed on 2026-10-11 held the box lock for
-    about 40 minutes in a venv without it.
+    helps. bootstrap installs the ``[test]`` extra as a non-fatal step
+    (``install_runtime_extras``), so a venv can still lack the plugin when that
+    step failed or before the first update that ran it; a hang observed on
+    2026-10-11 held the box lock for about 40 minutes in a venv without it.
     """
     config = session.config
     if config.pluginmanager.hasplugin("timeout"):

@@ -281,7 +281,7 @@ def test_readiness_does_not_start_rpc_after_deadline(runtime, tmp_path, monkeypa
     rpc = Mock()
     monkeypatch.setattr(namespace["subprocess"], "run", rpc)
     with pytest.raises(ValueError, match="ready"):
-        runtime.ready(dict(binary=str(binary)))
+        runtime.ready(dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path)))
     rpc.assert_not_called()
 
 
@@ -307,7 +307,7 @@ def test_readiness_native_window_is_clipped_to_total_startup_budget(
     monkeypatch.setattr(namespace["subprocess"], "run", rpc)
     if expected_timeout is None:
         with pytest.raises(ValueError, match="ready"):
-            runtime.ready(dict(binary=str(binary)))
+            runtime.ready(dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path)))
         rpc.assert_not_called()
     else:
         runtime.ready(dict(binary=str(binary), main=str(tmp_path), cache=str(tmp_path), runtime=str(tmp_path)))

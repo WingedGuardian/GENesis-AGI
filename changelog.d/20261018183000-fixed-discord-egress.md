@@ -1,0 +1,1 @@
+- Gate complete Discord bot replies before chunking or delivery, refusing sensitive content and failed safety checks without echoing values. Send and observe the shared egress gate's cleaned text.
