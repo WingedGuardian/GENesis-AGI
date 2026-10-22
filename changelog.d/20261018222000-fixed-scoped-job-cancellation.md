@@ -1,0 +1,1 @@
+- Scoped job cancellation waits for owned descendants after leader exit, keeps the first caller cancellation cooperative, and forces on the second. Watchdog stops retain their separate ten-second force deadline after leader exit. Launch without a reachable systemd user manager is refused.

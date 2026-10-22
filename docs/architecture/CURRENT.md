@@ -3470,7 +3470,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 96e0a4de31a8 2026-10-18
+verified: 8a62059720cd 2026-10-22
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3533,7 +3533,10 @@ tool-disabled CC probe without changing its schedule or routing authority.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the
-  budget (`docs/reference/resource-budget.md`). Importable without the runtime.
+  budget (`docs/reference/resource-budget.md`). `run` requires a reachable user
+  manager and acknowledged scope; first caller cancellation stays cooperative,
+  a second forces, and stopped-scope cleanup outlives the leader. Watchdog stops
+  alone arm a ten-second force deadline. Importable without the runtime.
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
   install usable" signal (CC OAuth login + ≥1 routing LLM key + ≥1 embedding key),
