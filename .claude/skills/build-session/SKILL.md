@@ -1795,6 +1795,7 @@ three protocol steps also apply: `.claude/skills/closing-session/SKILL.md`,
   hand-rolled-parsing hunting, not a lint/secrets scan — and writes the evidence marker. This is
   the review that catches Round-1 bugs before Codex does; `/audit-changes` is only a light
   self-check.
+  A PR whose diff touches the enforcement-hook surface runs the gate-fix lane (wider round 1): `.claude/skills/genesis-development/references/gate-fix-lane.md`.
 
 ### Publishing: the first push opens the PR
 
