@@ -248,6 +248,30 @@ async def complete_open_by_identity(
     return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
 
+async def count_stalled_pending_in(
+    db: aiosqlite.Connection,
+    *,
+    work_types: frozenset[str],
+    stale_cutoff_iso: str,
+) -> int:
+    """Count pending items of ``work_types`` deferred before ``stale_cutoff_iso``.
+
+    The stalled-worklist subset that ``count_recovery_pending`` folds back into
+    the recovery backlog, counted directly so a display can name it without
+    deriving it from other counts (empty set → 0).
+    """
+    if not work_types:
+        return 0
+    placeholders = ",".join("?" * len(work_types))
+    cursor = await db.execute(
+        f"SELECT COUNT(*) FROM deferred_work_queue WHERE status = 'pending' "
+        f"AND work_type IN ({placeholders}) AND deferred_at < ?",
+        [*work_types, stale_cutoff_iso],
+    )
+    row = await cursor.fetchone()
+    return int(row[0])
+
+
 async def count_recovery_pending(
     db: aiosqlite.Connection,
     *,

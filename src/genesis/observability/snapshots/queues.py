@@ -290,19 +290,36 @@ async def queues(
     # inflate the raw total but are NOT stuck recovery work, so alerting on the
     # raw total cries wolf on every tick. Mirror the dead_letter raw-vs-stuck
     # split below.
+    # A failed query leaves every figure None (key present, value None): a
+    # consumer must never read a depth nobody measured as 0. 0 is set only in
+    # the no-queue branch, where nothing is pending by construction.
     deferred_recovery = None
-    deferred_worklist = 0
+    deferred_worklist = None
+    # Worklist items stalled past a full drain cycle: counted in BOTH
+    # deferred_recovery and deferred_worklist. Counted directly (not derived as
+    # recovery + worklist - total, which three separate queries can get wrong),
+    # in its own try so its failure does not blank the three figures above.
+    deferred_worklist_stalled = None
     if deferred_queue:
         try:
             deferred = await deferred_queue.count_pending()
             deferred_recovery = await deferred_queue.count_recovery_pending()
             deferred_worklist = await deferred_queue.count_worklist_pending()
         except Exception:
+            deferred = deferred_recovery = deferred_worklist = None
             errors.append("deferred_work: query failed")
             logger.error("Failed to query deferred work queue", exc_info=True)
+        try:
+            deferred_worklist_stalled = await deferred_queue.count_stalled_worklist_pending()
+        except Exception:
+            deferred_worklist_stalled = None
+            errors.append("deferred_worklist_stalled: query failed")
+            logger.error("Failed to count stalled deferred worklist items", exc_info=True)
     else:
         deferred = 0
         deferred_recovery = 0
+        deferred_worklist = 0
+        deferred_worklist_stalled = 0
 
     dead = None
     if dead_letter:
@@ -618,6 +635,8 @@ async def queues(
         # Batch worklist depth (dream synthesis etc.) — display only, never
         # summed into the depth alarm.
         "deferred_worklist": deferred_worklist,
+        # Display only: the stalled-worklist overlap between the two above.
+        "deferred_worklist_stalled": deferred_worklist_stalled,
         "deferred_oldest_age_seconds": deferred_oldest_s,
         "deferred_processing": deferred_processing,
         "deferred_stuck": deferred_stuck,

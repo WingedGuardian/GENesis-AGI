@@ -99,6 +99,13 @@ class TestQueueCounts:
         q = _queue(db)
         assert await q.count_worklist_pending() == 5  # all batch, display
         assert await q.count_recovery_pending() == 2  # only the stale ones
+        assert await q.count_stalled_worklist_pending() == 2  # counted directly
+
+    @pytest.mark.asyncio
+    async def test_stalled_worklist_ignores_recovery_items(self, db):
+        await _seed_recovery(db, 4)
+        await _seed_worklist(db, 3, age_days=STALE_WORKLIST_DAYS + 1)
+        assert await _queue(db).count_stalled_worklist_pending() == 3
 
 
 class TestSnapshotSplit:
@@ -120,6 +127,7 @@ class TestSnapshotSplit:
         assert result["deferred_work"] == 8  # raw total
         assert result["deferred_worklist"] == 6  # batch, display-only
         assert result["deferred_recovery"] == 2  # alarm-eligible
+        assert result["deferred_worklist_stalled"] == 0  # all fresh
 
     @pytest.mark.asyncio
     async def test_deferred_items_sample_excludes_batch_worklists(self, db):
@@ -154,6 +162,38 @@ class TestSnapshotSplit:
         assert result["deferred_work"] == 0
         assert result["deferred_recovery"] == 0
         assert result["deferred_worklist"] == 0
+        assert result["deferred_worklist_stalled"] == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_deferred_query_leaves_every_split_none(self, db):
+        import importlib
+
+        qmod = importlib.import_module("genesis.observability.snapshots.queues")
+        q = AsyncMock()
+        q.count_pending.side_effect = RuntimeError("db unavailable")
+        q.count_stalled_worklist_pending.return_value = 2  # its own try
+        result = await qmod.queues(db, q, None)
+        assert result["deferred_work"] is None
+        assert result["deferred_recovery"] is None
+        assert result["deferred_worklist"] is None  # never a preset 0
+        assert result["deferred_worklist_stalled"] == 2
+        assert "deferred_work: query failed" in result["errors"]
+
+    @pytest.mark.asyncio
+    async def test_failed_stalled_count_keeps_the_good_figures(self, db):
+        import importlib
+
+        qmod = importlib.import_module("genesis.observability.snapshots.queues")
+        q = AsyncMock()
+        q.count_pending.return_value = 9
+        q.count_recovery_pending.return_value = 4
+        q.count_worklist_pending.return_value = 5
+        q.count_stalled_worklist_pending.side_effect = RuntimeError("db unavailable")
+        result = await qmod.queues(db, q, None)
+        assert (result["deferred_work"], result["deferred_recovery"]) == (9, 4)
+        assert result["deferred_worklist"] == 5
+        assert result["deferred_worklist_stalled"] is None
+        assert any("stalled" in e for e in result["errors"])
 
 
 class TestDriftGuard:
