@@ -9,7 +9,7 @@ Type=oneshot
 WorkingDirectory=__REPO_DIR__
 ExecStart=/bin/bash "__REPO_DIR__/scripts/install_browser_stack.sh"
 # The whole run: up to four steps (engine fetch, add-ons, Chromium, system
-# libraries) at the project's 2 h floor each (genesis-development, Timeout
+# libraries) at the project's 2 h floor each (build-session, Timeout
 # Policy). No hang has been observed; the engine download is about 1.3 GB. The
 # module cuts every step's timeout to what is left of this, so steps that each
 # stay inside their own limit cannot together be killed mid-install.

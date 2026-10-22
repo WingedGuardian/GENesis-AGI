@@ -114,6 +114,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+transcript-analytics = ["duckdb==1.5.6", "pyarrow==24.0.0"]
+# `test` and `payments` are installed on every install, after the core packages
+# and as a separate non-fatal step (scripts/lib/venv_setup.sh install_runtime_extras;
+# the list is INSTALL_EXTRAS in scripts/lib/venv_matches_pyproject.py): an install
+# runs its own test suite, and the card vault needs the payments packages.
 test = [
     "pytest>=8.0",
     "pytest-asyncio",

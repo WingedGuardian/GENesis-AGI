@@ -23,7 +23,9 @@ def _ts(t: datetime) -> str:
     return t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def _db(tmp_path: Path, *, days: int, fallback_at: datetime | None = None) -> Path:
+def _db(
+    tmp_path: Path, *, days: int, fallback_at: datetime | None = None, event: dict | None = None
+) -> Path:
     path = tmp_path / "genesis.db"
     conn = sqlite3.connect(path)
     conn.execute(
@@ -32,7 +34,7 @@ def _db(tmp_path: Path, *, days: int, fallback_at: datetime | None = None) -> Pa
         " created_at TEXT, prompt_hash TEXT)"
     )
     census = {
-        "v": 1,
+        "v": 2,  # graph_cutover.CLEAN_CENSUS_SCHEMA
         "procs": [],
         "other_servers": {},
         "unclassified": 0,
@@ -75,7 +77,7 @@ def _db(tmp_path: Path, *, days: int, fallback_at: datetime | None = None) -> Pa
             "outcomes": {"fallback": 1},
             "served": {"networkx": 1},
             "configured": {"falkordb": 1},
-            "events": [{"outcome": "fallback", "primary_reason": "ConnectionError"}],
+            "events": [event or {"outcome": "fallback", "primary_reason": "ConnectionError"}],
             "prior_write_failures": 0,
         }
         conn.execute(
@@ -228,3 +230,49 @@ def test_the_read_waits_for_an_exclusive_writer(tmp_path):
 
 def test_a_missing_lost_writes_file_reads_as_empty(tmp_path):
     assert _rep.read_lost_writes(tmp_path / "absent.jsonl") == []
+
+
+def test_a_reset_prints_the_cause_its_event_recorded(tmp_path, capsys):
+    event = {
+        "outcome": "fallback",
+        "primary_reason": "TimeoutError",
+        "pid": 4242,
+        "starttime_ticks": 99,
+        "proc_age_s": 12.5,
+        "diag": {
+            "budget_ms": 500.0,
+            "elapsed_ms": 501.2,
+            "late_ms": 1.2,
+            "cancel_ms": 0.4,
+            "frames": ["query", "readuntil", "_wait_for_data"],
+            "psi_stall_us": {"cpu_some": 0, "io_full": 3000},
+        },
+    }
+    db = _db(tmp_path, days=20, fallback_at=NOW - timedelta(days=2), event=event)
+    assert _run(tmp_path, db) == 1
+    out = capsys.readouterr().out
+    assert "pid 4242, age 12.5s" in out
+    assert "late 1.2ms" in out and "budget 500.0ms" in out and "cancel 0.4ms" in out
+    assert "at query>readuntil>_wait_for_data" in out
+    assert "stall io_full=3000us" in out
+    assert "cpu_some" not in out  # a zero stall is not news
+
+
+def test_a_reset_written_before_the_diagnostics_says_so(tmp_path, capsys):
+    db = _db(tmp_path, days=20, fallback_at=NOW - timedelta(days=2))
+    assert _run(tmp_path, db) == 1
+    assert "uninstrumented (written before timeout diagnostics)" in capsys.readouterr().out
+
+
+def test_a_malformed_event_never_crashes_the_report(tmp_path, capsys):
+    event = {"outcome": "fallback", "pid": 7, "diag": {"frames": "not-a-list", "psi_stall_us": 3}}
+    db = _db(tmp_path, days=20, fallback_at=NOW - timedelta(days=2), event=event)
+    assert _run(tmp_path, db) == 1
+    assert "pid 7" in capsys.readouterr().out
+
+
+def test_the_query_a_timeout_hit_is_named(tmp_path, capsys):
+    event = {"outcome": "fallback", "pid": 7, "diag": {"query": "marker", "budget_ms": 120.0}}
+    db = _db(tmp_path, days=20, fallback_at=NOW - timedelta(days=2), event=event)
+    assert _run(tmp_path, db) == 1
+    assert "marker query" in capsys.readouterr().out

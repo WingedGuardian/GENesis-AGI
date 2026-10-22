@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from genesis.mcp.health import browser
+from genesis.security.card_redaction import CARD_FILTER
+from genesis.security.card_shapes import REDACTED
 
 
 def _clear_all_browser_state():
@@ -4290,6 +4292,7 @@ class TestBrowserScreenshotUniquePath:
                 fh.write(b"\x89PNG")
 
         page.screenshot = AsyncMock(side_effect=_write)
+        page.frames = [_text_frame("Example")]  # the card check reads each frame
         return page
 
     @pytest.mark.asyncio
@@ -6886,3 +6889,547 @@ async def test_an_upgrade_during_the_driver_start_says_restart_not_provision(mon
     with pytest.raises(packages.BrowserPackagesChanged):
         await browser._ensure_chromium_fallback()
     pw.stop.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Card-number redaction of tool output and logs
+# ---------------------------------------------------------------------------
+# Stripe's public test number; no other card number may appear in tests.
+_CARD = "4242424242424242"
+_CARD_SPACED = "4242 4242 4242 4242"
+
+
+def _assert_redacted(result) -> None:
+    import json
+
+    text = json.dumps(result, default=str)
+    assert _CARD not in text and _CARD_SPACED not in text, text
+    assert REDACTED in text, text
+
+
+def _text_frame(text="", fails=False, detached=False):
+    """A frame whose visible text and field values read as ``text``."""
+    frame = MagicMock()
+    frame.evaluate = AsyncMock(
+        side_effect=RuntimeError("frame unreadable") if fails else None,
+        return_value=text,
+    )
+    frame.is_detached.return_value = detached
+    return frame
+
+
+def _card_page(url=f"https://shop.example/receipt/{_CARD}"):
+    page = MagicMock()
+    page.frames = [_text_frame("")]
+    page.url = url
+    page.title = AsyncMock(return_value=f"Receipt for {_CARD_SPACED}")
+    page.goto = AsyncMock()
+    page.is_closed.return_value = False
+    page.wait_for_load_state = AsyncMock()
+    locator = MagicMock()
+    locator.aria_snapshot = AsyncMock(return_value=f"- text: Card {_CARD_SPACED} order 12345")
+    page.locator.return_value = locator
+    return page
+
+
+class TestToolOutputIsRedacted:
+    """Every tool, through its real _impl_* path, returns [card redacted] for a
+    card number in its snapshot, result, url, title or error."""
+
+    @pytest.mark.asyncio
+    async def test_navigate(self):
+        page = _card_page()
+
+        async def _ensure():
+            browser._stealth_cm = MagicMock()
+            browser._stealth_page = page
+            return page
+
+        with (
+            patch.object(browser, "_ensure_browser", new=_ensure),
+            patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+            patch.object(browser, "_wait_for_turnstile", new=AsyncMock(return_value=None)),
+        ):
+            result = await browser._impl_browser_navigate("https://shop.example/")
+        _assert_redacted(result)
+        assert "order 12345" in result["snapshot"]  # other numbers are kept
+
+    @pytest.mark.asyncio
+    async def test_click(self):
+        browser._active_page = _card_page()
+        with (
+            patch.object(browser, "_stealth_click", new=AsyncMock()),
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch.object(browser, "_NEW_TAB_WAIT_S", 0.0),
+        ):
+            result = await browser._impl_browser_click("#go")
+        assert result["clicked"] == "#go"
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_fill_error(self):
+        browser._active_page = _card_page()
+        with (
+            patch.object(browser, "_human_delay", new=AsyncMock()),
+            patch.object(
+                browser, "_human_type",
+                new=AsyncMock(side_effect=RuntimeError(f"field shows {_CARD}")),
+            ),
+            patch.object(
+                browser, "_with_stall_diagnostics",
+                new=AsyncMock(side_effect=lambda failed, *a, **k: failed),
+            ),
+        ):
+            result = await browser._impl_browser_fill("#name", "hello")
+        assert result["error"].startswith("Fill failed on '#name': ")
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_upload_error(self, tmp_path):
+        page = _card_page()
+        page.set_input_files = AsyncMock(side_effect=RuntimeError(f"rejected near {_CARD}"))
+        browser._active_page = page
+        f = tmp_path / "doc.pdf"
+        f.write_bytes(b"%PDF")
+        with patch.object(browser, "_human_delay", new=AsyncMock()):
+            result = await browser._impl_browser_upload("input", str(f))
+        assert result["error"].startswith("Upload failed on 'input': ")
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_screenshot_metadata(self, tmp_path):
+        page = _card_page()
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert result["path"].startswith(str(tmp_path))  # the path is untouched
+        _assert_redacted(result)
+
+    @pytest.mark.parametrize(
+        ("frames", "refusal"),
+        [
+            # the main frame shows a card
+            ([f"Saved card {_CARD_SPACED}"], "_REFUSE_CARD_SCREENSHOT"),
+            # one digit group per element: innerText puts each on its own line
+            (["Card\n4242\n4242\n4242\n4242\nPay"], "_REFUSE_CARD_SCREENSHOT"),
+            # a cross-origin payment iframe holds the field value
+            (["Checkout", _CARD], "_REFUSE_CARD_SCREENSHOT"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_screenshot_refuses_a_page_showing_a_card(self, tmp_path, frames, refusal):
+        page = _card_page()
+        page.frames = [_text_frame(t) for t in frames]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert result["error"] == getattr(browser, refusal)
+        page.screenshot.assert_not_awaited()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_screenshot_refuses_when_a_frame_cannot_be_read(self, tmp_path):
+        page = _card_page()
+        page.frames = [_text_frame("ok"), _text_frame(fails=True)]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert result["error"] == browser._REFUSE_UNREAD_SCREENSHOT
+        page.screenshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_screenshot_skips_a_detached_frame_and_allows_ordinary_numbers(self, tmp_path):
+        page = _card_page()
+        page.frames = [
+            _text_frame("Order 100234567, call +1 555 123 4567, total 12.50, 2019 2020 2021"),
+            _text_frame(fails=True, detached=True),
+        ]
+        page.screenshot = AsyncMock()
+        browser._active_page = page
+        with patch.object(browser, "_SCREENSHOT_DIR", tmp_path):
+            result = await browser._impl_browser_screenshot()
+        assert "error" not in result, result
+        page.screenshot.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_snapshot(self):
+        browser._active_page = _card_page()
+        result = await browser._impl_browser_snapshot()
+        _assert_redacted(result)
+        assert result["snapshot"] == f"- text: Card {REDACTED} order 12345"
+
+    @pytest.mark.asyncio
+    async def test_run_js_result_numbers_strings_keys_and_json(self):
+        page = _card_page()
+        page.evaluate = AsyncMock(return_value={
+            "as_number": int(_CARD),
+            "as_float": float(_CARD),
+            "nested": [{"text": f"pan {_CARD_SPACED}"}],
+            _CARD: "key",
+            # JSON text spelling the digits as escapes: only parsing shows them.
+            "json": '{"pan": "\\u0034242424242424242"}',
+            "count": 3,
+        })
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("collect()")
+        _assert_redacted(result)
+        got = result["result"]
+        assert got["as_number"] == REDACTED
+        assert got["as_float"] == REDACTED
+        assert got["count"] == 3
+        assert "4242" not in got["json"]
+
+    @pytest.mark.asyncio
+    async def test_snapshot_with_a_segmented_card_field(self):
+        page = _card_page(url="https://shop.example/pay")
+        page.title = AsyncMock(return_value="Pay")
+        page.locator.return_value.aria_snapshot = AsyncMock(return_value=(
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- textbox "Card number": "4242"\n'
+            '- button "Pay"'
+        ))
+        browser._active_page = page
+        result = await browser._impl_browser_snapshot()
+        assert "4242" not in result["snapshot"]
+        assert REDACTED in result["snapshot"] and '- button "Pay"' in result["snapshot"]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            ["4242", "4242", "4242", "4242"],
+            {"p1": "4242", "p2": "4242", "p3": "4242", "p4": "4242"},
+            [["4242", "4242"], {"rest": ["4242", "4242"]}],
+            list(_CARD),
+            [_CARD[:8], _CARD[8:]],
+            [4242, 4242, 4242, 4242],
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_run_js_card_split_across_values(self, value):
+        page = _card_page()
+        page.evaluate = AsyncMock(return_value=value)
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("parts()")
+        assert result["result"] == REDACTED
+        assert "4242" not in str(result)
+
+    @pytest.mark.asyncio
+    async def test_run_js_colliding_keys_withhold_the_mapping(self):
+        page = _card_page()
+        page.evaluate = AsyncMock(return_value={_CARD: "a", REDACTED: "b"})
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("keys()")
+        assert result["result"] == REDACTED
+
+    @pytest.mark.asyncio
+    async def test_run_js_error(self):
+        page = _card_page()
+        page.evaluate = AsyncMock(side_effect=RuntimeError(f"Error: {_CARD}"))
+        browser._active_page = page
+        result = await browser._impl_browser_run_js("boom()")
+        assert result["error"].startswith("JS execution failed: ")
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_sessions(self):
+        _live_camoufox_ctx([{"domain": f".{_CARD}.example", "value": "v"}])
+        result = await browser._impl_browser_sessions()
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_clear_domain_error(self):
+        ctx = MagicMock()
+        ctx.cookies = AsyncMock(return_value=[{"name": "a", "domain": "example.com", "path": "/"}])
+        ctx.add_cookies = AsyncMock(side_effect=RuntimeError(f"rejected {_CARD}"))
+        browser._stealth_browser = ctx
+        browser._stealth_cm = MagicMock()
+        result = await browser._impl_browser_clear_domain("example.com")
+        camoufox = next(p for p in result["profiles"] if p["browser"] == "camoufox")
+        assert camoufox["error"].startswith("Failed to clear camoufox cookies: ")
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_press_key_error(self):
+        page = _card_page()
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock(side_effect=RuntimeError(f"page said {_CARD}"))
+        browser._active_page = page
+        result = await browser._impl_browser_press_key("Tab")
+        assert result["error"].startswith("Key press failed for 'Tab': ")
+        _assert_redacted(result)
+
+    def test_collaborate_stays_sync(self):
+        with patch.object(browser, "_get_vnc_url", return_value=f"http://vnc.example/{_CARD}"):
+            result = browser._impl_browser_collaborate(True)
+        assert not inspect.iscoroutine(result)
+        assert result["mode"] == "collaborate"
+        _assert_redacted(result)
+
+
+class TestRedactedOutsideTheResult:
+    @pytest.mark.asyncio
+    async def test_an_exception_becomes_a_redacted_error_result(self):
+        with patch.object(
+            browser, "_requested_layer", side_effect=RuntimeError(f"bad {_CARD}"),
+        ):
+            result = await browser._impl_browser_navigate("https://shop.example/")
+        assert result["error"].startswith("browser_navigate failed: RuntimeError: ")
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_the_tool_timeout_text_is_redacted(self):
+        result = await browser._with_tool_timeout(
+            asyncio.sleep(5), 0.01, f"browser_click('[data-pan=\"{_CARD}\"]')",
+        )
+        assert "timed out after" in result["error"]
+        _assert_redacted(result)
+
+    @pytest.mark.asyncio
+    async def test_the_captcha_alert_redacts_the_page_url(self, tmp_path):
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=1\n")
+        sent = []
+
+        class _Channel:
+            def __init__(self, *_a):
+                pass
+
+            async def send(self, alert):
+                sent.append(alert)
+
+        with (
+            patch("genesis.env.secrets_path", return_value=secrets),
+            patch("genesis.guardian.alert.telegram.TelegramAlertChannel", _Channel),
+            patch.object(browser, "_get_vnc_url", return_value="http://vnc.example"),
+        ):
+            await browser._send_turnstile_alert(f"https://shop.example/pay/{_CARD}")
+        assert len(sent) == 1
+        assert _CARD not in sent[0].body
+        assert REDACTED in sent[0].body
+
+
+def test_every_impl_browser_function_is_redacted():
+    """Contract: every _impl_browser_* in browser.py carries @_redacted. A new
+    tool implementation without it fails here; the count proves the scan saw
+    the functions at all (update it when a tool is added)."""
+    import ast
+
+    tree = ast.parse(Path(browser.__file__).read_text())
+    impls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+        and n.name.startswith("_impl_browser_")
+    ]
+    unwrapped = [
+        n.name for n in impls
+        if not any(isinstance(d, ast.Name) and d.id == "_redacted" for d in n.decorator_list)
+    ]
+    assert unwrapped == []
+    assert len(impls) == 11
+    for n in impls:
+        assert hasattr(getattr(browser, n.name), "__wrapped__"), n.name
+
+
+class TestLogsAreRedacted:
+    @pytest.mark.asyncio
+    async def test_the_log_file_and_turnstile_log_hold_no_card(self, tmp_path):
+        import logging
+
+        log_file = tmp_path / "mcp_health.log"
+        ts_file = tmp_path / "turnstile_debug.log"
+        # The same attachment the module makes for ~/tmp/mcp_health.log.
+        fh = logging.FileHandler(log_file)
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s %(message)s"))
+        genesis_logger = logging.getLogger("genesis")
+        genesis_logger.addHandler(fh)
+        page = _card_page()
+        page.goto = AsyncMock(side_effect=RuntimeError(f"net error at ?n={_CARD}"))
+
+        async def _ensure():
+            browser._stealth_cm = MagicMock()
+            browser._stealth_page = page
+            return page
+
+        try:
+            with (
+                patch.object(browser, "_TS_LOG_PATH", ts_file),
+                patch.object(browser, "_ensure_browser", new=_ensure),
+                patch.object(browser, "_ensure_vnc", new=AsyncMock()),
+            ):
+                result = await browser._impl_browser_navigate(f"https://shop.example/?c={_CARD}")
+        finally:
+            genesis_logger.removeHandler(fh)
+            fh.close()
+        _assert_redacted(result)
+        logged, ts_logged = log_file.read_text(), ts_file.read_text()
+        assert "browser_navigate failed" in logged and "Traceback" in logged
+        for text in (logged, ts_logged):
+            assert text.count(_CARD) == 0
+            assert REDACTED in text
+
+    def test_the_real_mcp_health_log_redacts_any_genesis_logger(self, tmp_path):
+        """mcp_health.log takes every propagated genesis.* record, not only the
+        named loggers', so its handler carries the filter. Run the import in a
+        child with a scratch HOME, so the handler the module attaches is the
+        real one and no shared log is opened."""
+        import subprocess
+
+        home = tmp_path / "home"
+        (home / "tmp").mkdir(parents=True)
+        script = (
+            "import logging\n"
+            "import genesis.mcp.health.browser\n"
+            "log = logging.getLogger('genesis.some.other')\n"
+            "log.setLevel(logging.INFO)\n"
+            "try:\n"
+            f"    raise RuntimeError('boom {_CARD}')\n"
+            "except RuntimeError:\n"
+            f"    log.warning('saw {_CARD_SPACED}', exc_info=True)\n"
+        )
+        src = Path(browser.__file__).resolve().parents[3]
+        out = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            env={"PATH": os.defpath, "HOME": str(home), "PYTHONPATH": str(src)},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert out.returncode == 0, out.stderr
+        logged = (home / "tmp" / "mcp_health.log").read_text()
+        assert "[genesis.some.other]" in logged and "Traceback" in logged
+        assert _CARD not in logged and _CARD_SPACED not in logged
+        assert REDACTED in logged
+
+    @pytest.mark.parametrize("name", browser._REDACTED_LOGGERS)
+    def test_each_named_logger_redacts(self, name):
+        import logging
+
+        records: list[str] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(self.format(record))
+
+        target = logging.getLogger(name)
+        handler = _Capture()
+        target.addHandler(handler)
+        old_level = target.level
+        target.setLevel(logging.DEBUG)
+        try:
+            try:
+                raise RuntimeError(f"boom {_CARD}")
+            except RuntimeError:
+                target.error("failed on %s", _CARD_SPACED, exc_info=True, stack_info=True)
+        finally:
+            target.removeHandler(handler)
+            target.setLevel(old_level)
+        assert len(records) == 1
+        assert _CARD not in records[0] and _CARD_SPACED not in records[0]
+        assert "Traceback" in records[0]
+
+    @pytest.mark.asyncio
+    async def test_fastmcp_tool_error_log_after_configure_logging(self, capsys):
+        """FastMCP's configure_logging replaces the fastmcp handlers; the filter
+        sits on the logger, so a tool exception's traceback is still redacted."""
+        import logging
+
+        from fastmcp import FastMCP
+        from fastmcp.utilities.logging import configure_logging
+
+        root = logging.getLogger("fastmcp")
+        saved = (root.handlers[:], root.level, root.propagate)
+        try:
+            configure_logging(level="DEBUG")
+            assert CARD_FILTER in logging.getLogger("fastmcp.tools.tool_manager").filters
+            server = FastMCP("redaction-test")
+
+            @server.tool()
+            def boom() -> str:
+                raise RuntimeError(f"page text {_CARD}")
+
+            with pytest.raises(Exception):  # noqa: B017 - FastMCP's ToolError
+                await server._tool_manager.call_tool("boom", {})
+        finally:
+            root.handlers[:] = saved[0]
+            root.setLevel(saved[1])
+            root.propagate = saved[2]
+        # Rich wraps lines to the console width, so compare without whitespace.
+        err = "".join(capsys.readouterr().err.split())
+        assert "Errorcallingtool" in err and "Traceback" in err
+        assert _CARD not in err
+        assert "".join(REDACTED.split()) in err
+
+
+_RENDERED_SOURCES = (
+    "innerText", "'placeholder'", "'value'", "'aria-label'", "'aria-placeholder'",
+    "'aria-valuetext'", "'title'", "'alt'", "matches('option')", "pseudo(el, '::before')",
+    "pseudo(el, '::after')", "attr\\(", "SVGElement", "el.shadowRoot", "el.value",
+)
+
+
+def test_the_screenshot_check_reads_every_rendered_text_source():
+    """Contract: the frame read covers each source of rendered text that is
+    not innerText. Removing one fails here; the real-browser test below shows
+    each one actually reaching the check."""
+    missing = [s for s in _RENDERED_SOURCES if s not in browser._PAGE_TEXT_JS]
+    assert missing == []
+
+
+_RENDERED_CARD_PAGES = {
+    "placeholder": f'<input placeholder="{_CARD_SPACED}">',
+    "aria-label": f'<button aria-label="Pay with {_CARD_SPACED}">Pay</button>',
+    "title": f'<span title="{_CARD}">card</span>',
+    "alt": f'<img alt="card {_CARD_SPACED}">',
+    "option": f"<select><option>x</option><option>{_CARD_SPACED}</option></select>",
+    "value": f'<input value="{_CARD}">',
+    "before": f'<style>#c::before{{content:"{_CARD_SPACED}"}}</style><span id="c"></span>',
+    "attr": f'<style>#d::after{{content:attr(data-pan)}}</style><span id="d" data-pan="{_CARD}"></span>',
+    "svg": f'<svg><text x="0" y="15">{_CARD_SPACED}</text></svg>',
+    "shadow": (
+        '<div id="h"></div><script>document.getElementById("h")'
+        f'.attachShadow({{mode:"open"}}).innerHTML="<p>{_CARD_SPACED}</p>"</script>'
+    ),
+    "segmented": '<input value="4242" aria-label="Card">' * 4,
+    "iframe": f'<iframe srcdoc="<input value={_CARD}>"></iframe>',
+}
+
+
+@pytest.mark.asyncio
+async def test_the_screenshot_check_on_a_real_browser():
+    """Runs the frame read in a fresh headless Chromium, no profile. Skipped
+    where no Playwright Chromium is installed (the contract test above still
+    applies there)."""
+    from genesis.security.card_redaction import contains_card_text
+
+    try:
+        from playwright.async_api import async_playwright
+
+        pw = await async_playwright().start()
+    except Exception as e:  # noqa: BLE001 - no driver on this machine
+        pytest.skip(f"playwright unavailable: {e}")
+    try:
+        try:
+            chromium = await pw.chromium.launch(headless=True)
+        except Exception as e:  # noqa: BLE001 - browser not downloaded
+            pytest.skip(f"chromium unavailable: {e}")
+        page = await chromium.new_page()
+        found = {}
+        for name, html in {
+            **_RENDERED_CARD_PAGES,
+            "clean": '<input placeholder="1234 1234 1234 1234"><p>Order 100234567</p>',
+        }.items():
+            await page.set_content(f"<html><body>{html}</body></html>")
+            await page.wait_for_timeout(50)
+            texts = [await f.evaluate(browser._PAGE_TEXT_JS) for f in page.frames]
+            found[name] = contains_card_text("\n".join(texts))
+        await chromium.close()
+    finally:
+        await pw.stop()
+    assert found.pop("clean") is False
+    assert [n for n, hit in found.items() if not hit] == []

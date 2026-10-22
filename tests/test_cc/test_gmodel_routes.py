@@ -541,3 +541,23 @@ def test_overridden_flag_is_announced_at_launch(launcher, monkeypatch, capsys):
     monkeypatch.setenv("MOONSHOT_API_KEY", _SECRET)
     assert launcher["main"](["--print-env", "kimi-k3", "--route", "api", "--effort", "low"]) == 0
     assert "--effort is overridden by this route's pinned settings" in capsys.readouterr().err
+
+
+def test_strip_route_env_undoes_every_route_pin_and_keeps_real_credentials():
+    """A child of a routed session must be able to run native: every variable
+    route_env_pins sets is removed, and a real native credential survives."""
+    selected = gmodel_routes.SelectedRoute(
+        name="peer", route="api", anthropic_base_url="https://peer.example",
+        auth_env="PEER_KEY", model_id="peer-model", context_tokens=200000,
+    )
+    env = {"PATH": "/usr/bin", "KEEP": "1"}
+    env.update(gmodel_routes.route_env_pins(selected, "peer-token"))
+    env["ANTHROPIC_API_KEY"] = "real-native-key"  # a genuinely configured credential
+    gmodel_routes.strip_route_env(env)
+    assert env == {"PATH": "/usr/bin", "KEEP": "1", "ANTHROPIC_API_KEY": "real-native-key"}
+
+
+def test_strip_route_env_without_a_route_marker_only_drops_routing():
+    env = {"ANTHROPIC_BASE_URL": "https://x", "CLAUDE_CODE_EFFORT_LEVEL": "low", "PATH": "/b"}
+    gmodel_routes.strip_route_env(env)
+    assert env == {"CLAUDE_CODE_EFFORT_LEVEL": "low", "PATH": "/b"}

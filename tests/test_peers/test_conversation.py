@@ -20,6 +20,7 @@ from genesis.cc.session_manager import SessionManager
 from genesis.cc.system_prompt import SystemPromptAssembler
 from genesis.cc.types import CCInvocation, CCOutput
 from genesis.dashboard.routes.agent_api import ROOT, agent_api_bp
+from genesis.db.connection import SerializedConnection, get_db
 from genesis.db.schema import create_all_tables, seed_data
 from genesis.peers.auth import PeerIdentity
 from genesis.peers.conversation import ConversationRefusal, ConversationService, head
@@ -336,7 +337,7 @@ def incoming(payload=None):
 async def bridge(tmp_path, monkeypatch):
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     path = tmp_path / "genesis.db"
-    db = await aiosqlite.connect(path)
+    db = await get_db(path)
     db.row_factory = aiosqlite.Row
     await create_all_tables(db)
     await seed_data(db)
@@ -430,6 +431,50 @@ async def test_send_retry_continuation_identity_result(bridge):
     assert "A considered reply" in calls[1].args[0].prompt
     assert calls[1].args[0].origin == "external_untrusted"
     assert calls[1].args[0].supervised is False
+
+
+async def test_bridge_uses_production_connection(bridge):
+    assert isinstance(bridge.db, SerializedConnection)
+    assert (await (await bridge.db.execute("PRAGMA journal_mode")).fetchone())[0] == "wal"
+    assert (await (await bridge.db.execute("PRAGMA foreign_keys")).fetchone())[0] == 1
+
+
+async def test_admission_checks_database_before_taking_write_lock(bridge, monkeypatch):
+    same_database = bridge.service._same_database
+    checks = 0
+
+    async def checked(db):
+        nonlocal checks
+        checks += 1
+        assert not db.in_transaction
+        # A runtime writer must be able to finish while identity is checked.
+        await bridge.db.execute("UPDATE peer_settings SET mode=mode WHERE id=1")
+        await bridge.db.commit()
+        await same_database(db)
+
+    monkeypatch.setattr(bridge.service, "_same_database", checked)
+    row = await asyncio.wait_for(bridge.service.send(bridge.identities["alpha"], incoming()), 3)
+    assert checks == 2  # Preflight and the actual admission connection.
+    monkeypatch.setattr(bridge.service, "_same_database", same_database)
+    assert project(await settle(bridge, row))["status"]["state"] == "TASK_STATE_COMPLETED"
+
+
+async def test_admission_rechecks_actual_database_after_enrichment(bridge, tmp_path, monkeypatch):
+    other_path = tmp_path / "other.db"
+    async with aiosqlite.connect(other_path):
+        pass
+
+    class ChangedRegistryAssembler:
+        async def assemble(self, **kwargs):
+            bridge.registry.path = other_path
+            return "Synthetic identity"
+
+    monkeypatch.setattr("genesis.peers.conversation.SystemPromptAssembler", ChangedRegistryAssembler)
+    with pytest.raises(ConversationRefusal, match="not_ready"):
+        await bridge.service.send(bridge.identities["alpha"], incoming())
+    bridge.invoker.run_streaming.assert_not_awaited()
+    assert (await (await bridge.db.execute("SELECT count(*) FROM cc_sessions")).fetchone())[0] == 0
+    assert bridge.service._enriching == {}
 
 
 async def test_changed_retry_conflicts(bridge):
@@ -797,7 +842,7 @@ async def test_a_send_burst_does_identity_work_only_within_capacity(bridge, monk
     release.set()
     for send in sends:
         if send is not refused:
-            task = bridge.runner._active.get((await send)["id"])
+            task = bridge.runner._active.get((await asyncio.wait_for(send, 10))["id"])
             if task:
                 await asyncio.wait_for(asyncio.shield(task), 3)
     assert bridge.service._enriching == {}
@@ -1047,3 +1092,31 @@ async def test_not_started_persistence_stops_retrying_once_closing(bridge, monke
     monkeypatch.setattr(conversation, "update_state", failing_update)
     await asyncio.wait_for(bridge.service.send(identity, incoming()), 3)
     assert attempts == [1]
+
+
+async def test_not_started_retry_logs_error_type_without_private_values(bridge, monkeypatch, caplog):
+    import sqlite3
+
+    from genesis.peers import conversation
+
+    error = sqlite3.OperationalError("synthetic private SQL and values")
+    error.sqlite_errorname = "SQLITE_BUSY_SNAPSHOT"
+    original = conversation.update_state
+    attempts = 0
+
+    async def flaky_update(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise error
+        await original(*args, **kwargs)
+
+    monkeypatch.setattr(bridge.runner, "adopt", AsyncMock(side_effect=ValueError("not adopted")))
+    monkeypatch.setattr(conversation, "update_state", flaky_update)
+    row = await asyncio.wait_for(bridge.service.send(bridge.identities["alpha"], incoming()), 3)
+    assert attempts == 3
+    assert row["status"] == "failed"
+    # Two failures ~0.1s apart emit one warning; retries stay unlogged inside
+    # the throttle window.
+    assert caplog.text.count("exception=OperationalError, sqlite_errorname=SQLITE_BUSY_SNAPSHOT") == 1
+    assert str(error) not in caplog.text

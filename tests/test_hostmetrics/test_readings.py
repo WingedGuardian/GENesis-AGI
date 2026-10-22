@@ -205,6 +205,37 @@ def test_psi_none_when_absent(cg, proc):
     assert r.read_psi("cpu", cg, proc) is None
 
 
+def test_psi_totals_read_every_counter_cgroup_first(cg, proc):
+    """The cumulative stall counters, so two readings give the stall time of a
+    sub-second wait that no avg10 can show."""
+    line = "{k} avg10=0.00 avg60=0.00 avg300=0.00 total={t}\n"
+    _tree(
+        cg,
+        {
+            "cpu.pressure": line.format(k="some", t=11) + line.format(k="full", t=7),
+            "io.pressure": line.format(k="some", t=5) + line.format(k="full", t=3),
+        },
+    )
+    _tree(
+        proc,
+        {
+            "pressure/io": line.format(k="some", t=999),
+            "pressure/memory": line.format(k="some", t=2),
+        },
+    )
+    assert r.read_psi_totals(cg, proc) == {
+        "cpu_some": 11,
+        "cpu_full": 7,
+        "io_some": 5,
+        "io_full": 3,
+        "memory_some": 2,
+    }
+
+
+def test_psi_totals_none_when_nothing_reads(cg, proc):
+    assert r.read_psi_totals(cg, proc) is None
+
+
 # ── disk ──────────────────────────────────────────────────────────────────────
 def test_disk_reads_statvfs(tmp_path):
     total, free = r.read_disk(tmp_path)
@@ -261,3 +292,12 @@ def test_proc_stat_steal_time_is_not_counted_as_busy(cg, proc):
         lambda: _tree(proc, {"stat": f"cpu  {tck} 0 0 {51 * tck} 0 0 0 {4 * tck} 0 0\n"})
     )
     assert r.read_cpu_used(1.0, cg, proc, sleep=fake.sleep, clock=fake.clock) == 0.0
+
+
+def test_psi_totals_cgroup_only_never_reads_the_host_wide_file(cg, proc):
+    """A container's /proc/pressure is host-wide; a caller that books the stall
+    as its own must not mix scopes."""
+    line = "some avg10=0.00 avg60=0.00 avg300=0.00 total=999\n"
+    _tree(proc, {"pressure/io": line})
+    assert r.read_psi_totals(cg, proc) == {"io_some": 999}
+    assert r.read_psi_totals(cg, proc, cgroup_only=True) is None

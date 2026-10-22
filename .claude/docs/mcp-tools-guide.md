@@ -288,6 +288,10 @@ Start broad, drill into specifics:
    or provider-specific failures.
 6. **`job_health`** — Scheduler job status. Use when a periodic task isn't
    firing.
+7. **`skill_usage_status`** — Which skills actually load, get nudged, or sit
+   unused (active / zombie / dead / not_nudgeable), split interactive vs
+   headless. Scans transcripts, so a cold 14-day call takes minutes; the same
+   report comes from `python -m genesis.learning.skills.usage`.
 
 ## Background Work — Session vs Subagent
 

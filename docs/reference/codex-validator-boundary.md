@@ -12,8 +12,22 @@ exactly one command: the sealed request invocation
 --workspace-root <workspace> --request <workspace>/requests/<uuid>.json`),
 matched as exact argv and exact canonical quoting, with the request file
 private, owned and unshared (`codex_validator_shell.py`); every other shell
-command is refused. Requests use strict JSON and a closed schema whose only
-operation is `protocol_probe`. Patches admit
+command is refused. Requests use strict JSON and closed per-operation schemas:
+`protocol_probe`, `serving_status` and `serving_verify`. Serving requests perform
+one invocation of the existing deployment status tripwire and project only its
+validated fields. Unknown, changed, partial or oversized output does not establish
+serving identity. The producer prints and hashes the same captured inputs; this
+is not an atomic snapshot of systemd, Git and filesystem state.
+
+The standalone Unix/main-thread reader scopes SIGTERM to task cancellation,
+allowing owned process-group cleanup during creation or collection. It restores
+the prior signal handler after loop shutdown. Cancellation at the request CLI
+returns exit 2 with a static refusal and no JSON result or child diagnostics.
+Output retention is bounded to 64 KiB per stream, with a 20-second collection
+timeout after process creation and a bounded post-kill reap. SIGKILL, OS kill
+refusals and descendants escaping the owned group are outside this guarantee.
+These operations provide observations, not functional verification verdicts.
+Patches admit
 every potential source and move destination inside the trusted workspace;
 existing symlinks, special files, hardlinked leaves, parent traversal, and
 instruction/configuration paths (`AGENTS.md`, `.codex`, `.agents`, `.git`) are

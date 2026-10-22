@@ -184,7 +184,15 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"vault init: {exc}", file=sys.stderr)
         return 2
     print(f"vault created at {vs.vault_dir()}")
+    print(_BACKUP_HINT)
     return 0
+
+
+# The 6-hourly backup carries the vault (backup.sh §8); a change made now is not
+# in any backup until then.
+_BACKUP_HINT = (
+    "back it up now with scripts/backup.sh (otherwise the next scheduled backup takes it)"
+)
 
 
 def _cmd_add(args: argparse.Namespace) -> int:
@@ -217,6 +225,7 @@ def _cmd_add(args: argparse.Namespace) -> int:
         print(f"vault add: {exc}", file=sys.stderr)
         return 2
     print(f"added {ref} ({stored['brand']} ending {stored['last4']})")
+    print(_BACKUP_HINT)
     return 0
 
 
@@ -255,6 +264,12 @@ def _cmd_retire(args: argparse.Namespace) -> int:
     print(
         f"retired {args.card_ref}; its encrypted details were removed from the vault "
         "(best effort on disk: also close the virtual card with its issuer)"
+    )
+    # Until the next backup, a restore would bring the retired card's details back.
+    print(_BACKUP_HINT)
+    print(
+        "earlier backups still hold the card (git history, older snapshots, the host "
+        "archive); see docs/reference/recovery-and-portability-workflow.md"
     )
     return 0
 
