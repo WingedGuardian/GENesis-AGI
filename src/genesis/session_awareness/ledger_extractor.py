@@ -24,8 +24,9 @@ import uuid
 from difflib import SequenceMatcher
 
 from genesis.db.crud.session_charters import MAX_LEDGER_TEXT_CHARS
+from genesis.session_awareness.headless import HEADLESS_JUDGE_MODEL
 
-EXTRACTOR_MODEL = "claude-haiku-4-5-20251001"  # arbiter's smoke-tested binary contract
+EXTRACTOR_MODEL = HEADLESS_JUDGE_MODEL  # the CC ``haiku`` alias (see headless.py)
 EXTRACTOR_TIMEOUT_S = 120.0  # arbiter is 90s at ~300ch candidates; this prompt is ~24k ch
 # Bumped with the prompt: proposals carry their version, so a change in what
 # the extractor was ASKED for stays distinguishable in the shadow store rather

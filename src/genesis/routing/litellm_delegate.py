@@ -280,6 +280,9 @@ class LiteLLMDelegate:
                 cache_read_tokens=cache_read,
                 cost_usd=cost,
                 cost_known=cost_known,
+                served_model=(
+                    response.model if isinstance(getattr(response, "model", None), str) else None
+                ),
             )
         except TimeoutError:
             # Hard wall-clock cap fired — the provider hung past hard_timeout.

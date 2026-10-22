@@ -111,7 +111,7 @@ If this is a follow-up cycle on a previously investigated target:
 1. Compare current findings against previous snapshot
 2. Classify changes:
    - **CRITICAL** (immediate attention): Leadership change, acquisition,
-     major funding (>$10M), product discontinuation, legal action, security breach
+     major funding (over 10M USD), product discontinuation, legal action, security breach
    - **IMPORTANT** (include in next report): New product launch, partnership,
      hiring surge (>5 roles), pricing change, competitor move
    - **MINOR** (note in report): Blog post, minor update, conference appearance

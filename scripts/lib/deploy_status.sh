@@ -23,6 +23,7 @@
 #
 # Imported once and kept, so a new copy loads only with a restart:
 _RUNTIME_RELOAD_SCRIPTS=(
+    scripts/hooks/secret_scrub.py    # retained by transcript_analytics.scrub
     scripts/lib/index_marker.py      # imported by surplus/jobs/gitnexus.py (and disk_reclaim.py)
     scripts/hooks/worktree_claim.py  # loaded at import by observability/worktree_ownership_config.py
 )
@@ -41,6 +42,12 @@ _RUNTIME_FRESH_SCRIPTS=(
     scripts/hooks/hook_output.py          # imported by main_checkout_guard.py to emit a note
     scripts/lib/disk_guardian.sh          # sourced by util/disk_headroom.py on every free-space check
     scripts/tmp_watchgod.sh               # sourced by util/disk_headroom.py for the watchdog's tiers
+    scripts/lib/serving_commit.py         # loaded afresh by memory/graph_census.py on every hourly census
+    scripts/codebase_managed.py           # run by infra_profile/codebase_mcp.py (`status`) on every profile refresh
+    scripts/lib/codebase_managed_unit.py  # imported by codebase_managed.py on every run
+    scripts/lib/code_intel_cbm_admission.py # imported by codebase_managed.py and codebase_managed_unit.py
+    scripts/lib/code_intel_cbm_worker.py  # imported by codebase_managed.py (the pinned BUILD)
+    scripts/lib/cbm_disable_file.sh       # run by infra_profile/codebase_mcp.py to resolve the opt-out path
     # Not under scripts/, but the same kind: cc/invoker.py runs the allowlist
     # guard through this launcher in the server, and reads its exit code.
     .claude/hooks/genesis-hook

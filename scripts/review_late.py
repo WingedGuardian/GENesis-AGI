@@ -270,7 +270,7 @@ def late_owed(
     return keys, [key for key in keys if key not in done]
 
 
-def _fixes(cwd: str, base: str, head: str) -> dict[str, datetime]:
+def _fixes(cwd: str, base: str, head: str, *, credit: bool = False) -> dict[str, datetime]:
     """Every fix after ``base`` on the way to ``head``, with its author time:
     each descendant of ``base`` that ``head`` reaches (``--ancestry-path``)
     and that is a merge or changes the tree (an empty reflection commit is no
@@ -280,40 +280,27 @@ def _fixes(cwd: str, base: str, head: str) -> dict[str, datetime]:
     a stale worktree reverses it), so no reading of one line is safe. Reading
     every path can only owe early and credit less, never the reverse. The
     AUTHOR time, the earlier of the two: amending a fix rewrites only its
-    committer time (owner ruling 2026-10-13). Raises ``Refused`` when git
-    cannot say."""
-    code, out, _ = rr._run(
-        ["git", "-C", cwd, "log", "--ancestry-path", "--format=%H %T %P|%at", f"{base}..{head}"]
-    )
-    if code != 0:
-        raise rr.Refused(f"git log {base[:12]}..{head[:12]} failed")
+    committer time (owner ruling 2026-10-13). With ``credit`` (the credit
+    side only; owing stays early), a merge of the default branch that holds
+    only git's merge and its conflict resolution is no fix either
+    (``review_reflection._merge_is_no_fix``, owner ruling 2026-10-20). Raises
+    ``Refused`` when git cannot say."""
     found: dict[str, datetime] = {}
-    for row in out.split("\n"):
-        if not row.strip():
-            continue
-        names, _, stamp = row.partition("|")
-        sha, tree, *parents = names.split()
-        if (
-            len(parents) == 1
-            and tree == rr._git(cwd, "rev-parse", f"{parents[0]}^{{tree}}").strip()
-        ):
-            continue
-        if not stamp.strip().isdigit():
+    for fix in rr.fix_rows(cwd, base, head, main_merges=credit) or []:
+        if fix.authored is None:
             raise rr.Refused(f"a fix after {base[:12]} has no readable author time")
-        try:
-            found[sha] = datetime.fromtimestamp(int(stamp), UTC)
-        except (ValueError, OverflowError, OSError) as exc:
-            raise rr.Refused(f"a fix after {base[:12]} has an unusable author time") from exc
+        found[fix.sha] = fix.authored
     return found
 
 
-def _fix_times(cwd: str, base: str, head: str) -> list[datetime]:
+def _fix_times(cwd: str, base: str, head: str, *, credit: bool = False) -> list[datetime]:
     """The author times of ``_fixes``. The owe rule (earliest fix to the
-    current head) and the credit rule (latest fix to the reflection's head)
-    read the same set, so a key owed is answerable until the next fix lands.
-    A fix committed while a key is owed leaves it owed for good: the commit
-    gate that sets the cutover must stop that commit."""
-    return sorted(_fixes(cwd, base, head).values())
+    current head) and the credit rule (latest fix to the reflection's head,
+    ``credit``: main merges excepted) read the same commits, so a key owed is
+    answerable until the next fix lands. A fix committed while a key is owed
+    leaves it owed for good: the commit gate that sets the cutover must stop
+    that commit."""
+    return sorted(_fixes(cwd, base, head, credit=credit).values())
 
 
 def fix_time_reader(cwd: str, current: str) -> Callable[[str], datetime | None]:
@@ -328,15 +315,6 @@ def fix_time_reader(cwd: str, current: str) -> Callable[[str], datetime | None]:
         return memo[head]
 
     return fix_time
-
-
-def _is_ancestor(cwd: str, sha: str, of: str) -> bool:
-    """Whether commit ``sha`` is an ancestor of ``of`` (git's exit 0 or 1).
-    Any other exit refuses: an unreadable history is unknown, never "no"."""
-    code, _, _ = rr._run(["git", "-C", cwd, "merge-base", "--is-ancestor", sha, of])
-    if code in (0, 1):
-        return code == 0
-    raise rr.Refused(f"git merge-base --is-ancestor {sha[:12]} {of[:12]} failed")
 
 
 def _descendants(cwd: str, sha: str, current: str) -> set[str]:
@@ -362,7 +340,7 @@ def _prior_labels(
     rows = [
         row
         for row in log
-        if row[0] != sha and rr.parse(row[2]).head in wanted and _is_ancestor(cwd, row[0], sha)
+        if row[0] != sha and rr.parse(row[2]).head in wanted and rr._is_ancestor(cwd, row[0], sha)
     ]
     return rr._class_labels(rows, prior_heads)
 
@@ -380,23 +358,34 @@ def covered_late_keys(
     N, committed at T, credits late key k (reviewed on head H at time S) only
     when ALL hold:
 
-    - R is an empty commit made before any fix to N (``before_any_fix``);
-    - N is the current head or in its history, and N is H or descends from it
-      (from the budget's commit graph; unknown ancestry never credits);
-    - R came before every fix that reached the current head: each fix after
-      N on the way to the tip descends from R and was authored no earlier
-      than R (or R is ahead of the tip locally). This never reads a merge's
-      parent order, so a reflection made on a fork of N after a fix credits
-      nothing, whichever way the fork was merged, and a fix reordered after R
-      by a rebase still counts as before it. Stated residuals, both failing
-      closed because local git records no push order: a reflection already
-      pushed and then put on a merge's second parent by a pull from a stale
-      worktree is refused, and so is a reflection made before any fix when a
-      side branch forked from N carries a fix merged in after it;
+    - R is an empty commit on the tip's line (at, ahead of or behind the
+      current head), and N is the current head or in its history, and N is H
+      or descends from it (from the budget's commit graph; unknown ancestry
+      never credits);
+    - R came before every fix of k on the way from N to R and to the tip
+      (``_before_every_fix``, judged per key from the one shared reading
+      ``review_reflection.fix_rows``, owner rulings 2026-10-20): a commit
+      made before S is no fix of k, nor is a merge of the default branch
+      holding only git's merge and its conflict resolution; every other fix
+      must descend from R and be authored no earlier than R. This never reads
+      a merge's parent order, so a reflection made on a fork of N after a fix
+      credits nothing, whichever way the fork was merged; a fix reordered
+      after R by a rebase still counts as before it; and pushing R and moving
+      the tip past it never turns a credited key back into an owed one
+      (round 1 of #3493). Stated residuals, both failing closed because local
+      git records no push order: a reflection already pushed and then put on
+      a merge's second parent by a pull from a stale worktree is refused, and
+      so is a reflection made before a fix of k that a side branch forked from
+      N carries and merges in after it. One residual fails OPEN: a fix made on
+      a branch forked BEFORE N lies on neither walk, so it is dated at the
+      merge that brings it in (as the owe side dates it), and a reflection
+      made between that fix and its merge credits;
     - S is no later than T: an answer cannot predate its finding;
     - when N is not H, S is after the LATEST fix on the way from H to N (author
-      time). A review that arrived before a fix was owed before it, and a
-      reflection made after that fix is a rationalisation, not a reflection;
+      time; a merge of the default branch holding only git's merge and its
+      conflict resolution is no fix). A review that arrived before a fix was
+      owed before it, and a reflection made after that fix is a
+      rationalisation, not a reflection;
     - ``check`` passes R under k's own round's context (every candidate round
       when k's round is ambiguous): that round's number, the classes of the
       reflections that are git ancestors of R and name an earlier round, the
@@ -404,16 +393,51 @@ def covered_late_keys(
       T. Round 0 (a late review with no earlier round) owes the grammar only.
 
     Returns only keys from ``late``; the open round's coverage is never mixed
-    in. ``deadline`` is a ``time.monotonic()`` bound; past it the check
+    in. ``deadline`` is a ``time.monotonic()`` bound on the whole check, every
+    git call included (``review_reflection.deadline_scope``); past it the check
     refuses. Raises ``Refused`` when git cannot be read: unknown, never
     nothing owed."""
+    with rr.deadline_scope(deadline):
+        return _covered_late_keys(
+            cwd, budget, late, gate_lane=gate_lane, acceptance=acceptance, deadline=deadline
+        )
+
+
+def _before_every_fix(
+    fixes: Iterable[rr.Fix], reviewed_at: datetime, made_at: datetime, after_r: set[str]
+) -> bool:
+    """Whether reflection R (made at ``made_at``) came before every fix of a
+    finding reviewed at ``reviewed_at``. A fix made before the review is no
+    fix of it (``rr.clears``). Every other fix, on the way from N to R or to
+    the tip, must come after R: descend from it (``after_r``) and be authored
+    no earlier than it, so a fix reordered after R by a rebase or cherry-pick
+    still counts as before it, and a fix reaching the tip around R (a fork
+    merged in either parent order) refuses. A fix whose time is unreadable
+    refuses."""
+    for fix in fixes:
+        if rr.clears(fix.clock, reviewed_at):
+            continue
+        if fix.sha not in after_r or fix.authored is None or fix.authored < made_at:
+            return False
+    return True
+
+
+def _covered_late_keys(
+    cwd: str,
+    budget: Mapping[str, Any],
+    late: Sequence[Mapping[str, Any]],
+    *,
+    gate_lane: bool,
+    acceptance: Sequence[str] | None,
+    deadline: float | None,
+) -> set[str]:
     current = budget.get("current_head")
     in_graph, ancestors = _ancestry(budget)
     log = rr._log_reflections(cwd)
     labels: dict[tuple[tuple[str, ...], str], list[str]] = {}
     checked: dict[tuple[str, RoundContext], bool] = {}
     fix_times: dict[tuple[str, str], datetime | None] = {}
-    fix_sets: dict[str, dict[str, datetime]] = {}
+    tip_rows: dict[str, list[rr.Fix]] = {}
     covered: set[str] = set()
     for sha, kind, body, made_at in log:
         if deadline is not None and time.monotonic() > deadline:
@@ -424,20 +448,27 @@ def covered_late_keys(
             continue
         if not (head == current or _descends(ancestors, str(current), head)):
             continue
-        if not rr.before_any_fix(cwd, head, sha):
+        # Every fix on the way from N, to R and to the tip, from the one shared
+        # reading (``rr.fix_rows``); each key then judges them by its own
+        # review time (``_before_every_fix``), so pushing R and moving the tip
+        # past it never turns a credited key back into an owed one.
+        r_fixes = rr.fix_rows(cwd, head, sha)
+        if r_fixes is None:
             continue
-        if not _is_ancestor(cwd, str(current), sha):
-            if not _is_ancestor(cwd, sha, str(current)):
-                continue
-            if head not in fix_sets:
-                fix_sets[head] = _fixes(cwd, head, str(current))
-            if not set(fix_sets[head]) <= _descendants(cwd, sha, str(current)):
-                continue
-            # By time as well as by graph: a fix authored before R and then
-            # reordered after it (a rebase or cherry-pick, force-pushed)
-            # descends from R yet is the fix the owe rule dates.
-            if any(when < made_at for when in fix_sets[head].values()):
-                continue
+        if rr._is_ancestor(cwd, str(current), sha):
+            tip_fixes: list[rr.Fix] = []  # R at or ahead of the tip
+            after_r: set[str] = set()
+        elif rr._is_ancestor(cwd, sha, str(current)):
+            if head not in tip_rows:
+                walked = rr.fix_rows(cwd, head, str(current))
+                if walked is None:  # cannot happen (N..R..tip), but never "no fixes"
+                    continue
+                tip_rows[head] = walked
+            tip_fixes = tip_rows[head]
+            after_r = _descendants(cwd, sha, str(current))
+        else:
+            continue  # R is off the tip's line
+        fixes = list({fix.sha: fix for fix in (*r_fixes, *tip_fixes)}.values())
         for item in late:
             key = item["key"]
             if key in covered or key not in parsed.keys:
@@ -447,9 +478,11 @@ def covered_late_keys(
                 continue
             if item["at"] > made_at + rr._COMMIT_CLOCK_SLACK:
                 continue
+            if not _before_every_fix(fixes, item["at"], made_at, after_r):
+                continue
             if head != reviewed:
                 if (reviewed, head) not in fix_times:
-                    found = _fix_times(cwd, reviewed, head)
+                    found = _fix_times(cwd, reviewed, head, credit=True)
                     fix_times[(reviewed, head)] = max(found) if found else None
                 fixed = fix_times[(reviewed, head)]
                 if fixed is not None and item["at"] <= fixed:
@@ -508,8 +541,23 @@ def late_status(
     """``review_reflection.status`` with a cutover: the open round judged as
     without one, plus the late keys from ``cutover`` on, each credited only
     under its own round; owed is unknown whenever the late debt is.
-    ``deadline`` (``time.monotonic()``) bounds the late-credit walk. Raises
-    ``Refused`` when git cannot be read."""
+    ``deadline`` (``time.monotonic()``) bounds every git and network call made
+    here (``review_reflection.deadline_scope``); past it, as when git cannot be
+    read, this raises ``Refused``."""
+    with rr.deadline_scope(deadline):
+        return _late_status(cwd, budget, repo, number, now=now, cutover=cutover, deadline=deadline)
+
+
+def _late_status(
+    cwd: str,
+    budget: Mapping[str, Any],
+    repo: str,
+    number: int,
+    *,
+    now: datetime,
+    cutover: str,
+    deadline: float | None,
+) -> dict[str, Any]:
     ok = budget.get("status") == "ok"
     fix_time = fix_time_reader(cwd, str(budget.get("current_head"))) if ok else None
     state = rr.owed_state(budget, (), now=now, cutover=cutover, fix_time=fix_time)
@@ -523,7 +571,7 @@ def late_status(
     acceptance = (
         rr._acceptance(budget, repo, number) if is_open or _needs_acceptance(budget, late) else None
     )
-    covered = rr._open_covered(cwd, budget, state, acceptance) if is_open else set()
+    covered = rr._open_covered(cwd, budget, state, acceptance, deadline) if is_open else set()
     late_covered = (
         covered_late_keys(
             cwd,

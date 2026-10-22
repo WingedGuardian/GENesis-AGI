@@ -53,6 +53,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 TAG = "COLLECTED-FLOOR"
@@ -63,6 +64,125 @@ OK, FAIL, REFUSED = 0, 1, 2
 _SUMMARY_BUDGET = 900_000
 
 _DROP_RE = re.compile(r"^\s*collected-drop\s*:\s*(\S.*)$", re.IGNORECASE)
+_EVIDENCE_LIMIT = 32 * 1024 * 1024
+
+
+class _Evidence:
+    """Optional review evidence: stricter completeness, unchanged floor policy."""
+
+    def __init__(self, path, inputs):
+        self.path = Path(path)
+        self.provenance = None
+        self.issues = set()
+        try:
+            if self.path.resolve().is_relative_to(Path(__file__).resolve().parents[2]):
+                raise ValueError("evidence must be written outside the checkout")
+            if self.path.resolve() in {Path(p).resolve() for p in inputs if p}:
+                raise ValueError("evidence path aliases a comparison input or summary")
+            self.path.unlink(missing_ok=True)
+            data = {"schema_version": 1, "scope": "ci-pytest-collection-v1",
+                    "workflow_path": ".github/workflows/ci.yml"}
+            for field, variable, pattern in (
+                ("repository", "GITHUB_REPOSITORY", r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"),
+                ("event", "GITHUB_EVENT_NAME", r"pull_request"),
+                ("base_ref", "GITHUB_BASE_REF", r"[^\s]+"),
+                ("pr_number", "COLLECTED_REVIEW_PR_NUMBER", r"[1-9][0-9]*"),
+                ("run_id", "GITHUB_RUN_ID", r"[1-9][0-9]*"),
+                ("producer_attempt", "GITHUB_RUN_ATTEMPT", r"[1-9][0-9]*"),
+                ("base_sha", "COLLECTED_REVIEW_BASE_SHA", r"[0-9a-f]{40}"),
+                ("head_sha", "COLLECTED_REVIEW_HEAD_SHA", r"[0-9a-f]{40}"),
+                ("comparison_sha", "COLLECTED_REVIEW_COMPARISON_SHA", r"[0-9a-f]{40}"),
+            ):
+                value = os.environ.get(variable, "")
+                if not re.fullmatch(pattern, value) or value == "0" * 40:
+                    raise ValueError(f"missing or invalid {variable}")
+                data[field] = int(value) if field in {"pr_number", "run_id", "producer_attempt"} else value
+            ref = f"refs/pull/{data['pr_number']}/merge"
+            workflow = f"{data['repository']}/{data['workflow_path']}@{ref}"
+            if os.environ.get("GITHUB_WORKFLOW_REF") != workflow:
+                raise ValueError("missing or invalid GITHUB_WORKFLOW_REF")
+            if (os.environ.get("GITHUB_REF") != ref
+                    or os.environ.get("GITHUB_SHA") != data["comparison_sha"]):
+                raise ValueError("comparison does not match GITHUB_REF/GITHUB_SHA")
+            self.provenance = data
+        except Exception as exc:
+            self.warn(exc)
+
+    @staticmethod
+    def warn(exc):
+        print(f"::warning::{TAG}: optional review evidence unavailable: {type(exc).__name__}: {exc}")
+
+    def object_pairs(self, pairs):
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            self.issues.add("duplicate JSON keys")
+        return result
+
+    @staticmethod
+    def encode(handle, data):
+        size = 0
+        for chunk in json.JSONEncoder(ensure_ascii=True, separators=(",", ":")).iterencode(data):
+            raw = chunk.encode("ascii")
+            size += len(raw)
+            if size > _EVIDENCE_LIMIT:
+                raise OverflowError("review evidence exceeds byte limit")
+            handle.write(raw)
+
+    def publish(self, base, pr, base_ids, pr_ids, added, vanished, explained,
+                moves, newly_skipped, verdict):
+        if self.provenance is None:
+            return
+        temporary = None
+        try:
+            for inventory in (base, pr):
+                if len(inventory["ids"]) != len(set(inventory["ids"])):
+                    self.issues.add("duplicate collected IDs")
+                if any(not i or not inventory["paths"][i] for i in inventory["ids"]):
+                    self.issues.add("empty collected identity or path")
+            sources = {m["from_id"] for m in moves}
+            targets = {m["to_id"] for m in moves}
+            if (len(sources) != len(moves) or len(targets) != len(moves)
+                    or not sources <= vanished or not targets <= added
+                    or any(m["from_path"] != base["paths"].get(m["from_id"])
+                           or m["to_path"] != pr["paths"].get(m["to_id"])
+                           or m["from_path"] == m["to_path"] for m in moves)):
+                self.issues.add("invalid structural move relation")
+            diagnostic = {**self.provenance, "complete": False,
+                          "reason": "review evidence exceeds byte limit", "floor_exit_code": verdict}
+            if self.issues:
+                report = {**diagnostic, "reason": "; ".join(sorted(self.issues))}
+            else:
+                complete = not (base["errors"] or pr["errors"])
+                explained_ids = set(explained)
+                report = {
+                    **self.provenance, "complete": complete,
+                    "reason": None if complete else "collection errors on one or both trees",
+                    "counts": {"base": len(base_ids), "pr": len(pr_ids),
+                               "added": len(added), "vanished": len(vanished)},
+                    "vanished": [{"id": i, "path": base["paths"][i], "explained": i in explained_ids}
+                                 for i in sorted(vanished)],
+                    "moves": sorted(moves, key=lambda m: (m["from_id"], m["to_id"])),
+                    "errors": {"base": base["errors"], "pr": pr["errors"]},
+                    "newly_skipped": newly_skipped, "floor_exit_code": verdict,
+                }
+            with tempfile.NamedTemporaryFile(mode="w+b", dir=self.path.parent,
+                                             prefix=f".{self.path.name}.", delete=False) as handle:
+                temporary = Path(handle.name)
+                try:
+                    self.encode(handle, report)
+                except OverflowError:
+                    handle.seek(0)
+                    handle.truncate()
+                    self.encode(handle, diagnostic)
+            os.replace(temporary, self.path)
+        except Exception as exc:
+            self.warn(exc)
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as exc:
+                    self.warn(exc)
 
 
 def _say(msg: str) -> None:
@@ -75,10 +195,11 @@ def _refuse(msg: str) -> int:
     return REFUSED
 
 
-def _load_tree(path: str) -> dict | str:
+def _load_tree(path: str, evidence=None) -> dict | str:
     """The plugin's JSON for one tree, or the reason it cannot be used."""
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data = json.loads(Path(path).read_text(encoding="utf-8"),
+                          object_pairs_hook=evidence.object_pairs if evidence else None)
     except FileNotFoundError:
         return f"no collection output at {path}: collection did not finish"
     except (OSError, ValueError) as exc:
@@ -110,6 +231,45 @@ def read_changed(path: str) -> set[str] | str:
     except OSError as exc:
         return f"changed-file list unreadable: {type(exc).__name__}: {exc}"
     return {os.fsdecode(p) for p in raw.split(b"\0") if p}
+
+
+def structural_moves(base: dict, pr: dict, changed: set[str]) -> list[dict[str, str]]:
+    """Pair unique changed-file deltas; raw losses and floor policy stay intact."""
+    def candidates(tree, delta):
+        keys = tree.get("move_keys")
+        result = {}
+        if not isinstance(keys, dict):
+            return result
+        for nodeid in sorted(delta):
+            path = tree["paths"][nodeid]
+            key = keys.get(nodeid)
+            prefix = path + "::"
+            if (
+                path not in changed
+                or not nodeid.startswith(prefix)
+                or not isinstance(key, list)
+                or len(key) != 2
+                or not all(isinstance(part, str) for part in key)
+                or key[0] != nodeid[len(prefix) :]
+                or not re.fullmatch(r"[0-9a-f]{64}", key[1])
+            ):
+                continue
+            result.setdefault(tuple(key), []).append(nodeid)
+        return result
+
+    base_ids, pr_ids = set(base["ids"]), set(pr["ids"])
+    vanished = candidates(base, base_ids - pr_ids)
+    added = candidates(pr, pr_ids - base_ids)
+    pairs = []
+    for key, sources in vanished.items():
+        targets = added.get(key, [])
+        if len(sources) != 1 or len(targets) != 1:
+            continue
+        old, new = sources[0], targets[0]
+        old_path, new_path = base["paths"][old], pr["paths"][new]
+        if old_path != new_path:
+            pairs.append({"from_id": old, "to_id": new, "from_path": old_path, "to_path": new_path})
+    return pairs
 
 
 def _conftest_dirs(changed: set[str]) -> set[str]:
@@ -214,6 +374,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     body.add_argument("--no-body", action="store_true", help="no PR exists for this change")
     parser.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
+    parser.add_argument("--evidence", help="optional schema-v1 review JSON (requires CI provenance)")
     args = parser.parse_args(argv)
     # A path with bytes that are not UTF-8 arrives as surrogates; print it
     # escaped rather than crash on the one id this job most needs to name.
@@ -221,10 +382,11 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="backslashreplace")
 
-    base = _load_tree(args.base)
+    evidence = _Evidence(args.evidence, [args.base, args.pr, args.changed, args.body_file, args.summary]) if args.evidence else None
+    base = _load_tree(args.base, evidence)
     if isinstance(base, str):
         return _refuse(base)
-    pr = _load_tree(args.pr)
+    pr = _load_tree(args.pr, evidence)
     if isinstance(pr, str):
         return _refuse(pr)
     changed = read_changed(args.changed)
@@ -246,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
     explained = sorted(vanished - set(unexplained))
     new_errors = sorted(set(pr["errors"]) - set(base["errors"]))
     newly_skipped = sorted(set(pr["skipped"]) - set(base["skipped"]))
+    moves = structural_moves(base, pr, changed)
 
     _say(
         f"base {len(base_ids)}, PR {len(pr_ids)}: +{len(added)} added, "
@@ -301,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
             )
     if explained:
         print(f"::notice::{TAG}: {len(explained)} test(s) removed from files this change touched")
+    if moves:
+        _say(f"{len(moves)} structural move(s) (not semantic proof); raw vanished IDs retained")
 
     if args.summary:
         summary = _Summary()
@@ -316,11 +481,18 @@ def main(argv: list[str] | None = None) -> int:
         summary.id_block("Unexplained: vanished from files this change did not touch", unexplained)
         summary.id_block("Modules now skipped at import", newly_skipped)
         summary.id_block("Explained: removed from files this change touched", explained)
+        summary.id_block(
+            "Structural moves (not semantic proof; raw vanished IDs retained above)",
+            [f"{pair['from_id']} -> {pair['to_id']}" for pair in moves],
+        )
         try:
             with open(args.summary, "a", encoding="utf-8", errors="backslashreplace") as fh:
                 fh.write("".join(summary.parts))
         except OSError as exc:
             print(f"::warning::{TAG}: could not write the step summary: {exc}")
+    if evidence:
+        evidence.publish(base, pr, base_ids, pr_ids, added, vanished, explained,
+                         moves, newly_skipped, verdict)
     return verdict
 
 

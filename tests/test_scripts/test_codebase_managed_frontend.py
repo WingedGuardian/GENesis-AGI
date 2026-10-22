@@ -179,7 +179,7 @@ def test_launch_uses_primary_helper_literal_paths_and_native_dependencies(fronte
 
     monkeypatch.setattr(namespace["os"], "execve", execute)
     with pytest.raises(Executed):
-        frontend.launch({"main": str(main)}, settings)
+        frontend.launch({"main": str(main), "cache": str(tmp_path)}, settings)
 
 
 @pytest.mark.parametrize("stage", ["verify_cache", "ready"])
@@ -190,7 +190,7 @@ def test_failed_parent_preflight_never_creates_unit(frontend, monkeypatch, stage
     native = Mock()
     monkeypatch.setattr(namespace["os"], "execve", native)
     with pytest.raises(ValueError):
-        frontend.launch({}, Path("/settings"))
+        frontend.launch({"main": "/main", "cache": "/cache"}, Path("/settings"))
     native.assert_not_called()
 
 
