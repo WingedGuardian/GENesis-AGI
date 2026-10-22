@@ -781,8 +781,8 @@ class MorningReportGenerator:
 
         Any figure it cannot vouch for prints "unavailable", never a zero: the
         queues section failed (``{"status": "error"}``) or the producer's query
-        failed, which leaves the figure None. A failed stalled count only drops
-        the stalled clause; the producer counts it in its own try.
+        failed, which leaves the figures None. Current producers measure all
+        four counts together; older snapshots may lack the optional overlap.
         """
         fig = MorningReportGenerator._fig
         total = fig(queues, "deferred_work")

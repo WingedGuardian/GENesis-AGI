@@ -178,7 +178,10 @@ async def _persist_health_alerts(db) -> None:
         from genesis.runtime import GenesisRuntime
 
         observation = {}
-        alerts, _current_ids = await _compute_alerts(agent_api_observation=observation)
+        queue_unknown_ids: set[str] = set()
+        alerts, _current_ids = await _compute_alerts(
+            agent_api_observation=observation, queue_unknown_ids=queue_unknown_ids,
+        )
         # Also preserve an open API incident if the health service itself could
         # not initialize and _compute_alerts returned before taking a snapshot.
         alerts = [a for a in alerts if a.get("id") != ALERT_ID]
@@ -196,7 +199,7 @@ async def _persist_health_alerts(db) -> None:
         state = observation.get("status")
         reasons = {ALERT_ID: state} if state in {"healthy", "disabled"} else None
         await _ae.reconcile_open_set(db, active=active, now=datetime.now(UTC).isoformat(),
-                                     resolution_reasons=reasons)
+                                     resolution_reasons=reasons, preserve_ids=queue_unknown_ids)
         runtime = GenesisRuntime.peek()
         await notify_pending(db, getattr(runtime, "_outreach_pipeline", None))
     except Exception:

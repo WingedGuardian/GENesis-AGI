@@ -296,25 +296,20 @@ async def queues(
     deferred_recovery = None
     deferred_worklist = None
     # Worklist items stalled past a full drain cycle: counted in BOTH
-    # deferred_recovery and deferred_worklist. Counted directly (not derived as
-    # recovery + worklist - total, which three separate queries can get wrong),
-    # in its own try so its failure does not blank the three figures above.
+    # deferred_recovery and deferred_worklist. All four populations use one
+    # statement and one cutoff, so their subset relationships remain coherent.
     deferred_worklist_stalled = None
     if deferred_queue:
         try:
-            deferred = await deferred_queue.count_pending()
-            deferred_recovery = await deferred_queue.count_recovery_pending()
-            deferred_worklist = await deferred_queue.count_worklist_pending()
+            counts = await deferred_queue.count_pending_split()
+            deferred = counts["total"]
+            deferred_recovery = counts["recovery"]
+            deferred_worklist = counts["worklist"]
+            deferred_worklist_stalled = counts["stalled"]
         except Exception:
-            deferred = deferred_recovery = deferred_worklist = None
+            deferred = deferred_recovery = deferred_worklist = deferred_worklist_stalled = None
             errors.append("deferred_work: query failed")
             logger.error("Failed to query deferred work queue", exc_info=True)
-        try:
-            deferred_worklist_stalled = await deferred_queue.count_stalled_worklist_pending()
-        except Exception:
-            deferred_worklist_stalled = None
-            errors.append("deferred_worklist_stalled: query failed")
-            logger.error("Failed to count stalled deferred worklist items", exc_info=True)
     elif db is not None:
         errors.append("deferred_work: queue unavailable")
     else:

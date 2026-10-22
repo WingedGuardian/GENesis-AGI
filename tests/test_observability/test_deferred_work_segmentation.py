@@ -12,7 +12,9 @@ display.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import aiosqlite
 import pytest
@@ -99,13 +101,13 @@ class TestQueueCounts:
         q = _queue(db)
         assert await q.count_worklist_pending() == 5  # all batch, display
         assert await q.count_recovery_pending() == 2  # only the stale ones
-        assert await q.count_stalled_worklist_pending() == 2  # counted directly
+        assert (await q.count_pending_split())["stalled"] == 2
 
     @pytest.mark.asyncio
     async def test_stalled_worklist_ignores_recovery_items(self, db):
         await _seed_recovery(db, 4)
         await _seed_worklist(db, 3, age_days=STALE_WORKLIST_DAYS + 1)
-        assert await _queue(db).count_stalled_worklist_pending() == 3
+        assert (await _queue(db).count_pending_split())["stalled"] == 3
 
 
 class TestSnapshotSplit:
@@ -222,41 +224,233 @@ class TestSnapshotSplit:
         assert not any("queue unavailable" in error for error in result.get("errors", []))
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("failed", [
-        "count_pending", "count_recovery_pending", "count_worklist_pending",
-    ])
-    async def test_failed_deferred_query_leaves_every_split_none(self, db, failed):
+    async def test_failed_deferred_query_leaves_every_split_none(self, db):
         import importlib
 
         qmod = importlib.import_module("genesis.observability.snapshots.queues")
         q = AsyncMock()
-        q.count_pending.return_value = 9
-        q.count_recovery_pending.return_value = 4
-        q.count_worklist_pending.return_value = 5
-        getattr(q, failed).side_effect = RuntimeError("db unavailable")
-        q.count_stalled_worklist_pending.return_value = 2  # its own try
+        q.count_pending_split.side_effect = RuntimeError("db unavailable")
         result = await qmod.queues(db, q, None)
         assert result["deferred_work"] is None
         assert result["deferred_recovery"] is None
         assert result["deferred_worklist"] is None  # never a preset 0
-        assert result["deferred_worklist_stalled"] == 2
+        assert result["deferred_worklist_stalled"] is None
         assert "deferred_work: query failed" in result["errors"]
 
+async def _isolated_queue_alerts(db, monkeypatch, tmp_path):
+    import importlib
+
+    import genesis.mcp.health.errors as errors_mod
+    import genesis.mcp.health_mcp as health_mcp_mod
+    from genesis.runtime import GenesisRuntime
+
+    home = tmp_path / "private-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GENESIS_HOME", str(home / ".genesis"))
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(GenesisRuntime, "peek", lambda: None)
+    queues_mod = importlib.import_module("genesis.observability.snapshots.queues")
+    depths = await queues_mod.queues(db, None, None)
+    snap = {
+        "queues": depths, "call_sites": {}, "services": {}, "cc_sessions": {},
+        "infrastructure": {}, "scheduler": {}, "agent_api": {"status": "healthy"},
+    }
+    service = SimpleNamespace(_db=db, snapshot=AsyncMock(return_value=snap))
+    monkeypatch.setattr(health_mcp_mod, "_service", service)
+    monkeypatch.setattr(health_mcp_mod, "_activity_tracker", None)
+    monkeypatch.setattr(health_mcp_mod, "_job_retry_registry", None)
+    monkeypatch.setattr(health_mcp_mod, "_alert_history", {})
+    return errors_mod, health_mcp_mod, snap
+
+
+class TestUnknownQueueIncidents:
     @pytest.mark.asyncio
-    async def test_failed_stalled_count_keeps_the_good_figures(self, db):
+    @pytest.mark.parametrize("other_firing", [False, True])
+    async def test_preserve_is_not_insertion_or_a_healthy_sibling_hold(self, db, other_firing):
+        from genesis.db.crud import alert_events
+        from genesis.observability.agent_api_alerts import ALERT_ID
+
+        held, cleared = "queue:dead_letters", "queue:deferred_recovery"
+        active = [
+            {"alert_id": aid, "source": "fixture", "severity": "WARNING", "message": aid}
+            for aid in (held, cleared, ALERT_ID)
+        ]
+        await alert_events.reconcile_open_set(db, active=active, now=_NOW.isoformat())
+        before = next(r for r in await alert_events.list_open(db) if r["alert_id"] == held)
+        firing = active[:0]
+        if other_firing:
+            firing = [{"alert_id": "fixture:active", "source": "fixture", "severity": "WARNING", "message": "active"}]
+        for _ in range(2):
+            await alert_events.reconcile_open_set(
+                db, active=firing, now=(_NOW + timedelta(seconds=10)).isoformat(),
+                preserve_ids={held, "queue:never-open"}, resolution_reasons={ALERT_ID: "healthy"},
+            )
+            rows = {r["alert_id"]: dict(r) for r in await (await db.execute("SELECT * FROM alert_events")).fetchall()}
+            assert rows[held]["resolved_at"] is None
+            assert rows[cleared]["resolved_at"] is not None
+            assert rows[ALERT_ID]["resolution_reason"] == "healthy"
+            assert "queue:never-open" not in rows
+            assert next(r for r in await alert_events.list_open(db) if r["alert_id"] == held) == before
+        await alert_events.reconcile_open_set(db, active=[], now=_NOW.isoformat(), preserve_ids=set())
+        assert not await alert_events.list_open(db)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["deferred_recovery", "dead_letters"])
+    @pytest.mark.parametrize("unknown", ["wrapper", "section", "service"])
+    async def test_unknown_preserves_existing_durable_incident(
+        self, db, monkeypatch, tmp_path, field, unknown,
+    ):
+        from genesis.awareness.loop import _persist_health_alerts
+        from genesis.db.crud import alert_events
+
+        _errors, health, snap = await _isolated_queue_alerts(db, monkeypatch, tmp_path)
+        sibling = "dead_letters" if field == "deferred_recovery" else "deferred_recovery"
+        snap["queues"][sibling] = 0
+        if unknown == "section":
+            snap["queues"] = {"status": "error"}
+        elif unknown == "service":
+            monkeypatch.setattr(health, "_service", None)
+        active = [
+            {"alert_id": f"queue:{key}", "source": "queue", "severity": "WARNING", "message": key}
+            for key in (field, sibling)
+        ]
+        await alert_events.reconcile_open_set(db, active=active, now=_NOW.isoformat())
+        before = {r["alert_id"]: r for r in await alert_events.list_open(db)}
+        for _ in range(2):
+            await _persist_health_alerts(db)
+            after = {r["alert_id"]: r for r in await alert_events.list_open(db)}
+            assert f"queue:{field}" in after
+            assert after[f"queue:{field}"] == before[f"queue:{field}"]
+            if unknown == "wrapper":
+                assert f"queue:{sibling}" not in after
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["deferred_recovery", "dead_letters"])
+    async def test_unknown_does_not_render_or_forget_local_recovery(
+        self, db, monkeypatch, tmp_path, field,
+    ):
+        errors, health, snap = await _isolated_queue_alerts(db, monkeypatch, tmp_path)
+        aid = f"queue:{field}"
+        health._alert_history = {aid: _NOW.isoformat()}
+        for _ in range(2):
+            alerts = await errors._impl_health_alerts(active_only=False)
+            assert not any(a["id"] == aid and a["severity"] == "RESOLVED" for a in alerts)
+            assert aid in health._alert_history
+        snap["queues"][field] = 0
+        alerts = await errors._impl_health_alerts(active_only=False)
+        assert sum(a["id"] == aid and a["severity"] == "RESOLVED" for a in alerts) == 1
+        assert aid not in health._alert_history
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("field", ["deferred_recovery", "dead_letters"])
+    async def test_never_open_queue_does_not_invent_an_incident(
+        self, db, monkeypatch, tmp_path, field,
+    ):
+        from genesis.awareness.loop import _persist_health_alerts
+        from genesis.db.crud import alert_events
+
+        errors, health, snap = await _isolated_queue_alerts(db, monkeypatch, tmp_path)
+        aid = f"queue:{field}"
+        for _ in range(2):
+            await _persist_health_alerts(db)
+            assert not any(r["alert_id"] == aid for r in await alert_events.list_open(db))
+            assert not any(a["id"] == aid for a in await errors._impl_health_alerts(active_only=False))
+            assert aid not in health._alert_history
+        snap["queues"][field] = 0
+        assert not any(a["id"] == aid for a in await errors._impl_health_alerts(active_only=False))
+
+
+class TestCoherentSnapshot:
+    @staticmethod
+    def _assert_relations(result):
+        total, recovery, worklist, stalled = (
+            result[key] for key in (
+                "deferred_work", "deferred_recovery", "deferred_worklist", "deferred_worklist_stalled",
+            )
+        )
+        assert stalled <= recovery <= total
+        assert stalled <= worklist <= total
+        assert total == recovery + worklist - stalled
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("after_read", ["count_pending", "count_recovery_pending"])
+    async def test_transition_between_old_reads_cannot_contradict_split(self, db, monkeypatch, after_read):
         import importlib
 
-        qmod = importlib.import_module("genesis.observability.snapshots.queues")
-        q = AsyncMock()
-        q.count_pending.return_value = 9
-        q.count_recovery_pending.return_value = 4
-        q.count_worklist_pending.return_value = 5
-        q.count_stalled_worklist_pending.side_effect = RuntimeError("db unavailable")
-        result = await qmod.queues(db, q, None)
-        assert (result["deferred_work"], result["deferred_recovery"]) == (9, 4)
-        assert result["deferred_worklist"] == 5
-        assert result["deferred_worklist_stalled"] is None
-        assert any("stalled" in e for e in result["errors"])
+        await _seed_worklist(db, 1, age_days=STALE_WORKLIST_DAYS + 1)
+        await db.execute("UPDATE deferred_work_queue SET status='processing'")
+        await db.commit()
+        queue = _queue(db)
+        old_read = getattr(queue, after_read)
+
+        async def transition(*args, **kwargs):
+            count = await old_read(*args, **kwargs)
+            await db.execute("UPDATE deferred_work_queue SET status='pending'")
+            await db.commit()
+            return count
+
+        monkeypatch.setattr(queue, after_read, transition)
+        queues_mod = importlib.import_module("genesis.observability.snapshots.queues")
+        self._assert_relations(await queues_mod.queues(db, queue, None))
+
+    @pytest.mark.asyncio
+    async def test_crossing_cutoff_cannot_contradict_split(self, db):
+        import importlib
+
+        await _seed_worklist(db, 1, age_days=STALE_WORKLIST_DAYS)
+        await db.execute(
+            "UPDATE deferred_work_queue SET deferred_at=?",
+            ((_NOW - timedelta(days=STALE_WORKLIST_DAYS) + timedelta(seconds=1)).isoformat(),),
+        )
+        await db.commit()
+        readings = iter((_NOW, _NOW + timedelta(seconds=2)))
+        queue = DeferredWorkQueue(db, clock=lambda: next(readings))
+        queues_mod = importlib.import_module("genesis.observability.snapshots.queues")
+        self._assert_relations(await queues_mod.queues(db, queue, None))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("work_type", sorted(BATCH_WORK_TYPES) + ["reflection"])
+    @pytest.mark.parametrize("status", ["pending", "processing", "completed"])
+    @pytest.mark.parametrize("offset", [-1, 0, 1])
+    async def test_summary_membership_and_strict_boundary(self, db, work_type, status, offset):
+        stamp = (_NOW - timedelta(days=STALE_WORKLIST_DAYS) + timedelta(seconds=offset)).isoformat()
+        await crud.create(
+            db, id="summary-matrix", work_type=work_type, priority=MEMORY_OPS,
+            payload_json="{}", deferred_at=stamp, deferred_reason="fixture", created_at=stamp,
+            staleness_policy=DRAIN,
+        )
+        await db.execute("UPDATE deferred_work_queue SET status=?", (status,))
+        await db.commit()
+        pending, batch, stale = status == "pending", work_type in BATCH_WORK_TYPES, offset < 0
+        assert await _queue(db).count_pending_split() == {
+            "total": int(pending), "recovery": int(pending and (not batch or stale)),
+            "worklist": int(pending and batch), "stalled": int(pending and batch and stale),
+        }
+
+    @pytest.mark.asyncio
+    async def test_summary_uses_one_statement_and_clock_read(self, db):
+        await _seed_worklist(db, 2, age_days=STALE_WORKLIST_DAYS + 1)
+        clock = Mock(return_value=_NOW)
+        queue = DeferredWorkQueue(db, clock=clock)
+        statements = []
+        await db.set_trace_callback(statements.append)
+        try:
+            assert await queue.count_pending_split() == {
+                "total": 2, "recovery": 2, "worklist": 2, "stalled": 2,
+            }
+        finally:
+            await db.set_trace_callback(None)
+        assert clock.call_count == 1
+        assert len(statements) == 1 and statements[0].lstrip().startswith("WITH pending")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("count", [0, 2])
+    async def test_empty_batch_types_keep_nonbatch_recovery(self, db, count):
+        await _seed_worklist(db, count)
+        assert await crud.count_pending_split(
+            db, work_types=frozenset(), stale_cutoff_iso=_NOW.isoformat(),
+        ) == {"total": count, "recovery": count, "worklist": 0, "stalled": 0}
 
 
 class TestDriftGuard:

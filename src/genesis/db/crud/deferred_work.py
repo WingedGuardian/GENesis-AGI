@@ -248,28 +248,25 @@ async def complete_open_by_identity(
     return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
 
-async def count_stalled_pending_in(
+async def count_pending_split(
     db: aiosqlite.Connection,
     *,
     work_types: frozenset[str],
     stale_cutoff_iso: str,
-) -> int:
-    """Count pending items of ``work_types`` deferred before ``stale_cutoff_iso``.
-
-    The stalled-worklist subset that ``count_recovery_pending`` folds back into
-    the recovery backlog, counted directly so a display can name it without
-    deriving it from other counts (empty set → 0).
-    """
-    if not work_types:
-        return 0
+) -> dict[str, int]:
+    """Measure related pending populations in one statement with one cutoff."""
     placeholders = ",".join("?" * len(work_types))
-    cursor = await db.execute(
-        f"SELECT COUNT(*) FROM deferred_work_queue WHERE status = 'pending' "
-        f"AND work_type IN ({placeholders}) AND deferred_at < ?",
+    batch = f"work_type IN ({placeholders})" if work_types else "0"
+    async with db.execute(
+        f"WITH pending AS (SELECT {batch} AS batch, deferred_at < ? AS stale "
+        "FROM deferred_work_queue WHERE status = 'pending') "
+        "SELECT COUNT(*), COUNT(CASE WHEN NOT batch OR stale THEN 1 END), "
+        "COUNT(CASE WHEN batch THEN 1 END), "
+        "COUNT(CASE WHEN batch AND stale THEN 1 END) FROM pending",
         [*work_types, stale_cutoff_iso],
-    )
-    row = await cursor.fetchone()
-    return int(row[0])
+    ) as cursor:
+        row = await cursor.fetchone()
+    return dict(zip(("total", "recovery", "worklist", "stalled"), map(int, row), strict=True))
 
 
 async def count_recovery_pending(
