@@ -81,9 +81,9 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
      one staged diff, in EITHER order, a mixed clean/defect pair records as CLEAN — the
      defect-bearing round vanishes and the cap it was arming goes back to zero. That is
      the failure the one-mark rule prevents (Codex P2, #1903).
-  2. **Triage before touching code — and here it OUTRANKS "fixing is usually free".**
-     That rule (closing-session, "'Not blocking' describes the GATE, not the finding", and right for ordinary PRs) says a cheap finding costs nothing to
-     fix so just fix it. On this surface the cost is not the edit, it is the PUSH: it
+  2. **Triage before touching code — and here it OUTRANKS the cheap-fix habit.**
+     That rule (closing-session, "'Not blocking' describes the GATE, not the finding", and right for ordinary PRs) weighs what a fix costs before the owner
+     decides. On this surface the cost is not the edit, it is the PUSH: it
      invalidates the review, and a push whose DELTA touches the hook surface is never
      classed review-trivial (`_classify_post_review_delta` tests the DELTA's files, not
      the PR's), so a one-line courtesy fix to guard code buys a whole extra review
@@ -114,7 +114,8 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
      instances (#1856, #1686, e7ae445a5): each a fail-open introduced BY fix-code
      written under review pressure, and each caught only by a later round. The danger is the fixing, not the
      reviewing.
-  4. **Round 2 is the discovery stop.** The two branches are: accept
+  4. **Round 2 is the discovery stop**, and a terminal round is the owner's call
+     (closing-session, step 4). The two branches are: accept
      and merge with every outstanding finding documented in the PR body, or abandon and
      re-cut from a design that does not need a third round. **The always-fix floor is
      never accepted** — a P1, a security defect, anything destructive or fail-open gets
@@ -129,7 +130,8 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
      `.md`. That is the identical claim rule 2 already corrects, and it survived here
      for a round because the fix was applied to the sentence that was flagged instead
      of to every sentence making the claim). That confirming review
-     is a GATE REQUIREMENT, not a discovery round: if it is clean you merge. If it
+     is a GATE REQUIREMENT, not a discovery round: if it is clean, the PR goes to the
+     owner's merge decision (closing-session, step 4). If it
      surfaces something new, the SEVERITY routes it, exactly as it does anywhere
      else in this rule — a non-floor finding is accepted and documented like any
      other, and only a FLOOR-CLASS one (P1, security, destructive, fail-open) goes

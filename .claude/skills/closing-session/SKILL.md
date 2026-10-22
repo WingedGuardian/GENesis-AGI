@@ -47,6 +47,15 @@ If the task is "take the open PRs and get them merged", you are here.
 
 The two are different SESSION TYPES, not two phases of one session's life.
 
+**There is no "repair" session type** (owner, 2026-10-19/20). Fixing review
+findings on an open PR is closing work, whoever built it: closing stays one
+role, and the merge gate is the judge (owner ruling, 2026-09-03). A PR sent back
+with a decision-complete `## Rework spec` (step 5) goes to a build session as
+rework (`build-session`, "Building a rework"), never back into this loop.
+Rescuing a broken architecture (a BROKEN premise, a `needs-architecture-session`
+PR) is owner-attended: a dispatched session hands it off as "Some PRs are not a
+review problem" (below) describes, and never attempts the rescue itself.
+
 ---
 
 **Load `genesis-development` (the shared core) first** if this session has not:
@@ -235,7 +244,7 @@ lease has to be built first — say so rather than running it.
 ## The per-PR loop
 
 Everything below composes machinery that already exists and is documented in
-detail in the sections appended below (moved from `genesis-development`), in
+detail in this skill's later sections, in
 `.claude/skills/genesis-development/references/commit-path.md`, in the
 `genesis-development` core and in the build-session sections named above. This
 skill's own sections are the QUEUE-level orchestration; all of those are the
@@ -251,7 +260,10 @@ MEASURED 2026-09-02: the main worktree sat at one commit from 09-01 13:40 to
 reported as a live repo-wide blocker. It had been fixed at 15:47 that day. The
 failure was real, reproducible, and describing state that no longer existed.
 `git log --all` and `git status` both work fine on a stale tree, so nothing
-warns you.
+warns you. A worktree created from a branch NAME sits wherever that ref pointed
+when it was created. When dispatching a subagent on a PR, put the head SHA in its
+prompt and have it verify the match first: it inherits your staleness silently
+and measures whatever tree it is pointed at with complete confidence.
 
 **(b) Your TOOLS are stale, because a worktree carries its own copy of them.**
 MEASURED 2026-09-02: `git_push_guard.py --check-pr 1611` run from a worktree
@@ -260,6 +272,21 @@ same command from a tree at `origin/main` reported `ci: green`. Same command,
 same PR, same minute — **different verdict**, because `scripts/` is versioned
 like everything else. A closing session touches branches of many ages, so it is
 the session type most exposed to both.
+
+So `--check-pr` is (remote PR state × LOCAL gate code): it executes the
+`git_push_guard.py` in your working copy, not the one on `main`. Run from a worktree
+carrying an unmerged change to the gate, it reports what WOULD be true once that
+change lands: a correct verification OF THE FIX, and a false statement about the
+PR. MEASURED 2026-09-09: a session reported a peer's PR as one blocker from green
+on exactly that confusion. Say which tree produced any verdict you pass on. To
+bound a verdict you already took, compare the CHECKER ITSELF and its effective
+policy inputs across the two trees: `git diff origin/main --
+scripts/hooks/git_push_guard.py` (plus the modules it imports), then any local
+configuration that can alter required reviews or CI; hash the relevant blobs when
+the effective policy is identical. `git log origin/main -- <checker>` is the
+trap: it comes back EMPTY in exactly the case that matters, a worktree carrying
+an unmerged change to the gate; empty history is not identical logic. The same
+holds for any local checker whose answer is about a remote object.
 
 **These two point at different remedies — do not collapse them into one rule:**
 
@@ -294,6 +321,7 @@ head=$(gh pr view <N> --json headRefOid --jq .headRefOid)
 [ "$(git -C <pr-tree> rev-parse HEAD)" = "$head" ] \
   && echo "worktree is at the PR head" \
   || echo "STALE — pull before reading findings or running tests"
+git -C <pr-tree> status --porcelain  # rev-parse HEAD is blind to uncommitted edits
 
 git -C <pr-tree> merge-base --is-ancestor origin/main HEAD \
   && echo "PR branch contains current main"
@@ -336,9 +364,13 @@ gate bug is always both.
 
 **Never hand-roll `gh api …/comments` to decide whether a PR is clean.** A wrong
 filter's empty result is indistinguishable from "no findings exist". That is not
-hypothetical: a hand-rolled filter keyed on the GraphQL bot login instead of the
-REST one matched nothing, and 13 real findings (10 P1) were reported to the user
-as "review-clean" until the merge gate blocked.
+hypothetical (2026-08-23, #1431/#1432): Codex authors both its inline findings
+and its review-summary body as `chatgpt-codex-connector[bot]`, the REST
+`user.login` WITH the `[bot]` suffix. A hand-rolled filter keyed on the GraphQL
+app login, which is a different string, matched nothing, and 13 real findings
+(10 P1) were reported to the user as "review-clean" until the merge gate
+blocked. An empty result from your own query is "my query found nothing", never
+"no findings exist".
 
 It prints one line per gate, then a `verdict` line. Read every line — a PR can
 be Codex-clean and still blocked by CI, base branch, or pin receipts.
@@ -382,12 +414,12 @@ GitHub failure by retargeting a PR that was fine.
 | `base-branch` | `BLOCK` — *"could not confirm … (base=?, default=?)"* | **Not a base problem: the query failed.** Fail-closed, so it wears the same label. RETRY the read. Retargeting here changes a base that was never shown to be wrong. |
 | `pin-receipts` | `BLOCK` | Moves the CC pin without its receipts. The detail lines name what is missing. |
 | `codex-at-head` | `BLOCK` | Covers BOTH "no Codex review found" and "review is stale" — they are different situations with the same remedy shape. The detail lines say which, and carry the `git log <reviewed>..<head>` command. Push any pending fix, comment `@codex review`, wait. |
-| `codex-at-head` | `ok (STALE review of <sha>, delta since is trivial)` | A **PASS**, not a block — the delta since the review is trivial. **Except on the hook surface**, which gets no leniency at all. |
+| `codex-at-head` | `ok (STALE review of <sha>, delta since is trivial)` | A **PASS**, not a block — the delta since the review is trivial. **Except when the unreviewed delta touches the hook surface**: such a delta is never trivial. |
 | `codex-at-head` | `ok (STALE review of <sha>, base-advance delta inline)` | A **PASS**: the branch contribution is unchanged and the base supplied the inline delta. The merge remains bound to the verified head. |
 | `codex-at-head` | `ok (freshness label unverified — pass reason not recorded)` | The gate passed, but the report has no pass record for the verified head and will not invent a freshness reason. Re-run before treating freshness as established. |
 | `codex-at-head` | `ok (<gate pass reason>); HEAD MOVED to <sha> after the gate verified <sha> — merge-with stays bound to <sha>, so GitHub will refuse it` | The later head is reported without relabeling the original pass. The printed merge command remains pinned to the gate-verified head; GitHub rejects it rather than merging the newer head. |
 | `codex-at-head` | `ok (<gate pass reason>); verified at <sha>, the current head could not be re-read` | The gate passed for the shown head, but the report could not check whether it moved afterward. Re-run before treating the current head as established. |
-| `codex-at-head` | `ok (clean signal at head: comment\|summary)` | A **PASS**: the clean signal's abbreviated id resolves repo-wide through `commits/{short}` to exactly the head; a 422 for an ambiguous or unknown id refuses it. A matching head is the PR's commit. No Codex review object at head or Codex findings comment may contradict it, and any non-Codex edit or deleted edit revision on any Codex Bot comment permanently refuses the signal (the editor is named when available); unrelated comments' edit data is ignored. History veto covers head force-push, head-branch delete or restore, and base changes. A base change stays a veto because the signal names the head, not the base Codex reviewed against; retargeting changes the effective diff without moving the head. A base force-push is retired: merging requires the default base, whose ruleset forbids force-push and deletion, so a force-pushed non-default base can reach a merge only through a base change, which vetoes. The 541 commits dropped by 191 force-pushes still resolve repo-wide by 7-hex id, so dropped head commits are not the binding risk. A branch/tag named exactly after the short id can shadow GitHub lookup, but creating one needs base-repo push rights (held only by the owner), and no hex-named ref exists. A deleted comment leaves no API trace. The report uses the gate's own pass record, and merge-with stays bound to the verified head. |
+| `codex-at-head` | `ok (clean signal at head: comment\|summary)` | A **PASS**: the clean signal's abbreviated id resolves repo-wide through `commits/{short}` to exactly the head; a 422 for an ambiguous or unknown id refuses it. A matching head is the PR's commit. No Codex review object at head or Codex findings comment may contradict it, and any non-Codex edit or deleted edit revision on any Codex Bot comment permanently refuses the signal (the editor is named when available). Edit-history completeness is required for Codex Bot comments (an incomplete history refuses the signal); unrelated comments' edit data is ignored. History veto covers head force-push, head-branch delete or restore, and base changes. A base change stays a veto because the signal names the head, not the base Codex reviewed against; retargeting changes the effective diff without moving the head. A base force-push is retired: merging requires the default base, whose ruleset forbids force-push and deletion, so a force-pushed non-default base can reach a merge only through a base change, which vetoes. The 541 commits dropped by 191 force-pushes still resolve repo-wide by 7-hex id, so dropped head commits are not the binding risk. A branch/tag named exactly after the short id can shadow GitHub lookup, but creating one needs base-repo push rights (held only by the owner), and no hex-named ref exists. A deleted comment leaves no API trace. The report uses the gate's own pass record, and merge-with stays bound to the verified head. |
 | `codex-at-head` | `BLOCK` with a `NOTE: Codex's clean <comment\|summary> naming commit … was read but not accepted` line | Codex's clean signal was seen but did not qualify; the note says why. If it also says a finding-free re-review **cannot clear this block** (the PR's history moved, or a Codex findings comment sits on it), do not re-request Codex expecting a clean pass. Either way: if another reviewer's review exists at the exact head, ask the owner and merge with `# substitute-review`. |
 | `codex-at-head` | `BLOCK — … — substitute available: <reviewer> reviewed this head` | Codex has not covered the head, but another reviewer has (any GitHub App reviewer except the PR's own workflow bot and CodeQL). Ask the owner in conversation first; with their yes, merge with `# substitute-review`, which records it. The gate keeps the base check and the head binding and refuses in a dispatched session. Asking is not optional, and the gate cannot check that you did, so the obligation is yours. |
 | `scheduled-claude` | `BLOCK` | The scheduled review never ran, or ran on an older head. Read the detail lines — they name WHICH cause, and the summary's `present: none` clause has been misread as "nothing was posted" when the marker was in the thread all along. If no `leaks` marker covers the current head and carried-forward relief does not apply, see "When the scheduled leaks review has not run" below. |
@@ -405,12 +437,9 @@ A blocking gate prints its diagnosis on the lines BELOW its summary — which
 finding, which pattern, which cause, and usually the remedy. Read them; they are
 the actionable part, and the summary alone is not enough to act on.
 
-**An outside contributor's fork PR needs no leaks review** (owner, 2026-10-05): when
-it is wholly theirs, the gate exempts it and `--check-pr` says `leaks not required:
-outside contribution by <login>`. Do not run the fallback below for it. Once one of
-our sessions pushes a commit to it, the contributor commits one of our review
-suggestions, or we edit its title or body, the review is required again; the block
-message then says which condition failed.
+**An outside contributor's fork PR needs no leaks review** (owner, 2026-10-05; the
+conditions, and what puts the requirement back, are in the Pre-Merge Gate): `--check-pr`
+says `leaks not required: outside contribution by <login>`. Do not run the fallback below for it.
 
 **When the scheduled leaks review has not run** at the current head, and
 carried-forward relief does not apply, run it as a fallback rather than leave the
@@ -489,39 +518,44 @@ words: "You don't block on the things that aren't blocking."
 
 **A PR labelled `gate-surface`, or whose diff touches the enforcement-hook surface, runs the gate-fix lane.** Before writing any fix or requesting any review on it, read `.claude/skills/genesis-development/references/gate-fix-lane.md` (MANDATORY).
 - Triage before touching code: on this surface the cost is not the edit, it is the PUSH, so a cheap NON-floor finding gets a reply, not a commit.
-- Round 2 is the discovery stop: accept and merge with every outstanding finding documented in the PR body, or abandon and re-cut; the always-fix floor is never accepted — a P1, a security defect, anything destructive or fail-open gets FIXED in the terminal push.
+- Round 2 is the discovery stop, and the owner decides (step 4): accept and merge with every outstanding finding documented in the PR body, or abandon and re-cut; the always-fix floor is never accepted — a P1, a security defect, anything destructive or fail-open gets FIXED in the terminal push.
 - A NEW P1 on the fix-code at round 2 is an owner decision, not round 3: stop and ask, and with no user to ask, do not merge and do not open round 3.
-
-**Findings are CLAIMS TO VERIFY, not orders.** Check each against the code
-before fixing it. A reviewer looking at a diff without the surrounding system
-can be confidently wrong, and "the reviewer said so" is not evidence.
-
-**Findings are a SAMPLE, not a to-do list.** Name the CLASS each belongs to,
-enumerate the full population programmatically, and fix the population. Fixing
-exactly what was named is how a review loop runs away — the next round finds the
-sibling you did not look for.
 
 **Reply in-thread to every finding, including the ones you reject.** An
 unanswered finding blocks the gate even when the code is already fixed —
 observed on PR #1541. A reasoned rejection is a valid resolution; silence is not.
+The gate clears a finding from the score only when a MAINTAINER account replied
+IN ITS THREAD: it reads `in_reply_to_id` from `pulls/N/comments`.
+`gh pr comment N --body ...` creates an ISSUE comment, which has no
+`in_reply_to_id` and answers nothing however thorough it is. Use:
+
+    gh api repos/<owner>/<repo>/pulls/<N>/comments \
+      -f body='verified and fixed at <sha>: …' -F in_reply_to=<comment_id>
+
+(comment ids from `gh api repos/<owner>/<repo>/pulls/<N>/comments`.) MEASURED
+2026-09-09: switching to this form took two PRs from `inline-findings: BLOCK` to
+`ok` with NO code change; 4 findings on #1847 and 5 on #1836 had been fixed for
+hours and still scored, because every reply was top-level. A score that will not
+fall while you are certain you fixed everything is this symptom; reach for this
+before you reach for an override. Two kinds of finding have no thread and cannot
+be engaged this way: one delivered in a review BODY rather than inline, and
+anything a locally-run secondary reviewer raised. Document those in the PR body.
 
 **The round budget is evaluated BEFORE dispatching the next review**, never
-after reading its findings. A ROUND is a distinct head on the PR that drew
-findings from a GitHub App reviewer (before the cutover in
-`scripts/review_budget.py`, a head Codex reviewed) — that word is reserved for it;
-a clean review confirms a head and adds no round, and a review that lands on a
-commit after one of that commit's descendants was already reviewed is a late
-review of an earlier round, never a round of its own. Your own internal subagent audits are
-AUDIT PASSES: they advance nothing, and no counter sees them, so never report a
-round number you did not get from `scripts/review_budget.py`. Reaching the
-budget CONSUMES standing approval — a prior "keep going until it's green" is
-void once it fires. Post the round ledger and get a fresh decision.
+after reading its findings. Never report a round number you did not get from
+`scripts/review_budget.py`: your own subagent audits are passes, not rounds (the
+definition is in "Review-loop discipline", below). Reaching the budget CONSUMES
+standing approval — a prior "keep going until it's green" is void once it fires.
+Post the round ledger and get a fresh decision.
 
 **ROUND 4 IS TERMINAL** (owner ruling, 2026-09-25). There is no ordinary round
 5. At four rounds the decision is not "another round": it is to MERGE
 with the outstanding issues accepted and filed, or to SEND IT BACK for rework. A
 fifth round exists only by explicit user approval, re-asked every round, and
-each of those is terminal in the same way. On the gate-surface lane the same
+each of those is terminal in the same way (this replaced "round 6 and later are
+strongly discouraged", which read round 5 as ordinary; the discouragement was never a
+softer tier, but the mechanism that stops an authorized fifth round coasting into a
+sixth unasked). On the gate-surface lane the same
 ladder is compressed to two rounds, each carrying two ordinary rounds' work.
 
 Two caveats a closing session needs, because both are live today. The MECHANISM
@@ -547,8 +581,9 @@ every defect-bearing external round with
 PR's worktree when its fix is staged. The streak's stops fire only on rounds that
 were recorded, and a past round cannot be recorded later.
 
-Full mechanics for all three — class enumeration, the two-tier machine gate,
-what counts as a round — are in "Review-loop discipline" below. Do not re-derive them.
+Full mechanics — findings as claims to verify and as a sample of a class, the
+two-tier machine gate, what counts as a round — are in "Review-loop discipline"
+below. Do not re-derive them.
 
 ### 4. The merge gate
 
@@ -652,18 +687,16 @@ Two triggers, two labels:
 Leave it OPEN ("Never RETIRE a PR you are not the one
 reviving", below). A rework comes back as FRESH PR(s) with new numbers, so each
 one's round count is its own (owner rulings 2026-09-24 and 2026-10-05). The
-BUILD session closes the old PR when the LAST replacement opens. Its closing
-comment walks every part of the old PR, file by file, naming the `file:line` in
-a replacement (or on `main`) that now covers it, or saying why that part is
-moot (the superseded-PR exception below, condition 3). If any part is neither, the builder
-leaves the old PR open with a comment naming that part. The old PR keeps its
-label, so the rebuild stays traceable to it. A Devin builder never closes the
-old PR: the closing session does, after the same check ("Devin-built PRs"
-below). Those rulings are the on-record owner authorization (condition 1 of
-the superseded-PR exception below); condition 2 is the open
-replacement, and condition 3 is that `file:line` coverage walk.
+BUILD session closes the old PR when the LAST replacement opens, under the
+superseded-PR exception ("Never RETIRE…", below), whose condition 1 the
+`## Rework spec` comment meets; its closing comment is that exception's
+condition-3 walk, a `file:line` for every part of the old PR. If any part is neither covered nor
+moot, the builder leaves the old PR open with a comment naming that part. The
+old PR keeps its label, so the rebuild stays traceable to it. A Devin builder
+never closes the old PR: the closing session does, after the same check
+("Devin-built PRs" below).
 
-The closing session verifies the mapping against the replacements' diffs.
+The closing session verifies that per-part mapping against the replacements' diffs.
 When it holds, leave the follow-up alone: the `Follow-up:` line in the
 replacement that merges last completes it when the whole rework lands. When a
 part is uncovered and the old PR was closed anyway, reopen it or say so on it,
@@ -704,11 +737,6 @@ This is what lets the owner tell a flawed spec from a flawed build without
 reconstructing either. A form check can confirm that the section exists and
 names a split; only you can judge whether a stated deviation is real. Read the
 diff, not just the section.
-
-A rework rebuilt as a NEW PR has to meet a contract the merge gate checks (the
-`rework` row): the gate blocks a rebuild that lacks a
-`## Rework acknowledgement` comment on the old PR, posted before the new PR
-opened by a maintainer or the Devin bot, or the new PR's `## Rework` section.
 
 ---
 
@@ -1064,42 +1092,6 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   first that fits. The trigger is the concentration of findings on one seam, not
   their count.
 
-- **PR review-findings status = `python3 scripts/hooks/git_push_guard.py --check-pr <N>`
-  — ONLY.** This runs the SAME code path as the merge gate (strict fail-closed: a
-  failed scan is never reported clean). NEVER hand-roll a `gh api pulls/N/comments`
-  query to decide whether a PR is review-clean: a wrong filter's EMPTY result reads
-  exactly like "clean". Origin (2026-08-23, #1431/#1432): Codex authors BOTH its inline
-  findings AND its review-summary body as `chatgpt-codex-connector[bot]` — the REST
-  `user.login`, WITH the `[bot]` suffix. A hand-rolled filter keyed on a DIFFERENT login
-  (the GraphQL app login, which is not the REST login) matched nothing, and 13 real
-  findings (10 P1) were reported to the user as "review-clean" until the merge gate
-  blocked. An empty result from your own query is "my query found nothing", never "no
-  findings exist". Freshness is a SEPARATE gate, and it is NOT a blanket
-  reviewed-SHA-equals-HEAD rule: for a hook-surface or otherwise non-trivial delta a
-  current Codex review must COVER head (reviews-API `commit_id == head`, or a clean
-  Codex signal whose abbreviated id RESOLVES to the head, see the Pre-Merge Gate),
-  but a trivial NON-hook delta may still merge on a stale
-  review — `--check-pr` reports that as `codex-at-head : ok (STALE review of <sha>, delta
-  since is trivial)`, a pass, not a block.
-
-  **And the verdict is a function of the TREE YOU RAN IT FROM.** `--check-pr` is
-  (remote PR state × LOCAL gate code) — it executes the `git_push_guard.py` sitting
-  in your working copy, not the one on `main`. Run from a worktree carrying an
-  unmerged change to the gate, it reports what WOULD be true once that change lands:
-  a correct verification OF THE FIX, and a false statement about the PR. MEASURED
-  2026-09-09: a session reported a peer's PR as one blocker from green on exactly
-  that confusion. So say which tree produced any verdict you pass on, and for a
-  claim about a PR's CURRENT state, run it from a tree at `origin/main`. To bound
-  a verdict you already took, compare the CHECKER ITSELF and its effective policy
-  inputs across the two trees, not main's history: `git diff origin/main --
-  scripts/hooks/git_push_guard.py` (add whichever modules the checker imports),
-  then identify any local configuration that can alter required reviews or CI.
-  Hash the relevant blobs when the effective policy is identical. Reaching for
-  `git log origin/main -- <checker>` instead is the trap — it inspects only what
-  landed on main, so it comes back EMPTY in the exact case that bites you, a
-  worktree carrying an unmerged change to the gate. Empty history is not identical
-  logic. The same reasoning applies to any local checker whose answer is about a
-  remote object.
 - **Hook-surface PRs merge only with a current GitHub Codex review — mechanical.**
   A PR touching the enforcement-hook surface (the guard code itself) gets almost no
   stale-review leniency: the merge gate (1) never classifies a post-review delta that
@@ -1283,17 +1275,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `review_budget.evaluate_evidence`; read those, not this paragraph, for an edge case.
   Ordinary PRs carry standing authorization through four rounds. Starting with the
   fifth review request or the fix commit after four rounds, every action needs its
-  own native user approval.
-
-  **ROUND 4 IS TERMINAL (owner ruling, 2026-09-25).** There is no ordinary round 5.
-  At four rounds the decision is not "another round" — it is MERGE, with the
-  outstanding issues accepted and FILED, or SEND IT BACK for rework. A fifth round
-  exists only where the owner explicitly authorizes one, and that authorization is
-  re-asked EVERY subsequent round, each of which is equally terminal and faces the
-  same decision. Earlier text here read "round 6 and later are strongly discouraged",
-  which invited a session to treat round 5 as ordinary; the discouragement was never
-  meant as a softer tier but as the mechanism that stops an authorized fifth round
-  coasting into a sixth unasked.
+  own native user approval. Round 4 is terminal (step 3).
 
   This approval is never a shell sigil and is never persisted. `# escalation-ack` still
   serves the local round-3 intervention; `# final-round-accept` is legacy syntax and
@@ -1417,16 +1399,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   reviewer rounds because a standing "proceed once clean" silently carried
   through rounds 4–6.)
 
-  **The Claude Code PR-side hook uses the same shared evaluator.** A review request reads the
-  rounds live from GitHub. Below four ordinary rounds it proceeds under
-  standing authorization. At four or more it emits a native user approval for exactly
-  one request; at five or more its message strongly recommends stopping. API, parse,
-  prefix-resolution, changed-file, or PR-identity uncertainty asks in foreground and
-  denies in autonomous sessions, and so do findings a review's body declares but whose
-  comments were deleted. A clean review comment's abbreviated SHA is resolved against the
-  PR's full commit list, and an ambiguous prefix makes the result unknown.
-  `--check-pr` prints the count as an advisory `rounds` row, with findings per round and
-  a RISING marker; it never moves the verdict.
+  **The Claude Code PR-side hook uses the same shared evaluator**, reading the
+  rounds live from GitHub on each review request; at five or more rounds its
+  approval message strongly recommends stopping. API, parse, prefix-resolution,
+  changed-file or PR-identity uncertainty takes the ask/deny path, and so do
+  findings a review's body declares but whose comments were deleted. A clean
+  review comment's abbreviated SHA is resolved against the PR's full commit list,
+  and an ambiguous prefix makes the result unknown. `--check-pr` prints the count
+  as an advisory `rounds` row, with findings per round and a RISING marker; it
+  never moves the verdict.
 
 - **GATE-FIX LANE** (hook-surface PRs): `.claude/skills/genesis-development/references/gate-fix-lane.md`.
 
@@ -1459,8 +1440,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   replaced the two inline heredocs the PR reimplements, and the literal base-wins
   resolution measured 61 passed → 36 failed / 25 passed, because it deleted the
   PR's own fix on two of its three declared paths.
-- **External review feedback is a set of claims to VERIFY, not orders.** For
-  every bot/external finding: check it against the actual code (its stated
+- **External review feedback is a set of claims to VERIFY, not orders.** A
+  reviewer looking at a diff without the surrounding system can be confidently
+  wrong, and "the reviewer said so" is not evidence. For every bot/external
+  finding, before fixing it: check it against the actual code (its stated
   mechanism may be wrong even when the underlying concern is real — quote the
   disproving file:line), check whether the "fix" breaks existing behavior or
   violates YAGNI, and push back with technical reasoning when it's wrong for
@@ -1496,17 +1479,19 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   engage each on merits: verify it, then fix or consciously accept with a
   stated reason. Merging past unread findings on a "skip review" is a trust
   breach, not obedience. (Origin: #1439 merged past 3 correct Codex P2s.)
-- **"Not blocking" describes the GATE, not the finding — and fixing is usually
-  FREE, so there is no tradeoff to weigh.** The subtler sibling of the rule
+- **"Not blocking" describes the GATE, not the finding — read every one, and
+  know what a fix costs before the owner decides.** The subtler sibling of the rule
   above: there, a waiver was granted; here the gate legitimately passes the
   finding on its own rules, and the pass gets read as "handled".
   MEASURED 2026-09-03 — two correct non-blocking findings merged UNFIXED because
   nobody read them: #1620's P2 (an invalid `wing` raises `ValueError`, and
   `tool_api.py:200-202` maps every exception to HTTP 500, so a caller input error
   reads as a retryable server failure) and #1606's doc-path P1 (merge-gate-findings.md).
-  **Neither cost anything to fix.** A docs-only follow-up commit is
-  review-TRIVIAL: `classify_compare_substantiality` returns `inline` for doc
-  paths at ANY size, and `_classify_post_review_delta` tests the DELTA's files
+  **Neither cost anything to fix** (#1606's anchor was `CHANGELOG.md`, ordinary
+  prose). A docs-only follow-up commit is
+  review-TRIVIAL: `classify_compare_substantiality` returns `inline` for
+  ordinary prose doc paths at ANY size (a skill, agent or command file is a
+  prompt surface, and a delta touching one is `substantial`), and `_classify_post_review_delta` tests the DELTA's files
   rather than the PR's — so a CHANGELOG-only fix stays trivial even on a
   hook-surface PR (verified: CHANGELOG-only → `inline`; a 1-line guard change →
   `substantial`). So it costs zero CODEX rounds — but not zero blocks, and the
@@ -1519,39 +1504,18 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `code-review` back via `merge_gate.required_scheduled_reviews` budgets one
   more: that kind has no ancestor relief, so the push invalidates its marker and
   the gate blocks until a fresh scheduled review lands at the new head.
-  So: read every finding the report prints, fix the cheap ones, then merge.
-  The read is what the standing merge-when-green policy is buying — a gate
-  verdict of `ok` is not a report that there is nothing there.
+  So: read every finding the report prints. A finding you accept as real is
+  fixed with the owner's yes, or filed (step 3, owner rule 2026-10-04, #2907);
+  the costs above are what that decision weighs, and a fix pushed to a prompt
+  surface buys a new review. The read is what the owner's merge authorization
+  (step 4) is buying — a gate verdict of `ok` is not a report that there is
+  nothing there.
   And the inverse failure is as costly: do NOT escalate a cheap finding into a
   mechanism change. The same session diagnosed its own inattention as a gate
   defect and proposed weighting that would have taxed every PR — *"we'll never
   get anything shipped if that's the standard"* (owner). Before proposing any
   gate change, ask whether the mechanism is broken or you simply did not do the
   work it assumed you would.
-
-### Replying to a finding
-
-**Traps with a real cost, each one measured:**
-
-- **ANSWERING A FINDING TAKES AN IN-THREAD REPLY. A top-level PR comment
-  engages NOTHING.** The gate clears a finding from the score only when a
-  MAINTAINER account replied IN ITS THREAD: it reads `in_reply_to_id` from
-  `pulls/N/comments`, so a reply is matched to the inline comment it answers.
-  `gh pr comment N --body ...` creates an ISSUE comment, which has no
-  `in_reply_to_id` and answers nothing however thorough it is. Use:
-
-      gh api repos/<owner>/<repo>/pulls/<N>/comments \
-        -f body='verified and fixed at <sha>: …' -F in_reply_to=<comment_id>
-
-  (comment ids from `gh api repos/<owner>/<repo>/pulls/<N>/comments`.)
-  MEASURED 2026-09-09: switching to this form took two PRs from
-  `inline-findings: BLOCK` to `ok` with NO code change — 4 findings on #1847 and
-  5 on #1836 had been fixed for hours and still scored, because every reply was
-  top-level. The symptom is a score that will not fall while you are certain
-  you fixed everything; reach for this before you reach for an override.
-  TWO FINDINGS HAVE NO THREAD AT ALL and cannot be engaged this way: one
-  delivered in a review BODY rather than as an inline comment, and anything a
-  locally-run secondary reviewer raised. Document those in the PR body.
 
 ## When to DRIVE a Merge (standing user rule, 2026-09-05)
 
@@ -1567,13 +1531,12 @@ justified ONLY when:
 - the user asks for that PR by name.
 
 Three things are NEVER driving — they stay mandatory. They bind **whichever
-session currently OWNS the PR**, which is not always the one that wrote it:
-under "Where your session ENDS" (build-session) (owner ruling, 2026-09-14) a BUILD
-session's ownership ends when the PR opens, and the closing/review session that
-picks the queue up owns them from there. So "answered before you stop" means
-answered by whoever holds the item when the finding arrives — it does not reach
-back and re-attach a review loop to a build session that has already handed
-off. A finding landing on a PR nobody holds is the drain's intake, not a
+session currently OWNS the PR**, which is not always the one that wrote it: once
+it opens, that is the closing/review session that picks the queue up, not its
+builder ("Where your session ENDS", build-session; owner ruling, 2026-09-14). So
+"answered before you stop" means answered by whoever holds the item when the
+finding arrives; it does not reach back and re-attach a review loop to a build
+session. A finding landing on a PR nobody holds is the drain's intake, not a
 builder's debt.
 
 - **Answering.** Findings received while you are present are answered before
@@ -1582,8 +1545,7 @@ builder's debt.
   you have begun is FINISHED, not "chased": answered, pushed, re-review
   triggered — never abandoned half-answered.
 - **Closing a green PR.** A PR already fully green at head is past baking:
-  merging it under the standing pre-approval (or asking, where none exists)
-  is closing, not driving — green DECAYS with base drift and head-freshness
+  merging it under the owner's authorization (step 4) is closing, not driving — green DECAYS with base drift and head-freshness
   rules, so a cleared gate is a now-or-re-earn asset.
 - **The stopping handoff.** A session that stops while its own PR has any
   gate un-green creates a `ready` follow-up naming the PR and the event it
@@ -1618,14 +1580,15 @@ MEASURED across the 65 open `fix`/`feat` PRs on this repo, 2026-09-10:
 | `fix` | 35 | 804 | 29% | 66% | 2.77 |
 
 Chained to the round data: **86% of PRs over 1,000 lines reach 3+ Codex rounds,
-against 6% under 200.** So the mechanism is `feat` → bigger → more rounds → more
-of the maintainer's conscious decisions consumed, because past the escalation cap
-every additional round costs a fresh human sign-off.
+against 6% under 200.** So the likely mechanism is `feat` → bigger → more rounds
+→ more of the maintainer's conscious decisions consumed, because past the
+escalation cap every additional round costs a fresh human sign-off; that chain is
+an association, and causation is not established (#1925).
 
 **The honest limit, which changes how to apply this.** The findings-score gap is
 modest (3.00 vs 2.77; 77% vs 66% blocked), so *"feats attract more findings per
-se"* is WEAKLY supported. *"Feats are bigger, and size drives rounds"* is
-STRONGLY supported. The rule is therefore the SIZE axis wearing a `feat:` prefix
+se"* is WEAKLY supported. *"Feats are bigger"* is measured, and size is STRONGLY
+ASSOCIATED with rounds (86% vs 6%); causation is not established. The rule is therefore the SIZE axis wearing a `feat:` prefix
 — which means **a small feat is not deprioritised, and a 2,000-line fix does not
 get a pass.** Read the diffstat, not the prefix; a rule keyed on the prefix
 rather than on the property would be wrong on exactly the cases where the
@@ -1698,7 +1661,7 @@ Route every finding by ONE question — **does the PR work without this fixed?**
 
 - **No, the PR is broken without it** → fix it in this PR. The builder session
   should have caught it, and shipping a PR that cannot function is not a merge.
-- **Yes, the PR works** → **file a GitHub issue and merge the PR.** Do not grow
+- **Yes, the PR works** → **file a GitHub issue; the PR proceeds to step 4.** Do not grow
   the diff, do not open a discussion, do not park it in a reply and move on.
 
 **No per-instance approval to file.** Do NOT ask — asking each time was the
@@ -1780,16 +1743,8 @@ open PR's own head just returns that PR:
 gh api repos/<owner>/<repo>/commits/<sha-on-main>/pulls --jq '.[] | "\(.number) \(.state)"'
 ```
 
-**A second, separate question: is the tree you are standing in at the PR's
-head?** A worktree created from a branch NAME sits wherever that ref pointed
-when it was created. That check is already specified — with the fetch it needs,
-the `main`-ancestry companion, and the reasons a ref comparison alone is not
-enough — in the `closing-session` skill under *Establish freshness by comparing
-REFS*, and in **Date the code before classifying a red** (build-session). Use those; do
-not re-derive a shorter version here. Note also that `rev-parse HEAD` is blind
-to uncommitted edits, so check `status --porcelain` too.
-
-MEASURED 2026-09-15, one worktree, the cost of skipping it: a tree four commits
+MEASURED 2026-09-15, one worktree, the cost of skipping the §0 head check (and
+build-session, "Date the code before classifying a red"): a tree four commits
 behind its PR head produced a CRITICAL finding, a full adversarial audit, a
 public issue, a commit and review evidence — all describing a defect the branch
 had already fixed in a commit that tree could not see. The same audit declared
@@ -1803,23 +1758,13 @@ Re-read the head before writing it down, and certainly before filing it
 publicly. That check is cheap and unconditional; the judgement about whether a
 finding is "too good" is not, which is why the action does not depend on it.
 
-**A subagent inherits your staleness silently** — point an audit at a worktree
-path and it will measure that tree with complete confidence. Put the head SHA in
-the dispatch prompt and ask it to verify the match first.
-
-**When a PR IS superseded: name the successor in a comment.** Leave it open
-unless all three conditions of the superseded-PR exception in *Never RETIRE a PR
-you are not the one reviving* above hold: owner-authorized supersession, the
-successor open or merged, and a per-file check showing it superseded in every
-part. Do not "rebase and revive" it either; that is how the same change lands
-twice.
+**When a PR IS superseded: name the successor in a comment**, and retire it only
+under the superseded-PR exception above; do not "rebase and revive" it; that is how the same change lands twice.
 
 ## Pre-Merge Gate
 
-> **This is closing-session territory.** A build session's work ends when the PR
-> is open (build-session, "Where your session ENDS"); driving it through this
-> gate is this skill's job, and the mechanics below are the authority.
-> Read on when you are the one at the gate.
+The mechanics in this section, with the step-2 rows they cite, are the
+authority over any summary of them elsewhere in this skill.
 
 **Canonical pre-merge check:** run
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
@@ -1856,42 +1801,23 @@ findings below, a gated `gh pr merge`:
   TOCTOU defense); the `--check-pr` command supplies this;
 - requires Codex to have reviewed the **current head** — Codex does NOT auto-review
   a later fix-commit, so comment `@codex review` and wait after any push.
-  **A clean Codex signal counts only when its id RESOLVES to the head.** Codex posts
-  NO review object when it finds nothing; its word on a clean head is a comment — a
-  clean re-review ("Codex Review: Didn't find any major issues. … **Reviewed
-  commit:** `<sha>`") or a `✅ Completed` Code Review row in its PR summary comment
-  (on PR open, often the only signal: #2418). Both name the commit by an ABBREVIATED
-  id, and a prefix that merely MATCHES the head binds nothing — the head is whatever
-  the branch's author pushed (#2487). So the gate resolves the id repo-wide via
-  `GET repos/{owner}/{repo}/commits/{short}` and accepts it only when GitHub resolves
-  it to exactly the PR head; a 422 (ambiguous or unknown) refuses it. Matching the
-  head implies the commit is the PR's. The comment must be the Codex Bot's, no Codex
-  review object (any state) may sit at the head, and no Codex issue comment on the PR
-  may carry findings (Codex usually files findings as a review object, but MEASURED
-  on 2 of 339 PRs it posted them as a `💡` issue comment with none). Any non-Codex edit
-  or deleted edit revision on any Codex comment permanently refuses clean signals;
-  the block names the editor when available. Edit-history completeness is required
-  only for Codex Bot comments; unrelated comments' edit data is ignored. History
-  veto covers head force-push, head-branch deletion or restoration, and base changes.
-  A base change stays a veto because the clean signal names the head, not the base
-  Codex reviewed against; retargeting changes the effective diff without moving the
-  head. A base force-push is retired: merging requires the default base, whose
-  ruleset forbids force-push and deletion, so a force-pushed non-default base can
-  reach a merge only through a base change, which vetoes. All 541 commits dropped
-  by 191 force-pushes still resolve repo-wide by 7-hex id, so dropped head commits
-  are not the binding risk.
-  A branch or tag exactly named after a short id can shadow GitHub's commit lookup
-  (which uses git name-guessing rules); measured `pull/2720/head` and `main` resolve.
-  Creating a shadow ref needs base-repo push rights, held only by the owner, and no
-  hex-named ref exists; fork authors cannot create one. A deleted comment leaves no
-  trace in the API. The block message says which clean signal it read and why it was
-  refused, and when no later clean signal can count it says a finding-free re-review
-  cannot help. `--check-pr` labels a pass from the gate's own record for its verified
-  head; a subsequent head move is stated without relabeling the original pass, while
-  merge-with stays bound to that verified head. When the signal does not resolve,
-  the routes are an owner-approved `# substitute-review` on another reviewer's review
-  at that exact head, or a conscious
-  `# stale-review-override` (which on the hook surface also needs fallback evidence).
+  **A clean Codex signal counts only when its id RESOLVES to the head** (the rules
+  the gate applies are the `ok (clean signal at head: …)` row and its neighbours,
+  step 2). Codex posts NO review object when it finds nothing; its word on a clean
+  head is a Codex Bot comment — a clean re-review ("Codex Review: Didn't find any
+  major issues. … **Reviewed commit:** `<sha>`") or a `✅ Completed` Code Review
+  row in its PR summary comment (on PR open, often the only signal: #2418). Both
+  name the commit by an ABBREVIATED id, and a prefix that merely MATCHES the head
+  binds nothing — the head is whatever the branch's author pushed (#2487). A Codex
+  review object in ANY state at the head refuses it, and so does a Codex issue
+  comment carrying findings (Codex usually files findings as a review object, but
+  MEASURED on 2 of 339 PRs it posted them as a `💡` issue comment with none).
+  GitHub's commit lookup uses git name-guessing rules (measured: `pull/2720/head`
+  and `main` resolve), which is why a hex-named ref could shadow it; fork authors
+  cannot create one. When the signal does not resolve, the routes are an
+  owner-approved `# substitute-review` on another reviewer's review at that exact
+  head, or a conscious `# stale-review-override` (which on the hook surface also
+  needs fallback evidence).
   **Smart-delta narrowing:** a STALE review passes anyway when the unreviewed
   delta (`reviewed...head` via the compare API, classified by `review_scope`
   substantiality) is provably review-trivial (docs-only / a small single-file
@@ -1977,22 +1903,20 @@ findings below, a gated `gh pr merge`:
   accepted and the one without it was silently refused. Without the verdict line a clean
   review can be rejected on wording alone;
   Fail-closed: an unreadable comments/reviews fetch BLOCKS (never a false all-clear);
-- requires the PR base to equal the repo's default branch (retarget guard);
-- blocks unless mergeability is a definite `MERGEABLE` (a failed/unknown read
-  does not merge).
-- **the CI gate** blocks red/pending checks; and — on the canonical public repo,
-  where CI always runs — an `absent` CI state (a readable EMPTY check set = CI
-  never ran, the tell of a conflicting branch or a dropped `pull_request` trigger)
-  also blocks, so an un-CI'd PR can't merge. Likewise `incomplete` (a NON-empty
-  rollup whose present checks are green but a REQUIRED workflow contributed no
-  verdict — e.g. a lone green CodeQL after a workflow-specific trigger drop, or a
-  fully-SKIPPED suite): the required identity is the rollup `workflowName`, config
-  driven via `merge_gate.required_ci_workflows: [<names>]` in local `genesis.yaml`
-  (default `CI`; fail-closed to the default on any malformed/empty config — there
-  is no disable value). An UNREADABLE CI read (`unknown`) fails OPEN, and off the
-  canonical repo `absent`/`incomplete` fail open too (another repo may
-  legitimately have no CI, or a differently-named suite). Waive with
-  `# ci-override` (never `--admin`).
+- requires the default base and a definite `MERGEABLE` (the `base-branch` and `mergeable` rows, step 2);
+- **the CI gate** (the `ci` rows, step 2): `absent` is a readable EMPTY rollup;
+  `incomplete` is a NON-empty rollup
+  whose present checks are green but a REQUIRED workflow contributed no verdict
+  (e.g. a lone green CodeQL after a workflow-specific trigger drop, or a
+  fully-SKIPPED suite). The required identity is the rollup `workflowName`, set by
+  `merge_gate.required_ci_workflows: [<names>]` in local `genesis.yaml` (default
+  `CI`; there is no disable value). A malformed or empty config takes the DEFAULT,
+  not "fail closed": `("CI",)` is narrower than an install that declared more, so
+  it is a relaxation, and it prints a NOTE when the key is present in `genesis.yaml` (#1903). An UNREADABLE CI read
+  (`unknown`) fails OPEN, unlike mergeable `UNKNOWN`. Off the canonical repo
+  `absent`/`incomplete` fail open too (another repo may legitimately have no CI,
+  or a differently-named suite). Waive with `# ci-override`
+  (never `--admin`).
 - **Override sigils are split by boundary** — `# review-override` waives ONLY the
   finding scans (review-body + inline P1s); `# scheduled-review-override` waives
   ONLY the scheduled-Claude-review gate; CI is `# ci-override`. Append several in
@@ -2011,24 +1935,19 @@ findings below, a gated `gh pr merge`:
   silently disarm an unrelated gate", and listed this sigil as waiving "ONLY"
   the review-context gates. Both were false of this one sigil.
 - **`# substitute-review` is the NARROW Codex stand-in** (owner standing order,
-  2026-09-24). When Codex has not reviewed the head, a NON-dismissed,
-  NON-pending review by another GitHub App reviewer (any, such as Devin or
-  CodeRabbit, except the PR's own workflow bot and CodeQL) whose `commit_id` is EXACTLY the head
-  satisfies the Codex freshness check. The owner approves each use IN
-  CONVERSATION before you add the sigil — the sigil is the record of that yes, so
-  never add it without asking (owner ruling 2026-09-24, which replaced a native
-  permission prompt the first version raised). The gate prints a NOTE naming the
-  stand-in and marks its override-log row `codex-freshness:used`; a dispatched
-  session is refused, since nobody there can have approved it. Every other gate
-  still applies. Unlike `# stale-review-override` it keeps the base-branch check and
-  the `--match-head-commit` binding (labelled with the reviewer that verified the
-  head), so no fallback-evidence file is needed on this path. Only a review
+  2026-09-24; who qualifies, the owner's yes and the dispatched-session refusal
+  are in the `codex-at-head` rows, step 2). The stand-in review must be
+  NON-dismissed and NON-pending with `commit_id` EXACTLY the head, and only a
   record with a BODY counts: an empty-body record at head is the wrapper GitHub
-  makes when the bot replies inside a thread, not a review of the head. With
-  both sigils present, `# stale-review-override` wins and the stand-in is never
-  used — it is already the broader waiver. `--check-pr` says when a stand-in exists:
-  `codex-at-head : BLOCK — … — substitute available: <reviewer> reviewed this
-  head`. Codex remains the official reviewer; this exists for its outages.
+  makes when the bot replies inside a thread, not a review of the head. Asking in
+  conversation replaced a native permission prompt the first version raised
+  (same ruling). The gate prints a NOTE naming the stand-in and marks its
+  override-log row `codex-freshness:used`; every other gate still applies, and
+  the `--match-head-commit` binding is labelled with the reviewer that verified
+  the head, so no fallback-evidence file is needed on this path. With both sigils
+  present, `# stale-review-override` wins and the stand-in is never used — it is
+  already the broader waiver. Codex remains the official reviewer; this exists
+  for its outages.
 
 The review-findings gate specifically:
 
@@ -2087,9 +2006,6 @@ The review-findings gate specifically:
    requires the exact base-and-head fallback-review evidence described above — or
    an owner-approved `# substitute-review` resting on another reviewer's review
    at that exact head.
-   ⚠ This item previously read "no review comments at all (quota exhausted) →
-   merge allowed on CI alone", which is FALSE and contradicted the Pre-Merge Gate
-   section above ("an ABSENT review always blocks") four hundred lines earlier.
    A quota message is evidence about ONE channel at ONE moment, never a licence
    to merge unreviewed — re-trigger and check the INLINE endpoint.
 5. **Override**: Append `# review-override` to the merge command to
@@ -2109,17 +2025,13 @@ The review-findings gate specifically:
    `gh repo view --json nameWithOwner --jq .nameWithOwner` — NEVER hardcode
    it (configs name several repos; the working repo is not the org default).
    A **404 from that endpoint means WRONG SLUG or PR number, never "no
-   findings"** — a clean PR returns `[]`. The merge-gate hook blocks on a P1 or a
-   CodeRabbit Critical/Major OUTRIGHT (the always-fix floor), and otherwise on the
-   weighted inline SCORE against this change's LANE threshold — so two unresolved
-   P2s block a CRITICAL change, while ordinary code takes four (full table in the
-   Pre-Merge Gate section above). Unread P2s no longer slip through in pairs on the
-   surface where that mattered (2026-07-10: 8 real P2s on the entity-layer PRs
-   merged past the OLD P1-only gate, the exact gap this score closes). Note what it
-   does NOT close, and do not read it as more than it is: a LONE P2 still passes
-   unread, which is how #1620's HTTP-500 finding merged (2026-09-03), and on an
-   ordinary change three now do. The score bounds what the gate stops; only reading
-   the report stops the rest — which is exactly why the gate prints a NOTE naming
+   findings"** — a clean PR returns `[]`. The lane score (item 3) means unread
+   P2s no longer slip through in pairs on the surface where that mattered
+   (2026-07-10: 8 real P2s on the entity-layer PRs merged past the OLD P1-only
+   gate, the exact gap this score closes). It does NOT close a LONE P2, which
+   still passes unread — how #1620's HTTP-500 finding merged (2026-09-03) — and on
+   an ordinary change three now do. The score bounds what the gate stops; only
+   reading the report stops the rest, which is why the gate prints a NOTE naming
    the lane and threshold whenever a non-zero score passes under one. And the two
    channels are INDEPENDENT: Codex can post a quota/usage-limit message as an
    ISSUE comment while a later `@codex review` trigger delivers real inline
@@ -2128,28 +2040,22 @@ The review-findings gate specifically:
    check the INLINE endpoint before concluding quota-limited (2026-08-26: #1484's
    real P2 arrived inline while the issue-comment channel still showed only the
    earlier quota message).
-8. **A CONFLICTING PR silently suppresses the whole CI suite.** When a PR
-   has a merge conflict with main, GitHub cannot build the merge ref, so
-   `pull_request`-triggered workflows (the entire ci.yml suite) never run —
-   while CodeQL still passes on the head SHA, making the check list LOOK
-   green. A thin check list (only Analyze/CodeQL) means CHECK
-   `gh pr view N --json mergeable` — `CONFLICTING` needs the base branch merged
-   in before any CI verdict exists at all (2026-07-16: #1089 sat
-   conflict-suppressed through three pushes; main had moved under it via
-   concurrent sessions). Since #1484 the merge gate ENFORCES this class
-   mechanically on the canonical repo: a fully-empty rollup reads `ci: absent`
-   and blocks, and a thin/partial rollup missing the required CI workflow reads
-   `ci: incomplete` and blocks (see the CI-gate bullet above) — the trap text
-   stays because the DIAGNOSIS (check `mergeable` first) is still the fastest
-   route to the cause.
+8. **A CONFLICTING PR silently suppresses the whole CI suite** (the `mergeable`
+   row, step 2): GitHub cannot build the merge ref, so the `pull_request`
+   workflows never run while CodeQL still passes on the head, and the thin list
+   LOOKS green. A thin check list (only Analyze/CodeQL) means CHECK `gh pr view N --json mergeable`:
+   `CONFLICTING` needs the base branch merged in before any CI verdict exists
+   (2026-07-16: #1089 sat conflict-suppressed through three pushes as main moved
+   under it). Enforced since #1484 on the canonical repo: `ci: absent`
+   or `ci: incomplete` blocks.
 
    Three corollaries, each measured 2026-09-08 and each costing a wrong diagnosis:
 
-   - **`UNKNOWN` suppresses it too, not just `CONFLICTING`.** GitHub recomputes
-     mergeability lazily, and EVERY merge to main invalidates it repo-wide — so
-     right after a merge batch the whole queue reads `UNKNOWN` and its CI looks
-     missing. That is also why a merge gate refuses with "mergeable status is
-     'UNKNOWN'": wait and re-read rather than concluding anything.
+   - **`UNKNOWN` suppresses it too.** EVERY merge to main invalidates
+     mergeability repo-wide (recomputed lazily), so after a merge batch the whole
+     queue reads `UNKNOWN` and its CI looks missing: wait and re-read. That is also
+     why a merge gate refuses with "mergeable status is UNKNOWN": it is a recompute
+     in progress, not a conclusion.
    - **A PR opened against a NON-DEFAULT base never ran CI at all**, because
      `ci.yml` filters `on: pull_request: branches: [main]` — the filter is on the
      BASE. Retargeting it to main afterwards fires nothing: the default
