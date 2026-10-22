@@ -463,7 +463,7 @@ class SerializedConnection:
                     raise
 
     def _capture_lock_holders(self, exc: Exception, *, attempts: int, backoff_s: float) -> str:
-        """Schedule a record of WHO held the lock; return the log text for it.
+        """Schedule sampled lock evidence; return the log text for it.
 
         Awaits nothing (the caller holds ``self._lock``, so it must not wait on
         /proc or the disk here) and never raises; see ``lock_holders``."""

@@ -100,6 +100,7 @@ def test_holders_match_by_inode_and_flag_device_mismatch(tmp_path):
         "label": "proc4242",
         "self": False,
         "file": "shm",
+        "type": "POSIX",
         "access": "WRITE",
         "lock": "writer",
         "range": [120, 120],
@@ -109,6 +110,35 @@ def test_holders_match_by_inode_and_flag_device_mismatch(tmp_path):
     mine = next(h for h in result["holders"] if h["pid"] == os.getpid())
     assert mine["self"] is True and mine["label"] == "self"
     assert result["writer_pids"] == [4242]
+
+
+def test_writer_candidates_require_owned_posix_write_ranges(tmp_path):
+    db = _db_files(tmp_path)
+    inode = os.stat(f"{db}-shm").st_ino
+    extra = (
+        f"6: POSIX ADVISORY READ 9001 ff:ff:{inode} 120 120\n"
+        f"7: POSIX ADVISORY WRITE 9002 ff:ff:{inode} 120 122\n"
+        f"8: -> POSIX ADVISORY WRITE 9003 ff:ff:{inode} 120 122\n"
+        f"9: POSIX ADVISORY WRITE 9004 ff:ff:{inode} 121 122\n"
+        f"10: OFDLCK ADVISORY WRITE -1 ff:ff:{inode} 120 120\n"
+        f"11: FLOCK ADVISORY WRITE 9005 ff:ff:{inode} 0 EOF\n"
+        f"12: POSIX ADVISORY WRITE 9006 ff:ff:{inode} 0 119\n"
+        f"13: POSIX ADVISORY WRITE 9007 ff:ff:{inode} 120 EOF\n"
+    )
+    result = lock_holders.holders_for(db, _locks_for(db, extra), label=lambda pid: "test")
+    assert result["writer_pids"] == [4242, 9002, 9007]
+    # Ineligible writer candidates remain available as raw diagnostic evidence.
+    rows = {h["pid"]: h for h in result["holders"]}
+    assert rows[9001]["access"] == "READ"
+    assert rows[9001]["type"] == "POSIX"
+    assert rows[9002]["range"] == [120, 122]
+    assert rows[9003]["waiting"] is True
+    assert rows[-1]["range"] == [120, 120]
+    assert rows[-1]["type"] == "OFDLCK"
+    assert rows[9005]["range"] == [0, None]
+    assert rows[9005]["type"] == "FLOCK"
+    assert rows[9006]["range"] == [0, 119]
+    assert rows[9007]["range"] == [120, None]
 
 
 def test_retention_uses_the_public_prune_helper(tmp_path, monkeypatch):
@@ -140,8 +170,19 @@ def test_capture_reports_unreadable_lock_table(tmp_path, monkeypatch):
     monkeypatch.setattr(lock_holders, "_PROC_LOCKS", str(tmp_path / "missing"))
     snap = lock_holders.capture(db)
     assert snap["readable"] is False
-    assert "missing" in snap["error"]
+    assert "missing" in snap["lock_table_error"]
     assert snap["holders"] == []
+
+
+@pytest.mark.parametrize("error", ["SQLITE_BUSY", "SQLITE_BUSY_SNAPSHOT", None])
+def test_unreadable_table_preserves_the_original_sqlite_error(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(lock_holders, "_PROC_LOCKS", str(tmp_path / "missing"))
+    target = tmp_path / "snapshot.json"
+    lock_holders.capture_and_write(target, tmp_path / "scratch.db", {"error": error})
+    data = json.loads(target.read_text())
+    assert data["error"] == error
+    assert data["readable"] is False
+    assert "missing" in data["lock_table_error"]
 
 
 @pytest.fixture
@@ -199,7 +240,7 @@ def test_child_holding_begin_immediate_is_reported_as_writer(tmp_path):
         assert child.stdout.readline().strip() == "ready"
         snap = lock_holders.capture(db)
         if not snap["readable"]:
-            pytest.skip(f"/proc/locks unreadable here: {snap['error']}")
+            pytest.skip(f"/proc/locks unreadable here: {snap['lock_table_error']}")
         if not snap["holders"]:
             pytest.skip("no /proc/locks line matched the database files here")
         assert child.pid in snap["writer_pids"], snap

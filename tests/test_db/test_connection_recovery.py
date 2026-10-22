@@ -7,6 +7,7 @@ Reconnect-after-N still works, at episode granularity.
 """
 
 import sqlite3
+from pathlib import Path
 
 import aiosqlite
 import pytest
@@ -236,7 +237,7 @@ async def test_exhaustion_schedules_one_capture_per_window(locked_conn, caplog):
     assert "not captured (rate-limited)" in giving_up[1]
     assert "cancelled_statement" not in context  # always null at exhaustion: dropped
     # The SQLite error kind and this connection's transaction state are recorded:
-    # SQLITE_BUSY_SNAPSHOT fails with no holder, and retries can never fix it.
+    # SQLITE_BUSY_SNAPSHOT rejects a stale read snapshot; retrying it is insufficient.
     assert context["error"] == "SQLITE_BUSY"
     assert context["in_transaction"] is False
 
@@ -261,6 +262,49 @@ async def test_exhaustion_survives_a_failing_capture(locked_conn, monkeypatch, c
             await lc.sc.execute("SELECT 1")
         await lc.settle()
     assert any("lock-holder snapshot failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_snapshot_rate_limit_uses_the_registered_database_identity(locked_conn, monkeypatch):
+    from genesis.db import lock_holders
+
+    lc = locked_conn
+    original = lc.sc._db_path
+    alias = original.with_name("alias.db")
+    alias.symlink_to(original)
+    monkeypatch.chdir(original.parent)
+    spellings = [original, alias, Path(original.name)]
+    connections = [lc.sc, *[
+        SerializedConnection(lc.sc._conn, db_path=path) for path in spellings[1:]
+    ]]
+    results = [
+        lock_holders.schedule_capture(conn, error="SQLITE_BUSY", attempts=1, backoff_s=0)
+        for conn in connections
+    ]
+    await lc.settle()
+    assert len(lc.calls) == 1
+    assert results[0][0] is not None
+    assert all(target is None and "rate-limited" in text for target, text in results[1:])
+
+
+async def test_missing_registered_identity_skips_without_spending_a_window(locked_conn):
+    from genesis.db import lock_holders
+
+    lc = locked_conn
+    with lock_holders._connections_lock:
+        entry = lock_holders._connections.pop(lc.sc)
+    target, text = lock_holders.schedule_capture(
+        lc.sc, error="SQLITE_BUSY", attempts=1, backoff_s=0,
+    )
+    await lc.settle()
+    assert target is None and "identity unavailable" in text
+    assert not lc.calls
+    with lock_holders._connections_lock:
+        lock_holders._connections[lc.sc] = entry
+    target, _ = lock_holders.schedule_capture(
+        lc.sc, error="SQLITE_BUSY", attempts=1, backoff_s=0,
+    )
+    await lc.settle()
+    assert target is not None and len(lc.calls) == 1
 
 
 async def test_exhaustion_survives_a_failing_schedule(locked_conn, monkeypatch, caplog):
@@ -450,6 +494,8 @@ async def test_exhaustion_with_unreadable_lock_table_still_writes(
     data = json.loads(files[0].read_text())
     assert data["readable"] is False
     assert data["statement"] == "SELECT 1"
+    assert data["error"] == "SQLITE_BUSY"
+    assert "no-such-locks" in data["lock_table_error"]
 
 
 async def test_disabled_env_skips_capture(locked_conn, monkeypatch, caplog):

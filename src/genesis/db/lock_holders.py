@@ -1,10 +1,13 @@
-"""Who held a SQLite database's locks when a write gave up.
+"""SQLite lock-failure context and later kernel lock-table evidence.
 
 ``SerializedConnection._retry_locked`` logs ``DB lock persisted through N
 attempts … giving up`` when a lock outlives its retry budget. That line says a
-lock was held, never by whom, and by the time anyone reads it the holder has
-usually let go. This module records the holders at that moment, from the
-kernel's lock table (``/proc/locks``), into a JSON file the warning names.
+lock was held, never by whom. This module records local connection context
+when capture is scheduled, then samples the kernel lock table (``/proc/locks``)
+on a worker. The two readings are not atomic: a writer can release its lock or
+a different writer can acquire one before the kernel sample. The JSON file
+named by the warning supplies evidence, not proof of which connection caused
+the original failure. ``taken_at`` timestamps the later kernel sample.
 
 What SQLite's locks look like there (WAL mode, unix VFS, POSIX advisory locks;
 MEASURED on a live install with two processes on a scratch database):
@@ -44,11 +47,12 @@ counts this event loop's tasks by name. Other pids are labelled with
 ``pid_breakdown.process_label`` (argv[0], plus a module or script name; never
 another argument, which can carry credentials).
 
-The snapshot records the SQLite error name (``SQLITE_BUSY``,
-``SQLITE_BUSY_SNAPSHOT``, ...): a BUSY_SNAPSHOT fails at once with no holder at
-all (a read transaction's snapshot is older than the latest commit), and no
-retry can fix it, so an empty holder list then means "no holder", not "the
-holder let go".
+The snapshot preserves the SQLite error name (``SQLITE_BUSY``,
+``SQLITE_BUSY_SNAPSHOT``, ...), separately from ``lock_table_error`` when the
+kernel table is unreadable. BUSY_SNAPSHOT means a stale read transaction;
+retrying it cannot refresh its snapshot, regardless of any concurrent writer.
+``writer_pids`` lists positive-PID, nonwaiting POSIX WRITE locks whose shm
+range includes byte 120; raw rows retain other lock types, readers and waiters.
 
 Statement text is ``_slow_log.sql_label`` (whitespace collapsed, 32-hex names
 collapsed, cut at 120 characters, the full length reported as ``*_chars``);
@@ -264,6 +268,7 @@ def holders_for(
                 "label": labels[pid],
                 "self": pid == me,
                 "file": role,
+                "type": row["type"],
                 "access": row["access"],
                 "lock": decode(role, row["start"], row["end"]),
                 "range": [row["start"], row["end"]],
@@ -273,7 +278,16 @@ def holders_for(
                 "waiting": row["waiting"],
             }
         )
-    writer_pids = sorted({h["pid"] for h in holders if h["lock"] == "writer" and not h["waiting"]})
+    writer_pids = sorted({
+        h["pid"] for h in holders
+        if h["file"] == "shm"
+        and h["type"] == "POSIX"
+        and h["access"] == "WRITE"
+        and h["pid"] > 0
+        and not h["waiting"]
+        and h["range"][0] <= 120
+        and (h["range"][1] is None or h["range"][1] >= 120)
+    })
     return {
         "holders": holders,
         "writer_pids": writer_pids,
@@ -284,7 +298,7 @@ def holders_for(
 
 def capture(db_path: Path) -> dict:
     """Read the lock table and report ``db_path``'s holders. Blocking; never
-    raises for an unreadable table (``readable: false`` and the error)."""
+    raises for an unreadable table (``readable: false`` and ``lock_table_error``)."""
     db_path = Path(db_path)
     snapshot: dict = {
         "taken_at": datetime.now(UTC).isoformat(),
@@ -297,7 +311,7 @@ def capture(db_path: Path) -> dict:
     except OSError as exc:
         snapshot.update(
             readable=False,
-            error=f"{type(exc).__name__}: {exc}",
+            lock_table_error=f"{type(exc).__name__}: {exc}",
             holders=[],
             writer_pids=[],
         )
@@ -366,7 +380,7 @@ def _in_process_connections(this: Any) -> list[dict]:
     Attribute reads only, on the loop thread: no awaits, no I/O."""
     with _connections_lock:
         entries = list(_connections.items())
-    target = _connections.get(this, {}).get("db_path")
+        target = _connections.get(this, {}).get("db_path")
     if target is None:
         return []
     rows: list[dict] = []
@@ -423,7 +437,14 @@ def schedule_capture(
             return None, "not captured (no database path)"
         if os.environ.get(DISABLE_ENV) == "1":
             return None, "not captured (disabled)"
-        key = str(db_path)
+        # Registration already resolved the open connection's identity.
+        # Reuse it for both the rate window and worker without filesystem I/O
+        # here; the original connection/admission path remains untouched.
+        with _connections_lock:
+            db_path = _connections.get(conn, {}).get("db_path")
+        if not isinstance(db_path, str) or not db_path:
+            return None, "not captured (database identity unavailable)"
+        key = db_path
         now = _clock()
         last = _last_capture_at.get(key)
         if last is not None and now - last < _INTERVAL_S:
@@ -435,7 +456,8 @@ def schedule_capture(
             "attempts": attempts,
             "backoff_s": round(backoff_s, 3),
             # SQLITE_BUSY: a holder outlived busy_timeout and the retries.
-            # SQLITE_BUSY_SNAPSHOT: no holder; this read snapshot is stale.
+            # SQLITE_BUSY_SNAPSHOT: this read snapshot is stale; current
+            # holders need not have caused the failure.
             "error": error,
             # The statement that gave up (this connection's own).
             "statement": text,
