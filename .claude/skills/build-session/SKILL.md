@@ -1347,7 +1347,25 @@ Four rules follow, each cheap:
   signal: any reviewer finding that exposes a semantic-modeling gap in a guard
   means STOP and re-architect — never patch the named instance.
 
-  **Decision test (verbatim, apply before shipping any guard):** could a git
+  Git argv is one instance. The class is **any check whose correctness depends on
+  predicting a future event from text available now**. Examples: a filename
+  standing for file identity, a path extension for artifact kind, a flag spelling
+  for whether a command executes, an unresolved prefix for directory containment.
+  A PreToolUse hook runs BEFORE the tool, so by position it must predict. That is
+  what makes the set open, and why each fix moves the boundary onto the next
+  adjacent case (#2255: on #1826, 8 of an audit's 11 findings and all 12 defects
+  across three rounds were this one shape).
+
+  **Decision test (apply before shipping any guard):** a guard may AUTHORIZE
+  (allow or exempt) only on something it has RESOLVED: an inode, a structural
+  parse, or a fact read through a single chokepoint every rule flows through. An
+  exact-form whitelist that fails closed outside its members is a closed set; a
+  regex, prefix, extension or filename standing in for a property is not. If the
+  property cannot be resolved before the event, fail closed and say why, abstain
+  and say so, or check it after the event where it IS resolved (snapshot, then
+  compare); never let an approximation allow. A `deny` or `ask` on an imprecise
+  predicate is a separate case ("Two things keep this from reading as licence",
+  below). For git: could a git
   flag you've never heard of change your guard's verdict? If yes, your claim
   is open-set — redesign to closed-set token claims (exact-form whitelists /
   literal token blocks) or to RECOVERABILITY (snapshot-then-allow, where a
