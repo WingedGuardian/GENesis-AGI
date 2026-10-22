@@ -291,8 +291,8 @@ async def queues(
     # raw total cries wolf on every tick. Mirror the dead_letter raw-vs-stuck
     # split below.
     # A failed query leaves every figure None (key present, value None): a
-    # consumer must never read a depth nobody measured as 0. 0 is set only in
-    # the no-queue branch, where nothing is pending by construction.
+    # consumer must never read a depth nobody measured as 0. The zero
+    # convention applies only when both the database and wrapper are absent.
     deferred_recovery = None
     deferred_worklist = None
     # Worklist items stalled past a full drain cycle: counted in BOTH
@@ -315,6 +315,8 @@ async def queues(
             deferred_worklist_stalled = None
             errors.append("deferred_worklist_stalled: query failed")
             logger.error("Failed to count stalled deferred worklist items", exc_info=True)
+    elif db is not None:
+        errors.append("deferred_work: queue unavailable")
     else:
         deferred = 0
         deferred_recovery = 0
@@ -361,6 +363,8 @@ async def queues(
         except Exception:
             errors.append("dead_letters: query failed")
             logger.error("Failed to query dead letter queue", exc_info=True)
+    elif db is not None:
+        errors.append("dead_letters: queue unavailable")
     else:
         dead = 0
 

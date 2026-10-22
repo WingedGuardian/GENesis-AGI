@@ -151,26 +151,89 @@ class TestSnapshotSplit:
         assert len(result["deferred_items"]) == 2
 
     @pytest.mark.asyncio
-    async def test_queues_snapshot_no_queue_is_zero(self, db):
+    async def test_missing_queue_with_persisted_work_is_unavailable(self, db):
         import importlib
 
-        # The snapshots package re-exports the ``queues`` FUNCTION, which shadows
-        # the submodule on attribute access — import the module object explicitly.
+        from genesis.outreach.morning_report import MorningReportGenerator
+
         qmod = importlib.import_module("genesis.observability.snapshots.queues")
 
+        await _seed_recovery(db, 2)
+        await _seed_worklist(db, 3)
         result = await qmod.queues(db, None, None)
+        for key in (
+            "deferred_work", "deferred_recovery", "deferred_worklist",
+            "deferred_worklist_stalled",
+        ):
+            assert result[key] is None
+        assert "deferred_work: queue unavailable" in result["errors"]
+        assert MorningReportGenerator._format_deferred_line(result) == "- Deferred work: unavailable"
+        assert await crud.count_pending(db) == 5
+
+    @pytest.mark.asyncio
+    async def test_missing_dead_letter_wrapper_does_not_certify_an_empty_queue(self, db):
+        import importlib
+
+        from genesis.db.crud import dead_letter
+        from genesis.outreach.morning_report import MorningReportGenerator
+
+        qmod = importlib.import_module("genesis.observability.snapshots.queues")
+        await dead_letter.create(
+            db, id="missing-wrapper", operation_type="test", payload="{}",
+            target_provider="test", failure_reason="test", created_at=_NOW.isoformat(),
+        )
+        resolve = AsyncMock()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(qmod, "_resolve_dead_letter_alerts", resolve)
+            result = await qmod.queues(db, None, None)
+        assert result["dead_letters"] is None
+        assert "dead_letters: queue unavailable" in result["errors"]
+        report = MorningReportGenerator(AsyncMock(), db, AsyncMock())
+        assert "dead_letters=unavailable" in report._format_health({"queues": result})
+        resolve.assert_not_awaited()
+        assert await dead_letter.count_pending(db) == 1
+
+    @pytest.mark.asyncio
+    async def test_fully_absent_sources_keep_the_zero_convention(self):
+        import importlib
+
+        qmod = importlib.import_module("genesis.observability.snapshots.queues")
+        result = await qmod.queues(None, None, None)
         assert result["deferred_work"] == 0
         assert result["deferred_recovery"] == 0
         assert result["deferred_worklist"] == 0
         assert result["deferred_worklist_stalled"] == 0
+        assert result["dead_letters"] == 0
 
     @pytest.mark.asyncio
-    async def test_failed_deferred_query_leaves_every_split_none(self, db):
+    async def test_present_empty_queues_still_measure_zero(self, db):
+        import importlib
+
+        qmod = importlib.import_module("genesis.observability.snapshots.queues")
+        dead = AsyncMock()
+        dead.get_pending_count.return_value = 0
+        dead.get_stuck_count.return_value = 0
+        result = await qmod.queues(db, _queue(db), dead)
+        assert result["deferred_work"] == 0
+        assert result["deferred_recovery"] == 0
+        assert result["deferred_worklist"] == 0
+        assert result["deferred_worklist_stalled"] == 0
+        assert result["dead_letters"] == 0
+        assert not any("queue unavailable" in error for error in result.get("errors", []))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failed", [
+        "count_pending", "count_recovery_pending", "count_worklist_pending",
+    ])
+    async def test_failed_deferred_query_leaves_every_split_none(self, db, failed):
         import importlib
 
         qmod = importlib.import_module("genesis.observability.snapshots.queues")
         q = AsyncMock()
-        q.count_pending.side_effect = RuntimeError("db unavailable")
+        q.count_pending.return_value = 9
+        q.count_recovery_pending.return_value = 4
+        q.count_worklist_pending.return_value = 5
+        getattr(q, failed).side_effect = RuntimeError("db unavailable")
         q.count_stalled_worklist_pending.return_value = 2  # its own try
         result = await qmod.queues(db, q, None)
         assert result["deferred_work"] is None
