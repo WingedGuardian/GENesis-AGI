@@ -34,7 +34,7 @@ agent_api_bp = Blueprint("agent_api", __name__)
 ROOT = "/v1/agent/a2a"
 
 
-def _err(code, status):
+def _err(code, status, task_id=None):
     states = {
         400: "INVALID_ARGUMENT",
         401: "UNAUTHENTICATED",
@@ -46,6 +46,7 @@ def _err(code, status):
         429: "RESOURCE_EXHAUSTED",
         503: "UNAVAILABLE",
     }
+    extra = {} if task_id is None else {"taskId": task_id}
     response = jsonify(
         error={
             "code": status,
@@ -53,6 +54,7 @@ def _err(code, status):
             "message": "Peer request refused",
         },
         code=code,
+        **extra,
     )
     if status == 401:
         response.headers["WWW-Authenticate"] = "Bearer"
@@ -100,9 +102,22 @@ def _handled(fn):
             return _err(exc.code, exc.status)
         except Exception:
             logger.warning("Peer operation unavailable")
-            return _err("not_ready", 503)
+            return _err("not_ready", 503, _send_task_id())
 
     return _async_route(timeout=15)(wrapped)
+
+
+def _send_task_id():
+    """The receipt id a send computed, for its 503 body; None elsewhere.
+
+    The admission is shielded, so it can outlive a send's timeout or a failure
+    after it returned. Naming the receipt lets the caller poll it or retry with
+    the same messageId instead of starting the work again under a new one. It
+    may still be refused, so a poll can 404.
+    """
+    if request.endpoint != "agent_api.send_message":
+        return None
+    return getattr(g, "peer_task_id", None)
 
 
 @_async_route(timeout=15)
@@ -159,7 +174,7 @@ def _install_gate(state):
             if response.status_code == 503 and not (response.get_json(silent=True) or {}).get(
                 "code"
             ):
-                response = current_app.make_response(_err("not_ready", 503))
+                response = current_app.make_response(_err("not_ready", 503, _send_task_id()))
             if response.is_json:
                 response.mimetype = "application/a2a+json"
             response.headers["A2A-Version"] = "1.0"
