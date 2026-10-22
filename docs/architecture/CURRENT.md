@@ -2984,8 +2984,13 @@ verified: b066be8d2fdc 2026-10-20
   Qdrant); bare arm = `--safe-mode` (the only OAuth-compatible CLAUDE.md
   suppression; `--bare` refuses OAuth) + cleanroom CLAUDE_CONFIG_DIR.
   Task set is PRIVATE (`~/.genesis/eval/bench_tasks_v1.jsonl`; loader
-  refuses in-repo paths). Judge = `bench_task_success` rubric, UNCALIBRATED
-  v1 (every surface stamps `judge_calibrated: false`). Every new
+  refuses in-repo paths). Judge = `bench_task_success` 1.1.0, UNCALIBRATED
+  (every surface stamps `judge_calibrated: false`). Missing or contradicted
+  explicitly required deliverables receive an instructed score ceiling of0.5,
+  below the unchanged0.6 pass threshold; writing quality stays separate.
+  Progress/refusal outcomes retain their task context. This prompt instruction
+  is not deterministic semantic enforcement; old-version references require
+  fresh review. Skill replay shares the rubric. Every new
   genesis-memory tool must be classified in `eval/bench/arms.py`
   (static-AST forcing test). Don't run across Sun 07:30 (J-9 aggregation).
   **A5 read surface** (WS-1 A5): the persisted paired win-rate is readable via

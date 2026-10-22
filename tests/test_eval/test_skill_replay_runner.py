@@ -138,4 +138,5 @@ async def test_report_carries_provenance(tmp_path):
     assert report.skill_name == "voice-master"
     assert report.task_set_version == "fixture_v1"
     assert report.rubric_name == "bench_task_success"
+    assert report.rubric_version == "1.1.0"
     assert report.task_file_sha256  # sha256 recorded for frozen-set provenance
