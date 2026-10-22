@@ -1025,6 +1025,17 @@ async def test_prompt_contract_grounding_rules():
     assert "Protective facts are never risks" in prompt
 
 
+async def test_prompt_contract_windowed_counts_are_history():
+    """MORNING_REPORT.md tells the model a peak or windowed count is history (#3530)."""
+    from genesis.outreach.morning_report import MorningReportGenerator as G
+
+    prompt = G._load_system_prompt()
+    assert prompt is not None
+    assert "Figures in observations are history" in prompt
+    assert "never as the present level" in prompt
+    assert "that observation's claim, not an established fact" in prompt
+
+
 async def test_negated_protection_never_tagged_protective(db, mock_health, mock_drafter):
     """The REAL shipping alert class: 'systemd-oomd … is not enforced' is a
     live risk. Tagging it protective would invert it and — via the prompt

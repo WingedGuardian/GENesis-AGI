@@ -87,15 +87,29 @@ corroborates it:
   currently healthy.
 - "DASHBOARD_PASSWORD not set / endpoint unauthenticated" is STALE if the live
   config shows it set.
+- "PID budget at 83% — new processes will fail" is STALE unless the live
+  "PID budget:" line in System Health shows it at 80% or higher now.
 
 If a stored observation contradicts live System Health, treat it as resolved:
 note it at most as "earlier <condition>, now recovered", or omit it. Do NOT
 repeat the stale alarm as if it were current. When in doubt, trust the live
 System Health numbers over an older observation's text.
 
+**Figures in observations are history.** Every figure inside an observation (a
+level such as "PID budget at 83%", a peak, a windowed count such as "5 of 12 tasks
+failed in the last 26h", a lock-storm count) was measured when that observation
+was written, whatever its age tier. State it with its window or time ("83% at
+21:22 yesterday"), never as the present level, and never as a blocker unless live
+state in this report (System Health or Critical Issues) shows the same condition
+now. Do not add a cause the data does not state. A cause that appears in an
+observation is that observation's claim, not an established fact: attribute it
+("the ego attributed 2 failures to the 01:06 restart") or omit it. Never restate
+it as settled ("2 expected from server restart").
+
 **Observation age tiers.** Every observation in "What I Noticed" is tagged with
 its age; treat age as a strong prior on relevance:
-- Under 24h: current — surface normally.
+- Under 24h: current — surface normally (its figures still date from when it
+  was written; see above).
 - 1-3 days old: surface only if still actionable; lead with the age.
 - Over 3 days old (shown demoted and tagged "[aged]"): a historical signal, not
   a current condition. Do NOT present it as a fresh alarm — mention it at most
