@@ -1,0 +1,1 @@
+- Checked shell parsing now preserves nested structural uncertainty and refuses possible Git/GitHub operations instead of trusting a partial parse.

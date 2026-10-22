@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import inspect
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,15 @@ def _push_blocked(cmd: str) -> bool:
 
 def _commit_nv(cmd: str) -> bool:
     return any(sp.commit_skips_hooks(s.argv) for s in sp.analyze(cmd))
+
+
+def _nested_blind(program: str, tail: str) -> str:
+    payload = f"""echo "$(echo 'a"b')" ; {program} {tail}"""
+    return "bash -c " + shlex.quote(payload)
+
+
+def _nested_script(script: str) -> str:
+    return "bash -c " + shlex.quote(script)
 
 
 # ── pytest-invocation detection (shared by the test guards) ─────────────
@@ -168,6 +178,106 @@ class TestNesting:
 
     def test_backtick_substitution(self):
         assert _push_blocked("echo `git push`")
+
+
+def test_nested_tokenization_failure_is_structural_and_withholds_prefix():
+    command = "echo ok; " + _nested_blind("git", "$ACTION origin feature-x")
+    result = sp._analyze_bounded(command)
+    assert result.bound_reason is None
+    assert result.structural_incomplete is True
+    assert result.diagnostic is sp._BLIND_STRUCTURAL
+    assert any(segment.argv == ["echo", "ok"] for segment in sp.analyze(command))
+    segments, blind = sp.analyze_checked(command)
+    assert segments == []
+    assert blind is sp._BLIND_STRUCTURAL
+
+
+def test_root_tokenization_keeps_legacy_non_bounds_behavior():
+    command = "echo 'a"
+    assert sp.untokenizable(command)
+    segments, blind = sp.analyze_checked(command)
+    assert segments
+    assert blind is sp._BLIND_UNTOKENIZABLE
+
+
+def test_nested_continuation_and_built_escape_are_reported():
+    continued = _nested_script("echo ok # don't\ngit pu\\\nsh origin feature-x")
+    _, continuation = sp.analyze_checked(continued)
+    assert continuation is sp._BLIND_CONTINUATION
+
+    escaped = _nested_script("echo ok # don't\ngit $'pu\\x73h' origin feature-x")
+    _, built = sp.analyze_checked(escaped)
+    assert built is sp._BLIND_BUILT_ESCAPE
+
+
+def test_root_legacy_failure_contrasts_with_nested_structural_failure():
+    script = "echo ok # don't\ngit $ACTION origin feature-x"
+    direct = sp._analyze_bounded(script)
+    assert direct.bound_reason is None
+    assert direct.structural_incomplete is False
+    assert sp.analyze_checked(script)[0]
+
+    nested = _nested_script(script)
+    result = sp._analyze_bounded(nested)
+    assert result.structural_incomplete is True
+    assert sp.analyze_checked(nested) == ([], sp._BLIND_STRUCTURAL)
+    assert sp.unresolved_verb_programs(nested) == frozenset({"git"})
+
+
+def test_built_escape_precedence_keeps_structural_recovery():
+    command = "echo $'\\x41'; " + _nested_script(
+        "echo ok # don't\ngit $ACTION origin feature-x"
+    )
+    result = sp._analyze_bounded(command)
+    assert result.diagnostic is sp._BLIND_BUILT_ESCAPE
+    assert result.structural_incomplete is True
+    assert sp.analyze_checked(command) == ([], sp._BLIND_BUILT_ESCAPE)
+    assert sp.unresolved_verb_programs(command) == frozenset({"git"})
+
+
+def test_supported_nested_control_remains_complete():
+    segments, blind = sp.analyze_checked("bash -c 'echo ok; git push origin feature-x'")
+    assert blind is None
+    assert any(segment.exe == "git" for segment in segments)
+
+
+def test_structural_fact_survives_higher_priority_continuation():
+    command = _nested_blind("git", "$ACTION origin feature-x") + " \\\n  echo done"
+    result = sp._analyze_bounded(command)
+    assert result.diagnostic is sp._BLIND_CONTINUATION
+    assert result.structural_incomplete is True
+    assert sp.analyze_checked(command) == ([], sp._BLIND_CONTINUATION)
+
+
+def test_structural_recovery_adds_only_dispatcher_candidates():
+    assert "git" in sp.unresolved_verb_programs(_nested_blind("git", "$ACTION origin feature-x"))
+    assert "git" in sp.unresolved_verb_programs(
+        _nested_blind("g\\\nit", "$ACTION origin feature-x")
+    )
+    assert "gh" in sp.unresolved_verb_programs(
+        _nested_blind("gh", "pr $GH_ACTION --title x --body y")
+    )
+    assert not sp.unresolved_verb_programs("echo 'a git")
+
+
+def test_proven_root_data_body_is_not_reintroduced_for_recovery():
+    command = "cat <<'EOF'\ngit status documentation\nEOF\n" + _nested_blind("printf", "ok")
+    assert sp.excise_data_heredoc(command) is not None
+    result = sp._analyze_bounded(command)
+    assert result.structural_incomplete is True
+    assert "git status documentation" not in result.decision_text
+    assert "git" not in sp.unresolved_verb_programs(command)
+
+
+def test_length_and_depth_bounds_skip_structural_recovery():
+    long_command = "x" * (sp.MAX_COMMAND_CHARS + 1) + " git $ACTION"
+    assert sp.unresolved_verb_programs(long_command) == frozenset()
+
+    nested = "git $ACTION"
+    for _ in range(sp.MAX_SUBSTITUTION_DEPTH + 1):
+        nested = "bash -c " + shlex.quote(nested)
+    assert sp.over_nested(nested)
+    assert sp.unresolved_verb_programs(nested) == frozenset()
 
 
 # ── override binding ────────────────────────────────────────────────────

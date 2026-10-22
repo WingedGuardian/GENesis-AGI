@@ -281,13 +281,15 @@ _SNAPSHOT_VERBS = frozenset(
 # a 32,000-character command took 4 seconds with it.
 _GIT_WORD = re.compile(r"\bgit\b")
 _HIDDEN_VERB_MSG = (
-    "[git-discard-guard] BLOCKED: this command runs git with a subcommand the "
-    "guard cannot read (a variable, a substitution or an escape stands where it "
-    "goes, or an option before it that the parser cannot classify). It could be "
-    "one that discards uncommitted work, and the guard cannot check or snapshot "
-    "an operation it cannot name. To proceed: write the git subcommand out "
-    "literally, and pass any option the parser does not recognise after it or "
-    "not at all."
+    "[git-discard-guard] BLOCKED: this command may run a git operation whose "
+    "subcommand the guard cannot read or reliably establish (a variable, a "
+    "substitution, an escape, unreadable nested syntax, or an unclassified Git "
+    "global option obscures it). A Git operation may discard uncommitted work, "
+    "and the guard cannot check or snapshot an operation it cannot name. To "
+    "proceed: for an unclassified Git global option, omit it or configure it "
+    "another way; split unreadable compounds into separate commands, "
+    "write the git subcommand out literally, or write prose or script text to a "
+    "file."
 )
 # The submodule gate's word, case-folded: the config KEY is case-insensitive.
 _RECURSE_WORD = re.compile("recurse", re.IGNORECASE)

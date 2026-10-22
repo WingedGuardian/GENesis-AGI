@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -192,6 +193,11 @@ SILENT = [
 @pytest.mark.parametrize(("command", "cwd"), SILENT)
 def test_silent(home: Path, command: str, cwd: str | None) -> None:
     assert _note(_run(home, command, home / cwd if cwd else None)) is None, command
+
+
+def test_nested_blind_delete_stays_silent(home: Path) -> None:
+    command = "bash -c " + shlex.quote("echo ok # don't\nrm -rf ~/.claude/plans/x.md")
+    assert _note(_run(home, command)) is None
 
 
 def test_relative_operand_resolves_against_the_payload_cwd(home: Path) -> None:

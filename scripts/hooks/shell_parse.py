@@ -1375,8 +1375,12 @@ def untokenizable(command: str) -> bool:
     escape-free decode does not touch — is tracked separately rather than closed
     here with a message-hostile broadening.
     """
+    return _raw_untokenizable(_excised_text(command))
+
+
+def _raw_untokenizable(command: str) -> bool:
     try:
-        shlex.split(_excised_text(command))
+        shlex.split(command)
         return False
     except ValueError:
         return True
@@ -1828,6 +1832,15 @@ _BLIND_BUILT_ESCAPE = BlindSpot(
     ),
 )
 
+_BLIND_STRUCTURAL = BlindSpot(
+    bounds_induced=True,
+    cause="contains nested syntax this parser cannot tokenize safely",
+    hint=(
+        "split the unreadable compound into separate commands, or write prose or "
+        "script text to a file instead"
+    ),
+)
+
 #: One ``$'…'`` string: its body, with escaped characters (including an escaped
 #: quote) kept inside it. Found in the raw text without a quote model, so a ``$'``
 #: that is itself inside other quotes is found too; that over-reports, in the
@@ -2012,8 +2025,14 @@ def may_build_words(command: str) -> bool:
     )
 
 
+_STRUCTURAL_DISPATCHERS = (
+    ("git", re.compile(r"\bgit\b")),
+    ("gh", re.compile(r"\bgh\b")),
+)
+
+
 def unresolved_verb_programs(command: str) -> frozenset[str]:
-    """The programs whose operation is named by an expansion, in EITHER reading.
+    """The programs whose operation is unresolved, plus structural candidates.
 
     For a consumer whose segments :func:`analyze_checked` withheld. A bounds-type
     blind spot returns no segments, and with them the one per-segment fact the push
@@ -2026,15 +2045,25 @@ def unresolved_verb_programs(command: str) -> frozenset[str]:
     advisory targets) meant re-modelling the join, and review found a new defect in
     that modelling each round; those consumers refuse or give a short note instead.
     Reads the command as written and with continuations folded, and returns the
-    union. Bounded exactly like :func:`analyze_checked`: a reading that trips a bound
-    contributes nothing, and the caller's own bounds branch has already refused.
+    union. A structural candidate means only that a Git or GitHub operation may run;
+    it does not establish execution or recover operation details. A reading that
+    trips a length or depth bound contributes nothing, and the caller's own bounds
+    branch has already refused.
     """
     programs: set[str] = set()
     for text in dict.fromkeys((command, fold_continuations(command))):
-        segments, reason = _analyze_bounded(text)
-        if reason:
+        result = _analyze_bounded(text)
+        if result.bound_reason:
             continue
-        programs.update(_basename(s.argv[0]) for s in segments if _dispatcher_verb_unresolved(s))
+        programs.update(
+            _basename(segment.argv[0])
+            for segment in result.segments
+            if _dispatcher_verb_unresolved(segment)
+        )
+        if result.structural_incomplete:
+            for program, pattern in _STRUCTURAL_DISPATCHERS:
+                if mentions(result.decision_text, pattern):
+                    programs.add(program)
     return frozenset(programs)
 
 
@@ -2087,6 +2116,7 @@ _ALL_BLIND_SPOTS = (
     _BLIND_UNCLASSIFIED_OPTION,
     _BLIND_CONTINUATION,
     _BLIND_BUILT_ESCAPE,
+    _BLIND_STRUCTURAL,
 )
 
 
@@ -2117,7 +2147,7 @@ def over_nested(command: str) -> bool:
     Reports the DEPTH bound specifically. A command refused for LENGTH is a different
     blind spot with a different remedy; ask :func:`analyze_checked` for either.
     """
-    return _analyze_bounded(command)[1] == "depth"
+    return _analyze_bounded(command).bound_reason == "depth"
 
 
 def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
@@ -2168,12 +2198,15 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     comment is valid shell that shlex cannot tokenize. Reversing the order costs
     2 of 45,956 real commands a reclassification and no change of verdict.
 
-    :data:`_BLIND_CONTINUATION` comes directly after the two bounds, and BEFORE
-    :func:`untokenizable`, for the same reason the bounds do: it is bounds-type, and
-    the discard guard acts on ``bounds_induced`` only, so a continued command that
-    was ALSO untokenizable would otherwise be handed the cause that guard ignores.
-    The bounds keep precedence because both are bounds-type — the verdict is the same —
-    and the bound's remedy is the one that must be acted on first.
+    Continuation and built-escape diagnostics follow the bounds. Structural
+    incompleteness follows those two and precedes root tokenization, so the legacy
+    non-bounds result remains intact unless a nested source could not be tokenized.
+    Every withholding cause has ``bounds_induced`` set: a consumer that trusts the
+    returned segments must not receive a partial list.
+
+    Structural incompleteness is retained independently of the selected diagnostic.
+    A higher-priority bound, continuation, or built escape can win the message while
+    recovery still needs the fact to add refusal-only Git/GitHub candidates.
 
     WITHHOLDING SEGMENTS ALSO WITHHOLDS THE FACTS ON THEM, which is how an earlier
     revision of this docstring came to claim the placement "never removes" a refusal
@@ -2194,32 +2227,10 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     flips it causes are exactly the commands moving from "clean parse" to "blind",
     with nothing else shifting underneath them.
     """
-    segments, reason = _analyze_bounded(command)
-    if reason == "length":
-        return [], _BLIND_OVER_LONG
-    if reason == "depth":
-        return [], _BLIND_OVER_NESTED
-    excised = _excised_text(command)
-    if has_continuation(excised):
-        return [], _BLIND_CONTINUATION
-    if has_built_escape(excised):
-        return [], _BLIND_BUILT_ESCAPE
-    if untokenizable(command):
-        return segments, _BLIND_UNTOKENIZABLE
-    hidden = [s for s in segments if _dispatcher_verb_unresolved(s)]
-    if hidden:
-        # Two causes reach one predicate, and they need DIFFERENT remedies. The
-        # expansion cause is answered by writing the subcommand out; telling a
-        # session that when its subcommand is ALREADY literal names a rewrite it
-        # cannot perform, which is the failure mode a refusal message has to
-        # avoid — the message is the only way out of a hard block. Recovered by
-        # re-deriving the cause here rather than by adding a field to
-        # :class:`BlindSpot`, which its own docstring rules out and for a
-        # measured reason: a field makes every consumer choose again, silently.
-        if any(_unclassified_global(s.argv) for s in hidden):
-            return segments, _BLIND_UNCLASSIFIED_OPTION
-        return segments, _BLIND_UNRESOLVED_VERB
-    return segments, None
+    result = _analyze_bounded(command)
+    if result.diagnostic is not None and result.diagnostic.bounds_induced:
+        return [], result.diagnostic
+    return result.segments, result.diagnostic
 
 
 def _basename(token: str) -> str:
@@ -3472,42 +3483,39 @@ def analyze(command: str) -> list[Segment]:
     distinguish "found nothing" from "stopped looking", and a guard that conflates
     the two fails OPEN.
     """
-    return _analyze_bounded(command)[0]
+    return _analyze_bounded(command).segments
 
 
-def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], str | None]:
-    """:func:`analyze`, plus which bound (if any) stopped it short of the whole command.
+@dataclass
+class _AnalysisResult:
+    segments: list[Segment]
+    bound_reason: str | None
+    diagnostic: BlindSpot | None
+    structural_incomplete: bool
+    decision_text: str
 
-    Returns ``(segments, reason)`` where reason is None, ``"length"`` or ``"depth"``.
-    ``"depth"`` is reported only when there was something left to descend INTO and the
-    bound refused it — reaching the bound with nothing nested below is a complete
-    parse, not a truncated one.
 
-    Both facts come from ONE traversal, on purpose. Answering "did this truncate?"
-    with a separate pass means a second model of shell syntax, and any disagreement
-    between the two is a silent fail-open: the parse stops early, the predictor says
-    it did not, and a buried command is invisible to both. That is not hypothetical —
-    it is what the hand-written counter this replaced actually did, on two measured
-    shapes. One parse, one answer.
-
-    The length cap lives HERE rather than in :func:`analyze_checked` so that
-    :func:`analyze` is bounded too. Putting it only on the checked path would leave
-    every bare-``analyze`` caller paying the unbounded first pass — which is the same
-    "unmigrated consumer" hole the checked path exists to close.
-
-    ``_depth`` is internal bookkeeping; every caller passes a command and nothing else.
-    """
+def _analyze_bounded(
+    command: str, *, _depth: int = 0, _decision_text: str | None = None
+) -> _AnalysisResult:
+    """Parse once, retaining diagnostics and structural facts from every visited level."""
     # Past the cap, parse NOTHING. Not a prefix: truncating a command mid-string flips
     # the quoting state for everything after the cut, so a prefix parse is not a
     # partial answer, it is a confidently wrong one — and the guards match on the
     # resolved exe and argv. An empty list plus the reason is the honest result, and
     # every consumer that must not be blind is already asking for the reason.
     if _depth == 0 and len(command) > MAX_COMMAND_CHARS:
-        return [], "length"
+        return _AnalysisResult([], "length", _BLIND_OVER_LONG, False, command)
     if _depth == 0:
         command = _excised_text(command)
+        _decision_text = command
+    if _decision_text is None:
+        _decision_text = command
     out: list[Segment] = []
     truncated = False
+    structural_incomplete = _depth > 0 and _raw_untokenizable(command)
+    continuation = has_continuation(command)
+    built_escape = has_built_escape(command)
     # Subshells opened and not yet closed by earlier segments of this command. A
     # `(` opener counts; a `)` closer (bare or glued) at the end of a segment
     # closes. Counted on the segment SOURCE text outside quotes and comments, so a
@@ -3553,21 +3561,47 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
             truncated = True
             continue
         for script in nested:
-            inner_segs, inner_reason = _analyze_bounded(script, _depth=_depth + 1)
-            truncated = truncated or inner_reason == "depth"
-            for inner in inner_segs:
+            inner = _analyze_bounded(script, _depth=_depth + 1, _decision_text=_decision_text)
+            truncated = truncated or inner.bound_reason == "depth"
+            structural_incomplete = structural_incomplete or inner.structural_incomplete
+            continuation = continuation or inner.diagnostic is _BLIND_CONTINUATION
+            built_escape = built_escape or inner.diagnostic is _BLIND_BUILT_ESCAPE
+            for inner_segment in inner.segments:
                 out.append(
                     Segment(
-                        exe=inner.exe,
-                        argv=inner.argv,
-                        override=override or inner.override,
-                        raw=inner.raw,
-                        depth=inner.depth + 1,
-                        redirects=inner.redirects,
-                        verb_unresolved=inner.verb_unresolved,
+                        exe=inner_segment.exe,
+                        argv=inner_segment.argv,
+                        override=override or inner_segment.override,
+                        raw=inner_segment.raw,
+                        depth=inner_segment.depth + 1,
+                        redirects=inner_segment.redirects,
+                        verb_unresolved=inner_segment.verb_unresolved,
                     )
                 )
-    return out, ("depth" if truncated else None)
+    bound_reason = "depth" if truncated else None
+    if _depth == 0 and len(_decision_text) > MAX_COMMAND_CHARS:
+        bound_reason = "length"
+    root_untokenizable = _depth == 0 and _raw_untokenizable(_decision_text)
+    hidden = [segment for segment in out if _dispatcher_verb_unresolved(segment)]
+    if bound_reason == "length":
+        diagnostic = _BLIND_OVER_LONG
+    elif bound_reason == "depth":
+        diagnostic = _BLIND_OVER_NESTED
+    elif continuation:
+        diagnostic = _BLIND_CONTINUATION
+    elif built_escape:
+        diagnostic = _BLIND_BUILT_ESCAPE
+    elif structural_incomplete:
+        diagnostic = _BLIND_STRUCTURAL
+    elif root_untokenizable:
+        diagnostic = _BLIND_UNTOKENIZABLE
+    elif hidden and any(_unclassified_global(segment.argv) for segment in hidden):
+        diagnostic = _BLIND_UNCLASSIFIED_OPTION
+    elif hidden:
+        diagnostic = _BLIND_UNRESOLVED_VERB
+    else:
+        diagnostic = None
+    return _AnalysisResult(out, bound_reason, diagnostic, structural_incomplete, _decision_text)
 
 
 def is_pytest_invocation(seg: Segment) -> bool:
