@@ -6,6 +6,27 @@
       "type": "Base64 High Entropy String",
       "sha1": "9a96960baa4d8c0559cf89f72b5f3486736762e9",
       "reason": "the public BIP-173 bech32 character set (_BECH32), not sensitive; main's copy carries the inline pragma"
+    },
+    {
+      "commit": "d5cd51b23a2bcf4216c1927c2013a46fcce9056b",
+      "path": "src/genesis/transcript_analytics/history.py",
+      "type": "Hex High Entropy String",
+      "sha1": "9daca38d7176aa5d908c9b3a28da779cdd129c46",
+      "reason": "public flat-v1 extraction compatibility fingerprint for the audited historical reader, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "d5cd51b23a2bcf4216c1927c2013a46fcce9056b",
+      "path": "src/genesis/transcript_analytics/history.py",
+      "type": "Hex High Entropy String",
+      "sha1": "58c8b2906827849da194ff98d00822f3472fa688",
+      "reason": "public record-v5 extraction compatibility fingerprint for the preserved producer, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "d5cd51b23a2bcf4216c1927c2013a46fcce9056b",
+      "path": "src/genesis/transcript_analytics/history.py",
+      "type": "Hex High Entropy String",
+      "sha1": "260fadbed7362c10436aec8a789841fc6dac18e4",
+      "reason": "public record-v5 extraction compatibility fingerprint for the previous producer, not sensitive; current source adds the inline pragma"
     }
   ]
 }
