@@ -36,8 +36,11 @@ guarantee immunity or change group-kill policy. A failed canonical lock namespac
 refuses managed work even if a temporary fallback opens.
 
 Queue prerequisite #2023 [merged on September 15](https://github.com/WingedGuardian/GENesis-AGI/pull/2023).
-Its existing generation and attempt accounting is retained. Resource/OOM
-quarantine across new commit generations remains a separate work package;
+Its existing generation and attempt accounting is retained. Partial success
+requeues the unfinished leg through the ordinary request writer, so a fresh
+pending row starts at zero rather than inheriting the inflight attempt count.
+Resource/OOM quarantine across new commit generations and partial-success
+splits remains a separate work package;
 successful fixture acceptance does not establish unattended indexing readiness.
 
 ### One supervised production acceptance, after separate merge/deploy approval
@@ -53,8 +56,10 @@ successful fixture acceptance does not establish unattended indexing readiness.
 4. Require stable capacity for the full worker cap and reserves using reclaimable
    cache-aware accounting; uncertainty leaves the freeze armed.
 5. Keep the timer stopped while releasing the freeze for exactly one invocation
-   of the existing queued runner. Never reset attempts or use a raw provider
-   command. Verify physical containment and the durable queue outcome.
+   of the existing queued runner. Never manually reset attempts or use a raw
+   provider command. Preserve the original and resulting queue counts, including
+   the existing partial-success split behavior. Verify physical containment and
+   the durable queue outcome.
 6. Verify publication, representative queries from fresh readers, old-index
    recoverability, and no new OOM kills or sustained pressure/dashboard failures.
    Preserve evidence on refusal or failure. Restore Codebase disablement and the
@@ -66,7 +71,9 @@ This is one run, not permission for unattended indexing.
 
 ### Remaining resource work
 
-- Persist resource-failure quarantine across commit generations.
+- Persist resource-failure quarantine across commit generations and partial-
+  success splits; resolve whether retry liability belongs to requests or provider
+  legs before claiming continuity of the failure cap.
 - Measure a representative rebuild alongside ordinary sessions and authorized
   deployment peaks; audit refusal reasons and effective ancestor limits before
   proposing RAM or reserve changes.

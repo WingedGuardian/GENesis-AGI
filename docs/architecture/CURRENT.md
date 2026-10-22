@@ -1490,7 +1490,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 96e0a4de3 2026-10-18
+verified: 91c3bbeb9 2026-10-22
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the

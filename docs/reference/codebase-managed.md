@@ -424,7 +424,13 @@ runtime. Current-install tests are not a separate Python 3.10 runtime qualificat
 The existing idle-gated runner probes managed availability before and after
 claiming a Codebase-only request. Unavailability leaves the pending generation
 uncharged; a post-claim refusal durably restores it. A combined request can
-complete GitNexus and retain its unfinished Codebase leg. Attempts are never reset.
+complete GitNexus and requeue its unfinished Codebase leg before consuming the
+combined request. Partial-success outcomes (rc 4/5) use the ordinary request
+writer: a new pending row starts at zero attempts; coalescing with an existing
+pending row retains that row's higher count. The original inflight attempt
+count is not carried into the split request. Operators must not manually reset
+attempts to force retries. Retry-budget continuity across splits and commit
+generations remains part of the resource-failure quarantine work.
 The runner records availability errors in its log; the index entry point includes
 the final refusal line in its skip diagnostic.
 
