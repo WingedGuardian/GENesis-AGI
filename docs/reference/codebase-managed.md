@@ -233,6 +233,11 @@ supported physical main/state path. Binary, interpreter, runtime, sentinel and
 settings paths retain their existing literal-path handling; this restriction
 applies to provider-consumed repository/cache identities.
 
+Runtime entry points validate those identities before cache checks, readiness
+retries or provider execution. An incompatible path therefore refuses promptly
+when enabling, launching, serving or checking readiness. Structural settings
+reads remain available for diagnosis and retirement.
+
 No service is enabled, no unit is rendered and no sentinel is removed.
 Configuration uses schema 2: paths and build identity, with no mutable `enabled`
 flag. Native systemd enablement owns operational state. The lifecycle lock coordinates cooperating same-user tools;
