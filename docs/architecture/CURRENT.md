@@ -1490,7 +1490,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 96e0a4de3 2026-10-18
+verified: 91c3bbeb9 2026-10-22
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1620,8 +1620,11 @@ the shared banner is not an assertion about all concurrent sessions.
   native query unit entry points in `scripts/codebase_managed.py`. Install and
   bootstrap render disabled query/client-slice templates without auto-upgrading
   a PATH provider. Staging does not activate it; MCP registration always uses
-  the managed launcher, including absent PATH binaries. Index queue integration
-  remains a separate concern. See
+  the managed launcher, including absent PATH binaries. Queued indexing uses the
+  existing durable queue and an exact-build native worker in a separate
+  8 GiB, zero-swap scope, with final managed admission and canonical repository
+  locks. This does not activate the service or establish production capacity
+  or unattended resource-failure readiness. See
   `docs/reference/codebase-managed.md`.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
@@ -2827,7 +2830,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 8a62059720cd 2026-10-22
+verified: ed048e214017 2026-10-22
 ```
 
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
@@ -3462,7 +3465,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 96e0a4de31a8 2026-10-18
+verified: 8a62059720cd 2026-10-22
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3525,7 +3528,10 @@ tool-disabled CC probe without changing its schedule or routing authority.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the
-  budget (`docs/reference/resource-budget.md`). Importable without the runtime.
+  budget (`docs/reference/resource-budget.md`). `run` requires a reachable user
+  manager and acknowledged scope; first caller cancellation stays cooperative,
+  a second forces, and stopped-scope cleanup outlives the leader. Watchdog stops
+  alone arm a ten-second force deadline. Importable without the runtime.
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
   install usable" signal (CC OAuth login + ≥1 routing LLM key + ≥1 embedding key),
