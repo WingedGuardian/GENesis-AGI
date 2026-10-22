@@ -1,6 +1,6 @@
 # Path-glob → label, applied by .github/workflows/labeler.yml on PR open/sync.
 #
-# WHY LABELS AT ALL. The gate-fix lane (genesis-development skill) applies to a
+# WHY LABELS AT ALL. The gate-fix lane (closing-session skill) applies to a
 # pull request whose diff touches the enforcement-hook surface, and today every
 # session derives that membership by hand — reading the diff, remembering the
 # constants, judging. A label makes the same fact visible on the pull request

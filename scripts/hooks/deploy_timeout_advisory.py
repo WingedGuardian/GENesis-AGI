@@ -199,7 +199,7 @@ DO NOT apply this to bootstrap.sh or host-setup.sh, which is why this hook no lo
 
 Then VERIFY it took: with the same two bus variables set, 'systemctl --user is-active genesis-deploy-manual' must print 'active' (without them a scrubbed session gets a bus error, which is not evidence the launch failed). A failed launch is otherwise indistinguishable from a good one -- with a relative path and no --working-directory, bash exits instantly and --collect reaps the unit, leaving no trace. Check promptly (it also reads 'inactive' once the deploy has FINISHED), then poll the log. genesis-server going 'inactive' mid-run is EXPECTED.
 
-This hook does not check whether you already detached, so if you did, ignore it. Rationale, measurements and incident history: the genesis-development skill's Timeout Policy."""
+This hook does not check whether you already detached, so if you did, ignore it. Rationale, measurements and incident history: the validating-merges skill ("DEPLOYS ARE THE EXCEPTION") and the build-session skill's Timeout Policy."""
 
 
 def _names_target(segment) -> bool:
