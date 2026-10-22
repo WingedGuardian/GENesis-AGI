@@ -4,7 +4,7 @@ Status: **the six implementation concerns have landed; follow-up fixes and
 production acceptance remain pending**.
 This plan does not authorize deployment or re-enabling Codebase MCP.
 
-## Current delivery and operational plan (2026-10-20)
+## Current delivery and operational plan (2026-10-22)
 
 The accepted replacement for the broker investigation below uses the pinned
 v0.11.0 native executable, immutable schema-2 settings, and the existing durable
@@ -15,9 +15,9 @@ commands and exact containment settings are documented in
 The six concerns landed through configuration publication (#2909), native runtime
 (#3000), guarded uninstall (#3209, replacing #3006), lifecycle (#3007), frontend
 (#3011), and queued-worker integration (#3012). The worker contribution merged on
-October 20 as `76a531718`. Runtime provider-path guards (#3463) and read-only
-availability/access repairs (#3464) remain separate open follow-ups. Reconcile
-those contributions against actual main, preserving its supported Python 3.10
+October 20 as `76a531718`. Runtime provider-path guards (#3463) merged on
+October 22 as `fbb0b6f19`. Read-only availability/access repairs (#3464) remain
+an open follow-up. Reconcile that contribution against actual main, preserving its supported Python 3.10
 streamed binary hashing and the existing worker/queue contract. An older local
 worker branch is not evidence that another worker implementation PR is needed.
 

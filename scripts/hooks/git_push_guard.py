@@ -4405,7 +4405,7 @@ def _check_inline_review_findings(
     # that has always stopped it.
     #
     # WHAT THIS ENFORCES IS NARROWER THAN THE DOCTRINE IT SERVES, and the two
-    # must not be conflated. The genesis-development skill's always-fix floor is
+    # must not be conflated. The closing-session skill's always-fix floor is
     # severity AND KIND — "a P1, a security defect, anything destructive or
     # fail-open". This check can only see the severity LABEL a reviewer attached,
     # so a CodeRabbit MINOR naming a fail-open scores 0.0 and passes here. The
@@ -4937,11 +4937,11 @@ def _comment_positional(argv: list[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
-# EXTRACTION patterns — what a target MEANS. `_PR_URL_RE` keeps its original
-# shape (trailing context tolerated, e.g. a `#issuecomment-…` fragment) because
-# it reads the number and OWNER/REPO out of a URL.
+# EXTRACTION patterns — what a target MEANS. `_PR_URL_RE` requires an explicit
+# scheme and host; scheme-less PR-shaped branch names stay branches. It permits
+# trailing context (e.g. a `#issuecomment-…` fragment) when reading a URL.
 _PR_NUMBER_RE = re.compile(r"#?([0-9]+)\Z")
-_PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b")
+_PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)([^/\s]+/[^/\s]+)/pull/(\d+)\b")
 
 # ALLOWLIST patterns — what the gate accepts as unambiguously LITERAL. See
 # `_unresolvable_identity` for why these are allowlists and not screens.
@@ -4951,7 +4951,7 @@ _PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b")
 # comment only at word start). It stops short of `?query`, because `?` is a
 # glob metacharacter and the shell WOULD act on it.
 _LITERAL_URL_RE = re.compile(
-    r"(?:[a-z]+://[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+"
+    r"(?:[a-z]+://[A-Za-z0-9._-]+/)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+"
     r"(?:[/#][A-Za-z0-9._/#-]*)?\Z"
 )
 # A branch name in characters that are both legal in a git ref and inert to the
@@ -4969,7 +4969,8 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     Number from a bare number, #N, or PR URL; a URL target ALSO carries its
     OWNER/REPO (counting against the hook cwd's repo for a cross-repo URL could
     produce a wrong count and a FALSE block — Codex round-1 finding). An
-    explicit ``--repo``/``-R`` flag wins over the URL-derived repo. A branch
+    explicit ``--repo``/``-R`` flag combined with a URL is refused, as are
+    unsupported explicit hosts; neither yields a usable identity. A branch
     target (non-numeric, non-URL positional) yields (None, …); the caller treats
     that unresolved identity as unknown evidence and asks/denies.
 
@@ -4980,6 +4981,8 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     be commented on, and resolving one was reading an identity out of a command
     that cannot run.
     """
+    if _unresolvable_identity(argv) is not None:
+        return None, None
     tok, _ = _comment_positional(argv)
     pr_num: str | None = None
     url_repo: str | None = None
@@ -5056,10 +5059,16 @@ def _unresolvable_identity(argv: list[str]) -> str | None:
     # Checked against the value AS WRITTEN, before the host reduction, so an
     # expansion in the host position cannot be dropped on the way in.
     repo = _comment_repo_value(argv)
-    if repo is None and tok is not None:
-        url = _PR_URL_RE.match(tok)
-        repo = url.group(1) if url else None
+    url = _PR_URL_RE.match(tok) if tok is not None else None
+    if url:
+        if repo is not None:
+            return f"{tok} combined with --repo/-R"
+        if "://" in tok and not tok.startswith(("https://github.com/", "http://github.com/")):
+            return tok
+        repo = url.group(1)
     if repo is not None and not _LITERAL_REPO_RE.match(repo):
+        return repo or "--repo (empty value)"
+    if repo is not None and repo.count("/") == 2 and repo.split("/", 1)[0] != "github.com":
         return repo
     return None
 
@@ -5070,10 +5079,12 @@ def _unresolvable_identity_advisory(token: str) -> str:
         "the Codex round cap cannot be checked.\n"
         "This hook runs BEFORE the shell expands anything, so the PR target and "
         "the --repo value are readable only when they are written out. The gate "
-        "accepts what gh documents, spelled literally; anything else is refused "
+        "accepts literal identities on github.com; anything else is refused "
         "rather than counted against the wrong pull request, or against none.\n"
-        "Re-run with the identity written out — a number, #N or a PR URL, and "
-        "OWNER/REPO for the repo — one command per PR:\n"
+        "Use either a PR URL without --repo/-R, or a number/#N with an optional "
+        "OWNER/REPO or github.com/OWNER/REPO flag. Never combine a URL and a "
+        "repository flag, even when they agree. Other explicit hosts are unsupported. "
+        "Run one command per PR:\n"
         '  gh pr comment 1234 --body "@codex review"\n'
         "If that PR is already at the cap you will get the step-back advisory, "
         "which is the point."
@@ -5085,11 +5096,9 @@ def _comment_repo_value(argv: list[str]) -> str | None:
 
     Handles separated (``--repo o/r`` / ``-R o/r``), ``--repo=o/r``, glued
     ``-Ro/r`` and ``-R=o/r`` forms. The value is otherwise unnormalised — the
-    identity check needs it as the user typed it, host part included — with one
-    exception: an EMPTY value reads as absent. Both empty spellings are commands
-    gh rejects outright, and treating them alike keeps ``--repo=`` from being
-    refused with an empty-quoted token in the message while ``-R=`` (which no
-    branch below matches) reads as no flag at all.
+    identity check needs it as the user typed it, host part included. An empty
+    or missing value stays empty, not absent: even a malformed repository flag
+    must not erase the fact that a URL was combined with a second selector.
     """
     val: str | None = None
     skip_next = False
@@ -5109,17 +5118,17 @@ def _comment_repo_value(argv: list[str]) -> str | None:
         if tok in _COMMENT_VALUE_FLAGS:
             # --repo/-R are themselves value flags: read their value, then skip
             # it so the same token cannot also be scanned as a flag.
-            if tok in ("--repo", "-R") and i + 1 < len(argv):
-                val = argv[i + 1]
+            if tok in ("--repo", "-R"):
+                val = argv[i + 1] if i + 1 < len(argv) else ""
             skip_next = True
             continue
         if tok.startswith("--repo="):
             val = tok.split("=", 1)[1]
         elif tok.startswith("-R") and len(tok) > 2 and not tok.startswith("-R="):
             val = tok[2:]
-        elif tok.startswith("-R=") and len(tok) > 3:
+        elif tok.startswith("-R="):
             val = tok[3:]
-    return val or None
+    return val
 
 
 def _comment_repo(argv: list[str]) -> str | None:
@@ -5253,10 +5262,16 @@ def _format_rounds(result: dict) -> str:
     )
     parts = [f"{count} ({'gate' if gate else 'ordinary'} lane, terminal at {limit})"]
     rounds = result.get("rounds") or []
-    if result.get("round_state") == "open" and rounds:
-        newest = rounds[-1]
-        who = ", ".join(newest.get("reviewers") or []) or "pre-cutover rule"
-        parts.append(f"open at {str(newest.get('head'))[:10]} ({who})")
+    if result.get("round_state") == "open":
+        # The head's own round, by identity: ``rounds`` is in commit-list (date)
+        # order, so its last entry need not be the head's (#3302).
+        head = result.get("current_head")
+        own = next((r for r in rounds if r.get("head") == head), None)
+        if own is None:
+            who = "no round entry for the head"
+        else:
+            who = ", ".join(own.get("reviewers") or []) or "pre-cutover rule"
+        parts.append(f"open at {str(head)[:10]} ({who})")
     elif result.get("round_state") == "complete":
         parts.append("complete (a commit has landed since the last round)")
     counts = [r.get("findings") for r in rounds if r.get("findings") is not None]

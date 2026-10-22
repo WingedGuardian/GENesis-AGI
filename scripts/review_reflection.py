@@ -1257,6 +1257,21 @@ def _covered_keys(
     return covered
 
 
+def _open_round(budget: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The ``rounds`` entry of the open round: the one whose head IS the current
+    head, never ``rounds[-1]``. That list follows the PR's commit list, which is
+    in date order, so after a rebase or cherry-pick a commit can be listed after
+    the head (#3302). None when the round is not open, or when the budget says
+    open but has no single entry for the head, which a caller must read as
+    unknown. Assumes ``current_head`` is the PR's tip, as ``evaluate_pr``
+    passes it; a test that passes an older head may find later rounds prior."""
+    if budget.get("round_state") != "open":
+        return None
+    head = budget.get("current_head")
+    own = [r for r in budget.get("rounds") or [] if r.get("head") == head]
+    return own[0] if len(own) == 1 else None
+
+
 def owed_state(
     budget: Mapping[str, Any],
     covered: Iterable[str],
@@ -1292,9 +1307,6 @@ def owed_state(
         # None (unknown) until a cutover's late findings have been read.
         "late_keys": [] if cutover is None else None,
     }
-    rounds = budget.get("rounds") or []
-    if budget.get("status") == "ok" and rounds:
-        state["round_head"] = rounds[-1].get("head")
     if budget.get("status") != "ok":
         return state
     late_owed: list[str] | None = []
@@ -1312,12 +1324,18 @@ def owed_state(
             # debt is known, owed or not. With no cutover this is main's False.
             state["settled"] = late_owed is not None
         return state
+    own = _open_round(budget)
+    if own is None:
+        # Open by the producer's word, with no single entry for the head: what
+        # it owes and when it started are unknown, never "nothing".
+        return state
+    state["round_head"] = own.get("head")
     if state["reflection_keys"] == "ok" and late_owed is not None:
         done = set(covered)
         state["owed"] = [k for k in state["open_keys"] if k not in done] + late_owed
     times = [
         when
-        for source in (rounds[-1].get("reviews") or [] if rounds else [])
+        for source in own.get("reviews") or []
         if (when := _parse_when(source.get("submitted_at"))) is not None
     ]
     if times:
@@ -1354,8 +1372,8 @@ def _open_review_times(budget: Mapping[str, Any]) -> dict[str, datetime | None]:
     be listed twice). A time that cannot be read is None, which leaves every
     fix standing against that key."""
     times: dict[str, datetime | None] = {}
-    rounds = budget.get("rounds") or []
-    for source in (rounds[-1].get("reviews") or []) if rounds else []:
+    own = _open_round(budget)
+    for source in (own.get("reviews") or []) if own else []:
         when = _parse_when(source.get("submitted_at"))
         for key in source.get("finding_keys") or []:
             if not isinstance(key, str):
@@ -1378,7 +1396,12 @@ def _open_covered(
         str(state["head"]),
         round_number=int(state["round"] or 0),
         gate_lane=state["gate_lane"],
-        prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
+        # Every round but the head's own, by identity (not ``rounds[:-1]``).
+        prior_heads=[
+            str(r.get("head"))
+            for r in budget.get("rounds") or []
+            if r.get("head") != state["head"]
+        ],
         acceptance=acceptance,
         round_started=state["round_started"],
         reviewed_at=_open_review_times(budget),
@@ -1410,11 +1433,12 @@ def owed_from_budget(
                 cwd, budget, repo, number, now=now, cutover=cutover, deadline=deadline
             )
         state = owed_state(budget, (), now=now)
-        if state["status"] == "ok" and state["round_state"] == "open":
+        # Only a KNOWN open-round debt is narrowed by coverage. ``owed`` None
+        # (keys unknown, or no single round entry for the head) stays None.
+        if state["status"] == "ok" and state["round_state"] == "open" and state["owed"] is not None:
             acceptance = _acceptance(budget, repo, number)
             covered = _open_covered(cwd, budget, state, acceptance, deadline)
-            if state["reflection_keys"] == "ok":
-                state["owed"] = [k for k in state["open_keys"] if k not in covered]
+            state["owed"] = [k for k in state["open_keys"] if k not in covered]
         return state
 
 

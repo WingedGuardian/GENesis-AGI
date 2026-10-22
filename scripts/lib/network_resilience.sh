@@ -86,11 +86,36 @@ _netres_ts_service_content() {
         "ExecStart=$NETRES_PYTHON $1"
 }
 
-# _netres_put_file <path> <content> <mode> — write-if-different via sudo. Bumps
-# _NETRES_WROTE on a real write; sets _NETRES_FAILED + WARNS on failure. Never
-# fails the caller (returns 0) so `set -e` callers are safe even outside an if.
+# The /etc writes share one step with every other /etc file Genesis manages
+# (scripts/lib/managed_etc.sh): stamped, a symlink (a masked unit) is never
+# written through, and a file edited by hand is KEPT and named rather than
+# overwritten. Sourced relative to this file, so the manual
+# `sudo bash -c 'source scripts/lib/network_resilience.sh && …'` keeps working.
+# shellcheck source=managed_etc.sh
+# Pure parameter expansion, not dirname: callers may run with a minimal PATH.
+_NETRES_LIB_DIR="${BASH_SOURCE[0]%/*}"
+[ "$_NETRES_LIB_DIR" = "${BASH_SOURCE[0]}" ] && _NETRES_LIB_DIR=.
+. "$_NETRES_LIB_DIR/managed_etc.sh"
+
+# _netres_put_file <path> <content> <mode> [class] — write-if-different via
+# sudo. Bumps _NETRES_WROTE when the content changed and _NETRES_STAMPED when
+# only the stamp line was added (a daemon-reload, never a networkd reload); sets
+# _NETRES_FAILED + WARNS on failure. Never fails the caller (returns 0) so
+# `set -e` callers are safe even outside an if. Files outside $NETRES_ETC_ROOT
+# (the watchdog scripts under $NETRES_LIBEXEC_DIR) are copied as before,
+# unstamped: a stamp line would sit inside an executable.
 _netres_put_file() {
-    local path="$1" content="$2" mode="$3"
+    local path="$1" content="$2" mode="$3" class="${4:-dropin}"
+    if [[ "$path" == "$NETRES_ETC_ROOT"/* ]]; then
+        genesis_etc_put "$path" "$content" "$mode" "$class"
+        case "$GENESIS_ETC_RESULT" in
+            written|taken) _NETRES_WROTE=$((_NETRES_WROTE + 1)) ;;
+            migrated) _NETRES_STAMPED=$((_NETRES_STAMPED + 1)) ;;
+            kept-edited) _NETRES_KEPT=1 ;;
+            kept-nonregular|uninspected|failed) _NETRES_FAILED=1 ;;
+        esac
+        return 0
+    fi
     # Never write THROUGH a symlink. A masked unit is a symlink to /dev/null:
     # tee would discard the file and chmod would change /dev/null itself, which
     # breaks every non-root process that writes to it.
@@ -178,10 +203,12 @@ _netres_install_watchdog() {
     fi
     local before=$_NETRES_WROTE
     _netres_put_file "$dst" "$(cat "$NETRES_WATCHDOG_SRC")" "0755"
-    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.service" "$(_netres_service_content "$dst")" "0644"
-    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.timer" "$_NETRES_WATCHDOG_TIMER" "0644"
-    # Reload only when a unit file actually changed this run.
-    if ((_NETRES_WROTE > before)); then
+    local stamped_before=$_NETRES_STAMPED
+    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.service" "$(_netres_service_content "$dst")" "0644" unit
+    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-network-watchdog.timer" "$_NETRES_WATCHDOG_TIMER" "0644" unit
+    # Reload only when a unit file actually changed this run (a stamp-only
+    # rewrite counts: systemd otherwise reports the unit as changed on disk).
+    if ((_NETRES_WROTE > before || _NETRES_STAMPED > stamped_before)); then
         sudo systemctl daemon-reload 2>/dev/null || true
     fi
     _netres_ensure_timer_enabled genesis-network-watchdog.timer "watchdog timer"
@@ -256,11 +283,14 @@ _netres_install_tailscale_watchdog() {
     fi
     local dst="$NETRES_LIBEXEC_DIR/tailscale-watchdog.py" before=$_NETRES_WROTE
     _netres_put_file "$dst" "$(cat "$NETRES_TS_WATCHDOG_SRC")" "0755"
-    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-tailscale-watchdog.service" "$(_netres_ts_service_content "$dst")" "0644"
-    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-tailscale-watchdog.timer" "$_NETRES_TS_TIMER" "0644"
+    local stamped_before=$_NETRES_STAMPED
+    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-tailscale-watchdog.service" "$(_netres_ts_service_content "$dst")" "0644" unit
+    _netres_put_file "$NETRES_ETC_ROOT/systemd/system/genesis-tailscale-watchdog.timer" "$_NETRES_TS_TIMER" "0644" unit
     if ((_NETRES_WROTE > before)); then
         sudo systemctl daemon-reload 2>/dev/null || true
         echo "  Tailscale watchdog installed ($dst)."
+    elif ((_NETRES_STAMPED > stamped_before)); then
+        sudo systemctl daemon-reload 2>/dev/null || true
     fi
     _netres_ensure_timer_enabled genesis-tailscale-watchdog.timer "Tailscale watchdog timer"
 }
@@ -275,6 +305,8 @@ network_resilience_apply() {
     fi
 
     _NETRES_WROTE=0
+    _NETRES_STAMPED=0
+    _NETRES_KEPT=""
     _NETRES_FAILED=""
     _NETRES_HEALED=""
     # Part C first: it does not need networkd, so the gates below must not
@@ -307,6 +339,8 @@ network_resilience_apply() {
 
     if [[ -n "$_NETRES_FAILED" ]]; then
         echo "  Network resilience NOT fully applied — see warnings above."
+    elif [[ -n "$_NETRES_KEPT" ]]; then
+        echo "  Network resilience: a file edited by hand was kept — see above."
     elif ((_NETRES_WROTE > 0)); then
         echo "  Network resilience applied (KeepConfiguration + watchdog timer active)."
     elif [[ -n "$_NETRES_HEALED" ]]; then

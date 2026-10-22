@@ -312,6 +312,10 @@ def _budget(**over):
         "expected_reviewers": [],
         "reviewers_reported": ["chatgpt-codex-connector[bot]"],
     }
+    if "current_head" in over and "rounds" not in over:
+        # The open round is the head's own entry (#3302): keep the default
+        # round on whatever head the test names, as the producer would.
+        budget["rounds"] = [dict(budget["rounds"][0], head=over["current_head"])]
     budget.update(over)
     return budget
 
@@ -351,7 +355,11 @@ def test_round_one_with_nobody_expected_waits_the_whole_window():
 
 
 def test_no_readable_review_time_never_settles():
-    got = rr.owed_state(_budget(rounds=[{"reviews": [{"submitted_at": None}]}]), [], now=T0)
+    # The head's OWN round, so this reaches the unreadable-time path, not the
+    # "no entry for the head" one (GLM P3 on #3302-A).
+    budget = _budget(rounds=[{"head": HEAD, "reviews": [{"submitted_at": None}]}])
+    got = rr.owed_state(budget, [], now=T0)
+    assert got["round_head"] == HEAD and got["owed"] == ["c1", "c2", "r5:1"]
     assert not got["settled"] and got["settle_until"] is None
 
 
@@ -2088,3 +2096,72 @@ def test_an_unexpected_error_in_status_is_cannot_check_not_invalid(monkeypatch):
 
     monkeypatch.setattr(rr, "status", boom)
     assert rr.main(["status"]) == 2
+
+
+# -- the open round is the head's own entry, never rounds[-1] (#3302) --------
+
+OLD = "b" * 40
+
+
+def _entry(head: str, minutes: int, key: str) -> dict:
+    review = {"submitted_at": _at(minutes).isoformat(), "finding_keys": [key]}
+    return {"head": head, "reviews": [review]}
+
+
+def _head_listed_first(**over):
+    """An open round on HEAD whose entry is listed BEFORE an older round's, as a
+    commit list ordered by date puts it after a rebase or cherry-pick."""
+    return _budget(
+        count=2,
+        open_keys=["c2"],
+        rounds=[_entry(HEAD, 5, "c2"), _entry(OLD, 0, "c1")],
+        **over,
+    )
+
+
+def test_the_open_round_is_read_by_the_heads_identity():
+    got = rr.owed_state(_head_listed_first(), [], now=_at(60))
+    assert got["owed"] == ["c2"] and got["round_head"] == HEAD
+    assert got["round_started"] == _at(5).isoformat()
+    assert rr._open_review_times(_head_listed_first()) == {"c2": _at(5)}
+
+
+def test_prior_heads_are_every_round_but_the_heads_own(monkeypatch):
+    seen = {}
+
+    def covered(cwd, head, **kw):
+        seen.update(kw, head=head)
+        return set()
+
+    monkeypatch.setattr(rr, "covered_keys", covered)
+    budget = _head_listed_first()
+    rr._open_covered("/x", budget, rr.owed_state(budget, [], now=_at(60)), None)
+    assert seen["head"] == HEAD and seen["prior_heads"] == [OLD]
+    assert seen["reviewed_at"] == {"c2": _at(5)}
+
+
+@pytest.mark.parametrize(
+    "rounds",
+    [
+        [{"head": OLD, "reviews": []}],  # the producer says open, no entry for the head
+        [{"head": HEAD, "reviews": []}, {"head": HEAD, "reviews": []}],  # two entries
+    ],
+)
+def test_an_open_round_without_one_entry_for_the_head_owes_unknown(rounds):
+    got = rr.owed_state(_budget(rounds=rounds), [], now=_at(60))
+    assert got["owed"] is None and got["round_started"] is None
+
+
+def test_owed_from_budget_keeps_an_inconsistent_open_round_unknown(repo):
+    """Coverage narrows a KNOWN debt only; it never turns None into a list."""
+    path, head = repo
+    budget = _budget(current_head=head, body="", rounds=[_entry(OLD, 0, "c1")])
+    got = rr.owed_from_budget(str(path), budget, "o/r", 7, now=T0, cutover=None)
+    assert got["owed"] is None
+
+
+def test_a_complete_round_names_no_round_head():
+    """``round_head`` was the newest entry by list order, a guess; with no round
+    open there is no head-owned round to name."""
+    got = rr.owed_state(_budget(round_state="complete"), [], now=T0)
+    assert got["round_head"] is None and got["owed"] == []
