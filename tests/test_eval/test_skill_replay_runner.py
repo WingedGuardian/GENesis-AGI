@@ -140,3 +140,50 @@ async def test_report_carries_provenance(tmp_path):
     assert report.rubric_name == "bench_task_success"
     assert report.rubric_version == "1.1.0"
     assert report.task_file_sha256  # sha256 recorded for frozen-set provenance
+
+
+async def test_both_replay_arms_judged_with_context_only_requirement(tmp_path):
+    from genesis.eval.scorers import LLMJudgeScorer
+
+    context = "Include the final recommendation: CONTEXT_ONLY_DELIVERABLE."
+    tasks = tmp_path / "context-tasks.jsonl"
+    tasks.write_text(json.dumps({
+        "id": "context_only", "category": "research",
+        "prompt": "Compare two fictional storage options.",
+        "expected": "Explain their trade-offs.", "context": context,
+    }) + "\n")
+    invocations = []
+    requests = []
+
+    class CaptureInvoker(_FakeInvoker):
+        async def run(self, inv):
+            invocations.append(inv)
+            return await super().run(inv)
+
+    class CaptureRouter:
+        async def route_call(self, call_site_id, messages, **kwargs):
+            from types import SimpleNamespace
+
+            requests.append(messages[0]["content"])
+            return SimpleNamespace(
+                success=True, content=json.dumps({"score": 0.5, "rationale": "synthetic"}),
+                model_id="fake-judge", provider_used="fake", error=None,
+            )
+
+    report = await run_skill_replay(
+        skill_name="voice-master", old_content="OLDBODY", new_content="NEWBODY",
+        tasks_path=tasks, config=SkillReplayConfig(min_pairs=1),
+        invoker=CaptureInvoker(), scorer=LLMJudgeScorer(router=CaptureRouter()),
+        verify_prod=False, allow_repo_tasks=True, run_root=tmp_path / "runs",
+    )
+    assert len(report.pairs) == 1 and not report.pairs[0].skipped
+    assert len(invocations) == len(requests) == 2
+    for inv, request in zip(invocations, requests, strict=True):
+        assert context in inv.prompt
+        assert context in request
+        assert "Explain their trade-offs." in request
+    for outcome in (report.pairs[0].old, report.pairs[0].new):
+        assert outcome.output_text in "\n".join(requests)
+        assert not outcome.judge_passed
+    assert report.verdict.verdict == VERDICT_INCONCLUSIVE
+    assert report.verdict.n_complete == 1
