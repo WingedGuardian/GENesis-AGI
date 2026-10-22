@@ -3,7 +3,7 @@
 
 WHAT GAP THIS FILLS
 ===================
-There IS a rule. `genesis-development/SKILL.md` carries a standing user
+There IS a rule. `closing-session/SKILL.md` carries a standing user
 rule, "Never RETIRE a PR you are not the one reviving": a reviewer session
 retires nothing, a premise-wrong PR gets `needs-architecture-session` and stays
 OPEN, and retiring belongs to the session taking up the revival. A superseded PR
@@ -87,7 +87,7 @@ _GH_WORD = re.compile(r"(?<![\w-])gh(?![\w-])")
 
 #: The two spellings that carry a `key=value` request parameter.
 #: The superseded-PR exception, stated in full in BOTH notes. A session that
-#: never loaded genesis-development sees only this text, so it carries every
+#: never loaded closing-session sees only this text, so it carries every
 #: condition and the evidence each needs rather than pointing at the skill.
 #: Both notes read this one constant, so they cannot drift apart.
 _SUPERSEDED_EXCEPTION = (
@@ -150,7 +150,7 @@ def _advisory(reasons: list[str], closes: int) -> str:
     )
     return (
         f"NOTE: {lead}\n"
-        "STANDING RULE (genesis-development, 'Never RETIRE a PR you are not the "
+        "STANDING RULE (closing-session, 'Never RETIRE a PR you are not the "
         "one reviving'): a reviewer session retires nothing. A PR that is wrong "
         "at the premise gets the `needs-architecture-session` label and a comment "
         "carrying the evidence, and STAYS OPEN — retiring belongs to the session "
@@ -186,7 +186,7 @@ def _unreadable_note(blind) -> str:
         f"NOTE: this command {blind.cause}, so I could not check whether it closes a "
         "pull request; it mentions a close. If it does: closing a PR is the user's "
         "decision unless you are reviving it with no rework replacing it, or the "
-        "superseded-PR exception below applies to you (genesis-development, "
+        "superseded-PR exception below applies to you (closing-session, "
         f"'Never RETIRE a PR you are not the one reviving'). {_SUPERSEDED_EXCEPTION} "
         f"For the specific check: {blind.hint}."
     )

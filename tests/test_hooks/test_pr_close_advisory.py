@@ -199,7 +199,7 @@ def test_the_note_states_the_limit_it_cannot_see():
 
 #: The phrases the superseded-PR exception must carry in EVERY note: who may use
 #: it, and the evidence each condition needs (owner rulings 2026-10-04 for the
-#: closing session and 2026-10-06 for a rework's builder; the genesis-development
+#: closing session and 2026-10-06 for a rework's builder; the closing-session
 #: skill, "A superseded PR is the one exception").
 _EXCEPTION_PHRASES = (
     "only two sessions may use",

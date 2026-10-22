@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -361,11 +362,20 @@ async def test_owned_grandchild_cannot_keep_output_pipe_open(
         await task
     assert created[0].returncode == 0 if leader_exits else created[0].returncode < 0
     # A killed descendant can await init's reap as a zombie; it cannot hold pipes.
-    # Read once: a check-then-read races init's reap, which removes the entry
-    # (FileNotFoundError) or empties it mid-read (ESRCH) — both mean it is gone.
-    try:
-        stat = Path(f"/proc/{child}/stat").read_text()
-    except (FileNotFoundError, ProcessLookupError):
-        return
+    # Each read is one read: a check-then-read races init's reap, which removes
+    # the entry (FileNotFoundError) or empties it mid-read (ESRCH) — both mean it
+    # is gone. SIGKILL is delivered when the process next runs, so on a loaded
+    # host it can still read R (running, handling the kill) for a moment; a
+    # failed kill would leave the sleeper in S. Poll briefly for Z, X or gone.
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            stat = Path(f"/proc/{child}/stat").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        state = stat.split(") ", 1)[1][:2]
+        if state in ("Z ", "X ") or time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.02)
     # Z (zombie) or X (dead, mid-reap): either way it holds no pipe.
-    assert stat.split(") ", 1)[1][:2] in ("Z ", "X ")
+    assert state in ("Z ", "X ")
