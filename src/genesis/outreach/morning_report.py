@@ -48,8 +48,37 @@ def _drop_unredacted_sources(rows: list[dict]) -> list[dict]:
     return [row for row in rows if row.get("source") not in _UNREDACTED_CONTENT_SOURCES]
 
 
-# Convert to tuple for db.execute() compatibility (requires sequence, not frozenset)
-_INTERNAL_OBS_TYPES = tuple(_INTERNAL_OBS_TYPES_SET)
+# Genesis's internal reflection/audit artifacts. They are kept OUT of the shared
+# INTERNAL_OBS_TYPES on purpose (the dashboard observations panel shows them for
+# review), but in this report they read as live faults: two independently
+# generated gap_clustering themes describing one event differently were rendered
+# as "pipeline drift" in Urgent, Overnight and Next Steps. Report-local, so the
+# dashboard and the other INTERNAL_OBS_TYPES consumers are unchanged. Members:
+#   - the surplus SELF-OBSERVATION task types (surplus/types.py
+#     SELF_OBSERVATION_TASK_TYPES), which surplus/intake.py writes with the task
+#     type as the observation type: meta-observations about Genesis's own state;
+#   - "quarantined_reflection" (reflection/output_router.py): a reflection pass
+#     gated for low confidence.
+# NOT a member: "contradiction". Deep reflection writes it at high priority
+# because it "needs human judgment" (output_router.py), and this report is the
+# human surface it is meant to reach.
+# They are still counted in the report's "Genesis internal" line, never dropped
+# silently.
+_REFLECTION_AUDIT_OBS_TYPES: frozenset[str] = frozenset(
+    {
+        "gap_clustering",
+        "wing_audit",
+        "self_unblock",
+        "memory_audit",
+        "procedure_audit",
+        "prompt_effectiveness_review",
+        "quarantined_reflection",
+    }
+)
+
+# Convert to tuple for db.execute() compatibility (requires sequence, not
+# frozenset). Sorted so the SQL parameter order is stable.
+_REPORT_INTERNAL_OBS_TYPES = tuple(sorted(_INTERNAL_OBS_TYPES_SET | _REFLECTION_AUDIT_OBS_TYPES))
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "identity" / "MORNING_REPORT.md"
 
@@ -525,7 +554,7 @@ class MorningReportGenerator:
             unsurfaced = await count_unsurfaced(
                 self._db,
                 priority_filter=("critical", "high", "medium"),
-                exclude_types=_INTERNAL_OBS_TYPES,
+                exclude_types=_REPORT_INTERNAL_OBS_TYPES,
             )
             lines.append(f"- Unsurfaced observations (worth attention): {unsurfaced}")
         except Exception:
@@ -678,26 +707,97 @@ class MorningReportGenerator:
         surplus = health.get("surplus", {})
         awareness = health.get("awareness", {})
         cc = health.get("cc_sessions", {})
-        # cc_sessions snapshot nests foreground/background as dicts
-        # (e.g. {"foreground": {"active": 2}}). Handle both nested and
-        # flat formats defensively for backward-compatible test fixtures.
-        fg = cc.get("foreground", 0)
-        fg_active = fg.get("active", 0) if isinstance(fg, dict) else fg
-        bg = cc.get("background", 0)
-        bg_active = bg.get("active", 0) if isinstance(bg, dict) else bg
+        fig = self._fig
+        # cc_sessions nests foreground/background as dicts ({"active": 2});
+        # _fig also accepts the older flat int form.
         lines = [
             "## System Health",
             self._format_cost_line(cost),
             f"- Infrastructure: DB={infra.get('genesis.db', {}).get('status', '?')}, Qdrant={infra.get('qdrant', {}).get('status', '?')}",
-            f"- Queues: deferred={queues.get('deferred_work', 0)}, dead_letters={queues.get('dead_letters', 0)}, pending_embeddings={queues.get('pending_embeddings', 0)}",
-            f"- Surplus: {surplus.get('status', '?')}, queue_depth={surplus.get('queue_depth', 0)}",
-            f"- Awareness: ticks_24h={awareness.get('ticks_24h', '?')}",
-            f"- CC Sessions: foreground={fg_active}, background={bg_active}, failed_24h={cc.get('failed_24h', 0)}",
+            self._format_pid_line(infra.get("pids")),
+            f"- Queues: dead_letters={fig(queues, 'dead_letters')}, pending_embeddings={fig(queues, 'pending_embeddings')}",
+            self._format_deferred_line(queues),
+            f"- Surplus: {surplus.get('status', '?')}, queue_depth={fig(surplus, 'queue_depth')}",
+            f"- Awareness: ticks_24h={fig(awareness, 'ticks_24h')}",
+            f"- CC Sessions: foreground={fig(cc, 'foreground', 'active')}, "
+            f"background={fig(cc, 'background', 'active')}, failed_24h={fig(cc, 'failed_24h')}",
         ]
-        pending_embed = queues.get("pending_embeddings", 0)
-        if pending_embed and pending_embed > 100:
+        pending_embed = fig(queues, "pending_embeddings")
+        if isinstance(pending_embed, int) and pending_embed > 100:
             lines.append(f"- **Embedding queue elevated**: {pending_embed} pending")
         return "\n".join(lines)
+
+    @staticmethod
+    def _fig(section: object, key: str, sub: str | None = None) -> int | str:
+        """One count from a health-snapshot section, or "unavailable".
+
+        A section that failed is ``{"status": "error"}`` (``_or_error``), and a
+        producer whose own query failed leaves the key present with a None
+        value. Neither is a measured 0, and None must not reach the drafter as
+        a literal "None". Only an int is a figure. ``sub`` reads one level
+        down (``cc_sessions["foreground"]["active"]``); a flat int at ``key``
+        is accepted as the older shape.
+        """
+        if not isinstance(section, dict) or section.get("status") == "error":
+            return "unavailable"
+        value = section.get(key)
+        if sub is not None and isinstance(value, dict):
+            value = value.get(sub)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return "unavailable"
+        return value
+
+    @staticmethod
+    def _format_pid_line(pids: dict | None) -> str:
+        """The LIVE PID/task budget of the binding cgroup level, read with this
+        snapshot. An alert observation can carry a peak from hours earlier; this
+        line is the current figure to weigh it against. Any read it cannot vouch
+        for (collector error, unavailable, missing or malformed metric) prints
+        "unavailable", never a stale or partial number.
+        """
+        if not isinstance(pids, dict) or pids.get("status") not in ("healthy", "degraded", "error"):
+            return "- PID budget: unavailable"
+        current = pids.get("current")
+        maximum = pids.get("max")
+        pct = pids.get("pct")
+        if not isinstance(current, int):
+            return "- PID budget: unavailable"
+        if maximum == "max" and pct is None:
+            return f"- PID budget: no sub-cap visible ({current} tasks)"
+        if not isinstance(maximum, int) or not isinstance(pct, (int, float)):
+            return "- PID budget: unavailable"
+        scope = pids.get("scope")
+        scope_txt = f", {scope}" if scope else ""
+        return f"- PID budget: {pct:.0f}% ({current}/{maximum}{scope_txt})"
+
+    @staticmethod
+    def _format_deferred_line(queues: dict) -> str:
+        """Pending deferred work, split by kind. The raw total mixes recovery
+        work (real backlog) with batch worklists that are parked on purpose and
+        drained on a schedule, so the total alone overstates the backlog.
+        A worklist item stalled past a full drain cycle counts in both subsets
+        (the recovery count includes it); the snapshot counts those directly and
+        the overlap is named when present.
+
+        Any figure it cannot vouch for prints "unavailable", never a zero: the
+        queues section failed (``{"status": "error"}``) or the producer's query
+        failed, which leaves the figures None. Current producers measure all
+        four counts together; older snapshots may lack the optional overlap.
+        """
+        fig = MorningReportGenerator._fig
+        total = fig(queues, "deferred_work")
+        recovery = fig(queues, "deferred_recovery")
+        worklist = fig(queues, "deferred_worklist")
+        if "unavailable" in (total, recovery, worklist):
+            return "- Deferred work: unavailable"
+        line = (
+            f"- Deferred work: recovery backlog={recovery}; scheduled worklist={worklist} "
+            f"(deliberate scheduled drain, not a backlog)"
+        )
+        stalled = fig(queues, "deferred_worklist_stalled")
+        if isinstance(stalled, int) and stalled > 0:
+            line += f"; recovery includes {stalled} stalled worklist item(s)"
+        return line
 
     @staticmethod
     def _format_cost_line(cost: dict) -> str:
@@ -775,7 +875,7 @@ class MorningReportGenerator:
         obs_rows = await obs_crud.get_unsurfaced(
             self._db,
             priority_filter=("high", "medium", "low"),
-            exclude_types=_INTERNAL_OBS_TYPES,
+            exclude_types=_REPORT_INTERNAL_OBS_TYPES,
             limit=5,
         )
         if obs_rows:
@@ -798,12 +898,12 @@ class MorningReportGenerator:
         # Genesis-internal observation count (single summary line)
         internal_count = await obs_crud.count_unresolved_by_types(
             self._db,
-            types=_INTERNAL_OBS_TYPES,
+            types=_REPORT_INTERNAL_OBS_TYPES,
         )
         if internal_count:
             lines.append(
                 f"- Genesis internal: {internal_count} items tracked "
-                "(reflections, awareness events, etc. — no user action needed)"
+                "(reflections, self-audits, awareness events, etc. — no user action needed)"
             )
 
         return "\n".join(lines) if lines else "No activity data."
@@ -1244,7 +1344,7 @@ class MorningReportGenerator:
         observations = await get_unsurfaced(
             self._db,
             priority_filter=("critical", "high", "medium"),
-            exclude_types=_INTERNAL_OBS_TYPES,
+            exclude_types=_REPORT_INTERNAL_OBS_TYPES,
             limit=10,
         )
         if not observations:
@@ -1288,7 +1388,7 @@ class MorningReportGenerator:
         items = await get_standing(
             self._db,
             priority_filter=("critical", "high", "medium"),
-            exclude_types=_INTERNAL_OBS_TYPES,
+            exclude_types=_REPORT_INTERNAL_OBS_TYPES,
             threshold=3,
             limit=5,
         )

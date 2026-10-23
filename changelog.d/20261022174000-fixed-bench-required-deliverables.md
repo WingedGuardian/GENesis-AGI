@@ -1,0 +1,1 @@
+- Task-completion rubric 1.1.0 instructs judges to keep missing or contradicted required deliverables below the existing pass threshold, separately from writing quality; qualification requires fresh version-bound references.

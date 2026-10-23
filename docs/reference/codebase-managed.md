@@ -5,8 +5,9 @@ a pinned provider and publishes immutable settings; `status` diagnoses settings
 and native service state. The ordinary install/bootstrap loops render disabled
 query service/client slice templates on every install and do not automatically
 install, upgrade or version-probe a PATH Codebase binary. Registration always
-uses the managed launcher, including when no PATH provider exists. The index
-queue remains on its previous route until its separate integration lands.
+uses the managed launcher, including when no PATH provider exists. The existing
+index queue now uses managed admission and the contained native worker described
+under "Queued indexing" below.
 Staging and rendering alone do not make Codebase available.
 
 Existing symlinks at either managed query unit destination, including `/dev/null`
@@ -443,6 +444,36 @@ The teardown helper retains its system Python entry point and uses only standard
 library operations available on the supported Python 3.10 platform. It does not
 perform the native binary hash/launch acceptance used by the installed query
 runtime. Current-install tests are not a separate Python 3.10 runtime qualification.
+
+## Queued indexing
+
+The existing idle-gated runner probes managed availability before and after
+claiming a Codebase-only request. Unavailability leaves the pending generation
+uncharged; a post-claim refusal durably restores it. A combined request can
+complete GitNexus and requeue its unfinished Codebase leg before consuming the
+combined request. Partial-success outcomes (rc 4/5) use the ordinary request
+writer: a new pending row starts at zero attempts; coalescing with an existing
+pending row retains that row's higher count. The original inflight attempt
+count is not carried into the split request. Operators must not manually reset
+attempts to force retries. Retry-budget continuity across splits and commit
+generations remains part of the resource-failure quarantine work.
+The runner records availability errors in its log; the index entry point includes
+the final refusal line in its skip diagnostic.
+
+The adapter executes the accepted native inode inside the admitted 8 GiB,
+zero-swap scope with a 6 GiB native budget. Its supervisor retains a nonmaximum
+OOM adjustment; only the native child receives 1000. The validated physical main
+path supplies both the native payload and working directory. Final admission
+rechecks managed settings, cache, native readiness and enablement under the
+lifecycle lock, which closes after child creation. Repository/runner locks and
+the scope watchdog retain execution ownership. Missing canonical repository
+locks refuse Codebase; GitNexus retains its independent handling.
+
+This wiring merged in #3012. Read-only availability/access repairs remain tracked
+in #3464. Neither fixture acceptance nor a successful probe grants permission to
+clear the sentinel, release the freeze or retry unattended after resource failures.
+Follow the supervised production acceptance and resource gates in
+`../architecture/codebase-managed-runtime.md`.
 
 ## Verification
 

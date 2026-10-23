@@ -7,14 +7,19 @@ import pytest
 from genesis.ego.context import EgoContextBuilder
 from genesis.ego.genesis_context import GenesisEgoContextBuilder
 from genesis.observability.health_data import HealthDataService
+from genesis.resilience.deferred_work import DeferredWorkQueue
+from genesis.routing.dead_letter import DeadLetterQueue
 
 
 @pytest.mark.asyncio
 async def test_both_ego_contexts_render_real_queue_snapshot_depths():
-    deferred_queue = AsyncMock()
-    deferred_queue.count_pending.return_value = 7
-    dead_letter = AsyncMock()
+    deferred_queue = AsyncMock(spec_set=DeferredWorkQueue)
+    deferred_queue.count_pending_split.return_value = {
+        "total": 7, "recovery": 7, "worklist": 0, "stalled": 0,
+    }
+    dead_letter = AsyncMock(spec_set=DeadLetterQueue)
     dead_letter.get_pending_count.return_value = 11
+    dead_letter.get_stuck_count.return_value = 0
     health_data = HealthDataService(
         deferred_queue=deferred_queue,
         dead_letter=dead_letter,
@@ -46,11 +51,9 @@ async def test_a_failed_queue_query_reads_unknown_never_zero():
     "nothing pending" for a depth nobody measured — the same confident-wrong
     reading this file's other test exists to prevent, one layer down.
     """
-    deferred_queue = AsyncMock()
-    deferred_queue.count_pending.side_effect = RuntimeError("db unavailable")
-    deferred_queue.count_recovery_pending.side_effect = RuntimeError("db unavailable")
-    deferred_queue.count_worklist_pending.side_effect = RuntimeError("db unavailable")
-    dead_letter = AsyncMock()
+    deferred_queue = AsyncMock(spec_set=DeferredWorkQueue)
+    deferred_queue.count_pending_split.side_effect = RuntimeError("db unavailable")
+    dead_letter = AsyncMock(spec_set=DeadLetterQueue)
     dead_letter.get_pending_count.side_effect = RuntimeError("db unavailable")
     health_data = HealthDataService(
         deferred_queue=deferred_queue,

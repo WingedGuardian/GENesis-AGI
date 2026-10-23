@@ -16,18 +16,19 @@ from .accounting import Journal, _billing, currency, total
 from .evidence import Incomplete, canonical, check_directory, digest, load_json, private_open
 
 ALIASES = ("openrouter-mimo", "openrouter-deepseek-flash")
+PRO_COMPARISON = ("openrouter-deepseek-v4", "openrouter-deepseek-flash")
 PROMISE = "operating_budget_with_overrun_risk"
 STOP = "stop_both_on_unresolved_evidence_no_resend"
 SINGLE_STOP = "stop_campaign_on_unresolved_evidence_no_resend"
 
 
 def selected_aliases(models):
-    """Only Flash alone or the historical complete pair can acquire answers."""
-    if not isinstance(models, dict) or set(models) not in (
-        {ALIASES[1]}, set(ALIASES)
-    ):
-        raise Incomplete("operating_plan_invalid")
-    return tuple(alias for alias in ALIASES if alias in models)
+    """Select one explicit population, preserving its serial order."""
+    if isinstance(models, dict):
+        for aliases in ((ALIASES[1],), ALIASES, PRO_COMPARISON):
+            if set(models) == set(aliases):
+                return aliases
+    raise Incomplete("operating_plan_invalid")
 
 
 def identity(info):

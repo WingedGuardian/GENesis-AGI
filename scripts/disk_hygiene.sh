@@ -553,6 +553,21 @@ rotate_log() {
     fi
 }
 
+rotate_mcp_logs() {
+    local mcp_log_dir
+    local helper="$REPO_DIR/src/genesis/util/mcp_logging.py"
+    [ -f "$helper" ] && [ -n "$VENV_PY" ] || return 0
+    # Pure stdlib entrypoint: no package import, handler, mkdir or secrets load.
+    # NUL framing preserves pathname newline bytes and rejects incomplete output.
+    IFS= read -r -d '' mcp_log_dir < <("$VENV_PY" -I "$helper") || return 0
+    [ -n "$mcp_log_dir" ] || return 0
+    # Keep dirname output ending in a dot: its command substitution in rotate_log
+    # otherwise strips trailing newlines from the selected directory name.
+    mcp_log_dir+=/.
+    rotate_log "$mcp_log_dir/mcp_health.log" 10000000 2
+    rotate_log "$mcp_log_dir/turnstile_debug.log" 10000000 2
+}
+
 # Settings read BY NAME out of secrets.env: the hook audit store knobs, and the
 # browser engine cache and override (prune_camoufox_engines_step).
 #
@@ -822,8 +837,7 @@ main() {
     # 10 MB: about nine days of mcp_health.log at the measured rate, small
     # enough to read whole, and with 2 copies the three files stay near 30 MB
     # instead of growing without bound.
-    rotate_log "$HOME/tmp/mcp_health.log" 10000000 2
-    rotate_log "$HOME/tmp/turnstile_debug.log" 10000000 2
+    rotate_mcp_logs
 
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"

@@ -63,5 +63,9 @@ async def db_schema(table: str = "") -> dict:
     Examples:
       db_schema()                → list of all table names
       db_schema(table="events")  → column names, types, constraints for 'events'
+
+    To run a read: ~/genesis/.venv/bin/python -m genesis db query "<sql>"
+    (read-only enforced by SQLite; --json, --param, --limit). Do not use the
+    sqlite3 shell.
     """
     return await _impl_db_schema(table)

@@ -127,10 +127,10 @@ def test_main_executes_launcher_with_sanitized_environment(monkeypatch) -> None:
     assert captured["environment"]["GENESIS_REPO_ROOT"] == str(subject.runtime_root())
 
 
-def test_project_config_exposes_only_the_read_oriented_pilot_tools() -> None:
-    """The external surface admits no tool a CALLER can ask to write.
+def test_project_genesis_config_exposes_only_the_read_oriented_pilot_tools() -> None:
+    """The Genesis surface admits no tool a CALLER can ask to write.
 
-    This list is the whole security story for the external client, and it is
+    This list is the tool boundary for the Genesis external client, and it is
     worth stating precisely, because the obvious phrasing is false. Several of
     these tools do write incidentally — recall is read-MOSTLY, and bumps access
     counters on a hit. The invariant is narrower and it is the one that matters:
@@ -168,7 +168,7 @@ def test_project_config_exposes_only_the_read_oriented_pilot_tools() -> None:
 
     servers = config["mcp_servers"]
 
-    assert set(servers) == {"genesis-health", "genesis-memory"}
+    assert set(servers) == {"genesis-health", "genesis-memory", "gitnexus"}
     assert servers["genesis-health"]["startup_timeout_sec"] == 30
     # `health_errors` and `health_alerts` are deliberately ABSENT. The floor for
     # this surface is not only "no caller-requestable write" but "a tool means
@@ -195,7 +195,8 @@ def test_project_config_exposes_only_the_read_oriented_pilot_tools() -> None:
         "procedure_recall",
         "observation_query",
     ]
-    for server in servers.values():
+    for server_name in ("genesis-health", "genesis-memory"):
+        server = servers[server_name]
         assert server["command"] == "python3"
         assert server["args"][0] == "scripts/codex_external_mcp.py"
         assert server["cwd"] == "."
@@ -215,5 +216,35 @@ async def test_project_allowlists_only_registered_genesis_tools() -> None:
         "genesis-memory": set(await memory_mcp.get_tools()),
     }
 
-    for server_name, server in servers.items():
-        assert set(server["enabled_tools"]) <= registered[server_name]
+    for server_name, tools in registered.items():
+        assert set(servers[server_name]["enabled_tools"]) <= tools
+
+
+def test_project_gitnexus_reuses_the_pinned_launcher_and_closed_tool_set():
+    root = Path(__file__).resolve().parents[2]
+    server = tomllib.loads((root / ".codex/config.toml").read_text())["mcp_servers"]["gitnexus"]
+    assert server == {
+        "command": "bash",
+        "args": [".claude/mcp/run-gitnexus", "mcp"],
+        "cwd": ".",
+        "startup_timeout_sec": 30,
+        "default_tools_approval_mode": "approve",
+        "enabled_tools": [
+            "api_impact",
+            "check",
+            "context",
+            "cypher",
+            "detect_changes",
+            "explain",
+            "group_list",
+            "impact",
+            "list_repos",
+            "pdg_query",
+            "query",
+            "route_map",
+            "shape_check",
+            "tool_map",
+            "trace",
+        ],
+    }
+    assert (root / server["args"][0]).is_file()
