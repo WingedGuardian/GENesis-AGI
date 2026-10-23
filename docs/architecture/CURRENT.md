@@ -2840,7 +2840,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: ed048e214017 2026-10-22
+verified: 2bf5587b5c5d 2026-10-23
 ```
 
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
@@ -2860,20 +2860,30 @@ verified: ed048e214017 2026-10-22
   `Skill` tool_use records, so once that library's storage ships this report
   should become a query over it rather than a second parser.
 
-- **transcript_analytics/**: optional local transcript parser library. It
+- **transcript_analytics/**: optional local transcript analytics library. It
   extracts physical records, preserves unresolved identity and usage, and
   applies the shared credential scrubber to structured content. Schema5 records
   distinguish executor identity from delegation evidence. This development
-  candidate adds the parser, durable per-source Parquet records and audited
-  historical readers. Readers capture immutable source selections; historical
-  provenance and unavailable facts remain explicit. Ingestion keeps one captured
+  candidate adds the parser, durable per-source records, audited historical
+  readers and live query views. Readers capture immutable source selections;
+  tool blocks remain distinct, and uncertain result or delegation matches stay
+  unresolved. CLI and scheduling arrive in dependent changes. Additional backup
+  and recovery integration is deferred independently of collection and search.
+  Unknown historical content is excluded from content metrics. Views version 24
+  preserves missing call/result hashes as unknown and admits ownership from the
+  same evidence used by supported status and delegation; absent envelopes remain
+  distinct. Duplicate orphan results retain scrub-failure evidence. Query manifests
+  identify the views version. Historical actors without identities cannot form
+  lineage nodes. Paired-result IDs remain searchable raw evidence but do not
+  prove or contradict lineage: their independent result context was not retained.
+  Independent companion evidence and scoped unpaired results remain eligible;
+  paired-only associations stay unresolved and excluded from confirmed coverage.
+  Ingestion keeps one captured
   canonical root, rejects malformed persisted root bindings and isolates source
   stat failures. Transcript and sidecar-fingerprint reads admit regular descriptors
   without blocking; fingerprint metadata is limited to 1 MiB. The extractor's
   independent sidecar reopen remains outside adversarial-concurrency guarantees;
-  parser signatures and historical formats are unchanged. Queries, CLI and scheduling
-  arrive in dependent changes. Additional backup and recovery work is deferred
-  independently of collection and search.
+  parser signatures and historical formats are unchanged.
   It does not describe a deployed capability.
   Hook names are limited to literal command targets and option-free supported
   interpreter operands; ambiguous commands report `<unknown>` while preserving

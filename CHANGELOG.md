@@ -9,6 +9,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Fixed
+
+- Transcript analytics keeps paired-result-only agent lineage unknown while
+  retaining raw result IDs for search. Independent companion and scoped unpaired
+  result evidence still support lineage; query views version23 invalidates caches
+  built with the earlier inference.
+
 ### Added
 
 - **A warning when a git command is about to rewind your whole working tree.**
