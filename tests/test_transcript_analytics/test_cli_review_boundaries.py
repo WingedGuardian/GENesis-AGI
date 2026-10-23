@@ -1,14 +1,38 @@
 """CLI diagnostics and bounded result consumption preserve query evidence."""
 
 import csv
+import errno
 import io
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from genesis.transcript_analytics import cli, config, query, store
+
+
+@pytest.mark.parametrize("number", [errno.EIO, errno.EACCES, errno.ELOOP, errno.ENOENT])
+def test_status_isolates_initial_source_stat_errors(tmp_path, monkeypatch, number):
+    projects, data = tmp_path / "projects", tmp_path / "data"
+    projects.mkdir()
+    data.mkdir()
+    bad, good = projects / "bad.jsonl", projects / "good.jsonl"
+    bad.write_text("{}\n")
+    good.write_text("{}\n")
+    monkeypatch.setattr(store, "discover", lambda _: [(bad, bad.name), (good, good.name)])
+    real_stat = os.stat
+    def inspect(path, *args, **kwargs):
+        if path == bad:
+            raise OSError(number, "synthetic stat error")
+        return real_stat(path, *args, **kwargs)
+    monkeypatch.setattr(cli.os, "stat", inspect)
+    out = cli._status(SimpleNamespace(projects=projects, data=data))
+    assert out["stale_or_unbuilt"] == (1 if number == errno.ENOENT else 2)
+    assert len(out["source_errors"]) == int(number != errno.ENOENT)
+    if out["source_errors"]:
+        assert out["source_errors"][0]["source"] == store.source_identity(bad.name)
 
 
 @pytest.mark.parametrize(

@@ -2871,7 +2871,8 @@ verified: ba89fa1a22b5 2026-10-23
   SQL, disposable cache building and independent live/cache verification. The
   canonical configuration defaults off and accepts the existing private overlay;
   default paths follow the canonical runtime homes while explicit paths win.
-  Status reads confined snapshot metadata; bounded SQL previews and streaming CSV
+  Status reads confined snapshot metadata and reports individual source stat or
+  fingerprint errors while continuing; bounded SQL previews and streaming CSV
   preserve full query counts without retaining every result row in Python.
   Source evidence validates the selected original block's ID/hash and reports
   ambiguous reused IDs without choosing an owner. Scheduling arrives in a
@@ -2886,6 +2887,12 @@ verified: ba89fa1a22b5 2026-10-23
   prove or contradict lineage: their independent result context was not retained.
   Independent companion evidence and scoped unpaired results remain eligible;
   paired-only associations stay unresolved and excluded from confirmed coverage.
+  Ingestion keeps one captured
+  canonical root, rejects malformed persisted root bindings and isolates source
+  stat failures. Transcript and sidecar-fingerprint reads admit regular descriptors
+  without blocking; fingerprint metadata is limited to 1 MiB. The extractor's
+  independent sidecar reopen remains outside adversarial-concurrency guarantees;
+  parser signatures and historical formats are unchanged.
   It does not describe a deployed capability.
   Hook names are limited to literal command targets and option-free supported
   interpreter operands; ambiguous commands report `<unknown>` while preserving

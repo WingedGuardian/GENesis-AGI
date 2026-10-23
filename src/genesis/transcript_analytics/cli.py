@@ -207,10 +207,10 @@ def _status(args):
     source_errors = []
     for p, rel in sources:
         try:
-            st = os.stat(p)
-        except FileNotFoundError:  # removed since discovery (review N-6)
-            continue
-        try:
+            try:
+                st = os.stat(p)
+            except FileNotFoundError:  # removed since discovery (review N-6)
+                continue
             if not store.is_current(
                 args.data, store.srckey(rel), store.source_fingerprint(p, st), source=rel
             ):
