@@ -2875,7 +2875,11 @@ verified: ba89fa1a22b5 2026-10-23
   fingerprint errors while continuing; bounded SQL previews and streaming CSV
   preserve full query counts without retaining every result row in Python.
   Source evidence validates the selected original block's ID/hash and reports
-  ambiguous reused IDs without choosing an owner. Scheduling arrives in a
+  ambiguous reused IDs without choosing an owner. Its regular-file reader bounds
+  physical records at 1 MiB, withholds oversized/recursive context and reports
+  oversized targets unavailable while retaining search rows and original files.
+  Applicable result envelopes retain their hash eligibility and are scrubbed.
+  Scheduling arrives in a
   dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   Unknown historical content is excluded from content metrics. Views version 24

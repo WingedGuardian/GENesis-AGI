@@ -37,6 +37,12 @@ live views over the same captured source selection. `verify` requires an availab
 current cache and compares schemas, counts and row digests with forced live views.
 Excluded sources keep verification incomplete.
 
+`evidence --tool-use-id ID` retrieves scrubbed call/result context from accepted
+source references. Its default output budget is 64 KiB, with five surrounding
+records. Physical JSONL records above 1 MiB report unavailable for a target or
+withheld for context; their stored search rows and original files remain intact.
+Nonregular originals and unparseable recursive JSON do not produce raw evidence.
+
 Use `sql --live` for raw tables and SQL text containing raw-looking names, including
 harmless literals or comments. The first release retains that documented text-gate
 usability quirk. A query's `--window` is a provenance label; filter timestamps in

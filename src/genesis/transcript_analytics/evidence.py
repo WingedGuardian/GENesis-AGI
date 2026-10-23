@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 import subprocess
@@ -11,6 +12,8 @@ from pathlib import Path, PurePosixPath
 
 from . import scrub
 from .query import run_query
+
+_MAX_RECORD_BYTES = 1024 * 1024
 
 
 def _target_available(records, line, expected_id):
@@ -23,18 +26,26 @@ def _target_available(records, line, expected_id):
     return any(f'"{key}": {token}' in target["text"] for key in ("id", "tool_use_id"))
 
 
+def _result_envelope(record, blocks):
+    results = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_result"]
+    denial = record.get("toolDenialKind")
+    return {
+        "toolUseResult": record.get("toolUseResult") if len(results) == 1 else None,
+        "toolDenialKind": denial if isinstance(denial, str) else None,
+    }
+
+
 def _observation_hash(record, blocks, block):
     from .extract import _hash
 
     if block["type"] == "tool_use":
         return _hash(block)
-    results = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_result"]
-    denial = record.get("toolDenialKind")
+    envelope = _result_envelope(record, blocks)
     return _hash(
         {
             "block": block,
-            "toolUseResult": record.get("toolUseResult") if len(results) == 1 else None,
-            "denial_kind": denial if isinstance(denial, str) else None,
+            "toolUseResult": envelope["toolUseResult"],
+            "denial_kind": envelope["toolDenialKind"],
         }
     )
 
@@ -70,10 +81,11 @@ def _matching_record(raw, expected_id, expected_hash=None, expected_kind=None):
             key: expected_id,
             **{k: v for k, v in block.items() if k not in ("type", key)},
         }
-        return (
-            json.dumps({"message": {"content": [block]}}, ensure_ascii=True) + "\n"
-        ).encode(), True
-    except (ValueError, AttributeError, TypeError, UnicodeError):
+        selected = {"message": {"content": [block]}}
+        if block["type"] == "tool_result":
+            selected.update({k: v for k, v in _result_envelope(record, blocks).items() if v is not None})
+        return (json.dumps(selected, ensure_ascii=True) + "\n").encode(), True
+    except (ValueError, AttributeError, TypeError, UnicodeError, RecursionError):
         return raw, False
 
 
@@ -81,7 +93,7 @@ def _scrub_record(raw):
     """Retain original JSON only when its bytes are valid UTF-8 JSON."""
     try:
         decoded, duplicates = scrub.load_json(raw)
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError, RecursionError):
         try:
             plain = raw.decode("utf-8")
         except UnicodeError:
@@ -92,50 +104,86 @@ def _scrub_record(raw):
     if duplicates:
         return None, True
     text, failed = scrub.scrub_json(decoded, preserve_identity=True)
-    if not failed and not duplicates and json.loads(text) == decoded:
+    try:
+        unchanged = not failed and not duplicates and json.loads(text) == decoded
+    except (ValueError, TypeError, RecursionError):
+        return None, True
+    if unchanged:
         try:
             original = raw.decode("utf-8")
             # BOM-less UTF-16/32 ASCII can decode as UTF-8 but contains NULs.
             json.loads(original.removeprefix("\ufeff"))
-        except (ValueError, UnicodeError):
+        except (ValueError, UnicodeError, RecursionError):
             pass  # The validated scrubbed JSON is already safe UTF-8 text.
         else:
             text = original
     return text, failed
 
 
+def _bounded_lines(stream, last_line, source_bytes):
+    """Yield physical lines without allocating an oversized record or following appends."""
+    remaining = source_bytes
+    for number in range(1, last_line + 1):
+        if remaining is not None and remaining <= 0:
+            break
+        limit = _MAX_RECORD_BYTES + 1
+        raw = stream.readline(limit if remaining is None else min(limit, remaining))
+        if not raw:
+            break
+        if remaining is not None:
+            remaining -= len(raw)
+        oversized = len(raw) > _MAX_RECORD_BYTES
+        if oversized:
+            while not raw.endswith(b"\n") and (remaining is None or remaining > 0):
+                raw = stream.readline(_MAX_RECORD_BYTES if remaining is None else min(_MAX_RECORD_BYTES, remaining))
+                if remaining is not None:
+                    remaining -= len(raw)
+                if not raw:
+                    break
+        yield number, None if oversized else raw
+
+
 def _window(
-    stream, line, surrounding, budget, expected_id=None, expected_hash=None, expected_kind=None
+    stream, line, surrounding, budget, expected_id=None, expected_hash=None, expected_kind=None,
+    *, source_bytes=None,
 ):
-    records = []
+    records, retained = [], 0
+    dropped = False
     identity_matches = expected_id is None
-    for number, raw in enumerate(stream, 1):
+    for number, raw in _bounded_lines(stream, line + surrounding, source_bytes):
         if number < max(1, line - surrounding):
             continue
-        if number > line + surrounding:
-            break
-        if number == line and expected_id is not None:
-            raw, identity_matches = _matching_record(raw, expected_id, expected_hash, expected_kind)
-        text, failed = _scrub_record(raw)
-        if failed:
-            text = "[scrub failed: evidence withheld]"
+        if raw is None:
+            if number == line:
+                return {"unavailable": "source record exceeds the 1 MiB evidence read limit",
+                        "records": [], "target_available": False}
+            text, failed = "[oversized context record: evidence withheld]", False
+        else:
+            if number == line and expected_id is not None:
+                raw, identity_matches = _matching_record(raw, expected_id, expected_hash, expected_kind)
+            text, failed = _scrub_record(raw)
+            if failed:
+                text = "[scrub failed: evidence withheld]"
         encoded = (text or "").encode()
-        records.append(
-            {
-                "line": number,
-                "text": encoded[:budget].decode("utf-8", "ignore"),
-                "truncated": len(encoded) > budget,
-                "scrub_failed": failed,
-            }
-        )
+        record = {"line": number, "text": encoded[:budget].decode("utf-8", "ignore"),
+                  "truncated": raw is None or len(encoded) > budget, "scrub_failed": failed}
+        cost = len(json.dumps(record, ensure_ascii=False).encode())
+        heapq.heappush(records, (-abs(number - line), -number, cost, record))
+        retained += cost
+        while len(records) > 1 and retained > max(budget, _MAX_RECORD_BYTES):
+            retained -= heapq.heappop(records)[2]
+            dropped = True
     if not identity_matches:
         return {
             "unavailable": "target line no longer matches the referenced tool use",
             "records": [],
             "target_available": False,
         }
+    return _fit_window([entry[3] for entry in records], line, budget, dropped, expected_id)
+
+
+def _fit_window(records, line, budget, truncated, expected_id):
     selected = []
-    truncated = False
     for record in sorted(records, key=lambda r: (abs(r["line"] - line), r["line"])):
         encoded = record["text"].encode()
         if budget <= 0:
@@ -186,7 +234,8 @@ def _archive_window(
             raise ValueError("archive member does not match source")
         with tar.extractfile(member) as stream:
             result = _window(
-                stream, line, surrounding, budget, expected_id, expected_hash, expected_kind
+                stream, line, surrounding, budget, expected_id, expected_hash, expected_kind,
+                source_bytes=member.size,
             )
         if tar.next() is not None:
             raise ValueError("archive has multiple members")
@@ -207,7 +256,7 @@ def read_reference(
     expected_hash=None,
     expected_kind=None,
 ):
-    from .store import source_path
+    from .store import _open_regular, source_path
 
     try:
         relative = source_path(relative)
@@ -217,21 +266,24 @@ def read_reference(
     if path.is_absolute() or ".." in path.parts or not path.parts or line < 1:
         return {"unavailable": "invalid source reference"}
     target = projects / relative
+    live_unavailable = None
     try:
         if not target.resolve().is_relative_to(projects.resolve()) or target.is_symlink():
             return {"unavailable": "source resolves outside projects or is a symlink"}
-        with target.open("rb") as stream:
+        with _open_regular(target) as stream:
             result = _window(
-                stream, line, surrounding, budget, expected_id, expected_hash, expected_kind
+                stream, line, surrounding, budget, expected_id, expected_hash, expected_kind,
+                source_bytes=os.fstat(stream.fileno()).st_size,
             )
             if "unavailable" not in result:
                 return {**result, "origin": "live"}
+            live_unavailable = result
             raise FileNotFoundError("live evidence identity changed")
     except FileNotFoundError:
         archive_dir = archive_dir or Path.home() / "backups/genesis-backups/transcripts"
         archive = archive_dir / f"v2-{hashlib.sha256(os.fsencode(relative)).hexdigest()}.tar.gpg"
         if not archive.is_file():
-            return {"unavailable": "original target and local encrypted archive unavailable"}
+            return live_unavailable or {"unavailable": "original target and local encrypted archive unavailable"}
         try:
             return _archive_window(
                 archive,
@@ -244,9 +296,9 @@ def read_reference(
                 expected_kind,
             )
         except (OSError, ValueError, tarfile.TarError, subprocess.SubprocessError):
-            return {"unavailable": "local archive unreadable or invalid"}
-    except OSError:
-        return {"unavailable": "source unreadable"}
+            return live_unavailable or {"unavailable": "local archive unreadable or invalid"}
+    except (OSError, ValueError, RuntimeError):
+        return {"unavailable": "source unreadable or not a regular file"}
 
 
 def _clip_json_text(text, budget):
