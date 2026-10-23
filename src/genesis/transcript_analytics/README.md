@@ -79,8 +79,15 @@ and excluded from confirmed coverage. Unpaired results retain their own context
 and remain eligible for the existing producer checks.
 Unknown historical actors keep distinct structured source-local identities and
 do not create lineage nodes. Missing content hashes remain unknown and count as
-excluded content; observed conflicting hashes remain conflicts. Conflicting
-tool observations retain stable display values without resolving their ownership.
+excluded content; observed conflicting hashes remain conflicts, including mixed
+known/missing copies. Ownership and supported attribution use the same complete
+evidence envelope, including every call copy used by delegation. Missing call or
+result envelopes are distinct from present envelopes whose hashes are unknown;
+validity remains false in both cases. Hook/event ownership also requires every
+observed actor. Conflicting tool observations retain stable display values without
+resolving ownership, and duplicate orphan results preserve any scrub-failure flag.
+Views version 24 invalidates caches containing the previous derived semantics;
+stored source schemas, extraction stamps and original provenance are unchanged.
 
 `source_coverage` exposes original per-source provenance and unavailable
 historical facts. `run_query(..., manifest_path=...)` records the same captured

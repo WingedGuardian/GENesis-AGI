@@ -23,7 +23,7 @@ import duckdb
 from genesis.transcript_analytics import history, store
 from genesis.transcript_analytics.extract import TABLES
 
-VIEWS_VERSION = "23"
+VIEWS_VERSION = "24"
 _READS = weakref.WeakKeyDictionary()
 _DERIVED = (
     "tool_calls",
@@ -415,14 +415,10 @@ CREATE OR REPLACE VIEW tool_calls AS
 -- call observation key (uuid or source+line), while unrelated calls may
 -- reuse the id. Dedup on the observation key, then pair each result row to
 -- its best call on same-source/session evidence.
-WITH call_observations AS (
-  SELECT c.*, to_json([coalesce('uuid:' || c.call_uuid,
-    'local:' || c.source_file || ':' || c.line_no_call), c.tool_use_id]) AS call_key
-  FROM raw_tool_calls c WHERE c.line_no_call IS NOT NULL
-), calls AS (
+WITH calls AS (
   SELECT * EXCLUDE (pick) FROM (
     SELECT c.*,
-      count(DISTINCT c.call_hash) OVER (PARTITION BY c.call_key) AS call_variants,
+      s.content_conflict AS call_content_conflict,
       bool_or(c.scrub_failed) OVER (PARTITION BY c.call_key) AS call_scrub_failed,
       list(DISTINCT struct_pack(source_file:=c.source_file,line_no_call:=c.line_no_call,
         line_no_result:=c.line_no_result)
@@ -432,14 +428,16 @@ WITH call_observations AS (
                          ORDER BY (c.source_file = m.source_file) DESC NULLS LAST,
                                   c.source_file,
                                   c.line_no_call, c.call_hash) AS pick
-    FROM call_observations c
+    FROM call_observations c JOIN call_states s USING(call_key)
     LEFT JOIN message_copy m ON m.turn_key = 'provider:' || c.message_id
     WHERE c.line_no_call IS NOT NULL
   ) WHERE pick = 1
 ),
 paired AS (
   SELECT * EXCLUDE (pick) FROM (
-    SELECT r.*, CASE WHEN count(DISTINCT k.call_key) OVER (
+    SELECT r.* EXCLUDE(scrub_failed),
+      bool_or(r.scrub_failed) OVER (PARTITION BY r.source_file,r.line_no_result,r.tool_use_id,r.result_hash) AS scrub_failed,
+      CASE WHEN count(DISTINCT k.call_key) OVER (
         PARTITION BY r.source_file, r.line_no_result, r.tool_use_id, r.result_hash
       ) = 1 THEN k.call_key END AS call_key,
       to_json([r.source_file, CAST(r.line_no_result AS VARCHAR), r.tool_use_id]) AS result_key,
@@ -463,7 +461,9 @@ results AS (
     ORDER BY source_file, line_no_result, result_hash) = 1
 ),
 envelopes AS (
-  SELECT coalesce(call_key, result_key) AS envelope_key, count(DISTINCT result_hash) AS result_variants,
+  SELECT coalesce(call_key, result_key) AS envelope_key,
+    CASE WHEN count(DISTINCT result_hash)>1 THEN TRUE
+      WHEN count(*) FILTER(WHERE result_hash IS NULL)>0 THEN NULL ELSE FALSE END AS result_content_conflict,
     bool_or(scrub_failed) AS result_scrub_failed,
     list(DISTINCT struct_pack(source_file:=source_file,line_no_call:=line_no_call,
       line_no_result:=line_no_result)
@@ -493,10 +493,10 @@ SELECT
   r.source_file AS result_source_file, k.call_uuid,
   own.executor_id, own.attribution_status, own.attribution_reason, own.context_sessions,
   lineage.parent_actor_id AS delegator_id, lineage.lineage_status,
-  coalesce(k.call_variants=1 AND NOT states.content_conflict,false) AS call_valid,
-  coalesce(env.result_variants=1, r.has_result, false) AS result_valid,
-  coalesce(k.call_variants > 1, false) AS content_conflict,
-  coalesce(env.result_variants > 1, false) AS result_conflict,
+  (k.call_content_conflict IS FALSE AND states.content_conflict IS FALSE) AS call_valid,
+  (env.result_content_conflict IS FALSE AND r.has_result IS TRUE) AS result_valid,
+  CASE WHEN k.call_key IS NULL THEN FALSE ELSE k.call_content_conflict END AS content_conflict,
+  CASE WHEN env.envelope_key IS NULL THEN FALSE ELSE env.result_content_conflict END AS result_conflict,
   list_sort(list_distinct(list_concat(coalesce(k.call_references, []), coalesce(env.result_references, [])))) AS source_references
 FROM calls k FULL OUTER JOIN results r ON r.call_key = k.call_key
 LEFT JOIN envelopes env ON env.envelope_key = coalesce(k.call_key, r.call_key, r.result_key)
@@ -576,7 +576,8 @@ WITH keyed AS (
 ), states AS (
  SELECT event_key,CASE WHEN count(DISTINCT record_hash)>1 THEN TRUE
  WHEN count(*) FILTER (WHERE record_hash IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict,
- CASE WHEN count(DISTINCT actor_id)=1 AND NOT bool_or(context_conflict)
+ CASE WHEN count(DISTINCT actor_id)=1 AND count(actor_id)=count(*)
+ AND count(DISTINCT record_hash)=1 AND count(record_hash)=count(*) AND NOT bool_or(context_conflict)
  THEN any_value(actor_id ORDER BY actor_id) END AS executor_id,
  list(DISTINCT context_session_id ORDER BY context_session_id) AS context_sessions,
  bool_or(context_conflict) AS context_conflict,
@@ -602,7 +603,8 @@ WITH keyed AS (
 ), states AS (
  SELECT event_key,CASE WHEN count(DISTINCT record_hash)>1 THEN TRUE
  WHEN count(*) FILTER (WHERE record_hash IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict,
- CASE WHEN count(DISTINCT actor_id)=1 AND NOT bool_or(context_conflict)
+ CASE WHEN count(DISTINCT actor_id)=1 AND count(actor_id)=count(*)
+ AND count(DISTINCT record_hash)=1 AND count(record_hash)=count(*) AND NOT bool_or(context_conflict)
  THEN any_value(actor_id ORDER BY actor_id) END AS executor_id,
  list(DISTINCT context_session_id ORDER BY context_session_id) AS context_sessions,
  bool_or(context_conflict) AS context_conflict,

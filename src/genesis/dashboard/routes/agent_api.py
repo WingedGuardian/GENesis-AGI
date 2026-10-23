@@ -193,7 +193,7 @@ def _install_gate(state):
 
 async def _view(service, row):
     g.peer_task_id = row["id"]
-    return project(row, await service.has_pending_approval(g.peer_identity, row["id"]))
+    return project(row)
 
 
 @agent_api_bp.route(ROOT + "/message:send", methods=["POST"])
