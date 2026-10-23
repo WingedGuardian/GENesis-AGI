@@ -9,7 +9,20 @@ writers. Role-specific publishing, service and store policy and launcher trust
 preflight are separate dependencies; this adapter alone is not an activated
 validator.
 
-Every Bash command must begin `cd /absolute/existing/directory && command`.
+Every Bash command must begin with this exact foreground opener and a literal
+newline before its command body:
+
+```bash
+cd /absolute/existing/directory || exit
+command
+```
+
+The opener permits no exit arguments, comments, redirections or continuations.
+The former `cd /directory && command` format is refused: a later background
+operator can run that entire AND-list in a subshell, leaving following commands
+in the original directory. The newline completes the directory change before
+the body runs; a failed directory change exits before the body. Later directory
+changes still need the existing guards' handling and the planned role policy.
 Single or double quoting of a literal directory is supported, without expansion
 or a `--` option. Parent (`..`) components are refused because Bash's logical
 parent resolution can differ from filesystem resolution through a symlink;
@@ -17,8 +30,8 @@ use the canonical directory instead. Ordinary symlink anchors remain supported.
 The command is unchanged. Native 0.163.0 omitted an explicit
 shell workdir from its hook input, so the adapter supplies the proven anchor as
 the guards' cwd instead. Reads require this prefix too.
-For the root directory, use `cd "/" && command`: the unquoted `cd /` spelling
-currently refuses (#3581).
+For the root directory, use `cd "/" || exit` followed by the newline and body:
+the unquoted `cd /` spelling currently refuses (#3581).
 
 The prefix makes the call a compound command. The unchanged parser deliberately
 does not exempt data-heredoc bodies in compound openers, so inline prose can be
@@ -81,7 +94,7 @@ activation. An outer hook that cannot start, is killed or times out can still
 fail open in Codex. This is bounded accident prevention, not OS containment.
 
 Twenty fresh-process plain-shell hook probes on the qualified source measured
-1.55 seconds for the first call, p95 1.57 seconds and maximum 1.66 seconds.
+1.61 seconds for the first call, p95 1.74 seconds and maximum 1.81 seconds.
 These are normal-call measurements, not a worst-case guarantee; later policy
 or profile changes require qualification again.
 Multi-file patches share the same overall budget and may need smaller batches.

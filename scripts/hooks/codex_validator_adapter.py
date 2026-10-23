@@ -9,7 +9,7 @@ behavioral_linter, procedure_advisor, cbm-discovery-gate, deploy_timeout_advisor
 do not reach hooks. Existing guards' internal fail-open paths remain theirs;
 observable failures here deny. Arbitrary programs, later stdin, filesystem races
 and failed/killed outer hooks remain outside this accident-prevention layer.
-Native 0.163.0 drops shell workdir: require an absolute cd anchor, no rewriting.
+Native 0.163.0 drops shell workdir: require cd/exit and a newline, no rewriting.
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ GUARDS = (
 INLINE_BASH_SAFETY = "bash -c 'IN=$(cat); CMD=$(printf %s \"$IN\" | jq -r .tool_input.command 2>/dev/null); if echo \"$CMD\" | grep -qE \"genesis[[:space:]]+serve\" && echo \"$CMD\" | grep -qi \"worktree\"; then echo \"BLOCKED: never boot the full Genesis runtime from/against a worktree.\" >&2; echo \"Children inherit PYTHONPATH and path-keyed subsystems reindex the worktree as a new project — OOM-crashed the container 2026-07-03.\" >&2; echo \"PYTHONPATH to a worktree is for pytest only. Use merge-then-verify or a blueprint-only harness.\" >&2; exit 2; fi; if echo \"$CMD\" | grep -qE \"pip install.*((-e|--ed[a-z]*|[[:space:]]-[a-zA-Z]*e)[=[:space:]]*[^ ]*worktree)\"; then echo \"BLOCKED: pip install -e to a worktree redirects the ENTIRE system genesis imports.\" >&2; echo \"This crashes the live bridge. Use PYTHONPATH instead:\" >&2; echo \"  PYTHONPATH=/path/to/worktree/src pytest tests/\" >&2; exit 2; fi; case \"$CMD\" in *\"git reset --hard\"*) echo \"BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user.\" >&2; exit 2;; *\"nohup\"*\"run_ui\"*|*\"nohup\"*\"bridge\"*|*\"nohup\"*\"genesis\"*) echo \"BLOCKED: AZ and bridge must run via systemd, not nohup.\" >&2; echo \"Use: systemctl --user restart genesis-az\" >&2; echo \"  or: systemctl --user restart genesis-bridge\" >&2; exit 2;; esac; if echo \"$CMD\" | grep -qE \"sqlite3.*genesis\\.db\"; then echo \"WARNING: Direct sqlite3 access to genesis.db detected. Use MCP tools (db_schema, health_status) or genesis.db.crud modules instead. Raw SQL risks write contention and bypasses WAL safety. Proceed only if read-only query.\" >&2; fi'"
 # Closed syntax for the anchor only, not a second shell-command parser.
 ANCHOR = re.compile(
-    r"""\Acd[ \t]+(?P<path>/[^\s;&|<>()$\x60\\'"*?!#\[{]+|'/[^'\r\n]*'|"/[^"$\x60\\\r\n]*")[ \t]+&&[ \t]+(?=\S)"""
+    r"""\Acd[ \t]+(?P<path>/[^\s;&|<>()$\x60\\'"*?!#\[{]+|'/[^'\r\n]*'|"/[^"$\x60\\\r\n]*")[ \t]+\|\|[ \t]+exit\n(?=\s*\S)"""
 )
 
 
@@ -63,7 +63,7 @@ exit 2'''
 def initial_directory(command: str) -> Path:
     match = ANCHOR.match(command)
     if not match:
-        raise Refused("Every Bash call requires literal cd /absolute/directory && command")
+        raise Refused("Every Bash call requires literal cd /absolute/directory || exit, newline, then command")
     directory = Path(shlex.split(match["path"])[0])
     if ".." in directory.parts:
         raise Refused("Validator command anchor must not contain parent components")

@@ -29,7 +29,7 @@ def adapter(monkeypatch, tmp_path):
     return module
 
 
-def payload(command="cd /tmp && printf fixture", name="Bash", **extra):
+def payload(command="cd /tmp || exit\nprintf fixture", name="Bash", **extra):
     return {"hook_event_name": "PreToolUse", "tool_name": name,
             "tool_input": {"command": command}, "cwd": "/tmp",
             "session_id": "fixture-session", "tool_use_id": "fixture-call", **extra}
@@ -43,9 +43,71 @@ def test_shell_requires_literal_absolute_anchor(adapter, command):
         adapter.prepare(payload(command))
 
 
+@pytest.mark.parametrize("body", ["printf fixture", "true & wait; pwd -P",
+    "{ true; } & wait; pwd -P", "false || true & wait; pwd -P"])
+def test_legacy_and_list_cannot_supply_foreground_anchor(adapter, tmp_path, body):
+    with pytest.raises(ValueError, match="literal"):
+        adapter.initial_directory(f"cd {tmp_path} && {body}")
+
+
+@pytest.mark.parametrize("tail", [" || exit 0\npwd", " || exit;\npwd", " || exit &\npwd",
+    " || exit # comment\npwd", " || exit > /dev/null\npwd", " || exit\\\n\npwd", " || exit\r\npwd",
+    " || exit\n", " || exit\n   "])
+def test_foreground_prefix_requires_exact_exit_newline_and_body(adapter, tmp_path, tail):
+    with pytest.raises(ValueError):
+        adapter.initial_directory(f"cd {tmp_path}" + tail)
+
+
+@pytest.mark.parametrize("label,body,changes_directory", [('ordinary-semicolon', 'true; pwd -P', False),
+ ('ordinary-and', 'true && pwd -P', False),
+ ('ordinary-or', 'false || pwd -P', False),
+ ('leading-and-list-background', 'true & wait; pwd -P', False),
+ ('long-and-list-background', 'true && true & wait; pwd -P', False),
+ ('or-list-background', 'false || true & wait; pwd -P', False),
+ ('background-after-newline-continuation', 'true \\\n& wait; pwd -P', False),
+ ('background-brace-body', '{ true; } & wait; pwd -P', False),
+ ('background-subshell-body', '(true) & wait; pwd -P', False),
+ ('background-if-body', 'if true; then true; fi & wait; pwd -P', False),
+ ('background-while-body', 'while false; do true; done & wait; pwd -P', False),
+ ('background-for-body', 'for x in 1; do true; done & wait; pwd -P', False),
+ ('background-pipeline-body', 'true | true & wait; pwd -P', False),
+ ('foreground-pipeline-body', 'true | true; pwd -P', False),
+ ('body-subshell-background', '(true & wait); pwd -P', False),
+ ('body-brace-background', '{ true & wait; }; pwd -P', False),
+ ('body-if-background', 'if true; then true & wait; fi; pwd -P', False),
+ ('body-for-background', 'for x in 1; do true & wait; done; pwd -P', False),
+ ('later-independent-background', 'true; true & wait; pwd -P', False),
+ ('newline-terminates-anchor-list', 'true\ntrue & wait; pwd -P', False),
+ ('single-quoted-ampersand', "printf '%s' '&' >/dev/null; pwd -P", False),
+ ('double-quoted-ampersand', 'printf "%s" "&" >/dev/null; pwd -P', False),
+ ('escaped-ampersand', 'printf "%s" \\& >/dev/null; pwd -P', False),
+ ('redirect-ampersand', 'true &>/dev/null; pwd -P', False),
+ ('redirect-append-ampersand', 'true &>>/dev/null; pwd -P', False),
+ ('redirect-fd-ampersand', 'true 2>&1; pwd -P', False),
+ ('redirect-input-fd-ampersand', 'true 0<&0; pwd -P', False),
+ ('comment-ampersand', 'true # & ignored\npwd -P', False),
+ ('command-substitution-background', 'x=$(true & wait); pwd -P', False),
+ ('process-substitution-background', 'cat <(true & wait); pwd -P', False),
+ ('later-foreground-cd', 'true; cd @OTHER@; pwd -P', True),
+ ('later-brace-cd', '{ cd @OTHER@; }; pwd -P', True),
+ ('later-subshell-cd', '(cd @OTHER@); pwd -P', False)])
+def test_foreground_opener_matches_bash_scope(adapter, tmp_path, label, body, changes_directory):
+    anchor = tmp_path / "anchor"
+    other = tmp_path / "other"
+    anchor.mkdir()
+    other.mkdir()
+    body = body.replace("@OTHER@", shlex.quote(str(other)))
+    command = f"cd {shlex.quote(str(anchor))} || exit\n{body}"
+    assert adapter.initial_directory(command) == anchor
+    actual = subprocess.run(["bash", "--noprofile", "--norc", "-c", command], cwd=tmp_path,
+                            env={"PATH": os.defpath, "HOME": str(tmp_path)}, capture_output=True, text=True, timeout=5)
+    assert actual.returncode == 0 and not actual.stderr, (label, actual)
+    assert actual.stdout.strip().splitlines()[-1] == str(other if changes_directory else anchor)
+
+
 @pytest.mark.parametrize("quote", ["", "'", '"'])
 def test_shell_preserves_command_and_native_ids_but_replaces_cwd(adapter, tmp_path, quote):
-    command = f"cd {quote}{tmp_path}{quote} && printf '$HOME; untouched'"
+    command = f"cd {quote}{tmp_path}{quote} || exit\nprintf '$HOME; untouched'"
     calls = adapter.prepare(payload(command, cwd="/not-execution-cwd"))
     assert len(calls) == 15
     for argv, data, budget in calls:
@@ -369,7 +431,7 @@ def test_existing_guard_vectors_through_real_adapter_path(adapter, tmp_path, mon
     (bins / "gh").write_text("#!/bin/sh\nexit 1\n")
     (bins / "gh").chmod(0o755)
     monkeypatch.setenv("PATH", str(bins) + os.pathsep + os.environ["PATH"])
-    calls = adapter.prepare(payload(f"cd {repo} && {command}", cwd=str(repo)))
+    calls = adapter.prepare(payload(f"cd {repo} || exit\n{command}", cwd=str(repo)))
     invocation = calls[-1] if guard == "inline" else next(c for c in calls if f"/{guard}.py" in " ".join(c[0]))
     if denied:
         with pytest.raises(ValueError, match=note):
@@ -377,7 +439,7 @@ def test_existing_guard_vectors_through_real_adapter_path(adapter, tmp_path, mon
     else:
         assert note.lower() in asyncio.run(adapter.run_guard(*invocation)).lower()
     # A harmless action must still allow through the SAME real guard/launcher.
-    control = {**invocation[1], "tool_input": {"command": f"cd {repo} && printf fixture"}}
+    control = {**invocation[1], "tool_input": {"command": f"cd {repo} || exit\nprintf fixture"}}
     asyncio.run(adapter.run_guard(invocation[0], control, invocation[2]))
 
 
@@ -408,7 +470,7 @@ def test_anchor_is_the_actual_child_cwd_for_relative_secret_globs(adapter, tmp_p
     anchor = tmp_path / "genesis"
     anchor.mkdir()
     (anchor / "secrets.env").write_text("synthetic")
-    data = payload(f"cd {anchor} && cat s*.env", cwd=str(runtime))
+    data = payload(f"cd {anchor} || exit\ncat s*.env", cwd=str(runtime))
     invocation = next(c for c in adapter.prepare(data) if "secrets_env_access_guard.py" in " ".join(c[0]))
     with pytest.raises(ValueError, match="owner"):
         asyncio.run(adapter.run_guard(*invocation))
@@ -419,13 +481,13 @@ def test_anchor_rejects_unquoted_expansion_and_allows_quoted_literals(adapter, t
     literal = tmp_path / name
     for directory in (literal, tmp_path / "da", tmp_path / "db"):
         directory.mkdir()
-    raw = f"cd {literal} && pwd"
+    raw = f"cd {literal} || exit\npwd"
     actual = subprocess.run(["bash", "-c", raw], capture_output=True, text=True, timeout=5)
     assert actual.returncode != 0 or actual.stdout.strip() != str(literal)
     with pytest.raises(ValueError, match="literal"):
         adapter.initial_directory(raw)
     for quote in ("'", '"'):
-        anchored = f"cd {quote}{literal}{quote} && pwd"
+        anchored = f"cd {quote}{literal}{quote} || exit\npwd"
         actual = subprocess.run(["bash", "-c", anchored], capture_output=True, text=True, timeout=5)
         assert actual.returncode == 0 and actual.stdout.strip() == str(literal)
         assert adapter.initial_directory(anchored) == literal
@@ -450,14 +512,20 @@ def test_anchor_refuses_parent_components_but_retains_canonical_and_symlink_anch
     if linked:
         assert Path(name).resolve() != origin
     with pytest.raises(ValueError, match="parent"):
-        adapter.initial_directory(f"cd {quote}{name}{quote} && printf fixture")
+        adapter.initial_directory(f"cd {quote}{name}{quote} || exit\nprintf fixture")
     for anchor, expected in ((origin, origin), (child, physical if linked else child)):
-        assert adapter.initial_directory(f"cd {quote}{anchor}{quote} && printf fixture") == expected
+        assert adapter.initial_directory(f"cd {quote}{anchor}{quote} || exit\nprintf fixture") == expected
 
 
 def test_missing_anchor_directory_is_refused(adapter, tmp_path):
     with pytest.raises(ValueError, match="existing"):
-        adapter.initial_directory(f"cd {tmp_path / 'absent'} && printf fixture")
+        adapter.initial_directory(f"cd {tmp_path / 'absent'} || exit\nprintf fixture")
+    missing = shlex.quote(str(tmp_path / "absent"))
+    for opener, ran in ((f"cd {missing} || exit\n", False), (f"cd {missing}; ", True)):
+        actual = subprocess.run(["bash", "--noprofile", "--norc", "-c", opener + "printf body-ran"],
+                                cwd=tmp_path, capture_output=True, text=True, timeout=5)
+        assert (actual.stdout == "body-ran") == ran
+        assert (actual.returncode == 0) == ran
 
 
 @pytest.mark.parametrize("suppressed", [False, True])
@@ -474,7 +542,7 @@ def test_install_ask_suppression_is_honored_without_changing_other_clients(adapt
     anchor = tmp_path / "genesis"
     anchor.mkdir()
     (anchor / "secrets.env").write_text("synthetic")
-    invocation = next(c for c in adapter.prepare(payload(f"cd {anchor} && cat secrets.env"))
+    invocation = next(c for c in adapter.prepare(payload(f"cd {anchor} || exit\ncat secrets.env"))
                       if "secrets_env_access_guard.py" in " ".join(c[0]))
     if suppressed:
         assert "hooks.asks.secrets_env" in asyncio.run(adapter.run_guard(*invocation))
@@ -504,7 +572,7 @@ def test_compound_heredoc_cost_and_real_removal_control(adapter, tmp_path, monke
         capture_output=True, text=True, cwd=tmp_path, timeout=8,
     )
     assert baseline.returncode == (2 if shape == "real-tail" else 0)
-    call = next(c for c in adapter.prepare(payload(f"cd {tmp_path} && {command}"))
+    call = next(c for c in adapter.prepare(payload(f"cd {tmp_path} || exit\n{command}"))
                 if "/worktree_cwd_guard.py" in " ".join(c[0]))
     if shape == "neutral-only":
         asyncio.run(adapter.run_guard(*call))
@@ -526,7 +594,7 @@ def test_body_file_avoids_inline_prose_refusal(adapter, tmp_path, monkeypatch, r
     scratch.mkdir(parents=True)
     body = scratch / "fixture-body.txt"
     body.write_text("fixture-body: xargs git worktree remove\n")
-    data = payload(f"cd {scratch} && {receiver} {shlex.quote(str(body))}")
+    data = payload(f"cd {scratch} || exit\n{receiver} {shlex.quote(str(body))}")
     call = next(c for c in adapter.prepare(data) if "/worktree_cwd_guard.py" in " ".join(c[0]))
     asyncio.run(adapter.run_guard(*call))
     if receiver == "cat":

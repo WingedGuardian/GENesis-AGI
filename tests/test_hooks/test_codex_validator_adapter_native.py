@@ -39,7 +39,7 @@ def source_copy(root):
 
 
 ALLOW_CASES = ["shell", "patch", "code_shell", "code_patch", "mcp", "mcp_direct", "advisory", "allow-reason", "patch-relative", "outer-timeout"]
-DENY_CASES = ["deny", "ask", "crash", "missing", "malformed", "timeout", "patch-deny", "missing-launcher", "broken-launcher", "silent-launcher", "mcp_direct-deny", "mcp-deny", "outer-completes"]
+DENY_CASES = ["deny", "ask", "crash", "missing", "malformed", "timeout", "patch-deny", "missing-launcher", "broken-launcher", "silent-launcher", "mcp_direct-deny", "mcp-deny", "outer-completes", "legacy-anchor"]
 
 
 @pytest.mark.parametrize("client", ["cli", "app"])
@@ -62,18 +62,22 @@ def test_native_adapter_controls_sink(tmp_path, monkeypatch, client, case, instr
     receipt = (tmp_path / "workspace" if case == "patch-deny" or sink == "mcp" else scratch) / f"{sink}-receipt.txt"
     if case == "patch-relative":
         receipt = run_root / "workspace/patch-receipt.txt"
-    command = f"cd {scratch} && printf fixture > {receipt}"
+    command = f"cd {scratch} || exit\nprintf fixture > {receipt}"
+    cwd_receipt = scratch / "actual-cwd.txt"
     body_marker = "fixture-body: xargs git worktree remove"
     if case == "shell":
         body = scratch / "fixture-body.txt"
         body.write_text(body_marker + "\n")
-        command = f"cd {scratch} && cat {shlex.quote(str(body))}; printf fixture > {receipt}"
+        command = (f"cd {scratch} || exit\ncat {shlex.quote(str(body))} & wait; "
+                   f"/bin/pwd -P > {cwd_receipt}; printf fixture > {receipt}")
+    if case == "legacy-anchor":
+        command = f"cd {scratch} && true & wait; /bin/pwd -P > {cwd_receipt}; printf fixture > {receipt}"
     if case == "advisory":
-        command = f"cd {scratch} && false | true; echo $?; printf fixture > {receipt}"
+        command = f"cd {scratch} || exit\nfalse | true; echo $?; printf fixture > {receipt}"
     if case == "deny":
         # Harmless even if unfenced: scratch is not a git repo, and only a local
         # receipt follows the failed reset. No real service or production write.
-        command = f"cd {scratch} && git reset --hard; printf fixture > {receipt}"
+        command = f"cd {scratch} || exit\ngit reset --hard; printf fixture > {receipt}"
     patch_name = receipt.name if case == "patch-relative" else str(receipt)
     patch = f"*** Begin Patch\n*** Add File: {patch_name}\n+fixture\n*** End Patch"
     if case.startswith("mcp_direct"):
@@ -113,7 +117,7 @@ def test_native_adapter_controls_sink(tmp_path, monkeypatch, client, case, instr
         wrapper.write_text(f"printf started > {shlex.quote(str(tmp_path / 'outer-started'))}\n"
                            "sleep 2\nprintf deny >&3\necho fixture-late-denial >&2\nexit 2\n")
     evidence = {"client": client, "case": case, "instrument": instrument, "version": version,
-                "runtime": str(runtime), "receipt": str(receipt),
+                "runtime": str(runtime), "receipt": str(receipt), "command": command,
                 "hashes": {str(p.relative_to(runtime)): hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in sorted(runtime.rglob("*")) if p.is_file()}}
     try:
@@ -157,6 +161,10 @@ def test_native_adapter_controls_sink(tmp_path, monkeypatch, client, case, instr
         assert effective[0]["timeoutSec"] == (1 if case == "outer-timeout" else 15)
     allowed = instrument == "noop" or case in ALLOW_CASES
     assert receipt.exists() == allowed, evidence
+    if case in {"shell", "legacy-anchor"}:
+        assert cwd_receipt.exists() == allowed
+        if allowed:
+            assert cwd_receipt.read_text().strip() == str(scratch if case == "shell" else run_root)
     if allowed:
         assert receipt.read_text().strip() == "fixture"
         if case == "advisory":
@@ -178,5 +186,5 @@ def test_native_adapter_controls_sink(tmp_path, monkeypatch, client, case, instr
                   "broken-launcher": "hook did not explicitly allow",
                   "silent-launcher": "hook did not explicitly allow",
                   "deny": "destroys uncommitted work", "mcp_direct-deny": "fixture owner approval", "mcp-deny": "fixture owner approval",
-                  "outer-completes": "fixture-late-denial"}[case]
+                  "outer-completes": "fixture-late-denial", "legacy-anchor": "requires literal cd"}[case]
         assert marker in json.dumps(evidence)

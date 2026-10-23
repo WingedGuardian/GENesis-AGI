@@ -47,8 +47,12 @@ runtime; do not relax the assertion to turn version drift into a passing run.
 
 The direct-shell positive case reads a real scratch body file containing prose
 that mentions worktree removal. It requires that content to appear in the next
-provider request and checks the separate action receipt. This qualifies actual
-file-to-tool-output flow on each pinned client. The unit adapter tests separately
+provider request and checks the separate action receipt. The read runs as
+background work after the foreground cd/exit newline opener; a separate pwd
+receipt must still name the anchor. The legacy AND-list opener has refusal and
+no-op controls, with the no-op recording its different foreground directory.
+This qualifies actual file-to-tool-output flow and starting-directory behavior
+on each pinned client. The unit adapter tests separately
 pin the known compound-heredoc refusal, the file-operand alternative and refusal
 of a real removal after a data body; their supplied action commands never execute.
 

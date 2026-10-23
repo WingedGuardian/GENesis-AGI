@@ -711,8 +711,9 @@ jobs:
         # cases skipped unless GENESIS_CODEX_NATIVE_TESTS=1, ceiling 216 -> 344.
         # Interactive adapter (#3577): runner job 120459349900 records 70
         # "opt-in native qualification" skips. Two added reason-delivery cases
-        # share that module flag: 72 new opt-ins, ceiling 344 -> 416.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 416
+        # share that module flag. Four legacy-anchor refusal/no-op controls
+        # bring the module to 76 new opt-ins, ceiling 344 -> 420.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 420
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job

@@ -399,7 +399,7 @@ def replay_case(request, monkeypatch, tmp_path, tmp_path_factory, existing_repla
             "cwd": str(cwd),
             "tool_input": {
                 **payload["tool_input"],
-                "command": "cd " + shlex.quote(str(cwd)) + " && " + command,
+                "command": "cd " + shlex.quote(str(cwd)) + " || exit\n" + command,
             },
         }
         row.update(

@@ -4105,7 +4105,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 11f366060 2026-10-22
+verified: 2f013ed7 2026-10-23
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4165,7 +4165,8 @@ verified: 11f366060 2026-10-22
   cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
   A separate, inactive `scripts/hooks/codex-validator-adapter` translates native
   validator calls to the existing guards concurrently. It requires an absolute
-  Bash cd anchor, confines patches to validator scratch roots, translates asks
+  Bash cd/exit opener terminated by a newline, confines patches to validator
+  scratch roots, translates asks
   to denials and preserves advisories. It has no ordinary configuration wiring
   or role-specific publishing/store policy yet. See
   `docs/reference/codex-validator-boundary.md`.
