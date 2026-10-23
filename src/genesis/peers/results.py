@@ -11,15 +11,16 @@ from google.protobuf.timestamp_pb2 import Timestamp
 
 from genesis.cc.managed_session import metadata
 from genesis.peers.disclosure_scan import json_strings_safe
+from genesis.peers.task_cursor import valid_stamp
 
 MAX_RESULT = 2 * 1024 * 1024
 STATES = {
-    "pending": TaskState.TASK_STATE_SUBMITTED,
-    "running": TaskState.TASK_STATE_WORKING,
-    "cancelling": TaskState.TASK_STATE_WORKING,
-    "succeeded": TaskState.TASK_STATE_COMPLETED,
+    "submitted": TaskState.TASK_STATE_SUBMITTED,
+    "working": TaskState.TASK_STATE_WORKING,
+    "auth_required": TaskState.TASK_STATE_AUTH_REQUIRED,
+    "completed": TaskState.TASK_STATE_COMPLETED,
     "failed": TaskState.TASK_STATE_FAILED,
-    "cancelled": TaskState.TASK_STATE_CANCELED,
+    "canceled": TaskState.TASK_STATE_CANCELED,
 }
 
 
@@ -55,28 +56,27 @@ def full_result(row):
     return text
 
 
-def project(row, pending_approvals=False):
-    from genesis.peers.conversation import head
+def project(row):
+    from genesis.peers.conversation import ConversationRefusal, head
 
     meta = metadata(row)
     state = meta.get("native_state", "pending")
-    if row["status"] == "active" and state in {"succeeded", "failed", "cancelled"}:
+    if row["status"] == "active" and isinstance(state, str) and state in {"succeeded", "failed", "cancelled"}:
         state = "running"  # Final metadata can precede the native status commit.
-    status = TaskStatus(state=STATES.get(state, TaskState.TASK_STATE_WORKING))
-    stamp = row.get("completed_at") or row.get("last_activity_at") or row.get("started_at")
-    if stamp:
-        ts = Timestamp()
-        ts.FromJsonString(stamp)
-        status.timestamp.CopyFrom(ts)
+    stamp = row.get("a2a_status_at")
+    if row.get("a2a_state") not in STATES or not valid_stamp(stamp):
+        raise ConversationRefusal("not_ready", 503)
+    status = TaskStatus(state=STATES[row["a2a_state"]])
+    ts = Timestamp()
+    ts.FromJsonString(stamp)
+    status.timestamp.CopyFrom(ts)
     view = {
         "nativeState": state,
-        "pendingOwnerActions": bool(pending_approvals),
+        "pendingOwnerActions": bool(row.get("pending_approvals")),
         "cleanupUnconfirmed": bool(meta.get("cleanup_unconfirmed")),
         "resultCommitted": bool(meta.get("result_committed")),
         "resultPartial": bool(meta.get("result_partial")),
     }
-    if pending_approvals and row["status"] == "active":
-        status.state = TaskState.TASK_STATE_AUTH_REQUIRED
     if row["status"] != "active":
         text = meta.get("output_text") or ""
         if json_strings_safe(text):
