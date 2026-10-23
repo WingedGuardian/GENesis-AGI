@@ -142,9 +142,27 @@ This is a bounded recap, not CC transcript resume or lossless shared memory.
 Full previous artifacts remain separately retrievable while retained.
 
 Lists default to 20 tasks, maximum 100; use `pageSize`, `pageToken` and optional
-`contextId`. A next-page token is the last owned receipt ID. `GET /approvals`
+`contextId`. Tasks sort by recorded public-status timestamp descending, then
+task ID descending. The next-page token is an opaque issued position scoped to
+the peer, relationship epoch and context filter. Pass it unchanged; changing or
+deleting the anchor task does not move its boundary. Old task-ID tokens return
+400 `validation_error`; restart listing without a token. This is a live list,
+not a frozen snapshot: deduplicate task IDs and poll page one again for updates
+that moved ahead of an earlier page boundary. Every page rechecks current grants.
+
+The public-status clock changes only when the effective A2A state changes,
+including first/last pending owner approval. Heartbeats, repeated native state,
+and additional overlapping approvals do not bump it. Get, List, Send and Cancel
+project the recorded state/time with pending-owner flags in one authorized
+snapshot. Missing or malformed projection returns503 `not_ready`, including an
+incomplete owned row outside the current page. Existing rows backfill an
+approximate normalized completion/activity/start timestamp; old transition
+history cannot be reconstructed. New clocks record UTC milliseconds; ties use
+task ID and wall-clock rollback is not made monotonic.
+
+`GET /approvals`
 pages the same way (`pageSize`, `pageToken`, oldest first; the token is the last
-approval ID), and each task carries `pendingOwnerActions` from a bounded check. Task history can be
+approval ID), and each task carries `pendingOwnerActions` from its snapshot. Task history can be
 requested with `historyLength`; this binding returns no history (a permitted
 maximum of zero), with the reply head in `status.message`. Unsupported list
 filters are explicitly refused; no silently ignored filter. Terminal reply

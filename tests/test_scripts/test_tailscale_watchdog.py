@@ -74,6 +74,9 @@ class World:
         self.calls: list[list[str]] = []
         self.mono = MONO
         self.status_rc = 0
+        # The DERP map (placeholder regions) and what force-prefer-derp exits.
+        self.derp_map = {"Regions": {"900": {"RegionID": 900, "RegionCode": "xyz"}}}
+        self.prefer_rc = 0
 
     def run(self, argv, timeout, merge_stderr=False):
         self.calls.append(list(argv))
@@ -92,6 +95,10 @@ class World:
         if cmd == "show":
             props = [argv[i + 1] for i, a in enumerate(argv) if a == "-p"]
             return 0, "".join(f"{p}={self.unit.get(p, '')}\n" for p in props)
+        if cmd == "debug" and argv[2] == "derp-map":
+            return 0, json.dumps(self.derp_map)
+        if cmd == "debug" and argv[2] == "force-prefer-derp":
+            return self.prefer_rc, ""
         if cmd == "try-restart":
             rc, changes = self.restart
             self.unit.update(changes)
@@ -111,8 +118,14 @@ class World:
     def restarts(self) -> int:
         return sum(1 for c in self.calls if c[1] == "try-restart")
 
+    def relay(self, code: str | None):
+        self.status["Self"] = {} if code is None else {"Relay": code}
 
-def ctx(world: World, tmp_path: Path, **env) -> tw.Ctx:
+    def pins(self) -> list:
+        return [c for c in self.calls if c[1:3] == ["debug", "force-prefer-derp"]]
+
+
+def ctx(world: World, tmp_path: Path, boot_id: str = BOOT, **env) -> tw.Ctx:
     full = {
         "NETWD_TS_STATE_FILE": str(tmp_path / "state.json"),
         "NETWD_TS_STATUS_SNAPSHOT": str(tmp_path / "status.json"),
@@ -124,7 +137,7 @@ def ctx(world: World, tmp_path: Path, **env) -> tw.Ctx:
         mono=lambda: world.mono,
         wall=lambda: NOW,
         sleep=lambda s: setattr(world, "mono", world.mono + s),
-        boot_id=BOOT,
+        boot_id=boot_id,
         which=lambda name: "/usr/bin/tailscale",
     )
 
@@ -1474,3 +1487,432 @@ def test_the_judged_daemon_is_read_before_the_status_it_vouches_for(tmp_path):
         i for i, c in enumerate(world.calls) if c[1] == "show" and "InvocationID" in c
     )
     assert first_identity < verbs.index("status")
+
+
+# ── the home-DERP pin (NETWD_TS_PREFER_DERP) ─────────────────────────────
+
+PIN = {"NETWD_TS_PREFER_DERP": "900"}
+
+
+def pin_world(relay: str | None = "xyz", **peers) -> World:
+    world = World(peers or {"a": peer(A, age=30)})
+    world.relay(relay)
+    return world
+
+
+@pytest.mark.parametrize("region", [10000, (1 << 53) - 1])
+def test_valid_large_region_ids_can_replace_an_existing_pin(tmp_path, region):
+    world = pin_world("xyz")
+    tick(world, ctx(world, tmp_path, **PIN))
+    world.derp_map["Regions"][str(region)] = {"RegionID": region, "RegionCode": "big"}
+    world.relay("big")
+    c = ctx(world, tmp_path, NETWD_TS_PREFER_DERP=str(region))
+    assert c.settings["NETWD_TS_PREFER_DERP"] == region
+    s = tick(world, c)
+    assert (s["derp_pin"]["wanted"], s["derp_pin"]["action"]) == (region, "applied")
+    assert [call[-1] for call in world.pins()] == ["900", str(region)]
+    assert tick(world, c)["derp_pin"]["action"] == "ok"
+    assert len(world.pins()) == 2
+    invalid = ctx(world, tmp_path, NETWD_TS_PREFER_DERP=str(1 << 53))
+    assert invalid.settings["NETWD_TS_PREFER_DERP"] == 0
+
+
+def test_the_pin_is_off_by_default_and_never_runs_a_debug_command(tmp_path):
+    world = pin_world("abc", a=peer(A))
+    world.stuck(A)
+    c = ctx(world, tmp_path)
+    s = tick(world, c)
+    assert s["last_action"] == "healed"
+    s = tick(world, c, 3601)
+    assert not any(call[1] == "debug" for call in world.calls)
+    assert (s["derp_pin"], s["derp_lapses"]) == (None, 0)
+
+
+def test_a_matching_relay_already_pinned_on_this_daemon_runs_nothing(tmp_path):
+    world = pin_world("xyz")
+    c = ctx(world, tmp_path, **PIN)
+    first = tick(world, c)["derp_pin"]
+    # status cannot show whether a pin is set, so the first run applies it.
+    assert (first["action"], len(world.pins())) == ("applied", 1)
+    assert world.pins()[0] == ["tailscale", "debug", "force-prefer-derp", "900"]
+    second = tick(world, c)["derp_pin"]
+    assert (second["action"], second["seen"], second["code"]) == ("ok", "xyz", "xyz")
+    assert len(world.pins()) == 1
+
+
+@pytest.mark.parametrize(("rc", "action"), [(0, "applied"), (1, "failed")])
+def test_a_relay_off_the_pinned_region_is_reapplied_once(tmp_path, rc, action):
+    world = pin_world("xyz")
+    c = ctx(world, tmp_path, **PIN)
+    tick(world, c)
+    tick(world, c)
+    world.relay("abc")
+    world.prefer_rc = rc
+    s = tick(world, c)
+    assert (s["derp_pin"]["action"], s["derp_pin"]["seen"], len(world.pins())) == (action, "abc", 2)
+    # Never an event, never spends the rate limit.
+    assert s["events"] == [] and s["last_action"] == "none"
+
+
+def test_tailscaled_restarted_since_the_last_run_is_reapplied_though_the_relay_matches(tmp_path):
+    world = pin_world("xyz")
+    c = ctx(world, tmp_path, **PIN)
+    tick(world, c)
+    assert tick(world, c)["derp_pin"]["action"] == "ok"
+    world.unit.update(
+        InvocationID="inv-9", ActiveEnterTimestampMonotonic=str(int((world.mono + 60) * 1e6))
+    )
+    s = tick(world, c)
+    assert (s["derp_pin"]["action"], len(world.pins()), s["derp_lapses"]) == ("applied", 2, 0)
+
+
+def test_a_new_boot_is_reapplied_and_resets_the_lapse_count(tmp_path):
+    world = pin_world("xyz")
+    c = ctx(world, tmp_path, **PIN)
+    tick(world, c)
+    tick(world, c)
+    world.relay("abc")
+    assert tick(world, c)["derp_lapses"] == 1
+    world.relay("xyz")
+    s = tick(world, ctx(world, tmp_path, boot_id="0" * 8 + "-1111-2222-3333-444444444444", **PIN))
+    assert (s["derp_pin"]["action"], len(world.pins()), s["derp_lapses"]) == ("applied", 3, 0)
+
+
+@pytest.mark.parametrize("relay", [None, ""], ids=["missing", "empty"])
+def test_an_unknown_relay_is_unknown_runs_nothing_and_is_no_lapse(tmp_path, relay):
+    world = pin_world("xyz")
+    c = ctx(world, tmp_path, **PIN)
+    tick(world, c)
+    tick(world, c)
+    world.relay(relay)
+    s = tick(world, c)
+    assert (s["derp_pin"]["action"], len(world.pins()), s["derp_lapses"]) == ("unknown", 1, 0)
+    world.relay("abc")  # unknown last run: the pin was not known to hold
+    assert tick(world, c)["derp_lapses"] == 0
+
+
+def test_a_region_missing_from_the_derp_map_is_unknown_and_runs_nothing(tmp_path):
+    world = pin_world("xyz")
+    world.derp_map = {"Regions": {"901": {"RegionID": 901, "RegionCode": "xyz"}}}
+    s = tick(world, ctx(world, tmp_path, **PIN))
+    assert (s["derp_pin"]["action"], s["derp_pin"]["code"], world.pins()) == ("unknown", None, [])
+
+
+def test_each_lapse_on_the_same_daemon_is_counted_and_a_lasting_one_persists(tmp_path):
+    world = pin_world("xyz")
+    c = ctx(world, tmp_path, **PIN)
+    tick(world, c)
+    tick(world, c)  # ok: the pin holds
+    world.relay("abc")
+    s = tick(world, c)
+    assert (s["derp_pin"]["action"], s["derp_pin"]["lapse"], s["derp_lapses"]) == ("applied", 1, 1)
+    s = tick(world, c)  # applied on this daemon and still off
+    assert (s["derp_pin"]["action"], s["derp_lapses"]) == ("drift-persists", 1)
+    world.relay("xyz")
+    assert tick(world, c)["derp_pin"]["action"] == "ok"
+    world.relay("abc")
+    assert tick(world, c)["derp_lapses"] == 2
+
+
+def test_a_restart_caused_drift_is_not_a_lapse(tmp_path):
+    world = pin_world("xyz")
+    c = ctx(world, tmp_path, **PIN)
+    tick(world, c)
+    tick(world, c)
+    world.relay("abc")
+    world.unit.update(
+        InvocationID="inv-9", ActiveEnterTimestampMonotonic=str(int((world.mono + 60) * 1e6))
+    )
+    s = tick(world, c)
+    assert (s["derp_pin"]["action"], s["derp_lapses"]) == ("applied", 0)
+
+
+@pytest.mark.parametrize(("relay", "action"), [("xyz", "ok"), ("abc", "drift")])
+def test_observe_mode_reports_what_it_would_do_and_runs_nothing(tmp_path, relay, action):
+    world = pin_world(relay)
+    c = ctx(world, tmp_path, NETWD_TS_MODE="observe", **PIN)
+    s = tick(world, c)
+    assert (s["derp_pin"]["action"], s["derp_pin"].get("would_apply")) == (action, True)
+    # Observe never applies a pin, so live mode would still apply it.
+    s = tick(world, c)
+    assert (s["derp_pin"]["action"], s["derp_pin"].get("would_apply")) == (
+        action,
+        True,
+    )
+    world.unit.update(
+        InvocationID="inv-9", ActiveEnterTimestampMonotonic=str(int((world.mono + 60) * 1e6))
+    )
+    assert tick(world, c)["derp_pin"].get("would_apply") is True
+    assert world.pins() == [] and s["derp_lapses"] == 0
+
+
+def test_the_pin_is_reapplied_after_the_watchdogs_own_heal(tmp_path):
+    world = pin_world("xyz", a=peer(A))
+    world.stuck(A)
+    restarted = str(int((MONO + 200) * 1e6))
+    world.restart = (0, {"InvocationID": "inv-2", "ActiveEnterTimestampMonotonic": restarted})
+    c = ctx(world, tmp_path, **PIN)
+    s = tick(world, c)
+    assert s["last_action"] == "healed"
+    restart_at = world.calls.index(["systemctl", "try-restart", "tailscaled"])
+    after = [i for i, call in enumerate(world.calls) if call in world.pins() and i > restart_at]
+    assert len(world.pins()) == 2 and len(after) == 1
+    pin = s["derp_pin"]
+    assert (pin["action"], pin["after_heal"], pin["applied_for"]) == ("applied", True, MONO + 200)
+    # The next run finds the pin applied on the new daemon: nothing to do.
+    world.tsmp = {}
+    assert tick(world, c)["derp_pin"]["action"] == "ok"
+    assert len(world.pins()) == 2
+
+
+@pytest.mark.parametrize("pin_rc", [0, 1, None])
+@pytest.mark.parametrize("reply", [True, False, None])
+def test_pin_dependent_tunnels_are_verified_after_restoring_the_pin(tmp_path, pin_rc, reply):
+    world = pin_world("xyz", a=peer(A))
+    world.stuck(A)
+    world.prefer_rc = pin_rc
+    runtime = {"pin": 0, "restarted": False}
+    verification_pins = []
+    real = world.run
+
+    def with_runtime_pin(argv, timeout, **kw):
+        result = real(argv, timeout, **kw)
+        if argv[1] == "try-restart":
+            runtime.update(pin=0, restarted=True)
+        elif argv[1:3] == ["debug", "force-prefer-derp"] and result[0] == 0:
+            runtime["pin"] = int(argv[-1])
+        elif argv[1] == "ping" and "--tsmp" in argv and runtime["restarted"]:
+            verification_pins.append(runtime["pin"])
+            if reply is None:
+                return None, ""
+            return (0, "pong") if reply and runtime["pin"] == 900 else (1, "timed out\nno reply")
+        return result
+
+    c = ctx(world, tmp_path, **PIN)
+    c.run = with_runtime_pin
+    s = tick(world, c)
+    restart_at = world.calls.index(["systemctl", "try-restart", "tailscaled"])
+    after = world.calls[restart_at + 1 :]
+    setter_at = next(
+        i for i, argv in enumerate(after) if argv[1:3] == ["debug", "force-prefer-derp"]
+    )
+    probe_at = next(i for i, argv in enumerate(after) if argv[1] == "ping" and "--tsmp" in argv)
+    assert setter_at < probe_at
+    assert verification_pins[0] == (900 if pin_rc == 0 else 0)
+    healed = pin_rc == 0 and reply is True
+    expected = (
+        "healed" if healed else "restart-unconfirmed" if reply is None else "restart-no-effect"
+    )
+    assert s["last_action"] == expected
+    assert s["events"][-1]["cleared"] == ([A] if healed else [])
+    assert s["unhelped_restarts"] == ({} if healed else {A: 1})
+
+
+def test_no_pin_after_a_restart_that_left_tailscaled_down(tmp_path):
+    world = pin_world("xyz", a=peer(A))
+    world.stuck(A)
+    world.restart = (0, {"InvocationID": "inv-2", "ActiveState": "failed"})
+    s = tick(world, ctx(world, tmp_path, **PIN))
+    assert s["last_action"] == "restart-failed"
+    assert len(world.pins()) == 1 and "after_heal" not in s["derp_pin"]
+
+
+def test_a_voided_run_does_not_touch_the_pin(tmp_path):
+    world = pin_world("abc")
+    c = ctx(world, tmp_path, **PIN)
+    world.status["Peer"] = {"a": peer(A)}
+    world.stuck(A)
+    shows = {"n": 0}
+    real = world.run
+
+    def operator_restarts_it(argv, timeout, **kw):
+        if argv[1] == "show":
+            shows["n"] += 1
+            if shows["n"] == 2:
+                world.unit["InvocationID"] = "inv-op"
+        return real(argv, timeout, **kw)
+
+    c.run = operator_restarts_it
+    s = tick(world, c)
+    assert s["last_action"] == "daemon-changed"
+    assert world.pins() == [] and "derp_pin" not in s
+
+
+def test_the_pin_calls_use_their_own_short_timeout(tmp_path):
+    """Every call the pin adds, including the identity read after the heal, is
+    bounded by DERP_CALL_TIMEOUT_SEC, not the general call timeout, so the
+    unit's worst-case run time stays inside its start timeout."""
+    world = pin_world("xyz", a=peer(A))
+    world.stuck(A)
+    seen = []
+    real = world.run
+
+    def record(argv, timeout, **kw):
+        seen.append((list(argv), timeout))
+        return real(argv, timeout, **kw)
+
+    c = ctx(world, tmp_path, NETWD_TS_CALL_TIMEOUT_SEC="120", **PIN)
+    c.run = record
+    tw.run_once(c)
+    debug = [t for argv, t in seen if argv[1] == "debug"]
+    assert len(debug) == 3 and set(debug) == {tw.DERP_CALL_TIMEOUT_SEC}
+    restart_at = next(i for i, (argv, _) in enumerate(seen) if argv[1] == "try-restart")
+    pin_after = max(i for i, (argv, _) in enumerate(seen) if argv[1] == "debug")
+    identity = [t for argv, t in seen[restart_at : pin_after + 2] if argv[1] == "show"]
+    assert identity[-1] == tw.DERP_CALL_TIMEOUT_SEC
+    assert tw.DERP_CALL_TIMEOUT_SEC < 120
+
+
+def test_an_unreadable_daemon_start_is_unknown_not_applied_every_run(tmp_path):
+    """Without the daemon's start the pin can never be known to hold: it is
+    still applied in live mode, but recorded unknown so the condition stays
+    honest instead of reading "applied" forever."""
+    world = pin_world("xyz")
+    world.unit["ActiveEnterTimestampMonotonic"] = "0"
+    c = ctx(world, tmp_path, **PIN)
+    for n in (1, 2):
+        s = tick(world, c)
+        assert (s["derp_pin"]["action"], s["derp_pin"]["applied_for"]) == ("unknown", None)
+        assert len(world.pins()) == n and s["derp_lapses"] == 0
+
+
+@pytest.mark.parametrize("disabled", [None, "0"])
+def test_disabling_the_preference_clears_the_daemons_pin(tmp_path, disabled):
+    world = pin_world("xyz")
+    tick(world, ctx(world, tmp_path, **PIN))
+    env = {} if disabled is None else {"NETWD_TS_PREFER_DERP": disabled}
+    s = tick(world, ctx(world, tmp_path, **env))
+    assert world.pins()[-1][-1] == "0"
+    assert s["derp_pin"] is None
+    tick(world, ctx(world, tmp_path, **env))
+    assert len(world.pins()) == 2
+
+
+def test_a_failed_clear_stays_visible_and_is_retried(tmp_path):
+    world = pin_world("xyz")
+    tick(world, ctx(world, tmp_path, **PIN))
+    world.prefer_rc = 1
+    c = ctx(world, tmp_path)
+    s = tick(world, c)
+    assert s["derp_pin"]["action"] == "clear-failed"
+    world.prefer_rc = 0
+    assert tick(world, c)["derp_pin"] is None
+    assert [call[-1] for call in world.pins()] == ["900", "0", "0"]
+
+
+@pytest.mark.parametrize("failure", ["status", "identity", "unavailable"])
+def test_an_incomplete_run_preserves_the_pin_for_later_clearing(tmp_path, failure):
+    world = pin_world("xyz")
+    c = ctx(world, tmp_path, **PIN)
+    tick(world, c)
+    if failure == "status":
+        world.status_rc = 1
+    elif failure == "identity":
+        world.unit["InvocationID"] = ""
+        world.unit["ActiveEnterTimestampMonotonic"] = "0"
+    else:
+        c.which = lambda name: None
+    assert tick(world, c)["derp_pin"]["action"] == "unknown"
+    world.status_rc = 0
+    world.unit.update(InvocationID="inv-1", ActiveEnterTimestampMonotonic="1000000")
+    assert tick(world, ctx(world, tmp_path))["derp_pin"] is None
+    assert [call[-1] for call in world.pins()] == ["900", "0"]
+
+
+def test_observe_mode_disabling_reports_a_pending_clear_without_running_it(tmp_path):
+    world = pin_world("xyz")
+    tick(world, ctx(world, tmp_path, **PIN))
+    s = tick(world, ctx(world, tmp_path, NETWD_TS_MODE="observe"))
+    assert s["derp_pin"]["action"] == "clear-pending"
+    assert len(world.pins()) == 1
+
+
+@pytest.mark.parametrize("mode", ["live", "observe"])
+@pytest.mark.parametrize("failed_clear", [False, True])
+def test_disabled_ownership_is_retired_after_a_known_daemon_replacement(
+    tmp_path, mode, failed_clear
+):
+    world = pin_world("xyz")
+    tick(world, ctx(world, tmp_path, **PIN))
+    if failed_clear:
+        world.prefer_rc = 1
+        assert tick(world, ctx(world, tmp_path))["derp_pin"]["action"] == "clear-failed"
+        world.prefer_rc = 0
+    calls = list(world.pins())
+    observe = ctx(world, tmp_path, NETWD_TS_MODE="observe")
+    # Missing identity proves nothing; a known same daemon still owns its pin.
+    world.unit["ActiveEnterTimestampMonotonic"] = "0"
+    assert tick(world, observe)["derp_pin"]["action"] == "clear-pending"
+    world.unit["ActiveEnterTimestampMonotonic"] = "1000000"
+    assert tick(world, observe)["derp_pin"]["action"] == "clear-pending"
+    assert world.pins() == calls
+    world.unit.update(InvocationID="inv-new", ActiveEnterTimestampMonotonic="2000000")
+    assert tick(world, ctx(world, tmp_path, NETWD_TS_MODE=mode))["derp_pin"] is None
+    assert world.pins() == calls
+
+
+def test_a_heal_while_disabling_does_not_reapply_the_old_pin(tmp_path):
+    world = pin_world("xyz")
+    tick(world, ctx(world, tmp_path, **PIN))
+    world.status["Peer"] = {"a": peer(A)}
+    world.stuck(A)
+    world.prefer_rc = 1
+    s = tick(world, ctx(world, tmp_path))
+    assert s["last_action"] == "healed" and s["derp_pin"] is None
+    assert [call[-1] for call in world.pins()] == ["900", "0"]
+
+
+@pytest.mark.parametrize("identity", [None, ("inv-2", "inactive", MONO + 200)])
+def test_a_successful_post_heal_pin_needs_a_running_daemon_identity(
+    tmp_path, monkeypatch, identity
+):
+    world = pin_world("xyz", a=peer(A))
+    world.stuck(A)
+    real = tw.daemon_identity
+
+    def read_identity(c, timeout=None):
+        return identity if len(world.pins()) == 2 else real(c, timeout)
+
+    monkeypatch.setattr(tw, "daemon_identity", read_identity)
+    s = tick(world, ctx(world, tmp_path, **PIN))
+    assert s["derp_pin"]["after_heal"] is True
+    assert (s["derp_pin"]["action"], s["derp_pin"]["applied_for"]) == ("unknown", None)
+
+
+def test_a_restart_during_post_heal_pinning_does_not_credit_the_successor(tmp_path):
+    world = pin_world("xyz", a=peer(A))
+    world.stuck(A)
+    c = ctx(world, tmp_path, **PIN)
+    real = world.run
+
+    def restart_after_setter(argv, timeout, **kw):
+        result = real(argv, timeout, **kw)
+        if argv[1:3] == ["debug", "force-prefer-derp"] and len(world.pins()) == 2:
+            world.unit.update(InvocationID="inv-op", ActiveEnterTimestampMonotonic="2000000")
+        return result
+
+    c.run = restart_after_setter
+    s = tick(world, c)
+    assert (s["derp_pin"]["action"], s["derp_pin"]["applied_for"]) == ("unknown", None)
+    assert tick(world, c)["derp_pin"]["action"] == "applied"
+    assert len(world.pins()) == 3
+
+
+@pytest.mark.parametrize("code", ["XYZ", "region_code", "x" * 40])
+def test_custom_region_codes_are_compared_without_persisting_unsafe_labels(tmp_path, code):
+    world = pin_world(code)
+    world.derp_map["Regions"]["900"]["RegionCode"] = code
+    c = ctx(world, tmp_path, **PIN)
+    assert tick(world, c)["derp_pin"]["action"] == "applied"
+    s = tick(world, c)
+    assert s["derp_pin"]["action"] == "ok"
+    assert len(world.pins()) == 1
+    assert s["derp_pin"]["code"] == s["derp_pin"]["seen"] == "region-900"
+
+
+def test_enabling_observe_with_a_matching_home_reports_the_unapplied_pin(tmp_path):
+    world = pin_world("xyz")
+    tick(world, ctx(world, tmp_path))
+    s = tick(world, ctx(world, tmp_path, NETWD_TS_MODE="observe", **PIN))
+    assert s["derp_pin"].get("would_apply") is True
+    assert not world.pins()

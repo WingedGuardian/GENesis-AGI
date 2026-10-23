@@ -17,6 +17,8 @@ use the canonical directory instead. Ordinary symlink anchors remain supported.
 The command is unchanged. Native 0.163.0 omitted an explicit
 shell workdir from its hook input, so the adapter supplies the proven anchor as
 the guards' cwd instead. Reads require this prefix too.
+For the root directory, use `cd "/" && command`: the unquoted `cd /` spelling
+currently refuses (#3581).
 
 The prefix makes the call a compound command. The unchanged parser deliberately
 does not exempt data-heredoc bodies in compound openers, so inline prose can be
@@ -82,6 +84,9 @@ Twenty fresh-process plain-shell hook probes on the qualified source measured
 1.55 seconds for the first call, p95 1.57 seconds and maximum 1.66 seconds.
 These are normal-call measurements, not a worst-case guarantee; later policy
 or profile changes require qualification again.
+Multi-file patches share the same overall budget and may need smaller batches.
+A single copied-source probe admitted 50 targets in 9.85 seconds; that is a
+near-budget observation, not a guaranteed supported patch size.
 
 ## Sealed request foundation
 
