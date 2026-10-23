@@ -111,6 +111,32 @@ class TestTelegramChannel:
         assert "&lt;script&gt;" in text
         assert "&lt;b&gt;tags&lt;/b&gt;" in text
 
+    def test_format_is_bounded_and_keeps_tags_whole(
+        self,
+        channel: TelegramAlertChannel,
+    ) -> None:
+        """Telegram rejects a message over 4,096 characters, which would drop the
+        EMERGENCY alert itself. Fields are cut before escaping, so no tag or
+        entity is ever split."""
+        import html
+        import re
+
+        alert = Alert(
+            severity=AlertSeverity.EMERGENCY,
+            title="T" * 1000,
+            body="a&b " * 5000,
+            failed_probes=[f"evidence {i} " + "x" * 200 for i in range(100)],
+            likely_cause="c<" * 3000,
+            proposed_action="ESCALATE",
+        )
+        text = channel._format_alert(alert)
+        rendered = html.unescape(re.sub(r"</?b>", "", text))
+        assert len(rendered) <= 4096
+        assert "(cut)" in rendered
+        assert text.count("<b>") == text.count("</b>")
+        assert re.search(r"&(?!amp;|lt;|gt;|quot;|#x27;)", text) is None  # no split entity
+        assert "ESCALATE" in text  # the action survives
+
     @pytest.mark.asyncio
     async def test_send_success(self, channel: TelegramAlertChannel) -> None:
         alert = Alert(severity=AlertSeverity.INFO, title="Test", body="Test body")

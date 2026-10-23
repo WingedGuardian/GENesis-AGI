@@ -1911,7 +1911,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 85652265c 2026-10-09
+verified: fbb0b6f19 2026-10-21
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -1975,6 +1975,23 @@ verified: 85652265c 2026-10-09
   can see (the host, a process owned by another user, or I/O byte counters
   miss, such as fsync storms and swap). Unreadable processes are counted, and
   command lines are never logged.
+- **Recovery on a `live` checkout** (#3492 D3): `REVERT_CODE` (stash, then
+  revert HEAD) never runs where the container checkout is on `live`, judged by
+  git's own HEAD (`refs/heads/live` bans, whatever the manifest says) and then
+  `scripts/lib/live_checkout.py`, both over `incus exec`; a failed git, or
+  anything but a clean `other`, counts as live. `check.py` turns that proposal into
+  `RESTART_CONTAINER` before Gate 2 (after F.1's git-health redirect), and
+  `recovery.py` refuses it as a backstop. A restart ends lock holders and lets
+  a boot repair run where one is installed; a bad candidate is removed by
+  `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
+  `live-move repair:` journal lines and a summary of the newest
+  `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
+  nor superseded (6 h window on its own `ts`), JSON-quoted, capped at 2,000
+  characters and fenced as untrusted; empty, and the prompt unchanged, when
+  there are none. The container reads are bounded where they are produced
+  (regular non-symlink reports, 4 MiB each; journal lines cut to 400), and
+  Telegram alert fields are cut before escaping. Residual: a container that
+  fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
