@@ -225,7 +225,7 @@ misreading from a real complication. So the spec is decision-complete:
 - **Acceptance:** what the reviewer will check first.
 - **Contract:** the builder acknowledges the spec on the OLD PR before
   building, and each replacement PR carries a `## Rework` section
-  (genesis-development, "Building a rework"). Say so in the spec.
+  (build-session, "Building a rework"). Say so in the spec.
 - **Follow-up:** the spec's last line, `Follow-up: <id>`, naming the follow-up
   the closing session opened before posting it. The builder copies
   it into the replacement that merges into main last.
@@ -241,7 +241,7 @@ the deciding question in the most fail-closed way, and three of round 1's six
 findings landed in machinery that answer produced. The premise was right, and the
 spec still allowed the failure.
 
-The builder's side of the contract (genesis-development, "Building a rework")
+The builder's side of the contract (build-session, "Building a rework")
 is an acknowledgement on the old PR before building, then a rework section in
 each new PR's body. The section reports against this spec: its split position,
 each deviation with its reason, and each delegated question with its answer.
@@ -259,7 +259,7 @@ is HIGH.** The repo already has a route for a change that is wrong at the premis
 or structurally superseded, and it is NOT "hand it to a builder": it is a
 foreground ARCHITECTURE conversation with the user, and where no user is present,
 the `needs-architecture-session` label, the PR moved to draft, and a `ready`
-follow-up naming the PR and the decision it awaits (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857). See the genesis-development skill, "Some PRs are not a
+follow-up naming the PR and the decision it awaits (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857). See the closing-session skill, "Some PRs are not a
 review problem". This check produces the EVIDENCE for that conversation; it does
 not invent a parallel path around it, and a session that reads "hand back" as
 "dispatch a builder and move on" has skipped the decision the label exists to

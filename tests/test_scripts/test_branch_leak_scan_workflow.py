@@ -265,6 +265,7 @@ def _history_repo(tmp_path: Path) -> Path:
     (root / "scripts" / "ci").mkdir(parents=True)
     shutil.copy(_SCRIPT, root / "scripts" / "ci" / "leak_scan.sh")
     shutil.copy(_ROOT / "scripts" / "ci" / "leak_scan_added_lines.py", root / "scripts" / "ci")
+    shutil.copy(_ROOT / "scripts" / "ci" / "leak_history_allow.py", root / "scripts" / "ci")
     env = {**os.environ, **_GIT_ENV, "HOME": str(root)}
 
     def git(*args: str) -> str:
@@ -394,6 +395,7 @@ def _clean_history_repo(tmp_path: Path) -> Path:
     (root / "scripts" / "ci").mkdir(parents=True)
     shutil.copy(_SCRIPT, root / "scripts" / "ci" / "leak_scan.sh")
     shutil.copy(_ROOT / "scripts" / "ci" / "leak_scan_added_lines.py", root / "scripts" / "ci")
+    shutil.copy(_ROOT / "scripts" / "ci" / "leak_history_allow.py", root / "scripts" / "ci")
     env = {**os.environ, **_GIT_ENV, "HOME": str(root)}
     run = {"cwd": root, "env": env, "check": True, "capture_output": True}
     subprocess.run(["git", "init", "-q", "-b", "main"], **run)

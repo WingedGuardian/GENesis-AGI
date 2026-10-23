@@ -1,0 +1,2 @@
+- Qualification retains failures even when exception formatting raises, and preserves required evidence fields when a credential value matches a field name, allowing verified answers to recover without another completion.
+- Live qualification refuses LiteLLM's optional unredacted payload printer before accessing credentials or sending requests; retained answers still replay offline.

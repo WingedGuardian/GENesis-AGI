@@ -35,13 +35,13 @@ Never push custom commits to the public repo's `main`.
 
 Operational backup of everything your Genesis has accumulated: SQLite DB,
 Qdrant snapshots, memory files, CC transcripts, local config overlays,
-and GPG-encrypted secrets. Written every 6 hours by `scripts/backup.sh`.
+GPG-encrypted secrets and credentials, and the card vault (if you created
+one). Written every 6 hours by `scripts/backup.sh`.
 
 **All PII-bearing payloads are encrypted** with `GENESIS_BACKUP_PASSPHRASE`
 before push: SQLite dump, memory files, transcripts, and secrets. The
 private repo is defense in depth; encryption is the primary defense.
-(Qdrant snapshots are opaque binary blobs and ship unencrypted; encrypting
-them is tracked as a follow-up.)
+Qdrant snapshots, credentials and the card vault are encrypted the same way.
 
 ## Recovery
 
@@ -89,4 +89,4 @@ changes, use the standard open-source flow (see `CONTRIBUTING.md`).
 | `scripts/restore.sh --dry-run` | Report what would be restored without touching the filesystem |
 | `python -m genesis restore` | Python CLI wrapper around `restore.sh` |
 | `genesis contribute <sha>` | Open an upstream PR for a committed bug fix |
-| `python -m genesis vault init\|add\|list\|retire\|status` | Encrypted payment card vault for virtual cards (secret-reading commands need your own terminal) |
+| `python -m genesis vault init\|add\|list\|retire\|status\|unlock\|lock` | Encrypted payment card vault for virtual cards; `unlock` hands the key to genesis-server until `lock`, 30 minutes idle, or a restart (secret-reading commands need your own terminal) |

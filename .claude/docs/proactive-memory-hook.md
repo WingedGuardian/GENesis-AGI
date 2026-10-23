@@ -67,11 +67,105 @@ write-backs, but it still re-applies the external-world provenance label
 blockable content it injects locally — the same injection-defense invariant the
 server path enforces. It self-heals on the next prompt once the server is back.
 
+## Run budget — a soft deadline and a hard stop, both counted from process start
+
+Claude Code kills a UserPromptSubmit hook at its configured timeout (10s for
+this hook) and discards everything it printed. Two layers keep the hook inside
+that limit.
+
+**Soft deadline, 8s (`_RUN_DEADLINE_S`).** Checked between steps; the run stops
+early and skips its best-effort bookkeeping (working-set measure, activity row,
+metrics, the ambient fold) once it is spent. It counts from when the process
+started, not from when `_run` began: `main()` reads the process age
+(`hook_deadline.process_age_s`: the start time in `/proc/self/stat` against
+`CLOCK_BOOTTIME`; `/proc/uptime` is not used, since lxcfs virtualises it in a
+container) and the budget shrinks by it. An age that cannot be read, or is
+outside 0-30s (clocks that disagree), leaves the full budget.
+
+**Hard stop, 8.5s from spawn (`_HARD_STOP_S`, `scripts/hooks/hook_deadline.py`).**
+The soft deadline cannot interrupt a step that is already running: a SQLite
+query or commit, a cold import, a file read. MEASURED 2026-10-07 from Claude
+Code transcripts and the server log: three memory-hook kills (10.0, 10.6 and
+12.5 s) each reached the server within 0.8-1.5 s of spawn, got a 503 at
+5.3-6.0 s, and then overran inside the keyword-only fallback; startup was not
+the cause. So a daemon timer, armed at the top of the script (only when it runs
+as the hook, never on import), ends the process 8.5 s after spawn: it flushes
+what was printed, adds the out-of-time notice when no output had been
+finalised, writes the main thread's stack to stderr (Claude Code keeps hook
+stderr in the transcript's `hook_success` row, so every hard stop records the
+step that overran), then the cut phase line (see Observability), and calls
+`os._exit(0)`. CPython releases the GIL inside
+sqlite3 calls and blocking reads, which is what lets the timer run while the
+main thread is stuck. Measured on the real hook with every database connect
+stalled for 30 s: the branch hook exited at 8.53 s with the notice and the
+blocked frame (`session_heartbeats.upsert_sync`); main's copy was still blocked
+at 60 s.
+
+**The notice**: `[Memory: the hook ran out of its 8s budget …; use
+memory_recall if prior context matters]`, a closing line that spends the
+writer's reserve (like the cut notice), so a large flush cannot clip it away.
+Printed only when the run ran out of time before reaching its own output
+decision and no recall line had landed. A run that reached its decision
+(a short prompt, a disabled server, a zero-hit answer) never prints it, however
+late it ends; off mode never prints it at all. A run that started already past
+its budget does print it even for a prompt that would not have recalled
+anything, because it stopped before it could tell.
+
+**What neither layer bounds.** A thread in uninterruptible disk sleep (an
+fsync) delays the process exit until that I/O returns; the hook's own SQLite
+connections therefore run `synchronous=NORMAL` (no per-commit fsync under WAL,
+as the server does), but connections opened by shared CRUD code
+(`upsert_sync`, `touch_terminal_session_row_sync`) keep the default. A C call
+that holds the GIL (a regex or JSON parse over a huge prompt) delays the timer.
+
 ## Observability
 
 `~/.genesis/proactive_metrics.json` records the latest invocation, including
 `mode` (`server`/`degraded`/`local`/`off`) and `server_ms`, so the server-path
 fallback rate is directly observable. The health dashboard reads this file.
+
+**Phase line (stderr).** Every run writes one `[hook-phases] {json}` line to
+stderr as it exits (`scripts/hooks/hook_phases.py`), on every path: an empty or
+unparseable input, off mode, a short prompt, the server and degraded paths, and
+a crash, after its traceback. A crash while the module is still loading (a
+missing dependency, say) happens before `main()` exists, so once its two helper
+modules (`hook_deadline`, `hook_phases`) load, the hook installs a
+`sys.excepthook` that writes the line after Python's traceback, with `startup_error` naming the exception and the open step naming
+where it happened; the hook still exits 1. Claude Code never shows an exit-0 hook's stderr to
+the model; it stores it in the transcript's `hook_success` attachment
+(`stderr`), next to the run's `durationMs`. A dispatched session
+(`GENESIS_CC_SESSION=1`) exits before any of this and writes nothing. The line
+carries:
+
+- `phases`: `[name, ms]` per step, in order. A step starts at its mark and runs
+  until the next one: `imports`, `dotenv`, `genesis_env` and `module` at load,
+  then `stdin`, `heartbeat_write`, `heartbeat_read`, `trail`, `activity`,
+  `recent_files`, `gates` (the off-mode, short-prompt and database checks),
+  `migration`, `suppress`, `server`, the path's own steps
+  (`server_emit`, `code_hints` / `fts5`, `code_index`, `degraded_emit`,
+  `shadow`), `flush` (writing the deferred session lines, wherever a path does
+  it; off mode then `metrics`), `ws_measure`, `activity_row`, `metrics`, `fold`,
+  and `finish` (cleanup and exit). Under its 1,000-byte cap the oldest steps fold into one
+  `["+N", ms]` entry.
+- `age0_s` (process age when timing started, null if unreadable), `total_s`,
+  `path` (`off`, `short`, `no_db`, `server`, `degraded`, `local`; absent when the
+  run stopped before deciding), `server_reason`, `timed_out`, `deadline_hit`
+  (judged when the line is written, so work that crossed the 8 s deadline after
+  the run's own checks still counts; null before the run started),
+  `recall_landed`, `flushed`, and `startup_error` on a load-time crash.
+- `psi`: pressure stall averages for the whole container, read from the
+  container-root cgroup (`/sys/fs/cgroup/{io,cpu,memory}.pressure`): `io_some10`,
+  `io_some60`, `io_full10`, `io_full60`, `cpu_some10`, `mem_full10`. Null when a
+  file cannot be read.
+
+When the hard stop fires, it writes the stack and then a phase line with
+`"cut": true`, whose `running` and `running_ms` name the step it cut. The line
+is built on its own thread, which the stop waits for at most 0.3 s
+(`DIAG_BUDGET_S`), so a stuck read can cost this line but never the exit. A stop
+that fires after the run wrote its own line adds no second line; only in the
+narrow window where both write at once can two lines appear, and then the one
+with `"cut": true` is the one that counts. A run Claude Code kills anyway leaves a
+`hook_cancelled` attachment and no stderr at all, so count those separately.
 
 The server response carries `timings_ms` with a per-stage breakdown —
 `embed`, `recall`, and (since ac27b693) the recall sub-stages `vector`,
@@ -225,7 +319,10 @@ Two rules from that work, because both are the kind you get wrong while
 believing otherwise. **A size bound must be measured in the unit the harness
 bills** (UTF-16 code units, via `utf16_len`/`clip_to_cost`) — mixing units does
 not loosen a bound, it SKIPS it, and the extremes hide that, so sweep a range
-rather than trying one huge value. A bound on MEANING (is this token a word?)
+rather than trying one huge value. Those units are counted on the text AS
+WRITTEN: the writers escape a lone surrogate to `\udXXX` (`printable`), so it
+costs six, and a size check done outside the module must use `utf16_len` rather
+than encode the raw text itself. A bound on MEANING (is this token a word?)
 stays in codepoints; say which you are writing. And **a bound must not decide
 eligibility** — filtering what gets rendered is not a judgement about whether the
 work is worth doing, and conflating them silently skipped recall for a whole

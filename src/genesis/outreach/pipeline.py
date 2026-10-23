@@ -64,6 +64,10 @@ def _suppressed_awaited_result() -> OutreachResult:
 class OutreachPipeline:
     """Main outreach orchestrator."""
 
+    def channel_configured(self, channel: str) -> bool:
+        """Whether an owner notice has a local adapter and default recipient."""
+        return bool(self._channels.get(channel) and self._recipients.get(channel))
+
     def __init__(
         self,
         governance: GovernanceGate,
@@ -512,6 +516,11 @@ class OutreachPipeline:
         gate_cleared: bool = False,
         best_effort: bool = False,
     ) -> OutreachResult:
+        if channel == "agent" and request.peer_envelope is None:
+            return OutreachResult(
+                outreach_id=outreach_id, status=OutreachStatus.REJECTED,
+                channel=channel, message_content="", error="agent channel requires a peer envelope",
+            )
         adapter = self._channels.get(channel)
         recipient = (
             request.validated_recipient
@@ -737,6 +746,7 @@ class OutreachPipeline:
                 delivery_recipient, formatted.text,
                 message_thread_id=thread_id,
                 reply_markup=reply_markup,
+                **({"peer_envelope": request.peer_envelope} if channel == "agent" else {}),
             )
             # Secondary DM copy for "both" mode (no buttons — primary only)
             if (routing == "both" and delivery_recipient != recipient
@@ -1087,6 +1097,7 @@ class OutreachPipeline:
                     # surface instead of the exact origin thread it promised.
                     "target_chat_id": request.target_chat_id,
                     "target_thread_id": request.target_thread_id,
+                    "peer_envelope": request.peer_envelope.encode() if request.peer_envelope else None,
                 }),
                 reason=reason,
                 # "ttl" (not "drain"): expire_by_policy honors staleness_ttl_s

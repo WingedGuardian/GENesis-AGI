@@ -125,10 +125,13 @@ def _is_current_gen_claude(model_id: str) -> bool:
     import re
 
     # Opus 4.7 and 4.8 already reject sampling parameters; so does every
-    # 5-generation-or-later Sonnet, Opus, Fable and Mythos model.
+    # 5-generation-or-later Sonnet, Opus, Fable and Mythos model. A floating
+    # OpenRouter '-latest' Claude alias (Haiku included) can resolve to such a
+    # model at any time, so it counts as current-generation too.
     return bool(
         re.search(r"claude-(sonnet|opus|fable|mythos)-([5-9]|\d{2,})", model_id)
         or re.search(r"claude-opus-4[.-][78](?!\d)", model_id)
+        or re.search(r"claude-[a-z]+-latest$", model_id)
     )
 
 
@@ -151,3 +154,6 @@ def test_older_claude_is_not_misclassified_as_current_gen():
     assert _is_current_gen_claude("anthropic/claude-opus-4-8")
     assert _is_current_gen_claude("anthropic/claude-mythos-5.1")
     assert not _is_current_gen_claude("anthropic/claude-opus-4.6")
+    assert _is_current_gen_claude("~anthropic/claude-haiku-latest")
+    assert _is_current_gen_claude("~anthropic/claude-sonnet-latest")
+    assert not _is_current_gen_claude("~deepseek/deepseek-flash-latest")

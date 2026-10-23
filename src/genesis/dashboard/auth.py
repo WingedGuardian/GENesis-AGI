@@ -13,6 +13,7 @@ import hmac
 import ipaddress
 import logging
 import os
+import re
 import secrets
 from collections import defaultdict
 from pathlib import Path
@@ -79,6 +80,11 @@ def get_or_create_secret_key() -> str:
 
 
 _internal_token_cache: str | None = None
+
+
+def conflicts_with_cached_internal_token(value: str) -> bool:
+    """Compare with the boot-loaded credential without reading/minting a file."""
+    return bool(value and _internal_token_cache and hmac.compare_digest(value, _internal_token_cache))
 
 
 def get_or_create_internal_api_token() -> str:
@@ -400,22 +406,31 @@ _SAFE_FETCH_SITES = frozenset({"same-origin", "none"})
 
 
 def _origin_matches_host(url: str) -> bool:
-    """True when ``url``'s host[:port] equals the request's ``Host`` header.
+    """True when ``url``'s host[:port] equals the request's ``Host`` header and its
+    scheme can be this server's.
 
     Host comparison is case-insensitive (hostnames are per RFC; browsers already
     lowercase, this covers hand-crafted same-origin tooling) — a case mismatch can
     only make the check stricter (fail-closed), never open a bypass.
+
+    Scheme: only ``http``/``https`` origins can be ours, and an ``http`` origin on a
+    request that arrived over TLS is a different origin. Where TLS ends at a proxy
+    the server sees plain HTTP; there ``Sec-Fetch-Site``, which current browsers
+    send to ``https``/``wss`` targets, is checked first by ``_is_same_origin_request``.
     """
     try:
-        netloc = urlsplit(url).netloc
+        parts = urlsplit(url)
     except ValueError:
         return False
-    return bool(netloc) and netloc.lower() == (request.host or "").lower()
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or (scheme == "http" and request.is_secure):
+        return False
+    return bool(parts.netloc) and parts.netloc.lower() == (request.host or "").lower()
 
 
 def _is_same_origin_request() -> bool:
-    """Whether a state-changing request is same-origin — the CSRF check for the
-    cookie auth path.
+    """Whether a request is same-origin — the CSRF check for the cookie auth path,
+    also used by the terminal WebSocket gate.
 
     ``SameSite=Lax`` attaches the session cookie on same-*site* requests too (a
     sibling origin on another port/subdomain of the dashboard host), so a valid
@@ -441,6 +456,15 @@ def _is_same_origin_request() -> bool:
     return False
 
 
+def is_same_origin_request() -> bool:
+    """Public entry to the same-origin check, for gates outside this module.
+
+    One implementation for every caller: the mutation gate and the terminal
+    WebSocket gate must agree about what counts as same-origin.
+    """
+    return _is_same_origin_request()
+
+
 def check_api_mutation_auth():
     """App-level gate: require auth for ``/api/**`` STATE-CHANGING requests when a
     dashboard password is set.
@@ -461,6 +485,20 @@ def check_api_mutation_auth():
     A cookie-authed cross-origin/originless mutation is rejected 403; a request with
     no credential at all is rejected 401.
     """
+    # Peer credentials never convey owner authority, including on installs
+    # with passwordless mutations or a valid accompanying browser cookie.
+    # Check names even for revoked peers; do not create an unconfigured DB.
+    if request.method not in ("GET", "HEAD", "OPTIONS") and request.path.startswith(
+        _GENESIS_API_PREFIXES
+    ):
+        from genesis.peers.auth import BACKEND_TOKEN
+
+        names = (BACKEND_TOKEN, *(
+            name for name in os.environ
+            if re.fullmatch(r"GENESIS_PEER_[A-Z0-9_]+_TOKEN", name)
+        ))
+        if any(presented_bearer_is(name) for name in names):
+            return jsonify(error="Owner authority required", code="unauthorized"), 403
     if not get_dashboard_password():
         return None
     if api_mutation_auth_disabled():
@@ -582,6 +620,22 @@ def check_api_network_scope():
     if _peer_is_trusted(request.remote_addr):
         return None
     return jsonify({"error": "not available from this network"}), 403
+
+
+def apply_dashboard_gates(app) -> None:
+    """Register every app-level dashboard gate, the Host gate first.
+
+    Every supported host that mounts the dashboard blueprints calls this. The
+    Host gate runs before the network-scope and mutation gates, so a request
+    addressed to a foreign name is refused before anything else looks at it.
+    Idempotent, like ``apply_api_mutation_gate``.
+    """
+    if not getattr(app, "_genesis_host_gate_applied", False):
+        from genesis.dashboard.host_gate import check_host_header
+
+        app.before_request(check_host_header)
+        app._genesis_host_gate_applied = True
+    apply_api_mutation_gate(app)
 
 
 def apply_api_mutation_gate(app) -> None:

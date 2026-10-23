@@ -43,6 +43,22 @@ def test_cap_constant_is_the_measured_harness_threshold():
     assert _ho.DEFAULT_BUDGET < _ho.HOOK_STDOUT_CAP
 
 
+@pytest.mark.parametrize("text", ["timeout", "😀timeout", "😀" * 20])
+@pytest.mark.parametrize("remaining", [0, 1, 2, 3, 4, 5, 20, 10000])
+def test_final_notice_preserves_locked_count_and_newline_margin(text, remaining):
+    emitted = _ho.HOOK_STDOUT_CAP - remaining
+    notice = _ho.clip_final_notice(text, emitted_units=emitted)
+    if remaining <= 3:
+        assert notice is None
+    else:
+        assert notice is not None
+        # Both framing newlines plus the spare unit fit, including astral text.
+        assert emitted + _ho.utf16_len("\n" + notice + "\n") < _ho.HOOK_STDOUT_CAP
+        assert text.startswith(notice)
+        if remaining >= _ho.utf16_len(text) + 3:
+            assert notice == text
+
+
 def test_under_budget_emits_everything_uncut(sink):
     out = _writer(sink)
     out.emit("alpha", block="a")
@@ -480,3 +496,214 @@ def test_an_astral_notice_still_degrades_gracefully_instead_of_cutting(sink):
 
     assert verdict == "truncated", f"graceful degrade became {verdict!r}"
     assert _units(sink.getvalue()) <= 400
+
+
+# ── #3236: trimming non-ASCII text keeps the longest prefix that fits ──
+
+
+_NOTE = f"\n[truncated — over the {_ho.HOOK_STDOUT_CAP}-char hook output cap]"
+_SHORT_NOTE = "\n[truncated]"
+
+
+def _nested(text: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "additionalContext": text,
+        }
+    }
+
+
+def _trim_one(text: str, budget: int = _ho.DEFAULT_BUDGET) -> tuple[bool, str, io.StringIO]:
+    sink = io.StringIO()
+    ok = _ho.print_json_bounded(
+        _nested(text),
+        text_keys=("hookSpecificOutput.additionalContext",),
+        budget=budget,
+        stream=sink,
+    )
+    return ok, json.loads(sink.getvalue())["hookSpecificOutput"]["additionalContext"], sink
+
+
+def test_3236_repro_em_dashes_are_trimmed_not_emptied():
+    """The issue's exact repro: 2,000 em dashes kept NONE of the text.
+
+    `json.dumps` writes "—" as the six-character `\\u2014`, so the overrun in
+    serialised units outgrew the field's Python length and `keep` fell to 0.
+    Room for 1,605 dashes plus the note existed, per the issue's own arithmetic.
+    """
+    ok, ctx, sink = _trim_one("—" * 2_000)
+
+    assert ok
+    assert ctx.endswith(_NOTE)
+    kept = ctx[: -len(_NOTE)]
+    assert kept == "—" * len(kept)
+    assert len(kept) >= 1_605, len(kept)
+    assert _units(sink.getvalue()) <= _ho.DEFAULT_BUDGET
+
+
+@pytest.mark.parametrize(
+    ("length", "every"),
+    [(12_000, 10), (12_000, 5), (20_000, 20), (20_000, 10), (50_000, 100), (50_000, 20)],
+)
+def test_3236_sweep_keeps_the_maximal_prefix(length, every):
+    """The issue's sweep rows that kept 0 or too little text, at 1-20% non-ASCII.
+
+    Asserted as MAXIMALITY rather than a number: one more character of the
+    original pushes the stream over budget. That is the contract `clip_to_cost`
+    already meets, now met by the JSON writer too.
+    """
+    text = "".join("—" if i % every == every - 1 else "a" for i in range(length))
+    ok, ctx, sink = _trim_one(text)
+
+    assert ok
+    assert _units(sink.getvalue()) <= _ho.DEFAULT_BUDGET
+    assert ctx.endswith(_NOTE)
+    kept = ctx[: -len(_NOTE)]
+    assert kept and text.startswith(kept)
+    longer = json.dumps(_nested(text[: len(kept) + 1] + _NOTE))
+    assert _ho.emit_cost(longer) > _ho.DEFAULT_BUDGET
+
+
+def test_3236_fields_are_ranked_by_serialised_size_not_python_length(sink):
+    """300 em dashes serialise to 1,802 units; 1,000 ASCII letters to 1,002.
+
+    Ranked by Python length the ASCII field was trimmed first, though the
+    em-dash field is the larger one on the wire.
+    """
+    payload = {"a": "—" * 300, "b": "y" * 1_000, "keep": "decision"}
+    assert _ho.print_json_bounded(payload, text_keys=("a", "b"), budget=2_500, stream=sink)
+    out = json.loads(sink.getvalue())
+    assert out["b"] == "y" * 1_000
+    assert out["a"].endswith(_NOTE)
+
+
+# ── #3255: True whenever the emptied envelope fits ─────────────────────
+
+
+def test_3255_repro_emptied_envelope_fitting_exactly_returns_true(sink, capsys):
+    """The issue's minimised case: the emptied envelope costs 45 against a 45 budget.
+
+    The old loop stopped at "note only", which is wider than the room, and
+    reported False although `{"permissionDecision": "deny", "reason": ""}` fits.
+    """
+    payload = {"permissionDecision": "deny", "reason": "x" * 80}
+    envelope = _ho.emit_cost(json.dumps({"permissionDecision": "deny", "reason": ""}))
+    assert envelope == 45
+
+    assert _ho.print_json_bounded(payload, text_keys=("reason",), budget=45, stream=sink)
+    assert json.loads(sink.getvalue()) == {"permissionDecision": "deny", "reason": ""}
+    assert _units(sink.getvalue()) <= 45
+    # An empty field carries no marker of its own, so the cut is reported.
+    assert "without a truncation note" in capsys.readouterr().err
+
+
+def test_3255_short_note_is_used_when_only_it_fits(sink):
+    """Between "full note fits" and "nothing fits": a field that says it was cut."""
+    payload = {"permissionDecision": "deny", "reason": "x" * 80}
+    budget = _ho.emit_cost(json.dumps({"permissionDecision": "deny", "reason": _SHORT_NOTE}))
+
+    assert _ho.print_json_bounded(payload, text_keys=("reason",), budget=budget, stream=sink)
+    assert json.loads(sink.getvalue())["reason"] == _SHORT_NOTE
+
+
+def test_3255_a_second_field_pays_when_the_first_cannot_fit_its_note(sink):
+    """Room for the envelope, one full note and 30 more units, across two fields."""
+    payload = {"permissionDecision": "deny", "a": "x" * 400, "b": "y" * 100}
+    room = _ho.emit_cost(json.dumps({"permissionDecision": "deny", "a": _NOTE, "b": "y" * 30}))
+
+    assert _ho.print_json_bounded(payload, text_keys=("a", "b"), budget=room, stream=sink)
+    out = json.loads(sink.getvalue())
+    assert out["permissionDecision"] == "deny"
+    for key, filler in (("a", "x"), ("b", "y")):
+        assert out[key].endswith((_NOTE, _SHORT_NOTE)), out[key]
+        assert set(out[key].split("\n")[0]) <= {filler}
+    assert _units(sink.getvalue()) <= room
+
+
+# ── #3237: a lone surrogate is escaped, billed and written identically ─
+
+
+def test_3237_repro_measurement_does_not_raise():
+    assert _ho.utf16_len("\ud800") == 6
+    assert _ho.emit_cost("\ud800") == 7
+    assert _ho.printable("ok \ud800") == "ok \\ud800"
+
+
+def _utf8_strict_stream() -> tuple[io.BytesIO, io.TextIOWrapper]:
+    buf = io.BytesIO()
+    return buf, io.TextIOWrapper(
+        buf, encoding="utf-8", errors="strict", newline="\n", write_through=True
+    )
+
+
+def test_3237_repro_emit_writes_what_it_billed():
+    """`print("ok \\ud800")` to a strict UTF-8 stream raises; the writer must not.
+
+    And the escape it writes instead is what it billed: the issue's design note
+    is that changing only the count leaves the write crashing, and changing only
+    the write leaves the count wrong.
+    """
+    buf, stream = _utf8_strict_stream()
+    out = _ho.BoundedStdout(label="x", stream=stream)
+    out.emit("ok \ud800")
+    stream.flush()
+
+    assert buf.getvalue() == b"ok \\ud800\n"
+    assert out.emitted_chars == _units(buf.getvalue().decode("utf-8"))
+    # The mirror records the written form, so writing it to disk cannot raise.
+    assert out.intended == "ok \\ud800"
+    out.intended.encode("utf-8")
+
+
+def test_3237_repro_print_bounded_does_not_raise(capsys):
+    out = _ho.print_bounded("ok \ud800", label="x")
+    assert capsys.readouterr().out == "ok \\ud800\n"
+    assert out.cut is None
+
+
+def test_3237_every_writer_input_is_made_printable():
+    """Label, mirror, divider, pointer, notice and the final line all reach the stream."""
+    buf, stream = _utf8_strict_stream()
+    out = _ho.BoundedStdout(90, label="l\udc80", mirror_hint="m\udc81", stream=stream)
+    out.emit_or_degrade(
+        "T\ud800" * 50,
+        block="b",
+        divider="\ud801",
+        pointer="p\ud806" * 40,
+        notice="[kept {kept}\ud802]",
+    )
+    out.emit("after a cut \ud803" * 20)
+    out.emit_final("done \ud804", fallback="d\ud805")
+    stream.flush()
+
+    text = buf.getvalue().decode("utf-8")
+    assert "\\ud802" in text  # the notice landed, escaped
+    assert _units(text) <= 90
+    assert out.emitted_chars == _units(text)
+
+
+def test_3237_a_cut_marker_with_a_surrogate_mirror_stays_in_budget():
+    """A path decoded with surrogateescape can carry a lone low surrogate."""
+    buf, stream = _utf8_strict_stream()
+    out = _ho.BoundedStdout(400, label="knowledge", mirror_hint="/x/\udcff.md", stream=stream)
+    out.emit("A" * 900, block="body")
+    stream.flush()
+
+    text = buf.getvalue().decode("utf-8")
+    assert out.cut is not None
+    assert "\\udcff" in text
+    assert _units(text) <= 400
+    assert out.emitted_chars == _units(text)
+
+
+def test_printable_is_the_identity_for_text_without_surrogates():
+    """ASCII and every valid non-ASCII string pass through as the SAME object.
+
+    That is what keeps every writer byte-identical to before for such text: the
+    only change on those paths is a `printable()` call that returns its input.
+    """
+    for text in ("", "plain ascii", "é — 漢 🎯", "\t\n\x00"):
+        assert _ho.printable(text) is text
+        assert _ho.utf16_len(text) == len(text.encode("utf-16-le")) // 2

@@ -77,7 +77,7 @@ existed), or a write to a live store. The usual free reads:
   -f text=...` renders what GitHub shows in that repository; without `context`,
   references like `#42` do not render as links;
 - a measurement over real data (merged PR bodies, live rows, transcripts),
-  reported as `k/N` with the method, per the Acceptance Bar section.
+  reported as `k/N` with the method, per build-session's "Acceptance Bar + Measured Rate".
 
 **The banned sentence, scoped.** "I did not verify X, but it should be fine" is
 banned where X is material AND a free read would settle it. That narrows
@@ -106,7 +106,7 @@ Item 3 applies to plans presented for approval in a foreground session.
 Task-executor plans (`/task`, `TASK_INTAKE.md`) keep their own section contract.
 A plan that outlives one session also carries the header in
 `references/plan-docs.md`. The test plan in item 3 never includes the full
-suite run locally; CI runs it (see "Pre-Commit Gate").
+suite run locally; CI runs it (see "Pre-Commit Gate" in `commit-path.md`).
 
 ## Ask vs decide (item 5)
 

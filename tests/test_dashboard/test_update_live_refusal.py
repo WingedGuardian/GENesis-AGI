@@ -22,7 +22,10 @@ from genesis.dashboard.routes import updates
 
 REPO = Path(__file__).resolve().parents[2]
 
-pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="git + POSIX paths")
+pytestmark = [
+    pytest.mark.skipif(sys.platform.startswith("win"), reason="git + POSIX paths"),
+    pytest.mark.usefixtures("updates_sandbox"),
+]
 
 
 @pytest.fixture()
@@ -34,9 +37,8 @@ def client():
 
 
 @pytest.fixture()
-def world(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    (home / ".genesis").mkdir(parents=True)
+def world(tmp_path, monkeypatch, updates_sandbox):
+    home = updates_sandbox.home
     root = tmp_path / "root"
     subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
     subprocess.run(
@@ -61,7 +63,6 @@ def world(tmp_path, monkeypatch):
     script.write_text("#!/bin/bash\nexit 0\n")
     escalation = tmp_path / "escalation.json"
     escalation.write_text("{}")
-    monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(updates, "_GENESIS_ROOT", root)
     monkeypatch.setattr(updates, "_UPDATE_SCRIPT", script)
     # raising=False: verify-RED runs this file against a routes module that has no
@@ -73,10 +74,7 @@ def world(tmp_path, monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(updates, "_ESCALATION_FILE", escalation)
-    monkeypatch.setattr(updates, "_PID_FILE", tmp_path / "update.pid")
     monkeypatch.setattr(updates, "update_in_progress", lambda: False)
-    # Never the install's real ~/.genesis/update_state.json.
-    monkeypatch.setattr(updates, "_STATE_FILE", home / ".genesis" / "update_state.json")
     return {"home": home, "root": root}
 
 
@@ -132,6 +130,9 @@ def test_on_live_the_route_refuses_and_names_the_rebuild(client, world, starters
     r = client.post(route, json={})
     assert r.status_code == 409
     body = r.get_json()["error"]
+    # update.sh is the way to update `live` (it rebuilds, then activates); the
+    # rebuild and restart pair is the no-activation alternative.
+    assert "scripts/update.sh" in body
     assert "scripts/deploy_candidates rebuild" in body
     assert "scripts/deploy_code_only.sh restart" in body
     assert starters == [], "a refused route started work"

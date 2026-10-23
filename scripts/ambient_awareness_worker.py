@@ -33,6 +33,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    import logging
+
+    # stderr goes to worker_err.log (the hook's spawn). Time and pid make a line
+    # joinable to the telemetry row of the same moment, which carries the pid.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(process)d %(levelname)s %(name)s: %(message)s",
+    )
+
     from genesis.session_awareness.worker import run_worker
 
     asyncio.run(run_worker(args.session_id, no_arbiter=args.no_arbiter))

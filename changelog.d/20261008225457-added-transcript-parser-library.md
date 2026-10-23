@@ -1,0 +1,1 @@
+- Optional transcript analysis can parse local records with structured credential scrubbing and explicit unresolved identity and usage. The parser is a library; collection and query commands follow separately.

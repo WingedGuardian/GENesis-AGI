@@ -208,9 +208,13 @@ def _patch_stream(spec: tuple[str, str], cwd: str | None):
     Raises :class:`RangeError` when git fails.
     """
     kind, value = spec
+    # core.quotePath=false: a non-ASCII path keeps its repository spelling
+    # (git otherwise writes it as quoted octal escapes); control characters,
+    # quotes and backslashes stay quoted.
+    git = ["git", "-c", "core.quotePath=false"]
     for argv in (
-        ["git", *_PATCH_ARGS[kind], value],
-        ["git", *_OCTOPUS_ARGS, _octopus_rev(spec)],
+        [*git, *_PATCH_ARGS[kind], value],
+        [*git, *_OCTOPUS_ARGS, _octopus_rev(spec)],
     ):
         proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         stdout = proc.stdout
@@ -254,8 +258,15 @@ def _added_rows(spec: tuple[str, str], cwd: str | None = None):
     commit = path = ""
     in_header = False
     for raw in _patch_stream(spec, cwd):
-        if raw.startswith(b"commit ") and not in_header:
+        if raw.startswith(b"commit "):
+            # Every commit boundary resets the parser: a diff with no hunk (a
+            # mode-only change, an empty file, a pure rename or copy) never clears
+            # in_header, and the next commit's lines would otherwise carry this
+            # commit's id.
+            # Header lines (index, mode, rename, ---/+++) never start "commit ".
             commit = raw[7:19].decode("ascii", errors="replace")
+            in_header = False
+            path = ""
         elif raw.startswith(b"diff --git ") or raw.startswith(b"diff --cc "):
             in_header = True
             path = ""

@@ -662,25 +662,8 @@ if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
     . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
     _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
 fi
-if [ -z "$_cbm_disable" ]; then
-    echo "    NOTE: codebase-memory-mcp kill-switch path unresolvable — refusing install (fail closed)"
-elif [ -e "$_cbm_disable" ]; then
-    echo "    . codebase-memory-mcp install/upgrade skipped (machine kill switch active)"
-else
-    # The pin, the digest and the install itself live in ONE place, shared with
-    # bootstrap.sh, so the commit and its digest cannot drift apart.
-    # shellcheck source=lib/cbm_installer.sh
-    . "$SCRIPT_DIR/lib/cbm_installer.sh"
-    _cbm_rc=0
-    genesis_cbm_install || _cbm_rc=$?
-    case "$_cbm_rc" in
-        0) echo "    + codebase-memory-mcp installed/upgraded" ;;
-        1) echo "    NOTE: codebase-memory-mcp installer download failed (optional)" ;;
-        3) echo "    ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
-        4) echo "    NOTE: codebase-memory-mcp install refused — machine kill switch active" ;;
-        *) echo "    NOTE: codebase-memory-mcp unavailable (optional) — see the error above" ;;
-    esac
-fi
+# Setup is deliberately manual (configure needs a pinned binary); whether it is
+# still owed is reported under "Next steps", after .mcp.json is rendered.
 
 _GITNEXUS_PIN_READY=0
 _gitnexus_pin_file="$SCRIPT_DIR/lib/gitnexus_version.sh"
@@ -917,6 +900,12 @@ if [ -d "$VENV_PATH" ]; then
             else
                 setup_warn "browser packages incomplete (see above; re-run scripts/bootstrap.sh)"
             fi
+            # The test and payments extras, the same way (see install_runtime_extras).
+            if install_runtime_extras "$REPO_DIR" "$VENV_PATH" | sed 's/^/    /'; then
+                echo "    + test and payments packages installed"
+            else
+                setup_warn "test/payments packages incomplete (see above; re-run scripts/bootstrap.sh)"
+            fi
             ;;
         1)
             # Blocked (worktree) — guard already printed the reason; the
@@ -1010,6 +999,15 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
+        # Keep links (including masks) through the ordinary policy below, without
+        # writing through them. Other nonregular Codebase destinations refuse.
+        case "$svc_name" in
+            genesis-cbm-query.service | genesis-cbm-query-clients.slice)
+                if [[ ! -L "$target" && -e "$target" && ! -f "$target" ]]; then
+                    echo "    ERROR: refusing nonregular managed Codebase unit: $target" >&2
+                    exit 1
+                fi ;;
+        esac
         # Any existing path counts, not only a regular file: a masked unit is a
         # symlink to /dev/null, and replacing it would unmask it (the timer loop
         # below then enables it). Bootstrap keeps such a unit the same way.
@@ -1044,6 +1042,10 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             # backslash. `\\\\&` would emit TWO, leaving `&` still meaning "the
             # whole match" — verified by hand, since it looks correct and is not.
             _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+            _systemd_exec_esc() { printf '%s' "$1" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g'; }
+            _home_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$HOME")")
+            _repo_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$REPO_DIR")")
+            _venv_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$VENV_PATH")")
             _home_esc=$(_sed_repl_esc "$HOME")
             _venv_esc=$(_sed_repl_esc "$VENV_PATH")
             _repo_esc=$(_sed_repl_esc "$REPO_DIR")
@@ -1052,6 +1054,9 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
             _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
             sed -e "s|__HOME__|$_home_esc|g" \
+                -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
+                -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
+                -e "s|__VENV_EXEC__|$_venv_exec_esc|g" \
                 -e "s|__VENV__|$_venv_esc|g" \
                 -e "s|__REPO_DIR__|$_repo_esc|g" \
                 -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
@@ -1127,25 +1132,8 @@ if command -v claude &>/dev/null; then
     . "$SCRIPT_DIR/lib/mcp_register.sh"
     [ -x "$REPO_DIR/.claude/mcp/run-gitnexus" ] && \
         _register_mcp "gitnexus" "user" "$REPO_DIR/.claude/mcp/run-gitnexus" "mcp"
-    # Via the repo launcher (NOT the bare binary): wraps the server in a
-    # systemd scope with MemoryMax=2G to contain upstream's unbounded memory
-    # leak (DeusData/codebase-memory-mcp#581). Rationale in the launcher.
-    if command -v codebase-memory-mcp &>/dev/null; then
-        # REGISTERED EVEN WHEN THE KILL SWITCH IS ACTIVE, deliberately. Registration
-        # does not start anything, and the launcher is fail-closed on the sentinel
-        # (.claude/mcp/run-codebase-memory exits 1 with "disabled by <file>"), so
-        # writing the registration while disabled cannot run the server.
-        #
-        # Skipping preserved the exact drift this helper exists to repair: a
-        # PRE-EXISTING registration pointing at the bare `codebase-memory-mcp`
-        # binary survives untouched, bypasses the launcher entirely, and starts the
-        # uncapped raw server in the next session — and stays uncapped after the
-        # sentinel is removed until somebody runs this again.
-        _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
-        if [ -n "${_cbm_disable:-}" ] && [ -e "$_cbm_disable" ]; then
-            echo "    . codebase-memory-mcp registered to the launcher; kill switch active, so it will refuse to start"
-        fi
-    fi
+    # Register managed setup on every install; registration never activates CBM.
+    _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
     _serena_registration_available && \
         _register_serena "$REPO_DIR"
     # grep-app (grep.app) — literal/regex code search over ~1M public GitHub
@@ -2044,6 +2032,10 @@ echo "    Genesis will guide you through first-time setup."
 if [ "$_final_keys" = "0" ] 2>/dev/null; then
     echo "    (API keys, user profile, channels — all handled interactively)"
 fi
+# codebase-memory-mcp: one line only when it is registered but not set up (or OK).
+# shellcheck source=lib/cbm_setup_notice.sh
+. "$SCRIPT_DIR/lib/cbm_setup_notice.sh"
+genesis_cbm_setup_notice "$VENV_PYTHON" "$REPO_DIR" "    "
 # Clarify what the skipped smoke tests mean so new users aren't confused
 if [ "${SMOKE_SKIP:-0}" -gt 0 ] && [ "${SMOKE_FAIL:-0}" = "0" ]; then
     echo ""

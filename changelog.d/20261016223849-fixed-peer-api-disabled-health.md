@@ -1,0 +1,1 @@
+- Treat an intentionally disabled peer API as disabled instead of reporting a deployment regression; enabled API readiness checks now include its conversation dependencies.

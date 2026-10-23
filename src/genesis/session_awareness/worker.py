@@ -91,7 +91,7 @@ async def _record_arbiter_telemetry(
             str(db_path),
             "ambient_arbiter",
             provider="cc",
-            model_id=ARBITER_MODEL,
+            model_id=verdict.get("served_model") or ARBITER_MODEL,
             response_text="|".join(parts),
             success=arbiter == "ok",
         )

@@ -55,6 +55,7 @@ dependencies = [
                                   # bound is the best instrument available here, not a complete one.
     "pydantic>=2.12,<3",  # strict validation for the decision registry (already pulled in by fastapi, litellm and mcp)
     "pyyaml",
+    "a2a-sdk==1.2.2",
     "markdown-it-py>=3",  # the merge gate's rework row reads PR bodies as CommonMark (already pulled in by rich)
     "httpx",
     "diskcache>=5.6",
@@ -113,6 +114,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+transcript-analytics = ["duckdb==1.5.6", "pyarrow==24.0.0"]
+# `test` and `payments` are installed on every install, after the core packages
+# and as a separate non-fatal step (scripts/lib/venv_setup.sh install_runtime_extras;
+# the list is INSTALL_EXTRAS in scripts/lib/venv_matches_pyproject.py): an install
+# runs its own test suite, and the card vault needs the payments packages.
 test = [
     "pytest>=8.0",
     "pytest-asyncio",
@@ -246,24 +252,31 @@ asyncio_mode = "auto"
 # --basetemp and `-o tmp_path_retention_policy=all`.
 # Pinned by tests/test_pytest_retention_policy.py.
 tmp_path_retention_policy = "failed"
-# PER-TEST ceiling (pytest-timeout), not a suite budget — a hung test is killed
-# and the suite carries on.
+# PER-TEST ceiling (pytest-timeout), not a suite budget. With the thread method
+# below, a test that exceeds it dumps every thread's stack and ENDS THE RUN: the
+# suite does not carry on.
 #
-# This setting is CI-ONLY in practice. pytest-timeout is declared in the
-# [test] extra below, so a local `pip install -e .` venv does not have it and
-# pytest prints `PytestConfigWarning: Unknown config option: timeout` on every
-# local run (MEASURED 2026-09-06 on this box: `pip show pytest-timeout` ->
-# not found). Its origin commit (05c307e6) credits it with stopping six stuck
-# pytest processes burning ~450% CPU for 2+ hours on the shared, swapless box
-# this repo develops on — but with the plugin absent there, it never did.
+# It applies wherever pytest-timeout is installed: always in CI (the test job
+# installs the [test] extra), and locally only in a venv where someone
+# installed it, because no install path installs that extra. Where it is
+# absent, tests/conftest.py says so at the top of the run.
 #
-# Raised 1800 -> 3600: 1800 was picked for that local incident and then
-# silently inherited by CI, and it sits BELOW this project's own documented
-# 7200s timeout floor. One hour is the deliberate midpoint — still under the
-# floor, still far above any legitimate test. The cost of raising it lands
-# only on GitHub runners: a genuinely hung test now burns 60 minutes instead
-# of 30 before being killed, and the job cap (180) bounds that at two such
-# kills. Nobody can pick a tighter number honestly yet — the suite has never
-# had its per-test durations measured, which is what the `--durations` flag
-# added to CI alongside this change fixes.
-timeout = 3600
+# 600 s, lowered from 3600 (2026-10). A hung test holds the box-wide pytest
+# lock (genesis.util.pytest_lock) until this kills it, and every other
+# session's run waits behind it: MEASURED, one hung mutation-sweep test held the
+# lock for 53 minutes with six runs queued. The slowest of 40,306 tests in CI
+# run 37962484661 (main, 2026-10-09, --durations) took 38.25 s, so 600 s is
+# about 16 times the slowest real test. Read the --durations block before
+# lowering it further. Raising it again costs every session on a shared box
+# the full value per hung test.
+timeout = 600
+# "thread", not the default "signal". MEASURED 2026-10: two CI test jobs
+# (38948727801, 39044594350) froze at the same point, just after
+# tests/test_peers/test_cli.py, for over two hours until the 180-minute job limit
+# cancelled them; the signal method never fired. A signal handler runs only when
+# the main thread executes Python code, and its exception can be absorbed by the
+# code it interrupts. The thread method uses a watchdog thread that dumps all
+# stacks and exits the process, so a hang fails in 600 s with the stack trace
+# that names it. Cost: one hang ends the whole run instead of failing one test.
+# The box-wide pytest lock is an flock, released when the process dies.
+timeout_method = "thread"

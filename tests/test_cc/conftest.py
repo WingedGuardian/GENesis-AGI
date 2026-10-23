@@ -69,3 +69,42 @@ def _guard_the_seal_isolation(tmp_path):
         f"the gh seal is not redirected to tmp ({sealed}); a test in this "
         "package can write the operator's real credential into their home"
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_oom_score_adj(monkeypatch):
+    """The launch path raises the child's ``/proc/<pid>/oom_score_adj`` to 500.
+
+    Raising needs no privilege, and these tests hand it fixed fake pids (4242,
+    99999, 424201): on a live machine any process of the operator's that holds
+    one of those pids would become the kernel's preferred OOM victim. Nothing
+    here asserts the real write, so every test in the package gets a no-op.
+    """
+    from genesis.cc import invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod, "set_oom_score_adj", lambda *_a, **_k: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_claude_login(tmp_path, monkeypatch):
+    """The launch path reads the login's expiry from ``~/.claude/.credentials.json``.
+
+    Against the operator's real file, a test's path depends on whether their
+    login is near expiry (a dead login turns on the API-key fallback); CI has no
+    file at all. The real-home fallback becomes a file that does not exist; a
+    test that sets ``CLAUDE_CONFIG_DIR`` (or patches ``credentials_path``) still
+    gets its own.
+    """
+    import os
+    from pathlib import Path
+
+    from genesis.cc import login_health
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    absent = tmp_path / "no-claude-home" / ".claude"
+
+    def credentials_path() -> Path:
+        base = os.environ.get("CLAUDE_CONFIG_DIR", "")
+        return (Path(base).expanduser() if base else absent) / ".credentials.json"
+
+    monkeypatch.setattr(login_health, "credentials_path", credentials_path)

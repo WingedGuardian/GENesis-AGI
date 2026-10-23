@@ -1,0 +1,1 @@
+- Add bounded serving-status requests for supervised Codex validators, including owned-child cleanup on termination.

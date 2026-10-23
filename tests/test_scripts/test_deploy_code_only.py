@@ -25,6 +25,7 @@ test_venv_matches_pyproject.py.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import subprocess
@@ -186,6 +187,90 @@ def test_a_finished_update_left_behind_does_not_block(station):
     r = _run(station)
     assert r.returncode == 0, r.stderr
     assert "genesis-server pid 2222" in r.stdout, r.stdout
+
+
+def _guard_state(station, content: dict, *, conflict: bool = False) -> str:
+    """Write update_state.json against a rollback tag `pre` at the station's HEAD."""
+    head = _git(station["root"], "rev-parse", "HEAD")
+    _git(station["root"], "tag", "-f", "pre")
+    if content.get("deploy_head") == "HEAD":
+        content = {**content, "deploy_head": head}
+    dot = station["home"] / ".genesis"
+    (dot / "update_state.json").write_text(json.dumps(content))
+    if conflict:
+        (dot / "update_conflicts.json").write_text(json.dumps({"deploy_head": head}))
+    return head
+
+
+def test_a_merge_conflict_waiting_on_its_resolver_is_refused(station):
+    """#3139: the shared rule's conflict verdict, and its remedy."""
+    head = _guard_state(
+        station, {"phase": "merging", "rollback_tag": "pre", "deploy_head": "HEAD"}, conflict=True
+    )
+    _advance_upstream(station)
+    r = _run(station)
+    _assert_untouched(station, head, r)
+    assert "merge conflicts" in r.stderr and "Resolve" in r.stderr
+
+
+def test_merged_code_never_activated_is_refused(station):
+    # The rollback tag is not HEAD: the checkout holds what the run merged.
+    head = _guard_state(station, {"phase": "merging", "rollback_tag": "not-head"})
+    _advance_upstream(station)
+    r = _run(station)
+    _assert_untouched(station, head, r)
+    assert "update.sh --post-merge" in r.stderr and "Dismiss" in r.stderr
+
+
+def test_a_run_that_stopped_before_merging_anything_does_not_block(station):
+    """The shared rule, not "any phase but done": a plain run that left its
+    "fetching" state with nothing merged guards nothing."""
+    _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": False},
+    )
+    tip = _advance_upstream(station)
+    r = _run(station)
+    assert r.returncode == 0, r.stderr
+    assert _git(station["root"], "rev-parse", "HEAD") == tip
+
+
+@pytest.mark.parametrize("mode", ["deploy", "pull"])
+def test_a_harmless_leftover_is_removed_before_the_pull_moves_head(station, mode):
+    """SF-C: after the pull HEAD is off the leftover's rollback tag, where the
+    same file would read as guarding merged code (update.sh would then exit 5
+    and the card would offer --post-merge)."""
+    _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": False},
+    )
+    _advance_upstream(station)
+    r = _run(station) if mode == "deploy" else _run(station, "pull")
+    assert r.returncode == 0, r.stderr
+    assert not (station["home"] / ".genesis" / "update_state.json").exists()
+
+
+def test_restart_moves_nothing_and_leaves_a_harmless_leftover(station):
+    state = station["home"] / ".genesis" / "update_state.json"
+    _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": False},
+    )
+    r = _run(station, "restart")
+    assert r.returncode == 0, r.stderr
+    assert state.exists(), "restart does not move HEAD; the leftover stays harmless"
+
+
+def test_a_post_merge_fetching_state_is_refused(station):
+    """SF1: a --post-merge writes "fetching" over code already merged."""
+    head = _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": True},
+    )
+    _advance_upstream(station)
+    r = _run(station)
+    _assert_untouched(station, head, r)
+    assert "update.sh --post-merge" in r.stderr
 
 
 def test_a_branch_other_than_main_is_refused(station):
@@ -939,3 +1024,54 @@ def test_a_path_argument_in_the_unit_is_not_read_as_its_python(station):
     _advance_upstream(station)
     r = _run(station, env={**station["env"], "UNIT_ARGS": "--db-path=/data/x.db"})
     assert r.returncode == 0, r.stderr
+
+
+# ── the extras advisory: warns about missing test/payments packages, never refuses ──
+
+
+def _run_extras_advisory(tmp_path: Path, gate_out: str, gate_rc: int):
+    """Run deploy_code_only.sh's _extras_advisory alone (the script is not a library),
+    with a venv python that answers the gate's --extras call as told."""
+    code = SCRIPT.read_text()
+    start = code.index("_extras_advisory() {")
+    body = code[start : code.index("\n}\n", start) + 3]
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text(
+        f"#!/bin/sh\ncat > /dev/null\nprintf '%s' '{gate_out}'\nexit {gate_rc}\n"
+    )
+    (venv / "bin" / "python").chmod(0o755)
+    script = f'{body}\n_extras_advisory "the working tree" "[project]"; echo "rc=$?"'
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "VENV_DIR": str(venv), "_SELF_DIR": str(tmp_path)},
+    )
+
+
+def test_the_extras_advisory_warns_and_never_refuses(tmp_path):
+    res = _run_extras_advisory(tmp_path, "missing: pyrage [payments] (required >=1.4)\n", 1)
+    assert "rc=0" in res.stdout
+    assert "WARNING: the venv lacks optional packages" in res.stderr
+    assert "missing: pyrage [payments]" in res.stderr
+    # Plain update.sh stops at "Already up to date" on a current tree.
+    assert "scripts/update.sh --post-merge" in res.stderr
+
+
+@pytest.mark.parametrize(
+    ("gate_out", "gate_rc"),
+    [
+        ("", 0),  # everything installed
+        # A gate that predates --extras reads it as a checkout path (measured on
+        # origin/main's gate): rc 1 with lines that are not package lines.
+        ("genesis-v3 is installed from /x, not --extras\npackage root: /x/src\n", 1),
+        ("extra not declared: [payments]\n", 1),  # not a reinstall problem
+    ],
+    ids=["present", "older-gate", "undeclared-group"],
+)
+def test_the_extras_advisory_is_silent_unless_packages_are_missing(tmp_path, gate_out, gate_rc):
+    res = _run_extras_advisory(tmp_path, gate_out, gate_rc)
+    assert "rc=0" in res.stdout
+    assert res.stderr == ""

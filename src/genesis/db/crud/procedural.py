@@ -251,22 +251,29 @@ async def list_by_tier(
     db: aiosqlite.Connection,
     tier: str,
     *,
-    limit: int = 100,
+    limit: int | None = 100,
     lessons: bool | None = None,
 ) -> list[dict]:
     """List active procedures at a specific activation tier."""
-    cursor = await db.execute(
+    sql = (
         "SELECT * FROM procedural_memory "  # noqa: S608 - fixed SQL fragments only
         "WHERE activation_tier = ? AND deprecated = 0 AND quarantined = 0"
         + _kind_clause(lessons)
-        + " ORDER BY confidence DESC LIMIT ?",
-        (tier, limit),
+        + " ORDER BY confidence DESC"
     )
+    params: list = [tier]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    cursor = await db.execute(sql, params)
     return [dict(r) for r in await cursor.fetchall()]
 
 
 async def list_lessons(
-    db: aiosqlite.Connection, *, include_quarantined: bool = False
+    db: aiosqlite.Connection,
+    *,
+    include_quarantined: bool = False,
+    include_deprecated: bool = False,
 ) -> list[dict]:
     """Every non-deprecated row that carries a lesson record.
 
@@ -276,8 +283,10 @@ async def list_lessons(
     listing leaves them out, unless a caller that manages them asks.
     """
     quarantine = "" if include_quarantined else " AND quarantined = 0"
+    deprecated = "" if include_deprecated else " AND deprecated = 0"
     cursor = await db.execute(
-        "SELECT * FROM procedural_memory WHERE lesson IS NOT NULL AND deprecated = 0"
+        "SELECT * FROM procedural_memory WHERE lesson IS NOT NULL"
+        + deprecated
         + quarantine
         + " ORDER BY created_at"
     )
@@ -359,7 +368,7 @@ async def list_active(
     db: aiosqlite.Connection,
     *,
     person_id: str | None = None,
-    limit: int = 100,
+    limit: int | None = 100,
     live_only: bool = False,
     lessons: bool | None = None,
 ) -> list[dict]:
@@ -374,8 +383,10 @@ async def list_active(
         sql += " AND person_id = ?"
         params.append(person_id)
     sql += _live_clause(live_only) + _kind_clause(lessons)
-    sql += " ORDER BY confidence DESC LIMIT ?"
-    params.append(limit)
+    sql += " ORDER BY confidence DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
     cursor = await db.execute(sql, params)
     return [dict(r) for r in await cursor.fetchall()]
 

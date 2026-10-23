@@ -87,7 +87,11 @@ def test_a_summary_path_inherited_from_the_caller_is_never_printed_or_removed(tm
     text = UPDATE.read_text()
     start = text.index("unset GENESIS_DEPLOY_SUMMARY")
     end = text.index(
-        "\n", text.index("trap 'rm -f \"$_SELF_COPY\" 2>/dev/null; _flush_deploy_summary' EXIT")
+        "\n",
+        text.index(
+            'trap \'rm -f "$_SELF_COPY" 2>/dev/null; _drop_own_prestop_state; '
+            "_flush_deploy_summary' EXIT"
+        ),
     )
     theirs = tmp_path / "theirs"
     theirs.write_text("the caller's line\n")
