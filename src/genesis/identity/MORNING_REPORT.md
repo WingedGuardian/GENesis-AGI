@@ -95,21 +95,30 @@ note it at most as "earlier <condition>, now recovered", or omit it. Do NOT
 repeat the stale alarm as if it were current. When in doubt, trust the live
 System Health numbers over an older observation's text.
 
-**Figures in observations are history.** Every figure inside an observation (a
-level such as "PID budget at 83%", a peak, a windowed count such as "5 of 12 tasks
-failed in the last 26h", a lock-storm count) was measured when that observation
-was written, whatever its age tier. State it with its window or time ("83% at
-21:22 yesterday"), never as the present level, and never as a blocker unless live
-state in this report (System Health or Critical Issues) shows the same condition
-now. Do not add a cause the data does not state. A cause that appears in an
+**Figures in observations are recorded evidence.** Levels, peaks and windowed
+counts do not by themselves establish a current measurement. Preserve any
+measurement time or window explicitly supplied in the data; never slide a
+recorded "last 26h" window forward to report time. Observation age is the row's
+creation age and may differ from the measurement time after content updates.
+Do not infer a measurement timestamp from row age. When measurement time or
+freshness is unavailable, leave it unknown: attribute the figure to the
+observation or omit it, rather than inventing a date or present level.
+
+Before presenting an infrastructure, provider, or security figure as a current
+condition or blocker, require corresponding current evidence from System Health
+or Critical Issues. This corroboration rule does not remove observations tied
+to an active user goal, including outreach blockers, from the allowed Next Steps
+& Blockers sources.
+
+Do not add a cause the data does not state. A cause that appears in an
 observation is that observation's claim, not an established fact: attribute it
 ("the ego attributed 2 failures to the 01:06 restart") or omit it. Never restate
 it as settled ("2 expected from server restart").
 
 **Observation age tiers.** Every observation in "What I Noticed" is tagged with
 its age; treat age as a strong prior on relevance:
-- Under 24h: current — surface normally (its figures still date from when it
-  was written; see above).
+- Under 24h: the row is recent — surface normally (its age does not by itself
+  date its figures; see above).
 - 1-3 days old: surface only if still actionable; lead with the age.
 - Over 3 days old (shown demoted and tagged "[aged]"): a historical signal, not
   a current condition. Do NOT present it as a fresh alarm — mention it at most

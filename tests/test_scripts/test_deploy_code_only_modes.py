@@ -96,6 +96,7 @@ _SCRIPT_FILES = (
     "deploy_code_only.sh",
     "lib/guardian_pause.sh",
     "lib/deploy_marker.sh",
+    "lib/live_system_guard.sh",
     "lib/alert_queue.sh",
     "lib/deploy_status.sh",
     "lib/deploy_checkout.sh",
@@ -109,6 +110,10 @@ _SCRIPT_FILES = (
     "lib/live_checkout.py",
     "lib/venv_matches_pyproject.py",
 )
+
+
+def test_script_inventory_includes_required_live_guard():
+    assert "lib/live_system_guard.sh" in _SCRIPT_FILES
 
 
 def _install_the_script(st) -> None:

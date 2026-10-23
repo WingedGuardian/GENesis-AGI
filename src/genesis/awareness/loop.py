@@ -178,7 +178,10 @@ async def _persist_health_alerts(db) -> None:
         from genesis.runtime import GenesisRuntime
 
         observation = {}
-        alerts, _current_ids = await _compute_alerts(agent_api_observation=observation)
+        queue_unknown_ids: set[str] = set()
+        alerts, _current_ids = await _compute_alerts(
+            agent_api_observation=observation, queue_unknown_ids=queue_unknown_ids,
+        )
         # Also preserve an open API incident if the health service itself could
         # not initialize and _compute_alerts returned before taking a snapshot.
         alerts = [a for a in alerts if a.get("id") != ALERT_ID]
@@ -196,7 +199,7 @@ async def _persist_health_alerts(db) -> None:
         state = observation.get("status")
         reasons = {ALERT_ID: state} if state in {"healthy", "disabled"} else None
         await _ae.reconcile_open_set(db, active=active, now=datetime.now(UTC).isoformat(),
-                                     resolution_reasons=reasons)
+                                     resolution_reasons=reasons, preserve_ids=queue_unknown_ids)
         runtime = GenesisRuntime.peek()
         await notify_pending(db, getattr(runtime, "_outreach_pipeline", None))
     except Exception:
@@ -2999,9 +3002,59 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
 # last severity stored, so we fire on a NEW scope or an ESCALATION (degraded→error)
 # but suppress a same-or-LOWER severity within the window — no storm, no A→B→A
 # oscillation flood, and no alert announcing a de-escalation (an improvement).
-_last_pid_alerts: dict[str | None, tuple[int, float]] = {}
+# scope -> (severity rank, monotonic time of the last alert, resolved since?).
+_last_pid_alerts: dict[str | None, tuple[int, float, bool]] = {}
+# Indirection so tests can drive the cooldown clock without patching
+# time.monotonic, which the asyncio event loop itself reads.
+_pid_clock = time.monotonic
 _PID_BUDGET_ALERT_COOLDOWN_S = 3600  # one alert per scope per hour unless it escalates
 _PID_SEVERITY_RANK = {"degraded": 1, "error": 2}
+# Resolve an open alert only once utilization is clearly back down: the alert
+# fires at 80% (the collector's degraded threshold), and resolving anywhere
+# under 80% would close and reopen it on every tick of a load hovering at the
+# line. 5 points of hysteresis.
+_PID_RESOLVE_PCT = 75.0
+
+
+async def _resolve_pid_budget_alert(db, pct: float | None) -> None:
+    """Resolve open PID-budget alerts on a healthy tick below _PID_RESOLVE_PCT.
+
+    Keeps a peak from an earlier tick from reading as a current condition (the
+    morning report shows the live figure beside it). No in-memory guard: an
+    alert written before a restart or deploy must resolve too, so the store is
+    asked. A read-only probe gates the write, so a healthy tick with nothing
+    open writes nothing. A resolve that closed rows marks every scope's cooldown
+    as resolved: a new degradation then re-alerts after a quarter of the
+    cooldown instead of the full hour, while load oscillating around the line
+    still cannot alert every other tick.
+    ``pct`` None (no finite sub-cap visible) is resolvable.
+    """
+    global _last_pid_alerts  # noqa: PLW0603
+    if db is None or (pct is not None and pct >= _PID_RESOLVE_PCT):
+        return
+    try:
+        if not await observations.has_unresolved_matching(
+            db, source="pid_budget_monitor", content_like="%"
+        ):
+            return
+        note = (
+            "PID budget healthy: no sub-cap visible"
+            if pct is None
+            else f"PID budget back below {_PID_RESOLVE_PCT:.0f}%"
+        )
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source="pid_budget_monitor",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=note,
+        )
+    except Exception:
+        logger.debug("Failed to resolve pid_budget alert observation", exc_info=True)
+        return
+    if resolved:
+        _last_pid_alerts = {s: (v[0], v[1], True) for s, v in _last_pid_alerts.items()}
+        logger.info("PID budget healthy again: resolved %d alert observation(s)", resolved)
 
 
 async def _check_pid_budget(db, budget: dict | None = None) -> None:
@@ -3012,8 +3065,9 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
     read green (the blind spot this closes). The collector walks the cgroup chain and
     reports whichever level binds (session scope / user slice / container root); this
     emits a scope-matched remedy at degraded (>=80%) -> 'high'; error (>=90%) ->
-    'critical'. Fork-free cgroup read; best-effort — never raises into the tick.
-    `budget` may be injected (tests); otherwise it reads live."""
+    'critical'. A later HEALTHY read below _PID_RESOLVE_PCT resolves any open alert
+    (see `_resolve_pid_budget_alert`). Fork-free cgroup read; best-effort — never raises
+    into the tick. `budget` may be injected (tests); otherwise it reads live."""
     global _last_pid_alerts  # noqa: PLW0603
     try:
         if budget is None:
@@ -3025,8 +3079,12 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
         return
 
     status = budget.get("status")
+    if status == "healthy":
+        # Only a definite healthy read resolves; unavailable/unknown never does.
+        await _resolve_pid_budget_alert(db, budget.get("pct"))
+        return
     if status not in ("degraded", "error"):
-        return  # healthy / no sub-cap (pids.max="max") / unavailable → nothing to alert
+        return  # unavailable / unknown → nothing to alert, nothing to resolve
     # Record WHO holds the budget on every low tick, cooldown or not: the holders
     # may be gone by the next alert, and the count alone cannot name them.
     breakdown = None
@@ -3046,16 +3104,21 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
         except Exception:
             logger.warning("pid budget breakdown could not run", exc_info=True)
     scope = budget.get("scope")
-    now = time.monotonic()
+    now = _pid_clock()
     # Per-scope cooldown with escalation bypass: fire when the scope is new, its
     # window expired, or it ESCALATED to a higher severity; suppress a same-or-lower
     # severity within the window — that covers a repeat, an A→B→A oscillation (each
     # scope cools independently), AND a de-escalation error→degraded (never alert
     # because things improved).
+    # After a resolve the scope's window shrinks to a quarter of the cooldown: a
+    # fresh episode is news, but a load swinging across the line every tick must
+    # still not alert every other tick (critical at >=90%).
     rank = _PID_SEVERITY_RANK[status]
     prev = _last_pid_alerts.get(scope)
-    if prev is not None and (now - prev[1]) < _PID_BUDGET_ALERT_COOLDOWN_S and rank <= prev[0]:
-        return
+    if prev is not None and rank <= prev[0]:
+        window = _PID_BUDGET_ALERT_COOLDOWN_S / 4 if prev[2] else _PID_BUDGET_ALERT_COOLDOWN_S
+        if (now - prev[1]) < window:
+            return
     if db is None:
         return  # can't write the observation now; retry next tick (cooldown not consumed)
     pct = budget.get("pct")
@@ -3097,7 +3160,7 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
     # Set before the await so a failed create still cools per-tick retries for the
     # same scope+severity. Prune scopes older than the cooldown to bound the map
     # (the server's own chain is a small fixed set, but keep it tidy regardless).
-    _last_pid_alerts[scope] = (rank, now)
+    _last_pid_alerts[scope] = (rank, now, False)
     _last_pid_alerts = {
         s: v for s, v in _last_pid_alerts.items() if now - v[1] < _PID_BUDGET_ALERT_COOLDOWN_S
     }

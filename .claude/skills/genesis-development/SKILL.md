@@ -406,6 +406,8 @@ references on every trigger.
 | What each `gh` listing caps at before you pass a flag | `references/gh-listing-caps.md` |
 | A blocked call, `secrets.env`, ask keys | `references/ask-keys-and-sigils.md` |
 | Merge-gate findings: Devin scoring, `auth`, outside-diff, doc paths | `references/merge-gate-findings.md` |
+| A PR whose diff touches the enforcement-hook surface (gate-fix lane) | `references/gate-fix-lane.md` |
+| Release review: scope, pre-existing defects a release recruits for | `references/release-review.md` |
 | Which session type you are | the router at the top of this file |
 
 **Freshness rule:** On first read of `codebase-map.md` in a session,
