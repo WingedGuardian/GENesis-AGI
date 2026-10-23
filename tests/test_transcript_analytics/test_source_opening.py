@@ -21,7 +21,10 @@ from pathlib import Path
 from genesis.transcript_analytics import locks,store
 
 root=Path(sys.argv[1]);when=sys.argv[2];initial=bool(int(sys.argv[3]))
-projects=root/'projects';projects.mkdir();data=root/'data';path=projects/'source.jsonl'
+projects=root/'projects';projects.mkdir();data=root/'data'
+path=projects/('agent-source.jsonl' if when=='sidecar' else 'source.jsonl')
+meta=path.with_suffix('.meta.json')
+if when=='sidecar':meta.write_text('{}')
 lock=root/'writer.lock'
 def write(number):
     path.write_text(json.dumps({'type':'assistant','uuid':'event','sessionId':'session',
@@ -44,7 +47,8 @@ def observe_extract(*args,**kwargs):
     return original_extract(*args,**kwargs)
 store.extract_source=observe_extract
 def substitute():
-    path.unlink();os.mkfifo(path)
+    target=meta if when=='sidecar' else path
+    target.unlink();os.mkfifo(target)
 if when=='discovery':
     original=store.discover
     def discovered(root):
@@ -71,7 +75,7 @@ print(json.dumps({'failed':result['failed'],'rebuilt':result['rebuilt'],
 '''
 
 
-@pytest.mark.parametrize("when", ["discovery", "open"])
+@pytest.mark.parametrize("when", ["discovery", "open", "sidecar"])
 @pytest.mark.parametrize("initial", [False, True])
 def test_fifo_substitution_is_rejected_before_extraction(tmp_path, when, initial):
     child = subprocess.Popen(
@@ -162,3 +166,84 @@ def test_opened_source_descriptor_closes_on_rejection(tmp_path, monkeypatch, fai
         for descriptor in opened:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
+
+
+@pytest.mark.parametrize("size", [0, 1048576, 1048577])
+def test_sidecar_fingerprint_read_has_a_ceiling(tmp_path, size):
+    source = tmp_path / "agent-source.jsonl"
+    source.write_text("{}\n")
+    source.with_suffix(".meta.json").write_bytes(b"x" * size)
+    if size > 1048576:
+        with pytest.raises(ValueError, match="metadata.*large"):
+            store.source_fingerprint(source)
+    else:
+        assert store.source_fingerprint(source)["meta"]
+
+
+@pytest.mark.parametrize("saved", [None, False, 17, [], {}, "relative", "/tmp/../other"])
+def test_malformed_root_is_not_an_adoptable_missing_binding(tmp_path, saved):
+    projects, data = tmp_path / "projects", tmp_path / "data"
+    projects.mkdir()
+    data.mkdir()
+    assert store._projects_root(data, projects) == str(projects)
+    (data / "projects-root.json").write_text(json.dumps({"projects_root": saved}))
+    with pytest.raises(ValueError, match="projects.root"):
+        store._projects_root(data, projects, adopt=True)
+
+
+def _source(path):
+    path.write_text(json.dumps({"type": "assistant", "uuid": "event", "sessionId": "s",
+        "timestamp": "2020-01-01T00:00:00Z", "message": {"content": []}}) + "\n")
+
+
+def test_ingest_keeps_the_root_captured_before_alias_repoint(tmp_path, monkeypatch):
+    original, other, alias = tmp_path / "original", tmp_path / "other", tmp_path / "alias"
+    original.mkdir()
+    other.mkdir()
+    _source(original / "source.jsonl")
+    alias.symlink_to(original, target_is_directory=True)
+    discover = store.discover
+    def repoint(root):
+        found = discover(root)
+        alias.unlink()
+        alias.symlink_to(other, target_is_directory=True)
+        return found
+    monkeypatch.setattr(store, "discover", repoint)
+    data = tmp_path / "data"
+    result = store.ingest(alias, data)
+    assert result["rebuilt"] == 1 and result["projects_root"] == str(original)
+    assert json.loads((data / "projects-root.json").read_text())["projects_root"] == str(original)
+    with pytest.raises(ValueError, match="differs"):
+        store.prune(data, before="2026-01-01", projects=other)
+    assert store.prune(data, before="2026-01-01", projects=original) == 0
+
+
+@pytest.mark.parametrize("number,stage", [
+    (errno.EIO, "stat"), (errno.EACCES, "stat"), (errno.ELOOP, "stat"),
+    (errno.ENOENT, "stat"), (errno.ENOENT, "extract"),
+])
+def test_source_stat_failures_preserve_later_work_and_inventory(tmp_path, monkeypatch, number, stage):
+    projects, data = tmp_path / "projects", tmp_path / "data"
+    projects.mkdir()
+    bad, good = projects / "bad.jsonl", projects / "good.jsonl"
+    _source(bad)
+    _source(good)
+    monkeypatch.setattr(store, "discover", lambda _: [(bad, bad.name), (good, good.name)])
+    real_stat, build = os.stat, store.build_source
+    def inspect(path, *args, **kwargs):
+        if path == bad and stage == "stat":
+            raise OSError(number, "synthetic source stat failure")
+        return real_stat(path, *args, **kwargs)
+    def extract(path, *args, **kwargs):
+        if path == bad and stage == "extract":
+            raise FileNotFoundError("synthetic source vanished")
+        return build(path, *args, **kwargs)
+    monkeypatch.setattr(store.os, "stat", inspect)
+    monkeypatch.setattr(store, "build_source", extract)
+    result = store.ingest(projects, data)
+    assert result["rebuilt"] == 1 and not result["complete"]
+    assert result["vanished"] == int(number == errno.ENOENT)
+    assert result["failed"] == int(number != errno.ENOENT)
+    assert result["sources"] == (1 if number == errno.ENOENT else 2)
+    assert len(store.select_sources(data)[0]) == 1
+    assert json.loads((data / "inventory.json").read_text()) == result
