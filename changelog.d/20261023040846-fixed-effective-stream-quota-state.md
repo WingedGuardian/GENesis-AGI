@@ -1,0 +1,1 @@
+- Ordinary Claude streaming now classifies the final effective quota state rather than the presence of a quota event, preserving answers and ordinary empty-output detection for informational events and usable overage.
