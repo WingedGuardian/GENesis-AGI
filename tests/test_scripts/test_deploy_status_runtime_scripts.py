@@ -105,6 +105,14 @@ EXEMPT: dict[tuple[str, str], str] = {
         "the entry script a memory server must run, compared against its /proc "
         "argv by the census; never imported, run or read"
     ),
+    ("memory/graph_census.py", "scripts/ambient_awareness_worker.py"): (
+        "a git pathspec for the census dirty check; the worker runs in its own "
+        "process, never in the server"
+    ),
+    ("memory/graph_census.py", "scripts/*"): (
+        "a producer's own entry script (the ambient worker), compared against its "
+        "/proc argv by the census; never imported, run or read"
+    ),
     ("browser/engine.py", "scripts/install_browser_stack.sh"): (
         "named in the operator step an unready engine reports; an operator or the "
         "browser-stack unit runs it, never the server"
