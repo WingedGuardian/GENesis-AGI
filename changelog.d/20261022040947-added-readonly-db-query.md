@@ -1,9 +1,1 @@
-- **`~/genesis/.venv/bin/python -m genesis db query "<sql>"` runs one read-only SQL
-  statement** against
-  the Genesis database. SQLite itself enforces read-only (a `mode=ro` URI,
-  `PRAGMA query_only`, and an allowlist authorizer), so reads whose text mentions
-  a write keyword now work, while writes, `ATTACH`, `VACUUM INTO`, transactions
-  and state-changing pragmas are refused. FTS5 tables work; rtree tables are not
-  supported. A runaway query is aborted after 60 seconds (`--timeout`, `0` for
-  none). Supports `--param`, `--json`, `--limit` (truncation reported on stderr)
-  and `--db`. A refused statement exits 4.
+- Add `genesis db query` for one SQLite-enforced read-only statement, with parameter binding, row limits, escaped TSV and strict JSON. Reject duplicate JSON column names and explicit empty database paths. Cap retained-result accounting at 100 MB and use a cooperative SQLite deadline with a setup-time busy cap; these are not hard process-memory or wall-clock bounds. SQLite-owned sidecars and temporary spill files can still be written. FTS5 works, rtree remains unsupported, and refused statements exit 4.

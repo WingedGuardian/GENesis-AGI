@@ -223,6 +223,17 @@ class DeferredWorkQueue:
         """
         return await crud.count_pending_in(self._db, work_types=BATCH_WORK_TYPES)
 
+    async def count_pending_split(
+        self, stale_worklist_days: int = STALE_WORKLIST_DAYS
+    ) -> dict[str, int]:
+        """Measure total/recovery/worklist/stalled together using one clock read."""
+        from datetime import timedelta
+
+        cutoff = (self._clock() - timedelta(days=stale_worklist_days)).isoformat()
+        return await crud.count_pending_split(
+            self._db, work_types=BATCH_WORK_TYPES, stale_cutoff_iso=cutoff
+        )
+
     async def count_recovery_pending(self, stale_worklist_days: int = STALE_WORKLIST_DAYS) -> int:
         """Count pending items that should trip the recovery-backlog depth alarm.
 

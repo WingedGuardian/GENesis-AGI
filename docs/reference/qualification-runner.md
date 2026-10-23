@@ -102,7 +102,11 @@ Deterministic embeddings and synthetic classifiers establish wiring, not model
 or retrieval quality.
 
 `run` supports Flash alone (`--alias openrouter-deepseek-flash --campaign`),
-or the historical MiMo–Flash pair with both `--against` and `--against-campaign`.
+or an explicit Pro–Flash or historical MiMo–Flash pair with both `--against`
+and `--against-campaign`. Pro uses `openrouter-deepseek-v4`, preserving the
+configured `deepseek/deepseek-v4-pro` identity. Choose and verify each model's
+upstream, parameters and receipt identity independently; Flash's upstream is
+not evidence that Pro supports that upstream.
 Both modes require `--operating-plan`, `--spending-approval` and all complete
 admission inputs above. The parameters file must contain exactly the selected
 population. Other singleton aliases and additional candidates are refused.

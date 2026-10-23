@@ -287,15 +287,19 @@ When no MCP tool answers the question and you need a raw SQL read:
    refused (exit 4). Options: `--param VALUE` binds `?` placeholders in order,
    `--json` prints a list of objects (default is TSV with a header), `--limit N`
    caps the rows (default 200, `0` for all; truncation is reported on stderr),
-   `--db PATH` targets another database, `--timeout SECONDS` sets the
-   wall-clock deadline (default 60, `0` for none; it exists because a runaway
-   query spills temp files into the shared session temp volume and pins a WAL
-   snapshot). Exit 1 is any other error (SQLite error, empty statement,
+   `--db PATH` targets another database, `--timeout SECONDS` sets a
+   cooperative SQLite deadline (default 60, `0` for none). Progress/row checks
+   and a setup-time busy cap do not provide a hard process deadline; a later
+   native wait can outlast the remaining budget. A runaway query can spill
+   temporary files and pin a WAL snapshot. Exit 1 is any other error (SQLite error, empty statement,
    deadline exceeded), 2 a usage error, 3 a quarantined database. The default
    is the live Genesis DB (or `GENESIS_DB_PATH`). Pass `--db` only for another
    file.
-   It never writes the database or any other file, except SQLite's own WAL
-   sidecar files (`-wal`/`-shm`) when they are absent. FTS5 tables work;
+   SQLite refuses logical writes, but can create its own WAL sidecars
+   (`-wal`/`-shm`) and temporary spill files. Retained-result accounting is capped
+   at 100 MB even with `--limit 0`; this is not a total process-memory bound.
+   JSON rejects duplicate column names instead of dropping values. An explicitly
+   empty `--db` is an error. FTS5 tables work;
    **rtree tables are unsupported** (rtree prepares writes on first use, so
    the query is refused).
 

@@ -14,14 +14,15 @@ text. Three independent layers, each closing something the others leave open:
    ``ATTACH 'file:x?mode=rwc'`` creates one. Both are denied here because
    their first authorizer action is ``SQLITE_ATTACH``.
 
-What it touches on disk: it never writes the database or any other file,
-except SQLite's own WAL sidecar files (``-wal``/``-shm``), which opening a
-WAL-mode database ``mode=ro`` creates when they are absent. A missing database
-is an error, never created.
+Logical database read-only does not mean zero filesystem writes: SQLite can
+create its own WAL sidecars (``-wal``/``-shm``) and temporary spill files. A
+missing database is an error, never created.
 
-Resource bounds: a wall-clock deadline (progress handler, default
-:data:`DEFAULT_TIMEOUT_S`) and a cap on any one string or blob
-(:data:`MAX_VALUE_BYTES`). The reason for each is in the comment above it.
+Resource bounds: a cooperative deadline (setup, progress and row checks, default
+:data:`DEFAULT_TIMEOUT_S`), a per-value cap (:data:`MAX_VALUE_BYTES`) and a
+conservative retained-result budget (:data:`MAX_RESULT_BYTES`). These are not
+a hard process deadline or RSS ceiling. The busy cap is installed once during
+trusted setup; a later native wait can outlast the remaining deadline.
 
 Unsupported: rtree virtual tables. The rtree module prepares write statements
 on its shadow tables when the table is first used, so the authorizer refuses
@@ -37,7 +38,9 @@ Pure and synchronous on purpose, so an MCP tool can reuse
 
 from __future__ import annotations
 
+import math
 import sqlite3
+import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -51,6 +54,8 @@ __all__ = [
     "DEFAULT_MAX_ROWS",
     "DEFAULT_TIMEOUT_S",
     "MAX_VALUE_BYTES",
+    "MAX_RESULT_BYTES",
+    "QueryResultTooLarge",
     "QueryResult",
     "QueryTimeout",
     "ReadOnlyViolation",
@@ -74,6 +79,8 @@ _PROGRESS_STEPS = 1000
 # Cap on any one string or blob. SQLite's default is 1e9 bytes, so
 # `zeroblob(1e9)` / `randomblob(...)` could spike memory by a gigabyte.
 MAX_VALUE_BYTES = 100_000_000
+# Conservative rows/columns accounting, not total process/native/encoder memory.
+MAX_RESULT_BYTES = 100_000_000
 
 # `data_version` is allowed ONLY with no argument: FTS5 prepares
 # `PRAGMA data_version` (arg None, measured on SQLite 3.45) to detect changes,
@@ -175,7 +182,11 @@ class ReadOnlyViolation(sqlite3.DatabaseError):
 
 
 class QueryTimeout(sqlite3.OperationalError):
-    """The query ran past its wall-clock deadline and was interrupted."""
+    """The query exceeded its cooperative execution deadline."""
+
+
+class QueryResultTooLarge(sqlite3.DataError):
+    """The retained rows and columns exceed the result accounting budget."""
 
 
 @dataclass(frozen=True)
@@ -235,58 +246,107 @@ def run_readonly_query(
     quarantined, and any other :class:`sqlite3.Error` unchanged (a missing
     file is an ``OperationalError`` and is never created).
     """
+    deadline = time.monotonic() + timeout_s if timeout_s else None
+    deadline_interrupted = False
+
+    def expired() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
+    def check_deadline() -> None:
+        if expired():
+            raise QueryTimeout(f"aborted: exceeded {timeout_s:g}s")
+
+    def progress() -> int:
+        nonlocal deadline_interrupted
+        deadline_interrupted = expired()
+        return int(deadline_interrupted)
+
+    def busy_budget_ms() -> int:
+        configured = max(0, int(db_busy_timeout_ms()))
+        if deadline is None:
+            return configured
+        check_deadline()
+        return min(configured, math.ceil(max(0.0, deadline - time.monotonic()) * 1000))
+
+    def check_result_budget(size: int) -> None:
+        if size > MAX_RESULT_BYTES:
+            raise QueryResultTooLarge(
+                f"aborted: result exceeds retained-result budget ({MAX_RESULT_BYTES} bytes)"
+            )
+
+    check_deadline()
     db_path = Path(path).expanduser()
     assert_admitted(db_path)
-    conn = sqlite3.connect(ro_uri(db_path), uri=True)
+    check_deadline()
+    conn = None
+    denied: list[str] = []
+    seen: list[int] = []
     try:
+        conn = sqlite3.connect(ro_uri(db_path), uri=True, timeout=busy_budget_ms() / 1000)
+        check_deadline()
         conn.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, False)
         conn.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
-        conn.execute(f"PRAGMA busy_timeout = {int(db_busy_timeout_ms())}")
+        if deadline is not None:
+            conn.set_progress_handler(progress, _PROGRESS_STEPS)
+        # Trusted setup only: never remove the authorizer to refresh this cap.
+        conn.execute(f"PRAGMA busy_timeout = {busy_budget_ms()}")
+        check_deadline()
         conn.execute("PRAGMA query_only = ON")
+        check_deadline()
         conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
-        if timeout_s:
-            deadline = time.monotonic() + timeout_s
-            conn.set_progress_handler(
-                lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_STEPS
-            )
-        denied: list[str] = []
-        seen: list[int] = []
         conn.set_authorizer(_make_authorizer(denied, seen))
-        try:
-            # execute(), never executescript(): it refuses a second statement.
-            cur = conn.execute(sql, tuple(params))
-            if not seen:
-                raise sqlite3.ProgrammingError("no statement: the SQL is empty or only comments")
-            if max_rows is None:
-                rows = cur.fetchall()
-                truncated = False
-            else:
-                rows = cur.fetchmany(max_rows + 1)
-                truncated = len(rows) > max_rows
-                rows = rows[:max_rows]
-        except sqlite3.ProgrammingError as exc:
-            if "one statement" in str(exc):
-                raise ReadOnlyViolation("refused: one statement only") from exc
-            raise
-        except sqlite3.DatabaseError as exc:
-            if (
-                timeout_s
-                and isinstance(exc, sqlite3.OperationalError)
-                and getattr(exc, "sqlite_errorname", "") == "SQLITE_INTERRUPT"
-            ):
-                raise QueryTimeout(f"aborted: exceeded {timeout_s:g}s") from exc
-            if denied:
-                # Worded about the OPERATION, not the user's query: a read can
-                # trip it too (an rtree table prepares writes on first use).
-                raise ReadOnlyViolation(
-                    "refused: query touched an operation outside the read-only "
-                    f"allowlist (denied: {denied[0]})",
-                    denied[0],
-                ) from exc
-            if isinstance(exc, sqlite3.OperationalError) and "readonly database" in str(exc):
-                raise ReadOnlyViolation(f"refused: not read-only ({exc})") from exc
-            raise
+        check_deadline()
+        # execute(), never executescript(): it refuses a second statement.
+        cur = conn.execute(sql, tuple(params))
+        if not seen:
+            raise sqlite3.ProgrammingError("no statement: the SQL is empty or only comments")
+        check_deadline()
         columns = [d[0] for d in cur.description or ()]
-        return QueryResult(columns=columns, rows=[tuple(r) for r in rows], truncated=truncated)
+        rows: list[tuple] = []
+        retained = sys.getsizeof(rows) + sys.getsizeof(columns)
+        retained += sum(sys.getsizeof(column) for column in columns)
+        check_result_budget(retained)
+        # Overcharge one one-element list per retained row rather than guessing
+        # the interpreter's list growth. Shared scalar objects may be charged twice.
+        list_allowance = sys.getsizeof([None])
+        truncated = False
+        while True:
+            check_deadline()
+            row = cur.fetchone()
+            check_deadline()
+            if row is None:
+                break
+            if max_rows is not None and len(rows) >= max_rows:
+                truncated = True
+                break  # The discarded lookahead is not retained-result memory.
+            retained += list_allowance + sys.getsizeof(row)
+            retained += sum(sys.getsizeof(value) for value in row)
+            check_result_budget(retained)
+            rows.append(row)
+        return QueryResult(columns=columns, rows=rows, truncated=truncated)
+    except sqlite3.ProgrammingError as exc:
+        if "one statement" in str(exc):
+            raise ReadOnlyViolation("refused: one statement only") from exc
+        raise
+    except sqlite3.DatabaseError as exc:
+        if denied:
+            raise ReadOnlyViolation(
+                "refused: query touched an operation outside the read-only "
+                f"allowlist (denied: {denied[0]})",
+                denied[0],
+            ) from exc
+        primary = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+        if deadline is not None and (
+            (primary == sqlite3.SQLITE_INTERRUPT and deadline_interrupted)
+            or (
+                primary in {sqlite3.SQLITE_INTERRUPT, sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                and expired()
+            )
+        ):
+            raise QueryTimeout(f"aborted: exceeded {timeout_s:g}s") from exc
+        if isinstance(exc, sqlite3.OperationalError) and "readonly database" in str(exc):
+            raise ReadOnlyViolation(f"refused: not read-only ({exc})") from exc
+        raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()

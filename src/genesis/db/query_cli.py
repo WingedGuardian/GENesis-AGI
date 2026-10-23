@@ -21,6 +21,7 @@ forge a row or a column. ``--json`` is strict JSON (no ``NaN``/``Infinity``).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import re
@@ -32,14 +33,18 @@ _EXIT_REFUSED = 4  # never 2: argparse exits 2 on a usage error
 _INVOCATION = '~/genesis/.venv/bin/python -m genesis db query "<sql>"'
 _NAMED_ESCAPES = {"\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r"}
 # C0 controls, DEL, and C1 controls, plus the backslash used as the escape.
-_TSV_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f\\]")
+_TSV_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\\]")
 # json.dumps already escapes C0; DEL and C1 pass through it raw.
 _JSON_UNSAFE = re.compile(r"[\x7f-\x9f]")
 
 
 def _escape_tsv(text: str) -> str:
     return _TSV_UNSAFE.sub(
-        lambda m: _NAMED_ESCAPES.get(m.group(), f"\\x{ord(m.group()):02x}"), text
+        lambda m: _NAMED_ESCAPES.get(
+            m.group(),
+            f"\\u{ord(m.group()):04x}" if ord(m.group()) > 255 else f"\\x{ord(m.group()):02x}",
+        ),
+        text,
     )
 
 
@@ -79,9 +84,12 @@ def _cmd_query(args: argparse.Namespace) -> int:
     from genesis.db.readonly_query import ReadOnlyViolation, run_readonly_query
     from genesis.env import genesis_db_path
 
-    db = args.db or genesis_db_path()
+    db = None
     max_rows = None if args.limit == _NO_LIMIT else args.limit
     try:
+        if args.db == "":
+            raise ValueError("--db must not be empty")
+        db = genesis_db_path() if args.db is None else args.db
         result = run_readonly_query(
             db, args.sql, args.param or (), max_rows=max_rows, timeout_s=args.timeout or None
         )
@@ -93,19 +101,38 @@ def _cmd_query(args: argparse.Namespace) -> int:
         return 3
     except Exception as exc:  # sqlite3.Error and friends: report, do not trace
         print(f"error: {exc}", file=sys.stderr)
-        if not Path(db).expanduser().exists():
-            # A missing database is never created; say which path was tried,
-            # since the default resolves under the CURRENT checkout.
+        missing = False
+        if db is not None:
+            # An optional diagnostic must not mask the original failure.
+            with contextlib.suppress(OSError, RuntimeError, ValueError):
+                missing = not Path(db).expanduser().exists()
+        if missing:
             print(f"  no database at {db} (pass --db PATH)", file=sys.stderr)
         return 1
 
     if args.json:
-        rows = [
-            {col: _json_value(val) for col, val in zip(result.columns, row, strict=True)}
-            for row in result.rows
-        ]
-        text = json.dumps(rows, indent=2, ensure_ascii=False, allow_nan=False)
-        print(_JSON_UNSAFE.sub(lambda m: f"\\u{ord(m.group()):04x}", text))
+        if len(set(result.columns)) != len(result.columns):
+            print(
+                "error: duplicate JSON column names; use explicit unique aliases", file=sys.stderr
+            )
+            return 1
+        # One mapping/encoder stream at a time, after all query errors are known.
+        encoder = json.JSONEncoder(indent=2, ensure_ascii=False, allow_nan=False)
+        if result.rows:
+            sys.stdout.write("[\n")
+            for index, row in enumerate(result.rows):
+                if index:
+                    sys.stdout.write(",\n")
+                values = {
+                    col: _json_value(val) for col, val in zip(result.columns, row, strict=True)
+                }
+                sys.stdout.write("  ")
+                for chunk in encoder.iterencode(values):
+                    escaped = _JSON_UNSAFE.sub(lambda m: f"\\u{ord(m.group()):04x}", chunk)
+                    sys.stdout.write(escaped.replace("\n", "\n  "))
+            sys.stdout.write("\n]\n")
+        else:
+            print("[]")
     else:
         if result.columns:
             print("\t".join(_escape_tsv(c) for c in result.columns))
@@ -121,7 +148,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
-    from genesis.db.readonly_query import DEFAULT_MAX_ROWS, DEFAULT_TIMEOUT_S
+    from genesis.db.readonly_query import DEFAULT_MAX_ROWS, DEFAULT_TIMEOUT_S, MAX_RESULT_BYTES
 
     p = subparsers.add_parser("db", help="Database tools (read-only query)")
     # required: a bare `genesis db` is a usage error (exit 2), like argparse's
@@ -135,7 +162,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             f"Run one read-only SQL statement: {_INVOCATION}. Writes, ATTACH, VACUUM, "
             "transactions and state-changing pragmas are refused by SQLite itself "
             "(exit 4). rtree tables are not supported. Exit codes: 0 ok, 1 error, "
-            "2 usage, 3 quarantined database, 4 refused."
+            f"2 usage, 3 quarantined database, 4 refused. Retained results have a "
+            f"{MAX_RESULT_BYTES}-byte accounting budget, including with --limit 0; "
+            "this is not a total process memory bound."
         ),
     )
     q.add_argument("sql", help="One SQL statement; use ? placeholders with --param")
@@ -152,7 +181,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         type=_non_negative_int,
         default=DEFAULT_MAX_ROWS,
         help=(
-            f"Max rows to print (default {DEFAULT_MAX_ROWS}; 0 = no limit). "
+            f"Max rows to print (default {DEFAULT_MAX_ROWS}; 0 = no row limit). "
             "Truncation is reported on stderr."
         ),
     )
@@ -162,8 +191,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default=DEFAULT_TIMEOUT_S,
         metavar="SECONDS",
         help=(
-            f"Abort the query after this many seconds (default {DEFAULT_TIMEOUT_S:g}; "
-            "0 = no deadline). Bounds runaway temp-file spill and WAL snapshot pinning."
+            f"Cooperative SQLite deadline in seconds (default {DEFAULT_TIMEOUT_S:g}; "
+            "0 = no deadline). Progress and row checks plus a setup-time busy cap; "
+            "native calls and output sinks have no hard process deadline."
         ),
     )
     q.set_defaults(func=_cmd_query)
