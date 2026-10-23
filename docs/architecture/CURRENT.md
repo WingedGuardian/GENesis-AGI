@@ -2830,7 +2830,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 236930b1b 2026-10-22
+verified: 22cb94e6e 2026-10-23
 ```
 
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
@@ -2860,7 +2860,10 @@ verified: 236930b1b 2026-10-22
   unresolved. This CLI candidate exposes opt-in capped collection, status, live
   SQL, disposable cache building and independent live/cache verification. The
   canonical configuration defaults off and accepts the existing private overlay;
-  scheduling arrives in a dependent change. Additional backup
+  default paths follow the canonical runtime homes while explicit paths win.
+  Status reads confined snapshot metadata; bounded SQL previews and streaming CSV
+  preserve full query counts without retaining every result row in Python.
+  Scheduling arrives in a dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   Unknown historical content is excluded from content metrics; query manifests
   identify the views version. Historical actors without identities cannot form

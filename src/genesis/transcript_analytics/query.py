@@ -61,7 +61,7 @@ _DERIVED = (
 )
 
 
-def _snapshot(data, selection):
+def _snapshot_directory(data):
     # The disposable layout is a real derived/ directory whose current
     # selector is a symlink into it; anything else is malformed cache and
     # the reader falls back to the live views.
@@ -75,6 +75,11 @@ def _snapshot(data, selection):
     directory = selector.resolve(strict=True)
     if directory.parent != root or not directory.is_dir():
         raise ValueError("invalid snapshot selector")
+    return directory
+
+
+def _snapshot(data, selection):
+    directory = _snapshot_directory(data)
     manifest = json.loads((directory / "MANIFEST.json").read_text())
     if (
         not isinstance(manifest, dict)
@@ -115,7 +120,7 @@ def _load_snapshot(con, data, selection):
 
 def snapshot_manifest(data):
     try:
-        value = json.loads((data / "derived/current/MANIFEST.json").read_text())
+        value = json.loads((_snapshot_directory(data) / "MANIFEST.json").read_text())
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError, RuntimeError):
         return {}
@@ -314,9 +319,37 @@ def turn_identity_coverage(con):
 
 
 def run_query(
-    data: Path, sql: str, params=None, *, live: bool = False, manifest_path=None, window=None, baseline=None
+    data: Path,
+    sql: str,
+    params=None,
+    *,
+    live: bool = False,
+    manifest_path=None,
+    window=None,
+    baseline=None,
 ):
     """Read a current cache or the captured live views; never serve stale cache."""
+
+    def consume(rel):
+        result = (rel.columns, rel.fetchall()) if rel is not None else ([], [])
+        return result, len(result[1])
+
+    return _query(
+        data,
+        sql,
+        params,
+        consume=consume,
+        live=live,
+        manifest_path=manifest_path,
+        window=window,
+        baseline=baseline,
+    )
+
+
+def _query(
+    data, sql, params=None, *, consume, live=False, manifest_path=None, window=None, baseline=None
+):
+    """Consume one execution completely before recording its query evidence."""
     with contextlib.closing(connect(data, live=live)) as con:
         coverage = _READS[con]["coverage"]
         snapshot = _READS[con].get("snapshot")
@@ -343,7 +376,7 @@ def run_query(
             if "raw_" in str(exc):
                 raise ValueError("raw_* views require --live") from exc
             raise
-        result = (rel.columns, rel.fetchall()) if rel is not None else ([], [])
+        result, result_rows = consume(rel)
         if manifest_path:
             identity_coverage = turn_identity_coverage(con)
             _write_manifest(
@@ -366,13 +399,9 @@ def run_query(
                     },
                     "denominator_basis": {"turns": "candidate_turn_rows"},
                     "turn_identity_coverage": identity_coverage,
-                    "result_rows": len(result[1]),
+                    "result_rows": result_rows,
                     "source_references": [
-                        store.source_identity(
-                            os.fsdecode(
-                                record.metadata.get(b"ta.source", b"")
-                            )
-                        )
+                        store.source_identity(os.fsdecode(record.metadata.get(b"ta.source", b"")))
                         for record in _READS[con]["selection"][0]
                     ],
                 },

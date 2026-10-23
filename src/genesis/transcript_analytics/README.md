@@ -134,6 +134,11 @@ collection, live search or opportunity scanning.
 Status captures accepted source records once for marker totals, coverage and the
 snapshot input signature. Concurrent collection can publish newer records while
 that response finishes; the captured metadata remains internally consistent.
+Status uses the same confined snapshot-selector boundary as the reader and does
+not load snapshot pages. SQL previews retain only their display limit, CSV streams
+in batches, and both preserve complete query counts in manifests. Default source
+and data paths honor `CLAUDE_HOME` and `GENESIS_HOME`; explicit paths remain chosen
+paths and the installed configuration is still required.
 `verify` uses the same captured selection for the configured cache reader and
 forced live reader, one connection at a time. It compares schema, row counts and
 row digests for every shared relation. Missing, stale or unreadable caches report
