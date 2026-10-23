@@ -466,10 +466,15 @@ shares the OAuth-compatible readiness helper. `cc_fallback` is a non-routing
 **Fallback** observation in the neural monitor for conversations and managed
 turns; actual committed outcomes, not readiness alone, establish success.
 
+Ordinary streaming and readiness share final-effective quota classification:
+allowed/warning and explicitly usable overage are not refusals, and a later
+allowed event supersedes a rejection. Result and no-result streaming paths
+preserve usable answers, real refusal health and dropped-output replay guards.
+
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 4606e5969 2026-10-16
+verified: a8fa35a35 2026-10-23
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
@@ -1490,7 +1495,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 91c3bbeb9 2026-10-22
+verified: a8fa35a358bc 2026-10-23
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1528,8 +1533,13 @@ the shared banner is not an assertion about all concurrent sessions.
   enrichment, observe/interact tools, external unattended provenance and the
   native background ceiling. Result heads and full artifacts have bounded
   disclosure checks. Approval attribution survives notification updates; the API
-  lists pending owner actions and never resolves them. Presented peer/backend
-  bearers are refused before owner mutation shortcuts. Deployment/enrollment and
+  lists pending owner actions and never resolves them.
+  Native receipts record their public-state clock through transactional native
+  and attributed-approval triggers. Get/List share state, timestamp and pending
+  approvals in one authorized snapshot; List uses timestamp/ID ordering and an
+  opaque issued-position cursor scoped to peer/epoch/context. Heartbeats do not
+  bump public status, and incomplete projections fail readiness explicitly.
+  Presented peer/backend bearers are refused before owner mutation shortcuts. Deployment/enrollment and
   connector-only ingress verification are separate prerequisites. No new listener
   or peer execution queue. See `docs/reference/peer-registry.md` and
   `docs/reference/agent-conversations.md`.
@@ -2830,7 +2840,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 50b6e2319f6f 2026-10-22
+verified: 2bf5587b5c5d 2026-10-23
 ```
 
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
@@ -2859,7 +2869,10 @@ verified: 50b6e2319f6f 2026-10-22
   tool blocks remain distinct, and uncertain result or delegation matches stay
   unresolved. CLI and scheduling arrive in dependent changes. Additional backup
   and recovery integration is deferred independently of collection and search.
-  Unknown historical content is excluded from content metrics; query manifests
+  Unknown historical content is excluded from content metrics. Views version 24
+  preserves missing call/result hashes as unknown and admits ownership from the
+  same evidence used by supported status and delegation; absent envelopes remain
+  distinct. Duplicate orphan results retain scrub-failure evidence. Query manifests
   identify the views version. Historical actors without identities cannot form
   lineage nodes. Paired-result IDs remain searchable raw evidence but do not
   prove or contradict lineage: their independent result context was not retained.
@@ -4191,6 +4204,14 @@ verified: f9a1d4cb 2026-10-18
   creating a charter, or joining Genesis foreground/background lifecycle
   management. Recall remains read-oriented rather than side-effect-free: its
   normal retrieval-use metadata may still be updated.
+  The same project configuration exposes 15 explicitly named GitNexus tools
+  through `.claude/mcp/run-gitnexus`, reusing the existing installed-version and
+  Node pin checks. It adds no Genesis writers or lifecycle integration. GitNexus
+  snapshots can be stale; connection startup does not rebuild an index, and
+  source-editing `rename` and group-metadata `group_sync` are excluded. Raw
+  Cypher and incidental cache/recovery effects remain; this catalog is not a
+  side-effect-free server contract. See
+  `docs/reference/codex-gitnexus.md` for native qualification and configuration.
   `web-research` is the shared method for foreground sessions, the
   `genesis-researcher` subagent, and research-profile background sessions;
   task risk and breadth select its depth. Tier-2 `research` resources resolve and
