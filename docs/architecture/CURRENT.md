@@ -3049,7 +3049,9 @@ verified: a47c1a618 2026-10-23
   is explicitly disabled. Contradictory served identities retain unresolved
   liability, while expense settlement cannot qualify invalid routing evidence.
   Frozen schedule/provider
-  mapping and dedicated nonreset credentials are required; any journal incident
+  mapping and explicit credential identity are required; dedicated mode retains
+  its nonreset-key policy, while shared mode requires a separately approved
+  operating plan. Any journal incident
   pauses new requests and replay until verified recovery. These checks do not
   admit more than reported or exact limit-minus-spend headroom supports. Local
   client setup precedes durable dispatch; recovery metadata uses the shared JSON
@@ -3093,9 +3095,13 @@ verified: a47c1a618 2026-10-23
   paired population and status rules. Exploratory case and reference-class comparisons do
   not treat repeated responses as independent cases or authorize promotion.
   A credential-scoped lock precedes journal writers and credential reads. The
-  actual pre-dispatch key snapshot must fund the whole selected pending
+  dedicated-mode pre-dispatch key snapshot must fund the whole selected pending
   population, including effective/member headroom; uncertain evidence stops
-  acquisition without resending dispatched coordinates. Observed expenses and
+  acquisition without resending dispatched coordinates. An explicit version-2
+  shared-key policy uses verified experiment receipts and
+  pending allocations, without exclusive account snapshots or attributing
+  unrelated traffic to the experiment. Mode and fingerprint stay frozen across
+  dispatch and GET-only recovery. Observed expenses and
   unresolved liability remain distinct; operating allowances are not guaranteed
   invoice ceilings. Source population/cache checks at admission and completion
   invalidate scoring on detected drift, without a per-request source-integrity

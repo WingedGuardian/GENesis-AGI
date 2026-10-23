@@ -101,12 +101,14 @@ def validate_campaign(manifest, checked, alias, *, cases=None):
             "credential_fingerprint", "receipt_provider", "provider_identity_evidence"
         )},
     }
+    mode = pinned.frozen_credential_mode(transport)
     for row in manifest["attempts"]:
         coordinate = tuple(row.get(key) for key in (
             "contract", "version", "case_id", "repetition", "prompt_hash"
         ))
         if (any(not isinstance(coordinate[index], str) for index in (0, 1, 2, 4))
             or type(row.get("repetition")) is not int or coordinate in actual
+            or pinned.frozen_credential_mode(row) != mode
             or any(canonical(row.get(key)) != canonical(value) for key, value in fields.items())):
             raise Incomplete("campaign_schedule_mismatch")
         actual[coordinate] = row["request_hash"]

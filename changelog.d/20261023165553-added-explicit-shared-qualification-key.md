@@ -1,0 +1,1 @@
+Qualification runs can explicitly select an existing shared OpenRouter key under a frozen version-2 operating plan and separate spending approval, retaining receipt evidence and no-resend recovery without exclusive account-usage claims.

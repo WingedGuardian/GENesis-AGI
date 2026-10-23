@@ -143,8 +143,8 @@ Both modes require `--operating-plan`, `--spending-approval` and all complete
 admission inputs above. The parameters file must contain exactly the selected
 population. Other singleton aliases and additional candidates are refused.
 Missing spending approval still
-refuses before credentials or campaign creation. The private version-1 operating
-plan freezes one or two complete 2,250-attempt manifests, source admission, requested
+refuses before credentials or campaign creation. The default private version-1 operating
+plan freezes the exact selected manifests (normally 2,250 attempts per model), source admission, requested
 parameters, receipt-provider identities, credential fingerprint, price evidence,
 per-model and combined allowances, key limit and baseline usage. Currency uses
 exact nonnegative decimal strings. The plan names
@@ -155,7 +155,8 @@ or `stop_semantics=stop_both_on_unresolved_evidence_no_resend` for the pair.
 These are operating allocations, not externally guaranteed maximum charges.
 The key envelope must fund every allocation and fit the combined allowance.
 The separate private approval binds the entire canonical plan hash, the owner,
-`2250_requests` or `4500_requests` scope matching the exact selected population,
+request-count scope matching the exact selected population (for example,
+`2250_requests`, `4500_requests`, or `2850_requests` for a 200-case Pro baseline),
 and actual decision provenance. Changing the population invalidates old consent.
 This is a trusted local
 operator assertion, not cryptographic authentication of a human decision. An
@@ -163,14 +164,36 @@ agent must never fabricate that record from design approval or a test fixture.
 
 A private kernel comparison lock, shared by credential fingerprint across both
 population sizes and all campaign directories, precedes journal writers and credential reads. The final pre-dispatch
-key observation must match the approved nonreset limit and baseline plus exact
+key observation in dedicated mode must match the approved nonreset limit and baseline plus exact
 consistent receipt costs from the selected campaigns; both key credit and validated
 effective/member budget headroom must cover all undispatched allocations across
 the entire selected population. One inference is in flight globally. Settlement and a
-fresh key observation precede the next request. Uncertainty or processing failure
+fresh dedicated-key observation precede the next request. Uncertainty or processing failure
 stops new acquisition in the entire selected population and retains an existing journal incident
 when there is a dispatched attempt. Pre-dispatch refusal invents no reservation,
 dispatch or acknowledgement. Resume never resends a dispatched coordinate.
+
+An explicit version-2 plan permits `credential_mode: "shared_existing"` under
+the same operating promise and exact spending approval. It retains the common
+fields above but replaces `expected_limit` and `baseline_usage` with
+`credential_mode`; those two exclusive-key fields are forbidden. Freeze
+`credential_mode: "shared_existing"` in every transport and scheduled attempt
+as well. Modes must agree across the plan and complete schedule, including on
+resume. Version 1 remains the default dedicated policy.
+
+Supply the specifically approved existing key through
+`GENESIS_QUALIFICATION_OPENROUTER_KEY` in the isolated process. The validated
+operating controller explicitly selects shared dispatch; a transport marker
+alone cannot enable it. Shared execution records the mode in dispatch evidence,
+skips key-status GETs and exact whole-account spend reconciliation, and uses
+only verified experiment receipts plus pending allocations against the approved
+allowance. Unrelated account traffic is outside that expense total. Missing,
+contradictory or above-allocation evidence still stops acquisition. Running out
+of account credit preserves the failed attempt and stops further requests;
+there is no automatic top-up, retry or resend. This policy proves no hard charge
+ceiling and changes no account limits, stored key or serving configuration.
+Detached reports remain credential-free; GET-only recovery uses the exact
+frozen mode and fingerprint without recreating a lost answer.
 
 Plan and approval descriptors remain open: metadata/replacement checks run per
 request, and full hashes are checked at admission and completion. Equal-size
