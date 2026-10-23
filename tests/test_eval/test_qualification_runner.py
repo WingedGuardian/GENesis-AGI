@@ -127,7 +127,7 @@ async def test_report_ephemeral_failure_changes_no_history(data):
     assert before == {p.name: p.read_bytes() for p in data.path.iterdir()}
 
 
-@pytest.mark.parametrize("module", ["run.py", "__main__.py", "execution.py", "accounting.py", "evidence.py"])
+@pytest.mark.parametrize("module", ["run.py", "__main__.py", "execution.py", "accounting.py", "evidence.py", "sampling.py", "../stats.py"])
 @pytest.mark.parametrize("when", ["before", "after"])
 async def test_report_binds_every_direct_runner_source(data, monkeypatch, capsys, module, when):
     # Actual identity and report boundaries; subset admission is explicit here.
@@ -140,7 +140,7 @@ async def test_report_binds_every_direct_runner_source(data, monkeypatch, capsys
     changed = when == "before"
 
     def file_hash(path):
-        if changed and path == run.Path(run.__file__).with_name(module):
+        if changed and path == run.Path(run.__file__).parent / module:
             return "0" * 64
         return original_hash(path)
 
