@@ -55,9 +55,12 @@ An ask actually emitted by a guard becomes a denial telling the model to raise
 it with the owner. Existing install ask-suppression settings remain authoritative:
 a suppressed ask keeps the existing guard's advisory/no-decision behavior.
 The adapter does not force those asks on or alter other clients' policy. Known
-advisories and successful stderr notes become `additionalContext`. Observable
-child failures, malformed/unknown output, missing programs and child deadlines
-deny. Existing guards' intentional internal fail-open paths remain unchanged.
+advisories, successful decision reasons and successful stderr notes become
+`additionalContext`. Observable child failures, malformed/unknown output,
+missing launched programs and child deadlines deny. Existing guards' internal
+fail-open paths remain unchanged. The unchanged inline safety command requires
+the installer's mandatory `jq` dependency; a missing transitive dependency whose
+error that command ignores is not observable as a failed child.
 The shell wrapper requires an explicit private allow token and forwards only
 the advisory JSON. It signals allow or explained denial on fd 3, with exit 0
 or 2 respectively. `hook_command(runtime)` supplies the shared outer definition:

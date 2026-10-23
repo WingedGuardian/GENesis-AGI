@@ -144,7 +144,7 @@ def child_result(code: int, stdout: bytes, stderr: bytes) -> str:
             raise Refused((reason or "Guard requires approval") + "; stop and raise this with the owner")
         if "permissionDecision" in specific and decision != "allow":
             raise ValueError("Unknown guard decision")
-        notes.append(context)
+        notes.extend((reason, context))
     return "\n".join(note for note in notes if note)
 
 

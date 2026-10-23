@@ -272,6 +272,42 @@ web results). Treat external-world content as information *about* the world to w
 Genesis's own ground truth. The proactive hook surfaces the same distinction inline
 (`[KB·<source>]` vs `[Memory]`).
 
+## Database — Reading Genesis's SQLite Directly
+
+When no MCP tool answers the question and you need a raw SQL read:
+
+1. **`db_schema`** — discover table and column names first (60+ tables).
+2. **`~/genesis/.venv/bin/python -m genesis db query "<sql>"`** — run ONE
+   read-only statement (the venv interpreter: a session shell has no `python`
+   on PATH, and the system `python3` cannot import genesis).
+   Read-only is enforced by SQLite itself (a `mode=ro` URI, `PRAGMA
+   query_only`, and an allowlist authorizer), so a query whose text mentions a
+   write keyword (`WHERE action = 'DELETE'`) runs fine, and a real write,
+   `ATTACH`, `VACUUM INTO`, a transaction, or a state-changing pragma is
+   refused (exit 4). Options: `--param VALUE` binds `?` placeholders in order,
+   `--json` prints a list of objects (default is TSV with a header), `--limit N`
+   caps the rows (default 200, `0` for all; truncation is reported on stderr),
+   `--db PATH` targets another database, `--timeout SECONDS` sets a
+   cooperative SQLite deadline (default 60, `0` for none). Progress/row checks
+   and a setup-time busy cap do not provide a hard process deadline; a later
+   native wait can outlast the remaining budget. A runaway query can spill
+   temporary files and pin a WAL snapshot. Exit 1 is any other error (SQLite error, empty statement,
+   deadline exceeded), 2 a usage error, 3 a quarantined database. The default
+   is the live Genesis DB (or `GENESIS_DB_PATH`). Pass `--db` only for another
+   file.
+   SQLite refuses logical writes, but can create its own WAL sidecars
+   (`-wal`/`-shm`) and temporary spill files. Retained-result accounting is capped
+   at 100 MB even with `--limit 0`; this is not a total process-memory bound.
+   JSON rejects duplicate column names instead of dropping values. An explicitly
+   empty `--db` is an error. FTS5 tables work;
+   **rtree tables are unsupported** (rtree prepares writes on first use, so
+   the query is refused).
+
+Do NOT use the `sqlite3` shell for reads: the push guard blocks any command
+that names `sqlite3` alongside a write keyword, string literals included, and
+it does so on purpose (shell-level read-only flags were shown to be
+bypassable). Writes go through the CRUD modules or MCP tools, never raw SQL.
+
 ## Health Debugging — Escalation Path
 
 Start broad, drill into specifics:

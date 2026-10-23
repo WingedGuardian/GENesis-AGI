@@ -159,6 +159,27 @@ def test_child_decisions_crashes_and_advisories(adapter, tmp_path, body, allowed
         assert "synthetic secret" not in str(caught.value)
 
 
+@pytest.mark.parametrize("decision", [None, "allow"])
+@pytest.mark.parametrize("fields", range(8))
+def test_success_keeps_all_guard_explanation_fields(adapter, tmp_path, decision, fields):
+    specific = {} if decision is None else {"permissionDecision": decision}
+    if fields & 1:
+        specific["permissionDecisionReason"] = "fixture successful reason"
+    if fields & 2:
+        specific["additionalContext"] = "fixture additional context"
+    body = []
+    if specific:
+        body.append("print(" + repr(json.dumps({"hookSpecificOutput": specific})) + ")")
+    if fields & 4:
+        body.append("import sys; print('fixture stderr note', file=sys.stderr)")
+    note = asyncio.run(adapter.run_guard(script(tmp_path, "\n".join(body)), payload(), 1))
+    for bit, expected in ((1, "fixture successful reason"), (2, "fixture additional context"),
+                          (4, "fixture stderr note")):
+        if fields & bit:
+            assert expected in note
+    assert (tmp_path / "called").exists()
+
+
 def test_child_environment_is_scrubbed_before_execution(adapter, tmp_path, monkeypatch):
     monkeypatch.setenv("GENESIS_CC_SESSION", "1")
     argv = script(tmp_path, 'import os; assert "GENESIS_CC_SESSION" not in os.environ; assert os.environ["CLAUDE_PROJECT_DIR"] == ' + repr(str(ROOT)))

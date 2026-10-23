@@ -4188,6 +4188,14 @@ verified: 11f366060 2026-10-22
   creating a charter, or joining Genesis foreground/background lifecycle
   management. Recall remains read-oriented rather than side-effect-free: its
   normal retrieval-use metadata may still be updated.
+  The same project configuration exposes 15 explicitly named GitNexus tools
+  through `.claude/mcp/run-gitnexus`, reusing the existing installed-version and
+  Node pin checks. It adds no Genesis writers or lifecycle integration. GitNexus
+  snapshots can be stale; connection startup does not rebuild an index, and
+  source-editing `rename` and group-metadata `group_sync` are excluded. Raw
+  Cypher and incidental cache/recovery effects remain; this catalog is not a
+  side-effect-free server contract. See
+  `docs/reference/codex-gitnexus.md` for native qualification and configuration.
   `web-research` is the shared method for foreground sessions, the
   `genesis-researcher` subagent, and research-profile background sessions;
   task risk and breadth select its depth. Tier-2 `research` resources resolve and

@@ -29,7 +29,8 @@ Codex 0.163.0. It copies the guard
 source and records its hashes, reuses the installed Python interpreter without
 changing it, and exercises actual scratch receipts on both clients. It adds
 child ask, crash, missing-script, malformed-output and timeout cases, advisory
-delivery, relative patches and code-mode MCP admission. Raw direct MCP function
+and successful decision-reason delivery, relative patches and code-mode MCP
+admission. Raw direct MCP function
 calls rejected as unsupported before any hook are transport controls, not
 adapter denial evidence. The outer-timeout pair uses the same delayed denial:
 the short deadline must let its harmless receipt execute, while the normal

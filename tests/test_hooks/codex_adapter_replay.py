@@ -481,6 +481,7 @@ def replay_case(request, monkeypatch, tmp_path, tmp_path_factory, existing_repla
         )
         assert allowed == expected, "Adapter admission disagrees with actual child result"
         if allowed:
+            assert specific.get("permissionDecisionReason", "") in note
             assert specific.get("additionalContext", "") in note
             assert err.decode(errors="replace").strip() in note
         elif code == 2 and err.strip():

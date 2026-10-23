@@ -38,7 +38,7 @@ def source_copy(root):
     return runtime
 
 
-ALLOW_CASES = ["shell", "patch", "code_shell", "code_patch", "mcp", "mcp_direct", "advisory", "patch-relative", "outer-timeout"]
+ALLOW_CASES = ["shell", "patch", "code_shell", "code_patch", "mcp", "mcp_direct", "advisory", "allow-reason", "patch-relative", "outer-timeout"]
 DENY_CASES = ["deny", "ask", "crash", "missing", "malformed", "timeout", "patch-deny", "missing-launcher", "broken-launcher", "silent-launcher", "mcp_direct-deny", "mcp-deny", "outer-completes"]
 
 
@@ -92,6 +92,7 @@ def test_native_adapter_controls_sink(tmp_path, monkeypatch, client, case, instr
         item = {"type": "function_call", "id": "fc_fixture", "call_id": "call_fixture", "name": "exec_command", "arguments": json.dumps({"cmd": command, "workdir": str(tmp_path)})}
     guard = runtime / "scripts/hooks" / ("secrets_env_access_guard.py" if case in {"mcp_direct-deny", "mcp-deny"} else "pipe_status_guard.py")
     fault = {"ask": 'print(\'{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"fixture owner approval"}}\')',
+             "allow-reason": 'print(\'{"hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"fixture successful reason"}}\')',
              "crash": "raise RuntimeError('fixture')", "malformed": "print('not-json')",
              "timeout": "import time; time.sleep(30)"}
     fault["mcp_direct-deny"] = fault["ask"]
@@ -161,6 +162,9 @@ def test_native_adapter_controls_sink(tmp_path, monkeypatch, client, case, instr
         if case == "advisory":
             assert "PIPESTATUS" not in json.dumps(requests[0]["input"])
             assert "PIPESTATUS" in json.dumps(requests[1]["input"])
+        if case == "allow-reason":
+            assert "fixture successful reason" not in json.dumps(requests[0]["input"])
+            assert "fixture successful reason" in json.dumps(requests[1]["input"])
         if case == "shell":
             assert body_marker not in json.dumps(requests[0]["input"])
             assert body_marker in json.dumps(requests[1]["input"])
