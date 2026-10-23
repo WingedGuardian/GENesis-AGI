@@ -337,12 +337,10 @@ class CCSessionExecutor:
                         step_results.append(sr)
                         completed_indices.add(row["step_idx"])
 
-                # Recover or create worktree for code tasks
+                # Persisted steps must use retained history, never a fresh cut.
                 has_code = any(s.get("type") == "code" for s in steps)
                 if has_code:
-                    recovered = await self._recover_worktree(task_id, task)
-                    if not recovered:
-                        await self._create_worktree(task_id)
+                    await self._recover_worktree(task_id, task)
 
                 # Filter to only pending/failed steps
                 remaining_steps = [
@@ -1230,18 +1228,24 @@ class CCSessionExecutor:
     # Worktree management (Amendment #7)
     # =================================================================
 
-    async def _create_worktree(self, task_id: str) -> Path:
+    async def _create_worktree(self, task_id: str, *, require_existing: bool = False) -> Path:
         """Create a git worktree for code task isolation."""
-        base = await self._resolve_and_record_base(task_id)
-        wt_path = await _worktree.create_worktree(
-            task_id, _REPO_ROOT, _WORKTREE_BASE, base=base,
+        branch, _ = _worktree.task_locator(task_id, _WORKTREE_BASE)
+        retained = require_existing or await _worktree.branch_tip(branch, _REPO_ROOT) is not None
+        base = (
+            await self._base_for(task_id) if retained
+            else await self._resolve_and_record_base(task_id)
         )
+        wt_path = await _worktree.create_worktree(
+            task_id, _REPO_ROOT, _WORKTREE_BASE, base=base, require_existing=retained,
+        )
+        self._bases[task_id] = base
         self._worktree_paths[task_id] = wt_path
         await self._set_output(task_id, "worktree_path", str(wt_path))
         return wt_path
 
     async def _resolve_and_record_base(self, task_id: str) -> _worktree.BaseRef | None:
-        """Resolve the remote default branch once per worktree creation.
+        """Resolve the remote default branch for a genuinely new task cut.
 
         Its commit is the cut point and the scope gate's diff base, and its
         name is the PR base, so the three cannot disagree. Unresolved (None)
@@ -1282,11 +1286,7 @@ class CCSessionExecutor:
     async def _recover_worktree(
         self, task_id: str, task: dict,
     ) -> bool:
-        """Recover a worktree from persisted state.
-
-        Returns True if a valid worktree was found or recreated.
-        Falls back to False so the caller can create a fresh one.
-        """
+        """Validate and attach canonical retained history, or refuse recovery."""
         raw_outputs = task.get("outputs") or ""
         try:
             parsed = json.loads(raw_outputs)
@@ -1295,41 +1295,21 @@ class CCSessionExecutor:
                 if isinstance(parsed, dict)
                 else None
             )
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, TypeError):
             wt_path_str = None
 
-        if not wt_path_str:
-            return False
-
-        wt_path = Path(wt_path_str)
-        if await _worktree.is_registered_worktree(wt_path, _REPO_ROOT):
-            self._worktree_paths[task_id] = wt_path
-            logger.info(
-                "Recovered existing worktree at %s for task %s",
-                wt_path, task_id,
-            )
-            return True
-
-        # Worktree gone but branch might still exist — recreate
-        try:
-            base = await self._resolve_and_record_base(task_id)
-            wt_path = await _worktree.create_worktree(
-                task_id, _REPO_ROOT, _WORKTREE_BASE, base=base,
-            )
-            self._worktree_paths[task_id] = wt_path
-            await self._set_output(task_id, "worktree_path", str(wt_path))
-            logger.info(
-                "Recreated worktree at %s for task %s (branch recovered)",
-                wt_path, task_id,
-            )
-            return True
-        except _worktree.StaleWorktreeError:
-            raise
-        except RuntimeError:
-            logger.warning(
-                "Worktree recovery failed for task %s", task_id,
-            )
-            return False
+        # Cleanup writes an empty path even when dirty contents remain.
+        # Missing/null/empty paths still require the canonical retained ref.
+        if wt_path_str is not None and wt_path_str != "":
+            _, expected = _worktree.task_locator(task_id, _WORKTREE_BASE)
+            try:
+                matches = isinstance(wt_path_str, str) and Path(wt_path_str).resolve() == expected.resolve()
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise _worktree.StaleWorktreeError("Task worktree path cannot be resolved") from exc
+            if not matches:
+                raise _worktree.StaleWorktreeError("Persisted worktree path does not match the task locator")
+        await self._create_worktree(task_id, require_existing=True)
+        return True
 
     _NOTEPAD_SKELETON = (
         "# Task Notepad\n\n"
@@ -1341,15 +1321,18 @@ class CCSessionExecutor:
     )
 
     def _seed_notepad(self, task_id: str) -> None:
-        """Write an empty TASK_NOTEPAD.md into the task worktree."""
+        """Seed an absent TASK_NOTEPAD.md without replacing any existing entry."""
         wt_path = self._worktree_paths.get(task_id)
         if not wt_path:
             return
         notepad = Path(wt_path) / "TASK_NOTEPAD.md"
         try:
-            notepad.write_text(self._NOTEPAD_SKELETON, encoding="utf-8")
+            with notepad.open("x", encoding="utf-8") as stream:
+                stream.write(self._NOTEPAD_SKELETON)
+        except FileExistsError:
+            pass
         except OSError:
-            logger.debug("Failed to seed notepad for task %s", task_id)
+            logger.debug("Failed to seed notepad for task %s", task_id, exc_info=True)
 
     async def _promote_notepad(
         self, task_id: str, description: str,

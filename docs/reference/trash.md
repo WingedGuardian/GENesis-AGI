@@ -160,9 +160,13 @@ is why the note says "if this session created them, nothing to do".
   staging, like other temp.
 - **Database rows**: deleting a follow-up, a knowledge entry, a memory or a
   reference from the dashboard deletes rows, not files, and is not covered.
-- **Task branches, not yet covered**: the executor's worktree cleanup still
-  force-deletes a task's branch after the task ends, so a failed task's
-  unpushed commits lose their only ref (#3020).
+- **Task branches**: the worktree manager's cleanup retains each
+  `task/<id8>` branch. A later `create_worktree(..., require_existing=True)`
+  reattaches only the exact retained local branch and commit; if that history
+  is missing or its worktree identity is unsafe, it raises
+  `StaleWorktreeError` rather than cutting a fresh branch. This is not a backup
+  or expiry policy: an external ref deletion/reset, an eight-character
+  task-id collision, and uncommitted files are outside the retention guarantee.
 
 ## Retention and backups
 

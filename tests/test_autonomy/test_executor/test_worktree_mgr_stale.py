@@ -43,15 +43,15 @@ TASK = "abcdef1234567890"
 
 
 @pytest.mark.asyncio
-async def test_a_dirty_registered_worktree_is_left_in_place(repo):
+async def test_a_dirty_registered_worktree_is_adopted_untouched(repo):
     base = repo / ".claude" / "worktrees"
     wt = await worktree_mgr.create_worktree(TASK, repo, base)
     (wt / "work.txt").write_text("uncommitted task work")
     subprocess.run(["git", "-C", str(wt), "add", "work.txt"], check=True)
 
-    with pytest.raises(worktree_mgr.StaleWorktreeError, match="worktree reaper"):
-        await worktree_mgr.create_worktree(TASK, repo, base)
+    again = await worktree_mgr.create_worktree(TASK, repo, base)
 
+    assert again == wt
     assert (wt / "work.txt").read_text() == "uncommitted task work"
     assert list_entries() == []  # nothing trashed, nothing deleted
 
@@ -68,8 +68,8 @@ async def test_a_newline_in_the_repo_path_does_not_hide_a_registered_worktree(tm
 
     records = await worktree_mgr._worktree_records(odd)
     assert worktree_mgr._record_for(records, wt) is not None
-    with pytest.raises(worktree_mgr.StaleWorktreeError, match="uncommitted work"):
-        await worktree_mgr.create_worktree(TASK, odd, base)
+    again = await worktree_mgr.create_worktree(TASK, odd, base)
+    assert again == wt
     assert (wt / "work.txt").read_text() == "uncommitted"
     assert list_entries() == []
 
@@ -80,7 +80,7 @@ async def test_a_locked_worktree_says_nothing_will_reap_it(repo):
     wt = await worktree_mgr.create_worktree(TASK, repo, base)
     subprocess.run(["git", "-C", str(repo), "worktree", "lock", str(wt)], check=True)
 
-    with pytest.raises(worktree_mgr.StaleWorktreeError, match="is locked; nothing reaps"):
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="is locked"):
         await worktree_mgr.create_worktree(TASK, repo, base)
     assert wt.is_dir() and list_entries() == []
 
@@ -160,8 +160,7 @@ async def test_ambient_git_location_variables_are_ignored_throughout(tmp_path, r
         check=True,
         env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
     )
-    with pytest.raises(worktree_mgr.StaleWorktreeError, match="uncommitted work"):
-        await worktree_mgr.create_worktree(TASK, repo, base)
+    assert await worktree_mgr.create_worktree(TASK, repo, base) == wt
     assert (wt / "work.txt").read_text() == "uncommitted"
     assert list_entries() == []
 
@@ -246,6 +245,27 @@ async def test_a_locked_record_does_not_make_an_orphan_registered(repo):
 
 
 @pytest.mark.asyncio
+async def test_a_missing_locked_registration_fails_before_prune(repo, monkeypatch):
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    subprocess.run(["git", "-C", str(repo), "worktree", "lock", str(wt)], check=True)
+    shutil.rmtree(wt)
+    pruned = False
+    real = worktree_mgr._prune_worktrees
+
+    async def record_prune(root):
+        nonlocal pruned
+        pruned = True
+        await real(root)
+
+    monkeypatch.setattr(worktree_mgr, "_prune_worktrees", record_prune)
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="is locked"):
+        await worktree_mgr.create_worktree(TASK, repo, base, require_existing=True)
+    assert not pruned
+    assert "locked" in _porcelain(repo)
+
+
+@pytest.mark.asyncio
 async def test_command_line_config_reaches_every_git_call(repo, monkeypatch):
     # safe.directory is accepted only from protected config, which includes
     # GIT_CONFIG_COUNT and GIT_CONFIG_PARAMETERS; scrubbing them breaks an
@@ -318,6 +338,170 @@ async def test_a_task_path_linked_to_another_worktree_is_not_registered(repo):
     with pytest.raises(worktree_mgr.StaleWorktreeError, match="is a symlink"):
         await worktree_mgr.create_worktree(TASK, repo, base)
     assert a.is_dir() and b.is_symlink()
+
+
+@pytest.mark.parametrize(
+    "registration",
+    ["clean-removal", "real-prunable", "unlocked-stale"],
+)
+@pytest.mark.asyncio
+async def test_cleanup_retains_unpushed_commit_as_recoverable_ref(
+    repo,
+    monkeypatch,
+    registration,
+):
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    (wt / "task.txt").write_text("unpublished work\n")
+    subprocess.run(["git", "-C", str(wt), "add", "task.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(wt), "commit", "-q", "-m", "task progress"], check=True,
+    )
+    tip = subprocess.run(
+        ["git", "-C", str(wt), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    if registration == "clean-removal":
+        await worktree_mgr.cleanup_worktree(wt, repo)
+    else:
+        shutil.rmtree(wt)
+        real_records = worktree_mgr._worktree_records
+        records = await real_records(repo)
+        stale = worktree_mgr._listed_record(records, wt)
+        assert stale is not None and "prunable" in stale
+
+        if registration == "unlocked-stale":
+            first_read = True
+
+            async def report_unlocked_registration(root):
+                nonlocal first_read
+                current_records = await real_records(root)
+                if first_read:
+                    first_read = False
+                    return [
+                        {
+                            key: value
+                            for key, value in record.items()
+                            if key != "prunable"
+                        }
+                        if worktree_mgr._as_named(Path(record["worktree"]))
+                        == worktree_mgr._as_named(wt)
+                        else record
+                        for record in current_records
+                    ]
+                return current_records
+
+            monkeypatch.setattr(
+                worktree_mgr, "_worktree_records", report_unlocked_registration,
+            )
+    subprocess.run(
+        ["git", "-C", str(repo), "reflog", "expire", "--expire=now", "--all"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "gc", "--prune=now"], check=True)
+
+    recovered = await worktree_mgr.create_worktree(
+        TASK, repo, base, require_existing=True,
+    )
+
+    assert subprocess.run(
+        ["git", "-C", str(recovered), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip() == tip
+    assert (recovered / "task.txt").read_text() == "unpublished work\n"
+    assert subprocess.run(
+        ["git", "-C", str(recovered), "rev-parse", "--abbrev-ref", "@{upstream}"],
+        capture_output=True, text=True,
+    ).returncode != 0
+
+
+@pytest.mark.asyncio
+async def test_required_missing_branch_fails_without_cutting_a_new_one(repo):
+    base = repo / ".claude" / "worktrees"
+    with pytest.raises(worktree_mgr.StaleWorktreeError) as raised:
+        await worktree_mgr.create_worktree(
+            TASK, repo, base, require_existing=True,
+        )
+    message = str(raised.value)
+    assert TASK in message
+    assert f"task/{TASK[:8]}" in message
+    assert str(base / f"task-{TASK[:8]}") in message
+    assert "inspect" in message
+    assert not (base / f"task-{TASK[:8]}").exists()
+
+
+@pytest.mark.parametrize("checkout", ["wrong-branch", "detached"])
+@pytest.mark.asyncio
+async def test_registered_wrong_branch_or_detached_worktree_is_refused(repo, checkout):
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    if checkout == "wrong-branch":
+        subprocess.run(
+            ["git", "-C", str(wt), "checkout", "-q", "-b", "task/other"],
+            check=True,
+        )
+    else:
+        subprocess.run(["git", "-C", str(wt), "checkout", "-q", "--detach"], check=True)
+
+    with pytest.raises(
+        worktree_mgr.StaleWorktreeError,
+        match="not on expected branch",
+    ):
+        await worktree_mgr.create_worktree(TASK, repo, base, require_existing=True)
+    assert wt.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_branch_ref_query_failure_is_stale(repo, monkeypatch):
+    base = repo / ".claude" / "worktrees"
+    branch, wt = worktree_mgr.task_locator(TASK, base)
+    real_read = worktree_mgr._git_read
+
+    async def fail_branch_query(root, *args):
+        if args == ("show-ref", "--verify", "--quiet", f"refs/heads/{branch}"):
+            return 2, ""
+        return await real_read(root, *args)
+
+    monkeypatch.setattr(worktree_mgr, "_git_read", fail_branch_query)
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="could not be read"):
+        await worktree_mgr.create_worktree(TASK, repo, base, require_existing=True)
+    assert not wt.exists()
+
+
+@pytest.mark.asyncio
+async def test_branch_to_tag_race_is_rejected_without_retrying(repo, monkeypatch):
+    base = repo / ".claude" / "worktrees"
+    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    tip = subprocess.run(
+        ["git", "-C", str(wt), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    await worktree_mgr.cleanup_worktree(wt, repo)
+    real = worktree_mgr.asyncio.create_subprocess_exec
+    raced = False
+
+    async def replace_branch_with_tag(*args, **kwargs):
+        nonlocal raced
+        if args[:3] == ("git", "worktree", "add") and not raced:
+            subprocess.run(
+                ["git", "-C", str(repo), "branch", "-D", f"task/{TASK[:8]}"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "tag", f"task/{TASK[:8]}", tip],
+                check=True,
+            )
+            raced = True
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(
+        worktree_mgr.asyncio, "create_subprocess_exec", replace_branch_with_tag,
+    )
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="not safely registered"):
+        await worktree_mgr.create_worktree(TASK, repo, base, require_existing=True)
+    assert raced
+    assert (wt / ".git").exists()
+    await worktree_mgr.cleanup_worktree(wt, repo)
 
 
 @pytest.mark.asyncio

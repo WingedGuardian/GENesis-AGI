@@ -100,6 +100,17 @@ def mock_subprocess(monkeypatch):
     proc.returncode = 0
     create = AsyncMock(return_value=proc)
     monkeypatch.setattr("asyncio.create_subprocess_exec", create)
+    from genesis.autonomy.executor import worktree_mgr
+
+    async def create_worktree(
+        task_id, repo_root, worktree_base, base=None, *, require_existing=False,
+    ):
+        path = worktree_base / f"task-{task_id[:8]}"
+        await create("git", "worktree", "add", str(path))
+        return path
+
+    monkeypatch.setattr(worktree_mgr, "branch_tip", AsyncMock(return_value=None))
+    monkeypatch.setattr(worktree_mgr, "create_worktree", create_worktree)
     return create
 
 

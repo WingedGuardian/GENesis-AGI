@@ -465,18 +465,19 @@ async def test_pr_targets_the_branch_the_gate_diffed_against(
 class TestBaseWiring:
     """End-to-end tests above run with a subprocess mock that makes origin/HEAD
     unresolved, so they only ever exercise the fallback. These pin the resolved
-    path: the base reaches create_worktree and is persisted, on creation and on
-    recovery, and an unresolved re-resolution clears a stale record."""
+    path: new cuts record their base, while retained recovery reuses the
+    persisted base instead of re-resolving the remote default."""
 
     _BASE = worktree_mgr.BaseRef(name="main", sha="c0ffee" * 7)
 
     def _spy(self, monkeypatch, base):
         seen: list[dict] = []
 
-        async def fake_create(task_id, repo_root, worktree_base, base=None):
-            seen.append({"base": base})
+        async def fake_create(task_id, repo_root, worktree_base, base=None, *, require_existing=False):
+            seen.append({"base": base, "require_existing": require_existing})
             return worktree_base / f"task-{task_id[:8]}"
 
+        monkeypatch.setattr(worktree_mgr, "branch_tip", AsyncMock(return_value=None))
         monkeypatch.setattr(worktree_mgr, "resolve_base", AsyncMock(return_value=base))
         monkeypatch.setattr(worktree_mgr, "create_worktree", fake_create)
         return seen
@@ -490,31 +491,35 @@ class TestBaseWiring:
         engine = _engine(db)
         seen = self._spy(monkeypatch, self._BASE)
         await engine._create_worktree("t-sg1")
-        assert seen == [{"base": self._BASE}]
+        assert seen == [{"base": self._BASE, "require_existing": False}]
         out = await self._outputs(db)
         assert (out["base_branch"], out["base_sha"]) == ("main", self._BASE.sha)
         engine._bases.clear()  # a restart: read back from the outputs
         assert await engine._base_for("t-sg1") == self._BASE
 
-    async def test_recovery_recut_passes_and_records_the_base(self, db, tmp_path, monkeypatch):
+    async def test_recovery_reuses_the_original_base(self, db, tmp_path, monkeypatch):
         await _seed(db)
         engine = _engine(db)
-        seen = self._spy(monkeypatch, self._BASE)
-        monkeypatch.setattr(worktree_mgr, "is_registered_worktree", AsyncMock(return_value=False))
-        await engine._set_output("t-sg1", "worktree_path", str(tmp_path / "gone"))
+        newer = worktree_mgr.BaseRef(name="next", sha="d" * 40)
+        seen = self._spy(monkeypatch, newer)
+        monkeypatch.setattr("genesis.autonomy.executor.engine._WORKTREE_BASE", tmp_path)
+        await engine._set_output("t-sg1", "base_branch", self._BASE.name)
+        await engine._set_output("t-sg1", "base_sha", self._BASE.sha)
+        await engine._set_output("t-sg1", "worktree_path", str(tmp_path / "task-t-sg1"))
         task = await task_states.get_by_id(db, "t-sg1")
         assert await engine._recover_worktree("t-sg1", task) is True
-        assert seen == [{"base": self._BASE}]
+        assert seen == [{"base": self._BASE, "require_existing": True}]
+        worktree_mgr.resolve_base.assert_not_awaited()
         assert (await self._outputs(db))["base_sha"] == self._BASE.sha
 
-    async def test_an_unresolved_recut_clears_a_stale_record(self, db, monkeypatch):
+    async def test_an_unresolved_new_cut_clears_a_stale_record(self, db, monkeypatch):
         await _seed(db)
         engine = _engine(db)
         await engine._set_output("t-sg1", "base_branch", "main")
         await engine._set_output("t-sg1", "base_sha", "c0ffee" * 7)
         seen = self._spy(monkeypatch, None)
         await engine._create_worktree("t-sg1")
-        assert seen == [{"base": None}]
+        assert seen == [{"base": None, "require_existing": False}]
         engine._bases.clear()
         assert await engine._base_for("t-sg1") is None
 
