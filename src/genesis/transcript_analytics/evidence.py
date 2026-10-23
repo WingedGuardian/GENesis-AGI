@@ -277,7 +277,9 @@ def read_reference(
             )
             if "unavailable" not in result:
                 return {**result, "origin": "live"}
-            live_unavailable = result
+            # Other refusals retain the existing archive-fallback diagnostics.
+            if result["unavailable"] == "source record exceeds the 1 MiB evidence read limit":
+                live_unavailable = result
             raise FileNotFoundError("live evidence identity changed")
     except FileNotFoundError:
         archive_dir = archive_dir or Path.home() / "backups/genesis-backups/transcripts"

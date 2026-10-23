@@ -173,3 +173,28 @@ def test_symlink_loops_report_unavailable(tmp_path, ancestor):
     relative = "loop/source.jsonl" if ancestor else "loop"
     out = evidence.read_reference(tmp_path, relative, 1)
     assert "unavailable" in out and not out.get("target_available")
+
+
+@pytest.mark.parametrize("archive", ["absent", "invalid", "usable"])
+def test_changed_live_identity_keeps_existing_archive_diagnostics(tmp_path, monkeypatch, archive):
+    original = _call()
+    expected = _hash(original["message"]["content"][0])
+    original["message"]["content"][0]["name"] = "Grep"
+    (tmp_path / "source.jsonl").write_text(json.dumps(original) + "\n")
+    if archive != "absent":
+        path = tmp_path / ("v2-" + hashlib.sha256(b"source.jsonl").hexdigest() + ".tar.gpg")
+        path.write_bytes(b"synthetic routing fixture")
+
+    def archived(*args, **kwargs):
+        if archive == "invalid":
+            raise ValueError("synthetic invalid archive")
+        return {"origin": "local encrypted archive", "target_available": True, "records": []}
+
+    monkeypatch.setattr(evidence, "_archive_window", archived)
+    out = evidence.read_reference(tmp_path, "source.jsonl", 1, archive_dir=tmp_path,
+        expected_id="unit", expected_hash=expected, expected_kind="call")
+    if archive == "usable":
+        assert out["target_available"] and out["origin"] == "local encrypted archive"
+    else:
+        reason = "original target and local encrypted archive unavailable" if archive == "absent" else "local archive unreadable or invalid"
+        assert out == {"unavailable": reason}
