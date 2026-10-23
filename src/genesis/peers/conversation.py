@@ -17,6 +17,8 @@ from genesis.cc.managed_session import metadata, prepared_metadata, update_state
 from genesis.cc.system_prompt import SystemPromptAssembler
 from genesis.cc.types import CCModel, EffortLevel
 from genesis.db.crud import cc_sessions
+from genesis.db.peer_status import PENDING, VALID
+from genesis.peers import task_cursor
 from genesis.util.execution_privacy import private_execution
 from genesis.util.inflight import inflight
 
@@ -134,7 +136,8 @@ class ConversationService:
         # Retrieve failures even if the HTTP waiter timed out, without logging
         # raw input, provider errors or database paths.
         task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
-        return await asyncio.shield(task)
+        await asyncio.shield(task)
+        return await self.get(identity, sid)
 
     async def _existing(self, db, sid, digest, identity):
         row = await cc_sessions.get_by_id(db, sid)
@@ -428,26 +431,28 @@ class ConversationService:
             await authorize(db, identity)
             row = await (
                 await db.execute(
-                    f"SELECT * FROM cc_sessions WHERE {OWNED} AND id=?",  # noqa: S608 — compiled owner clause, values bound
+                    f"SELECT cc_sessions.*, {PENDING} AS pending_approvals, COALESCE(({VALID}),0) AS projection_valid "  # noqa: S608 — static schema expressions
+                    f"FROM cc_sessions WHERE {OWNED} AND id=?",  # noqa: S608 — compiled owner clause, values bound
                     (identity.peer["peer_id"], identity.peer["epoch"], sid),
                 )
             ).fetchone()
             if row is None:
                 raise ConversationRefusal("not_found", 404)
+            if not row["projection_valid"]:
+                raise ConversationRefusal("not_ready", 503)
             return dict(row)
 
     async def list(self, identity, size, token=None, context=None):
-        if token:
-            anchor = await self.get(identity, uuid_id(token))
-        else:
-            anchor = None
         if context:
             uuid_id(context)
+        else:
+            context = None
+        anchor = task_cursor.decode(token, identity.peer, context) if token is not None else None
         where = OWNED
         values = [identity.peer["peer_id"], identity.peer["epoch"]]
         if anchor:
-            where += " AND (started_at,id)<(?,?)"
-            values += [anchor["started_at"], anchor["id"]]
+            where += " AND (a2a_status_at,id)<(?,?)"
+            values += list(anchor)
         if context:
             where += " AND json_extract(metadata,'$.context_id')=?"
             values.append(context)
@@ -457,7 +462,8 @@ class ConversationService:
             await authorize(db, identity)
             rows = await (
                 await db.execute(
-                    f"SELECT * FROM cc_sessions WHERE {where} ORDER BY started_at DESC,id DESC LIMIT ?",  # noqa: S608 — fixed clauses, placeholders
+                    f"SELECT cc_sessions.*, {PENDING} AS pending_approvals "  # noqa: S608 — static schema expression
+                    f"FROM cc_sessions WHERE {where} ORDER BY a2a_status_at DESC,id DESC LIMIT ?",  # noqa: S608 — fixed clauses, placeholders
                     (*values, size + 1),
                 )
             ).fetchall()
@@ -466,13 +472,15 @@ class ConversationService:
             )
             total = await (
                 await db.execute(
-                    f"SELECT count(*) FROM cc_sessions WHERE {total_where}",  # noqa: S608 — fixed clauses, placeholders
+                    f"SELECT count(*), sum(NOT COALESCE(({VALID}),0)) FROM cc_sessions WHERE {total_where}",  # noqa: S608 — fixed clauses, placeholders
                     (*values[:2], context) if context else values[:2],
                 )
             ).fetchone()
+            if total[1]:
+                raise ConversationRefusal("not_ready", 503)
             return (
                 [dict(r) for r in rows[:size]],
-                rows[size - 1]["id"] if len(rows) > size else "",
+                task_cursor.encode(rows[size - 1], identity.peer, context) if len(rows) > size else "",
                 total[0],
             )
 

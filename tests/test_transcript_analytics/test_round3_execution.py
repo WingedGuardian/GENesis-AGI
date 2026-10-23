@@ -95,7 +95,9 @@ def test_private_opt_in_cannot_resurrect_missing_install(tmp_path, monkeypatch):
 def test_display_values_and_column_names_escape_controls(monkeypatch, capsys):
     from genesis.transcript_analytics import query
 
-    monkeypatch.setattr(query, "run_query", lambda *a, **k: (["col\x1b[2J"], [("x\r\x1b[31m\u202e",)]))
+    monkeypatch.setattr(
+        query, "_query", lambda *a, **k: (["col\x1b[2J"], [("x\r\x1b[31m\u202e",)], 1)
+    )
     args = Mock(csv=False, max_rows=10, cell_width=120)
     assert cli.cmd_sql(args) == 0
     output = capsys.readouterr().out

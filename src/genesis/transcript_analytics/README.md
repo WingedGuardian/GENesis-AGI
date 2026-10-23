@@ -79,8 +79,15 @@ and excluded from confirmed coverage. Unpaired results retain their own context
 and remain eligible for the existing producer checks.
 Unknown historical actors keep distinct structured source-local identities and
 do not create lineage nodes. Missing content hashes remain unknown and count as
-excluded content; observed conflicting hashes remain conflicts. Conflicting
-tool observations retain stable display values without resolving their ownership.
+excluded content; observed conflicting hashes remain conflicts, including mixed
+known/missing copies. Ownership and supported attribution use the same complete
+evidence envelope, including every call copy used by delegation. Missing call or
+result envelopes are distinct from present envelopes whose hashes are unknown;
+validity remains false in both cases. Hook/event ownership also requires every
+observed actor. Conflicting tool observations retain stable display values without
+resolving ownership, and duplicate orphan results preserve any scrub-failure flag.
+Views version 24 invalidates caches containing the previous derived semantics;
+stored source schemas, extraction stamps and original provenance are unchanged.
 
 `source_coverage` exposes original per-source provenance and unavailable
 historical facts. `run_query(..., manifest_path=...)` records the same captured
@@ -134,6 +141,11 @@ collection, live search or opportunity scanning.
 Status captures accepted source records once for marker totals, coverage and the
 snapshot input signature. Concurrent collection can publish newer records while
 that response finishes; the captured metadata remains internally consistent.
+Status uses the same confined snapshot-selector boundary as the reader and does
+not load snapshot pages. SQL previews retain only their display limit, CSV streams
+in batches, and both preserve complete query counts in manifests. Default source
+and data paths honor `CLAUDE_HOME` and `GENESIS_HOME`; explicit paths remain chosen
+paths and the installed configuration is still required.
 `verify` uses the same captured selection for the configured cache reader and
 forced live reader, one connection at a time. It compares schema, row counts and
 row digests for every shared relation. Missing, stale or unreadable caches report

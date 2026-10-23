@@ -1025,6 +1025,21 @@ async def test_prompt_contract_grounding_rules():
     assert "Protective facts are never risks" in prompt
 
 
+async def test_prompt_contract_windowed_counts_are_history():
+    """The prompt preserves recorded windows without inventing measurement times."""
+    from genesis.outreach.morning_report import MorningReportGenerator as G
+
+    prompt = G._load_system_prompt()
+    assert prompt is not None
+    assert "Figures in observations are recorded evidence" in prompt
+    assert "Do not infer a measurement timestamp from row age." in prompt
+    assert "This corroboration rule does not remove" in prompt
+    assert "including outreach blockers" in prompt
+    assert "that observation's claim, not an established fact" in prompt
+    assert "was measured when that observation" not in prompt
+    assert "its figures still date from when it" not in prompt
+
+
 async def test_negated_protection_never_tagged_protective(db, mock_health, mock_drafter):
     """The REAL shipping alert class: 'systemd-oomd … is not enforced' is a
     live risk. Tagging it protective would invert it and — via the prompt

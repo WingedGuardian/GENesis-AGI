@@ -1,7 +1,7 @@
 """ta — local Claude Code transcript analytics.
 
     ta ingest [--since DAYS] [--timer]   build/refresh the per-source Parquet store
-    ta status                            store size, sources, staleness, row counts
+    ta status                            store size, sources, staleness
     ta sql "<query>" [--csv]             query the views (tool_calls, turns, hooks, events,
                                          session_meta, agents, sessions; raw_<table> too)
     ta prune --before YYYY-MM-DD         drop sources whose transcript is GONE and is older
@@ -183,9 +183,14 @@ def _snapshot_state(data, *, selection):
 
     current = data / "derived" / "current"
     try:
-        manifest = _json.loads((current / "MANIFEST.json").read_text())
-    except (OSError, ValueError):
-        return None, (False if current.exists() else None)
+        manifest = _json.loads((query._snapshot_directory(data) / "MANIFEST.json").read_text())
+    except (OSError, ValueError, RuntimeError):
+        root = data / "derived"
+        try:
+            invalid_root = root.is_symlink() or (root.exists() and not root.is_dir())
+            return None, (False if invalid_root or current.is_symlink() or current.exists() else None)
+        except OSError:
+            return None, False
     current_flag = (
         isinstance(manifest, dict)
         and manifest.get("views_version") == query.VIEWS_VERSION
@@ -259,12 +264,35 @@ def _cell(v, width: int) -> str:
     return s if len(s) <= width else s[:width] + f"…(+{len(s) - width} chars)"
 
 
-def cmd_sql(args) -> int:
-    from genesis.transcript_analytics.query import run_query
+def _sql_rows(rel, args):
+    """Drain once, retaining only the preview or streaming CSV batches."""
+    if rel is None:
+        return ([], [], 0), 0
+    cols, shown, total = rel.columns, [], 0
+    writer = None
+    if args.csv and cols:
+        import csv
 
-    cols, rows = run_query(
+        writer = csv.writer(sys.stdout)
+        writer.writerow(cols)
+    while batch := rel.fetchmany(1024):
+        total += len(batch)
+        if writer is not None:
+            writer.writerows(batch)
+        elif len(shown) < args.max_rows:
+            shown.extend(batch[: args.max_rows - len(shown)])
+    if writer is not None:
+        sys.stdout.flush()
+    return (cols, shown, total), total
+
+
+def cmd_sql(args) -> int:
+    from genesis.transcript_analytics.query import _query
+
+    cols, shown, total = _query(
         args.data,
         args.query,
+        consume=lambda rel: _sql_rows(rel, args),
         live=args.live,
         manifest_path=args.manifest,
         window=args.window,
@@ -273,13 +301,7 @@ def cmd_sql(args) -> int:
     if not cols:
         return 0
     if args.csv:
-        import csv
-
-        w = csv.writer(sys.stdout)
-        w.writerow(cols)
-        w.writerows(rows)
         return 0
-    shown = rows[: args.max_rows]
     from genesis.transcript_analytics.rendering import terminal_text
 
     cols = [terminal_text(c) for c in cols]
@@ -290,7 +312,7 @@ def cmd_sql(args) -> int:
     for r in cells:
         print("  ".join(v.ljust(w) for v, w in zip(r, widths, strict=True)))
     print(
-        f"({len(rows)} rows{'' if len(rows) <= args.max_rows else f', first {args.max_rows} shown; use --csv for all'})"
+        f"({total} rows{'' if total <= args.max_rows else f', first {args.max_rows} shown; use --csv for all'})"
     )
     return 0
 

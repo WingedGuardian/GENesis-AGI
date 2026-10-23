@@ -101,16 +101,18 @@ WITH candidates AS (
  list(DISTINCT context_session_id ORDER BY context_session_id) AS context_sessions
  FROM candidates GROUP BY event_key
 )
-SELECT g.*, CASE WHEN s.content_conflict OR g.context_conflict THEN 'conflicting'
- WHEN remaining=1 AND missing_actors=0 THEN CASE WHEN has_inference THEN 'inferred' ELSE 'confirmed' END
- ELSE 'unresolved' END AS attribution_status,
- CASE WHEN remaining=1 AND missing_actors=0 AND NOT s.content_conflict AND NOT g.context_conflict THEN executor END AS executor_id,
+SELECT g.*, CASE WHEN remaining=1 AND missing_actors=0 AND s.content_conflict IS FALSE
+ AND NOT g.context_conflict THEN executor END AS executor_id,
+ CASE WHEN s.content_conflict OR g.context_conflict THEN 'conflicting'
+ WHEN executor_id IS NULL THEN 'unresolved'
+ WHEN has_inference THEN 'inferred' ELSE 'confirmed' END AS attribution_status,
  CASE WHEN g.context_conflict THEN 'source path contradicts record context/actor'
  WHEN s.content_conflict THEN 'conflicting identity content'
+ WHEN s.content_conflict IS NULL THEN 'unknown identity content'
  WHEN missing_actors>0 THEN 'missing observed actor'
- WHEN remaining=1 AND has_inference THEN 'shared containing-main prefix'
- WHEN remaining=1 THEN 'unique observed actor'
- ELSE 'multiple observed actors' END AS attribution_reason
+ WHEN executor_id IS NOT NULL AND has_inference THEN 'shared containing-main prefix'
+ WHEN executor_id IS NOT NULL THEN 'unique observed actor'
+ ELSE 'multiple or unavailable observed actors' END AS attribution_reason
 FROM g JOIN event_states s USING(event_key);
 
 -- Evidence/availability precede presentation selection. Every distinct event
@@ -321,17 +323,37 @@ def install(con):
     con.execute(RECONCILIATION)
     # Tool/result assertions are interpreted only for an observed Agent/Task call.
     con.execute("""
+      CREATE TEMP VIEW call_observations AS
+      SELECT c.*,to_json([coalesce('uuid:' || c.call_uuid,
+       'local:' || c.source_file || ':' || c.line_no_call),c.tool_use_id]) AS call_key
+      FROM raw_tool_calls c WHERE c.line_no_call IS NOT NULL;
+      CREATE TEMP TABLE call_states AS
+      SELECT call_key,CASE WHEN count(DISTINCT call_hash)>1 THEN TRUE
+       WHEN count(*) FILTER(WHERE call_hash IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict
+      FROM call_observations GROUP BY call_key;
       CREATE TEMP TABLE tool_ownership AS
-      SELECT c.source_file,c.tool_use_id,
-       CASE WHEN count(DISTINCT c.call_hash)=1 AND count(DISTINCT o.executor_id)=1
-       AND count(*) FILTER(WHERE o.executor_id IS NULL)=0 THEN any_value(o.executor_id) END AS executor_id,
-       CASE WHEN count(DISTINCT c.call_hash)>1 OR bool_or(o.attribution_status='conflicting') THEN 'conflicting'
-       WHEN count(DISTINCT o.executor_id)!=1 OR count(*) FILTER(WHERE o.executor_id IS NULL)>0 THEN 'unresolved'
-       WHEN bool_or(o.attribution_status='inferred') THEN 'inferred' ELSE 'confirmed' END AS attribution_status,
-       'reconciled call observations' AS attribution_reason,
-       list_sort(list_distinct(flatten(list(o.context_sessions ORDER BY c.source_file,c.line_no_call)))) AS context_sessions
-      FROM raw_tool_calls c LEFT JOIN event_ownership o ON o.event_key=coalesce('uuid:' || c.call_uuid,'local:' || c.source_file || ':' || c.line_no_call)
-      WHERE c.line_no_call IS NOT NULL GROUP BY c.source_file,c.tool_use_id
+      WITH grouped AS (
+       SELECT c.source_file,c.tool_use_id,
+        CASE WHEN count(DISTINCT c.call_hash)>1 OR bool_or(s.content_conflict) THEN TRUE
+         WHEN count(*) FILTER(WHERE s.content_conflict IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict,
+        CASE WHEN count(DISTINCT o.executor_id)=1 AND count(*) FILTER(WHERE o.executor_id IS NULL)=0
+         THEN any_value(o.executor_id) END AS executor,
+        bool_or(o.attribution_status='conflicting') AS ownership_conflict,
+        bool_or(o.attribution_status='inferred') AS has_inference,
+        list_sort(list_distinct(flatten(list(o.context_sessions ORDER BY c.source_file,c.line_no_call)))) AS context_sessions
+       FROM call_observations c JOIN call_states s USING(call_key)
+       LEFT JOIN event_ownership o ON o.event_key=coalesce('uuid:' || c.call_uuid,'local:' || c.source_file || ':' || c.line_no_call)
+       GROUP BY c.source_file,c.tool_use_id
+      ) SELECT source_file,tool_use_id,
+       CASE WHEN content_conflict IS FALSE AND NOT ownership_conflict THEN executor END AS executor_id,
+       CASE WHEN content_conflict OR ownership_conflict THEN 'conflicting'
+        WHEN executor_id IS NULL THEN 'unresolved'
+        WHEN has_inference THEN 'inferred' ELSE 'confirmed' END AS attribution_status,
+       CASE WHEN ownership_conflict THEN 'conflicting call ownership'
+        WHEN content_conflict THEN 'conflicting call content'
+        WHEN content_conflict IS NULL THEN 'unknown call content'
+        ELSE 'reconciled call observations' END AS attribution_reason,context_sessions
+      FROM grouped
     """)
     _spawn_associations(con)
     rows = con.execute("""
