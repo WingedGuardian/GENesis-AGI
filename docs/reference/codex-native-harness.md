@@ -41,6 +41,10 @@ child failures caught by the adapter, not evidence that a failed outer native
 hook is safe. Keep the unique base directory and retention options above when
 running this file too. No production validator profile is activated.
 
+This file refuses a binary reporting a different version. If the default Codex
+has moved on, use both binary overrides above to select the qualified 0.163.0
+runtime; do not relax the assertion to turn version drift into a passing run.
+
 The direct-shell positive case reads a real scratch body file containing prose
 that mentions worktree removal. It requires that content to appear in the next
 provider request and checks the separate action receipt. This qualifies actual

@@ -79,7 +79,7 @@ activation. An outer hook that cannot start, is killed or times out can still
 fail open in Codex. This is bounded accident prevention, not OS containment.
 
 Twenty fresh-process plain-shell hook probes on the qualified source measured
-2.04 seconds for the first call, p95 2.05 seconds and maximum 2.12 seconds.
+1.55 seconds for the first call, p95 1.57 seconds and maximum 1.66 seconds.
 These are normal-call measurements, not a worst-case guarantee; later policy
 or profile changes require qualification again.
 
