@@ -41,6 +41,7 @@ from genesis.mcp.health import mcp
 from genesis.security.card_redaction import CARD_FILTER, contains_card_text, redact_text
 from genesis.security.card_redaction import redacted as _redacted
 from genesis.security.card_shapes import contains_card_number
+from genesis.util.mcp_logging import configure_mcp_logging
 
 logger = logging.getLogger(__name__)
 
@@ -56,32 +57,20 @@ _REFUSE_CARD_RUN_JS = (
     "browser-automation skill, Safety gates)."
 )
 
-# File-based logging for the entire MCP health server — routes ALL log
-# output to ~/tmp/mcp_health.log so it's readable after timeouts.
-# The MCP server runs as a CC child process; its stderr is inaccessible.
-# This runs at import, in every process that imports the module (a test run
-# included), so GENESIS_MCP_LOG_DIR can move it; a directory that does not
-# exist attaches no handler at all.
-_mcp_log_dir = Path(os.environ.get("GENESIS_MCP_LOG_DIR") or Path.home() / "tmp").expanduser()
-if _mcp_log_dir.is_dir():
-    _mcp_fh = logging.FileHandler(_mcp_log_dir / "mcp_health.log")
-    _mcp_fh.setFormatter(logging.Formatter(
-        "%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    ))
-    _mcp_fh.setLevel(logging.DEBUG)
-    # Attach to root logger so ALL genesis.* logs are captured
-    logging.getLogger("genesis").addHandler(_mcp_fh)
-    # On the handler: records propagated from any genesis.* logger are redacted.
-    _mcp_fh.addFilter(CARD_FILTER)
+# Read the environment once, at import; optional logging cannot abort startup.
+# The shared selector also gives daily rotation the same fixed absolute path.
+_mcp_log_dir = configure_mcp_logging(CARD_FILTER)
 
 # Direct file-write debug log for Turnstile — bypasses logging framework
 # entirely to guarantee output is visible. The logging.FileHandler approach
 # produced empty files despite correct setup (likely a process/import issue).
-_TS_LOG_PATH = _mcp_log_dir / "turnstile_debug.log"
+_TS_LOG_PATH = _mcp_log_dir / "turnstile_debug.log" if _mcp_log_dir is not None else None
 
 
 def _ts_log_write(msg: str) -> None:
     """Write a timestamped line directly to the Turnstile debug log."""
+    if _TS_LOG_PATH is None:
+        return
     try:
         # Deliberate LOCAL import despite the module-level one: it keeps this
         # writer out of reach of patch.object(browser, "datetime"), which the
