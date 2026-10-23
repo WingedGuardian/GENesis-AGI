@@ -2866,7 +2866,12 @@ verified: ed048e214017 2026-10-22
   distinguish executor identity from delegation evidence. This development
   candidate adds the parser, durable per-source Parquet records and audited
   historical readers. Readers capture immutable source selections; historical
-  provenance and unavailable facts remain explicit. Queries, CLI and scheduling
+  provenance and unavailable facts remain explicit. Ingestion keeps one captured
+  canonical root, rejects malformed persisted root bindings and isolates source
+  stat failures. Transcript and sidecar-fingerprint reads admit regular descriptors
+  without blocking; fingerprint metadata is limited to 1 MiB. The extractor's
+  independent sidecar reopen remains outside adversarial-concurrency guarantees;
+  parser signatures and historical formats are unchanged. Queries, CLI and scheduling
   arrive in dependent changes. Additional backup and recovery work is deferred
   independently of collection and search.
   It does not describe a deployed capability.
