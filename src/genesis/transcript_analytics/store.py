@@ -47,6 +47,7 @@ DEFAULT_LOCK = locks.DEFAULT_LOCK
 Busy = locks.Busy
 _KEY = re.compile(r"[0-9a-f]{16}\Z")
 _RECORD = re.compile(r"[0-9a-f]{32}\Z")
+_MAX_METADATA_BYTES = 1024 * 1024
 
 
 def _extraction_signature():
@@ -136,6 +137,17 @@ def _fingerprint(st: os.stat_result) -> dict:
     return {"dev": st.st_dev, "ino": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
 
 
+@contextlib.contextmanager
+def _open_regular(path):
+    """Admit the descriptor actually read without blocking on special files."""
+    with open(path, "rb", opener=lambda name, flags: os.open(
+        name, flags | os.O_NOFOLLOW | os.O_NONBLOCK
+    )) as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError("source is not a regular file")
+        yield handle
+
+
 def source_fingerprint(path: Path, st: os.stat_result | None = None) -> dict:
     fp = _fingerprint(st or path.stat())
     if path.name.startswith("agent-"):
@@ -143,7 +155,11 @@ def source_fingerprint(path: Path, st: os.stat_result | None = None) -> dict:
         if meta.is_symlink():
             raise ValueError("agent metadata must not be a symlink")
         try:
-            fp["meta"] = hashlib.sha256(meta.read_bytes()).hexdigest()
+            with _open_regular(meta) as handle:
+                body = handle.read(_MAX_METADATA_BYTES + 1)
+            if len(body) > _MAX_METADATA_BYTES:
+                raise ValueError("agent metadata is too large")
+            fp["meta"] = hashlib.sha256(body).hexdigest()
         except FileNotFoundError:
             fp["meta"] = None
     return fp
@@ -434,16 +450,19 @@ def _projects_root(data, projects, *, adopt=False):
     path = data / "projects-root.json"
     root = str(projects.resolve(strict=True))
     try:
-        saved = json.loads(path.read_text())["projects_root"]
+        saved = json.loads(path.read_text(), object_pairs_hook=_no_duplicate_catalog_keys)["projects_root"]
     except FileNotFoundError:
         if source_keys(data) and not adopt:
             raise ValueError(
                 "store has no projects root; ingest with --adopt-projects-root after verifying its origin"
             ) from None
-        saved = None
+        return root
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise ValueError("store projects-root record is unreadable") from exc
-    if saved is not None and saved != root and not adopt:
+    if (not isinstance(saved, str) or not saved.startswith("/") or "\0" in saved
+            or os.path.normpath(saved) != saved):
+        raise ValueError("store projects-root record is unreadable")
+    if saved != root and not adopt:
         raise ValueError("projects root differs from the store; explicit root adoption required")
     return root
 
@@ -545,12 +564,7 @@ def _build_source(
     # Fingerprint the descriptor actually read (review #23): a path re-stat can
     # describe a different inode than the one extraction consumed, and comparing
     # only ``meta`` missed body churn. Compare the whole fingerprint afterwards.
-    with open(
-        path, "rb",
-        opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK),
-    ) as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise ValueError("source is not a regular file")
+    with _open_regular(path) as handle:
         res = extract_source(path, rel, stop_at=st.st_size, fh=handle)
         observed = source_fingerprint(path, os.fstat(handle.fileno()))
     if observed != fp:
@@ -637,23 +651,20 @@ def ingest(
         _make_directory(data)
         os.chmod(data, 0o700)
         root = _projects_root(data, projects, adopt=adopt_projects_root)
-        sources = discover(projects)
+        sources = discover(Path(root))
         _atomic_write(data / "projects-root.json", json.dumps({"projects_root": root}))
         _sweep_staging(data)
         keys = set(source_keys(data))
         unbuilt = {source_identity(rel) for _, rel in sources if srckey(rel) not in keys}
         for path, rel in sources:
-            try:
-                st = os.stat(path)
-            except FileNotFoundError:
-                summary["vanished"] += 1
-                continue
-            key = srckey(rel)
-            if cutoff is not None and st.st_mtime < cutoff and key not in keys:
-                summary["skipped_old"] += 1
-                continue
             summary["sources"] += 1
             try:
+                st = os.stat(path)
+                key = srckey(rel)
+                if cutoff is not None and st.st_mtime < cutoff and key not in keys:
+                    summary["skipped_old"] += 1
+                    summary["sources"] -= 1
+                    continue
                 fp = source_fingerprint(path, st)
                 if is_current(data, key, fp, source=rel):
                     summary["unchanged"] += 1
@@ -677,7 +688,7 @@ def ingest(
         summary["unbuilt"] = sorted(unbuilt)
         summary["complete"] = not summary["failed"] and not summary["vanished"]
         summary["completed_at"] = datetime.now(UTC).isoformat()
-        summary["projects_root"] = str(projects.resolve())
+        summary["projects_root"] = root
         summary["seconds"] = round(time.monotonic() - t0, 2)
         _atomic_write(
             data / "projects-root.json", json.dumps({"projects_root": summary["projects_root"]})

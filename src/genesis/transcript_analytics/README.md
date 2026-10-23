@@ -8,7 +8,17 @@ symlink. Files and containing directories are fsync'd before the selector is
 published. An interrupted refresh never overwrites the accepted record.
 `build_source`, ingest and prune use the same exclusive writer flock.
 Collection opens the source leaf without following symlinks, including a leaf
-replaced after discovery. Directory durability fencing currently opens every
+replaced after discovery, and admits only regular descriptors without blocking.
+Agent-sidecar fingerprinting uses the same admission and a 1 MiB read ceiling;
+missing sidecars retain their existing meaning. Collection uses one captured
+canonical projects root and isolates individual source stat/read failures, writing
+an incomplete inventory while continuing with the other sources. Corrupt root
+bindings require correction; they cannot silently become an unbound store.
+Accepted residue for the local first release: the extractor reopens sidecar
+metadata after fingerprint admission. Concurrent adversarial sidecar replacement
+or growth in that gap is outside this release's scope; admission is not a
+filesystem sandbox. Parser signatures and accepted historical records are unchanged.
+Directory durability fencing currently opens every
 ancestor of the data directory; execute-only ancestors are unsupported.
 During first publication, a concurrent reader may briefly report the new source
 as excluded until its selector exists. It never admits an incomplete record.
