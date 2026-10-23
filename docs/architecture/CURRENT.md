@@ -2840,7 +2840,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 2bf5587b5c5d 2026-10-23
+verified: ba89fa1a22b5 2026-10-23
 ```
 
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
@@ -2867,7 +2867,14 @@ verified: 2bf5587b5c5d 2026-10-23
   candidate adds the parser, durable per-source records, audited historical
   readers and live query views. Readers capture immutable source selections;
   tool blocks remain distinct, and uncertain result or delegation matches stay
-  unresolved. CLI and scheduling arrive in dependent changes. Additional backup
+  unresolved. This CLI candidate exposes opt-in capped collection, status, live
+  SQL, disposable cache building and independent live/cache verification. The
+  canonical configuration defaults off and accepts the existing private overlay;
+  default paths follow the canonical runtime homes while explicit paths win.
+  Status reads confined snapshot metadata and reports individual source stat or
+  fingerprint errors while continuing; bounded SQL previews and streaming CSV
+  preserve full query counts without retaining every result row in Python.
+  Scheduling arrives in a dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   Unknown historical content is excluded from content metrics. Views version 24
   preserves missing call/result hashes as unknown and admits ownership from the

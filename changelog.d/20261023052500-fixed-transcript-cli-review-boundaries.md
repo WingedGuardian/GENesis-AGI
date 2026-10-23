@@ -1,0 +1,2 @@
+Confine analytics status to valid snapshot selectors, honor canonical runtime homes for default paths, and batch SQL previews and CSV exports while preserving complete query counts and explicit path overrides.
+Report individual source stat failures without aborting the remaining status checks.
