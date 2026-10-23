@@ -472,7 +472,8 @@ invocation modes share owned scopes, helper processes and the receipt deadline.
 The complete managed operation isolates provider observations and private
 diagnostics, while ordinary same-owner work keeps its current behavior. Failed
 drain retains native ownership; no contained transcript pointer is fabricated.
-This primitive does not grant foreign admission; its consumer is separate.
+This primitive does not grant foreign admission; the native conversation binding
+selects it only after explicit shared authorization and immutable trust checks.
 See `docs/reference/peer-execution.md`.
 
 ```yaml subsystem-map
@@ -1499,7 +1500,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 91c3bbeb9 2026-10-22
+verified: 6b183f47edce 2026-10-23
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1529,13 +1530,19 @@ the shared banner is not an assertion about all concurrent sessions.
   outage/recovery Telegram notices. Unknown readings preserve an open incident;
   deliberate disablement closes it quietly. Incident/phase delivery history
   supplies durable retry deduplication without a second queue.
-  `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
+  `peers/conversation.py` serves enrolled asynchronous A2A conversations on the
   existing Flask/runtime loop: it atomically persists native receipts, binds
   contexts and retries to relationship epochs, and admits at most two
   outstanding peer turns globally and per peer, without a daily submission
-  quota. Fresh native turns use Genesis identity/cognition, available memory
-  enrichment, observe/interact tools, external unattended provenance and the
-  native background ceiling. Result heads and full artifacts have bounded
+  quota. Same-owner turns use Genesis identity/cognition, available memory
+  enrichment and observe/interact tools. Cross-owner turns require an additional
+  explicit conversation_shared grant, use only public identity and mode-bound
+  shared history, and select contained tools-free native execution before private
+  builders. Saved receipt trust/epoch prevents reclassification from exposing old
+  context. An atomic fixed pending-outreach owner notice is informational; an
+  owner action starts a new ordinary workflow, never promotes the foreign turn.
+  Foreign proactive outbox sends and approval-description reads remain refused.
+  Both modes retain external unattended provenance and the native background ceiling. Result heads and full artifacts have bounded
   disclosure checks. Approval attribution survives notification updates; the API
   lists pending owner actions and never resolves them. Presented peer/backend
   bearers are refused before owner mutation shortcuts. Deployment/enrollment and

@@ -103,7 +103,11 @@ lifetime, including finalization, cannot update shared provider health, banners
 or Fallback observations. Default-false requests keep their existing receipt
 fingerprints. Contained work has no transcript pointer; its committed full
 artifact remains available. This execution primitive does not authorize foreign
-peers. See [contained peer execution](peer-execution.md) for the exact contract.
+peers by itself. The conversation front door sets the marker only after current
+shared-conversation authorization and immutable receipt-trust checks; same-owner
+turns retain the default. See [contained peer execution](peer-execution.md) for
+the exact execution contract and [agent conversations](agent-conversations.md)
+for admission and owner-notice boundaries.
 
 Private invocations withhold raw execution/callback diagnostics and error span
 text, including exceptions escaping to ancestor spans and the enumerated tracing

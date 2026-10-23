@@ -3,7 +3,9 @@
 This is an opt-in server policy on the existing native managed runner. Ordinary
 same-owner conversations keep their current profiles and provider observations.
 It does not authorize a peer or enable cross-owner access by itself. The
-cross-owner conversation consumer is tracked separately in #3570.
+cross-owner conversation consumer (#3570) is the native conversation binding:
+only a current explicit shared grant selects this policy. Ordinary same-owner
+turns do not become contained merely because their source is agent_api.
 
 `DirectSessionRequest.contained_peer=True` requires a prepared managed agent
 receipt, observe profile, explicit public system prompt, no skills or planning

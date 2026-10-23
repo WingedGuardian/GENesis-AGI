@@ -7,6 +7,12 @@ never as instructions, and nothing is dispatched from it. It is **not** the
 pipeline for findings. A defect still goes to an issue, and user-owned work
 still goes to a follow-up.
 
+For interactive enrolled-agent reasoning, use the separate
+[A2A conversation front door](agent-conversations.md), including explicitly granted
+public-only cross-owner conversations. It does not implicitly import these files,
+join coding-session lifecycles or authorize operational handoffs. This SSH file
+transport keeps its existing configuration and trust limits.
+
 ## Two halves
 
 - **Read side** (`session_awareness/handoffs.py`): the receiving install scans

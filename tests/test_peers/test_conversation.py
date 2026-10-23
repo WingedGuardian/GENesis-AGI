@@ -454,7 +454,7 @@ async def test_admission_checks_database_before_taking_write_lock(bridge, monkey
 
     monkeypatch.setattr(bridge.service, "_same_database", checked)
     row = await asyncio.wait_for(bridge.service.send(bridge.identities["alpha"], incoming()), 3)
-    assert checks == 2  # Preflight and the actual admission connection.
+    assert checks == 3  # Preflight, actual admission, then authorized post-admission projection.
     monkeypatch.setattr(bridge.service, "_same_database", same_database)
     assert project(await settle(bridge, row))["status"]["state"] == "TASK_STATE_COMPLETED"
 
@@ -768,11 +768,13 @@ async def test_a_rewritten_result_file_is_not_served(bridge):
 
 @pytest.mark.parametrize("second_service", [False, True])
 async def test_a_retry_in_admission_shares_its_claim(bridge, monkeypatch, second_service):
-    entered, release = [], asyncio.Event()
+    entered, release, prepared = [], asyncio.Event(), asyncio.Event()
 
     class SlowAssembler:
         async def assemble(self, **kwargs):
             entered.append(True)
+            if len(entered) == 2:
+                prepared.set()
             await release.wait()
             return "Synthetic identity"
 
@@ -785,14 +787,13 @@ async def test_a_retry_in_admission_shares_its_claim(bridge, monkeypatch, second
         asyncio.create_task((other if index % 2 else bridge.service).send(identity, incoming(p)))
         for index, p in enumerate((*([payload] * 12), message()))
     ]
-    for _ in range(100):
-        if len(entered) >= 2:
-            break
-        await asyncio.sleep(0.01)
-    await asyncio.sleep(0.1)
-    assert len(entered) == 2 and not any(send.done() for send in sends)
-    release.set()
-    rows = [await send for send in sends]
+    try:
+        await asyncio.wait_for(prepared.wait(), 5)
+        assert len(entered) == 2 and not any(send.done() for send in sends)
+    finally:
+        release.set()
+        await asyncio.gather(*sends, return_exceptions=True)
+    rows = [send.result() for send in sends]
     assert len({row["id"] for row in rows[:12]}) == 1
     assert rows[0]["id"] != rows[-1]["id"]
     for row in (rows[0], rows[-1]):
