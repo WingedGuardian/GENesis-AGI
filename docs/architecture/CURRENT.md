@@ -2840,7 +2840,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: ba89fa1a22b5 2026-10-23
+verified: 2f013ed7b19d 2026-10-23
 ```
 
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
@@ -2874,7 +2874,13 @@ verified: ba89fa1a22b5 2026-10-23
   Status reads confined snapshot metadata and reports individual source stat or
   fingerprint errors while continuing; bounded SQL previews and streaming CSV
   preserve full query counts without retaining every result row in Python.
-  Scheduling arrives in a dependent change. Additional backup
+  Source evidence validates the selected original block's ID/hash and reports
+  ambiguous reused IDs without choosing an owner. Its regular-file reader bounds
+  physical records at 1 MiB, withholds oversized/recursive context and reports
+  oversized targets unavailable while retaining search rows and original files.
+  Applicable result envelopes retain their hash eligibility and are scrubbed.
+  Scheduling arrives in a
+  dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   Unknown historical content is excluded from content metrics. Views version 24
   preserves missing call/result hashes as unknown and admits ownership from the

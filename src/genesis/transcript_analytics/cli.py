@@ -382,10 +382,33 @@ def _configure(ap):
     p = sub.add_parser("prune")
     p.add_argument("--before", required=True)
     p.set_defaults(handler=cmd_prune)
+    p = sub.add_parser("evidence", help="show bounded scrubbed call/result context")
+    p.add_argument("--tool-use-id", required=True)
+    p.add_argument("--context", type=int)
+    p.add_argument("--max-bytes", type=int)
+    p.set_defaults(handler=cmd_evidence)
     sub.add_parser("verify", help="compare all snapshot and live rows").set_defaults(
         handler=cmd_verify
     )
     ap.set_defaults(func=run)
+
+
+def cmd_evidence(args):
+    from .evidence import evidence
+
+    print(
+        json.dumps(
+            evidence(
+                args.data,
+                args.projects,
+                args.tool_use_id,
+                surrounding=args.context if args.context is not None else args.cfg.evidence_records,
+                budget=args.max_bytes if args.max_bytes is not None else args.cfg.evidence_bytes,
+            ),
+            ensure_ascii=False,
+        )
+    )
+    return 0
 
 
 def cmd_verify(args):
