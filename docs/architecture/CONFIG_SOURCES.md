@@ -197,6 +197,13 @@ names, so an overlay of a read-only file is editable (#2446).
 
 ## 4. Other sources
 
+- **Contained peer CLI environment** — `cc/peer_segment.py` filters inherited
+  values to provider identity and connectivity, including proxy/bypass and CA
+  paths. The invoker reapplies instruction, memory and attachment suppression
+  plus an absolute PATH outside the peer cwd after login fallback. GitHub
+  credential variables stay present and empty under the existing launch guard.
+  Fixed auth/version helpers use the same policy; no configuration file is changed.
+
 - **Process env only** (no file layer): paths — `GENESIS_REPO_ROOT`, `SECRETS_PATH`,
   `GENESIS_DB_PATH`, `GENESIS_HOME`, `VENV_PATH`, `CLAUDE_HOME`, `GENESIS_PLANS_DIR`,
   `GENESIS_OUTPUT_DIR`, `GENESIS_CC_PROJECT_ID`; tuning — `GENESIS_DB_BUSY_TIMEOUT_MS`

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import shutil
 import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
+from uuid import uuid4
 
 from genesis.cc.exceptions import CCProcessError, CCRateLimitError
 from genesis.cc.types import PROBE_CALLER_TAG, CCInvocation, EffortLevel
@@ -19,9 +21,10 @@ _phase = ContextVar("provider_readiness_phase", default=None)
 
 
 @contextmanager
-def isolated_provider(*, probe=False):
+def isolated_provider(*, probe=False, contained=False):
     """Keep routed calls from changing shared home-provider status callbacks."""
-    token = _phase.set("probe" if probe else "execution")
+    phase = "probe" if probe else "execution"
+    token = _phase.set("contained_" + phase if contained or contained_provider() else phase)
     try:
         yield
     finally:
@@ -29,11 +32,27 @@ def isolated_provider(*, probe=False):
 
 
 def probing_provider() -> bool:
-    return _phase.get() == "probe"
+    return _phase.get() in {"probe", "contained_probe"}
+
+
+def contained_provider() -> bool:
+    return _phase.get() in {"contained_probe", "contained_execution"}
 
 
 def provider_status_isolated() -> bool:
     return _phase.get() is not None
+
+
+def _probe_options(policy, empty_mcp, timeout_s):
+    if policy is None:
+        return dict(safe_mode=True, mcp_config=str(empty_mcp), timeout_s=timeout_s)
+    from genesis.cc.peer_segment import PeerSegment
+
+    return dict(
+        safe_mode=False, mcp_config=None, timeout_s=min(7200, math.ceil(timeout_s)),
+        peer_segment=PeerSegment(uuid4().hex, policy.deadline_at, (), mode="conversation"),
+        system_prompt="Public provider availability diagnostic. No private context or tools.",
+    )
 
 
 async def probe_provider(invoker, base: CCInvocation, *, timeout_s: float):
@@ -46,18 +65,16 @@ async def probe_provider(invoker, base: CCInvocation, *, timeout_s: float):
     root = Path(tempfile.mkdtemp(prefix="provider-ready-", dir=big_tmp_dir()))
     empty_mcp = root / "mcp.json"
     empty_mcp.write_text('{"mcpServers":{}}', encoding="utf-8")
+    options = _probe_options(base.peer_segment, empty_mcp, timeout_s)
     probe = CCInvocation(
         prompt=f"Provider availability check. Reply exactly {READY}.",
         model=base.model,
         effort=EffortLevel.LOW,
-        safe_mode=True,
         disable_tools=True,
         no_session_persistence=True,
-        mcp_config=str(empty_mcp),
         strict_mcp_config=True,
         working_dir=str(root),
         claude_code_tmpdir=str(root / "tmp"),
-        timeout_s=timeout_s,
         confirm_cleanup=True,
         origin=base.origin,
         supervised=False,
@@ -66,6 +83,7 @@ async def probe_provider(invoker, base: CCInvocation, *, timeout_s: float):
         anthropic_auth_token=base.anthropic_auth_token,
         model_id_override=base.model_id_override,
         caller_tag=PROBE_CALLER_TAG,
+        **options,
     )
     empty_init = False
     last_limit = None

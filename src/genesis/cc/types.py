@@ -465,8 +465,16 @@ class CCInvocation:
     # --no-session-persistence: disposable print-mode checks must not leave
     # transcripts in CC's separate project tree. Actual tasks keep persistence.
     no_session_persistence: bool = False
+    # Server-only containment policy; never populated from a peer payload.
+    peer_segment: object | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.peer_segment is not None:
+            from genesis.cc.peer_segment import PeerSegment
+
+            if not isinstance(self.peer_segment, PeerSegment):
+                raise ValueError("Invalid peer containment policy")
+            self.peer_segment.validate(self)
         # Producer-side loud validation of the WS-3 origin (the env READER is
         # fail-safe instead): a dispatch-site typo like "external-untrusted"
         # must fail at construction, not silently classify a session's memory
