@@ -2830,7 +2830,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: b066be8d2fdc 2026-10-20
+verified: 8a62059720cd 2026-10-22
 ```
 
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
@@ -2987,8 +2987,13 @@ verified: b066be8d2fdc 2026-10-20
   Qdrant); bare arm = `--safe-mode` (the only OAuth-compatible CLAUDE.md
   suppression; `--bare` refuses OAuth) + cleanroom CLAUDE_CONFIG_DIR.
   Task set is PRIVATE (`~/.genesis/eval/bench_tasks_v1.jsonl`; loader
-  refuses in-repo paths). Judge = `bench_task_success` rubric, UNCALIBRATED
-  v1 (every surface stamps `judge_calibrated: false`). Every new
+  refuses in-repo paths). Judge = `bench_task_success` 1.1.0, UNCALIBRATED
+  (every surface stamps `judge_calibrated: false`). Missing or contradicted
+  explicitly required deliverables receive an instructed score ceiling of0.5,
+  below the unchanged0.6 pass threshold; writing quality stays separate.
+  Progress/refusal outcomes retain their task context. This prompt instruction
+  is not deterministic semantic enforcement; old-version references require
+  fresh review. Skill replay shares the rubric. Every new
   genesis-memory tool must be classified in `eval/bench/arms.py`
   (static-AST forcing test). Don't run across Sun 07:30 (J-9 aggregation).
   **A5 read surface** (WS-1 A5): the persisted paired win-rate is readable via
@@ -3618,6 +3623,37 @@ tool-disabled CC probe without changing its schedule or routing authority.
   the run (run includes SQLite's busy-timeout wait and lock-retry backoff), the
   outcome (ok / cancelled / error) and what it was stuck behind — rate-limited
   per label and outcome to one line per 60 s unless a repeat is twice as slow.
+  When a lock outlives the retry budget (`DB lock persisted through N attempts
+  … giving up`, or a lock error on the unretried `executescript`),
+  `db/lock_holders.py` records local failure context, then samples the kernel
+  lock table on a worker; these readings do not prove who caused the failure.
+  It preserves the SQLite error name (`SQLITE_BUSY_SNAPSHOT` is a stale read
+  snapshot that retry cannot refresh), separately from any `lock_table_error`.
+  Kernel lines on the database, `-wal` and `-shm` files are matched by inode
+  and decoded to SQLite roles (`-shm` byte 120 = writer, 121
+  checkpointer, 122 recoverer, 123-127 reader marks, 128 open), each pid
+  labelled credential-free (`pid_breakdown.process_label`). SQLite's own
+  waiters are INVISIBLE there (non-blocking `F_SETLK`, sleep-and-retry), so it
+  retains positive-PID, nonwaiting POSIX WRITE ranges covering byte 120 as
+  writer candidates and keeps all other raw rows. POSIX locks are per process,
+  so an in-process
+  holder shows only as `self`; the snapshot therefore also lists every
+  connection of this process on the same database that a factory opened
+  (`get_db`/`SerializedConnection`, `get_raw_db`, `connect_aiosqlite_rw`, and
+  `connect_sqlite_rw` via a weakref-able `factory=` subclass), each with the
+  `module:function` that opened it and `in_transaction` (an implicit write
+  transaction holds the write lock until commit with nothing running), plus,
+  for a `SerializedConnection`, its asyncio lock state and statement (never
+  bound parameters; inline literals can appear). NOT covered: direct
+  `sqlite3.connect`/`aiosqlite.connect` calls outside those factories (about
+  two dozen sites: attention, eval, browser profile, payments vault, guardian
+  watchdog, migrations, integrity and others) and the read-only pool. Task
+  names are counted, unnamed `Task-N` folded into `Task-*`. The capture
+  call awaits nothing (the in-process state is read on the loop thread, the
+  lock table on a worker thread via a tracked task), at most once per
+  registered canonical database per process per 60 s, into `~/.genesis/logs/lock_snapshots/`
+  (7 days / 20 MB); the warning line names the file or why there is none.
+  `GENESIS_LOCK_SNAPSHOT_DISABLED=1` turns it off.
   Not timed: raw `aiosqlite`/`sqlite3` connections and the unlocked
   `db.cursor()` / `cursor.execute()` routes (unused in production). Two
   schema paths coexist: base DDL (`schema/_tables.py`, 117 CREATE TABLE, a count

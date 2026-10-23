@@ -277,7 +277,8 @@ def test_the_size_cap_drops_the_oldest(tmp_path, monkeypatch):
         p = tmp_path / name
         p.write_text("12345")
         os.utime(p, (now - 100 + i,) * 2)
-    pb._prune(tmp_path, now)
+    pb.prune_snapshot_dir(tmp_path, now)
+    assert not hasattr(pb, "_prune")  # one public name, no private alias
     assert sorted(p.name for p in tmp_path.glob("*.json")) == ["b.json", "c.json"]
 
 
