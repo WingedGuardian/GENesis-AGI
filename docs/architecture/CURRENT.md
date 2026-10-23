@@ -2871,7 +2871,8 @@ verified: ba89fa1a22b5 2026-10-23
   SQL, disposable cache building and independent live/cache verification. The
   canonical configuration defaults off and accepts the existing private overlay;
   default paths follow the canonical runtime homes while explicit paths win.
-  Status reads confined snapshot metadata; bounded SQL previews and streaming CSV
+  Status reads confined snapshot metadata and reports individual source stat or
+  fingerprint errors while continuing; bounded SQL previews and streaming CSV
   preserve full query counts without retaining every result row in Python.
   Scheduling arrives in a dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.

@@ -50,6 +50,8 @@ SQL can still reach its resource or runtime limit. CSV streams every row using
 the existing CSV format; an interrupted export may leave partial output and
 exits with an error without publishing a new success manifest. Status reads only
 confined snapshot metadata; use `verify` for complete cache/live validation.
+Status reports individual source stat/fingerprint failures in `source_errors`
+and continues inspecting the remaining sources.
 
 `GENESIS_TRANSCRIPT_ANALYTICS_DISABLED=1` or a `DISABLED` file in the configured
 data directory blocks analytics commands while retaining saved opt-in. Status

@@ -156,6 +156,9 @@ not load snapshot pages. SQL previews retain only their display limit, CSV strea
 in batches, and both preserve complete query counts in manifests. Default source
 and data paths honor `CLAUDE_HOME` and `GENESIS_HOME`; explicit paths remain chosen
 paths and the installed configuration is still required.
+An individual source stat or fingerprint failure is reported in `source_errors`
+and counted stale while status continues inspecting other sources. A source that
+vanishes before its initial stat keeps the existing skipped-source behavior.
 `verify` uses the same captured selection for the configured cache reader and
 forced live reader, one connection at a time. It compares schema, row counts and
 row digests for every shared relation. Missing, stale or unreadable caches report
