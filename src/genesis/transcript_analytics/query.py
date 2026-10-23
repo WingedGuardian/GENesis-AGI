@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -37,7 +38,97 @@ _DERIVED = (
     "delegation_rollups",
     "context_rollups",
     "metric_coverage",
+    # Reconciliation outputs are part of the shared query surface, so the
+    # disposable snapshot carries them alongside the deduplicated views.
+    "observations",
+    "provider_candidates",
+    "turn_events",
+    "event_states",
+    "canonical_fragments",
+    "fragments",
+    "message_sequences",
+    "representation",
+    "message_copy",
+    "inherited",
+    "event_ownership",
+    "turn_evidence",
+    "assembled_fragments",
+    "result_candidates",
+    "producers",
+    "companion_assertions",
+    "spawn_associations",
+    "tool_ownership",
 )
+
+
+def _snapshot(data, selection):
+    # The disposable layout is a real derived/ directory whose current
+    # selector is a symlink into it; anything else is malformed cache and
+    # the reader falls back to the live views.
+    raw_root = data / "derived"
+    if raw_root.is_symlink() or not raw_root.is_dir():
+        raise ValueError("invalid snapshot root")
+    root = raw_root.resolve()
+    selector = root / "current"
+    if not selector.is_symlink():
+        raise ValueError("invalid snapshot selector")
+    directory = selector.resolve(strict=True)
+    if directory.parent != root or not directory.is_dir():
+        raise ValueError("invalid snapshot selector")
+    manifest = json.loads((directory / "MANIFEST.json").read_text())
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("views_version") != VIEWS_VERSION
+        or manifest.get("inputs_signature") != store.inputs_signature(data, selection=selection)
+        or manifest.get("views") != list(_DERIVED)
+        or not isinstance(manifest.get("schemas"), dict)
+    ):
+        raise ValueError("snapshot is not current")
+    return directory, manifest
+
+
+def _load_snapshot(con, data, selection):
+    started = False
+    try:
+        directory, manifest = _snapshot(data, selection)
+        con.execute("BEGIN")
+        started = True
+        for view in _DERIVED:
+            path = str(directory / f"{view}.parquet").replace("'", "''")
+            # CTAS reads every page now; returned connections never lazily
+            # depend on a disposable snapshot that another build can remove.
+            con.execute(
+                f"CREATE TEMP TABLE _derived_{view} AS SELECT * FROM read_parquet('{path}')"  # noqa: S608 — fixed view names, escaped path
+            )
+            con.execute(f"CREATE VIEW {view} AS SELECT * FROM _derived_{view}")  # noqa: S608 — fixed view names
+            schema = [list(row[:2]) for row in con.execute(f"DESCRIBE {view}").fetchall()]  # noqa: S608 — fixed view names
+            if schema != manifest["schemas"].get(view):
+                raise ValueError("incompatible snapshot schema")
+        con.execute("COMMIT")
+        return manifest
+    except Exception as exc:
+        if started:
+            con.execute("ROLLBACK")
+        print(json.dumps({"event": "snapshot_fallback", "reason": type(exc).__name__}), file=sys.stderr)
+        return None
+
+
+def snapshot_manifest(data):
+    try:
+        value = json.loads((data / "derived/current/MANIFEST.json").read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, RuntimeError):
+        return {}
+
+
+def derived_current(data, *, selection=None):
+    selection = store.select_sources(data) if selection is None else selection
+    try:
+        _snapshot(data, selection)
+        with contextlib.closing(connect(data, selection=selection)) as con:
+            return _READS[con].get("snapshot") is not None
+    except Exception:
+        return False
 
 
 def _spill_directory():
@@ -58,8 +149,8 @@ def _spill_directory():
     return temporary
 
 
-def connect(data: Path, *, memory_limit=None, threads=None, selection=None):
-    """Live-views connection; only compatible sources enter the views."""
+def connect(data: Path, *, memory_limit=None, threads=None, selection=None, live=False):
+    """Use a fully read current cache, or live views over one source selection."""
     import pyarrow as pa
 
     from genesis.transcript_analytics.schema import SCHEMAS
@@ -116,6 +207,12 @@ def connect(data: Path, *, memory_limit=None, threads=None, selection=None):
             ])
         ))
         con.execute("CREATE VIEW source_coverage AS SELECT * FROM _source_coverage")
+        if not live:
+            snapshot = _load_snapshot(con, data, selection)
+            if snapshot is not None:
+                _READS[con]["snapshot"] = snapshot
+                con.execute("SET lock_configuration=true")
+                return con
         for table in TABLES:
             groups = {}
             for record in records:
@@ -151,8 +248,8 @@ def connect(data: Path, *, memory_limit=None, threads=None, selection=None):
 
 
 @contextlib.contextmanager
-def read_connection(data):
-    with contextlib.closing(connect(data)) as con:
+def read_connection(data, *, live=False):
+    with contextlib.closing(connect(data, live=live)) as con:
         yield con
 
 
@@ -217,29 +314,35 @@ def turn_identity_coverage(con):
 
 
 def run_query(
-    data: Path, sql: str, params=None, *, live: bool = True, manifest_path=None, window=None, baseline=None
+    data: Path, sql: str, params=None, *, live: bool = False, manifest_path=None, window=None, baseline=None
 ):
-    """Read the live views over every compatible per-source record.
-
-    ``live`` is retained for callers shared with the snapshot path; the
-    derived-cache PR gives ``live=False`` its meaning. All reads are live here.
-    """
-    with contextlib.closing(connect(data)) as con:
+    """Read a current cache or the captured live views; never serve stale cache."""
+    with contextlib.closing(connect(data, live=live)) as con:
         coverage = _READS[con]["coverage"]
+        snapshot = _READS[con].get("snapshot")
         # The inventory is diagnostic and read only after the immutable source
         # selection has been captured; manifest consumers should use coverage.
         inventory = store.inventory(data)
         print(
             json.dumps(
                 {
-                    "mode": "live",
+                    "mode": "snapshot" if snapshot is not None else "live",
                     "coverage": coverage,
                     "inventory": inventory,
                 }
             ),
             file=sys.stderr,
         )
-        rel = con.sql(sql, params=params)
+        # live=False forbids raw access even when a failed snapshot load
+        # fell back to the live graph and raw_* views therefore exist.
+        if not live and re.search(r"\braw_[A-Za-z0-9_]*", sql):
+            raise ValueError("raw_* views require --live")
+        try:
+            rel = con.sql(sql, params=params)
+        except duckdb.CatalogException as exc:
+            if "raw_" in str(exc):
+                raise ValueError("raw_* views require --live") from exc
+            raise
         result = (rel.columns, rel.fetchall()) if rel is not None else ([], [])
         if manifest_path:
             identity_coverage = turn_identity_coverage(con)
@@ -247,6 +350,9 @@ def run_query(
                 manifest_path,
                 {
                     **_scrub_labels(sql, window, baseline),
+                    "snapshot": snapshot,
+                    "snapshot_current": snapshot is not None,
+                    "live": live,
                     "inventory": inventory,
                     "inputs_signature": _READS[con]["inputs_signature"],
                     "versions": {

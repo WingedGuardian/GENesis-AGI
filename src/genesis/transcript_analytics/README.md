@@ -70,7 +70,7 @@ historical observations remain usable.
 
 ## Live queries
 
-`query.connect(data)` binds all raw tables to one captured source selection.
+`query.connect(data, live=True)` binds all raw tables to one captured source selection.
 DuckDB's later lazy reads and query evidence use those same immutable paths and
 metadata. Live and deduplicated views retain the existing reconciliation rules;
 hooks/events aggregate scrub failures over every copy. Recomputed tool latency
@@ -107,4 +107,41 @@ historical identity is unresolved, not attributed to a current executor.
 Each connection uses its own 0700 spill directory under `TA_DUCKDB_TMP` or
 `~/tmp/transcript-analytics/duckdb`; an unowned or symlinked root is rejected.
 The independent storage tests require no query/reconciliation modules.
-Disposable snapshots follow in the dependent B part of #3425.
+
+## Disposable snapshots
+
+`derive.build(data)` holds the same writer flock while capturing the sources
+and writing all thirty shared derived and reconciliation views into `derived/.staging/<stamp>/`.
+It fsyncs every Parquet file, the manifest and the directory, publishes the
+complete `derived/<stamp>/`, then atomically replaces `derived/current`.
+The immediately previous snapshot is retained; older cache directories and
+interrupted staging are disposable. No durable source is removed by a build.
+Rebuilding removes malformed staging and selector entries by their actual type;
+cache symlinks are unlinked without inspecting or deleting their targets.
+
+`query.connect(data)` and `run_query` prefer a snapshot whose manifest matches
+both the current views version and the captured inputs signature. Every table
+is read completely into connection-private DuckDB tables in one transaction,
+with its schema checked against the manifest. A missing, corrupt, unreadable,
+incompatible or stale snapshot rolls back and uses live views over the same
+captured source selection, emitting one `snapshot_fallback` event. This also
+catches damaged data pages with intact Parquet footers. A successful connection
+no longer depends on disposable files, so cache cleanup cannot break later
+queries. Full reads trade connection-start work and private spill for catching
+all snapshot read errors before results reach the caller.
+
+Use `run_query(..., live=True)` (CLI `sql --live`) for raw views; snapshots
+contain derived views only. The first release also requires `--live` for harmless
+raw-looking SQL text, including `SELECT 'raw_tool_calls'`, comments and search
+patterns such as `LIKE '%raw_%'`. Its text check is case sensitive, so uppercase
+raw relation queries can behave differently after cache fallback. Use `--live`
+consistently for these queries. This is a deferred SQL usability limitation, not
+a security boundary. The private spill rules also
+apply to snapshot materialization. `derive.is_current` checks the complete
+cache, not just file existence.
+
+After backup restore, call `derive.discard_after_restore(data)`: it deletes
+only `derived/` and syncs its parent directory before returning, without changing source records, original stamps, root binding
+or inventory. Live queries work immediately and snapshots rebuild from durable
+records even when their original transcripts are permanently gone. Additional backup and restore command wiring is deferred; it does not gate
+collection, live search or opportunity scanning.
