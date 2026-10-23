@@ -1490,7 +1490,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 91c3bbeb9 2026-10-22
+verified: a8fa35a358bc 2026-10-23
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1528,8 +1528,13 @@ the shared banner is not an assertion about all concurrent sessions.
   enrichment, observe/interact tools, external unattended provenance and the
   native background ceiling. Result heads and full artifacts have bounded
   disclosure checks. Approval attribution survives notification updates; the API
-  lists pending owner actions and never resolves them. Presented peer/backend
-  bearers are refused before owner mutation shortcuts. Deployment/enrollment and
+  lists pending owner actions and never resolves them.
+  Native receipts record their public-state clock through transactional native
+  and attributed-approval triggers. Get/List share state, timestamp and pending
+  approvals in one authorized snapshot; List uses timestamp/ID ordering and an
+  opaque issued-position cursor scoped to peer/epoch/context. Heartbeats do not
+  bump public status, and incomplete projections fail readiness explicitly.
+  Presented peer/backend bearers are refused before owner mutation shortcuts. Deployment/enrollment and
   connector-only ingress verification are separate prerequisites. No new listener
   or peer execution queue. See `docs/reference/peer-registry.md` and
   `docs/reference/agent-conversations.md`.

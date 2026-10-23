@@ -1,0 +1,1 @@
+- Record agent task status transitions and owner-approval changes consistently, and keep task-list pagination stable when an anchor task changes or is deleted.
