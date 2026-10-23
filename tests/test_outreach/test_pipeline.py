@@ -98,6 +98,7 @@ async def test_submit_surplus_allowed(config, db, mock_drafter, mock_formatter, 
     assert result.delivery_id == "delivery-123"
     assert result.channel == "telegram"
     mock_channel.send_message.assert_called_once()
+    assert "subject" not in mock_channel.send_message.call_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -588,6 +589,58 @@ async def test_submit_to_email_quarantines_secret_end_to_end(config, db, mock_dr
     assert result.status == OutreachStatus.FAILED
     assert "quarantine" in (result.error or "").lower()
     email_adapter.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approved", [False, True])
+@pytest.mark.parametrize("topic,subject", [
+    ("[PEER] Résumé review", "[PEER] Résumé review"),
+    ("First line\nsecond line", "First line second line"),
+    ("Notice\r\nBcc: other@example.com", "Notice Bcc: other@example.com"),
+    ("First — second", "First--second"),
+    ("Internal /etc/genesis/config.yaml", None),
+    ("", "Message from Genesis"),
+])
+async def test_email_subject_reaches_mime_header(config, db, monkeypatch, approved, topic, subject):
+    from email import policy
+    from email.parser import BytesParser
+
+    from genesis.channels.email_adapter import EmailAdapter
+    from genesis.content.formatter import ContentFormatter
+
+    smtp = MagicMock()
+    smtp_class = MagicMock()
+    smtp_class.return_value.__enter__.return_value = smtp
+    monkeypatch.setattr("genesis.channels.email_adapter.smtplib.SMTP_SSL", smtp_class)
+    adapter = EmailAdapter("smtp.invalid", 465, "user", "password", "sender@example.com")
+    pipe = OutreachPipeline(
+        GovernanceGate(config, db), None, ContentFormatter(), {"email": adapter},
+        db=db, config=config,
+    )
+    if approved:
+        result = await pipe.deliver_approved({
+            "category": "notification", "message": "The complete message body.",
+            "validated_recipient": "recipient@example.com",
+        }, subject=topic)
+    else:
+        result = await pipe.submit(OutreachRequest(
+            category=OutreachCategory.NOTIFICATION, topic=topic,
+            context="The complete message body.", salience_score=1.0,
+            channel="email", validated_recipient="recipient@example.com", verbatim=True,
+        ))
+    if subject is None:
+        assert result.status == OutreachStatus.FAILED
+        smtp_class.assert_not_called()
+        return
+    assert result.status == OutreachStatus.DELIVERED
+    smtp.send_message.assert_called_once()
+    message = BytesParser(policy=policy.default).parsebytes(
+        smtp.send_message.call_args.args[0].as_bytes(policy=policy.SMTP),
+    )
+    assert str(message["Subject"]) == subject
+    assert message["Bcc"] is None
+    assert message["To"] == "recipient@example.com"
+    assert message.get_content().strip() == "The complete message body."
 
 
 # ── self-send / recipient-less terminal guards at the _deliver chokepoint ──

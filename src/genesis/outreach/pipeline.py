@@ -741,11 +741,26 @@ class OutreachPipeline:
                     text = self._formatter.format(text, target).text
                 formatted = replace(formatted, text=text)
 
+        email_subject = None
+        if channel == "email" and request.topic:
+            subject_egress = gate(
+                " ".join(request.topic.splitlines()),
+                channel=channel, category=request.category.value,
+            )
+            if subject_egress.quarantined:
+                return OutreachResult(
+                    outreach_id=outreach_id, status=OutreachStatus.FAILED,
+                    channel=channel, message_content=formatted.text,
+                    error="Subject scan quarantine",
+                )
+            email_subject = subject_egress.text
+
         try:
             delivery_id = await adapter.send_message(
                 delivery_recipient, formatted.text,
                 message_thread_id=thread_id,
                 reply_markup=reply_markup,
+                **({"subject": email_subject} if email_subject else {}),
                 **({"peer_envelope": request.peer_envelope} if channel == "agent" else {}),
             )
             # Secondary DM copy for "both" mode (no buttons — primary only)
