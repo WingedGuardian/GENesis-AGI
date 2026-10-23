@@ -94,4 +94,11 @@ def test_update_path_inline_writers_enforce_quarantine():
     update = (repo / "scripts" / "update.sh").read_text()
     bootstrap = (repo / "scripts" / "bootstrap.sh").read_text()
     assert 'connect_sqlite_rw(os.environ["GH_DB_PATH"]' in update
-    assert "assert_not_quarantined('$DB_PATH')" in bootstrap
+    # bootstrap's crash-recovery insert runs under the system python3, before the
+    # venv exists, so it cannot import connect_sqlite_rw (aiosqlite); it makes the
+    # same admission check (assert_admitted delegates to it) before opening.
+    start = bootstrap.index("INSERT INTO update_history")
+    block = bootstrap[bootstrap.rindex("<<'PY'", 0, start) : bootstrap.index("\nPY\n", start)]
+    assert "from genesis.db.integrity import assert_not_quarantined" in block
+    check = block.index("assert_not_quarantined(db_path)")
+    assert check < block.index("sqlite3.connect(db_path")

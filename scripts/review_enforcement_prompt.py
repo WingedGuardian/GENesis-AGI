@@ -143,7 +143,7 @@ def main() -> None:
         "permission to take it. Do not request an at-head review before the head you "
         "want reviewed is pushed. Details, and the rest of the merge gate (CI, base, "
         "Codex freshness, scheduled review, hook-surface evidence), are in the "
-        "genesis-development skill — consult it there rather than from memory.\n\n"
+        "closing-session skill — consult it there rather than from memory.\n\n"
         "MANDATORY: Before committing, you MUST verify the end-to-end OUTCOME — "
         "not just unit tests. Unit tests prove the code works in isolation. "
         "You must also verify that the actual runtime path delivers the intended "

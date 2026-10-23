@@ -41,10 +41,11 @@ Two ceilings bound the suite, and they are different things:
 
 - `timeout = 600` in `pyproject.toml` is pytest-timeout's **per-test** limit —
   one hung test is killed and the suite continues. It is NOT a suite budget.
-  It applies wherever `pytest-timeout` is installed: always in CI, and locally
-  only if you installed it (it ships in the `[test]` extra, which no install
-  path installs). Without it a run starts with a warning saying so, because a
-  hung test then holds the box-wide test lock until it is killed by hand.
+  It applies wherever `pytest-timeout` is installed: always in CI, and on an
+  install once bootstrap's non-fatal step has installed the `[test]` extra
+  (`install_runtime_extras`; a code-only deploy warns when it is missing).
+  Without it a run starts with a warning saying so, because a hung test then
+  holds the box-wide test lock until it is killed by hand.
 - `timeout-minutes: 180` on CI's `test` job bounds the whole job, for a hang
   the per-test timeout cannot catch. It must stay above (max job + one
   per-test kill) — 31m15s + 10m ≈ 41m — or it would pre-empt the per-test

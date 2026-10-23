@@ -193,9 +193,9 @@ def staged_configuration(managed, tmp_path, monkeypatch):
     binary = tmp_path / "source"
     binary.write_bytes(b"accepted")
     binary.chmod(0o500)
-    monkeypatch.setattr(
-        hashlib, "file_digest", lambda *a: SimpleNamespace(hexdigest=lambda: managed.BUILD)
-    )
+    expected = hashlib.sha256(binary.read_bytes()).hexdigest()
+    monkeypatch.setitem(managed.configure.__globals__, "BUILD", expected)
+    monkeypatch.setattr(managed, "BUILD", expected)
     state = tmp_path / "new ancestor" / "nested" / "staged $% Unicode \u00e9 "
     settings = home / ".genesis/config/codebase-managed.json"
     args = SimpleNamespace(
@@ -360,9 +360,7 @@ def test_source_refusal_does_not_claim_retained_staging(
     if kind == "unexecutable":
         source.chmod(0o400)
     elif kind == "wrong-pin":
-        monkeypatch.setattr(
-            hashlib, "file_digest", lambda *a: SimpleNamespace(hexdigest=lambda: "wrong")
-        )
+        monkeypatch.setitem(managed.configure.__globals__, "BUILD", "0" * 64)
     else:
         source.unlink()
         if kind == "link":
@@ -389,10 +387,8 @@ def test_verified_executable_is_same_inode_and_foreign_path_survives(
     binary = tmp_path / "bin"
     binary.write_bytes(b"accepted")
     binary.chmod(0o500)
-    monkeypatch.setattr(
-        managed.verified_binary.__globals__["hashlib"],
-        "file_digest",
-        lambda stream, algorithm: SimpleNamespace(hexdigest=lambda: managed.BUILD),
+    monkeypatch.setitem(
+        managed.verified_binary.__globals__, "BUILD", hashlib.sha256(binary.read_bytes()).hexdigest()
     )
     with managed.verified_binary(binary) as stream:
         replacement = tmp_path / "replacement"

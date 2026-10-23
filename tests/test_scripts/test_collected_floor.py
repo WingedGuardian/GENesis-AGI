@@ -9,13 +9,18 @@ plugin, a real ``pytest --collect-only``) rather than a copy of its logic.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import select
 import subprocess
 import sys
+import types
 from pathlib import Path
 
+import pytest
 import yaml
+from _pytest.fixtures import FixtureManager
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "ci" / "collected_floor.py"
@@ -36,7 +41,7 @@ def tree(path: Path, ids, errors=(), skipped=(), paths=None) -> Path:
     return path
 
 
-def run(tmp_path: Path, base, pr, changed=(), body=None, mode=None, summary=True):
+def run(tmp_path: Path, base, pr, changed=(), body=None, mode=None, summary=True, evidence=None):
     b = base if isinstance(base, Path) else tree(tmp_path / "base.json", base)
     p = pr if isinstance(pr, Path) else tree(tmp_path / "pr.json", pr)
     ch = tmp_path / "changed.txt"
@@ -52,6 +57,8 @@ def run(tmp_path: Path, base, pr, changed=(), body=None, mode=None, summary=True
     out = tmp_path / "summary.md"
     if summary:
         args += ["--summary", str(out)]
+    if evidence is not None:
+        args += ["--evidence", str(evidence)]
     env = {k: v for k, v in os.environ.items() if k != "GITHUB_STEP_SUMMARY"}
     r = subprocess.run(args, capture_output=True, text=True, env=env)
     r.summary = out.read_text() if out.exists() else ""
@@ -396,6 +403,495 @@ class TestPlugin:
         assert set(data["paths"]) == set(data["ids"])
         assert data["errors"] == ["tests/test_err.py"]
         assert data["skipped"] == ["tests/sub/test_skip.py"]
+
+
+def collect_project(project, output):
+    env = {
+        **os.environ,
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "COLLECTED_FLOOR_OUT": str(output),
+        "PYTHONPATH": str(PLUGIN_DIR),
+    }
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "collect_ids_plugin"],
+        cwd=project, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(output.read_text())
+
+
+MOVE_SOURCE = (
+    "import pytest\n"
+    "def test_plain(): assert True\n"
+    "@pytest.mark.parametrize('x', [1, '2001:db8::1'])\n"
+    "def test_param(x): assert x\n"
+    "class TestA:\n"
+    "    def test_same(self): assert True\n"
+    "class TestB:\n"
+    "    def test_same(self): assert True\n"
+)
+
+
+class TestStructuralMoves:
+    @pytest.mark.parametrize(
+        ("case", "expected"),
+        [("pure", 5), ("body", 4), ("class_name", 4), ("class_header", 4),
+         ("param_id", 4), ("duplicate_survivor", 0), ("ambiguous", 0)],
+    )
+    def test_real_collection_classifies_only_unique_unchanged_moves(self, tmp_path, case, expected):
+        project = tmp_path / "project"
+        project.mkdir()
+        old = project / "test_old.py"
+        old.write_text(MOVE_SOURCE)
+        base = tmp_path / "base.json"
+        base_data = collect_project(project, base)
+        assert len(base_data.get("move_keys", {})) == 5
+        source = MOVE_SOURCE
+        if case == "body":
+            source = source.replace("def test_plain(): assert True", "def test_plain(): assert False")
+        elif case == "class_name":
+            source = source.replace("class TestA:", "class TestRenamed:")
+        elif case == "class_header":
+            source = source.replace("class TestA:", "class TestA(object):")
+        elif case == "param_id":
+            # Same AST and parameter values, but a collection hook changes one node ID.
+            (project / "conftest.py").write_text(
+                "def pytest_collection_modifyitems(items):\n"
+                "    for item in items:\n"
+                "        item._nodeid = item.nodeid.replace('[1]', '[renamed]')\n"
+            )
+        old.unlink()
+        if case == "duplicate_survivor":
+            old.write_text(source.replace("class TestA:\n    def test_same(self): assert True\n", ""))
+        else:
+            (project / "test_new.py").write_text(source)
+        if case == "ambiguous":
+            (project / "test_second.py").write_text(source)
+        pr = tmp_path / "pr.json"
+        collect_project(project, pr)
+        result = run(tmp_path, base, pr, changed=["test_old.py", "test_new.py", "test_second.py"])
+        assert result.returncode == OK, result.stdout + result.stderr
+        if expected:
+            assert f"{expected} structural move(s)" in result.stdout
+            assert "not semantic proof" in result.summary
+        else:
+            assert "Structural moves" not in result.summary
+        # Classification never deletes the original disappearance evidence.
+        vanished = set(base_data["ids"]) - set(json.loads(pr.read_text())["ids"])
+        explained = result.summary.split("Explained: removed", 1)[1].split("Structural moves", 1)[0]
+        assert all(nodeid in explained for nodeid in vanished)
+
+    @pytest.mark.parametrize(
+        ("method", "suffix"),
+        [
+            ("    def test_one(self): pass\n", "TestCase::test_one"),
+            ("    @staticmethod\n    def test_one(): pass\n", "TestCase::test_one"),
+            ("    @classmethod\n    def test_one(cls): pass\n", "TestCase::test_one"),
+        ],
+        ids=["instance", "static", "class"],
+    )
+    def test_shadowed_enclosing_class_does_not_create_a_move_pair(
+        self, tmp_path, method, suffix
+    ):
+        project = tmp_path / "project"
+        project.mkdir()
+        old = project / "test_old.py"
+        old.write_text(f"class TestCase:\n{method}")
+        base = tmp_path / "base.json"
+        base_data = collect_project(project, base)
+        old_id = base_data["ids"][0]
+        assert old_id.endswith(suffix)
+
+        old.unlink()
+        (project / "test_new.py").write_text(
+            f"class TestCase:\n{method}\n"
+            "_Base = TestCase\n"
+            "class TestCase(_Base):\n"
+            "    pass\n"
+        )
+        pr = tmp_path / "pr.json"
+        pr_data = collect_project(project, pr)
+        new_id = pr_data["ids"][0]
+        assert new_id.endswith(suffix)
+        assert new_id not in pr_data.get("move_keys", {})
+
+        result = run(tmp_path, base, pr, changed=["test_old.py", "test_new.py"])
+        assert result.returncode == OK, result.stdout + result.stderr
+        assert old_id in result.summary
+        assert "Structural moves" not in result.summary
+
+    def test_shadowed_outer_class_does_not_create_a_nested_move_pair(self, tmp_path):
+        project = tmp_path / "project"
+        project.mkdir()
+        old = project / "test_old.py"
+        old.write_text(
+            "class TestOuter:\n"
+            "    class TestInner:\n"
+            "        def test_one(self): pass\n"
+        )
+        base = tmp_path / "base.json"
+        base_data = collect_project(project, base)
+        old_id = base_data["ids"][0]
+        assert old_id.endswith("TestOuter::TestInner::test_one")
+
+        old.unlink()
+        (project / "test_new.py").write_text(
+            "class TestOuter:\n"
+            "    class TestInner:\n"
+            "        def test_one(self): pass\n"
+            "_Base = TestOuter\n"
+            "class TestOuter(_Base):\n"
+            "    pass\n"
+        )
+        pr = tmp_path / "pr.json"
+        pr_data = collect_project(project, pr)
+        new_id = pr_data["ids"][0]
+        assert new_id.endswith("TestOuter::TestInner::test_one")
+        assert new_id not in pr_data.get("move_keys", {})
+
+        result = run(tmp_path, base, pr, changed=["test_old.py", "test_new.py"])
+        assert result.returncode == OK, result.stdout + result.stderr
+        assert old_id in result.summary
+        assert "Structural moves" not in result.summary
+
+    def test_unshadowed_nested_static_and_class_methods_keep_move_keys(self, tmp_path):
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "test_cases.py").write_text(
+            "class TestOuter:\n"
+            "    def test_instance(self): pass\n"
+            "    @staticmethod\n"
+            "    def test_static(): pass\n"
+            "    @classmethod\n"
+            "    def test_class(cls): pass\n"
+            "    class TestInner:\n"
+            "        def test_nested(self): pass\n"
+        )
+        data = collect_project(project, tmp_path / "ids.json")
+        expected = {
+            "test_cases.py::TestOuter::test_instance",
+            "test_cases.py::TestOuter::test_static",
+            "test_cases.py::TestOuter::test_class",
+            "test_cases.py::TestOuter::TestInner::test_nested",
+        }
+        assert set(data["ids"]) == expected
+        assert set(data.get("move_keys", {})) == expected
+
+    @pytest.mark.parametrize("keys", [None, [], {"bad": []}, "invalid"])
+    def test_missing_or_malformed_optional_keys_preserve_raw_loss(self, tmp_path, keys):
+        base = tree(tmp_path / "base.json", ["old.py::test_one"])
+        pr = tree(tmp_path / "pr.json", ["new.py::test_one"])
+        for path in (base, pr):
+            data = json.loads(path.read_text())
+            data["move_keys"] = keys
+            path.write_text(json.dumps(data))
+        result = run(tmp_path, base, pr, changed=["old.py", "new.py"])
+        assert result.returncode == OK
+        assert "old.py::test_one" in result.summary
+        assert "Structural moves" not in result.summary
+
+    @pytest.mark.parametrize("mutation", ["none", "digest", "suffix", "shape", "untouched", "duplicate"])
+    def test_key_validation_changed_paths_and_ambiguity(self, tmp_path, mutation):
+        # The recorded path itself contains ::, as does the parameter value.
+        old, new = "old::file.py", "new::file.py"
+        suffix = "TestA::test_one[2001:db8::1]"
+        base = tree(tmp_path / "base.json", [old + "::" + suffix], paths={old + "::" + suffix: old})
+        pr = tree(tmp_path / "pr.json", [new + "::" + suffix], paths={new + "::" + suffix: new})
+        for path in (base, pr):
+            data = json.loads(path.read_text())
+            key = [suffix, "a" * 64]
+            if mutation == "digest":
+                key[1] = "not-a-hash"
+            elif mutation == "suffix":
+                key[0] = "bare-name"
+            elif mutation == "shape":
+                key = {"suffix": suffix}
+            data["move_keys"] = {data["ids"][0]: key}
+            if mutation == "duplicate" and path == base:
+                duplicate = "other.py::" + suffix
+                data["ids"].append(duplicate)
+                data["paths"][duplicate] = "other.py"
+                data["move_keys"][duplicate] = key
+            path.write_text(json.dumps(data))
+        changed = [new] if mutation == "untouched" else [old, new, "other.py"]
+        result = run(tmp_path, base, pr, changed=changed)
+        assert result.returncode == (FAIL if mutation == "untouched" else OK)
+        assert ("Structural moves" in result.summary) == (mutation == "none")
+        assert old + "::" + suffix in result.summary
+
+    def test_wrappers_generated_inherited_and_ambiguous_source_have_no_keys(self, tmp_path):
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "test_cases.py").write_text(
+            "import functools\n"
+            "def decorate(fn):\n"
+            "    @functools.wraps(fn)\n"
+            "    def wrapper(): return fn()\n"
+            "    return wrapper\n"
+            "@decorate\n"
+            "def test_wrapped(): pass\n"
+            "exec('def test_generated(): pass')\n"
+            "class TestParent:\n"
+            "    def test_method(self): pass\n"
+            "class TestChild(TestParent): pass\n"
+            "def test_duplicate(): pass\n"
+            "def test_duplicate(): pass\n"
+        )
+        (project / "test_encoded.py").write_bytes(
+            b"# coding: latin-1\ndef test_encoded(): assert '\xe9'\n"
+        )
+        data = collect_project(project, tmp_path / "ids.json")
+        assert len(data["ids"]) == 6
+        assert list(data.get("move_keys", {})) == ["test_cases.py::TestParent::test_method"]
+
+    def test_source_failure_and_parameter_cache(self, tmp_path, monkeypatch):
+        spec = importlib.util.spec_from_file_location("collection_plugin", PLUGIN_DIR / "collect_ids_plugin.py")
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        definitions = getattr(plugin, "_definitions", None)
+        assert callable(definitions)
+        path = tmp_path / "test_cases.py"
+        path.write_text("def not_valid(:")
+        assert definitions(path) == {}
+        assert definitions(tmp_path / "missing.py") == {}
+        # Compile the real function at this path, then use ordinary pytest Function items.
+        path.write_text("def test_param(x): pass\n")
+        module_code = compile(path.read_text(), str(path), "exec")
+        function_code = next(
+            constant for constant in module_code.co_consts if isinstance(constant, types.CodeType)
+        )
+        callobj = types.FunctionType(function_code, {})
+        config = pytest.Config.fromdictargs({}, ["--rootdir", str(tmp_path)])
+        session = pytest.Session.from_config(config)
+        session._fixturemanager = FixtureManager(session)
+        module = pytest.Module.from_parent(session, path=path)
+        cache = {}
+        calls = []
+        original = definitions
+        monkeypatch.setattr(plugin, "_definitions", lambda p: (calls.append(p), original(p))[1])
+        for parameter in ["1", "2001:db8::1"]:
+            item = pytest.Function.from_parent(
+                module,
+                name=f"test_param[{parameter}]",
+                callobj=callobj,
+                originalname="test_param",
+            )
+            item._nodeid = f"test_cases.py::test_param[{parameter}]"
+            item._location = ("test_cases.py", 0, "test_param")
+            assert plugin._move_key(item, tmp_path, "test_cases.py", cache) is not None
+        assert calls == [path]
+        assert plugin._move_key(item, tmp_path / "other-root", "test_cases.py", cache) is None
+
+
+@pytest.fixture
+def evidence_env(monkeypatch):
+    values = {
+        "GITHUB_REPOSITORY": "owner/repo", "GITHUB_EVENT_NAME": "pull_request",
+        "GITHUB_BASE_REF": "main", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_WORKFLOW_REF": "owner/repo/.github/workflows/ci.yml@refs/pull/7/merge",
+        "GITHUB_REF": "refs/pull/7/merge", "GITHUB_SHA": "c" * 40,
+        "COLLECTED_REVIEW_PR_NUMBER": "7", "COLLECTED_REVIEW_BASE_SHA": "a" * 40,
+        "COLLECTED_REVIEW_HEAD_SHA": "b" * 40, "COLLECTED_REVIEW_COMPARISON_SHA": "c" * 40,
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    return values
+
+
+@pytest.fixture
+def evidence_case(tmp_path, evidence_env):
+    spec = importlib.util.spec_from_file_location("collected_evidence_test", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    b, p = tree(tmp_path / "base.json", BASE), tree(tmp_path / "pr.json", BASE)
+    changed = tmp_path / "changed"
+    changed.write_bytes(b"")
+    output = tmp_path / "review-v1.json"
+    args = [str(b), str(p), "--changed", str(changed), "--no-body", "--evidence", str(output)]
+    return mod, args, output
+
+
+class TestEvidence:
+    @pytest.mark.parametrize("case,verdict,complete", [
+        ("clean", OK, True), ("touched", OK, True), ("unexplained", FAIL, True),
+        ("accepted", OK, True), ("move", OK, True), ("new_error", FAIL, False),
+        ("shared_error", OK, False), ("base_error", OK, False), ("skip", OK, True),
+        ("duplicate_ids", OK, False), ("duplicate_keys", OK, False),
+    ])
+    def test_evidence_round_trip_preserves_verdict_and_raw_loss(self, tmp_path, evidence_env,
+                                                              case, verdict, complete):
+        b, p = tree(tmp_path / "base.json", BASE), tree(tmp_path / "pr.json", BASE)
+        changed, body, moves = [], None, []
+        if case in {"touched", "unexplained", "accepted", "move"}:
+            tree(p, BASE[:2])
+            if case in {"touched", "move"}:
+                changed = ["tests/b/test_y.py"]
+            if case == "accepted":
+                body = "Collected-drop: deliberately removed (do not copy this into evidence)"
+            if case == "move":
+                target = "tests/c/test_new.py::test_3"
+                tree(p, [*BASE[:2], target])
+                changed.append("tests/c/test_new.py")
+                for path, node in [(b, BASE[-1]), (p, target)]:
+                    data = json.loads(path.read_text())
+                    data["move_keys"] = {node: ["test_3", "d" * 64]}
+                    path.write_text(json.dumps(data))
+                moves = [{"from_id": BASE[-1], "to_id": target,
+                          "from_path": changed[0], "to_path": changed[1]}]
+        if case in {"shared_error", "base_error"}:
+            tree(b, BASE, errors=["broken.py"])
+        if case in {"shared_error", "new_error"}:
+            tree(p, BASE, errors=["broken.py"])
+        if case == "skip":
+            tree(p, BASE, skipped=["skipped.py"])
+        if case == "duplicate_ids":
+            tree(b, [*BASE, BASE[0]])
+        if case == "duplicate_keys":
+            b.write_text(b.read_text().replace('"ids":', '"ids": [], "ids":', 1))
+        without = run(tmp_path, b, p, changed=changed, body=body, summary=False)
+        output = tmp_path / "review-v1.json"
+        with_report = run(tmp_path, b, p, changed=changed, body=body, summary=False, evidence=output)
+        assert (with_report.returncode, with_report.stdout, with_report.stderr) == (
+            without.returncode, without.stdout, without.stderr)
+        assert with_report.returncode == verdict
+        report = json.loads(output.read_text())
+        assert all(type(report[k]) is int for k in ("schema_version", "pr_number", "run_id", "producer_attempt"))
+        assert report["complete"] is complete
+        assert report["floor_exit_code"] == verdict
+        assert report["reason"] is None if complete else bool(report["reason"])
+        assert {k: report[k] for k in ("schema_version", "repository", "pr_number", "run_id",
+                                     "producer_attempt", "base_sha", "head_sha", "comparison_sha",
+                                     "scope", "event", "workflow_path", "base_ref")} == {
+            "schema_version": 1, "repository": "owner/repo", "pr_number": 7, "run_id": 123,
+            "producer_attempt": 2, "base_sha": "a" * 40, "head_sha": "b" * 40,
+            "comparison_sha": "c" * 40, "scope": "ci-pytest-collection-v1", "event": "pull_request",
+            "workflow_path": ".github/workflows/ci.yml", "base_ref": "main"}
+        if case.startswith("duplicate"):
+            assert "vanished" not in report and "counts" not in report
+            return
+        loss = case in {"touched", "unexplained", "accepted", "move"}
+        assert report["counts"] == {"base": 3, "pr": 3 - int(loss) + int(case == "move"),
+                                    "added": int(case == "move"), "vanished": int(loss)}
+        assert report["vanished"] == ([{"id": BASE[-1], "path": "tests/b/test_y.py",
+                                         "explained": case in {"touched", "move"}}] if loss else [])
+        assert report["moves"] == moves
+        assert report["errors"] == {"base": json.loads(b.read_text())["errors"],
+                                    "pr": json.loads(p.read_text())["errors"]}
+        assert report["newly_skipped"] == (["skipped.py"] if case == "skip" else [])
+        assert "deliberately removed" not in output.read_text()
+
+    @pytest.mark.parametrize("variable", ["GITHUB_REPOSITORY", "GITHUB_EVENT_NAME", "GITHUB_BASE_REF",
+        "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW_REF", "COLLECTED_REVIEW_PR_NUMBER",
+        "COLLECTED_REVIEW_BASE_SHA", "COLLECTED_REVIEW_HEAD_SHA", "COLLECTED_REVIEW_COMPARISON_SHA",
+        "GITHUB_REF", "GITHUB_SHA"])
+    @pytest.mark.parametrize("value", ["", "not valid"])
+    def test_evidence_bad_provenance_removes_previous_report(self, evidence_case, monkeypatch,
+                                                           variable, value):
+        mod, args, output = evidence_case
+        output.write_text("previous attempt")
+        monkeypatch.setenv(variable, value)
+        assert mod.main(args) == OK
+        assert not output.exists()
+
+    @pytest.mark.parametrize("failure", ["missing", "malformed", "empty", "body"])
+    def test_evidence_refusal_does_not_leave_a_previous_report(self, evidence_case, failure):
+        mod, args, output = evidence_case
+        output.write_text("previous attempt")
+        if failure == "missing":
+            Path(args[0]).unlink()
+        elif failure == "malformed":
+            Path(args[0]).write_text("{")
+        elif failure == "empty":
+            tree(Path(args[0]), [])
+        else:
+            tree(Path(args[1]), BASE[:2])
+            args[4] = "--body-unreadable"
+        assert mod.main(args[:-2]) == mod.main(args) == REFUSED
+        assert not output.exists()
+
+    @pytest.mark.parametrize("fault", ["directory", "encode", "replace"])
+    @pytest.mark.parametrize("verdict", [OK, FAIL])
+    def test_evidence_write_failures_preserve_verdict(self, evidence_case, monkeypatch, fault, verdict):
+        mod, args, output = evidence_case
+        if verdict == FAIL:
+            tree(Path(args[1]), BASE[:2])
+        def broken(*args, **kwargs):
+            raise OSError("injected writer failure")
+        if fault == "directory":
+            monkeypatch.setattr(mod.tempfile, "NamedTemporaryFile", broken)
+        elif fault == "encode":
+            monkeypatch.setattr(mod._Evidence, "encode", broken)
+        else:
+            monkeypatch.setattr(mod.os, "replace", broken)
+        assert mod.main(args) == verdict
+        assert not output.exists()
+        assert not list(output.parent.glob(".review-v1.json.*"))
+
+    def test_evidence_cap_produces_small_incomplete_diagnostic(self, evidence_case, monkeypatch):
+        mod, args, output = evidence_case
+        tree(Path(args[0]), [*BASE, "tests/lost.py::test_" + "x" * 3000])
+        monkeypatch.setattr(mod, "_EVIDENCE_LIMIT", 1200)
+        assert mod.main(args) == FAIL
+        report = json.loads(output.read_text())
+        assert report["complete"] is False and "byte limit" in report["reason"]
+        assert "counts" not in report and "vanished" not in report
+        assert output.stat().st_size <= 1200
+
+    @pytest.mark.parametrize("slot", [0, 1, 3])
+    def test_evidence_cannot_destroy_comparison_inputs(self, evidence_case, slot):
+        mod, args, output = evidence_case
+        original = Path(args[slot]).read_bytes()
+        args[-1] = args[slot]
+        assert mod.main(args) == OK
+        assert Path(args[slot]).read_bytes() == original
+
+    def test_evidence_cleanup_failure_disables_writer(self, evidence_case):
+        mod, args, output = evidence_case
+        output.mkdir()
+        assert mod.main(args) == OK
+        assert output.is_dir() and not list(output.iterdir())
+
+    def test_evidence_preserves_unusual_identity_and_rejects_invalid_move(self, evidence_case, monkeypatch):
+        mod, args, output = evidence_case
+        path = "tests/strange::\udcff.py"
+        node = path + "::test_param[::\n]"
+        tree(Path(args[0]), [*BASE, node], paths={node: path})
+        assert mod.main(args) == FAIL
+        assert json.loads(output.read_text())["vanished"] == [{"id": node, "path": path, "explained": False}]
+        monkeypatch.setattr(mod, "structural_moves", lambda *a: [
+            {"from_id": node, "to_id": BASE[0], "from_path": path, "to_path": path}])
+        assert mod.main(args) == FAIL
+        report = json.loads(output.read_text())
+        assert report["complete"] is False and "move relation" in report["reason"]
+        assert "moves" not in report
+
+    def test_evidence_killed_writer_never_exposes_partial_final(self, evidence_case):
+        _, args, output = evidence_case
+        output.write_text("previous report")
+        program = """import importlib.util, sys, contextlib
+spec = importlib.util.spec_from_file_location('floor', sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+def pause(*args):
+    print('ready', file=sys.__stdout__, flush=True)
+    sys.stdin.read()
+mod.os.replace = pause
+with contextlib.redirect_stdout(sys.stderr):
+    mod.main(sys.argv[2:])
+"""
+        with subprocess.Popen([sys.executable, "-c", program, str(SCRIPT), *args],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as proc:
+            try:
+                assert select.select([proc.stdout], [], [], 15)[0], "writer did not reach replace"
+                assert proc.stdout.readline() == "ready\n"
+                assert not output.exists()
+                assert len(list(output.parent.glob(".review-v1.json.*"))) == 1
+            finally:
+                proc.kill()
+                proc.communicate(timeout=15)
+        assert not output.exists()
 
 
 class TestWorkflowContract:

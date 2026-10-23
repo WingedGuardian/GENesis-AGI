@@ -460,16 +460,40 @@ elif [ "$_marker_rc" -ne 0 ]; then
     die "a live deploy (pid $DEPLOY_MARKER_HOLDER) holds $DEPLOY_MARKER_FILE — a dashboard update or a restore is running."
 fi
 
+# _extras_advisory <what> <pyproject text>: a WARNING, never a refusal, when the
+# optional groups every install installs (INSTALL_EXTRAS in the gate) are not all
+# present. A failed non-fatal extras step legitimately leaves them incomplete,
+# so the deploy goes on. Only `missing:` / `unsatisfied:` lines warn, so anything
+# else the gate prints (it could not tell, a group the pyproject does not declare,
+# or a gate that predates --extras and reads it as a checkout path) stays silent.
+# Plain update.sh would stop at "Already up to date"
+# on a current tree, so the remedy names --post-merge, which always reinstalls.
+_extras_advisory() {
+    local what="$1" pyproject="$2" out rc=0
+    out="$(printf '%s\n' "$pyproject" | "$VENV_DIR/bin/python" -P "$_SELF_DIR/lib/venv_matches_pyproject.py" --extras 2>/dev/null)" || rc=$?
+    [ "$rc" -eq 1 ] || return 0
+    # Packages only: a group the pyproject does not declare is not something a
+    # reinstall fixes (tests/test_scripts/test_venv_matches_pyproject.py keeps the
+    # install set declared), so it is no reason to warn here.
+    out="$(printf '%s\n' "$out" | grep -E '^(missing|unsatisfied):')" || return 0
+    echo "WARNING: the venv lacks optional packages every install installs ($what's pyproject.toml); the deploy continues. Install them with scripts/update.sh --post-merge:" >&2
+    printf '%s\n' "$out" | sed 's/^/         /' >&2
+}
+
 # Does the venv match the pyproject.toml read from stdin (<what> names that
 # tree)? A code-only deploy never reinstalls, so any difference goes to the
 # command in <remedy>, which does. Exit 3 is the one difference a reinstall
 # cannot fix: this interpreter is outside the incoming requires-python (too old,
 # or too new for its upper bound).
 _deps_ok() {
-    local what="$1" remedy="$2" out rc=0
-    out="$("$VENV_DIR/bin/python" -P "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
+    local what="$1" remedy="$2" out rc=0 pyproject
+    pyproject="$(cat)"
+    out="$(printf '%s\n' "$pyproject" | "$VENV_DIR/bin/python" -P "$_SELF_DIR/lib/venv_matches_pyproject.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
     case "$rc" in
-        0) return 0 ;;
+        0)
+            _extras_advisory "$what" "$pyproject"
+            return 0
+            ;;
         3) echo "ERROR: $what needs a Python version (its requires-python) that this venv does not run, and a reinstall cannot change that:" >&2 ;;
         *) echo "ERROR: the venv does not match $what's pyproject.toml — run $remedy instead:" >&2 ;;
     esac

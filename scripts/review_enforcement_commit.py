@@ -183,7 +183,7 @@ _DOCS_CONFIG_BASENAMES = {"CHANGELOG", "LICENSE", ".GITIGNORE"}  # compared uppe
 # Executable prompt/agent/skill SURFACES: files whose content shapes autonomous LLM
 # behavior (agent + slash-command + skill definitions, and the in-repo skill library).
 # These are NEVER docs/config even when ``.md`` — an autonomous system editing its own
-# prompts is high-consequence (genesis-development SKILL.md requires prompt/LLM-behavior
+# prompts is high-consequence (build-session SKILL.md requires prompt/LLM-behavior
 # changes to get adversarial review + a CI warning). User-sovereign top-level CAPS behavior
 # docs (SOUL.md, USER.md, CLAUDE.md) are deliberately NOT here: the user editing their own
 # behavior files is not gated (user sovereignty). Directory prefixes, `/`-normalized.
@@ -1725,7 +1725,7 @@ def main() -> None:
     # self-review. This is why the mode-switch audit below (an internal subagent) does
     # NOT trip the cap: only a repeat EXTERNAL non-convergence does. The machine-
     # enforced STOP keeps a genuine cross-model review→fix loop from silently running
-    # long on a standing "proceed" (see genesis-development SKILL.md), while
+    # long on a standing "proceed" (see closing-session SKILL.md), while
     # honestly-clean multi-commit development never trips. Checked BEFORE
     # both the docs/config skip AND Rule 2 ON PURPOSE: the hard stop must not be
     # bypassable by file extension (a reviewed prompt/skill/docs-only commit at the

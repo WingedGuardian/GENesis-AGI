@@ -133,8 +133,7 @@ def _commit_cwd(seg) -> str | None:
 def _request_identity_reason(argv: list[str]) -> Fixable | None:
     """Admit only identities the shared hostless budget lookup resolves correctly.
 
-    gh 2.100.0 selects a PR URL before --repo; the shared helper does the reverse
-    and drops hostnames. Mixed selectors and foreign hosts require a rewrite.
+    The shared boundary refuses mixed selectors and unsupported explicit hosts.
     The host must be WRITTEN: a bare OWNER/REPO resolves against gh's configured
     default host, which may be an enterprise host the budget lookup never sees.
     """

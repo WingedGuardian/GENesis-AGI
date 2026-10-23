@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # rendering) completes in well under a minute even for very large documents;
 # 300s gives generous headroom while ensuring a single wedged/adversarial PDF
 # cannot jam the max_workers=1 pipeline indefinitely. This is the subprocess
-# exception to the "no speculative timeouts" rule (genesis-development timeout
+# exception to the "no speculative timeouts" rule (build-session timeout
 # policy): the pool is the ONLY recovery mechanism for a hung native call, and
 # a hang here blocks every subsequent ingest.
 PDF_EXTRACT_TIMEOUT_S = 300.0

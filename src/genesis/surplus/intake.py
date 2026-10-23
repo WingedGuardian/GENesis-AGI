@@ -878,6 +878,13 @@ def _pipeline_for_source(source: IntakeSource) -> str:
     return _PIPELINE_FOR_SOURCE.get(source, "surplus")
 
 
+#: Every ``source_pipeline`` label :func:`_pipeline_for_source` can write,
+#: including its default. ``source_pipeline`` is also caller-writable (the
+#: knowledge_ingest provenance), so a reader that renders a stored label into a
+#: prompt shows only these and buckets anything else.
+INTAKE_PIPELINE_LABELS: frozenset[str] = frozenset(_PIPELINE_FOR_SOURCE.values()) | {"surplus"}
+
+
 # ── Web search capture ───────────────────────────────────────────────────
 
 

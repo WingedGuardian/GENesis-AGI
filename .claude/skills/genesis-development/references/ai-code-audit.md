@@ -69,4 +69,4 @@ collection-processing code against empty/null/single-item inputs.
 
 Genesis-specific overlays for these passes: `tracked_task()` for background
 tasks, the observability rules in `references/observability.md`, and the
-enumerate-don't-spot-check protocol in the skill body.
+enumerate-don't-spot-check protocol in spec-session, "Auditing Existing Capabilities".

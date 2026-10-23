@@ -41,6 +41,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from genesis.payments.vault_store import CARD_REF
+
 logger = logging.getLogger(__name__)
 
 PAYMENT_APPROVAL_ACTION_TYPE = "payment_card_release"
@@ -119,6 +121,11 @@ def build_text(fields: Mapping[str, str]) -> str:
     return text
 
 
+def _is_card_ref(value) -> bool:
+    """A plain str shaped exactly like a vault card ref (see ``_audit_detail``)."""
+    return type(value) is str and CARD_REF.fullmatch(value) is not None
+
+
 def _audit_detail(detail: Mapping | None) -> dict:
     """The caller's value-light audit facts: plain values, one level of dict.
 
@@ -129,6 +136,12 @@ def _audit_detail(detail: Mapping | None) -> dict:
     a pid passes, an int or float card number does not). Any other type is
     refused, and so are NaN, infinities, a Decimal beyond 64 digits of
     exponent, and two keys that stringify alike.
+
+    One exemption: the top-level ``card_ref`` key, when its value is a plain str
+    that fullmatches the vault's ``CARD_REF`` (``card_`` and 12 hex characters).
+    A generated ref is all digits about 0.36% of the time, and 12 digits cannot
+    hold a card number (13 to 19). Any other key, a nested ``card_ref``, or a
+    value of any other shape still passes the guard.
     """
     def number(value):
         # The exact base type first, so a subclass's __str__ cannot hide its digits.
@@ -151,7 +164,10 @@ def _audit_detail(detail: Mapping | None) -> dict:
             key = _safe_str(str(k))
             if key in out:
                 raise ValueError("two audit keys collide")
-            out[key] = clean(v, depth)
+            if depth == 0 and type(k) is str and k == "card_ref" and _is_card_ref(v):
+                out[key] = v
+            else:
+                out[key] = clean(v, depth)
         return out
 
     def clean(value, depth):
@@ -235,11 +251,18 @@ class PaymentApprovalRegistry:
             logger.error("payment approval audit failed (%s)", type(exc).__name__)
             return False
 
-    async def request(self, fields: Mapping[str, str], *, audit_detail: Mapping | None = None) -> str:
+    async def request(
+        self,
+        fields: Mapping[str, str],
+        *,
+        audit_detail: Mapping | None = None,
+        timeout_s: float | None = None,
+    ) -> str:
         """Ask the owner; return ``granted``, ``refused`` or ``expired``.
 
         ``fields`` are shown in the message; ``audit_detail`` is recorded (see
         ``_audit_detail``). Both pass the digit-run guard or the request is refused.
+        ``timeout_s`` replaces the registry's deadline for this request.
         """
         nonce = secrets.token_urlsafe(16)
         detail: dict = {"nonce": nonce}
@@ -310,7 +333,10 @@ class PaymentApprovalRegistry:
             # The deadline belongs to this wait, not to the dict: a tap that
             # popped the nonce and then died cannot leave it waiting forever.
             try:
-                return await asyncio.wait_for(asyncio.shield(pending.future), self._timeout_s)
+                return await asyncio.wait_for(
+                    asyncio.shield(pending.future),
+                    self._timeout_s if timeout_s is None else timeout_s,
+                )
             except TimeoutError:
                 if pending.future.done():  # a tap settled it as the deadline fired
                     return pending.future.result()
@@ -325,6 +351,32 @@ class PaymentApprovalRegistry:
                     ("approval_refused", {**detail, "reason": "requester cancelled"})
                 ):
                     raise asyncio.CancelledError  # a further cancel, re-raised once
+
+    async def notify(self, text: str) -> bool:
+        """Tell the owner something, with no button: True if Telegram took the message.
+
+        For the release flow's own fixed texts. The same guards as a request:
+        one plain-text message to the owner, nothing with a long digit run.
+        """
+        if self._bot is None or self._owner is None:
+            return False
+        if holds_long_digit_run(text) or _utf16_len(text) > _TG_MAX_UTF16:
+            return False
+        from genesis.channels.telegram.transport.send import (
+            safe_send_message,
+            send_with_client_heal,
+        )
+
+        try:
+            msg = await send_with_client_heal(
+                self._bot,
+                lambda: safe_send_message(self._bot, self._owner, text, parse_mode=None),
+                stopping=self._stopping,
+            )
+        except Exception as exc:  # noqa: BLE001 - a lost notice is logged, never raised
+            logger.error("payment notice send failed (%s)", type(exc).__name__)
+            return False
+        return msg is not None
 
     def _mismatch(self, pending: _Pending, user_id: int | None, message) -> str | None:
         """Why this tap must not grant, or None."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 
 import pytest
 
@@ -95,8 +96,8 @@ def test_a_slow_probe_is_refused_not_uncapped(has_systemd_run):
     fake, seen = _runner([subprocess.TimeoutExpired("systemd-run", 15), (0, "")])
     with pytest.raises(run.ProbeRefused, match="did not finish"):
         run.choose_properties("u", 2**30, 100, None, fake)
-    assert seen[1][:4] == ["systemctl", "--user", "stop", "--no-block"]  # probe cleaned up
-    assert seen[1][-1] == "u-probe0.scope"
+    assert len(seen) == 1  # Injected runner owns cleanup; a guessed name grants no authority.
+    assert "--unit=u-probe0" in seen[0]
 
 
 def test_systemd_run_that_cannot_execute_is_refused(has_systemd_run):
@@ -158,16 +159,40 @@ class _Proc:
     pid = 4242  # explicit: a mock pid of 1 would make killpg hit every process
 
     def __init__(self, argv, **kw):
-        self.argv, self.kw = argv, kw
+        self.argv, self.args, self.kw, self.returncode = argv, argv, kw, None
+        if kw.get("pass_fds"):
+            os.write(kw["pass_fds"][-1], b"1")  # Successful in-scope registration.
 
     def wait(self):
         return 0
 
 
+def _fake_child_status(monkeypatch, status=0, before_observe=None):
+    """Only fake child 4242; preserve the entry syscall capability check."""
+    real_waitid = os.waitid
+    fired = False
+
+    def observe(kind, pid, flags):
+        nonlocal fired
+        if pid != 4242:
+            return real_waitid(kind, pid, flags)
+        if not fired and before_observe is not None:
+            fired = True
+            before_observe()
+        return object()
+
+    monkeypatch.setattr(run.os, "waitid", observe)
+    monkeypatch.setattr(run.os, "waitpid", lambda pid, flags: (pid, status))
+    monkeypatch.setattr(run, "kill_group", lambda *args: None)
+    monkeypatch.setattr(run, "_scope_quiescent", lambda unit: True)
+    monkeypatch.setattr(run, "_signal_scope", lambda *args: True)
+
+
 def test_launch_runs_the_probed_properties(monkeypatch, capsys):
+    _fake_child_status(monkeypatch)
     props = run.scope_properties(2**30, 100)
     launched = []
-    monkeypatch.setattr(run, "choose_properties", lambda *a: run.Caps(props))
+    monkeypatch.setattr(run, "choose_properties", lambda *a, **kw: run.Caps(props))
     monkeypatch.setattr(
         run.subprocess,
         "Popen",
@@ -175,32 +200,36 @@ def test_launch_runs_the_probed_properties(monkeypatch, capsys):
     )
     assert run.launch("j", ["make"], 2**30, 100, lambda: None) == 0
     argv = launched[0].argv
-    assert _props(argv) == props and argv[argv.index("--") + 1 :][:2] == ["/bin/sh", "-c"]
+    assert _props(argv) == props
+    helper = argv[argv.index("--") + 1:]
+    assert helper[:4] == [sys.executable, "-I", "-S", "-c"]
+    assert helper[7:9] == ["1" if "LC_CTYPE" in os.environ else "0", os.environ.get("LC_CTYPE", "")]
+    assert helper[9:11] == ["/bin/sh", "-c"]
     assert argv[-1] == "make" and launched[0].kw["pass_fds"]
     assert "genesis-job genesis-job-j-" in capsys.readouterr().err
 
 
-def test_launch_uncapped_runs_the_command_for_real(monkeypatch, capsys):
-    monkeypatch.setattr(run, "choose_properties", lambda *a: None)
-    assert run.launch("j", ["sh", "-c", "exit 3"], 2**30, 100, lambda: None) == 3
-    err = capsys.readouterr().err
-    assert "UNCAPPED" in err and "exit 3" in err and "largest process" in err
+def test_launch_refuses_missing_manager_before_command_spawn(monkeypatch):
+    monkeypatch.setattr(run, "choose_properties", lambda *a, **kw: None)
+    spawned = []
+    monkeypatch.setattr(run.subprocess, "Popen", lambda *a, **kw: spawned.append(a))
+    with pytest.raises(run.ProbeRefused, match="refusing uncapped launch"):
+        run.launch("j", ["true"], 2**30, 100, lambda: None)
+    assert spawned == []
 
 
-def test_launch_uncapped_missing_command_is_127(monkeypatch):
-    monkeypatch.setattr(run, "choose_properties", lambda *a: None)
-    assert run.launch("j", ["/nonexistent/cmd"], 2**30, 100, lambda: None) == 127
+def test_cancellation_wins_over_manager_absence_before_spawn(monkeypatch):
+    import signal
 
+    def absent(*args, owned=None):
+        owned._forward(signal.SIGHUP, None)
+        return None
 
-def test_stop_scope_never_raises_and_does_not_wait():
-    calls = []
-
-    def slow(argv, **kw):
-        calls.append(argv)
-        raise subprocess.TimeoutExpired(argv, 15)
-
-    run.stop_scope("genesis-job-j-1", slow)  # must not raise
-    assert calls[0][:4] == ["systemctl", "--user", "stop", "--no-block"]
+    spawned = []
+    monkeypatch.setattr(run, "choose_properties", absent)
+    monkeypatch.setattr(run.subprocess, "Popen", lambda *a, **kw: spawned.append(a))
+    assert run.launch("j", ["true"], 2**30, 100, lambda: None) == 129
+    assert spawned == []
 
 
 def test_parse_report():
@@ -387,6 +416,7 @@ class _SignallingProc:
 
     def __init__(self, signals):
         self.signals = signals
+        self.args, self.returncode = ["true"], None
 
     def wait(self):
         import signal as _signal
@@ -400,12 +430,17 @@ def _launch_with(monkeypatch, caps, signals):
     import signal as _signal
 
     killed, stopped = [], []
-    monkeypatch.setattr(run, "choose_properties", lambda *a: caps)
-    monkeypatch.setattr(run.subprocess, "Popen", lambda argv, **kw: _SignallingProc(signals))
+    _fake_child_status(monkeypatch, status=_signal.SIGTERM, before_observe=lambda: [os.kill(os.getpid(), sig) for sig in signals])
+    monkeypatch.setattr(run, "choose_properties", lambda *a, **kw: caps)
+    def registered(argv, **kw):
+        os.write(kw["pass_fds"][-1], b"1")
+        return _SignallingProc(signals)
+
+    monkeypatch.setattr(run.subprocess, "Popen", registered)
     monkeypatch.setattr(
         run, "kill_group", lambda pgid, sig=_signal.SIGTERM: killed.append((pgid, sig))
     )
-    monkeypatch.setattr(run, "stop_scope", lambda unit, *a: stopped.append(unit))
+    monkeypatch.setattr(run, "_signal_scope", lambda unit, sig: stopped.append(unit) or True)
     rc = run.launch("j", ["true"], 2**30, 100, lambda: None)
     return rc, killed, stopped
 
@@ -424,7 +459,7 @@ def test_a_stop_reaches_the_launch_before_the_scope_exists(monkeypatch):
 def test_a_repeated_signal_escalates_to_sigkill(monkeypatch):
     import signal as _signal
 
-    rc, killed, _ = _launch_with(monkeypatch, None, [_signal.SIGTERM, _signal.SIGINT])
+    rc, killed, _ = _launch_with(monkeypatch, run.Caps(run.scope_properties(2**30, 100)), [_signal.SIGTERM, _signal.SIGINT])
     assert killed == [(4242, _signal.SIGTERM), (4242, _signal.SIGKILL)]
 
 
@@ -482,7 +517,8 @@ def test_run_rejects_a_non_finite_wait(flow):
 )
 def test_a_cap_the_kernel_is_not_applying_gets_the_fallback_limits(monkeypatch, caps, limited):
     seen = {}
-    monkeypatch.setattr(run, "choose_properties", lambda *a: caps)
+    _fake_child_status(monkeypatch)
+    monkeypatch.setattr(run, "choose_properties", lambda *a, **kw: caps)
     monkeypatch.setattr(run.subprocess, "Popen", lambda argv, **kw: seen.update(kw) or _Proc(argv))
     run.launch("j", ["true"], 2**30, 100, lambda: None)
     assert (seen.get("preexec_fn") is not None) is limited

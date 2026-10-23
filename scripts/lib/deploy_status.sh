@@ -43,6 +43,11 @@ _RUNTIME_FRESH_SCRIPTS=(
     scripts/lib/disk_guardian.sh          # sourced by util/disk_headroom.py on every free-space check
     scripts/tmp_watchgod.sh               # sourced by util/disk_headroom.py for the watchdog's tiers
     scripts/lib/serving_commit.py         # loaded afresh by memory/graph_census.py on every hourly census
+    scripts/codebase_managed.py           # run by infra_profile/codebase_mcp.py (`status`) on every profile refresh
+    scripts/lib/codebase_managed_unit.py  # imported by codebase_managed.py on every run
+    scripts/lib/code_intel_cbm_admission.py # imported by codebase_managed.py and codebase_managed_unit.py
+    scripts/lib/code_intel_cbm_worker.py  # imported by codebase_managed.py (the pinned BUILD)
+    scripts/lib/cbm_disable_file.sh       # run by infra_profile/codebase_mcp.py to resolve the opt-out path
     # Not under scripts/, but the same kind: cc/invoker.py runs the allowlist
     # guard through this launcher in the server, and reads its exit code.
     .claude/hooks/genesis-hook
