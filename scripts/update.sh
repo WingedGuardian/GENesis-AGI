@@ -1600,14 +1600,14 @@ _start_genesis_server() {
 # scripts/lib/guardian_pause.sh (sourced near the top of this script).
 
 # ── Pre-update DB snapshot ────────────────────────────────
-# Flush the WAL and create a clean backup before stopping services.
+# Create a consistent backup before stopping services.
 # If the server is killed mid-write during the update, this backup
 # enables recovery without data loss.
 DB_FILE="$GENESIS_ROOT/data/genesis.db"
 MIGRATIONS_RAN=0  # set to 1 once the migration runner is invoked; gates the
                   # pre-update DB restore in _do_rollback (rollback the schema
                   # only if this update actually migrated it).
-DB_SNAPSHOT_TAKEN=0  # set to 1 only when THIS run's `.backup` succeeds; the
+DB_SNAPSHOT_TAKEN=0  # set to 1 only when THIS run's verified snapshot succeeds; the
                   # restore trusts this, not mere file existence, so a stale
                   # snapshot from a prior run is never restored as if current.
 # BEGIN db-snapshot (extracted by tests/test_scripts/test_update_live.py)
@@ -1616,42 +1616,106 @@ DB_SNAPSHOT_TAKEN=0  # set to 1 only when THIS run's `.backup` succeeds; the
 # runs after the stop, in the merge's place). The authority check runs the copy of
 # peer_restore.py this run read at its start (on `live`, the reviewed base's),
 # never one a later step may have replaced.
+_prepare_db_snapshot() {
+    # exec is essential: timeout must own the worker, not a wrapper that exits
+    # on TERM before timeout can escalate to KILL. No subprocesses in this worker.
+    exec python3 -I -S - "$1" "$2" <<'SNAPSHOT_PY'
+import contextlib
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import sys
+import tempfile
+
+
+def copy_snapshot(source, destination):
+    destination.touch(mode=0o600)
+    with contextlib.closing(sqlite3.connect(destination)) as target:
+        with contextlib.closing(sqlite3.connect(
+            source.resolve().as_uri() + "?mode=ro", uri=True,
+        )) as reader:
+            # BEGIN alone is deferred. A real read pins the WAL snapshot so
+            # commits from other connections cannot restart each backup step.
+            # https://www.sqlite.org/backup.html#file_and_database_connection_locking
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+            reader.backup(target, pages=256)
+        # Release the source read before verification, avoiding unnecessary WAL
+        # retention. The published file must not depend on destination sidecars.
+        if target.execute("PRAGMA journal_mode=DELETE").fetchone() != ("delete",):
+            raise ValueError("snapshot journal mode")
+        if target.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise ValueError("snapshot verification")
+
+
+def publish(stage, destination):
+    # Only non-serving snapshot paths; stale sidecars must not be replayed into
+    # the replacement. The deploy lock serializes this preflight with restores.
+    for suffix in ("-wal", "-shm", "-journal"):
+        Path(str(destination) + suffix).unlink(missing_ok=True)
+    os.replace(stage, destination)
+    fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def prepare(source, authority):
+    raw = Path(str(source) + ".pre-update")
+    guarded = Path(str(raw) + ".peer-restore")
+    phase = "SNAPSHOT"
+    try:
+        with tempfile.TemporaryDirectory(prefix=".update-snapshot-", dir=source.parent) as tmp:
+            stage = Path(tmp) / "raw.db"
+            copy_snapshot(source, stage)
+            publish(stage, raw)
+            phase = "RESTORE AUTHORITY CHECK"
+            candidate = Path(tmp) / "guarded.db"
+            candidate.touch(mode=0o600)
+            shutil.copyfile(raw, candidate)
+            # Same reviewed source selected at updater startup / live base, in
+            # the same isolated stdlib interpreter. Never import checkout code.
+            namespace = {"__name__": "_pinned_peer_restore"}
+            exec(compile(authority, "pinned-peer_restore.py", "exec"), namespace)
+            namespace["reset_peer_authority"](candidate)
+            publish(candidate, guarded)
+        print(f"  DB snapshot: {raw} (verified; rollback authority prepared)")
+        return 0
+    except (Exception, SystemExit):
+        print(f"  DATABASE {phase} FAILED — UPDATE ABORTED", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(prepare(Path(sys.argv[1]), sys.argv[2]))
+SNAPSHOT_PY
+}
+
 _take_db_snapshot() {
     DB_SNAPSHOT_TAKEN=0
     [ -f "$DB_FILE" ] || return 0
-    echo "--- Snapshotting database ---"
-    sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
-    # Use the online-backup API, not `cp`: this snapshot runs while the server
-    # is still up (before the stop, to avoid extending the downtime window), and
-    # a plain `cp` of a live WAL database yields a TORN copy if the server writes
-    # mid-copy — which is exactly the file _do_rollback later restores. sqlite3
-    # `.backup` takes a transactionally-consistent snapshot of a live database.
-    if sqlite3 "$DB_FILE" ".backup '$DB_FILE.pre-update'" 2>/dev/null; then
-        _snapshot_check=$(sqlite3 "$DB_FILE.pre-update" "PRAGMA quick_check;" 2>&1) || _snapshot_check=""
-        if [ "$_snapshot_check" = "ok" ]; then
-            echo "  DB snapshot: $DB_FILE.pre-update (verified)"
-            # Prepare the rollback authority boundary while this helper still
-            # exists, before stopping services or rolling code back. Retain the
-            # original snapshot for forensic recovery; never consume stale work.
-            rm -f "$DB_FILE.pre-update.peer-restore" "$DB_FILE.pre-update.peer-restore-wal" \
-                "$DB_FILE.pre-update.peer-restore-shm" "$DB_FILE.pre-update.peer-restore-journal"
-            if ! cp "$DB_FILE.pre-update" "$DB_FILE.pre-update.peer-restore" \
-                || [ -z "${_PEER_RESTORE_PY:-}" ] \
-                || ! python3 -I -S -c "$_PEER_RESTORE_PY" "$DB_FILE.pre-update.peer-restore"; then
-                echo "  DATABASE RESTORE AUTHORITY CHECK FAILED — UPDATE ABORTED" >&2
-                return 1
-            fi
-            DB_SNAPSHOT_TAKEN=1
-        else
-            echo "  DATABASE SNAPSHOT FAILED VERIFICATION — UPDATE ABORTED" >&2
-            return 1
-        fi
+    # Observed repeated backup restarts under writes can run indefinitely.
+    # 7200s is the repository fallback, not a measured production copy budget.
+    local snapshot_timeout="${GENESIS_UPDATE_SNAPSHOT_TIMEOUT_S:-7200}"
+    if [[ ! "$snapshot_timeout" =~ ^[1-9][0-9]*$ ]]; then
+        echo "  Invalid GENESIS_UPDATE_SNAPSHOT_TIMEOUT_S (positive seconds required) — UPDATE ABORTED" >&2
+        return 1
+    fi
+    if [ -z "${_PEER_RESTORE_PY:-}" ]; then
+        echo "  DATABASE RESTORE AUTHORITY CHECK FAILED — UPDATE ABORTED" >&2
+        return 1
+    fi
+    echo "--- Snapshotting database (deadline ${snapshot_timeout}s) ---"
+    # Bound the entire copy, verification and authority preparation. Killed
+    # workers can leave private scratch, never a current-run admission marker.
+    if timeout --kill-after=5s "${snapshot_timeout}s" bash -c \
+        "$(declare -f _prepare_db_snapshot)"$'\n''_prepare_db_snapshot "$@"' \
+        snapshot "$DB_FILE" "$_PEER_RESTORE_PY"; then
+        DB_SNAPSHOT_TAKEN=1
     else
-        # Leave any stale $DB_FILE.pre-update on disk untouched — DB_SNAPSHOT_TAKEN
-        # stays 0 so _do_rollback will NOT restore it (and will fail the rollback
-        # loudly if this run then migrates). Removing it would erase a prior valid
-        # snapshot for no gain.
-        echo "  DATABASE SNAPSHOT FAILED — UPDATE ABORTED" >&2
+        echo "  DATABASE SNAPSHOT FAILED OR TIMED OUT — UPDATE ABORTED; services not stopped" >&2
         return 1
     fi
 }
