@@ -38,8 +38,10 @@ the conversation a Genesis session.
 
 The project also configures `gitnexus` through `.claude/mcp/run-gitnexus`,
 which enforces the repository's installed-version and Node compatibility pin.
-Its explicit tool list includes code edits and group metadata updates: having
-the tool does not authorize those actions. GitNexus reads a snapshot, so check
+Its explicit 15-tool catalog excludes source-editing `rename` and group-metadata
+`group_sync`. The retained tools include raw Cypher and can have incidental
+cache/recovery effects; this is not a side-effect-free server contract.
+GitNexus reads a snapshot, so check
 freshness before relying on it for current code. Linked worktrees use live
 symbol tools for branch truth rather than indexing another checkout. See
 `docs/reference/codex-gitnexus.md` for setup and qualification limits.

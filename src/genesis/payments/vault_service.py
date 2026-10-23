@@ -5,8 +5,8 @@
 ``SO_PEERCRED``). The service unwraps ``identity.age`` and keeps the X25519
 identity in memory. It relocks on ``vault lock``, after ``IDLE_RELOCK_S``
 idle, when the held key no longer matches ``recipient.txt``, and on every
-restart (the key is never written anywhere). Nothing decrypts a card yet; the
-first user of the key is the card-fill flow, which approval gates.
+restart (the key is never written anywhere). The key's one user is a card
+release (``payments/release.py``), which the owner's Telegram tap gates.
 
 The unwrap (age scrypt, about 1-2 s of CPU) runs in a short-lived subprocess
 that imports only pyrage, so the event loop never waits on it. MEASURED on
@@ -22,14 +22,25 @@ with no audit log, or if the audit write fails, the key is not held. Lock
 always drops the key, whatever happens to its audit row.
 
 Protocol: one JSON line in (at most 4096 bytes), one JSON line out, then the
-connection closes. Ops: ``status``, ``unlock`` (``passphrase``), ``lock``.
-Responses never echo a request.
+connection closes. Ops: ``status``, ``unlock`` (``passphrase``), ``lock``, and
+the release ops ``release_request``, ``release_status``, ``release_claim`` and
+``release_cancel``. The first three need only the peer's uid, so the owner's
+CLI works; a release op also needs a peer that ``peer_check`` verifies as the
+genesis-health MCP server. Responses never echo a request.
+
+A client keeps its write side open until the reply arrives and sends nothing
+after the request line. The service cannot tell a half-close (``shutdown``
+of the write side) from a close: both read as EOF, and an ``unlock`` or
+``release_claim`` whose client reads as closed is refused. Bytes sent after
+the request line hide a later close from that check (``at_eof`` stays False
+while they sit unread), so a claim then relies on the requester's pid check.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import importlib.util
 import json
 import logging
@@ -44,6 +55,10 @@ from pathlib import Path
 from genesis.db.crud import payment_vault_events as audit
 from genesis.env import vault_socket_path
 from genesis.payments import vault_store as vs
+from genesis.payments.approval import holds_long_digit_run
+from genesis.payments.peer_check import PeerPolicy, PeerRefused, accept_ticks, check_release_peer
+from genesis.payments.release import ReleaseManager
+from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
 
@@ -123,10 +138,36 @@ def peer_of(writer: asyncio.StreamWriter) -> dict:
     return info
 
 
+WITHHELD = "(withheld: 12 or more digits)"
+
+
+def _withhold_long_runs(value, key: str | None = None):
+    """``value`` with every str that holds a 12+ digit run replaced by ``WITHHELD``.
+
+    The one guard every audit row passes, whoever wrote it: requester and /proc
+    text (a host, field origins, process names, an exe path, env var names) is
+    recorded as it came, so a card number in any of it must stop here. The same
+    rule as the approval registry (``approval.holds_long_digit_run``), with the
+    same one exemption: a ``card_ref`` value shaped exactly like a vault card ref.
+    Shorter values (a CVC, an expiry) cannot be told apart from ordinary text;
+    the fields that could carry one as free text are recorded only as lengths.
+    """
+    if isinstance(value, str):
+        if key == "card_ref" and vs.CARD_REF.fullmatch(value):
+            return value
+        return WITHHELD if holds_long_digit_run(value) else value
+    if isinstance(value, dict):
+        return {k: _withhold_long_runs(v, k) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_withhold_long_runs(v) for v in value]
+    return value
+
+
 class VaultService:
     """The in-memory vault state and the socket that drives it.
 
-    ``db`` must be a connection the service owns (see ``start_vault_service``).
+    ``db`` must be dedicated to this service, never shared with other writers.
+    Failed rollback retires and closes it, including for directly constructed services.
     """
 
     owned_db = None  # the connection start_vault_service opened, closed at stop
@@ -141,6 +182,8 @@ class VaultService:
         idle_check_s: float = _IDLE_CHECK_S,
         clock=None,
         python: str = sys.executable,
+        approvals=None,
+        release_peer=None,
     ) -> None:
         self._db = db
         self._vault = vault_path or vs.vault_dir()
@@ -167,6 +210,15 @@ class VaultService:
         self._socket_ino: int | None = None
         self._writers: set[asyncio.StreamWriter] = set()
         self._tasks: set[asyncio.Task] = set()
+        self._audit_owners: set[asyncio.Task] = set()
+        self._audit_close: asyncio.Task | None = None
+        # (pid, *, accept_ticks) -> Peer, raising PeerRefused. genesis-server's
+        # own pid is passed explicitly: the ancestor walk looks for it to tell
+        # a session it launched from a foreground one.
+        self._release_peer = release_peer or functools.partial(
+            check_release_peer, policy=PeerPolicy.default(), server_pid=os.getpid()
+        )
+        self._release = ReleaseManager(self, approvals)
 
     @property
     def unlocked(self) -> bool:
@@ -174,20 +226,77 @@ class VaultService:
 
     # -- audit -------------------------------------------------------------
 
-    async def _audit(self, event: str, detail: dict | None = None) -> bool:
-        if self._db is None:
+    async def _audit(
+        self,
+        event: str,
+        detail: dict | None = None,
+        *,
+        _stopping: bool = False,
+        _correction: bool = False,
+    ) -> bool:
+        if self._db is None or (self._stopped and not _stopping):
             return False
+        owner = tracked_task(
+            self._write_audit(event, detail, _stopping, _correction),
+            name="payment-vault-audit",
+        )
+        self._audit_owners.add(owner)
+        owner.add_done_callback(self._audit_owners.discard)
+        try:
+            return await asyncio.shield(owner)
+        except asyncio.CancelledError:
+            if not owner.cancelling():
+                owner.cancel()
+            raise
+
+    def _retire_audit(self) -> asyncio.Task | None:
+        db, self._db = self._db, None
+        if self._audit_close is None and db is not None:
+            # No new statements may use this handle. Close queues behind SQL
+            # already submitted; it cannot undo an already-queued COMMIT.
+            self._audit_close = tracked_task(db.close(), name="payment-vault-audit-close")
+            self._audit_close.add_done_callback(self._closed_audit)
+        return self._audit_close
+
+    def _closed_audit(self, task: asyncio.Task) -> None:
+        self._audit_close = None
+
+    async def _rollback_audit(self, db) -> None:
+        cleanup = tracked_task(db.rollback(), name="payment-vault-audit-rollback")
+        try:
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    # The owner keeps the lock and the cleanup reference even
+                    # when cancellation first arrives during an error rollback.
+                    continue
+            cleanup.result()
+        except (Exception, asyncio.CancelledError) as exc:
+            logger.error("payment vault audit rollback failed (%s)", type(exc).__name__)
+            self._retire_audit()
+
+    async def _write_audit(
+        self,
+        event: str,
+        detail: dict | None,
+        stopping: bool,
+        _correction: bool = False,
+    ) -> bool:
         async with self._audit_lock:
+            if self._db is None or (self._stopped and not stopping):
+                return False
+            if _correction and self.unlocked:
+                return False
+            db = self._db
             try:
-                await audit.record_event(self._db, event, detail)
+                await audit.record_event(db, event, _withhold_long_runs(detail))
+            except asyncio.CancelledError:
+                await self._rollback_audit(db)
+                raise
             except Exception as exc:  # noqa: BLE001 - the caller decides what a lost row means
                 logger.error("payment vault audit write failed (%s)", type(exc).__name__)
-                # A failed COMMIT leaves the INSERT pending; a later commit would
-                # persist a row (an "unlock") that never took effect. The
-                # connection is the service's own and the audit lock is held,
-                # so rolling back discards only this write.
-                with contextlib.suppress(Exception):
-                    await self._db.rollback()
+                await self._rollback_audit(db)
                 return False
         return True
 
@@ -203,11 +312,17 @@ class VaultService:
             return
         try:
             async with self._audit_lock:
-                rows = await audit.list_recent(self._db, 1)
+                if self._db is None:
+                    return
+                rows = await audit.list_recent(self._db, 1, events=audit.KEY_EVENTS)
         except Exception:  # noqa: BLE001 - status reports the audit log as unavailable
             return
-        if rows and rows[0]["event"] == "unlock":
-            await self._audit("lock", {"correction": "no key is held; an earlier row was lost"})
+        if not self.unlocked and rows and rows[0]["event"] == "unlock":
+            await self._audit(
+                "lock",
+                {"correction": "no key is held; an earlier row was lost"},
+                _correction=True,
+            )
 
     # -- state -------------------------------------------------------------
 
@@ -257,8 +372,6 @@ class VaultService:
         if self._clock() < self._relock_at:
             self._schedule_idle_check()
             return
-        from genesis.util.tasks import tracked_task
-
         task = tracked_task(self.lock(None, event="idle_relock"), name="payment-vault-idle-relock")
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -298,8 +411,12 @@ class VaultService:
         last, audit_ok = None, self._db is not None
         if audit_ok:
             try:
-                async with self._audit_lock:
-                    rows = await audit.list_recent(self._db, 1)
+                async with self._audit_lock:  # the last KEY event, not an approval row
+                    audit_ok = self._db is not None
+                    rows = (
+                        await audit.list_recent(self._db, 1, events=audit.KEY_EVENTS)
+                        if audit_ok else []
+                    )
                 last = rows[0] if rows else None
             except Exception:  # noqa: BLE001 - reported as audit unavailable
                 audit_ok = False
@@ -342,9 +459,13 @@ class VaultService:
         # Taken on arrival, not after waiting for the unlock lock: a lock that
         # lands while this request waits behind another unlock still wins.
         epoch = self._epoch
-        if self._db is None:
-            return {"ok": False, "error": "the audit log is unavailable; the vault stays locked"}
         async with self._unlock_lock:
+            async with self._audit_lock:
+                if self._db is None:
+                    return {
+                        "ok": False,
+                        "error": "the audit log is unavailable; the vault stays locked",
+                    }
             if self._stopped:
                 return {"ok": False, "error": "the vault service is stopping"}
             if self.unlocked:  # checked first: a held key is never answered with a refusal
@@ -404,6 +525,7 @@ class VaultService:
         self._epoch += 1
         was_unlocked = self.unlocked
         self._drop()
+        await self._release.abort("the vault was locked")
         if not was_unlocked:
             if peer:  # every lock request is on the trail, even one with nothing to drop
                 await self._audit(event, {"peer": peer, "state": "already locked"})
@@ -434,33 +556,46 @@ class VaultService:
         self._epoch += 1
         was_unlocked = self.unlocked
         self._drop()
-        for task in list(self._tasks):
-            task.cancel()
-        if self._server is not None:
-            self._server.close()
-            for writer in list(self._writers):
-                writer.close()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._server.wait_closed(), _STOP_WAIT_S)
-        with contextlib.suppress(OSError):
-            if (
-                self._socket_ino is not None
-                and os.lstat(self._socket_path).st_ino == self._socket_ino
-            ):
-                os.unlink(self._socket_path)
-        # Bounded like the rest of stop: behind a held SQLite write lock one
-        # write can take about 22 s (busy timeout x retries, MEASURED), and the
-        # key is already dropped above, so a lost stop row costs only the row.
+        # Before the tasks are cancelled: the approval task is one of them.
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(
-                self._audit("service_stop", {"was_unlocked": was_unlocked}), _STOP_WAIT_S
+                self._release.abort("the vault service stopped", stopping=True), _STOP_WAIT_S
             )
+        for task in list(self._tasks):
+            task.cancel()
+        try:
+            if self._server is not None:
+                self._server.close()
+                for writer in list(self._writers):
+                    writer.close()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._server.wait_closed(), _STOP_WAIT_S)
+            with contextlib.suppress(OSError):
+                if (
+                    self._socket_ino is not None
+                    and os.lstat(self._socket_path).st_ino == self._socket_ino
+                ):
+                    os.unlink(self._socket_path)
+            # The key is already dropped; a stuck write costs only its row.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._audit("service_stop", {"was_unlocked": was_unlocked}, _stopping=True),
+                    _STOP_WAIT_S,
+                )
+        finally:
+            for owner in self._audit_owners:
+                if not owner.done() and not owner.cancelling():
+                    owner.cancel()
+        if self._audit_owners:
+            # A timeout must not cancel rollback or give up its lock ownership.
+            await asyncio.wait(self._audit_owners, timeout=_STOP_WAIT_S)
 
     async def _respond(self, writer: asyncio.StreamWriter, reply: dict) -> None:
         writer.write((json.dumps(reply) + "\n").encode())
         await writer.drain()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        accepted = accept_ticks()  # first: a pid reused after connect() started later
         self._writers.add(writer)
         try:
             peer = peer_of(writer)
@@ -474,7 +609,24 @@ class VaultService:
                 await self._respond(writer, {"ok": False, "error": "bad request"})
                 return
             op = request.get("op") if isinstance(request, dict) else None
-            if op == "status":
+
+            def client_gone() -> bool:
+                # The peer closing leaves the transport half-open, so
+                # is_closing() stays False; the reader sees the EOF.
+                return reader.at_eof() or writer.is_closing()
+
+            if isinstance(op, str) and op.startswith("release_"):
+                try:
+                    verified = self._release_peer(peer["pid"], accept_ticks=accepted)
+                except PeerRefused as exc:
+                    await self._audit(
+                        "release_refused",
+                        {"reason": "peer not allowed", "peer": {**peer, **exc.detail}},
+                    )
+                    reply = {"ok": False, "error": "peer not allowed"}
+                else:
+                    reply = await self._release.handle(op, request, verified, client_gone)
+            elif op == "status":
                 reply = await self.status()
             elif op == "lock":
                 reply = await self.lock(peer)
@@ -486,9 +638,7 @@ class VaultService:
                 reply = await self.unlock(
                     request["passphrase"],
                     peer,
-                    # The peer closing leaves the transport half-open, so
-                    # is_closing() stays False; the reader sees the EOF.
-                    client_gone=lambda: reader.at_eof() or writer.is_closing(),
+                    client_gone=client_gone,
                 )
             else:
                 reply = {"ok": False, "error": "bad request"}
@@ -501,13 +651,15 @@ class VaultService:
             writer.close()
 
 
-async def start_vault_service(runtime) -> VaultService | None:
+async def start_vault_service(runtime, approvals=None) -> VaultService | None:
     """Start the vault service for genesis-server; None (logged) if it cannot start.
 
     The audit log gets the service's OWN database connection, never the
     runtime's shared one: a failed audit commit is rolled back, and a rollback
     on the shared connection would discard other subsystems' pending writes.
     If it cannot open, the service still runs (status, lock) and refuses unlock.
+    ``approvals`` (a ``PaymentApprovalRegistry``) gets its audit rows written
+    through the same connection; with no service it refuses every request.
     """
     from genesis.db.connection import get_db
     from genesis.env import genesis_db_path
@@ -517,16 +669,22 @@ async def start_vault_service(runtime) -> VaultService | None:
         db = await get_db(genesis_db_path())
     except Exception as exc:  # noqa: BLE001 - unlock then refuses (fail closed)
         logger.error("payment vault audit connection did not open (%s)", type(exc).__name__)
-    service = VaultService(db)
+    service = VaultService(db, approvals=approvals)
     service.owned_db = db
     try:
         await service.start()
+    except asyncio.CancelledError:
+        service._retire_audit()
+        raise
     except Exception as exc:  # noqa: BLE001 - the server runs on without a vault service
         logger.error("payment vault service did not start (%s: %s)", type(exc).__name__, exc)
-        if db is not None:
+        closing = service._retire_audit()
+        if closing is not None:
             with contextlib.suppress(Exception):
-                await db.close()
+                await asyncio.shield(closing)
         return None
+    if approvals is not None:
+        approvals.attach_audit(service._audit)
     return service
 
 
@@ -535,9 +693,12 @@ async def stop_vault_service(service: VaultService | None) -> None:
         return
     try:
         await service.stop()
+    except asyncio.CancelledError:
+        service._retire_audit()
+        raise
     except Exception as exc:  # noqa: BLE001 - shutdown continues regardless
         logger.error("payment vault service stop failed (%s)", type(exc).__name__)
-    finally:
-        if service.owned_db is not None:
-            with contextlib.suppress(Exception):
-                await service.owned_db.close()
+    closing = service._retire_audit()
+    if closing is not None:
+        with contextlib.suppress(Exception):
+            await asyncio.shield(closing)

@@ -1,1 +1,1 @@
-- Make the existing GitNexus tools available through portable Codex project configuration, using the repository's pinned launcher.
+- Make 15 GitNexus tools available through portable Codex project configuration, using the repository's pinned launcher; defer source-editing rename and group-metadata sync.

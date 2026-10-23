@@ -5,8 +5,9 @@ a pinned provider and publishes immutable settings; `status` diagnoses settings
 and native service state. The ordinary install/bootstrap loops render disabled
 query service/client slice templates on every install and do not automatically
 install, upgrade or version-probe a PATH Codebase binary. Registration always
-uses the managed launcher, including when no PATH provider exists. The index
-queue remains on its previous route until its separate integration lands.
+uses the managed launcher, including when no PATH provider exists. The existing
+index queue now uses managed admission and the contained native worker described
+under "Queued indexing" below.
 Staging and rendering alone do not make Codebase available.
 
 Existing symlinks at either managed query unit destination, including `/dev/null`
@@ -18,6 +19,44 @@ lets bootstrap back up and replace that link; `--take-templates` keeps masks.
 Install always keeps existing links. Directories and FIFOs at these two
 destinations remain errors. Use the configured disablement sentinel for the
 runtime off-switch; masking may refuse when a local regular unit already exists.
+
+## If you see the 'registered but unconfigured' alert
+
+The health alert `codebase_mcp_registered_unconfigured`, and the matching
+`Codebase: NOT SET UP` line that bootstrap, install and update print, mean that
+`codebase-memory-mcp` is registered (the checkout's `.mcp.json` or the
+user-scope `~/.claude.json`) but its launcher will refuse. Either
+`~/.genesis/config/codebase-managed.json` is missing, it fails validation (the
+`status` command below names the error), or `genesis-cbm-query.service` is not
+persistently enabled. Every Claude Code session then shows the server as failed
+to connect.
+
+To set it up, obtain the pinned binary, then run from the primary checkout (see
+[Configure](#configure) for what each argument must be):
+
+```bash
+.venv/bin/python -I scripts/codebase_managed.py configure \
+  --main "$PWD" \
+  --binary "$HOME/tmp/codebase-memory-mcp" \
+  --state "$HOME/.genesis/cbm" \
+  --sentinel "$HOME/.genesis/codebase-memory-mcp.disabled"
+python3 -I scripts/codebase_managed.py enable
+```
+
+If a valid settings file already exists, run only `enable`; for an invalid one,
+follow "Diagnose and recover" below. To opt out instead, create the kill-switch
+file. If a settings file exists, that is its configured `sentinel` path;
+otherwise it is `~/.genesis/codebase-memory-mcp.disabled`, or the path
+`CODEBASE_MEMORY_MCP_DISABLE_FILE` names:
+
+```bash
+touch "$HOME/.genesis/codebase-memory-mcp.disabled"
+```
+
+The alert reads the infrastructure profile, which refreshes at boot and daily.
+After either fix, run `infrastructure_profile(refresh=true)` and the alert
+clears at the next hourly posture check. Both the alert and the installer line
+come from `genesis.infra_profile.codebase_mcp`, so they always agree.
 
 ## Native lifecycle
 
@@ -194,6 +233,11 @@ A configure argument's symlink alias may contain a backslash if it resolves to a
 supported physical main/state path. Binary, interpreter, runtime, sentinel and
 settings paths retain their existing literal-path handling; this restriction
 applies to provider-consumed repository/cache identities.
+
+Runtime entry points validate those identities before cache checks, readiness
+retries or provider execution. An incompatible path therefore refuses promptly
+when enabling, launching, serving or checking readiness. Structural settings
+reads remain available for diagnosis and retirement.
 
 No service is enabled, no unit is rendered and no sentinel is removed.
 Configuration uses schema 2: paths and build identity, with no mutable `enabled`
@@ -374,6 +418,36 @@ The teardown helper retains its system Python entry point and uses only standard
 library operations available on the supported Python 3.10 platform. It does not
 perform the native binary hash/launch acceptance used by the installed query
 runtime. Current-install tests are not a separate Python 3.10 runtime qualification.
+
+## Queued indexing
+
+The existing idle-gated runner probes managed availability before and after
+claiming a Codebase-only request. Unavailability leaves the pending generation
+uncharged; a post-claim refusal durably restores it. A combined request can
+complete GitNexus and requeue its unfinished Codebase leg before consuming the
+combined request. Partial-success outcomes (rc 4/5) use the ordinary request
+writer: a new pending row starts at zero attempts; coalescing with an existing
+pending row retains that row's higher count. The original inflight attempt
+count is not carried into the split request. Operators must not manually reset
+attempts to force retries. Retry-budget continuity across splits and commit
+generations remains part of the resource-failure quarantine work.
+The runner records availability errors in its log; the index entry point includes
+the final refusal line in its skip diagnostic.
+
+The adapter executes the accepted native inode inside the admitted 8 GiB,
+zero-swap scope with a 6 GiB native budget. Its supervisor retains a nonmaximum
+OOM adjustment; only the native child receives 1000. The validated physical main
+path supplies both the native payload and working directory. Final admission
+rechecks managed settings, cache, native readiness and enablement under the
+lifecycle lock, which closes after child creation. Repository/runner locks and
+the scope watchdog retain execution ownership. Missing canonical repository
+locks refuse Codebase; GitNexus retains its independent handling.
+
+This wiring merged in #3012. Read-only availability/access repairs remain tracked
+in #3464. Neither fixture acceptance nor a successful probe grants permission to
+clear the sentinel, release the freeze or retry unattended after resource failures.
+Follow the supervised production acceptance and resource gates in
+`../architecture/codebase-managed-runtime.md`.
 
 ## Verification
 

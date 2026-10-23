@@ -18,7 +18,7 @@ import logging
 import httpx
 from fastmcp import FastMCP
 
-from genesis.security.card_shapes import contains_card_number
+from genesis.content.egress import gate
 
 logger = logging.getLogger(__name__)
 
@@ -222,13 +222,25 @@ async def send_reply(
         content: Message text (Discord markdown supported).
         reply_to: Message ID to reply to (creates a threaded reply).
 
-    A reply holding a payment card number is refused before any request is
-    sent; the refusal does not echo the number.
+    The complete reply passes through the outbound egress gate before chunking
+    or any request. Unsafe content or a failed check is refused without echoing
+    sensitive values; permitted replies use the gate's cleaned text.
     """
-    if contains_card_number(content):
+    try:
+        egress = gate(content, channel="discord")
+    except Exception:  # noqa: BLE001 — failed safety checks must not send or echo values
         return json.dumps(
-            {"error": "send_reply: refused, the message contains a payment card number."}
+            {"error": "send_reply: refused, the outbound safety check failed."}
         )
+    if egress.quarantined:
+        if egress.scan is not None and "payment_card" in egress.scan.detected:
+            return json.dumps(
+                {"error": "send_reply: refused, the message contains a payment card number."}
+            )
+        return json.dumps(
+            {"error": "send_reply: refused, the message contains sensitive content."}
+        )
+    content = egress.text
     try:
         headers = _headers()
     except RuntimeError as exc:

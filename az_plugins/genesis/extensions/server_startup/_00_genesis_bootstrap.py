@@ -63,6 +63,24 @@ class GenesisBootstrap(Extension):
         except Exception:
             logger.exception("Failed to register health blueprint")
 
+        # App-level dashboard gates (Host name, network scope, /api mutation
+        # auth), installed BEFORE anything below is mounted. Every host that
+        # mounts the dashboard blueprints must install them, and this extension
+        # is how Agent Zero mode mounts them. If they cannot be installed, mount
+        # nothing further: an ungated dashboard is worse than none (standalone
+        # fails to start in the same case). They are scoped to Genesis-owned
+        # paths, so AZ's own routes are untouched. Idempotent.
+        if webapp is not None:
+            try:
+                from genesis.dashboard.auth import apply_dashboard_gates
+
+                apply_dashboard_gates(webapp)
+            except Exception:
+                logger.exception(
+                    "Failed to apply dashboard auth gates; not mounting the dashboard"
+                )
+                return
+
         # Register Genesis dashboard blueprint
         try:
             if webapp is not None:

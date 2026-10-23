@@ -6,10 +6,12 @@ The trusted project `.codex/config.toml` connects `gitnexus` using
 supported Node runtime, and refuses missing, conflicting or mismatched installs.
 It does not download a package or rebuild the repository index at startup.
 
-The project explicitly admits 17 tools. A future tool added upstream is not
-automatically admitted. The list includes `rename`, `group_sync` and raw graph
-queries; tool availability is not authorization to edit code, update shared
-metadata or perform other mutations. The Genesis health and memory entries
+The project explicitly admits 15 tools. A future tool added upstream is not
+automatically admitted. Source-editing `rename` and group-metadata `group_sync`
+are excluded. Raw Cypher and group listing remain available. This catalog
+restriction does not make GitNexus side-effect-free: retained operations can
+recover/cache data, and it does not constrain a separate raw server or host
+operator. Tool availability still requires task authorization. The Genesis health and memory entries
 retain their existing narrow allowlists. Interactive Genesis writer activation
 is separate work; this connection does not enroll Codex in Genesis's lifecycle.
 
@@ -47,7 +49,8 @@ and an optional app-server connection and direct tool call after startup.
 The opt-in `tests/test_hooks/test_codex_gitnexus_native.py` qualifies installed
 Codex CLI and app-server binaries with the real pinned GitNexus package, copied
 project sources, a private registry, and a localhost fixture model provider.
-It checks conflicting user configuration and an excluded-tool control. No paid
+It checks conflicting user configuration, both excluded mutators, an independent
+excluded-list_repos control, and disabled-tool refusals on direct app-server calls. No paid
 model or production Genesis MCP bootstrap is used. Qualification applies to
 the recorded binaries and sources; it does not certify every graph/edit tool,
 desktop UI behavior or production data.

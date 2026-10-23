@@ -97,6 +97,14 @@ EXEMPT: dict[tuple[str, str], str] = {
     ("util/pytest_lock.py", "scripts/pytest_lock_wait.py"): (
         "named in the advice a blocked pytest prints; never executed"
     ),
+    ("payments/peer_check.py", "scripts/genesis_mcp_server.py"): (
+        "the expected argv of the genesis-health MCP server, compared against a "
+        "socket peer's /proc cmdline; never imported, run or read"
+    ),
+    ("memory/graph_census.py", "scripts/genesis_mcp_server.py"): (
+        "the entry script a memory server must run, compared against its /proc "
+        "argv by the census; never imported, run or read"
+    ),
     ("browser/engine.py", "scripts/install_browser_stack.sh"): (
         "named in the operator step an unready engine reports; an operator or the "
         "browser-stack unit runs it, never the server"
@@ -494,7 +502,11 @@ def test_the_scan_sees_each_shape_it_claims(tmp_path):
 # ── behaviour, through the deploy script ────────────────────────────────────
 # Named here so a parametrization cannot come up empty (an empty list would
 # collect no case and read as a pass); a test keeps them equal to the lists.
-_RELOAD = ("scripts/lib/index_marker.py", "scripts/hooks/worktree_claim.py")
+_RELOAD = (
+    "scripts/lib/index_marker.py",
+    "scripts/hooks/worktree_claim.py",
+    "scripts/hooks/secret_scrub.py",
+)
 _FRESH = (
     "scripts/disk_reclaim.py",
     "scripts/lib/live_checkout.py",
@@ -509,6 +521,12 @@ _FRESH = (
     "scripts/hooks/hook_output.py",
     "scripts/lib/disk_guardian.sh",
     "scripts/tmp_watchgod.sh",
+    "scripts/lib/serving_commit.py",
+    "scripts/codebase_managed.py",
+    "scripts/lib/codebase_managed_unit.py",
+    "scripts/lib/code_intel_cbm_admission.py",
+    "scripts/lib/code_intel_cbm_worker.py",
+    "scripts/lib/cbm_disable_file.sh",
     ".claude/hooks/genesis-hook",
 )
 

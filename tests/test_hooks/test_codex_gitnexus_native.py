@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import time
 import tomllib
 from pathlib import Path
 
@@ -18,6 +19,7 @@ pytestmark = pytest.mark.skipif(
     reason="native Codex and pinned GitNexus are separate opt-in requirements",
 )
 REPO = Path(__file__).resolve().parents[2]
+DEFERRED_MUTATORS = ("rename", "group_sync")
 SOURCES = (".codex/config.toml", ".claude/mcp/run-gitnexus", "scripts/lib/gitnexus_version.sh")
 
 
@@ -71,6 +73,26 @@ def _assert_empty_registry(result):
     assert data["pagination"]["hasMore"] is False
 
 
+def _expect_disabled_tool(driver, thread_id, tool, request_id):
+    """Capture only this expected refusal without weakening success-path RPCs."""
+    driver.send("mcpServer/tool/call", {
+        "threadId": thread_id, "server": "gitnexus", "tool": tool, "arguments": {},
+    }, request_id)
+    deadline = time.monotonic() + 30
+    while True:
+        event = driver.pending.get(timeout=max(0, deadline - time.monotonic()))
+        driver.events.append(event)
+        assert "closed" not in event and "invalid_json" not in event, event
+        assert not ("method" in event and "id" in event), event
+        if event.get("id") == request_id and "method" not in event:
+            assert "result" not in event and "error" in event, event
+            assert event["error"]["message"] == (
+                f"tool '{tool}' is disabled for MCP server 'gitnexus'"
+            ), event
+            return event
+        assert "error" not in event and "id" not in event, event
+
+
 @pytest.mark.parametrize("client", ["cli", "app"])
 @pytest.mark.parametrize("allowed", [True, False])
 def test_project_gitnexus_native_call_and_allowlist(tmp_path, client, allowed):
@@ -90,7 +112,12 @@ def test_project_gitnexus_native_call_and_allowlist(tmp_path, client, allowed):
             ".map(t => t.name).sort(); let result; "
             "try { result = await tools.mcp__gitnexus__list_repos({}); } "
             "catch (error) { result = {error: String(error)}; } "
-            'text("GITNEXUS_FIXTURE:" + JSON.stringify({catalog, result}));'
+            "const deferred = {}; "
+            'for (const name of ["rename", "group_sync"]) { '
+            'const key = "mcp__gitnexus__" + name; const type = typeof tools[key]; '
+            'try { deferred[name] = {type, result: await tools[key]({})}; } '
+            'catch (error) { deferred[name] = {type, error: String(error)}; } } '
+            'text("GITNEXUS_FIXTURE:" + JSON.stringify({catalog, result, deferred}));'
         ),
     }
     evidence = {"client": client, "allowed": allowed}
@@ -138,7 +165,7 @@ def test_project_gitnexus_native_call_and_allowlist(tmp_path, client, allowed):
                 server = catalog["data"][0]
                 assert server["runtimeStatus"] == "connected" and server["toolsError"] is None
                 assert server["serverInfo"]["version"] == "1.6.12"
-                assert set(gitnexus["enabled_tools"]) <= set(server["tools"])
+                assert set(gitnexus["enabled_tools"]) == set(server["tools"])
             finally:
                 driver.close()
             cli_binary = binary
@@ -175,6 +202,10 @@ def test_project_gitnexus_native_call_and_allowlist(tmp_path, client, allowed):
         returned = records[0]
         expected_names = expected["mcp_servers"]["gitnexus"]["enabled_tools"]
         assert returned["catalog"] == sorted("mcp__gitnexus__" + name for name in expected_names)
+        for name in DEFERRED_MUTATORS:
+            refusal = returned["deferred"][name]
+            assert refusal["type"] == "undefined", refusal
+            assert "not a function" in refusal.get("error", ""), refusal
         if allowed:
             _assert_empty_registry(returned["result"])
         else:
@@ -210,7 +241,9 @@ def test_optional_project_connects_and_calls_without_model(tmp_path):
             assert catalog["nextCursor"] is None and len(catalog["data"]) == 1
             server = catalog["data"][0]
             assert server["runtimeStatus"] == "connected" and server["toolsError"] is None
-            assert len(server["tools"]) == 17
+            expected = tomllib.loads((root / "workspace/.codex/config.toml").read_text())
+            selected = expected["mcp_servers"]["gitnexus"]["enabled_tools"]
+            assert len(selected) == 15 and set(server["tools"]) == set(selected)
             result = driver.request(
                 "mcpServer/tool/call",
                 {
@@ -223,6 +256,27 @@ def test_optional_project_connects_and_calls_without_model(tmp_path):
             )
             evidence["result"] = result
             _assert_empty_registry(result)
+            registry = root / "private-registry"
+            before = {
+                str(path.relative_to(registry)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in registry.rglob("*") if path.is_file()
+            }
+            evidence["refusals"] = {}
+            for request_id, tool in enumerate(DEFERRED_MUTATORS, 5):
+                evidence["refusals"][tool] = _expect_disabled_tool(
+                    driver, thread["id"], tool, request_id
+                )
+            after = {
+                str(path.relative_to(registry)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in registry.rglob("*") if path.is_file()
+            }
+            assert after == before, "disabled calls changed the private registry"
+            result_after = driver.request("mcpServer/tool/call", {
+                "threadId": thread["id"], "server": "gitnexus",
+                "tool": "list_repos", "arguments": {},
+            }, 7)
+            evidence["result_after"] = result_after
+            _assert_empty_registry(result_after)
             assert not requests, "catalog/call probe must not invoke a model"
         finally:
             driver.close()

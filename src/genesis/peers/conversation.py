@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -17,6 +19,8 @@ from genesis.cc.types import CCModel, EffortLevel
 from genesis.db.crud import cc_sessions
 from genesis.util.execution_privacy import private_execution
 from genesis.util.inflight import inflight
+
+logger = logging.getLogger(__name__)
 
 OWNED = (
     "source_tag='agent_api' AND "
@@ -212,8 +216,9 @@ class ConversationService:
                 system += "\n\n" + context
             except Exception:
                 pass  # Existing enrichment is optional; authority is not.
-        async with self.registry.transaction() as db:
-            await self._same_database(db)
+        # Identity reads use the runtime connection; finish them before taking
+        # the private write lock, which runtime finalization may be waiting for.
+        async with self.registry.transaction(before_begin=self._same_database) as db:
             await authorize(db, identity)
             row = await self._existing(db, sid, digest, identity)
             if row is not None:
@@ -299,12 +304,22 @@ class ConversationService:
                 # Never replay the receipt. If shutdown has begun, or this
                 # task is cancelled, stop retrying: the row stays active and
                 # boot reconciliation records it as outcome_unknown.
+                warning_at = 0.0
                 while True:
                     try:
                         await update_state(self.runtime._db, sid, "failed", error="not_started")
                         await cc_sessions.update_status(self.runtime._db, sid, status="failed")
                         break
-                    except Exception:
+                    except Exception as exc:
+                        now = time.monotonic()
+                        if now - warning_at >= 1.0:
+                            logger.warning(
+                                "Not-started receipt persistence unavailable; capacity retained "
+                                "(exception=%s, sqlite_errorname=%s)",
+                                type(exc).__name__,
+                                getattr(exc, "sqlite_errorname", None),
+                            )
+                            warning_at = now
                         if runner.closing:
                             break
                         await asyncio.sleep(0.1)

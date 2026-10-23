@@ -84,8 +84,12 @@ async def pending_approvals():
     # Approve on that would believe they cleared a stuck dispatch while
     # actually handing over their keyboard and mouse. Desktop consent belongs
     # to the purpose-built surface that names the target window back to them.
+    from genesis.payments.approval import PAYMENT_APPROVAL_ACTION_TYPE
+
+    # A card release is approved only by its Telegram tap (payments/approval.py).
     pending = [
-        r for r in pending if r.get("action_type") != DESKTOP_GATE_ACTION_TYPE
+        r for r in pending
+        if r.get("action_type") not in (DESKTOP_GATE_ACTION_TYPE, PAYMENT_APPROVAL_ACTION_TYPE)
     ]
     return jsonify(_parse_approval_rows(pending))
 

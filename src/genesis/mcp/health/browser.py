@@ -38,7 +38,10 @@ from fastmcp import Context
 from genesis.browser import chromium, engine, packages, profile_backup
 from genesis.browser.types import CAMOUFOX_PROFILE_DIR, BrowserLayer
 from genesis.mcp.health import mcp
+from genesis.security.card_redaction import CARD_FILTER, contains_card_text, redact_text
+from genesis.security.card_redaction import redacted as _redacted
 from genesis.security.card_shapes import contains_card_number
+from genesis.util.mcp_logging import configure_mcp_logging
 
 logger = logging.getLogger(__name__)
 
@@ -54,27 +57,20 @@ _REFUSE_CARD_RUN_JS = (
     "browser-automation skill, Safety gates)."
 )
 
-# File-based logging for the entire MCP health server — routes ALL log
-# output to ~/tmp/mcp_health.log so it's readable after timeouts.
-# The MCP server runs as a CC child process; its stderr is inaccessible.
-_mcp_log_dir = Path.home() / "tmp"
-if _mcp_log_dir.is_dir():
-    _mcp_fh = logging.FileHandler(_mcp_log_dir / "mcp_health.log")
-    _mcp_fh.setFormatter(logging.Formatter(
-        "%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    ))
-    _mcp_fh.setLevel(logging.DEBUG)
-    # Attach to root logger so ALL genesis.* logs are captured
-    logging.getLogger("genesis").addHandler(_mcp_fh)
+# Read the environment once, at import; optional logging cannot abort startup.
+# The shared selector also gives daily rotation the same fixed absolute path.
+_mcp_log_dir = configure_mcp_logging(CARD_FILTER)
 
 # Direct file-write debug log for Turnstile — bypasses logging framework
 # entirely to guarantee output is visible. The logging.FileHandler approach
 # produced empty files despite correct setup (likely a process/import issue).
-_TS_LOG_PATH = Path.home() / "tmp" / "turnstile_debug.log"
+_TS_LOG_PATH = _mcp_log_dir / "turnstile_debug.log" if _mcp_log_dir is not None else None
 
 
 def _ts_log_write(msg: str) -> None:
     """Write a timestamped line directly to the Turnstile debug log."""
+    if _TS_LOG_PATH is None:
+        return
     try:
         # Deliberate LOCAL import despite the module-level one: it keeps this
         # writer out of reach of patch.object(browser, "datetime"), which the
@@ -86,7 +82,7 @@ def _ts_log_write(msg: str) -> None:
 
         ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         with open(_TS_LOG_PATH, "a") as f:
-            f.write(f"{ts} {msg}\n")
+            f.write(f"{ts} {redact_text(msg)}\n")
             f.flush()
     except Exception:
         pass  # debug logging must never crash the tool
@@ -104,6 +100,32 @@ class _TsLog:
 
 
 _ts_log = _TsLog()
+
+
+# ---------------------------------------------------------------------------
+# Card-number redaction of tool output and logs
+# ---------------------------------------------------------------------------
+# A page can show a card number. Every _impl_browser_* result passes through
+# @_redacted, and CARD_FILTER (security/card_redaction.py) sits on the loggers
+# below and on the mcp_health.log handler. A logger filter sees only records
+# created on that logger, so each emitting logger is named: this module, the
+# genesis.browser modules it calls, FastMCP's tool and server loggers
+# (tool_manager logs a tool exception with its traceback, server logs call
+# arguments at debug) and the MCP SDK's lowlevel server logger. Logger-level,
+# because FastMCP's configure_logging replaces the fastmcp handlers.
+_REDACTED_LOGGERS = (
+    __name__,
+    "genesis.browser.engine",
+    "genesis.browser.profile",
+    "genesis.browser.profile_backup",
+    "genesis.browser.provision",
+    "fastmcp.tools.tool_manager",
+    "fastmcp.tools.tool",
+    "fastmcp.server.server",
+    "mcp.server.lowlevel.server",
+)
+for _name in _REDACTED_LOGGERS:
+    logging.getLogger(_name).addFilter(CARD_FILTER)
 
 # Prevents concurrent browser init/cleanup races across tool calls.
 _browser_lock = asyncio.Lock()
@@ -1740,8 +1762,9 @@ async def _with_tool_timeout(
         global _active_page
         logger.warning("%s timed out after %.0fs — resetting active page", operation, timeout_s)
         _active_page = None
+        # Outside @_redacted: the operation names the caller's selector or key.
         return {
-            "error": (
+            "error": redact_text(
                 f"{operation} timed out after {timeout_s:.0f}s. {note}"
                 "Browser state was reset — call browser_navigate to resume."
             )
@@ -2475,14 +2498,14 @@ async def _send_turnstile_alert(page_url: str) -> None:
             severity=AlertSeverity.WARNING,
             title="CAPTCHA Challenge Detected",
             body=(
-                f"Browser at {page_url} hit a Cloudflare challenge. "
+                f"Browser at {redact_text(page_url)} hit a Cloudflare challenge. "
                 f"Auto-resolve and VNC click both failed after multiple attempts. "
                 f"Genesis will retry on next navigation.\n\n"
                 f"VNC available at: {vnc_url}"
             ),
         )
         await channel.send(alert)
-        logger.info("CAPTCHA alert sent to Telegram for %s", page_url)
+        logger.info("CAPTCHA alert sent to Telegram for %s", redact_text(page_url))
     except Exception:
         logger.warning("Failed to send CAPTCHA Telegram alert", exc_info=True)
 
@@ -3241,6 +3264,7 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
 # ---------------------------------------------------------------------------
 
 
+@_redacted
 async def _impl_browser_navigate(
     url: str,
     stealth: bool = True,
@@ -3612,6 +3636,7 @@ async def _follow_new_page(old, new) -> str | None:
     return None
 
 
+@_redacted
 async def _impl_browser_click(selector: str) -> dict:
     """Click an element on the current page.
 
@@ -4125,6 +4150,7 @@ async def _with_stall_diagnostics(
     return result
 
 
+@_redacted
 async def _impl_browser_fill(selector: str, value: str) -> dict:
     """Fill a form field on the current page.
 
@@ -4203,6 +4229,7 @@ async def _fill(page, selector: str, value: str) -> dict:
             nav.stop()
 
 
+@_redacted
 async def _impl_browser_upload(selector: str, file_path: str) -> dict:
     """Upload a file to a file input element on the current page.
 
@@ -4238,6 +4265,81 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
             return {"error": f"Upload failed on '{selector}': {e}"}
 
 
+# A screenshot is pixels: text redaction cannot reach a card number drawn in
+# it. Before capturing, every frame is read for the text a page can RENDER:
+# innerText, every element's placeholder, value, aria-label, aria-placeholder,
+# aria-valuetext, title and alt attributes, <option> text, form-field values,
+# CSS ::before/::after content (an attr() there is resolved), SVG text, and
+# the same inside open shadow roots. The pieces go through the split-aware card
+# check; a card number anywhere refuses the capture and no file is written. A
+# frame that cannot be read refuses it as well, except one already detached.
+# Not read: text drawn into a canvas or an image, closed shadow roots, and a
+# change to the page between this read and the capture.
+_PAGE_TEXT_JS = r"""() => {
+  const out = [document.body ? document.body.innerText : ''];
+  const ATTRS = ['placeholder', 'value', 'aria-label', 'aria-placeholder',
+                 'aria-valuetext', 'title', 'alt'];
+  const pseudo = (el, which) => {
+    const c = getComputedStyle(el, which).content;
+    if (!c || c === 'none' || c === 'normal') return;
+    out.push(c.replace(/attr\(([^)]+)\)/g, (_, n) => el.getAttribute(n.trim()) || ''));
+  };
+  const visit = (root) => {
+    for (const el of root.querySelectorAll('*')) {
+      // A field's live value replaces its value attribute: reading both would
+      // repeat each group and hide a segmented card from the split check.
+      const field = el.matches('input, textarea, select');
+      for (const a of ATTRS) {
+        const v = a === 'value' && field ? null : el.getAttribute(a);
+        if (v) out.push(v);
+      }
+      if (field) out.push(String(el.value || ''));
+      if (el.matches('option')) out.push(el.text || '');
+      if (el instanceof SVGElement && el.matches('text, tspan')) out.push(el.textContent || '');
+      pseudo(el, '::before');
+      pseudo(el, '::after');
+      if (el.shadowRoot) {
+        for (const child of el.shadowRoot.children) out.push(child.innerText || '');
+        visit(el.shadowRoot);
+      }
+    }
+  };
+  visit(document);
+  return out.join('\n');
+}"""
+_SCREENSHOT_FRAME_READ_S: float = 5.0
+_REFUSE_CARD_SCREENSHOT = (
+    "Refused: the page shows what looks like a payment card number, so no "
+    "screenshot was taken. Use browser_snapshot, which redacts it."
+)
+_REFUSE_UNREAD_SCREENSHOT = (
+    "Refused: a frame of the page could not be read to check it for a payment "
+    "card number, so no screenshot was taken."
+)
+
+
+async def _screenshot_refusal(page) -> str | None:
+    """A fixed refusal when the page may show a card number, else None."""
+    texts = []
+    for frame in list(page.frames):
+        try:
+            text = await asyncio.wait_for(
+                frame.evaluate(_PAGE_TEXT_JS), timeout=_SCREENSHOT_FRAME_READ_S
+            )
+        except Exception:
+            if frame.is_detached():
+                continue
+            logger.warning("Screenshot card check could not read a frame", exc_info=True)
+            return _REFUSE_UNREAD_SCREENSHOT
+        texts.append(text if isinstance(text, str) else str(text))
+    if not texts:
+        return _REFUSE_UNREAD_SCREENSHOT
+    if contains_card_text("\n".join(texts)):
+        return _REFUSE_CARD_SCREENSHOT
+    return None
+
+
+@_redacted
 async def _impl_browser_screenshot() -> dict:
     """Take a screenshot of the current page."""
     _touch()
@@ -4249,6 +4351,9 @@ async def _impl_browser_screenshot() -> dict:
             return health
         page = _active_page
     try:
+        refusal = await _screenshot_refusal(page)
+        if refusal:
+            return {"error": refusal, "url": page.url}
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         # Unique per call: consecutive captures must not overwrite one another
         # (a session capturing 8 pages kept only the last one). The timestamp
@@ -4272,6 +4377,7 @@ async def _impl_browser_screenshot() -> dict:
         return {"error": f"Screenshot failed: {e}"}
 
 
+@_redacted
 async def _impl_browser_snapshot() -> dict:
     """Return the accessibility tree snapshot of the current page."""
     global _remote_last_url
@@ -4321,6 +4427,7 @@ async def _evaluate_main_world(page, expression: str):
     return await page.evaluate(expression)
 
 
+@_redacted
 async def _impl_browser_run_js(expression: str) -> dict:
     """Execute JavaScript on the current page and return the result.
 
@@ -4431,6 +4538,7 @@ def _cookie_key(cookie: dict) -> tuple:
     )
 
 
+@_redacted
 async def _impl_browser_sessions() -> dict:
     """List cookie counts per domain in both local browser profiles.
 
@@ -4487,6 +4595,7 @@ async def _impl_browser_sessions() -> dict:
     return {"profiles": profiles}
 
 
+@_redacted
 async def _impl_browser_clear_domain(domain: str) -> dict:
     """Clear the cookies of a domain and its subdomains in both profiles.
 
@@ -4567,6 +4676,7 @@ async def _impl_browser_clear_domain(domain: str) -> dict:
     return {"domain": d, "cookies_removed": total, "profiles": profiles}
 
 
+@_redacted
 async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
     """Press a keyboard key on the current page."""
     _touch()
@@ -4781,6 +4891,11 @@ async def browser_screenshot() -> dict:
     call gets its own file, so consecutive screenshots don't overwrite one
     another and sort chronologically) and returns the path. Always read the
     returned "path" — never reconstruct it. Use the Read tool to view it.
+
+    Refused, with no file written, when the text the page renders in any
+    frame (visible text, form values, placeholders, labels, titles, alt text,
+    CSS-generated content) shows a payment card number, or a frame cannot be
+    read to check.
     """
     return await _with_tool_timeout(
         _impl_browser_screenshot(), 30.0, "browser_screenshot"
@@ -4879,6 +4994,7 @@ async def browser_collaborate(enable: bool = True) -> dict:
     return _impl_browser_collaborate(enable)
 
 
+@_redacted
 def _impl_browser_collaborate(enable: bool = True) -> dict:
     """Set the timing profile explicitly (see browser_collaborate)."""
     global _collaborate_mode

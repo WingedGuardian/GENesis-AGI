@@ -49,6 +49,14 @@ fi
 # Pluggable Tier-2 (off-site) backend interface — selects none/local/smb at runtime
 # (backward-compat: a configured GENESIS_BACKUP_NAS with no selector → smb).
 _SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Test fence first (sourced): this script acts on ${GENESIS_DIR:-$HOME/genesis},
+# and the refusal must precede the validation run and status writes below — so
+# GENESIS_DIR resolves here, not at its old later site. No-op unless the
+# suite-wide fence arms GENESIS_TEST_FENCE_LIVE_ROOTS.
+GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
+# shellcheck source=scripts/lib/live_system_guard.sh
+source "$_SCRIPT_DIR/lib/live_system_guard.sh"
+refuse_if_test_fenced_live "$GENESIS_DIR" || exit 97
 # shellcheck source=scripts/lib/backup_backends.sh
 source "$_SCRIPT_DIR/lib/backup_backends.sh"
 # Load definitions before the off-site credential lease and its RETURN cleanup.
@@ -61,6 +69,7 @@ DRY_RUN=false
 FORCE=false
 REFRESH_SNAPSHOT=false
 _RESTORE_MANAGED=false
+_PV_GAP=""  # set from the selected snapshot's COMPLETE marker (payment_vault <status>)
 DATABASE_ONLY=false
 _TRANSCRIPT_PREFERENCES=()
 while [ $# -gt 0 ]; do
@@ -151,17 +160,30 @@ _cleanup_plaintext() {
     if [ -n "${_DB_STAGE:-}" ]; then
         rm -f "$_DB_STAGE" "$_DB_STAGE-journal" "$_DB_STAGE-wal" "$_DB_STAGE-shm" 2>/dev/null || true
     fi
+    # §8 card vault: once staging began, every .payment_vault.* temp under
+    # CREDS_STAGE (the decrypted tar, the unpacked set) is this run's or an
+    # earlier killed run's, never a placed set (payment_vault) or an aside
+    # (payment_vault.pre-restore-*); the run holds the restore lock. A glob, not
+    # recorded names: the unpack creates its directory inside a subshell.
+    if [ -n "${_PV_STAGING:-}" ] && [ -n "${CREDS_STAGE:-}" ]; then
+        for _pv_tmp in "${CREDS_STAGE%/}"/.payment_vault.*; do
+            [ -e "$_pv_tmp" ] || [ -L "$_pv_tmp" ] || continue
+            rm -rf -- "$_pv_tmp" 2>/dev/null || true
+        done
+    fi
 }
 trap '_cleanup_plaintext; _write_status; _release_deploy_marker; backend_cleanup' EXIT
 
 # ── Setup ────────────────────────────────────────────────────────────
-GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
+# GENESIS_DIR resolved at the top of the script, before the test-fence check.
 BACKUP_DIR="$HOME/backups/genesis-backups"
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
 # shellcheck source=scripts/lib/backup_core_paths.sh
 source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
+# shellcheck source=scripts/lib/payment_vault_backup.sh
+source "$_SCRIPT_DIR/lib/payment_vault_backup.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-restore]"
@@ -304,6 +326,94 @@ decrypt_file() {
     backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
     printf '%s' "$_BACKUP_PASSPHRASE" | python3 \
         "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup "$src" "$dst" 2>/dev/null
+}
+
+# _pv_overlaps <a> <b>: true when the two paths are the same or one holds the
+# other. Staging the card vault must never land on (or over) the live vault,
+# which a GENESIS_CREDS_STAGE pointed at GENESIS_HOME would do with no symlink.
+_pv_overlaps() {
+    local a b
+    # The staging path's own last component stays literal: an earlier staged
+    # copy that is a symlink is moved aside (never followed) by _pv_stage_vault.
+    a="$(realpath -m -- "$(dirname -- "$1")")/$(basename -- "$1")"
+    b="$(realpath -m -- "$2")"
+    case "$a/" in "$b/"*) return 0 ;; esac
+    case "$b/" in "$a/"*) return 0 ;; esac
+    return 1
+}
+
+# The live vault under every resolution of GENESIS_HOME: the value now, the one
+# the core-path lib took when sourced (the shell's, which the vault CLI uses), and
+# the one secrets.env sets (the server's), read on its own because restore loads
+# secrets.env wholesale only when GENESIS_MERGE_OVERRIDE_DIR is unset.
+# _PV_OVERLAP names the one that matched.
+_pv_overlaps_live() {
+    local live
+    for live in "$_PV_LIVE" "$_BACKUP_CORE_VAULT" ${_PV_SECRETS_VAULT:+"$_PV_SECRETS_VAULT"} \
+        "$HOME/.genesis/payment_vault"; do
+        if _pv_overlaps "$1" "$live"; then
+            _PV_OVERLAP="$live"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# _pv_stage_vault: decrypt $_PV_ARCHIVE into a private temp file, unpack it into
+# a NEW directory (payment_vault_unpack checks member types, names and the
+# vault itself), move any earlier staged vault aside (never deleted), then
+# rename the new one into place and print how to use it. Never places it.
+_pv_stage_vault() {
+    local tarf dir why aside
+    _PV_STAGING=1  # from here on, the EXIT trap removes any .payment_vault.* temp
+    tarf="$(umask 077 && mktemp -p "$CREDS_STAGE" .payment_vault.tar.XXXXXX 2>/dev/null)" || {
+        warn "Payment vault: cannot create a temp file in $CREDS_STAGE; not staged"
+        return 1
+    }
+    if ! decrypt_file "$_PV_ARCHIVE" "$tarf"; then
+        rm -f -- "$tarf"
+        warn "Payment vault: decrypting $PAYMENT_VAULT_ARCHIVE failed; not staged"
+        return 1
+    fi
+    if ! dir="$(payment_vault_unpack "$tarf" "$CREDS_STAGE")"; then
+        why="$dir"
+        rm -f -- "$tarf"
+        warn "Payment vault: the archive failed its check ($why); not staged, do not use it"
+        return 1
+    fi
+    rm -f -- "$tarf"
+    if [ -e "$_PV_STAGE" ] || [ -L "$_PV_STAGE" ]; then
+        aside="$_PV_STAGE.pre-restore-$(date -u +%Y%m%dT%H%M%SZ).$$"
+        if ! mv -T -- "$_PV_STAGE" "$aside"; then
+            rm -rf -- "$dir"
+            warn "Payment vault: could not move the earlier staged vault aside; not staged"
+            return 1
+        fi
+        log "Payment vault: the earlier staged copy was moved aside to $aside"
+    fi
+    if ! mv -T -- "$dir" "$_PV_STAGE"; then
+        rm -rf -- "$dir"
+        warn "Payment vault: could not rename the staged vault into place; not staged"
+        return 1
+    fi
+    log "Payment vault: staged at $_PV_STAGE (NOT placed). To use it, on a box with no vault:"
+    log "      1. confirm $_PV_LIVE does not exist (placing it over a live vault would bring"
+    log "         back retired cards or replace a newer key)"
+    log "      2. systemctl --user stop genesis-server"
+    log "      3. mv -T \"$_PV_STAGE\" \"$_PV_LIVE\""
+    log "      4. systemctl --user start genesis-server, then: python -m genesis vault unlock"
+    log "         (a successful unlock proves the passphrase and the key match)"
+    if [ -n "$_PV_SECRETS_VAULT" ] \
+        && [ "$(realpath -m -- "$_PV_SECRETS_VAULT")" != "$(realpath -m -- "$_PV_LIVE")" ]; then
+        log "      NOTE: genesis-server reads the vault at $_PV_SECRETS_VAULT (GENESIS_HOME in"
+        log "      secrets.env), not $_PV_LIVE: use that path in steps 1 and 3"
+    fi
+    log "      Until it is placed (or retired: git rm creds/$PAYMENT_VAULT_ARCHIVE in the backups"
+    log "      repo), every backup reports payment_vault: missing and fails."
+    if [ "$CREDS_SRC_DIR" != "$BACKUP_DIR/creds" ]; then
+        warn "Payment vault: it came from the fallback copy $CREDS_SRC_DIR (the host mirror or its never-pruned archive), which may hold a vault since retired"
+    fi
+    return 0
 }
 
 # read_payload <path-without-.gpg> → echo resolved path and whether decryption needed.
@@ -581,6 +691,11 @@ PYBOUNDARY
             [ ! -d "$BACKUP_DIR/extra" ] || _EXTRA_PULLED=$(find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -printf '%f\n')
         fi
         while IFS= read -r fname; do warn "off-site: snapshot does not hold extra directory $fname (backup skipped it that run)"; done < <(awk '$1 == "skipped" {$1=""; sub(/^ /, ""); print}' "$marker" | tr -cd '[:print:]\n')
+        # The run that wrote this snapshot did not back up the card vault (§8 says so).
+        if grep -q '^payment_vault' "$marker"; then
+            _PV_GAP="$(awk '$1 == "payment_vault" {print $2; exit}' "$marker" | tr -cd 'a-z')"
+            _PV_GAP="${_PV_GAP:-unknown}"  # a malformed line still means a gap
+        fi
     elif [ -s "$marker" ]; then warn "off-site: unknown COMPLETE format; extra recovery withheld"; fi
 }
 
@@ -1659,11 +1774,95 @@ if [ -d "$CREDS_SRC_DIR" ]; then
         else
             warn "Creds: decrypt failed for $_rel"
         fi
-    done < <(find "$CREDS_SRC_DIR" -type f -name '*.gpg' -print0)
+    done < <(find "$CREDS_SRC_DIR" -type f -name '*.gpg' ! -name "$PAYMENT_VAULT_ARCHIVE" ! -name "$PAYMENT_VAULT_LAST_GOOD" -print0)
     umask "$_prev_umask"
     if ! $DRY_RUN; then
         log "Creds: $_CREDS_STAGED file(s) decrypted → $CREDS_STAGE (staged, NOT auto-placed)"
         log "      Move into place manually (ssh/ → ~/.ssh/, gh_hosts.yml → ~/.config/gh/hosts.yml, etc.)."
+    fi
+    # The card vault: one archive, decrypted here (never by the loop above) and
+    # only after its checks, so a refused archive never leaves a plaintext copy
+    # behind. It comes from this restore's source: an off-site pull reads the
+    # selected snapshot's private view (CREDS_SRC_DIR is under it), never the
+    # checkout, so an archive left there by an older backup cannot be staged.
+    # A DRY RUN of an off-site restore is the exception: it selects and pulls
+    # nothing, so CREDS_SRC_DIR is still the checkout, and what is there says
+    # nothing about the snapshot a real run would select.
+    _PV_ARCHIVE="$CREDS_SRC_DIR/$PAYMENT_VAULT_ARCHIVE"
+    _PV_STAGE="$CREDS_STAGE/payment_vault"
+    _PV_LIVE="$(_backup_core_home)/payment_vault"
+    # The vault genesis-server uses when secrets.env sets GENESIS_HOME: read with
+    # the server's own parser (python-dotenv, which interpolates ${VAR}), an empty
+    # value meaning the default as in genesis.env.genesis_home(), and a relative
+    # one anchored at the repo, the unit's WorkingDirectory. Only that key leaves
+    # the file.
+    _PV_SECRETS_VAULT=""
+    if [ -f "$SECRETS_FILE" ]; then
+        _pv_py="$_SCRIPT_DIR/../.venv/bin/python"
+        [ -x "$_pv_py" ] || _pv_py="$(command -v python3.12 || command -v python3 || true)"
+        if [ -n "$_pv_py" ] && _PV_SECRETS_VAULT="$("$_pv_py" -I -c '
+import os, sys
+try:
+    from dotenv import dotenv_values
+except ImportError:
+    sys.exit(3)
+value = dotenv_values(sys.argv[1]).get("GENESIS_HOME")
+if value is not None:
+    home = os.path.expanduser(value) if value else os.path.expanduser("~/.genesis")
+    print(os.path.join(sys.argv[2], home, "payment_vault"))
+' "$SECRETS_FILE" "$GENESIS_DIR" 2>/dev/null)"; then
+            :
+        else
+            # No python-dotenv: the shell parser (no ${VAR} interpolation).
+            _PV_SECRETS_VAULT="$(
+                unset GENESIS_HOME
+                # shellcheck source=scripts/lib/load_secrets.sh
+                source "$_SCRIPT_DIR/lib/load_secrets.sh" >/dev/null 2>&1 \
+                    && load_secrets_file "$SECRETS_FILE" >/dev/null 2>&1
+                # A ${VAR} value needs dotenv's interpolation: no guess here.
+                if [ -n "${GENESIS_HOME+x}" ] && [[ "$GENESIS_HOME" != *'$'* ]]; then
+                    _BACKUP_CORE_CWD="$GENESIS_DIR"
+                    printf '%s/payment_vault' "$(_backup_core_home)"
+                fi
+            )"
+        fi
+    fi
+    _PV_STAGED=false
+    if $DRY_RUN && $_RESTORE_MANAGED; then
+        # The refusals that do not depend on the snapshot still apply, so a dry
+        # run never predicts a stage the real run would refuse.
+        if ! command -v realpath >/dev/null 2>&1; then
+            warn "Payment vault: not staged. realpath is not installed, so the staging path cannot be checked against the live vault"
+        elif _pv_overlaps_live "$_PV_STAGE"; then
+            warn "Payment vault: not staged. Its staging path $_PV_STAGE overlaps the live vault $_PV_OVERLAP (check GENESIS_CREDS_STAGE)"
+        else
+            log "Creds: would stage the card vault only if the selected off-site snapshot holds $PAYMENT_VAULT_ARCHIVE (a dry run pulls nothing, so it cannot tell)"
+        fi
+    elif [ -n "${_PV_GAP:-}" ]; then
+        # The selected snapshot's run did not back up the vault. What it carries is
+        # an earlier run's archive, which is not staged as if it were this snapshot's.
+        if [ -f "$CREDS_SRC_DIR/$PAYMENT_VAULT_LAST_GOOD" ] && [ ! -L "$CREDS_SRC_DIR/$PAYMENT_VAULT_LAST_GOOD" ]; then
+            warn "Payment vault: not staged. The selected snapshot's backup did not capture the vault (vault step: $_PV_GAP). It carries the last good archive from an earlier run at $CREDS_SRC_DIR/$PAYMENT_VAULT_LAST_GOOD. To stage that one, make a new empty directory <dir>, copy the file to <dir>/creds/$PAYMENT_VAULT_ARCHIVE, and run restore.sh --from <dir>"
+        else
+            warn "Payment vault: not staged. The selected snapshot's backup did not capture the vault (vault step: $_PV_GAP), and no earlier archive was pulled from it (see any off-site pull warning above)"
+        fi
+    elif [ -L "$_PV_ARCHIVE" ]; then
+        warn "Payment vault: not staged. $PAYMENT_VAULT_ARCHIVE in the backup source is a symlink"
+    elif [ -f "$_PV_ARCHIVE" ]; then
+        if ! command -v realpath >/dev/null 2>&1; then
+            warn "Payment vault: not staged. realpath is not installed, so the staging path cannot be checked against the live vault"
+        elif _pv_overlaps_live "$_PV_STAGE"; then
+            warn "Payment vault: not staged. Its staging path $_PV_STAGE overlaps the live vault $_PV_OVERLAP (check GENESIS_CREDS_STAGE)"
+        elif $DRY_RUN; then
+            log "Creds: would stage the card vault from $PAYMENT_VAULT_ARCHIVE"
+            _PV_STAGED=true
+        else
+            _pv_stage_vault && _PV_STAGED=true
+        fi
+    fi
+    # Whatever is still at the staging path was not written by this restore.
+    if ! $_PV_STAGED && ! $DRY_RUN && [ -e "$_PV_STAGE/identity.age" ]; then
+        log "NOTE: $_PV_STAGE holds a vault from an EARLIER restore, not from this backup"
     fi
 else
     log "Creds: no backup payload at $CREDS_SRC_DIR"

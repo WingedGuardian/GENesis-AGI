@@ -106,6 +106,8 @@ def write_capabilities_file(runtime: GenesisRuntime) -> None:
             capabilities[name] = {"status": "active", "description": desc}
         elif raw_status == "degraded":
             capabilities[name] = {"status": "degraded", "description": desc}
+        elif raw_status == "disabled":
+            capabilities[name] = {"status": "disabled", "description": desc}
         else:
             error_msg = raw_status.removeprefix("failed: ") if raw_status.startswith("failed:") else raw_status
             capabilities[name] = {

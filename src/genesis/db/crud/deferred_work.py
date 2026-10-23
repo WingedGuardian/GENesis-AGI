@@ -248,6 +248,27 @@ async def complete_open_by_identity(
     return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
 
+async def count_pending_split(
+    db: aiosqlite.Connection,
+    *,
+    work_types: frozenset[str],
+    stale_cutoff_iso: str,
+) -> dict[str, int]:
+    """Measure related pending populations in one statement with one cutoff."""
+    placeholders = ",".join("?" * len(work_types))
+    batch = f"work_type IN ({placeholders})" if work_types else "0"
+    async with db.execute(
+        f"WITH pending AS (SELECT {batch} AS batch, deferred_at < ? AS stale "
+        "FROM deferred_work_queue WHERE status = 'pending') "
+        "SELECT COUNT(*), COUNT(CASE WHEN NOT batch OR stale THEN 1 END), "
+        "COUNT(CASE WHEN batch THEN 1 END), "
+        "COUNT(CASE WHEN batch AND stale THEN 1 END) FROM pending",
+        [*work_types, stale_cutoff_iso],
+    ) as cursor:
+        row = await cursor.fetchone()
+    return dict(zip(("total", "recovery", "worklist", "stalled"), map(int, row), strict=True))
+
+
 async def count_recovery_pending(
     db: aiosqlite.Connection,
     *,

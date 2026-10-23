@@ -23,8 +23,8 @@ Layout of ``~/.genesis/payment_vault/`` (directory 0700, every file 0600):
   card is sealed to a key that cannot open it.
 
 Only virtual cards go in: every card is scoped to one merchant, or marked
-single-use, or both. Decryption of cards is not here; the vault service that
-unlocks the identity and fills a card comes later.
+single-use, or both. Decrypting a card for a release the owner approved is in
+``vault_release_store``.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import time
 import unicodedata
 from contextlib import closing, contextmanager, suppress
 from datetime import UTC, datetime
@@ -198,13 +199,17 @@ def _read_small(file: Path, limit: int = 4096) -> bytes:
 
 
 @contextmanager
-def _dir_lock(path: Path):
+def _dir_lock(path: Path, *, tries: int | None = None, pause_s: float = 0.1):
     """Hold an exclusive lock on the vault directory (one writer at a time).
 
     Yields the directory's file descriptor. Init, add and retire write through
     it, so everything they touch lands in the directory they locked even if
-    another directory is moved onto the path meanwhile.
+    another directory is moved onto the path meanwhile. With ``tries``, the
+    lock is tried that many times ``pause_s`` apart and then refused, so a
+    caller in a thread is never left waiting on it for good.
     """
+    if tries is not None and tries < 1:
+        raise ValueError("tries must be at least 1")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
@@ -214,7 +219,19 @@ def _dir_lock(path: Path):
     except OSError as exc:
         raise VaultError(f"the vault directory cannot be opened ({exc.strerror})") from None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if tries is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            for attempt in range(tries):
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if attempt + 1 == tries:
+                        raise VaultError(
+                            "the vault is busy (another vault command holds it)"
+                        ) from None
+                    time.sleep(pause_s)
         yield fd
     finally:
         os.close(fd)
@@ -325,6 +342,19 @@ def _check_bound_keys(path: Path, sealed: bytes) -> None:
             "recipient.txt is not the public key this vault was created with (replaced?); "
             "restore the vault from backup"
         )
+
+
+def verify_set(path: Path) -> None:
+    """Everything the vault requires of its three files, checked without the passphrase.
+
+    The sealed identity's shape, the exact schema (``_shape``: version, DDL, no
+    other objects), the whole recipient file with its checksum, and the key pair
+    recorded at init. Backup and restore run this (``payment_vault_check`` in
+    scripts/lib/payment_vault_backup.sh), so a set the vault would refuse is
+    never published over the last good archive. Raises VaultError on the first
+    defect.
+    """
+    _check_bound_keys(path, _check_identity(path))
 
 
 def _translate(exc: sqlite3.Error) -> VaultError:

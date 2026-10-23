@@ -93,6 +93,21 @@ rechecks its existing breaker and ceiling before hooks or execution. Native
 profile/roster model selection still applies; interact currently pins Opus before
 normal roster handling, so a requested tier is not a guaranteed provider/model.
 
+Managed turns now perform provider readiness selection before executing the
+task: a home-provider rate/quota refusal can select a configured roster backup.
+Preflight remains inside the existing task deadline and concurrency reservation;
+it does not execute the peer's prompt. The chosen provider retains the same
+background profile, authority ceiling and owner approval gates. See
+[native provider selection](native-managed-sessions.md#provider-selection-before-work).
+
+After task execution starts, a later limit fails the task without another
+provider attempt. Failed turns are not waiting for a quota reset. An exact
+message-ID retry returns the original receipt, including a terminal failure;
+an intentional new turn needs a new message ID. **Fallback** on the neural
+monitor reports the last actual fallback outcome, and the dashboard's last
+successful fallback indicator is historical rather than a claim that all
+concurrent tasks use that model.
+
 Send returns the A2A `SendMessageResponse` task. Persist its task/context IDs.
 Reuse `messageId` and identical parsed request semantics for retry: one receipt,
 one adoption. Changing that message's content/options conflicts. Context IDs are
@@ -104,6 +119,22 @@ without work. Capacity stays reserved through cancellation and uncertain cleanup
 Once the runtime starts shutting down, new sends return 503 and in-flight
 admissions are drained or cancelled before sessions stop; an admission cut off
 there is recorded as outcome unknown after restart, never replayed.
+
+A send that is still being admitted when the route's 15-second bound expires
+returns `503 not_ready`, but the admission is not abandoned: it keeps running,
+and either commits its receipt or is refused (403, 404, 409 or 429) after the
+response has gone. Retry a 503 send with the **same** `messageId` and the same
+request, never a new one: an exact retry returns the original receipt
+(idempotent), or the refusal, while a new message ID is a second turn and
+duplicates the work. A same-ID retry that arrives while the original admission
+has not yet committed waits on that same work rather than starting its own, so
+it can itself return 503 with the same `taskId`; retry again later. When a send
+fails with 503 after computing its receipt (a timeout, or a failure after the
+receipt committed), the body carries the receipt ID the send computed as a
+top-level `taskId` (beside `code`), so a client can poll `GET /tasks/<taskId>`
+instead of resending. The send may still be refused, so that poll can return
+404 until admission commits the receipt and stays 404 if it was refused: treat
+a 404 there as "not yet known" and fall back to the same-`messageId` retry.
 
 Each fresh native turn gets at most eight previous prompt/reply heads, each at
 most 4 KiB UTF-8, with an overall 64 KiB prior-context cap and visible omissions.

@@ -10,12 +10,18 @@ checkout are supported.
 
 The caller supplies the complete corpus, reference policy, independently read
 current policy, human reference approval, explicit candidate parameters, and
-frozen reference source files (`path -> SHA-256`). Admission uses the existing
+frozen reference source identities (`logical origin path -> SHA-256`) and
+`source_retention` in the genuine human approval. Complete admission verifies
+the primary archive and separately restored backup at admission and completion;
+temporary-only originals cannot satisfy this requirement. The diagnostic
+`source_evidence` primitive can still inspect original paths without retention,
+but that is not complete admission. See `qualification-runner.md` for the
+archive command and genuine backup/restore requirements. Admission uses the existing
 corpus and reference validators: all registered contracts and class floors,
 current versions, complete feedback actors, exact approval hashes, and candidate
 exclusion from reference graders. Every source hash declared in case `source`
-metadata must match a supplied file's actual bytes; explicit source paths must
-also match. Composite references check all nested arms. Historical Git baselines
+metadata must match retained file bytes; explicit source paths must match the
+logical origin map. Composite references check all nested arms. Historical Git baselines
 bind exported bytes by their declared hash; their repository-relative path is
 part of approved provenance, not the export's filesystem location. This exception
 requires a full 40- or 64-hex Git object name and a nonempty relative path;

@@ -307,7 +307,15 @@ async def _finalize(runner, request, result, state):
                 )
             else:
                 await runner._session_manager.fail(result.session_id, reason=result.error)
+            from genesis.cc.managed_fallback import record_managed_outcome
+
+            await record_managed_outcome(runner, result.session_id, result)
             return
-        except Exception:
-            logger.warning("Managed receipt persistence unavailable; capacity retained")
+        except Exception as exc:
+            logger.warning(
+                "Managed receipt persistence unavailable; capacity retained "
+                "(exception=%s, sqlite_errorname=%s)",
+                type(exc).__name__,
+                getattr(exc, "sqlite_errorname", None),
+            )
             await asyncio.sleep(1)
