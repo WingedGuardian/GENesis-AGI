@@ -96,6 +96,8 @@ source "$_SCRIPT_DIR/lib/dr_lock.sh"
 # shellcheck source=scripts/lib/backup_core_paths.sh
 source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
 _GENESIS_HOME="$(realpath -s -m -- "$(_backup_core_home)")"
+# This legacy derivation can select a different path from the raw lock home.
+refuse_if_test_fenced_live "$_GENESIS_HOME" || exit 97
 _STATUS_FILE="$_GENESIS_HOME/backup_status.json"
 _RUN_ID="${GENESIS_BACKUP_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 _TRIGGER="${GENESIS_BACKUP_TRIGGER:-timer}"
