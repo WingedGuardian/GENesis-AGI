@@ -94,6 +94,10 @@ Paired financial reporting censuses both exact scored snapshots together;
 conflicting generation ownership makes the combined result incomplete and
 excludes the conflicting charges from its resolved expense total.
 
+Unmarked legacy histories retain detailed incomplete reports with
+`campaign_incompatible` reasons. Reporting accesses no credentials and preserves
+the history files. Present malformed `baseline_sample` markers are refused.
+
 An explicit Pro incumbent sample can reduce comparison requests while Flash
 still runs the complete corpus. Put `baseline_sample` in Pro's campaign binding,
 with exactly `purpose: "incumbent_baseline"`, the complete `corpus_hash`,

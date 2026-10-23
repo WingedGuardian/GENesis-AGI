@@ -7,6 +7,12 @@ FLASH = "openrouter-deepseek-flash"
 BASELINE = "sampled_incumbent_baseline"
 
 
+def has_sample(manifest):
+    """Detect marker presence before strict validation, including malformed markers."""
+    return (isinstance(manifest, dict) and isinstance(manifest.get("binding"), dict)
+            and "baseline_sample" in manifest["binding"])
+
+
 def coordinates(manifest, checked, alias, *, cases=None):
     full = {name: list(rows) for name, rows in checked["plan"].items()}
     if "baseline_sample" not in manifest["binding"]:
@@ -107,11 +113,11 @@ def comparison(cases, reports, records, states, financial):
     """One execution/detached-report population and aggregate-status contract."""
     from . import run
 
-    sampled = any("baseline_sample" in state.manifest["binding"] for state in states.values())
+    sampled = any(has_sample(state.manifest) for state in states.values())
     selected = cases
     if sampled:
-        if (set(states) != {PRO, FLASH} or "baseline_sample" not in states[PRO].manifest["binding"]
-                or "baseline_sample" in states[FLASH].manifest["binding"]):
+        if (set(states) != {PRO, FLASH} or not has_sample(states[PRO].manifest)
+                or has_sample(states[FLASH].manifest)):
             raise Incomplete("incumbent_sample_population_invalid")
         manifest = states[PRO].manifest
         selected = campaign_cases(cases, manifest["binding"]["admission"], manifest, PRO)
