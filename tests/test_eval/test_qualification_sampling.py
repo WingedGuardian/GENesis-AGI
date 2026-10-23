@@ -144,6 +144,64 @@ def test_flash_cannot_be_sampled(sample):
         run.validate_campaign(sample.manifests[FLASH], sample.checked, FLASH, cases=sample.cases)
 
 
+@pytest.mark.parametrize("manifest", [None, {"version": 1}, {"version": 1, "binding": None},
+                                     {"version": 1, "binding": []},
+                                     {"version": 1, "binding": "baseline_sample"}])
+def test_operating_legacy_manifests_refuse_through_validation(tmp_path, manifest):
+    from tests.test_eval.test_qualification_operating import population_plan
+
+    plan = population_plan(tmp_path, execution.PRO_COMPARISON)
+    execution.validate(plan.value, plan.consent, plan.checked)
+    plan.value["models"][PRO]["manifest"] = manifest
+    plan.consent["plan_hash"] = digest(plan.value)
+    with pytest.raises(Incomplete):
+        execution.validate(plan.value, plan.consent, plan.checked)
+
+
+@pytest.mark.parametrize("legacy_alias", [PRO, FLASH])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_sample_and_legacy_pair_preserves_completion_contract(sample, legacy_alias, reverse):
+    from genesis.eval.qualification import sampling
+
+    states = {a: SimpleNamespace(manifest=m) for a, m in sample.manifests.items()}
+    if legacy_alias == PRO:
+        states[FLASH].manifest["binding"]["baseline_sample"] = sample.marker
+    states[legacy_alias].manifest = None
+    if reverse:
+        states = dict(reversed(list(states.items())))
+    if legacy_alias == PRO:
+        with pytest.raises(Incomplete, match="incumbent_sample_population_invalid"):
+            sampling.comparison(sample.cases, {}, {}, states, {"unresolved_attempts": 0})
+        return
+    selected = sampling.campaign_cases(sample.cases, sample.checked, sample.manifests[PRO], PRO)
+    records = {PRO: {name: {rep: {c["id"]: {"local": None, "error": None, "agreed": True,
+                                           "prediction": c["expected_target"] if name == corpus.NOVELTY
+                                           else corpus.label(name, c)} for c in rows}
+                            for rep in run.REPETITIONS} for name, rows in selected.items()},
+               FLASH: run.unscored(sample.cases, "campaign_incompatible")}
+    reports = {PRO: {"status": "baseline_only", "scope": "sampled_incumbent_baseline",
+                     "qualification_status": "not_assessed", "baseline_completion": "complete"},
+               FLASH: {"status": "incomplete"}}
+    if reverse:
+        reports, records = (dict(reversed(list(values.items()))) for values in (reports, records))
+    result = sampling.comparison(sample.cases, reports, records, states, {"unresolved_attempts": 0})
+    assert result["status"] == result["comparison_completion"] == "incomplete"
+    assert result["paired"] == result["per_case_comparison"] == {}
+    assert result["paired_aliases"] == [PRO, FLASH]
+
+
+@pytest.mark.parametrize("marker", [None, False, 0, "", [], {}])
+def test_present_invalid_marker_never_falls_back_to_unsampled_comparison(sample, marker):
+    from genesis.eval.qualification import sampling
+
+    sample.manifests[PRO]["binding"]["baseline_sample"] = marker
+    states = {a: SimpleNamespace(manifest=m) for a, m in sample.manifests.items()}
+    reports = {a: {"status": "pass"} for a in (PRO, FLASH)}
+    records = {a: run.unscored(sample.cases, "unanswered") for a in (PRO, FLASH)}
+    with pytest.raises(Incomplete, match="incumbent_sample_invalid"):
+        sampling.comparison(sample.cases, reports, records, states, {"unresolved_attempts": 0})
+
+
 def test_sample_report_never_qualifies_and_observed_model_error_is_complete(sample):
     from genesis.eval.qualification import sampling
 

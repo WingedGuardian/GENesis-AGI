@@ -321,7 +321,7 @@ async def qualify(alias, cases, params, campaign, temp_root, *, reference_policy
     try:
         view = campaign if dispatch or isinstance(campaign, ReadView) else ReadView(campaign)
         manifest = view.state.manifest
-        baseline = "baseline_sample" in manifest["binding"]
+        baseline = sampling.has_sample(manifest)
         validate_campaign(manifest, checked, alias, cases=cases)
         scoring_cases = sampling.campaign_cases(cases, checked, manifest, alias)
         factory = operating.router if dispatch else pinned.PinnedRouter

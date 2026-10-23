@@ -11,7 +11,7 @@ from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from pathlib import Path
 
-from . import pinned
+from . import pinned, sampling
 from .accounting import Journal, _billing, currency, total
 from .evidence import Incomplete, canonical, check_directory, digest, load_json, private_open
 
@@ -131,7 +131,7 @@ def validate(plan, consent, checked, *, cases=None):
         if not isinstance(model, dict) or set(model) != {"manifest"}:
             raise Incomplete("operating_model_invalid")
         manifest = deepcopy(model["manifest"])
-        sampled = "baseline_sample" in manifest["binding"]
+        sampled = sampling.has_sample(manifest)
         if sampled and aliases != PRO_COMPARISON:
             raise Incomplete("incumbent_sample_population_invalid")
         run.validate_campaign(manifest, checked, alias, cases=cases)

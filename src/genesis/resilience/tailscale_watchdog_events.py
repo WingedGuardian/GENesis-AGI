@@ -64,6 +64,15 @@ after one resolves:
 That is the only way its failures reach anyone: this user cannot read the
 system journal.
 
+**The home-DERP pin** (``NETWD_TS_PREFER_DERP``, ``derp_pin`` in the file), all
+``high``: each lapse (the relay left the pinned region on a daemon where the
+pin held) is a one-off row keyed per boot and lapse number. ``failed``,
+``unknown``, ``drift`` (observe mode) and ``drift-persists`` are one condition
+row, kept to the latest text and resolved on ``ok`` or when the pin is turned
+off. Fresh failure evidence renews the store's type TTL without creating or
+surfacing another alert. A run that did not reach the pin (no ``derp_pin`` key)
+changes nothing.
+
 The observation names a peer by its IPv4 address only. The watchdog never
 reads peer hostnames (another tailnet member chooses those), and first-party
 observations carry no text from outside Genesis (``memory/provenance.py``).
@@ -77,6 +86,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -95,6 +105,7 @@ CATEGORY_DOWN = "tailscale_tunnel_down"
 CATEGORY_RESTART = "tailscale_restart"
 CATEGORY_SILENT = "tailscale_watchdog_silent"
 CATEGORY_BLIND = "tailscale_watchdog_blind"
+CATEGORY_DERP = "tailscale_derp_pin"
 _MAX_STATE_BYTES = 1_000_000
 #: The timer fires every ~2 minutes; three missed runs plus slack is silence.
 _SILENT_AFTER_S = 600
@@ -136,6 +147,14 @@ _DAEMON_OK_ACTIONS = frozenset(
         "restart-no-effect",
         "restart-unconfirmed",
     }
+)
+
+_REGION_RE = re.compile(r"[a-z0-9-]{1,32}")
+#: Lapse rows looked at per tick: more than a tick can add, bounded for a hostile file.
+_MAX_LAPSE_ROWS = 20
+_DERP_FIX = (
+    " A peer can lose its tunnel to this node when the home region moves."
+    " Check: tailscale status --json (Self.Relay); tailscale debug derp-map."
 )
 
 TimerState = Callable[[], Awaitable[dict[str, str] | None]]
@@ -478,6 +497,89 @@ async def _watchdog_health(db, state, fresh: bool, boot: str, now: float, timer)
     )
 
 
+def _derp_condition(pin: dict[str, Any]) -> str | None:
+    """The condition text for a ``derp_pin`` record, or None when it is fine."""
+    wanted = pin.get("wanted") if type(pin.get("wanted")) is int else "?"
+    code, seen = (
+        v if isinstance(v, str) and _REGION_RE.fullmatch(v) else "?"
+        for v in (pin.get("code"), pin.get("seen"))
+    )
+    texts = {
+        "clear-pending": "The home-DERP pin setting is disabled, but the watchdog has"
+        " not yet cleared the daemon's runtime preference.",
+        "clear-failed": "The watchdog could not clear the home-DERP pin:"
+        " tailscale debug force-prefer-derp 0 failed. The runtime preference may remain set.",
+        "failed": "The Tailscale watchdog could not apply the home-DERP pin:"
+        f" tailscale debug force-prefer-derp {wanted} failed.",
+        "unknown": "The Tailscale watchdog cannot tell whether the home-DERP pin holds:"
+        f" this node reports no home relay, region {wanted} is not in the DERP map, or"
+        " tailscaled's start time is unreadable.",
+        "drift": f"This node is homed on DERP region {seen}, not the pinned region {code}"
+        f" ({wanted}); the watchdog is in observe mode, so it does not re-apply the pin.",
+        "drift-persists": f"The Tailscale watchdog re-applied the home-DERP pin ({code}),"
+        f" but this node is still homed on {seen}.",
+    }
+    action = pin.get("action")
+    text = texts.get(action) if isinstance(action, str) else None
+    return None if text is None else text + _DERP_FIX
+
+
+async def _apply_derp(db, state: dict[str, Any], boot: str) -> int:
+    from genesis.db.crud import observations
+
+    if "derp_pin" not in state:
+        return 0  # the run ended before the pin: unknown, changes nothing
+    pin = state["derp_pin"]
+    if pin is not None and not isinstance(pin, dict):
+        return 0  # malformed: changes nothing
+    created = 0
+    lapses = state.get("derp_lapses")
+    if type(lapses) is int and lapses > 0 and isinstance(pin, dict):
+        code = pin.get("code") if isinstance(pin.get("code"), str) else ""
+        code = code if _REGION_RE.fullmatch(code) else "?"
+        action = pin.get("action") if isinstance(pin.get("action"), str) else ""
+        for n in range(max(1, lapses - _MAX_LAPSE_ROWS + 1), lapses + 1):
+            # The record carries the result of lapse ``n`` only when it is the latest.
+            if pin.get("lapse") != n or action not in ("applied", "drift-persists", "failed"):
+                result = "The result of re-applying the pin was not recorded."
+            elif action == "failed":
+                result = "The Tailscale watchdog could not re-apply the pin (result: failed)."
+            else:
+                result = f"The Tailscale watchdog re-applied the pin (result: {action})."
+            created += await _create(
+                db,
+                key=f"derp-lapse:{boot}:{n}",
+                priority="high",
+                category=CATEGORY_DERP,
+                once=True,
+                content=f"This node's home DERP left the pinned region {code} while"
+                f" tailscaled kept running (lapse {n} this boot): either the region was"
+                " unreachable at a netcheck, or the pin was cleared. " + result + _DERP_FIX,
+            )
+    text = _derp_condition(pin) if isinstance(pin, dict) else None
+    if text is not None:
+        ttl = observations._compute_ttl(TYPE)
+        expires_at = (_now() + ttl).isoformat() if ttl else None
+        row = await observations.latest_by_hash(db, source=SOURCE, content_hash=_hash("derp-pin"))
+        if row is not None and not row["resolved"]:
+            await observations.set_expires_at(db, row["id"], expires_at)
+            await observations.update_content(db, row["id"], text)
+        else:
+            created += await _create(
+                db,
+                key="derp-pin",
+                priority="high",
+                category=CATEGORY_DERP,
+                once=False,
+                content=text,
+                expires_at=expires_at,
+            )
+    elif pin is None or pin.get("action") == "ok":
+        why = "the pin is turned off" if pin is None else "this node is homed on the pinned region"
+        await _resolve(db, CATEGORY_DERP, _NOTE + why, hashes={_hash("derp-pin")})
+    return created
+
+
 async def _apply_evidence(db, state: dict[str, Any]) -> int:
     created = 0
     evidence = state.get("evidence")
@@ -595,6 +697,8 @@ async def record_new_events(
                 _NOTE + "tailscaled is running and its status is readable",
                 priority="critical",
             )
+        # Last, so a defect in the pin record cannot cost the restart rows.
+        created += await _apply_derp(db, state, boot)
 
         return created
     except Exception:

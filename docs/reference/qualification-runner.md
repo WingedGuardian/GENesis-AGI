@@ -94,6 +94,10 @@ Paired financial reporting censuses both exact scored snapshots together;
 conflicting generation ownership makes the combined result incomplete and
 excludes the conflicting charges from its resolved expense total.
 
+Unmarked legacy histories retain detailed incomplete reports with
+`campaign_incompatible` reasons. Reporting accesses no credentials and preserves
+the history files. Present malformed `baseline_sample` markers are refused.
+
 An explicit Pro incumbent sample can reduce comparison requests while Flash
 still runs the complete corpus. Put `baseline_sample` in Pro's campaign binding,
 with exactly `purpose: "incumbent_baseline"`, the complete `corpus_hash`,
@@ -143,8 +147,8 @@ Both modes require `--operating-plan`, `--spending-approval` and all complete
 admission inputs above. The parameters file must contain exactly the selected
 population. Other singleton aliases and additional candidates are refused.
 Missing spending approval still
-refuses before credentials or campaign creation. The private version-1 operating
-plan freezes one or two complete 2,250-attempt manifests, source admission, requested
+refuses before credentials or campaign creation. The default private version-1 operating
+plan freezes the exact selected manifests (normally 2,250 attempts per model), source admission, requested
 parameters, receipt-provider identities, credential fingerprint, price evidence,
 per-model and combined allowances, key limit and baseline usage. Currency uses
 exact nonnegative decimal strings. The plan names
@@ -155,7 +159,8 @@ or `stop_semantics=stop_both_on_unresolved_evidence_no_resend` for the pair.
 These are operating allocations, not externally guaranteed maximum charges.
 The key envelope must fund every allocation and fit the combined allowance.
 The separate private approval binds the entire canonical plan hash, the owner,
-`2250_requests` or `4500_requests` scope matching the exact selected population,
+request-count scope matching the exact selected population (for example,
+`2250_requests`, `4500_requests`, or `2850_requests` for a 200-case Pro baseline),
 and actual decision provenance. Changing the population invalidates old consent.
 This is a trusted local
 operator assertion, not cryptographic authentication of a human decision. An

@@ -1,1 +1,1 @@
-- Allow a smaller Pro incumbent baseline in Flash model comparisons while retaining full Flash qualification and clearly reporting the baseline's limited scope.
+- Allow a smaller Pro incumbent baseline in Flash model comparisons while retaining full Flash qualification, detailed incomplete legacy reports, and clear reporting of the baseline's limited scope.
