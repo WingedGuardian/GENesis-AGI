@@ -2840,7 +2840,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: ba89fa1a22b5 2026-10-23
+verified: 2f013ed7b19d 2026-10-23
 ```
 
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
