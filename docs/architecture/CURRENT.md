@@ -466,10 +466,15 @@ shares the OAuth-compatible readiness helper. `cc_fallback` is a non-routing
 **Fallback** observation in the neural monitor for conversations and managed
 turns; actual committed outcomes, not readiness alone, establish success.
 
+Ordinary streaming and readiness share final-effective quota classification:
+allowed/warning and explicitly usable overage are not refusals, and a later
+allowed event supersedes a rejection. Result and no-result streaming paths
+preserve usable answers, real refusal health and dropped-output replay guards.
+
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 4606e5969 2026-10-16
+verified: a8fa35a35 2026-10-23
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
