@@ -252,6 +252,7 @@ def test_fails_open_on_garbage(raw: str, tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.real_tool("gh")  # reads the installed gh's own --help
 @pytest.mark.skipif(shutil.which("gh") is None, reason="gh not installed")
 def test_default_table_matches_the_installed_gh() -> None:
     """Re-read gh's own --help and compare. A detector, not a frozen literal.
