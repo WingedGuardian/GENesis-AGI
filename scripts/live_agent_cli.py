@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
+import stat
 import sys
 import time
 from collections.abc import Awaitable, Callable
@@ -44,6 +46,8 @@ _PREFIX = {
 async def _print_events(agent: LiveAgent) -> None:
     async for event in agent.events():
         print(f"{_PREFIX.get(event.kind, '  ')} {event.text}", flush=True)
+        if event.kind == "disconnected":
+            return
 
 
 async def _command(agent: LiveAgent, line: str, last_input_at: float) -> bool:
@@ -109,17 +113,52 @@ async def main() -> int:
     started_at = time.monotonic()
     await agent.start()
     printer = tracked_task(_print_events(agent), name="live_agent_cli.print")
-    loop = asyncio.get_running_loop()
-
-    async def readline() -> str:
-        return await loop.run_in_executor(None, sys.stdin.readline)
-
     try:
-        await _input_loop(agent, readline, printer, started_at)
+        async with _stdin_lines() as readline:
+            await _input_loop(agent, readline, printer, started_at)
     finally:
         printer.cancel()
-        await agent.close()
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await printer
+        finally:
+            await agent.close()
     return 0
+
+
+@contextlib.asynccontextmanager
+async def _stdin_lines():
+    """Pipe/terminal reads cancel without leaving an executor thread behind."""
+    if stat.S_ISREG(os.fstat(sys.stdin.fileno()).st_mode):
+        async def read_file():
+            return sys.stdin.readline()
+        yield read_file
+        return
+    reader = asyncio.StreamReader()
+    transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(reader), sys.stdin,
+    )
+
+    async def read_pipe():
+        # Drain over-limit chunks without imposing a new limit on pasted input.
+        parts = []
+        while True:
+            try:
+                parts.append(await reader.readuntil(b"\n"))
+                break
+            except asyncio.LimitOverrunError as exc:
+                parts.append(await reader.readexactly(exc.consumed))
+            except asyncio.IncompleteReadError as exc:
+                parts.append(exc.partial)
+                break
+        return b"".join(parts).decode(
+            sys.stdin.encoding or "utf-8", errors=sys.stdin.errors or "strict",
+        )
+
+    try:
+        yield read_pipe
+    finally:
+        transport.close()
 
 
 async def _input_loop(
@@ -135,12 +174,19 @@ async def _input_loop(
     would let a reply meant for a withdrawn ask approve its replacement.
     """
     while True:
-        line = await readline()
+        reading = tracked_task(readline(), name="live_agent_cli.input")
+        try:
+            await asyncio.wait([reading, printer], return_when=asyncio.FIRST_COMPLETED)
+            if printer.done():
+                # Asks are no longer shown, so no reply can be tied to one.
+                print("  ! the event printer stopped; exiting", flush=True)
+                return
+            line = reading.result()
+        finally:
+            reading.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reading
         if not line:
-            return
-        if printer.done():
-            # Asks are no longer shown, so no reply can be tied to one.
-            print("  ! the event printer stopped; exiting", flush=True)
             return
         if not line.strip():
             continue

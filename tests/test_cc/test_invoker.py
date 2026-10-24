@@ -1617,6 +1617,58 @@ async def test_run_streaming_attaches_tools_when_the_stream_has_no_result(invoke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_result", [False, True])
+@pytest.mark.parametrize("text", ["", "answer"])
+@pytest.mark.parametrize(
+    "infos,rejected",
+    [
+        ([{"status": "allowed", "overageStatus": "rejected"}], False),
+        ([{"status": "allowed_warning"}], False),
+        ([{"status": "rejected", "isUsingOverage": True}], False),
+        ([{"status": "rejected"}, {"status": "allowed"}], False),
+        ([{"status": "allowed"}, {"status": "rejected"}], True),
+        ([{"status": "rejected", "isUsingOverage": False}], True),
+        ([{"status": "rejected", "isUsingOverage": "true"}], True),
+        ([{"status": "unknown"}], False),
+        ([{}], False),
+    ],
+)
+async def test_streaming_uses_final_effective_quota_state(
+    invoker, monkeypatch, infos, rejected, text, with_result
+):
+    from genesis.cc.exceptions import CCRateLimitError
+
+    _no_host_syscalls(monkeypatch)
+    status, empty, downgrade = AsyncMock(), AsyncMock(), AsyncMock()
+    invoker._on_cc_status_change = status
+    invoker._on_cc_empty_output = empty
+    invoker._on_model_downgrade = downgrade
+    invoker._last_was_error = True
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        *({"type": "rate_limit_event", "rate_limit_info": info} for info in infos),
+    ]
+    if with_result:
+        events.append(_result_event(text))
+    elif text:
+        events.append({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+    proc = _streaming_proc(_make_stream_lines(*events))
+    proc.pid = 424214
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        if rejected and not text:
+            with pytest.raises(CCRateLimitError) as caught:
+                await invoker.run_streaming(CCInvocation(prompt="test", expect_output=True))
+            assert caught.value.raw_event["rate_limit_info"] == infos[-1]
+        else:
+            out = await invoker.run_streaming(CCInvocation(prompt="test", expect_output=True))
+            assert out.text == text
+            assert out.result_received == with_result
+    status.assert_awaited_once_with("RATE_LIMITED" if rejected else "NORMAL")
+    assert empty.await_count == int(not rejected and not text)
+    downgrade.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_run_streaming_rate_limit_with_valid_response():
     """rate_limit_event with valid text returns the response, sets RATE_LIMITED."""
     statuses: list[str] = []
@@ -1629,7 +1681,7 @@ async def test_run_streaming_rate_limit_with_valid_response():
     events = [
         {"type": "system", "subtype": "init", "session_id": "s1"},
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "Got it"}]}},
-        {"type": "rate_limit_event", "info": {}},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
         {
             "type": "result",
             "subtype": "success",
@@ -1671,7 +1723,7 @@ async def test_run_streaming_rate_limit_with_empty_response_raises():
 
     events = [
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "rate_limit_event", "info": {}},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
         {
             "type": "result",
             "subtype": "success",
@@ -3591,7 +3643,7 @@ async def test_a_drop_before_an_empty_rate_limited_result_is_not_retryable(invok
                 ]
             },
         },
-        {"type": "rate_limit_event", "info": {}},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
         _result_event(""),
     )
     proc = _streaming_proc(data, raise_on=(1,))
@@ -3619,7 +3671,7 @@ async def test_an_empty_rate_limited_result_without_a_drop_still_rate_limits(inv
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "rate_limit_event", "info": {}},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
         _result_event(""),
     )
     proc = _streaming_proc(data)  # nothing dropped
@@ -3653,7 +3705,7 @@ async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(invok
                 ]
             },
         },
-        {"type": "rate_limit_event", "info": {}},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
         _result_event("the answer survived"),
     )
     proc = _streaming_proc(data, raise_on=(1,))

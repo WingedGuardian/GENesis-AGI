@@ -26,11 +26,18 @@ from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITra
 
 from genesis.live_agent.agent import (
     OWNER_CLI_MARKER,
+    PARENT_SESSION_VARS,
     ApprovalPending,
     LiveAgent,
     approval_reply,
     owner_environ,
 )
+
+
+@pytest.fixture(autouse=True)
+def owner_environment(monkeypatch):
+    for key in (*PARENT_SESSION_VARS, "GENESIS_ROSTER_MODEL"):
+        monkeypatch.delenv(key, raising=False)
 
 
 def state(name: str) -> SystemMessage:
@@ -360,12 +367,8 @@ async def test_one_unhandleable_message_does_not_end_the_session(tmp_path):
     h = Harness(tmp_path)
     await h.agent.start()
     h.agent._state_path = tmp_path / "missing-dir" / "state.json"
-    h.agent._state_path.parent.mkdir()
-    h.agent._state_path.parent.chmod(0o500)  # the session-id write will fail
-    try:
-        await h.feed(SystemMessage("init", {"session_id": "s-1", "apiKeySource": "none"}))
-    finally:
-        h.agent._state_path.parent.chmod(0o700)
+    h.agent._state_path.parent.write_text("not a directory")
+    await h.feed(SystemMessage("init", {"session_id": "s-1", "apiKeySource": "none"}))
     assert h.agent.status()["connected"] is True
     await h.agent.interrupt()  # still reachable: running work can be stopped
     assert h.client.interrupts == 1
@@ -665,3 +668,288 @@ async def test_the_host_stops_when_its_event_printer_is_gone(capsys):
     await cli._input_loop(agent, readline, printer, 0.0)
     assert agent.anchors == []  # no reply was applied to an unseen ask
     assert "event printer stopped" in capsys.readouterr().out
+
+
+def test_clean_mapping_cannot_hide_the_real_parent_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("GENESIS_CC_SESSION", "parent")
+    with pytest.raises(RuntimeError, match="GENESIS_CC_SESSION"):
+        Harness(tmp_path)
+
+
+async def test_environment_is_checked_again_at_spawn(tmp_path, monkeypatch):
+    h = Harness(tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent")
+    with pytest.raises(RuntimeError, match="CLAUDE_CODE_SESSION_ID"):
+        await h.agent.start()
+    assert not h.clients
+
+
+@pytest.mark.parametrize("control", ["steer", "interrupt"])
+async def test_redirect_denies_all_asks_before_sending_and_rejects_late_yes(tmp_path, control):
+    h = Harness(tmp_path)
+    await h.agent.start()
+    asks = [await _ask(h), await _ask(h)]
+    ids = [a["id"] for a in h.agent.status()["pending_approvals"]]
+    reached = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def blocked_send(*args):
+        reached.set()
+        await proceed.wait()
+
+    if control == "steer":
+        h.client.query = blocked_send
+        action = asyncio.create_task(h.agent.turn("redirect", cancel_pending=True))
+    else:
+        h.client.interrupt = blocked_send
+        action = asyncio.create_task(h.agent.interrupt())
+    try:
+        await asyncio.wait_for(reached.wait(), 1)
+        assert all(not h.agent.answer(ask_id, True) for ask_id in ids)
+        assert all([isinstance(await ask, PermissionResultDeny) for ask in asks])
+    finally:
+        proceed.set()
+        await action
+        await h.agent.close()
+
+
+async def test_persistence_failure_retries_without_losing_result_or_cost(tmp_path):
+    h = Harness(tmp_path)
+    await h.agent.start()
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    h.agent._state_path = blocker / "state.json"
+    await h.feed(result(result="the answer"))
+    assert h.agent.status()["session_id"] is None
+    assert any(e.kind == "finished" and "the answer" in e.text for e in drain(h.agent))
+    assert len(h.costs) == 1
+    h.agent._state_path = h.state
+    await h.feed(SystemMessage("init", {"session_id": "sess-1", "apiKeySource": "none"}))
+    assert json.loads(h.state.read_text()) == {"session_id": "sess-1"}
+    await h.agent.close()
+
+
+async def test_unexpected_eof_reports_disconnect_and_denies_asks(tmp_path):
+    h = Harness(tmp_path)
+    await h.agent.start()
+    ask = await _ask(h)
+    await h.feed(None)
+    assert any(e.kind == "disconnected" for e in drain(h.agent))
+    assert isinstance(await asyncio.wait_for(ask, 1), PermissionResultDeny)
+    await h.agent.close()
+
+
+async def test_close_does_not_report_an_unexpected_disconnect(tmp_path):
+    h = Harness(tmp_path)
+    await h.agent.start()
+    await h.feed(state("idle"))
+    await h.agent.close()
+    assert not any(e.kind == "disconnected" for e in drain(h.agent))
+
+
+async def test_only_one_host_can_hold_the_state_file_until_close(tmp_path):
+    first, second = Harness(tmp_path), Harness(tmp_path)
+    await first.agent.start()
+    try:
+        with pytest.raises(RuntimeError, match="live host"):
+            await second.agent.start()
+        assert not second.clients
+    finally:
+        await first.agent.close()
+    await second.agent.start()
+    await second.agent.close()
+
+
+async def test_terminal_host_exits_on_ctrl_c_with_stdin_still_open(tmp_path):
+    import signal
+    import sys
+
+    script = tmp_path / "host_probe.py"
+    cli_path = Path(__file__).resolve().parents[2] / "scripts" / "live_agent_cli.py"
+    script.write_text(f'''
+import asyncio, importlib.util
+spec = importlib.util.spec_from_file_location("probe_cli", {str(cli_path)!r})
+cli = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cli)
+class Agent:
+    def __init__(self, **kw): pass
+    async def start(self): print("READY", flush=True)
+    async def close(self): print("CLOSED", flush=True)
+    async def events(self):
+        await asyncio.Event().wait()
+        yield
+cli.LiveAgent = Agent
+original_loop = cli._input_loop
+async def input_loop(agent, readline, printer, started):
+    async def observed_readline():
+        reading = asyncio.create_task(readline())
+        await asyncio.sleep(0)
+        print("READING", flush=True)
+        return await reading
+    await original_loop(agent, observed_readline, printer, started)
+cli._input_loop = input_loop
+asyncio.run(cli.main())
+''')
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(script), stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        assert await asyncio.wait_for(proc.stdout.readline(), 15) == b"READY\n"
+        assert await asyncio.wait_for(proc.stdout.readline(), 5) == b"READING\n"
+        # The read has begun; the pipe remains open until finally.
+        proc.send_signal(signal.SIGINT)
+        await asyncio.wait_for(proc.wait(), 5)
+        assert b"CLOSED" in await proc.stdout.read()
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        proc.stdin.close()
+
+
+async def test_stale_resume_reported_by_the_reader_starts_fresh_once(tmp_path):
+    h = Harness(tmp_path)
+    h.state.write_text(json.dumps({"session_id": "missing"}))
+    reconnecting, proceed = asyncio.Event(), asyncio.Event()
+
+    def factory(options):
+        client = FakeClient(options)
+        if options.resume:
+            async def failed_stream():
+                options.stderr("No conversation found with session ID: missing")
+                raise ProcessError("CLI exited", exit_code=1, stderr="Check stderr output for details")
+                yield
+            client.receive_messages = failed_stream
+        else:
+            async def slow_connect():
+                reconnecting.set()
+                await proceed.wait()
+            client.connect = slow_connect
+        h.clients.append(client)
+        return client
+
+    h.agent._client_factory = factory
+    await h.agent.start()
+    await asyncio.wait_for(reconnecting.wait(), 1)
+    assert not h.agent.status()["connected"]
+    with pytest.raises(CLIConnectionError, match="not running"):
+        await h.agent.turn("too early")
+    assert not h.clients[0].sent
+    proceed.set()
+    async with asyncio.timeout(1):
+        while not h.agent.status()["connected"]:
+            await asyncio.sleep(0)
+    assert [c.options.resume for c in h.clients] == ["missing", None]
+    await h.feed(SystemMessage("init", {"session_id": "new", "apiKeySource": "none"}))
+    assert json.loads(h.state.read_text()) == {"session_id": "new"}
+    assert h.agent.status()["connected"]
+    await h.agent.close()
+
+
+async def test_a_new_ask_during_interrupt_mode_redirect_is_also_denied(tmp_path):
+    h = Harness(tmp_path, steer="interrupt")
+    await h.agent.start()
+    await h.agent.turn("job")
+    asks = []
+
+    async def interrupted():
+        asks.append(await _ask(h))
+        await h.client.inbox.put(state("idle"))
+
+    h.client.interrupt = interrupted
+    await h.agent.turn("redirect", cancel_pending=True)
+    assert isinstance(await asyncio.wait_for(asks[0], 1), PermissionResultDeny)
+    await h.agent.close()
+
+
+async def test_printer_failure_still_closes_the_agent(tmp_path, monkeypatch):
+    cli = _load_cli()
+    closed = []
+
+    class Agent:
+        def __init__(self, **kw):
+            pass
+
+        async def start(self):
+            pass
+
+        async def close(self):
+            closed.append(True)
+
+    async def broken_printer(agent):
+        raise BrokenPipeError("output closed")
+
+    @contextlib.asynccontextmanager
+    async def stdin_lines():
+        async def readline():
+            await asyncio.Event().wait()
+        yield readline
+
+    monkeypatch.setattr(cli, "LiveAgent", Agent)
+    monkeypatch.setattr(cli, "_print_events", broken_printer)
+    monkeypatch.setattr(cli, "_stdin_lines", stdin_lines)
+    monkeypatch.setattr(cli, "owner_environ", lambda env: env)
+    monkeypatch.setattr(cli.sys, "argv", ["live_agent_cli"])
+    with pytest.raises(BrokenPipeError):
+        await cli.main()
+    assert closed == [True]
+
+
+async def test_failed_background_task_cannot_skip_disconnect_or_lock_release(tmp_path):
+    h = Harness(tmp_path)
+    await h.agent.start()
+
+    async def failed():
+        raise ValueError("bad progress")
+
+    task = asyncio.create_task(failed())
+    with pytest.raises(ValueError):
+        await task
+    h.agent._tasks.insert(0, task)
+    with pytest.raises(ValueError):
+        await h.agent.close()
+    assert h.agent._client is None
+    replacement = Harness(tmp_path)
+    await replacement.agent.start()
+    await replacement.agent.close()
+
+
+@pytest.mark.parametrize("ending", ["\n/q\n", ""])
+async def test_pipe_input_preserves_long_unicode_lines(tmp_path, ending):
+    import sys
+
+    script = tmp_path / "long_input.py"
+    cli_path = Path(__file__).resolve().parents[2] / "scripts" / "live_agent_cli.py"
+    script.write_text(f'''
+import asyncio, importlib.util
+from types import SimpleNamespace
+spec = importlib.util.spec_from_file_location("probe_cli", {str(cli_path)!r})
+cli = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cli)
+class Agent:
+    def __init__(self, **kw): pass
+    async def start(self): pass
+    async def close(self): pass
+    def status(self): return {{"pending_approvals": []}}
+    async def turn(self, text):
+        print("LENGTH=" + str(len(text)), flush=True)
+        return SimpleNamespace(steered=False, id="test")
+    async def events(self):
+        await asyncio.Event().wait()
+        yield
+cli.LiveAgent = Agent
+asyncio.run(cli.main())
+''')
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(script), stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        output, errors = await asyncio.wait_for(proc.communicate(("é" * 100_000 + ending).encode()), 15)
+        assert proc.returncode == 0, errors.decode()
+        assert b"LENGTH=100000" in output
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()

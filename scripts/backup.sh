@@ -48,6 +48,14 @@ fi
 # Pluggable Tier-2 (off-site) backend interface — selects none/local/smb at runtime
 # (backward-compat: a configured GENESIS_BACKUP_NAS with no selector → smb).
 _SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Test fence first (sourced): this script acts on ${GENESIS_DIR:-$HOME/genesis},
+# and the refusal must precede the lock open and status writes below — so
+# GENESIS_DIR resolves here, not at its old later site. No-op unless the
+# suite-wide fence arms GENESIS_TEST_FENCE_LIVE_ROOTS.
+GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
+# shellcheck source=scripts/lib/live_system_guard.sh
+source "$_SCRIPT_DIR/lib/live_system_guard.sh"
+refuse_if_test_fenced_live "$GENESIS_DIR" || exit 97
 # shellcheck source=scripts/lib/backup_backends.sh
 source "$_SCRIPT_DIR/lib/backup_backends.sh"
 # Durable alert queue (F.3): if a Telegram alert can't send, persist it so the
@@ -88,6 +96,8 @@ source "$_SCRIPT_DIR/lib/dr_lock.sh"
 # shellcheck source=scripts/lib/backup_core_paths.sh
 source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
 _GENESIS_HOME="$(realpath -s -m -- "$(_backup_core_home)")"
+# This legacy derivation can select a different path from the raw lock home.
+refuse_if_test_fenced_live "$_GENESIS_HOME" || exit 97
 _STATUS_FILE="$_GENESIS_HOME/backup_status.json"
 _RUN_ID="${GENESIS_BACKUP_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 _TRIGGER="${GENESIS_BACKUP_TRIGGER:-timer}"
@@ -228,7 +238,7 @@ _on_exit() {
 }
 trap _on_exit EXIT
 
-GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
+# GENESIS_DIR resolved at the top of the script, before the test-fence check.
 BACKUP_DIR="$HOME/backups/genesis-backups"
 # Derive CC project dir from genesis dir path (CC convention: / → -)
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')

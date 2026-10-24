@@ -598,6 +598,9 @@ def _isolate_alert_queue(tmp_path):
     # At >= 80% of the live PID budget the tick would also write a breakdown of
     # the real /proc into the real ~/.genesis/logs/pid_snapshots.
     mp.setenv("GENESIS_PID_BREAKDOWN_DISABLED", "1")
+    # Every test that exhausts the DB lock retries would otherwise write a
+    # lock-holder snapshot into the real ~/.genesis/logs/lock_snapshots.
+    mp.setenv("GENESIS_LOCK_SNAPSHOT_DISABLED", "1")
     yield
     mp.undo()
 

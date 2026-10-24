@@ -102,3 +102,15 @@ def test_result_flushes_pending_text_and_leaves_the_final_line_to_the_host():
     assert final(result(result="All  three tests pass.")) == "finished: All three tests pass."
     assert final(result(terminal_reason="aborted_streaming")) == "interrupted"
     assert final(result(is_error=True, api_error_status=429)) == "error: success (HTTP 429)"
+
+
+def test_completed_tools_leave_no_progress_cache():
+    s = ProgressSummarizer()
+    for error in (False, True):
+        s.feed(AssistantMessage(content=[ToolUseBlock(id="t1", name="Bash", input={})], model="m"))
+        lines = s.feed(UserMessage(content=[ToolResultBlock(tool_use_id="t1", is_error=error)]))
+        assert lines == (["tool failed: Bash"] if error else [])
+        assert s._tool_names == {}
+    s.feed(AssistantMessage(content=[ToolUseBlock(id="aborted", name="Read", input={})], model="m"))
+    s.feed(result(terminal_reason="aborted_tools"))
+    assert s._tool_names == {}

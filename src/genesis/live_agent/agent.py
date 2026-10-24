@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -37,7 +38,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TextIO
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -56,6 +57,7 @@ from claude_agent_sdk import (
 
 from genesis.cc.gmodel_routes import strip_route_env
 from genesis.live_agent.progress import ProgressSummarizer
+from genesis.util.atomic import atomic_write_text
 from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
@@ -111,6 +113,16 @@ PARENT_SESSION_VARS = (
 # not the owner's (a routed peer's backend, or a dispatched session), so the
 # agent refuses to start rather than run as the wrong session.
 _MUST_BE_ABSENT = (*PARENT_SESSION_VARS, "GENESIS_ROSTER_MODEL")
+
+
+def _validate_environment(environ: Mapping[str, str] | None = None) -> None:
+    """The SDK inherits os.environ; an optional mapping can never hide it."""
+    inherited = sorted(v for v in _MUST_BE_ABSENT if v in os.environ or v in (environ or {}))
+    if inherited:
+        raise RuntimeError(
+            f"live agent refuses to start with {inherited} set: run owner_environ() "
+            "over the host environment first"
+        )
 
 
 # A bare reply that answers a waiting approval (normalised: lower case, outer
@@ -215,14 +227,7 @@ class LiveAgent:
         cli_path: str | None = None,
         environ: Mapping[str, str] | None = None,
     ) -> None:
-        inherited = sorted(
-            v for v in _MUST_BE_ABSENT if v in (os.environ if environ is None else environ)
-        )
-        if inherited:
-            raise RuntimeError(
-                f"live agent refuses to start with {inherited} set: run owner_environ() "
-                "over the host environment first"
-            )
+        _validate_environment(environ)
         self._cwd = cwd
         self._state_path = state_path
         self._steer = steer
@@ -237,6 +242,10 @@ class LiveAgent:
         if not self._cli_path:
             raise CLINotFoundError("`claude` is not on PATH; refusing the SDK's bundled CLI")
         self._client: Any = None
+        self._host_lock: TextIO | None = None
+        self._resume_attempt: str | None = None
+        self._stale_resume_diagnostic = False
+        self._reconnecting = False
         self._stream_open = False
         self._tasks: list[asyncio.Task[None]] = []
         self._events: asyncio.Queue[Event] = asyncio.Queue()
@@ -269,26 +278,50 @@ class LiveAgent:
             # Surfaces the CLI's running / requires_action / idle frames, which
             # the SDK otherwise reads and drops (measured on 2.1.299).
             env={"CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"},
+            stderr=self._stderr,
         )
 
     async def start(self) -> None:
-        saved = self._load_session_id()
+        if self._host_lock is not None:
+            raise RuntimeError("this live host is already started")
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = self._state_path.with_suffix(".lock").open("a")
         try:
-            await self._connect(saved)
-        except (CLIConnectionError, ProcessError) as exc:
-            detail = f"{exc} {getattr(exc, 'stderr', '') or ''}"
-            if saved is None or _STALE_RESUME not in detail:
-                raise
-            logger.warning("live agent: resume of %s failed (%s); starting fresh", saved, exc)
-            self._emit(
-                "session", f"could not resume {saved}; started a fresh session", {"error": str(exc)}
-            )
-            await self._connect(None)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException as exc:
+            lock.close()
+            if isinstance(exc, BlockingIOError):
+                raise RuntimeError("the session state already has a live host") from exc
+            raise
+        self._host_lock = lock
+        try:
+            saved = self._load_session_id()
+            try:
+                await self._connect(saved)
+            except (CLIConnectionError, ProcessError) as exc:
+                if not self._missing_resume(exc):
+                    raise
+                self._report_fresh_session()
+                await self._connect(None)
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _spawn(self, resume: str | None) -> Any:
+        _validate_environment()
+        self._resume_attempt = resume
+        self._stale_resume_diagnostic = False
+        client = self._client_factory(self.options(resume))
+        try:
+            await client.connect()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+            raise
+        return client
 
     async def _connect(self, resume: str | None) -> None:
-        client = self._client_factory(self.options(resume))
-        await client.connect()
-        self._client = client
+        self._client = await self._spawn(resume)
         self._stream_open = True
         self._tasks = [
             tracked_task(self._read(), name="live_agent.read", logger=logger),
@@ -297,19 +330,24 @@ class LiveAgent:
 
     async def close(self) -> None:
         self._stream_open = False  # before anything wakes a waiting steer
-        for approval in list(self._pending.values()):
-            if not approval.future.done():
-                approval.future.set_result(False)
+        self._deny_pending()
         for task in self._tasks:
             task.cancel()
-        for task in self._tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        self._stream_open = False
-        self._set_state(_IDLE)
-        if self._client is not None:
-            await self._client.disconnect()
-            self._client = None
+        try:
+            for task in self._tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            self._stream_open = False
+            self._set_state(_IDLE)
+            try:
+                if self._client is not None:
+                    await self._client.disconnect()
+            finally:
+                self._client = None
+                if self._host_lock is not None:
+                    self._host_lock.close()
+                    self._host_lock = None
 
     # -- driving -----------------------------------------------------------
 
@@ -333,6 +371,8 @@ class LiveAgent:
                 "may drive the live agent until the approval gate is wired"
             )
         client = self._require_client()
+        if cancel_pending:
+            self._deny_pending()
         if self._pending and not cancel_pending:
             waiting = ", ".join(sorted(self._pending))
             raise ApprovalPending(
@@ -350,6 +390,8 @@ class LiveAgent:
                 raise CLIConnectionError(
                     "the interrupt never settled; the steer was not sent"
                 ) from None
+            if cancel_pending:
+                self._deny_pending()
             if self._pending and not cancel_pending:
                 waiting = ", ".join(sorted(self._pending))
                 raise ApprovalPending(
@@ -376,7 +418,18 @@ class LiveAgent:
         return handle
 
     async def interrupt(self) -> None:
-        await self._require_client().interrupt()
+        client = self._require_client()
+        self._deny_pending()
+        await client.interrupt()
+
+    def _deny_pending(self) -> None:
+        """Retire asks before yielding, so a late yes cannot approve old work."""
+        for approval in self._pending.values():
+            if not approval.future.done():
+                approval.future.set_result(False)
+                self._ask_churn_at = time.monotonic()
+                self._emit("approval", f"[{approval.id}] cancelled; denied", {"id": approval.id})
+        self._pending.clear()
 
     def answer_reply(self, allow: bool, *, last_input_at: float) -> tuple[bool, str]:
         """Apply a bare yes / no only when the owner can only have meant one ask.
@@ -415,7 +468,7 @@ class LiveAgent:
 
     def status(self) -> dict[str, Any]:
         return {
-            "connected": self._stream_open,
+            "connected": self._stream_open and not self._reconnecting,
             "session_id": self._session_id,
             "state": self._state,
             "busy": self._state != _IDLE,
@@ -438,6 +491,8 @@ class LiveAgent:
     async def _permission(
         self, tool_name: str, tool_input: dict[str, Any], ctx: ToolPermissionContext
     ) -> PermissionResultAllow | PermissionResultDeny:
+        if not self._stream_open or self._reconnecting:
+            return PermissionResultDeny(message="The live session is disconnected.")
         if tool_name in _UNANSWERABLE_TOOLS:
             self._emit("progress", f"{tool_name} declined: this host cannot answer it")
             return PermissionResultDeny(
@@ -479,22 +534,60 @@ class LiveAgent:
 
     async def _read(self) -> None:
         try:
-            async for msg in self._client.receive_messages():
-                # One message that cannot be handled must not end the session:
-                # the CLI is still running, and only a live reader can interrupt it.
+            while self._stream_open:
                 try:
-                    for line in self._summary.feed(msg):
-                        self._emit("progress", line)
-                    await self._handle(msg)
-                except Exception:
-                    logger.exception("live agent: could not handle a %s", type(msg).__name__)
-                    self._emit("error", f"could not handle a {type(msg).__name__}; continuing")
+                    await self._consume_messages()
+                except (CLIConnectionError, ProcessError) as exc:
+                    if not self._missing_resume(exc):
+                        raise
+                    self._reconnecting = True
+                    self._deny_pending()
+                    self._set_state(_IDLE)
+                    await self._client.disconnect()
+                    self._report_fresh_session()
+                    self._client = await self._spawn(None)
+                    self._reconnecting = False
+                    continue
+                break
         except Exception as exc:  # the CLI process died or the stream broke
             logger.exception("live agent: session stream ended")
             self._emit("error", f"session stream ended: {exc}; restart the host to resume")
         finally:
+            unexpected = self._stream_open
             self._stream_open = False
+            self._reconnecting = False
+            self._deny_pending()
             self._set_state(_IDLE)  # wakes an interrupt-mode steer, which then refuses
+            if unexpected:
+                self._emit("disconnected", "session disconnected; restart the host to resume")
+
+    async def _consume_messages(self) -> None:
+        """Keep one malformed message from disabling controls on a live session."""
+        async for msg in self._client.receive_messages():
+            try:
+                for line in self._summary.feed(msg):
+                    self._emit("progress", line)
+                await self._handle(msg)
+            except Exception:
+                logger.exception("live agent: could not handle a %s", type(msg).__name__)
+                self._emit("error", f"could not handle a {type(msg).__name__}; continuing")
+
+    def _stderr(self, line: str) -> None:
+        # Only keep the diagnostic bit; stderr can contain private tool output.
+        if _STALE_RESUME in line:
+            self._stale_resume_diagnostic = True
+
+    def _missing_resume(self, exc: Exception) -> bool:
+        detail = f"{exc} {getattr(exc, 'stderr', '') or ''}"
+        return self._resume_attempt is not None and (
+            self._stale_resume_diagnostic or _STALE_RESUME in detail
+        )
+
+    def _report_fresh_session(self) -> None:
+        self._emit(
+            "session", f"could not resume {self._resume_attempt}; starting a fresh session; "
+            "resend any request sent before this notice",
+        )
 
     async def _handle(self, msg: Any) -> None:
         if isinstance(msg, SystemMessage) and msg.subtype == "session_state_changed":
@@ -502,6 +595,7 @@ class LiveAgent:
             if isinstance(state, str) and state:
                 self._set_state(state)
         elif isinstance(msg, SystemMessage) and msg.subtype == "init":
+            self._resume_attempt = None  # a live session can no longer be a missing resume
             # The CLI sends an init frame before EVERY turn; report it once.
             first = self._api_key_source is None
             self._api_key_source = msg.data.get("apiKeySource")
@@ -539,7 +633,7 @@ class LiveAgent:
             self._idle.clear()
 
     async def _flush(self) -> None:
-        while True:
+        while self._stream_open:
             await asyncio.sleep(_FLUSH_TICK_S)
             line = self._summary.flush()
             if line:
@@ -557,11 +651,13 @@ class LiveAgent:
         """Persist a new session id; True when it changed."""
         if not session_id or session_id == self._session_id:
             return False
+        try:
+            atomic_write_text(self._state_path, json.dumps({"session_id": session_id}))
+        except OSError:
+            logger.exception("live agent: could not persist session id")
+            self._emit("error", "could not persist session id; continuing and will retry")
+            return False
         self._session_id = session_id
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"session_id": session_id}))
-        tmp.replace(self._state_path)
         return True
 
     def _load_session_id(self) -> str | None:
@@ -572,7 +668,7 @@ class LiveAgent:
         return value if isinstance(value, str) and value else None
 
     def _require_client(self) -> Any:
-        if self._client is None or not self._stream_open:
+        if self._client is None or not self._stream_open or self._reconnecting:
             raise CLIConnectionError("live agent session is not running; restart the host")
         return self._client
 

@@ -68,6 +68,19 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
+# ── Test fence — before the self-copy or any other side effect ──
+# When the suite-wide fence is armed (GENESIS_TEST_FENCE_LIVE_ROOTS), refuse
+# here rather than letting a test drive this script against live state. This
+# sits ahead of the copy-to-temp block because that block already writes under
+# $HOME. The root it acts on is GENESIS_UPDATE_ORIG_DIR when set (the temp-copy
+# re-exec) else the checkout this script lives in — the same expression
+# GENESIS_ROOT uses below. No-op when the variable is unset.
+_FENCE_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=lib/live_system_guard.sh
+. "$_FENCE_ROOT/scripts/lib/live_system_guard.sh"
+refuse_if_test_fenced_live "$_FENCE_ROOT" || exit 97
+unset _FENCE_ROOT
+
 # ── Copy-to-temp guard ──────────────────────────────────
 # The update script may update itself during git merge, which would corrupt
 # the running process. Industry standard (Chrome, Homebrew, Windows Update):

@@ -98,10 +98,12 @@ class ProgressSummarizer:
                     self._text += block.text
         elif isinstance(msg, UserMessage) and isinstance(msg.content, list):
             for block in msg.content:
-                if isinstance(block, ToolResultBlock) and block.is_error:
-                    name = self._tool_names.get(block.tool_use_id, "tool")
-                    lines.append(clip(f"tool failed: {name}"))
+                if isinstance(block, ToolResultBlock):
+                    name = self._tool_names.pop(block.tool_use_id, "tool")
+                    if block.is_error:
+                        lines.append(clip(f"tool failed: {name}"))
         elif isinstance(msg, ResultMessage):
+            self._tool_names.clear()
             # Only the text still pending; the host emits ``final_line`` once,
             # as its "finished" event.
             pending = self.flush(force=True)

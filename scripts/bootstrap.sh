@@ -34,6 +34,10 @@ echo
 # update.sh opts out via GENESIS_BOOTSTRAP_ALLOW_LIVE=1; humans use --force.
 # shellcheck source=lib/live_system_guard.sh
 . "$SCRIPT_DIR/lib/live_system_guard.sh"
+# Test fence first: a test pointing this script at live state refuses here,
+# before the live-system check's probes and everything after. No-op unless
+# GENESIS_TEST_FENCE_LIVE_ROOTS is armed.
+refuse_if_test_fenced_live "$GENESIS_ROOT" || exit 97
 bootstrap_refuse_if_server_live "$@" || exit 3
 
 # shellcheck source=lib/deploy_marker.sh

@@ -183,7 +183,7 @@ async def test_awareness_uses_one_captured_observation(setup_notice, monkeypatch
     monkeypatch.setattr(GenesisRuntime, "peek", classmethod(lambda cls: runtime))
     calls = []
 
-    async def compute(*, agent_api_observation):
+    async def compute(*, agent_api_observation, queue_unknown_ids=None):
         state = ("degraded", "unknown", "healthy")[len(calls)]
         calls.append(state)
         agent_api_observation.update(status=state, reasons=["fixture_fault"], pid=12345)
