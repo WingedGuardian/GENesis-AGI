@@ -724,7 +724,7 @@ these are the GATES that make it enforceable:
   fixes in the same breath as the symptom. "It's probably X, let me fix that"
   = investigation skipped.
 - **Fix-attempt cap: 3 failed fixes → STOP and question the architecture.**
-  The debugging twin of the review escalation cap, with the same mechanics
+  The debugging twin of the review round cap, with the same mechanics
   (count attempts visibly; the cap consumes standing approval). Each failed fix
   revealing a new problem in a different place is not bad luck — it is the
   signature of a wrong architecture or a wrong problem statement. Do not
@@ -1702,7 +1702,7 @@ substantial or prompt-surface one takes the adversarial pass.)
 Every defect that
 survives to the end-of-build review costs an adversarial cycle there, and
 every one that survives THAT costs an external Codex round against the
-escalation cap.
+round budget.
 
 **For a SUBSTANTIAL change, the end-of-build adversarial review is canonical,
 not the builder's choice: run `/deep-review`.** Judge substantial at end of
