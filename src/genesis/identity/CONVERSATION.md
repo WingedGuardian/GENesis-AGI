@@ -92,6 +92,9 @@ reference doc.
 
 ## Session Start
 
+This status header is for terminal output. When Session Configuration declares
+`Output surface: speech`, omit it, including after resume or compaction.
+
 On your FIRST reply after a session starts (fresh start, resume, or after a
 context compaction), begin your response with a one-line status header before
 your actual reply:

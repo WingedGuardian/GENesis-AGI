@@ -57,6 +57,7 @@ from claude_agent_sdk import (
 
 from genesis.cc.gmodel_routes import strip_route_env
 from genesis.live_agent.progress import ProgressSummarizer
+from genesis.live_agent.registration import update_session_row
 from genesis.util.atomic import atomic_write_text
 from genesis.util.tasks import tracked_task
 
@@ -158,6 +159,7 @@ def owner_environ(env: dict[str, str]) -> dict[str, str]:
 
 
 CostRecorder = Callable[[str, float, dict[str, Any]], Awaitable[None]]
+SessionRecorder = Callable[[str, str | None, bool], Awaitable[None]]
 
 
 @dataclass
@@ -224,16 +226,23 @@ class LiveAgent:
         approval_timeout_s: float = APPROVAL_TIMEOUT_S,
         client_factory: Callable[[ClaudeAgentOptions], Any] = ClaudeSDKClient,
         cost_recorder: CostRecorder | None = record_cost_on_session_row,
+        session_recorder: SessionRecorder | None = update_session_row,
         cli_path: str | None = None,
         environ: Mapping[str, str] | None = None,
+        output_surface: Literal["terminal", "speech"] = "terminal",
     ) -> None:
         _validate_environment(environ)
+        if output_surface not in ("terminal", "speech"):
+            raise ValueError("output_surface must be terminal or speech")
+        self._output_surface = output_surface
         self._cwd = cwd
         self._state_path = state_path
         self._steer = steer
         self._approval_timeout_s = approval_timeout_s
         self._client_factory = client_factory
         self._cost_recorder = cost_recorder
+        self._session_recorder = session_recorder
+        self._observed_sessions: set[str] = set()
         # The PATH symlink, deliberately not its resolved target: the process
         # name stays `claude`, which the SessionStart registration hook matches.
         # Without it the SDK would silently run its own bundled CLI, a
@@ -277,7 +286,10 @@ class LiveAgent:
             resume=resume,
             # Surfaces the CLI's running / requires_action / idle frames, which
             # the SDK otherwise reads and drops (measured on 2.1.299).
-            env={"CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"},
+            env={
+                "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1",
+                "GENESIS_OUTPUT_SURFACE": self._output_surface,
+            },
             stderr=self._stderr,
         )
 
@@ -342,8 +354,15 @@ class LiveAgent:
             self._set_state(_IDLE)
             try:
                 if self._client is not None:
-                    await self._client.disconnect()
+                    try:
+                        await self._client.disconnect()
+                    except BaseException:
+                        self._emit("error", "child teardown failed; registration not checkpointed")
+                        raise
+                    for session_id in self._observed_sessions:
+                        await self._update_registration(session_id, closed=True)
             finally:
+                self._observed_sessions.clear()
                 self._client = None
                 if self._host_lock is not None:
                     self._host_lock.close()
@@ -475,7 +494,7 @@ class LiveAgent:
             "api_key_source": self._api_key_source,
             "rate_limited_until": self._rate_limited_until,
             "pending_approvals": [
-                {"id": a.id, "tool": a.tool_name, "reason": a.reason}
+                {"id": a.id, "tool": a.tool_name, "reason": a.reason, "input": a.tool_input}
                 for a in self._pending.values()
             ],
             "cli_path": self._cli_path,
@@ -599,6 +618,7 @@ class LiveAgent:
             # The CLI sends an init frame before EVERY turn; report it once.
             first = self._api_key_source is None
             self._api_key_source = msg.data.get("apiKeySource")
+            await self._observe_init(msg.data)
             if self._remember_session(msg.data.get("session_id")) or first:
                 self._emit("session", f"session {self._session_id}", msg.data)
         elif isinstance(msg, RateLimitEvent):
@@ -609,6 +629,8 @@ class LiveAgent:
         elif isinstance(msg, AssistantMessage) and msg.error == "rate_limit":
             self._emit("rate_limited", "rate-limited (assistant error)")
         elif isinstance(msg, ResultMessage):
+            if msg.session_id:
+                self._observed_sessions.add(msg.session_id)
             self._remember_session(msg.session_id)
             if msg.api_error_status == 429:
                 self._emit("rate_limited", "rate-limited (HTTP 429); the turn was not retried")
@@ -646,6 +668,27 @@ class LiveAgent:
             await self._cost_recorder(msg.session_id, msg.total_cost_usd, msg.usage or {})
         except Exception:
             logger.warning("live agent: cost recording failed", exc_info=True)
+
+    async def _update_registration(
+        self, session_id: str, *, model: str | None = None, closed: bool = False,
+    ) -> None:
+        if self._session_recorder is None:
+            return
+        try:
+            await self._session_recorder(session_id, model, closed)
+        except Exception:
+            logger.warning("live agent: registration update failed", exc_info=True)
+            self._emit("error", "registration update failed; existing reaper remains the fallback")
+
+    async def _observe_init(self, data: dict[str, Any]) -> None:
+        session_id = data.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return
+        self._observed_sessions.add(session_id)
+        model = data.get("model")
+        await self._update_registration(
+            session_id, model=model if isinstance(model, str) else None,
+        )
 
     def _remember_session(self, session_id: str | None) -> bool:
         """Persist a new session id; True when it changed."""

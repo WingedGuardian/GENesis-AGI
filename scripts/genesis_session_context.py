@@ -557,7 +557,9 @@ def _cached_session_model(session_id: str) -> str:
     return ""
 
 
-def _session_config_block(effort: str, hook_model: str, roster_model: str) -> str:
+def _session_config_block(
+    effort: str, hook_model: str, roster_model: str, *, output_surface: str = "terminal",
+) -> str:
     """Top Session Configuration block: effort + first-reply status-header directive.
 
     Model-identity precedence (highest first):
@@ -576,6 +578,15 @@ def _session_config_block(effort: str, hook_model: str, roster_model: str) -> st
     injected can't be captured here — the precedence note covers it ("a /model
     switch after this message wins").
     """
+    if output_surface == "speech":
+        model = roster_model or _model_display_name(hook_model) or hook_model or "not reported"
+        return (
+            f"## Session Configuration\n\n- Thinking effort: {effort}\n"
+            f"- Current model: {model}\n- Output surface: speech\n\n"
+            "Do not emit or speak a model/effort status header, including after "
+            "resume or context compaction. Respond directly to the request. "
+            "The model and effort above are session facts, not spoken boilerplate."
+        )
     tmpl = (
         "Begin your first reply of this session with a one-line status header "
         f"on its own line — `[{{model}} / {effort}]` — then your normal reply."
@@ -859,7 +870,8 @@ def _emit_body() -> tuple[str, str, str] | None:
                 print(f"[session_context] Failed to read session config: {exc}", file=sys.stderr)
         _emit(
             _session_config_block(
-                effort, _hook_model, os.environ.get("GENESIS_ROSTER_MODEL", "") or ""
+                effort, _hook_model, os.environ.get("GENESIS_ROSTER_MODEL", "") or "",
+                output_surface=os.environ.get("GENESIS_OUTPUT_SURFACE", "terminal"),
             )
         )
         first = False
