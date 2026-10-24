@@ -2840,9 +2840,17 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: ed048e214017 2026-10-22
+verified: 2f013ed7b19d 2026-10-23
 ```
 
+- **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
+  two-table SQLite fixtures, real resolution/revocation/revision/claim helpers,
+  independent committed-state reads and claim-gated artifact checks. Nine fixed
+  cases cross continuous and clean-reopen modes. No approval simulator, model or
+  candidate runtime runs; runtime comparison runners remain unbuilt. See
+  `docs/reference/ego-runtime-offline.md`.
+  This verification refresh covers the probe slice, not a new audit of the
+  whole learning/evaluation entry.
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
   glue over Claude Code transcripts and `cc_sessions.skill_tags`. Per skill:
   tool loads, slash loads, SKILL.md reads (not counted in a session that edits

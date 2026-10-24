@@ -1,0 +1,1 @@
+Added an opt-in offline baseline exercising canonical proposal resolution, revocation, revision and dispatch claims in disposable databases, with independent committed-state and fixture artifact checks.
