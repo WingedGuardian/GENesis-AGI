@@ -2840,7 +2840,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 9654e4b67 2026-10-23
+verified: 2f013ed7b 2026-10-24
 ```
 
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
@@ -3119,6 +3119,12 @@ verified: 9654e4b67 2026-10-23
   Integrated success requires the actual contained report. No production provider,
   inference, B/C orchestration or Codex parity is added. See
   `docs/reference/headlong-native-action-port.md`.
+- **Contained Headlong reference redaction**: a separate B-only derived source
+  preserves controller-issued references through generic card masking while
+  retaining other secret rules and rejecting reference loss/boundary conflicts.
+  Independently runnable contained controls compare pinned/adapted sanitizers;
+  this adds no production provider or native monolith qualification. See
+  `docs/reference/headlong-reference-redaction.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
