@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from genesis.modules.config_schema import ConfigField, infer_field_type
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -49,6 +52,81 @@ class LifecycleConfig:
     logs_cmd: str | None = None
 
 
+_KNOWN_NETWORKS = ("lan", "tailnet")
+
+
+def _positive_number(raw, default):
+    """Normalize a numeric config field; invalid values fall back to default.
+
+    An unvalidated timeout reaches ``min()`` inside the transport layer as
+    a raw YAML scalar — a string raises TypeError there, a bool silently
+    becomes 1s, and a negative kills the subprocess instantly. None of
+    those errors name the config key that caused them. Falls back rather
+    than raising so a bad value degrades visibly (a warning here) instead
+    of deleting the module.
+    """
+    if (
+        isinstance(raw, (int, float))
+        and not isinstance(raw, bool)
+        and raw > 0
+    ):
+        return raw
+    logger.warning(
+        "Invalid numeric config value %r — using default %s", raw, default
+    )
+    return default
+
+
+def _validated_networks(raw):
+    """Refuse any allowed_networks shape that is not a list of known names."""
+    # SHAPE is fail-closed; EMPTINESS is not an error. `[]` is a valid list
+    # meaning "deny every network", which the gate already enforces with a
+    # readable EndpointNotReachable. Raising on it instead deleted the module:
+    # both callers wrap from_dict in `except Exception: logger.warning`, so a
+    # typo removed the endpoint from module_list and the dashboard entirely —
+    # the exact outcome mcp/health/module_ops.py's own comment says to avoid,
+    # because "not configured" and "not available here" read differently to
+    # whoever is debugging.
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"endpoint.allowed_networks must be a list of "
+            f"{list(_KNOWN_NETWORKS)}, got {raw!r}"
+        )
+    unknown = [n for n in raw if n not in _KNOWN_NETWORKS]
+    if unknown:
+        raise ValueError(
+            f"endpoint.allowed_networks contains unknown entries {unknown}; "
+            f"valid values are {list(_KNOWN_NETWORKS)}"
+        )
+    return list(raw)
+
+
+@dataclass
+class EndpointConfig:
+    """An endpoint is a MACHINE Genesis operates on, not a service it calls.
+
+    One instance per machine, declared in the install overlay. The fields are
+    deliberately per-machine rather than per-fleet: the archetype is cloned by
+    copying a YAML, not by subclassing.
+
+    ``machine_id`` is the stable identity and it must NOT be a hostname.
+    MEASURED 2026-09-08: two distinct Windows machines were observed reporting
+    the SAME ``COMPUTERNAME`` while differing in MachineGuid, BIOS serial, model
+    and GPU — so anything keyed on hostname merges them and one machine's state
+    silently overwrites the other's. Use a genuinely unique per-machine value
+    (Windows MachineGuid, a DMI UUID, or an operator-assigned label).
+
+    ``allowed_networks`` enforces reachability rather than assuming it: an
+    endpoint may be reachable only over an overlay network, or only over the
+    LAN, so "either-or" is a requirement rather than flexibility.
+    """
+
+    state_dir: str | None = None
+    mission_command: str | None = None
+    machine_id: str | None = None
+    allowed_networks: list[str] = field(default_factory=lambda: ["lan", "tailnet"])
+
+
 @dataclass
 class ProgramConfig:
     """Full configuration for an external program module.
@@ -76,6 +154,7 @@ class ProgramConfig:
     ipc: IPCConfig = field(default_factory=IPCConfig)
     health_check: HealthCheckConfig | None = None
     lifecycle: LifecycleConfig | None = None
+    endpoint: EndpointConfig | None = None
     research_profile: str | None = None
     enabled: bool = False
     # Typed field schema (source of truth for field metadata)
@@ -91,13 +170,15 @@ class ProgramConfig:
         ipc = IPCConfig(
             method=ipc_data.get("method", "http"),
             url=ipc_data.get("url"),
-            timeout=ipc_data.get("timeout", 30),
+            timeout=_positive_number(ipc_data.get("timeout", 30), 30),
             command=ipc_data.get("command", []),
             working_dir=Path(ipc_data["working_dir"]) if ipc_data.get("working_dir") else None,
             env=ipc_data.get("env", {}),
             ssh_host=ipc_data.get("ssh_host"),
             ssh_key=ipc_data.get("ssh_key"),
-            ssh_connect_timeout=ipc_data.get("ssh_connect_timeout", 10),
+            ssh_connect_timeout=_positive_number(
+                ipc_data.get("ssh_connect_timeout", 10), 10
+            ),
             remote_working_dir=ipc_data.get("remote_working_dir"),
             remote_claude_path=ipc_data.get("remote_claude_path", "claude"),
         )
@@ -121,6 +202,23 @@ class ProgramConfig:
                 source_dir=lc_data.get("source_dir"),
                 restart_cmd=lc_data.get("restart_cmd"),
                 logs_cmd=lc_data.get("logs_cmd"),
+            )
+
+        # A dict or a bare string passes an `in` test with entirely different
+        # semantics: `allowed_networks: {lan: false}` makes `"lan" in allowed`
+        # test KEYS and admit the network the operator just disabled, and a
+        # string admits by substring. Fail closed on any shape that is not a
+        # list of known names.
+        ep_data = data.get("endpoint")
+        endpoint = None
+        if ep_data:
+            endpoint = EndpointConfig(
+                state_dir=ep_data.get("state_dir"),
+                mission_command=ep_data.get("mission_command"),
+                machine_id=ep_data.get("machine_id"),
+                allowed_networks=_validated_networks(
+                    ep_data.get("allowed_networks", ["lan", "tailnet"])
+                ),
             )
 
         # Config fields: prefer new typed schema, fall back to legacy configurable dict
@@ -156,6 +254,7 @@ class ProgramConfig:
             ipc=ipc,
             health_check=health_check,
             lifecycle=lifecycle,
+            endpoint=endpoint,
             research_profile=data.get("research_profile"),
             enabled=data.get("enabled", False),
             config_fields=config_fields,
