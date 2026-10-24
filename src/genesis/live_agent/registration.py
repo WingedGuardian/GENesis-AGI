@@ -11,7 +11,7 @@ async def update_session_row(session_id: str, model: str | None, closed: bool) -
     from genesis.db.crud.cc_sessions import checkpoint_dark, get_by_id, update_model_effort
     from genesis.env import genesis_db_path
 
-    async with connect_aiosqlite_rw(genesis_db_path()) as db:
+    async with connect_aiosqlite_rw(genesis_db_path(), existing_only=True) as db:
         db.row_factory = aiosqlite.Row
         row = await get_by_id(db, session_id)
         if not row or row["cc_session_id"] != session_id or row["session_type"] != "foreground":

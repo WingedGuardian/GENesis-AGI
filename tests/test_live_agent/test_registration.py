@@ -177,7 +177,8 @@ async def test_unconfirmed_process_death_keeps_row_active(db, monkeypatch, pid):
     await db.commit()
 
     @asynccontextmanager
-    async def connect(path):
+    async def connect(path, **kwargs):
+        assert kwargs == {"existing_only": True}
         yield db
 
     monkeypatch.setattr("genesis.db.connection.connect_aiosqlite_rw", connect)
@@ -185,3 +186,15 @@ async def test_unconfirmed_process_death_keeps_row_active(db, monkeypatch, pid):
     with pytest.raises(RuntimeError, match="death unconfirmed"):
         await update_session_row("actual", None, True)
     assert (await (await db.execute("SELECT status FROM cc_sessions WHERE id='actual'")).fetchone())[0] == "active"
+
+
+async def test_missing_database_is_not_created(tmp_path, monkeypatch):
+    import sqlite3
+
+    from genesis.live_agent.registration import update_session_row
+
+    missing = tmp_path / "missing.db"
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: missing)
+    with pytest.raises(sqlite3.OperationalError):
+        await update_session_row("actual", "m", False)
+    assert not missing.exists()
