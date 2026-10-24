@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 import aiosqlite
 import ego_owned_loop as owned
 import headlong_native_controls as native
+from ego_runtime_report import valid_c_counters
 from headlong_controls import dependency_inventory, preflight, read_jsonl, tree_hash
 from headlong_monolith_controls import (
     CROSSING,
@@ -29,7 +30,13 @@ from headlong_native_provider import Backend
 from headlong_prompt_references import canonical_id
 
 
-async def seed(root, name):
+async def seed(root, name, *, mechanics=None):
+    if mechanics is not None and mechanics.name != name:
+        raise ValueError("misbound shared mechanics fixture")
+    if mechanics is None:
+        approved, reactive, conflict, large = name == "restart_effect", name == "reactive", name == "blocked", False
+    else:
+        approved, reactive, conflict, large = mechanics.kind == "approved", mechanics.reactive, mechanics.blocked, name == "large_context"
     root.mkdir()
     identity = root / "identity"
     for sub in ("run", "workdir", "memories", "skills/fixture", "kernel", "trajectories"):
@@ -48,24 +55,25 @@ async def seed(root, name):
     spec["reference_ids"] = [spec["trajectory_id"], canonical_id(append({"type": "observation", "source": "fixture",
         "content": "continuity orbit fixture-stream-marker"}, env, root))]
     (identity / "info.txt").write_text(f"name=fixture\nroot_trajectory={spec['trajectory_id']}\n")
-    (identity / "core_identity_prompt.md").write_text("fixture-identity-marker λ @mention-target.txt\n")
+    (identity / "core_identity_prompt.md").write_text("fixture-identity-marker λ @mention-target.txt\n" +
+        ("continuity context " * 9000 if large else ""))
     (identity / "workdir/mention-target.txt").write_text(MENTION_CONTENT)
     (identity / "memories/goal.md").write_text("---\ntype: goal\ncreated: 2000-01-01\n---\nfixture-goal-marker\n")
     (identity / "memories/continuity-note.md").write_text("---\ntype: memory\ncreated: 2000-01-01\n---\ncontinuity orbit fixture-memory-marker\n")
     (identity / "skills/fixture/SKILL.md").write_text("---\nname: fixture\ndescription: fixture-skill-marker\n---\nSynthetic context only.\n")
-    if name == "blocked":
+    if conflict:
         spec["reference_ids"].append(canonical_id(append({"type": "observation", "source": "fixture",
             "step_id": CROSSING, "content": "owned crossing control"}, env, root)))
         with (identity / "core_identity_prompt.md").open("a") as stream:
             stream.write(CROSSING + " 1111 1111\n")
-    if name == "reactive":
+    if reactive:
         spec["feed"] = [{"id": "external-1", "seq": 1, "due": spec["start"], "source": "fixture",
                          "target": "genesis_ego_cycle", "type": "observation", "content": "continuity orbit wake"}]
     async with aiosqlite.connect(root / "fixture.sqlite3") as db:
         db.row_factory = aiosqlite.Row
         for table in ("ego_proposals", "ego_proposal_revisions"):
             await db.execute(native.TABLES[table])
-        await native.prepare_case(db, "approved" if name == "restart_effect" else "pending")
+        await native.prepare_case(db, "approved" if approved else "pending")
     return spec
 
 
@@ -90,7 +98,8 @@ def qualify(name, case):
                 "reactive": ["noop"], "blocked": ["blocked"]}[name]
     if [row["outcome"] for row in observations] != expected:
         return False
-    if (case["effect"] != (native.EFFECT.hex() if name == "restart_effect" else None)
+    if (not valid_c_counters(report["state"])
+            or case["effect"] != (native.EFFECT.hex() if name == "restart_effect" else None)
             or case["state"]["status"] != ("executed" if name == "restart_effect" else "pending")
             or case["groups_closed"] is not True
             or report["state"]["cursor"] != int(name == "reactive")

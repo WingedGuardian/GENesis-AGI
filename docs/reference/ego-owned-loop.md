@@ -90,5 +90,30 @@ SDK HOME caches are excluded. The workflow retains this report and Docker settin
 alongside the stock/reference/native/B foundation reports. Source/binary/container,
 physical-effect and cleanup verification of the actual run is still required.
 
-The fuller C mechanics/crash matrix and B/C comparison follow separately. This
-early smoke establishes no full workflow, useful model behavior or Codex parity.
+The shared native population in `ego_owned_matrix.py` replays all thirteen
+mechanics cases from `ego_runtime_cases.py` using C's own timer/cursor/pacing
+semantics. Native invocation counts are derived from actual receipts and checked
+against the predeclared applicability. The forced operational UUID, exact history
+lookup, large context, safe provider-error retry, partial effects and reference
+conflicts retain separate expected outcomes. A typed native final alone cannot
+qualify a completed effect. Expected failure cases must also match the declared
+collector and protected-call error; unrelated artifact or binding failures cannot
+qualify merely by producing uncertainty. C halts uncertain partial effects, which differs
+from the monolith's pacing after its visible-work probe.
+
+The same report keeps a distinct pure reducer population:36event/outcome/clock
+cells,17burst/delivery cells,6restart/manifest/writer guards and one ladder/cap/
+reopen cell. One impossible empty-feed altered-duplicate combination is declared
+excluded. Synthetic reducer observations establish no native work or policy
+authority. All60cell IDs must match the inventory exactly; counts alone cannot
+hide a missing cell. A144mutant calibration checks the scoring instrument.
+Typed counter/time checks reject Python boolean/integer aliases, and retries
+must retain the bound logical event and wake. Actual synthetic journals are
+retained for detached replay inspection.
+
+The new container/report are separate from the early smoke and existing
+foundation arms. Qualification requires actual post-review contained results,
+source/binary/container identities and independent artifact/state/effect readback.
+Real-process interruption, timing/recovery cells and the final B/C comparison
+follow separately. Neither native mechanics nor synthetic state scoring establish
+full workflow, useful model behavior, production or Codex parity.
