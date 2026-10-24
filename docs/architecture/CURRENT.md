@@ -3125,6 +3125,16 @@ verified: 2f013ed7b 2026-10-24
   Independently runnable contained controls compare pinned/adapted sanitizers;
   this adds no production provider or native monolith qualification. See
   `docs/reference/headlong-reference-redaction.md`.
+- **Native monolith probe**: opt-in contained B1 experiment replaces only the
+  pinned monolith invocation, retaining outer context/probe/backoff/wake code.
+  Thirteen cases/fifteen wakes/thirteen native sessions plus reader correlations
+  require actual state, bytes, run attribution, context and pacing evidence.
+  Integration requires its actual post-review CI report. Tiered memory is off,
+  deterministic related context remains on, and only the protected MCP effect is
+  exposed; no full runtime, dispatcher or capability parity follows. See
+  `docs/reference/headlong-native-monolith.md`.
+  The reference-redaction prerequisite retains issued IDs; explicit conflicts
+  stop before SDK execution and preserve existing timer/reactive pacing.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).

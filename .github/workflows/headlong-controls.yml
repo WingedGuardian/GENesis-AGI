@@ -23,6 +23,7 @@ jobs:
       CONTROL_CONTAINER: headlong-${{ github.run_id }}-${{ github.run_attempt }}
       NATIVE_CONTAINER: headlong-native-${{ github.run_id }}-${{ github.run_attempt }}
       REFERENCE_CONTAINER: headlong-reference-${{ github.run_id }}-${{ github.run_attempt }}
+      BRIDGE_CONTAINER: headlong-bridge-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -45,6 +46,7 @@ jobs:
           printf '%s\n' eab04ad4097fb2030f27bee6026e24f57289f12d > "$context/headlong/.source-pin"
           cp scripts/ci/headlong_fixture.py scripts/ci/headlong_controls.py scripts/ci/headlong_native_*.py "$context/"
           cp scripts/ci/headlong_prompt_references.py scripts/ci/headlong_reference_*.py "$context/"
+          cp scripts/ci/headlong_monolith_controls.py scripts/ci/headlong_bridge_patch.json "$context/"
           cp scripts/ci/headlong_controls.Dockerfile "$context/Dockerfile"
           docker build -t headlong-controls "$context"
           docker image inspect headlong-controls > "$RUNNER_TEMP/headlong-image.json"
@@ -122,9 +124,39 @@ jobs:
           assert report['sdk'] == '0.2.172' and report['native_binary']['sha256']
           print('11/11 native cells and handler-error instrument control passed')
           PY
+      - name: Run actual monolith with the native inner invocation
+        run: |
+          set -euo pipefail
+          docker create --name "$BRIDGE_CONTAINER" --init --network none --read-only \
+            --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 256 --memory 1g --memory-swap 1g --cpus 1 \
+            --tmpfs /work:rw,exec,nosuid,nodev,size=512m,mode=1777 \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=128m,mode=1777 \
+            headlong-controls python3 /fixture/headlong_monolith_controls.py
+          docker inspect "$BRIDGE_CONTAINER" > "$RUNNER_TEMP/headlong-bridge-container.json"
+          timeout 600 docker start -a "$BRIDGE_CONTAINER" > "$RUNNER_TEMP/headlong-bridge-report.json"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$BRIDGE_CONTAINER")" = 0
+          python3 - "$RUNNER_TEMP/headlong-bridge-report.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1]) as stream:
+              report = json.load(stream)
+          expected = {'effect', 'noop', 'refusal', 'provider_error', 'handler_error', 'large_context', 'reactive_noop', 'restart_duplicate', 'reference_continuity', 'observation_failure', 'final_failure', 'reference_conflict', 'reactive_reference_conflict'}
+          assert report['schema'] == 'headlong-native-monolith/v1' and report['status'] == 'pass'
+          assert report['cleanup_confirmed'] is True and report['sources_unchanged'] is True
+          assert len(report['cases']) == 13 and {case['scenario'] for case in report['cases']} == expected
+          assert all(case['control_passed'] is True for case in report['cases'])
+          runs = [run for case in report['cases'] for run in case['runs']]
+          assert len(runs) == 15 and all(run['control_passed'] is True for run in runs)
+          native_runs = [run for run in runs if run['driver']['native'] is not None]
+          assert len(native_runs) == 13 and report['correlations']['passed'] is True
+          assert len({run['driver']['native']['session_id'] for run in native_runs}) == 13
+          assert all(not case['runs'][0]['driver']['complete'] for case in report['cases'] if case['scenario'].endswith('_failure'))
+          assert all(run['backend']['main_requests'] == 0 and run['driver']['prompt_status'] == '65' for case in report['cases'] if case['scenario'].endswith('reference_conflict') for run in case['runs'])
+          print('13 cases / 15 wakes / 13 native sessions plus exact reader correlations verified')
+          PY
       - name: Remove only this evaluation container
         if: always()
-        run: docker rm -f "$CONTROL_CONTAINER" "$NATIVE_CONTAINER" "$REFERENCE_CONTAINER" || true
+        run: docker rm -f "$CONTROL_CONTAINER" "$NATIVE_CONTAINER" "$REFERENCE_CONTAINER" "$BRIDGE_CONTAINER" || true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -137,5 +169,7 @@ jobs:
             ${{ runner.temp }}/headlong-native-container.json
             ${{ runner.temp }}/headlong-reference-report.json
             ${{ runner.temp }}/headlong-reference-container.json
+            ${{ runner.temp }}/headlong-bridge-report.json
+            ${{ runner.temp }}/headlong-bridge-container.json
           retention-days: 7
           if-no-files-found: error
