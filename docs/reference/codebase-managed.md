@@ -477,6 +477,14 @@ Follow the supervised production acceptance and resource gates in
 
 ## Verification
 
+The runner's SQLite contention fixture verifies actual outcome replay: after
+the fixture locker releases the ordinary runner lock, a real recovery tick
+must retire pending, inflight and failure records and the outcome spool while
+calling the fake provider only once. An empty pending list or a successful
+lock-busy no-op does not prove completion. The fixture also bounds its locker
+readiness wait. These tests use an isolated home and fake provider; they do not
+qualify production indexing or explain a separate first-tick timeout.
+
 The configuration test suite uses synthetic paths and fixtures. Native staging
 acceptance explicitly opts in to the independently pinned release binary:
 
