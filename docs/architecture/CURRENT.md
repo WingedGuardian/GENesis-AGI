@@ -1775,7 +1775,10 @@ the shared banner is not an assertion about all concurrent sessions.
   bytes) for a voice front end. It runs the install's pinned `claude`, with
   Claude Code's own system prompt and every settings source, so it loads hooks,
   skills and MCP servers like a terminal and registers as an owner foreground
-  session. Hosts can declare `output_surface="speech"`; identity injection
+  session. The host updates its initialized model and checkpoints existing rows
+  after disconnect only when the recorded child is confirmed dead; failures
+  remain visible and leave the existing reaper as fallback.
+  Hosts can declare `output_surface="speech"`; identity injection
   then requests direct spoken replies without terminal model/effort headers.
   Phase 0 host: `scripts/live_agent_cli.py`; only the `owner_cli`
   initiator may call `turn()` until model-initiated turns pass the
