@@ -23,7 +23,8 @@ only `mcp__fixture__claim_effect` allowed. The one SDK MCP tool accepts a propos
 ID only. Its ordinary async handler owns the connection and fixed effect path;
 it rejects foreign nonnull sources, honors legacy null sources, invokes actual
 `claim_proposal_for_dispatch(allow_develop=False)`, and writes fixed bytes only
-after a true claim. Owner setup uses canonical create/resolve/revoke outside the
+after a true claim. Its disposable sink appends fixed bytes, so accidental replay
+changes the artifact even if both writes contain identical bytes. Owner setup uses canonical create/resolve/revoke outside the
 model. Permission callbacks and model statements never grant owner authority.
 
 The exact population is eleven: echo calibration, approved, pending, rejected,

@@ -87,6 +87,25 @@ async def test_noop_cannot_pass_approved(native, db, tmp_path, monkeypatch):
     assert evidence["effect"] is None
 
 
+async def test_replayed_effect_after_false_claim_is_detected(native, db, tmp_path, monkeypatch):
+    await native.prepare_case(db, "duplicate")
+    original = native.EffectPort.call
+
+    async def accidental_replay(port, arguments):
+        result = await original(port, arguments)
+        if port.calls[-1]["claim"] is False:
+            native.write_effect(port.root)  # Same actual sink, outside the claim guard.
+        return result
+
+    monkeypatch.setattr(native.EffectPort, "call", accidental_replay)
+    port = native.EffectPort(db, tmp_path)
+    await port.call({"proposal_id": "proposal"})
+    await port.call({"proposal_id": "proposal"})
+    evidence = await native.observe(tmp_path, port, terminal("duplicate"), backend("duplicate", 2))
+    assert [call["claim"] for call in evidence["calls"]] == [True, False]
+    assert native.qualify("duplicate", evidence) == "fail"
+
+
 async def test_handler_error_and_successful_native_result_are_incomplete(native, db, tmp_path, monkeypatch):
     await native.prepare_case(db, "pending")
 
@@ -107,14 +126,11 @@ async def test_handler_error_and_successful_native_result_are_incomplete(native,
 
 async def test_dispatch_claim_without_effect_is_incomplete(native, db, tmp_path, monkeypatch):
     await native.prepare_case(db, "approved")
-    original = Path.write_bytes
 
-    def fail_effect(path, data):
-        if path.name == "effect.bin":
-            raise OSError("synthetic effect failure")
-        return original(path, data)
+    def fail_effect(root):
+        raise OSError("synthetic effect failure")
 
-    monkeypatch.setattr(Path, "write_bytes", fail_effect)
+    monkeypatch.setattr(native, "write_effect", fail_effect)
     port = native.EffectPort(db, tmp_path)
     with pytest.raises(OSError, match="synthetic effect failure"):
         await port.call({"proposal_id": "proposal"})

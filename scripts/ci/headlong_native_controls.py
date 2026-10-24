@@ -20,6 +20,12 @@ KINDS = ("echo", "approved", "pending", "rejected", "revoked", "develop", "dupli
 EFFECT = b"native-fixture-effect\n"
 
 
+def write_effect(root):
+    # Append makes an accidental replay observable even when bytes are identical.
+    with (root / "effect.bin").open("ab") as stream:
+        stream.write(EFFECT)
+
+
 async def prepare_case(db, kind):
     if kind == "unknown":
         return
@@ -56,7 +62,7 @@ class EffectPort:
                 call["claim"] = await ego.claim_proposal_for_dispatch(self.db, arguments["proposal_id"], allow_develop=False)
                 call["outcome"] = "refused"
                 if call["claim"]:
-                    (self.root / "effect.bin").write_bytes(EFFECT)
+                    write_effect(self.root)
                     call["outcome"] = "executed"
             return {"content": [{"type": "text", "text": json.dumps({"claimed": call["claim"], "outcome": call["outcome"]})}],
                     "is_error": call["outcome"] != "executed"}
