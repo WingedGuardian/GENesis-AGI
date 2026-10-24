@@ -440,6 +440,7 @@ def _can_unshare_pid() -> bool:
     return r.returncode == 0
 
 
+@pytest.mark.real_tool("sudo")  # sudo unshare: a throwaway PID namespace that only reads /proc
 def test_in_a_real_private_pid_namespace_your_own_child_is_blind():
     # The #2515 scenario for real: inside its own PID namespace the caller is
     # pid 1 and /proc shows only its own tree, so its child's PPid is 1 — which
