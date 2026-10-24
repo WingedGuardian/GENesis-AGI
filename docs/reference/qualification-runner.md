@@ -93,6 +93,42 @@ current shared admission identity and never selects a winner or promotes a route
 Paired financial reporting censuses both exact scored snapshots together;
 conflicting generation ownership makes the combined result incomplete and
 excludes the conflicting charges from its resolved expense total.
+
+Unmarked legacy histories retain detailed incomplete reports with
+`campaign_incompatible` reasons. Reporting accesses no credentials and preserves
+the history files. Present malformed `baseline_sample` markers are refused.
+
+An explicit Pro incumbent sample can reduce comparison requests while Flash
+still runs the complete corpus. Put `baseline_sample` in Pro's campaign binding,
+with exactly `purpose: "incumbent_baseline"`, the complete `corpus_hash`,
+`case_ids` mapping every admitted contract to a nonempty proper subset of unique
+case IDs, and nonblank `selection_evidence`. Every selected contract must include
+both reference classes. Select and freeze the sample before examining candidate
+results. Sampling is permitted only for Pro in a Pro–Flash execution pair; Flash
+retains its complete schedule. The operating consent scope names the exact
+combined request count, including all three repetitions of each selected case.
+Complete preflight still validates the full corpus, approval, sources and class
+floors; sampling does not approve a cropped reference corpus.
+
+The Pro report has `status: "baseline_only"`,
+`scope: "sampled_incumbent_baseline"`, `qualification_status: "not_assessed"`,
+and a separate `baseline_completion`. A verified served malformed model grade
+is a completed observed error; missing, local or unverified evidence remains
+incomplete. A paired report has scope `full_flash_with_sampled_pro_baseline`.
+Its status preserves Flash's full pass/fail result only when the baseline and
+full Flash evidence are complete; otherwise the comparison is incomplete.
+An exit of zero never means that sampled Pro was fully requalified.
+
+Paired tables use the exact declared common sample. Case-level summaries for
+each contract and reference class use
+the majority of three correct judgments, counting malformed model grades as
+incorrect. Repetitions are not additional independent cases. McNemar p-values
+are exploratory because source-family independence is unverified; they do not
+select a winner or authorize promotion. Deliberately balanced sample classes
+and correlated constructed cases do not support an unweighted whole-corpus or
+production accuracy claim. Close results can remain inconclusive, without
+automatically running a larger sample.
+
 Judge qualification includes all registered rubrics and J9 relevance. Every
 repetition needs 80% agreement overall and in each class with the required class
 floors. Novelty permits no false or wrong-target suppression, including when
@@ -102,13 +138,17 @@ Deterministic embeddings and synthetic classifiers establish wiring, not model
 or retrieval quality.
 
 `run` supports Flash alone (`--alias openrouter-deepseek-flash --campaign`),
-or the historical MiMo–Flash pair with both `--against` and `--against-campaign`.
+or an explicit Pro–Flash or historical MiMo–Flash pair with both `--against`
+and `--against-campaign`. Pro uses `openrouter-deepseek-v4`, preserving the
+configured `deepseek/deepseek-v4-pro` identity. Choose and verify each model's
+upstream, parameters and receipt identity independently; Flash's upstream is
+not evidence that Pro supports that upstream.
 Both modes require `--operating-plan`, `--spending-approval` and all complete
 admission inputs above. The parameters file must contain exactly the selected
 population. Other singleton aliases and additional candidates are refused.
 Missing spending approval still
-refuses before credentials or campaign creation. The private version-1 operating
-plan freezes one or two complete 2,250-attempt manifests, source admission, requested
+refuses before credentials or campaign creation. The default private version-1 operating
+plan freezes the exact selected manifests (normally 2,250 attempts per model), source admission, requested
 parameters, receipt-provider identities, credential fingerprint, price evidence,
 per-model and combined allowances, key limit and baseline usage. Currency uses
 exact nonnegative decimal strings. The plan names
@@ -119,7 +159,8 @@ or `stop_semantics=stop_both_on_unresolved_evidence_no_resend` for the pair.
 These are operating allocations, not externally guaranteed maximum charges.
 The key envelope must fund every allocation and fit the combined allowance.
 The separate private approval binds the entire canonical plan hash, the owner,
-`2250_requests` or `4500_requests` scope matching the exact selected population,
+request-count scope matching the exact selected population (for example,
+`2250_requests`, `4500_requests`, or `2850_requests` for a 200-case Pro baseline),
 and actual decision provenance. Changing the population invalidates old consent.
 This is a trusted local
 operator assertion, not cryptographic authentication of a human decision. An

@@ -2170,7 +2170,14 @@ def _doc_findings_mode() -> str:
 # command that merely MENTIONS a bare keyword alongside "sqlite3" without a write
 # (a `grep 'sqlite3 … DELETE' file`, or a read whose STRING VALUE is a keyword
 # like `WHERE s='DELETE'`) still matches. Excluding those needs real SQL/shell
-# parsing — tracked as a follow-up, not worth reintroducing bypass risk for.
+# parsing, which is not worth reintroducing bypass risk for. Read-only queries
+# go through `~/genesis/.venv/bin/python -m genesis db query "<sql>"` instead
+# (issue #3531; the venv interpreter, since a session shell has no `python` on
+# PATH and the system python3 cannot import genesis): SQLite
+# itself enforces read-only there (mode=ro, query_only, an allowlist
+# authorizer), and its command text carries no `sqlite3`, so no exemption is
+# needed here. A text-level exemption for `sqlite3 -readonly -safe` was
+# rejected: shell expansion, dot-commands and `.sqliterc` all bypassed it.
 _DML_KEYWORD_RE = re.compile(
     r"\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b(?!\s*\()",
     re.IGNORECASE,
@@ -16214,7 +16221,9 @@ def _run_merge_and_push_gates() -> int:
         if _is_sqlite_write(cmd):
             print(
                 "BLOCKED: Direct database writes via sqlite3 are not allowed. "
-                "Use CRUD modules or MCP tools instead.",
+                "Use CRUD modules or MCP tools instead. For a READ-ONLY query, use: "
+                '~/genesis/.venv/bin/python -m genesis db query "<sql>" '
+                "(read-only is enforced by SQLite; --json, --param, --limit).",
                 file=sys.stderr,
             )
             return 2

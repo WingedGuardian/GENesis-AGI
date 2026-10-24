@@ -83,8 +83,10 @@ starting, rechecks and refreshes accepted sources again, then starts and verifie
 native readiness. Backend argv must match
 the installed positional bridge, including its `no-env-expand` flag; auxiliary
 execution commands refuse. A custom installation must supply the same absolute
-`VENV_PATH` used by `install.sh` when invoking `enable`; otherwise the configured
-main checkout's `.venv` is expected. Disable/remove do not require that variable.
+`VENV_PATH` used by `install.sh` when invoking `enable` or `available`; otherwise
+the configured main checkout's `.venv` is expected. The rendered indexing runner
+exports that same literal selection to its child processes.
+Disable/remove do not require that variable.
 Missing typed manager properties, unsupported native namespace layouts or unavailable
 `busctl` refuse activation. Installation calls cannot fall back to a client-side
 reader. Current canonical templates are the authority, not a partial directive
@@ -299,6 +301,30 @@ regular units; bootstrap follows the shared managed-unit ownership policy.
 
 ## Diagnose and recover
 
+The read-only `available --repo /absolute/main --persistence true|false` command
+checks configured main identity, cache and completed query-service startup, plus writer
+prerequisites in the caller's filesystem namespace. It creates no probe files or
+queue rows and does not index repositories. It validates the loaded startup
+contract, accepted executable and active constrained backend without invoking the
+native CLI. Current RPC responsiveness is checked again by final worker admission.
+Persistence checks include the artifact destination
+and the pinned provider's fixed snapshot scratch directory; false omits both.
+The immutable `_config.db` stays a reader surface, while index databases and their
+WAL/SHM and rollback-journal sidecars require read/write access, as does the
+mutable queue database and its sidecars. Cache and queue directories require
+read access for enumeration. The append-only runner log and non-enumerated
+runtime/lock directories do not require read access. The accepted executable
+must also be executable by the caller in this namespace. Existing writable
+descendants can remain usable under a read-only parent.
+
+Availability is advisory: a runner with filesystem restrictions must perform its
+own checks. Custom state roots need an operator-owned `ReadWritePaths` allowlist;
+persistent snapshot scratch can use an operator-owned disk `BindPaths` mapping.
+Genesis does not install a policy drop-in or broaden the runner sandbox. Preserve
+paths masked by a mapping and assess its capacity before using it. The separate
+worker/queue integration performs final admission; this command grants no right
+to index and does not activate providers.
+
 ```bash
 .venv/bin/python -I scripts/codebase_managed.py status
 .venv/bin/python -I scripts/codebase_managed.py --config /absolute/settings.json status
@@ -320,6 +346,19 @@ Unsupported repository/cache identities and symlink-resolution failures also
 populate `settings_error` without suppressing metadata or the systemd check.
 Structural settings reads remain available for retained-state diagnosis; no
 incompatible cache is repaired or deleted automatically.
+
+The separate `queue_initialization` object observes
+`$GENESIS_HOME/index-requests/.queue-db-init.lock` (defaulting to
+`$HOME/.genesis`). Its `required_when` is `queue initialization or schema upgrade`:
+a current-schema queue can remain usable when this append-only lock is not
+writable. `state` reports `absent`, `observed_writable`, or `unavailable`, with
+the selected `path`, observed lexical `exists`, and any `error`. Unknown
+existence is `null` when lookup fails. An absent lock also checks its first
+existing parent's write/search prerequisites without creating anything. This
+advisory neither inspects the database schema nor acquires a lock, and does not
+change availability or readiness. Observed writability does not guarantee a
+future open or an uncontended lock. Settings and manager diagnostics remain
+independent of this observation.
 
 Existing settings and state are never refreshed in place. Schema 1 and other
 builds remain diagnosable, but are not valid schema-2 execution configurations.
@@ -450,6 +489,14 @@ Follow the supervised production acceptance and resource gates in
 `../architecture/codebase-managed-runtime.md`.
 
 ## Verification
+
+The runner's SQLite contention fixture verifies actual outcome replay: after
+the fixture locker releases the ordinary runner lock, a real recovery tick
+must retire pending, inflight and failure records and the outcome spool while
+calling the fake provider only once. An empty pending list or a successful
+lock-busy no-op does not prove completion. The fixture also bounds its locker
+readiness wait. These tests use an isolated home and fake provider; they do not
+qualify production indexing or explain a separate first-tick timeout.
 
 The configuration test suite uses synthetic paths and fixtures. Native staging
 acceptance explicitly opts in to the independently pinned release binary:

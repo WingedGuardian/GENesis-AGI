@@ -18,6 +18,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from tests.test_scripts.test_codebase_managed_lifecycle import loaded as loaded
+from tests.test_scripts.test_codebase_managed_lifecycle import operator as operator
+from tests.test_scripts.test_codebase_managed_templates import render as render
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TEMPLATE = _REPO_ROOT / "scripts" / "systemd" / "genesis-code-intel.service.template"
 _CBM_LAUNCHER = _REPO_ROOT / ".claude" / "mcp" / "run-codebase-memory"
@@ -50,3 +56,38 @@ def test_managed_launcher_does_not_select_a_path_provider() -> None:
     assert 'scripts/codebase_managed.py" launch' in launcher
     assert "CODEBASE_MEMORY_MCP_BIN" not in launcher
     assert "command -v codebase-memory-mcp" not in launcher
+
+
+@pytest.mark.parametrize("renderer", ["install.sh", "bootstrap.sh"])
+def test_runner_carries_rendered_venv_into_backend_validation(
+    render, operator, loaded, tmp_path, monkeypatch, renderer,
+):
+    import shlex
+    import shutil
+
+    units, run = render
+    shutil.copy2(_TEMPLATE, units.parent / "templates")
+    home = tmp_path / 'home $%λ" \\ '
+    result = run(renderer, home)
+    assert result.returncode == 0, result.stdout + result.stderr
+    venv = home / ".venv" if renderer == "bootstrap.sh" else tmp_path / 'venv=$%&|λ" '
+    escaped = str(venv).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    lines = (units / "genesis-code-intel.service").read_text().splitlines()
+    expected = f'Environment="VENV_PATH={escaped}"'
+    assert expected in lines
+    assignment, = shlex.split(expected.removeprefix("Environment="))
+    key, selected = assignment.split("=", 1)
+    selected = selected.replace("%%", "%")
+    assert key == "VENV_PATH" and selected == str(venv)
+    config, properties, _ = loaded
+    for name in ("ExecStartEx", "ExecStartPostEx"):
+        properties[name]["data"][0][1][4] = str(venv) + "/bin/python"
+    monkeypatch.delenv("VENV_PATH", raising=False)
+    monkeypatch.setenv("PATH", str(venv / "bin") + ":/usr/bin")
+    with pytest.raises(ValueError, match="ExecStartEx"):
+        operator.validate_loaded_backend(config)
+    monkeypatch.setenv(key, selected)
+    operator.validate_loaded_backend(config)
+    monkeypatch.setenv(key, str(tmp_path / "different-venv"))
+    with pytest.raises(ValueError, match="ExecStartEx"):
+        operator.validate_loaded_backend(config)
