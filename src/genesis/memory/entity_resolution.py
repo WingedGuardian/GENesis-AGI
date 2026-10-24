@@ -177,6 +177,7 @@ def _find_dedup_candidates_sync(
     collection: str,
 ) -> list[tuple[dict, dict, float]]:
     """Synchronous inner loop for dedup candidate discovery."""
+    from genesis.memory.namespace import is_namespaced_id
     from genesis.qdrant import collections as qdrant_ops
 
     seen_pairs: set[tuple[str, str]] = set()
@@ -193,6 +194,7 @@ def _find_dedup_candidates_sync(
             collection=collection,
             query_vector=vec,
             limit=max_candidates_per_point + 1,  # +1 for self-match
+            exclude_namespaced=True,
         )
 
         for hit in hits:
@@ -201,6 +203,8 @@ def _find_dedup_candidates_sync(
                 continue  # self-match
             if hit["score"] < threshold:
                 continue
+            if is_namespaced_id(str(hid)) or is_namespaced_id(str(pid)):
+                continue  # never merge/supersede across the peer namespace
 
             pair_key = tuple(sorted((pid, hid)))
             if pair_key in seen_pairs:

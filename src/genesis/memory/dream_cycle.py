@@ -768,8 +768,10 @@ def _scroll_and_group_sync(
     Synchronous — runs in a thread pool via ``_scroll_and_group()`` so
     the blocking Qdrant I/O never starves the async event loop.
 
-    Skips already-deprecated points.
+    Skips already-deprecated points and namespaced (external peer) points:
+    those never acquire automatic links, merges or supersessions.
     """
+    from genesis.memory.namespace import is_namespaced_id
     from genesis.qdrant.collections import scroll_points
 
     buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -783,6 +785,8 @@ def _scroll_and_group_sync(
             payload = point.get("payload", {})
             # Skip already-deprecated memories
             if payload.get("deprecated") is True:
+                continue
+            if is_namespaced_id(str(point["id"])):
                 continue
             wing = payload.get("wing") or "general"
             room = payload.get("room") or "uncategorized"
@@ -822,6 +826,7 @@ async def _cross_wing_scan(
 
     Returns a list of finding dicts for the report.
     """
+    from genesis.memory.namespace import is_namespaced_id
     from genesis.qdrant.collections import search as qdrant_search
 
     # Group points by wing (collapse rooms within each wing)
@@ -868,6 +873,7 @@ async def _cross_wing_scan(
                         query_vector=vec,
                         limit=5,
                         wing=wing_b,
+                        exclude_namespaced=True,
                     )
                 except Exception:
                     continue
@@ -876,6 +882,8 @@ async def _cross_wing_scan(
                     score = hit.get("score", 0.0)
                     if score < similarity_threshold:
                         continue
+                    if is_namespaced_id(str(hit["id"])):
+                        continue  # peer memories take no automatic links
 
                     content_a = point.get("payload", {}).get("content", "")[:200]
                     content_b = hit.get("payload", {}).get("content", "")[:200]
