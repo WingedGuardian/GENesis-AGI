@@ -1,1 +1,0 @@
-- **Graph-engine cutover report.** `scripts/graph_cutover_report.py` says whether the FalkorDB graph engine is ready to become the default: PASS after 14 consecutive days with no fallback and enough traffic, NOT YET with what is still short, or INCONCLUSIVE when some of the evidence may be missing.
