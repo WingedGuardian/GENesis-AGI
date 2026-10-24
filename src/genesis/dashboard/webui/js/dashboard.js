@@ -3313,11 +3313,14 @@
               headers: {'Content-Type': 'application/json'},
               body: JSON.stringify({ action }),
             });
-            if (resp && resp.ok) {
-              await this.fetchSchedulerData();
+            const data = resp ? await resp.json() : null;
+            if (!resp?.ok || data?.success !== true) {
+              alert(data?.error || "User job action failed. Check the current job status and retry.");
             }
           } catch (e) {
-            console.warn("User job action failed:", e);
+            alert("User job action failed. Check the current job status and retry.");
+          } finally {
+            await this.fetchSchedulerData();
           }
         },
 

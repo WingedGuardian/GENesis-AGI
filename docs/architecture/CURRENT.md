@@ -1250,7 +1250,7 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: 50b79ffb 2026-09-01
+verified: a8fa35a358bc 2026-10-23
 ```
 
 - **Surplus generators are deliberately BLIND to `infrastructure_alert`
@@ -1291,7 +1291,12 @@ verified: 50b79ffb 2026-09-01
   distinct labels classified `external_untrusted` (wrapped on recall).
 - **`scheduler/` (top-level package) is the UserJobScheduler** — user-authored
   cron jobs (via MCP) that dispatch background DirectSessions. Distinct from
-  `surplus/scheduler.py`.
+  `surplus/scheduler.py`. Saved `active` is desired intent, while MCP/dashboard
+  `registered` derives current membership in the running scheduler. Failed
+  create registration retains the saved ID; retry `resume` on that ID or the
+  next startup reloads active intent. There is no automatic in-process
+  registration retry loop. Dispatch history `passed` means spawn accepted,
+  not session completion or delivery. See [user-job recovery](../reference/user-jobs.md).
 - `follow_ups/` = accountability ledger + dispatcher (every 5 min) that turns
   follow-ups into surplus tasks; retention sweep on the learning scheduler. The
   `follow_up_create` MCP tool routes USER-OWNED and purely-local operational work
