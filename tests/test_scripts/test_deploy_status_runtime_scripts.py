@@ -348,7 +348,8 @@ def _named_by_listed(listed: list[str]) -> set[str]:
     for path in listed:
         source = (REPO / path).read_text(encoding="utf-8")
         if path.endswith(".py"):
-            for node in ast.walk(ast.parse(source)):
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     tops = [a.name.split(".")[0] for a in node.names]
                 elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
@@ -356,6 +357,32 @@ def _named_by_listed(listed: list[str]) -> set[str]:
                 else:
                     continue
                 named.update(modules[t] for t in tops if t in modules)
+            receiver = ast.dump(ast.parse("Path(__file__)", mode="eval").body)
+            loader = ast.dump(ast.parse("importlib.util.spec_from_file_location", mode="eval").body)
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Call)
+                    and ast.dump(node.func) == loader
+                    and len(node.args) == 2
+                    and not node.keywords
+                ):
+                    continue
+                target = node.args[1]
+                if (
+                    isinstance(target, ast.Call)
+                    and isinstance(target.func, ast.Attribute)
+                    and target.func.attr == "with_name"
+                    and ast.dump(target.func.value) == receiver
+                    and len(target.args) == 1
+                    and not target.keywords
+                    and isinstance(target.args[0], ast.Constant)
+                    and isinstance(target.args[0].value, str)
+                ):
+                    filename = target.args[0].value
+                    if filename and Path(filename).name == filename:
+                        sibling = Path(path).with_name(filename)
+                        if (REPO / sibling).is_file():
+                            named.add(sibling.as_posix())
         else:
             here = (REPO / path).parent
             for line in source.splitlines():
@@ -404,6 +431,22 @@ def _chains(path: Path) -> set[str]:
         if texts and None not in texts:
             out.add(_join([t.strip("/") for t in texts]))
     return out
+
+
+def test_listed_sibling_file_loader_is_recognized_without_guessing(tmp_path, monkeypatch):
+    directory = tmp_path / "scripts/lib"
+    directory.mkdir(parents=True)
+    (directory / "facade.py").write_text(
+        "from pathlib import Path\n"
+        'spec = importlib.util.spec_from_file_location("synthetic", Path(__file__).with_name("helper.py"))\n'
+        'unrelated = importlib.util.spec_from_file_location("other", other.with_name("unrelated.py"))\n'
+        'subprocess.run([str(Path(__file__).with_name("worker-only.sh"))])\n'
+    )
+    (directory / "helper.py").write_text("# loaded sibling\n")
+    (directory / "unrelated.py").write_text("# not a file-loader declaration\n")
+    (directory / "worker-only.sh").write_text("# separate worker, not an import\n")
+    monkeypatch.setitem(globals(), "REPO", tmp_path)
+    assert _named_by_listed(["scripts/lib/facade.py"]) == {"scripts/lib/helper.py"}
 
 
 def test_every_listed_script_is_consumed_and_exists():
@@ -504,6 +547,7 @@ def test_the_scan_sees_each_shape_it_claims(tmp_path):
 # collect no case and read as a pass); a test keeps them equal to the lists.
 _RELOAD = (
     "scripts/lib/index_marker.py",
+    "scripts/lib/index_marker_legacy.py",
     "scripts/hooks/worktree_claim.py",
     "scripts/hooks/secret_scrub.py",
 )
@@ -676,10 +720,11 @@ def test_a_pull_of_an_unlisted_script_leaves_the_bracket_valid(station):
     assert _verify(station, start)
 
 
-def test_a_deploy_of_an_imported_script_restarts(station):
+@pytest.mark.parametrize("reload_path", _RELOAD[:2])
+def test_a_deploy_of_an_imported_script_restarts(station, reload_path):
     """index_marker is imported once and kept, so a new copy needs a restart."""
-    _seed(station, _RELOAD[0])
-    tip = _advance_upstream(station, "script", {_RELOAD[0]: "# v2\n"})
+    _seed(station, reload_path)
+    tip = _advance_upstream(station, "script", {reload_path: "# v2\n"})
     r = _run(station, env=_env(station, GIT_COMMITTER_DATE=_later(station, 180)))
     assert r.returncode == 0, (r.stdout, r.stderr)
     assert _git(station["root"], "rev-parse", "HEAD") == tip
