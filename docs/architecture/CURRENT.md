@@ -1495,7 +1495,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: a8fa35a358bc 2026-10-23
+verified: 74c474c0f 2026-10-24
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1627,9 +1627,11 @@ the shared banner is not an assertion about all concurrent sessions.
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
   live runtime (stale-but-functional).
   External Codebase has pinned configuration staging/diagnostics and bounded
-  native query unit entry points in `scripts/codebase_managed.py`. Install and
-  bootstrap render disabled query/client-slice templates without auto-upgrading
-  a PATH provider. Staging does not activate it; MCP registration always uses
+  native query unit entry points in `scripts/codebase_managed.py`.
+  Status separately observes conditional queue initialization-lock prerequisites
+  without opening the queue or changing current-schema availability.
+  Install and bootstrap render disabled query/client-slice templates without
+  auto-upgrading a PATH provider. Staging does not activate it; MCP registration always uses
   the managed launcher, including absent PATH binaries. Queued indexing uses the
   existing durable queue and an exact-build native worker in a separate
   8 GiB, zero-swap scope, with final managed admission and canonical repository

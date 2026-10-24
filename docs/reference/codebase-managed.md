@@ -347,6 +347,19 @@ populate `settings_error` without suppressing metadata or the systemd check.
 Structural settings reads remain available for retained-state diagnosis; no
 incompatible cache is repaired or deleted automatically.
 
+The separate `queue_initialization` object observes
+`$GENESIS_HOME/index-requests/.queue-db-init.lock` (defaulting to
+`$HOME/.genesis`). Its `required_when` is `queue initialization or schema upgrade`:
+a current-schema queue can remain usable when this append-only lock is not
+writable. `state` reports `absent`, `observed_writable`, or `unavailable`, with
+the selected `path`, observed lexical `exists`, and any `error`. Unknown
+existence is `null` when lookup fails. An absent lock also checks its first
+existing parent's write/search prerequisites without creating anything. This
+advisory neither inspects the database schema nor acquires a lock, and does not
+change availability or readiness. Observed writability does not guarantee a
+future open or an uncontended lock. Settings and manager diagnostics remain
+independent of this observation.
+
 Existing settings and state are never refreshed in place. Schema 1 and other
 builds remain diagnosable, but are not valid schema-2 execution configurations.
 Before reconfiguration, stop any existing managed native processes, preserve
