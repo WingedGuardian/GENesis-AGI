@@ -14,6 +14,12 @@ and the Genesis tree. The base image is digest-pinned and SDK version is pinned.
 Package versions and source hashes identify the actual run; package repository
 contents are not frozen across builds.
 
+The image uses Debian Trixie's jq and checks its reserved-variable syntax during
+build. The pinned recap uses `$end`, which jq 1.6 rejects; a minimal compiler
+probe reproduced the difference between jq 1.6 and 1.7. The older Bookworm image
+therefore does not qualify this source pin. This is a fixture dependency
+requirement, checked before any upstream test is executed.
+
 Run only on a disposable GitHub-hosted runner. The container has no host mounts,
 Docker socket or supplied secrets. It uses a read-only root, private writable
 tmpfs, loopback-only network, nonroot UID, no capabilities, no-new-privileges and
