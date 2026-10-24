@@ -184,8 +184,9 @@ def test_call_site_actually_redirects(tmp_path, monkeypatch):
     redirect itself could be DELETED with the file still green (measured --
     removing `config.option.basetemp = target` left 12/12 passing).
 
-    Asserts the effect, not the decision: basetemp is moved to a per-pid leaf
-    under GENESIS_BIG_TMP, and the directory exists.
+    Asserts the effect, not the decision: basetemp is moved into a per-pid leaf
+    under GENESIS_BIG_TMP (``<leaf>/bt``: the live closure keeps the test HOME
+    beside it in the leaf), and the leaf exists.
     """
     mod = _load_conftest()
 
@@ -200,7 +201,7 @@ def test_call_site_actually_redirects(tmp_path, monkeypatch):
     mod.pytest_configure(config)
     try:
         expected = big / "pytest" / str(os.getpid())
-        assert config.option.basetemp == str(expected)
+        assert config.option.basetemp == str(expected / "bt")
         assert expected.is_dir()
         assert config._genesis_basetemp_cleanup == str(expected)
     finally:
@@ -249,7 +250,7 @@ def test_call_site_reads_TMPDIR_for_the_cc_tmp_case(tmp_path, monkeypatch):
     )
     mod.pytest_configure(config)
     try:
-        assert config.option.basetemp == str(big / "pytest" / str(os.getpid()))
+        assert config.option.basetemp == str(big / "pytest" / str(os.getpid()) / "bt")
     finally:
         mod.pytest_unconfigure(config)
 
