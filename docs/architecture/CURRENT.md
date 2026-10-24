@@ -2847,9 +2847,11 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: ed048e214017 2026-10-22
+verified: 2f013ed7b 2026-10-23
 ```
 
+- Verification refresh is limited to the sampled qualification-runner behavior
+  below; other learning and evaluation evidence retains its dated basis.
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
   glue over Claude Code transcripts and `cc_sessions.skill_tags`. Per skill:
   tool loads, slash loads, SKILL.md reads (not counted in a session that edits
@@ -3092,6 +3094,11 @@ verified: ed048e214017 2026-10-22
   independent-backup claim. Missing retained evidence refuses before rendering.
   The isolated serial CLI supports Flash-only, explicit Pro–Flash or historical MiMo–Flash execution
   under an exact frozen operating plan and a separate local spending assertion.
+  An explicit manifest-bound Pro incumbent sample retains complete reference
+  admission and full Flash gates. Sampled Pro reports completion separately
+  from qualification; execution and detached reporting use the same declared
+  paired population and status rules. Exploratory case and reference-class comparisons do
+  not treat repeated responses as independent cases or authorize promotion.
   A credential-scoped lock precedes journal writers and credential reads. The
   actual pre-dispatch key snapshot must fund the whole selected pending
   population, including effective/member headroom; uncertain evidence stops
@@ -3101,6 +3108,8 @@ verified: ed048e214017 2026-10-22
   invalidate scoring on detected drift, without a per-request source-integrity
   guarantee. Detached reports score retained snapshots under current admission,
   read no credentials and do not authenticate current external spending consent.
+  Unmarked legacy histories retain detailed incomplete reports; malformed sample
+  markers are refused during validation.
   No paid quality, promotion or live activation follows from synthetic wiring.
   After source review, the integrated runner passed 1,777 affected tests and a
   complete synthetic 750-case/2,250-request actual-CLI run plus credential-free
