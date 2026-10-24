@@ -12,6 +12,9 @@ import pytest
 
 from genesis.awareness.loop import AwarenessLoop
 
+# Real awareness ticks here: keep their git-health and bundle steps off the live install.
+pytestmark = pytest.mark.usefixtures("quiet_live_tick")
+
 
 @pytest.mark.asyncio
 async def test_on_tick_dispatches_observer_out_of_band(db, monkeypatch):

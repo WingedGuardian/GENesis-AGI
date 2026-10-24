@@ -1603,6 +1603,7 @@ class TestSubcommandBypass:
     def test_the_two_lists_are_disjoint(self):
         assert not set(self.EPHEMERAL) & set(self.KEEPS_A_SLOT)
 
+    @pytest.mark.real_tool("claude")  # reads the installed claude's own --help
     def test_every_installed_subcommand_is_CLASSIFIED(self):
         """A new subcommand must be CLASSIFIED, not defaulted into the bypass.
 

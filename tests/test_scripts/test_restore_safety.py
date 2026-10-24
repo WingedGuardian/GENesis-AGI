@@ -133,6 +133,7 @@ def _run_restore(sandbox, *extra_args: str, scan_mode: str = "none"):
     """
     bkp = _seed_backup(sandbox["tmp"])
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env["HOME"] = str(sandbox["home"])
     env["GENESIS_DIR"] = str(sandbox["gd"])
     env["QDRANT_URL"] = "http://127.0.0.1:1"  # dead → Qdrant restore skips fast
@@ -325,6 +326,7 @@ def test_database_only_restore_keeps_newer_guard_when_not_quarantined(sandbox):
     os.utime(sql, (1_000, 1_000))
     os.utime(db, (2_000, 2_000))
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(sandbox["home"]),
         GENESIS_DIR=str(sandbox["gd"]),
@@ -359,6 +361,7 @@ def test_database_only_restore_aborts_if_quarantine_state_cannot_be_checked(sand
         f'exec "{real_python}" "$@"\n',
     )
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(sandbox["home"]),
         GENESIS_DIR=str(sandbox["gd"]),

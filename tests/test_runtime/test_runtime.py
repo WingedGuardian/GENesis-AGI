@@ -18,9 +18,22 @@ def _reset_runtime():
     GenesisRuntime.reset()
 
 
+@pytest.fixture(autouse=True)
+def _private_home(tmp_path, monkeypatch):
+    """Bootstrap writes its manifests and status files under ``Path.home()``
+    (capabilities.json, bootstrap_manifest.json, cred_integrity_status.json) and
+    the credential checks read files there: a private home keeps every one of
+    them in this test's tmp_path."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+
 def _all_init_patches():
     """Context managers that patch all bootstrap init steps."""
     return [
+        # Reads, and can restore, the real home's credential files.
+        patch("genesis.runtime.GenesisRuntime._selfheal_credentials_startup"),
         patch("genesis.runtime.GenesisRuntime._load_secrets"),
         patch("genesis.runtime.GenesisRuntime._init_db", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_tool_registry", new_callable=AsyncMock),

@@ -3,8 +3,13 @@
 import json
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401 - MagicMock used
 
+import pytest
+
 from genesis.awareness.loop import AwarenessLoop, perform_tick
 from genesis.awareness.types import Depth, SignalReading, TickResult
+
+# Real awareness ticks here: keep their git-health and bundle steps off the live install.
+pytestmark = pytest.mark.usefixtures("quiet_live_tick")
 
 
 class _HotSignal:
