@@ -12,6 +12,7 @@ COPY ego_runtime_report.py /fixture/
 COPY ego_owned_state.py ego_owned_loop.py ego_owned_context.sh ego_owned_controls.py /fixture/
 COPY ego_owned_matrix.py ego_owned_state_controls.py /fixture/
 COPY ego_owned_probe.py ego_owned_processes.py ego_owned_recovery.py /fixture/
+COPY ego_owned_timing.py /fixture/
 RUN cp -a /headlong /headlong-b && python3 /fixture/headlong_reference_patch.py /headlong-b
 RUN python3 -c 'import json, sys; from pathlib import Path; sys.path.insert(0,"/fixture"); from headlong_reference_patch import replace_once; p=Path("/headlong-b/thinkers/monolith/step"); spec=json.loads(Path("/fixture/headlong_bridge_patch.json").read_text()); s=replace_once(p.read_text(),spec["before"],spec["after"]); s=replace_once(s,spec["prompt_before"],spec["prompt_after"]); p.write_text(s)'
 RUN chmod 755 /fixture/headlong_fixture.py /fixture/headlong_native_bridge.py && ln -s headlong_fixture.py /fixture/fake-claude && dpkg-query -W > /fixture/packages.txt && pip freeze > /fixture/python-packages.txt

@@ -3158,6 +3158,10 @@ verified: 2f013ed7b 2026-10-24
   ownership. Actual native process/cleanup evidence is required; its host tests
   establish neither abrupt recovery nor actual clock behavior. Timing and final
   B/C readback remain separate.
+  An additional contained actual-clock controller covers timer waits across
+  plain-CLI reopen, fixed reactive arrivals, backoff shutdown and exclusive
+  writer contention. It requires a genuine during-backoff arrival and retains
+  the complete population; injected-clock tests do not qualify those timings.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
