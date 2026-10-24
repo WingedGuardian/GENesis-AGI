@@ -3162,6 +3162,10 @@ verified: 2f013ed7b 2026-10-24
   plain-CLI reopen, fixed reactive arrivals, backoff shutdown and exclusive
   writer contention. It requires a genuine during-backoff arrival and retains
   the complete population; injected-clock tests do not qualify those timings.
+  A pure comparison consumer joins same-pin B/C mechanics and separate reducer,
+  recovery and timing reports into the frozen case table. It preserves their
+  different failure/pacing semantics and requires independent artifact/process
+  verification; report flags alone confer no production or Codex qualification.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).

@@ -169,3 +169,25 @@ survivors. Twenty-four missing-evidence mutants calibrate the actual rows.
 Host tests use injected clocks and native/upstream stubs; actual clock and CLI
 lifecycle claims require post-review contained results plus independent raw
 readback. The final B/C report remains separate work.
+
+`ego_runtime_report.comparison` consumes the B native mechanics, C native/state,
+C recovery and C timing reports from the same CI image/source pin. The pure
+consumer produces `ego-comparison-report.json`, keyed by the frozen thirteen
+mechanics cases, and rejects missing/duplicate cases, mixed source/native
+profiles, numeric boolean aliases and incomplete populations. Requested and
+resolved model identities accompany native records. Reducer, interruption,
+late-I/O and actual-clock denominators stay separate.
+
+The table preserves observed differences: B records provider failures as run
+errors even when the outer shell exits zero, while C records a logical retry.
+B appends its own idle marker after a nonproductive successful native final.
+After a visible effect with a missing final, B may reset pacing while C stops
+uncertain. A successful native final alone is not proof of completed work.
+The summary still requires independent retained-byte/process/container readback;
+it selects no winner and establishes neither useful-model performance nor
+production/full-workflow readiness. Codex remains an unqualified separate native
+adapter that must satisfy the same invocation, authority, artifact, continuity
+and lifecycle contract and run the declared populations.
+Only the thirteen native mechanics cases are bilateral in this table. The
+additional state/recovery/timing populations are explicitly C evidence; this
+run establishes no B-versus-C recovery or actual-clock parity result.

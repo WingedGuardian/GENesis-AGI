@@ -74,3 +74,8 @@ the exact nine-cell population, all selected upstream invocations and cleanup.
 It uploads the report and actual image/container metadata for seven days, then
 removes only that run's container. A killed or timed-out run is incomplete and
 cannot pass. No integrated success is claimed until the contained job is observed.
+
+The separate B/C native table and C-only state/recovery/timing readback are
+documented in [the owned-loop reference](ego-owned-loop.md). Their additional
+arms do not change the stock-only scope described above; each population has
+its own retained report and independent verification requirement.
