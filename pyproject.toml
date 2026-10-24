@@ -56,6 +56,12 @@ dependencies = [
     "pydantic>=2.12,<3",  # strict validation for the decision registry (already pulled in by fastapi, litellm and mcp)
     "pyyaml",
     "a2a-sdk==1.2.2",
+    "claude-agent-sdk==0.2.172",  # live_agent: drives a persistent Claude Code session (query/steer/interrupt/
+                                  # can_use_tool). Pinned exactly: the wire contract it speaks to the CLI moves
+                                  # between releases. The wheel bundles its own CLI (~280 MB); live_agent runs the
+                                  # install's pinned `claude` instead (cli_path), so the bundle is unused.
+                                  # Core, not an extra, so update.sh installs it with no operator step;
+                                  # move it to an extra if the ~280 MB matters before live_agent ships.
     "markdown-it-py>=3",  # the merge gate's rework row reads PR bodies as CommonMark (already pulled in by rich)
     "httpx",
     "diskcache>=5.6",
