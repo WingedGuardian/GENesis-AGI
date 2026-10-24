@@ -1495,7 +1495,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: a8fa35a358bc 2026-10-23
+verified: 74c474c0f901 2026-10-24
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1775,7 +1775,9 @@ the shared banner is not an assertion about all concurrent sessions.
   bytes) for a voice front end. It runs the install's pinned `claude`, with
   Claude Code's own system prompt and every settings source, so it loads hooks,
   skills and MCP servers like a terminal and registers as an owner foreground
-  session. Phase 0 host: `scripts/live_agent_cli.py`; only the `owner_cli`
+  session. Hosts can declare `output_surface="speech"`; identity injection
+  then requests direct spoken replies without terminal model/effort headers.
+  Phase 0 host: `scripts/live_agent_cli.py`; only the `owner_cli`
   initiator may call `turn()` until model-initiated turns pass the
   autonomous-CLI approval gate. Turns the session injects itself
   (background-task notifications, peer or scheduled messages) still run, as in
