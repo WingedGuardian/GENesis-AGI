@@ -22,6 +22,7 @@ jobs:
     env:
       CONTROL_CONTAINER: headlong-${{ github.run_id }}-${{ github.run_attempt }}
       NATIVE_CONTAINER: headlong-native-${{ github.run_id }}-${{ github.run_attempt }}
+      REFERENCE_CONTAINER: headlong-reference-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -43,6 +44,7 @@ jobs:
           git rev-parse HEAD > "$context/genesis-source-pin"
           printf '%s\n' eab04ad4097fb2030f27bee6026e24f57289f12d > "$context/headlong/.source-pin"
           cp scripts/ci/headlong_fixture.py scripts/ci/headlong_controls.py scripts/ci/headlong_native_*.py "$context/"
+          cp scripts/ci/headlong_prompt_references.py scripts/ci/headlong_reference_*.py "$context/"
           cp scripts/ci/headlong_controls.Dockerfile "$context/Dockerfile"
           docker build -t headlong-controls "$context"
           docker image inspect headlong-controls > "$RUNNER_TEMP/headlong-image.json"
@@ -73,6 +75,27 @@ jobs:
           assert len(report["upstream"]) == 8 and all(row["passed"] is True for row in report["upstream"] + report["routes"])
           print("9/9 route controls and 8/8 selected upstream test invocations passed")
           PY
+      - name: Run pinned and adapted prompt redaction inside disposable containment
+        run: |
+          set -euo pipefail
+          docker create --name "$REFERENCE_CONTAINER" --init --network none --read-only \
+            --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 256 --memory 1g --memory-swap 1g --cpus 1 \
+            --tmpfs /work:rw,exec,nosuid,nodev,size=512m,mode=1777 \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=128m,mode=1777 \
+            headlong-controls python3 /fixture/headlong_reference_controls.py
+          docker inspect "$REFERENCE_CONTAINER" > "$RUNNER_TEMP/headlong-reference-container.json"
+          timeout 600 docker start -a "$REFERENCE_CONTAINER" > "$RUNNER_TEMP/headlong-reference-report.json"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$REFERENCE_CONTAINER")" = 0
+          python3 - "$RUNNER_TEMP/headlong-reference-report.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          assert report['schema'] == 'headlong-reference-controls/v1' and report['status'] == 'pass'
+          assert report['sources_unchanged'] is True and report['cleanup_confirmed'] is True
+          assert len(report['cases']) == 116 and all(row['passed'] is True for row in report['cases'])
+          assert len(report['upstream']) == 2 and all(row['passed'] is True for row in report['upstream'])
+          print('116 reference controls plus both pinned upstream sanitizer suites passed')
+          PY
       - name: Run real native SDK action port inside disposable containment
         run: |
           set -euo pipefail
@@ -101,7 +124,7 @@ jobs:
           PY
       - name: Remove only this evaluation container
         if: always()
-        run: docker rm -f "$CONTROL_CONTAINER" "$NATIVE_CONTAINER" || true
+        run: docker rm -f "$CONTROL_CONTAINER" "$NATIVE_CONTAINER" "$REFERENCE_CONTAINER" || true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -112,5 +135,7 @@ jobs:
             ${{ runner.temp }}/headlong-container.json
             ${{ runner.temp }}/headlong-native-report.json
             ${{ runner.temp }}/headlong-native-container.json
+            ${{ runner.temp }}/headlong-reference-report.json
+            ${{ runner.temp }}/headlong-reference-container.json
           retention-days: 7
           if-no-files-found: error
