@@ -3143,8 +3143,12 @@ verified: 2f013ed7b 2026-10-24
   for immutable manifest, intake, prepared/bound attempt and observation records.
   External cursor, generated timer ordinals, pacing/retry and related-memory
   pointers replay from that private journal; unresolved attempts stop automatic
-  replay. This is state machinery with host-safe tests, not a runnable/native C
-  qualification or a production runtime. See `docs/reference/ego-owned-loop.md`.
+  replay. `ego_owned_loop.py` adds a finite contained adapter using the existing
+  native bridge and pinned data-only context helpers; it verifies independent
+  proposal/effect and retained child evidence before logical commit. A separate
+  four-case native smoke requires actual contained results; state tests alone
+  do not establish native C success, full workflow/Codex parity or production
+  activation. See `docs/reference/ego-owned-loop.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
