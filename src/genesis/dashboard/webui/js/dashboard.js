@@ -2394,10 +2394,11 @@
         },
 
         async dismissUpdate() {
-          // A record that still guards unactivated code: dismissing it lets
+          // A record that still guards (unactivated code, a half-written
+          // checkout, or a record that cannot be read): dismissing it lets
           // code-only deploys and the live engine restart onto the checkout.
           if (this.updateProgress?.guards && !(await this.showConfirm("Dismiss update record",
-            "An earlier update merged code it has not activated (or its record cannot be read).\n\nDismissing it lets code-only deploys restart onto the checkout as it stands. Dismiss anyway?"))) return;
+            "An earlier update has not finished: it merged code it has not activated, left the checkout half-written, or its record cannot be read.\n\nDismissing it lets code-only deploys restart onto the checkout as it stands. Dismiss anyway?"))) return;
           try {
             await fetchApi("/api/genesis/updates/dismiss", { method: "POST" });
             this.updateProgress = {};

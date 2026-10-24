@@ -35,7 +35,7 @@ _RUNTIME_FRESH_SCRIPTS=(
     scripts/lib/update_state_guard.py     # loaded by dashboard/routes/updates.py for /apply and the progress poll
     scripts/hooks/bash_allowlist_guard.sh # run through .claude/hooks/genesis-hook by cc/invoker.py
     scripts/hooks/bash_allowlist_lib.sh   # sourced by bash_allowlist_guard.sh on every run
-    scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot
+    scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot, and by update_state_guard.py
     scripts/lib/deploy_checkout.sh        # sourced by the same probe (its dirty-tree predicate), and by update_state_guard.py
     scripts/hooks/main_checkout_guard.py  # registered by cc/invoker.py for dispatched sessions
     scripts/hooks/hook_input.py           # imported by main_checkout_guard.py on every run
