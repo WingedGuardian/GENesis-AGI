@@ -2868,8 +2868,16 @@ verified: 2f013ed7b 2026-10-23
   extracts physical records, preserves unresolved identity and usage, and
   applies the shared credential scrubber to structured content. Schema5 records
   distinguish executor identity from delegation evidence. This development
-  candidate adds the parser and optional DuckDB/Parquet dependencies; storage,
-  queries, CLI, scheduling and encrypted recovery arrive in dependent changes.
+  candidate adds the parser, durable per-source Parquet records and audited
+  historical readers. Readers capture immutable source selections; historical
+  provenance and unavailable facts remain explicit. Ingestion keeps one captured
+  canonical root, rejects malformed persisted root bindings and isolates source
+  stat failures. Transcript and sidecar-fingerprint reads admit regular descriptors
+  without blocking; fingerprint metadata is limited to 1 MiB. The extractor's
+  independent sidecar reopen remains outside adversarial-concurrency guarantees;
+  parser signatures and historical formats are unchanged. Queries, CLI and scheduling
+  arrive in dependent changes. Additional backup and recovery work is deferred
+  independently of collection and search.
   It does not describe a deployed capability.
   Hook names are limited to literal command targets and option-free supported
   interpreter operands; ambiguous commands report `<unknown>` while preserving
