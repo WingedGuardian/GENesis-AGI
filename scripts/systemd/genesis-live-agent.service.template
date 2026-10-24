@@ -1,0 +1,28 @@
+[Unit]
+Description=Genesis persistent live agent (local owner controls)
+After=network.target
+StartLimitBurst=4
+StartLimitIntervalSec=120
+# Opt-in: bootstrap and update render this file, without enabling or starting it.
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_DIR__
+ExecStart=:/bin/sh -c 'exec "$@"' -- "__VENV_EXEC__/bin/python" -m genesis.live_agent
+EnvironmentFile=__REPO_DIR__/secrets.env
+Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+RuntimeDirectory=genesis-live-agent
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=7200
+LimitCORE=0
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

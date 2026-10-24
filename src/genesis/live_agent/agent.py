@@ -494,7 +494,7 @@ class LiveAgent:
             "api_key_source": self._api_key_source,
             "rate_limited_until": self._rate_limited_until,
             "pending_approvals": [
-                {"id": a.id, "tool": a.tool_name, "reason": a.reason}
+                {"id": a.id, "tool": a.tool_name, "reason": a.reason, "input": a.tool_input}
                 for a in self._pending.values()
             ],
             "cli_path": self._cli_path,

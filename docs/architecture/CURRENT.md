@@ -1782,7 +1782,12 @@ the shared banner is not an assertion about all concurrent sessions.
   remain visible and leave the existing reaper as fallback.
   Hosts can declare `output_surface="speech"`; identity injection
   then requests direct spoken replies without terminal model/effort headers.
-  Phase 0 host: `scripts/live_agent_cli.py`; only the `owner_cli`
+  Hosts: `scripts/live_agent_cli.py` for a direct terminal, or the opt-in
+  `genesis-live-agent.service` with a private Unix control socket and
+  `scripts/live_agent_attach.py` owner client. Detaching preserves the agent;
+  reconnect sends current state/full pending asks, not event history. Slow
+  controllers disconnect rather than accumulate unbounded delivery queues.
+  The unit renders without default enablement. Only the `owner_cli`
   initiator may call `turn()` until model-initiated turns pass the
   autonomous-CLI approval gate. Turns the session injects itself
   (background-task notifications, peer or scheduled messages) still run, as in
