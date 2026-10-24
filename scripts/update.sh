@@ -1707,7 +1707,8 @@ _take_db_snapshot() {
         echo "  DATABASE RESTORE AUTHORITY CHECK FAILED — UPDATE ABORTED" >&2
         return 1
     fi
-    echo "--- Snapshotting database (deadline ${snapshot_timeout}s) ---"
+    echo "--- Snapshotting database ---"
+    echo "  Snapshot deadline: ${snapshot_timeout}s"
     # Bound the entire copy, verification and authority preparation. Killed
     # workers can leave private scratch, never a current-run admission marker.
     if timeout --kill-after=5s "${snapshot_timeout}s" bash -c \
