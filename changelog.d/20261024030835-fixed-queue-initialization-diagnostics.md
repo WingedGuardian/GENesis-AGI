@@ -1,0 +1,1 @@
+- Managed Codebase status reports conditional queue initialization-lock prerequisites without opening the queue or rejecting a usable current-schema queue.
