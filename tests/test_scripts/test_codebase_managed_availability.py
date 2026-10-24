@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -12,6 +13,75 @@ import pytest
 from tests.test_scripts.test_codebase_managed_config import config, managed
 
 availability = managed
+
+
+@pytest.mark.parametrize("fault", [
+    "none", "loaded-contract", "binary", "activating", "identity", "boundary", "revoked",
+])
+def test_available_observes_completed_startup_without_native_initialization(
+    availability, tmp_path, monkeypatch, fault,
+):
+    value = config(tmp_path, availability)
+    main = Path(value["main"])
+    (main / ".git").mkdir(parents=True)
+    for key in ("cache", "runtime"):
+        Path(value[key]).mkdir(mode=0o750)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps(value))
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "state"))
+    ns = availability.main.__globals__
+    monkeypatch.setitem(ns, "SCRIPT", main / "scripts/codebase_managed.py")
+    monkeypatch.setitem(ns, "verify_cache", Mock())
+    native = Mock(side_effect=AssertionError("observer must not initialize native paths"))
+    monkeypatch.setitem(ns, "ready", native)
+    monkeypatch.setattr(ns["subprocess"], "run", native)
+    events = []
+
+    def show(unit, *properties, **kwargs):
+        if properties == ("UnitFileState",):
+            events.append("enabled")
+            if fault == "revoked" and events.count("enabled") == 2:
+                Path(value["sentinel"]).touch()
+            return {"UnitFileState": "enabled"}
+        assert properties == ("ActiveState", "MainPID")
+        events.append("active")
+        return {"ActiveState": "activating" if fault == "activating" else "active", "MainPID": "123"}
+
+    def loaded(config):
+        events.append("contract")
+        if fault == "loaded-contract":
+            raise ValueError("incompatible startup contract")
+
+    @contextmanager
+    def accepted(path):
+        events.append("binary")
+        if fault == "binary":
+            raise ValueError("unsupported managed executable")
+        yield
+        events.append("closed")
+
+    def boundary(pid):
+        assert pid == "123"
+        events.append("boundary")
+        if fault == "boundary":
+            raise ValueError("unenforced query cap")
+
+    monkeypatch.setitem(ns, "show", show)
+    monkeypatch.setitem(ns, "validate_loaded_backend", loaded)
+    monkeypatch.setitem(ns, "verified_binary", accepted)
+    monkeypatch.setitem(ns, "verify_query_boundary", boundary)
+    monkeypatch.setattr(os.path, "samefile", lambda *args: fault != "identity")
+    before = {str(p): p.stat().st_mode for p in tmp_path.rglob("*")}
+    assert availability.main(["--config", str(settings), "available", "--repo", str(main),
+                              "--persistence", "false"]) == (0 if fault == "none" else 1)
+    native.assert_not_called()
+    after = {str(p): p.stat().st_mode for p in tmp_path.rglob("*")}
+    if fault == "revoked":
+        after.pop(value["sentinel"])  # deliberate test-side concurrent revocation
+    assert after == before
+    assert settings.read_text() == json.dumps(value)
+    if fault == "none":
+        assert events == ["enabled", "contract", "binary", "active", "boundary", "closed", "enabled"]
 
 
 @pytest.mark.parametrize(
@@ -35,9 +105,11 @@ def test_readonly_availability_refuses_incomplete_authority(availability, tmp_pa
     )
     cache = Mock()
     monkeypatch.setitem(namespace, "verify_cache", cache)
-    # Native RPC/cgroup semantics have dedicated runtime/native tests. Preserve
-    # real require_enabled here while controlling only endpoint readiness.
-    monkeypatch.setitem(namespace, "ready", managed.require_enabled)
+    # Keep real enablement checks; isolate loaded-contract, digest and cgroup
+    # readers here. Dedicated cases below enforce the observer boundary.
+    monkeypatch.setitem(namespace, "validate_loaded_backend", Mock())
+    monkeypatch.setitem(namespace, "verified_binary", lambda path: nullcontext())
+    monkeypatch.setitem(namespace, "check_backend", Mock(return_value="123"))
     path = tmp_path / "settings.json"
     if fault == "schema":
         value["version"] = 1
