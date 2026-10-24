@@ -53,6 +53,44 @@ MAPPINGS = {
     "test_query_file_with_a_merge_is_refused_and_a_plain_one_is_not": "graphql-file",
     "test_input_file_body_is_read": "graphql-file",
 }
+DIRECT_PUBLISHING_ALLOWANCES = {
+    "test_republish_bare_push_allows", "test_republish_explicit_push_allows",
+    "test_safe_flags_still_allow", "test_republish_hit_records_branch",
+    "test_republish_offline_allow_when_ls_remote_fails",
+    "test_integration_record_stays_under_isolated_home",
+}
+PUBLISHING_TEST_SHA256 = (
+    "fd3475fd"
+    "2d0d6ab0"
+    "3bcba305"
+    "53aafcbb"
+    "ad673caf"
+    "881d0e44"
+    "4a6b58df"
+    "0afa9ef6"
+)
+PUBLISHING_GUARD_SHA256 = (
+    "7e83b3e8"
+    "3880a648"
+    "208d5d06"
+    "9921cafd"
+    "a156d95c"
+    "6e47d554"
+    "12462caf"
+    "1491d051"
+)
+
+
+def direct_publishing_allowance(request, guard):
+    test_source = ROOT / "tests/test_hooks/test_push_create_override.py"
+    if (request.module.__name__ != "tests.test_hooks.test_push_create_override"
+            or request.node.originalname not in DIRECT_PUBLISHING_ALLOWANCES
+            or Path(getattr(request.module, "__file__", "")).resolve() != test_source
+            or guard.resolve() != ROOT / "scripts/hooks/git_push_guard.py"):
+        return False
+    assert (sha(test_source) == PUBLISHING_TEST_SHA256
+            and sha(guard) == PUBLISHING_GUARD_SHA256), "publishing allowance source changed; requalify"
+    return True
 
 
 def pytest_addoption(parser):
@@ -270,6 +308,13 @@ def replay_case(request, monkeypatch, tmp_path, tmp_path_factory, existing_repla
                        fixture_adaptation="source-reviewed command-only refusal class in owned cwd")
         if not inline and len(argv) != 2:
             row["reason"] = "Direct guard CLI mode, not a Codex hook event: " + shlex.join(argv[2:])
+            return original_run(args, *positional, **kwargs)
+        if not inline and direct_publishing_allowance(request, guard):
+            # Owner-approved exception: the opener defeats publishing auto-allow.
+            # This guard writes cache even before ASK; never baseline-pair here.
+            row.update(kind="direct", reason="Owner-approved publishing allowance; separate independent-state proof",
+                       publishing_test_sha256=(
+                           PUBLISHING_TEST_SHA256))
             return original_run(args, *positional, **kwargs)
         if (
             not inline and guard.stem in {"secrets_env_access_guard", "git_push_guard"}
@@ -594,6 +639,10 @@ def pytest_collection_finish(session):
 def pytest_sessionfinish(session, exitstatus):
     coverage = {}
     reports = {}
+    for row in ROWS:
+        if row.get("child_fault") or row.get("injected_guard_sha256"):
+            row.update(kind="instrument-control",
+                       reason="Intentional child fault: instrument control, no unchanged-source qualification")
     final_hash = sha(Path(__file__))
     source_mismatches = []
     runtime = getattr(session.config, "_codex_replay_runtime", None)

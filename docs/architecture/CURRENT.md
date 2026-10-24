@@ -4114,7 +4114,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 2f013ed7 2026-10-23
+verified: 3e27b479 2026-10-23
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4176,7 +4176,9 @@ verified: 2f013ed7 2026-10-23
   validator calls to the existing guards concurrently. It requires an absolute
   Bash cd/exit opener terminated by a newline, confines patches to validator
   scratch roots, translates asks
-  to denials and preserves advisories. It has no ordinary configuration wiring
+  to denials and preserves advisories. Six source-bound publishing-allowance
+  tests retain direct evidence only; separate independent-state controls verify
+  the actual ask/refusal and existing push-cache effects. It has no ordinary configuration wiring
   or role-specific publishing/store policy yet. See
   `docs/reference/codex-validator-boundary.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it

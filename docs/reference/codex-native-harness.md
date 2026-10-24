@@ -86,6 +86,29 @@ and explanations. Both no-op and generic-denial child controls must catch every
 force case. This pairing is limited to that module's empty local remotes; it
 does not apply to guards with advisory deduplication or publishing state.
 
+Six source-bound publishing-allowance tests in `test_push_create_override.py`
+are an owner-approved direct-only exception: bare/explicit/safe-flag re-push,
+record-on-hit, recorded-offline, and record-location assertions. Their original
+fixtures and assertions still run, with zero adapter-compatibility credit.
+The module and guard source digests are pinned; drift requires requalification.
+The foreground opener adds an `exit` neighbour, which the unchanged guard does
+not treat as inert, so these ask-enabled fixtures emit an ask instead of the
+old publishing allowance. The guard can record its local push cache before
+emitting that ask. A same-cache baseline-first replay would change the adapted
+arm's initial state, so this family is never added to the generic paired mapping.
+
+Run `tests/test_hooks/test_codex_adapter_republish.py` separately, without the
+legacy replay plugin. Its dedicated real-child proof prepares independent
+direct/adapted cache roots before either arm runs, crossing fresh-online and
+recorded-offline state with bare, explicit and safe-flag push commands. It
+requires direct allow, raw adapted ask with the extra-step cause, adapter
+refusal preserving that cause, and the expected cache record at each assigned
+location. Git config, refs and remote availability remain unchanged. Real empty
+and generic-deny child controls must fail the expected ask/cause relation;
+they are instrument controls, not unchanged-source qualification. This composed
+proof adds no native-client case and does not override ask suppression. The
+policy-independent validator push prohibition belongs to the later role guard.
+
 The plugin requires fresh, separate absolute base, receipt and sidecar paths
 under the original `HOME/tmp`, outside the checkout. Before collection it gives
 the pytest process a fresh shallow owned HOME under `/tmp`, preserving existing
@@ -149,9 +172,13 @@ GENESIS_PYTEST_LOCK_WAIT=1 python -m genesis.hostmetrics run \
 The private receipt lists every test's source location, direct result, replay
 count and `FULL`/`PARTIAL`/`NO` invocation coverage. Failed, skipped and unfinished
 test lifecycles have zero qualified replays. Changed instrument, copied/public
-source or HEAD invalidates qualification. Every unreplayed invocation has a reason; tests without a subprocess
+source or HEAD invalidates qualification. Intentionally faulted children are
+explicit instrument controls with zero replay/qualification credit, including
+digest-only fault metadata; mixed calls retain credit only for real-source rows.
+Every unreplayed invocation has a reason; tests without a subprocess
 payload retain their direct evidence and referenced source symbols. Internal
-helper/mocked-main tests, Claude-only lifecycle/read/file event shapes, malformed
+helper/mocked-main tests, the six source-bound publishing allowances,
+Claude-only lifecycle/read/file event shapes, malformed
 or empty non-native payloads and the explicitly excluded main-checkout Bash half
 are not relabelled as adapter replays. Review the complete exception list rather
 than adding direct-suite passes to the replay count. Receipts contain local

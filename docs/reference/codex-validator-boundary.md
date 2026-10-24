@@ -42,6 +42,15 @@ checks public content. This workflow avoids the inline limitation; it does not
 restore arbitrary heredoc parity or authorize raw publishing commands. Guards
 still receive the complete unchanged command, including the anchor.
 
+With asks enabled, the foreground opener also removes the shared push guard's
+re-push auto-allowance: its `exit` neighbour is outside that guard's inert-step
+allowlist, so it asks and the adapter refuses. The guard can still update its
+local pushed-branch cache before asking; denial does not imply that no advisory
+or cache state was written. Six original publishing-allowance tests retain
+direct evidence with zero adapter credit; a separate independent-state proof
+checks the real ask/refusal and cache effects. Existing ask suppression remains
+authoritative. The later role policy owns unconditional validator push denial.
+
 GraphQL file inputs have a separate accepted limitation: the push guard trusts
 `@query` and `--input` bodies only in a single-step command. The mandatory anchor
 therefore makes even a read-only GraphQL file request refuse, including with an

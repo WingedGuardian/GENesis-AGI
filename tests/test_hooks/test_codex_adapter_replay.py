@@ -328,6 +328,7 @@ def test_fixture_manifest_binds_public_import_in_sibling_without_healing(tmp_pat
     assert manifest["fixture_source_hashes"]["shell_parse.py"] == bridge.sha(sibling)
 
 
+@pytest.mark.parametrize("fault", [None, "empty", "deny", "digest-only", "mixed-empty", "mixed-digest"])
 @pytest.mark.parametrize(
     "phases,expected",
     [
@@ -341,23 +342,21 @@ def test_fixture_manifest_binds_public_import_in_sibling_without_healing(tmp_pat
     ],
 )
 def test_receipt_keeps_every_selected_node_and_qualifies_only_complete_passes(
-    monkeypatch, tmp_path, phases, expected
+    monkeypatch, tmp_path, phases, expected, fault
 ):
     nodeid = "tests/fixture.py::test_case"
     monkeypatch.setattr(bridge, "REPORTS", {})
     monkeypatch.setattr(bridge, "SOURCE_ITEMS", {})
     monkeypatch.setattr(bridge, "COPIED", {})
-    monkeypatch.setattr(
-        bridge,
-        "ROWS",
-        [
-            {
-                "nodeid": nodeid,
-                "kind": "replay",
-                "adapter_assertions_passed": True,
-            }
-        ],
-    )
+    real = {"nodeid": nodeid, "kind": "replay", "adapter_assertions_passed": True}
+    control = real.copy()
+    if fault in {"digest-only", "mixed-digest"}:
+        control["injected_guard_sha256"] = "0" * 64
+    elif fault:
+        control["child_fault"] = "empty" if fault == "mixed-empty" else fault
+    mixed = fault is not None and fault.startswith("mixed-")
+    rows = [real] if fault is None else [real, control] if mixed else [control]
+    monkeypatch.setattr(bridge, "ROWS", rows)
     path = tmp_path / "receipt.json"
     item = SimpleNamespace(
         nodeid=nodeid, location=("tests/fixture.py", 7, "test_case"), function=lambda: None
@@ -383,7 +382,12 @@ def test_receipt_keeps_every_selected_node_and_qualifies_only_complete_passes(
     assert set(receipt["coverage"]) == {nodeid}
     row = receipt["coverage"][nodeid]
     assert row["direct_test_result"] == expected
-    assert row["qualified_replays"] == (1 if expected == "passed" else 0)
+    real_replays = int(fault is None or mixed)
+    assert row["qualified_replays"] == (real_replays if expected == "passed" else 0)
+    assert row["completed_replays"] == real_replays
+    assert row["status"] == ("FULL" if fault is None else "PARTIAL" if mixed else "NO")
+    if fault:
+        assert any("instrument control" in reason for reason in row["exclusions"])
 
 
 def test_receipt_invalidates_instrument_changed_after_load(monkeypatch, tmp_path):
