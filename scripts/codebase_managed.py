@@ -41,6 +41,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     canonical_sources,
     cgroup_empty,
     config_path,
+    first_existing_parent,
     frontend_command,
     implicit_slice_absent,
     index_writer_targets_main,
@@ -55,6 +56,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     validate_frontend_boundary,
     validate_provider_paths,
     validate_source_identity,
+    verify_binary_access,
     verify_worker_writes,
 )
 from codebase_managed_unit import (  # noqa: E402
@@ -510,15 +512,13 @@ def validate_settings(value: dict, *, require_build: bool = True) -> dict:
     return value
 
 
-def verified_binary(path: Path):
-    """Execute this verified inode, not a later resolution of its pathname."""
+def verified_binary(path: Path, *, execute: bool = True):
+    """Verify this inode; only a staging copy source may omit effective execute access."""
     absolute(str(path))
     fd = os.open(path, os.O_RDONLY | OPEN_FLAGS)
     stream = os.fdopen(fd, "rb")
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
-            raise ValueError("managed binary must be a regular executable")
+        verify_binary_access(fd, execute=execute)
         digest = hashlib.sha256()
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
@@ -547,13 +547,6 @@ def sync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-
-
-def first_existing_parent(path: Path) -> Path:
-    parent = path.parent
-    while not parent.exists():
-        parent = parent.parent
-    return parent
 
 
 def sync_ancestors(path: Path, stop: Path) -> None:
@@ -639,7 +632,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         staging_created = False
         try:
             existing_parent = first_existing_parent(state)
-            with verified_binary(source) as executable:
+            with verified_binary(source, execute=False) as executable:
                 state.mkdir(parents=True, mode=0o700)
                 staging_created = True
                 (state / "bin").mkdir(mode=0o700)
@@ -943,15 +936,15 @@ def available(path: Path, repo: str, persistence: bool = True) -> None:
         raise ValueError("managed indexing requires the configured physical main checkout")
     verify_worker_writes(config, persistence)
     verify_cache(config)
-    ready(config)
-
-
-def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
-    return native_parse_arguments(argv, __doc__)
+    require_enabled(config)
+    validate_loaded_backend(config)
+    with verified_binary(Path(config["binary"])):
+        check_backend(config)
+    require_enabled(config)
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_arguments(argv)
+    args = native_parse_arguments(argv, __doc__)
     try:
         home = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
         absolute(home)

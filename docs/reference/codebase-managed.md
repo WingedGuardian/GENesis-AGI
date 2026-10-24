@@ -83,8 +83,10 @@ starting, rechecks and refreshes accepted sources again, then starts and verifie
 native readiness. Backend argv must match
 the installed positional bridge, including its `no-env-expand` flag; auxiliary
 execution commands refuse. A custom installation must supply the same absolute
-`VENV_PATH` used by `install.sh` when invoking `enable`; otherwise the configured
-main checkout's `.venv` is expected. Disable/remove do not require that variable.
+`VENV_PATH` used by `install.sh` when invoking `enable` or `available`; otherwise
+the configured main checkout's `.venv` is expected. The rendered indexing runner
+exports that same literal selection to its child processes.
+Disable/remove do not require that variable.
 Missing typed manager properties, unsupported native namespace layouts or unavailable
 `busctl` refuse activation. Installation calls cannot fall back to a client-side
 reader. Current canonical templates are the authority, not a partial directive
@@ -298,6 +300,30 @@ and FalkorDB rendering retain their existing behavior. Install preserves existin
 regular units; bootstrap follows the shared managed-unit ownership policy.
 
 ## Diagnose and recover
+
+The read-only `available --repo /absolute/main --persistence true|false` command
+checks configured main identity, cache and completed query-service startup, plus writer
+prerequisites in the caller's filesystem namespace. It creates no probe files or
+queue rows and does not index repositories. It validates the loaded startup
+contract, accepted executable and active constrained backend without invoking the
+native CLI. Current RPC responsiveness is checked again by final worker admission.
+Persistence checks include the artifact destination
+and the pinned provider's fixed snapshot scratch directory; false omits both.
+The immutable `_config.db` stays a reader surface, while index databases and their
+WAL/SHM and rollback-journal sidecars require read/write access, as does the
+mutable queue database and its sidecars. Cache and queue directories require
+read access for enumeration. The append-only runner log and non-enumerated
+runtime/lock directories do not require read access. The accepted executable
+must also be executable by the caller in this namespace. Existing writable
+descendants can remain usable under a read-only parent.
+
+Availability is advisory: a runner with filesystem restrictions must perform its
+own checks. Custom state roots need an operator-owned `ReadWritePaths` allowlist;
+persistent snapshot scratch can use an operator-owned disk `BindPaths` mapping.
+Genesis does not install a policy drop-in or broaden the runner sandbox. Preserve
+paths masked by a mapping and assess its capacity before using it. The separate
+worker/queue integration performs final admission; this command grants no right
+to index and does not activate providers.
 
 ```bash
 .venv/bin/python -I scripts/codebase_managed.py status
