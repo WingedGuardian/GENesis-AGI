@@ -25,6 +25,7 @@
 _RUNTIME_RELOAD_SCRIPTS=(
     scripts/hooks/secret_scrub.py    # retained by transcript_analytics.scrub
     scripts/lib/index_marker.py      # imported by surplus/jobs/gitnexus.py (and disk_reclaim.py)
+    scripts/lib/index_marker_legacy.py # retained by index_marker's registered sibling loader
     scripts/hooks/worktree_claim.py  # loaded at import by observability/worktree_ownership_config.py
 )
 # Read or run afresh on every use, so a new copy is live at once, no restart:
