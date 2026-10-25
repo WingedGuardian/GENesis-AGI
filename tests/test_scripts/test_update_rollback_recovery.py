@@ -54,14 +54,14 @@ def test_rollback_restores_db_only_when_migrated(text: str) -> None:
     assert 'cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE"' in rb, (
         "restore copies the authority-reset pre-update candidate back"
     )
-    # The snapshot flag is set ONLY on a successful `.backup` this run.
-    snap = text[text.find("--- Snapshotting database ---") : text.find("_do_rollback() {")]
-    assert "DB_SNAPSHOT_TAKEN=1" in snap, "flag set on successful .backup"
-    assert snap.index("DB_SNAPSHOT_TAKEN=1") > snap.index('".backup'), (
-        "flag set AFTER the .backup succeeds, inside the success branch"
-    )
-    # The authority check runs the copy read at the run's start, isolated.
-    assert snap.index("DB_SNAPSHOT_TAKEN=1") > snap.index('python3 -I -S -c "$_PEER_RESTORE_PY"')
+    # Current-run authority is granted only after the bounded worker succeeds.
+    snap = text[text.index("# BEGIN db-snapshot") : text.index("# END db-snapshot")]
+    assert 'exec python3 -I -S - "$1" "$2"' in snap
+    assert 'if timeout --kill-after=5s' in snap
+    assert 'snapshot "$DB_FILE" "$_PEER_RESTORE_PY"; then\n        DB_SNAPSHOT_TAKEN=1' in snap
+    # The isolated worker invokes the selected authority source before publishing.
+    assert snap.index('exec(compile(authority,') < snap.index('namespace["reset_peer_authority"](candidate)')
+    assert snap.index('namespace["reset_peer_authority"](candidate)') < snap.index('publish(candidate, guarded)')
     assert 'if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then' in rb
     assert 'rm -f "$DB_FILE-wal" "$DB_FILE-shm"' in rb, (
         "restore MUST clear the stale WAL/SHM or SQLite replays the migrated changes"

@@ -339,10 +339,26 @@ open (`live_db_moved` otherwise). The threat model is accidental drift (owner
 ruling): deliberately constructed inputs, such as a swapped ancestor directory
 or forged bytecode, are documented residuals in the module docstring. Anything unproven
 lands in `unknown_reasons` or `telemetry_off: null`, and the verdict reads the
-row as not clean, so the clock waits for that server to restart. The cutover
-clock can only start at a census with no server that could be running older
-code; a row of an older schema reads dirty ("predates the current census
-contract"). Pruned with the telemetry rows.
+row as not clean, so the clock waits for that server to restart. Since schema 3
+the census covers the other traversal producers it can see in `/proc`, not
+only memory servers:
+- ambient workers: the same source proof against main's worker script, with the
+  switch and database taken from the launch environment, since the worker loads
+  no secrets file;
+- the census host's own row, proven from where its genesis modules actually
+  loaded;
+- any other python process on main's venv (found by its absolute interpreter
+  path, or by resolving a bare `python` through its own PATH): history and
+  database scope only (owner ruling);
+- replay, listed as excluded because it is not live traffic (owner ruling);
+- another bridge or server beside the host, always dirty.
+
+A census-level `head_history_telemetry` checks every commit HEAD held in the
+last 2h30m, so the CODE HISTORY of a process that lived and died between two
+censuses is still covered; its source and switch are not. Every producer row
+uses the memory servers' database rule above. The cutover clock can only start
+at a census with no producer that could be running older code; a row of an older schema reads dirty
+("predates the current census contract"). Pruned with the telemetry rows.
 **The verdict** is `scripts/graph_cutover_report.py` over the pure
 `memory/graph_cutover.py`: PASS needs 14 days on the clock, at least 100
 falkordb-served traversals and falkordb traffic on at least 10 UTC days in the
@@ -2916,8 +2932,16 @@ verified: 2f013ed7b 2026-10-23
   extracts physical records, preserves unresolved identity and usage, and
   applies the shared credential scrubber to structured content. Schema5 records
   distinguish executor identity from delegation evidence. This development
-  candidate adds the parser and optional DuckDB/Parquet dependencies; storage,
-  queries, CLI, scheduling and encrypted recovery arrive in dependent changes.
+  candidate adds the parser, durable per-source Parquet records and audited
+  historical readers. Readers capture immutable source selections; historical
+  provenance and unavailable facts remain explicit. Ingestion keeps one captured
+  canonical root, rejects malformed persisted root bindings and isolates source
+  stat failures. Transcript and sidecar-fingerprint reads admit regular descriptors
+  without blocking; fingerprint metadata is limited to 1 MiB. The extractor's
+  independent sidecar reopen remains outside adversarial-concurrency guarantees;
+  parser signatures and historical formats are unchanged. Queries, CLI and scheduling
+  arrive in dependent changes. Additional backup and recovery work is deferred
+  independently of collection and search.
   It does not describe a deployed capability.
   Hook names are limited to literal command targets and option-free supported
   interpreter operands; ambiguous commands report `<unknown>` while preserving
