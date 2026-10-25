@@ -258,6 +258,7 @@ async def traverse(
     track = _TraversalTrack(served_by=getattr(active, "name", "?"))
     outcome: str | None = None
     final_reason: str | None = None
+    primary_ms: float | None = None
 
     async def _record_break(kind: str) -> None:
         # The engine has failed: record that NOW, before awaiting a fallback that
@@ -272,6 +273,7 @@ async def traverse(
             served_by="pending",
             primary_reason=selection_error or track.primary_reason,
             final_reason=None,
+            diag=track.primary_diag,
         )
 
     track.on_break = _record_break
@@ -308,6 +310,7 @@ async def traverse(
             outcome = "mode_unsupported"
         else:
             outcome = "primary"
+            primary_ms = result.query_ms
         return result
     finally:
         # Only a classified outcome is recorded: anything else escaping
@@ -321,6 +324,8 @@ async def traverse(
                 served_by=track.served_by,
                 primary_reason=selection_error or track.primary_reason,
                 final_reason=final_reason,
+                diag=track.primary_diag,
+                elapsed_ms=primary_ms,
             )
 
 
@@ -332,6 +337,9 @@ class _TraversalTrack:
     declined: bool = False
     fell_back: bool = False
     primary_reason: str | None = None
+    #: The selected store's own account of its failure (``GraphUnavailableError.diag``,
+    #: set by ``graphstore_falkor`` on a timeout), carried to the telemetry event.
+    primary_diag: dict | None = None
     #: Called once when the selected store fails, before any fallback runs.
     on_break: Callable[[str], Awaitable[None]] | None = None
     #: The break was recorded as it happened; nothing more to write.
@@ -388,6 +396,8 @@ async def _traverse_tiers(
     except GraphUnavailableError as exc:
         track.fell_back = True
         track.primary_reason = exception_reason(exc)
+        diag = getattr(exc, "diag", None)
+        track.primary_diag = diag if isinstance(diag, dict) else None
         if track.on_break is not None and not track.recorded:
             await track.on_break("fallback")
         # Traversal is an ENRICHMENT path — its readers already treat a thin

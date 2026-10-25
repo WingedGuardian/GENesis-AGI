@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -15,8 +17,12 @@ from genesis.cc.managed_session import metadata, prepared_metadata, update_state
 from genesis.cc.system_prompt import SystemPromptAssembler
 from genesis.cc.types import CCModel, EffortLevel
 from genesis.db.crud import cc_sessions
+from genesis.db.peer_status import PENDING, VALID
+from genesis.peers import task_cursor
 from genesis.util.execution_privacy import private_execution
 from genesis.util.inflight import inflight
+
+logger = logging.getLogger(__name__)
 
 OWNED = (
     "source_tag='agent_api' AND "
@@ -130,7 +136,8 @@ class ConversationService:
         # Retrieve failures even if the HTTP waiter timed out, without logging
         # raw input, provider errors or database paths.
         task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
-        return await asyncio.shield(task)
+        await asyncio.shield(task)
+        return await self.get(identity, sid)
 
     async def _existing(self, db, sid, digest, identity):
         row = await cc_sessions.get_by_id(db, sid)
@@ -212,8 +219,9 @@ class ConversationService:
                 system += "\n\n" + context
             except Exception:
                 pass  # Existing enrichment is optional; authority is not.
-        async with self.registry.transaction() as db:
-            await self._same_database(db)
+        # Identity reads use the runtime connection; finish them before taking
+        # the private write lock, which runtime finalization may be waiting for.
+        async with self.registry.transaction(before_begin=self._same_database) as db:
             await authorize(db, identity)
             row = await self._existing(db, sid, digest, identity)
             if row is not None:
@@ -299,12 +307,22 @@ class ConversationService:
                 # Never replay the receipt. If shutdown has begun, or this
                 # task is cancelled, stop retrying: the row stays active and
                 # boot reconciliation records it as outcome_unknown.
+                warning_at = 0.0
                 while True:
                     try:
                         await update_state(self.runtime._db, sid, "failed", error="not_started")
                         await cc_sessions.update_status(self.runtime._db, sid, status="failed")
                         break
-                    except Exception:
+                    except Exception as exc:
+                        now = time.monotonic()
+                        if now - warning_at >= 1.0:
+                            logger.warning(
+                                "Not-started receipt persistence unavailable; capacity retained "
+                                "(exception=%s, sqlite_errorname=%s)",
+                                type(exc).__name__,
+                                getattr(exc, "sqlite_errorname", None),
+                            )
+                            warning_at = now
                         if runner.closing:
                             break
                         await asyncio.sleep(0.1)
@@ -413,26 +431,28 @@ class ConversationService:
             await authorize(db, identity)
             row = await (
                 await db.execute(
-                    f"SELECT * FROM cc_sessions WHERE {OWNED} AND id=?",  # noqa: S608 — compiled owner clause, values bound
+                    f"SELECT cc_sessions.*, {PENDING} AS pending_approvals, COALESCE(({VALID}),0) AS projection_valid "  # noqa: S608 — static schema expressions
+                    f"FROM cc_sessions WHERE {OWNED} AND id=?",  # noqa: S608 — compiled owner clause, values bound
                     (identity.peer["peer_id"], identity.peer["epoch"], sid),
                 )
             ).fetchone()
             if row is None:
                 raise ConversationRefusal("not_found", 404)
+            if not row["projection_valid"]:
+                raise ConversationRefusal("not_ready", 503)
             return dict(row)
 
     async def list(self, identity, size, token=None, context=None):
-        if token:
-            anchor = await self.get(identity, uuid_id(token))
-        else:
-            anchor = None
         if context:
             uuid_id(context)
+        else:
+            context = None
+        anchor = task_cursor.decode(token, identity.peer, context) if token is not None else None
         where = OWNED
         values = [identity.peer["peer_id"], identity.peer["epoch"]]
         if anchor:
-            where += " AND (started_at,id)<(?,?)"
-            values += [anchor["started_at"], anchor["id"]]
+            where += " AND (a2a_status_at,id)<(?,?)"
+            values += list(anchor)
         if context:
             where += " AND json_extract(metadata,'$.context_id')=?"
             values.append(context)
@@ -442,7 +462,8 @@ class ConversationService:
             await authorize(db, identity)
             rows = await (
                 await db.execute(
-                    f"SELECT * FROM cc_sessions WHERE {where} ORDER BY started_at DESC,id DESC LIMIT ?",  # noqa: S608 — fixed clauses, placeholders
+                    f"SELECT cc_sessions.*, {PENDING} AS pending_approvals "  # noqa: S608 — static schema expression
+                    f"FROM cc_sessions WHERE {where} ORDER BY a2a_status_at DESC,id DESC LIMIT ?",  # noqa: S608 — fixed clauses, placeholders
                     (*values, size + 1),
                 )
             ).fetchall()
@@ -451,13 +472,15 @@ class ConversationService:
             )
             total = await (
                 await db.execute(
-                    f"SELECT count(*) FROM cc_sessions WHERE {total_where}",  # noqa: S608 — fixed clauses, placeholders
+                    f"SELECT count(*), sum(NOT COALESCE(({VALID}),0)) FROM cc_sessions WHERE {total_where}",  # noqa: S608 — fixed clauses, placeholders
                     (*values[:2], context) if context else values[:2],
                 )
             ).fetchone()
+            if total[1]:
+                raise ConversationRefusal("not_ready", 503)
             return (
                 [dict(r) for r in rows[:size]],
-                rows[size - 1]["id"] if len(rows) > size else "",
+                task_cursor.encode(rows[size - 1], identity.peer, context) if len(rows) > size else "",
                 total[0],
             )
 

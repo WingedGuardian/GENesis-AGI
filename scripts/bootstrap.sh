@@ -34,6 +34,10 @@ echo
 # update.sh opts out via GENESIS_BOOTSTRAP_ALLOW_LIVE=1; humans use --force.
 # shellcheck source=lib/live_system_guard.sh
 . "$SCRIPT_DIR/lib/live_system_guard.sh"
+# Test fence first: a test pointing this script at live state refuses here,
+# before the live-system check's probes and everything after. No-op unless
+# GENESIS_TEST_FENCE_LIVE_ROOTS is armed.
+refuse_if_test_fenced_live "$GENESIS_ROOT" || exit 97
 bootstrap_refuse_if_server_live "$@" || exit 3
 
 # shellcheck source=lib/deploy_marker.sh
@@ -798,6 +802,11 @@ fi
 echo "  Syncing browser packages..."
 install_browser_extra "$GENESIS_ROOT" "$VENV_DIR" \
     || echo "  WARNING: browser packages incomplete (non-fatal; the browser tools say what to repair)"
+# The test and payments extras, the same way: after the core, never fatal. An
+# install runs its own test suite, and the card vault needs the payments packages.
+echo "  Syncing test and payments packages..."
+install_runtime_extras "$GENESIS_ROOT" "$VENV_DIR" \
+    || echo "  WARNING: test/payments packages incomplete (non-fatal; see above)"
 echo
 
 # --- Skill-security trusted baseline ---
@@ -1072,17 +1081,34 @@ echo "  CC temp: ${CC_TMP_DIR}"
 echo "  ~/.genesis/ initialized"
 echo
 
+# BEGIN etc-dropins (extracted by tests/test_scripts/test_bootstrap_etc_dropins.py)
+# Root-owned config files Genesis writes (here, and in the memory and network
+# resilience libs) go through one step: stamped, and a file edited by hand is
+# KEPT and named rather than overwritten. Its summary lines join this run's.
+# shellcheck source=lib/managed_etc.sh
+. "$SCRIPT_DIR/lib/managed_etc.sh"
+GENESIS_ETC_SUMMARY_OK=1
+
+# genesis_etc_put never aborts; these two steps always did when sudo could not
+# write (e.g. sudo needs a password and there is no terminal). Keep that: such a
+# sudo now fails at the inspection, so `uninspected` aborts like `failed`.
+_bootstrap_etc_failed() {
+    echo "ERROR: could not write $1 with sudo (see above); bootstrap stops here."
+    exit 1
+}
+
 # --- Journal size cap ---
 echo "--- Capping systemd journal size ---"
 JOURNALD_DROP_IN="/etc/systemd/journald.conf.d/genesis-size-cap.conf"
-if [[ "$(sudo cat "$JOURNALD_DROP_IN" 2>/dev/null)" != $'[Journal]\nSystemMaxUse=200M' ]]; then
-    sudo mkdir -p /etc/systemd/journald.conf.d/
-    printf '[Journal]\nSystemMaxUse=200M\n' | sudo tee "$JOURNALD_DROP_IN" >/dev/null
-    sudo systemctl restart systemd-journald 2>/dev/null || true
-    echo "  Journal capped at 200MB (~7 days rolling)"
-else
-    echo "  Journal cap already set (200MB)"
-fi
+genesis_etc_put "$JOURNALD_DROP_IN" $'[Journal]\nSystemMaxUse=200M' "" dropin
+case "$GENESIS_ETC_RESULT" in
+    written|taken)
+        sudo systemctl restart systemd-journald 2>/dev/null || true
+        echo "  Journal capped at 200MB (~7 days rolling)" ;;
+    unchanged|migrated) echo "  Journal cap already set (200MB)" ;;
+    failed|uninspected) _bootstrap_etc_failed "$JOURNALD_DROP_IN" ;;
+    *) ;;  # kept: genesis_etc_put said why
+esac
 echo
 
 # --- sshd dead-client detection ---
@@ -1102,37 +1128,47 @@ SSHD_CONTENT=$'# Genesis: detect dead SSH clients fast so an orphaned foreground
 # PATH — check both so the hardening never silently skips on a real install.
 if ! command -v sshd >/dev/null 2>&1 && [[ ! -x /usr/sbin/sshd ]]; then
     echo "  sshd not installed — skipping"
-elif [[ "$(sudo cat "$SSHD_DROP_IN" 2>/dev/null)" == "$SSHD_CONTENT" ]] \
-    && sudo sshd -T 2>/dev/null | grep -qi '^clientaliveinterval 15$'; then
-    echo "  ClientAlive already configured and effective (15s x 4)"
 else
-    sudo mkdir -p /etc/ssh/sshd_config.d/
-    printf '%s\n' "$SSHD_CONTENT" | sudo tee "$SSHD_DROP_IN" >/dev/null
-    if sudo sshd -t 2>/dev/null; then
-        sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd 2>/dev/null || true
+    genesis_etc_put "$SSHD_DROP_IN" "$SSHD_CONTENT" "" sshd validate
+    _sshd_result="$GENESIS_ETC_RESULT"
+    if [[ "$_sshd_result" == failed || "$_sshd_result" == uninspected ]]; then
+        if [[ "$GENESIS_ETC_ATTEMPTED" == 1 ]]; then
+            genesis_etc_rollback "$SSHD_DROP_IN" "sshd drop-in write failed" || _bootstrap_etc_failed "$SSHD_DROP_IN"
+        else
+            genesis_etc_finalize discard
+        fi
+        _bootstrap_etc_failed "$SSHD_DROP_IN"
+    fi
+    if [[ "$_sshd_result" == written || "$_sshd_result" == taken || "$_sshd_result" == migrated ]]; then
+        if ! sudo sshd -t 2>/dev/null; then
+            genesis_etc_rollback "$SSHD_DROP_IN" "sshd -t rejected the config" || _bootstrap_etc_failed "$SSHD_DROP_IN"
+            _sshd_result="rejected"
+        elif [[ "$_sshd_result" != migrated ]]; then
+            sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd 2>/dev/null || true
+        fi
+    fi
+    genesis_etc_finalize commit
+    if [[ "$_sshd_result" != rejected && "$_sshd_result" != kept-* ]]; then
         # Verify the EFFECTIVE value — another drop-in sorting earlier would
         # silently win (first-value-wins), leaving dead-client detection off.
-        # `|| SSHD_EFFECTIVE=""` is load-bearing, and this site is worse than most:
-        # it is TOP LEVEL, so unlike a function there is no `|| …` call site to
-        # disable errexit. Under `set -o pipefail` a failing `sshd -T` (or a grep
-        # that matches nothing) makes the assignment non-zero and aborts bootstrap
-        # HERE — immediately after the sshd drop-in was written and sshd reloaded,
-        # skipping git hooks, unit rendering, timer enablement and the
-        # setup-complete marker, with no message. The else-branch below is written
-        # for exactly the empty/odd value that the abort prevents it from ever seeing.
+        # `|| SSHD_EFFECTIVE=""` is load-bearing: this is TOP LEVEL, so under
+        # `set -o pipefail` a failing `sshd -T` (or a grep that matches nothing)
+        # would otherwise abort bootstrap here with no message.
         SSHD_EFFECTIVE=$(sudo sshd -T 2>/dev/null | grep -i '^clientaliveinterval ' | awk '{print $2}') || SSHD_EFFECTIVE=""
         if [[ "$SSHD_EFFECTIVE" == "15" ]]; then
-            echo "  ClientAlive configured (15s x 4 -> dead client HUP'd in ~60s)"
+            if [[ "$_sshd_result" == unchanged || "$_sshd_result" == migrated ]]; then
+                echo "  ClientAlive already configured and effective (15s x 4)"
+            else
+                echo "  ClientAlive configured (15s x 4 -> dead client HUP'd in ~60s)"
+            fi
         else
             echo "  WARNING: effective ClientAliveInterval is '$SSHD_EFFECTIVE', not 15 —"
             echo "  another sshd config sets it first (OpenSSH is first-value-wins)."
             echo "  Check: grep -ri clientalive /etc/ssh/sshd_config /etc/ssh/sshd_config.d/"
         fi
-    else
-        sudo rm -f "$SSHD_DROP_IN"
-        echo "  WARNING: sshd -t rejected the config — drop-in removed, sshd untouched"
     fi
 fi
+# END etc-dropins
 echo
 
 # --- slot-first interactive claude ---
@@ -1644,6 +1680,7 @@ echo
 # comes from the summary, not GENESIS_MU_KEPT: setup-vnc.sh keeps its units in a
 # child process whose counter never reaches this shell.
 _mu_kept_count="$(grep -c '^kept ' "$GENESIS_DEPLOY_SUMMARY" 2>/dev/null || true)"
+_etc_kept_count="$(grep -c '^kept-etc ' "$GENESIS_DEPLOY_SUMMARY" 2>/dev/null || true)"
 if [[ "${_bootstrap_owns_summary:-0}" = "1" ]]; then
     if [[ -s "$GENESIS_DEPLOY_SUMMARY" ]]; then
         echo "--- What this run changed outside the checkout ---"
@@ -1653,6 +1690,9 @@ if [[ "${_bootstrap_owns_summary:-0}" = "1" ]]; then
 fi
 if [[ "${_mu_kept_count:-0}" -gt 0 ]]; then
     echo "  ${_mu_kept_count} systemd unit(s) KEPT, not overwritten: edited by hand or not a regular file."
+fi
+if [[ "${_etc_kept_count:-0}" -gt 0 ]]; then
+    echo "  ${_etc_kept_count} /etc file(s) KEPT, not overwritten: edited by hand or not a regular file."
 fi
 # codebase-memory-mcp: one line only when it is registered but not set up (or OK).
 # Run by hand only: under update.sh (which hands us its summary) update.sh prints

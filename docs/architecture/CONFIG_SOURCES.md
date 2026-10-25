@@ -203,6 +203,16 @@ names, so an overlay of a read-only file is editable (#2446).
   (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`,
   `GENESIS_SQLITE_SLOW_MS` (slow-statement log threshold, default 1000, `0` = off).
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
+  Outside `env.py`: `GENESIS_MCP_LOG_DIR`, the directory of `mcp_health.log` and
+  `turnstile_debug.log` (default `~/tmp`), read when `genesis/mcp/health/browser.py` is
+  imported. Set it in the process environment before import; this knob does not
+  load itself from `secrets.env`. Relative values are anchored to HOME, tilde
+  forms are expanded, and writers and rotation use the same absolute selection.
+  An unusable directory or handler disables optional file logging without a
+  fallback directory. Nothing creates the destination automatically. The hygiene
+  timer needs the same environment value and writable access to that directory;
+  its existing `ProtectSystem`/`ReadWritePaths` confinement is unchanged, so an
+  external destination requires separate operator provisioning.
 - **The update remote** — which git remote `scripts/update.sh` fetches `main` from, and
   which the version collector compares against. Chosen by `src/genesis/util/update_remote.py`:
   env `GENESIS_UPDATE_REMOTE` (one run), then the checkout's own git config

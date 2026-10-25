@@ -179,7 +179,7 @@ def test_launch_uses_primary_helper_literal_paths_and_native_dependencies(fronte
 
     monkeypatch.setattr(namespace["os"], "execve", execute)
     with pytest.raises(Executed):
-        frontend.launch({"main": str(main)}, settings)
+        frontend.launch({"main": str(main), "cache": str(tmp_path)}, settings)
 
 
 @pytest.mark.parametrize("stage", ["verify_cache", "ready"])
@@ -190,7 +190,7 @@ def test_failed_parent_preflight_never_creates_unit(frontend, monkeypatch, stage
     native = Mock()
     monkeypatch.setattr(namespace["os"], "execve", native)
     with pytest.raises(ValueError):
-        frontend.launch({}, Path("/settings"))
+        frontend.launch({"main": "/main", "cache": "/cache"}, Path("/settings"))
     native.assert_not_called()
 
 
@@ -206,7 +206,6 @@ def test_home_normalized_before_dispatch(frontend, monkeypatch, command, home):
         monkeypatch.setenv("HOME", home)
     passwd = Mock(return_value=SimpleNamespace(pw_dir="/passwd home"))
     monkeypatch.setattr(namespace["pwd"], "getpwuid", passwd)
-    monkeypatch.setitem(namespace, "parse_arguments", lambda _: SimpleNamespace(command=command, config=None))
     expected = home or "/passwd home"
 
     def dispatched(*args):
@@ -215,8 +214,13 @@ def test_home_normalized_before_dispatch(frontend, monkeypatch, command, home):
 
     for name in ("lifecycle_main", "uninstall_main", "config_path"):
         monkeypatch.setitem(namespace, name, dispatched)
+    argv = [command]
+    if command == "client":
+        argv += ["--unit", "fixture.service"]
+    elif command == "verify-uninstall-locks":
+        argv += ["3", "4", "5"]
     with pytest.raises(Executed):
-        frontend.main([])
+        frontend.main(argv)
     assert passwd.call_count == (0 if home else 1)
 
 

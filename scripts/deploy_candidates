@@ -40,6 +40,13 @@ export HOME
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Test fence first (sourced): the engine only ever acts on the checkout this
+# script lives in — the manifest, its `git -C` worktree moves and update.lock
+# are all rooted at $_SELF_DIR/.. — so that root is first known here, before
+# the lock's mkdir. No-op unless GENESIS_TEST_FENCE_LIVE_ROOTS is armed.
+# shellcheck source=lib/live_system_guard.sh
+. "$_SELF_DIR/lib/live_system_guard.sh"
+refuse_if_test_fenced_live "$(cd "$_SELF_DIR/.." && pwd)" || exit 97
 # shellcheck source=lib/deploy_marker.sh
 . "$_SELF_DIR/lib/deploy_marker.sh"
 export DEPLOY_CANDIDATES_EPHEMERAL_RE="$EPHEMERAL_DIRTY_RE"

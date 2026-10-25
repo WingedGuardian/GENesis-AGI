@@ -468,6 +468,57 @@ def test_every_python_the_status_path_runs_is_isolated():
     assert calls and all(c.startswith("python3 -I -S ") for c in calls), calls
 
 
+def _deploy_python_calls(line):
+    call = re.compile(r'(?:(?<![\w.$-])(?:/[\w./-]*/)?python[0-9.]*|/bin/python[0-9.]*"|\$\{?PY\w*\}?")\s+(-\S+(?:\s+-\S+)?)?')
+    if line.lstrip().startswith("#"):
+        return []
+    # A message ("cannot read which python ...") is prose, not a call.
+    code = re.split(r'\b(?:die|echo|printf)\s+["\']', line)[0]
+    # Only this leading simple-command position establishes literal pgrep
+    # data. Leave expansions, outer-quoted assignments and the line's actual
+    # interpreter invocations visible to the existing isolation matcher.
+    literal = re.match(
+        r'''^\s*if\s+pgrep\s+-f\s+(?P<operand>'[^'\\\n]*'|"[^"$`\\\n]*")(?=\s|;|$)''',
+        code,
+    )
+    if literal:
+        start, end = literal.span("operand")
+        code = code[:start] + " " * (end - start) + code[end:]
+    return list(call.finditer(code))
+
+
+def test_copied_engine_includes_its_required_live_guard(dc_world):
+    dc_world.install_engine()
+    assert (dc_world.root / "scripts/lib/live_system_guard.sh").read_bytes() == (
+        SCRIPTS / "lib/live_system_guard.sh"
+    ).read_bytes()
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_pgrep_literal_pattern_is_not_a_python_call(quote):
+    assert not _deploy_python_calls(f"if pgrep -f {quote}python -m genesis serve{quote}; then")
+
+
+@pytest.mark.parametrize("line", [
+    'if pgrep -f "python -m genesis serve"; then python3 -c payload; fi',
+    'if pgrep -f "$(python3 -c payload)"; then',
+    'value="pgrep -f \'$(python3 -c payload)\'"',
+    'python3 -c payload',
+])
+def test_actual_python_calls_remain_visible(line):
+    calls = _deploy_python_calls(line)
+    assert calls and any(m.group(1) == "-c" for m in calls)
+
+
+@pytest.mark.parametrize("line, expected", [
+    ('if pgrep -f "python -m genesis serve"; then python3 -I -S helper; fi', "-I -S"),
+    ('"$ROOT/bin/python" -P helper', "-P"),
+])
+def test_isolated_python_calls_keep_their_flags(line, expected):
+    calls = _deploy_python_calls(line)
+    assert len(calls) == 1 and calls[0].group(1) == expected
+
+
 def test_every_python_the_deploy_path_runs_is_isolated():
     """deploy_code_only.sh restarts the server on `live`, a checkout holding
     candidate code: no python it runs, nor any its sourced libs run, may put the
@@ -479,15 +530,10 @@ def test_every_python_the_deploy_path_runs_is_isolated():
     puts the checkout's src/ on the path, the code the restart is about to run)."""
     text = (SCRIPTS / "deploy_code_only.sh").read_text()
     libs = re.findall(r'^\s*(?:\.|source) "\$[A-Z_]+/(lib/[^"]+)"', text, re.MULTILINE)
-    call = re.compile(r'(?:(?<![\w.$-])(?:/[\w./-]*/)?python[0-9.]*|/bin/python[0-9.]*"|\$\{?PY\w*\}?")\s+(-\S+(?:\s+-\S+)?)?')
     seen = 0
     for name in ["deploy_code_only.sh", *libs]:
         for n, line in enumerate((SCRIPTS / name).read_text().splitlines(), 1):
-            if line.lstrip().startswith("#"):
-                continue
-            # A message ("cannot read which python ...") is prose, not a call.
-            code = re.split(r'\b(?:die|echo|printf)\s+["\']', line)[0]
-            for m in call.finditer(code):
+            for m in _deploy_python_calls(line):
                 seen += 1
                 venv = m.group(0).startswith("/bin/python")
                 want = ("-I -S", "-P", "-P -c") if venv else ("-I -S",)

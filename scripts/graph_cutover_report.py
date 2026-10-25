@@ -70,6 +70,31 @@ def read_lost_writes(path: Path) -> list[str]:
         return []
 
 
+def _cause(event: dict) -> str:
+    """One reset event's own account of itself, written at the moment it broke
+    the clock (``graph_telemetry._moment`` plus the store's ``.diag``)."""
+    if "pid" not in event:
+        return "uninstrumented (written before timeout diagnostics)"
+    parts = [f"pid {event['pid']}"]
+    if event.get("proc_age_s") is not None:
+        parts[0] += f", age {event['proc_age_s']}s"
+    diag = event.get("diag") if isinstance(event.get("diag"), dict) else {}
+    if diag.get("budget_spent"):
+        parts.append("budget spent before the second query")
+    for key in ("budget_ms", "elapsed_ms", "late_ms", "cancel_ms"):
+        if diag.get(key) is not None:
+            parts.append(f"{key.removesuffix('_ms')} {diag[key]}ms")
+    if diag.get("query"):
+        parts.append(f"{diag['query']} query")
+    if isinstance(diag.get("frames"), list):
+        parts.append("at " + ">".join(str(f) for f in diag["frames"]))
+    psi = diag.get("psi_stall_us") if isinstance(diag.get("psi_stall_us"), dict) else {}
+    stalls = {k: v for k, v in psi.items() if v}
+    if stalls:
+        parts.append("stall " + " ".join(f"{k}={v}us" for k, v in stalls.items()))
+    return ", ".join(parts)
+
+
 def render(v) -> str:
     out = [f"FalkorDB default-on cutover: {v.status}"]
     if v.clock_start:
@@ -91,6 +116,9 @@ def render(v) -> str:
             who = " ".join(str(r[k]) for k in ("proc", "caller") if r.get(k))
             old = "" if r.get("in_window", True) else "  (before the window)"
             out.append(f"    {r['at']}  {r['why']}{'  ' + who if who else ''}{old}")
+            for event in r.get("events") or []:
+                if isinstance(event, dict):
+                    out.append(f"      cause: {_cause(event)}")
         if len(v.resets) > 10:
             out.append(f"    ({len(v.resets) - 10} earlier, see --json)")
     out.append(
