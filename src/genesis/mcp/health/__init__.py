@@ -97,6 +97,7 @@ from genesis.mcp.health import skill_usage_status as _skill_usage_status  # noqa
 from genesis.mcp.health import status as _status  # noqa: E402
 from genesis.mcp.health import task_tools as _task_tools  # noqa: E402
 from genesis.mcp.health import update_history as _update_history  # noqa: E402
+from genesis.mcp.health import user_job_tools as _user_job_tools  # noqa: E402, F401
 from genesis.mcp.health import web_tools as _web_tools  # noqa: E402, F401
 from genesis.mcp.health import zero_drop_tools as _zero_drop_tools  # noqa: E402, F401
 
