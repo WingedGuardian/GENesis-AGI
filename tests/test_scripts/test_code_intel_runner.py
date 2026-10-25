@@ -17,10 +17,14 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shlex
 import sqlite3
 import stat
 import subprocess
+from contextlib import closing
 from pathlib import Path
+
+import pytest
 
 from tests.test_scripts.managed_code_intel_fixture import configured_sentinel, install_manager
 
@@ -385,6 +389,57 @@ def test_persisted_success_outcome_replays_without_reindex(tmp_path):
     assert not (tmp_path / "entry.log").exists()
 
 
+def _contention_entrypoint(tmp_path, locker, db_path, ready):
+    """Fake successful provider that waits for its own SQLite locker."""
+    entry = tmp_path / "contention_entry.sh"
+    entry.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "ENTRY repo=$1 tools=$2 mode=$3" >> {shlex.quote(str(tmp_path / "entry.log"))}\n'
+        f'python3 {shlex.quote(str(locker))} {shlex.quote(str(db_path))} {shlex.quote(str(ready))} &\n'
+        'locker_pid=$!\n'
+        f'printf "LOCKER pid=%s ready=%s\\n" "$locker_pid" {shlex.quote(str(ready))} >&2\n'
+        'deadline=$((SECONDS + 5))\n'
+        f'while [ ! -e {shlex.quote(str(ready))} ]; do\n'
+        '  if ! kill -0 "$locker_pid" 2>/dev/null; then\n'
+        '    wait "$locker_pid"\n'
+        '    printf "locker pid=%s exited rc=%s before ready\\n" "$locker_pid" "$?" >&2\n'
+        '    exit 76\n'
+        '  fi\n'
+        '  if [ "$SECONDS" -ge "$deadline" ]; then\n'
+        '    printf "locker pid=%s did not become ready within 5s\\n" "$locker_pid" >&2\n'
+        '    exit 76\n'
+        '  fi\n'
+        '  sleep 0.01\n'
+        'done\n'
+        "exit 0\n"
+    )
+    entry.chmod(entry.stat().st_mode | stat.S_IXUSR)
+    return entry
+
+
+def _contention_diagnostics(tmp_path, ready):
+    log = tmp_path / ".genesis" / "code-intelligence-runner.log"
+    return f"fixture={tmp_path} ready={ready.exists()}\n" + (
+        log.read_text() if log.exists() else "runner log absent"
+    )
+
+
+@pytest.mark.parametrize("locker_source", ["raise SystemExit(23)\n", "import time; time.sleep(6)\n"],
+                         ids=["exits-before-ready", "never-ready"])
+def test_contention_fixture_refuses_without_ready(tmp_path, locker_source):
+    locker = tmp_path / "not_ready.py"
+    locker.write_text(locker_source)
+    entry = _contention_entrypoint(tmp_path, locker, tmp_path / "unused.db", tmp_path / "ready")
+    # The outer guard owns only this fake fixture's process group. It makes the
+    # broken unbounded loop a visible failure, rather than leaving an orphan.
+    result = subprocess.run(
+        ["timeout", "--kill-after=1", "8", "bash", str(entry)],
+        capture_output=True, text=True, start_new_session=True, timeout=12,
+    )
+    assert result.returncode == 76, result.stderr
+    assert "locker" in result.stderr and "ready" in result.stderr
+
+
 def test_runner_spools_busy_success_and_replays_without_reindex(tmp_path):
     """Exercise the exact shell claim/outcome path across a real DB lock."""
     h = _seed_marker(tmp_path, tools="gitnexus", mode="fast")
@@ -400,15 +455,7 @@ def test_runner_spools_busy_success_and_replays_without_reindex(tmp_path):
         "db.rollback()\n"
         "db.close()\n"
     )
-    entry = tmp_path / "contention_entry.sh"
-    entry.write_text(
-        "#!/usr/bin/env bash\n"
-        f'echo "ENTRY repo=$1 tools=$2 mode=$3" >> "{tmp_path}/entry.log"\n'
-        f'python3 "{locker}" "{db_path}" "{ready}" &\n'
-        f'while [ ! -e "{ready}" ]; do sleep 0.01; done\n'
-        "exit 0\n"
-    )
-    entry.chmod(entry.stat().st_mode | stat.S_IXUSR)
+    entry = _contention_entrypoint(tmp_path, locker, db_path, ready)
     env = {
         "PATH": "/usr/bin:/bin",
         "HOME": str(tmp_path),
@@ -419,21 +466,43 @@ def test_runner_spools_busy_success_and_replays_without_reindex(tmp_path):
         "CODE_INTEL_FAKE_CLAUDE_CPU": "0",
     }
 
-    first = subprocess.run(
-        ["bash", str(_RUNNER)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    assert first.returncode == 76
-    assert len(list(_mdir(tmp_path).glob(f".outcome-spool-{h}-*.spool"))) == 1
-    assert (tmp_path / "entry.log").read_text().count("ENTRY ") == 1
+    try:
+        first = subprocess.run(
+            ["bash", str(_RUNNER)], env=env, capture_output=True, text=True, timeout=20,
+        )
+        assert first.returncode == 76, _contention_diagnostics(tmp_path, ready)
+        spools = list(_mdir(tmp_path).glob(f".outcome-spool-{h}-*.spool"))
+        assert len(spools) == 1
+        with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as db:
+            db.execute("PRAGMA query_only=ON")
+            claim = db.execute("SELECT claim_id,repo_path FROM inflight WHERE hash=?", (h,)).fetchone()
+        assert claim is not None and claim[1] == str(tmp_path / "primary")
+        assert spools[0].name.startswith(f".outcome-spool-{h}-{claim[0]}-")
+        assert (tmp_path / "entry.log").read_text().count("ENTRY ") == 1
 
-    second = _run_runner(tmp_path, entry_rc=0)
-    assert second.returncode == 0
-    assert _markers(tmp_path) == []
-    assert (tmp_path / "entry.log").read_text().count("ENTRY ") == 1
+        # The locker inherits runner fd8. Wait for its ordinary exit, not a flag
+        # written before it releases that descriptor; a lock-busy tick returns 0.
+        lock = tmp_path / ".genesis" / "locks" / "code-intel-runner.lock"
+        released = subprocess.run(
+            ["flock", "-w", "10", str(lock), "true"],
+            capture_output=True, text=True, timeout=12,
+        )
+        assert released.returncode == 0, _contention_diagnostics(tmp_path, ready)
+        second = _run_runner(tmp_path, entry_rc=0)
+        assert second.returncode == 0, _contention_diagnostics(tmp_path, ready)
+        assert _markers(tmp_path) == []
+        assert (tmp_path / "entry.log").read_text().count("ENTRY ") == 1
+        with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as db:
+            db.execute("PRAGMA query_only=ON")
+            remaining = {
+                table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("pending", "inflight", "failed", "failed_outcomes")
+            }
+        assert remaining == {"pending": 0, "inflight": 0, "failed": 0, "failed_outcomes": 0}
+        assert list(_mdir(tmp_path).glob(".outcome-spool-*")) == []
+    except subprocess.TimeoutExpired as error:
+        error.add_note(_contention_diagnostics(tmp_path, ready))
+        raise
 
 
 def test_uses_claimed_state_not_stale_list_snapshot(tmp_path):

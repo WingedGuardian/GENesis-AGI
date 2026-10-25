@@ -466,10 +466,15 @@ shares the OAuth-compatible readiness helper. `cc_fallback` is a non-routing
 **Fallback** observation in the neural monitor for conversations and managed
 turns; actual committed outcomes, not readiness alone, establish success.
 
+Ordinary streaming and readiness share final-effective quota classification:
+allowed/warning and explicitly usable overage are not refusals, and a later
+allowed event supersedes a rejection. Result and no-result streaming paths
+preserve usable answers, real refusal health and dropped-output replay guards.
+
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 4606e5969 2026-10-16
+verified: a8fa35a35 2026-10-23
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
@@ -1490,7 +1495,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 96e0a4de3 2026-10-18
+verified: 74c474c0f 2026-10-24
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1528,8 +1533,13 @@ the shared banner is not an assertion about all concurrent sessions.
   enrichment, observe/interact tools, external unattended provenance and the
   native background ceiling. Result heads and full artifacts have bounded
   disclosure checks. Approval attribution survives notification updates; the API
-  lists pending owner actions and never resolves them. Presented peer/backend
-  bearers are refused before owner mutation shortcuts. Deployment/enrollment and
+  lists pending owner actions and never resolves them.
+  Native receipts record their public-state clock through transactional native
+  and attributed-approval triggers. Get/List share state, timestamp and pending
+  approvals in one authorized snapshot; List uses timestamp/ID ordering and an
+  opaque issued-position cursor scoped to peer/epoch/context. Heartbeats do not
+  bump public status, and incomplete projections fail readiness explicitly.
+  Presented peer/backend bearers are refused before owner mutation shortcuts. Deployment/enrollment and
   connector-only ingress verification are separate prerequisites. No new listener
   or peer execution queue. See `docs/reference/peer-registry.md` and
   `docs/reference/agent-conversations.md`.
@@ -1617,11 +1627,16 @@ the shared banner is not an assertion about all concurrent sessions.
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
   live runtime (stale-but-functional).
   External Codebase has pinned configuration staging/diagnostics and bounded
-  native query unit entry points in `scripts/codebase_managed.py`. Install and
-  bootstrap render disabled query/client-slice templates without auto-upgrading
-  a PATH provider. Staging does not activate it; MCP registration always uses
-  the managed launcher, including absent PATH binaries. Index queue integration
-  remains a separate concern. See
+  native query unit entry points in `scripts/codebase_managed.py`.
+  Status separately observes conditional queue initialization-lock prerequisites
+  without opening the queue or changing current-schema availability.
+  Install and bootstrap render disabled query/client-slice templates without
+  auto-upgrading a PATH provider. Staging does not activate it; MCP registration always uses
+  the managed launcher, including absent PATH binaries. Queued indexing uses the
+  existing durable queue and an exact-build native worker in a separate
+  8 GiB, zero-swap scope, with final managed admission and canonical repository
+  locks. This does not activate the service or establish production capacity
+  or unattended resource-failure readiness. See
   `docs/reference/codebase-managed.md`.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
@@ -1738,6 +1753,54 @@ the shared banner is not an assertion about all concurrent sessions.
   reclaim); a click that opens a new tab switches the tools to it. `browser_fill` refuses a payment card number
   as the value and `browser_run_js` one in its script (the value check only:
   telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
+  `browser_fill_card` (off unless `config/payments.yaml` `card_fill.enabled`) pays with a
+  vault card in a second, short-lived Camoufox `BrowserContext` that only
+  `mcp/health/payment_context.py` creates or holds (an AST contract test pins it):
+  the merchant's cookies and storage (sessionStorage included) are handed over,
+  it refuses a checkout or card frame not on https at a host the vault's release
+  accepts (a dotted DNS name: no IP, single-label or loopback host), every
+  document is masked transparent from creation and kept so by an observer, top-layer content
+  (modal dialogs, popovers, fullscreen, backdrops, view transitions) and the page background included; a nested frame Camoufox's init script
+  missed (no mask at all) is masked by evaluate and re-checked, while a defeated mask or an unmasked
+  top document fails the check, the owner's tap shows the Pay button label and the
+  extra field names, the tool clicks Pay itself and returns fixed codes only.
+  Card values never leave in a URL: a Pay control whose form DECLARES GET is
+  refused before the tap, and a context-wide network route aborts the first
+  request of any redirect chain whose URL carries a typed card value
+  (`card_url_blocked`, do not retry): the number anywhere in a digit run; the
+  CVC, expiry, name and postal code as a whole parameter or path segment equal
+  to the value (exact equality, so a coincidental `?qty=123` with CVC 123 is
+  blocked too). A script-handled form that is GET only by default is not
+  refused. A redirect hop carrying one cannot be stopped by a
+  route; it is seen and reported (`card_url_leaked`; before Pay,
+  `card_url_before_pay`, or `card_value_in_request` when only a short value
+  matched, which may be a coincidence). WebSocket URLs are not covered. This guards a trusted
+  merchant's flawed form, not a hostile page script: one that reads a field can
+  still send it another way (a request body, an encoding the guard does not undo).
+  Selectors are plain CSS (a `>>` chain, an `engine=` part, quoted text or XPath
+  is refused, mirroring Playwright's own selector parser) and every
+  resolved element must live in the frame whose origin the tap shows
+  (`owner_frame`); a checkout whose host is itself a public suffix is refused;
+  the accessibility tree is off while card fill is on (owner ruling Q14).
+  Top-level navigation requests (sent, committed or not; a fragment or history
+  change sends none) and new windows are counted from the first keystroke: a
+  checkout that moves on while the card is typed ends `moved_while_filling`
+  (do not retry), never "nothing paid", unless a card value also went out in
+  a URL, which ends `card_url_before_pay` (also do not retry). Not seen: a
+  script-only submit (fetch, no navigation) and a navigation inside a child
+  frame (a hosted card frame posting its own form). The network-guard flags are checked
+  again after the last await before the click; a bank frame preloaded hidden
+  and shown after Pay is a `challenge`.
+  Before the tap it waits up to 10 s for a hosted widget's frames, fields, Pay
+  and total to mount (after it, a missing element means the page changed).
+  After the grant, after the claim and before Pay it re-checks the tapped
+  title, origins, Pay control, amount, extra fields and for a bot check, and
+  before Pay reads every card field back; it keeps reporting progress until
+  the end, so a client's idle timeout does not cancel it past the claim.
+  While it runs, the idle reclaim skips Camoufox, Turnstile's X clicks in the
+  same MCP process stand down (other processes on the display: not yet), and after the claim a stale-page restart is refused. Cookies are not
+  handed back to the main context yet, and a 3DS challenge closes the context
+  (`challenge`, outcome unknown).
   Every `_impl_browser_*` result and error passes `@_redacted` (card numbers in
   snapshots, script results, urls, titles and exception text become
   `[card redacted]`; a contract test requires the decorator on each), and the
@@ -2844,9 +2907,11 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: b066be8d2fdc 2026-10-20
+verified: 2f013ed7b 2026-10-23
 ```
 
+- Verification refresh is limited to the sampled qualification-runner behavior
+  below; other learning and evaluation evidence retains its dated basis.
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
   glue over Claude Code transcripts and `cc_sessions.skill_tags`. Per skill:
   tool loads, slash loads, SKILL.md reads (not counted in a session that edits
@@ -2868,8 +2933,16 @@ verified: b066be8d2fdc 2026-10-20
   extracts physical records, preserves unresolved identity and usage, and
   applies the shared credential scrubber to structured content. Schema5 records
   distinguish executor identity from delegation evidence. This development
-  candidate adds the parser and optional DuckDB/Parquet dependencies; storage,
-  queries, CLI, scheduling and encrypted recovery arrive in dependent changes.
+  candidate adds the parser, durable per-source Parquet records and audited
+  historical readers. Readers capture immutable source selections; historical
+  provenance and unavailable facts remain explicit. Ingestion keeps one captured
+  canonical root, rejects malformed persisted root bindings and isolates source
+  stat failures. Transcript and sidecar-fingerprint reads admit regular descriptors
+  without blocking; fingerprint metadata is limited to 1 MiB. The extractor's
+  independent sidecar reopen remains outside adversarial-concurrency guarantees;
+  parser signatures and historical formats are unchanged. Queries, CLI and scheduling
+  arrive in dependent changes. Additional backup and recovery work is deferred
+  independently of collection and search.
   It does not describe a deployed capability.
   Hook names are limited to literal command targets and option-free supported
   interpreter operands; ambiguous commands report `<unknown>` while preserving
@@ -3001,8 +3074,13 @@ verified: b066be8d2fdc 2026-10-20
   Qdrant); bare arm = `--safe-mode` (the only OAuth-compatible CLAUDE.md
   suppression; `--bare` refuses OAuth) + cleanroom CLAUDE_CONFIG_DIR.
   Task set is PRIVATE (`~/.genesis/eval/bench_tasks_v1.jsonl`; loader
-  refuses in-repo paths). Judge = `bench_task_success` rubric, UNCALIBRATED
-  v1 (every surface stamps `judge_calibrated: false`). Every new
+  refuses in-repo paths). Judge = `bench_task_success` 1.1.0, UNCALIBRATED
+  (every surface stamps `judge_calibrated: false`). Missing or contradicted
+  explicitly required deliverables receive an instructed score ceiling of0.5,
+  below the unchanged0.6 pass threshold; writing quality stays separate.
+  Progress/refusal outcomes retain their task context. This prompt instruction
+  is not deterministic semantic enforcement; old-version references require
+  fresh review. Skill replay shares the rubric. Every new
   genesis-memory tool must be classified in `eval/bench/arms.py`
   (static-AST forcing test). Don't run across Sun 07:30 (J-9 aggregation).
   **A5 read surface** (WS-1 A5): the persisted paired win-rate is readable via
@@ -3082,8 +3160,13 @@ verified: b066be8d2fdc 2026-10-20
   and separately restored bytes bound by human approval. Original paths remain
   logical provenance identities; archive creation supplies no approval or
   independent-backup claim. Missing retained evidence refuses before rendering.
-  The isolated serial CLI supports Flash-only or historical paired execution
+  The isolated serial CLI supports Flash-only, explicit Pro–Flash or historical MiMo–Flash execution
   under an exact frozen operating plan and a separate local spending assertion.
+  An explicit manifest-bound Pro incumbent sample retains complete reference
+  admission and full Flash gates. Sampled Pro reports completion separately
+  from qualification; execution and detached reporting use the same declared
+  paired population and status rules. Exploratory case and reference-class comparisons do
+  not treat repeated responses as independent cases or authorize promotion.
   A credential-scoped lock precedes journal writers and credential reads. The
   actual pre-dispatch key snapshot must fund the whole selected pending
   population, including effective/member headroom; uncertain evidence stops
@@ -3093,6 +3176,8 @@ verified: b066be8d2fdc 2026-10-20
   invalidate scoring on detected drift, without a per-request source-integrity
   guarantee. Detached reports score retained snapshots under current admission,
   read no credentials and do not authenticate current external spending consent.
+  Unmarked legacy histories retain detailed incomplete reports; malformed sample
+  markers are refused during validation.
   No paid quality, promotion or live activation follows from synthetic wiring.
   After source review, the integrated runner passed 1,777 affected tests and a
   complete synthetic 750-case/2,250-request actual-CLI run plus credential-free
@@ -3479,7 +3564,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 96e0a4de31a8 2026-10-18
+verified: 8a62059720cd 2026-10-22
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3520,8 +3605,11 @@ tool-disabled CC probe without changing its schedule or routing authority.
   message id and text, unedited and accessible, once; anything else, a missing
   bot or audit, or 10 minutes without a tap refuses. Nonces live in memory
   only; no `approval_requests` row is written, and the type is in the gate's
-  approve-all denylist, `refuse_generic` and both dashboard filters. Nothing
-  calls it or decrypts a card yet.
+  approve-all denylist, `refuse_generic` and both dashboard filters.
+  `release.py` serves the release ops (request, status, claim, cancel) to the
+  verified genesis-health peer; `release_client.py` is that peer's side, used
+  by `browser_fill_card`, and `card_fill.py` holds the tool's rules (the
+  switch, launch prefs, argument checks, fixed result texts).
   Backup: `scripts/lib/payment_vault_backup.sh` from
   backup.sh §8 writes the three files as ONE GPG-encrypted tar,
   `creds/payment_vault.tar.gpg`, renamed into place once (cards.db via SQLite
@@ -3542,7 +3630,10 @@ tool-disabled CC probe without changing its schedule or routing authority.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the
-  budget (`docs/reference/resource-budget.md`). Importable without the runtime.
+  budget (`docs/reference/resource-budget.md`). `run` requires a reachable user
+  manager and acknowledged scope; first caller cancellation stays cooperative,
+  a second forces, and stopped-scope cleanup outlives the leader. Watchdog stops
+  alone arm a ten-second force deadline. Importable without the runtime.
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
   install usable" signal (CC OAuth login + ≥1 routing LLM key + ≥1 embedding key),
@@ -3629,6 +3720,37 @@ tool-disabled CC probe without changing its schedule or routing authority.
   the run (run includes SQLite's busy-timeout wait and lock-retry backoff), the
   outcome (ok / cancelled / error) and what it was stuck behind — rate-limited
   per label and outcome to one line per 60 s unless a repeat is twice as slow.
+  When a lock outlives the retry budget (`DB lock persisted through N attempts
+  … giving up`, or a lock error on the unretried `executescript`),
+  `db/lock_holders.py` records local failure context, then samples the kernel
+  lock table on a worker; these readings do not prove who caused the failure.
+  It preserves the SQLite error name (`SQLITE_BUSY_SNAPSHOT` is a stale read
+  snapshot that retry cannot refresh), separately from any `lock_table_error`.
+  Kernel lines on the database, `-wal` and `-shm` files are matched by inode
+  and decoded to SQLite roles (`-shm` byte 120 = writer, 121
+  checkpointer, 122 recoverer, 123-127 reader marks, 128 open), each pid
+  labelled credential-free (`pid_breakdown.process_label`). SQLite's own
+  waiters are INVISIBLE there (non-blocking `F_SETLK`, sleep-and-retry), so it
+  retains positive-PID, nonwaiting POSIX WRITE ranges covering byte 120 as
+  writer candidates and keeps all other raw rows. POSIX locks are per process,
+  so an in-process
+  holder shows only as `self`; the snapshot therefore also lists every
+  connection of this process on the same database that a factory opened
+  (`get_db`/`SerializedConnection`, `get_raw_db`, `connect_aiosqlite_rw`, and
+  `connect_sqlite_rw` via a weakref-able `factory=` subclass), each with the
+  `module:function` that opened it and `in_transaction` (an implicit write
+  transaction holds the write lock until commit with nothing running), plus,
+  for a `SerializedConnection`, its asyncio lock state and statement (never
+  bound parameters; inline literals can appear). NOT covered: direct
+  `sqlite3.connect`/`aiosqlite.connect` calls outside those factories (about
+  two dozen sites: attention, eval, browser profile, payments vault, guardian
+  watchdog, migrations, integrity and others) and the read-only pool. Task
+  names are counted, unnamed `Task-N` folded into `Task-*`. The capture
+  call awaits nothing (the in-process state is read on the loop thread, the
+  lock table on a worker thread via a tracked task), at most once per
+  registered canonical database per process per 60 s, into `~/.genesis/logs/lock_snapshots/`
+  (7 days / 20 MB); the warning line names the file or why there is none.
+  `GENESIS_LOCK_SNAPSHOT_DISABLED=1` turns it off.
   Not timed: raw `aiosqlite`/`sqlite3` connections and the unlocked
   `db.cursor()` / `cursor.execute()` routes (unused in production). Two
   schema paths coexist: base DDL (`schema/_tables.py`, 117 CREATE TABLE, a count
@@ -4105,6 +4227,23 @@ verified: f9a1d4cb 2026-10-18
   `update.sh` restores AGENTS.md to HEAD before its merge — saving any local
   edits under `~/.genesis/premerge-backups/` first — so the block must live in
   the commit).
+  The skill LISTING Claude Code sends every session has its own budget,
+  `skillListingBudgetFraction` in `.claude/settings.json` (0.02; CC's default is
+  0.01). The budget in characters is the model's context window × the model's
+  characters per token × the fraction, so a smaller window gets a smaller
+  listing. Over budget, CC (2.1.299) keeps every skill's name but drops the lower-
+  priority skills' descriptions, and logs `Skill listing over budget` only in a
+  debug log. MEASURED 2026-10-21 on one install: 122 skills needed 41,712 chars
+  against the default's 30,000 for each of the `sonnet`, `opus` and `haiku`
+  aliases; at 0.02 none of them warns. A model with a 200k-token window gets
+  about a fifth of that, so it still drops descriptions at 0.02. The setting
+  applies only to sessions launched at a checkout's root (the main checkout or a
+  worktree): CC reads project settings from the launch directory, and a session
+  started in `src/` was measured to keep the default. Most dispatched sessions run
+  outside the repo (`background_session_dir`, see `cc/invoker.py`) and keep 0.01
+  too; `--settings` does not carry this key (#3543). Re-measure
+  with `claude -p --model <m> --debug-file <f>` when the catalog or installed
+  plugins grow, or for a model with a smaller window.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
   existing commit/request budget decisions, denies approval-required or unknown
@@ -4140,6 +4279,14 @@ verified: f9a1d4cb 2026-10-18
   creating a charter, or joining Genesis foreground/background lifecycle
   management. Recall remains read-oriented rather than side-effect-free: its
   normal retrieval-use metadata may still be updated.
+  The same project configuration exposes 15 explicitly named GitNexus tools
+  through `.claude/mcp/run-gitnexus`, reusing the existing installed-version and
+  Node pin checks. It adds no Genesis writers or lifecycle integration. GitNexus
+  snapshots can be stale; connection startup does not rebuild an index, and
+  source-editing `rename` and group-metadata `group_sync` are excluded. Raw
+  Cypher and incidental cache/recovery effects remain; this catalog is not a
+  side-effect-free server contract. See
+  `docs/reference/codex-gitnexus.md` for native qualification and configuration.
   `web-research` is the shared method for foreground sessions, the
   `genesis-researcher` subagent, and research-profile background sessions;
   task risk and breadth select its depth. Tier-2 `research` resources resolve and

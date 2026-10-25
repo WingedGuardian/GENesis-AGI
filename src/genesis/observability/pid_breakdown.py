@@ -490,8 +490,11 @@ def _snapshot_dir() -> Path:
     return genesis_home() / "logs" / "pid_snapshots"
 
 
-def _prune(directory: Path, now: float) -> None:
-    """Delete snapshots older than 7 days, then the oldest until under 20 MB."""
+def prune_snapshot_dir(directory: Path, now: float) -> None:
+    """Delete snapshots older than 7 days, then the oldest until under 20 MB.
+
+    Shared by every JSON snapshot directory under ``<genesis_home>/logs/``
+    (``pid_snapshots``, ``lock_snapshots``)."""
     files = []
     for path in directory.glob("*.json"):
         try:
@@ -508,7 +511,7 @@ def _prune(directory: Path, now: float) -> None:
             path.unlink()
             total -= size
         except OSError:
-            logger.debug("pid snapshot prune failed: %s", path, exc_info=True)
+            logger.debug("snapshot prune failed: %s", path, exc_info=True)
 
 
 def snapshot_for(budget: dict) -> dict | None:
@@ -532,7 +535,7 @@ def snapshot_for(budget: dict) -> dict | None:
         name = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ") + ".json"
         target = directory / name
         atomic_write_text(target, json.dumps(snapshot, indent=1), encoding="utf-8")
-        _prune(directory, time.time())
+        prune_snapshot_dir(directory, time.time())
         return {"text": summarize(snapshot), "file": str(target) if target.is_file() else None}
     except Exception:
         logger.warning("pid budget breakdown snapshot failed", exc_info=True)

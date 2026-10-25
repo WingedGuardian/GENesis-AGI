@@ -5,7 +5,7 @@ launches the physical worker with its own cgroup, OOM priority and native memory
 budget. Capping the one-shot CLI therefore does not contain that worker when a
 query daemon already exists.
 
-## Opt-in queued adapter
+## Managed queued adapter
 
 Immutable managed settings select the pinned executable for the stock internal
 worker adapter in `scripts/lib/code_intel_cbm_worker.py`. The existing
@@ -25,8 +25,8 @@ Configure the cache and runtime directories through managed setup. Query clients
 the query daemon and the worker use the same configured stock cache and IPC namespace. The
 adapter preserves native build-cohort admission, project mutation locks,
 maintenance cancellation, parent-death handling and publication. Its cooperative
-worker budget is three quarters of the admitted physical cap; the physical cap
-is unchanged. The remaining quarter is headroom for other charged memory.
+worker budget is 6 GiB, three quarters of the required 8 GiB physical cap.
+The remaining quarter is headroom for other charged memory.
 
 A clean native process exit is insufficient: stock workers also return zero for
 MCP tool errors. The adapter reads a bounded response and propagates tool or
@@ -49,7 +49,7 @@ child is promoted to 1000. For a shared deployment, include the
 full query-daemon and aggregate frontend ceilings in the capacity envelope,
 plus the existing sibling reserve; current usage alone is insufficient.
 
-Private acceptance measured a 12 GiB zero-swap batch ceiling, a separate 2 GiB
+Historical private acceptance measured a 12 GiB zero-swap batch ceiling, a separate 2 GiB
 query daemon, a 2 GiB aggregate frontend ceiling and 2 GiB sibling reserve.
 The physical worker stayed in the batch scope with OOM priority 1000 and a
 9 GiB native budget. Eight indexed readers succeeded during a changed-repository
@@ -65,7 +65,7 @@ graph and the newly indexed symbol. Killing only the adapter preserved the graph
 cleaned up the worker and retained a failed attempt. Resuming that same request
 with fault injection removed consumed it successfully without resetting its
 attempt count. These are measurements for the pinned build and tested repository,
-not a completed long-run acceptance claim.
+not a completed long-run acceptance claim or acceptance of subsequent repairs.
 
 ## Rollback
 

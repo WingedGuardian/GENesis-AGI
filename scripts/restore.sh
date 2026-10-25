@@ -49,6 +49,14 @@ fi
 # Pluggable Tier-2 (off-site) backend interface — selects none/local/smb at runtime
 # (backward-compat: a configured GENESIS_BACKUP_NAS with no selector → smb).
 _SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Test fence first (sourced): this script acts on ${GENESIS_DIR:-$HOME/genesis},
+# and the refusal must precede the validation run and status writes below — so
+# GENESIS_DIR resolves here, not at its old later site. No-op unless the
+# suite-wide fence arms GENESIS_TEST_FENCE_LIVE_ROOTS.
+GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
+# shellcheck source=scripts/lib/live_system_guard.sh
+source "$_SCRIPT_DIR/lib/live_system_guard.sh"
+refuse_if_test_fenced_live "$GENESIS_DIR" || exit 97
 # shellcheck source=scripts/lib/backup_backends.sh
 source "$_SCRIPT_DIR/lib/backup_backends.sh"
 # Load definitions before the off-site credential lease and its RETURN cleanup.
@@ -167,7 +175,7 @@ _cleanup_plaintext() {
 trap '_cleanup_plaintext; _write_status; _release_deploy_marker; backend_cleanup' EXIT
 
 # ── Setup ────────────────────────────────────────────────────────────
-GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
+# GENESIS_DIR resolved at the top of the script, before the test-fence check.
 BACKUP_DIR="$HOME/backups/genesis-backups"
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"

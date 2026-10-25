@@ -78,6 +78,66 @@ class _FakeRouter:
         return r
 
 
+@pytest.mark.parametrize("context", ["", "Also include recommendation CONTEXT_ONLY_DELIVERABLE."])
+@pytest.mark.parametrize("score,passed", [(0.5, False), (0.6, True), (0.9, True)])
+async def test_task_completion_prompt_and_numeric_boundary(score, passed, context):
+    """Real scorer/judge plumbing; canned scores do NOT test model obedience.
+
+    The 0.9 response deliberately violates the new omission instruction and
+    still passes: semantics belong to the model, not a hidden parser here.
+    """
+    from genesis.eval.bench.runner import judge_arm
+    from genesis.eval.bench.types import BenchArmOutcome, BenchTask
+    from genesis.eval.scorers import LLMJudgeScorer
+    from genesis.eval.skill_replay.types import SkillReplayConfig
+    from genesis.eval.skill_replay.verdict import compute_verdict
+
+    task = BenchTask(
+        id="recommendation", category="research",
+        prompt="Compare two storage options and recommend one.",
+        expected="Explain the storage trade-offs.",
+        context=context,
+    )
+    output = "Option A is compact. Option B is faster."
+    captured = []
+
+    class CaptureRouter(_FakeRouter):
+        async def route_call(self, call_site_id, messages, **kwargs):
+            captured.append((call_site_id, messages, kwargs))
+            return await super().route_call(call_site_id, messages, **kwargs)
+
+    result = await judge_arm(
+        LLMJudgeScorer(router=CaptureRouter({output: score})), task,
+        BenchArmOutcome(task_id=task.id, arm="genesis", output_text=output),
+    )
+    assert not result.skipped
+    assert result.judge_passed is passed
+    assert result.judge_score == score
+    assert len(captured) == 1
+    _, messages, _ = captured[0]
+    prompt = messages[0]["content"]
+    assert all(text in prompt for text in (task.prompt, task.expected, output))
+    task_section = prompt.split("THE TASK GIVEN TO THE ASSISTANT:\n", 1)[1].split(
+        "\n\nSUCCESS CRITERIA (ex-ante):", 1,
+    )[0]
+    assert task_section == task.rendered_prompt()
+    assert "INCOMPLETE" in prompt
+    assert "at most 0.5" in prompt
+    assert "task or the ex-ante success criteria" in prompt
+    assert "optional" in prompt
+    assert "progress update" in prompt
+    assert "refusal" in prompt
+    assert json.loads(result.judge_detail)["rubric_version"] == "1.1.0"
+    verdict = compute_verdict(
+        old_scores=[0.6], new_scores=[result.judge_score],
+        old_pass=[True], new_pass=[result.judge_passed],
+        config=SkillReplayConfig(min_pairs=1),
+    )
+    assert verdict.verdict == {
+        0.5: "regression", 0.6: "inconclusive", 0.9: "net_positive",
+    }[score]
+
+
 @pytest.fixture
 async def eval_db(db):
     """The shared in-memory db + the eval-tables migration chain
@@ -142,12 +202,42 @@ async def _run(bench_env, **kwargs):
 
 
 class TestRunBench:
+    async def test_both_arms_judged_with_context_only_requirement(self, bench_env):
+        task = {
+            "id": "context_only", "category": "research",
+            "prompt": "Compare the two fictional storage options.",
+            "expected": "Explain their trade-offs.",
+            "context": "Include a final recommendation: CONTEXT_ONLY_DELIVERABLE.",
+        }
+        tasks = bench_env / "context-tasks.jsonl"
+        tasks.write_text(json.dumps(task) + "\n")
+        captured = []
+
+        class CaptureRouter(_FakeRouter):
+            async def route_call(self, call_site_id, messages, **kwargs):
+                captured.append(messages[0]["content"])
+                return await super().route_call(call_site_id, messages, **kwargs)
+
+        invoker = _FakeInvoker(snapshot_writer=_snapshot_writer)
+        report = await _run(
+            bench_env, tasks_path=tasks, invoker=invoker, router=CaptureRouter(),
+        )
+        assert len(report.pairs) == 1 and not report.pairs[0].skipped
+        assert len(invoker.invocations) == len(captured) == 2
+        for inv, request in zip(invoker.invocations, captured, strict=True):
+            assert task["context"] in inv.prompt
+            assert task["context"] in request
+            assert task["expected"] in request
+        for outcome in (report.pairs[0].bare, report.pairs[0].genesis):
+            assert outcome.output_text in "\n".join(captured)
+            assert not outcome.judge_passed
+
     async def test_happy_path_pairs_and_stats(self, bench_env):
         report = await _run(bench_env)
         assert len(report.pairs) == 3
         assert all(not p.skipped for p in report.pairs)
         assert report.judge_calibrated is False
-        assert report.rubric_version == "1.0.0"
+        assert report.rubric_version == "1.1.0"
         # genesis (0.9) beats bare (0.4) on every pair.
         assert report.score_winrate["n_treatment_wins"] == 3
         assert report.score_winrate["n_control_wins"] == 0
@@ -264,7 +354,7 @@ class TestRunBench:
         )
         assert len(results) == 6  # 3 tasks × 2 arms
         detail = json.loads(results[0][3])
-        assert detail["rubric_version"] == "1.0.0"
+        assert detail["rubric_version"] == "1.1.0"
 
     async def test_persistence_failure_is_nonfatal(self, bench_env):
         class _BrokenDB:
