@@ -15,11 +15,13 @@ so. Four ways that left the server down after a crashed update:
 
 The fix: update.sh records the services it is about to stop in its state AND
 writes ~/.genesis/server_restart_owed.json before it stops genesis-server. Only
-update.sh retires that file, and only once the server is back (health-checked on
-the update paths, active after the pre-stop interrupt handler's restart).
-Recovery detection runs whenever genesis-server is not running (a running bridge
-no longer hides it) and the no-delta path runs the full activation when a restart
-is owed. A server nobody's update stopped stays stopped. bootstrap's crash
+update.sh retires that file, and only when its OWN health check of genesis-server
+passes, right at that check (owner ruling, round 6): no activation time, file age
+or unit state pays it. Recovery detection runs whenever genesis-server is not
+running (a running bridge no longer hides it) and the no-delta path runs the full
+activation when a restart is owed. A server nobody's update stopped stays stopped
+(a deliberate stay-down after an update's stop is the hold marker's job, #2718).
+bootstrap's crash
 recovery still writes last_update_failure.json when the crashed state says the
 server was stopped: that is the alert, and the dashboard's record of the crash.
 
@@ -41,6 +43,8 @@ import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from tests.test_scripts.test_bootstrap_guards import (
     UPDATE,
@@ -272,8 +276,13 @@ for arg in "$@"; do
     if [ "$arg" = is-active ]; then
         unit="${*: -1}"
         unit="${unit%.service}"
-        [[ " ${FAKE_ACTIVE:-} " == *" $unit "* ]]
-        exit
+        # Like systemctl: the state is printed unless --quiet.
+        if [[ " ${FAKE_ACTIVE:-} " == *" $unit "* ]]; then
+            [[ " $* " == *" --quiet "* ]] || echo active
+            exit 0
+        fi
+        [[ " $* " == *" --quiet "* ]] || echo inactive
+        exit 3
     fi
 done
 printf '%s\n' "$*" >> "${FAKE_LOG:-/dev/null}"
@@ -345,7 +354,7 @@ def _run_update_until_stop(
         'STARTED_AT="2026-10-18T00:00:00+00:00"\n'
         "ROLLBACK_TAG=rollback\nORIGINAL_BRANCH=main\nUPDATE_OWN_HEAD=''\n"
         f"DEPLOY_HEAD={rollback}\nOLD_TAG=v1.0.0\nOLD_COMMIT={rollback[:7]}\n"
-        f"POST_MERGE={post_merge}\nON_LIVE={on_live}\n_LIVE_WERE_RUNNING=()\n"
+        f"POST_MERGE={post_merge}\nON_LIVE={on_live}\n"
         '_SELF_COPY="$HOME/self-copy"\n'
         # Not a repository; the fake git refuses anything run against it anyway.
         f'GENESIS_ROOT="{tmp_path / "cwd"}"\n'
@@ -353,14 +362,12 @@ def _run_update_until_stop(
         + _func(text, "_write_state")
         + "_guardian_pause() { :; }\n_guardian_resume() { :; }\n"
         "_drop_own_prestop_state() { :; }\n_flush_deploy_summary() { :; }\n"
-        "_live_prestop_exit() { :; }\n_ensure_server_down() { return 0; }\n"
+        "_ensure_server_down() { return 0; }\n"
         "_stop_genesis_server() { kill -KILL $$; }\n"
         '_clear_deploy_state() { rm -f "$STATE_FILE"; echo CLEARED; }\n'
-        '_live_abandon() { echo "LIVE-ABANDON $1"; exit "$1"; }\n'
-        "_live_stop_failed_note() { :; }\n"
         + pre
         # update.sh's own "fetching" write, made before the services are inspected.
-        + 'WERE_RUNNING=()\nif [ "$ON_LIVE" != 1 ]; then _write_state "fetching"; fi\n'
+        + 'WERE_RUNNING=()\n_write_state "fetching"\n'
         + text[
             text.index("\nWERE_RUNNING=()\n") + 1 : text.index(
                 '[[ ${#WERE_RUNNING[@]} -gt 0 ]] && echo "  Stopped:'
@@ -417,11 +424,12 @@ def test_the_next_update_restores_a_server_killed_at_the_stop_without_bootstrap(
 
 
 def test_on_live_a_kill_at_the_stop_still_restores_the_server(tmp_path):
-    """On `live` no state is written before the stop (by design); the
-    obligation still is."""
+    """On `live` the rebuild runs after the stop (in the merge's place), so the
+    window before the stop is the same as a plain run's: state and record."""
     root, _, home, proc = _crash_at_stop(tmp_path, on_live="1")
     assert proc.returncode == -9, proc.stdout + proc.stderr
-    assert not (home / ".genesis" / "update_state.json").exists()
+    state = json.loads((home / ".genesis" / "update_state.json").read_text())
+    assert state["services_stopped"] == ["genesis-server"]
     assert _detect(tmp_path, home, root) == (["genesis-server"], "false")
 
 
@@ -583,25 +591,14 @@ def test_no_delta_with_the_server_running_is_unchanged(tmp_path):
     assert _no_delta_route(tmp_path, home, "genesis-server") == ("no-delta", [])
 
 
-# ── only update.sh retires the obligation, once the server is back ──────────
+# ── only update.sh's own passing health check retires the obligation ────────
 
 
 def _with_owed(home: Path) -> None:
     _owed(home).parent.mkdir(parents=True, exist_ok=True)
-    # A confirmed stop's record (see the round-3 tests for a "stopping" one).
+    # Its content is never read (presence is the debt). This is what the round-5
+    # writer left after a CONFIRMED stop, the one record its inference paid.
     _owed(home).write_text('{"stage": "stopped"}')
-
-
-def test_a_successful_update_retires_the_obligation(tmp_path):
-    text = UPDATE.read_text()
-    start = text.index("# ── Clear update failure file on success")
-    block = text[start : text.index("# ── Record success in update_history", start)]
-    home = tmp_path / "home"
-    _with_owed(home)
-    script = "set -Eeuo pipefail\nWERE_RUNNING=(genesis-server)\n" + _owed_block(text) + block
-    r = _sh(tmp_path, home, script)
-    assert r.returncode == 0, r.stderr
-    assert not _owed(home).exists()
 
 
 def test_the_no_delta_path_retires_it_only_when_the_server_answers_health(tmp_path):
@@ -623,81 +620,28 @@ def test_the_no_delta_path_retires_it_only_when_the_server_answers_health(tmp_pa
         assert _owed(home).exists() is kept, (running, healthy)
 
 
-def test_the_prestop_handler_retires_it_only_when_the_server_is_back(tmp_path):
+def test_the_prestop_handler_never_retires_it(tmp_path):
+    """The interrupt handler restarts what it stopped but checks no health, so
+    even a unit that reads active pays nothing: the next update restarts and
+    health-checks the server."""
     text = UPDATE.read_text()
     home = tmp_path / "home"
-    for active, kept in (("genesis-server", False), ("", True)):
+    for active in ("genesis-server", ""):
         _with_owed(home)
         script = (
             "set -Eeuo pipefail\n"
             + _owed_block(text)
-            + "_start_genesis_server() { :; }\n_clear_deploy_state() { :; }\n"
-            "_live_abandon() { :; }\nON_LIVE=0\n_LIVE_WERE_RUNNING=()\n"
+            + "_start_genesis_server() { echo SERVER-STARTED; }\n_clear_deploy_state() { :; }\n"
             "WERE_RUNNING=(genesis-server)\n"
             + _func(text, "_on_signal_prestop")
             + "_on_signal_prestop TERM\n"
         )
         r = _sh(tmp_path, home, script, active=active)
-        assert r.returncode == 1, r.stdout + r.stderr
-        assert _owed(home).exists() is kept, active
+        assert r.returncode == 1 and "SERVER-STARTED" in r.stdout, r.stdout + r.stderr
+        assert _owed(home).exists(), active
 
 
-def _crash_after_confirmed_stop(tmp_path: Path):
-    """The run stops the server (no restart during the stop), confirms it down,
-    and is killed before "merging"."""
-    root, _, rollback = _recovery_repo(tmp_path)
-    db = _migrated_genesis_root(tmp_path, root)
-    home = tmp_path / "home"
-    proc = _run_update_until_stop(
-        tmp_path,
-        home,
-        active="genesis-server",
-        rollback=rollback,
-        pre="_stop_genesis_server() { :; }\n",
-        tail="kill -KILL $$\n",
-    )
-    assert '"stage": "stopped"' in _owed(home).read_text()
-    return root, db, home, proc
-
-
-def test_a_kill_at_the_stop_leaves_an_unconfirmed_record_no_activation_pays(tmp_path):
-    """Killed during the stop: the stop was never confirmed, so a later activation
-    may be the stop's own restart. The record stays owed (the price: a server
-    revived after such a kill and then stopped by the operator is restarted by
-    the next update)."""
-    root, _, home, proc = _crash_at_stop(tmp_path)
-    assert proc.returncode == -9, proc.stdout + proc.stderr
-    assert '"stage": "stopping"' in _owed(home).read_text()
-    later = _systemd_time(time.time() + 120)
-    assert _detect(tmp_path, home, root, active_enter=later) == (["genesis-server"], "false")
-
-
-def test_a_restart_owed_is_paid_once_anything_else_brought_the_server_back(tmp_path):
-    """Architect review: the watchdog (or a hand start, deploy_code_only.sh, the
-    conflict exit, a rollback) revived the server after the crash; the operator
-    then stopped it. The unit came up after the obligation was dated (at the
-    confirmed stop), so the stop is the operator's and stays; the file is retired."""
-    root, _, home, proc = _crash_after_confirmed_stop(tmp_path)
-    assert proc.returncode == -9, proc.stdout + proc.stderr
-    later = time.strftime("%a %Y-%m-%d %H:%M:%S %Z", time.localtime(time.time() + 120))
-    assert _detect(tmp_path, home, root, active_enter=later) == ([], "true")
-    assert not _owed(home).exists()
-
-
-def test_a_unit_last_up_before_the_obligation_still_owes_the_restart(tmp_path):
-    root, _, home, proc = _crash_after_confirmed_stop(tmp_path)
-    assert proc.returncode == -9, proc.stdout + proc.stderr
-    # Written two days ago: an empty value read by `date -d` would be midnight
-    # TODAY, which is after it, and would wrongly pay the debt.
-    written = time.time() - 2 * 86400
-    os.utime(_owed(home), (written, written))
-    earlier = time.strftime("%a %Y-%m-%d %H:%M:%S %Z", time.localtime(written - 3600))
-    for value in (earlier, "n/a", ""):
-        assert _detect(tmp_path, home, root, active_enter=value) == (["genesis-server"], "false")
-    assert _owed(home).exists()
-
-
-# ── round 2: no stop without the record; a later activation outranks older evidence ──
+# ── round 2: no stop without the record ─────────────────────────────────────
 
 
 def _systemd_time(epoch: float) -> str:
@@ -725,15 +669,17 @@ def _archive_failure(db: Path, home: Path, monkeypatch) -> None:
     assert not failure.exists()
 
 
-def test_the_server_is_never_stopped_without_its_restart_record(tmp_path):
+@pytest.mark.parametrize("on_live", ["0", "1"])
+def test_the_server_is_never_stopped_without_its_restart_record(tmp_path, on_live):
     """Codex P1 (4309637542): the restart record cannot be written, so nothing is
-    stopped: the run clears its state and exits, the server still running."""
+    stopped: the run clears its state and exits, the server still running. The
+    same on `live`, whose rebuild now runs after the stop."""
     root, _, rollback = _recovery_repo(tmp_path)
     home = tmp_path / "home"
     # The record's temporary file cannot be created.
     (home / ".genesis" / "server_restart_owed.json.tmp").mkdir(parents=True)
     proc = _run_update_until_stop(
-        tmp_path, home, active="genesis-server genesis-bridge", rollback=rollback
+        tmp_path, home, active="genesis-server genesis-bridge", rollback=rollback, on_live=on_live
     )
     out = proc.stdout + proc.stderr
     assert proc.returncode == 1, out  # -9 would mean the stop ran
@@ -768,17 +714,6 @@ def test_a_post_merge_refusal_keeps_the_earlier_runs_rollback_tag(tmp_path):
         assert ("tag -d rollback" in calls) is deleted, (post_merge, calls)
 
 
-def test_on_live_the_server_is_never_stopped_without_its_restart_record(tmp_path):
-    root, _, rollback = _recovery_repo(tmp_path)
-    home = tmp_path / "home"
-    (home / ".genesis" / "server_restart_owed.json.tmp").mkdir(parents=True)
-    proc = _run_update_until_stop(
-        tmp_path, home, active="genesis-server", rollback=rollback, on_live="1"
-    )
-    out = proc.stdout + proc.stderr
-    assert proc.returncode == 1 and "LIVE-ABANDON 1" in out, out
-
-
 def test_a_pre_marker_updaters_crash_is_restored_after_its_record_was_archived(
     tmp_path, monkeypatch
 ):
@@ -800,215 +735,7 @@ def test_bootstrap_writes_no_restart_record_for_a_crash_before_the_stop(tmp_path
     assert not _owed(tmp_path / "home").exists()
 
 
-def test_bootstrap_dates_its_records_to_the_crash_not_to_itself(tmp_path):
-    """The records bootstrap writes carry the crashed state's time, so a server
-    revived after the crash (the watchdog) and stopped by the operator before
-    bootstrap ran is not started again."""
-    root, _, rollback = _recovery_repo(tmp_path)
-    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
-    _migrated_genesis_root(tmp_path, root)
-    home = tmp_path / "home"
-    state = _write_recovery_state(
-        home,
-        own_head=deploy,
-        deploy_head=deploy,
-        old_tag="v1.0.0",
-        old_commit=rollback[:7],
-        started_at="2026-10-18T00:00:00+00:00",
-        services_stopped=["genesis-server"],
-    )
-    crashed = time.time() - 3600
-    os.utime(state, (crashed, crashed))
-    rec = _run_crash_recovery(root, home)
-    assert rec.returncode == 0 and "Crash recovery complete" in rec.stdout, rec.stdout + rec.stderr
-    for record in (_owed(home), _failure_file(tmp_path)):
-        assert abs(record.stat().st_mtime - crashed) < 2, record
-    revived = _systemd_time(crashed + 600)
-    assert _detect(tmp_path, home, root, active_enter=revived) == ([], "true")
-
-
-def test_a_later_activation_outranks_an_older_failure_record(tmp_path):
-    """Codex P2 (4309637546): the restart was paid by a later activation; the
-    failure record from the same crash must not restart a server the operator
-    has stopped since. The alert record itself is left for its readers."""
-    home = tmp_path / "home"
-    _with_owed(home)
-    failure = _failure_file(tmp_path)
-    failure.write_text("{}")
-    crash = time.time() - 7200
-    for record in (_owed(home), failure):
-        os.utime(record, (crash, crash))
-    revived = _systemd_time(crash + 3600)
-    assert _detect(tmp_path, home, tmp_path / "no-root", active_enter=revived) == ([], "true")
-    assert not _owed(home).exists()
-    assert failure.exists()
-
-
-def test_failure_evidence_newer_than_the_last_activation_still_restores(tmp_path):
-    home = tmp_path / "home"
-    failure = _failure_file(tmp_path)
-    failure.parent.mkdir(parents=True)
-    failure.write_text("{}")
-    revived = _systemd_time(time.time() - 3600)
-    for value in (revived, "", "n/a"):
-        assert _detect(tmp_path, home, tmp_path / "no-root", active_enter=value) == (
-            ["genesis-server"],
-            "false",
-        )
-
-
-def _history_root(tmp_path: Path, status: str | None, completed_at: str) -> Path:
-    import sqlite3
-
-    root = tmp_path / f"root-{status}-{abs(hash(completed_at))}"
-    (root / "data").mkdir(parents=True)
-    con = sqlite3.connect(root / "data" / "genesis.db")
-    con.execute("CREATE TABLE update_history (status TEXT, started_at TEXT, completed_at TEXT)")
-    if status is not None:
-        con.execute(
-            "INSERT INTO update_history VALUES (?, ?, ?)",
-            (status, "2026-10-18T00:00:00+00:00", completed_at),
-        )
-    con.commit()
-    con.close()
-    return root
-
-
-def test_a_later_activation_outranks_an_older_failed_status(tmp_path):
-    from datetime import UTC, datetime
-
-    home = tmp_path / "home"
-    (home / ".genesis").mkdir(parents=True)
-    now = time.time()
-    revived = _systemd_time(now - 3600)
-    older = datetime.fromtimestamp(now - 7200, UTC).isoformat()
-    newer = datetime.fromtimestamp(now - 600, UTC).isoformat()
-    for status in ("rolled_back", "failed"):
-        stale = _history_root(tmp_path, status, older)
-        assert _detect(tmp_path, home, stale, active_enter=revived) == ([], "true"), status
-        fresh = _history_root(tmp_path, status, newer)
-        assert _detect(tmp_path, home, fresh, active_enter=revived) == (
-            ["genesis-server"],
-            "false",
-        ), status
-        # No readable activation, or no readable completion time: still a recovery.
-        assert _detect(tmp_path, home, stale, active_enter="") == (["genesis-server"], "false")
-        bad = _history_root(tmp_path, status, "not a time")
-        assert _detect(tmp_path, home, bad, active_enter=revived) == (
-            ["genesis-server"],
-            "false",
-        )
-
-
-# ── round 3: only an activation after the CONFIRMED stop pays the debt ──────
-
-# The stop's own kill reads as a failure to systemd, so Restart=on-failure can
-# bring the server back between the first kill and _ensure_server_down's final
-# stop. That activation is the stop's, not a restart by someone else.
-_RESURRECTING_STOP = (
-    "_stop_genesis_server() {\n"
-    "    sleep 1.2\n"
-    '    date "+%a %Y-%m-%d %H:%M:%S %Z" > "$FAKE_ACTIVE_ENTER_FILE"\n'
-    "}\n"
-)
-
-
-def _resurrection(tmp_path: Path) -> str:
-    return (tmp_path / "active-enter").read_text().strip()
-
-
-def test_a_restart_during_the_stop_does_not_pay_the_debt(tmp_path):
-    """Codex P1 (4310414810): the unit came back during the stop and was stopped
-    again; the run is then killed before "merging". The next update restores it."""
-    root, _, rollback = _recovery_repo(tmp_path)
-    _migrated_genesis_root(tmp_path, root)
-    home = tmp_path / "home"
-    proc = _run_update_until_stop(
-        tmp_path,
-        home,
-        active="genesis-server",
-        rollback=rollback,
-        pre=_RESURRECTING_STOP,
-        tail="kill -KILL $$\n",
-    )
-    assert proc.returncode == -9, proc.stdout + proc.stderr
-    # Re-dated at the confirmed stop, so a revival after it can still pay it.
-    owed = _owed(home)
-    assert '"stage": "stopped"' in owed.read_text()
-    local_time = _resurrection(tmp_path).rsplit(" ", 1)[0]  # drop the zone name
-    revived = time.mktime(time.strptime(local_time, "%a %Y-%m-%d %H:%M:%S"))
-    assert owed.stat().st_mtime >= revived
-    assert _detect(tmp_path, home, root, active_enter=_resurrection(tmp_path)) == (
-        ["genesis-server"],
-        "false",
-    )
-
-
-def test_a_kill_between_the_restart_and_the_confirmed_stop_keeps_the_debt(tmp_path):
-    root, _, rollback = _recovery_repo(tmp_path)
-    _migrated_genesis_root(tmp_path, root)
-    home = tmp_path / "home"
-    proc = _run_update_until_stop(
-        tmp_path,
-        home,
-        active="genesis-server",
-        rollback=rollback,
-        pre=_RESURRECTING_STOP + "_ensure_server_down() { kill -KILL $$; }\n",
-    )
-    assert proc.returncode == -9, proc.stdout + proc.stderr
-    assert _detect(tmp_path, home, root, active_enter=_resurrection(tmp_path)) == (
-        ["genesis-server"],
-        "false",
-    )
-
-
-def test_a_debt_that_cannot_be_dated_after_the_stop_restores_the_server_and_stops(tmp_path):
-    """The record cannot be rewritten once the server is confirmed down: the run
-    must neither go on (the debt could then read as paid) nor leave the server
-    down. It restores what it stopped and exits, like an interrupt there."""
-    text = UPDATE.read_text()
-    root, _, rollback = _recovery_repo(tmp_path)
-    home = tmp_path / "home"
-    proc = _run_update_until_stop(
-        tmp_path,
-        home,
-        active="genesis-server",
-        rollback=rollback,
-        pre=(
-            _func(text, "_on_signal_prestop")
-            + "_start_genesis_server() { echo SERVER-STARTED; }\n"
-            + '_ensure_server_down() { mkdir -p "$HOME/.genesis/server_restart_owed.json.tmp"; }\n'
-            + "_stop_genesis_server() { :; }\n"
-        ),
-    )
-    out = proc.stdout + proc.stderr
-    assert proc.returncode == 1, out
-    assert "SERVER-STARTED" in out and "REACHED-END" not in out, out
-
-
-def test_bootstrap_does_not_let_a_restart_during_the_stop_pay_the_debt(tmp_path):
-    """A crash in "fetching" with the server in services_stopped: the state was
-    written before the stop, so an activation after it may be the stop's own.
-    The record bootstrap writes for it is not paid by one."""
-    root, _, rollback = _recovery_repo(tmp_path)
-    _migrated_genesis_root(tmp_path, root)
-    home = tmp_path / "home"
-    state = _write_recovery_state(
-        home,
-        phase="fetching",
-        deploy_head=rollback,
-        post_merge=False,
-        services_stopped=["genesis-server"],
-    )
-    written = time.time() - 3600
-    os.utime(state, (written, written))
-    rec = _run_crash_recovery(root, home)
-    assert rec.returncode == 0 and "Crash recovery complete" in rec.stdout, rec.stdout + rec.stderr
-    later = _systemd_time(written + 5)
-    assert _detect(tmp_path, home, root, active_enter=later) == (["genesis-server"], "false")
-
-
-# ── round 5: a durable record; sub-second ordering; no debt for a live server ──
+# ── round 5: a durable record; no debt for a live server ─────────────────────
 
 
 def _owed_writer_source(text: str, name: str) -> str:
@@ -1054,9 +781,9 @@ def test_update_sh_makes_the_restart_record_durable_before_it_counts(monkeypatch
     source = _owed_writer_source(UPDATE.read_text(), "_owe_server_restart() {")
     (tmp_path / "g").mkdir()
     path = tmp_path / "g" / "server_restart_owed.json"
-    events = _run_writer(monkeypatch, tmp_path, source, [str(path), "123", "s", "stopped"])
+    events = _run_writer(monkeypatch, tmp_path, source, [str(path), "123", "s"])
     assert events == ["fsync-file", "rename", "fsync-dir"], events
-    assert json.loads(path.read_text())["stage"] == "stopped"
+    assert json.loads(path.read_text())["pid"] == 123
 
 
 def test_a_record_that_cannot_be_synced_refuses_the_stop(monkeypatch, tmp_path):
@@ -1068,7 +795,7 @@ def test_a_record_that_cannot_be_synced_refuses_the_stop(monkeypatch, tmp_path):
         raise OSError(5, "I/O error")
 
     monkeypatch.setattr(os, "fsync", broken)
-    monkeypatch.setattr(sys, "argv", ["-", str(path), "123", "s", "stopping"])
+    monkeypatch.setattr(sys, "argv", ["-", str(path), "123", "s"])
     try:
         exec(compile(source, "<restart-record-writer>", "exec"), {"__name__": "__main__"})  # noqa: S102 - the shipped writer, extracted
     except (OSError, SystemExit) as exc:
@@ -1077,66 +804,15 @@ def test_a_record_that_cannot_be_synced_refuses_the_stop(monkeypatch, tmp_path):
         raise AssertionError("a record that could not be synced was reported written")
 
 
-def test_bootstrap_makes_its_restart_record_durable_and_dated_to_the_crash(monkeypatch, tmp_path):
+def test_bootstrap_makes_its_restart_record_durable(monkeypatch, tmp_path):
     from tests.test_scripts.test_bootstrap_guards import BOOTSTRAP
 
     source = _owed_writer_source(BOOTSTRAP.read_text(), 'OWED_FILE="$HOME/.genesis/')
     (tmp_path / "g").mkdir()
-    state = tmp_path / "g" / "update_state.json"
-    state.write_text("{}")
-    crashed_ns = time.time_ns() - 3_600_123_456_789
-    os.utime(state, ns=(crashed_ns, crashed_ns))
     path = tmp_path / "g" / "server_restart_owed.json"
-    events = _run_writer(monkeypatch, tmp_path, source, [str(path), str(state), "123", "stopped"])
+    events = _run_writer(monkeypatch, tmp_path, source, [str(path), "123"])
     assert events == ["fsync-file", "rename", "fsync-dir"], events
-    assert path.stat().st_mtime_ns == crashed_ns  # to the nanosecond
-    assert json.loads(path.read_text())["stage"] == "stopped"
-
-
-def _set_mtime_ns(path: Path, ns: int) -> None:
-    os.utime(path, ns=(ns, ns))
-
-
-def _us_utc(ns: int) -> str:
-    """An ActiveEnterTimestamp as `systemctl show --timestamp=us+utc` prints it."""
-    secs, rem = divmod(ns, 1_000_000_000)
-    return time.strftime("%a %Y-%m-%d %H:%M:%S", time.gmtime(secs)) + f".{rem // 1000:06d} UTC"
-
-
-def test_an_activation_later_in_the_same_second_pays_the_debt(tmp_path):
-    """Codex P2 (4316956950): ordering within one second is kept. Rule: an
-    activation STRICTLY after the confirmed stop pays; the same instant, or any
-    earlier one, or an unreadable one, leaves the restart owed."""
-    home = tmp_path / "home"
-    second = (time.time_ns() // 1_000_000_000 - 600) * 1_000_000_000
-    stop = second + 300_000_000
-    _with_owed(home)
-    _set_mtime_ns(_owed(home), stop)
-    assert _detect(
-        tmp_path, home, tmp_path / "no-root", active_enter=_us_utc(stop + 400_000_000)
-    ) == (
-        [],
-        "true",
-    )
-    for activation in (stop, stop - 200_000_000):
-        _with_owed(home)
-        _set_mtime_ns(_owed(home), stop)
-        assert _detect(tmp_path, home, tmp_path / "no-root", active_enter=_us_utc(activation)) == (
-            ["genesis-server"],
-            "false",
-        ), activation
-
-
-def test_a_failure_record_from_earlier_in_the_same_second_is_stale(tmp_path):
-    home = tmp_path / "home"
-    failure = _failure_file(tmp_path)
-    failure.parent.mkdir(parents=True)
-    failure.write_text("{}")
-    second = (time.time_ns() // 1_000_000_000 - 600) * 1_000_000_000
-    _set_mtime_ns(failure, second + 100_000_000)
-    assert _detect(
-        tmp_path, home, tmp_path / "no-root", active_enter=_us_utc(second + 900_000_000)
-    ) == ([], "true")
+    assert json.loads(path.read_text())["pid"] == 123
 
 
 def test_no_debt_is_left_for_a_server_the_stop_could_not_bring_down(tmp_path):
@@ -1168,3 +844,176 @@ def test_no_debt_is_left_for_a_server_the_stop_could_not_bring_down(tmp_path):
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert _owed(home2).exists()
+
+
+# ── round 6: retired ONLY by update.sh's own passing health check ────────────
+
+
+def test_an_activation_after_the_record_never_pays_the_debt(tmp_path):
+    """Codex P1 (4319194773): genesis-server is Type=simple, so "active" is not
+    "healthy": a unit that came up after the record and died before it answered
+    its health endpoint is still down. No activation pays the debt; the next
+    update restarts and health-checks it, the no-delta path included."""
+    home = tmp_path / "home"
+    _with_owed(home)
+    written = time.time() - 7200
+    os.utime(_owed(home), (written, written))
+    came_up = _systemd_time(written + 3600)
+    assert _detect(tmp_path, home, tmp_path / "no-root", active_enter=came_up) == (
+        ["genesis-server"],
+        "false",
+    )
+    assert _owed(home).exists()
+    assert _no_delta_route(tmp_path, home, active_enter=came_up) == ("full", ["genesis-server"])
+
+
+def test_bootstraps_record_is_not_paid_by_an_activation_after_the_crash(tmp_path):
+    """The record bootstrap's crash recovery writes is the same debt: a unit that
+    came up after the crash pays nothing."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    _migrated_genesis_root(tmp_path, root)
+    home = tmp_path / "home"
+    state = _write_recovery_state(
+        home,
+        own_head=deploy,
+        deploy_head=deploy,
+        old_tag="v1.0.0",
+        old_commit=rollback[:7],
+        started_at="2026-10-18T00:00:00+00:00",
+        services_stopped=["genesis-server"],
+    )
+    crashed = time.time() - 3600
+    os.utime(state, (crashed, crashed))
+    rec = _run_crash_recovery(root, home)
+    assert rec.returncode == 0 and "Crash recovery complete" in rec.stdout, rec.stdout + rec.stderr
+    assert _owed(home).is_file()
+    came_up = _systemd_time(crashed + 600)
+    assert _detect(tmp_path, home, root, active_enter=came_up) == (["genesis-server"], "false")
+
+
+def _p6_health_loop() -> str:
+    text = UPDATE.read_text()
+    start = text.index("    # ── Health verification with retry (FATAL on failure) ─")
+    return text[start : text.index('    if [ "$HEALTH_OK" = "true" ]; then', start)]
+
+
+def test_only_a_passing_p6_health_check_retires_the_debt_at_the_check(tmp_path):
+    """Codex P2 (4319194767): the debt goes the moment P6's health check passes, so
+    a kill right after it (the direct-start fallback has no unit for anything to
+    read) leaves no debt for a server that is up and answering. A unit that reads
+    active but never answers keeps it: active is not healthy."""
+    text = UPDATE.read_text()
+    for active, healthy, kept in (
+        ("genesis-server", "1", False),
+        ("genesis-server", "", True),
+        ("", "", True),
+    ):
+        home = tmp_path / f"home-{bool(active)}-{bool(healthy)}"
+        _with_owed(home)
+        script = (
+            "set -Eeuo pipefail\n"
+            + _owed_block(text)
+            + "GUARDIAN_PAUSE_TTL=600\nGUARDIAN_PAUSE_RENEW_MAX=4\n"
+            "GENESIS_DEPLOY_HEALTH_WINDOW_SECS=180\n"
+            "WERE_RUNNING=(genesis-server)\n"
+            # No real wait and no real network: the probe answers as told.
+            "sleep() { :; }\n"
+            f'curl() {{ [ -n "{healthy}" ]; }}\n'
+            + _p6_health_loop()
+            + 'echo "HEALTH_OK=$HEALTH_OK"\n'
+            # Killed the instant the loop ends: no later step may be what retires it.
+            + "kill -KILL $$\n"
+        )
+        r = _sh(tmp_path, home, script, active=active)
+        assert r.returncode == -9, r.stdout + r.stderr
+        assert f"HEALTH_OK={'true' if healthy else 'false'}" in r.stdout, r.stdout
+        assert _owed(home).exists() is kept, (active, healthy)
+
+
+def test_the_success_path_has_no_later_retirement():
+    """The late success-path removal is gone: P6's check is the one place on the
+    full activation, so nothing after it can pay a debt the check did not."""
+    text = UPDATE.read_text()
+    start = text.index("# ── Clear update failure file on success")
+    block = text[start : text.index("# ── Record success in update_history", start)]
+    assert "SERVER_RESTART_OWED" not in block
+
+
+_DIR_FSYNC_FAILS = """#!/bin/bash
+# The restart-record writer (run as `python3 -I - ...`) with its DIRECTORY fsync
+# failing, after the rename has already put the new file in place. Anything else
+# runs the real interpreter.
+if [ "$1" = -I ] && [ "$2" = - ]; then
+    shift 2
+    exec "{python}" -I -c '
+import os, stat, sys
+_real = os.fsync
+def _fsync(fd):
+    if stat.S_ISDIR(os.fstat(fd).st_mode):
+        with open(os.environ["FAKE_LOG"], "a") as log:
+            log.write("DIR-FSYNC-FAILED renamed=%s\\n" % os.path.exists(sys.argv[1]))
+        raise OSError(5, "I/O error")
+    return _real(fd)
+os.fsync = _fsync
+exec(compile(sys.stdin.read(), "<writer>", "exec"), {{"__name__": "__main__"}})
+' "$@"
+fi
+exec "{python}" "$@"
+"""
+
+
+@pytest.mark.parametrize("prior", [False, True])
+def test_a_refused_stop_removes_the_record_its_failed_write_left(tmp_path, prior):
+    """Codex P2 (4319194779): the rename succeeded and the directory fsync then
+    failed, so the stop is refused with the new record already on disk. The
+    server was never stopped: that record is false and goes. A record from before
+    this run is an earlier update's unpaid debt and stays."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    if prior:
+        _with_owed(home)
+    pybin = tmp_path / "pybin"
+    pybin.mkdir()
+    (pybin / "python3").write_text(_DIR_FSYNC_FAILS.format(python=sys.executable))
+    (pybin / "python3").chmod(0o755)
+    proc = _run_update_until_stop(
+        tmp_path, home, active="genesis-server", rollback=rollback, pre=f'PATH="{pybin}:$PATH"\n'
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "NOT stopped" in out, out
+    log = (tmp_path / "fake.log").read_text()
+    # Guard the guard: the failure really came after the rename.
+    assert "DIR-FSYNC-FAILED renamed=True" in log, log
+    assert "stop" not in log.replace("DIR-FSYNC-FAILED", ""), "nothing may be stopped"
+    assert _owed(home).exists() is prior
+
+
+def _rollback_until_its_stop(text: str) -> str:
+    start = text.index("_do_rollback() {\n")
+    end = text.index("    _stop_genesis_server\n", start) + len("    _stop_genesis_server\n")
+    return text[start:end] + "}\n"
+
+
+def test_a_rollback_records_the_restart_before_it_stops_the_server(tmp_path):
+    """P6's passing check may already have retired the debt when a later step
+    rolls back (a service that failed to start). The rollback stops the server
+    again, so it owes the restart first: a kill at its stop leaves the record. A
+    server this run never restarted gets none."""
+    text = UPDATE.read_text()
+    for were, owed in (("genesis-server genesis-bridge", True), ("genesis-bridge", False)):
+        home = tmp_path / f"home-{owed}"
+        (home / ".genesis").mkdir(parents=True)
+        script = (
+            "set -Eeuo pipefail\n"
+            + _owed_block(text)
+            + "ROLLBACK_TAG=rollback\n"
+            + f"WERE_RUNNING=({were})\n"
+            + _rollback_until_its_stop(text)
+            + "_stop_genesis_server() { kill -KILL $$; }\n"
+            + '_do_rollback "1 service(s) failed to start: genesis-bridge"\n'
+        )
+        r = _sh(tmp_path, home, script)
+        assert r.returncode == -9, r.stdout + r.stderr
+        assert _owed(home).exists() is owed, were

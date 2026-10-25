@@ -10,6 +10,7 @@ the function, the house pattern for disk_hygiene steps.
 from __future__ import annotations
 
 import os
+import pwd
 import shutil
 import subprocess
 from pathlib import Path
@@ -86,8 +87,64 @@ def test_a_missing_log_or_a_symlink_is_a_noop(tmp_path):
 
 def test_main_rotates_both_shared_logs():
     src = _HYGIENE.read_text()
-    assert 'rotate_log "$HOME/tmp/mcp_health.log"' in src
-    assert 'rotate_log "$HOME/tmp/turnstile_debug.log"' in src
+    assert '    rotate_mcp_logs\n' in src[src.index('main()'):]
+    assert 'rotate_log "$mcp_log_dir/mcp_health.log"' in src
+    assert 'rotate_log "$mcp_log_dir/turnstile_debug.log"' in src
+
+
+@pytest.mark.parametrize("kind", ["relative", "named-user", "trailing-newline"])
+def test_mcp_step_rotates_the_writer_directory_across_working_directories(tmp_path, kind):
+    home, elsewhere, logs = tmp_path / "home", tmp_path / "cwd", tmp_path / "home/logs"
+    logs.mkdir(parents=True)
+    elsewhere.mkdir()
+    value = "logs"
+    if kind == "trailing-newline":
+        logs = logs.rename(home / "logs\n\n")
+        value = str(logs)
+    if kind == "named-user":
+        account = pwd.getpwuid(os.getuid())
+        value = "~" + account.pw_name + "/" + os.path.relpath(logs, account.pw_dir)
+    for name in ("mcp_health.log", "turnstile_debug.log"):
+        (logs / name).write_bytes(b"x" * 10_000_001)
+    source = _HYGIENE.read_text()
+    start = source.index('    echo "--- MCP log rotation')
+    stop = source.index('    echo "=== genesis-disk-hygiene done', start)
+    block = source[start:stop]
+    assert "rotate_log" in block or "rotate_mcp_logs" in block
+    script = 'source "$1"\n_mcp_step_fixture() {\n' + block + '\n}\n_mcp_step_fixture\n'
+    result = subprocess.run(
+        ["bash", "-c", script, "_", str(_HYGIENE)], cwd=elsewhere,
+        env={"PATH": os.defpath, "HOME": str(home), "GENESIS_MCP_LOG_DIR": value},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    for name in ("mcp_health.log", "turnstile_debug.log"):
+        assert (logs / name).stat().st_size == 0
+        assert (logs / (name + ".1")).stat().st_size == 10_000_001
+
+
+@pytest.mark.parametrize("response", ["no-record", "partial", "empty-record", "missing-interpreter", "missing-helper"])
+def test_mcp_selection_failure_skips_rotation_and_continues(tmp_path, response):
+    home, logs = tmp_path / "home", tmp_path / "home/tmp"
+    logs.mkdir(parents=True)
+    sentinel = logs / "mcp_health.log"
+    sentinel.write_bytes(b"x" * 10_000_001)
+    interpreter = tmp_path / "selector"
+    replies = {"no-record": "exit 1", "partial": "printf incomplete", "empty-record": "printf '\\0'"}
+    interpreter.write_text("#!/bin/sh\n" + replies.get(response, "exit 1") + "\n")
+    interpreter.chmod(0o755)
+    if response == "missing-interpreter":
+        interpreter = tmp_path / "absent"
+    script = 'source "$1"; VENV_PY="$2"; if [ "$3" = missing-helper ]; then REPO_DIR="$4"; fi; rotate_mcp_logs; printf "CONTINUED\\n"'
+    result = subprocess.run(
+        ["bash", "-c", script, "_", str(_HYGIENE), str(interpreter), response, str(tmp_path)],
+        env={"PATH": os.defpath, "HOME": str(home)},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "CONTINUED\n"
+    assert sentinel.stat().st_size == 10_000_001
+    assert not list(logs.glob("*.1"))
 
 
 def test_a_planted_symlink_at_the_temp_name_is_never_written_through(tmp_path):

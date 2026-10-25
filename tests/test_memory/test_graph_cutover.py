@@ -31,6 +31,10 @@ def _proc(**over) -> dict:
         "unknown": None,
         "telemetry_off": False,
         "foreign": False,
+        "role": "mcp-memory",
+        "source": "main",
+        "unknown_reasons": [],
+        "db_identity": [1, 2],
     }
     p.update(over)
     return p
@@ -38,7 +42,7 @@ def _proc(**over) -> dict:
 
 def _census_metrics(**over) -> dict:
     m = {
-        "v": 1,
+        "v": cut.CLEAN_CENSUS_SCHEMA,
         "procs": [_proc()],
         "other_servers": {},
         "unclassified": 0,
@@ -280,6 +284,13 @@ def test_telemetry_switched_off_in_the_server_is_inconclusive():
         ({"head_telemetry": False}, "HEAD does not contain"),
         ({"head_dirty": True}, "dirty"),
         ({"v": 99}, "unknown census schema"),
+        ({"v": 1}, "predates the current census contract"),
+        ({"procs": [_proc(telemetry_off=None)]}, "kill-switch state unknown"),
+        ({"procs": [_proc(source=None, unknown_reasons=["not_main_venv"])]},
+         "cannot prove its code (not_main_venv)"),
+        ({"procs": [_proc(source=None)]}, "cannot prove its code (no source proof)"),
+        ({"procs": [_proc(unknown_reasons="x")]}, "unreadable census row"),
+        ({"procs": [_proc(unknown_reasons=None)]}, "unreadable census row"),
     ],
 )
 def test_a_dirty_census_row_holds_the_clock(over, why):
@@ -447,3 +458,23 @@ def test_negative_or_boolean_counts_are_unreadable(over):
     v = cut.evaluate(trav, census, [], NOW)
     assert v.status == "INCONCLUSIVE"
     assert any(r.startswith("unreadable traversal row") for r in v.reasons), v.reasons
+
+
+def test_an_unknown_switch_is_never_reported_as_on():
+    """S6: None means unproven, which is a different fault from a switch that is
+    on, and the message must not send a reader looking for the wrong one."""
+    why = cut.census_dirt(_census_metrics(procs=[_proc(telemetry_off=None)]))
+    assert "unknown" in why
+    assert "kill switch on" not in why
+
+
+def test_a_disabled_row_of_an_older_schema_still_reads_disabled():
+    row = {"v": 1, "procs": [], "complete": False, "reasons": ["telemetry_disabled"]}
+    assert cut.census_dirt(row) == cut._DISABLED
+
+
+def test_the_clean_schema_is_the_one_the_census_writes():
+    from genesis.memory import graph_census
+
+    assert cut.CLEAN_CENSUS_SCHEMA == graph_census.CENSUS_SCHEMA
+    assert set(range(1, cut.CLEAN_CENSUS_SCHEMA + 1)) == cut.KNOWN_CENSUS_SCHEMAS

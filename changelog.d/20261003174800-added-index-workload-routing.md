@@ -1,1 +1,0 @@
-- Added optional verified placement of indexing batches in a dedicated workload slice; routing failures defer indexing instead of falling back outside the requested boundary.

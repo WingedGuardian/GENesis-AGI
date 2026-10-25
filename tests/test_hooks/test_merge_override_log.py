@@ -527,7 +527,7 @@ class TestWiredIntoTheMergePath:
         assert _rows(log_dir)[0]["head"] == HEAD
 
     def test_review_override_on_a_real_merge_is_recorded(self, monkeypatch, log_dir):
-        """The sigil the genesis-development skill documents as logged. It is read
+        """The sigil the closing-session skill documents as logged. It is read
         off merge_seg.override, so enumerating has_trailing_override's call sites —
         how the first cut chose its population — missed it entirely."""
         self._drive(

@@ -143,6 +143,8 @@ async def rig(_sealed, tmp_path):
             "amount": "12.00 USD",
             "claim_hash": hashlib.sha256(SECRET.encode()).hexdigest(),
             "field_origins": {"number": "https://js.stripe.com"},
+            "button_label": "Pay 12.00 USD",
+            "also_filled": ["email"],
         }
         env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
         env.update(VAULT_SOCK=str(svc._socket_path), REQUEST=json.dumps(request), CLAIM=SECRET)
@@ -193,6 +195,9 @@ async def test_the_health_server_peer_claims_once(rig):
     peer = rows[0]["detail"]["peer"]
     assert peer["kind"] == LAUNCHED and peer["claude_pid"] == os.getpid()
     assert "Genesis-launched session" in reg.fields[0]["Requester"]
+    assert (reg.fields[0]["Button"], reg.fields[0]["Also filled"]) == ("Pay 12.00 USD", "email")
+    assert rows[0]["detail"]["field_lengths"]["button_label"] == len("Pay 12.00 USD")
+    assert rows[0]["detail"]["also_filled"] == ["email"]
     assert VISA not in json.dumps(rows) and VISA not in json.dumps(out)
 
 

@@ -18,30 +18,37 @@
 #   --take-template <unit>  A systemd unit edited by hand makes the update REFUSE,
 #                 before anything stops (exit 4). This replaces that one unit with
 #                 its template instead, after saving the old file under
-#                 ~/.genesis/deploy-backups/. Repeatable. --take-templates: all.
+#                 ~/.genesis/deploy-backups/. Repeatable. --take-templates: all units.
 #                 A symlinked unit (a mask) is replaced only when named.
 #                 Local changes that should survive updates belong in a drop-in,
 #                 ~/.config/systemd/user/<unit>.d/*.conf, which updates never touch.
 #                 --post-merge never refuses: the merge already happened, so it
 #                 keeps an edited unit (bootstrap does) and names it at the end.
+#                 The same flag takes an /etc file Genesis manages (journald,
+#                 sshd, memory and network resilience) that was edited by hand and
+#                 so is kept rather than updated: pass its full path, or etc:* for
+#                 all of them. --take-templates never covers those.
 #
 # On `live` (the integration branch scripts/deploy_candidates builds from the
 # deploy manifest, admitted only when scripts/lib/live_checkout.py says so), the
-# merge is replaced by the engine's rebuild, run as the last step before the stop
-# (scripts/deploy_candidates.py rebuild: fetch origin/main, readiness, every
-# per-candidate check, one move). What is recorded and sent to the host guardian
-# is the reviewed origin/main commit `live` sits on, never the candidates on top.
-# Only origin is accepted as the update remote there. A rebuild that moved `live`
-# and then failed keeps the rollback tag (the old tip), writes no state, and says
-# to re-run update.sh; nothing is merged into `live` and the override variable
-# never admits it. Between the rebuild and the stop the running server's tree has
-# already moved (a lazy import may read the new code), as after a bare
-# `scripts/deploy_candidates rebuild`.
+# merge is replaced by the engine's rebuild, run in the merge's place after the
+# stop (scripts/deploy_candidates.py rebuild: fetch origin/main, readiness against
+# the stopped server's checkout, every per-candidate check, one move), under the
+# same state rows, snapshot and rollback as a merge. A refusal or failure there
+# rolls back like a failed merge: the old tip is put back (with its git hooks) and
+# the services restart on it. What is recorded and sent to the host guardian is
+# the reviewed origin/main commit `live` sits on, never the candidates on top.
+# Only origin is accepted as the update remote there; nothing is merged into
+# `live` and the override variable never admits it.
 #
 # Exit codes: 0 updated (or nothing to do); 1 failed (rolled back where it got that
-# far); 2 merge conflicts; 4 refused, nothing stopped: hand-edited units are named,
+# far); 2 merge conflicts; 4 refused: hand-edited units are named,
 # and ~/.genesis/update_refused.json records the refusal for the dashboard's
-# supervised update, which never escalates past it; 5 refused, nothing changed:
+# supervised update, which never escalates past it. Nothing was stopped, except on
+# `live` when a unit only the rebuilt tip brings is refused: that is judged after
+# the stop, so the rebuild is rolled back and the services restart on the old
+# tip first (a rollback that does not complete exits 1, not 4); 5 refused,
+# nothing changed:
 # an earlier update's ~/.genesis/update_state.json still guards code it merged and
 # never activated, or a merge conflict it is waiting on (the rule is
 # scripts/lib/update_state_guard.py). Finish that one with --post-merge, resolve
@@ -60,6 +67,19 @@ if [ -z "${HOME:-}" ]; then
     [ -n "$HOME" ] || { echo "ERROR: HOME is unset and could not be resolved from passwd." >&2; exit 1; }
     export HOME
 fi
+
+# ── Test fence — before the self-copy or any other side effect ──
+# When the suite-wide fence is armed (GENESIS_TEST_FENCE_LIVE_ROOTS), refuse
+# here rather than letting a test drive this script against live state. This
+# sits ahead of the copy-to-temp block because that block already writes under
+# $HOME. The root it acts on is GENESIS_UPDATE_ORIG_DIR when set (the temp-copy
+# re-exec) else the checkout this script lives in — the same expression
+# GENESIS_ROOT uses below. No-op when the variable is unset.
+_FENCE_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=lib/live_system_guard.sh
+. "$_FENCE_ROOT/scripts/lib/live_system_guard.sh"
+refuse_if_test_fenced_live "$_FENCE_ROOT" || exit 97
+unset _FENCE_ROOT
 
 # ── Copy-to-temp guard ──────────────────────────────────
 # The update script may update itself during git merge, which would corrupt
@@ -126,7 +146,7 @@ _flush_deploy_summary() {
 # the state it finishes. On every EXIT trap below.
 _drop_own_prestop_state() {
     [ "${_STATE_WRITTEN:-0}" = 1 ] && [ "${_STATE_PHASE:-}" = fetching ] \
-        && [ "${POST_MERGE:-false}" = false ] && [ "${ON_LIVE:-0}" != 1 ] \
+        && [ "${POST_MERGE:-false}" = false ] \
         && rm -f "${STATE_FILE:-}" 2>/dev/null
     return 0
 }
@@ -164,7 +184,7 @@ while [ "$_i" -lt "${#_args[@]}" ]; do
         --take-template)
             _i=$((_i + 1))
             if [ "$_i" -ge "${#_args[@]}" ] || [ -z "${_args[$_i]}" ] || [[ "${_args[$_i]}" == -* ]]; then
-                echo "ERROR: --take-template needs a unit name (e.g. genesis-server.service)." >&2
+                echo "ERROR: --take-template needs a unit name (e.g. genesis-server.service) or an /etc path." >&2
                 exit 1
             fi
             GENESIS_TAKE_TEMPLATES="${GENESIS_TAKE_TEMPLATES:+$GENESIS_TAKE_TEMPLATES }${_args[$_i]}"
@@ -207,8 +227,8 @@ MANIFEST_DELTA_PY="$(cat "$SCRIPT_DIR/lib/manifest_delta.py")"
 # The `live` verdict (genesis_live_checkout, deploy_checkout.sh, runs this copy),
 # read now for the same reason: every ask this run makes uses the copy it started with.
 _LIVE_CHECKOUT_PY="$(cat "$SCRIPT_DIR/lib/live_checkout.py")"
-# The DB snapshot's authority check (stdlib only), read now for the same reason: on
-# `live` the snapshot is retaken after the rebuild moved the checkout.
+# The DB snapshot's authority check (stdlib only), read now for the same reason
+# (on `live` it is replaced by the reviewed base's copy, in live-shape).
 _PEER_RESTORE_PY="$(cat "$GENESIS_ROOT/src/genesis/db/crud/peer_restore.py")"
 # The deployable-checkout assertion, DEPLOY_BRANCH, and the tracked-dirty query,
 # shared with deploy_code_only.sh so the two deploy paths cannot disagree.
@@ -253,50 +273,51 @@ PY
 
 # BEGIN restart-owed (extracted by tests/test_scripts/test_bootstrap_crash_restart.py)
 # The restart an update owes genesis-server (#3451). update.sh writes it
-# immediately before it stops the server, and refuses to stop the server when it
-# cannot; bootstrap's crash recovery writes it too (dated to the crashed state)
-# when a crash left the server stopped without one, as an update from before this
-# file existed does. Retired by update.sh once the server is back (health-checked
-# on the success and no-delta paths, active after the pre-stop interrupt handler
-# restarted it), or as paid when the unit has come up since it was written
-# (_server_recovery_pending). Present while genesis-server is not running, it tells
-# the next run "an update stopped this and nothing brought it back". A kill
-# anywhere after the stop leaves it, a power loss included (which runs no handler),
-# whatever state file that kill left and whether or not bootstrap's crash recovery
-# ever reads one: the next update overwrites a "fetching" state it is allowed past,
-# so that recovery often never runs. A server no update stopped has no such file,
-# so an operator's stop stays a stop. Nothing consumes it: the alert record
-# (last_update_failure.json) is separate, because the version collector archives
-# that one.
+# immediately before it stops the server (and refuses to stop the server when it
+# cannot), and again before a rollback stops it; bootstrap's crash recovery writes
+# it when a crashed update left the server stopped without one, as an update from
+# before this file existed does.
 #
-# Its "stage" says whether the stop it records was CONFIRMED. "stopping" is
-# written before the stop: the stop's own kill can make systemd's
-# Restart=on-failure bring the server back before _ensure_server_down stops it for
-# good, so an activation after a "stopping" record may be the stop's own and pays
-# nothing. "stopped" is rewritten (with a fresh mtime) once the server is
-# confirmed down: only an activation after THAT pays the debt.
+# It is retired in exactly ONE way: update.sh's own health check of genesis-server
+# passes, and the file is removed right then, before any later step (P6's health
+# loop on the full activation, _server_health_ok on the no-delta path and on a
+# rollback that verifies health). Nothing else pays it. Not the unit's activation
+# time: genesis-server is Type=simple, so "active" is not "healthy", and a server
+# that came up and died before answering is still down. Not a file's age either.
+# A kill anywhere after the stop leaves it, a power loss included (which runs no
+# handler), whatever state file that kill left and whether or not bootstrap's
+# crash recovery ever reads one.
+#
+# While it exists, the next update restarts genesis-server and health-checks it,
+# the "Already up to date" path included. A deliberate stay-down is honoured only
+# by the operator's hold marker (#2718), which _server_recovery_pending checks
+# first once it exists. Two removals are not payments, because no debt was ever
+# incurred: the stop was refused before anything stopped (the record is false),
+# and _ensure_server_down failed with the server still running. Nothing else
+# consumes it: the alert record (last_update_failure.json) is separate, because
+# the version collector archives that one.
 SERVER_RESTART_OWED="$HOME/.genesis/server_restart_owed.json"
 # Written DURABLY: a rename is atomic but not power-loss durable on its own, so
 # the temporary file is fsynced before the rename and the directory after it
 # (fsync(2); the same pattern as cc_version.sh's settings writer and
 # codebase_managed.py's sync_staging). Only then may the server be stopped: any
-# failure, including either fsync, returns 1 and the caller refuses the stop.
+# failure, including either fsync, returns 1 and the caller refuses the stop. A
+# failure AFTER the rename (the directory fsync) leaves the new file in place, so
+# a caller that refuses the stop removes what it wrote (see its call site).
 _owe_server_restart() {
-    local stage="${1:-stopping}"
     mkdir -p "$HOME/.genesis" 2>/dev/null || true
-    if ! python3 -I - "$SERVER_RESTART_OWED" "$$" "${STARTED_AT:-}" "$stage" 2>/dev/null <<'PY'
+    if ! python3 -I - "$SERVER_RESTART_OWED" "$$" "${STARTED_AT:-}" 2>/dev/null <<'PY'
 import json
 import os
 import sys
 from datetime import datetime
 
-path, pid, started_at, stage = sys.argv[1:]
+path, pid, started_at = sys.argv[1:]
 tmp = path + ".tmp"
 data = {
     "pid": int(pid),
     "started_at": started_at,
     "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
-    "stage": stage,
 }
 fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 try:
@@ -317,85 +338,29 @@ PY
         return 1
     fi
 }
-# Times in NANOSECONDS since the epoch, so ordering within one second survives
-# (whole seconds made a stop and a later restart in the same second equal).
-# Each prints 0 when it cannot read the time; 0 always leaves evidence current.
-# A file's mtime: %.9Y, falling back to whole seconds where stat lacks it.
-_mtime_ns() {
-    local t
-    t="$(stat -c %.9Y "$1" 2>/dev/null || true)"
-    if [[ "$t" =~ ^[0-9]+\.[0-9]{9}$ ]]; then
-        echo "${t/./}"
-        return 0
-    fi
-    t="$(stat -c %Y "$1" 2>/dev/null || true)"
-    if [[ "$t" =~ ^[0-9]+$ ]]; then echo "${t}000000000"; else echo 0; fi
-}
-# genesis-server's last activation: microseconds where systemctl offers them
-# (--timestamp=us+utc, systemd 248 and later; MEASURED on systemd 255), whole
-# seconds otherwise. An empty value must not reach `date -d`, which reads "" as
-# midnight today.
-_activation_ns() {
-    local v t
-    v="$(systemctl --user show genesis-server.service -p ActiveEnterTimestamp --value --timestamp=us+utc 2>/dev/null || true)"
-    if [ -z "$v" ]; then
-        v="$(systemctl --user show genesis-server.service -p ActiveEnterTimestamp --value 2>/dev/null || true)"
-    fi
-    [ -n "$v" ] || { echo 0; return 0; }
-    t="$(date -d "$v" +%s%N 2>/dev/null || true)"
-    if [[ "$t" =~ ^[0-9]+$ ]]; then echo "$t"; else echo 0; fi
-}
-# Is evidence dated $1 still current against the unit's last activation $2 (both
-# nanoseconds)? Evidence is stale only when the activation came STRICTLY after it:
-# something brought the server back after it, so a server down now was stopped
-# after that, by someone else. The same instant, an earlier activation, or either
-# time unreadable (0) keeps the evidence current, which is the recovery side.
-_evidence_current() {
-    [ "${1:-0}" -eq 0 ] 2>/dev/null || [ "${2:-0}" -eq 0 ] 2>/dev/null \
-        || [ "$1" -ge "$2" ] 2>/dev/null
-}
 # Is genesis-server, which is NOT running, owed a restart? Prints why and returns
 # 0; returns 1 when nothing says an update left it down, so it stays as the
 # operator left it. The one predicate for recovery detection and the no-delta
-# dispatch, so the two cannot disagree. Every piece of evidence answers to the
-# same rule: a later activation of the unit outranks it (_evidence_current), so a
-# restart by anything (the watchdog, a deploy_code_only.sh restart, a start by
-# hand, this script's conflict exit or rollback) followed by an operator stop is
-# never undone by evidence from before that restart. (_latest_update_status and
-# _latest_update_completed_ns are defined below.) When an operator "hold"
-# marker exists (#2718: keep a stopped server stopped), this predicate must
-# check it first.
+# dispatch, so the two cannot disagree. It reads presence only, never a time:
+# the restart record above, a leftover last_update_failure.json, or a last
+# update_history status of rolled_back/failed (or one that cannot be read).
+# (_latest_update_status is defined below.)
 _server_recovery_pending() {
-    # The unit's last activation, read once, in nanoseconds. Anything unreadable
-    # (no bus, "n/a", a unit never started since boot) is 0, which leaves all
-    # evidence current.
-    local _up_at _at
-    _up_at="$(_activation_ns)"
+    # The operator hold marker (#2718: keep a stopped server stopped) goes HERE,
+    # first, once it exists: it is the only way a deliberate stay-down outranks
+    # the evidence below.
     if [ -e "$SERVER_RESTART_OWED" ]; then
-        _at="$(_mtime_ns "$SERVER_RESTART_OWED")"
-        # Only a record of a CONFIRMED stop can be paid by an activation: one
-        # still "stopping" (or unreadable, or of no known stage) stays owed.
-        if ! grep -q '"stage": "stopped"' "$SERVER_RESTART_OWED" 2>/dev/null \
-            || _evidence_current "$_at" "$_up_at"; then
-            echo "an earlier update stopped genesis-server and never verified it back"
-            return 0
-        fi
-        # Paid by the later activation.
-        rm -f "$SERVER_RESTART_OWED"
+        echo "an earlier update stopped genesis-server and never health-checked it back"
+        return 0
     fi
     if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
-        _at="$(_mtime_ns "$HOME/.genesis/last_update_failure.json")"
-        if _evidence_current "$_at" "$_up_at"; then
-            echo "a prior update's failure record is present"
-            return 0
-        fi
+        echo "a prior update's failure record is present"
+        return 0
     fi
     case "$(_latest_update_status)" in
         rolled_back | failed)
-            if _evidence_current "$(_latest_update_completed_ns)" "$_up_at"; then
-                echo "the last update did not complete cleanly"
-                return 0
-            fi
+            echo "the last update did not complete cleanly"
+            return 0
             ;;
         unreadable)
             # Unknown is not "nothing failed". Recovering costs a restart and a
@@ -446,11 +411,10 @@ _clear_deploy_state() {
 # clear this run's state/marker and exit. Swapped for _on_signal (rollback)
 # once the ERR trap arms. Defined here so it exists before its trap install.
 _on_signal_prestop() {
-    # $2: why, when called directly rather than by a signal.
-    local sig="$1" why="${2:-}"
+    local sig="$1"
     trap - INT TERM
     echo "" >&2
-    echo "  ${why:-Update interrupted by SIG$sig} before the merge — restoring any stopped services and cleaning up." >&2
+    echo "  Update interrupted by SIG$sig before the merge — restoring any stopped services and cleaning up." >&2
     # The interrupt may have landed mid-stop (the stop polls up to ~10s), so a
     # service may already be down. Restart exactly what was detected running —
     # WERE_RUNNING is populated BEFORE the physical stop — so the server is never
@@ -459,10 +423,11 @@ _on_signal_prestop() {
     # if the interrupt already took it down — either way it ends up running. The
     # bridge uses `start`, a no-op when still running. No rollback is needed
     # here: nothing has been merged yet.
-    local _svc _seen=" "
+    # On `live` too: the rebuild runs in the merge's place, after the stop, so
+    # nothing has moved yet in this window either.
+    local _svc
     for _svc in "${WERE_RUNNING[@]:-}"; do
         [ -n "$_svc" ] || continue
-        _seen+="$_svc "
         if [ "$_svc" = "genesis-server" ]; then
             _start_genesis_server 2>/dev/null \
                 || systemctl --user restart genesis-server.service 2>/dev/null || true
@@ -470,126 +435,66 @@ _on_signal_prestop() {
             systemctl --user start "$_svc.service" 2>/dev/null || true
         fi
     done
-    # On `live` an interrupt can land in the rebuild, before WERE_RUNNING is read
-    # and before anything was stopped. What ran when the marker was taken
-    # (_LIVE_WERE_RUNNING) is only STARTED, and only if it is down now: a server
-    # still running keeps running (never bounced onto a moved tree), and one that
-    # died meanwhile comes back on the checkout as it stands, which the moved
-    # message then says.
-    for _svc in "${_LIVE_WERE_RUNNING[@]:-}"; do
-        [ -n "$_svc" ] || continue
-        [[ "$_seen" == *" $_svc "* ]] && continue
-        _seen+="$_svc "
-        if [ "$_svc" = "genesis-server" ]; then
-            if ! systemctl --user is-active --quiet genesis-server.service 2>/dev/null \
-                && ! pgrep -f "python -m genesis serve" >/dev/null 2>&1; then
-                _start_genesis_server 2>/dev/null || true
-                _LIVE_STOPPED=1
-            fi
-        else
-            systemctl --user start "$_svc.service" 2>/dev/null || true
-        fi
-    done
-    # The server is running again, so the restart owed for it (restart-owed) is
-    # paid. A server still down keeps the file for the next update to restore.
-    if [ -e "${SERVER_RESTART_OWED:-}" ] \
-        && systemctl --user is-active --quiet genesis-server.service 2>/dev/null; then
-        rm -f "$SERVER_RESTART_OWED"
-    fi
-    # On `live` this run writes no state before the stop, so a state file on disk
-    # is another run's and stays; the rebuild may have moved `live` already.
-    [ "${ON_LIVE:-0}" != 1 ] || _live_abandon 1
+    # The restart record this run wrote before the stop (restart-owed) stays: this
+    # restart is not health-checked, so it pays nothing, and the next update
+    # restarts and health-checks the server.
     _clear_deploy_state
     exit 1
 }
 
-# BEGIN live-prestop (extracted by tests/test_scripts/test_update_live.py)
-# On `live` the rebuild (the live-rebuild block) moves the checkout BEFORE the stop,
-# so from the engine on, "nothing changed" has to be read off git, never assumed:
-# a SIGTERM to the cgroup can kill `git switch` mid-write, and the shell only runs
-# a trap once its foreground child is gone. Every exit before the stop goes through
-# here. A moved `live` keeps the rollback tag (the old tip, by name) and this run
-# writes no state for it: re-running update.sh activates what moved.
-_LIVE_MOVED_SAID=0
-_LIVE_STOPPED=0
-_live_moved_message() {
-    [ "${_LIVE_MOVED_SAID:-0}" = 1 ] && return 0
-    _LIVE_MOVED_SAID=1
-    local now rerun="scripts/update.sh"
-    [[ "${POST_MERGE:-false}" == "true" ]] && rerun="scripts/update.sh --post-merge"
-    now="$(git -C "$GENESIS_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-    if _live_head_at_tag; then
-        # HEAD did not move, yet the tree is not clean or a git command is half
-        # done: what is on disk may be a partly written switch.
-        echo "  live is still at tag ${ROLLBACK_TAG:-?} ($now), but the checkout holds a half-written tree (tracked changes or .git/index.lock): run git status in $GENESIS_ROOT and settle it before anything else."
-    elif [ "${_LIVE_STOPPED:-0}" = 1 ]; then
-        echo "  live moved to $now; the services were restarted on it without activation; re-run $rerun${1:+ $1}. The old tip is tag ${ROLLBACK_TAG:-?}."
-    else
-        echo "  live moved to $now; the server still runs the old code; re-run $rerun${1:+ $1} (or scripts/deploy_code_only.sh restart to run it without activation). The old tip is tag ${ROLLBACK_TAG:-?}."
-    fi
-}
-# Is HEAD still `live` at the rollback tag (whatever the tree holds)?
-_live_head_at_tag() {
-    local tag_commit
-    tag_commit="$(git -C "$GENESIS_ROOT" rev-parse -q --verify "${ROLLBACK_TAG:-}^{commit}" 2>/dev/null)" || return 1
-    genesis_checkout_unmoved "$GENESIS_ROOT" "$tag_commit" "$ORIGINAL_BRANCH"
-}
-# The stop could not be completed after the rebuild moved `live`: say where it is.
-_live_stop_failed_note() {
-    local now
-    now="$(git -C "$GENESIS_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-    _LIVE_MOVED_SAID=1
-    if [[ "${POST_MERGE:-false}" == "true" ]]; then
-        echo "  live is at $now (an earlier run's rebuild); the old tip is tag ${ROLLBACK_TAG:-?}. Starting the server runs it without activation; re-run scripts/update.sh --post-merge."
-    else
-        echo "  live is at $now (this run's rebuild); the old tip is tag ${ROLLBACK_TAG:-?}. Starting the server runs it without activation; re-run scripts/update.sh."
-    fi
-}
-# Is the checkout exactly where this run found it: `live` at the rollback tag, no
-# git operation half done (index.lock), and no tracked change?
-_live_unmoved() {
-    local index_lock dirty
-    _live_head_at_tag || return 1
-    index_lock="$(git -C "$GENESIS_ROOT" rev-parse --path-format=absolute --git-path index.lock 2>/dev/null)" || return 1
-    [ ! -e "$index_lock" ] || return 1
-    dirty="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" || return 1
-    [ -z "$dirty" ]
-}
-# Leave before the stop: release the deploy marker, then either delete the tag
-# (nothing moved) or keep it and say what moved. --post-merge never deletes the
-# tag: it is the earlier run's, named in that run's state file.
-_live_abandon() {
-    _release_deploy_marker
-    if _live_unmoved; then
-        if [[ "$POST_MERGE" == "false" ]]; then
-            git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" >/dev/null 2>&1 || true
-        fi
-        if [ -n "${_live_cleared:-}" ]; then
-            echo "  live was not moved${2:+ ($2)}; the local edits cleared before the rebuild are saved under $EPHEMERAL_BACKUP_ROOT/live:${_live_cleared}."
-        else
-            echo "  live was not moved: nothing changed${2:+ ($2)}."
-        fi
-    else
-        _live_moved_message "${3:-}"
-    fi
-    exit "$1"
-}
-# On EXIT while `live` is ours to report: the marker goes, and a move nobody has
-# described yet (a `set -e` exit, an unexpected path) is described.
-_live_prestop_exit() {
-    _release_deploy_marker
-    [ "${_LIVE_STOPPED:-0}" = 1 ] && return 0
-    local now
-    now="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null || true)"
-    [ "$now" = "${VALIDATED_HEAD:-}" ] || _live_moved_message
-    return 0
-}
+# BEGIN live-helpers (extracted by tests/test_scripts/test_update_live.py)
 # On `live` the recorded commit is the reviewed base under the rebuild's tip.
 _live_new_commit() {
     NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$DEPLOY_HEAD" 2>/dev/null || echo "untagged")
     NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short "$DEPLOY_HEAD")
 }
-# END live-prestop
+# Both successful adoption and rollback consume the same exact move identity.
+_live_read_move_record() {
+    python3 -I -S -c '
+import json, re, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    d = json.load(fh)
+to, phase = d.get("to"), d.get("phase")
+if not (isinstance(to, str) and re.fullmatch("[0-9a-f]{40}(?:[0-9a-f]{24})?", to)
+        and phase in ("ref", "moving", "partial", "clean", "done")):
+    raise SystemExit(1)
+print(to, phase)
+' "$_LIVE_MOVE_REC" 2>/dev/null
+}
+# A rebuild that moved `live` and then failed, or was interrupted (the shell runs a
+# trap only once the engine has exited), leaves the checkout at a tip this run made
+# but never adopted. What the engine did is read from its move record
+# ($_LIVE_MOVE_REC, written by deploy_candidates_plan.py before and after each
+# move), never inferred from git: the tip is taken as this run's own (and so moved
+# back to the tag) only when the record names it and HEAD is on this run's branch at
+# exactly that commit. Anything else stays "moved by someone else". Nothing from
+# the moved tree runs here. A record that cannot be read, or that says the switch
+# began ("moving") or wrote part of the tree ("partial") while HEAD is not at its
+# target, marks the tree suspect: the rollback then restarts nothing on it.
+_live_adopt_tip() {
+    [ "${ON_LIVE:-0}" = 1 ] && [ "${_LIVE_ENGINE_RAN:-0}" = 1 ] || return 0
+    local rec="${_LIVE_MOVE_REC:-}" got="" to="" phase="" valid=0
+    [ -n "$rec" ] || return 0
+    { [ -e "$rec" ] || [ -L "$rec" ]; } || return 0
+    if got="$(_live_read_move_record)" && [ -n "$got" ]; then
+        to="${got% *}"
+        phase="${got#* }"
+        valid=1
+    fi
+    rm -f "$rec" 2>/dev/null || true
+    if [ "$valid" = 1 ] && genesis_checkout_unmoved "$GENESIS_ROOT" "$to" "$ORIGINAL_BRANCH"; then
+        [ "$to" != "${UPDATE_OWN_HEAD:-}" ] || return 0
+        echo "  The rebuild had moved live to ${to:0:12} before it stopped; rolling that back."
+        UPDATE_OWN_HEAD="$to"
+        return 0
+    fi
+    if [ "$valid" != 1 ] || [ "$phase" = moving ] || [ "$phase" = partial ]; then
+        _LIVE_TREE_SUSPECT=1
+        echo "  The rebuild may have written part of the new tree (move record: ${phase:-unreadable}); HEAD is not at its target."
+    fi
+    return 0
+}
+# END live-helpers
 
 # ── Refuse a checkout that is not deployable — BEFORE anything changes ───
 # A linked worktree (at ANY path — git decides, not the path), a bare repository,
@@ -613,7 +518,13 @@ fi
 # Never inherited: only the verdict below sets them.
 ON_LIVE=0
 _LIVE_BASE=""
-_LIVE_WERE_RUNNING=()
+_LIVE_ENGINE_RAN=0
+_LIVE_MOVE_REC=""
+_LIVE_TREE_SUSPECT=0
+# Nor these, which decide a rollback's checkout lock and exit 4: only this run
+# sets them.
+_CHECKOUT_LOCK_BUSY=0
+_ROLLBACK_CLEAN=0
 if ! genesis_deploy_branch_ok "$GENESIS_ROOT" --allow-override; then
     _live_rc=1
     if [ "$_branch" = live ]; then
@@ -1407,7 +1318,7 @@ echo ""
 # qualified tracking ref names only $DEPLOY_BRANCH (never another branch), and a tag
 # that happens to be called "main" cannot win name disambiguation.
 DEPLOY_HEAD=""
-# On `live` the engine fetches (the live-rebuild block), and its own checks cover
+# On `live` the engine fetches (the live-engine block), and its own checks cover
 # what this block refuses; the deploy head is the base `live` sits on.
 [ "${ON_LIVE:-0}" != 1 ] || DEPLOY_HEAD="$_LIVE_BASE"
 if [[ "$POST_MERGE" == "false" ]] && [ "${ON_LIVE:-0}" != 1 ]; then
@@ -1591,7 +1502,7 @@ _mu_rev="${DEPLOY_HEAD:-HEAD}"
 _mu_src="$(cat "$GENESIS_ROOT/scripts/lib/managed_units.py" 2>/dev/null)" || _mu_src=""
 if [ "${ON_LIVE:-0}" = 1 ]; then
     # On `live` nothing is fetched yet: the templates judged are HEAD's (the tip),
-    # and the rebuilt tip is judged again after the move (live-rebuild). The
+    # and the rebuilt tip is judged again after the move (live-engine). The
     # checker that runs is the base's own copy, never a candidate's or a newly
     # fetched one. A stamped unit's verdict does not depend on --upto, so an
     # edited unit refuses here, before anything moves.
@@ -1687,53 +1598,12 @@ if [[ "$POST_MERGE" == "false" ]]; then
 fi
 # END ephemeral-prestop-backup
 
-# Not on `live`: a "fetching" row over a checkout the rebuild then moves would read,
-# to bootstrap's crash recovery, as a checkout moved before the update could merge.
-# The first state `live` gets is "merging", after the stop, naming the rebuilt tip.
-if [ "${ON_LIVE:-0}" != 1 ]; then
 _write_state "fetching"
-fi
 
 # Catch an interrupt during the pre-stop window (fetch done, services still up).
 # Replaced by the rollback-capable _on_signal once the ERR trap arms post-stop.
 trap '_on_signal_prestop INT' INT
 trap '_on_signal_prestop TERM' TERM
-
-# BEGIN live-marker (extracted by tests/test_scripts/test_update_live.py)
-# On `live` the deploy marker is the in-progress signal in place of "fetching", in
-# both modes: the rebuild moves the checkout before the stop, and --post-merge,
-# which skips the rebuild, still holds the server stopped until bootstrap's state
-# row. The watchdog defers on the marker, so nothing restarts the server in either
-# window. _live_prestop_exit, on EXIT, releases it on every way out.
-if [ "${ON_LIVE:-0}" = 1 ]; then
-    # What runs now, before the marker holds the watchdog off: a service that
-    # dies during the rebuild is still restarted (merged into WERE_RUNNING at
-    # the stop), never read as stopped by the operator.
-    if systemctl --user is-active --quiet genesis-server.service 2>/dev/null || \
-       pgrep -f "python -m genesis serve" >/dev/null 2>&1; then
-        _LIVE_WERE_RUNNING+=("genesis-server")
-    fi
-    if systemctl --user is-active --quiet genesis-bridge.service 2>/dev/null; then
-        _LIVE_WERE_RUNNING+=("genesis-bridge")
-    fi
-    _marker_rc=0
-    _acquire_deploy_marker || _marker_rc=$?
-    if [ "$_marker_rc" -ne 0 ]; then
-        if [ "$_marker_rc" -eq 2 ]; then
-            echo "ERROR: cannot write the deploy marker $DEPLOY_MARKER_FILE."
-        else
-            echo "ERROR: a live deploy (pid $DEPLOY_MARKER_HOLDER) holds the deploy marker $DEPLOY_MARKER_FILE."
-        fi
-        echo "       Nothing was changed."
-        # --post-merge never deletes the tag: it is the earlier run's.
-        if [[ "$POST_MERGE" == "false" ]]; then
-            git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" >/dev/null 2>&1 || true
-        fi
-        exit 1
-    fi
-    trap '_live_prestop_exit; _guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
-fi
-# END live-marker
 
 # ── Service stop/start helpers ───────────────────────────
 # Works with both systemd and bare-process environments.
@@ -1848,11 +1718,10 @@ DB_SNAPSHOT_TAKEN=0  # set to 1 only when THIS run's `.backup` succeeds; the
                   # snapshot from a prior run is never restored as if current.
 # BEGIN db-snapshot (extracted by tests/test_scripts/test_update_live.py)
 # Returns 1, having said why, when no current snapshot could be taken; each caller
-# decides how to leave. On `live` it runs a second time, as the last step before
-# the stop (the end of the live-rebuild block), so the snapshot a rollback restores
-# is not older than the rebuild. The authority check runs the copy of
-# peer_restore.py this run read at its start, never the checkout's, which the
-# rebuild may have replaced.
+# decides how to leave. It runs once, before the stop, on `live` too (the rebuild
+# runs after the stop, in the merge's place). The authority check runs the copy of
+# peer_restore.py this run read at its start (on `live`, the reviewed base's),
+# never one a later step may have replaced.
 _take_db_snapshot() {
     DB_SNAPSHOT_TAKEN=0
     [ -f "$DB_FILE" ] || return 0
@@ -1893,7 +1762,7 @@ _take_db_snapshot() {
     fi
 }
 # END db-snapshot
-# The first snapshot: a failure here exits with nothing moved and nothing stopped.
+# A failure here exits with nothing moved and nothing stopped.
 _take_db_snapshot || exit 1
 
 # The staged-path guard again, as the last step before the stop: the backups and
@@ -1905,117 +1774,8 @@ if [[ "$POST_MERGE" == "false" ]] && [ "${ON_LIVE:-0}" != 1 ]; then
 fi
 # END staged-excused-prestop
 
-# ── Rebuild `live` (instead of the merge), the last step before the stop ──
-# The engine fetches origin/main, judges readiness against the server running
-# now, re-derives every candidate's checks, and moves the checkout once. It runs
-# after every refusal above, because each says "nothing changed", which is true
-# only while nothing has moved. It takes genesis-checkout.lock itself (and polls it
-# 300 s), so this run must not hold it. From the engine on, an exit before the stop
-# reads git to say what moved (_live_abandon, live-prestop): a moved `live` keeps
-# the rollback tag and gets no state row.
-# BEGIN live-rebuild (extracted by tests/test_scripts/test_update_live.py)
-if [[ "$POST_MERGE" == "false" ]] && [ "${ON_LIVE:-0}" = 1 ]; then
-    if [ -n "${GENESIS_CHECKOUT_LOCK_FD:-}" ]; then
-        echo "ERROR: this run holds genesis-checkout.lock, which the rebuild takes itself. Nothing was changed."
-        git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" >/dev/null 2>&1 || true
-        exit 1
-    fi
-    # Every tracked path the dirty-tree gate excused is saved, then put back to
-    # HEAD: a switch that writes one would otherwise refuse over the local edit.
-    if ! _live_status="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames)"; then
-        echo "ERROR: cannot read the working tree's status. Nothing was changed."
-        git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" >/dev/null 2>&1 || true
-        exit 1
-    fi
-    # What a refusal from here on must admit to: the edits it cleared, and where.
-    _live_cleared=""
-    _live_nothing_moved() {
-        if [ -n "$_live_cleared" ]; then
-            echo "       live was not moved. Cleared, with their local edits saved under $EPHEMERAL_BACKUP_ROOT/live:$_live_cleared"
-        else
-            echo "       Nothing was changed."
-        fi
-    }
-    while IFS= read -r _line; do
-        [ -n "$_line" ] && [[ "$_line" != '??'* ]] && [[ "$_line" =~ $EPHEMERAL_DIRTY_RE ]] || continue
-        _eph="${_line:3}"
-        if ! _ephemeral_backup "$_eph" "$EPHEMERAL_BACKUP_ROOT/live" \
-            || ! genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout -q HEAD -- "$_eph"; then
-            echo "  Could not back up and clear local edits to $_eph — server NOT stopped."
-            _live_nothing_moved
-            git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" >/dev/null 2>&1 || true
-            exit 1
-        fi
-        echo "  (backed up and cleared local edits to $_eph before the rebuild: $EPHEMERAL_BACKUP_ROOT/live/$_eph)"
-        _live_cleared+=" $_eph"
-    done <<< "$_live_status"
-    # This run holds the deploy marker since live-marker, so the watchdog restarts
-    # nothing mid-move.
-    echo "--- Rebuilding live ---"
-    _eng_rc=0
-    DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" DEPLOY_CANDIDATES_EPHEMERAL_RE="$EPHEMERAL_DIRTY_RE" python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" rebuild || _eng_rc=$?
-    # What happened is read off git, never off the exit code alone: success must
-    # leave the checkout on `live`'s own tip, and that tip must be a rebuild's.
-    _live_tip=""
-    _live_new_base=""
-    if [ "$_eng_rc" -eq 0 ]; then
-        _live_tip="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'refs/heads/live^{commit}' 2>/dev/null || true)"
-        if [ -z "$_live_tip" ] \
-            || ! genesis_checkout_unmoved "$GENESIS_ROOT" "$_live_tip" "$ORIGINAL_BRANCH" \
-            || ! _live_new_base="$(python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" live-shaped "$_live_tip")" \
-            || [ -z "$_live_new_base" ]; then
-            echo "  The rebuild reported success, but the checkout is not on live at a rebuild's tip."
-            _eng_rc=1
-        fi
-    fi
-    if [ "$_eng_rc" -ne 0 ]; then
-        _live_abandon 1 "the rebuild stopped (exit $_eng_rc); the server was not stopped"
-    fi
-    UPDATE_OWN_HEAD="$_live_tip"
-    _LIVE_BASE="$_live_new_base"
-    DEPLOY_HEAD="$_LIVE_BASE"
-    _live_new_commit
-    echo "  live is at ${_live_tip:0:12} on origin/$DEPLOY_BRANCH ${DEPLOY_HEAD:0:12}; update.sh stops, activates and restarts the server itself."
-    # A unit template only the rebuilt tip brings is judged now, by the same
-    # checker (the old base's); the rollback tag (the old tip) is judged with it.
-    _mu_rc=0
-    if [ -n "$_mu_src" ]; then
-        _mu_out="$(python3 -I -S -c "$_mu_src" check --repo "$GENESIS_ROOT" \
-            --unit-dir "$HOME/.config/systemd/user" --upto "$_live_tip" --also "$ROLLBACK_TAG" \
-            --accept-legacy --take "$GENESIS_TAKE_TEMPLATES" 2>&1)" || _mu_rc=$?
-    else
-        _mu_out="scripts/lib/managed_units.py is missing from the base live was on"
-        _mu_rc=2
-    fi
-    rm -f "$REFUSED_FILE" 2>/dev/null || true
-    if [ "$_mu_rc" -ne 0 ]; then
-        if [ "$_mu_rc" -eq 4 ]; then
-            echo "REFUSED: these systemd units were edited by hand, and the rebuilt live would leave them behind:"
-            printf '%s\n' "$_mu_out" | grep REFUSED || true
-            _mu_remedy
-            # deploy_head = the commit judged: here the rebuilt tip (candidates
-            # included). Nothing may merge it; the orchestrator reads only the
-            # record's presence.
-            _mu_record_refusal "$_mu_out" "$_live_tip"
-        else
-            echo "ERROR: could not check the installed systemd units for hand edits (exit $_mu_rc):"
-            printf '%s\n' "$_mu_out" | sed 's/^/  /'
-        fi
-        _live_abandon "$([ "$_mu_rc" -eq 4 ] && echo 4 || echo 1)" "" "after fixing the units"
-    fi
-    # The database snapshot again, as the last step before the stop: the rebuild
-    # above can take minutes after the first one, and a rollback restores the
-    # snapshot, which would drop anything the server wrote in between.
-    if ! _take_db_snapshot; then
-        _live_abandon 1 "the database snapshot could not be refreshed; the server was not stopped"
-    fi
-fi
-# END live-rebuild
-
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
-# From here an exit no longer describes a move: the rollback machinery owns it.
-_LIVE_STOPPED=1
 
 # Baseline for the post-restart subsystem delta (consumed in the health block far
 # below). Captured HERE, while the old server is still ALIVE, and NOT next to the
@@ -2046,11 +1806,6 @@ for svc in genesis-bridge; do
         WERE_RUNNING+=("$svc")
     fi
 done
-# On `live`, also what ran before the rebuild (sampled at the marker).
-for svc in "${_LIVE_WERE_RUNNING[@]:-}"; do
-    [ -n "$svc" ] || continue
-    [[ " ${WERE_RUNNING[*]} " == *" $svc "* ]] || WERE_RUNNING+=("$svc")
-done
 
 # Now stop them. From here a SIG* runs _on_signal_prestop, which restarts
 # WERE_RUNNING (populated above) — so an interrupt mid-stop restores the server.
@@ -2060,22 +1815,23 @@ done
 # bootstrap's crash recovery reports the crash from (the "fetching" state above was
 # written before anything was inspected), and below, for genesis-server, the
 # restart this run now owes. Same phase, so every reader of the state treats it as
-# before. Not on `live`, which writes no state before the stop (see the "fetching"
-# write); the restart obligation is written there too.
-if [ "${ON_LIVE:-0}" != 1 ]; then
-    _write_state "fetching"
-fi
+# before.
+_write_state "fetching"
 if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     # Never stop the server without that record on disk: a run that died after
     # such a stop would leave it down with nothing to tell the next run that an
     # update, not the operator, stopped it. Nothing is stopped yet, so refuse
     # here and change nothing, like the pre-stop backup refusal above.
+    _owed_before=0
+    if [ -e "$SERVER_RESTART_OWED" ]; then _owed_before=1; fi
     if ! _owe_server_restart; then
+        # The server was never stopped, so a record this attempt left behind is
+        # false: the writer can fail AFTER its rename (the directory fsync), with
+        # the new file already in place. Remove it, unless one was there before
+        # this run, which is an earlier update's unpaid debt and stays.
+        [ "$_owed_before" = 1 ] || rm -f "$SERVER_RESTART_OWED"
         echo "  Could not record the restart this update would owe genesis-server — server NOT stopped, nothing changed."
         echo "  Make $HOME/.genesis writable (and free space on its disk), then re-run."
-        if [ "${ON_LIVE:-0}" = 1 ]; then
-            _live_abandon 1 "the restart record could not be written"
-        fi
         # --post-merge never deletes the tag: it is the earlier run's, and the
         # state still names it as the rollback point for the merged code.
         if [[ "$POST_MERGE" == "false" ]]; then
@@ -2091,10 +1847,6 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     # accepted pause and its resume; _guardian_resume no-ops until a pause is
     # accepted.
     trap '_guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _drop_own_prestop_state; _flush_deploy_summary' EXIT
-    # On `live` the deploy marker this run holds goes on every exit too.
-    if [ "${ON_LIVE:-0}" = 1 ]; then
-        trap '_live_prestop_exit; _guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _flush_deploy_summary' EXIT
-    fi
     _guardian_pause
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
@@ -2102,10 +1854,9 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     # yet, so aborting here leaves the repo/DB untouched — safe to exit.
     if ! _ensure_server_down; then
         echo "  Aborting update — could not stop genesis-server; refusing to merge over a live process."
-        # A server still running is owed no restart: a "stopping" record left for
-        # it would make a later update start it after a deliberate stop. One that
-        # did go down keeps the record, still "stopping" (never confirmed), so the
-        # next update restores it.
+        # A server still running is owed no restart: the record written above
+        # would make a later update start it after a deliberate stop. One that did
+        # go down keeps the record, so the next update restores it.
         if [ -e "${SERVER_RESTART_OWED:-}" ] \
             && { systemctl --user is-active --quiet genesis-server.service 2>/dev/null \
                 || pgrep -f "python -m genesis serve" >/dev/null 2>&1; }; then
@@ -2113,25 +1864,10 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
         fi
         echo "  genesis-server has been stopped and was NOT restarted. Bring it back with:"
         echo "    systemctl --user restart genesis-server.service"
-        # On `live` the rebuild has already moved the checkout (and the EXIT
-        # trap stays quiet once the stop began), so say so here.
-        if [ "${ON_LIVE:-0}" = 1 ]; then
-            _live_stop_failed_note
-        fi
         # Deliberate: disarm the signal handler so it does NOT "restore" a server
         # we are intentionally leaving stopped (we could not cleanly stop it).
         trap - INT TERM
         exit 1
-    fi
-    # The stop is confirmed: date the record from NOW, as "stopped" (see
-    # restart-owed). The stop's own kill may have let systemd restart the server
-    # before _ensure_server_down stopped it for good, and that activation must not
-    # read as someone else bringing it back. If the record cannot be rewritten,
-    # the run must not go on with a debt that is still "stopping", and must not
-    # leave the server down either: restore what was stopped and exit, exactly as
-    # an interrupt here does (nothing is merged yet).
-    if ! _owe_server_restart stopped; then
-        _on_signal_prestop TERM "Could not record the confirmed stop of genesis-server"
     fi
 fi
 for svc in "${WERE_RUNNING[@]}"; do
@@ -2356,38 +2092,6 @@ except Exception:
 PYEOF
 }
 
-# When the row _latest_update_status reads was completed, in nanoseconds since
-# the epoch (the unit _server_recovery_pending compares in); "" when it cannot be
-# read or parsed, which that reader treats as current evidence: the recovery side.
-_latest_update_completed_ns() {
-    local db_path="$GENESIS_ROOT/data/genesis.db" py=""
-    [ -f "$db_path" ] || return 0
-    py="$(_metadata_python 12 || true)"
-    [ -n "$py" ] || return 0
-    GH_DB_PATH="$db_path" "$py" - <<'PYEOF' 2>/dev/null || true
-import os
-import sqlite3
-from datetime import UTC, datetime
-
-try:
-    con = sqlite3.connect(f"file:{os.environ['GH_DB_PATH']}?mode=ro", uri=True, timeout=5)
-    try:
-        # The same row as _latest_update_status.
-        row = con.execute(
-            "SELECT completed_at FROM update_history ORDER BY datetime(started_at) DESC LIMIT 1"
-        ).fetchone()
-    finally:
-        con.close()
-    when = datetime.fromisoformat(row[0]) if row and row[0] else None
-    if when is not None and when.tzinfo is not None:
-        # Exact integer arithmetic: a float timestamp would round the microseconds.
-        delta = when - datetime(1970, 1, 1, tzinfo=UTC)
-        print((delta.days * 86400 + delta.seconds) * 10**9 + delta.microseconds * 1000)
-except Exception:
-    pass
-PYEOF
-}
-
 # Whether genesis-server answers its health endpoint right now. Used where a
 # restart is attempted without P6's health loop: `_start_genesis_server` returns 0
 # whenever `systemctl restart` exits cleanly, and its direct-start fallback
@@ -2437,9 +2141,20 @@ _server_health_ok() {
 _do_rollback() {
     local reason="$1"
     local degraded="${2:-}"
+    # 1 = a restarted genesis-server must also answer its health endpoint before
+    # the verdict counts the rollback complete. Only the live units refusal asks
+    # (its exit 4 promises the old tip is back and up); every other caller passes
+    # nothing (read as 0, so set -u never trips on it), and main's rollback never
+    # waits on it.
+    local verify_health="${3:-0}"
 
     # Disarm the ERR trap to prevent recursive rollback
     trap - ERR INT TERM
+    # A rollback whose live hook restore or service restart failed is not clean
+    # (_ROLLBACK_CLEAN), whatever the summary below prints. Only this rollback's
+    # verdict sets it: exit 4's gate reads it.
+    _ROLLBACK_CLEAN=0
+    local hooks_ok=true svc_ok=true
 
     echo ""
     echo "  UPDATE FAILED — $reason"
@@ -2448,7 +2163,17 @@ _do_rollback() {
     # Stop any running services first. _ensure_server_down also disarms the
     # on-failure restart timer so a stale instance can't come back mid-rollback
     # (best-effort here — the rollback continues even if it can't fully stop).
+    # A server this rollback stops and means to restart is owed that restart
+    # (restart-owed) from before the stop: the health check that passed earlier in
+    # this run may already have retired the record, and a kill mid-rollback must
+    # not leave the server down with nothing saying so. Best-effort: the rollback
+    # goes on either way. A server this run never restarted (not in WERE_RUNNING)
+    # stays as the operator left it, so it gets no record.
     local server_down=true
+    if [[ " ${WERE_RUNNING[*]:-} " == *" genesis-server "* ]]; then
+        _owe_server_restart \
+            || echo "  WARNING: could not record the restart this rollback owes genesis-server" >&2
+    fi
     _stop_genesis_server
     if ! _ensure_server_down; then
         echo "  WARNING: genesis-server may still be running during rollback"
@@ -2460,6 +2185,9 @@ _do_rollback() {
             echo "  WARNING: checkout lock busy during rollback; the checkout will be left as it is" >&2
         fi
     fi
+    # On `live`, a rebuild that moved the checkout before it failed or was
+    # interrupted: its tip is this run's to move back (live-helpers).
+    _live_adopt_tip
 
     # What the code rollback may touch is decided from the checkout as it is NOW,
     # by exact commit identity: another session may have switched the branch,
@@ -2561,8 +2289,10 @@ _do_rollback() {
                 # The checkout ran with hooks off, so the git hooks the rebuild
                 # installed are still the tip's; the engine puts back the old
                 # tip's (readiness refuses every later rebuild until it does).
-                genesis_without_checkout_lock env DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" DEPLOY_CANDIDATES_EPHEMERAL_RE="$EPHEMERAL_DIRTY_RE" python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" restore-hooks "$own_head" "$ROLLBACK_TAG" \
-                    || echo "  WARNING: could not restore the git hooks of $ROLLBACK_TAG; readiness refuses every rebuild until each installed hook matches scripts/hooks/ there."
+                if ! genesis_without_checkout_lock env DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" DEPLOY_CANDIDATES_EPHEMERAL_RE="$EPHEMERAL_DIRTY_RE" python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" restore-hooks "$own_head" "$ROLLBACK_TAG"; then
+                    hooks_ok=false
+                    echo "  WARNING: could not restore the git hooks of $ROLLBACK_TAG; readiness refuses every rebuild until each installed hook matches scripts/hooks/ there."
+                fi
             fi
             ;;
         locked_out)
@@ -2597,6 +2327,11 @@ _do_rollback() {
             genesis_has_flagged_entries "$GENESIS_ROOT" && echo "    (A listed path git status does not show is flagged: see 'git ls-files -v'; clear it with git update-index --no-assume-unchanged or --no-skip-worktree.)"
         fi
         checkout_ok=false
+    fi
+    if [ "${_LIVE_TREE_SUSPECT:-0}" = 1 ]; then
+        restart_ok=false
+        checkout_ok=false
+        echo "  CRITICAL: services are NOT restarted: the rebuild may have left a mixed working tree (part of the new tree written while HEAD stayed on the old one). See git status in $GENESIS_ROOT, and the rebuild's own message above, for which paths changed."
     fi
     # END rollback-code-guard
 
@@ -2661,19 +2396,51 @@ _do_rollback() {
     if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then
         for svc in "${WERE_RUNNING[@]}"; do
             if [ "$svc" = "genesis-server" ]; then
-                _start_genesis_server || echo "  CRITICAL: failed to restart genesis-server"
-            else
-                systemctl --user start "$svc.service" 2>/dev/null || \
-                    echo "  CRITICAL: failed to restart $svc"
+                if ! _start_genesis_server; then
+                    svc_ok=false
+                    echo "  CRITICAL: failed to restart genesis-server"
+                fi
+            elif ! systemctl --user start "$svc.service" 2>/dev/null; then
+                svc_ok=false
+                echo "  CRITICAL: failed to restart $svc"
             fi
         done
     elif [ "${#WERE_RUNNING[@]}" -gt 0 ]; then
         echo "  NOT restarted: ${WERE_RUNNING[*]}. Verify the checkout and database recovery before starting them."
     fi
 
-    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then
+    # ONE verdict for every report of this rollback: the message, the history
+    # row, the failure file, the closing summary and exit 4's gate. A rollback
+    # whose hooks or services did not come back is not complete, whatever the code
+    # and database did.
+    local rollback_ok=false
+    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ] \
+        && [ "$hooks_ok" = true ] && [ "$svc_ok" = true ]; then
+        rollback_ok=true
+    fi
+    # _start_genesis_server's fallback returns 0 whether or not the server came
+    # back, so when asked, health is part of this verdict, decided before anything
+    # is recorded. Asked only of a rollback that is otherwise complete: an
+    # incomplete one is already reported so, and never pays the wait. The traps
+    # are already disarmed: a TERM during this wait (up to _server_health_ok's
+    # 180 s bound) ends the run with no final history row (the run's open row
+    # stays unfinished) and no failure file, and keeps the state file (the clear
+    # below never runs), which is fail-safe: nothing claims the rollback succeeded.
+    if [ "$rollback_ok" = true ] && [ "$verify_health" = 1 ] && [ "$restart_ok" = "true" ] \
+        && [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+        if _server_health_ok; then
+            # update.sh's own health check passed: the restart owed (restart-owed)
+            # is paid, now, before anything else runs.
+            rm -f "$SERVER_RESTART_OWED"
+        else
+            rollback_ok=false
+            echo "  CRITICAL: genesis-server was restarted but did not answer its health endpoint"
+        fi
+    fi
+    if [ "$rollback_ok" = true ]; then
         echo "  Rolled back to $ROLLBACK_TAG (code, deps$([ "${MIGRATIONS_RAN:-0}" = "1" ] && echo ", database"))."
         echo "  NOT reverted: installed systemd units and hooks (self-heal on the next update)."
+        _ROLLBACK_CLEAN=1
         _record_update_history "rolled_back" "$reason" "$degraded"
     else
         echo "  ROLLBACK INCOMPLETE — manual intervention required"
@@ -2711,7 +2478,7 @@ with open(sys.argv[11], 'w') as f:
     json.dump(data, f, indent=4)
 " "$OLD_TAG" "$NEW_TAG" "$OLD_COMMIT" "$NEW_COMMIT" "$ROLLBACK_TAG" \
   "$reason" "${degraded:-}" "$ORIGINAL_BRANCH" \
-  "$([ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && echo true || echo false)" \
+  "$rollback_ok" \
   "$(date -Iseconds)" \
   "$HOME/.genesis/last_update_failure.json"
 
@@ -2734,7 +2501,7 @@ with open(sys.argv[11], 'w') as f:
 
     echo ""
     echo "  ──────────────────────────────────────"
-    if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]; then
+    if [ "$rollback_ok" = true ]; then
         echo "  Rolled back: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"
     else
         echo "  NOT fully rolled back — see CRITICAL above. Pre-update state: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"
@@ -2813,9 +2580,9 @@ _checkout_unmoved_or_roll_back() {
 }
 _checkout_unmoved_or_roll_back
 # END checkout-unmoved
-# On `live` the rebuild already put the checkout where it goes (the live-rebuild
-# block, before the stop): no lock, no clears, no merge, no adoption. Not
-# re-indented, so the blocks the tests extract keep their text.
+# On `live` the engine's rebuild takes the merge's place (the live-engine block,
+# after the `else` below). Not re-indented, so the blocks the tests extract keep
+# their text.
 if [ "${ON_LIVE:-0}" != 1 ]; then
 if ! genesis_checkout_lock "$GENESIS_ROOT"; then
     _CHECKOUT_LOCK_BUSY=1
@@ -3078,8 +2845,140 @@ if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD 2>/dev/
     exit 1
 fi
 else
-    # None of the pre-merge clears ran, so the no-change path has nothing to restore.
-    SETTINGS_LOCAL_BAK="" SERENA_YML_BAK="" USER_MD_BAK=""
+# BEGIN live-engine (extracted by tests/test_scripts/test_update_live.py)
+# On `live` the merge is the engine's rebuild (scripts/deploy_candidates.py
+# rebuild): fetch origin/main, readiness against the checkout the stopped server
+# will start from, every per-candidate check, one move. It runs here, under the
+# armed rollback trap and the "merging" state row, so a refusal, a failure or an
+# interrupt rolls back like a failed merge: the old tip is put back with its git
+# hooks, and the services restart on it. update.lock is handed over; the engine's
+# move takes genesis-checkout.lock itself (polling it up to 300 s), so this run
+# holds that lock only while it clears the excused local edits, never across the
+# rebuild. DEPLOY_CANDIDATES_OWN_STATE_PID tells the engine the "merging" row is
+# this run's own, not an unfinished update to refuse or a leftover to retire.
+# --expect-branch/--expect-head name where this run verified the checkout; the
+# engine refuses, moving nothing, if it is elsewhere under its lock (#3492).
+# None of the main path's pre-merge clears ran, so the no-change path has nothing
+# to restore.
+SETTINGS_LOCAL_BAK="" SERENA_YML_BAK="" USER_MD_BAK=""
+if ! genesis_checkout_lock "$GENESIS_ROOT"; then
+    _CHECKOUT_LOCK_BUSY=1
+    _do_rollback "checkout lock busy: a Claude launch holds genesis-checkout.lock"
+    exit 1
+fi
+# Every tracked path the dirty-tree gate excused is saved, then put back to HEAD:
+# a switch that writes one would otherwise refuse over the local edit.
+if ! _live_status="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames)"; then
+    trap - ERR INT TERM
+    _do_rollback "cannot read the working tree's status before the rebuild"
+    exit 1
+fi
+while IFS= read -r _line; do
+    [ -n "$_line" ] && [[ "$_line" != '??'* ]] && [[ "$_line" =~ $EPHEMERAL_DIRTY_RE ]] || continue
+    _eph="${_line:3}"
+    if ! _ephemeral_backup "$_eph" "$EPHEMERAL_BACKUP_ROOT/live" \
+        || ! genesis_without_checkout_lock git -C "$GENESIS_ROOT" checkout -q HEAD -- "$_eph"; then
+        trap - ERR INT TERM
+        _do_rollback "could not back up and clear local edits to $_eph before the rebuild"
+        exit 1
+    fi
+    echo "  (backed up and cleared local edits to $_eph before the rebuild: $EPHEMERAL_BACKUP_ROOT/live/$_eph)"
+done <<< "$_live_status"
+genesis_checkout_unlock
+echo "--- Rebuilding live ---"
+# The engine's move record says how far its move got (live-helpers reads it on a
+# rollback). This run holds update.lock, so a file left there is a dead run's.
+_LIVE_MOVE_REC="${GENESIS_HOME:-$HOME/.genesis}/live_move.json"
+rm -f "$_LIVE_MOVE_REC"
+_LIVE_ENGINE_RAN=1
+_eng_rc=0
+DEPLOY_CANDIDATES_LOCK_FD="$_UPDATE_LOCK_FD" DEPLOY_CANDIDATES_EPHEMERAL_RE="$EPHEMERAL_DIRTY_RE" \
+    DEPLOY_CANDIDATES_OWN_STATE_PID="$$" DEPLOY_CANDIDATES_MOVE_RECORD="$_LIVE_MOVE_REC" \
+    python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" rebuild \
+    --expect-branch "$ORIGINAL_BRANCH" --expect-head "$UPDATE_OWN_HEAD" || _eng_rc=$?
+# Success must leave the checkout at the exact recorded move, not another
+# actor's valid live tip. An unchanged rebuild writes no record and may retain
+# only the head this updater already owns. Keep the record for rollback until
+# both ownership and rebuild shape have been verified.
+_live_tip=""
+_live_new_base=""
+if [ "$_eng_rc" -eq 0 ]; then
+    _live_expected="$UPDATE_OWN_HEAD"
+    if [ -e "$_LIVE_MOVE_REC" ] || [ -L "$_LIVE_MOVE_REC" ]; then
+        if _live_move="$(_live_read_move_record)"; then
+            _live_expected="${_live_move% *}"
+            case "${_live_move#* }" in
+                ref|moving|done) ;; # A failed final receipt write can retain the pre-move phase.
+                *) _eng_rc=1 ;;
+            esac
+        else
+            _eng_rc=1
+        fi
+    fi
+    _live_tip="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'refs/heads/live^{commit}' 2>/dev/null || true)"
+    if [ "$_eng_rc" -ne 0 ] || [ -z "$_live_tip" ] || [ "$_live_tip" != "$_live_expected" ] \
+        || ! genesis_checkout_unmoved "$GENESIS_ROOT" "$_live_tip" "$ORIGINAL_BRANCH" \
+        || ! _live_new_base="$(python3 -I -S "$SCRIPT_DIR/deploy_candidates.py" live-shaped "$_live_tip")" \
+        || [ -z "$_live_new_base" ]; then
+        echo "  The rebuild reported success, but the checkout is not at its own recorded live tip."
+        _eng_rc=1
+    fi
+fi
+if [ "$_eng_rc" -ne 0 ]; then
+    trap - ERR INT TERM
+    _do_rollback "the live rebuild stopped (exit $_eng_rc)"
+    exit 1
+fi
+# The rebuilt tip is this run's own from here, as a merge result is: recorded at
+# once, so a crash leaves a state row naming it.
+UPDATE_OWN_HEAD="$_live_tip"
+_LIVE_BASE="$_live_new_base"
+DEPLOY_HEAD="$_LIVE_BASE"
+_write_state "merging"
+rm -f "$_LIVE_MOVE_REC"
+_live_new_commit
+echo "  live is at ${_live_tip:0:12} on origin/$DEPLOY_BRANCH ${DEPLOY_HEAD:0:12}."
+# A unit template only the rebuilt tip brings is judged now, by the same checker
+# (the old base's); the rollback tag (the old tip) is judged with it. A refusal
+# rolls the rebuild back and exits 4 after the stop (the header's exit codes).
+_mu_rc=0
+if [ -n "$_mu_src" ]; then
+    _mu_out="$(python3 -I -S -c "$_mu_src" check --repo "$GENESIS_ROOT" \
+        --unit-dir "$HOME/.config/systemd/user" --upto "$_live_tip" --also "$ROLLBACK_TAG" \
+        --accept-legacy --take "$GENESIS_TAKE_TEMPLATES" 2>&1)" || _mu_rc=$?
+else
+    _mu_out="scripts/lib/managed_units.py is missing from the base live was on"
+    _mu_rc=2
+fi
+rm -f "$REFUSED_FILE" 2>/dev/null || true
+if [ "$_mu_rc" -ne 0 ]; then
+    if [ "$_mu_rc" -eq 4 ]; then
+        echo "REFUSED: these systemd units were edited by hand, and the rebuilt live would leave them behind:"
+        printf '%s\n' "$_mu_out" | grep REFUSED || true
+        _mu_remedy
+    else
+        echo "ERROR: could not check the installed systemd units for hand edits (exit $_mu_rc):"
+        printf '%s\n' "$_mu_out" | sed 's/^/  /'
+    fi
+    trap - ERR INT TERM
+    # 4 promises the old tip is back, hooks, services and a healthy server: only
+    # that path asks _do_rollback to put health in its verdict (any other exit
+    # code here is 1 whatever the health, so it never pays the wait).
+    _mu_health=""
+    [ "$_mu_rc" -ne 4 ] || _mu_health=1
+    _do_rollback "the rebuilt live's systemd units were refused (exit $_mu_rc)" "" "$_mu_health"
+    # A rollback that did not complete is a failure, and leaves no refusal record
+    # (the dashboard reads its presence as exit 4's).
+    if [ "$_mu_rc" -eq 4 ] && [ "${_ROLLBACK_CLEAN:-0}" = 1 ]; then
+        # deploy_head = the commit judged: here the rebuilt tip (candidates
+        # included). Nothing may merge it; the orchestrator reads only the
+        # record's presence.
+        _mu_record_refusal "$_mu_out" "$_live_tip"
+        exit 4
+    fi
+    exit 1
+fi
+# END live-engine
 fi  # end: not on `live`
 
 genesis_checkout_unlock
@@ -3543,7 +3442,7 @@ fi
 # `_apply_direct` (dashboard, supervised=False) does too — see
 # `dashboard/routes/updates.py::_apply_direct`, which probes scope availability
 # before spawning. A manual CLI run must be launched detached the same way (see
-# the genesis-development skill's Timeout Policy).
+# the validating-merges skill, "DEPLOYS ARE THE EXCEPTION").
 #
 # CORRECTED 2026-09-16: this comment previously stated that `_apply_direct` does
 # NOT scope-isolate and called it a pre-existing bug awaiting P5. That is no longer
@@ -3708,6 +3607,14 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
         if curl -sf --max-time 20 http://localhost:5000/api/genesis/health > /dev/null 2>&1; then
             echo "  OK: Genesis health endpoint responding (attempt $attempt)"
             HEALTH_OK=true
+            # update.sh's own health check passed: the restart owed (restart-owed)
+            # is paid, NOW, before any later step. On the direct-start fallback no
+            # unit tracks the server, and a kill after this point must not leave
+            # a debt for a server that is up and answering. A rollback after this
+            # point writes the record again before it stops the server.
+            if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
+                rm -f "$SERVER_RESTART_OWED"
+            fi
             break
         fi
         # `|| true` stays: `is-active` exits non-zero for inactive/failed while
@@ -3911,11 +3818,6 @@ set -e
 if [ -f "$HOME/.genesis/last_update_failure.json" ]; then
     rm -f "$HOME/.genesis/last_update_failure.json"
     echo "  Cleared previous update failure context"
-fi
-# genesis-server was restarted and passed the health check above (a failure there
-# rolled back): the restart owed for it (restart-owed) is paid.
-if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
-    rm -f "$SERVER_RESTART_OWED"
 fi
 
 # ── Record success in update_history ─────────────────────

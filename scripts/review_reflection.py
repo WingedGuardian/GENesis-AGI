@@ -52,9 +52,16 @@ the PR's acceptance points must appear within one Scope line that starts
 ``covered:``; that is a substring floor for an honest session, not proof
 that the line covers the point.
 
-``covered_keys`` is THE coverage check: the commit gate (a later change) calls
-it, and it applies every local rule, so a reflection committed by hand is held
-to exactly the standard a tool-made one is.
+``covered_keys`` is THE coverage check, and it applies every local rule, so a
+reflection committed by hand is held to exactly the standard a tool-made one
+is. A reflection must come before any fix of the key it credits (owner rulings
+2026-10-20, ``fix_clock``): a commit made before that key's review is no fix of
+it, nor is a merge of the default branch holding only git's own merge result
+and its conflict resolution, so a session that committed after pushing the
+head and before its reviews landed can still reflect.
+``owed_from_budget`` is the one answer ``status`` and the commit gate (a later
+change) share, from a budget already read; its ``deadline`` bounds every git
+call, and running out is a refusal, never "nothing owed".
 
 Late findings (reviews that opened no round, and round-opening reviews that
 arrived after a fix to their head) are owed from ``REFLECTION_CUTOVER_ISO`` on,
@@ -77,8 +84,11 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -339,28 +349,101 @@ def parse(
 
 # -- git and the network -----------------------------------------------------
 
-#: ``git replace`` could swap a fix commit for an empty one in every read.
-_GIT_ENV = {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
+#: ``git replace`` or a graft could swap a fix commit, or its parents, in
+#: every read; a graft file that does not exist turns grafts off.
+_GIT_ENV = {
+    **os.environ,
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_GRAFT_FILE": os.devnull + ".no-grafts",
+}
+
+_TREE_ID = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
+_INJECTED_CONFIG = re.compile(r"GIT_CONFIG_(PARAMETERS|COUNT|KEY_\d+|VALUE_\d+)")
 
 
-def _run(argv: Sequence[str], cwd: str | None = None) -> tuple[int, str, str]:
+def _merge_env() -> dict[str, str]:
+    """For the merge exemption, whose answer credits: no global or system
+    config or attributes, and none of the config a ``git -c`` caller passes
+    down to its hooks through the environment. The global attributes file,
+    which git reads even with no config naming it, is cut by ``-c``."""
+    return {
+        **{k: v for k, v in _GIT_ENV.items() if not _INJECTED_CONFIG.fullmatch(k)},
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
+    }
+
+
+#: A ``time.monotonic()`` bound on every command this module runs, set by
+#: ``deadline_scope``. None (as for the CLI) keeps each command's own 120 s.
+_DEADLINE: ContextVar[float | None] = ContextVar("review_reflection_deadline", default=None)
+_COMMAND_TIMEOUT = 120.0
+
+
+@contextmanager
+def deadline_scope(deadline: float | None) -> Iterator[None]:
+    """Bound every command run inside to ``deadline`` (``time.monotonic()``),
+    the earlier of it and any enclosing bound. Running out raises ``Refused``,
+    so a caller with its own budget (the commit gate) gets an unknown answer,
+    never a command killed half-way whose exit reads as a verdict."""
+    outer = _DEADLINE.get()
+    bound = outer if deadline is None else deadline if outer is None else min(outer, deadline)
+    token = _DEADLINE.set(bound)
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def _timeout() -> float:
+    """What a command may take: its own 120 s, cut to what the deadline leaves.
+    Raises ``Refused`` once nothing is left."""
+    deadline = _DEADLINE.get()
+    if deadline is None:
+        return _COMMAND_TIMEOUT
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise Refused("the reflection check ran out of time")
+    return min(_COMMAND_TIMEOUT, left)
+
+
+def _run(
+    argv: Sequence[str], cwd: str | None = None, *, env: Mapping[str, str] | None = None
+) -> tuple[int, str, str]:
     """Run a command. Output is decoded with replacement, so a commit message
     in a legacy encoding is read (and then refused by the grammar), never a
-    crash."""
+    crash. Under a deadline, a command that does not finish in time raises
+    ``Refused``: its non-zero exit would otherwise read as an answer."""
+    code, out, err = _run_bytes(argv, cwd, env=env)
+    return code, _text(out), _text(err)
+
+
+def _text(raw: bytes) -> str:
+    # What ``text=True`` gave: replacement decoding and universal newlines.
+    return raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _run_bytes(
+    argv: Sequence[str], cwd: str | None = None, *, env: Mapping[str, str] | None = None
+) -> tuple[int, bytes, bytes]:
+    """``_run`` with the output left as bytes, for paths compared as sets: two
+    paths that are not UTF-8 can decode to the same text."""
+    timeout = _timeout()
     try:
         done = subprocess.run(
             list(argv),
             cwd=cwd,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=120,
+            timeout=timeout,
             check=False,
-            env=_GIT_ENV,
+            env=dict(env if env is not None else _GIT_ENV),
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return 1, "", str(exc)
+    except subprocess.TimeoutExpired as exc:
+        if _DEADLINE.get() is not None:
+            raise Refused("the reflection check ran out of time") from exc
+        return 1, b"", str(exc).encode()
+    except OSError as exc:
+        return 1, b"", str(exc).encode()
     return done.returncode, done.stdout, done.stderr
 
 
@@ -443,7 +526,7 @@ def _commit_objects(cwd: str, shas: Sequence[str]) -> dict[str, bytes]:
             ["git", "-C", cwd, "cat-file", "--batch"],
             input=("\n".join(shas) + "\n").encode(),
             capture_output=True,
-            timeout=120,
+            timeout=_timeout(),
             check=False,
             env=_GIT_ENV,
         )
@@ -863,25 +946,225 @@ def check(
     return parsed
 
 
-def before_any_fix(cwd: str, head: str, sha: str) -> bool:
-    """Whether reflection ``sha`` was made before any fix to round ``head``.
+#: ``fix_clock``'s answer when no finding can be credited: the reflection does
+#: not descend from the head, or a fix's time could not be read.
+NEVER = datetime.max.replace(tzinfo=UTC)
 
-    Every commit from the head to the reflection must have exactly one parent
-    and that parent's tree: a fix that was later reverted, or a merge, between
-    them disqualifies it. A reflection made after a fix is a rationalisation,
-    not a reflection. A second reflection for the same round still qualifies.
-    """
-    code, _, _ = _run(["git", "-C", cwd, "merge-base", "--is-ancestor", head, sha])
+
+def _default_branch(cwd: str) -> str | None:
+    """The remote default branch's tracking ref: ``origin/HEAD`` where it is
+    set and names a commit, else ``origin/main``; None when neither resolves.
+    A clone made by ``git init`` plus ``git remote add`` has no
+    ``origin/HEAD``, and after a default-branch rename and prune it can name a
+    ref that no longer exists, so each candidate is checked before use."""
+    candidates = []
+    code, out, _ = _run(["git", "-C", cwd, "symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+    if code == 0 and out.strip():
+        candidates.append(out.strip())
+    candidates.append("refs/remotes/origin/main")
+    for ref in candidates:
+        code, _, _ = _run(["git", "-C", cwd, "rev-parse", "-q", "--verify", f"{ref}^{{commit}}"])
+        if code == 0:
+            return ref
+    return None
+
+
+def _mainline(cwd: str) -> frozenset[str]:
+    """Every commit on the default branch's FIRST-PARENT line. Empty when there
+    is no default branch. Reachability through any parent would let a topic
+    merged into main later make an earlier merge of that topic read as a merge
+    of main (round 1 of #3493). Residual, failing open: a topic FAST-FORWARDED
+    into main puts all its commits on this line, so an earlier merge of that
+    topic reads as a merge of main afterwards (never on a squash-only repo)."""
+    default = _default_branch(cwd)
+    if default is None:
+        return frozenset()
+    code, out, err = _run(["git", "-C", cwd, "rev-list", "--first-parent", default])
+    if code != 0:
+        raise Refused(f"git rev-list --first-parent {default} failed: {err.strip()[:300]}")
+    return frozenset(out.split())
+
+
+def _merge_is_no_fix(
+    cwd: str, tree: str, parents: Sequence[str], mainline: Iterable[str], on_path: Iterable[str]
+) -> bool:
+    """Whether a two-parent merge is just merging the default branch in (owner
+    ruling 2026-10-20, narrowed the same day): its later parent is on the
+    default branch's first-parent line (``mainline``), and its tree is git's
+    own merge result, or differs from it only in the files that conflicted
+    (the resolution). Anything else a merge carries is content like any
+    commit's. An octopus merge, or a git that cannot say, is never exempt:
+    ``--attr-source`` needs git 2.41, and ``merge-tree`` crashed with it until
+    2.43, so on an older git a merge it cannot compute is judged by its time.
+
+    Both trees are compared by plumbing, as bytes: paths that are not UTF-8
+    stay distinct, and no ``diff.*`` setting (ignored submodules, relative
+    paths) can hide a change. Attributes come from the first parent, files
+    without a merge attribute merge as text, and global, system and
+    environment-injected config is cut off. Residual: the repository's own
+    ``.git/config`` (a ``merge.text.driver``) and ``.git/info/attributes``
+    (a ``-merge``) have no off switch and can widen the conflicted set; like
+    the local refs above, that takes deliberate tampering."""
+    if len(parents) != 2:
+        return False
+    # A merge bringing nothing new is git-merged to its first parent's tree,
+    # so any content it carries fails the tree comparison below. The first
+    # parent must be on the head's own line (``on_path``): a head that is
+    # itself already in the default branch could otherwise bring a fix in
+    # through the first parent unexamined.
+    first, later = parents
+    if first not in on_path or later not in mainline:
+        return False
+    # Attributes (and so merge drivers) come from the first parent's commit,
+    # and a file with no merge attribute merges as text whatever the config
+    # says (the docstring's residuals aside).
+    git = ["git", "-C", cwd, "-c", f"core.attributesFile={os.devnull}", "-c", "merge.default=text"]
+    merge_tree = ["merge-tree", "--write-tree", "--name-only", "--no-messages", "-z"]
+    code, out, _ = _run_bytes(
+        [*git, f"--attr-source={first}", *merge_tree, first, later], env=_merge_env()
+    )
+    if code not in (0, 1):
+        return False
+    merged, *conflicted = out.split(b"\0")
+    # A timeout reads as exit 1 with no output: only a real tree id is a merge.
+    if not _TREE_ID.fullmatch(merged.strip()):
+        return False
+    if code == 0:
+        return merged.strip().decode() == tree
+    # A committed .gitmodules "ignore = all" hides a gitlink even from diff-tree.
+    diff_tree = ["diff-tree", "-r", "--no-renames", "--ignore-submodules=none", "--name-only", "-z"]
+    code, out, _ = _run_bytes([*git, *diff_tree, merged.strip().decode(), tree], env=_merge_env())
     if code != 0:
         return False
-    rows = _git(cwd, "log", "--format=%T %P", f"{head}..{sha}").split("\n")
-    for row in (r for r in rows if r.strip()):
-        tree, *parents = row.split()
-        if len(parents) != 1:
-            return False
-        if tree != _git(cwd, "rev-parse", f"{parents[0]}^{{tree}}").strip():
-            return False
-    return True
+    changed = {path for path in out.split(b"\0") if path}
+    return changed <= {path for path in conflicted if path}
+
+
+def _stamp(raw: str) -> datetime | None:
+    if not raw.isdigit():
+        return None
+    try:
+        return datetime.fromtimestamp(int(raw), UTC)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+@dataclass(frozen=True)
+class Fix:
+    """A commit that changes something on the way from a head: what it is and
+    when it was made. A time git could not read is None."""
+
+    sha: str
+    authored: datetime | None
+    committed: datetime | None
+    orphan: bool = False  # parentless after the head: a graft, never honest
+
+    @property
+    def clock(self) -> datetime:
+        """When this fix was made, for the credit rule: the LATER of its author
+        and committer times (an amend or a rebase moves only the committer
+        time, so a fix cannot be laundered backwards). ``NEVER`` when either is
+        unreadable or the commit is an orphan."""
+        if self.orphan or self.authored is None or self.committed is None:
+            return NEVER
+        return max(self.authored, self.committed)
+
+
+def fix_rows(cwd: str, head: str, tip: str, *, main_merges: bool = True) -> list[Fix] | None:
+    """Every fix on the way from round ``head`` to ``tip``: the ONE reading of
+    "what is a fix" both credit paths and the owe side share. None when ``tip``
+    does not descend from ``head``.
+
+    The commits read are those on the way from the head to the tip
+    (``--ancestry-path``), so what a merge brings in from elsewhere is not one
+    of them. Of those (owner rulings 2026-10-20):
+
+    - a commit that keeps its parent's tree (another reflection) is no fix;
+    - with ``main_merges`` (the credit side), a merge of the default branch is
+      no fix while it holds only git's own merge result plus the resolution
+      of the files that conflicted (``_merge_is_no_fix``); the owe side passes
+      False, so it owes early, never late;
+    - every other commit, merges included, is a fix.
+
+    Raises ``Refused`` when git cannot say, a head this clone has not fetched
+    included: the owe side reading that as "no fix" would owe too little, so
+    both sides answer "unknown" until a fetch."""
+    code, _, _ = _run(["git", "-C", cwd, "merge-base", "--is-ancestor", head, tip])
+    if code == 1:
+        return None
+    if code != 0:
+        raise Refused(f"git cannot relate {head[:12]} to {tip[:12]} (not fetched?)")
+    walk = ["--no-show-signature", "--ancestry-path", "--format=%H %T %P|%at %ct"]
+    code, out, err = _run(["git", "-C", cwd, "log", *walk, f"{head}..{tip}"])
+    if code != 0:
+        raise Refused(f"git log {head[:12]}..{tip[:12]} failed: {err.strip()[:300]}")
+    rows = [row for row in out.split("\n") if row.strip()]
+    if not rows:
+        return []
+    trees = {head: _git(cwd, "rev-parse", f"{head}^{{tree}}").strip()}
+    parsed = []
+    for row in rows:
+        names, _, stamps = row.partition("|")
+        fields = names.split()
+        if len(fields) < 2:
+            raise Refused(f"git log printed an unreadable row: {row[:80]!r}")
+        times = stamps.split()
+        if len(times) != 2:
+            times = ["", ""]
+        trees[fields[0]] = fields[1]
+        parsed.append((fields[0], fields[1], fields[2:], times))
+    mainline: frozenset[str] | None = None  # read on the first merge only
+    found = []
+    for sha, tree, parents, (authored, committed) in parsed:
+        if not parents:
+            found.append(Fix(sha, _stamp(authored), _stamp(committed), orphan=True))
+            continue
+        if len(parents) == 1:
+            # One parent: on the way from the head, so its tree was read above.
+            if trees.get(parents[0]) == tree:
+                continue
+        elif main_merges:
+            if mainline is None:
+                mainline = _mainline(cwd)
+            if _merge_is_no_fix(cwd, tree, parents, mainline, trees):
+                continue
+        found.append(Fix(sha, _stamp(authored), _stamp(committed)))
+    return found
+
+
+def fix_clock(cwd: str, head: str, sha: str) -> datetime | None:
+    """When the latest fix between round ``head`` and reflection ``sha`` was
+    made (``fix_rows``, ``Fix.clock``): None when there was none, ``NEVER``
+    when no finding can be credited (``sha`` does not descend from ``head``,
+    or a fix's time could not be read). A commit made before a review and
+    amended or rebased after it counts as a fix of that review's findings, so
+    reflect before rewriting. Raises ``Refused`` when git cannot relate the two
+    (an unfetched head): unknown, never "nothing owed"."""
+    found = fix_rows(cwd, head, sha)
+    if found is None:
+        return NEVER
+    return max((fix.clock for fix in found), default=None)
+
+
+def clears(clock: datetime | None, reviewed_at: datetime | None) -> bool:
+    """Whether a reflection whose latest fix is ``clock`` (``fix_clock``) came
+    before every fix of a finding reviewed at ``reviewed_at``: a commit made
+    before the finding existed cannot be a fix of it. An unknown review time
+    leaves every fix standing; the clock slack counts toward a fix."""
+    if clock is None:
+        return True
+    if clock is NEVER or reviewed_at is None:
+        return False
+    return clock < reviewed_at - _COMMIT_CLOCK_SLACK
+
+
+def _is_ancestor(cwd: str, sha: str, of: str) -> bool:
+    """Whether commit ``sha`` is an ancestor of ``of`` (git's exit 0 or 1).
+    Any other exit refuses: an unreadable history is unknown, never "no"."""
+    code, _, _ = _run(["git", "-C", cwd, "merge-base", "--is-ancestor", sha, of])
+    if code in (0, 1):
+        return code == 0
+    raise Refused(f"git merge-base --is-ancestor {sha[:12]} {of[:12]} failed")
 
 
 def covered_keys(
@@ -893,11 +1176,18 @@ def covered_keys(
     prior_heads: Sequence[str],
     acceptance: Sequence[str] | None,
     round_started: object,
+    reviewed_at: Mapping[str, datetime | None] | None = None,
+    deadline: float | None = None,
 ) -> set[str]:
     """Keys answered at ``head`` by committed reflections. THE coverage check.
 
     A reflection counts only when it is an EMPTY commit naming this exact head,
-    made before any fix to it (``before_any_fix``), and ``check`` passes it:
+    made before any fix of the key it credits (``fix_clock``: a commit made
+    before the key's review in ``reviewed_at`` is no fix of it, nor is a merge
+    of the default branch holding only git's merge and its conflict
+    resolution; a key with no review time there counts every other
+    commit as a fix, so leaving ``reviewed_at`` out is the strictest check),
+    and ``check`` passes it:
     the grammar, the round's obligations, the recurring-class rule against
     every earlier round head (``prior_heads``), readable evidence files
     (an adversarial audit, a premise check) written between ``round_started``
@@ -915,11 +1205,41 @@ def covered_keys(
     edit that removes an acceptance point, or one that moves the PR across the
     hook-surface boundary (the lanes owe different checks at a round); cite
     evidence from a place nothing prunes (``~/.genesis/review_evidence/``).
+
+    ``deadline`` (``time.monotonic()``) bounds the whole check, every git call
+    included; past it the check raises ``Refused``.
     """
+    with deadline_scope(deadline):
+        return _covered_keys(
+            cwd,
+            head,
+            round_number=round_number,
+            gate_lane=gate_lane,
+            prior_heads=prior_heads,
+            acceptance=acceptance,
+            round_started=round_started,
+            reviewed_at=reviewed_at or {},
+        )
+
+
+def _covered_keys(
+    cwd: str,
+    head: str,
+    *,
+    round_number: int,
+    gate_lane: bool,
+    prior_heads: Sequence[str],
+    acceptance: Sequence[str] | None,
+    round_started: object,
+    reviewed_at: Mapping[str, datetime | None],
+) -> set[str]:
     previous = previous_class_labels(cwd, prior_heads)
     covered: set[str] = set()
     for sha, kind, body, committed_at in _log_reflections(cwd):
-        if kind != "empty" or not before_any_fix(cwd, head, sha):
+        if kind != "empty":
+            continue
+        clock = fix_clock(cwd, head, sha)
+        if clock is NEVER:
             continue
         result = check(
             body,
@@ -933,8 +1253,23 @@ def covered_keys(
             cwd=cwd,
         )
         if result.ok:
-            covered.update(result.keys)
+            covered.update(k for k in result.keys if clears(clock, reviewed_at.get(k)))
     return covered
+
+
+def _open_round(budget: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The ``rounds`` entry of the open round: the one whose head IS the current
+    head, never ``rounds[-1]``. That list follows the PR's commit list, which is
+    in date order, so after a rebase or cherry-pick a commit can be listed after
+    the head (#3302). None when the round is not open, or when the budget says
+    open but has no single entry for the head, which a caller must read as
+    unknown. Assumes ``current_head`` is the PR's tip, as ``evaluate_pr``
+    passes it; a test that passes an older head may find later rounds prior."""
+    if budget.get("round_state") != "open":
+        return None
+    head = budget.get("current_head")
+    own = [r for r in budget.get("rounds") or [] if r.get("head") == head]
+    return own[0] if len(own) == 1 else None
 
 
 def owed_state(
@@ -972,9 +1307,6 @@ def owed_state(
         # None (unknown) until a cutover's late findings have been read.
         "late_keys": [] if cutover is None else None,
     }
-    rounds = budget.get("rounds") or []
-    if budget.get("status") == "ok" and rounds:
-        state["round_head"] = rounds[-1].get("head")
     if budget.get("status") != "ok":
         return state
     late_owed: list[str] | None = []
@@ -992,12 +1324,18 @@ def owed_state(
             # debt is known, owed or not. With no cutover this is main's False.
             state["settled"] = late_owed is not None
         return state
+    own = _open_round(budget)
+    if own is None:
+        # Open by the producer's word, with no single entry for the head: what
+        # it owes and when it started are unknown, never "nothing".
+        return state
+    state["round_head"] = own.get("head")
     if state["reflection_keys"] == "ok" and late_owed is not None:
         done = set(covered)
         state["owed"] = [k for k in state["open_keys"] if k not in done] + late_owed
     times = [
         when
-        for source in (rounds[-1].get("reviews") or [] if rounds else [])
+        for source in own.get("reviews") or []
         if (when := _parse_when(source.get("submitted_at"))) is not None
     ]
     if times:
@@ -1029,8 +1367,28 @@ def _acceptance(budget: Mapping[str, Any], repo: str, number: int) -> list[str] 
     return acceptance_points(body)
 
 
+def _open_review_times(budget: Mapping[str, Any]) -> dict[str, datetime | None]:
+    """When each open-round key's review arrived (the earliest, should a key
+    be listed twice). A time that cannot be read is None, which leaves every
+    fix standing against that key."""
+    times: dict[str, datetime | None] = {}
+    own = _open_round(budget)
+    for source in (own.get("reviews") or []) if own else []:
+        when = _parse_when(source.get("submitted_at"))
+        for key in source.get("finding_keys") or []:
+            if not isinstance(key, str):
+                continue
+            if key not in times or when is None or times[key] is not None and when < times[key]:
+                times[key] = when
+    return times
+
+
 def _open_covered(
-    cwd: str, budget: Mapping[str, Any], state: Mapping[str, Any], acceptance: Sequence[str] | None
+    cwd: str,
+    budget: Mapping[str, Any],
+    state: Mapping[str, Any],
+    acceptance: Sequence[str] | None,
+    deadline: float | None = None,
 ) -> set[str]:
     """``covered_keys`` for the open round, every argument taken from the budget."""
     return covered_keys(
@@ -1038,10 +1396,50 @@ def _open_covered(
         str(state["head"]),
         round_number=int(state["round"] or 0),
         gate_lane=state["gate_lane"],
-        prior_heads=[str(r.get("head")) for r in (budget.get("rounds") or [])[:-1]],
+        # Every round but the head's own, by identity (not ``rounds[:-1]``).
+        prior_heads=[
+            str(r.get("head"))
+            for r in budget.get("rounds") or []
+            if r.get("head") != state["head"]
+        ],
         acceptance=acceptance,
         round_started=state["round_started"],
+        reviewed_at=_open_review_times(budget),
+        deadline=deadline,
     )
+
+
+def owed_from_budget(
+    cwd: str,
+    budget: Mapping[str, Any],
+    repo: str,
+    number: int,
+    *,
+    now: datetime,
+    cutover: str | None,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    """What is owed, from a ``review_budget`` result already read: the one
+    answer ``status`` and the commit gate share, so the two cannot disagree.
+    ``cutover`` set adds the late findings (``review_late``). ``deadline``
+    (``time.monotonic()``) bounds every git and network call made here; past
+    it this raises ``Refused``, as it does when git cannot be read: a caller
+    must treat either as unknown, never as nothing owed."""
+    with deadline_scope(deadline):
+        if cutover is not None:
+            import review_late  # noqa: PLC0415
+
+            return review_late.late_status(
+                cwd, budget, repo, number, now=now, cutover=cutover, deadline=deadline
+            )
+        state = owed_state(budget, (), now=now)
+        # Only a KNOWN open-round debt is narrowed by coverage. ``owed`` None
+        # (keys unknown, or no single round entry for the head) stays None.
+        if state["status"] == "ok" and state["round_state"] == "open" and state["owed"] is not None:
+            acceptance = _acceptance(budget, repo, number)
+            covered = _open_covered(cwd, budget, state, acceptance, deadline)
+            state["owed"] = [k for k in state["open_keys"] if k not in covered]
+        return state
 
 
 _MODULE_CUTOVER = object()
@@ -1059,19 +1457,9 @@ def status(
         cutover = REFLECTION_CUTOVER_ISO
     repo, number = pr_identity(cwd)
     budget = review_budget.evaluate_pr(repo, number)
-    if cutover is not None:
-        import review_late  # noqa: PLC0415
-
-        state = review_late.late_status(
-            cwd, budget, repo, number, now=now or datetime.now(UTC), cutover=cutover
-        )
-        state.update({"repo": repo, "pr": number, "errors": budget.get("errors", [])})
-        return state
-    state = owed_state(budget, (), now=now or datetime.now(UTC))
-    if state["status"] == "ok" and state["round_state"] == "open":
-        covered = _open_covered(cwd, budget, state, _acceptance(budget, repo, number))
-        if state["reflection_keys"] == "ok":
-            state["owed"] = [k for k in state["open_keys"] if k not in covered]
+    state = owed_from_budget(
+        cwd, budget, repo, number, now=now or datetime.now(UTC), cutover=cutover
+    )
     state.update({"repo": repo, "pr": number, "errors": budget.get("errors", [])})
     return state
 

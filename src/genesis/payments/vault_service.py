@@ -58,6 +58,7 @@ from genesis.payments import vault_store as vs
 from genesis.payments.approval import holds_long_digit_run
 from genesis.payments.peer_check import PeerPolicy, PeerRefused, accept_ticks, check_release_peer
 from genesis.payments.release import ReleaseManager
+from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +166,8 @@ def _withhold_long_runs(value, key: str | None = None):
 class VaultService:
     """The in-memory vault state and the socket that drives it.
 
-    ``db`` must be a connection the service owns (see ``start_vault_service``).
+    ``db`` must be dedicated to this service, never shared with other writers.
+    Failed rollback retires and closes it, including for directly constructed services.
     """
 
     owned_db = None  # the connection start_vault_service opened, closed at stop
@@ -208,6 +210,8 @@ class VaultService:
         self._socket_ino: int | None = None
         self._writers: set[asyncio.StreamWriter] = set()
         self._tasks: set[asyncio.Task] = set()
+        self._audit_owners: set[asyncio.Task] = set()
+        self._audit_close: asyncio.Task | None = None
         # (pid, *, accept_ticks) -> Peer, raising PeerRefused. genesis-server's
         # own pid is passed explicitly: the ancestor walk looks for it to tell
         # a session it launched from a foreground one.
@@ -222,20 +226,77 @@ class VaultService:
 
     # -- audit -------------------------------------------------------------
 
-    async def _audit(self, event: str, detail: dict | None = None) -> bool:
-        if self._db is None:
+    async def _audit(
+        self,
+        event: str,
+        detail: dict | None = None,
+        *,
+        _stopping: bool = False,
+        _correction: bool = False,
+    ) -> bool:
+        if self._db is None or (self._stopped and not _stopping):
             return False
+        owner = tracked_task(
+            self._write_audit(event, detail, _stopping, _correction),
+            name="payment-vault-audit",
+        )
+        self._audit_owners.add(owner)
+        owner.add_done_callback(self._audit_owners.discard)
+        try:
+            return await asyncio.shield(owner)
+        except asyncio.CancelledError:
+            if not owner.cancelling():
+                owner.cancel()
+            raise
+
+    def _retire_audit(self) -> asyncio.Task | None:
+        db, self._db = self._db, None
+        if self._audit_close is None and db is not None:
+            # No new statements may use this handle. Close queues behind SQL
+            # already submitted; it cannot undo an already-queued COMMIT.
+            self._audit_close = tracked_task(db.close(), name="payment-vault-audit-close")
+            self._audit_close.add_done_callback(self._closed_audit)
+        return self._audit_close
+
+    def _closed_audit(self, task: asyncio.Task) -> None:
+        self._audit_close = None
+
+    async def _rollback_audit(self, db) -> None:
+        cleanup = tracked_task(db.rollback(), name="payment-vault-audit-rollback")
+        try:
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    # The owner keeps the lock and the cleanup reference even
+                    # when cancellation first arrives during an error rollback.
+                    continue
+            cleanup.result()
+        except (Exception, asyncio.CancelledError) as exc:
+            logger.error("payment vault audit rollback failed (%s)", type(exc).__name__)
+            self._retire_audit()
+
+    async def _write_audit(
+        self,
+        event: str,
+        detail: dict | None,
+        stopping: bool,
+        _correction: bool = False,
+    ) -> bool:
         async with self._audit_lock:
+            if self._db is None or (self._stopped and not stopping):
+                return False
+            if _correction and self.unlocked:
+                return False
+            db = self._db
             try:
-                await audit.record_event(self._db, event, _withhold_long_runs(detail))
+                await audit.record_event(db, event, _withhold_long_runs(detail))
+            except asyncio.CancelledError:
+                await self._rollback_audit(db)
+                raise
             except Exception as exc:  # noqa: BLE001 - the caller decides what a lost row means
                 logger.error("payment vault audit write failed (%s)", type(exc).__name__)
-                # A failed COMMIT leaves the INSERT pending; a later commit would
-                # persist a row (an "unlock") that never took effect. The
-                # connection is the service's own and the audit lock is held,
-                # so rolling back discards only this write.
-                with contextlib.suppress(Exception):
-                    await self._db.rollback()
+                await self._rollback_audit(db)
                 return False
         return True
 
@@ -251,11 +312,17 @@ class VaultService:
             return
         try:
             async with self._audit_lock:
+                if self._db is None:
+                    return
                 rows = await audit.list_recent(self._db, 1, events=audit.KEY_EVENTS)
         except Exception:  # noqa: BLE001 - status reports the audit log as unavailable
             return
-        if rows and rows[0]["event"] == "unlock":
-            await self._audit("lock", {"correction": "no key is held; an earlier row was lost"})
+        if not self.unlocked and rows and rows[0]["event"] == "unlock":
+            await self._audit(
+                "lock",
+                {"correction": "no key is held; an earlier row was lost"},
+                _correction=True,
+            )
 
     # -- state -------------------------------------------------------------
 
@@ -305,8 +372,6 @@ class VaultService:
         if self._clock() < self._relock_at:
             self._schedule_idle_check()
             return
-        from genesis.util.tasks import tracked_task
-
         task = tracked_task(self.lock(None, event="idle_relock"), name="payment-vault-idle-relock")
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -347,7 +412,11 @@ class VaultService:
         if audit_ok:
             try:
                 async with self._audit_lock:  # the last KEY event, not an approval row
-                    rows = await audit.list_recent(self._db, 1, events=audit.KEY_EVENTS)
+                    audit_ok = self._db is not None
+                    rows = (
+                        await audit.list_recent(self._db, 1, events=audit.KEY_EVENTS)
+                        if audit_ok else []
+                    )
                 last = rows[0] if rows else None
             except Exception:  # noqa: BLE001 - reported as audit unavailable
                 audit_ok = False
@@ -390,9 +459,13 @@ class VaultService:
         # Taken on arrival, not after waiting for the unlock lock: a lock that
         # lands while this request waits behind another unlock still wins.
         epoch = self._epoch
-        if self._db is None:
-            return {"ok": False, "error": "the audit log is unavailable; the vault stays locked"}
         async with self._unlock_lock:
+            async with self._audit_lock:
+                if self._db is None:
+                    return {
+                        "ok": False,
+                        "error": "the audit log is unavailable; the vault stays locked",
+                    }
             if self._stopped:
                 return {"ok": False, "error": "the vault service is stopping"}
             if self.unlocked:  # checked first: a held key is never answered with a refusal
@@ -485,28 +558,37 @@ class VaultService:
         self._drop()
         # Before the tasks are cancelled: the approval task is one of them.
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._release.abort("the vault service stopped"), _STOP_WAIT_S)
+            await asyncio.wait_for(
+                self._release.abort("the vault service stopped", stopping=True), _STOP_WAIT_S
+            )
         for task in list(self._tasks):
             task.cancel()
-        if self._server is not None:
-            self._server.close()
-            for writer in list(self._writers):
-                writer.close()
+        try:
+            if self._server is not None:
+                self._server.close()
+                for writer in list(self._writers):
+                    writer.close()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._server.wait_closed(), _STOP_WAIT_S)
+            with contextlib.suppress(OSError):
+                if (
+                    self._socket_ino is not None
+                    and os.lstat(self._socket_path).st_ino == self._socket_ino
+                ):
+                    os.unlink(self._socket_path)
+            # The key is already dropped; a stuck write costs only its row.
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._server.wait_closed(), _STOP_WAIT_S)
-        with contextlib.suppress(OSError):
-            if (
-                self._socket_ino is not None
-                and os.lstat(self._socket_path).st_ino == self._socket_ino
-            ):
-                os.unlink(self._socket_path)
-        # Bounded like the rest of stop: behind a held SQLite write lock one
-        # write can take about 22 s (busy timeout x retries, MEASURED), and the
-        # key is already dropped above, so a lost stop row costs only the row.
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(
-                self._audit("service_stop", {"was_unlocked": was_unlocked}), _STOP_WAIT_S
-            )
+                await asyncio.wait_for(
+                    self._audit("service_stop", {"was_unlocked": was_unlocked}, _stopping=True),
+                    _STOP_WAIT_S,
+                )
+        finally:
+            for owner in self._audit_owners:
+                if not owner.done() and not owner.cancelling():
+                    owner.cancel()
+        if self._audit_owners:
+            # A timeout must not cancel rollback or give up its lock ownership.
+            await asyncio.wait(self._audit_owners, timeout=_STOP_WAIT_S)
 
     async def _respond(self, writer: asyncio.StreamWriter, reply: dict) -> None:
         writer.write((json.dumps(reply) + "\n").encode())
@@ -591,11 +673,15 @@ async def start_vault_service(runtime, approvals=None) -> VaultService | None:
     service.owned_db = db
     try:
         await service.start()
+    except asyncio.CancelledError:
+        service._retire_audit()
+        raise
     except Exception as exc:  # noqa: BLE001 - the server runs on without a vault service
         logger.error("payment vault service did not start (%s: %s)", type(exc).__name__, exc)
-        if db is not None:
+        closing = service._retire_audit()
+        if closing is not None:
             with contextlib.suppress(Exception):
-                await db.close()
+                await asyncio.shield(closing)
         return None
     if approvals is not None:
         approvals.attach_audit(service._audit)
@@ -607,9 +693,12 @@ async def stop_vault_service(service: VaultService | None) -> None:
         return
     try:
         await service.stop()
+    except asyncio.CancelledError:
+        service._retire_audit()
+        raise
     except Exception as exc:  # noqa: BLE001 - shutdown continues regardless
         logger.error("payment vault service stop failed (%s)", type(exc).__name__)
-    finally:
-        if service.owned_db is not None:
-            with contextlib.suppress(Exception):
-                await service.owned_db.close()
+    closing = service._retire_audit()
+    if closing is not None:
+        with contextlib.suppress(Exception):
+            await asyncio.shield(closing)

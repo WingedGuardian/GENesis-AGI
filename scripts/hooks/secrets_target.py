@@ -4,7 +4,7 @@ The first version of this gate matched the literal ``secrets.env`` in a Bash
 command. An adversarial review broke it in seconds with shapes nobody would call
 exotic — ``cat ~/genesis/secrets.*``, ``cat secrets.e*``, ``cat s*.env`` — and it
 never saw ``Read``/``Grep`` at all, since it was wired only to ``Bash``. That is
-the hand-rolled-matcher tar pit the genesis-development skill names: every round
+the hand-rolled-matcher tar pit the build-session skill names: every round
 finds one more spelling, and it does not converge.
 
 So this module asks a different question. Not "does the text look like the

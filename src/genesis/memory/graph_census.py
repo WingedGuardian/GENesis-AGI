@@ -20,14 +20,20 @@ refuses (and the census records why) on a reflog gap, a move in the process's
 start second, a clock that stepped back, or a start older than git's expiry
 cutoff for unreachable entries.
 
-``/proc/<pid>/environ`` is the environment at exec. A value a process loads into
-``os.environ`` later (the MCP server's ``secrets.env`` allowlist) is not in it. So
-each memory server's kill switch is derived the way the server decides it: the
-exec-time value if set, else its secrets file (``SECRETS_PATH`` or the default),
-which counts only if unchanged since the process started; otherwise its state
-is unknown and the row is not clean until it restarts. genesis-server reads
-``secrets.env`` only when its unit starts, so each census also reads the file
-itself and says ``telemetry_disabled`` once the switch is set there.
+Schema 2 ("conservative unknowns"): a memory server's row is clean only when
+its code SOURCE, its kill SWITCH and its database SCOPE are proven, as well as
+its history above. ``graph_census_proof`` holds those rules and says what each
+one can and cannot prove: the source from the venv its ``argv[0]`` names and
+what that venv and ``PYTHONPATH`` can load; the switch it actually runs with
+(the startup router reloads its secrets file with override=True, so a proven
+file carrying the key decides; launch and running disagreeing, or an unprovable
+file, is unknown); the scope by every database's file identity. Anything
+unproven lands in ``unknown_reasons`` (or ``telemetry_off: None``) and the
+verdict reads the row as not clean, so the cutover clock waits for a restart.
+``/proc/<pid>/environ`` is the environment at exec, which is why a later
+``os.environ`` load is re-derived from the file rather than read. genesis-server
+reads ``secrets.env`` only when its unit starts, so each census also reads the
+file itself and says ``telemetry_disabled`` once the switch is set there.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING
 
+from genesis.memory import graph_census_proof as proof
 from genesis.memory import graph_telemetry as telemetry
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -52,7 +59,7 @@ logger = logging.getLogger(__name__)
 #: ``eval_events.event_type`` of a census row; pruned with the telemetry rows.
 CENSUS_EVENT_TYPE = "graph_traverse_census"
 #: Bumped whenever a field's meaning changes, so a reader can tell rows apart.
-CENSUS_SCHEMA = 1
+CENSUS_SCHEMA = 2
 #: The module a memory server must have imported for its traversals to be recorded.
 TELEMETRY_MODULE = "src/genesis/memory/graph_telemetry.py"
 #: git's default for gc.reflogExpireUnreachable when the setting is unset.
@@ -98,6 +105,20 @@ def _start_epoch(pid: int, boot: float, proc_root: Path) -> float | None:
 
 def _read_nul_list(path: Path) -> list[str]:
     return [part.decode("utf-8", "replace") for part in path.read_bytes().split(b"\0") if part]
+
+
+def _realpath_or_none(path: Path) -> str | None:
+    try:
+        return os.path.realpath(os.readlink(path))
+    except OSError:
+        return None
+
+
+def _readlink_or_none(path: Path) -> str | None:
+    try:
+        return os.readlink(path)
+    except OSError:
+        return None
 
 
 def scan_mcp_servers(proc_root: Path = _PROC) -> tuple[list[dict], bool]:
@@ -150,6 +171,11 @@ def scan_mcp_servers(proc_root: Path = _PROC) -> tuple[list[dict], bool]:
                 "env_switch": env.get(telemetry._TELEMETRY_OFF_ENV),
                 "secrets_path": env.get("SECRETS_PATH"),
                 "db_path": env.get("GENESIS_DB_PATH"),
+                # For the proof rules (graph_census_proof); never written to a row.
+                "argv": tuple(argv),
+                "env": {k: env[k] for k in proof.PROOF_ENV_KEYS if k in env},
+                "exe": _realpath_or_none(base / "exe"),
+                "mnt_ns": _readlink_or_none(base / "ns" / "mnt"),
             }
         )
     return found, complete
@@ -225,15 +251,28 @@ def build_census(
     *,
     proc_root: Path = _PROC,
     live_db: Path | None = None,
+    live_held_by: int | None = None,
 ) -> dict:
     """One census row's metrics. Blocking (``/proc`` and ``git``): run it in a
-    thread."""
+    thread. ``live_held_by`` is the pid whose connection the row will be written
+    through: the live database is the file IT holds open, so a path retargeted
+    since that connection opened makes the census incomplete."""
     from genesis.env import genesis_db_path, repo_root
 
     repo = repo or repo_root()
     live = (live_db or genesis_db_path()).resolve()
+    own_ns = _readlink_or_none(proc_root / "self" / "ns" / "mnt")
     procs, complete = scan_mcp_servers(proc_root)
     reasons: list[str] = [] if complete else ["proc_unreadable"]
+    if live_held_by is not None:
+        held = proof.open_file_identities(proc_root, live_held_by)
+        try:
+            ident = (live.stat().st_dev, live.stat().st_ino)
+        except OSError:
+            ident = None
+        if held is None or ident not in held:
+            complete = False
+            reasons.append("live_db_moved")
 
     if proc_root == _PROC:
         boot = _boot_epoch(proc_root)
@@ -259,9 +298,6 @@ def build_census(
         complete = False
         reasons.append("reflog_unreadable")
 
-    from genesis.env import secrets_path
-
-    default_secrets = secrets_path()
     memory: list[dict] = []
     others: dict[str, int] = {}
     unclassified = 0
@@ -288,22 +324,47 @@ def build_census(
         if held:
             results = [has_telemetry(repo, sha, cache) for sha in held]
             telemetry_ok = None if None in results else all(results)
-        db_path = proc["db_path"]
+        env = proc["env"]
+        view = proof.ProcView(
+            pid=proc["pid"],
+            argv=proc["argv"],
+            env=env,
+            start=proc["start"],
+            exe=proc["exe"],
+            mnt_ns=proc["mnt_ns"],
+        )
+        source_reasons = proof.interpreter_source(
+            view,
+            main_root=repo,
+            own_mnt_ns=own_ns,
+            script=repo / "scripts" / "genesis_mcp_server.py",
+        )
+        # Each value derived the way THIS server derives it (its own SECRETS_PATH,
+        # GENESIS_REPO_ROOT and HOME), never from the census process's state.
+        file_vals = proof.secrets_values(proof.secrets_file(env, main_root=repo), proc["start"])
+        foreign, db_identity = proof.db_scope(
+            proof.db_paths(env, file_vals, main_root=repo),
+            live,
+            start=proc["start"],
+            open_files=proof.open_file_identities(proc_root, proc["pid"]),
+        )
+        # The DB rules model main's own server code; with that code unproven, a
+        # "foreign" reading is not evidence enough to skip the row.
+        foreign = foreign and not source_reasons
         memory.append(
             {
                 "pid": proc["pid"],
+                "role": "mcp-memory",
                 "started_at": _iso(proc["start"]),
                 "commit": held[0] if held else None,
                 "held": held,
                 "telemetry": telemetry_ok,
                 "unknown": unknown,
-                "telemetry_off": effective_telemetry_off(proc, default_secrets),
-                # ``~`` expands as genesis_db_path() expands it. A relative path
-                # cannot be resolved against the other process's cwd from here,
-                # so it is never called foreign (never ignored).
-                "foreign": bool(db_path)
-                and Path(db_path).expanduser().is_absolute()
-                and Path(db_path).expanduser().resolve() != live,
+                "source": proof.SOURCE_MAIN if not source_reasons else None,
+                "unknown_reasons": source_reasons,
+                "telemetry_off": proof.switch_off(env, file_vals),
+                "foreign": foreign,
+                "db_identity": db_identity,
             }
         )
     return {
@@ -316,44 +377,6 @@ def build_census(
         "complete": complete,
         "reasons": reasons,
     }
-
-
-def effective_telemetry_off(proc: dict, default_secrets: Path) -> bool | None:
-    """Whether a memory server's traversal telemetry is off, the way the server
-    itself decides it (``scripts/genesis_mcp_server.py``): an exec-time
-    environment value wins; otherwise the value its secrets file held when it
-    loaded it. ``None`` when that cannot be proven, which the verdict treats as
-    not clean: the file changed after the process started (it read the old
-    contents), it is missing from a directory that changed after the process
-    started (it may have been deleted), the path is relative, or the file
-    cannot be read."""
-    if proc["env_switch"] is not None:
-        return proc["env_switch"] == "1"
-    raw = proc.get("secrets_path")
-    path = Path(raw).expanduser() if raw else default_secrets
-    if not path.is_absolute():
-        return None
-    try:
-        changed = path.stat().st_mtime
-    except FileNotFoundError:
-        # Absent now proves absent at start only if the directory has not
-        # changed since: deleting or renaming the file updates its mtime. A
-        # file that was there, was loaded, and is gone cannot be read back.
-        try:
-            dir_changed = path.parent.stat().st_mtime
-        except OSError:
-            return None
-        return False if dir_changed < proc["start"] else None
-    except OSError:
-        return None
-    if changed >= proc["start"]:
-        return None
-    try:
-        from dotenv import dotenv_values
-
-        return dotenv_values(path).get(telemetry._TELEMETRY_OFF_ENV) == "1"
-    except Exception:
-        return None
 
 
 def _disabled_in_secrets() -> bool:
@@ -385,7 +408,7 @@ async def record_census(db: aiosqlite.Connection) -> dict:
             "reasons": ["telemetry_disabled"],
         }
     else:
-        metrics = await asyncio.to_thread(build_census)
+        metrics = await asyncio.to_thread(build_census, live_held_by=os.getpid())
     await j9_eval.insert_event(
         db, dimension="system", event_type=CENSUS_EVENT_TYPE, metrics=metrics
     )

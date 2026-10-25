@@ -117,16 +117,20 @@ def test_an_approved_hook_goes_live_installed_and_leaves_with_its_candidate(dc, 
 
 def test_a_hand_edited_installed_hook_is_left_alone(dc, dc_ready, capsys):
     """drop runs no readiness check, so it reaches the replacement with a hook
-    someone edited: equal to neither checkout's copy, it stays."""
+    someone edited: equal to neither checkout's copy, it stays. drop is past its
+    commit point there, so that is a WARNING naming the hook, not a refusal."""
     w = dc_ready
     w.candidate("feat/h", {PRE_COMMIT: "#!/bin/sh\n# approved\nexit 0\n"})
     assert _approve(w, dc, "feat/h") == 0
     assert w.run(dc, "rebuild") == 0, capsys.readouterr()
     mine = "#!/bin/sh\n# edited by hand\nexit 0\n"
     (w.root / ".git" / "hooks" / "pre-commit").write_text(mine)
-    assert w.run(dc, "drop", "feat/h") == 0, capsys.readouterr()
+    capsys.readouterr()
+    assert w.run(dc, "drop", "feat/h") == 0
+    out = capsys.readouterr().out
     assert (w.root / PRE_COMMIT).read_text() == BASE_HOOK
     assert _installed(w) == mine
+    assert "WARNING: feat/h WAS dropped" in out and "pre-commit was edited by hand" in out, out
 
 
 def test_two_approved_candidates_whose_hook_changes_merge_are_excluded(dc, dc_ready, capsys):

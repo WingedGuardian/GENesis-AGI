@@ -900,6 +900,12 @@ if [ -d "$VENV_PATH" ]; then
             else
                 setup_warn "browser packages incomplete (see above; re-run scripts/bootstrap.sh)"
             fi
+            # The test and payments extras, the same way (see install_runtime_extras).
+            if install_runtime_extras "$REPO_DIR" "$VENV_PATH" | sed 's/^/    /'; then
+                echo "    + test and payments packages installed"
+            else
+                setup_warn "test/payments packages incomplete (see above; re-run scripts/bootstrap.sh)"
+            fi
             ;;
         1)
             # Blocked (worktree) — guard already printed the reason; the

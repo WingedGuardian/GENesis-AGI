@@ -123,7 +123,11 @@ def _result(r: subprocess.CompletedProcess) -> dict[str, str]:
     return dict(kv.split("=", 1) for kv in m.group(1).split())
 
 
-# ── the rebuild, against the real engine ────────────────────────────────────
+# ── the rebuild in the merge slot, against the real engine ──────────────────
+
+_DOWN = (
+    "serving: unknown (genesis-server is not running (inactive))\nserver-state: inactive inactive"
+)
 
 
 def _serving_stub(w, lines: str) -> None:
@@ -135,7 +139,8 @@ def _serving_stub(w, lines: str) -> None:
 
 def _live_world(dc, w, capsys, files: dict | None = None) -> str:
     """`live` = origin/main + feat/a, rebuilt in-process; then the engine is
-    installed into the checkout for update.sh to run, ready against the old base.
+    installed into the checkout for update.sh to run, ready against the old base,
+    with the server stopped (update.sh runs the rebuild after the stop).
     Returns the old base."""
     w.candidate("feat/a", files or {"src/a.py": "a = 1\n"})
     assert w.add(dc, "feat/a") == 0, capsys.readouterr()
@@ -145,24 +150,48 @@ def _live_world(dc, w, capsys, files: dict | None = None) -> str:
     w.install_engine()
     gate = w.root / "scripts" / "deploy_candidates_gate.py"
     gate.write_text(gate.read_text() + f'\nREQUIRED_MERGED = (("scratch base", "{old_base}"),)\n')
-    _serving_stub(w, f"serving: {w.rev('HEAD')}\nserver-state: active inactive")
+    _serving_stub(w, _DOWN)
     w.git(w.root, "tag", TAG)
     return old_base
 
 
-def _rebuild_script(w, old_base: str, mu_src: str | None = None, pre: str = "") -> str:
-    mu = f'_mu_src="$(cat "{CHECKER}")"\n' if mu_src is None else _assign("_mu_src", mu_src)
+def _do_rollback_fn() -> str:
+    """update.sh's _do_rollback, whole (its body holds a column-0 `}` in an
+    embedded python program, so _function cannot cut it)."""
+    text = _text()
+    start = text.index("_do_rollback() {\n")
+    end = text.index("\n}\n", text.index("# END rollback-state-clear", start)) + len("\n}\n")
+    return text[start:end]
+
+
+# What the merge slot's rollback reaches outside git, recorded in $CALLS.
+_SERVICE_STUBS = (
+    '_stop_genesis_server() { echo "stop-server" >> "$CALLS"; }\n'
+    "_ensure_server_down() { return 0; }\n"
+    '_start_genesis_server() { echo "restart-server" >> "$CALLS"; }\n'
+    '_server_health_ok() { echo "health-probe" >> "$CALLS"; return 0; }\n'
+    'systemctl() { echo "systemctl $*" >> "$CALLS"; }\n'
+    '_record_update_history() { echo "history $1" >> "$CALLS"; }\n'
+)
+
+
+def _engine_script(root: Path, script_dir: Path, base: str, mu: str, pre: str = "") -> str:
+    """update.sh from the armed traps through the live-engine block: the real
+    _do_rollback, ERR and signal handlers, state rows and the live helpers; only
+    the services are stubs."""
     return (
-        f'GENESIS_ROOT="{w.root}"\nSCRIPT_DIR="$GENESIS_ROOT/scripts"\n'
+        f'GENESIS_ROOT="{root}"\nSCRIPT_DIR="{script_dir}"\n'
         f"POST_MERGE=false\nON_LIVE=1\nORIGINAL_BRANCH=live\nROLLBACK_TAG={TAG}\n"
         'VALIDATED_HEAD="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"\n'
         'UPDATE_OWN_HEAD="$VALIDATED_HEAD"\n'
-        f'_LIVE_BASE="{old_base}"\nDEPLOY_HEAD="$_LIVE_BASE"\nNEW_COMMIT=""\nNEW_TAG=""\n'
+        f'_LIVE_BASE="{base}"\nDEPLOY_HEAD="$_LIVE_BASE"\n'
+        'OLD_TAG=untagged\nOLD_COMMIT=old\nNEW_TAG=""\nNEW_COMMIT=""\nSTARTED_AT=now\n'
+        'MERGE_ATTEMPTED=0\nMIGRATIONS_RAN=0\nDB_FILE="$HOME/none.db"\n'
         'GENESIS_TAKE_TEMPLATES=""\nREFUSED_FILE="$HOME/.genesis/update_refused.json"\n'
-        'STATE_FILE="$HOME/.genesis/update_state.json"\n_SELF_COPY="$HOME/self-copy"\n'
-        "WERE_RUNNING=()\n"
-        "_guardian_resume() { :; }\n_flush_deploy_summary() { :; }\n"
-        'mkdir -p "$HOME/.genesis/locks"\n'
+        'STATE_FILE="$HOME/.genesis/update_state.json"\nWERE_RUNNING=(genesis-server)\n'
+        '_STATE_WRITTEN=0\n_STATE_PHASE=""\n_LIVE_ENGINE_RAN=0\nCALLS="$HOME/calls"\n'
+        'VENV_DIR="$HOME/venv"\nmkdir -p "$VENV_DIR/bin" "$HOME/.genesis/locks"\n'
+        'printf \'#!/bin/sh\\nexit 0\\n\' > "$VENV_DIR/bin/pip"\nchmod +x "$VENV_DIR/bin/pip"\n'
         'exec {_UPDATE_LOCK_FD}>"$HOME/.genesis/locks/update.lock"\nflock -n "$_UPDATE_LOCK_FD"\n'
         + mu
         + "".join(
@@ -171,25 +200,36 @@ def _rebuild_script(w, old_base: str, mu_src: str | None = None, pre: str = "") 
             ).group(0)
             for name in ("_mu_record_refusal", "_mu_remedy")
         )
+        # The restart record (#3451) the stop and _do_rollback write.
+        + _block("restart-owed")
+        + _function("_write_state")
         + _function("_clear_deploy_marker")
-        + _function("_clear_deploy_state")
-        + _function("_on_signal_prestop")
-        + _block("live-prestop")
-        + _snapshot_defs()
-        + _block("live-marker")
+        + _block("live-helpers")
+        + _SERVICE_STUBS
+        + _do_rollback_fn()
+        + _function("_on_err")
+        + _function("_on_signal")
+        + "trap _on_err ERR\ntrap '_on_signal INT' INT\ntrap '_on_signal TERM' TERM\n"
+        + '_write_state "merging"\n'
         + pre
-        + _block("live-rebuild")
-        + 'echo "RESULT OWN=$UPDATE_OWN_HEAD DEPLOY=$DEPLOY_HEAD NEW=$NEW_COMMIT PID=$$ '
-        'MARKER=$(cat "$DEPLOY_MARKER_FILE" 2>/dev/null || echo none) SNAP=$DB_SNAPSHOT_TAKEN"\n'
+        + _block("live-engine")
+        + 'echo "RESULT OWN=$UPDATE_OWN_HEAD DEPLOY=$DEPLOY_HEAD NEW=$NEW_COMMIT"\n'
     )
 
 
-def _no_state(w) -> bool:
-    return not (w.home / ".genesis" / "update_state.json").exists()
+def _rebuild_script(w, old_base: str, mu_src: str | None = None) -> str:
+    mu = f'_mu_src="$(cat "{CHECKER}")"\n' if mu_src is None else _assign("_mu_src", mu_src)
+    return _engine_script(w.root, w.root / "scripts", old_base, mu)
 
 
-def _marker(w) -> Path:
-    return w.home / ".genesis" / "update_in_progress.pid"
+def _state(home: Path) -> dict | None:
+    path = home / ".genesis" / "update_state.json"
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def _calls(home: Path) -> list[str]:
+    path = home / "calls"
+    return path.read_text().splitlines() if path.exists() else []
 
 
 def _tag(w) -> str | None:
@@ -197,10 +237,19 @@ def _tag(w) -> str | None:
     return r.stdout.strip() or None
 
 
-def test_u1_update_on_live_rebuilds_onto_new_main(dc, dc_ready, capsys):
-    """#2526: update.sh on `live` puts the candidate back on top of the NEW main,
-    with only rebuild merges above origin/main; it records the base, keeps the
-    tip as its own head, and holds the deploy marker into the stop."""
+def _assert_rolled_back_onto(home: Path, head: str, want: str) -> None:
+    """The normal rollback ran and put the old tip back: the server restarted on
+    it, the history row says so, and the state row went with the move."""
+    assert head == want
+    calls = _calls(home)
+    assert "restart-server" in calls and "history rolled_back" in calls, calls
+    assert _state(home) is None, "the rollback kept a state row for a checkout back at its tag"
+
+
+def test_u1_update_on_live_rebuilds_after_the_stop_onto_new_main(dc, dc_ready, capsys):
+    """#2526, #3370: the rebuild runs in the merge's place, with the server
+    stopped, puts the candidate back on top of the NEW main, and records the
+    rebuilt tip as this run's own in the "merging" row."""
     w = dc_ready
     old_base = _live_world(dc, w, capsys)
     old_tip = w.rev("HEAD")
@@ -219,28 +268,16 @@ def test_u1_update_on_live_rebuilds_onto_new_main(dc, dc_ready, capsys):
     assert res["OWN"] == tip
     assert res["DEPLOY"] == new_main
     assert res["NEW"] == w.git(w.root, "rev-parse", "--short", new_main).stdout.strip()
-    assert res["MARKER"] == res["PID"], "the deploy marker is not held into the stop"
-    assert _no_state(w), "the rebuild wrote an update state before the stop"
+    state = _state(w.home)
+    assert state and state["phase"] == "merging" and state["own_head"] == tip, state
+    assert state["deploy_head"] == new_main
     assert _tag(w) == old_tip
+    assert _calls(w.home) == [], "a successful rebuild touched the services"
 
 
-def test_u1_server_down_still_rebuilds(dc, dc_ready, capsys):
-    """Nothing runs (both units definitely stopped): readiness judges the
-    checkout, and the rebuild goes ahead."""
-    w = dc_ready
-    old_base = _live_world(dc, w, capsys)
-    _serving_stub(
-        w,
-        "serving: unknown (genesis-server is not running (inactive))\nserver-state: inactive inactive",
-    )
-    w.advance_main({"c.txt": "c\n"})
-    r = _bash(_rebuild_script(w, old_base), _env(w.home))
-    assert r.returncode == 0, _out(r)
-    assert _result(r)["OWN"] == w.rev("refs/heads/live")
-
-
-def test_u1_server_starting_still_refuses(dc, dc_ready, capsys):
-    """Control for the test above: a unit in any other state is not "down"."""
+def test_u1_a_server_not_definitely_down_refuses_and_rolls_back(dc, dc_ready, capsys):
+    """A unit in any state but stopped is not "down": readiness refuses, and the
+    refusal, after the stop, rolls back like a failed merge."""
     w = dc_ready
     old_base = _live_world(dc, w, capsys)
     old_tip = w.rev("HEAD")
@@ -251,26 +288,25 @@ def test_u1_server_starting_still_refuses(dc, dc_ready, capsys):
     w.advance_main({"c.txt": "c\n"})
     r = _bash(_rebuild_script(w, old_base), _env(w.home))
     assert r.returncode == 1, _out(r)
-    assert w.rev("HEAD") == old_tip
+    assert "the live rebuild stopped" in r.stdout
+    _assert_rolled_back_onto(w.home, w.rev("HEAD"), old_tip)
 
 
-def test_u2_a_readiness_refusal_changes_nothing(dc, dc_ready, capsys):
+def test_u2_a_readiness_refusal_rolls_back_onto_the_old_tip(dc, dc_ready, capsys):
     w = dc_ready
     old_base = _live_world(dc, w, capsys)
     old_tip = w.rev("HEAD")
     new_main = w.advance_main({"c.txt": "c\n"})
-    # A required fix the running server's base lacks.
+    # A required fix the stopped server's checkout lacks.
     w.git(w.root, "fetch", "-q", "origin")
     gate = w.root / "scripts" / "deploy_candidates_gate.py"
     gate.write_text(gate.read_text() + f'\nREQUIRED_MERGED = (("newer fix", "{new_main}"),)\n')
     r = _bash(_rebuild_script(w, old_base), _env(w.home))
     assert r.returncode == 1, _out(r)
-    assert "not ready" in _out(r) and "live was not moved" in r.stdout
-    assert w.rev("HEAD") == old_tip
+    assert "not ready" in _out(r) and "UPDATE FAILED" in r.stdout
+    _assert_rolled_back_onto(w.home, w.rev("HEAD"), old_tip)
     assert w.git(w.root, "status", "--porcelain", "--untracked-files=no").stdout == ""
-    assert _tag(w) is None, "an unmoved refusal left the rollback tag"
-    assert not _marker(w).exists(), "the deploy marker was not released"
-    assert _no_state(w)
+    assert _tag(w) == old_tip, "the rollback deleted the tag it rolled back to"
 
 
 def test_u4_dirty_excused_files_are_backed_up_and_cleared(dc, dc_ready, capsys):
@@ -293,7 +329,10 @@ def test_u4_dirty_excused_files_are_backed_up_and_cleared(dc, dc_ready, capsys):
     assert len(saved) == 1 and saved[0].read_text() == "filled in\n"
 
 
-def test_u6_post_move_unit_refusal_keeps_the_tag_and_says_what_moved(dc, dc_ready, capsys):
+def test_u6_a_unit_refusal_after_the_move_rolls_back_and_exits_4(dc, dc_ready, capsys):
+    """The units only the rebuilt tip brings are judged after the move, which is
+    after the stop: a refusal rolls the rebuild back (old tip, its hooks, the
+    services restarted on it) and still exits 4 with the record."""
     w = dc_ready
     old_base = _live_world(dc, w, capsys)
     old_tip = w.rev("HEAD")
@@ -301,30 +340,94 @@ def test_u6_post_move_unit_refusal_keeps_the_tag_and_says_what_moved(dc, dc_read
     refuse = 'import sys\nprint("REFUSED: demo.service (edited by hand)")\nsys.exit(4)\n'
     r = _bash(_rebuild_script(w, old_base, mu_src=refuse), _env(w.home))
     assert r.returncode == 4, _out(r)
-    tip = w.rev("refs/heads/live")
-    assert tip != old_tip and _tag(w) == old_tip
-    assert "live moved to" in r.stdout and "after fixing the units" in r.stdout
     record = json.loads((w.home / ".genesis" / "update_refused.json").read_text())
-    assert record["units"] == ["demo.service"] and record["deploy_head"] == tip
+    assert record["units"] == ["demo.service"] and record["deploy_head"] != old_tip
     assert "--take-template" in r.stdout and "override.conf" in r.stdout, r.stdout
-    assert not _marker(w).exists()
-    assert _no_state(w)
+    _assert_rolled_back_onto(w.home, w.rev("HEAD"), old_tip)
+    assert w.rev("refs/heads/live") == old_tip
 
 
-# ── the rebuild, against a stub engine ──────────────────────────────────────
+def test_u6_a_unit_refusal_whose_rollback_does_not_complete_exits_1(dc, dc_ready, capsys):
+    """Exit 4 promises the old tip is back. A hand edit to a file only the rebuilt
+    tip has makes the non-forced rollback checkout refuse, so the rollback is
+    incomplete and the run exits 1, not 4."""
+    w = dc_ready
+    old_base = _live_world(dc, w, capsys)
+    w.advance_main({"c.txt": "c\n"})
+    refuse = (
+        "import sys\n"
+        "root = sys.argv[sys.argv.index('--repo') + 1]\n"
+        "open(root + '/c.txt', 'a').write('hand edit\\n')\n"
+        "print('REFUSED: demo.service (edited by hand)')\n"
+        "sys.exit(4)\n"
+    )
+    r = _bash(_rebuild_script(w, old_base, mu_src=refuse), _env(w.home))
+    assert r.returncode == 1, _out(r)
+    assert "ROLLBACK INCOMPLETE" in r.stdout, r.stdout
+    assert not (w.home / ".genesis" / "update_refused.json").exists(), (
+        "exit 1 left the refusal record that means exit 4"
+    )
+
+
+# ── the rebuild in the merge slot, against a stub engine ────────────────────
 
 _STUB_ENGINE = """\
-import os, subprocess, sys
-with open(os.environ["STUB_LOG"], "a") as fh:
-    fh.write(" ".join(sys.argv[1:]) + " lockfd=" + os.environ.get("DEPLOY_CANDIDATES_LOCK_FD", "-")
-             + " re=" + ("yes" if os.environ.get("DEPLOY_CANDIDATES_EPHEMERAL_RE") else "no") + "\\n")
+import fcntl, json, os, signal, subprocess, sys
 mode = os.environ.get("STUB_MODE", "")
 root = os.environ["STUB_ROOT"]
+
+
+def record(to, phase):
+    # The engine's move record, as deploy_candidates_plan.py writes it.
+    path = os.environ.get("DEPLOY_CANDIDATES_MOVE_RECORD")
+    if path:
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"to": to, "phase": phase}) if phase != "garbage" else "{")
+
+
+def head():
+    return subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True,
+                          text=True, check=True).stdout.strip()
+
+
+def checkout_lock():
+    fd = os.open(os.path.join(root, ".git", "genesis-checkout.lock"), os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return "free"
+    except BlockingIOError:
+        return "held"
+    finally:
+        os.close(fd)
+
+
+with open(os.environ["STUB_LOG"], "a") as fh:
+    fh.write(" ".join(sys.argv[1:]) + " lockfd=" + os.environ.get("DEPLOY_CANDIDATES_LOCK_FD", "-")
+             + " re=" + ("yes" if os.environ.get("DEPLOY_CANDIDATES_EPHEMERAL_RE") else "no")
+             + " own=" + os.environ.get("DEPLOY_CANDIDATES_OWN_STATE_PID", "-")
+             + " ppid=" + str(os.getppid()) + " checkout=" + checkout_lock() + "\\n")
 if sys.argv[1] == "rebuild":
-    if mode == "move-fail":
+    if mode in ("move", "move-fail", "move-signal", "foreign", "foreign-success",
+                "unrecorded-success", "move-ref", "move-moving"):
         subprocess.run(["git", "-C", root, "-c", "core.hooksPath=/dev/null", "commit", "-q",
                         "--allow-empty", "-m", "moved"], check=True)
-    sys.exit(1 if mode in ("move-fail", "fail") else 0)
+        # move-signal: killed between the switch and its "done" (the record says
+        # "moving", HEAD is at its target). foreign: the record names another commit.
+        if mode != "unrecorded-success":
+            record("f" * 40 if mode in ("foreign", "foreign-success") else head(),
+                   "moving" if mode in ("move-signal", "move-moving") else
+                   "ref" if mode == "move-ref" else "done")
+    if mode in ("partial", "garbage", "interrupted"):
+        # git wrote part of the new tree (an untracked file) and failed, or was
+        # killed mid-switch (the record still says "moving"); HEAD stayed.
+        open(os.path.join(root, "half-written.py"), "w").write("x = 1\\n")
+        record("e" * 40, "moving" if mode == "interrupted" else mode)
+    if mode == "move-signal":
+        os.kill(os.getppid(), signal.SIGTERM)
+    sys.exit(0 if mode in ("", "move", "foreign-success", "unrecorded-success",
+                          "move-ref", "move-moving") else 1)
+if sys.argv[1] == "restore-hooks" and os.environ.get("STUB_HOOKS_FAIL") == "1":
+    sys.exit(1)
 if sys.argv[1] == "live-shaped":
     print(os.environ["STUB_BASE"])
 sys.exit(0)
@@ -352,93 +455,256 @@ def plain_live(tmp_path: Path):
     return root, home, stub, env, tmp_path / "engine.log"
 
 
-def _plain_script(root: Path, stub: Path) -> str:
-    return (
-        f'GENESIS_ROOT="{root}"\nSCRIPT_DIR="{stub}"\n'
-        f"POST_MERGE=false\nON_LIVE=1\nORIGINAL_BRANCH=live\nROLLBACK_TAG={TAG}\n"
-        'VALIDATED_HEAD="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"\nUPDATE_OWN_HEAD="$VALIDATED_HEAD"\n'
-        '_LIVE_BASE="$VALIDATED_HEAD"\nDEPLOY_HEAD="$_LIVE_BASE"\n_mu_src="import sys"\n'
-        'GENESIS_TAKE_TEMPLATES=""\nREFUSED_FILE="$HOME/.genesis/update_refused.json"\n'
-        'STATE_FILE="$HOME/.genesis/update_state.json"\n_SELF_COPY="$HOME/self-copy"\nWERE_RUNNING=()\n'
-        "_guardian_resume() { :; }\n_flush_deploy_summary() { :; }\n"
-        'mkdir -p "$HOME/.genesis/locks"\n'
-        'exec {_UPDATE_LOCK_FD}>"$HOME/.genesis/locks/update.lock"\nflock -n "$_UPDATE_LOCK_FD"\n'
-        + _function("_clear_deploy_marker")
-        + _function("_clear_deploy_state")
-        + _function("_on_signal_prestop")
-        + _block("live-prestop")
-        + _snapshot_defs()
-        + _block("live-marker")
-        + _block("live-rebuild")
-        + 'echo "RESULT OWN=$UPDATE_OWN_HEAD"\n'
-    )
+def _plain_script(root: Path, stub: Path, mu_src: str = "import sys\n", pre: str = "") -> str:
+    return _engine_script(root, stub, "$VALIDATED_HEAD", _assign("_mu_src", mu_src), pre)
 
 
-def test_u3_a_move_then_failure_keeps_the_tag_and_writes_no_state(plain_live):
+def _move_record(home: Path) -> Path:
+    return home / ".genesis" / "live_move.json"
+
+
+def _engine_calls(log: Path) -> list[str]:
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def test_the_engine_gets_the_update_lock_its_own_state_pid_and_a_free_checkout_lock(plain_live):
+    """update.lock is handed over, the "merging" row is named as the caller's,
+    and genesis-checkout.lock is NOT held: the engine's move takes it itself."""
+    root, home, stub, env, log = plain_live
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "move"})
+    assert r.returncode == 0, _out(r)
+    first = _engine_calls(log)[0]
+    fields = dict(kv.split("=", 1) for kv in first.split() if "=" in kv)
+    assert first.startswith("rebuild ") and fields["lockfd"] != "-" and fields["re"] == "yes"
+    assert fields["own"] == fields["ppid"], "the engine was not told the row is its caller's"
+    assert fields["checkout"] == "free", "update.sh held genesis-checkout.lock across the rebuild"
+    state = _state(home)
+    assert state["phase"] == "merging" and state["pid"] == int(fields["own"])
+    assert state["own_head"] == _git(root, "rev-parse", "HEAD") != state["rollback_tag"]
+    assert not _move_record(home).exists(), "the adopted move's record outlived the adoption"
+
+
+def test_the_engine_is_told_where_update_sh_left_the_checkout(plain_live):
+    """#3492: the engine re-checks the branch and head this run verified, under
+    its own checkout lock, instead of trusting what it reads after its fetch."""
+    root, home, stub, env, log = plain_live
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "move"})
+    assert r.returncode == 0, _out(r)
+    own = _git(root, "rev-parse", TAG)
+    first = _engine_calls(log)[0]
+    assert first.startswith(f"rebuild --expect-branch live --expect-head {own} "), first
+
+
+def test_p2_an_interrupt_during_the_rebuild_rolls_back_onto_the_old_tip(plain_live):
+    """#3370 P2 #1: an interrupt that lands while the engine runs (after the
+    stop, after its move) goes through the normal rollback: the old tip comes
+    back with its hooks, and the server is restarted on it, never on the moved
+    tree."""
+    root, home, stub, env, log = plain_live
+    old = _git(root, "rev-parse", "HEAD")
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "move-signal"})
+    assert r.returncode == 1, _out(r)
+    assert "interrupted by SIGTERM" in r.stderr and "RESULT" not in r.stdout
+    restores = [c.split() for c in _engine_calls(log) if c.startswith("restore-hooks ")]
+    assert len(restores) == 1 and restores[0][2] == TAG, _engine_calls(log)
+    moved = restores[0][1]
+    assert moved != old and _git(root, "cat-file", "-t", moved) == "commit"
+    _assert_rolled_back_onto(home, _git(root, "rev-parse", "HEAD"), old)
+
+
+def test_a_move_then_failure_rolls_back_onto_the_old_tip(plain_live):
     root, home, stub, env, log = plain_live
     old = _git(root, "rev-parse", "HEAD")
     r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "move-fail"})
     assert r.returncode == 1, _out(r)
-    assert _git(root, "rev-parse", "HEAD") != old
-    assert _git(root, "rev-parse", TAG) == old, "a moved run lost the name of the old tip"
-    assert "live moved to" in r.stdout and "re-run scripts/update.sh" in r.stdout
-    assert r.stdout.count("live moved to") == 1, r.stdout
-    assert not (home / ".genesis" / "update_state.json").exists()
-    assert not (home / ".genesis" / "update_in_progress.pid").exists()
+    assert "rolling that back" in r.stdout
+    _assert_rolled_back_onto(home, _git(root, "rev-parse", "HEAD"), old)
+    assert any(c.startswith("restore-hooks ") for c in _engine_calls(log))
 
 
-def test_u3_control_an_unmoved_failure_deletes_the_tag(plain_live):
+def test_an_unmoved_refusal_restarts_the_old_tip_and_keeps_the_tag(plain_live):
+    """The normal rollback, not the old pre-stop abandon: the tag stays (as
+    after any rollback), the services restart, no hook restore is needed."""
     root, home, stub, env, log = plain_live
+    old = _git(root, "rev-parse", "HEAD")
     r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "fail"})
     assert r.returncode == 1, _out(r)
-    assert "live was not moved" in r.stdout and "live moved to" not in r.stdout
-    assert _git(root, "tag", "-l", TAG) == ""
+    _assert_rolled_back_onto(home, _git(root, "rev-parse", "HEAD"), old)
+    assert _git(root, "tag", "-l", TAG) == TAG
+    assert not any(c.startswith("restore-hooks ") for c in _engine_calls(log))
 
 
-def test_the_engine_gets_the_update_lock_and_the_excuse_list(plain_live):
+@pytest.mark.parametrize("mode", ["foreign", "foreign-success", "unrecorded-success"])
+def test_a_moved_tip_the_record_does_not_name_is_never_adopted(plain_live, mode):
+    """Codex P2 (exact ownership): HEAD moved, but not to the commit the engine's
+    record names. It is someone else's move: the code is not reset to the tag,
+    nothing restarts on it, and the restart guard stays."""
     root, home, stub, env, log = plain_live
-    r = _bash(_plain_script(root, stub), env)
-    assert r.returncode == 0, _out(r)
-    first = log.read_text().splitlines()[0]
-    assert (
-        first.startswith("rebuild lockfd=") and "lockfd=-" not in first and first.endswith("re=yes")
-    )
-
-
-def test_u5_a_held_checkout_lock_refuses_before_the_engine(plain_live):
-    root, home, stub, env, log = plain_live
-    r = _bash("exec {GENESIS_CHECKOUT_LOCK_FD}>/dev/null\n" + _plain_script(root, stub), env)
+    old = _git(root, "rev-parse", "HEAD")
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": mode})
     assert r.returncode == 1, _out(r)
-    assert "genesis-checkout.lock" in r.stdout
-    assert not log.exists(), "the engine ran while this run held the checkout lock"
-    assert _git(root, "tag", "-l", TAG) == ""
+    assert _git(root, "rev-parse", "HEAD") != old, "the rollback reset a move it does not own"
+    assert "rolling that back" not in r.stdout
+    assert "restart-server" not in _calls(home)
+    assert not any(c.startswith("restore-hooks ") for c in _engine_calls(log))
+    assert _state(home) is not None, "the restart guard went while moved code stays"
+    assert not _move_record(home).exists()
 
 
-def test_u5_order_tag_preflight_snapshot_rebuild_stop():
+@pytest.mark.parametrize("mode", ["", "move-ref", "move-moving"])
+def test_success_adopts_only_the_unchanged_or_recorded_tip(plain_live, mode):
+    """No-op success has no receipt; moved success may retain a pre-move phase
+    if the final receipt write failed. Neither loses exact ownership."""
+    root, home, stub, env, log = plain_live
+    old = _git(root, "rev-parse", "HEAD")
+    r = _bash(_plain_script(root, stub, _REFUSE_UNITS), {**env, "STUB_MODE": mode})
+    assert r.returncode == 4, _out(r)
+    _assert_rolled_back_onto(home, _git(root, "rev-parse", "HEAD"), old)
+    assert any(c.startswith("restore-hooks ") for c in _engine_calls(log)) is bool(mode)
+    assert not _move_record(home).exists()
+
+
+@pytest.mark.parametrize("mode", ["partial", "garbage", "interrupted"])
+def test_a_partly_written_tree_is_never_restarted(plain_live, mode):
+    """Codex P2: git wrote part of the new tree (here an untracked file, which
+    no tracked-dirt check sees) and failed with HEAD unmoved; or it was killed
+    mid-switch (record "moving", HEAD unmoved); or the record cannot be read. The rollback restarts nothing and says the tree may be mixed."""
+    root, home, stub, env, log = plain_live
+    old = _git(root, "rev-parse", "HEAD")
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": mode})
+    assert r.returncode == 1, _out(r)
+    assert _git(root, "rev-parse", "HEAD") == old
+    assert "restart-server" not in _calls(home), "services restarted on a mixed tree"
+    assert "ROLLBACK INCOMPLETE" in r.stdout and "mixed working tree" in r.stdout, r.stdout
+    assert _state(home) is not None
+
+
+_REFUSE_UNITS = 'import sys\nprint("REFUSED: demo.service (edited by hand)")\nsys.exit(4)\n'
+
+
+_UNHEALTHY = '_server_health_ok() { echo "health-probe" >> "$CALLS"; return 1; }\n'
+
+
+@pytest.mark.parametrize(
+    ("hooks_fail", "pre", "rc", "probes"),
+    [
+        ("0", "", 4, 1),
+        ("1", "", 1, 0),
+        ("1", _UNHEALTHY, 1, 0),
+        ("0", '_start_genesis_server() { echo "restart-server" >> "$CALLS"; return 1; }\n', 1, 0),
+        ("0", _UNHEALTHY, 1, 1),
+    ],
+    ids=[
+        "clean",
+        "hook-restore-fails",
+        "hook-restore-fails-never-waits-on-health",
+        "restart-fails",
+        "restarted-but-unhealthy",
+    ],
+)
+def test_exit_4_needs_a_rollback_that_completed(plain_live, hooks_fail, pre, rc, probes):
+    """Codex P2 (F5, F6): exit 4 promises the old tip is back with its hooks and
+    its services; a failed hook restore or service restart exits 1 instead, and
+    only an exit 4 leaves the refusal record the dashboard reads.
+
+    #3492 gap 3: a server that was restarted but never answers its health
+    endpoint is part of the same single verdict, decided BEFORE anything is
+    recorded: the history row, the failure file and the exit code agree, and
+    the health endpoint is asked once, and only of a rollback that is otherwise
+    complete (an incomplete one never pays the wait)."""
+    root, home, stub, env, log = plain_live
+    r = _bash(
+        _plain_script(root, stub, _REFUSE_UNITS, pre),
+        {**env, "STUB_MODE": "move", "STUB_HOOKS_FAIL": hooks_fail},
+    )
+    assert r.returncode == rc, _out(r)
+    assert any(c.startswith("restore-hooks ") for c in _engine_calls(log))
+    refused = home / ".genesis" / "update_refused.json"
+    assert refused.exists() is (rc == 4), "a refusal record without exit 4 (or the reverse)"
+    # One verdict for every report: a rollback whose hooks or services did not
+    # come back is recorded as incomplete, not "rolled_back" (Devin/CodeRabbit).
+    complete = rc == 4
+    calls = _calls(home)
+    assert ("history rolled_back" in calls) is complete, calls
+    assert ("history failed" in calls) is (not complete), calls
+    failure = json.loads((home / ".genesis" / "last_update_failure.json").read_text())
+    assert failure["rollback_complete"] is complete, failure
+    assert calls.count("health-probe") == probes, calls
+    if probes:
+        history = next(i for i, c in enumerate(calls) if c.startswith("history "))
+        assert calls.index("health-probe") < history, "health was asked after the verdict"
+
+
+def test_an_inherited_rollback_clean_never_reaches_exit_4(plain_live):
+    """_ROLLBACK_CLEAN is this rollback's verdict, never the environment's: with
+    an inherited 1, an unhealthy rollback still exits 1 with no refusal record."""
+    root, home, stub, env, log = plain_live
+    r = _bash(
+        _plain_script(root, stub, _REFUSE_UNITS, _UNHEALTHY),
+        {**env, "STUB_MODE": "move", "_ROLLBACK_CLEAN": "1"},
+    )
+    assert r.returncode == 1, _out(r)
+    assert not (home / ".genesis" / "update_refused.json").exists()
+    assert "history failed" in _calls(home)
+
+
+def test_a_units_check_that_could_not_run_never_waits_on_health(plain_live):
+    """Only exit 4's promise needs a healthy server: a units check that failed
+    to run (exit 2) exits 1 whatever the health, so it never pays the wait."""
+    root, home, stub, env, log = plain_live
+    r = _bash(
+        _plain_script(root, stub, "import sys\nsys.exit(2)\n", _UNHEALTHY),
+        {**env, "STUB_MODE": "move"},
+    )
+    assert r.returncode == 1, _out(r)
+    calls = _calls(home)
+    assert "health-probe" not in calls and "history rolled_back" in calls, calls
+
+
+def test_a_rollback_called_main_s_way_never_waits_on_health(plain_live):
+    """Main's callers pass no third argument: no health wait, even with a stray
+    variable of the old global's shape in the environment."""
+    root, home, stub, env, log = plain_live
+    main_call = 'ON_LIVE=0\n_do_rollback "a main-shaped failure" "some-subsystem"\nexit 0\n'
+    r = _bash(
+        _plain_script(root, stub, "import sys\n", _UNHEALTHY + main_call),
+        {**env, "_ROLLBACK_HEALTH": "1", "VERIFY_HEALTH": "1"},
+    )
+    assert r.returncode == 0, _out(r)
+    calls = _calls(home)
+    assert "restart-server" in calls and "history rolled_back" in calls, calls
+    assert "health-probe" not in calls, calls
+
+
+def test_u5_order_snapshot_stop_merging_engine_bootstrap():
+    """One snapshot, before the stop; the rebuild after the stop, under the armed
+    rollback trap and the "merging" row; the same pre-stop "fetching" row as main;
+    no deploy marker on the CLI path."""
     text = _text()
-    tag = text.index('git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"')
-    pre = text.index("# BEGIN managed-units-preflight")
-    snap = text.index("--- Snapshotting database ---")
-    staged = text.index("# BEGIN staged-excused-prestop")
-    rebuild = text.index("# BEGIN live-rebuild")
+    snap = text.index("_take_db_snapshot || exit 1")
     stop = text.index('echo "--- Stopping services for update ---"')
-    assert tag < pre < snap < staged < rebuild < stop
-    block = _block("live-rebuild")
-    lock = block.index("GENESIS_CHECKOUT_LOCK_FD")
+    arm = text.index("trap '_on_signal TERM' TERM\n")
+    merging = text.index('_write_state "merging"', arm)
+    engine = text.index("# BEGIN live-engine")
+    assert snap < stop < arm < merging < engine < text.index('_write_state "bootstrap"')
+    assert text.count("_take_db_snapshot") == 2, "a second snapshot call came back"
+    assert "_acquire_deploy_marker" not in text and "_LIVE_WERE_RUNNING" not in text
+    assert '\n_write_state "fetching"\n' in text
+    block = _block("live-engine")
+    lock = block.index('genesis_checkout_lock "$GENESIS_ROOT"')
     clear = block.index('checkout -q HEAD -- "$_eph"')
-    engine = block.index('"$SCRIPT_DIR/deploy_candidates.py" rebuild')
+    unlock = block.index("genesis_checkout_unlock")
+    rebuild = block.index('"$SCRIPT_DIR/deploy_candidates.py" rebuild')
     recheck = block.index('--upto "$_live_tip" --also "$ROLLBACK_TAG"')
-    assert lock < clear < engine < recheck
-    # The marker, its EXIT trap and the signal traps are armed before the rebuild.
-    marker = text.index("# BEGIN live-marker")
-    assert text.index("trap '_on_signal_prestop TERM' TERM") < marker < snap < rebuild
-    assert "_acquire_deploy_marker" not in block and "trap " not in block
+    assert lock < clear < unlock < rebuild < recheck
+    assert 'DEPLOY_CANDIDATES_OWN_STATE_PID="$$"' in block
+    # --post-merge never runs the engine: the block sits in the plain run's merge.
+    plain = text.index('if [[ "$POST_MERGE" == "false" ]]; then\n_write_state "merging"\n')
+    assert plain < engine < text.index('fi  # end: [[ "$POST_MERGE" == "false" ]]', plain)
     # The checker that runs on `live` is the old base's, read from git.
     assert 'git -C "$GENESIS_ROOT" show "$_LIVE_BASE:scripts/lib/managed_units.py"' in _block(
         "managed-units-preflight"
     )
-    # The first state on `live` is written after the stop.
-    assert '\nif [ "${ON_LIVE:-0}" != 1 ]; then\n_write_state "fetching"\nfi\n' in text
 
 
 # ── branch admission ────────────────────────────────────────────────────────
@@ -533,6 +799,18 @@ def test_u7_an_inherited_on_live_is_ignored(checkout):
     root, home = checkout
     r = _admit(root, home, ON_LIVE="1", _LIVE_BASE="deadbeef")
     assert r.returncode == 0 and "ON_LIVE=0" in r.stdout, _out(r)
+
+
+def test_u7_the_rollback_flags_are_never_inherited(checkout):
+    """The flags that decide a rollback's checkout lock and exit 4 start at 0."""
+    root, home = checkout
+    r = _bash(
+        f'GENESIS_ROOT="{root}"\n_LIVE_CHECKOUT_PY="$(cat "{LIVE_PY}")"\n'
+        + _block("branch-admission")
+        + 'echo "CLEAN=$_ROLLBACK_CLEAN BUSY=$_CHECKOUT_LOCK_BUSY"\n',
+        _env(home, _ROLLBACK_CLEAN="1", _CHECKOUT_LOCK_BUSY="1"),
+    )
+    assert r.returncode == 0 and "CLEAN=0 BUSY=0" in r.stdout, _out(r)
 
 
 def test_u7_the_verdict_is_asked_again_under_the_lock(checkout):
@@ -721,7 +999,7 @@ def test_u10_new_commit_is_the_base_at_both_sites(tmp_path, history):
     for site in sites:
         script = (
             f'GENESIS_ROOT="{root}"\nON_LIVE=1\nDEPLOY_HEAD="{base}"\n'
-            + _block("live-prestop")
+            + _block("live-helpers")
             + site
             + 'echo "NEW=$NEW_COMMIT TAG=$NEW_TAG"\n'
         )
@@ -756,9 +1034,7 @@ def test_u11_a_live_rollback_restores_the_hooks(plain_live, on_live):
     assert _git(root, "rev-parse", "HEAD") == _git(root, "rev-parse", TAG)
     if on_live == "1":
         line = log.read_text().strip()
-        assert line.startswith(f"restore-hooks {tip} {TAG} lockfd=") and line.endswith("re=yes"), (
-            line
-        )
+        assert line.startswith(f"restore-hooks {tip} {TAG} lockfd=") and " re=yes " in line, line
         assert "lockfd=-" not in line
     else:
         assert not log.exists()
@@ -776,7 +1052,7 @@ def test_u11_a_failed_restore_only_warns(plain_live):
     )
 
 
-# ── the live prestop handler ────────────────────────────────────────────────
+# ── the prestop handler ─────────────────────────────────────────────────────
 
 
 def _prestop(root: Path, on_live: str, before: str = "", *, written: bool = False) -> str:
@@ -788,8 +1064,6 @@ def _prestop(root: Path, on_live: str, before: str = "", *, written: bool = Fals
         + _function("_clear_deploy_marker")
         + _function("_clear_deploy_state")
         + _function("_on_signal_prestop")
-        + _block("live-prestop")
-        + "_acquire_deploy_marker\n"
         + before
         + "_on_signal_prestop TERM\n"
     )
@@ -801,48 +1075,17 @@ def _other_runs_state(home: Path) -> Path:
     return state
 
 
-def test_u12_unmoved_keeps_the_other_runs_state_and_deletes_the_tag(plain_live):
+@pytest.mark.parametrize("on_live", ["1", "0"])
+def test_u12_a_prestop_interrupt_clears_its_own_state_on_both_branches(plain_live, on_live):
+    """Before the stop nothing has moved on `live` either (the rebuild runs after
+    it), so the handler is main's: its own "fetching" row goes, the tag stays for
+    the caller to drop, and nothing describes a move."""
     root, home, stub, env, log = plain_live
     state = _other_runs_state(home)
-    r = _bash(_prestop(root, "1"), env)
-    assert r.returncode == 1, _out(r)
-    assert state.exists(), "the live prestop handler deleted another run's state"
-    assert not (home / ".genesis" / "update_in_progress.pid").exists()
-    assert _git(root, "tag", "-l", TAG) == ""
-    assert "live was not moved" in r.stdout
-
-
-@pytest.mark.parametrize("how", ["moved", "index-lock"])
-def test_u12_a_move_or_a_half_done_git_keeps_the_tag(plain_live, how):
-    root, home, stub, env, log = plain_live
-    state = _other_runs_state(home)
-    before = (
-        'git -C "$GENESIS_ROOT" commit -q --allow-empty -m moved\n'
-        if how == "moved"
-        else ': > "$GENESIS_ROOT/.git/index.lock"\n'
-    )
-    r = _bash(_prestop(root, "1", before), env)
-    assert r.returncode == 1, _out(r)
-    assert state.exists()
-    assert _git(root, "tag", "-l", TAG) == TAG
-    if how == "moved":
-        assert "live moved to" in r.stdout and "re-run scripts/update.sh" in r.stdout
-    else:
-        # HEAD never moved: what is on disk may be a half-written switch, and
-        # re-running is not the next step.
-        assert "half-written tree" in r.stdout and "git status" in r.stdout, r.stdout
-        assert "live moved to" not in r.stdout and "re-run" not in r.stdout
-    assert not (home / ".genesis" / "update_in_progress.pid").exists()
-
-
-def test_u12_control_off_live_clears_the_state(plain_live):
-    """Off `live` the handler is armed after this run wrote its own "fetching"
-    state, and that file goes."""
-    root, home, stub, env, log = plain_live
-    state = _other_runs_state(home)
-    r = _bash(_prestop(root, "0", written=True), env)
+    r = _bash(_prestop(root, on_live, written=True), env)
     assert r.returncode == 1, _out(r)
     assert not state.exists()
+    assert "live moved" not in r.stdout and "live was not moved" not in r.stdout
 
 
 def test_u12_off_live_a_state_this_run_never_wrote_stays(plain_live):
@@ -954,206 +1197,40 @@ def test_b1_bootstrap_does_not_roll_live_back(tmp_path):
     assert _recovery_git(root, "rev-parse", "HEAD") == merged
 
 
-# ── what a refusal says after the rebuild began ─────────────────────────────
+# ── a stop that fails, on `live` ────────────────────────────────────────────
 
 
-def _stop_abort_branch() -> str:
-    """The stop's abort branch: genesis-server could not be stopped."""
+def _snapshot_to_stop() -> str:
+    """update.sh from its one snapshot call through the stop."""
     text = _text()
-    start = text.index("    if ! _ensure_server_down; then\n")
-    end = text.index("\n    fi\n", start) + len("\n    fi\n")
-    return text[start:end]
+    start = text.index("_take_db_snapshot || exit 1\n")
+    return text[start : text.index("# Restart the tmp watchgod", start)]
 
 
-@pytest.mark.parametrize(("on_live", "post_merge"), [("1", "false"), ("1", "true"), ("0", "false")])
-def test_sf1_a_failed_stop_on_live_says_where_live_is(plain_live, on_live, post_merge):
-    """The EXIT trap is quiet once the stop began, so the abort branch itself
-    names the rebuilt tip and the old one."""
+def test_p2_a_failed_stop_on_live_has_moved_nothing(plain_live):
+    """#3370 P2 #2: a server that cannot be stopped aborts the update before
+    anything moved on `live` (the rebuild runs after the stop), so main's own
+    message is the whole story: the checkout is still at the tag, untouched, and
+    the engine never ran."""
     root, home, stub, env, log = plain_live
-    _git(root, "commit", "-q", "--allow-empty", "-m", "the rebuilt tip")
-    short = _git(root, "rev-parse", "--short", "HEAD")
+    old = _git(root, "rev-parse", "HEAD")
     script = (
-        f'GENESIS_ROOT="{root}"\nON_LIVE={on_live}\nPOST_MERGE={post_merge}\n'
-        f"ORIGINAL_BRANCH=live\nROLLBACK_TAG={TAG}\n"
-        + _block("live-prestop")
-        + "_LIVE_STOPPED=1\n_ensure_server_down() { return 1; }\n"
-        + _stop_abort_branch()
+        _plain_script(root, stub).split("trap _on_err ERR")[0]
+        + "_take_db_snapshot() { :; }\n"
+        + "_guardian_pause() { :; }\n_guardian_resume() { :; }\n"
+        + "_drop_own_prestop_state() { :; }\n_flush_deploy_summary() { :; }\n"
+        + '_SELF_COPY="$HOME/self-copy"\n'
+        + 'systemctl() { [ "$2" = is-active ] && [ "${@: -1}" = genesis-server.service ]; }\n'
+        + "_ensure_server_down() { return 1; }\n"
+        + _snapshot_to_stop()
+        + 'echo "NOT REACHED"\n'
     )
     r = _bash(script, env)
     assert r.returncode == 1, _out(r)
-    if on_live == "0":
-        assert "live is at" not in r.stdout
-        return
-    assert f"live is at {short}" in r.stdout and f"tag {TAG}" in r.stdout, r.stdout
-    assert "without activation" in r.stdout
-    if post_merge == "true":
-        assert "re-run scripts/update.sh --post-merge." in r.stdout
-    else:
-        assert "re-run scripts/update.sh." in r.stdout and "--post-merge" not in r.stdout
-
-
-@pytest.mark.parametrize("post_merge", ["false", "true"])
-def test_the_moved_message_names_the_run_to_repeat(plain_live, post_merge):
-    root, home, stub, env, log = plain_live
-    _git(root, "commit", "-q", "--allow-empty", "-m", "the rebuilt tip")
-    script = (
-        f'GENESIS_ROOT="{root}"\nPOST_MERGE={post_merge}\nORIGINAL_BRANCH=live\n'
-        f"ROLLBACK_TAG={TAG}\n" + _block("live-prestop") + "_live_moved_message\n"
-    )
-    r = _bash(script, env)
-    assert r.returncode == 0, _out(r)
-    assert "live moved to" in r.stdout
-    assert ("re-run scripts/update.sh --post-merge" in r.stdout) is (post_merge == "true")
-
-
-def test_a_marker_refusal_comes_before_any_edit_is_cleared(plain_live):
-    """The marker is taken before the rebuild block, so a refusal over it leaves
-    the excused local edits where they are and changes nothing."""
-    root, home, stub, env, log = plain_live
-    (root / "AGENTS.md").write_text("v1\n")
-    _git(root, "add", "AGENTS.md")
-    _git(root, "commit", "-qm", "agents")
-    _git(root, "tag", "-f", TAG)
-    (root / "AGENTS.md").write_text("local edit\n")
-    # A live foreign holder: this test's own process.
-    marker = home / ".genesis" / "update_in_progress.pid"
-    marker.write_text(f"{os.getpid()}\n")
-    r = _bash(_plain_script(root, stub), env)
-    assert r.returncode == 1, _out(r)
-    assert "holds the deploy marker" in r.stdout and "Nothing was changed" in r.stdout
-    assert (root / "AGENTS.md").read_text() == "local edit\n"
-    assert not log.exists(), "the engine ran without the deploy marker"
-    assert _git(root, "tag", "-l", TAG) == ""
-    assert marker.read_text() == f"{os.getpid()}\n", "a refused run took the holder's marker"
-
-
-# ── F5: the deploy marker, in both modes ────────────────────────────────────
-
-
-def _marker_script(root: Path, on_live: str, post_merge: str, after: str = "") -> str:
-    return (
-        f'GENESIS_ROOT="{root}"\nON_LIVE={on_live}\nPOST_MERGE={post_merge}\n'
-        f"ORIGINAL_BRANCH=live\nROLLBACK_TAG={TAG}\n"
-        'VALIDATED_HEAD="$(git -C "$GENESIS_ROOT" rev-parse HEAD)"\n_SELF_COPY="$HOME/self-copy"\n'
-        "_guardian_resume() { :; }\n_flush_deploy_summary() { :; }\n"
-        + _block("live-prestop")
-        + _block("live-marker")
-        + 'echo "RESULT PID=$$ MARKER=$(cat "$DEPLOY_MARKER_FILE" 2>/dev/null || echo none)"\n'
-        + after
-    )
-
-
-@pytest.mark.parametrize("post_merge", ["true", "false"])
-def test_f5_live_takes_the_marker_before_the_stop_in_both_modes(plain_live, post_merge):
-    """--post-merge skips the rebuild, yet it holds the server stopped until the
-    bootstrap state row: the marker must cover it too, and go on exit."""
-    root, home, stub, env, log = plain_live
-    # The stop and the activation: the EXIT trap still releases the marker.
-    r = _bash(_marker_script(root, "1", post_merge, "_LIVE_STOPPED=1\nexit 0\n"), env)
-    assert r.returncode == 0, _out(r)
-    res = _result(r)
-    assert res["MARKER"] == res["PID"], "live ran toward the stop without the deploy marker"
-    marker = home / ".genesis" / "update_in_progress.pid"
-    assert not marker.exists(), "the deploy marker outlived the run"
-
-
-def test_f5_main_never_takes_the_marker(plain_live):
-    root, home, stub, env, log = plain_live
-    r = _bash(_marker_script(root, "0", "true"), env)
-    assert r.returncode == 0, _out(r)
-    assert _result(r)["MARKER"] == "none"
-
-
-def test_f5_the_marker_is_taken_for_every_live_run_before_the_stop():
-    text = _text()
-    block = _block("live-marker")
-    # Gated on `live` alone: never on POST_MERGE, which only decides the tag.
-    gate = block.index('\nif [ "${ON_LIVE:-0}" = 1 ]; then\n')
-    assert "POST_MERGE" not in block[: block.index("_acquire_deploy_marker")]
-    assert gate < block.index("_acquire_deploy_marker")
-    assert "_acquire_deploy_marker" in block and "trap '_live_prestop_exit;" in block
-    marker = text.index("# BEGIN live-marker")
-    assert text.index('_write_state "fetching"') < marker
-    assert marker < text.index('echo "--- Stopping services for update ---"')
-    assert marker < text.index("# BEGIN live-rebuild")
-    assert "_acquire_deploy_marker" not in _block("live-rebuild")
-
-
-# ── F1: the database snapshot, retaken after the rebuild ────────────────────
-
-
-def test_f1_live_retakes_the_snapshot_after_the_rebuild_before_the_stop():
-    text = _text()
-    block = _block("live-rebuild")
-    recheck = block.index('--upto "$_live_tip" --also "$ROLLBACK_TAG"')
-    engine = block.index('"$SCRIPT_DIR/deploy_candidates.py" rebuild')
-    snap = block.index("_take_db_snapshot")
-    assert engine < recheck < snap
-    assert "_live_abandon 1" in block[snap:]
-    # The first snapshot still runs early, where a failure has moved nothing.
-    assert text.index("_take_db_snapshot || exit 1") < text.index("# BEGIN live-rebuild")
-    # The authority check is the copy read at the start, run isolated.
-    snapshot = _block("db-snapshot")
-    assert 'python3 -I -S -c "$_PEER_RESTORE_PY"' in snapshot
-    assert "-m genesis" not in snapshot
-    assert '_PEER_RESTORE_PY="$(cat ' in text[: text.index("# BEGIN live-prestop")]
-
-
-def _db_rows(path: Path) -> list[str]:
-    con = sqlite3.connect(path)
-    try:
-        return [r[0] for r in con.execute("SELECT v FROM t ORDER BY rowid")]
-    finally:
-        con.close()
-
-
-def test_f1_a_write_during_the_rebuild_is_in_the_snapshot(dc, dc_ready, capsys):
-    """The server keeps writing while the engine rebuilds; the snapshot a
-    rollback would restore must hold those writes."""
-    w = dc_ready
-    old_base = _live_world(dc, w, capsys)
-    db = w.home / "live.db"
-    con = sqlite3.connect(db)
-    con.execute("CREATE TABLE t (v TEXT)")
-    con.execute("INSERT INTO t VALUES ('before')")
-    con.commit()
-    con.close()
-    # The engine reads the serving commit through this stub mid-rebuild: it
-    # stands in for the server writing in that window.
-    stub = w.root / "scripts" / "deploy_code_only.sh"
-    stub.write_text(
-        "#!/bin/bash\n"
-        f'python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); '
-        f'c.execute(\\"INSERT INTO t VALUES (\'during\')\\"); c.commit()" "{db}"\n'
-        f'echo "serving: {w.rev("HEAD")}"\necho "server-state: active inactive"\n'
-    )
-    w.advance_main({"c.txt": "c\n"})
-    # The early snapshot, as update.sh takes it before the rebuild.
-    r = _bash(_rebuild_script(w, old_base, pre="_take_db_snapshot\n"), _env(w.home))
-    assert r.returncode == 0, _out(r)
-    assert _result(r)["SNAP"] == "1"
-    assert "during" in _db_rows(db), "the stub never wrote; nothing was tested"
-    for name in ("live.db.pre-update", "live.db.pre-update.peer-restore"):
-        assert "during" in _db_rows(w.home / name), f"{name} predates the rebuild"
-
-
-def test_f1_a_failed_refresh_after_the_move_says_live_moved(dc, dc_ready, capsys):
-    w = dc_ready
-    old_base = _live_world(dc, w, capsys)
-    old_tip = w.rev("HEAD")
-    con = sqlite3.connect(w.home / "live.db")
-    con.execute("CREATE TABLE t (v TEXT)")
-    con.commit()
-    con.close()
-    w.advance_main({"c.txt": "c\n"})
-    refuse = "_PEER_RESTORE_PY='import sys; sys.exit(1)'\n"
-    r = _bash(_rebuild_script(w, old_base, pre=refuse), _env(w.home))
-    assert r.returncode == 1, _out(r)
-    assert "RESTORE AUTHORITY CHECK FAILED" in r.stderr
-    assert "live moved to" in r.stdout and "RESULT" not in r.stdout
-    assert w.rev("refs/heads/live") != old_tip and _tag(w) == old_tip
-    assert not _marker(w).exists()
-    assert _no_state(w)
+    assert "could not stop genesis-server" in r.stdout and "NOT REACHED" not in r.stdout
+    assert _git(root, "rev-parse", "HEAD") == old
+    assert _git(root, "status", "--porcelain", "--untracked-files=no") == ""
+    assert _engine_calls(log) == [], "the rebuild ran before the stop"
 
 
 # ── F3: tier-2 against the activated tip ───────────────────────────────────
@@ -1241,83 +1318,6 @@ def test_f3_the_record_follows_the_success_row():
     assert success < record < text.index('_write_state "done"', success)
 
 
-# ── R3-A: what ran before the rebuild is restarted after it ────────────────
-
-_FAKE_SERVICES = """#!/bin/bash
-# systemctl / pgrep stand-in: "running" iff $FAKE_STATE_FILE holds the unit's name.
-state="$(cat "$FAKE_STATE_FILE" 2>/dev/null || true)"
-case "$(basename "$0")" in
-    systemctl) unit="${@: -1}"; unit="${unit%.service}" ;;
-    pgrep) unit=genesis-server ;;
-esac
-[[ " $state " == *" $unit "* ]]
-"""
-
-
-def _stop_detection() -> str:
-    """update.sh's detection of what runs, just before the stop."""
-    text = _text()
-    start = text.index("\nWERE_RUNNING=()\n") + 1
-    return text[start : text.index("# Now stop them.", start)]
-
-
-def _services_env(tmp_path: Path, home: Path) -> tuple[dict[str, str], Path]:
-    bin_ = tmp_path / "fakebin"
-    bin_.mkdir(exist_ok=True)
-    for name in ("systemctl", "pgrep"):
-        (bin_ / name).write_text(_FAKE_SERVICES)
-        (bin_ / name).chmod(0o755)
-    state = tmp_path / "services"
-    env = _env(home, FAKE_STATE_FILE=str(state))
-    env["PATH"] = f"{bin_}{os.pathsep}{env['PATH']}"
-    return env, state
-
-
-def _were_running(plain_live, tmp_path, on_live: str, at_marker: str, at_stop: str) -> list[str]:
-    """Run live-marker with services `at_marker` running, then the stop's
-    detection with `at_stop` running; returns WERE_RUNNING."""
-    root, home, stub, _env_unused, log = plain_live
-    env, state = _services_env(tmp_path, home)
-    script = (
-        # Set where branch-admission sets it, never inherited.
-        f'_LIVE_WERE_RUNNING=()\necho "{at_marker}" > "{state}"\n'
-        + _marker_script(root, on_live, "false")
-        + f'echo "{at_stop}" > "{state}"\n'
-        + _stop_detection()
-        + 'echo "WERE=${WERE_RUNNING[*]:-}"\n'
-    )
-    r = _bash(script, env)
-    assert r.returncode == 0, _out(r)
-    m = re.search(r"^WERE=(.*)$", r.stdout, re.MULTILINE)
-    assert m, _out(r)
-    return m.group(1).split()
-
-
-def test_r3a_a_server_that_died_during_the_rebuild_is_still_restarted(plain_live, tmp_path):
-    assert _were_running(plain_live, tmp_path, "1", "genesis-server", "") == ["genesis-server"]
-
-
-def test_r3a_a_server_still_running_is_listed_once(plain_live, tmp_path):
-    assert _were_running(plain_live, tmp_path, "1", "genesis-server", "genesis-server") == [
-        "genesis-server"
-    ]
-
-
-def test_r3a_main_reads_only_the_stop(plain_live, tmp_path):
-    """Off `live` nothing is sampled at the marker: the stop alone decides."""
-    assert _were_running(plain_live, tmp_path, "0", "genesis-server", "") == []
-    assert _were_running(plain_live, tmp_path, "0", "", "genesis-bridge") == ["genesis-bridge"]
-
-
-def test_r3a_the_sample_precedes_the_marker():
-    block = _block("live-marker")
-    sample = block.index('_LIVE_WERE_RUNNING+=("genesis-server")')
-    assert sample < block.index("_acquire_deploy_marker")
-    assert '_LIVE_WERE_RUNNING+=("genesis-bridge")' in block[: sample + 400]
-    # Never inherited: set where the other `live` variables are.
-    assert "\n_LIVE_WERE_RUNNING=()\n" in _block("branch-admission")
-
-
 # ── R3-B: the restore authority check comes from the reviewed base ─────────
 
 _PEER_PATH = "src/genesis/db/crud/peer_restore.py"
@@ -1377,83 +1377,6 @@ def test_r3b_an_empty_check_fails_the_snapshot_closed(tmp_path):
     assert r.returncode == 0, _out(r)
     assert "SNAP=refused 0" in r.stdout, _out(r)
     assert "RESTORE AUTHORITY CHECK FAILED" in r.stderr
-
-
-# ── R3-A: an interrupt during the rebuild restores what ran at the marker ────
-
-# systemctl: `is-active` answers from FAKE_SERVER_ACTIVE (1 = active) and is not
-# recorded; every other call is recorded. pgrep: finds a bare server iff FAKE_PGREP=1.
-_RECORDING_SYSTEMCTL = """#!/bin/bash
-for a in "$@"; do
-    if [ "$a" = is-active ]; then [ "${FAKE_SERVER_ACTIVE:-0}" = 1 ]; exit; fi
-done
-echo "systemctl $*" >> "$CALLS"
-exit 0
-"""
-_FAKE_PGREP = '#!/bin/bash\n[ "${FAKE_PGREP:-0}" = 1 ]\n'
-
-
-def _prestop_restarts(
-    tmp_path: Path, were: str, live_were: str, active: bool = False, bare: bool = False
-) -> tuple[list[str], str]:
-    """Run the real _on_signal_prestop with `WERE_RUNNING=(were)` and
-    `_LIVE_WERE_RUNNING=(live_were)`. Returns the service calls it made (a
-    `_start_genesis_server` call is a RESTART, recorded as such) and the
-    `_LIVE_STOPPED` value it left for the moved-message."""
-    bin_ = tmp_path / "bin"
-    bin_.mkdir()
-    for name, body in (("systemctl", _RECORDING_SYSTEMCTL), ("pgrep", _FAKE_PGREP)):
-        (bin_ / name).write_text(body)
-        (bin_ / name).chmod(0o755)
-    calls = tmp_path / "calls"
-    env = _env(
-        tmp_path,
-        CALLS=str(calls),
-        FAKE_SERVER_ACTIVE="1" if active else "0",
-        FAKE_PGREP="1" if bare else "0",
-    )
-    env["PATH"] = f"{bin_}{os.pathsep}{env['PATH']}"
-    script = (
-        f"WERE_RUNNING=({were})\n_LIVE_WERE_RUNNING=({live_were})\nON_LIVE=1\n"
-        '_start_genesis_server() { echo "restart-server" >> "$CALLS"; }\n'
-        '_live_abandon() { echo "LIVE_STOPPED=${_LIVE_STOPPED:-0}"; }\n'
-        "_clear_deploy_state() { :; }\n"
-        + _function("_on_signal_prestop")
-        + "_on_signal_prestop TERM\n"
-    )
-    r = _bash(script, env)
-    assert r.returncode == 1, _out(r)
-    m = re.search(r"^LIVE_STOPPED=(\S*)$", r.stdout, re.MULTILINE)
-    assert m, _out(r)
-    return (calls.read_text().splitlines() if calls.exists() else []), m.group(1)
-
-
-def test_r3a_an_interrupt_brings_back_a_server_that_died_during_the_rebuild(tmp_path):
-    """The rebuild runs before WERE_RUNNING is read: what the marker sampled and
-    is down now comes back, each once, and the moved-message says so."""
-    got, stopped = _prestop_restarts(tmp_path, "", "genesis-server genesis-bridge")
-    assert got == ["restart-server", "systemctl --user start genesis-bridge.service"], got
-    assert stopped == "1"
-
-
-def test_r3a_an_interrupt_never_bounces_a_running_server(tmp_path):
-    """A server still running when the rebuild is interrupted gets no call: a
-    restart would put it on the moved tree without activation."""
-    got, stopped = _prestop_restarts(tmp_path, "", "genesis-server genesis-bridge", active=True)
-    assert got == ["systemctl --user start genesis-bridge.service"], got
-    assert stopped == "0"
-
-
-def test_r3a_an_interrupt_leaves_a_bare_server_alone(tmp_path):
-    """Not active per systemd, but a bare `genesis serve` runs: still running."""
-    got, stopped = _prestop_restarts(tmp_path, "", "genesis-server", bare=True)
-    assert got == [], got
-    assert stopped == "0"
-
-
-def test_r3a_an_interrupt_restarts_a_service_listed_twice_once(tmp_path):
-    got, _stopped = _prestop_restarts(tmp_path, "genesis-server", "genesis-server")
-    assert got == ["restart-server"], got
 
 
 # ── R3-B: on `live` the backup gate is the reviewed base's ─────────────────

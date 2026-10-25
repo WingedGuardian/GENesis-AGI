@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import os
@@ -337,6 +338,74 @@ def parent_identity(path: Path):
     return value.st_dev, value.st_ino
 
 
+def _writable_path(path: Path, *, directory: bool, readable: bool = False) -> None:
+    """Observe this caller's namespace without creating a probe or directory."""
+    target = path
+    while True:
+        try:
+            info = target.stat()
+            break
+        except FileNotFoundError:
+            if target.is_symlink() or target == target.parent:
+                raise
+            target = target.parent
+    if (directory or target != path) and not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"managed worker requires a directory: {path}")
+    if target == path and not directory and not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"managed worker requires a regular file: {path}")
+    permission = os.W_OK | (os.X_OK if stat.S_ISDIR(info.st_mode) else 0)
+    if readable and target == path:
+        permission |= os.R_OK
+    if (os.statvfs(target).f_flag & os.ST_RDONLY
+            or not os.access(target, permission, effective_ids=True)):
+        raise ValueError(
+            f"managed worker write path unavailable: {path}; check permissions and the "
+            "runner's operator-owned ReadWritePaths allowlist"
+        )
+
+
+def queue_initialization_advisory() -> dict:
+    """Conditional append-lock prerequisites; no schema or contention probe."""
+    result = {
+        "path": None, "exists": None, "state": "unavailable", "error": None,
+        "required_when": "queue initialization or schema upgrade",
+    }
+    try:
+        state = absolute(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
+        lock = state / "index-requests/.queue-db-init.lock"
+        result["path"] = str(lock)
+        try:
+            lock.lstat()
+            result["exists"] = True
+        except FileNotFoundError:
+            result["exists"] = False
+        _writable_path(lock, directory=False)
+        result["state"] = "observed_writable" if result["exists"] else "absent"
+    except (OSError, ValueError, RuntimeError) as error:
+        result["error"] = str(error)
+    return result
+
+
+def verify_worker_writes(config: dict, persistence: bool) -> None:
+    """Advisory write prerequisites; real IO failures retain their classification."""
+    state = absolute(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
+    cache = Path(config["cache"])
+    queue = state / "index-requests"
+    for path in (Path(config["runtime"]), state / "locks"):
+        _writable_path(path, directory=True)
+    for path in (cache, queue):
+        _writable_path(path, directory=True, readable=True)
+    _writable_path(state / "code-intelligence-runner.log", directory=False)
+    for database in (queue / "queue.sqlite3", *cache.glob("*.db")):
+        if database.name == "_config.db":
+            continue  # immutable configuration is validated through the RO reader
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            _writable_path(Path(str(database) + suffix), directory=False, readable=True)
+    if persistence:
+        _writable_path(Path("/tmp"), directory=True)  # noqa: S108 - observe pinned root; no creation
+        _writable_path(Path(config["main"]) / ".codebase-memory", directory=True)
+
+
 def absolute(raw: str) -> Path:
     if not isinstance(raw, str) or not raw or any(c in raw for c in "\n\r\x00"):
         raise ValueError("invalid managed path")
@@ -348,6 +417,13 @@ def absolute(raw: str) -> Path:
 
 def units_dir() -> Path:
     return Path.home() / ".config/systemd/user"
+
+
+def first_existing_parent(path: Path) -> Path:
+    parent = path.parent
+    while not parent.exists():
+        parent = parent.parent
+    return parent
 
 
 def config_path(raw: str) -> Path:
@@ -506,3 +582,36 @@ def frontend_command(main: Path, settings: Path, unit: str, backend: str, slice_
     bridge = 'exec "$$CBM_CLIENT_PYTHON" -I "$$CBM_CLIENT_HELPER" --config "$$CBM_CLIENT_CONFIG" client --unit "$$CBM_CLIENT_UNIT"'
     command.extend(("--", "/bin/sh", "-c", bridge))
     return command
+
+
+def verify_binary_access(fd: int, *, execute: bool) -> None:
+    """Retain source mode checks; executing roles also need effective inode access."""
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111
+            or (execute and not os.access(f"/proc/self/fd/{fd}", os.X_OK, effective_ids=True))):
+        raise ValueError("managed binary must be a regular executable")
+
+
+def parse_arguments(argv: list[str] | None, description: str | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--config", default=None)
+    commands = parser.add_subparsers(dest="command", required=True)
+    setup = commands.add_parser("configure")
+    for key in ("main", "binary", "state", "sentinel"):
+        setup.add_argument("--" + key, required=True)
+    commands.add_parser("status")
+    commands.add_parser("serve")
+    commands.add_parser("ready")
+    commands.add_parser("launch")
+    child = commands.add_parser("client")
+    child.add_argument("--unit", required=True)
+    availability = commands.add_parser("available")
+    availability.add_argument("--repo", required=True)
+    availability.add_argument("--persistence", choices=("true", "false"), default="true")
+    for command in ("enable", "disable", "remove"):
+        commands.add_parser(command)
+    teardown = commands.add_parser("uninstall")
+    teardown.add_argument("arguments", nargs=argparse.REMAINDER)
+    verification = commands.add_parser("verify-uninstall-locks")
+    verification.add_argument("fds", type=int, nargs=3)
+    return parser.parse_args(argv)

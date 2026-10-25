@@ -41,6 +41,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     canonical_sources,
     cgroup_empty,
     config_path,
+    first_existing_parent,
     frontend_command,
     implicit_slice_absent,
     index_writer_targets_main,
@@ -48,6 +49,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     native_env,
     native_install,
     parent_identity,
+    queue_initialization_advisory,
     sentinel_armed,
     systemctl_env,
     units_dir,
@@ -55,6 +57,11 @@ from codebase_managed_unit import (  # noqa: E402,F401
     validate_frontend_boundary,
     validate_provider_paths,
     validate_source_identity,
+    verify_binary_access,
+    verify_worker_writes,
+)
+from codebase_managed_unit import (  # noqa: E402
+    parse_arguments as native_parse_arguments,
 )
 
 SCRIPT = Path(__file__).resolve()
@@ -287,6 +294,7 @@ def retire_managed():
 
 def runtime_config(path: Path) -> dict:
     config = read_settings(path)
+    validate_provider_paths(config)
     main = absolute(config["main"]).resolve(strict=True)
     if main != SCRIPT.parent.parent or not (main / ".git").is_dir():
         raise ValueError("managed runtime requires its configured primary checkout")
@@ -298,6 +306,7 @@ def validate_loaded_backend(config: dict) -> None:
 
 
 def runtime_preflight(config: dict) -> None:
+    validate_provider_paths(config)
     verify_cache(config)
     with verified_binary(Path(config["binary"])):
         pass  # fail before changing native state when the accepted inode is invalid
@@ -504,16 +513,17 @@ def validate_settings(value: dict, *, require_build: bool = True) -> dict:
     return value
 
 
-def verified_binary(path: Path):
-    """Execute this verified inode, not a later resolution of its pathname."""
+def verified_binary(path: Path, *, execute: bool = True):
+    """Verify this inode; only a staging copy source may omit effective execute access."""
     absolute(str(path))
     fd = os.open(path, os.O_RDONLY | OPEN_FLAGS)
     stream = os.fdopen(fd, "rb")
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
-            raise ValueError("managed binary must be a regular executable")
-        if hashlib.file_digest(stream, "sha256").hexdigest() != BUILD:
+        verify_binary_access(fd, execute=execute)
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if digest.hexdigest() != BUILD:
             raise ValueError("unsupported managed executable; repeat acceptance before upgrading")
         stream.seek(0)
     except BaseException:
@@ -538,13 +548,6 @@ def sync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-
-
-def first_existing_parent(path: Path) -> Path:
-    parent = path.parent
-    while not parent.exists():
-        parent = parent.parent
-    return parent
 
 
 def sync_ancestors(path: Path, stop: Path) -> None:
@@ -630,7 +633,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         staging_created = False
         try:
             existing_parent = first_existing_parent(state)
-            with verified_binary(source) as executable:
+            with verified_binary(source, execute=False) as executable:
                 state.mkdir(parents=True, mode=0o700)
                 staging_created = True
                 (state / "bin").mkdir(mode=0o700)
@@ -670,7 +673,8 @@ def configure(args: argparse.Namespace, path: Path) -> None:
 
 def status(path: Path | None, path_error: str | None = None) -> dict:
     """Diagnose broken/old configuration without running its binary or requiring it."""
-    result = dict(settings=None, settings_error=path_error, service=None, manager_error=None)
+    result = dict(settings=None, settings_error=path_error, service=None, manager_error=None,
+                  queue_initialization=queue_initialization_advisory())
     try:
         if path is not None:
             value = read_document(path)
@@ -797,6 +801,7 @@ def verify_frontend_boundary(unit: str) -> None:
 
 def launch(config: dict, path: Path) -> None:
     """Read-only preflight; the actual capped child owns final admission."""
+    validate_provider_paths(config)
     verify_cache(config)
     ready(config)
     main = absolute(config["main"]).resolve(strict=True)
@@ -839,6 +844,7 @@ def check_backend(config: dict, *, starting: bool = False, timeout: float = 30) 
 
 
 def ready(config: dict) -> None:
+    validate_provider_paths(config)
     deadline = time.monotonic() + 120
     native_deadline = None
     require_enabled(config)
@@ -884,6 +890,7 @@ def ready(config: dict) -> None:
 
 
 def serve(config: dict) -> None:
+    validate_provider_paths(config)
     require_enabled(config)
     verify_cache(config)
     verify_query_boundary("self")
@@ -925,30 +932,21 @@ def uninstall_main(args: argparse.Namespace) -> int:
         return 1
 
 
-def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=None)
-    commands = parser.add_subparsers(dest="command", required=True)
-    setup = commands.add_parser("configure")
-    for key in ("main", "binary", "state", "sentinel"):
-        setup.add_argument("--" + key, required=True)
-    commands.add_parser("status")
-    commands.add_parser("serve")
-    commands.add_parser("ready")
-    commands.add_parser("launch")
-    child = commands.add_parser("client")
-    child.add_argument("--unit", required=True)
-    for command in ("enable", "disable", "remove"):
-        commands.add_parser(command)
-    teardown = commands.add_parser("uninstall")
-    teardown.add_argument("arguments", nargs=argparse.REMAINDER)
-    verification = commands.add_parser("verify-uninstall-locks")
-    verification.add_argument("fds", type=int, nargs=3)
-    return parser.parse_args(argv)
+def available(path: Path, repo: str, persistence: bool = True) -> None:
+    config = runtime_config(path)
+    if absolute(repo).resolve(strict=True) != Path(config["main"]):
+        raise ValueError("managed indexing requires the configured physical main checkout")
+    verify_worker_writes(config, persistence)
+    verify_cache(config)
+    require_enabled(config)
+    validate_loaded_backend(config)
+    with verified_binary(Path(config["binary"])):
+        check_backend(config)
+    require_enabled(config)
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_arguments(argv)
+    args = native_parse_arguments(argv, __doc__)
     try:
         home = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
         absolute(home)
@@ -985,6 +983,8 @@ def main(argv: list[str] | None = None) -> int:
             launch(read_settings(path), path)
         elif args.command == "client":
             client(path, args.unit)
+        elif args.command == "available":
+            available(path, args.repo, args.persistence == "true")
         else:
             config = runtime_config(path)
             (serve if args.command == "serve" else ready)(config)

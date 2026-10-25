@@ -41,6 +41,16 @@ class IntegrityResult:
     checked_fingerprint: dict[str, int | str] | None = None
 
 
+def ro_uri(db_path: str | Path) -> str:
+    """A SQLite ``mode=ro`` URI for *db_path*, with the path percent-quoted.
+
+    Quoting is load-bearing: an unquoted ``?`` or ``#`` in the path would be
+    read as the start of the URI query or fragment, so SQLite would open a
+    DIFFERENT file than the one named. Pass the result with ``uri=True``.
+    """
+    return f"file:{quote(str(Path(db_path).resolve()), safe='/')}?mode=ro"
+
+
 def quarantine_path() -> Path:
     return genesis_home() / QUARANTINE_FILENAME
 
@@ -199,7 +209,7 @@ def _quick_check_stable_identity(db_path: Path) -> IntegrityResult | None:
         before = _fingerprint(db_path)
     except FileNotFoundError:
         return None
-    uri = f"file:{quote(str(db_path.resolve()), safe='/')}?mode=ro"
+    uri = ro_uri(db_path)
     error_proves_corruption = False
     try:
         with sqlite3.connect(uri, uri=True) as conn:

@@ -4,8 +4,14 @@ Four socket ops, reachable only by a peer that ``peer_check`` verified as the
 genesis-health MCP server (``vault_service._handle`` runs that check):
 
 - ``release_request {card_ref, host, page_title, amount, claim_hash,
-  field_origins}`` -> ``{nonce}``. Checks the request, shows the owner a tap
-  (``approval.PaymentApprovalRegistry.request``) and returns at once.
+  field_origins, button_label?, also_filled?}`` -> ``{nonce}``. Checks the
+  request, shows the owner a tap (``approval.PaymentApprovalRegistry.request``)
+  and returns at once. ``button_label`` is the visible label of the Pay control
+  the fill tool will click, read from the page; the tap shows it on a
+  ``Button`` line, or ``(not given)`` when the request has none. ``also_filled``
+  lists the NAMES (never the values) of the non-card fields the tool will fill,
+  each one of ``FILL_NAMES``; the tap shows them on an ``Also filled`` line, or
+  ``none``.
 - ``release_status {nonce}`` -> ``{state, expires_in_s}``, the state one of
   ``pending``, ``granted``, ``refused``, ``expired``. A claimed release reads
   ``expired`` (used up); a cancelled or unknown one reads ``refused``.
@@ -46,10 +52,12 @@ safe (a lost card, never a card handed to someone else).
 
 Every request, grant, claim, refusal and cancel is a value-free row in
 ``payment_vault_events``: nonce, card ref, host, the field-origin hosts, the
-verified peer and a fixed reason. The amount and page title are the
-requester's free text: the tap shows them, and the request row records only
-their lengths. A refused request records only ``{reason, peer}``, never the
-input it rejected, and a nonce is recorded only when this service issued it.
+verified peer and a fixed reason. The amount, page title and button label are
+the requester's free text: the tap shows them, and the request row records only
+their lengths (the button label's as null when none was given). The request row
+also records the ``also_filled`` names, which hold no value. A refused request
+records only ``{reason, peer}``, never the input it rejected, and a nonce is
+recorded only when this service issued it.
 Every row also passes ``vault_service``'s one guard, which withholds any
 string with a run of 12 or more digits. The vault never writes a card value it
 holds; what it cannot promise is that requester text it must show (the host,
@@ -90,10 +98,34 @@ _CHECK_EVERY_S = 30.0  # loop time; the deadline itself is on the service clock
 _RECENT = 16
 _TITLE_CHARS = 80
 _AMOUNT_CHARS = 32
+_BUTTON_CHARS = 40  # a Pay control's label is short: the title's rule, at half its cap
+_NO_BUTTON = "(not given)"  # what the tap shows when a request carries no label
+# The non-card fields a fill may also fill, in the order the tap lists them.
+# Names only: a request never carries their values.
+FILL_NAMES = (
+    "email",
+    "name",
+    "phone",
+    "address_line1",
+    "address_line2",
+    "city",
+    "region",
+    "postal_code",
+    "country",
+    "company",
+)
 _ORIGIN_KEYS = frozenset(
     {"number", "expiry", "exp_month", "exp_year", "cvc", "name", "postal_code"}
 )
 _EXPIRY_KEYS = ("exp_month", "exp_year")  # one "expiry" field is both
+#: Unicode Default_Ignorable_Code_Point (DerivedCoreProperties.txt), the ranges
+#: that render as nothing. Most are category Cf/Cn and dropped anyway; this
+#: catches the rest (Mn variation selectors, U+034F, Hangul fillers, U+115F/60).
+_DEFAULT_IGNORABLE = re.compile(
+    r"[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f"
+    r"\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8"
+    r"\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+)
 _CLAIM_HASH = re.compile(r"[0-9a-f]{64}")
 _NONCE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _ORIGIN = re.compile(r"(https?)://([^/:?#@]+)(?::([0-9]{1,5}))?")
@@ -125,17 +157,32 @@ class _Release:
     row: dict = field(default_factory=dict)  # value-free facts every row repeats
 
 
-def _sanitise_title(title: str) -> str:
-    text = unicodedata.normalize("NFC", title)
+def _sanitise_shown(raw: str, *, empty: str, cap: int) -> str:
+    """Page-supplied text as the tap shows it: one printable line, at most ``cap`` long."""
+    text = unicodedata.normalize("NFC", raw)
     # Drops controls, format characters (bidi overrides, zero-width joiners),
-    # surrogates, private-use and unassigned code points.
+    # surrogates, private-use and unassigned code points, and the Unicode
+    # default-ignorable code points that are not in those categories (variation
+    # selectors and the combining grapheme joiner are Mn): they render as nothing,
+    # so a label carrying one could pass as text it merely looks like.
     # A newline or tab separates words; it becomes a space, then whitespace collapses.
     text = "".join(
         " " if ch.isspace() else ch
-        for ch in text
+        for ch in _DEFAULT_IGNORABLE.sub("", text)
         if ch.isspace() or not unicodedata.category(ch).startswith("C")
     )
-    return (" ".join(text.split()) or "(no title)")[:_TITLE_CHARS]
+    return (" ".join(text.split()) or empty)[:cap].rstrip()  # a cut can end on a space
+
+
+def _also_filled(value) -> tuple[str, ...]:
+    """The extra field names: each one of ``FILL_NAMES``, at most once, in that order."""
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise _Refusal("bad also_filled")
+    if len(set(value)) != len(value) or not set(value) <= set(FILL_NAMES):
+        raise _Refusal("bad also_filled")
+    return tuple(n for n in FILL_NAMES if n in value)
 
 
 def _host(value) -> str:
@@ -200,7 +247,9 @@ class ReleaseManager:
 
     # -- rows, tasks, endings ------------------------------------------------
 
-    async def _row(self, event: str, detail: dict) -> bool:
+    async def _row(self, event: str, detail: dict, *, stopping: bool = False) -> bool:
+        if stopping:  # only stop()'s own abort row passes the stopped-service guard
+            return await self._svc._audit(event, detail, _stopping=True)
         return await self._svc._audit(event, detail)
 
     def _spawn(self, coro, name: str) -> asyncio.Task:
@@ -234,15 +283,21 @@ class ReleaseManager:
         while len(self._recent) > _RECENT:
             self._recent.popitem(last=False)
 
-    async def _refuse_slot(self, rel: _Release, reason: str, state: str = REFUSED) -> None:
+    async def _refuse_slot(
+        self, rel: _Release, reason: str, state: str = REFUSED, *, stopping: bool = False
+    ) -> None:
         if self._end(rel, state):
-            await self._row("release_refused", {**rel.row, "reason": reason})
+            await self._row("release_refused", {**rel.row, "reason": reason}, stopping=stopping)
 
-    async def abort(self, reason: str) -> None:
-        """Refuse the release in the slot (lock, relock, stop). A decided claim completes."""
+    async def abort(self, reason: str, *, stopping: bool = False) -> None:
+        """Refuse the release in the slot (lock, relock, stop). A decided claim completes.
+
+        ``stopping`` is the service's stop: the service already refuses late audit
+        writes, so the refusal row is written as part of the stop.
+        """
         rel = self._slot
         if rel is not None and not rel.decided:
-            await self._refuse_slot(rel, reason)
+            await self._refuse_slot(rel, reason, stopping=stopping)
 
     def _arm(self, rel: _Release) -> None:
         if rel.timer is not None:
@@ -338,8 +393,16 @@ class ReleaseManager:
                 raise _Refusal("bad amount")
             if not isinstance(title, str):
                 raise _Refusal("bad page_title")
-            title = _sanitise_title(title)
+            title = _sanitise_shown(title, empty="(no title)", cap=_TITLE_CHARS)
+            button = request.get("button_label")  # optional; None is "not given"
+            if button is not None:
+                if not isinstance(button, str):
+                    raise _Refusal("bad button_label")
+                button = _sanitise_shown(button, empty="(no label)", cap=_BUTTON_CHARS)
+                if button == _NO_BUTTON:  # page text posing as "the tool sent none"
+                    raise _Refusal("bad button_label")
             origins = _origins(request.get("field_origins"))
+            also = _also_filled(request.get("also_filled"))
             try:
                 cards = await asyncio.to_thread(vs.list_cards, svc._vault)
             except (vs.VaultError, OSError):
@@ -358,7 +421,9 @@ class ReleaseManager:
                 "Card": f"{row['label']} ending {row['last4']}",
                 "Requester": f"{peer.comm} pid {peer.pid}, {session} (claude pid {peer.claude_pid})",
                 "Page title": title,
+                "Button": _NO_BUTTON if button is None else button,
                 "Fields": ", ".join(f"{k}={v}" for k, v in origins.items()),
+                "Also filled": ", ".join(also) or "none",
             }
             # What the registry would refuse is refused here, before any row.
             try:
@@ -377,8 +442,13 @@ class ReleaseManager:
                 **facts,
                 # Requester-supplied free text, shown in the tap: recorded only as
                 # lengths, as the approval registry does (it can hold a short card value).
-                "field_lengths": {"amount": len(amount), "page_title": len(title)},
+                "field_lengths": {
+                    "amount": len(amount),
+                    "page_title": len(title),
+                    "button_label": None if button is None else len(button),
+                },
                 "field_origins": origins,
+                "also_filled": list(also),  # names from FILL_NAMES, never values
             },
         ):
             return {"ok": False, "error": "the audit write failed"}
