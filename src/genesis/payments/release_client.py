@@ -75,23 +75,31 @@ async def request_release(
     field_origins: dict[str, str],
     button_label: str,
     also_filled: list[str],
+    consent_labels: list[str] | None = None,
+    step_labels: list[str] | None = None,
 ) -> dict:
-    """``{ok, nonce}`` or ``{ok: False, error}`` (the service's fixed reason).
-    ``button_label`` is the Pay control's visible text and ``also_filled`` the
-    names (never values) of the non-card fields filled; the tap shows both."""
-    return await _ask(
-        {
-            "op": "release_request",
-            "card_ref": card_ref,
-            "host": host,
-            "page_title": page_title,
-            "amount": amount,
-            "claim_hash": claim_hash,
-            "field_origins": field_origins,
-            "button_label": button_label,
-            "also_filled": also_filled,
-        }
-    )
+    """``{ok, nonce, shown}`` or ``{ok: False, error}`` (the service's fixed reason).
+    ``button_label`` is the Pay control's visible text, ``also_filled`` the
+    names (never values) of the non-card fields filled, and ``consent_labels``
+    the labels of the checkboxes the fill will tick after the tap; the tap shows
+    all three."""
+    request = {
+        "op": "release_request",
+        "card_ref": card_ref,
+        "host": host,
+        "page_title": page_title,
+        "amount": amount,
+        "claim_hash": claim_hash,
+        "field_origins": field_origins,
+        "button_label": button_label,
+        "also_filled": also_filled,
+    }
+    # Only when there are any; the reply's "shown" says the tap showed them.
+    if consent_labels:
+        request["consent_labels"] = consent_labels
+    if step_labels:
+        request["step_labels"] = step_labels
+    return await _ask(request)
 
 
 async def release_status(nonce: str) -> dict:
