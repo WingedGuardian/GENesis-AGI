@@ -355,6 +355,16 @@ def mirror_credential_backup(
 
     if not src_files:
         logger.debug("Backup clone %s has no encrypted creds to mirror", src_root)
+        # A vault archive mirrored before the exclusion still goes, even when the
+        # vault is all the clone holds; the rest of the mirror is left as it was.
+        old = shared_base / _CREDS_SUBDIR / _MIRROR_SUBDIR
+        if old.is_dir() and not old.is_symlink():
+            keep = {
+                f.relative_to(old)
+                for f in old.rglob("*")
+                if f.is_file() and not _is_vault_archive(f.relative_to(old))
+            }
+            _prune_to_keep(old, keep)
         return None
 
     dest_root = shared_base / _CREDS_SUBDIR / _MIRROR_SUBDIR

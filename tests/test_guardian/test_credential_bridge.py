@@ -490,6 +490,20 @@ class TestMirrorCredentialBackup:
         assert (dest / "creds" / "claude.json.gpg").exists()  # everything else still is
         assert "count=3" in (dest / "MIRROR_STAMP").read_text()
 
+    def test_an_old_vault_archive_goes_even_when_the_vault_is_all_the_clone_holds(
+        self, tmp_path: Path
+    ) -> None:
+        from genesis.guardian.credential_bridge import mirror_credential_backup
+        clone = self._clone(tmp_path, rels=("creds/payment_vault.tar.gpg",))
+        shared = tmp_path / "shared"
+        dest = shared / "guardian" / "creds-mirror"
+        (dest / "creds").mkdir(parents=True)
+        (dest / "creds" / "payment_vault.tar.gpg").write_bytes(b"OLD")  # mirrored before
+        (dest / "creds" / "claude.json.gpg").write_bytes(b"KEEP")
+        assert mirror_credential_backup(shared_dir=shared, backup_dir=clone) is None
+        assert not (dest / "creds" / "payment_vault.tar.gpg").exists()
+        assert (dest / "creds" / "claude.json.gpg").read_bytes() == b"KEEP"
+
     def test_skips_unchanged_on_second_run(self, tmp_path: Path) -> None:
         from genesis.guardian.credential_bridge import mirror_credential_backup
         clone = self._clone(tmp_path)
