@@ -90,7 +90,9 @@ import stat
 import subprocess
 import sys
 import tarfile
+import threading
 import time
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
@@ -1285,7 +1287,7 @@ def _sidecar_meta_path(trash_path: Path) -> Path:
     return Path(str(trash_path) + ".meta.json")
 
 
-def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
+def _compress_entry(trash_path: Path, meta: dict, *, keep_source: bool = False) -> Path | None:
     """Replace a trashed directory with a gzip tarball. Returns the archive path.
 
     The original directory is removed ONLY after the archive is written AND read
@@ -1371,6 +1373,15 @@ def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
         _atomic_write_text(_sidecar_meta_path(trash_path), json.dumps(meta, indent=2),
                            mode=_PRIVATE_FILE_MODE)
 
+    if keep_source:
+        _log(f"RESUME {trash_path.name}: verified archive published; source directory retained")
+        return archive
+    _remove_archived_source(trash_path, archive)
+    return archive
+
+
+def _remove_archived_source(trash_path: Path, archive: Path) -> None:
+    """Normal reaping only: the verified archive precedes source cleanup."""
     try:
         shutil.rmtree(str(trash_path))
     except OSError as e:
@@ -1387,9 +1398,6 @@ def _compress_entry(trash_path: Path, meta: dict) -> Path | None:
         _log(f"WARN could not fully remove {trash_path} after archiving: {e} — "
              f"KEEPING the verified archive at {archive.name}; the leftover "
              f"directory may be incomplete and should be removed by hand")
-        return archive
-
-    return archive
 
 
 def _atomic_write_text(
@@ -1461,18 +1469,13 @@ def _write_board_cache(results: list[dict]) -> None:
         print(f"WARN could not write board cache {BOARD_CACHE}: {e}", file=sys.stderr)
 
 
-def _append_tombstone(record: dict) -> None:
+def _append_tombstone(record: dict) -> bool:
     """Append one line to the tombstone index. Best-effort and never fatal.
 
     Failing to write a tombstone must not abort a reap — the archive is the
     durable artifact and this is the index over it.
     """
-    try:
-        TOMBSTONE_INDEX.parent.mkdir(parents=True, exist_ok=True)
-        with TOMBSTONE_INDEX.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, sort_keys=True) + "\n")
-    except OSError as e:
-        _log(f"WARN could not append tombstone for {record.get('name')}: {e}")
+    return _append_record(record)
 
 
 def _unique_commits(ref: str, repo_root: Path, limit: int = 50) -> list[str]:
@@ -1582,6 +1585,24 @@ def _trash_name_taken(trash_path: Path) -> bool:
 
 
 def _trash_worktree(
+    wt: dict, repo_root: Path, *, dry_run: bool = False,
+    lane: str = "merged", merge_method: str = "",
+    min_idle_days: float | None = None,
+) -> bool:
+    """Serialize a reap with recovery, expiry and interrupted-archive resume."""
+    options = dict(dry_run=dry_run, lane=lane, merge_method=merge_method,
+                   min_idle_days=min_idle_days)
+    if dry_run:
+        return _trash_worktree_locked(wt, repo_root, **options)
+    with _lifecycle_lock() as held:
+        if held:
+            return _trash_worktree_locked(wt, repo_root, **options)
+        wt["held"] = "another lifecycle operation holds the archive lock"
+        _log(f"SKIP {wt['path']}: {wt['held']}")
+        return False
+
+
+def _trash_worktree_locked(
     wt: dict, repo_root: Path, *, dry_run: bool = False,
     lane: str = "merged", merge_method: str = "",
     min_idle_days: float | None = None,
@@ -2093,9 +2114,7 @@ def _trash_worktree(
         archive = _compress_entry(trash_path, meta)
         stored = archive if archive is not None else trash_path
 
-        meta["archive"] = str(archive) if archive else ""
-        meta["stored_at"] = str(stored)
-        _append_tombstone(meta)
+        _finish_archive(meta, stored)
 
         _log(f"TRASH {wt_path}: {ref_label} [{lane}] → {stored}")
         return True
@@ -3883,9 +3902,17 @@ def _resolve_retention_days(cli_days: int | None) -> tuple[int | None, str]:
     return TRASH_RETENTION_DAYS, f"{TRASH_RETENTION_DAYS}d default"
 
 
+_LIFECYCLE_OWNER: tuple[int, int] | None = None
+
+
 @contextlib.contextmanager
 def _lifecycle_lock():
     """Exclusive, NON-blocking lock over the trash. Yields False when busy."""
+    global _LIFECYCLE_OWNER
+    owner = (os.getpid(), threading.get_ident())
+    if owner == _LIFECYCLE_OWNER:
+        yield True
+        return
     try:
         TRASH_DIR.mkdir(parents=True, exist_ok=True)
         fd = os.open(
@@ -3901,7 +3928,11 @@ def _lifecycle_lock():
         except OSError:
             yield False
             return
-        yield True
+        _LIFECYCLE_OWNER = owner
+        try:
+            yield True
+        finally:
+            _LIFECYCLE_OWNER = None
     finally:
         os.close(fd)
 
@@ -4007,19 +4038,208 @@ def _read_meta(meta_path: Path) -> dict:
 
 
 def _append_record(record: dict) -> bool:
-    """Append to the tombstone index, REPORTING failure. Expiry must not delete
-    an archive whose intent it could not record: the record is what lets a later
-    run finish removing the anchor if this one dies half-way."""
+    """Durably append one logical event; interrupted publication is retryable.
+
+    Archive completion is idempotent; expiry's distinct event types retain
+    their existing semantics. Every writer shares the lifecycle lock.
+    """
+    with _lifecycle_lock() as held:
+        if not held:
+            _log("WARN index write deferred: another lifecycle operation is active")
+            return False
+        return _publish_record(record)
+
+
+def _read_index() -> tuple[str, list[dict]]:
+    if TOMBSTONE_INDEX.is_symlink():
+        raise ValueError("index is a symlink")
     try:
+        with TOMBSTONE_INDEX.open(encoding="utf-8", newline="") as stream:
+            text = stream.read()
+    except FileNotFoundError:
+        return "", []
+    rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    if any(not isinstance(row, dict) for row in rows):
+        raise ValueError("index contains a non-object record")
+    for row in rows:
+        for key in ("name", "original_path", "commit", "stored_at", "archive", "event"):
+            if key in row and row[key] is not None and not isinstance(row[key], str):
+                raise ValueError(f"index {key} must be a string")
+    return text, rows
+
+
+def _publish_record(record: dict) -> bool:
+    try:
+        text, rows = _read_index()
+        if not record.get("event") and any(
+            not row.get("event") and all(row.get(k) == record.get(k)
+                                        for k in ("name", "original_path", "commit", "stored_at"))
+            for row in rows
+        ):
+            return True
         TOMBSTONE_INDEX.parent.mkdir(parents=True, exist_ok=True)
-        with TOMBSTONE_INDEX.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, sort_keys=True) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-    except OSError as e:
+        # Preserve every existing logical record and byte; rename means a kill
+        # cannot leave half a JSONL record that prevents the next retry.
+        temporary = TOMBSTONE_INDEX.with_name(f".{TOMBSTONE_INDEX.name}.{os.getpid()}.publish")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, _PRIVATE_FILE_MODE)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(text + ("\n" if text and not text.endswith("\n") else ""))
+                fh.write(json.dumps(record, sort_keys=True) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temporary, TOMBSTONE_INDEX)
+            _fsync_path(TOMBSTONE_INDEX.parent)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+    except (OSError, ValueError) as e:
         _log(f"WARN could not append to the tombstone index: {e}")
         return False
     return True
+
+
+def _finish_archive(meta: dict, stored: Path) -> bool:
+    record = {**meta, "stored_at": str(stored),
+              "archive": str(stored) if stored.name.endswith(ARCHIVE_SUFFIX) else ""}
+    return _append_tombstone(record)
+
+
+def _published_identity(archive: Path, entry: str) -> tuple[dict, str]:
+    """Read identity without extraction; force gzip to EOF before trusting it."""
+    if archive.is_symlink():
+        raise ValueError("published archive is a symlink")
+    found = {}
+    with tarfile.open(archive, "r:gz") as tf:
+        for member in tf:
+            if member.name in (f"{entry}/.trash_meta.json", f"{entry}/.git"):
+                if not member.isfile() or member.name in found or member.size > 1024 * 1024:
+                    raise ValueError("ambiguous or oversized archive identity")
+                found[member.name] = tf.extractfile(member).read()
+        while tf.fileobj.read(1024 * 1024):
+            pass
+    return (json.loads(found[f"{entry}/.trash_meta.json"]),
+            found[f"{entry}/.git"].decode("utf-8", "surrogateescape"))
+
+
+def _resume_has_holders(directory: Path) -> bool:
+    """Hold visible same-uid cwd/fd users. Retry ALWAYS retains the source.
+
+    Some same-uid descriptors (including the user systemd manager) are opaque.
+    They are not evidence of a holder. Keeping the complete source after retry
+    avoids making data preservation depend on perfect /proc visibility.
+    """
+    if _find_processes_in_dir(str(directory)):
+        return True
+    prefix = str(directory.resolve()).rstrip(os.sep) + os.sep
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            for fd in (process / "fd").iterdir():
+                try:
+                    target = os.readlink(fd)
+                except (FileNotFoundError, PermissionError):
+                    continue
+                if target.startswith(prefix) or target == prefix[:-1]:
+                    return True
+        except (FileNotFoundError, PermissionError):
+            continue
+    return False
+
+
+def _resume_entry(repo_root: Path, anchor: dict, *, dry_run: bool) -> dict:
+    entry = anchor["entry"]
+    directory = TRASH_DIR / entry
+    archive = _archive_path(directory)
+    if not _path_absent(anchor["path"]):
+        raise ValueError("original worktree path is present or unreadable")
+    if _resume_has_holders(directory):
+        raise ValueError("retained directory has a live holder")
+    if archive.exists() or archive.is_symlink():
+        meta, pointer = _published_identity(archive, entry)
+        sidecar = _sidecar_meta_path(directory)
+        if sidecar.is_symlink():
+            raise ValueError("archive sidecar is a symlink")
+        if sidecar.exists() and _read_meta(sidecar) != meta:
+            raise ValueError("embedded archive metadata and sidecar disagree")
+        stored = archive
+    else:
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("neither a published archive nor a retained source exists")
+        metadata = directory / ".trash_meta.json"
+        if metadata.is_symlink():
+            raise ValueError("source metadata is a symlink")
+        meta = _read_meta(metadata)
+        status, pointer = _read_git_pointer(directory / ".git")
+        if status != "ok":
+            raise ValueError("retained source has no readable Git identity")
+        stored = directory
+    if (not isinstance(meta, dict) or meta.get("name") != entry
+            or meta.get("original_path") != anchor["path"]
+            or not isinstance(meta.get("commit"), str)
+            or not re.fullmatch(r"[a-f0-9]{40,64}", meta["commit"])):
+        raise ValueError("archive metadata does not identify this registration")
+    status, admin = _registration_for_pointer(pointer, anchor["path"], repo_root)
+    if status != "ok" or admin != anchor["admin"] or _read_lock_file(admin) != anchor["reason"]:
+        raise ValueError("Git registration no longer owns this archive")
+    head = _run_git(repo_root, ["--git-dir", str(admin), "rev-parse", "HEAD"], timeout=15)
+    if not head or head.strip() != meta["commit"]:
+        raise ValueError("archive commit differs from its retained registration")
+    if dry_run:
+        _log(f"WOULD RESUME {entry}: source and history identity verified")
+        return meta
+    if stored == directory:
+        stored = _compress_entry(directory, meta, keep_source=True)
+        if stored is None:
+            raise ValueError("compression did not finish; source retained")
+    elif directory.exists():
+        _log(f"RESUME {entry}: keeping leftover directory; published archive is authoritative")
+    if not _finish_archive(meta, stored):
+        raise ValueError("archive retained; index completion could not be published")
+    _log(f"RESUMED {entry}: {stored}")
+    return meta
+
+
+def _resume_archives(repo_root: Path, *, dry_run: bool = False) -> tuple[dict, int]:
+    """Reconcile owned incomplete entries, without auditing indexed history."""
+    updates = {}
+    if not TRASH_DIR.exists():
+        return updates, 0
+    try:
+        _, records = _read_index()
+        completed = {(r.get("name"), r.get("original_path")) for r in records
+                     if not r.get("event") and r.get("archive")}
+        anchors = _archive_anchors(repo_root)
+        if anchors is None:
+            raise ValueError("could not enumerate archive registrations")
+        names = {p.name for p in TRASH_DIR.iterdir()}
+    except (OSError, ValueError) as e:
+        _log(f"RESUME HELD: {e}")
+        return updates, 1
+    failures = 0
+    for anchor in anchors:
+        entry, original = anchor["entry"], anchor["path"]
+        if entry + ARCHIVE_SUFFIX in names and (entry, original) in completed:
+            continue
+        if not any(n in names for n in (entry, entry + ARCHIVE_SUFFIX, entry + ARCHIVE_SUFFIX + ".part")):
+            continue
+        try:
+            if dry_run:
+                _resume_entry(repo_root, anchor, dry_run=True)
+            else:
+                with _lifecycle_lock() as held:
+                    if not held:
+                        raise ValueError("another lifecycle operation is active")
+                    _resume_entry(repo_root, anchor, dry_run=False)
+            updates[original] = {"state": "archived", "action": "none", "reason": "archive reconciled"}
+        except (OSError, ValueError, KeyError, tarfile.TarError, EOFError, zlib.error) as e:
+            failures += 1
+            updates[original] = {"state": STATE_PROTECTED, "action": "none", "reason": f"archive held: {e}"}
+            _log(f"RESUME HELD {entry}: {e}")
+    return updates, failures
 
 
 def _deleted_names() -> set[str]:
@@ -4382,6 +4602,34 @@ def _release_stale_claims(repo_root: Path, *, dry_run: bool = False) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _refresh_resumed_board(repo_root: Path, resumed: dict, *, no_network: bool) -> None:
+    results = classify_all(repo_root, allow_network=not no_network)
+    for row in results:
+        row.update(resumed.get(row["path"], {}))
+    if not no_network:
+        _write_board_cache(results)
+
+
+def _reap_results(results: list[dict], repo_root: Path, *, dry_run: bool, publish: bool) -> None:
+    for row in results:
+        if row["action"] == "none":
+            _log(f"SKIP {row['path']}: {row['reason']}")
+            continue
+        done = _trash_worktree(
+            row, repo_root, dry_run=dry_run,
+            lane="merged" if row["merged"] else "unmerged", merge_method=row["merge_method"],
+            min_idle_days=MERGED_STALE_DAYS if row["merged"] else UNMERGED_STALE_DAYS,
+        )
+        if dry_run:
+            continue
+        row["action"] = "none"
+        row["state"] = "archived" if done else STATE_PROTECTED
+        row["reason"] = ("archived by this run; recover with --recover" if done
+                         else f"archive held this run: {row.pop('held', 'archive interrupted')}")
+        if publish:
+            _write_board_cache(results)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Worktree lifecycle manager")
     parser.add_argument("--dry-run", action="store_true",
@@ -4393,6 +4641,8 @@ def main() -> int:
     parser.add_argument("--report-json", action="store_true",
                         help="Print the classification of every worktree as JSON "
                              "and exit, changing nothing")
+    parser.add_argument("--resume-archives", action="store_true",
+                        help="Finish owned interrupted archives and missing completion records")
     parser.add_argument("--expire-trash", action="store_true",
                         help="Expire clean MERGED archives older than the retention window: "
                              "delete the archive, then unlock and prune its registration. "
@@ -4515,6 +4765,16 @@ def main() -> int:
         print(json.dumps(results, indent=2))
         return 0
 
+    resumed, resume_failures = _resume_archives(repo_root, dry_run=args.dry_run)
+    if args.resume_archives:
+        if not args.dry_run:
+            try:
+                _refresh_resumed_board(repo_root, resumed, no_network=args.no_network)
+            except WorktreeScanError as e:
+                _log(f"ERROR could not refresh board after resume: {e}")
+                return 2
+        return 2 if resume_failures else 0
+
     # Normal run: archive stale worktrees into the trash. Nothing is deleted.
     _log("Worktree lifecycle check starting")
 
@@ -4528,6 +4788,8 @@ def main() -> int:
         _log(f"ERROR could not enumerate worktrees: {e} — board NOT updated, nothing reaped")
         return 2
     _log(f"Found {len(results)} linked worktree(s)")
+    for row in results:
+        row.update(resumed.get(row["path"], {}))
     # Publish BEFORE acting: if a reap below fails partway, the board still
     # describes the tree the run actually saw. NOT under --dry-run, whose whole
     # contract is that it changes nothing on disk.
@@ -4545,36 +4807,8 @@ def main() -> int:
     # MEASURED 2026-09-10, session 59b971ca authored PR #1702 and has no
     # cc_sessions row and no transcript in any of 532 CC project directories, so
     # its commits are the whole record. A timer must not be what ends that.
-    for r in results:
-        if r["action"] == "none":
-            _log(f"SKIP {r['path']}: {r['reason']}")
-            continue
-        _trash_worktree(
-            r, repo_root, dry_run=args.dry_run,
-            lane="merged" if r["merged"] else "unmerged",
-            merge_method=r["merge_method"],
-            min_idle_days=MERGED_STALE_DAYS if r["merged"] else UNMERGED_STALE_DAYS,
-        )
-
-    # Republish AFTER acting. The pre-flight publish above is for crash-safety;
-    # left alone it would advertise `action: trash` for the next 24 hours against
-    # worktrees that were archived seconds later and no longer exist. Reclassifying
-    # would cost another full scan, so the acted-on rows are simply retired in
-    # place — which is exactly what the dashboard needs to stop showing ghosts.
-    # A row the archive step HELD keeps its worktree, so it stops advertising
-    # `action: trash` too, with the reason, whatever held it: a re-check above,
-    # or an error the archive step reported in the log.
-    if not args.dry_run and not args.no_network:
-        for r in results:
-            if r["action"] == "none":
-                continue
-            r["action"] = "none"
-            if "held" not in r and not Path(r["path"]).exists():
-                r["state"] = "archived"
-                r["reason"] = "archived by this run; recover with --recover"
-            else:
-                r["reason"] = f"archive held this run: {r.pop('held', 'see the reaper log')}"
-        _write_board_cache(results)
+    _reap_results(results, repo_root, dry_run=args.dry_run,
+                  publish=not args.dry_run and not args.no_network)
 
     tally: dict[str, int] = {}
     for r in results:
@@ -4582,7 +4816,7 @@ def main() -> int:
     _log("States: " + ", ".join(f"{k}={v}" for k, v in sorted(tally.items())))
 
     _log("Worktree lifecycle check complete")
-    return 0
+    return 2 if resume_failures else 0
 
 
 if __name__ == "__main__":
