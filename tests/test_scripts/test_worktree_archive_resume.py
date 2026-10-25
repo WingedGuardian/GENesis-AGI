@@ -87,6 +87,43 @@ def test_published_archive_is_authoritative_and_leftover_is_retained(entry, monk
     assert json.loads(wl.TOMBSTONE_INDEX.read_text())["commit"] == meta["commit"]
 
 
+def _publish_without_sidecar(moved):
+    meta = json.loads((moved / ".trash_meta.json").read_text())
+    with tarfile.open(wl._archive_path(moved), "w:gz") as tf:
+        tf.add(moved, arcname=moved.name)
+    assert not wl._sidecar_meta_path(moved).exists()
+    return meta
+
+
+def test_a_missing_sidecar_is_restored_before_completion(entry, monkeypatch):
+    """Listing and trash expiry read only the sidecar, and a completed entry is
+    never resumed again, so completion must not publish without one."""
+    _, _, moved = entry
+    meta = _publish_without_sidecar(moved)
+    assert run_resume(monkeypatch) == 0
+    assert json.loads(wl._sidecar_meta_path(moved).read_text()) == meta
+    listed = dict(wl._iter_trash_entries())
+    assert json.loads(listed[wl._archive_path(moved)].read_text()) == meta
+
+
+def test_a_sidecar_that_cannot_be_restored_keeps_the_entry_incomplete(entry, monkeypatch):
+    _, _, moved = entry
+    _publish_without_sidecar(moved)
+    real = wl._atomic_write_text
+
+    def refuse_sidecar(path, *args, **kwargs):
+        if path == wl._sidecar_meta_path(moved):
+            raise OSError("disk full")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(wl, "_atomic_write_text", refuse_sidecar)
+    assert run_resume(monkeypatch) != 0
+    assert not wl.TOMBSTONE_INDEX.exists() or not wl.TOMBSTONE_INDEX.read_text().strip()
+    monkeypatch.setattr(wl, "_atomic_write_text", real)
+    assert run_resume(monkeypatch) == 0
+    assert wl._sidecar_meta_path(moved).is_file()
+
+
 @pytest.mark.parametrize("problem", ["dry-run", "bad-metadata", "original-present", "busy", "corrupt-index", "corrupt-archive"])
 def test_ambiguous_or_readonly_states_preserve_source(entry, monkeypatch, problem):
     repo, original, moved = entry

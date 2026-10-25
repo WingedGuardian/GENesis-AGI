@@ -4197,6 +4197,17 @@ def _resume_entry(repo_root: Path, anchor: dict, *, dry_run: bool) -> dict:
             raise ValueError("compression did not finish; source retained")
     elif directory.exists():
         _log(f"RESUME {entry}: keeping leftover directory; published archive is authoritative")
+    # Listing and trash expiry read only the sidecar, and a completed entry is
+    # never resumed again: restore a missing one from the verified metadata
+    # before completion, or the archive stays unlabelled for good. A failed
+    # write keeps the entry incomplete so the next run retries it.
+    sidecar = _sidecar_meta_path(directory)
+    if stored != directory and not sidecar.exists() and not sidecar.is_symlink():
+        try:
+            _atomic_write_text(sidecar, json.dumps(meta, indent=2), mode=_PRIVATE_FILE_MODE)
+        except OSError as e:
+            raise ValueError(f"archive sidecar could not be restored: {e}") from e
+        _log(f"RESUME {entry}: restored missing archive sidecar")
     if not _finish_archive(meta, stored):
         raise ValueError("archive retained; index completion could not be published")
     _log(f"RESUMED {entry}: {stored}")
