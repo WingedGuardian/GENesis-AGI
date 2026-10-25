@@ -141,6 +141,35 @@ def test_explicit_review_identity_reaches_unchanged_policy(adapter, monkeypatch,
     assert seen == [("1", "owner/repo")]
 
 
+@pytest.mark.parametrize("flag", ["--repo {}", "--repo={}", "-R {}", "-R{}", "-R={}"])
+@pytest.mark.parametrize("repo", ["github.com/owner/repo", "github.com/other/repo"])
+@pytest.mark.parametrize("before", [False, True])
+def test_mixed_review_selectors_never_query_budget(adapter, monkeypatch, flag, repo, before):
+    url = "https://github.com/owner/repo/pull/1"
+    selector = flag.format(repo)
+    target = f"{selector} {url}" if before else f"{url} {selector}"
+    monkeypatch.setattr(adapter.requests._review_budget, "evaluate_pr",
+                        lambda *a, **kw: pytest.fail("budget lookup"))
+    assert isinstance(adapter.decide(payload(f'gh pr comment {target} --body "@codex review"')),
+                      adapter.Fixable)
+
+
+@pytest.mark.parametrize("selector", [
+    "1 --repo github.com/owner/repo", "1 -R=github.com/owner/repo",
+    "https://github.com/owner/repo/pull/1",
+])
+def test_literal_review_identity_queries_intended_budget(adapter, monkeypatch, selector):
+    seen = []
+
+    def budget(repo, number, **kwargs):
+        seen.append((repo, number))
+        return {"status": "ok", "approval_required": False}
+
+    monkeypatch.setattr(adapter.requests._review_budget, "evaluate_pr", budget)
+    assert adapter.decide(payload(f'gh pr comment {selector} --body "--repo other/repo @codex review"')) is None
+    assert seen == [("owner/repo", "1")]
+
+
 @pytest.mark.parametrize("command", [
     f"git -C {ROOT} commit -m x", 'gh pr comment 1 --repo github.com/owner/repo --body "@codex review"',
 ])

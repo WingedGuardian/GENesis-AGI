@@ -541,6 +541,7 @@ Before finalizing any skill:
 | Missing Genesis fields | Skill evolution system can't track it | Add `consumer`, `phase`, `skill_type` |
 | No in-skill examples | Abstract instructions get misinterpreted | Add 1-2 input→output demos in SKILL.md body |
 | No negative boundaries | Skill hijacks unrelated requests | Add "Do NOT use for [list]" to description |
+| `$` followed by a digit in the body (`$0`, `$4`, `$1.50`) | Loaded with arguments, Claude Code replaces it with an argument word; `\$0` renders as `$0` when loaded but leaves a stray `\` for code that reads the file raw | Write `$ 0` in awk, `${N}` in shell, words in prose, prices as "N USD" (`tests/test_skill_body_substitution.py` enforces it) |
 
 ---
 

@@ -113,3 +113,38 @@ install_browser_extra() {
     # The checkout's ranges, not the installed metadata a failed pip left behind.
     "$venv_path/bin/python" -m genesis.browser.provision check-packages --pyproject "$repo_dir/pyproject.toml"
 }
+
+# install_runtime_extras <repo_dir> <venv_path>
+#
+# The optional groups every install uses (INSTALL_EXTRAS in
+# lib/venv_matches_pyproject.py, the one list: `test` so an install can run its
+# own suite, `payments` for the card vault), installed AFTER the core packages
+# and as their own call, for the reason install_browser_extra gives. Callers
+# treat a failure as non-fatal. A failure is also written to
+# GENESIS_DEPLOY_SUMMARY when it is set: update.sh shows only bootstrap's last
+# lines, but prints that summary on every path.
+#
+# Returns 0 when every package of those groups is installed at a version the
+# checkout accepts, 1 otherwise (each problem printed); also 1 when the guard
+# refused the install or the list cannot be read.
+install_runtime_extras() {
+    local repo_dir="$1"
+    local venv_path="$2"
+    local gate="$repo_dir/scripts/lib/venv_matches_pyproject.py"
+    local extras rc=0 out
+    extras="$("$venv_path/bin/python" -P "$gate" --install-extras 2>/dev/null)" || extras=""
+    if [ -z "$extras" ]; then
+        echo "runtime extras: cannot read the list from $gate" >&2
+        rc=1
+    else
+        editable_install_guarded "$repo_dir" "$venv_path" "$extras" || rc=1
+        # The checkout's ranges, not the installed metadata a failed pip left behind.
+        out="$("$venv_path/bin/python" -P "$gate" --extras "$extras" < "$repo_dir/pyproject.toml" 2>&1)" || rc=1
+        if [ -n "$out" ]; then echo "$out"; fi
+    fi
+    if [ "$rc" -ne 0 ] && [ -n "${GENESIS_DEPLOY_SUMMARY:-}" ]; then
+        printf '%s\n' "warning: runtime extras [${extras:-unknown}] incomplete (non-fatal); install them with scripts/update.sh --post-merge" \
+            >> "$GENESIS_DEPLOY_SUMMARY" 2>/dev/null || true
+    fi
+    return "$rc"
+}

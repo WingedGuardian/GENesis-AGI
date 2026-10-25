@@ -4,7 +4,7 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
-from genesis.eval.qualification import contracts, corpus, pinned, preflight
+from genesis.eval.qualification import contracts, corpus, pinned, preflight, sampling
 from genesis.eval.qualification.accounting import reconstruct, validate_manifest
 from genesis.eval.qualification.evidence import Campaign, Incomplete, canonical, digest
 from genesis.eval.scorers import LLMJudgeScorer
@@ -53,13 +53,13 @@ def admission_identity(checked):
         for name, rows in checked["plan"].items()
     }
     shared["runner_sources"] = {
-        name: preflight.file_hash(Path(__file__).with_name(name))
-        for name in ("run.py", "__main__.py", "execution.py", "accounting.py", "evidence.py")
+        name: preflight.file_hash(Path(__file__).parent / name)
+        for name in ("run.py", "__main__.py", "execution.py", "accounting.py", "evidence.py", "sampling.py", "../stats.py")
     }
     return deepcopy(shared)
 
 
-def validate_campaign(manifest, checked, alias):
+def validate_campaign(manifest, checked, alias, *, cases=None):
     """All frozen coordinates and wire bodies must match complete current admission."""
     validate_manifest(manifest)
     binding = manifest["binding"]
@@ -84,9 +84,12 @@ def validate_campaign(manifest, checked, alias):
         or any(not isinstance(transport.get(key), str) or not transport[key].strip()
                for key in ("receipt_provider", "provider_identity_evidence"))):
         raise Incomplete("campaign_identity_missing")
+    selected = sampling.coordinates(manifest, checked, alias, cases=cases)
     expected = {}
     for contract, rows in checked["plan"].items():
         for identity, row in rows.items():
+            if identity not in selected[contract]:
+                continue
             for repetition in REPETITIONS:
                 coordinate = contract, checked["versions"][contract], identity, repetition, row["prompt_hash"]
                 expected[coordinate] = digest(pinned.request_body(model, params, contract, row["messages"]))
@@ -311,20 +314,27 @@ async def qualify(alias, cases, params, campaign, temp_root, *, reference_policy
     if dispatch:
         _paid_eligibility(checked, operating)
     view = None
+    scoring_cases = cases
+    baseline = False
     records = unscored(cases, "campaign_unavailable")
     clamped = dict.fromkeys(cases, 0)
     try:
         view = campaign if dispatch or isinstance(campaign, ReadView) else ReadView(campaign)
-        validate_campaign(view.state.manifest, checked, alias)
+        manifest = view.state.manifest
+        baseline = sampling.has_sample(manifest)
+        validate_campaign(manifest, checked, alias, cases=cases)
+        scoring_cases = sampling.campaign_cases(cases, checked, manifest, alias)
         factory = operating.router if dispatch else pinned.PinnedRouter
         router = factory(view, alias=alias, params=params, dispatch=dispatch,
                          config=config, transport=transport)
     except (ValueError, OSError):
+        if baseline:
+            raise
         if dispatch:
             operating.stop(Incomplete("campaign_incompatible"))
-        records = unscored(cases, "campaign_incompatible")
+        records = unscored(scoring_cases, "campaign_incompatible")
     else:
-        records, clamped = await score(cases, router, temp_root)
+        records, clamped = await score(scoring_cases, router, temp_root)
     try:
         if (preflight.source_evidence(cases, source_files,
                                      retention=reference_approval.get("source_retention"))
@@ -336,8 +346,10 @@ async def qualify(alias, cases, params, campaign, temp_root, *, reference_policy
     except (ValueError, OSError):
         if dispatch:
             operating.stop(Incomplete("admission_changed"))
-        records, clamped = unscored(cases, "admission_changed"), dict.fromkeys(cases, 0)
-    result = summarize(alias, cases, records, clamped, view)
+        records, clamped = unscored(scoring_cases, "admission_changed"), dict.fromkeys(scoring_cases, 0)
+    result = summarize(alias, scoring_cases, records, clamped, view)
+    if baseline:
+        sampling.baseline_report(result, scoring_cases, records, cases)
     result["admission"] = digest(admission)
     return result, records
 

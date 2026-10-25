@@ -203,6 +203,16 @@ names, so an overlay of a read-only file is editable (#2446).
   (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`,
   `GENESIS_SQLITE_SLOW_MS` (slow-statement log threshold, default 1000, `0` = off).
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
+  Outside `env.py`: `GENESIS_MCP_LOG_DIR`, the directory of `mcp_health.log` and
+  `turnstile_debug.log` (default `~/tmp`), read when `genesis/mcp/health/browser.py` is
+  imported. Set it in the process environment before import; this knob does not
+  load itself from `secrets.env`. Relative values are anchored to HOME, tilde
+  forms are expanded, and writers and rotation use the same absolute selection.
+  An unusable directory or handler disables optional file logging without a
+  fallback directory. Nothing creates the destination automatically. The hygiene
+  timer needs the same environment value and writable access to that directory;
+  its existing `ProtectSystem`/`ReadWritePaths` confinement is unchanged, so an
+  external destination requires separate operator provisioning.
 - **The update remote** — which git remote `scripts/update.sh` fetches `main` from, and
   which the version collector compares against. Chosen by `src/genesis/util/update_remote.py`:
   env `GENESIS_UPDATE_REMOTE` (one run), then the checkout's own git config
@@ -233,9 +243,22 @@ names, so an overlay of a read-only file is editable (#2446).
   `config/mcp.json.template` by `scripts/setup_claude_config.py`, minus the servers only a
   dispatch profile uses (`INTERACTIVE_EXCLUDED_SERVERS` there, today `discord-bot`): the
   template stays the single source, and dispatched sessions get their servers from it
-  through `cc/session_config._MCP_PROFILES`. `install.sh` leaves an existing file alone, but
-  `scripts/bootstrap.sh` runs the same script, which REWRITES it whenever
-  it differs from that render, so custom entries do not survive a bootstrap. Its Genesis servers carry
+  through `cc/session_config._MCP_PROFILES`. `install.sh` leaves an existing file alone;
+  `scripts/bootstrap.sh` runs the same script, which MERGES by server name: the servers the
+  template defines (plus `INTERACTIVE_EXCLUDED_SERVERS` and `RETIRED_SERVERS`) belong to
+  Genesis and are replaced by the render, while every other server (your own, and the
+  `serena` entry bootstrap registers) and every other top-level key is kept. When the file
+  changes, the old one is saved under `~/.genesis/deploy-backups/<UTC time>/` and the run
+  names the servers it updated, added, removed or kept. The rewrite goes through a symlink
+  and keeps the file's mode, owner, group and ACL. A changed file with multiple hard links
+  is left unchanged so every alias keeps the same contents. The file
+  is left as it was, and the run says so, when it cannot keep those, cannot make a backup,
+  cannot read or write it, finds something other than a regular file, or the file changed
+  while the merge ran; `--mcp-only` then exits 1. A file that is not valid JSON is
+  backed up and replaced by the render. Edit a Genesis server in place and the next
+  bootstrap puts the template's version back (from the backup you can recover the edit);
+  give a changed copy its own name instead. A Genesis server you delete comes back at the
+  next bootstrap; to drop one for good, remove it from the template. Its Genesis servers carry
   no `env` block, so they get env from the CC process plus `secrets.env` (section 1).
 
 ---

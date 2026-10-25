@@ -133,7 +133,7 @@ are, not asking for keys. Let the user choose their comfort level.
    >
    > **2. An embedding provider** — this is how I remember things. Embeddings
    > turn text into vectors for semantic search. **DeepInfra** is fast and cheap
-   > (~$0.01/M tokens). Sign up at deepinfra.com.
+   > (~0.01 USD per million tokens). Sign up at deepinfra.com.
    >
    > **3. Telegram** — this is how I reach you. Morning reports, alerts, proactive
    > insights — all of Genesis's outreach happens over Telegram. Without it, I

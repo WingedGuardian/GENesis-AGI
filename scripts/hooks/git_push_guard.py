@@ -119,6 +119,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+from collections.abc import Callable
 from typing import Literal, NamedTuple
 
 # Self-locate so `from hook_input import …` resolves both when CC runs this as a
@@ -339,11 +340,13 @@ try:
         raw_sets_repo_env,
         seg_redirects_repo,
     )
+    from pr_close_predicate import pr_close_reason  # noqa: E402
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
         _REPARSE_CARRIERS,
         PushArg,
         PushArgKind,
+        Segment,
         analyze,
         analyze_checked,
         commit_skips_hooks,
@@ -2167,7 +2170,14 @@ def _doc_findings_mode() -> str:
 # command that merely MENTIONS a bare keyword alongside "sqlite3" without a write
 # (a `grep 'sqlite3 … DELETE' file`, or a read whose STRING VALUE is a keyword
 # like `WHERE s='DELETE'`) still matches. Excluding those needs real SQL/shell
-# parsing — tracked as a follow-up, not worth reintroducing bypass risk for.
+# parsing, which is not worth reintroducing bypass risk for. Read-only queries
+# go through `~/genesis/.venv/bin/python -m genesis db query "<sql>"` instead
+# (issue #3531; the venv interpreter, since a session shell has no `python` on
+# PATH and the system python3 cannot import genesis): SQLite
+# itself enforces read-only there (mode=ro, query_only, an allowlist
+# authorizer), and its command text carries no `sqlite3`, so no exemption is
+# needed here. A text-level exemption for `sqlite3 -readonly -safe` was
+# rejected: shell expansion, dot-commands and `.sqliterc` all bypassed it.
 _DML_KEYWORD_RE = re.compile(
     r"\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b(?!\s*\()",
     re.IGNORECASE,
@@ -4402,7 +4412,7 @@ def _check_inline_review_findings(
     # that has always stopped it.
     #
     # WHAT THIS ENFORCES IS NARROWER THAN THE DOCTRINE IT SERVES, and the two
-    # must not be conflated. The genesis-development skill's always-fix floor is
+    # must not be conflated. The closing-session skill's always-fix floor is
     # severity AND KIND — "a P1, a security defect, anything destructive or
     # fail-open". This check can only see the severity LABEL a reviewer attached,
     # so a CodeRabbit MINOR naming a fail-open scores 0.0 and passes here. The
@@ -4934,11 +4944,11 @@ def _comment_positional(argv: list[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
-# EXTRACTION patterns — what a target MEANS. `_PR_URL_RE` keeps its original
-# shape (trailing context tolerated, e.g. a `#issuecomment-…` fragment) because
-# it reads the number and OWNER/REPO out of a URL.
+# EXTRACTION patterns — what a target MEANS. `_PR_URL_RE` requires an explicit
+# scheme and host; scheme-less PR-shaped branch names stay branches. It permits
+# trailing context (e.g. a `#issuecomment-…` fragment) when reading a URL.
 _PR_NUMBER_RE = re.compile(r"#?([0-9]+)\Z")
-_PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b")
+_PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)([^/\s]+/[^/\s]+)/pull/(\d+)\b")
 
 # ALLOWLIST patterns — what the gate accepts as unambiguously LITERAL. See
 # `_unresolvable_identity` for why these are allowlists and not screens.
@@ -4948,7 +4958,7 @@ _PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b")
 # comment only at word start). It stops short of `?query`, because `?` is a
 # glob metacharacter and the shell WOULD act on it.
 _LITERAL_URL_RE = re.compile(
-    r"(?:[a-z]+://[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+"
+    r"(?:[a-z]+://[A-Za-z0-9._-]+/)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+"
     r"(?:[/#][A-Za-z0-9._/#-]*)?\Z"
 )
 # A branch name in characters that are both legal in a git ref and inert to the
@@ -4966,7 +4976,8 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     Number from a bare number, #N, or PR URL; a URL target ALSO carries its
     OWNER/REPO (counting against the hook cwd's repo for a cross-repo URL could
     produce a wrong count and a FALSE block — Codex round-1 finding). An
-    explicit ``--repo``/``-R`` flag wins over the URL-derived repo. A branch
+    explicit ``--repo``/``-R`` flag combined with a URL is refused, as are
+    unsupported explicit hosts; neither yields a usable identity. A branch
     target (non-numeric, non-URL positional) yields (None, …); the caller treats
     that unresolved identity as unknown evidence and asks/denies.
 
@@ -4977,6 +4988,8 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     be commented on, and resolving one was reading an identity out of a command
     that cannot run.
     """
+    if _unresolvable_identity(argv) is not None:
+        return None, None
     tok, _ = _comment_positional(argv)
     pr_num: str | None = None
     url_repo: str | None = None
@@ -5053,10 +5066,16 @@ def _unresolvable_identity(argv: list[str]) -> str | None:
     # Checked against the value AS WRITTEN, before the host reduction, so an
     # expansion in the host position cannot be dropped on the way in.
     repo = _comment_repo_value(argv)
-    if repo is None and tok is not None:
-        url = _PR_URL_RE.match(tok)
-        repo = url.group(1) if url else None
+    url = _PR_URL_RE.match(tok) if tok is not None else None
+    if url:
+        if repo is not None:
+            return f"{tok} combined with --repo/-R"
+        if "://" in tok and not tok.startswith(("https://github.com/", "http://github.com/")):
+            return tok
+        repo = url.group(1)
     if repo is not None and not _LITERAL_REPO_RE.match(repo):
+        return repo or "--repo (empty value)"
+    if repo is not None and repo.count("/") == 2 and repo.split("/", 1)[0] != "github.com":
         return repo
     return None
 
@@ -5067,10 +5086,12 @@ def _unresolvable_identity_advisory(token: str) -> str:
         "the Codex round cap cannot be checked.\n"
         "This hook runs BEFORE the shell expands anything, so the PR target and "
         "the --repo value are readable only when they are written out. The gate "
-        "accepts what gh documents, spelled literally; anything else is refused "
+        "accepts literal identities on github.com; anything else is refused "
         "rather than counted against the wrong pull request, or against none.\n"
-        "Re-run with the identity written out — a number, #N or a PR URL, and "
-        "OWNER/REPO for the repo — one command per PR:\n"
+        "Use either a PR URL without --repo/-R, or a number/#N with an optional "
+        "OWNER/REPO or github.com/OWNER/REPO flag. Never combine a URL and a "
+        "repository flag, even when they agree. Other explicit hosts are unsupported. "
+        "Run one command per PR:\n"
         '  gh pr comment 1234 --body "@codex review"\n'
         "If that PR is already at the cap you will get the step-back advisory, "
         "which is the point."
@@ -5082,11 +5103,9 @@ def _comment_repo_value(argv: list[str]) -> str | None:
 
     Handles separated (``--repo o/r`` / ``-R o/r``), ``--repo=o/r``, glued
     ``-Ro/r`` and ``-R=o/r`` forms. The value is otherwise unnormalised — the
-    identity check needs it as the user typed it, host part included — with one
-    exception: an EMPTY value reads as absent. Both empty spellings are commands
-    gh rejects outright, and treating them alike keeps ``--repo=`` from being
-    refused with an empty-quoted token in the message while ``-R=`` (which no
-    branch below matches) reads as no flag at all.
+    identity check needs it as the user typed it, host part included. An empty
+    or missing value stays empty, not absent: even a malformed repository flag
+    must not erase the fact that a URL was combined with a second selector.
     """
     val: str | None = None
     skip_next = False
@@ -5106,17 +5125,17 @@ def _comment_repo_value(argv: list[str]) -> str | None:
         if tok in _COMMENT_VALUE_FLAGS:
             # --repo/-R are themselves value flags: read their value, then skip
             # it so the same token cannot also be scanned as a flag.
-            if tok in ("--repo", "-R") and i + 1 < len(argv):
-                val = argv[i + 1]
+            if tok in ("--repo", "-R"):
+                val = argv[i + 1] if i + 1 < len(argv) else ""
             skip_next = True
             continue
         if tok.startswith("--repo="):
             val = tok.split("=", 1)[1]
         elif tok.startswith("-R") and len(tok) > 2 and not tok.startswith("-R="):
             val = tok[2:]
-        elif tok.startswith("-R=") and len(tok) > 3:
+        elif tok.startswith("-R="):
             val = tok[3:]
-    return val or None
+    return val
 
 
 def _comment_repo(argv: list[str]) -> str | None:
@@ -5250,10 +5269,16 @@ def _format_rounds(result: dict) -> str:
     )
     parts = [f"{count} ({'gate' if gate else 'ordinary'} lane, terminal at {limit})"]
     rounds = result.get("rounds") or []
-    if result.get("round_state") == "open" and rounds:
-        newest = rounds[-1]
-        who = ", ".join(newest.get("reviewers") or []) or "pre-cutover rule"
-        parts.append(f"open at {str(newest.get('head'))[:10]} ({who})")
+    if result.get("round_state") == "open":
+        # The head's own round, by identity: ``rounds`` is in commit-list (date)
+        # order, so its last entry need not be the head's (#3302).
+        head = result.get("current_head")
+        own = next((r for r in rounds if r.get("head") == head), None)
+        if own is None:
+            who = "no round entry for the head"
+        else:
+            who = ", ".join(own.get("reviewers") or []) or "pre-cutover rule"
+        parts.append(f"open at {str(head)[:10]} ({who})")
     elif result.get("round_state") == "complete":
         parts.append("complete (a commit has landed since the last round)")
     counts = [r.get("findings") for r in rounds if r.get("findings") is not None]
@@ -5376,6 +5401,16 @@ def _comment_review_request(argv: list[str]) -> tuple[str | None, bool, bool | N
     return inline_body, opaque, None
 
 
+def _review_request_triggers(segs):
+    return [
+        (seg, body, signal)
+        for seg in segs
+        if gh_pr_subcommand(seg.argv) == "comment" and not gh_requests_help(seg.argv)
+        for body, _opaque, signal in (_comment_review_request(seg.argv),)
+        if signal is not False
+    ]
+
+
 def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = None) -> tuple[str, str]:
     """Return (allow|ask|note|deny, reason) for Codex review requests.
 
@@ -5387,13 +5422,7 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
     are intentionally ignored: at the approval boundary only the hook's native
     user decision can authorize the action.
     """
-    triggers = [
-        (seg, body, signal)
-        for seg in segs
-        if gh_pr_subcommand(seg.argv) == "comment" and not gh_requests_help(seg.argv)
-        for body, _opaque, signal in (_comment_review_request(seg.argv),)
-        if signal is not False
-    ]
+    triggers = _review_request_triggers(segs)
     if not triggers:
         return "allow", ""
 
@@ -12892,6 +12921,32 @@ def _push_targets_current_branch(
 _INERT_GIT_NEIGHBOURS = frozenset({"status", "rev-parse", "add", "commit"})
 
 
+def _neighbours_are_inert(
+    segs, own_seg, command: str, seg_ok: Callable[[Segment], bool]
+) -> bool:
+    """Apply the shared structural checks before evaluating neighboring segments.
+
+    A redirect in a compound command is a refusal even when its target would
+    otherwise be inert. This intentionally over-blocks compounds; a lone
+    command is unaffected by ordinary redirects.
+    """
+    others = [s for s in segs if s is not own_seg]
+    if "<(" in command or ">(" in command:
+        return False
+    if others and ("<" in command or ">" in command):
+        return False
+    for s in others:
+        try:
+            words = shlex.split(s.raw or "", comments=True)
+        except ValueError:
+            return False
+        if words != list(s.argv or []):
+            return False  # a stripped wrapper (sudo / env / command …)
+        if not seg_ok(s):
+            return False
+    return True
+
+
 def _push_compound_is_inert(segs, push_seg, command: str) -> bool:
     """Whether every non-push segment leaves the config read before the push unchanged.
 
@@ -12913,20 +12968,9 @@ def _push_compound_is_inert(segs, push_seg, command: str) -> bool:
     accepted over-block; a lone ``git push … 2>&1`` is unaffected). Each
     neighbour must additionally re-tokenize to exactly its argv, which refuses
     a stripped wrapper. A substring match only ever keeps the ask."""
-    others = [s for s in segs if s is not push_seg]
-    if "<(" in command or ">(" in command:
-        return False
-    if others and ("<" in command or ">" in command):
-        return False
-    for s in others:
-        try:
-            words = shlex.split(s.raw or "", comments=True)
-        except ValueError:
-            return False
-        if words != list(s.argv or []):
-            return False  # a stripped wrapper (sudo / env / command …)
+    def push_neighbour_is_inert(s: Segment) -> bool:
         if s.exe == "cd":
-            continue
+            return True
         if s.exe != "git":
             return False
         i = 1
@@ -12934,9 +12978,61 @@ def _push_compound_is_inert(segs, push_seg, command: str) -> bool:
             if s.argv[i] != "-C":
                 return False  # -c / --exec-path / --git-dir / -p …
             i += 2
-        if git_subcommand(s.argv) not in _INERT_GIT_NEIGHBOURS:
+        return git_subcommand(s.argv) in _INERT_GIT_NEIGHBOURS
+
+    return _neighbours_are_inert(segs, push_seg, command, push_neighbour_is_inert)
+
+
+def _first_close_reason(segs) -> str | None:
+    for seg in segs:
+        reason = pr_close_reason(seg.argv)
+        if reason is not None:
+            return reason
+    return None
+
+
+def _review_request_compound_is_inert(segs, review_seg, command: str) -> bool:
+    """Whether every neighbor of a review request is on its inert allowlist.
+
+    The structural checks are ``_neighbours_are_inert``'s: the parse drops
+    redirects from a segment's ``raw``, so a redirect is tested on the raw
+    COMMAND, and any ``<`` or ``>`` in a command with a neighbor refuses —
+    including one belonging to the review request itself (an accepted
+    over-block, as in the push arm). A ``gh`` neighbor must resolve, through
+    ``gh_command``, to exactly ``pr view`` or ``pr checks`` with no unmodelled
+    flag; ``gh_pr_subcommand`` finds ``pr`` anywhere in argv, which reads
+    ``gh alias set pv -- pr view`` as a read. A neighbor must be spelled with
+    the bare program name. ``git log`` is deliberately absent (owner ruling
+    2026-10-18): under any spelling, repo config can make it run a program
+    (``gpg.program`` through ``log.showSignature`` or a ``%G`` format alias,
+    textconv drivers for diff output), and ``--output`` writes a file.
+    """
+
+    def review_neighbour_is_inert(s: Segment) -> bool:
+        # The bare name only: `exe` is a basename, so `./gh` or `/tmp/x/git`
+        # would otherwise pass as the real program.
+        if not s.argv or s.argv[0] != s.exe:
             return False
-    return True
+        if s.exe in {"cd", "sleep"}:
+            return True
+        if s.exe == "git":
+            i = 1
+            while i < len(s.argv) and s.argv[i].startswith("-"):
+                if s.argv[i] != "-C":
+                    return False
+                i += 2
+            return git_subcommand(s.argv) == "status"
+        if s.exe == "gh":
+            inv = gh_command(s.argv)
+            return (
+                inv is not None
+                and inv.group == "pr"
+                and inv.subcommand in {"view", "checks"}
+                and not inv.unmodelled
+            )
+        return False
+
+    return _neighbours_are_inert(segs, review_seg, command, review_neighbour_is_inert)
 
 
 def _push_seg_has_no_prefix(seg) -> bool:
@@ -13421,6 +13517,21 @@ def _urls_name_repo(urls: set[str], canonical: str) -> bool:
     if not urls or want is None:
         return False
     return all(_repo_identity_from_url(u) == want for u in urls)
+
+
+def _no_open_pr_deny_message(cur: str | None) -> str:
+    """The no-open-PR BLOCK text, shared by the plain and close-compound arms."""
+    return (
+        f"BLOCKED: re-push to '{cur}' — this branch is "
+        f"PUBLIC but has NO OPEN PR, so CI and the leak "
+        f"detector never run on it (ci.yml triggers on "
+        f"pull_request; a branch with no PR matches no "
+        f"trigger).\n"
+        f"Open its PR first — `gh pr create` — then push "
+        f"again. Or close the branch out if it is "
+        f"finished with. Both leave the branch in a state "
+        f"something actually looks at."
+    )
 
 
 def _no_pr_block_applies(urls: set[str]) -> bool:
@@ -14796,23 +14907,32 @@ def _run_merge_and_push_gates() -> int:
             # specific diagnostic when both appear in one command.
             round_autonomous_deny = esc_msg
 
-        if esc_decision in ("ask", "note"):
-            other_gated_actions = [
-                s
-                for s in segs
-                if git_subcommand(s.argv) in {"commit", "push", "merge"}
-                or gh_pr_subcommand(s.argv) in {"create", "merge", "close"}
-            ]
-            if other_gated_actions:
+        if esc_decision == "ask":
+            review_triggers = _review_request_triggers(segs)
+            review_seg = review_triggers[0][0] if len(review_triggers) == 1 else None
+            if review_seg is not None and not _review_request_compound_is_inert(
+                segs, review_seg, cmd
+            ):
                 # Defer this refusal to the tail. Specific hard checks below
                 # (force push, --no-verify, merge gates, sqlite) must retain
                 # precedence over a compound-action diagnostic.
-                round_compound_deny = (
-                    "BLOCKED: this review request needs its own fresh user approval, "
-                    "but the same command also contains a commit, push, merge, close, "
-                    "or PR-create action. Run the review request separately so one "
-                    "approval cannot authorize multiple actions."
-                )
+                close_reason = _first_close_reason(segs)
+                if close_reason is not None:
+                    round_compound_deny = (
+                        "BLOCKED: this review request needs its own fresh user approval, "
+                        "but the same command also closes a pull request "
+                        f"({close_reason}). Run the review request separately so one "
+                        "approval cannot authorize multiple actions."
+                    )
+                else:
+                    round_compound_deny = (
+                        "BLOCKED: this review request needs its own fresh user approval, "
+                        "but the same command also runs a step that is not on the inert "
+                        "list (cd, sleep, git status, gh pr view/checks), or "
+                        "carries a redirect. "
+                        "Run the review request separately so one approval cannot "
+                        "authorize multiple actions."
+                    )
 
         # An interactive push defers to a native approve/deny dialog at the END
         # of main(), so every hard-block below (merge-into-main, the pr-merge
@@ -15123,28 +15243,36 @@ def _run_merge_and_push_gates() -> int:
                     # branch, not a security boundary, so an unanswerable
                     # question must not manufacture prompts on every network
                     # blip.
-                    # An earlier segment that CLOSES a PR invalidates the state
-                    # this allow is read from. The hook runs before any of the
-                    # command executes, so `gh pr close <n> && git push` sees the
-                    # PR still open, keeps the silent allow, and then publishes
-                    # into exactly the PR-less state the ask exists to report.
-                    # The count cannot see a close that has not happened yet, so
-                    # the command's own shape has to.
+                    # A close is never an inert neighbour, so the
+                    # _push_compound_is_inert check further down would also ask
+                    # here. It runs first so the message names the close. On the
+                    # public repo it still takes the no-PR BLOCK below when the
+                    # branch already has no open PR: a close cannot add one, and
+                    # turning that deny into an ask would let one approval publish
+                    # the state the block forbids. Off the public repo the lookup
+                    # is skipped (_no_pr_block_applies is local and runs first).
                     closes_pr = any(
-                        gh_pr_subcommand(s.argv) == "close" for s in segs
+                        pr_close_reason(s.argv) is not None for s in segs
                     )
                     if push_allow_reason and closes_pr:
                         push_allow_reason = None
-                        ask_routine = True
-                        routine_dests.append((push_remote, urls, pcwd, cur))
-                        ask_reason = (
-                            f"re-push to '{cur}': an earlier step in this command "
-                            f"CLOSES a pull request, so the push that follows may "
-                            f"land on a branch with no open PR — outside CI and "
-                            f"the leak scan. Run the close and the push as "
-                            f"separate commands so each is judged on the state it "
-                            f"actually runs in."
-                        )
+                        if (
+                            not _push_is_dry_run(push_segs[0])
+                            and _no_pr_block_applies(urls)
+                            and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
+                        ):
+                            no_open_pr_deny = _no_open_pr_deny_message(cur)
+                        else:
+                            ask_routine = True
+                            routine_dests.append((push_remote, urls, pcwd, cur))
+                            ask_reason = (
+                                f"re-push to '{cur}': an earlier step in this command "
+                                f"CLOSES a pull request, so the push that follows may "
+                                f"land on a branch with no open PR — outside CI and "
+                                f"the leak scan. Run the close and the push as "
+                                f"separate commands so each is judged on the state it "
+                                f"actually runs in."
+                            )
                     # NO `gh pr create` exemption: whether a same-command create
                     # yields a PR for THIS branch is not decidable from argv
                     # (another --head, --dry-run, a failing create before `&&`,
@@ -15171,17 +15299,7 @@ def _run_merge_and_push_gates() -> int:
                             # `&& gh pr create`, since the create needs the branch
                             # on the remote. Dispatched sessions never get here
                             # (`_is_dispatched()` denies every push above).
-                            no_open_pr_deny = (
-                                f"BLOCKED: re-push to '{cur}' — this branch is "
-                                f"PUBLIC but has NO OPEN PR, so CI and the leak "
-                                f"detector never run on it (ci.yml triggers on "
-                                f"pull_request; a branch with no PR matches no "
-                                f"trigger).\n"
-                                f"Open its PR first — `gh pr create` — then push "
-                                f"again. Or close the branch out if it is "
-                                f"finished with. Both leave the branch in a state "
-                                f"something actually looks at."
-                            )
+                            no_open_pr_deny = _no_open_pr_deny_message(cur)
                         else:
                             # Off the public repo — or when the public repo is not
                             # declared — the pre-existing ask, unchanged.
@@ -15199,17 +15317,28 @@ def _run_merge_and_push_gates() -> int:
                     # writes config or remotes ahead of the push is invisible
                     # to the predicate that just passed. Only an allowlisted
                     # neighbour keeps the relaxation.
-                    elif push_allow_reason and not _push_compound_is_inert(segs, push_segs[0], cmd):
+                    elif push_allow_reason and not _push_compound_is_inert(
+                        segs, push_segs[0], cmd
+                    ):
                         push_allow_reason = None
                         ask_routine = True
                         routine_dests.append((push_remote, urls, pcwd, cur))
-                        ask_reason = (
-                            f"re-push to '{cur}': another step in this command "
-                            f"may change git config or remotes before the push "
-                            f"runs, so the config check could not see what the "
-                            f"push will use. Run the push as its own command to "
-                            f"skip this prompt."
-                        )
+                        close_reason = _first_close_reason(segs)
+                        if close_reason is not None:
+                            ask_reason = (
+                                f"re-push to '{cur}': this command also CLOSES a "
+                                f"pull request ({close_reason}), so it is not an "
+                                f"inert compound. Run the push as its own command "
+                                f"to skip this prompt."
+                            )
+                        else:
+                            ask_reason = (
+                                f"re-push to '{cur}': another step in this command "
+                                f"may change git config or remotes before the push "
+                                f"runs, so the config check could not see what the "
+                                f"push will use. Run the push as its own command to "
+                                f"skip this prompt."
+                            )
                 elif (
                     not pcwd_unknown
                     and cur
@@ -16090,7 +16219,9 @@ def _run_merge_and_push_gates() -> int:
         if _is_sqlite_write(cmd):
             print(
                 "BLOCKED: Direct database writes via sqlite3 are not allowed. "
-                "Use CRUD modules or MCP tools instead.",
+                "Use CRUD modules or MCP tools instead. For a READ-ONLY query, use: "
+                '~/genesis/.venv/bin/python -m genesis db query "<sql>" '
+                "(read-only is enforced by SQLite; --json, --param, --limit).",
                 file=sys.stderr,
             )
             return 2

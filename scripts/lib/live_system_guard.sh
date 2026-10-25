@@ -91,7 +91,10 @@ EOF
 # --rcfile, nested -c, a path built in a variable all defeat it).
 #
 #   unset/empty  → return 0 immediately: production behaviour never changes.
-#   set          → realpath -m the acting root, $HOME and ${GENESIS_HOME:-};
+#   set          → resolve the acting root, HOME, explicit GENESIS_HOME and
+#                  default HOME/.genesis, preserving pathname bytes;
+#                  unprovable resolution, colon paths and tilde-form explicit
+#                  homes refuse while armed (the list cannot encode colons);
 #                  any of them equal to or under a listed root prints
 #                  "REFUSED (test fence): <script> would act on <path>" to
 #                  stderr, appends the same line to $GENESIS_TEST_FENCE_LOG
@@ -104,7 +107,7 @@ EOF
 
 refuse_if_test_fenced_live() {
     [ -n "${GENESIS_TEST_FENCE_LIVE_ROOTS:-}" ] || return 0
-    local _candidate _listed _hit=""
+    local _candidate _listed _hit="" _resolved _status _reason=""
     # Split on colons by parameter expansion, not `read` or unquoted expansion:
     # read is line-oriented (a listed root may contain a literal newline) and
     # expansion would glob (/tmp/live[1] must compare as itself, not matches).
@@ -116,15 +119,45 @@ refuse_if_test_fenced_live() {
         _rest=${_rest#*:}
     done
     _roots+=("$_rest")
-    for _candidate in "$1" "${HOME:-}" "${GENESIS_HOME:-}"; do
+    local -a _candidates=("$1" "${HOME:-}" "${GENESIS_HOME:-}")
+    [ -z "${HOME:-}" ] || _candidates+=("$HOME/.genesis")
+    # Backup expands this form differently from the raw lock path.
+    if [[ "${GENESIS_HOME:-}" == '~'* ]]; then
+        _hit=$GENESIS_HOME
+        _reason="unsupported tilde-form GENESIS_HOME"
+    fi
+    for _candidate in "${_candidates[@]}"; do
+        [ -z "$_hit" ] || break
         [ -n "$_candidate" ] || continue
-        _candidate="$(realpath -m "$_candidate" 2>/dev/null)" || continue
+        # Adapt backup_capture_path's sentinel/status capture locally: remove
+        # exactly the formatter LF, never trailing LF bytes in the pathname.
+        if _resolved=$(realpath -m -- "$_candidate" 2>/dev/null; _status=$?; printf '.'; exit "$_status"); then
+            _resolved=${_resolved%.}
+            if [[ "$_resolved" != *$'\n' ]]; then
+                _hit=$_candidate
+                _reason="unprovable path resolution"
+                break
+            fi
+            _resolved=${_resolved%$'\n'}
+        else
+            _resolved=""
+        fi
+        if [[ "$_resolved" != /* ]]; then
+            _hit=$_candidate
+            _reason="unprovable path resolution"
+            break
+        fi
+        if [[ "$_resolved" == *:* ]]; then
+            _hit=$_resolved
+            _reason="colon path is not representable"
+            break
+        fi
         for _listed in "${_roots[@]}"; do
             [ -n "$_listed" ] || continue
             # "${_listed%/}/" * covers the listed-root-is-/ case: "/" trims to
             # "" so the pattern is /* — every absolute descendant.
-            if [ "$_candidate" = "$_listed" ] || [[ "$_candidate" == "${_listed%/}/"* ]]; then
-                _hit="$_candidate"
+            if [ "$_resolved" = "$_listed" ] || [[ "$_resolved" == "${_listed%/}/"* ]]; then
+                _hit="$_resolved"
                 break 2
             fi
         done
@@ -133,7 +166,7 @@ refuse_if_test_fenced_live() {
     # Name the script that sourced this lib (BASH_SOURCE[1]), not $0: under a
     # BASH_ENV/--rcfile launch $0 is "bash" while the script still names itself.
     local _script="${BASH_SOURCE[1]:-$0}"
-    local _msg="REFUSED (test fence): ${_script##*/} would act on $_hit"
+    local _msg="REFUSED (test fence): ${_script##*/} would act on $_hit${_reason:+ ($_reason)}"
     printf '%s\n' "$_msg" >&2
     if [ -n "${GENESIS_TEST_FENCE_LOG:-}" ]; then
         printf '%s\n' "$_msg" >> "$GENESIS_TEST_FENCE_LOG" 2>/dev/null || true

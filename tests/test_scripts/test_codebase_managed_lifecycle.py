@@ -178,7 +178,7 @@ def startup(operator, monkeypatch):
     )
     monkeypatch.setitem(namespace, "show", lambda *args: properties)
     monkeypatch.setitem(namespace, "validate_loaded_backend", lambda config: calls.append("loaded"))
-    config = {"binary": "/binary", "sentinel": "/sentinel", "main": "/main"}
+    config = {"binary": "/binary", "sentinel": "/sentinel", "main": "/main", "cache": "/cache"}
     monkeypatch.setitem(namespace, "runtime_config", lambda path: config)
     monkeypatch.setitem(namespace, "inspect_sources", lambda *a, **k: "canonical sources")
     monkeypatch.setitem(namespace, "refresh_sources", lambda *a, **k: calls.append("refresh"))

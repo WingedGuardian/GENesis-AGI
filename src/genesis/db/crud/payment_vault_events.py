@@ -23,8 +23,22 @@ EVENTS = frozenset(
         "idle_relock",
         "stale_identity_relock",
         "peer_refused",
+        # Owner approval of a card release (payments/approval.py).
+        "approval_requested",
+        "approval_granted",
+        "approval_refused",
+        "approval_expired",
+        # A card release (payments/release.py).
+        "release_requested",
+        "release_granted",
+        "release_claimed",
+        "release_refused",
+        "release_cancelled",
     }
 )
+# The events that say whether the key is held; approval and release rows
+# interleave with them.
+KEY_EVENTS = EVENTS - {e for e in EVENTS if e.startswith(("approval_", "release_"))}
 
 
 async def record_event(db: aiosqlite.Connection, event: str, detail: dict | None = None) -> None:
@@ -42,11 +56,18 @@ async def record_event(db: aiosqlite.Connection, event: str, detail: dict | None
     await db.commit()
 
 
-async def list_recent(db: aiosqlite.Connection, limit: int = 20) -> list[dict]:
-    """The newest ``limit`` events, newest first."""
+async def list_recent(
+    db: aiosqlite.Connection, limit: int = 20, *, events: frozenset[str] | None = None
+) -> list[dict]:
+    """The newest ``limit`` events, newest first; only ``events`` when given."""
+    where, args = "", ()
+    if events is not None:
+        where = f"WHERE event IN ({','.join('?' * len(events))}) "
+        args = tuple(sorted(events))
     cursor = await db.execute(
-        "SELECT event, detail, created_at FROM payment_vault_events ORDER BY id DESC LIMIT ?",
-        (limit,),
+        "SELECT event, detail, created_at FROM payment_vault_events "  # noqa: S608 - placeholders only
+        f"{where}ORDER BY id DESC LIMIT ?",
+        (*args, limit),
     )
     rows = await cursor.fetchall()
     return [

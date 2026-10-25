@@ -38,11 +38,14 @@ two ways:
    would run is unknowable in-process, and every attempt to predict it leaked
    launch forms. A deploy script run through any shell spelling instead refuses
    ITSELF: the fence exports ``GENESIS_TEST_FENCE_LIVE_ROOTS`` (this checkout's
-   real root plus the real home's ``~/.genesis``/``~/genesis`` when they exist)
-   and ``GENESIS_TEST_FENCE_LOG`` (this log), and
+   real root, the real home's ``~/.genesis``/``~/genesis`` when they exist, and
+   a root named in ``GENESIS_LIVE_FENCE_LIVE_ROOT``) and
+   ``GENESIS_TEST_FENCE_LOG`` (this log), and
    ``scripts/lib/live_system_guard.sh``'s ``refuse_if_test_fenced_live`` makes
    each deploy script refuse — ``REFUSED (test fence): ...`` on stderr, the same
-   line appended here, exit 97 — when its acting root is a listed root.
+   line appended here, exit 97 — when its acting root, ``HOME``,
+   ``GENESIS_HOME`` or ``HOME/.genesis`` is at or under a listed root, or a
+   path it must check cannot be resolved provably.
 
 2. **PATH shims** for processes a child starts (a script under test, a detached
    orchestrator): a directory of refusing, logging stubs goes first on ``PATH``,

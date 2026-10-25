@@ -5,8 +5,9 @@ a pinned provider and publishes immutable settings; `status` diagnoses settings
 and native service state. The ordinary install/bootstrap loops render disabled
 query service/client slice templates on every install and do not automatically
 install, upgrade or version-probe a PATH Codebase binary. Registration always
-uses the managed launcher, including when no PATH provider exists. The index
-queue remains on its previous route until its separate integration lands.
+uses the managed launcher, including when no PATH provider exists. The existing
+index queue now uses managed admission and the contained native worker described
+under "Queued indexing" below.
 Staging and rendering alone do not make Codebase available.
 
 Existing symlinks at either managed query unit destination, including `/dev/null`
@@ -18,6 +19,44 @@ lets bootstrap back up and replace that link; `--take-templates` keeps masks.
 Install always keeps existing links. Directories and FIFOs at these two
 destinations remain errors. Use the configured disablement sentinel for the
 runtime off-switch; masking may refuse when a local regular unit already exists.
+
+## If you see the 'registered but unconfigured' alert
+
+The health alert `codebase_mcp_registered_unconfigured`, and the matching
+`Codebase: NOT SET UP` line that bootstrap, install and update print, mean that
+`codebase-memory-mcp` is registered (the checkout's `.mcp.json` or the
+user-scope `~/.claude.json`) but its launcher will refuse. Either
+`~/.genesis/config/codebase-managed.json` is missing, it fails validation (the
+`status` command below names the error), or `genesis-cbm-query.service` is not
+persistently enabled. Every Claude Code session then shows the server as failed
+to connect.
+
+To set it up, obtain the pinned binary, then run from the primary checkout (see
+[Configure](#configure) for what each argument must be):
+
+```bash
+.venv/bin/python -I scripts/codebase_managed.py configure \
+  --main "$PWD" \
+  --binary "$HOME/tmp/codebase-memory-mcp" \
+  --state "$HOME/.genesis/cbm" \
+  --sentinel "$HOME/.genesis/codebase-memory-mcp.disabled"
+python3 -I scripts/codebase_managed.py enable
+```
+
+If a valid settings file already exists, run only `enable`; for an invalid one,
+follow "Diagnose and recover" below. To opt out instead, create the kill-switch
+file. If a settings file exists, that is its configured `sentinel` path;
+otherwise it is `~/.genesis/codebase-memory-mcp.disabled`, or the path
+`CODEBASE_MEMORY_MCP_DISABLE_FILE` names:
+
+```bash
+touch "$HOME/.genesis/codebase-memory-mcp.disabled"
+```
+
+The alert reads the infrastructure profile, which refreshes at boot and daily.
+After either fix, run `infrastructure_profile(refresh=true)` and the alert
+clears at the next hourly posture check. Both the alert and the installer line
+come from `genesis.infra_profile.codebase_mcp`, so they always agree.
 
 ## Native lifecycle
 
@@ -44,8 +83,10 @@ starting, rechecks and refreshes accepted sources again, then starts and verifie
 native readiness. Backend argv must match
 the installed positional bridge, including its `no-env-expand` flag; auxiliary
 execution commands refuse. A custom installation must supply the same absolute
-`VENV_PATH` used by `install.sh` when invoking `enable`; otherwise the configured
-main checkout's `.venv` is expected. Disable/remove do not require that variable.
+`VENV_PATH` used by `install.sh` when invoking `enable` or `available`; otherwise
+the configured main checkout's `.venv` is expected. The rendered indexing runner
+exports that same literal selection to its child processes.
+Disable/remove do not require that variable.
 Missing typed manager properties, unsupported native namespace layouts or unavailable
 `busctl` refuse activation. Installation calls cannot fall back to a client-side
 reader. Current canonical templates are the authority, not a partial directive
@@ -195,6 +236,11 @@ supported physical main/state path. Binary, interpreter, runtime, sentinel and
 settings paths retain their existing literal-path handling; this restriction
 applies to provider-consumed repository/cache identities.
 
+Runtime entry points validate those identities before cache checks, readiness
+retries or provider execution. An incompatible path therefore refuses promptly
+when enabling, launching, serving or checking readiness. Structural settings
+reads remain available for diagnosis and retirement.
+
 No service is enabled, no unit is rendered and no sentinel is removed.
 Configuration uses schema 2: paths and build identity, with no mutable `enabled`
 flag. Native systemd enablement owns operational state. The lifecycle lock coordinates cooperating same-user tools;
@@ -255,6 +301,30 @@ regular units; bootstrap follows the shared managed-unit ownership policy.
 
 ## Diagnose and recover
 
+The read-only `available --repo /absolute/main --persistence true|false` command
+checks configured main identity, cache and completed query-service startup, plus writer
+prerequisites in the caller's filesystem namespace. It creates no probe files or
+queue rows and does not index repositories. It validates the loaded startup
+contract, accepted executable and active constrained backend without invoking the
+native CLI. Current RPC responsiveness is checked again by final worker admission.
+Persistence checks include the artifact destination
+and the pinned provider's fixed snapshot scratch directory; false omits both.
+The immutable `_config.db` stays a reader surface, while index databases and their
+WAL/SHM and rollback-journal sidecars require read/write access, as does the
+mutable queue database and its sidecars. Cache and queue directories require
+read access for enumeration. The append-only runner log and non-enumerated
+runtime/lock directories do not require read access. The accepted executable
+must also be executable by the caller in this namespace. Existing writable
+descendants can remain usable under a read-only parent.
+
+Availability is advisory: a runner with filesystem restrictions must perform its
+own checks. Custom state roots need an operator-owned `ReadWritePaths` allowlist;
+persistent snapshot scratch can use an operator-owned disk `BindPaths` mapping.
+Genesis does not install a policy drop-in or broaden the runner sandbox. Preserve
+paths masked by a mapping and assess its capacity before using it. The separate
+worker/queue integration performs final admission; this command grants no right
+to index and does not activate providers.
+
 ```bash
 .venv/bin/python -I scripts/codebase_managed.py status
 .venv/bin/python -I scripts/codebase_managed.py --config /absolute/settings.json status
@@ -276,6 +346,19 @@ Unsupported repository/cache identities and symlink-resolution failures also
 populate `settings_error` without suppressing metadata or the systemd check.
 Structural settings reads remain available for retained-state diagnosis; no
 incompatible cache is repaired or deleted automatically.
+
+The separate `queue_initialization` object observes
+`$GENESIS_HOME/index-requests/.queue-db-init.lock` (defaulting to
+`$HOME/.genesis`). Its `required_when` is `queue initialization or schema upgrade`:
+a current-schema queue can remain usable when this append-only lock is not
+writable. `state` reports `absent`, `observed_writable`, or `unavailable`, with
+the selected `path`, observed lexical `exists`, and any `error`. Unknown
+existence is `null` when lookup fails. An absent lock also checks its first
+existing parent's write/search prerequisites without creating anything. This
+advisory neither inspects the database schema nor acquires a lock, and does not
+change availability or readiness. Observed writability does not guarantee a
+future open or an uncontended lock. Settings and manager diagnostics remain
+independent of this observation.
 
 Existing settings and state are never refreshed in place. Schema 1 and other
 builds remain diagnosable, but are not valid schema-2 execution configurations.
@@ -375,7 +458,45 @@ library operations available on the supported Python 3.10 platform. It does not
 perform the native binary hash/launch acceptance used by the installed query
 runtime. Current-install tests are not a separate Python 3.10 runtime qualification.
 
+## Queued indexing
+
+The existing idle-gated runner probes managed availability before and after
+claiming a Codebase-only request. Unavailability leaves the pending generation
+uncharged; a post-claim refusal durably restores it. A combined request can
+complete GitNexus and requeue its unfinished Codebase leg before consuming the
+combined request. Partial-success outcomes (rc 4/5) use the ordinary request
+writer: a new pending row starts at zero attempts; coalescing with an existing
+pending row retains that row's higher count. The original inflight attempt
+count is not carried into the split request. Operators must not manually reset
+attempts to force retries. Retry-budget continuity across splits and commit
+generations remains part of the resource-failure quarantine work.
+The runner records availability errors in its log; the index entry point includes
+the final refusal line in its skip diagnostic.
+
+The adapter executes the accepted native inode inside the admitted 8 GiB,
+zero-swap scope with a 6 GiB native budget. Its supervisor retains a nonmaximum
+OOM adjustment; only the native child receives 1000. The validated physical main
+path supplies both the native payload and working directory. Final admission
+rechecks managed settings, cache, native readiness and enablement under the
+lifecycle lock, which closes after child creation. Repository/runner locks and
+the scope watchdog retain execution ownership. Missing canonical repository
+locks refuse Codebase; GitNexus retains its independent handling.
+
+This wiring merged in #3012. Read-only availability/access repairs remain tracked
+in #3464. Neither fixture acceptance nor a successful probe grants permission to
+clear the sentinel, release the freeze or retry unattended after resource failures.
+Follow the supervised production acceptance and resource gates in
+`../architecture/codebase-managed-runtime.md`.
+
 ## Verification
+
+The runner's SQLite contention fixture verifies actual outcome replay: after
+the fixture locker releases the ordinary runner lock, a real recovery tick
+must retire pending, inflight and failure records and the outcome spool while
+calling the fake provider only once. An empty pending list or a successful
+lock-busy no-op does not prove completion. The fixture also bounds its locker
+readiness wait. These tests use an isolated home and fake provider; they do not
+qualify production indexing or explain a separate first-tick timeout.
 
 The configuration test suite uses synthetic paths and fixtures. Native staging
 acceptance explicitly opts in to the independently pinned release binary:

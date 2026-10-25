@@ -290,7 +290,7 @@ async def test_pending_cancel_waits_for_retained_publication_and_rechecks_atomic
     pending_id, _ = await box.enqueue(envelope)
     inserted, release, attempted = asyncio.Event(), asyncio.Event(), asyncio.Event()
     transaction = bridge.registry.transaction
-    execute = bridge.db.execute
+    execute = type(bridge.db).execute
 
     @asynccontextmanager
     async def held_publication():
@@ -299,13 +299,13 @@ async def test_pending_cancel_waits_for_retained_publication_and_rechecks_atomic
             inserted.set()
             await release.wait()
 
-    async def observed_cancel(sql, *args, **kwargs):
-        if "UPDATE pending_outreach" in sql:
+    async def observed_cancel(db, sql, *args, **kwargs):
+        if db is bridge.db and "UPDATE pending_outreach" in sql:
             attempted.set()
-        return await execute(sql, *args, **kwargs)
+        return await execute(db, sql, *args, **kwargs)
 
     monkeypatch.setattr(bridge.registry, "transaction", held_publication)
-    monkeypatch.setattr(bridge.db, "execute", observed_cancel)
+    monkeypatch.setattr(type(bridge.db), "execute", observed_cancel)
     publishing = asyncio.create_task(box.put(envelope))
     cancelling = None
     try:

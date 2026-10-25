@@ -41,10 +41,11 @@ Two ceilings bound the suite, and they are different things:
 
 - `timeout = 600` in `pyproject.toml` is pytest-timeout's **per-test** limit —
   one hung test is killed and the suite continues. It is NOT a suite budget.
-  It applies wherever `pytest-timeout` is installed: always in CI, and locally
-  only if you installed it (it ships in the `[test]` extra, which no install
-  path installs). Without it a run starts with a warning saying so, because a
-  hung test then holds the box-wide test lock until it is killed by hand.
+  It applies wherever `pytest-timeout` is installed: always in CI, and on an
+  install once bootstrap's non-fatal step has installed the `[test]` extra
+  (`install_runtime_extras`; a code-only deploy warns when it is missing).
+  Without it a run starts with a warning saying so, because a hung test then
+  holds the box-wide test lock until it is killed by hand.
 - `timeout-minutes: 180` on CI's `test` job bounds the whole job, for a hang
   the per-test timeout cannot catch. It must stay above (max job + one
   per-test kill) — 31m15s + 10m ≈ 41m — or it would pre-empt the per-test
@@ -163,8 +164,9 @@ guardrail (code in the test process could get around it), not a sandbox.
     `scripts/lib/live_system_guard.sh`'s `refuse_if_test_fenced_live` makes each
     deploy script (`scripts/{update,deploy_code_only,restore,backup,
     bootstrap}.sh` and `deploy_candidates`) print `REFUSED (test fence): ...`,
-    append the same line to the log, and exit 97 when its acting root is a
-    listed root. This runs inside the script after bash's own expansion, so no
+    append the same line to the log, and exit 97 when its acting root,
+    `HOME`, `GENESIS_HOME` or `HOME/.genesis` is at or under a listed root
+    (or a path it must check cannot be resolved provably). This runs inside the script after bash's own expansion, so no
     launch spelling escapes it — `bash script`, `bash -c`, `BASH_ENV`,
     `--rcfile`, a here-string, whatever a child starts.
 

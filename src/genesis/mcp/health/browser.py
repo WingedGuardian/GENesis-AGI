@@ -37,8 +37,12 @@ from fastmcp import Context
 
 from genesis.browser import chromium, engine, packages, profile_backup
 from genesis.browser.types import CAMOUFOX_PROFILE_DIR, BrowserLayer
-from genesis.mcp.health import mcp
+from genesis.mcp.health import mcp, payment_context
+from genesis.payments import card_fill
+from genesis.security.card_redaction import CARD_FILTER, contains_card_text, redact_text
+from genesis.security.card_redaction import redacted as _redacted
 from genesis.security.card_shapes import contains_card_number
+from genesis.util.mcp_logging import configure_mcp_logging
 
 logger = logging.getLogger(__name__)
 
@@ -54,27 +58,20 @@ _REFUSE_CARD_RUN_JS = (
     "browser-automation skill, Safety gates)."
 )
 
-# File-based logging for the entire MCP health server — routes ALL log
-# output to ~/tmp/mcp_health.log so it's readable after timeouts.
-# The MCP server runs as a CC child process; its stderr is inaccessible.
-_mcp_log_dir = Path.home() / "tmp"
-if _mcp_log_dir.is_dir():
-    _mcp_fh = logging.FileHandler(_mcp_log_dir / "mcp_health.log")
-    _mcp_fh.setFormatter(logging.Formatter(
-        "%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    ))
-    _mcp_fh.setLevel(logging.DEBUG)
-    # Attach to root logger so ALL genesis.* logs are captured
-    logging.getLogger("genesis").addHandler(_mcp_fh)
+# Read the environment once, at import; optional logging cannot abort startup.
+# The shared selector also gives daily rotation the same fixed absolute path.
+_mcp_log_dir = configure_mcp_logging(CARD_FILTER)
 
 # Direct file-write debug log for Turnstile — bypasses logging framework
 # entirely to guarantee output is visible. The logging.FileHandler approach
 # produced empty files despite correct setup (likely a process/import issue).
-_TS_LOG_PATH = Path.home() / "tmp" / "turnstile_debug.log"
+_TS_LOG_PATH = _mcp_log_dir / "turnstile_debug.log" if _mcp_log_dir is not None else None
 
 
 def _ts_log_write(msg: str) -> None:
     """Write a timestamped line directly to the Turnstile debug log."""
+    if _TS_LOG_PATH is None:
+        return
     try:
         # Deliberate LOCAL import despite the module-level one: it keeps this
         # writer out of reach of patch.object(browser, "datetime"), which the
@@ -86,7 +83,7 @@ def _ts_log_write(msg: str) -> None:
 
         ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         with open(_TS_LOG_PATH, "a") as f:
-            f.write(f"{ts} {msg}\n")
+            f.write(f"{ts} {redact_text(msg)}\n")
             f.flush()
     except Exception:
         pass  # debug logging must never crash the tool
@@ -104,6 +101,35 @@ class _TsLog:
 
 
 _ts_log = _TsLog()
+
+
+# ---------------------------------------------------------------------------
+# Card-number redaction of tool output and logs
+# ---------------------------------------------------------------------------
+# A page can show a card number. Every _impl_browser_* result passes through
+# @_redacted, and CARD_FILTER (security/card_redaction.py) sits on the loggers
+# below and on the mcp_health.log handler. A logger filter sees only records
+# created on that logger, so each emitting logger is named: this module, the
+# genesis.browser modules it calls, FastMCP's tool and server loggers
+# (tool_manager logs a tool exception with its traceback, server logs call
+# arguments at debug) and the MCP SDK's lowlevel server logger. Logger-level,
+# because FastMCP's configure_logging replaces the fastmcp handlers.
+_REDACTED_LOGGERS = (
+    __name__,
+    "genesis.browser.engine",
+    "genesis.browser.profile",
+    "genesis.browser.profile_backup",
+    "genesis.browser.provision",
+    "genesis.mcp.health.payment_context",
+    "genesis.payments.card_fill",
+    "genesis.payments.release_client",
+    "fastmcp.tools.tool_manager",
+    "fastmcp.tools.tool",
+    "fastmcp.server.server",
+    "mcp.server.lowlevel.server",
+)
+for _name in _REDACTED_LOGGERS:
+    logging.getLogger(_name).addFilter(CARD_FILTER)
 
 # Prevents concurrent browser init/cleanup races across tool calls.
 _browser_lock = asyncio.Lock()
@@ -383,6 +409,8 @@ def _on_local_context_closed(layer: BrowserLayer, ctx) -> None:
     logger.warning("%s window closed — stopping its driver", layer.value)
 
     async def _reap():
+        if layer is BrowserLayer.CAMOUFOX:  # its payment context closed with it
+            await payment_context.abort("browser_closed")  # outside the lock: it can wait
         async with _browser_lock:
             now = _stealth_browser if layer is BrowserLayer.CAMOUFOX else _context
             if now is ctx:
@@ -413,6 +441,8 @@ async def async_cleanup():
     global _active_page, _idle_task
 
     _active_page = None
+    # First: a release not yet claimed is cancelled, the payment context closed.
+    await payment_context.abort("mcp_exit")
 
     # Cancel the idle watcher first, so it cannot reclaim a layer concurrently.
     if _idle_task is not None:
@@ -457,6 +487,8 @@ async def _ensure_browser():
     async with _browser_lock:
         if _stealth_page is not None and _is_page_alive(_stealth_page):
             return _stealth_page
+        if payment_context.past_claim():  # a restart would close a claimed card's window
+            raise payment_context.PaymentInFlight(card_fill.TEXTS["payment_in_flight"])
         if _layer_open(BrowserLayer.CAMOUFOX):
             logger.warning("Camoufox page is stale — restarting Camoufox")
             await _cleanup_camoufox()
@@ -482,6 +514,17 @@ async def _ensure_browser():
         # Always headed — Xvfb :99 is always running.
         os.environ["DISPLAY"] = _VNC_DISPLAY
 
+        prefs = {
+            # Camoufox disables session history (max_entries=0) for
+            # anti-detection.  Re-enable it so back/forward navigation
+            # works in collaborate mode.
+            "browser.sessionhistory.max_entries": 10,
+            "browser.sessionhistory.max_total_viewers": -1,
+        }
+        # Read once per launch: prefs cannot change under a running browser.
+        pinned = card_fill.card_fill_enabled()
+        if pinned:
+            prefs.update(card_fill.CARD_FILL_PREFS)
         cm = AsyncCamoufox(
             executable_path=str(status.path),
             headless=False,
@@ -489,13 +532,7 @@ async def _ensure_browser():
             user_data_dir=str(_PROFILE_DIR),
             humanize=2.5,  # Native Camoufox cursor humanization (Bézier curves, max 2.5s)
             window=(1920, 1080),  # Fill VNC display (Xvfb :99 is 1920x1080x24)
-            firefox_user_prefs={
-                # Camoufox disables session history (max_entries=0) for
-                # anti-detection.  Re-enable it so back/forward navigation
-                # works in collaborate mode.
-                "browser.sessionhistory.max_entries": 10,
-                "browser.sessionhistory.max_total_viewers": -1,
-            },
+            firefox_user_prefs=prefs,
         )
         # Nothing is assigned until __aenter__ succeeds, so a failed launch
         # leaves no half-open layer behind. __aenter__ starts the Playwright
@@ -508,6 +545,7 @@ async def _ensure_browser():
             raise
         # With persistent_context, browser IS the context
         _stealth_cm, _stealth_browser = cm, ctx
+        payment_context.set_prefs_pinned(pinned)
         _layer_launched[BrowserLayer.CAMOUFOX] = time.monotonic()
         ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CAMOUFOX, c))
         ctx.on("dialog", _on_dialog)
@@ -1171,8 +1209,12 @@ async def _reclaim_idle_layers(now: float) -> None:
         last = _layer_last_used.setdefault(layer, now)
         if now - last < _IDLE_TIMEOUT_S:
             continue
+        if layer is BrowserLayer.CAMOUFOX and payment_context.in_flight():
+            continue  # a payment holds it (the flow also keeps its clock fresh)
         async with _browser_lock:
             last = _layer_last_used.get(layer, now)
+            if layer is BrowserLayer.CAMOUFOX and payment_context.in_flight():
+                continue
             if _layer_open(layer) and now - last >= _IDLE_TIMEOUT_S:
                 logger.info(
                     "Browser layer %s idle for %ds — reclaiming it", layer.value, _IDLE_TIMEOUT_S,
@@ -1495,6 +1537,8 @@ async def _get_page(
         # created before its page load timed out) still bills, and only the
         # watcher reclaims it.
         _start_idle_watcher()
+    if payment_context.is_payment_page(page):  # never: no tool may act on that context
+        raise RuntimeError("refused: the payment context is not a tool page")
     _active_page = page
     # Leaving TinyFish does NOT end its session: ending a paid session because
     # of what it costs is automatic cost control, which the design principles
@@ -1740,8 +1784,9 @@ async def _with_tool_timeout(
         global _active_page
         logger.warning("%s timed out after %.0fs — resetting active page", operation, timeout_s)
         _active_page = None
+        # Outside @_redacted: the operation names the caller's selector or key.
         return {
-            "error": (
+            "error": redact_text(
                 f"{operation} timed out after {timeout_s:.0f}s. {note}"
                 "Browser state was reset — call browser_navigate to resume."
             )
@@ -2475,14 +2520,14 @@ async def _send_turnstile_alert(page_url: str) -> None:
             severity=AlertSeverity.WARNING,
             title="CAPTCHA Challenge Detected",
             body=(
-                f"Browser at {page_url} hit a Cloudflare challenge. "
+                f"Browser at {redact_text(page_url)} hit a Cloudflare challenge. "
                 f"Auto-resolve and VNC click both failed after multiple attempts. "
                 f"Genesis will retry on next navigation.\n\n"
                 f"VNC available at: {vnc_url}"
             ),
         )
         await channel.send(alert)
-        logger.info("CAPTCHA alert sent to Telegram for %s", page_url)
+        logger.info("CAPTCHA alert sent to Telegram for %s", redact_text(page_url))
     except Exception:
         logger.warning("Failed to send CAPTCHA Telegram alert", exc_info=True)
 
@@ -2753,6 +2798,14 @@ async def _read_pointer_position(
 
 
 async def _vnc_click_turnstile(page) -> bool:
+    """:func:`_vnc_click_now`, unless a card payment runs (it would aim at the
+    active X window, which can be the payment window); a payment cannot start
+    while it clicks."""
+    with payment_context.try_x_input() as ok:
+        return ok and await _vnc_click_now(page)
+
+
+async def _vnc_click_now(page) -> bool:
     """Click the Turnstile checkbox via VNC trusted input (fallback).
 
     Uses vncdotool to send a mouse click through the VNC protocol, producing
@@ -3148,6 +3201,10 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                 _ts_log.info("RESOLVED: playwright_captcha (challenge gone)")
                 return {"status": "resolved", "method": "playwright_captcha"}
 
+        # Phases 2-3 click on the shared display, where a payment window may be.
+        if payment_context.in_flight():
+            return {"status": "blocked", "reason": "payment_in_flight"}
+
         # Phase 2: VNC click — last resort fallback
         _ts_log.info("PHASE 2: VNC click fallback")
         logger.warning(
@@ -3186,6 +3243,8 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                     attempt,
                 )
             else:
+                if payment_context.in_flight():  # stood down, not a VNC fault
+                    return {"status": "blocked", "reason": "payment_in_flight"}
                 vnc_failed_count += 1
                 logger.warning(
                     "VNC click attempt %d failed — repairing VNC infra",
@@ -3241,6 +3300,7 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
 # ---------------------------------------------------------------------------
 
 
+@_redacted
 async def _impl_browser_navigate(
     url: str,
     stealth: bool = True,
@@ -3287,6 +3347,8 @@ async def _impl_browser_navigate(
         return {"error": f"Chromium is not ready: {e}"}
     except packages.BrowserPackagesChanged as e:
         return {"error": str(e)}
+    except payment_context.PaymentInFlight:
+        return {"error": card_fill.TEXTS["payment_in_flight"], "code": "payment_in_flight"}
     except PatchrightBroken as e:
         # Restarting comes first when a package changed under this session, as for
         # any import error; otherwise the message is patchright's own repair.
@@ -3558,7 +3620,7 @@ async def _follow_new_page(old, new) -> str | None:
     global _active_page
 
     layer = _layer_of(old)
-    if layer is None:
+    if layer is None or payment_context.is_payment_page(new):
         return _NOT_FOLLOWED_LAYER_MOVED
     # The endpoint whose Genesis tab id the follow and a later close rewrite
     # (_remote_target_ids is keyed by CDP URL). While remote CDP drives ``old``
@@ -3612,6 +3674,7 @@ async def _follow_new_page(old, new) -> str | None:
     return None
 
 
+@_redacted
 async def _impl_browser_click(selector: str) -> dict:
     """Click an element on the current page.
 
@@ -4125,6 +4188,7 @@ async def _with_stall_diagnostics(
     return result
 
 
+@_redacted
 async def _impl_browser_fill(selector: str, value: str) -> dict:
     """Fill a form field on the current page.
 
@@ -4203,6 +4267,7 @@ async def _fill(page, selector: str, value: str) -> dict:
             nav.stop()
 
 
+@_redacted
 async def _impl_browser_upload(selector: str, file_path: str) -> dict:
     """Upload a file to a file input element on the current page.
 
@@ -4238,6 +4303,81 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
             return {"error": f"Upload failed on '{selector}': {e}"}
 
 
+# A screenshot is pixels: text redaction cannot reach a card number drawn in
+# it. Before capturing, every frame is read for the text a page can RENDER:
+# innerText, every element's placeholder, value, aria-label, aria-placeholder,
+# aria-valuetext, title and alt attributes, <option> text, form-field values,
+# CSS ::before/::after content (an attr() there is resolved), SVG text, and
+# the same inside open shadow roots. The pieces go through the split-aware card
+# check; a card number anywhere refuses the capture and no file is written. A
+# frame that cannot be read refuses it as well, except one already detached.
+# Not read: text drawn into a canvas or an image, closed shadow roots, and a
+# change to the page between this read and the capture.
+_PAGE_TEXT_JS = r"""() => {
+  const out = [document.body ? document.body.innerText : ''];
+  const ATTRS = ['placeholder', 'value', 'aria-label', 'aria-placeholder',
+                 'aria-valuetext', 'title', 'alt'];
+  const pseudo = (el, which) => {
+    const c = getComputedStyle(el, which).content;
+    if (!c || c === 'none' || c === 'normal') return;
+    out.push(c.replace(/attr\(([^)]+)\)/g, (_, n) => el.getAttribute(n.trim()) || ''));
+  };
+  const visit = (root) => {
+    for (const el of root.querySelectorAll('*')) {
+      // A field's live value replaces its value attribute: reading both would
+      // repeat each group and hide a segmented card from the split check.
+      const field = el.matches('input, textarea, select');
+      for (const a of ATTRS) {
+        const v = a === 'value' && field ? null : el.getAttribute(a);
+        if (v) out.push(v);
+      }
+      if (field) out.push(String(el.value || ''));
+      if (el.matches('option')) out.push(el.text || '');
+      if (el instanceof SVGElement && el.matches('text, tspan')) out.push(el.textContent || '');
+      pseudo(el, '::before');
+      pseudo(el, '::after');
+      if (el.shadowRoot) {
+        for (const child of el.shadowRoot.children) out.push(child.innerText || '');
+        visit(el.shadowRoot);
+      }
+    }
+  };
+  visit(document);
+  return out.join('\n');
+}"""
+_SCREENSHOT_FRAME_READ_S: float = 5.0
+_REFUSE_CARD_SCREENSHOT = (
+    "Refused: the page shows what looks like a payment card number, so no "
+    "screenshot was taken. Use browser_snapshot, which redacts it."
+)
+_REFUSE_UNREAD_SCREENSHOT = (
+    "Refused: a frame of the page could not be read to check it for a payment "
+    "card number, so no screenshot was taken."
+)
+
+
+async def _screenshot_refusal(page) -> str | None:
+    """A fixed refusal when the page may show a card number, else None."""
+    texts = []
+    for frame in list(page.frames):
+        try:
+            text = await asyncio.wait_for(
+                frame.evaluate(_PAGE_TEXT_JS), timeout=_SCREENSHOT_FRAME_READ_S
+            )
+        except Exception:
+            if frame.is_detached():
+                continue
+            logger.warning("Screenshot card check could not read a frame", exc_info=True)
+            return _REFUSE_UNREAD_SCREENSHOT
+        texts.append(text if isinstance(text, str) else str(text))
+    if not texts:
+        return _REFUSE_UNREAD_SCREENSHOT
+    if contains_card_text("\n".join(texts)):
+        return _REFUSE_CARD_SCREENSHOT
+    return None
+
+
+@_redacted
 async def _impl_browser_screenshot() -> dict:
     """Take a screenshot of the current page."""
     _touch()
@@ -4249,6 +4389,9 @@ async def _impl_browser_screenshot() -> dict:
             return health
         page = _active_page
     try:
+        refusal = await _screenshot_refusal(page)
+        if refusal:
+            return {"error": refusal, "url": page.url}
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         # Unique per call: consecutive captures must not overwrite one another
         # (a session capturing 8 pages kept only the last one). The timestamp
@@ -4272,6 +4415,7 @@ async def _impl_browser_screenshot() -> dict:
         return {"error": f"Screenshot failed: {e}"}
 
 
+@_redacted
 async def _impl_browser_snapshot() -> dict:
     """Return the accessibility tree snapshot of the current page."""
     global _remote_last_url
@@ -4321,6 +4465,7 @@ async def _evaluate_main_world(page, expression: str):
     return await page.evaluate(expression)
 
 
+@_redacted
 async def _impl_browser_run_js(expression: str) -> dict:
     """Execute JavaScript on the current page and return the result.
 
@@ -4431,6 +4576,7 @@ def _cookie_key(cookie: dict) -> tuple:
     )
 
 
+@_redacted
 async def _impl_browser_sessions() -> dict:
     """List cookie counts per domain in both local browser profiles.
 
@@ -4487,6 +4633,7 @@ async def _impl_browser_sessions() -> dict:
     return {"profiles": profiles}
 
 
+@_redacted
 async def _impl_browser_clear_domain(domain: str) -> dict:
     """Clear the cookies of a domain and its subdomains in both profiles.
 
@@ -4567,6 +4714,7 @@ async def _impl_browser_clear_domain(domain: str) -> dict:
     return {"domain": d, "cookies_removed": total, "profiles": profiles}
 
 
+@_redacted
 async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
     """Press a keyboard key on the current page."""
     _touch()
@@ -4589,6 +4737,64 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
             return {"pressed": key, "count": count, "url": page.url}
         except Exception as e:
             return {"error": f"Key press failed for '{key}': {e}"}
+
+
+# ---------------------------------------------------------------------------
+# browser_fill_card: the flow is payment_context's; this is the entry point
+# ---------------------------------------------------------------------------
+
+
+async def _close_browser_for_payment(ctx) -> None:
+    """The payment context would not close: close Camoufox, and it with it, if
+    it is still the launch the payment ran on (not one started since)."""
+    async with _browser_lock:
+        if _stealth_browser is ctx:
+            await _cleanup_camoufox()
+
+
+@_redacted
+async def _impl_browser_fill_card(
+    card_ref: str = "",
+    amount: str = "",
+    fields: dict | None = None,
+    pay: str | dict | None = None,
+    expiry_format: str = "MM/YY",
+    extra_fields: dict | None = None,
+    report=None,
+) -> dict:
+    """Pay with a vault card in an isolated browser context. See browser_fill_card."""
+    try:
+        if not card_fill.card_fill_enabled():
+            return card_fill.result("card_fill_disabled")
+        if card_fill.playwright_debug_on():
+            return card_fill.result("playwright_debug_on")
+        args = card_fill.validate(card_ref, amount, fields, pay, expiry_format, extra_fields)
+        # Short hold: every browser tool waits on this lock, and the flow waits minutes.
+        async with _browser_lock:
+            page, ctx = _active_page, _stealth_browser
+            if page is None or not _is_page_alive(page):
+                return card_fill.result("no_page")
+            if _layer_of(page) is not BrowserLayer.CAMOUFOX or ctx is None:
+                return card_fill.result("not_camoufox")
+            if card_fill.origin_of(page.url) is None:
+                return card_fill.result("not_http")
+            if not payment_context.prefs_pinned():
+                return card_fill.result("prefs_not_pinned")
+            if packages.stale_loaded_modules(_layer_dists(BrowserLayer.CAMOUFOX)):
+                return card_fill.result("browser_packages_changed")
+        _touch(BrowserLayer.CAMOUFOX)
+        hooks = payment_context.Hooks(
+            alive=lambda: _stealth_browser is ctx,
+            touch=lambda: _touch(BrowserLayer.CAMOUFOX),
+            interstitial=_detect_interstitial,
+            close_browser=lambda: _close_browser_for_payment(ctx),
+        )
+        return await payment_context.fill_card(args, ctx, page, hooks, report)
+    except card_fill.Refused as r:
+        return card_fill.result(r.code)
+    except Exception as e:  # noqa: BLE001 - never an exception's text: it may quote the page
+        logger.error("browser_fill_card failed (%s)", type(e).__name__)
+        return card_fill.result("internal_error")
 
 
 # ---------------------------------------------------------------------------
@@ -4781,6 +4987,11 @@ async def browser_screenshot() -> dict:
     call gets its own file, so consecutive screenshots don't overwrite one
     another and sort chronologically) and returns the path. Always read the
     returned "path" — never reconstruct it. Use the Read tool to view it.
+
+    Refused, with no file written, when the text the page renders in any
+    frame (visible text, form values, placeholders, labels, titles, alt text,
+    CSS-generated content) shows a payment card number, or a frame cannot be
+    read to check.
     """
     return await _with_tool_timeout(
         _impl_browser_screenshot(), 30.0, "browser_screenshot"
@@ -4863,6 +5074,55 @@ async def browser_press_key(key: str, count: int = 1) -> dict:
 
 
 @mcp.tool()
+async def browser_fill_card(
+    card_ref: str = "",
+    amount: str = "",
+    fields: dict | None = None,
+    pay: str | dict | None = None,
+    expiry_format: str = "MM/YY",
+    extra_fields: dict | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Pay with a vault card on the open Camoufox checkout after the owner's
+    Telegram tap; fills in a separate blank window and clicks Pay itself. Card
+    values never reach you. Full usage: the browser-automation skill, "Money".
+
+    card_ref: card_ + 12 hex. amount: the total exactly as the page shows it,
+    digits included. fields: kind -> CSS selector, or {"selector", "frames":
+    [iframe selector, ...]}; kinds number (required), expiry or exp_month +
+    exp_year, cvc, name, postal_code. pay: the Pay button, same shape.
+    Selectors are printable plain CSS (no ``>>``, engine= prefix, quoted text
+    or XPath); each element must be in the frame its chain names. Snapshots
+    cannot see inside a cross-origin frame: use the provider's standard ids.
+    expiry_format: MM/YY, MM / YY, MM-YY, MMYY, MM/YYYY or MMYYYY.
+    extra_fields: name -> {"selector", "value"} (email, name, phone,
+    address_line1, address_line2, city, region, postal_code, country, company;
+    top document only), filled before the tap.
+
+    Returns {code, status, host} (+ filled, field, reason where they apply).
+    submitted_unverified: check the order. challenge, card_url_blocked,
+    card_url_leaked, pay_click_unknown, outcome_unknown, moved_while_filling,
+    card_url_before_pay, card_value_in_request: do NOT retry; tell the owner. Refused while card fill
+    is off or another payment runs.
+    """
+    last_sent, sent = 0.0, 0
+
+    async def report(message: str) -> None:
+        nonlocal last_sent, sent
+        if ctx is None or time.monotonic() - last_sent < _FILL_PROGRESS_EVERY_S:
+            return
+        last_sent, sent = time.monotonic(), sent + 1  # MCP progress must increase
+        with contextlib.suppress(Exception):  # best effort: a lost report changes nothing
+            await asyncio.wait_for(
+                ctx.report_progress(sent, message=message), timeout=_FILL_PROGRESS_SEND_S
+            )
+
+    return await _impl_browser_fill_card(
+        card_ref, amount, fields, pay, expiry_format, extra_fields, report=report
+    )
+
+
+@mcp.tool()
 async def browser_collaborate(enable: bool = True) -> dict:
     """Toggle collaborative timing mode.
 
@@ -4879,6 +5139,7 @@ async def browser_collaborate(enable: bool = True) -> dict:
     return _impl_browser_collaborate(enable)
 
 
+@_redacted
 def _impl_browser_collaborate(enable: bool = True) -> dict:
     """Set the timing profile explicitly (see browser_collaborate)."""
     global _collaborate_mode

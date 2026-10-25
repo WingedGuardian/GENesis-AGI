@@ -19,6 +19,11 @@ from tests.test_eval.qualification_transport_fixtures import bundle
 @pytest.fixture
 def plan(tmp_path):
     """Complete schedule geometry only, not current production admission proof."""
+    return population_plan(tmp_path, execution.ALIASES)
+
+
+def population_plan(tmp_path, aliases):
+    """Build explicit synthetic model geometry without changing production aliases."""
     data = bundle(tmp_path)
     contract = data.contract
     checked = {"corpus_hash": "a" * 64, "policy_hash": "b" * 64,
@@ -27,11 +32,11 @@ def plan(tmp_path):
                "plan": {contract: {f"case-{i}": {"messages": data.messages,
                                                "prompt_hash": digest(data.messages)}
                                     for i in range(750)}},
-               "models": {a: pinned.resolve(a).model_id for a in execution.ALIASES},
-               "parameters": {a: data.params for a in execution.ALIASES}}
+               "models": {a: pinned.resolve(a).model_id for a in aliases},
+               "parameters": {a: data.params for a in aliases}}
     models = {}
     fingerprint = hashlib.sha256(b"synthetic-only-key").hexdigest()
-    for alias in execution.ALIASES:
+    for alias in aliases:
         identity = {**data.campaign.expected_manifest["binding"]["transports"][data.alias],
                     "model": checked["models"][alias], "receipt_provider": "Synthetic Gateway Display",
                     "provider_identity_evidence": "synthetic mapping only"}
