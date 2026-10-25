@@ -329,3 +329,31 @@ def test_source_replaced_by_directory_closes_failed_reader_descriptor(tmp_path, 
         for descriptor in opened:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
+
+
+@pytest.mark.parametrize("link_level", ["root", "ancestor"])
+def test_prune_retention_is_anchored_to_the_validated_root(tmp_path, monkeypatch, link_level):
+    bound, other = tmp_path / "bound", tmp_path / "other"
+    (bound / "projects").mkdir(parents=True)
+    (other / "projects").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(bound / "projects" if link_level == "root" else bound, target_is_directory=True)
+    projects = link if link_level == "root" else link / "projects"
+    original = bound / "projects" / "source.jsonl"
+    _write(original, "2025-01-01T00:00:00Z")
+    data = tmp_path / "data"
+    assert store.ingest(projects, data)["rebuilt"] == 1
+    check = store._prunable_key
+
+    def repoint_then_check(*args, **kwargs):
+        if link.resolve() != (other / "projects" if link_level == "root" else other):
+            link.unlink()
+            link.symlink_to(
+                other / "projects" if link_level == "root" else other, target_is_directory=True
+            )
+        return check(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_prunable_key", repoint_then_check)
+    assert store.prune(data, before="2026-01-01", projects=projects) == 0
+    assert original.exists()
+    assert store.select_sources(data)[0][0].path("fragments").exists()

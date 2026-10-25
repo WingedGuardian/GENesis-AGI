@@ -1,0 +1,17 @@
+# Card payments from the encrypted vault (`python -m genesis vault`).
+#
+# card_fill.enabled turns on browser_fill_card, which fills a vault card into a
+# checkout opened in a separate, short-lived browser context and clicks Pay,
+# after the owner approves the payment with a Telegram tap (every payment,
+# every time). Off unless exactly `true`. A missing or unreadable file means
+# off, and GENESIS_CARD_FILL_DISABLED=1 in the environment turns it off
+# whatever this file says. Read on every call.
+#
+# Camoufox reads it once at launch to pin the form-data prefs card fill needs
+# (no form history, autofill, password capture, places history or disk cache,
+# for all browsing while it is on); after turning it on, restart the browser
+# before the first payment.
+#
+# Override per install in ~/.genesis/config/payments.local.yaml.
+card_fill:
+  enabled: false

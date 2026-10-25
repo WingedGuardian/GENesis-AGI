@@ -16,7 +16,7 @@ runtime = managed
 
 @pytest.mark.parametrize("entry", [
     "runtime_config", "runtime_preflight", "enable", "launch",
-    "ready", "serve", "client",
+    "ready", "serve", "available", "client",
 ])
 @pytest.mark.parametrize("key", ["main", "cache"])
 @pytest.mark.parametrize("physical_alias", [False, True])
@@ -42,7 +42,7 @@ def test_unsupported_provider_path_refuses_before_runtime_effects(
     for name in (
         "verify_cache", "verified_binary", "require_enabled", "show",
         "require_quiescent", "inspect_sources", "refresh_sources", "native_install",
-        "verify_frontend_boundary", "verify_query_boundary",
+        "verify_frontend_boundary", "verify_query_boundary", "verify_worker_writes",
         "check_backend", "frontend_command",
     ):
         effect = Mock(name=name, side_effect=AssertionError(f"unexpected effect: {name}"))
@@ -57,6 +57,8 @@ def test_unsupported_provider_path_refuses_before_runtime_effects(
         arguments = (settings,)
     elif entry == "launch":
         arguments = (value, settings)
+    elif entry == "available":
+        arguments = (settings, value["main"])
     elif entry == "client":
         arguments = (settings, "test-client.service")
     else:
@@ -68,8 +70,9 @@ def test_unsupported_provider_path_refuses_before_runtime_effects(
     sleep.assert_not_called()
 
 @pytest.mark.parametrize("key", ["main", "cache"])
-def test_ready_cli_rejects_provider_identity_before_manager_or_provider(
-    managed, tmp_path, key,
+@pytest.mark.parametrize("command", ["ready", "available"])
+def test_runtime_cli_rejects_provider_identity_before_manager_or_provider(
+    managed, tmp_path, key, command,
 ):
     value = config(tmp_path, managed)
     value[key] += "\\unsupported"
@@ -78,8 +81,11 @@ def test_ready_cli_rejects_provider_identity_before_manager_or_provider(
     state = tmp_path / "isolated-state"
     env = dict(os.environ, HOME=str(tmp_path / "home"), GENESIS_HOME=str(state))
     before = path.read_bytes()
+    argv = [sys.executable, "-I", str(SCRIPT), "--config", str(path), command]
+    if command == "available":
+        argv.extend(["--repo", value["main"], "--persistence", "false"])
     result = subprocess.run(
-        [sys.executable, "-I", str(SCRIPT), "--config", str(path), "ready"],
+        argv,
         env=env, capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 1
@@ -93,6 +99,9 @@ def test_ready_cli_rejects_provider_identity_before_manager_or_provider(
     (["--config", "/settings", "ready"], {"command": "ready", "config": "/settings"}),
     (["serve"], {"command": "serve"}),
     (["launch"], {"command": "launch"}),
+    (["available", "--repo", "/repo"], {"command": "available", "repo": "/repo", "persistence": "true"}),
+    (["available", "--repo", "/repo", "--persistence", "false"],
+     {"command": "available", "repo": "/repo", "persistence": "false"}),
     (["enable"], {"command": "enable"}),
     (["disable"], {"command": "disable"}),
     (["remove"], {"command": "remove"}),
@@ -103,19 +112,19 @@ def test_ready_cli_rejects_provider_identity_before_manager_or_provider(
      {"command": "configure", "main": "/repo", "binary": "/binary", "state": "/state", "sentinel": "/sentinel"}),
 ])
 def test_extracted_parser_preserves_existing_command_contract(managed, argv, expected):
-    parsed = vars(managed.parse_arguments(argv))
+    parsed = vars(managed.native_parse_arguments(argv, managed.__doc__))
     assert {key: parsed[key] for key in expected} == expected
 
 
 @pytest.mark.parametrize("argv", [[], ["client"], ["configure"], ["verify-uninstall-locks", "x", "4", "5"]])
 def test_extracted_parser_still_refuses_incomplete_arguments(managed, argv):
     with pytest.raises(SystemExit) as error:
-        managed.parse_arguments(argv)
+        managed.native_parse_arguments(argv, managed.__doc__)
     assert error.value.code == 2
 
 
 def test_extracted_parser_keeps_operator_help_description(managed, capsys):
     with pytest.raises(SystemExit) as error:
-        managed.parse_arguments(["--help"])
+        managed.native_parse_arguments(["--help"], managed.__doc__)
     assert error.value.code == 0
     assert "Stage immutable Codebase settings" in capsys.readouterr().out

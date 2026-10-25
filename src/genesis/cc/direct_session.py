@@ -218,6 +218,9 @@ _NO_OUTREACH_SEND = [
 _NO_BROWSER_INTERACTION = [
     "mcp__genesis-health__browser_click",
     "mcp__genesis-health__browser_fill",
+    # Pays with a vault card behind the owner's Telegram tap. Profiles that
+    # keep browser interaction (interact) keep it too.
+    "mcp__genesis-health__browser_fill_card",
     "mcp__genesis-health__browser_run_js",
     "mcp__genesis-health__browser_clear_domain",
     "mcp__genesis-health__browser_collaborate",

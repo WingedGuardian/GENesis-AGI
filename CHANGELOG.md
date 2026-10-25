@@ -9,12 +9,5071 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+## [v3.0b19] - 2026-10-24
+
+### Added
+
+- **Daily free-tier budgets for providers.** Providers can now carry
+  `rpd_limit` (requests/UTC-day) and `tpd_limit` (tokens/UTC-day) in
+  `config/model_routing.yaml`, each in the provider's own unit. When a
+  provider's daily budget is spent, routing deselects it until the next UTC
+  day instead of burning the rest of the day on 429s that silently push load
+  onto paid fallbacks — you get one warning event at the crossing, and the
+  live counters appear in the dashboard's routing config API
+  (`daily_budget`). Groq ships with its measured caps (200K tokens/day,
+  1K requests/day); other providers are opt-in. Counters survive restarts
+  (`~/.genesis/routing_budget_state.json`) and err toward undercounting, so
+  a miscount can never lock a healthy provider out. Kill switch:
+  `GENESIS_DAILY_BUDGET_DISABLED=1`.
+
+- **Optional graph engine: module fetched, service unit written, nothing armed.**
+  `bootstrap.sh` now downloads the FalkorDB engine module (one file under
+  `~/.genesis/deps`, checked against a pinned digest and re-checked on every
+  run) and writes a `genesis-falkordb` user unit that stays **disabled**: it
+  listens on no TCP port, only a unix socket in `~/.genesis/falkordb`, and can
+  write nothing in your home but its own data directory where the host allows
+  user-unit sandboxing. Nothing on your system changes — the `redis-server`
+  8.x the engine needs is a manual, opt-in step described in SETUP.md, "Graph
+  engine (FalkorDB)". Once you select it (graphstore `mode: falkordb`) or
+  enable its unit, the infrastructure health check alerts if it fails, stops
+  (a start-only unit after a reboot), or loses its socket; an engine you never
+  armed stays silent. A provision that cannot verify the module does not
+  re-render an existing unit onto it.
+  `GENESIS_FALKORDB_PROVISION_DISABLED=1` skips the module download.
+
+- **Genesis now enumerates its own stranded work instead of trying to remember
+  it.** Finished code sitting on a branch nobody pushed, a pushed branch with no
+  pull request, edits left uncommitted in a worktree — all of it was invisible
+  unless somebody happened to think of it. A detector now sweeps the repository
+  on a schedule and keeps one row per standing condition, so the question "what
+  fell through the cracks?" has an answer that was counted rather than recalled.
+
+  Getting that count right is the whole problem. Because this project
+  squash-merges, a branch that landed weeks ago still looks like it is ahead of
+  the main line forever, so simply asking git turned up 145 candidates of which
+  roughly 18 were real. Matching each branch against the project's pull-request
+  history by NAME is what recovers the precision — but a name is a hint, not a
+  receipt, and treating it as one hid real work. A pull request records the
+  exact commit it merged, and the server can be asked what it actually holds;
+  the detector now prefers those. If the recorded commit IS your local commit,
+  or contains it, the work landed and no clock is consulted. If the server's
+  copy of the branch differs from yours and yours is not simply older, then you
+  are holding commits that exist nowhere else, and no pull request on that name
+  covers them — however recently it merged, and whether it merged or was
+  abandoned. Only when the commits themselves settle nothing do the merge and
+  close timestamps get a say. Measured against this project's history, the
+  older name-and-clock rule was hiding five branches whose work existed on no
+  server, including finished fixes with tests; four of them sat behind a closed
+  pull request and one behind an open one that was reviewing something else.
+
+  The same mistake runs the other way too, and had to be closed from both ends.
+  Looking a branch up by its NAME alone means a branch you renamed — or one you
+  created locally to review somebody's pull request under a name of your own —
+  matches nothing in the history, so the exact commit that would have proved it
+  was already handled never gets consulted, and it is reported as stranded.
+  Names change; the commit a pull request points at does not. Branches are now
+  matched by both, which on this project's own history removed four such false
+  reports out of twenty-six — every one of them a branch sitting on the exact
+  commit of a real pull request. The same reasoning settles a smaller one: if
+  you have the same branch open in two working copies at once, they are now two
+  separate rows rather than one, so acknowledging the uncommitted work in one
+  of them no longer silently speaks for the other.
+
+  Coverage that cannot be established is now reported rather than assumed. If
+  the merged commit is one this machine has never fetched, the branch is
+  flagged as unconfirmed and carries the single command that settles it, on the
+  principle that an extra row somebody dismisses costs less than a clean board
+  that lied. Where the ambiguity runs the other way — the server's copy differs
+  and there is no way to tell ahead from behind — the detector reports neither,
+  leaving any existing row exactly as it was. Closed-but-unmerged pull requests
+  are still read as deliberate abandonment and suppressed, but a decision to
+  abandon covers the work that was IN the pull request, not commits made
+  afterwards or never sent. Every run publishes its full arithmetic, including
+  what it declined to judge.
+
+  There is no list of branch-name prefixes to ignore. A branch that is meant to
+  sit there — a backup, a scratch experiment — is acknowledged with a written
+  reason, which leaves a record a person can read instead of a rule nobody can
+  see. The acknowledgement is tied to the exact commit it was granted against,
+  so it lapses by itself the moment new work lands on that branch — and only
+  then. An earlier version let ordinary typing revoke one: editing a file
+  inside an acknowledged working copy briefly pushed it under an age filter,
+  and the reconciler read "not reported this time" as "gone". Not reporting
+  something and it having gone away are now different things, which is also
+  what stops a recurring finding from silently restarting its count.
+
+  Three failure modes shaped the rest. A sweep that cannot see everything says
+  so and changes nothing, rather than reporting the branches it failed to look
+  at as resolved — a detector that manufactures a clean board is worse than no
+  detector. A detector that quietly dies would go on answering "nothing"
+  forever, so it reports its own liveness. And the subtler one: a detector that
+  is alive but half-blind — say its access token expired — would keep its
+  liveness green, keep its numbers, and never notice anything new again. That
+  now raises its own alarm, separately from whatever it found, and every count
+  it publishes says which parts of the picture the last look actually covered.
+
+  Read the board with `zero_drop_status`, which reports how long ago it was
+  compiled, because a stale zero is not a clean one. Off, quiet, or noisy is a
+  setting (`zero_drop`: `off`, `observe`, `alert`). It ships on `observe`: the
+  board fills and is readable, while the summary-alert lane waits on a
+  refinement to how such alerts expire. A damaged setting falls back to
+  `observe` rather than to `off`, on the principle that a silent detector is
+  the more dangerous of the two.
+
+- **The graph engine can now answer, and nothing routes to it yet.** A second
+  memory-graph backend lands behind the existing seam: a long-lived FalkorDB
+  server reached over a unix socket, with its own projection of the memory
+  graph. **Reads do not move** — the selector in `config/graphstore.yaml`
+  defaults to the in-process NetworkX store, and every unreadable or
+  unrecognised value degrades to it as well. Moving reads onto the new engine is
+  a deliberate one-line change; nothing moves them there by accident.
+
+  What it buys, when you do move: NetworkX rebuilds its whole projection
+  whenever any writer invalidates it, and the new store never rebuilds. It also
+  re-checks whether a memory has expired on every read instead of once per
+  rebuild, so a memory whose validity window closes becomes invisible
+  immediately rather than waiting for the next write to trigger a rebuild.
+
+  What it does not change: both stores hide exactly the same memories — 400 real
+  traversals were replayed through both and disagreed on none of them, which is
+  the point, since which backend answers must never change what you are shown.
+  Betweenness centrality deliberately stays on NetworkX whichever backend is
+  selected; the new engine cannot compute it, and quietly substituting a
+  different measure would change which memories are protected from
+  consolidation. If the engine is unreachable, traversals fall back to NetworkX
+  and then to SQL rather than returning an empty answer that would read as "this
+  memory has no connections".
+
+  If you do arm the engine, build its projection first with `python -m
+  genesis.memory.graphstore_project` — safe to re-run at any time, including
+  while the engine is being read, because the new copy is built alongside the
+  old one and swapped in atomically. Selecting the engine before building a
+  projection is refused rather than silently answered, since a never-built
+  projection makes every memory look like it has no connections and the answer
+  alone cannot tell you which it is. A projection that was built and is
+  genuinely empty — a fresh install, or one whose links were all pruned — is
+  answered normally, not refused.
+
+  **This update does change your dependencies.** The graph engine is part of the
+  memory architecture rather than an optional add-on, so its client ships as a
+  normal dependency — which also raises `redis` from 7.x to 8.x, because the
+  client requires it. Genesis itself never connects to redis outside the graph
+  engine; the version matters only because other libraries import it. Before
+  shipping this, that upgrade was tested against the stack that does: the MCP
+  server framework and its task/queue dependency import and run correctly under
+  redis 8, and the full graph projection was built and queried on it. Nothing to
+  do on your side beyond the usual update.
+
+- **"What fell through the cracks?" now has one answer instead of five partial
+  ones.** Genesis already detected work stranded in git — finished code on a
+  branch nobody pushed, a pushed branch with no pull request, edits left
+  uncommitted. Everything else it was carrying was counted somewhere else, or
+  nowhere: open pull requests in one cache, agreements in a per-session ledger,
+  deferred items in another store, things waiting on you in a third. Each
+  surface was correct about its own slice and none of them was the answer, which
+  is how something goes missing while every individual view looks fine.
+
+  A single board now assembles all of it on demand — nothing new is stored, and
+  every part is derived from a store that already owned the data. Read it on the
+  new Zero-Drop tab in the dashboard, or as one line in the morning report.
+
+  The rules it follows are the point, more than the counts themselves. A count
+  of a population carries the denominator that makes it checkable: not "3
+  stranded" but "3 open of 11 tracked". The one exception is the section for
+  things waiting on you, where the count IS the population and an all-time
+  total would size it against a number nobody acts on — and that exception is
+  stated rather than left as an inconsistency. A part that could not be read
+  says so rather than reporting nothing, and it degrades on its own: one
+  unavailable store no longer costs you the ones that were readable, and the
+  board says plainly that an unread part is not a zero. A source that has gone
+  stale withholds its number entirely instead of showing an old one beside a
+  caveat, because a figure printed next to a warning is still read as a figure —
+  and if the page itself stops refreshing, it now says so instead of quietly
+  showing you the last board that loaded.
+  The stranded-work count always carries the detector's own age for the same
+  reason: a zero from something that has not run in a week is not a clean board,
+  and saying so is the difference between a report and a reassurance.
+
+  One number it surfaces did not exist anywhere before. A ledger row is shown
+  by its own session and by nothing else, so once that session ends its open
+  rows are invisible to every process and person — the hourly sweep that chases
+  them acts on a handful at a time but never counted the population it was
+  drawing from. Now it is counted, across every session.
+
+  The board also states what it does NOT cover, since a list of five sections
+  reads as complete unless it says otherwise.
+
+- **Follow-ups now record which session they came from.** The `source_session`
+  column existed and repo-pulse read it to attribute completions — but no live
+  producer wrote it: across the four sources that create follow-ups today, 513
+  of 513 rows were NULL, so every annotation the repo-pulse worker made carried
+  empty provenance. It now fills without guessing. The inbox evaluator and the
+  task executor pass through the session id they already held and were
+  dropping. The `follow_up_create` tool takes a `source_session` the calling
+  session reads off its own per-turn tag: an 8-character prefix is resolved
+  against every store that can hold a session id — including the one written
+  before a new session has done anything else, which is exactly when a session
+  first describes its own work — and a prefix that does not resolve to a single
+  complete id is stored as NULL, and says so, rather than as a truncated or
+  malformed one. A dispatched session, which never receives that per-turn tag
+  and so had no way to know its own id, is now told it at session start.
+  Callers with no session, like surplus ideation, keep an honest NULL.
+
+- **The commit-message hook now warns about security-incident framing.** Public
+  artifacts should describe what the code does, not assert in past tense that this
+  system leaked or exposed something — a fix does not need a confessed incident to
+  justify it. The hook already blocked private addresses and install identifiers in
+  commit messages; it now also prints a warning (never a block) when a message's
+  SUBJECT reads that way, at the point where rewriting is still free. This matters
+  most for commit messages specifically: squash merges take their text from the
+  branch commits, so that wording is what lands permanently, and a pushed public
+  branch cannot be force-pushed to correct it. Scope and wording are measured
+  against this repository's own history, and the test suite re-derives both the
+  hit rate and the recall on every run so a later edit cannot quietly narrow it.
+
+- **Career pipeline "bite" notifications (opt-in, off by default).** Genesis can now
+  ping you on Telegram when a company advances into an engaged stage (in conversation /
+  interviewing / offer) in your job-search pipeline — so you hear about momentum
+  without watching the board. It only READS your pipeline and notifies you (no
+  autonomous action, no sending), on an independent lever separate from the
+  draft-staging driver. Ships OFF: enable it by pointing `data_module` at your
+  career-agent module and setting `bite_relay_mode` to `observe` then `live`.
+
+- **The development skill now covers why a PR's CI can be missing, red, or
+  lying.** Four diagnosis traps that each produced a wrong conclusion in one
+  session, added beside the existing conflict-suppression trap rather than
+  duplicating it: mergeability reading `UNKNOWN` after any merge (and so
+  suppressing CI queue-wide for a while); a PR opened against a non-default base
+  never running CI at all, because the workflow filters on the base and
+  retargeting emits no triggering event; `workflow_dispatch` completing without
+  ever appearing in the PR's check rollup; and `gh run rerun` replaying the
+  original merge commit, so it cannot clear a failure caused by a base that has
+  since been fixed.
+
+  Also recorded: `gh run view --log-failed` truncates on a large suite and shows
+  only PASSED lines, so a failing job reads as a clean log; and the class where
+  two individually-green pull requests break `main` together, because one adds a
+  repo-wide invariant test and the other adds a violation of it, with no textual
+  conflict between them and no signal until both have merged.
+
+- **A verification keyed on existence can only confirm.** The skill's
+  verify-outcomes guidance now names the shape directly: a check that would still
+  pass if the thing were absent, stale, or the wrong object has proven nothing.
+  Three worked examples, all of the same shape — waiting for a new artifact by
+  testing that any exists, matching the first row rather than the intended one,
+  and counting from a listing sorted by a key other than the one being counted.
+
+- **A refused command now says that the WHOLE command was discarded, not just the
+  step that was refused.** A blocking hook cancels the entire Bash call, so
+  `cat > config.py <<'EOF' … EOF && git commit`, refused for the commit, also loses
+  the write — and the message named only the commit, which reads as "the commit
+  didn't happen" rather than "and the edit you just made never happened". Every
+  guard that can refuse a Bash command now adds a line saying so, and approval
+  prompts carry the same warning in the dialog, since declining skips every other
+  step too.
+
+  The note deliberately names nothing — not the files, not the steps. Working out
+  which files a command would have written means deciding what each tool's flags
+  do, a set with no closed boundary that produced fourteen review findings.
+  Listing the parsed steps instead looks safer and is not: the shared parser
+  splits on `|` as well as `&&`, and drops a plain redirect target, so the case
+  this exists for renders as `cat / PORT=8080 / EOF` — no filename, and heredoc
+  body lines presented as commands. Stating the one fact true of every block
+  needs no knowledge of any tool and cannot go stale.
+
+  It appears on any command with more than one step, which is most of them, and
+  is load-bearing on the subset that actually lost a write. Separating those
+  needs the tool-semantics guesswork above, so the ubiquity is the price of the
+  note being unable to mislead.
+
+- **The development guide now names three ways a test can look rigorous and
+  prove nothing.** A test that fails before the fix is the standard evidence
+  that it caught something, but the failure has to come from the assertion that
+  describes the defect — when it comes from setup instead, what it proves is
+  that the test never built the situation it was written for. Related: a test
+  of the seam between two components has to run both of them, because a value
+  typed by hand in the middle is exactly where the defect hides, and a copy of
+  the fix pasted into the test grades the copy rather than the shipped code.
+  The guide also records that two reviewers pushing opposite values for the
+  same field position a review apart is a signal that the code depends on
+  something that is not fixed, not an invitation to pick a side.
+
+- **Genesis now remembers which merged PRs still need their end-to-end check.**
+  "Verify this after it merges" used to live in whoever merged it — measured, one
+  of two owner-directed merges had its E2E forgotten until someone asked, and both
+  found real problems once run. Every merged PR now gets a durable row, and a
+  docs-only change closes its own row automatically with the reason recorded, so
+  the list holds real work rather than noise. Documentation and prompt/skill edits
+  are exempted by a fixed path rule, never by a model deciding case-by-case. See
+  what is outstanding with
+  `python scripts/repo_pulse_worker.py --verification-backlog`; turn the whole
+  thing off with `verification_enabled: false` in `config/repo_pulse.yaml`.
+  Recording starts from the merges the pulse worker sees after the upgrade; it
+  does not reach back over history already behind the worker's cursor. Verified
+  against a scratch copy of this repo's real merge history — 105 of 105 merges
+  recorded, 21 auto-exempted as documentation — which is a check of the
+  behaviour, not a description of rows your install will have.
+
+- **The desktop-takeover authorization gate, shipped before anything can call
+  it.** `autonomy/desktop_gate.py` is the deterministic check that would stand
+  between Genesis and your own keyboard, mouse and screen. Nothing calls it: the
+  actuator is inert and the loop lands later. An actuator with a caller and no
+  gate *is* the ungated capability, so the gate goes first and alone.
+
+  It decides from what the actuator RESOLVED — the operation, the key chord, the
+  target window's handle, and the element name, control type and `IsPassword`
+  the accessibility tree reported — never from the acting model's prose about
+  its own intent. Consent inferred from a model's self-report is the weakness
+  the whole gate exists to avoid. A call that omits any of that is REFUSED with
+  a reason naming the missing field, rather than held: a hold would ask you to
+  approve an action nobody can describe, and a missing field is a caller defect,
+  not a judgement to delegate.
+
+  Authority is per SESSION, MISSION and WINDOW, and every field it carries is
+  compared. The window is identified by `(handle, process id)` rather than by
+  title, because two browser tabs are both called "New Tab" and a title changes
+  when the document inside it does — so a title bar authorises the wrong window
+  while looking strict, and stops matching the right one. The mission binds an
+  id, never the mission text, which is model-generated and gets rewritten on
+  every re-plan. A grant must also be a grant and not a hold (both are rows of
+  the same action type, so a `kind` marker is what stops approving one held
+  click from handing over the session), must be approved and unconsumed, must
+  carry a wire format this version knows, must have been resolved through a
+  channel whose messages originate outside this box — Telegram or voice,
+  deliberately narrower than `classify_resolver`'s "human" class, because
+  `dashboard` is stamped by a route any local process can reach with the
+  internal bearer token and `user` is merely a default — and must be unexpired
+  against a config TTL bounded in both directions, so a backwards clock step
+  cannot mint a permanent grant.
+
+  Risk comes from four independent signals combined highest-wins, because the
+  ways an action can be dangerous are not the same shape. Labels are one of
+  them: "Send", "Delete", "Sign up" cross the identity bar. But `Pay` and
+  `Remove account` are on no desktop label list while the reversibility
+  classifier has always called them irreversible, so that verdict now counts
+  too. A drag acts on geometry and no label describes its effect, so it holds. A
+  key chord is checked against an allowlist of chords that only navigate or edit
+  text — `ctrl+enter` sends the mail in most clients and appears on no denylist
+  anyone finished writing, so an unrecognised chord holds. That polarity is the
+  point: a denylist's misses on a safety boundary are vulnerabilities, an
+  allowlist's are one hold apiece.
+
+  Ordinary work stays ordinary, which is a safety property and not a
+  convenience. Typing "please delete the old draft" into a text editor is not an
+  irreversible action, clicking in a window called "Messages" is not sending
+  one, and a commit hash is not a bank transfer — money is matched by card, IBAN
+  and SSN *shapes* as well as labels, with the IBAN validated by its ISO 7064
+  checksum rather than its shape, because a country-code pattern alone held
+  roughly one git SHA in every hundred and ten. A gate that stops the most
+  ordinary thing you do teaches you to wave it through.
+
+  Secret fields are outside all of it: `IsPassword`, or a target merely *named*
+  like one, is a refusal with no approval path — custom controls routinely do
+  not set the flag, and the list covers the family (OTP, one-time and
+  verification codes, 2FA, recovery keys, passkeys, security questions, SSNs).
+  That match is scoped to the target alone, so a window called "Password
+  Manager" does not make its controls unreachable. "Pin" gets its own rule
+  rather than a bare keyword, because a case-insensitive match made "Pin to
+  taskbar" a secret field — and a secret-field match is a refusal with no way
+  to proceed, so a false one is the most obstructive mistake this gate can
+  make.
+
+  That "nothing types into a password box" is an absolute, and keeping it true
+  is why paste is not on the inert-chord list. A keypress has no resolved
+  target, so `IsPassword` is always false for one and the refusal has nothing
+  to match against; with `tab` inert and `ctrl+v` inert, the loop could move
+  focus into a credential box and paste into it. Copy, undo and backspace stay,
+  because none of them can put chosen content anywhere.
+
+  The approval a person reads is newline-delimited, one field per line, rather
+  than quoting the window and control inline. Screen text cannot contain a
+  newline by the time it reaches the card, but it can contain an apostrophe: an
+  element named `Cancel' in 'Notepad` produced a card that read as well-formed
+  and named the wrong window. Structure closes that; stripping quotes would
+  have corrupted every legitimate title.
+
+  Screen-supplied text is treated as hostile where it reaches a person: window
+  titles and element names pass through the canonical control-character strip
+  and a declared length bound before they reach the approval you read, so a
+  malicious window cannot forge extra lines, reorder the text with bidi
+  overrides, or conceal part of it — while the full value is kept verbatim in
+  the row's context.
+
+  `shadow` — the shipped default — now reports the verdict the live path
+  computes, from the same function, instead of recomputing it by hand. A shadow
+  that silently disagrees with live is worse than no shadow, because shadow is
+  the mode installs actually run and the only thing telling you what live would
+  do.
+
+  Arming needs both `mode: live` and `live_opt_in: true` in
+  `config/desktop_takeover.yaml` (default `shadow`; env kill
+  `GENESIS_DESKTOP_TAKEOVER_DISABLED`, checked before any config read, and now
+  honouring `true`/`yes`/`on` rather than only the literal `1` — it previously
+  ignored every spelling but one, silently, on the control documented as the
+  one thing config damage cannot get around). Both time windows have an upper
+  bound as well as a lower one: the lever is described as bounded and was
+  bounded on one side, so a mistyped `grant_ttl_minutes: 30000` was a 20-day
+  grant. Anything past the maximum falls back to the default rather than
+  clamping to the ceiling, because every degradation here moves toward less
+  authority. And the
+  domain is deliberately absent from the settings MCP so arming is a conscious
+  file edit rather than one unconfirmed API call. If your local overlay is
+  present but unparseable the capability goes to `off` rather than falling back
+  to defaults, because the base ships `enabled: true` and your disable can only
+  live in the overlay — degrading it would quietly re-enable something you
+  switched off. The capability cell can permanently DENY but can never GRANT, so
+  no amount of banked evidence converts session consent into standing autonomy.
+  Desktop rows are withheld from the generic dashboard approvals queue and from
+  the unified comms feed, refused by the per-item resolve path, excluded from
+  `approve_all_pending`, and sit outside the voice-gated types: neither a batch
+  "approve all" tap nor a bare spoken "approve" aimed at something else can hand
+  over the machine. That set is maintained by enumeration rather than by an
+  allowlist, so it was checked by listing every reader of the approvals table —
+  the comms feed was the one that had been missed.
+
+  Three limits stated plainly rather than left to be discovered. The grant
+  predicate is not a complete authorization boundary — the database is writable
+  by the uid every Genesis process runs as, so the allowlist closes the
+  app-layer path and nothing more. The classifier raises the bar on ordinary
+  software but is not a defence against adversarial UI, since a hostile page
+  names its own controls. And approving a held action currently authorizes
+  nothing: the row is recorded, no surface can resolve it yet, and what an
+  approval should buy is a new authorization surface that lands with the consent
+  path in a later change.
+
+- Branch protection now lives in the repository as reviewable files. Two rulesets are declared in `.github/rulesets/` and applied by `scripts/apply_rulesets.py` (`--dry-run` shows the diff first): one keeps the maintainer bypass so the approval rule stays usable on a single-maintainer repo, and a second — with no bypass at all — makes `test`, `leak-detector` and `lint` bind every merge. Previously a single bypass entry made every server-side rule advisory for the account doing the merging, so a required check could not actually stop anything.
+
+- **A queued message can now be cancelled before it sends.** Scheduling a
+  reminder or notification for later used to be one-way: once queued, the only
+  states the message could reach were "sent" or "sent". Changing your mind meant
+  either letting a stale message arrive and sending a correction after it, or
+  marking the original as delivered — which writes a record saying you were told
+  something you never were, and a later session reads that record and believes
+  it. Cancelling is now its own state, so a retracted message is recorded as
+  retracted rather than disguised as delivered. Two new tools: one lists what is
+  currently queued and when each item is due, the other cancels one by id. A
+  cancel that finds nothing to cancel — an unknown id, a message already sent,
+  or one cancelled a moment ago — says so plainly instead of reporting success.
+
+- The cross-model reviewer is now asked whether the approach is right, not only whether the code is. It was previously told to hunt defects and nothing else, so a solution that was wrong in shape produced round after round of real findings with nobody ever saying why they kept coming.
+
+- **Superseding a memory is now its own operation.** Until now the only way to
+  mark a memory as corrected was to pass `supersedes` to `memory_store`, which
+  meant the deprecation could only happen as a side effect of writing new
+  content. There was no way to say "this memory replaces that one" about two
+  memories that already existed, and a supersede that failed could not simply be
+  retried -- retrying meant re-sending the content too.
+
+  `memory_supersede(old_id, new_id)` does just the one thing. Both ids accept
+  the same short handles as the rest of the system, and because the caller names
+  both, both can be checked before anything is written: a handle naming no
+  memory, an ambiguous prefix, a memory asked to replace itself, or a successor
+  that is itself deprecated are all rejected with nothing changed. A failed call
+  is a no-op that is safe to retry.
+
+  `memory_store(supersedes=...)` keeps working and is still the right call when
+  the correction is new content.
+
+- The daily disk-hygiene run now ages out the guard replay corpus cache
+  (`~/.genesis/output/guard-corpus.jsonl`) and any temp left by an interrupted
+  rebuild after 45 days. The cache is regenerable and holds verbatim command
+  lines from your own sessions, so it no longer lives forever by default.
+
+- **The library that will record which live session is using which worktree
+  lands here. Nothing calls it yet.** With many sessions sharing one repository,
+  nothing says who is where, so the daily cleanup can archive a worktree a
+  session is still working in — leaving that session broken and its unsaved work
+  recoverable only by hand. The fix records ownership using git's own "this
+  worktree is in use" marker, which the cleanup job already respects. This
+  release ships only the piece that knows how to write and read that marker: the
+  hook that takes a claim on first edit, and the cleanup-side release, follow
+  separately, and until they land nothing behaves differently. Recording the
+  fact is the whole protection when it arrives; nothing enforces anything.
+- **Both signals the cleanup job had for "is anyone using this" turned out not to
+  work, and that is why this exists.** The first looked for a session whose
+  working directory was inside the worktree; sessions change directory per
+  command, so their working directory never leaves the main checkout — measured
+  as none of two hundred worktrees, while seven sessions were running. The second
+  asked how recently anything in the worktree changed, but only looked at the top
+  two levels of directories, and editing a file updates only that file. A
+  worktree whose source had just been edited still reported nineteen days idle
+  and eligible for cleanup; git could see the edit, the check could not. Nearly
+  all of this project's source sits below the level that check looks at, so this
+  was the ordinary case rather than an edge one.
+- **Exactly one thing is recorded: which live process is using the worktree.**
+  Whether there is unsaved work is deliberately NOT recorded — the cleanup job
+  can determine that itself, at the moment it decides, and does. Writing it down
+  in advance would mean checking it in one place and acting on it somewhere else,
+  and everything that had to be built to keep those two in agreement turned out
+  to be where the problems came from.
+- **A marker left by something else is reported, never touched.** A hand-written
+  one, or one belonging to another tool, is left exactly as found, and ours
+  carries an identifier specific enough that ordinary notes cannot be mistaken
+  for it. Claims are tied to a process and to when that process started, so a
+  recycled process number cannot be mistaken for the original owner, and a claim
+  that cannot be given a condition for lifting is never written at all.
+
+- Shared one evidence-driven web research method across foreground researchers,
+  research-profile background sessions, autonomous blocker investigation, and
+  tool-less autonomous steps assigned the legacy research skill.
+- Added public-repository-only GitHub.com search and source-inspection tools for
+  background research through a fixed unauthenticated endpoint, with explicit API
+  failures, pagination, bounded trees, UTF-8 file reads up to 8 MiB, and truncation
+  reporting.
+
+- **A git command that rewinds the whole worktree now says so, instead of being
+  noted as an ordinary discard.** `git checkout <commit> -- .` and its relatives
+  rewrite every tracked path under the pathspec, so anything merged since that
+  commit is reverted — and because the revert lands in your own working tree it
+  appears inside your own diff, looking deliberate. There is no natural point at
+  which anyone notices. On one install two merged pull requests were reverted in a
+  single operation; the first was found by luck and the second only by a separate,
+  later check. The guard already snapshotted the worktree for these verbs, but its
+  note said a snapshot exists, which is not the same as saying what the command
+  does. It now names the operation, the repository, and the conflict-aware
+  alternatives (`git merge --squash`, `git cherry-pick`, `git apply --3way`) that
+  fail loudly where this one succeeds silently.
+
+- **The recovery instructions in that note are now the ones that actually
+  recover.** Two earlier versions each offered a single command, and each lost
+  work. `git stash apply --index <sha>` was dropped on the belief that it writes
+  conflict markers into the file being rescued; re-measured, it exits 1 and leaves
+  the file untouched — a safe refusal, not corruption — and on a freshly rewound
+  tree it restores everything with the staged/unstaged split intact. Its
+  replacement, `git checkout <sha> -- .`, is the one that silently loses work:
+  path checkout is overlay-mode by default, so a file your work had DELETED is
+  never removed again and the rewind's copy survives to be committed. The note now
+  gives the complete form first, the robust `--no-overlay` fallback second, and
+  states the fallback's cost — it lands everything staged. Each claim was checked
+  by running the command against a repository carrying a staged change, an
+  unstaged change, a tracked deletion and a dirty file outside the pathspec.
+
+- **The advisory can no longer be lost by being too long.** Claude Code persists a
+  hook payload over its size cap and hands the model a short preview instead, so
+  an oversized advisory is an absent one, silently. One rewind note is about 1.3 KB
+  and the payload crossed the cap at eight repositories — precisely the
+  multi-repository compound the per-repository note was added to serve. The bound
+  drops whole notes and says how many it dropped, rather than trimming the text:
+  every note ends in a recovery command carrying a snapshot id, and a cut value
+  would hand someone a truncated id dressed as a recovery instruction.
+
+- **Rewind events are counted whether or not a snapshot was possible.** Whether
+  this note should ever become a hard block is a question about how often the
+  situation arises, so each event is recorded in the snapshot log. The flag used
+  to ride on the snapshot row, which made the count a measure of how often
+  `git stash create` happened to produce an id: a rewind from a clean worktree
+  wrote no row at all and went uncounted — and a clean worktree is the likeliest
+  setting for the incident being measured, where you have no local edits of your
+  own and the rewind reverts someone else's merged work. Rows stay metadata only:
+  no command text and no commit id, because the log is durable and a command line
+  can carry credentials.
+
+- **The detection no longer misreads git's own option grammar.** It matched any
+  argument that happened to equal a verb name, so `git add checkout <file> .` —
+  three filenames — reported a rewind and wrote false evidence into the log that
+  would justify escalating to a block. It skipped every dash-prefixed token, so
+  `git checkout - -- .` (the previously checked-out branch, a real reversion) went
+  unwarned while an option's *value* was named as the commit being restored. And
+  it treated index-only commands as worktree rewrites: measured against real git,
+  `git read-tree --reset` and `git restore --staged` touch only the index, while
+  `-u` and `--worktree` respectively are what reach the working tree.
+
+- A `gh` listing that is silently capped now says so before it runs. `gh pr list` returns at most 30 items by default, `run list` 20, `workflow list` 50 — so an unflagged listing is already a bounded read with nothing in the command to show it, which is how a count drawn from one can be wrong without looking wrong. It also fires when an explicit `--limit` merely restates the default and therefore changed nothing, warns about every distinct cap in a compound command rather than only the first, and says so when it could not parse the command well enough to check. For `gh search` it names the API's 1,000-result ceiling instead of telling you to raise a limit gh will refuse. Advisory only: never blocks, fires once per listing kind per session, and stays quiet for `--help`, `--web`, and any limit you passed that actually narrows or widens the read.
+
+- Codex can use a reviewed set of Genesis health and recall tools as an external MCP client without joining Genesis session tracking.
+
+- **A vendor stylesheet's layout rule with no Genesis answer now fails a test
+  instead of shipping.** Every page loads an inherited sheet before any Genesis
+  one, and two of its layout rules land on selectors Genesis also uses. Neither
+  errors, neither logs, and a page that renders wrong renders wrong quietly: one
+  of them made a page unscrollable and was fixed by copying three declarations
+  into each page that hit it, so the page that never hit it never got a copy;
+  the other laid every panel's header down the left side of its panel as a
+  narrow vertical gutter and went unnoticed for months. Both were found by
+  someone looking at a page, which is the one check with no harness.
+
+  The guard asserts, per page, that any layout property an inherited sheet sets
+  on a shared selector is answered by a Genesis rule on the same selector, at the
+  top level, in a sheet that loads later — and, across pages, that an answer
+  present on one page is present on all of them, which is what the second
+  incident actually was. Polarity is allowlist: a denylist of known-bad selectors
+  would have passed cleanly for the entire time the panel rule was broken,
+  because nobody knew to add it.
+
+- **It compares selectors for identity rather than modelling the cascade, and
+  that is a retreat from two models that were each attacked successfully.**
+  Matching a bare class against a descendant form needed a rule for which one
+  wins, so specificity was compared; specificity answers who wins where both
+  rules apply and says nothing about where, so a hover-scoped answer was accepted
+  while every element nobody was pointing at still took the vendor declaration; a
+  coverage test was added on top of it.
+
+  Both were estimates. The specificity estimate over-counted in five
+  separately-constructed selector shapes, two of which accepted a live leak end
+  to end. The coverage test compared flat token sets, which cannot see position
+  or multiplicity, so a descendant, a child, a sibling and an id-qualified form
+  of the same class all read as covering it — substituting the first of those for
+  the shipped answer reintroduced the original incident with 26 tests green.
+
+  Four consecutive reviews each found the model fail-open in a new shape, and the
+  shapes had nothing in common except that a person had to think of them. An
+  answer must now be written on the vendor's own selector, normalised for
+  whitespace and group order. Two rules with the same selector apply to the same
+  elements at the same specificity, so neither question needs estimating, and
+  what remains — which sheet loads later, which declaration is important — are
+  facts rather than approximations.
+
+  The cost is stated rather than discovered: a genuinely covering answer written
+  any other way now reads as unanswered. That is a false alarm, and the remedy is
+  a table row naming the reason. The failure it replaces was silence.
+
+- **An unresolvable stylesheet link now fails the guard instead of disarming
+  it.** A link whose href named no file under the web root was dropped; with none
+  left the page had no owned sheet, and the test skipped. One cache-busting query
+  string on one link therefore turned the whole check off for that page and the
+  run reported a skip and exited zero. Query strings and fragments are stripped,
+  so an ordinary cache-buster resolves; anything still unresolvable is reported.
+
+- **A stylesheet this repository does not ship makes a page unreadable, and the
+  guard now says so instead of standing down.** A link to another origin is
+  rightly excused from the resolvability check — it is not ours to ship — and it
+  then failed to resolve too, so it fell out of both the owned and the vendor
+  list and the page skipped by a second route. Moving one page's links to a
+  content network gave a skip and exit zero on a page whose rules had not
+  changed. Not ours to READ is not the same as clean.
+
+- **A clearance is for a declaration, never for a slot.** The table of vendor
+  declarations that need no answer was keyed on selector and property, while the
+  comment beside it said, correctly, that the same property at a different value
+  would be a real leak and must still fail. Changing the vendor's `width: 100%`
+  on the page root to `250px` was cleared by a row written for the other number,
+  with every test green. Rows now carry the value they excuse.
+
+- **Type selectors are matched case-insensitively, as HTML defines them.** Keys
+  and comparisons were case-sensitive, so rewriting the vendor's own page-root
+  rule in capitals left the whole viewport lock in place with the suite green —
+  one of the two incidents this guard exists for, reproduced with the shift key.
+  Class and id names stay case-sensitive, which is why the fold walks tokens
+  rather than lowercasing the text. Whitespace around a combinator is now
+  insignificant too, so a minified vendor rule and a hand-written answer compare
+  equal.
+
+- **Shapes the reader cannot see are refused rather than dropped.** A rule nested
+  inside another, and any block at-rule not on the descend list, previously
+  vanished with everything in them; both now raise and name the remedy. The
+  property set gained the near neighbours it was missing — a clip set through
+  `max-height` passed while `height` was watched — and a stylesheet that parses
+  to zero rules is reported instead of reading as a sheet with no leaks.
+
+- **The last approximation is gone, and it was never in the comparison.** Six
+  rounds of review each found this guard failing open in a new shape, and the
+  pattern only became legible when the findings were bucketed by pipeline stage:
+  none of them landed on the selector comparison the previous round introduced.
+  They landed one stage earlier, on the "key" — an estimate of which elements a
+  selector could reach, derived by reducing each selector to its last compound,
+  its classes, or a bare element name. That estimate ran BEFORE the comparison
+  and decided whether a rule was looked at, so its errors were silent by
+  construction. Measured against the shipped vendor sheet, thirty of its
+  hundred and seventy-five layout declarations — seventeen per cent — derived no
+  key at all and were invisible to every check here, an identifier-selected panel
+  rule among them.
+
+  Since the comparison already works on normalised selector text, the key can be
+  that text. One stage instead of two, no approximation left anywhere, and the
+  last-compound split, the class-name pattern, the bare-element rule and the
+  parenthesis stripper are deleted rather than fixed. Measured after: zero
+  invisible declarations, zero new findings on the real stylesheets, both
+  original incidents still caught. The round count had been tracking remaining
+  estimating stages, not remaining bugs.
+
+- **What the guard cannot read is now refused rather than skipped.** A rule
+  nested inside another was refused already; a conditional nested inside a rule
+  was not, so it walked through the refusal added for exactly that shape. Joining
+  it: a cascade layer carrying a layout declaration, whose precedence outranks
+  everything compared here; a local import, which pulls in a stylesheet nobody
+  parses, while the font-service import the vendor sheet opens with is allowed
+  through by name; a stylesheet link under a media condition, whose declarations
+  answer nothing outside it; and a vendor layout rule whose selector embeds
+  another selector, where a reader would reasonably expect an answer on the
+  embedded one to count and identity cannot say so. The single real instance of
+  that last shape carries a row explaining why it is inert.
+
+- **Inline style blocks are read, having been documented as invisible.** Four of
+  the six pages declare layout properties in a `<style>` block — forty-seven
+  selectors' worth on one of them — and a Genesis layout claim the guard cannot
+  see makes the vendor declaration it answers read as unclaimed, so the selector
+  was skipped rather than checked. Blocks are now collected alongside links, in
+  document order, and their position is read rather than assumed.
+
+- **The login page is in scope, at the third attempt.** It is built as a string in
+  Python rather than as a template, so every check written against a glob of the
+  template directory has omitted it: once when the viewport fix was copied per
+  page and it never got a copy, once while that very omission was being fixed,
+  and once more when this guard was first written. The enumeration now lives in
+  one place that both test files import, with the reason attached — a rule every
+  call site has to remember is a rule the next call site will not.
+
+- **The redesign deleted every estimate about how the inputs RELATE and kept
+  every estimate about what the inputs ARE.** That is the sentence the last six
+  review rounds were circling. Specificity and coverage — estimates about whether
+  two selectors reach the same elements — were deleted and replaced by identity.
+  Four other estimates were left standing, all upstream of the comparison, all
+  deciding whether a rule was ever looked at: which pages exist, which sheets the
+  browser actually applies, which properties count as layout, and which selector
+  shapes are unreadable. Nine measured members, four of them live fail-opens
+  demonstrated against the shipped stylesheets.
+
+  Each is now closed the way the at-rule walk already worked — an allowlist with
+  a refusal on the tail, so a shape invented next year fails loudly instead of
+  vanishing.
+
+- **The page population is derived rather than listed.** The previous fix
+  replaced a directory glob with an explicit list of two page sources, which has
+  the glob's defect and more entries: it omits silently. A review then found a
+  third page — a terminal view serving a vendor stylesheet and declaring
+  `overflow: hidden` on the document root, the first incident's exact shape — and
+  a search of the tree found a fourth emitter besides. Emitters are now
+  discovered mechanically and each must be mapped to the page it serves or
+  exempted with a stated reason; an unmapped one fails, and so does a mapping for
+  a module that has stopped emitting.
+
+- **One function now answers whether a stylesheet is applied at all.** It was
+  answered in four places from four partial rules and not at all in three more.
+  Marking the sheet that carries the panel answer as an alternate stylesheet left
+  every test green; so did marking it disabled; so did putting a media condition
+  on an inline block rather than on a link. The same function is asked of a
+  `<style>` element and a `<link>`, and an unrecognised condition raises rather
+  than being guessed at.
+
+- **Refusals that fired only in the cases nobody reaches now fire
+  unconditionally.** The external-stylesheet refusal ran only when a page had no
+  readable local pair, so adding an unread content-network layout sheet to any
+  real page sidestepped it entirely. The import exemption admitted any absolute
+  URL rather than the font service it was written for, so a content-network
+  import was dropped whole. Both measured green before, both refused now.
+
+- **Three smaller members, each measured.** Ownership is classified from the
+  resolved path, because a link spelled with a dot segment resolves to the vendor
+  sheet while a prefix check called it ours. A stray brace is not reported as a
+  parse error — the parser folds it into the next rule's selector, so that rule
+  keys under the wrong name and its leaks read as absent; preludes that did not
+  parse are refused, and the check reads the token type the parser actually
+  produces rather than the one it seemed like it should. And `@namespace` is
+  refused outright, since prefixes are per-sheet and identical selector text in
+  two sheets can target different elements.
+
+- **The layout-property set gained the shorthands of what it already watched,
+  and an honest statement of what it is.** A flex shorthand bypassed the
+  longhand; an inset shorthand bypassed position. Those are closed at no cost —
+  zero new findings on the real stylesheets. The set is still a deliberate
+  sample: 136 non-custom properties in the shipped sheets sit outside it, of
+  which roughly 69 plausibly affect layout, and watching those would flood the
+  guard into uselessness. That the line is a judgement rather than a boundary is
+  now said rather than implied.
+
+- **The refusal list in the module docstring was four claims larger than the
+  code.** A reader trusts that list instead of re-checking, which is the same
+  mechanism that let the second incident ship — a page that obviously had a copy.
+  Every entry is now pinned by a test that constructs the shape it names.
+
+- Measured both directions throughout: fifteen of fifteen, nine constructed leaks caught and six correct trees left alone, plus every replay from every previous round still firing. The collected-test floor is re-derived again.
+
+- **Genesis can now be the brain behind a desktop assistant.** Any tool that
+  speaks OpenAI chat-completions to a configurable `base_url` can be pointed at
+  `POST /v1/desk/chat/completions` instead of a model vendor. Every turn then
+  routes through Genesis's router, so provider choice, cost tracking, circuit
+  breakers and observability are Genesis's — and the desktop holds no model
+  credential of its own. Authenticate with `GENESIS_DESK_TOKEN`, which opens
+  this route and nothing else; the broad `GENESIS_MCP_HTTP_TOKEN` also works
+  here, but it opens every other `/v1` route too, so it is the wrong credential
+  to hand a desktop client.
+
+  **Two lanes, because the turns are not the same shape.** `desk_primary` leads
+  with a capable model: a client that fires its own tools by emitting an exact
+  control tag needs instruction-following, since a near-miss silently does
+  nothing. `desk_fast` leads with a fast one, for replies composed while a
+  call is live. Select with the `X-Genesis-Lane` header, or with a `-fast` /
+  `-primary` suffix on `model` where a proxy strips unknown headers; anything
+  unrecognised resolves to the capable lane, because being quietly served from
+  the fast one is the harder failure to notice. Both chains are configurable in
+  `config/model_routing.yaml`.
+
+  Honest about what it is not. It performs no memory recall — a client that
+  builds its own system prompt should reach Genesis memory through an explicit
+  tool, not by injection, or two context builders end up fighting over one
+  prompt. It refuses streaming, tool-call turns, and image content: the routing
+  layer is text-only, and answering an image question from the text alone would
+  describe something never seen. Every refusal is an error object with no
+  `choices` key, so a client parsing the completion raises rather than speaking
+  the error aloud as if it were the answer.
+
+  A provider that answers with no content at all is one of those refusals, not
+  an empty reply passed through: the endpoint returns 502 rather than handing
+  back a blank turn for the desktop to speak as silence. Note the limitation
+  that sits behind it — the router stops its fallback walk on the first
+  success, and a blank answer counts as one, so the later links in the chain
+  are not tried. Fixing that belongs to the router and every caller it serves
+  rather than to this endpoint, and is tracked separately.
+
+- **Every `/v1` route is now checked for authentication by a test, not a
+  convention.** The suite enumerates them from the live route map and asserts
+  each refuses an anonymous caller, so a surface added later is covered without
+  anyone remembering to add it. A route that should be public has to be named,
+  with a reason, where a reviewer will see it.
+
+- **A pull request's branch is now deleted when the request closes without
+  merging.** Merged requests already cleaned up after themselves; closed ones
+  did not, and every abandoned or superseded request stranded its branch on the
+  public repository. Measured before this change: thirty of the hundred-odd
+  branches on the remote were exactly such leftovers, and because a squash
+  merge severs ancestry, those leftovers are indistinguishable from unmerged
+  work — which is how stale branches were later mistaken for pending changes
+  and grew duplicate pull requests for work that had already landed. Deletion
+  is recoverable (the closed request keeps a restore button), skips branches
+  another open request still uses, and can be switched off in the Actions UI.
+
+- **The push gate now enforces the publish rule it could only document.** A
+  prompt, not a block. A re-push to a branch that is public but has no open
+  pull request no longer slides through on its first-push approval: the gate
+  asks, and says why — such a branch runs no CI and no leak scan at all, which
+  is the state the publish rule exists to prevent. The lookup fails toward the
+  previous behaviour: a question it cannot answer changes no verdict and
+  manufactures no prompt, and a dry run stays silent because it publishes
+  nothing.
+
+- **Plan documents carry a structured header.** A plan that outlives one
+  session now opens with YAML frontmatter naming its status, the `origin/main`
+  it was written against, what adopting it commits the project to (`binds`),
+  what it forecloses (`prevents`), and the decision/ledger/issue ids it
+  executes — plus a `## ═══ SUPERSEDED BELOW ═══` divider separating live
+  content from archaeology. Three failure modes motivate it: three things
+  enumerate the plan directory but all key on filename and mtime, so a
+  commitment living only in a plan file is tracked by nothing; a long-running
+  plan accretes with no signal for which part is current (measured on one
+  install: 2,501 of 4,488 lines below the divider); and the line numbers and
+  PR heads a plan cites go quietly false. `pinned.main` turns the last one
+  into a one-command read. The header is written by hand and nothing validates
+  it yet — the upstream linter it borrows vocabulary from checks body
+  structures this header does not emit, so a checker is a separate later
+  change.
+
+- **Every hook that can fire on Bash must now declare its degrade direction, and
+  the size of the refusal is computed rather than written down.** A new allowlist
+  gate parses `.claude/settings.json`, runs each such hook against a poisoned
+  `hook_input`, and asserts that it either carries a degraded handler (emits
+  `GUARD DEGRADED`, exits 2) or is NAMED — in `_ADVISORY_BY_DESIGN` with words
+  verified verbatim against its own docstring, or in `_NOT_PYTHON_ON_BASH` because
+  it never imports the module. There is no third bucket, so a guard wired later
+  that forgets its handler fails by construction instead of quietly ceasing to
+  guard — an omission invisible in production, because Claude Code treats a non-2
+  exit as a non-blocking error when the hook emits no `permissionDecision`, so a
+  guard dying on its import traceback exits 1, the command runs, and nothing
+  distinguishes it from a guard that looked and approved.
+
+  Motivation: that figure was wrong three times in review and then went stale a
+  fourth time with nobody being wrong at all, when another change wired one more
+  Bash hook. Four hand-written copies existed across the repo; all four are now
+  gone, replaced by a pointer to the derived gate.
+
+  **The population filter, not the assertion, is where this kind of gate fails.**
+  The first version compared `matcher != "Bash"` — an exact-string test against a
+  field Claude Code treats as a regex — and discarded any command its narrow
+  pattern could not parse. An adversarial audit broke it four ways against mutated
+  copies of the real settings: alternation and wildcard matchers were invisible,
+  and an existing blocker respelled as a bare `python3 …/guard.py` silently left
+  the population with the suite still green. One in-repo hook was already outside
+  the gate for that reason. The enumerator now evaluates the matcher as a regex
+  and makes an unresolvable command a failing row rather than a skipped one, the
+  shape `test_hook_output_contract.py::_resolve` already used. All four evasion
+  spellings, a collapsed enumeration, and an invented allowlist justification were
+  each confirmed to turn the suite red.
+
+  The rule itself was derived by execution rather than assumed: the first
+  hypothesis — that a hook importing `hook_input` blocks — was refuted, since all
+  of them import it at module scope, including every non-blocker. A docstring
+  keyword scan was tried as the discriminator and rejected, because "advisory"
+  also appears in three hooks that do refuse. Two limits are stated rather than
+  assumed away: the enumeration is scoped to the repo settings, so a user-level
+  settings file can wire more on the same matcher invisibly, and shell hooks on
+  the matcher never import the module and so are exempted by name rather than
+  left unseen.
+
+- **The Guardian can now see the agent tooling die.** A new host-side side-watch
+  (`guardian/guard_layer_watch.py`, wired into `run_check`) probes whether the CC
+  hook layer can still EVALUATE: the `genesis-hook` launcher runs end to end, the
+  container venv interpreter runs, `hook_input` and `shell_parse` import, container
+  `node` runs, and the host's own configured Claude Code binary starts. That last
+  one probes the CONSUMER `diagnosis.py` actually launches rather than
+  `node --version`, so a PATH failure is a true positive rather than a false one —
+  host Node is frequently nvm-managed and a systemd timer's PATH is minimal.
+
+  Two failure polarities motivate it, and the quiet one is the reason it exists.
+  An unimportable `hook_input` fails CLOSED: every non-advisory Bash guard refuses,
+  loud and unmissable. A dead launcher or venv makes `genesis-hook` exit non-2,
+  which Claude Code treats as a non-blocking error, so every security guard is
+  silently off while Bash keeps working and nothing on the install would report it.
+
+  It must be host-side: a broken guard layer bricks CC sessions, and the
+  container-side Sentinel is itself a CC call site, so it would dispatch into the
+  same broken tooling — reasoning the repo already encodes independently in
+  `sentinel/remediation_map.py`'s `UNMAPPED_BY_DESIGN`. It is deliberately NOT a
+  `probe_*` in `collect_all_signals`: `SignalResult` carries no severity, so every
+  probe there feeds the confirmation ladder into `RecoveryEngine.execute`, and a
+  broken hook file must never be able to trigger a container restart. Alerts reach
+  Telegram over stdlib urllib straight from the host, so they survive a fully dead
+  container.
+
+  **Alert-only, by decision rather than omission.** An earlier draft carried one
+  automatic repair verb. An adversarial audit reproduced two ways it destroyed
+  work — `git checkout HEAD -- <file>` overwrites the index, so staged content is
+  lost and recoverable only via `git fsck`, and mid-merge the same command clears
+  the conflict stages and silently resolves to ours while `MERGE_HEAD` remains, so
+  the next commit drops the other side with no marker — and the probe's own
+  dirty/clean signal failed OPEN, because `git diff --quiet` is tri-state and both
+  error codes read as "differs", the value that authorised the write. The verb was
+  removed rather than patched, and its config knobs are absent rather than
+  defaulted off, since a disabled destructive path is still one config edit from
+  running. A test asserts the module defines no repair function and that no
+  executed payload carries a mutating git verb.
+
+  Two further audit findings are fixed in the detection half: an episode that
+  never reached a warning is now cleared when the condition goes healthy, rather
+  than stranding state whose stale start timestamp silently expired every
+  elapsed-time window on the next occurrence; and a condition whose probe returns
+  INCONCLUSIVE is skipped rather than falling through the healthy branch, which
+  had emitted a false "recovered" and reset a ladder that was still climbing. The
+  host probe now uses the house `kill_process_group`/`reap_bounded` pair with
+  `start_new_session`, matching `diagnosis.py`, so a wedged probe cannot orphan
+  node children on a watch that runs every tick.
+
+- The merge gate now runs as an advisory GitHub check (`genesis-merge-gate`,
+  workflow `merge-gate`) on every pull request, review, and comment, producing
+  the same `git_push_guard.py --check-pr` report installs run at merge time —
+  phase 1 of issue #1670. It is deliberately NOT a required check; promotion
+  follows the criteria documented in `.github/workflows/merge-gate.yml` after
+  its false-block rate is measured. While running under Actions the gate
+  excludes its own workflow's checks from the CI rollup so the check can never
+  vouch for or block on itself (a check inspecting its own pending run would
+  deadlock); the interactive merge path is unchanged.
+
+- **A daily watcher that announces once when the public repo crosses a star
+  milestone**, so work parked behind "revisit at N stars" wakes up on its own
+  instead of waiting to be remembered. It reads the count unauthenticated, writes
+  a permanent observation on the transition, and stays silent otherwise; each
+  configured milestone is announced once, including one added below a milestone
+  already announced. An install with no repo configured falls back to the
+  checkout's remote for the public repo, matched by owner/name (then `origin`);
+  when several remotes carry repositories with the configured name and no owner
+  is set, it does not guess and logs which key to set, and an install with no
+  candidate at all is a clean no-op rather than a daily failing unit. Its state
+  lives under `GENESIS_HOME`, and it never writes to a database the integrity
+  check has quarantined.
+
+- **The CC model roster config now documents DeepSeek as a worked failover peer,
+  including a billing trap it is easy to walk into.** The roster is what runs your
+  Claude Code turn on another provider when the Anthropic subscription hits its
+  usage cap, and the shipped config file explains how to declare a peer without
+  shipping one. DeepSeek previously appeared only in a list of vendor-published
+  endpoints nobody here had tried; it is now a full example with its endpoint,
+  model id and credential variable.
+
+  The reason it earned its own entry is cost. DeepSeek's Anthropic-compatible
+  endpoint bills per token, and it silently maps model names it does not
+  recognise rather than rejecting them: an unsupported name becomes its cheap
+  Flash model, while anything beginning `claude-opus` becomes its Pro model and is
+  billed at the Pro price. The vendor's own quickstart sets only the base URL and
+  the key, which leaves Claude Code's opus-tier variable holding a Claude name —
+  so opus-tier calls quietly bill at the higher rate. Configuring the peer through
+  the roster avoids this, because the roster sets every model variable to the
+  peer's own id; the note is there for anyone wiring it up by hand instead.
+
+- **The rule against retiring someone else's pull request is now reachable
+  from the command line.** `genesis-development` carries a standing rule — a
+  reviewer session retires nothing; a premise-wrong PR gets the
+  `needs-architecture-session` label and stays open; a superseded one gets a
+  comment naming its successor and also stays open; retiring belongs to the
+  session taking up the revival. Nothing enforced or surfaced it, so it bound
+  only a session that happened to have loaded the skill. A new advisory hook
+  prints the rule at the moment a command would close a PR, on the forms
+  visible in the command text: `gh pr close` (including the separated-repo
+  spelling that was once a real bypass in the merge gate), a
+  `closePullRequest` GraphQL mutation, and a `state=closed` field on a pull or
+  issue endpoint. It never blocks, never prompts, and behaves identically in a
+  dispatched session as in a foreground one.
+
+  Advisory by design rather than by compromise. An enforcing version drew
+  eleven review findings, five of them one unanswerable question: whether a
+  gate can tell from argv that a command closes a PR. It cannot — `gh api
+  graphql` takes its mutation from stdin or a file, neither of which is in
+  argv. Under enforcement that gap is a bypass which must be closed and cannot
+  be; under an advisory it is a note that did not fire. The note says so
+  itself, so a reader meets the boundary where they rely on it rather than in
+  a docstring.
+
+- **The graph engine's projection now refreshes on its own, hourly.** If you
+  armed the graph engine, its projection of the memory graph used to be a
+  deliberate act — you ran `python -m genesis.memory.graphstore_project` by hand,
+  and from that moment the projection drifted from the real graph until you ran
+  it again. Nothing announced the drift, because a stale projection and a current
+  one are indistinguishable from the engine's side: it serves links you have
+  since removed, omits links you have since added, and never errors.
+
+  MEASURED on a live install, six days after one manual projection: **2,286 links
+  and 659 memories missing.** The drift is also bursty rather than steady — one
+  week on the same install ranged from 4,075 new links in a day down to 5 — so
+  "it has probably not changed much" is not a safe assumption to run on.
+
+  A new `genesis-graph-project.timer` now rebuilds it every hour. That bounds how
+  far behind the projection can be, which is what makes moving reads onto the
+  engine a decision you can take at any moment rather than one that lands on a
+  graph as stale as the day you built it. A full rebuild MEASURED 16.1s against
+  285,683 links, and it is built alongside the live copy and swapped in
+  atomically, so nothing reading the graph sees a partial one.
+
+  **This does not move your reads.** The selector in `config/graphstore.yaml`
+  still defaults to the in-process NetworkX store. The projection is kept current
+  whenever the engine *exists*, not only once reads point at it — deliberately,
+  since a projection that only starts refreshing after you flip the lever gives
+  you a stale graph at exactly the moment you begin trusting it.
+
+  **If you never armed the graph engine, this does nothing at all.** The timer is
+  installed everywhere, so it also runs on installs that have no engine — there
+  it exits immediately with one line and no error, rather than failing hourly
+  forever. Setting `enabled: false` in `config/graphstore.yaml` stops it too.
+
+  Two caveats, both worth knowing if you are relying on this. An hour is a
+  *bound*, not freshness-on-write: a burst of writes inside the hour can still
+  leave the projection meaningfully behind, and write-level freshness needs a
+  database-side change signal that is tracked separately. And the bound is a
+  little over an hour rather than exactly one — the schedule adds up to three
+  minutes of deliberate jitter so this job does not collide with the other
+  timers, and the published snapshot is further behind by however long the
+  rebuild takes.
+
+- Every install now gets the Grep code-search MCP server (`searchGitHub`) registered automatically — literal/regex search across roughly a million public GitHub repositories, with no API key to obtain. It registers as `grep-app` and never removes or replaces an entry already under that name: if you have your own, or you point `GENESIS_GREP_MCP_URL` at a proxy after setup, Genesis leaves your registration alone and prints the two steps that hand the name over (remove it, then re-run bootstrap). `web_search` also gained `include_domains` / `exclude_domains`, so the documented recipe for scoping an Exa search to a single site now actually takes effect instead of silently searching the whole web.
+
+- **Finishing a piece of work now includes auditing the CLAIMS it produced, not
+  only its code.** A green test suite checks what the code does; nothing checked
+  the sentences written *about* it — the numbers in a commit message, a
+  docstring's assertion about behaviour, a reply saying a review finding was
+  fixed, a stored memory. Those are permanent record, and permanent record has
+  no tone of voice: the next session reads a confident sentence as a measured
+  one.
+
+  The genesis-development skill gains a section listing the surfaces where those
+  claims accumulate, and a short walk over them — re-compute the numbers,
+  re-measure anything taken before the tree moved, check that bulk edits landed
+  everywhere they were supposed to, and re-derive rather than pick a side when a
+  comment and a tool disagree. The session wrap-up rule now names the same
+  obligation for sessions that wrote numbers, dates or status assertions into
+  permanent record.
+
+- **Decision question registry.** `config/decisions.yaml` is the single
+  enumerable home for every decision Genesis makes between bounded choices —
+  including ones currently made by a hardcoded constant standing in for a
+  judgment. Each entry declares its primitive (`choice` / `score` / `noul`),
+  the question wording, what the caller does with the answer (`consumes`), and
+  what it falls back to when no decision backend is available. A
+  gitignored `decisions.local.yaml` overlay is deep-merged on top, following
+  the `model_routing.yaml` pattern.
+
+  `consumes` is the load-bearing field: it turns "may this site branch on a
+  probability?" from something a reviewer has to notice into a property the
+  loader enforces. `consumes: threshold` requires an explicit threshold inside
+  `(0, 1)`, a stray threshold on a non-thresholding consumer is rejected, and
+  only thresholding sites need calibration at all — `argmax` and `ordering`
+  consumers stay fully functional without it. High-cardinality choices must
+  declare a `cardinality_strategy`, because options share a fixed token budget
+  in encoder-based decision models and labels stop being distinguishable as
+  the set grows.
+
+  Registering a decision does not wire it. Every entry starts inert and is
+  promoted individually on measured evidence that it beats its incumbent.
+
+- An optional Claude Code status line, `scripts/genesis_statusline.py`, shows the current branch, the session's open ledger rows, the local review streak against its cap, and the branch's PR with its review state — `feat/x · ledger:2 · streak:1/3 · PR#42:approved`. Turn it on with a `statusLine` command in `~/.claude/settings.json`; the script's header has the setup, including a one-line `sh -c` recipe for showing it alongside a status line you already use (Claude Code allows only one). Nothing is enabled by default, and any field it cannot read shows `—` rather than blanking the line.
+
+- A validator session can now record what it concluded about a merged PR, and the ledger keeps the reason when it could not finish. Four verdicts: two close the obligation, and `fail-intent` / `cannot-verify` leave it open with a note the next validator inherits — so a PR that could not be checked on your install says why, instead of looking untouched. The verdict is derived from the evidence document rather than chosen, so it always says what the evidence says: `scripts/pr_verification.py close --pr N --evidence-file <doc>` records it (`print-schema` gives a template), `repo_pulse_worker.py --verification-backlog` shows attempted rows inline, and `--verification-log --pr N` prints the full record for one PR. An obligation cannot be marked handled by a document that established nothing, and a failed verification can never be quietly parked. A claim nobody could check is recorded as `unverified` rather than as a pass or a failure, and only an established failure reaches you as a failed verification — one that was merely suspected keeps the row open with the suspicion named. The document must say whether deployment was established, and a verification run on a tree that does not carry the merge can never close the obligation. Failed verifications lead the backlog, so a long queue cannot hide one.
+
+- **Threshold decisions abstain near their cut.** A decision site that acts on
+  a probability threshold must now declare a `dead_band` around its cut and a
+  `tie_rule` for scores landing exactly on a band edge. The new
+  `DecisionSpec.gate()` returns act, decline or abstain, and abstains for any
+  score inside the band and for every score outside calibrated mode. Near-cut
+  decisions are not repeatable: re-sending the identical request to a pinned
+  decision model can flip roughly one in five of them while the aggregate rate
+  barely moves, so a site may not take a branch that a retry could reverse.
+
+- **Every failed Claude Code invocation now emits one `cc.invocation_failed`
+  event.** Previously a CC error surfaced only in whatever the calling
+  subsystem chose to log, so failures across the many CC call sites had no
+  common signal. The invoker now emits the event on both its entry points —
+  including the pre-spawn offline check — and then re-raises the original
+  error unchanged. It carries the error class, streaming flag, requested model,
+  the roster model the call was actually routed to, session id and, where the
+  call site is tagged, a caller tag naming the dispatching subsystem, and
+  appears in
+  `health_errors`. The raw error text is not stored in the event (it is built
+  from unbounded CLI output); only its length is recorded. Rate-limit and
+  quota errors are WARNING; everything else is ERROR. Repeats of the same error
+  from the same tagged caller on the same route are coalesced to one event
+  per minute, and the
+  next event's message reports how many were folded into it; untagged callers
+  are never pooled together. Cancellations emit nothing, and the fallback
+  liveness probe is exempt only for its expected rate-limit answer — a probe
+  that times out or fails otherwise is reported. The event does not wake a
+  reactive ego cycle, since that cycle would itself need Claude Code.
+
+- Every proactive memory recall now leaves a retrieval trace: which retriever (vector, full-text, event, graph) found each candidate and at what rank, its fused, rerank and final scores, and whether it was injected or dropped (and why). Traces are written in the background, kept 14 days, and can be switched off with `proactive.trace: off` in `config/memory_recall.yaml`.
+
+- Sessions now learn at start when another install has left handoff files in a configured shared directory. Each is listed as an untrusted claim to verify, never with its contents, and nothing is dispatched from it. Mark one handled with `python -m genesis handoffs mark <id> --note "..."`; handled state stays local, and a `<name>-REPLY.md` sibling also counts. Off until an absolute `dir:` is set in `~/.genesis/config/handoffs.local.yaml`. The session-start scan runs under a hard time bound, so a slow or hung shared mount reports "unknown" instead of silently producing nothing; `python -m genesis handoffs list` scans the whole directory without that bound.
+
+- **A locked code-only deploy: `scripts/deploy_code_only.sh`.** Runtime code is an
+  editable install, so most changes deploy by pulling main and restarting the
+  server. Done by hand, that took no lock and could land in the middle of
+  another session's validation against the live server, or of `update.sh`. The
+  script takes the same lock `update.sh` takes, exclusively, and queues for it.
+  A validation run holds the lock shared
+  (`flock -s -w 7200 "${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock" <cmd>`), so a deploy waits for
+  it to finish; `update.sh` keeps refusing rather than queuing.
+  - **Four modes.** `deploy` (the default) pulls main and restarts. `pull` pulls
+    and syncs the git hook copies without restarting, and accepts any range: it
+    names every change to `src/`, `config/` or `pyproject.toml` that the running
+    server has not loaded, and the next step. `restart` restarts the tree as it
+    stands. `status` is read-only and takes no lock.
+  - **What the server booted from.** Every mode reports the commit the running
+    server started from against the tree, read from HEAD's reflog at the unit's
+    start time. It is "unknown" when the reflog does not reach back that far,
+    has a gap left by pruned entries, does not end at HEAD, shows the clock
+    stepping back across the boot, has a move in the boot's own second, or when
+    the boot is older than git's expiry for unreachable reflog entries (which
+    can remove a detour as a pair without leaving a gap). The reflog cannot show
+    a manual `git reflog expire --rewrite`, a move whose committer time was
+    backdated, or one made after the clock stepped back behind the boot; the
+    server recording its own commit at boot is the complete answer.
+  - **`deploy` restarts only for what the server loads:** when the files under
+    `src/`, `config/` and `pyproject.toml` are the ones the server booted from,
+    after the merge and at every commit HEAD has held since the boot (a docs or
+    hooks range, or nothing to merge), it neither stops nor restarts the server.
+    The history matters because the server imports lazily: after a `pull` of
+    code, a module it loaded stays in memory even once a later commit restores
+    the files. `restart` forces one.
+  - **It refuses before anything changes:** a linked worktree, an unfinished
+    `update.sh` run, a branch other than main, a dirty tracked tree, a unit that
+    runs a different venv or from a different directory, a live foreign deploy
+    marker (or one that cannot be written), a diverged tree, and a venv that
+    does not match the
+    `pyproject.toml` being deployed. That check reads the installed project's own
+    metadata: an editable install from this checkout, with requirements (base and
+    every optional group, compared parsed) and `requires-python` equal to the
+    incoming file's, every base requirement actually present at a version it
+    accepts, and the installed entry points (console commands, plugins) equal to
+    the file's, since a new command gets its shim only from a reinstall. The refusal names the command that fixes it: `update.sh` when there
+    is a range to merge, `update.sh --post-merge` at the tip (plain `update.sh`
+    stops at "Already up to date" without reinstalling, unless update.sh-only
+    paths changed since its last recorded run), and neither when the
+    venv's python is older than the incoming `requires-python`.
+  - **`deploy` stops the server before the fast-forward**, as `update.sh` does,
+    so no request runs against a mix of old and new modules. A merge git refuses
+    starts it again on the unchanged tree, and any failure while it is stopped
+    starts it before exiting, and so does a restart whose start half fails.
+  - **Just before any restart it checks again** that the checkout is the exact
+    commit it checked, with no tracked change and no untracked file under
+    `src/`, `config/` or `pyproject.toml`, and that no server is running outside
+    the unit (such as `update.sh`'s fallback, which a restart would not replace).
+    `deploy` and `restart` also refuse those last two before anything changes.
+    If a late check fails after `deploy` stopped the server, refusing would leave
+    it down, so it is restarted on the tree as it stands with its health check,
+    and the run ends in a critical alert naming what changed. The git hook
+    copies are synced after the restart, not while the server is down.
+  - **A range that adds a file already present here, untracked, is refused.** A
+    fast-forward overwrites an ignored file without asking, so a local secrets or
+    settings file would be lost. A tracked file or directory the range replaces
+    is git's own and does not count. The merge itself runs with
+    `--no-overwrite-ignore`, so an ignored file that appears after that check
+    (written by the server, or another session) is refused by git at the merge,
+    and a stopped server goes back up on the unchanged tree. The regenerable files
+    reset for the merge (`AGENTS.md`, the procedure trigger cache, which update.sh
+    discards the same way) are named as they are reset, in a refusal's message and
+    in the exit alert, so a refused merge never reads as "nothing changed" in
+    silence.
+  - **Across a restart** it holds the deploy marker (the watchdog defers) and
+    pauses the host Guardian (no false "Genesis down" alert), then waits for
+    health with the same window `update.sh` computes. The health request goes to
+    the loopback address with no proxy and no `.curlrc`, and counts only if the
+    same unit pid owns the port before and after it.
+  - It queues for the lock for up to two hours by default, as long as a
+    validation's documented hold. Healthy means the
+    RESTARTED unit is serving: the unit is active in a new systemd activation (its
+    invocation id, since the kernel can hand the new process the old pid), and every
+    socket listening on the health port is one of that pid's own (read from
+    `/proc`; when ownership cannot be read the answer is no). The subsystems are
+    then compared with the pre-restart manifest, as `update.sh` does; a
+    regression is reported and alerted, and the deploy stands.
+  - **On a failed health check it alerts and holds.** The tree is not reverted.
+  - It names what a code-only deploy leaves to `update.sh`: activation paths
+    (units, bootstrap, the Claude Code pin, dependencies), code the host Guardian
+    runs, and code the tmp watchgod runs from the tree.
+  - Launch `deploy` and `restart` detached, as a transient `systemd-run --user`
+    unit named with the time, so a second launch queues on the lock (the command
+    is in the script's header): a session's background job dies with the session.
+  - For a validation against the live server, the script judges the bracket:
+    take the `bracket:` token `status` prints at the start, and run
+    `status --verify <token>` at the end (exit 0 is valid). A token exists only
+    when the boot commit is known, HEAD's runtime files are the ones the server
+    booted from and were at every commit HEAD held since the boot, and nothing
+    under them is edited outside git. It covers a
+    restart (boot commit, MainPID, systemd invocation id, which a reused pid
+    cannot fake) and an edit to an ignored runtime override such as a
+    `config/*.local.yaml`, fingerprinted without the files the server rewrites on
+    its own, and the user overlays in `~/.genesis/config` that the loaders prefer.
+    HEAD may move over docs or hooks without invalidating the run. It is a
+    tripwire, not a certificate: it cannot see, and reads valid through, a change
+    to the venv's installed packages, the other files the server reads from
+    `~/.genesis/config` (only the `*.local.yaml` overlays are fingerprinted), an
+    edit undone without moving HEAD (a stash and its pop included), and a
+    rewritten or backdated reflog. Proving what the server runs needs the server
+    to report its own identity.
+
+- On an install that runs a local integration branch named `live` (declared by `~/.genesis/deploy_manifest.json`, and only in the repository the hooks ship in), `git commit` and merge commits on `live` are refused, and on every install a push that would publish a commit carrying a `Deploy-rebuild:` trailer is refused on every remote, so a branch cut from `live` cannot carry other candidates' unreviewed code into a pull request. The Claude Code merge guard also refuses a `git merge` on `live`, including a fast-forward, which no git hook can see. Not covered: any other way of moving the `live` ref (a fast-forward merge or pull in a plain shell, `reset`, `branch -f`, `update-ref`, `checkout -B`, a fetch into it), and cherry-pick, revert and rebase, none of which run these hooks. Worktree instructions now create branches from origin/main with `--no-track`, so a new branch does not take origin/main as its upstream.
+
+- A root Tailscale watchdog (`genesis-tailscale-watchdog.timer`, every ~2 min) heals a stuck Tailscale tunnel: when a peer that traffic wants has not completed a WireGuard handshake for 5 minutes, and the peer answers discovery pings while the tunnel does not, it runs `systemctl try-restart tailscaled`, at most once an hour. What the restart did is read back from systemd, and it counts as a heal only if the stuck peer then answers through the tunnel. Each run reports only what it observed, per peer; the awareness tick keeps one owner alert per stuck peer, paged once and resolved only on evidence that the tunnel answers again or the peer went offline, and only peers confirmed stuck in the same run are ever restarted; a restart that failed, hung or could not be confirmed pages too. A stuck-tunnel alert ends a day after the tunnel was last seen stuck, and turning the watchdog off withdraws its alerts. A watchdog that stops reporting, or keeps reporting that it cannot check any tunnel, raises its own alert, and the protection-posture check flags a host with tailscaled but no enabled watchdog. It installs on any systemd host with a tailscaled unit. `NETWD_TS_MODE=observe|off` in a drop-in turns it down or off durably (off also withdraws its alerts), and `scripts/uninstall.sh` now removes both root watchdog timers, and names anything it could not remove instead of reporting success. The network-resilience installer no longer writes through a symlink: reinstalling over a masked unit (a symlink to `/dev/null`) could change `/dev/null`'s mode, since `chmod` follows symlinks.
+
+- **An install can now switch off the credentials guard's `secrets.env` prompt without loosening any block.** Set `hooks.asks.secrets_env: off` in `~/.genesis/config/genesis.yaml`. Clones with no local config keep the prompt. Switching it off does not approve the command: the guard makes no permission decision and leaves a note naming the setting, and Claude Code's own permission settings then decide the command. A dispatched session is still denied. The key set is closed: a misspelled or unknown key, a duplicate key, a value that is not a boolean, or an unreadable file keeps the prompt, and the prompt says why. The push / PR-open approval prompt has no such switch, on purpose, because it is where code leaves the machine; `push_publish: off` is ignored with a note. The setting is read from the file only; there is no supported environment-variable override.
+
+- **Optional: Claude Code's built-in `WebSearch` can be answered by Genesis's own `web_search` chain.** Set `GENESIS_CC_WEB_OVERRIDE=1` in `~/.genesis/cc-slot.env`, and each interactive slot created after that loads a new plugin, `plugins/genesis-web-override/`, from your checkout. It answers the built-in search in the main session and in subagents. It falls back to the built-in on any failure, and whenever a call restricts domains. It runs on Claude Code's early-access function hooks, which the lever turns on for those slots only. Details and limits are in `.claude/docs/web-tools-guide.md`.
+- **Claude Code sessions that Genesis dispatches now always run with function hooks off.** They pin `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=0`, so a plugin's JS modules cannot start running in background work if Claude Code later turns the feature on by default.
+
+- **Guardian: pool relief acts early, from measured growth, and can use VG
+  space LVM's autoextend could not.** Relief now keeps a 7-day pool history
+  and also acts before the 3% / 10% reserve, when data or metadata would fill
+  within 48 hours at the measured rate. Early relief frees pre-recovery and
+  superseded snapshots, and the rollback snapshot only once it is older than
+  48 hours and (on LVM) measured holding space; a younger one is still only
+  deleted at the reserve. On an LVM thin pool with the `genesis-thinpool`
+  profile, when data reaches 80% and the volume group has free space but less
+  than one 20% autoextend step (so LVM would not extend at all), relief grows
+  the pool by that space, keeping some unallocated for metadata. New
+  `storage_pool` keys: `early_horizon_hours`, `lifeline_max_age_hours`,
+  `history_sample_interval_s`, `history_max_samples`, `extend_keep_free_mib`.
+
+- **`web_fetch` now reads what a LinkedIn post's video says.** For a LinkedIn post, the page is fetched as before, and when the post has a captioned video its transcript comes back in a separate `video_transcript` field, so the inbox evaluator (which has no shell) sees the video's content, not just the post text. It uses captions only, never audio; a post whose video has no captions, or whose captions could not be fetched, says why in `video_error`, and a text-only post is unchanged.
+
+- **A peer session's `SendMessage` name now appears next to its id.** Each `[Concurrent | …]` awareness line ends with the peer's address, for example `a1b2c3d4 -> genesis-7f (cc-2:@1.%1)` (its name, then its tmux pane), so a session that knows which peer owns some work can message it instead of guessing by topic. For any other session id, use the new `session_address` MCP tool or `python -m genesis session-address <id-or-prefix>`; add `--check` to compare the answer with Claude Code's own `claude agents --json`. A peer whose process has ended reads `(not reachable)`, and nothing is ever guessed: an address is shown only when exactly one live process holds that session.
+
+- Local Codex CLI sessions can now stop recognized review requests and fix commits when the shared review budget requires fresh approval, handing the decision back to the user.
+
+- **`scripts/deploy_candidates`: the engine for `live`, a local integration branch that runs unmerged pull requests on this install's server before they merge (inactive for now).** Nothing is pushed or merged anywhere. `live` is origin/main plus the candidate branches listed in `~/.genesis/deploy_manifest.json`, rebuilt from scratch without touching the working tree (`git merge-tree` and `git commit-tree`), so several open PRs can run together while they are reviewed.
+  - **Pinned commits, no approval step.** `add` pins a candidate to the commit it sees, and `live` runs that commit, never a later one. If the branch moves, the candidate leaves `live` until it is added again. There is no approval step: running an unmerged branch on the install's own server does not need one.
+  - **What `rebuild` checks.** Each rebuild re-checks every candidate: that the branch still points at the pinned commit, the admission rules, and that its PR (if any) is still open against `main` with that commit at its head. A candidate that fails is excluded, by name and reason. A rebuild that cannot read something it needs, such as GitHub or a fetch of `main`, changes nothing.
+  - **Retirement.** A candidate is retired only once its PR's merge commit is in the fetched `main`.
+  - **Other `rebuild` behaviour.** It refuses a dirty checkout, a commit on `live` that it did not make, a `live` checked out in another worktree, and a file in the way of the move. It moves the checkout once, and only when the files change, then syncs the git hooks and fast-forwards local `main`. It never restarts the server.
+  - **`drop`** only removes code from `live`. It needs no network, and it works from a plain shell (`env -i`), so a candidate that breaks the session hooks can still be taken out.
+  - **One candidate per commit.** Two candidates may not share a commit that is not reachable from `main` (a squash-merged commit never becomes reachable), so a stack of branches goes in as its top branch. `add` refuses a branch that shares one with a listed candidate, naming the remedy for how the two relate, and a rebuild excludes every candidate in such a pair, by name. A merged candidate in such a pair is not retired until one of the pair is dropped.
+  - **Admission** refuses:
+    - any change to a database or data migration, and the boot-time schema files;
+    - the host guardian's own files, the Claude Code pin, and what drives the host on a timer;
+    - git and Claude Code hooks;
+    - the scripts that keep `update.sh` and code-only deploys off `live`;
+    - the engine itself.
+  - **Nothing can go live yet.** `add` and `rebuild` require the server to be running the change that teaches `update.sh`, crash recovery, the guardian's code revert and the dashboard's update routes about `live`. That change has not merged.
+
+- **An install can now switch off the first-push prompt for its public repo, for a single plain `git push` only.** Set `hooks.asks.push_publish: off` in `~/.genesis/config/genesis.yaml`. The push guard then stops asking for the first push of the current branch only when every one of these holds:
+  - The whole command is exactly one plain `git push` (for example `git push -u origin HEAD`). There is no other step of any kind, no redirection, no subshell, no global option between `git` and `push`, no environment prefix and no wrapper. A chained command still asks, so run the first push as its own command.
+  - The remote git really pushes to resolves, after any URL rewrite, to exactly `https://github.com/<owner>/<repo>` for the public repo configured under `github.user` / `github.public_repo`. The ssh and scp forms always ask.
+  - Its push config is simple, and no `http.*` git config, remote proxy or remote helper is set.
+  - No proxy, TLS-trust, ssh-program or git-config-injection environment variable is visible to the hook.
+  - A live check, with redirects and credential prompts refused, confirms the branch does not yet exist there.
+
+  Like the `secrets_env` switch, it approves nothing: the guard makes no permission decision and leaves a note naming the setting. `gh pr create` is not covered, because without a terminal gh refuses to push an unpushed branch rather than pushing it. Everything else still asks or blocks as before, including force pushes, pushes anywhere else, close-then-push, re-pushes with no open PR, and round-cap asks. A dispatched session is still denied. Clones with no local config keep the prompt. This replaces the earlier note that `push_publish: off` is ignored.
+
+  Known residue: the hook cannot see shell-profile environment variables, aliases, functions or `PATH`. It assumes its payload's cwd is the shell's cwd, as every arm of the push guard does. It also cannot see a concurrent process changing config or the branch, or publishing the same branch, between its check and the push.
+- **Fixed: a bare `git push` is now checked against the remote git actually pushes to.** When `branch.<name>.remote` named a remote other than origin and its remote-tracking ref was missing, the guard assumed origin. A re-push could then be allowed silently on the strength of origin while the push went to the other remote. The guard now reads `branch.<name>.remote` from config, and an unreadable value asks.
+
+- **Embedding backend order is now an install setting.** Set
+  `memory.embed_local_first: true` in `~/.genesis/config/genesis.yaml` (or
+  `GENESIS_EMBED_LOCAL_FIRST=true`) to put the local Ollama backend ahead of the
+  cloud one. Unset, the order stays cloud-first with Ollama as the fallback.
+  It applies to every chain built without an explicit order: runtime storage
+  and recall, the memory MCP server, and default providers. It changes the
+  order only, never which model writes. Takes effect on restart.
+
+- **A parser for the PR body's `## Acceptance` section and source pointer.**
+  `scripts/acceptance_declaration.py` reads a PR body and reports what "done"
+  means (the list items under the first `## Acceptance` heading) and where the
+  work came from (`Closes #N`, a `Ledger:` or `Follow-up:` row id, or a
+  `Spec:`/`Plan:` name). It reads a small, closed Markdown grammar over the same
+  visibility scanner the other PR-body checks use, so comments and fenced
+  examples never count. A body it cannot read reliably is refused with a reason
+  rather than guessed at: one over GitHub's 65,536-character cap, or one with a
+  code fence that is indented or inside a list item or quote. Nothing calls it
+  yet; wiring it into PR creation and the merge report is a separate change.
+
+- **PR size counter.** `scripts/pr_shape.py` turns a unified `git diff -M` into a counted line total and a size band (`ok`/`shape`/`override`), excluding tests, changelog, prose, binaries, blanks, comments and verbatim moves; `parse_shape` reads a `Shape:` reason from a PR body. No callers yet — wiring into the review gate is a later maintainer change.
+
+- Added opt-in shared Serena services for the main checkout, reducing duplicate language-server memory across concurrent clients while keeping linked worktrees isolated.
+
+- Added an open-questions store: sessions can park a decision that only the owner can make (`open_question_raise`), mark which ledger rows, follow-ups or board cards it blocks, and close it with what settled it. The morning report counts the questions still waiting on you. The store is local only and never posted anywhere. Also adds the work board's local stores and a `board` setting (`off` by default) that the upcoming GitHub Projects board builds on.
+
+- **`readable_body` gains an opt-in `keep_blank` that preserves paragraph boundaries.** `scripts/check_cc_pin_receipts.py` and the fallback in `scripts/e2e_declaration.py` now emit a blank source line (outside fences and comments) as `""` when called with `keep_blank=True`, so paragraph-aware readers can see where a list item ends. The default stays `False`; no existing caller changes.
+
+- Added promotion onto the work board: `board_promote` turns a private ledger row or follow-up into a public GitHub issue after the owner approves it individually. The draft is privacy-scanned first; a record an open question blocks is refused; the issue never names the private record; and a crash mid-post can never create the issue twice. Everything that can change while a promotion waits for approval (the record closing, a label being deleted, a new open question) is checked again right before the issue is created: a promotion that can no longer go out is ended with the reason logged, so it can be proposed again once fixed. Promotion does not put the issue on the board's project yet; that arrives with the board reconciler. `scripts/board_setup.py` creates or checks the board's GitHub project (dry run by default): it works only on the project recorded in the board config (or one it creates and records), links it to the tracker repo, and never deletes a Status column. The issue poster's duplicate check now also searches all open issues, not only the 200 most recent.
+
+- Added an advisory `main-reverts` row to the `--check-pr` merge report: it names the files a PR's diff carries that none of the PR's own commits touched, the signature of a merge from main that kept stale copies and would silently revert main, along with how to repair it; it never blocks a merge.
+
+- Added foreground `gmodel` routes for Kimi K3 and MiMo V2.6 Pro, with subscription, direct API and OpenRouter choices and automatic credential-based selection that says why it picked a per-token route. A routed session's endpoint, credential, context window, effort and compaction/thinking settings are pinned for the whole session, so editing a settings file mid-session cannot re-route it; a `maxEffortLevel` cap in any settings file still applies, and `gmodel` warns about one at launch. Managed (organization) settings outrank `gmodel`; `/status` shows whether one is in force. The model is pinned at launch, and `/model` can still change it for the session on the same endpoint and key; on the OpenRouter route a Claude model ID bills Anthropic per token, and on Kimi routes Alt+T turns thinking off (on the Kimi subscription, Kimi then serves K2.8 Preview), both said at launch. `--effort` and `--autocompact` are accepted, and `gmodel` says the pins outrank them. The effort-cap warning also checks the `settings.local.json` that Claude Code reads at the repository root or main checkout. The Kimi subscription route reads `KIMI_CODING_API_KEY`, the same key as the Kimi Code roster example.
+
+- Added optional verified placement of indexing batches in a dedicated workload slice; routing failures defer indexing instead of falling back outside the requested boundary.
+
+- Added a read-only work-board reconciler: every five minutes it reads your GitHub project board and records what is on it. It counts cards by column and kind, measures how many of the repo's open issues and pull requests are on the board, and logs each card moved into In Progress once. `board_status` shows that summary and whether the reconciler is alive; `board_item` shows one card's column, its blockers and any open question holding it. It writes nothing to GitHub. It reports in every mode, but it reads GitHub only when the board's mode is not `off`, Genesis is not paused and a project is configured; `board_item` likewise reads nothing while the mode is `off`.
+
+- **Backups can now include extra directories you choose.** Set `GENESIS_BACKUP_EXTRA_DIRS` to directories under your home directory (separated by `:`); each is kept as an encrypted archive in the off-site backup tier, with rebuildable caches such as `.venv` left out, rebuilt fresh on every run, and `restore.sh` puts each directory back whole, keeping any existing copy beside it. See SETUP.md, "Extra directories".
+
+- Claude Code sessions, foreground and background alike, are now kept from hand-editing tracked files in your install's main checkout (the deployed install). A file edit (Write/Edit/MultiEdit/NotebookEdit) to a tracked file there is refused with a pointer to work in a worktree and open a PR. Shell commands are never refused: the guard compares the checkout before and after each command and, if a tracked file changed or HEAD moved, tells the session which files changed and, when the command was aimed at the main checkout, how to restore them — so a stray edit is caught and can be cleaned up before `scripts/deploy_code_only.sh` refuses to deploy a dirty tree. It reports after the fact, so it does not stop a command's effects. Untracked files, worktrees, and the dashboard update's own merge sessions are unaffected. Turn it off with `settings_update("main_checkout_guard", {"enabled": false})` or `GENESIS_MAIN_CHECKOUT_GUARD=0`.
+
+- Add explicit pinned Codebase configuration staging and read-only diagnostics; setup validates resolved settings paths before staging, synchronizes staged files and directory entries before immutable publication, preserves created staging on failure and the machine disable switch, and reports incompatible builds while limiting the environment path override to status.
+
+- Added a private qualification journal with immutable manifests funding the
+  complete request schedule, decimal reservations, provider-scoped generation
+  ownership, retained billing evidence and explicit recovery state. This is
+  groundwork for the qualification rebuild; it performs no paid requests.
+
+- **A click that opens a new tab is followed.** When a click opens a new tab or popup (a `target=_blank` link, a form submitted to a new tab, `window.open`), the browser tools switch to it and the click result names it (`new_page`); the original tab stays open, and if the new tab closes itself (a sign-in popup) the tools return to the tab that opened it, or to the nearest still-open tab in that chain.
+
+- **The merge gate now checks the rework contract on rebuilt PRs.** When a PR replaces one that was sent back for rework (labelled `needs-rework` or `needs-architecture-session`), whether its body has a `Replaces: #N` or `Supersedes: #N` field line (prose is never read as a declaration) or its commits contain the old PR's head, the merge is blocked until the old PR carries a maintainer's `## Rework acknowledgement` comment, posted before the new PR opened, and the new PR's body has a `## Rework` section with `Replaces:`, `Split:`, `Deviations:` and `Questions answered:` lines. `--check-pr` shows this as a new `rework` row. The owner can waive it with `# rework-override`, which is logged.
+
+- Managed Codebase now has deliberate native enable, disable and remove commands with validated startup, independent failure cleanup and preservation of immutable settings and provider state. Custom unit dependency namespaces refuse before activation.
+
+- **A session can ask whether a heavy job fits before launching it.** `python -m genesis.hostmetrics preflight --name N --ram GB --cpu PCT` (with the Genesis venv's python) answers GO, WAIT, NO or ASK (exit 0, 3, 2, 4) against a configurable share (default 80%) of the container's memory, CPU and disk, counting current load and, when the guardian is configured, the host's free memory too. `status` prints the readings it uses. Tune it with `GENESIS_RB_*` variables or `~/.genesis/resource-budget.env`; see `docs/reference/resource-budget.md`.
+
+- **Heavy jobs can run admitted and capped, visible to every session.** `python -m genesis.hostmetrics run --name N --ram GB --cpu PCT -- CMD` (with the Genesis venv's python) runs the preflight. On GO it launches the command in a `genesis-job-*` systemd scope, with the RAM and CPU estimates as hard caps. On exit it reports the job's peak memory and CPU time, and whether the job hit its memory cap. `status` lists live jobs, and `preflight` counts each job's unused reservation, so sessions see each other's jobs once they are launched and stop over-committing memory. `--wait-until-fits MIN` waits for room instead of giving up. A watchdog stops the job if the box stays over the line for a minute. Without a systemd user manager the job runs uncapped at low priority and says so; if systemd refuses the caps, `run` stops with an error instead.
+
+- **Genesis now tells you when the next deploy would refuse to run.** The hourly deploy-health check notices tracked files edited in place in the install's own checkout (by hand, by another coding tool, or by Genesis's own runtime writers), which make `scripts/deploy_code_only.sh` and `scripts/update.sh` refuse. It raises a non-paging alert on the dashboard and in the morning report naming the files, and clears it once they are restored or brought in through a pull request. The health snapshot's `deploy_health` section carries the current list under `main_checkout`.
+
+- The disk guardian now names the file that is filling a disk. A file held open for writing that is a large share of its filesystem (25% by default), or that grew by 5% of it in one poll, triggers a critical alert naming the file, the processes writing it and, for a file in Claude Code's temp space, the session. Fast growth also switches the guardian to its 5-second poll. Detection only: nothing is stopped or deleted. Thresholds are `DG_RUNAWAY_PCT`, `DG_RUNAWAY_RATE_PCT` and `DG_RUNAWAY_MIN_MB` in `watchgod.conf`.
+- In observe mode (`WATCHGOD_ACT=0`) the disk guardian now sends its alerts, marked as observe-mode, instead of only logging them. Observe mode still changes nothing on disk.
+
+- Added offline reference admission and whole-corpus feedback review for the
+  qualification rebuild, with separate human/frontier labels, policy-bound
+  receipts and exact corpus/policy human approval. No grading calls are made.
+
+- Added qualification corpus validation and offline production-contract adapters
+  for relevance and novelty, preserving source-labelled references and actual
+  rendered candidate identity. Full execution and storage replay land later.
+
+Corpus JSONL decoding uses UTF-8 with structured invalid-byte refusal. Adapter observations are scoped to each invocation, raw relevance must be a numeric value in [0, 1], and embeddings that store as an all-zero float32 vector are rejected.
+
+- Deletes of user data by Genesis are now recoverable: a cognitive-file rollback and a leftover task-worktree directory move into a Genesis-owned trash (`~/.genesis/trash/`, list and restore with `python -m genesis.trash`) instead of being deleted. A task worktree holding uncommitted work is no longer force-deleted when its task is re-run; the task fails with the reason and the worktree is kept for the worktree reaper. See `docs/reference/trash.md`.
+
+- `scripts/deploy_candidates add <branch> --approve-hooks <who>` lets a candidate that changes a git or Claude Code hook run on `live` before it merges, once the owner has approved it: the approval is recorded for the pinned commit only, a rebuild leaves out any approved candidate whose hook would merge into bytes nobody approved (naming why), and when a candidate leaves `live` its installed git hooks are put back to what the checkout now holds. The deploy manifest moves to version 3.
+
+- Qualification transport retains responses before SDK cleanup, refuses repeated completions, and reconciles exact costs through generation receipts. Documented routing metadata and disabled gateway response caching guard both live acceptance and replay; contradictory identities retain unresolved liability. Frozen bindings and incident recovery are required; the execution runner and spending approval remain separate.
+
+- Add offline qualification preflight that checks complete reference admission, actual production questions and committed disposable storage effects before the later runner can request execution approval, with historical-source and procedure-metadata validation, normalizer registry source binding and stale-cache refusal.
+
+- Add current-bound offline qualification reports and separately approved serial Flash-only or MiMo–Flash runs with operating allocations, retained billing incidents and observed-cost reporting; provider charges can exceed the approved allowance.
+
+- **Graph-engine fallbacks are now recorded durably.** Every memory-graph traversal (recall enrichment, memory expansion, drift queries and the ambient worker) records which graph store was configured, which one answered, and why they differed, in the evaluation events table, kept 30 days. The first fallback of each request is written the moment it happens, and a record that fails to save is also noted in a local file, so the evidence cannot vanish silently. This is the evidence the FalkorDB default-on decision waits on; until now those fallbacks only reached logs, and from the MCP memory server not even that. Set `GENESIS_GRAPH_TELEMETRY_DISABLED=1` to turn it off.
+
+- The review-round evaluator (`scripts/review_budget.py`) now reports what a round reflection must answer for: an immutable key per finding in the open round (`c<comment id>`; `r<review id>:<count>` for the findings in a review body, answered as one; `i<comment id>` for a Codex findings comment), whether every key could be read, which reviewers reported on the current head, and which reviewers reported on any other head of the PR (the reviewers a settle window should wait for). Nothing consumes these fields yet; the round-reflection tool and gate that read them are later changes. Ids are read from GitHub's `fullDatabaseId` (the older `databaseId` is deprecated). A missing id never changes the round count or status; it only marks the keys unknown.
+
+- Shared credential-label recognition for structured consumers, using the same token, password and environment-label vocabulary as the plain-text scrubber. Existing plain-text redaction behavior is unchanged.
+
+- New `scripts/review_reflection.py`: the round-reflection format and its coverage check. A round reflection is an empty commit, made before a review round's first fix, that answers for every finding of the round (distribution, premise verdict, scope against the acceptance list, decision, and one disposition per finding key from `review_budget`). `covered_keys` is the single check a later commit-gate change will call: it counts a reflection only when it is an empty commit naming the round head and it meets every rule (the round's structure and obligations by lane, the recurring-class rule against the branch's previous round, a readable adversarial audit where one is cited, no escalation). `status` reports what the open round owes and whether it has settled; `validate` checks a file offline. Nothing calls it yet.
+
+- **`python -m genesis.trash put PATH --reason R`** moves a file or directory into the Genesis trash from the shell, so a session deleting user or project data can make it recoverable instead of using `rm`. The trash also refuses to move the live Genesis database (or its `-wal`/`-shm` files, or a folder holding it).
+
+- **Memory-server census for the graph-engine cutover.** Once an hour genesis-server records which memory servers are running and whether each one started on code that records graph traversals. The FalkorDB default-on decision needs 14 days in which every traversal was on record, and a memory server started before that code was deployed records nothing, so the clock can only start once none is left.
+
+- **Graph-engine cutover report.** `scripts/graph_cutover_report.py` says whether the FalkorDB graph engine is ready to become the default: PASS after 14 consecutive days with no fallback and enough traffic, NOT YET with what is still short, or INCONCLUSIVE when some of the evidence may be missing.
+
+- **An install can now switch off the review-request prompt that appears when the review history cannot be read.** Set `hooks.asks.review_request: off` in `~/.genesis/config/genesis.yaml`. A PR comment requesting a Codex review, as the whole command, whose round history the guard could not read because GitHub failed to answer just then (every error code on the evaluator's transient allowlist) then goes ahead with a context note instead of a prompt. Persistent or tamper codes (deleted findings, truncated responses, a malformed record, a configuration error, a moving head) keep asking. The cost: while GitHub is unreadable, the round budget is not checked for that request. The round-cap prompt, a request whose PR number cannot be resolved, a dispatched session's deny, and the refusal of a review request chained with a commit, push, merge, close or PR create are unchanged. Like the other keys, it approves nothing.
+- **A failed GitHub read in the review-round counter is retried once** while its read budget allows, instead of one failure deciding the result.
+- **The unreadable-history prompt now says why the read failed**: the evaluator's error codes plus a fixed-vocabulary class of each failed `gh` call (for example `gh_failure:http_502`, `gh_failure:rate_limited`, `gh_failure:hook_deadline`), never the raw error text.
+
+- A session that deletes user data with `rm`, `unlink` or `shred` (Claude Code memory, plans and settings, `~/.genesis` config and output, the gitignored identity and local config files) now gets a note pointing it at `python -m genesis.trash put`, which can be undone. The note is advisory and never blocks a command.
+
+- Added an opt-in, paid-model-free native Codex CLI/app-server hook harness with isolated shell, patch, and MCP sinks.
+
+- `python -m genesis handoffs send` delivers a handoff file to another install over ssh, for installs that share no handoff directory. It writes into the peer's configured handoff `dir` (and refuses when none is set), treats a re-send of the same content as a no-op, needs `--replace` to overwrite different content, and reads the file back by sha256. `--session` also adds one fixed-text pointer row to a session's ledger on the peer, and `--dry-run` writes nothing. `handoffs peers` lists peers from `~/.genesis/config/peers.local.yaml`, and `handoffs sessions` lists a peer's recent sessions read-only. A peer handoff is context, untrusted on arrival, not a way to report findings. See `docs/reference/peer-handoff.md`.
+
+- Enforce external and validator Genesis MCP tool profiles during discovery and direct calls, and skip unused health dispatch initialization for external clients.
+
+- Added an opt-in guardian swap ceiling (`swap_ceiling_pct` in a deployed
+  install's guardian config): caps this container's share of host swap as a
+  percentage of the host's total swap pool, enforced through Incus's own
+  native swap-ceiling key under a hard memory cap, or a direct cgroup write
+  otherwise (no memory cap, or `limits.memory.enforce: soft`). Set
+  `swap_ceiling_pct: off` to remove a ceiling; removing the setting leaves
+  whatever is set alone. Install-local; the public default remains uncapped.
+
+- Codex's inactive validator boundary now admits workspace patch sources and destinations while refusing protected instructions, paths outside the workspace, symlinks and shared file inodes.
+
+- Optional transcript analysis can parse local records with structured credential scrubbing and explicit unresolved identity and usage. The parser is a library; collection and query commands follow separately.
+
+- Add an inactive, strict local request protocol for future interactive Codex validators, currently limited to a private-file protocol probe.
+
+- Genesis now names a slow SQLite statement in its log the first time it happens. Any statement on a shared database connection (including the row fetches of its cursors), and any pooled recall read, that takes at least `GENESIS_SQLITE_SLOW_MS` (default 1000 ms; `0` turns it off) logs one warning with the SQL text (never its parameters), how long it queued for the connection versus how long it ran, whether it finished, was cancelled or failed, and what it was most likely stuck behind. Repeats are limited to one line per statement and outcome per minute, unless a repeat is at least twice as slow.
+
+- Added snapshot-bound restore retries and compatible legacy/v2 encrypted transcript readers before new-format capture is enabled. Explicit local sources take precedence over off-site configuration, separate Tier-1 audit records remain recoverable, and failed selection initialization cleans unpublished staging.
+- Fixed selected cache identity and inventory validation, preventing damaged inventory from silently omitting recovery, and made retirement resumable after interrupted deletion. Identical legacy transcript copies collapse; differing plaintext/encrypted copies require an explicit encoding preference.
+- Fixed fresh pooled transcript recovery over SMB by keeping its temporary credentials available through all off-site downloads.
+
+- **An install can now switch off the prompt for a push onto an open pull request's branch from another checkout.** Set `hooks.asks.push_pr_branch: off` in `~/.genesis/config/genesis.yaml`. A `git push <remote> <current>:refs/heads/<branch>` then goes ahead with a context note instead of a prompt, but only when `<branch>` is the head of an open pull request on this repository, the remote is a github.com https repo of the configured owner, `<branch>` is not a default branch, and no other step in the command can change git config first. It is separate from `push_routine`, which never reaches this push. Force pushes, deletes, tags, unqualified destinations, every block and a dispatched session's deny are unchanged. Like the other keys, it approves nothing.
+
+- Standalone hosting provides bounded request-body ingestion for the dependent
+  peer send/cancel API: an absolute body deadline, decoded and framing byte caps,
+  and bounded unread-body cleanup. The existing listener and network topology are
+  preserved; peer routes and task execution are not activated by this prerequisite.
+
+- `python -m genesis vault` creates an encrypted card vault for virtual cards: `init` seals an age key under a strong passphrase, `add` encrypts a card's details to the vault's public key (a merchant scope or `--single-use` is required), and `list`, `retire` and `status` manage it. The commands that read a secret run only in your own terminal. Install the new `payments` extra to use it.
+
+- **Browser profiles are copied aside before a new browser version first opens them.** A browser upgrades its profile on first open, and the older version may then refuse it. Before the browser tools open a profile with a different Camoufox or Chromium version, the profile is copied to `<profile>.pre-v<old version>-<time>` (caches left out), so going back to the old version can restore it. The newest copy per profile is kept, the newest of each version for 90 days, and older ones are removed after 14 days. Sessions launching at the same time make one copy, a launch that fails before opening the profile does not make another, and a copy is skipped when it would move the disk into the disk watchdog's ORANGE or RED tier (a disk already ORANGE still gets one, unless it would reach RED). A copy that cannot be made (low disk, profile open elsewhere) is logged and never stops the launch; a launch waits up to 10 minutes for another session's copy of the same profile.
+
+- `python -m genesis vault unlock` hands the card vault's key to genesis-server, which holds it in memory until `vault lock`, 30 minutes idle, or a restart. `vault status` shows whether it is unlocked and the last vault event. Every unlock, lock and refusal is recorded with the process that asked, and an unlock that cannot be recorded is refused.
+
+- **`scripts/install_browser_stack.sh` installs the browser stack in one step.** It fetches the Camoufox engine the installed camoufox package pairs with (camoufox 0.5.7 or later; never on an older package, whose fetch deletes the whole engine cache), installs the Chromium the browser tools' fallback launches (patchright's when patchright is installed, otherwise playwright's) and reinstalls a build whose files went missing, and installs missing system libraries through non-interactive sudo or prints the command to run. The download goes to `~/tmp`, a run is skipped when the engine cache, the download directory or Chromium's directory has less than 4 GB free (`GENESIS_BROWSER_MIN_FREE_GB`, measured with any btrfs quota taken into account), and a re-run does nothing when everything is in place. A `genesis-browser-stack.service` unit can run it unattended; it refuses to run inside a Claude Code session.
+
+- When a browser click, or a fill's focus click, fails after Playwright has started sending the mouse events ("performing click action"), the error now carries a `diagnostics` snapshot taken at that moment: the browser layer, its age and open pages; the last JS dialog and whether it was settled; the document's visibility, focus and ready state and whether a modal dialog is open; whether the page navigated; and the target's box against the viewport, with what lies under the point the click aimed at (or `point: unknown` when that point is not known). Strings are limited to standard tag names and fixed keywords, and numbers are rounded and bounded, so no field value or page text is included. If the page navigated after the click, the snapshot says so instead of describing the new page, and a click that fails close to its 60-second limit skips the probes rather than losing its error.
+
+- **Disk hygiene retires Camoufox engines nothing runs.** camoufox 0.5 keeps every engine version it fetches (about 2.4 GB each) and never deletes one, and an install upgraded from camoufox 0.4 still holds the old engine in its cache root. Once the engine the installed camoufox pairs with has been paired for 14 days, `scripts/disk_hygiene.sh` removes the older version directories and the old root engine's files, through its mount-aware deleter. It keeps every engine while `CAMOUFOX_EXECUTABLE_PATH` or a `camoufox set` choice is in effect, and it never removes an engine a running browser uses, one launched in the last 14 days, or camoufox 0.5's own files. It skips the step when it cannot see the process table or the provisioner is running. A version directory is moved aside before it is deleted, so an interrupted run is finished by the next one.
+
+- The card vault is now backed up with the encrypted credentials every backup run and comes back with a restore, staged and checked but never put in place for you. A vault backup that fails, or a backed-up vault that disappears, fails the backup run and sends the backup-failed alert. `python -m genesis vault init`, `add` and `retire` remind you to run a backup right away.
+
+- When a session files an issue with `gh issue create`, it now sees up to three of the closest existing issues (open, or closed in the last 30 days) found by GitHub's semantic search, with the exact command to close the new one as a duplicate if it is one. The note never blocks, and when it cannot check (for example on gh older than 2.98) it says why. The search itself needs gh 2.98 or newer.
+
+- The PID/task budget alert now names what is holding the budget: the Claude Code sessions, services and cgroups with the most tasks, and a full per-tick breakdown saved under `~/.genesis/logs/pid_snapshots/` while the budget stays at or above 80%.
+
+- When a Claude Code task's output file is growing fast enough to fill cc-tmp (ORANGE or RED), the disk guardian now pauses that command (SIGSTOP, never a kill, never the session itself) instead of only paging. Every pause is recorded and paged with exact `scripts/watchgod thaw <pid>` and `scripts/watchgod kill <pid>` commands, and reminded every 6 hours while it stays paused. The file itself is not emptied yet.
+
+- After pausing a runaway Claude Code task, the disk guardian now also empties its output file once every writer it paused is confirmed stopped, which frees the space at once. A writer it did not see only refills the file (task outputs are appended to), and that refill is detected and paused again. The last 1 MB is kept, owner-only, in `~/tmp/watchgod-truncated` when the home disk has room. A refill is detected and handled again.
+
+- When cc-tmp is its own volume, the disk guardian now keeps a small reserve there (5% of the volume, at most 128 MB) and releases it at RED, so a session's Bash keeps the last few MB it needs while a runaway is dealt with. It is held for one poll after the guardian empties a runaway output in cc-tmp, and the guardian's own reserves no longer read as the disk filling. A reserve that cannot be removed is now reported as not released.
+
+- Machine connectors can now use prepared background-session receipts with explicit cancellation, bounded execution, private full results, and restart reconciliation. These native controls preserve existing tool and owner-approval boundaries and do not enable network access by themselves.
+
+- Added an opt-in same-owner A2A conversation interface: enrolled agents can ask Genesis to reason with its normal background tools, continue bounded conversations, poll/cancel native turns and retrieve scanned results. Owner approval remains in Telegram/dashboard; no daily peer task quota or new listener.
+
+- Add a governed local agent channel and durable A2A pull outbox for explicitly
+enrolled same-owner peers, with scoped idempotent collection ACKs and correlated
+native replies. Preserve message identity through existing retry queues; add no
+HTTP sender, listener or peer approval authority.
+
+- The round reflection can now owe late findings, each credited only under its own round: a review that opened no round, or one that arrived after a fix to its head. Its readers take the review budget's own late flags and round opening times, and read earlier rounds' classes only from reflections that are git ancestors of the one judged. Nothing more is owed yet: the cutover that turns it on is set when the commit gate enforces reflections, and `review_reflection.py status --cutover <time>` reports what it would owe.
+
+- Send peer API outage and recovery notices through Telegram, preserving incidents across restarts and keeping deliberate disablement quiet.
+
+- Expose current peer API readiness in health snapshots and periodic status, and return an unavailable response when an enabled API cannot accept conversations.
+
+- Make 15 GitNexus tools available through portable Codex project configuration, using the repository's pinned launcher; defer source-editing rename and group-metadata sync.
+
+- Support an explicitly approved DeepSeek Pro–Flash qualification run with separate campaigns and the existing serial spending controls.
+
+- genesis-server can now ask the owner to approve a card release with one Telegram button tap. The tap counts only from the first id in `TELEGRAM_ALLOWED_USERS`, on the exact message it sent, unedited, and only once; anything else, or no tap within 10 minutes, refuses. Every request and outcome is recorded in the vault audit log. Nothing asks for an approval yet.
+
+- Add read-only managed worker availability checks for configuration, readiness and namespace-local access prerequisites, including persistence-specific storage, SQLite sidecars and effective executable access. Preserve the installed virtualenv selection in the indexing runner's checks.
+
+- Add bounded serving-status requests for supervised Codex validators, including owned-child cleanup on termination.
+
+- **The card-release approval message now shows the Pay button's label and the names of the other fields the fill will touch.** A `release_request` may carry `button_label`, the visible label of the Pay control the fill tool will click, read from the page. The tap shows it on a `Button:` line, with control and format characters removed, whitespace collapsed and at most 40 characters, or `Button: (not given)` when the request has none. A request may also carry `also_filled`, the names of the non-card fields the tool will fill, each one of `email`, `name`, `phone`, `address_line1`, `address_line2`, `city`, `region`, `postal_code`, `country` or `company`. The tap lists them on an `Also filled:` line, or shows `none`. Any other name refuses the request (`bad also_filled`) before any audit row is written. The audit row records the button label only as its length and the field names as a list. No field values are sent or stored.
+
+- **A test-vault harness for trying card fill with a test card.**
+  `scripts/payments_test_vault.py` builds a separate vault that holds only
+  Stripe's public test card (labelled `TEST 4242`), serves it on its own socket,
+  and asks for each approval in its own terminal (type `y`) instead of on
+  Telegram. A branch's card-fill tool can then be run live without the real
+  vault, its socket, its cards or the bot. Every approval it shows starts with
+  a `TEST:` line. See
+  `docs/reference/payment-test-vault.md`.
+
+- **The memory hook now records how long each of its steps took.** Every run of the UserPromptSubmit memory hook writes one `[hook-phases]` line to stderr: the milliseconds spent in each step (startup imports, the heartbeat writes, the server call, the keyword fallback, and so on), whether it ran out of time, and the container's I/O, CPU and memory pressure averages at that moment. When the hard stop ends a stuck run, the line names the step it cut. Claude Code keeps this line in the transcript's hook record and never shows it to the model, so a slow or cut prompt can be traced to the step and the stall behind it. Details: `.claude/docs/proactive-memory-hook.md`, "Phase line".
+
+- **See which skills actually fire.** A new `skill_usage_status` health tool, and `python -m genesis.learning.skills.usage`, report per skill how often it was loaded, typed as a slash command, read, nudged by the skill hook, preloaded by an agent or injected into dispatched sessions, with counts split between interactive and headless sessions. Each skill gets a state (active, zombie, dead, not_nudgeable) decided only by chosen uses, so a skill that is injected into dispatched sessions but never picked does not show as active. It only reads existing transcripts and the session table.
+
+- A graph-engine read that times out now records its own cause on the cutover telemetry row: the process (pid, start, age), how far past its deadline it fired, the awaits it cancelled, and the container's stall time across the wait. Rows also carry a latency spread of answered traversals, the cutover report prints each reset's cause, the ambient worker's log lines carry time and pid, and the engine unit keeps a deeper slow log plus a latency monitor.
+
+- When a database write gives up on a lock (after its retries, or at once for a script), Genesis now records the moment in a JSON file under `~/.genesis/logs/lock_snapshots/`. The warning line names that file. The record includes the SQLite error kind and which processes held locks on that database. It also names this process's own connections to that database: which code opened each one, whether it is inside a transaction, and what statement it is running. Running tasks are counted by name. Connections opened outside Genesis's database helpers are not named. SQLite's own waiters are not visible in the kernel lock table, so the file shows who held a lock, not who was queued behind it. Set `GENESIS_LOCK_SNAPSHOT_DISABLED=1` to turn the recording off.
+
+- Add `genesis db query` for one SQLite-enforced read-only statement, with parameter binding, row limits, escaped TSV and strict JSON. Reject duplicate JSON column names and explicit empty database paths. Cap retained-result accounting at 100 MB and use a cooperative SQLite deadline with a setup-time busy cap; these are not hard process-memory or wall-clock bounds. SQLite-owned sidecars and temporary spill files can still be written. FTS5 works, rtree remains unsupported, and refused statements exit 4.
+
+- **The Tailscale watchdog can keep this node's home DERP region pinned.** Set
+  `NETWD_TS_PREFER_DERP=<region id>` in a drop-in on
+  `genesis-tailscale-watchdog.service` (off by default) and each run keeps the
+  node homed on that region with `tailscale debug force-prefer-derp`,
+  re-applying it whenever the relay drifts off the region or tailscaled has
+  restarted (including the watchdog's own restart heal), since a restart clears
+  the pin. This avoids a one-way tunnel that can follow a home-region change
+  when a peer keeps sending to the old region. A lapse (the home left the
+  pinned region while tailscaled kept running: either the region was
+  unreachable at a netcheck, or the pin was cleared) raises an owner alert
+  naming the result of the re-apply, as does a pin that cannot be applied or
+  judged; observe mode reports and changes nothing.
+
+- Allow a smaller Pro incumbent baseline in Flash model comparisons while retaining full Flash qualification, detailed incomplete legacy reports, and clear reporting of the baseline's limited scope.
+
+
+### Changed
+
+- **Changelog entries are now written one file at a time, so two branches
+  never collide over them.** Add a file under `changelog.d/` instead of editing
+  `CHANGELOG.md`; at release time they are folded into the `[Unreleased]`
+  section and removed. Two branches writing two different filenames have
+  nothing to merge, which is the entire point — a shared changelog is a file
+  everyone edits at the same position, and git reports that as a conflict
+  somebody has to resolve by hand.
+
+  Measured against this repository's own queue beforehand: of 49 open pull
+  requests, 21 could not merge, and 18 of those 21 conflicted on `CHANGELOG.md`
+  and nothing else — every other file in them merged cleanly. A smarter merge
+  setting cannot fix it, because GitHub ignores a repository's `.gitattributes`
+  in its server-side merge; that was measured against GitHub's own merge engine
+  rather than assumed.
+
+  Nothing in the directory is skipped quietly. A misspelled name, a timestamp
+  that is fourteen digits but not a real date, an unknown category, an empty
+  file, or a nested folder is reported rather than ignored, because a fragment
+  that is silently passed over is a changelog entry that never ships and that
+  nobody notices — the release section still looks complete.
+
+- The commit and push guards no longer interrupt you with an approval dialog when a command cannot be parsed safely. Previously an unparseable command that mentioned a commit, push, or merge raised a prompt asking you to approve it; now the guard refuses it outright and tells the agent how to rewrite it (use the Write tool for prose, or pass the text as a file). The one approval that remains is the deliberate one: publishing externally with `git push` or `gh pr create` still asks. A crashed parseability probe also now reports itself instead of failing quietly.
+
+- **Graph-enriched recall no longer surfaces memories that recall itself
+  hides.** When a memory was returned, Genesis also showed its graph
+  neighbours — but that traversal never applied the visibility filter the rest
+  of recall uses, so consolidated-away and expired memories were presented as
+  live context. They are now filtered out of the graph entirely. On this
+  install that changed the neighbour list for roughly a quarter of enriched
+  results, and 6.5% of them turned out to have had neighbours that were
+  *entirely* hidden memories.
+
+- **The deferred-work rule now says plainly that filing something is not
+  deferring it.** It opened with a fix-now bias and then spent a paragraph on
+  where a record belongs depending on who owns the work — and that second half
+  read as though it answered the whole question. "This is repo work, therefore a
+  GitHub issue" became a disposition rather than a filing location, so an in-scope
+  problem could get a ticket instead of a fix, and the tracker made that look like
+  diligence.
+
+  The two decisions are now separated in the order they should be made: is this in
+  scope for what the session is doing, and only then, where does the record live.
+  An issue is a public record, not a disposal — in-scope work is filed *and* done,
+  often in the same session. The mechanics section of the MCP tools guide carries
+  the same note at its top, since that is the page someone lands on when they are
+  already reaching for the routing answer and have skipped the question before it.
+
+- **Corrected a stale example about bounded output.** The development guide
+  cited the cap on a subprocess's captured output as an example of a size limit
+  that cuts without saying so. That limit now reports the true total alongside
+  the bytes it kept, so the guide no longer describes it as silent — but it
+  also records why the fix is not yet complete end to end: the notice is added
+  at the tail of a large field that every later reader trims well before it,
+  so a declaration still has to survive its consumers to count as one.
+
+- **A review session no longer closes a pull request it is not reviving.** When
+  a PR turns out to be wrong at the premise rather than in its details, it now
+  gets a `needs-architecture-session` comment carrying the evidence and stays
+  open; closing it belongs to whoever picks up the redesign, at the moment they
+  pick it up. An open PR with the reasoning attached is found by listing the
+  queue, and its review threads stay where the conversation is happening — a
+  closed one is found only if somebody remembers it existed. If a PR should be
+  closed and nobody is picking it up, that is a question for the maintainer
+  rather than a call the review station makes on its own.
+
+- **A code review that finds an unrelated bug now files it and lets the pull
+  request through.** Reviews regularly turn up real defects that already existed
+  and have nothing to do with the change being reviewed. The rule is one
+  question: does the change work without that fix? If it does, the finding
+  becomes a tracked issue and the change merges; only a defect that actually
+  breaks the change gets folded into it. This keeps a review from widening into
+  an open-ended cleanup, which is what turns a small change into a long series
+  of review rounds. A security defect is the exception and is never posted
+  publicly before it is fixed.
+
+- **Changing the review gate no longer has to pass the gate it is changing.** A PR
+  touching the enforcement-hook surface now runs an expedited lane: both cross-model
+  reviewers on round 1 instead of one, findings triaged before any code changes, a
+  single batched fix push, and a hard stop at two rounds. It is a stricter-review,
+  fewer-rounds trade — the always-fix floor (P1, security, destructive, fail-open) is
+  never waived, and a new P1 in the fix itself stops for a human decision. The lane is
+  process doctrine layered under the existing round caps, so nothing about the gate's
+  code changed. Which secondary reviewer an install uses is now named once in
+  `merge_gate.secondary_reviewer` in local config, rather than written into the repo
+  where it goes stale; installs without one simply run Codex-only.
+
+- **The development skill now names the six axes review findings actually fall
+  along.** Genesis classified 31 review findings from two pull requests,
+  attributing each to the commit that introduced the line it points at. Of the 25
+  distinct findings left after removing duplicates and one that later proved
+  unfounded, 24 fall into six shapes: a signal that does not change when the
+  property it stands for changes; a scope or lifetime narrower than the operation
+  it guards; an input the type permits but nobody pictured; an equivalence
+  claimed but never checked; a failure path that leaves work behind; and a
+  caller's explicit option silently dropped. The 25th was a test whose identity
+  comparison was unsound in both directions. Those six are now a checklist to run
+  against new code before the first review rather than after it.
+
+  The same measurement settled where findings live, which was worth knowing
+  because two successive intuitions about it were both wrong. Counting every
+  round, 21 of the 31 sat in the original implementation — but a first review has
+  no fix code to find anything in, so that number is partly arithmetic. Counting
+  only the rounds that actually loop, it is nearly even: 11 findings were already
+  in the original code and 10 were in code written to answer an earlier round.
+  Neither writing the feature nor answering the review is the dominant source,
+  and the checklist applies to both.
+
+  The entry records what would disprove it, with a rate and a sample size rather
+  than an adjective, and a note on the attribution method — an earlier version of
+  this measurement was inverted by treating a review comment's recorded commit as
+  the commit that introduced the line, when it is the branch head at the moment
+  the review was posted.
+
+- **Batch code-index commands and their newly spawned descendants now receive the maximum OOM preference without sacrificing their supervisor.** Only the disposable batch child is adjusted; the watchdog and launcher keep their inherited score so they can still pause, stop, and reap it. The preference applies within the kernel's eligible OOM domain, and a lower override or an adjustment that cannot be verified refuses the heavy workload instead of silently weakening protection. Workers already running in an external daemon are not reprioritized by this launcher.
+
+- **The development guide now covers five ways a verification can be complete
+  and still be wrong.** All five came out of one long pass through the pull
+  request queue, and each had already cost hours. A change can be verified three
+  separate ways and still ship a resource defect, because a correctness suite
+  cannot go red on one — and where the code sits on a path that gets killed on a
+  timeout, and the kill permits what it was meant to refuse, a scan that slows
+  down super-linearly on attacker-chosen input is the defect no matter how right
+  its answers are; the fix is a timing test. A clean measurement over a corpus of
+  real inputs is a lead and not a clearance, because a corpus records what has
+  been typed rather than what can be typed, so a null result now has to be handed
+  on with its denominator and its blind spot attached. The matrix that replaces
+  it is generated from the grammar of what a rule flags rather than from history,
+  run against both trees so the baseline can be seen to move, with a note on the
+  probe that reads a verdict from an exit code and so cannot tell "ask" from
+  "allow". Refuting a reviewer's finding is itself a claim at the same evidence
+  bar, and an admitted gap in the argument is the reason not to state the
+  conclusion. And a local checker's verdict about a remote pull request depends
+  on the tree it ran in, so a claim about a PR's current state has to come from a
+  tree at the default branch. Recorded alongside the first of those: a lesson
+  about a vulnerability does not need the vulnerability's parameters — the shape
+  of the failure is what teaches, while exact inputs, thresholds and affected
+  counts only compose into a recipe that keeps working for anyone still on the
+  unfixed code.
+
+- **The guide now says which pull request to pick up first when several are
+  eligible.** A fix restores functionality that is already broken, so it goes
+  ahead of new functionality — but the measurement behind that is about size
+  rather than kind. Across the 65 open fix and feature pull requests on this
+  repository, features average 2,024 added lines against 804 for fixes, and 67%
+  of them exceed a thousand lines against 29%; separately, 86% of pull requests
+  over a thousand lines need three or more external review rounds, against 6%
+  under two hundred. The gap in findings per pull request is much smaller, so the
+  rule is written on the property rather than the prefix: a small feature is not
+  deprioritised, and a large fix gets no pass. It remains one input among
+  several, not an ordering.
+
+- genesis-development skill: rising review findings now prompt a provenance check; split correct separable additions or revert incorrect ones before adding more changes.
+
+- **The inbox now notices when an evaluation silently skips a URL — and says so
+  before it starts acting on it.** The accountability check only ever caught
+  give-up *language* ("could not be fetched"); a response that simply never
+  mentioned one of its URLs passed, and the omitted link was permanently
+  absorbed into the evaluated baseline — invisible, unrecoverable loss. A
+  coverage check now requires every scanner-recognized input URL's complete
+  parsed identity to APPEAR in the response. Scheme and host case plus one leading `www.` are
+  presentation variants; userinfo, port, path, query, and fragment remain
+  identity-bearing. The evaluation prompt requires each URL echoed as a
+  `**Source:**` line. It ships in **shadow**
+  (`url_coverage_mode: shadow` in `config/inbox_monitor.yaml`): it computes its
+  verdict and logs opaque stable ids for what it *would* have re-queued (never
+  raw signed URLs or credentials), and changes nothing. Set
+  `url_coverage_mode: enforce` to have a miss re-queue the item through the
+  existing bounded retry path with the partial response preserved.
+
+  Coverage now counts only dedicated `**Source:**` fields and preserves legal
+  terminal URL characters. Exact retry-exhausted items remain terminal across
+  unrelated edits without suppressing genuinely new siblings. New batch rows
+  store versioned, lossless item boundaries in the existing database column;
+  malformed text or binary values are safely re-derived instead of crashing
+  the monitor or replaying a whole file. Legacy rows whose item boundaries
+  cannot be reconstructed retain the bounded file-level storm guard.
+
+  Shadow is the default deliberately. The check is new, and replaying it over
+  this install's completed evaluations flags roughly half of older responses —
+  which would re-queue them into a retry path that parks a whole file after
+  `max_retries` with no notification. Watch the shadow log first; enforce when
+  the rate reflects responses written under the `**Source:**` prompt.
+
+  **The link the evaluator is asked to fetch is now the link you wrote.** The
+  coverage check keeps every trailing character so it can fail closed on
+  ambiguous punctuation, which is right for deciding identity and wrong for
+  telling the evaluator what to open: a markdown link, a quoted URL or a URL in
+  a code span used to be handed over with its wrapper still attached
+  (`https://example.com/foo)`), so the fetch asked for a page that does not
+  exist. Measured across this install's stored evaluations and current inbox,
+  340 of 18,119 extracted links (1.9%) ended in wrapper punctuation; that is
+  now 11 (0.06%).
+
+  Trimming is structural rather than a guess at prose: a bracket or quote is
+  dropped only when nothing in the link opens it, so a balanced
+  `/wiki/Foo_(bar)` and an IPv6 address keep their brackets. Sentence
+  punctuation alone is never enough — a link ending in `;` or `!` is left
+  exactly as written, because nothing proves that character is prose and
+  asking for a different address than you saved is the very loss this check
+  exists to catch. That is what the 11 remaining are: 9 links ending in a
+  bare comma or semicolon, plus 2 templates the check already skips. Links
+  wrapped in markdown emphasis (`**`) are also out of scope and still reach
+  the evaluator wrapped.
+
+  The check itself is unchanged and still compares the link as written; it
+  simply also accepts the trimmed form **of that same link**, so an answer
+  citing exactly what it was asked for counts. A different link that merely
+  looks similar still does not.
+
+  One known false positive, left documented rather than patched: a response that
+  cites a URL *without* its tracking or query parameters (the prompt asks for
+  verbatim) reads as a miss. Stripping tracking params does not fix it — measured
+  at 0 of 146 rescued — and stripping the whole query string would merge
+  genuinely different URLs (`watch?v=A` and `watch?v=B`), which is worse than the
+  false positive.
+
+- **A note written directly above a URL now travels with it.** The natural way
+  to annotate a saved link — intent on one line, URL on the next — used to be
+  split into two unrelated items, so the evaluator never saw why the link was
+  saved. Adjacent prose now rides in the URL's own item (a blank line keeps a
+  thought independent), and an already-evaluated line elided from a delta
+  leaves a separator so unrelated lines can't be mistaken for annotations.
+
+- **Inbox items are now evaluated one at a time by default**
+  (`items_per_eval: 1`, previously 5), with default effort `high` and a 20-minute
+  evaluation timeout. Each link gets an evaluation session to itself — no more
+  depth dilution across batch neighbours — at the cost of more (smaller)
+  sessions. Raise `items_per_eval` in `config/inbox_monitor.yaml` to trade
+  depth for fewer sessions.
+
+- **Editing an inbox file before its previous snapshot was evaluated no longer
+  burns a retry or strands sibling batches.** Startup recovery atomically
+  returns every pre-dispatch row to the bounded retry lane without incrementing
+  its retry count. Complete outstanding work is rebuilt from the current file
+  and completed baseline, including a never-created tail when a crash interrupted
+  multi-batch row creation.
+
+- **An inbox evaluation is not baselined before its synchronous durable side
+  effects finish.** Follow-up and build-lane writes still treat ordinary local
+  errors as non-fatal, but cancellation or process exit leaves the batch
+  non-completed and recoverable instead of permanently hiding a missing side
+  effect behind a completed baseline.
+
+- Quiet hours are now OFF by default, so a message you schedule for 01:30 arrives at
+  01:30. Previously outreach shipped with a 22:00–07:00 window that silently held every
+  non-urgent category until morning, with no way to turn it off or to override it for a
+  specific send. To re-enable it, set real times under `quiet_hours` in
+  `config/outreach.yaml` (or your local overlay); `start` equal to `end` means disabled.
+
+- When a change keeps failing review, both escalation tiers now offer the remedy that was missing: hand it back to be rebuilt. Every option those two tiers used to print assumed the change was salvageable — audit harder, redesign, narrow, shelve — so a change whose *premise* was wrong could only be patched round after round, which is the one situation more review cannot fix. They now name the fork explicitly, say what evidence distinguishes the two cases (handing back a change that only needed polish is the more expensive mistake), and say plainly that work handed back was not wasted.
+
+- The merge gate now weighs review findings against what a change costs to get wrong, instead of holding every change to one bar. A serious finding — a P1, or a Critical/Major from CodeRabbit — still stops any merge outright, in every lane. Below that, a change to an enforcement hook, a CI workflow, an API surface or a migration blocks on the same two findings it always did, while ordinary code, and prose or test-only changes, tolerate more before the gate refuses. Configuration counts as ordinary, not as documentation. The verdict names the lane and the threshold it used, so a merge that passes with findings outstanding says so plainly rather than looking clean.
+
+- The project instructions loaded into every session no longer carry issue or pull-request numbers. A ticket number dates the sentence around it — usually a status like "not built yet" — which quietly stops being true the day the ticket closes, and nothing fails when it does. The two that had accumulated are rewritten to say what stays true, and a test now fails if another is added.
+
+- **When the review escalation cap blocks, its remedies are now put to you
+  directly instead of being relayed.** Previously the gate printed its four
+  options and the session retold them to you in its own words — which is how a
+  real block once reached a user with the first option missing, a fourth
+  invented, and "ship as-is" added, the one outcome that gate exists to prevent.
+  Now, while the cap is the tier your next commit would hit, the gate's own
+  question is appended to the next question the session asks you through the
+  question tool, carrying the gate's own wording — the option text is a verbatim
+  excerpt of the gate's message — in the gate's own order, with "hand it back"
+  first. The session does not author those options, so it cannot drop, reword or
+  pad them. Nothing else changes: the acknowledgement comments mean exactly what
+  they meant before, and no gate reads your answer back. Turn the substitution
+  off with `GENESIS_GATE_MENU_DISABLED=1` — any value except `0`, `false`, `no`
+  and `off`, which name the switch's own position and so mean "leave it on" —
+  or by creating `~/.genesis/config/gate_menu_disabled`. With it off, the gate
+  blocks and the session asks exactly as it did before.
+
+- **What the menu does NOT cover, stated so the claim is not wider than the
+  thing.** It appears only for the escalation cap: the round-2 mode-switch tier
+  and the final-round terminal still rely on the session relaying their options,
+  and the terminal is excluded deliberately — its options are different, so
+  showing the cap's menu there would be the very substitution error this exists
+  to prevent. It only reaches you through the question tool, so a session that
+  relays the block as ordinary prose is not covered at all, and a session that
+  happens to ask four questions at once will not get the menu appended (the tool
+  caps a call at four, and a rejected call would cost you the session's own
+  questions too). It stops being offered as soon as the gate ACCEPTS your
+  acknowledgement — which is not the same as a commit landing: the gate clears
+  the streak the moment it recognises the acknowledgement, deliberately even if
+  a later rule then blocks that same commit — except after "hand it back",
+  where the gate deliberately
+  forbids that acknowledgement, so the menu keeps being offered on that branch
+  until you leave it or use the off switch. If a session is sitting in one
+  worktree and committing into another, the menu will not appear. And a session
+  in a long-lived worktree created before this change keeps that worktree's own
+  frozen hook configuration, so the commit gate there still blocks — its entry
+  is redirected to the current script — while the menu, which needs a new entry
+  that worktree does not have, stays silent until the worktree catches up with
+  the main branch.
+
+- **Cleaning up an old worktree no longer destroys anything.** The daily cleanup
+  used to move a worktree aside and then permanently delete it a week later, and
+  restoring one deliberately did not bring back edits that had never been
+  committed — so a worktree holding unsaved work could be cleaned up and, seven
+  days on, be gone for good. It is now packed into a verified archive that is
+  kept indefinitely, with a patch of any uncommitted edits saved beside it. On
+  the install this was developed against, the very next cleanup would have taken
+  twenty-five worktrees, two of which held uncommitted work.
+- **The archive is only trusted once it has been read back in full.** Writing it
+  and checking the first entry is not a check: a half-written archive passes that
+  and then the original is deleted. Every entry is now walked and the count
+  compared against the source before anything is removed, and if any part of that
+  fails the original is left exactly where it was.
+- **Worktrees that are still being worked in are left alone**, including ones with
+  a paused rebase or merge, ones containing another worktree, and ones explicitly
+  marked as in use. Each worktree now also gets a single plain-language state —
+  in use, protected, fresh, at risk, or ready to clean up — so what the cleanup
+  decided and what any other view reports can never disagree.
+- **Asking for the machine-readable report now returns only that.** When the
+  report was requested without network access, an explanatory note was printed
+  ahead of the data on the same channel, which made the output unparseable for
+  anything reading it programmatically. The note now goes where a person reads it
+  and a parser does not.
+- **An archived worktree is no longer readable by other accounts on the
+  machine.** A reaped worktree is a verbatim copy of a working tree, which
+  routinely holds a private key or environment file. Rolling that into an
+  archive under ordinary settings republished it at world-readable permissions
+  inside a world-listable directory, so a file that was private in the worktree
+  stopped being private the moment it was archived. The archive, the directory,
+  and the recovery patch are now created private from the outset rather than
+  tightened afterwards.
+- **The archive is forced to disk before the original is removed.** Reading a
+  freshly written archive back proves the bytes are in memory, not that they
+  would survive a power cut, and publishing the finished name guarantees that
+  nobody sees a half-written file rather than that the name itself survives a
+  crash. A badly timed power loss could therefore keep the deletion and lose the
+  archive — the one outcome this whole change exists to prevent.
+- **An archived worktree whose name is legal on disk but illegal as a git
+  reference now still gets its safety anchor.** Names beginning with a dot, or
+  containing a space and several ordinary punctuation characters, were rejected
+  when the anchor was created; the archive was still recorded, so the anchor
+  that keeps the archived history reachable was silently missing and a later
+  cleanup could discard it.
+- **Recovering a worktree whose branch was deleted now produces a working
+  checkout.** This is the common case rather than an exotic one, because the
+  task runner deletes the branch right after cleanup. Recovery previously moved
+  the files back, reported success, and left a directory that git refused to
+  operate on. It now rebuilds a real checkout at the recorded commit and tells
+  you the one command that restores the branch name.
+- **A worktree that contains another worktree is left alone.** Moving the outer
+  one takes the inner one's files with it and can orphan its history.
+- **A cleanup run that cannot list the worktrees now says so instead of
+  reporting that there are none.** Failure and emptiness were the same answer,
+  so a timed-out or failing scan published a confident, valid-looking view in
+  which every worktree had vanished, and nothing downstream could tell that from
+  the truth. Such a run now reports the error, changes nothing, and leaves the
+  previous view in place.
+- **An archived worktree now carries its own history, instead of pointing at
+  history kept somewhere else.** Previously the archive held the files while the
+  commits stayed reachable only through a reference outside it — first the
+  branch, then a marker created just before cleanup. Every one of those is
+  something another process can remove, and each removal left a perfectly intact
+  archive whose contents could no longer be reconstructed. The archive now
+  contains the commits themselves, so nothing outside it has to survive for a
+  recovery to work. Verified by deleting the branch, expiring every reference and
+  running a full garbage collection until the commit was provably gone, then
+  recovering it from the archive alone.
+- **The commit recorded for an archive is the one it actually contains.** The
+  identifier was taken from a scan that runs over every worktree up front and can
+  be minutes old, so anything committed in that window was archived but recorded
+  under the earlier commit — sending a later recovery to a commit the archive
+  never held. It is now read at the moment of archiving.
+- **A worktree that contains its own bookkeeping file no longer loses it.** The
+  internal metadata file was written unconditionally, which replaced a file of
+  the same name belonging to the worktree — in the worktree and in the archive at
+  once, since the archive is made from the moved copy. The worktree file is now
+  preserved alongside ours, under a name that says where it came from.
+- **A cleanup run started from inside a worktree no longer archives the
+  directory you are standing in.** The check for processes using a worktree
+  skipped the running process and its parent shell, so a hand-run from a cold
+  worktree could not see the one user it definitely had. Entering a directory
+  refreshes no timestamps either, so an otherwise idle worktree passed the
+  staleness test while somebody was working in it.
+- **Worktree names that are not plain text no longer break the scan.** A name
+  containing a line break was split into a truncated name matching nothing on
+  disk, and a name containing bytes that are not valid text crashed the scan
+  outright rather than reporting a failure. Names are now read as the bytes they
+  are, with records separated unambiguously.
+- **An archive with a very long name can be opened again.** The temporary
+  directory used during recovery was named after the archive, which could push it
+  past the length limit the filesystem enforces — so an archive that was created
+  successfully could never be recovered. That name is now a fixed length.
+- **Recovery no longer buries the archive one level down.** When creating the
+  worktree fails after the destination has already been made, moving the archive
+  into that destination places it inside rather than at it. Recovery now refuses
+  and says so, leaving the archive intact for another attempt, instead of
+  reporting success with everything one directory deeper than stated.
+- **A branch is only treated as merged when the merge matches it.** The check
+  accepted any merged request that had once used the same branch name, whatever
+  it was merged into and whatever has been committed since — so a branch carrying
+  unmerged work could be archived early. It now requires the default target and
+  the same commit.
+
+- **The OpenClaw completions endpoint now requires a bearer token, and existing
+  installs must add one.** `POST /v1/chat/completions` previously accepted
+  unauthenticated requests; it now refuses them, matching every other `/v1/*`
+  route. The dashboard's session gate exempts that whole prefix by design —
+  machine callers have no browser session — so each such route carries its own
+  bearer check, and this one now does too.
+
+  **What to do when you update.** Set `GENESIS_MCP_HTTP_TOKEN` in `secrets.env`
+  if it is not already set, and put that same value in your OpenClaw provider
+  config as the API key — it is an ordinary OpenAI-compatible client, so the
+  header needs no custom code. Until you do, the endpoint answers 401. With the
+  variable unset it answers 503, and the boot-time warning now names every
+  surface that depends on it rather than the voice API alone.
+
+  The repo's own setup instructions for that client were stale in the same
+  direction — a placeholder key and the wrong port — and have been corrected.
+
+- **Two refusals on the `/v1` surface got less confusing.** A non-ASCII
+  `Authorization` header raised inside the constant-time comparison and surfaced
+  as a 500 instead of a 401; the comparison is now on bytes. And a quoted
+  whitespace-only token in `secrets.env` counted as configured, which a blank
+  credential then satisfied; it is stripped now, as the dashboard password
+  already was. Both had been true of every `/v1/voice/*` route since they were
+  written, and are fixed once rather than three times because the check finally
+  has a single implementation.
+
+- Review continuation now counts distinct GitHub-reviewed commit heads. In Claude Code, ordinary pull requests require a fresh native user approval for every review request and fix commit after four reviewed heads, with round six and later strongly discouraged. Review-gate changes use the expedited two-round lane plus one exact-head confirmation. Autonomous sessions deny actions that need approval, unreadable evidence never becomes a zero-round allowance, and protected actions must use separate commands so one approval cannot cover a branch switch, multiple requests, or multiple commits. Dynamic shell-expanded review-comment bodies take the conservative ask/deny path.
+
+- Published prose no longer carries em dashes at all: the anti-slop scrubber rewrites both the spaced form and the bare word—word form to two hyphens closed up (word--word) on every publishing path (email, Discord, Medium, content review copies), and the voice-master, genesis-voice, and deliverable-builder style rules prescribe the same form. Conversational output keeps its em dash. The scrubber also no longer flags its own output when the rewrite lands next to inline code. Genesis's soul gains a Socratic clause: serious discussions advance by real questions that expose the load-bearing assumption, not by lecturing.
+
+- The merge gate no longer requires a scheduled `code-review` marker by default; `leaks` alone is the shipped default, and it remains irreducible. A required kind is a promise that some producer emits its marker, and for `code-review` none does: measured 2026-09-16 across every owner-authored comment and review on all 51 open non-draft PRs and the 40 most recently merged ones, `leaks` markers appear 47 and 31 times respectively and `code-review` markers appear zero times — never emitted at any head, not merely stale at an older one. The gate therefore blocked 51/51 open PRs on a kind nothing produces, so every recent merge necessarily carried `# scheduled-review-override`, which demoted an exception valve into the standard merge incantation and, being a single sigil, disarmed the leaks lane along with it. Nothing about leak protection changes: `leaks` stays required and carries its mechanical ancestor relief, and the blocking `leak-detector` CI job still runs per head. Per-head *quality* review is unaffected too — Codex-at-head freshness and the inline-finding thresholds both have live producers and still block. An install that does run a `code-review` routine re-arms the kind by naming the larger set in local config: `merge_gate: {required_scheduled_reviews: [code-review, leaks]}`. Because the default is now minimal rather than maximal, a discarded config value narrows rather than tightens, so the fallback now prints a NOTE when the key was visibly declared in the file — the same contract `required_ci_workflows` already carries.
+
+- **The guard-replay corpus now says how old it is, how much it is missing, and what it could not see — and a limited run names what it was limited from.** Two ways the tool could overstate what it had measured, both silent. A cached corpus was returned with nothing said about its age, so a rate computed over a stale corpus read exactly like one computed over the whole transcript tree; the run now prints the cache's build date, its age, and how many transcript files have changed since — on stdout beside the corpus size, where the number that gets quoted actually lives. The date is rendered in UTC rather than local time, deliberately: this line exists to be pasted into a pull request, and a local timestamp with a timezone abbreviation would publish the operator's region and the hour they were at the machine. Separately, `--limit` truncated without a word: `corpus: 500 unique real commands` against a corpus of 149,385 is a subset wearing the grammar of a full sweep, printed one line above a rate. A limited run now names the denominator, the flag, and the fact that it is the first N in sort order rather than a sample — the corpus is sorted, so a limited run is biased toward whatever sorts lowest.
+
+  Five ways this line could have lied are now reported instead, and the enumeration is deliberate — a universal claim here would be the same overstatement the change exists to remove. An unreadable subdirectory used to shrink the denominator silently, because a directory walk swallows that failure and raises nothing, so a partly-seen tree produced a confident count; the walk now counts what it could not read and marks both figures floors. A transcript rotated away mid-walk is counted the same way rather than quietly dropped. A cache whose timestamp is in the FUTURE — a clock step, a restore from a machine that was ahead — used to render as "0 minutes ago" with "0 changed", the strongest possible currency claim produced by a broken input; it is now reported as a future timestamp with age and drift declared unknown. A cache that exists but cannot be read says so instead of vanishing from the output, and an unrenderable timestamp no longer aborts a run that has already paid for a full corpus load.
+
+  Separately, the cache is now stamped with the moment its build STARTED rather than the moment it was written. The write lands at the end of a walk that takes minutes, so a transcript appended during the build carried an older timestamp than the cache and read as unchanged — the corpus was short and the line said it was current. Stamping the start reports anything touched during the build as drift, which is the honest direction. Two known cases remain unreported and are named rather than implied: a transcript whose own timestamp moves backwards (a restore, a checkout) still reads as unchanged, and a cache timestamp far in the past renders as an absurd age rather than an error.
+
+  Deliberately no staleness threshold and no automatic rebuild. A strict freshness check fires on every single run, because the newest transcript is always the caller's own session and is seconds old, and a full rebuild walks the entire transcript tree. The other unusable-cache branches rebuild because the cache cannot be READ; a stale cache reads fine and is merely shorter, so the defect is the silence rather than the staleness, and naming it is the fix.
+
+  Also corrected: the `bash_safety` replay declaration listed the hook beside five that this repository wires in `.claude/settings.json`, and it wires none for that one — it never has, in any ref. Where the hook runs at all it is registered by hand in a user-level settings file outside the repository, so on a fresh clone it is not wired, and its registration cannot be read from inside the repository at all. A test now binds that claim to the settings file rather than to its own prose, so it fails if the wiring ever appears.
+
+- Inbox evaluations now receive the complete canonical `evaluate` and
+  `user_evaluate` skills in a deterministic system prompt. Inbox scans stop
+  before changing durable state if any required instruction component is
+  missing, unreadable, or empty, instead of silently using a reduced fallback.
+
+- A question needing an answer must be asked through the question tool, carry
+  the context to answer it, and be **re-asked** if it goes unanswered while it
+  still blocks. Two failures were compounding: a prose question in the body of
+  a message gets missed, and one offering bare options asks the reader to
+  supply the analysis the session owed. Measured: two decisions sat unanswered
+  for 11 and 12 days while being restated each turn and worked around.
+
+- **A fail-open in a local development guard is no longer withheld from the
+  public tracker as though it were a security defect.** The filing rule said a
+  security defect — *"an unpatched bypass, a credential exposure, anything
+  exploitable"* — is never filed publicly before it is fixed. That is right, but
+  the bare word "bypass" swept in every guard fail-open, which is most of what
+  this repo builds. The rule now turns on **who gains**: a defect is
+  security-class when disclosure hands someone a capability they do not already
+  have. A local hook fails that test on its own terms — it runs only where an
+  install wires it, whoever can trigger it already has commit access to that
+  checkout, and the worst outcome is an under-reviewed change reaching a pull
+  request that still waits on maintainer approval, which is the state of any PR
+  authored without those hooks.
+
+  The rule also now says to verify the chain rather than the wording. The
+  specific misfire it was written from: a deny message naming *"secrets"* was
+  read as proof that credential scanning was the defeated control. It was not —
+  that message describes what `--no-verify` does to git's own pre-commit chain,
+  while this repo's privacy controls are a blocking CI job and two PreToolUse
+  hooks, none of which that flag reaches.
+
+- **The genesis-development skill now carries the prior that decides whether a
+  guard should refuse at all**, ahead of its existing section on which direction
+  a guard should fail in. Advisory is the default; escalating to a block needs a
+  specific, credible, measured reason, and neither "for safety" nor a single
+  incident is one. The section is explicit that this answers the VERDICT
+  question — advisory or block, when the guard evaluates — and not the DEGRADE
+  question of what a guard does when it cannot evaluate, which the existing
+  fail-semantics section decides per boundary and whose contract test requires
+  many hooks to fail closed. It also scopes itself to guards rather than
+  approval boundaries, described as a class (anything gating autonomy,
+  spending, data destruction, or publication) rather than as a list of names.
+  An adversarial audit of the first draft found it stating all three of those
+  too broadly — text that would have contradicted an enforced test, banned a
+  shipped ask pattern, and read as a four-member denylist — which is recorded
+  here because the audit requirement on prompt surfaces is what caught it.
+
+- **Updated the routed model versions.** The routing table had fallen behind the providers, so several call sites were asking for models that have since been superseded. Providers now point at current models. Three of the bumps cost noticeably more per token, so check them if you watch spend: the adversarial-counterargument lane (`openrouter-gpt55`, now GPT-6 Astra) is about 4x its previous rate, the Kimi provider (`kimi-k2.5`, now Kimi K3, first in the code-auditor chain) about 5x, and GLM 5.3 through ZenMux about 1.7x. Sonnet 5 and GPT-5.6 are cheaper than the models they replace. Four of the bumped providers (xAI, Qwen, MiniMax and the direct OpenAI route) are wired to no call site, so nothing routes to them yet. This change deliberately does not touch the NVIDIA NIM DeepSeek provider: its model reached end of life and now answers HTTP 410, 18 call sites reference it, and repointing them is its own decision.
+
+- **The merge gate now scores Devin's review findings like Codex's.** A Devin severe bug or critical security finding blocks a merge in every lane, and a non-severe one counts toward the review score like a Codex P2; a finding Devin posted twice counts once, and Devin can withdraw its own finding with a `✅ **Resolved**` reply. CodeRabbit scoring is unchanged. When Codex has not reviewed a PR's head, `# substitute-review` lets a Devin or CodeRabbit review of that exact head stand in for it — the owner approves each use in conversation, the gate refuses it in unattended sessions, and keeps the base-branch check and the head binding that `# stale-review-override` drops.
+
+- **Seven routing providers whose names encoded a model version were renamed, and old names keep working.** `glm51`, `kimi-k2.5`, `minimax-m25`, `openrouter-deepseek-v4-flash`, `openrouter-gpt55`, `gpt-5.4` and `openai-gpt5` now carry names that do not go stale the next time the underlying model is updated. A rename would normally break every install that keeps a local routing overlay, because the overlay is the one place the change cannot reach — an override on a renamed provider would silently vanish, and a chain pinned to an old name would be discarded in favour of the shipped chain, both without an error. Old names are therefore migrated automatically wherever they appear: in the overlay, in a chain, and at the command line, so `--model openrouter-deepseek-v4-flash` still resolves. Your overlay is also brought up to date the next time the dashboard saves, rather than carrying the old name indefinitely. If an overlay somehow names both an old and a new form, the new one wins; if a chain names both, it collapses to one entry rather than routing to the same provider twice.
+
+- **Build sessions now verify before they open a PR, when this install can show the result.** The genesis-development skill adds a build step: a change whose effect this install can show, and whose run can be undone, is run from the branch before the PR opens, risky surfaces ship behind a shadow flag, and when acceptance needs the owner's hands the session iterates with them and opens the PR once they confirm. Runtime code keeps its post-merge `E2E:` obligation until a supported way to run a branch in the live runtime exists.
+
+- Genesis now pins Claude Code **2.1.280** (was 2.1.246); `scripts/update.sh` aligns both the container and the host. This range fixes a startup stall and a headless hang on the recovery path, and makes the `opus` model alias resolve to Opus 5.5. Genesis also turns off syncing your claude.ai skills and plugins into Claude Code (`syncClaudeAiSkills` / `syncClaudeAiPlugins` set to `false`). It only does this where you have not set them yourself and nothing of that kind is synced yet; see the settings-defaults entry for what happens where something is.
+
+- **Existing installs now receive Genesis's Claude Code settings defaults**, not just fresh ones. On the next `update.sh` run or daily settings check, the container's `~/.claude/settings.json` gains any of these that are not already set. Values you have set yourself are never changed.
+  - `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2`: one level of nested subagents.
+  - `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH=8192`: MCP tool descriptions longer than Claude Code's 2,048-character default now reach the model whole, for roughly 1,200 extra tokens per session. This affects some third-party code-intelligence tools. To use a different cap, edit `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH` in `~/.claude/settings.json`; your value is kept from then on. The `CC_MCP_DESCRIPTION_LIMIT` variable only takes effect where the key is not yet set, such as a fresh install, and a value below 2,048 is refused with a warning.
+  - `syncClaudeAiSkills` and `syncClaudeAiPlugins` set to `false`: stops syncing your claude.ai account's skills and plugins into this machine's Claude Code. This is only applied where nothing of that kind has been synced yet. Turning sync off makes Claude Code hide skills or plugins it already synced and move them to `.trash`, and turning sync back on downloads them again rather than restoring them. So where anything is already in the synced folder, Genesis sets the key to `true` instead, which keeps syncing exactly as before and records the choice, and prints a note once saying how to turn it off. The choice then survives signing out of claude.ai, which empties the synced folder. While a machine is syncing, Claude Code keeps an account folder there even with no items left, so a syncing machine is recognised on its first update. Where the folder cannot be read, Genesis leaves the setting alone and prints a note on every update. On a machine where the folder is empty or missing, including one that has never synced, this update turns sync off; the install output and the daily settings check say so, and to sync your claude.ai skills or plugins into it, set the key to `true`. Use the JSON values `true`/`false`: Claude Code treats anything else, including the string `"true"`, as off.
+
+  The host VM is not changed. Adding these defaults is not reported as a degraded deploy.
+
+- The review-round doctrine now says one thing: **round 4 is terminal.** Past four
+  reviewed heads the decision is to merge with the outstanding issues filed, or to
+  send the change back for rework — a fifth round happens only where you
+  explicitly authorise one, and that authorisation is asked again every round
+  after. The retired `FINAL_ROUND_CAP = 7` is deleted rather than deprecated a
+  second time: no gate consulted it, while its value had been chosen to avoid
+  colliding with the four-head boundary, so a dead tier was still shaping the live
+  one and reading as though a seventh round were real. The `final-round-accept`
+  sigil is still recognised and still refused out loud, so an older checkout is
+  told it is dead rather than silently ignored.
+
+- **Embedding writes now go to the cloud backend first.** Storage previously led
+  with the local Ollama backend, on the reasoning that a background write has no
+  deadline so the slower local path costs nothing. That left out the CPU: local
+  embedding is inference, and on a host without a GPU every memory write burned
+  cores the rest of the system was contending for. Measured through the real
+  chain, 20 calls each on representative memory-length texts: local p50 2395.8ms
+  / p95 2952.9ms, cloud p50 207.8ms / p95 399.0ms — **11.5x at p50**. Ollama
+  stays as the second rung, so a cloud outage degrades to local writes rather
+  than losing them, and recall was already cloud-first. The change is to the
+  chain builder's DEFAULT rather than one call site, because fifteen components
+  construct an embedding provider without naming a chain — six in the package
+  (execution traces, stale-embedding repair, procedural embedding and its
+  promoter, the procedural MCP tool, the session-awareness worker) and nine
+  maintenance scripts, the busiest being the MCP server that backs memory,
+  reference and knowledge writes for every session. Flipping only the runtime
+  wiring would have left them on local inference. Storage stays on the ordinary
+  rate tier rather than the paid priority tier recall uses; the standalone memory
+  MCP server now builds a separate priority-tier provider for recall, as the full
+  runtime already did, so interactive recall does not inherit the ordinary tier's
+  queue. Asking for local-first explicitly still works, and Ollama remains the
+  fallback rung.
+
+  **Every embedding chain now uses exactly one model.** Backends are only
+  interchangeable if they produce vectors in the same space; matching dimension
+  is not enough. DeepInfra and the local Ollama model are the same Qwen3 0.6B
+  model (measured cosine 0.9997-0.9999 on identical text), but the DashScope
+  backend is a different model and is no longer mixed into a Qwen3 chain — before
+  this, an install with DashScope and Ollama but no DeepInfra would have written
+  DashScope vectors into its Qwen3 memory collection. On such an install recall
+  now runs on the local model only, which is slower but no longer compares
+  vectors from two different models. DashScope is still used when it is the
+  only backend configured. A provider assembled by hand from
+  backends in different spaces now refuses to start, and the embedding cache is
+  keyed by vector space (a one-time cold cache after updating). Every embedding
+  backend must now declare the vector space it produces; a custom backend that
+  does not is refused rather than silently mixed in. The dashboard's embedding
+  panel now reads the chains the server actually built and names the model that
+  wrote the server process's most recent vector, so a fallback to the local
+  model during a cloud outage is marked as a fallback, with the configured
+  primary beside it. (Writes made by a session's own memory tools run in a
+  separate process and are not reflected there.) The LongMemEval harness,
+  which writes into brand-new throwaway collections, now keeps its cloud-first
+  chain even when the local model is a different one.
+
+  **What this changes about where your data goes.** Memory and knowledge content
+  is now sent to the cloud embedding provider at WRITE time, not only at recall.
+  Retrieved bodies already left the host on the read path — the post-retrieval
+  reranker scores `(query, document)` pairs remotely — so this is a change in
+  when and how often, and it adds a second vendor to the set that sees stored
+  text. Anything that must not leave the machine should not be stored in a body
+  that retrieval can surface; that is true before this change and remains true
+  after it.
+
+- **The inbox now acts on its URL-coverage check, and tells you when it gives up
+  on something.** An evaluation that never cites one of its input URLs as a
+  `**Source:**` field is re-queued instead of being marked done. This check ran
+  in observe-only mode until compliance was measured: across the first 42
+  evaluations under the citation rule, every one cited its sources and none would
+  have been re-queued. To observe without acting, set `url_coverage_mode: shadow`.
+  Previously, an item that used up its retries, or a file that tripped the
+  repeated-failure guard, simply stopped being evaluated, with no signal. Now you
+  get an alert naming the file (by its path inside the inbox folder) and, where
+  individual items stopped, each of them, with links shown without query strings
+  or token-like path segments. The guard's retry lane now stops the file's URL
+  retries instead of re-checking it on every scan. An approval request that ends
+  unanswered no longer uses up one of the item's retries, which could leave the
+  item never evaluated again. A `**Source:**` line inside a list item or
+  blockquote, including nested ones such as `- > **Source:**`, now counts as a
+  citation. With network parking live (`resilience.parking_mode: live`), an
+  outage no longer spends an item's retries. Invalid `items_per_eval`,
+  `max_retries`, `timeout_s` and interval values in the config file now fall back
+  to their defaults with a warning, including `true`, fractional and infinite
+  values, and the settings tool rejects such values for the integer settings it checks
+  instead of reporting them applied.
+
+- **The tmp watchgod now guards whole disks instead of policing a 500 MB budget, and never kills a session or deletes live work.** It watches every filesystem Genesis writes to (root, `$HOME`, `/tmp`, the cc-tmp volume), including a separately limited volume that shares a device with root, and measures the space that is really left — whichever is closer of what `df` reports and the btrfs quota on the volume, plus btrfs metadata headroom, which `df` cannot see. Tiers follow free space and time-to-full: YELLOW logs who is writing, ORANGE starts a reclaim pass (caches, `~/tmp` older than 2 days) and pages a warning, RED releases a preallocated reserve file, starts last-resort reclaim and pages. A page is recorded as sent only once it is actually queued, so a full disk cannot swallow the emergency page. Reclaim runs (daily and under pressure) never overlap, every step that deletes working files (`~/tmp`, background sandboxes, cc-tmp) refuses to run when it cannot see which files are in use, uninstall stops them, and `scripts/update.sh` now restarts the watchgod whenever its code changed, so an update actually reaches it. `scripts/watchgod status` shows the state. cc-tmp gets real retention instead: an hourly sweep removes what ended sessions left behind once nothing holds it and nothing has touched it for 7 days. Install-local overrides (observe mode `WATCHGOD_ACT=0`, thresholds) go in `~/.genesis/config/watchgod.local.conf`. The old `CC_TMP_BUDGET_MB`, `SACRED_GROUND_MB` and `CC_TMP_CAPACITY_MB` settings no longer do anything.
+
+- **The merge gate now requires a Codex review of the exact head commit; a clean Codex re-review comment counts only when its commit id resolves to that head (see the later entry on clean Codex reviews).** When Codex re-reviews and finds nothing, it posts a comment that names the commit only by an abbreviated id, and an abbreviated id does not identify the commit being merged. The gate still reads that comment and mentions it in its block message. When a clean comment is Codex's only word on the current head, merge with an owner-approved `# substitute-review` resting on a Devin or CodeRabbit review of that exact head. `--check-pr` no longer reports `ok (clean comment at head)`.
+
+- **The decision registry validates through one strict pydantic model.**
+  `DecisionSpec` and `Fallback` are now pydantic dataclasses with strict field
+  types, so loading a file and constructing a spec in code run the same rules.
+  - Identifiers have a grammar (ASCII snake_case), not just a type.
+  - Text fields must be real strings, and `latency_budget_ms` a real integer.
+  - Score levels must be distinct and ordered, and every threshold/band rule
+    runs on construction.
+  - `pydantic` is now a declared dependency. It was already installed through
+    fastapi, litellm and mcp.
+- **One YAML entry point.** Every parse failure is a `RegistryError`. The
+  loader rejects duplicate keys, aliases, merge keys (`<<`), unhashable keys
+  and non-canonical numbers (YAML 1.1 reads `0200` as 128, `1:30` as 90 and
+  `0:0.5` as 0.5). An unreadable or mis-encoded file is a `RegistryError` too.
+- **Overlays only override.** The shipped registry must validate on its own
+  before any overlay is merged, so an overlay cannot mask a broken shipped file.
+  - The `decisions.local.yaml` overlay is found where every other config
+    overlay is: `~/.genesis/config/` first, then beside the shipped file.
+  - An overlay may not add a decision or an option, and may not change a
+    question's type, what it consumes, or its criteria.
+  - An overlay may not set any field to null.
+  - Unknown top-level keys and falsy non-mapping overlays are errors.
+- **Gate verdicts name their fallback.** Legacy mode returns a `legacy`
+  verdict that routes to `fallback.legacy` and needs no score. A
+  calibrated-mode score abstains unless it carries a well-formed calibration
+  version. `DecisionSpec.fallback_for()` resolves a verdict to its declared
+  behaviour.
+- **No site declares an outcome source it does not have.** Six sites named
+  label sources that either did not exist or held other labels, so all are
+  unset until a real persisted signal exists.
+- **Three ego proposal decisions are registered:** reconcile, scope and
+  realist, each described as its call site actually behaves. The registry
+  header states that coverage is incomplete.
+
+- **Inbox alerts identify stopped items by line number.** An alert about an item the inbox stopped evaluating now names each link by its site and the line it sits on in the file (for example `example.com — line 12`), instead of a partly masked link path. No part of a link's path or query string, where share links keep their access tokens, appears in the alert any more.
+
+- **Wrapped untrusted content carries a keyed id on both boundary markers.** `ContentSanitizer.wrap_content` now emits `<external-content … id="…" note="…">` and a matching `</external-content id="…">`. The id is derived from the content and a per-install secret (created once as `~/.genesis/boundary_key`, mode 0600), so the same content always wraps identically while text inside a block cannot compute the id that would close it. The opening marker states that the block ends only at the closing marker with that id, and the voice, distillation and inbox prompts say so too. Wrapped text itself is passed on unchanged, apart from Unicode line and paragraph separators becoming newlines and a missing value becoming empty text. `strip_boundary_markers` removes markers with or without an id, and leaves tags that only start with the marker name alone. Injection-pattern scanning also checks the text with every line boundary as a newline and with invisible and control characters removed, so perimeter checks (email, inbox) can block some inbound messages that previously passed. Code that matched the literal `</external-content>` closing marker must now allow the id attribute.
+
+- **The inbox evaluator no longer has shell access, and YouTube videos come through `web_fetch`.** The evaluation session reads untrusted content, so it now runs without Bash. The genesis `web_fetch` tool returns a YouTube video's title, channel, description and transcript. It picks captions in the video's own language (manual before automatic) and says which track it used, marking the text as untrusted content the way fetched pages are; a video without captions returns its metadata only, since this route never transcribes audio. Previously only English automatic captions were tried, and non-English videos often came back with no transcript at all. Every yt-dlp call ignores user config files and cookies, stays on YouTube hosts, and verifies certificates. A new `youtube_fetch` setting (`tls: verify | auto_fallback | off`) controls what happens on a certificate error; the default retries that one call once without verification and flags the result. `audio_max_minutes` (default 120) limits audio transcription in knowledge ingestion to videos of that length or less, read from the metadata before anything is downloaded. `yt-dlp` is now a declared dependency, with its JavaScript challenge solver installed locally.
+
+- **Skill suggestions no longer fire on everyday words.** The per-prompt skill nudge ignores common words such as "user", "genesis", "plan", "model", "report" and "deploy" when they appear in a skill's NAME, so skills like `user_evaluate` and `genesis-voice` stop surfacing on unrelated prompts. A skill that should still match one of those words can list it under `keywords:` in its frontmatter; `genesis-development` and `cc-update` now do. Skills installed as a vendor plugin bundle under `~/.genesis/skill-library/<vendor>/<bundle>/skills/` are now suggested only when the prompt names that vendor — every word of the folder name, or for AWS also "sagemaker", "bedrock" or "hyperpod" — and a skill's own `keywords:` do not bypass that. Once the vendor is named, those skills match on their full names again, so "sagemaker planning" still suggests the bundle's `planning` skill.
+
+- The paid OpenRouter Claude lanes now route to Claude Sonnet 5.5 and Claude Opus 5.5 (from Sonnet 5 / Opus 5), which cost the same or less. They now drop `temperature`, `top_p` and `top_k` before the request leaves, because current-generation Claude models reject sampling parameters and the desk endpoint forwards a caller-supplied temperature down these lanes. The Claude model profiles also now use OpenRouter's catalogue ids, so the model-intelligence price-drift check can see them.
+
+- **The merge gate now keeps reviewer trust narrow and each reviewer's verdicts separate.** Codex is the one primary reviewer that merge freshness and the review-round counter wait on. Under `# substitute-review`, which the owner still approves each time, any GitHub App reviewer with a real review of the exact head can now stand in for Codex, not just Devin and CodeRabbit. The exceptions are bots the pull request's own workflow can drive and CodeQL, which is only shown. A stand-in whose finding format the gate does not yet read is labelled "format unknown: its findings are not scored yet", so the owner knows that before approving. Codex, Devin and CodeRabbit findings are still scored by their own formats. Each reviewer's findings and newest verdict are kept separately, so one reviewer's clean verdict or reply can no longer clear another reviewer's finding. Reviewer definitions live in `scripts/review_findings.py` and change only through a reviewed pull request.
+
+- **A review round now means a pull-request head that drew findings, from any GitHub App reviewer.** Before, the round budget counted every commit Codex reviewed, clean reviews included, and ignored Devin and CodeRabbit entirely. Now a head counts once any App reviewer posted a finding on it, so a clean re-review no longer uses up a round, while a Devin or CodeRabbit finding does. Informational comments (Codex P3, Devin 🔍, CodeRabbit nitpicks) never open a round. A reviewer whose comment format the gate does not know counts on any inline comment. Reviews posted before the change keep the old count, so no open pull request's round number moved when it shipped. A review on a commit that a force-push later removed now counts instead of making the budget unreadable, which had blocked every commit on such a pull request. On the gate lane, the one free confirmation request after round two is spent once it has been asked for (its marker names a head other than the current one), and a head that itself drew findings gets no free request. `--check-pr` gains an advisory `rounds` row showing the count, the lane's terminal round, and findings per round with a RISING marker.
+
+- Restore NVIDIA free routing with DeepSeek V4.1 Flash after the previous endpoint retired; use MiMo V2.6 Pro for ordinary paid Pro routes and both Fusion panels, preserving the protected novelty and evaluation judge baselines.
+
+- CONTRIBUTING now states that stacked PRs are not supported yet, so open each PR against `main` once the PR it builds on has merged.
+
+- Every plan and every issue that specifies work now answers five premise questions before it starts — the questions live in `.claude/docs/premise-check.md` ("At plan and issue time"), are restated in `CLAUDE.md` and the feature-request issue template, and are pointed to by the genesis-development `references/plan-docs.md`.
+
+- Deep and Strategic reflection prompts now ask observations to explain the finding, evidence, significance and next step in four short lines, while keeping the existing JSON output fields. The reflection topic message shows every line of each observation whole, instead of cutting every observation at 300 characters; a long observation shows as many whole lines as fit and says how many it left out, and a single line too long to fit is shortened and marked.
+
+- AGENTS.md now states the deploy and working-tree boundary for external clients: never edit the main checkout directly (use a worktree + PR), deploy only through `scripts/update.sh` / `scripts/deploy_code_only.sh`, and never run `scripts/deploy_candidates` (the operator tool for the local `live` integration branch).
+
+- The plan reminder that fires around plan mode now also asks, for development plans, that free reads are done, the architect plan review is run and verified, and measured edge cases are decided rather than asked; it points at the genesis-development "Due diligence before building" and "Architecture Review" sections for the rest. It stays advisory.
+
+- The push guard now refuses the first push of your current branch to your configured public repository unless the same command opens its pull request — `git push -u origin HEAD && gh pr create --title "..." --body-file <file>` (a ready PR, not a draft). The pull request command must be one `gh` accepts without a terminal: a title and a body (an existing `--body-file`, or `--body`), or one of `--fill`, `--fill-first`, `--fill-verbose`, with literal values (no `$`, backticks, globs or `~`). Labels, assignees, reviewers, milestones and projects are refused in it, because `gh` fails the whole create on a name it cannot resolve after the push has already run — add them afterwards with `gh pr edit`. Work that is not ready for review stays committed locally. This is a convenience check on the common case only: other ways of spelling a push keep their approval prompt, and what `gh` decides at run time (which repository or base branch it targets, a failed create) is not checked here — the guarantee that no branch reaches the public repository unchecked is the server-side leak scan that runs on every branch push. With `hooks.asks.push_publish: off`, the chained form is the one the first-push prompt is silenced for; pushes to any other repository, re-pushes, dry runs, and installs with no public repository declared behave as before.
+
+- `scripts/deploy_code_only.sh deploy` and `restart` now refuse to restart genesis-server while it is running Claude work a restart would cancel. genesis-server reports that work itself on a new authenticated endpoint, `GET /api/genesis/inflight`: every Claude invocation, plus the whole life of a dispatched session or a CLI reflection, from before its Claude process starts until its result is stored and delivered. Work other subsystems do after their Claude call returns, such as a chat turn delivering its reply, is not covered (#2917). The script also refuses on any live Claude process below the server. The refusal names each item and changes nothing; `--allow-killing <item,…|all>`, with the items it prints (`<pid>@<start>` or a reported id), proceeds deliberately. A server too old to answer (HTTP 404) falls back to the process check alone, with a note; any other failure to ask refuses unless `--allow-killing all` is given.
+
+- The external-I/O check is a per-class, count-baselined census covering provider hosts in `src/`, `scripts/`, and `tests/`, case-insensitively across multiple executable formats, reconciled with `provider_health`, `model_routing` and the CC roster; it is a review tripwire, not a spend barrier.
+
+- The `gh pr close` advisory now states the superseded-PR exception: the closing session may retire a superseded PR when the owner authorized the supersession, the successor is open or merged, and a per-file check shows every part covered or moot.
+
+- Premise checks, rework specs and new PRs now consider PR shape, using the size rule from #2737 measured in counted lines (`scripts/pr_shape.py`). Under 500 lines is the target; from 500 to 1,000 a `Shape:` line in the PR body says why the change cannot be smaller; over 1,000 needs owner approval. The rule is a guideline the building session weighs, and a stated reason is enough. A PR sent back for rework now carries a decision-complete spec: what is kept, what is deleted, the shape, a split plan, and every question either answered or explicitly delegated. The builder acknowledges that spec on the old PR in a `## Rework acknowledgement` comment before opening any replacement, and each replacement PR reports against it in a `## Rework` section, giving its split position, its deviations with their reasons, and its answers to delegated questions. The rules live in `.claude/docs/premise-check.md`, the `genesis-architect` agent, the closing-session and genesis-development skills, `CLAUDE.md`, `AGENTS.md` and the feature-request issue template.
+
+- `BrowserLayer` now names the four layers the browser tools actually have (`camoufox`, `chromium`, `remote_cdp`, `tinyfish_cdp`), equal to the `layer` field of a successful `browser_navigate` result. The old `FETCH`, `MANAGED`, `RELAY` and `VISUAL` members, which described a planned design and had no runtime users, are removed.
+- The `browser_navigate` tool description now says what happens on a Cloudflare challenge: the tool works on it itself (on Camoufox and Chromium) and, if it stays unresolved, sends an alert and returns `turnstile.status == "blocked"`, rather than waiting for a person over VNC. If the challenge handling itself fails, the result has no `turnstile` field, so check the page title.
+
+- **`scripts/update.sh` now tells an extras-only backup gap apart from an off-site failure.** When the core off-site copy is complete and only opt-in extra directories are missing, the pre-update backup check reports `backup:tier2_extras` instead of `backup:tier2`.
+
+- Setup renders disabled, bounded native Codebase query units and requires explicit pinned provider staging instead of automatic upgrades; startup refuses unsupported enablement, armed disable switches and missing kernel limits.
+
+- Only the main session publishes now. A subagent may run only known read-only `git`/`gh` commands and local git work; anything else — `git push`, `gh pr create`, a PR comment or `@codex review` request, a review, a merge, an issue or release write, `gh auth login`, a `gh api` write, an unknown or aliased command, or a git/gh command written in a form the guard cannot read (a line continuation, a too-long command, a program held in a variable) — is refused, with instructions to commit locally and hand the work back to the main session. This includes re-pushes to an existing PR branch and replies to review findings. Fanned-out subagents no longer put one approval prompt per agent in front of you. With `hooks.asks.push_publish: off`, a first push spelled `git -C <a worktree of the same repository> push …`, or followed by `2>&1` and a `| tail -N` / `| head -N` output filter, is now silenced like a plain `git push`.
+
+- Genesis uninstall now refuses busy indexing or unverified Codebase shutdown and uses one guarded cleanup path from the host or container, retaining configured state outside its documented deletion roots.
+
+- Codebase MCP now uses managed, individually capped analysis readers against an explicitly enabled query backend. Install and bootstrap register this route even without a PATH provider; missing setup refuses without a raw or address-space fallback. The launcher and capped child retain the selected installed interpreter and normalized HOME; literal paths use a transport compatible with systemd 249 options.
+
+- Queued Codebase indexing requires managed native authority and a pinned physical worker in the existing 8 GiB scope; unavailable setup preserves pending work and admitted jobs release lifecycle admission before waiting. The coordinator retains its nonmaximum inherited OOM adjustment while only the native child reaches1000. Failed canonical lock creation refuses managed indexing even if a temporary fallback opens.
+- Read-only write-path diagnosis respects the runner's inherited filesystem sandbox and actual persistence selection, including native snapshot scratch for persistent exports. Custom write roots remain supported through an explicit operator-owned native allowlist; detected restrictions preserve queued attempts before provider spawn.
+
+- **The merge gate no longer requires the scheduled leaks review on an outside contributor's fork PR.** The review guards the maintainer's private data, which an outsider's own text cannot hold. The exemption applies only while the PR is wholly theirs: opened by a human non-maintainer from a fork, every commit authored by them with no co-author trailer, the title renamed only by them, the body edited only by them or a named review app, and CI's leak-detector green at the current head. A leaks review that ran and objected is never overruled. `--check-pr` shows `leaks not required: outside contribution by <login>`, and a fork PR the exemption could not clear says why.
+
+- The merge gate's `--check-pr` now writes the squash commit body and prints `--body-file <path>` in its `merge-with` line, so each squash commit on `main` records the reviewed head (`Squashed-From:`) and the sessions that built the branch (`Genesis-Session:`). At merge the gate recomputes that body from the live PR and refuses a file that differs. `--body`, `--subject` and `--author-email` are now refused on every merge, including under `# stale-review-override`, and `gh help pr merge` is no longer refused as a merge.
+
+- On an install whose checkout runs `live` (the integration branch `scripts/deploy_candidates` builds), `scripts/deploy_code_only.sh restart` now restarts the server on it, while `deploy` and `pull` refuse and name the rebuild instead; the dashboard's Apply update and Resolve conflicts actions refuse there too, rather than starting an update that would move the checkout off `live`. A refused Apply now shows its reason instead of returning silently. Installs on `main` are unchanged.
+
+- **The dashboard's memory-file Delete, and the file API's delete route, now move the file to the Genesis trash** instead of deleting it, so it can be restored with `python -m genesis.trash restore`. A file the trash refuses (Claude Code's temp volume, another volume) is left in place with an error, the memory index (`MEMORY.md`) can no longer be deleted, and the file browser no longer shows or opens the trash folders.
+
+- Routing no longer calls `nvidia-nim-deepseek`: NVIDIA accepted DeepSeek V4.1 Flash requests and never answered, so every call waited out its timeout before falling back, and the outage paged as a provider failure. Where it led or sat among paid models, its place is now `deepseek-flash` (DeepSeek's own API, the same V4.1 Flash; needs `API_KEY_DEEPSEEK`, paid) followed by `openrouter-deepseek-flash`. Eight call sites now lead with this paid rung (dream-cycle synthesis, both adversarial challenge sites, wing backfill, procedure extraction, knowledge distillation, task retrospective and premortem); chains that have other free rungs simply drop NIM. A `gemini-free-latest` provider (Google's `gemini-flash-latest` alias) is declared but not yet in any chain: it currently resolves to the same model as `gemini-free`. Installs without `API_KEY_DEEPSEEK` will see a missing-key warning for these chains; `openrouter-deepseek-flash` still covers them. With these chains, an `API_KEY_DEEPSEEK` now satisfies the onboarding LLM-key floor and an NVIDIA-only key no longer does.
+
+- Capped work now runs in its own systemd slice, `app-capped.slice` (a child of `app.slice`, so no limit above it changes): `python -m genesis.hostmetrics run` jobs unless `--slice` names another, the codebase-memory MCP wrapper's scope, and GitNexus index batches (CBM batches keep inheriting their caller's slice for their ancestor admission). The slice keeps a kill counter that outlives each job's scope, which lets the disk guardian tell a job killed at its own memory cap from any other OOM kill.
+
+- A provider that has been dead for an hour now pages (critical, Telegram) only when an essential call site that uses it has no other available provider. While fallback still covers every essential site, its notice is written at high priority instead (dashboard and morning report) and says that calls are falling back; when coverage is lost later, the notice is promoted and pages then. With the coverage map unavailable, behaviour is unchanged.
+
+- When the container's disk I/O stalls, the watchdog now logs which of its processes were doing I/O (top five by current rate, with their systemd unit and Claude Code session), plus the container's total I/O rate, next to its pressure warning. A stall in the journal now says who was doing I/O, or that the I/O came from outside the container.
+
+- New host installations use a loopback dashboard proxy and server binding, stopping setup when the proxy cannot be verified. Existing installations can migrate through the Guardian ingress command, which preserves configuration and keeps direct HTTP health separate from container ICMP checks. Remote dashboard access uses an owner tunnel or restricted HTTPS proxy.
+- Guardian retains environment-proxy routing for custom HTTP targets and bypasses it only for numeric loopback. Ingress migration refuses unproven or conflicting loaded Guardian service profiles before mutation; optional installer alignment checks the profile after unit installation/reload and preserves settings when proof is unavailable.
+
+- The round reflection's ordinary-lane ladder now asks for the independent premise check at round 2 and the class sweep at round 3. A premise check must cite its output file as `Premise-evidence: <path> <verdict>`; the file has to carry the `Design-premise:` block, and the reflection's verdict and claims must match what that file concludes, so a check that found the premise BROKEN cannot be cited as sound. Evidence files are read only when they are regular files of at most 1 MiB, with a relative path resolved against the repository, and `review_reflection.py status` refuses rather than guess when the PR body changes while it is being read.
+
+- A premise check's `Design-premise:` block now has one exact shape, defined in `.claude/docs/premise-check.md`: the verdict line at column 0, then the claim lines with the verdict first (`P1 TRUE — <claim>`), in plain text. `review_reflection.py` reads only that shape, so a word inside a claim's text can no longer be taken for its verdict. Premise checks written in the earlier free-text shape no longer count as premise evidence.
+
+- Trusted peer enrollment no longer requires a daily task allowance. The deprecated option remains compatible with saved databases and is omitted from peer listings.
+- Scoped peer health checks remain available while A2A discovery returns a clear not-ready response until the task transport is installed. Revoked peers no longer suppress the missing-credential boot warning.
+- Peer and backend credentials cannot reuse the app's loaded active or fallback Flask session-signing keys; boot warnings and request checks use the same loaded authority.
+- Peer routes no longer read request bodies (no current route uses one); an oversized declared length is still refused after authentication.
+
+- General rubric judging now tries DeepSeek V4.1 Flash directly and through OpenRouter before the V4 Pro fallback. This interim operator preference does not qualify Flash for procedure suppression.
+
+- The note shown when a session closes a pull request now says the builder of a rework may retire the PR it replaces, under the same conditions as the closing session: the owner's spec on record, the last replacement open, and a per-file coverage mapping in the closing comment. Devin never closes one; the closing session does.
+
+- **The browser tools launch Camoufox from an explicitly resolved engine.** A camoufox upgrade can no longer make a browser call delete the installed engine and download a new one (about 1.3 GB) mid-call. A missing or broken engine now returns `Camoufox is not ready: …` with the step to give the operator, browser packages upgraded under a running session return a restart message instead of an import error, and a new `browser_automation` capability shows whether a launchable engine is present. On camoufox below 0.5 the launched binary is unchanged.
+
+- **The browser skills now describe the browser tools as they work after the recent fixes.** `browser-automation` says that `browser_fill` has no overall deadline (it fails only when one step stalls for 30 s, and reports progress while it types), that `browser_sessions` and `browser_clear_domain` cover both the Camoufox and the Chromium profiles and match whole domain labels, that a click which opens a new tab on remote CDP makes that tab the Genesis tab, and what the "still running" and "no longer on the page" errors of the page tools mean. `stealth-browser` no longer says that a remote navigate leaves fast timing switched on.
+
+- **The Chromium fallback and `scripts/browser.py` run through patchright when it is installed.** patchright is Playwright with its automation signals hidden, so sites that flag plain Playwright Chromium see an ordinary browser. The page now follows the window instead of a fixed 1280x720 viewport, and `browser_run_js` on Chromium runs in the page's own JavaScript world. Without patchright the fallback keeps plain Playwright and logs that it is detectable; an installed patchright that fails to import is reported, never silently replaced.
+
+- **Every install gets the browser stack.** `bootstrap.sh` and `install.sh` install the `browser` extra (now camoufox 0.5.7+, playwright and patchright 1.62) after the core packages, as a separate step whose failure only warns. `bootstrap.sh`, which `update.sh` runs, then starts `genesis-browser-stack.service` without waiting, so the 1.5 GB first download never lengthens an update's downtime. A new daily `genesis-browser-stack.timer` retries it. `install.sh` runs the step inline, where sudo can install missing system libraries. Until the download finishes, the browser tools refuse with the operator step, and the Chromium fallback and `scripts/browser.py` now do the same when their Chromium build is missing, instead of Playwright's advice to run its installer. After an update that pins a new engine, the `browser_automation` capability reads degraded until the server next restarts. Restart Claude Code sessions after this update: a session started before it runs older browser code, which would download the new engine itself.
+
+- MCP child servers now record names-only reads of undeclared `secrets.env` keys, providing evidence to narrow their future environment allowlists without changing what they load.
+
+- Dashboard: the web terminal now accepts same-origin connections only.
+
+- A premise check's `Design-premise:` block is now closed. From the verdict line to the next blank line, every line must be one of the block's lines: the verdict, the required `Expected before checking:` line directly under it, the claims, then `Effect:`, `Better shape:`, `PR-shape:`, `Persisted-state:` or a code fence. Any other line there is refused by its line number, so no misspelled claim or misplaced Expected line inside the block can be read as prose. A heading or list item labelled `Design-premise:` is refused only when it carries an uppercase `SOUND` or `BROKEN`, so a lowercase question about the check is no longer refused.
+
+- A review that lands on a commit after one of that commit's descendants in the same PR was already reviewed no longer counts as a new review round; it belongs to the earlier round. The review budget now lists every finding review with the round it belongs to (or none, when no earlier round exists), so the round reflection can later be made to answer it.
+
+- `scripts/update.sh` now runs on a checkout bound to the `live` integration branch instead of refusing it: in place of the merge it runs the candidates engine's rebuild as the last step before the stop (fetch origin/main, readiness, every per-candidate check, one move), then activates as usual. What it records in update history and redeploys to the host guardian is the origin/main commit `live` sits on, never the candidates on top. A rebuild that moved `live` and then failed keeps the rollback tag as the old tip, writes no update state, and says to re-run `scripts/update.sh`; a rollback on `live` also puts back the git hooks the rebuild installed. Only origin is accepted as the update remote on `live`, a commit made on `live` by hand refuses before anything changes, and bootstrap's crash recovery refuses to roll `live` back and points to `scripts/update.sh --post-merge`. The dashboard keeps refusing updates on `live` and now names `scripts/update.sh` as the way to update it. Nothing changes on `main`.
+
+- The `evaluate` skill now searches for alternatives before scoring a tool: Genesis's own open PRs and issues, public repositories, and, for anything that runs inside a Claude Code session, the Claude Code mods and plugins catalogues. An ADAPT verdict starts by reverse-engineering the reference implementation. `genesis-development`, `web-research` and the `genesis-researcher` agent search mods the same way.
+
+- The review budget now marks each listed finding review as late or not, and records when each review round opened, so the round reflection can read both instead of inferring them.
+
+- On the `live` integration branch, `scripts/update.sh` now rebuilds `live` after it stops the server, in the place a merge takes on `main`, instead of before the stop. The rebuild therefore runs under the same safeguards as a merge: one database snapshot, the same in-progress record, and the normal rollback. If the rebuild refuses, fails or is interrupted, the old `live` tip (with its git hooks) is put back and the services restart on it; previously an interrupt or a failed stop could leave a moved `live` with only a message to re-run. The rollback learns what the rebuild did to the checkout from a record the rebuild writes before and after it moves (never by guessing from git), so it moves back only a tip the rebuild itself made, and it restarts nothing when the rebuild may have written part of the new tree. Each update on `live` stays down a few seconds longer while the rebuild runs, and exit code 4 (a hand-edited systemd unit) can now follow a stop on `live`, when the refused unit is one only the rebuilt tip brings. That exit 4 also records the run as rolled back in the update history, which the pre-stop exit 4 on `main` does not; a rollback that does not complete (including a failed git-hook restore or service restart) exits 1 and leaves no refusal record.
+
+- **Claude Code is now pinned to 2.1.299** (was 2.1.280). Your next `scripts/update.sh` moves both the container and the host to it. The `sonnet` and `haiku` model aliases now resolve to Sonnet 5.5 and Haiku 5.5, so any Genesis call that names a bare alias runs on the newer model. Unattended `claude -p` runs now wait for background commands they started, and stop those commands after 30 minutes by default. Hooks that fail to match a tool call now block it instead of being skipped silently. See `docs/reference/cc-compatibility.md` (Version History) for the full evaluation.
+
+- **The ledger extractor, memory arbiter and repo-pulse matcher now run on the latest Haiku.** They were pinned to Haiku 4.5. They now use Claude Code's `haiku` alias on your subscription, which today means Haiku 5.5 (roughly 4–10 s per call instead of 40–56 s on 4.5). They always run on your own Claude login, even when the session that triggered them was launched against another provider. Their run records now store the exact model that answered.
+
+- **Routed Claude, GPT and Kimi calls through OpenRouter now always use the newest model in their family.** The Claude Haiku, Sonnet and Opus routes, the GPT Sol and GPT Astra routes, and the Kimi route now use OpenRouter's `~…-latest` ids instead of fixed versions. Today that means Haiku 5.5 (was 4.5), Sonnet 5.5, Opus 5.5, GPT 6.1 Sol (was 5.6), GPT 6 Astra and Kimi K3. A new release in one of those families is picked up without an update, which can change quality and price; Genesis reports routing cost but does not cap it. The two DeepSeek routes stay on fixed versions on purpose: one is part of the evaluation judge, and the other carries a measured permission to merge duplicate procedures.
+
+- A closing session asked to close out open PRs now merges each PR in scope that is ready at its current head, without asking again per PR. Override sigils, a PR that hit a round cap, terminal-round merge-and-accept, a real finding left unfixed, PRs over 1,000 counted lines, and design questions still need the owner's yes per PR.
+
+- Reconcile the managed Codebase roadmap and worker documentation with merged #3012, open runtime/availability repairs, and the remaining production and resource gates.
+
+- A round reflection now counts for a finding when the only commits between the reviewed head and the reflection were made before that finding's review, or merge the default branch in without adding anything beyond git's merge and the resolution of its conflicts. Previously any such commit disqualified the reflection, so a session that kept committing while a head's reviews were still arriving could never reflect without rewriting history.
+
+- The graph census (schema 2) counts a memory server as clean only when it can prove the server's code came from the main checkout (including the venv configuration CPython actually finds, and no stray module that would replace one the server imports), the kill-switch state it actually runs with (its secrets file, which a startup reload lets override the launch environment), and its databases by file identity and by the files it holds open; anything unproven is recorded with a reason and keeps the FalkorDB cutover clock from starting. The verdict now reports an unproven kill switch as unknown rather than as on, and reads rows from the earlier schema as predating the contract.
+
+- **Development sessions load a much smaller skill.** `genesis-development` is
+  now a shared core with a router at its top, and the rest of its text moved,
+  verbatim, into one skill per session type: `build-session` and `spec-session`
+  (new), and `closing-session` and `validating-merges` (which grew). Commit
+  rules every committing session needs are in the core's
+  `references/commit-path.md`. A build session now loads about 49k tokens of
+  skill text instead of 87k; a spec session about 9k. The move was generated by
+  `scripts/skill_move.py` from `scripts/skill_split/rows.yaml`, and `--check`
+  proves every source line landed exactly once.
+
+- **Sessions started at a checkout's root list every skill with its
+  description again** (on a 1M-token context window, while the catalog fits
+  60,000 chars). Claude Code gives the always-on skill listing 1% of the
+  context window by default; a large catalog (122 skills on one measured
+  install) needs more, so the lower-priority skills were listed by name only,
+  without the description that tells a session when to use them. The repo now
+  sets `skillListingBudgetFraction` to 0.02. The budget is a ceiling, so an
+  install with fewer skills pays nothing extra. Sessions started elsewhere,
+  including most dispatched sessions, keep Claude Code's default, and a model
+  with a 200k-token window still gets too small a budget for a full install.
+
+- **The closing-session skill is about a sixth shorter.** It went from 2,494
+  to 2,080 lines. Text repeated between its original half and the half moved
+  in from `genesis-development` now has one copy. Gate internals a closing
+  session reads only on demand moved to references:
+  - `genesis-development/references/gate-fix-lane.md` (new), the protocol for
+    PRs that touch the enforcement-hook surface;
+  - `release-review.md` (new);
+  - `merge-gate-findings.md`.
+
+  Six places where the two copies disagreed now follow the newer owner ruling,
+  or the gate code. The Load Gate states that there is no "repair" session type.
+
+- **The direct-`sqlite3`-write block now names the read-only route.** When the
+  push guard blocks a `sqlite3` command that mentions a write keyword, its
+  message now points read-only queries at
+  `~/genesis/.venv/bin/python -m genesis db query "<sql>"`, where SQLite itself
+  enforces read-only. Detection is unchanged.
+
+- **The rule against hand-rolled parsing in guards now covers the whole class.**
+  The rule now covers authorizing an operation from a spelling or snapshot that
+  does not establish its promised property, beyond git argv. Identity lookups
+  and structural parses establish only their own observed facts, not arbitrary
+  later effects; exact-form membership remains a closed structural claim.
+  When it cannot resolve that fact before the event, it fails closed, abstains,
+  or checks after the event; it never lets a pattern stand in for the fact when
+  allowing.
+
+
+### Removed
+
+- **The cc-tmp watchdog's ORANGE tier no longer kills idle terminal sessions.**
+  At 75% of the cc-tmp budget the watchdog used to reap unattached CC tmux
+  sessions idle more than two hours. It never fired and could not have helped if
+  it had. Measured directly in the current log: the loop was reached on 356
+  ORANGE polls and killed nothing; a further ~1,029 polls with no kills are
+  reported in the pull request that first raised this, from a window this
+  install's rotated log can no longer confirm. The code's own comment already
+  gave the reason — sessions are not what fills cc-tmp — and one measured
+  episode is the demonstration: an install sat ORANGE for 2h45m on a
+  third-party tool's index cache plus live session trees, none of which a
+  session kill would have touched. ORANGE now records the stuck state and
+  stops; the RED tier (90%) still kills every unattached session and is
+  unchanged. One residual, stated rather than hidden: killing a process closes
+  its descriptors and so releases any unlinked-but-held blocks it pinned, which
+  a directory-usage figure cannot see. That reclaim was never reachable from
+  this tier, for a reason the old predicate hid — it judged idleness with
+  tmux's session-activity timestamp, which tracks terminal output rather than
+  the process, so "idle" meant "not printing", never "not writing". Measured: a
+  session writing 8MB/s to disk advanced that timestamp by 0 seconds. The loop's
+  best case was freeing space the tier could not measure, and its worst case was
+  reaping a session that was working.
+
+- **The one background-session profile that could run a shell has been removed.** It was allowed exactly one binary — the GitHub CLI — for stewarding this project's own pull requests against other repositories: read state, comment, reopen, close, and escalate code-change requests rather than editing anything itself. It never ran. Zero sessions, against 257, 167 and 154 for the three busiest profiles, so nothing depended on it and nothing changes for anyone by its absence.
+- **It was removed rather than confined, and the reasoning is the specification for adding one back.** Restricting a shell to a single permitted binary bounds *which program runs*; it says nothing about what that program can be told to do, and four measured facts each close off a different repair. The tool will run programs of its own accord through its own configuration — an alias, the pager, the editor, an extension — every one of them reached with the permitted name as the first word, so the restriction permits both installing an escape and firing it; that one is closed, by a read-only configuration directory which is retained. It reads arbitrary local files through its own documented flags, which means denying the file-reading *tools* cannot make "no file reads" true while the binary itself is permitted — this is what defeated the attempt to confine it by tool scope. It writes files to caller-chosen paths, so "it only comments" was never a property the restriction conferred. And a profile's tool denials can be re-enabled per request unless the tool sits in a protected set.
+- **All four want the same unbuilt thing: a restriction at the sub-command level.** Gating the profile behind an operator switch was built, reviewed and discarded, because a switch only moves the decision — its enabled position still hands a session that reads text written by strangers the operator's identity on that service, plus file read and write through the permitted binary. A capability whose enabled state cannot be made safe is not made safer by being switchable, and "ready to turn on" was not a state it could reach.
+- **The machinery stays, and is not dead code.** The permitted-binary map, the guard that enforces it, and the per-binary hardening all key on the *binary*, not on any profile name — so an installation that grants that shell to a profile of its own, through the documented profile-overlay hook, still gets the sealed configuration and the pinned program routes with no further wiring. The map being empty is a statement about what ships, never about the mechanism. A test asserts the emptiness and a separate one asserts the hardening survives, because those are different claims and both were easy to get wrong.
+- **The floor is measured against what SHIPS, not against the running install.** The guards that assert no shipped profile grants a shell originally read the live tables — which the profile-overlay hook mutates in place at import — so on an installation that deliberately grants that shell to a profile of its own, this project's own tests went red. A floor that breaks on the supported configuration is not a floor, and it contradicted the reasoning above it. The tables are now snapshotted before the overlay loader runs, and a test simulates such an installation to hold the distinction.
+- **Removal was verified as complete rather than assumed.** A profile is registered in six separate tables, and dropping it from only the one that gates dispatch would leave a name that cannot run while another table still reports it as holding a shell. The check enumerates the tables from the module itself rather than from a list written alongside, so renaming one is loud rather than silent — though it filters by type, so a table of a different type is covered only by its own explicit assertion, and the count it asserts is a floor rather than a proof of completeness.
+
+- `secrets.env.example` no longer lists `API_KEY_AZURE`, `API_KEY_BEDROCK`, `API_KEY_HUGGINGFACE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `TESTSPRITE_API_KEY` or `CONTAINER`. Nothing in Genesis read any of them, so the dashboard's Provider Keys panel stops showing eight fields that had no effect. Values already set in an existing `secrets.env` are left alone.
+
+- **The loopback-only dashboard default is withdrawn for now.** On an existing install the update that applied it cut off the host dashboard proxy, a Tailscale address inside the container, and the Guardian health check until manual host steps ran. The dashboard keeps listening as before until the change returns with a rollout that keeps existing installs working.
+- **An install whose full update refuses at the dashboard-loopback check can take this rollback with `scripts/deploy_code_only.sh pull` on a clean checkout.** The installed `update.sh` runs that check before it merges new code, so it cannot reach the withdrawal by itself; the code-only pull has no such check, and the next full update then runs without it.
+
+
 ### Fixed
 
-- Transcript analytics keeps paired-result-only agent lineage unknown while
-  retaining raw result IDs for search. Independent companion and scoped unpaired
-  result evidence still support lineage; query views version23 invalidates caches
-  built with the earlier inference.
+- **A broken critical call site no longer falls silent after a day.** The
+  dashboard's `callsite:down` view only counted failures from the last 24
+  hours, so a slow-cadence critical site (like the weekly strategic
+  reflection) that failed its last run went quiet after a day and stayed
+  broken-and-invisible until its next attempt — the longer something was
+  broken, the quieter Genesis got. Critical sites now stay red for up to 35
+  days after a failed last run (matching the job-health floor), while
+  non-critical sites keep the tight 24h window so long-abandoned one-off
+  sites still don't nag.
+
+- **An update that leaves part of the system broken now says so.** After every
+  update Genesis checked which subsystems had come up — except it asked the health
+  endpoint for a list that endpoint has never returned, so the answer was always
+  "nothing wrong" and the check had never once reported anything on any install.
+  It now reads the record the server writes when it finishes starting, and compares
+  it against the same record from before the restart. The comparison is what makes
+  it trustworthy: a subsystem's own status is ambiguous, because most of them catch
+  their own startup errors and end up described the same way as one whose optional
+  dependency is simply absent. Something that was working before the update and is
+  not working after it is unambiguous. Anything that got worse is named in the
+  update history and in the update's own output, while a component that was already
+  dormant — no optional dependency installed, nothing to start — stays quiet
+  instead of crying wolf on every update.
+
+  Findings are recorded, not treated as failures: one optional subsystem not
+  starting is not a reason to undo an otherwise good update. The subsystems the
+  server genuinely cannot run without were already covered — without them it does
+  not finish starting at all, and the update rolls itself back.
+
+  The server now also records which process wrote that startup record, so the
+  update can tell its own server's report from one written by another Genesis
+  process on the same machine at the same moment. When it cannot tell, it says so
+  rather than reporting all-clear — including on the first update after this
+  change, which has no earlier record to compare against.
+
+- **The merge gate now reads review findings it previously could not see at all.**
+  When a reviewer's finding points at a line outside the changes a pull request
+  actually made, CodeRabbit cannot attach it to the diff and puts it in the review
+  summary instead. The gate only ever read the attached findings, so those went
+  unreported — a pull request could show a clean review status with real findings
+  outstanding. Measured on the install this was built against: 27 findings across
+  23 open pull requests were invisible this way, 15 of them rated Major, including
+  one about silently losing a stored preference and one about writing unredacted
+  URLs to a log.
+
+  Those findings are now collected and shown, deduplicated across re-reviews and
+  kept at the highest severity any review gave them. Only a Critical one holds up
+  a merge: the rest are reported but do not block, because a finding delivered
+  this way has no comment thread, and the usual way to accept a finding you
+  disagree with is to reply in its thread. Blocking on something you cannot answer
+  would leave no way forward.
+
+  A review summary quotes code, so it can contain text that looks like the
+  summary's own structure. Findings are therefore located by where they sit in the
+  document rather than by matching that text wherever it appears, which stops a
+  finding being hidden or filed against the wrong file by content in the pull
+  request under review. If the summary says it carries more findings than were
+  read, the merge is held rather than proceeding on a partial list.
+
+- **Two end-of-turn checks were firing correctly and reaching nobody.** When
+  Claude finishes responding, Genesis checks the reply for work handed back to
+  you that it could have done itself, and for a claim of completion with no
+  evidence behind it. Both checks worked; both then wrote their reminder to a
+  channel the assistant cannot read, while the file said in as many words that
+  the text reached the next turn.
+
+  Claude Code shows a model a hook's plain output for only a few kinds of
+  event, and the end of a turn is not one of them. What that channel does
+  instead is worth stating plainly, because it is not what the name suggests:
+  handing text back there does not leave a message for later, it declines to
+  end the turn and says why. Claude keeps working and takes the note into
+  account. That is the right shape for these two — being told you have handed
+  work back, or claimed something is done without checking, is precisely a case
+  for not stopping yet — but it is a change in behaviour and not only in
+  plumbing, so it is bounded: the reminder speaks once and then stays quiet,
+  costing at most one extra step rather than looping.
+
+  Both stay quiet when a reply ends by asking you something. A turn that hands
+  control back is already stopping correctly, and declining to end it would
+  have Claude talking past the person it is waiting on — including at the point
+  where it asks whether to open a pull request. That mattered only once the
+  reminders started arriving; while they went nowhere, firing on the wrong turn
+  cost nothing.
+
+  A third check, for code changed without a review, deliberately stays out of
+  this path. It depends on a condition rather than on something in the reply,
+  so it would repeat until the condition cleared; it also already arrives by
+  another route, at the start of each of your messages, and always did.
+
+  The one other end-of-turn check Genesis runs — the deliverable gate, which
+  refuses to end a session that rendered a document nobody verified — keeps
+  repeating on purpose, and is unchanged. A reminder said twice adds nothing; a
+  gate that gives up after being acknowledged once was never a gate. It still
+  lets go the moment the document is verified or the draft is abandoned.
+
+  Now that the two reminders cost a step instead of nothing, three ways they
+  read a reply wrongly are fixed. A quoted review verdict saying the work is
+  *not* ready no longer reads as a claim that it is. A reply quoting the phrase
+  "read the implementation completely" no longer reads as "implementation
+  complete". And naming a check that has not happened yet — testing planned for
+  next session, verification deferred or blocked — no longer buys silence from
+  the reminder that exists for exactly that case; only a check reported as done
+  does. The same holds for a check reported as not having run ("did not run",
+  "timed out", "errored"), even when the same sentence says something else
+  passed.
+
+  Deliberately unchanged: a reply that phrases finishing in the negative ("I
+  won't merge without your go-ahead") still gets the reminder. Measured against
+  this install's own history, suppressing those would have silenced the
+  reminder on turns that genuinely wanted it and caught none of the wrong ones.
+
+- **Genesis notices when its own file edits fail.** The sensor behind the
+  tool-call calibration base rate had recorded zero failures in roughly 25,000
+  rows over eight weeks — not because nothing failed, but because on current
+  Claude Code a failed `Edit` or `Write` fires no hook at all, so the failure
+  path was unreachable and the base rate read a constant "everything succeeds".
+  Both outcomes were in the session transcript the whole time. Genesis now scans
+  that transcript when a turn ends and records every edit outcome, success and
+  failure together as one population, so the calibration lane finally measures
+  something real: on this install's transcripts the rate comes out near 0.95
+  rather than a flat 1.0. Existing rows are left alone and re-scans are
+  idempotent, so nothing is double-counted. Each recorded outcome also names the
+  session it actually happened in — it previously stored the wrong session id, or
+  none, for most rows.
+
+- **The worktree-removal guard no longer refuses a command for *mentioning* a
+  removal, and no longer misses one that is really happening.** It matched raw
+  command text, so the phrase inside a quoted grep pattern, a heredoc body, a
+  docstring or a commit message read as the operation itself. That is not only
+  friction: a blocked command is discarded *whole*, so a false match on the last
+  step silently threw away the file writes in the earlier ones while the error
+  mentioned only the rule that fired. The check now keys on the parsed command —
+  the executable, its subcommand and its real arguments. Replayed over 51,052
+  unique (command, directory) pairs from one install's own session history, each
+  from the directory it was typed in: 154 commands blocked before and 154 after,
+  but it is a different set — 6 refusals of commands that merely *mention* a
+  removal are released, and 6 real removals that were previously allowed are
+  caught. The unchanged total is why the composition is quoted rather than the
+  count. That corpus is built from real transcripts and cannot be published, so
+  these totals are the scale at which the change was observed rather than a
+  result anyone else can reproduce; the composition is the claim.
+- **A worktree removal hidden behind a global git flag is now caught.** The
+  check required `git` to be followed immediately by the subcommand, so
+  `git -C <path> worktree remove <target>` slipped past it entirely. Two shapes
+  did: a global flag before the subcommand, and — found by cross-model review —
+  a global flag whose *operand* happened to equal the subcommand's own name,
+  which made the operand extraction anchor one token early and skip the segment.
+  The parser now reports the subcommand's index from the same scan that finds
+  it, so no caller has to re-derive it.
+- **The global Bash safety hook is now syntax-checked by the test suite.** It is
+  loaded for every session on the machine, and a shell syntax error there exits 2
+  — which Claude Code reads as "block" — so a typo would have refused every
+  subsequent command, including the one needed to repair it. Nothing checked for
+  that before.
+- **An ordinary `pip install` run from inside a worktree is no longer blocked.**
+  The editable-install check looked for `-e` as a plain substring, so any pip
+  command carrying a long option whose name begins with `e` supplied one —
+  `--exclude-files`, `--extra-index-url`, `--exists-action` — as did a package
+  name with `-e` inside it, such as `pytest-env`. Since the same check also fires
+  when the current directory is a worktree, that hard-blocked routine installs
+  from every worktree, and a blocked command is discarded whole. It now asks
+  whether a `-e` *option* is present rather than whether those two characters
+  appear anywhere.
+- **Editable installs that were slipping through are now caught.** `-qe`, `-ve`
+  and `--editable=<path>` all reach pip's editable code path and none of them
+  contains a literal `-e`, so the old substring never saw them. Abbreviated long
+  flags are covered too — pip installs from `--ed` just as it does from
+  `--editable` — which the stricter check would otherwise have started missing.
+  The same gaps existed in the project-level copy of the check and are closed
+  there too.
+- **A forced worktree removal is now caught however the flag is spelled.** The
+  check wanted `-f` followed by a literal space, so a tab before the operand or
+  the flag placed last did not count; and it wanted the long form spelled out in
+  full, while git removes just as happily on `--f`. Measured against every
+  spelling git accepts, the old check missed 39% of them and the new one misses
+  none.
+- **The shell-side checks stay deliberately over-matching about WHERE the command
+  starts.** They run in the global hook with no access to the command parser, so
+  keying them on command position means modelling shell grammar with a regex — an
+  open set. An attempt to do so fell open on a leading redirection and on the
+  `command` / `env` wrappers, all of which the broader form catches. They keep
+  refusing some commands that merely mention an operation; that friction is the
+  deliberate price of not leaving a hole in a check that exists because of a real
+  crash. Recognising a flag is a separate question that needs no grammar, which
+  is why the two fixes above do not reopen that hole.
+- **A removal launched through a shell option bundle, or through a tool named by
+  its full path, is caught again.** `bash -ce '<removal>'` runs the removal, but
+  the parser read the bundle's trailing letter as the script and never looked
+  inside; and the check for tools that carry a command string required the tool's
+  name to start a word, so `/usr/bin/find … -exec <removal>` matched nothing. It
+  now asks the parser, which has already resolved the executable, instead of
+  re-reading the text.
+- **A removal inside a command the parser cannot read is refused again.** When
+  tokenizing fails the guard falls back to a coarse text match, and that fallback
+  still required `git` immediately before the subcommand — so a global flag in
+  between let it through on exactly the input nothing else could inspect.
+
+- **A crafted Bash command could run a safety guard past its timeout, and a timed-out
+  hook does not block — it permits.** The shared shell parser had no bound on the work
+  a single command could ask of it. Cost rises with the length of the command, with
+  its nesting depth, and (measured, 3.4x) with the shape of its padding, and Claude
+  Code's documented hook contract is explicit that a hook which reaches its timeout
+  "doesn't block the tool call". So a guard that ran out of clock did not refuse the
+  command — it allowed it.
+
+  Measured end to end against the real protected-paths guard, on a payload it
+  genuinely refuses, under its registered 10s timeout: refused in under half a second
+  unnested at 64 KB, but **killed at the timeout** at deep nesting, at every depth
+  once the command reached 300 KB, and — with no nesting whatsoever — at 450 KB.
+  Eleven of fifteen measured cells failed open. Reaching this needs a command far
+  larger than ordinary work produces, which for a security guard is the threat model
+  rather than a mitigation.
+
+  Both axes are now bounded, because neither subsumes the other: a length cap alone
+  leaves nesting free to multiply the work, and a depth bound alone leaves the first
+  pass — which happens before any recursion — completely unbounded. Every one of the
+  same fifteen cells now refuses, well inside the budget. Both limits are set from
+  data rather than taste, sized against the longest and deepest commands in this
+  install's own history, and neither fires on any of them; no command's top-level
+  segments change, which is what keeps the guards that match working directories by
+  exact string unaffected.
+
+  The limits are sized against the tightest path rather than the loosest, which is not
+  the one the individual guards are registered on: the shell safety hook is registered
+  at 5 seconds and delegates to three guards over the same command, one of which
+  analysed it three times over — five parses on one budget, not the two an earlier
+  measurement assumed. Those duplicates are now parsed once. The two limits are chosen
+  together, because the parser re-scans the remaining text at every level and the
+  worst case is a command at the size limit nested to the depth limit — cost is length
+  times levels, so neither number means anything alone. The two directions are
+  deliberately not treated as symmetric: over the size limit a command is refused or
+  prompted, while over the timeout it runs unchecked, so margin is bought on the side
+  that fails open.
+
+  Bounding the work alone would have traded one fail-open for a worse one — a guard
+  that quietly stops seeing a buried command and allows it — so the bounds and the
+  signal ship together. One traversal now returns both what the command runs and
+  whether the parser could read all of it, and every guard that fails closed on an
+  unreadable command asks that single question. A test derives the consumer set from
+  the code and requires it, so a consumer added later cannot quietly go back to the
+  unchecked call; an over-length command yields no segments at all rather than a
+  parsed prefix, because truncating a command mid-string changes the meaning of
+  everything after the cut.
+
+  Refusal messages also stopped guessing at the cause. Each blind spot carries its own
+  explanation and its own way out, so a command that is merely too long or too deeply
+  nested no longer tells the reader to go fix quoting that was never the problem — and
+  the protected-paths fallback no longer describes an unresolved shell variable or an
+  unresolvable relative path as "an untokenizable command", which it had been doing
+  for two of its three callers.
+
+- **Clearing every review marker now also clears the legacy pre-upgrade one**, which
+  it could previously skip while reporting success. That legacy file authorizes a
+  commit entirely on its own — it needs no per-worktree marker directory to exist, or
+  to be readable — but it was removed at the very end of the routine, below a check
+  that returns early in exactly those two states. An install carrying only the legacy
+  marker, which is what an upgrade leaves behind, therefore got "cleared 0, no
+  failures" while a time-valid marker sat intact and could authorize an unreviewed
+  commit for its lifetime. It is now cleared before anything can return early, so the
+  ordering itself prevents this rather than a second check catching it; a marker
+  directory that cannot be read is still reported as the separate failure it is.
+
+- **An out-of-memory kill inside a deliberately capped job no longer pages as a
+  container emergency.** Some background jobs run under their own memory cap on
+  purpose, so a runaway one is killed without touching anything else — that is
+  the containment working. But the kill counter the monitor watches aggregates
+  every such event up to the container, so a contained kill paged as "processes
+  OOM-killed in the container" and pointed at your sessions as the likely
+  victims, while the container itself had gigabytes free. One stuck indexing
+  job produced eleven emergency pages in two hours this way.
+
+  The monitor now asks the system journal which unit actually died before
+  paging. A kill fully accounted for by known capped jobs is recorded in the
+  log and the durable snapshot but does not page; anything else — an unknown
+  unit, no record, or no journal to ask — pages exactly as before, now naming
+  the killed unit when it is known. The set of "known capped jobs" is
+  configurable. Attribution can only ever downgrade an explained kill, never
+  silence an unexplained one.
+
+- **A failed or retried delivery can no longer page the same alert twice.** When sending
+  an alert to Telegram failed transiently, two independent recovery mechanisms
+  both took ownership of the retry: the durable alert queue kept its copy for
+  the next pass, and the delivery pipeline separately queued its own retry.
+  Each then delivered — one alert, two pages, minutes apart, in the middle of
+  exactly the kind of incident where you are reading the channel carefully.
+
+  The durable queue is now the single owner: a caller that carries its own
+  retry tells the pipeline not to queue a second one. The queue's fourteen-day
+  patience is kept deliberately — the pipeline's own retry gives up after
+  about an hour and a half, so handing the alert over would have traded the
+  duplicate for a page silently lost in any longer outage. The same rule stops
+  a failed retry from queueing a shadow copy of itself, which was quietly
+  possible before and delivered doubles the same way.
+
+- **Per-session memory on the dashboard now counts the whole session, not just
+  one process of it.** A Claude Code session is not a single program: alongside
+  the main process it runs a language server and a fleet of MCP servers, and
+  those children turn out to be about two thirds of what a session actually
+  costs. Only the main process was being measured, so seven concurrent sessions
+  reported roughly 5 GB when the real figure was closer to 16 GB.
+
+  The more consequential half was invisible: the warning and critical
+  thresholds were applied to that same partial number. A session whose true
+  footprint had grown past the alert threshold still showed a small main
+  process and reported healthy, so the alert could not fire in the situation it
+  was written for. Session memory is now measured across the whole process
+  tree, the thresholds are rebased on what a healthy session actually costs,
+  and the alert says how much sits in the main process versus its children —
+  so the figure can be reconciled against what you would see in `top`.
+
+- **Genesis's self-review now reads your whole reply before judging it.** After
+  each interaction a background pipeline grades what happened — whether the
+  request was met, what to learn from it — and writes the verdict to long-term
+  memory. It was shown only the first 1,000 characters of a response, with no
+  indication that anything had been left out — so an ordinary answer could arrive
+  looking like one that stopped mid-sentence. Measured over a month of production
+  traffic on this install, about two in five graded responses were being shortened
+  that way. The limit is now a safety valve set above real traffic; if a very long
+  response does have to be shortened, the middle is removed rather than the end and
+  the gap is labelled. The graders are also given the response inside explicit
+  markers, and told about a shortened or interrupted run only when there is an
+  actual signal to report — and the "shortened" signal now comes from the
+  pipeline's own record of what it did, rather than from searching the reply for
+  a phrase. A reply that
+  happens to discuss this mechanism (or an incoming message that quotes it back)
+  can no longer make the grader believe the reply was shortened when it was not,
+  and the label on a genuinely shortened reply no longer claims anything about
+  whether the model stopped early.
+
+- **The tools a session used are now read from the session, not from its own
+  reply.** The same self-review pipeline told its graders which tools an
+  interaction used by pattern-matching the reply's text — so a reply that merely
+  *discussed* running a tool was reported as having run it. Genesis now records
+  tool use as it happens and reports that instead. Where it cannot — some
+  invocations do not stream — the graders are told plainly that any names were
+  extracted from the reply and may be tools it only mentioned, and where there
+  is no evidence either way they are told that too, rather than being handed a
+  bare "none" that reads like a finding. One visible consequence: short
+  interactions that genuinely used a tool are now reviewed where some were
+  previously filtered out, so review volume rises slightly.
+
+- **A reply cannot forge the notes written beside it.** The reviewed text is
+  wrapped in markers so a grader can tell the interaction apart from the
+  system's own remarks about it — but the markers were a fixed pair, which a
+  reply could simply write, ending the quoted region early and placing its own
+  lines where the system's go. The markers are now derived per message and
+  checked against it, so no message can contain the one that ends its own
+  region. The user's message is wrapped the same way; it had not been wrapped at
+  all, which is the same gap on the input an outside sender writes.
+
+- **Tools are reported as requested, not as run.** The runtime records the
+  moment the model asks for a tool, which is before anything happens — a call a
+  safety hook then denies looks identical. The line shown to the reviewer says
+  so instead of asserting the tool ran.
+
+- **The size limit on reviewed text now bounds what it claims to.** It counted
+  characters, so text in a non-Latin script or heavy in emoji could be several
+  times larger than the limit implied, with no combined bound across the message
+  and the reply together. Counting bytes bounds it for any script. Ordinary
+  English text is unaffected — for it the two counts are the same number.
+
+- **A long request is no longer cut off before Genesis reviews it.** The same
+  pipeline shortened the user's own message to its first 500 characters with
+  nothing marking the cut, and then asked a grader to judge whether the reply
+  matched the request. On this install 15% of incoming messages were over that
+  limit. Requests now reach the reviewer whole; a genuinely enormous one is
+  shortened from the middle, keeps its ending, and says how much was removed.
+
+- **One malformed character no longer stops Genesis reviewing an interaction at
+  all.** Some text encodings allow a stray half-character that is technically
+  invalid on its own. JSON accepts it, so it can arrive in an incoming message or
+  in a reply, and the self-review pipeline measures text in bytes — so it stopped
+  with an error before grading began, and every lesson from that interaction was
+  lost. Text is now checked as it enters review, and anything unencodable is
+  shown in a visible escaped form rather than crashing the pass or being silently
+  dropped.
+
+- **A message can no longer plant a procedure Genesis will follow later.** One
+  older path that turns a finished interaction into a reusable, stored procedure
+  was handing the request and the reply to the model as plain text, with nothing
+  marking where they ended. Text written by whoever sent the message could
+  therefore pose as the pipeline's own instructions — and because the result of
+  that step is SAVED and recalled by later sessions, a single crafted message
+  could leave behind a procedure Genesis would go on following. Both pieces of
+  text now sit inside markers the text itself cannot forge, the same protection
+  the review prompts already use.
+
+- **A partly-explained batch of out-of-memory kills now pages instead of going quiet.** When several processes are killed between two checks, the monitor asks the system journal which ones died so a kill inside a job's own memory cap does not raise an alarm. But it only checked that the units it *found* were expected — so if two processes died and the journal explained one of them, the alarm was suppressed and the unexplained kill went unreported. It now requires every observed kill to be accounted for, and pages when any is not. It also reads the journal from an exact position rather than a timestamp, so an entry on the boundary is never counted twice, and two kills of the same job are counted as two rather than collapsed into one.
+
+- **An alert held for approval is no longer re-held on every retry.** When a queued alert routes to email, the approval gate records a pending item and takes ownership of delivering it. The alert queue did not treat that as finished, so it resubmitted the same alert on the next pass and created a fresh pending item each time — and approving them would have delivered the same alert once per hold. A held alert is now treated as handed over, matching what the recovery worker already did.
+
+- **"N commits behind" now means how far behind YOU are.** The update notice
+  counted the commits between the two release tags and labelled the result as
+  your distance from the new version. On any install that pulls main between
+  releases those are different numbers, and not by a little: the tag moves once a
+  release while your deployment moves constantly. Measured on a live install, the
+  dashboard read "v3.0b18 (668 commits behind)" on a tree that was twenty commits
+  behind that tag. The figure was true about the release and false about the
+  reader, which is worse than a wrong sum — it looked like a checked number, so
+  nobody checked it.
+
+  Both places that produced it are fixed, and the list of changes shown beneath
+  it now covers the same range as the count, instead of ending "and 658 more"
+  next to a figure the reader takes as their own. A third place in the codebase
+  already measured this correctly and its field name said so; the two that were
+  wrong shared a name that did not.
+
+  The same rule is now applied to the cases where the count cannot be taken at
+  all. When the distance could not be measured, one of these reported "1 commit
+  behind" beside an empty list of changes, and the other reported zero — which
+  renders as "up to date" and cleared a real pending update from the dashboard.
+  Neither number had been counted. A measurement that failed now says it failed,
+  and a measured zero is left alone instead of being rounded up to an update that
+  does not exist for this reader.
+
+- **A Codex round request is now refused unless the hook can read which pull
+  request it names.** The cap counts a PR's existing Codex reviews and blocks a
+  further round until a conscious `# escalation-ack`, but it resolves the PR
+  from the command text — and a `PreToolUse` hook sees that text *before* the
+  shell expands anything. Any identity it could not read simply skipped the cap.
+
+  Measured: writing the request as
+  `for n in 1625 1576 1609; do gh pr comment $n --body "@codex review"; done`
+  posted round requests against two pull requests already at or past the cap,
+  with no acknowledgement and none of the step-back triage the block exists to
+  force. The same request written with a literal number was refused correctly,
+  so the cap was doing its job whenever it could tell which PR it was reading.
+
+  Both identity-bearing values are now covered — the PR target *and* the
+  repository (`--repo`/`-R`, or the owner/repo inside a URL target); with a
+  literal number and an unreadable repo the count went to a nonexistent API
+  path, errored, and failed open. Each is accepted by an **allowlist** of what
+  gh documents (`[<number> | <url> | <branch>]`, `[HOST/]OWNER/REPO`), spelled
+  in characters the shell does not act on, so a spelling nobody thought of is
+  refused by construction rather than added to a list next time.
+
+  What this costs, since it will be met in normal use: the common
+  `gh pr comment 1234 --repo "$SLUG" --body "@codex review"` now needs the slug
+  written out (or dropped, when running inside the repo). Measured over 530
+  distinct real round requests, 47 (8.9%) are refused; in that corpus every one
+  of them is a request whose PR or repository the cap genuinely could not read.
+  A PR URL keeps working as copied from a browser, `/files`, `#issuecomment-…`
+  and all.
+
+  Two fail-opens are deliberately kept: a request with no positional target at
+  all, and a literal branch name. The acknowledgement sigil does not clear this
+  refusal either — it is computed across the whole command, so one sigil on a
+  loop would license a round on every pull request the loop touched.
+
+- **The worktree-removal guard no longer goes silent when a bound stops the
+  parse.** It decided by searching `analyze`'s segment list, and a parse halted
+  by the substitution-depth or command-length bound yields no segments at all —
+  by design, so a searching consumer cannot read "stopped looking" as "nothing
+  found". The guard read it as the latter: a removal wrapped past the depth
+  bound produced no targets and was allowed, on a guard whose only job is
+  blocking.
+
+  It now asks `analyze_checked` once per invocation and treats a blind spot the
+  same way it already treats a command shlex cannot tokenize — falling back to
+  the coarser regex extractor, which reads the raw text and so cannot be hidden
+  from by nesting. Measured by mutation: with the new branch removed, a real
+  `git worktree remove` nested eight substitutions deep exits 0 (allowed); with
+  it, 2 (blocked). A deep command carrying no removal is still allowed, so the
+  fallback discriminates rather than blocking everything unreadable.
+
+  This also restores the chokepoint invariant that every consumer of the shared
+  parser either uses the checked entry point or is listed with a stated reason
+  why blindness is safe for it. That reason could not be written here.
+
+- **The dependency audit no longer fails on a litellm advisory Genesis cannot
+  reach.** `CVE-2026-37004` (CVSS 9.8) is server-side template injection through
+  the `dotprompt_content` parameter of the `/prompts/test` endpoint, from an
+  unsandboxed `jinja2.Environment`. The sink is
+  `litellm/proxy/prompts/prompt_endpoints.py` and it is served only by the proxy,
+  which Genesis never starts — the same structural reason the four `2026-11`
+  proxy advisories are already triaged. Verified rather than assumed: all five
+  `litellm` imports in the tree are the client library, and the tree contains no
+  reference to `litellm.proxy`, `proxy_server`, or that endpoint.
+
+  It is triaged rather than upgraded because pip-audit names 1.83.7 as the fix,
+  which is past the 1.82.x releases the pin exists to avoid. Here the
+  reachability argument is what holds, not the version — so the pin stays and the
+  advisory is recorded with its reasoning next to the four of its own class.
+
+- **Memory recall no longer fails on some ordinary prompts.** A query could be expanded into a search expression the text index refused to parse, which surfaced as an error instead of results. Expansion terms are now cleaned before they are combined, and a malformed expression falls back to a plain keyword search rather than failing the whole recall.
+
+- **Memory recall handles concurrent sessions better.** Recall reads share a small pool of database connections, and once every connection was in use the next recall waited — long enough to exceed its time budget and fall back to a keyword-only search. The pool is now sized from the CPUs available to Genesis rather than a fixed four, so the point at which recalls start queueing moves up with the machine. It is still a ceiling, not an unlimited pool: enough simultaneous recalls will still queue, and `GENESIS_RECALL_READ_POOL_SIZE` raises it further. A pool that fails partway through opening now cleans up after itself instead of leaving connections behind.
+
+- **A database problem no longer surfaces as a raw error from a memory
+  recall.** The in-process graph store answers by reading the memory database,
+  and if that read failed — a locked file, a connection that had been closed
+  underneath it — the underlying error escaped instead of being reported as
+  "the graph is unavailable". That distinction is what the fallback chain keys
+  on, so the failure skipped it entirely: no fallback to the SQL path, no
+  warning in the log, just the raw error arriving wherever the traversal had
+  been called from.
+
+  Both halves are now reported as unavailability, which is what the surrounding
+  code was already written to handle. The second half matters because the SQL
+  fallback reads the same database connection that just failed — so for anything
+  other than a passing lock it fails the same way, and fixing only the first
+  half would have moved the raw error rather than removing it.
+
+- **GitHub steward: no more notifications about your own activity.** A notification was reported whenever the thread had been touched, and the "actor" was resolved as whoever had commented most recently — which, on your own pull requests, is you. Routine review-bot traffic therefore arrived as digest entries with no contributor attached. The steward now reports a thread only when somebody who is not you and not a bot actually acted on it during the window the notification covers, and it reads three text surfaces it previously ignored entirely: a pull request's inline review comments and review summary bodies, and commit comments. Editing a comment counts as acting, and a thread whose surfaces could not be fully read is still reported rather than silently dropped. Because the steward now identifies who ACTED rather than who wrote the `@`, a mention alert says so: GitHub keeps reporting `mention` on every later update of a thread you were mentioned in once, so the person the alert names is frequently not the one who mentioned you.
+
+- **The server's OOM protection setting now matches what the kernel actually uses.** The service declared a value the system silently refused to apply, so the setting looked correct on every surface while the kernel used a different one — and nothing anywhere reported the mismatch. The declaration is now a value that can actually take effect, and Genesis raises a standing alert if any of its services ever declares a setting the kernel does not honour.
+
+- **Related memories now show how strongly they are actually connected, and the
+  same question gives the same answer twice.** When a memory could be reached by
+  more than one route of equal length, the graph walk credited it to whichever
+  route it happened to look at first and reported THAT connection's strength —
+  often the weaker one. It now uses the strongest connection that actually
+  reaches it. Because strength is also what orders these results before the top
+  few are shown, an understated memory sank in that ordering and could drop out
+  of view.
+
+  Measured against the live graph: of every connection the walk computes, 6.4%
+  were understated, affecting half of all lookups — but most of those never reach
+  you, so the number that matters is smaller. Of the related memories actually
+  shown, the set changes on 1.9% of lookups and their order on 8.2%. The same
+  change also removes a second oddity: which related memories you saw could shift
+  between runs on identical data, purely from database row order — 3.1% of
+  lookups before, none after. Nothing changes about which memories are
+  *reachable*, and no connection is ever credited with a lower strength than
+  before.
+
+  The SQL path Genesis falls back to when the in-process graph is unavailable had
+  the same flaw in a worse form: it could return the same memory twice, once with
+  each route's strength, taking two of the handful of slots shown and dragging a
+  false weaker number into the ordering. Fixing that exposed two more differences
+  in the same place — the fallback would return a memory linked to itself as its
+  own related memory (30 such links exist), and it answered with one level of
+  results even when asked for none. Both are closed, so the two paths now agree
+  on every case covered here: same memories, same strengths, same labels, same
+  order. One difference is left standing deliberately, because it cannot occur
+  with the identifiers Genesis actually uses: the fallback's loop protection
+  compares identifiers as text, so it would over-prune if one memory's id were
+  contained in another's.
+
+- **The related-memory graph no longer goes quietly stale after the database
+  recovers from an error.** Genesis keeps an in-process copy of the memory graph
+  and rebuilds it when the database it was built from changes. The check for
+  "changed" compared the connection object it had been handed — but that object
+  is a wrapper, and when the database recovers from a run of errors it replaces
+  the connection *inside* the wrapper while the wrapper itself stays the same.
+  The check therefore could not notice, and the freshness signal it fell back on
+  is per-connection, so it was being compared against a counter belonging to the
+  connection that had just been closed.
+
+  The effect was a graph that could keep serving its old contents indefinitely,
+  and it was worst at exactly the wrong moment: right after the database had
+  trouble, which is when the copy is most likely to be out of date. Genesis now
+  tracks the connection underneath the wrapper, so a recovery is seen as what it
+  is and the graph is rebuilt once on the next read.
+
+- **Filing a bug you find while reviewing no longer needs to be asked about.** The
+  rule used to require explicit approval for every GitHub issue, which is what kept
+  adjacent bugs unfiled — someone finds a real problem mid-review, has nowhere cheap
+  to put it, and it evaporates. Now the gate is what goes IN the issue rather than
+  permission to open one: scrub anything personal or identifying, keep it to
+  technical detail, and ask when a case is borderline either way. A security defect
+  is still never filed publicly before it is fixed.
+- **Three review-process rules that said two things at once now say one.** The docs
+  claimed a gate-touching PR gets no stale-review leniency at all, while a passage
+  further down measured the opposite — the check is on the delta's files, not the
+  PR's, so a docs-only follow-up can still be trivial. The code agrees with the
+  second. And a usage-limits reply from the code reviewer was described as proof it
+  cannot review, contradicting a measured case where findings arrived anyway; it is
+  now the strongest available evidence rather than proof, which matters because that
+  judgement is what authorises reaching for a fallback reviewer.
+
+- **A command whose operation the shell assembles is now treated as unknown
+  rather than as harmless.** The shared parser behind the approval guards uses
+  Python's shell tokenizer, which reproduces quoting faithfully but performs no
+  expansion at all. A word built by the shell therefore parses cleanly into
+  something other than what actually runs, and when that word is the one
+  choosing the operation, the guards saw a tidy parse naming nothing they gate —
+  the same answer they give for a command that gates nothing at all. The parser
+  now marks such a segment and reports it, so an operation it cannot establish
+  routes to the existing "ask a human" path instead of a confident all-clear.
+  Two word-generating constructs are covered — substitution and brace expansion
+  — and the rule for each is stated as what it accepts rather than as a list of
+  the spellings that fool it, so spellings nobody has thought of are covered
+  too. Two further constructs are named in the code as deliberately uncovered,
+  with the reason for each, because the recurring mistake on this file is
+  claiming a set is complete. Measured against 129,179 real commands from this
+  install's history, 15 change how they are read, every one of them from a
+  silent allow to a prompt; ordinary work that interpolates a variable into an
+  argument, a path, or a `gh api` endpoint is untouched. A sibling guard that
+  answered an unreadable command by falling back to a weaker check now runs both,
+  because the weaker check cannot see the most destructive shapes.
+
+- Merge gate: a duplicated CI dispatch no longer wedges the scheduled-review relief. When one commit carries both a cancelled and a successful run of the same job, the leaks relief now drops the superseded cancel exactly as the CI check already did, so a single `--check-pr` can no longer report CI green while telling you a green job is not green.
+
+- **Sessions that read untrusted incoming messages can no longer reach tools they
+  were never meant to have.** Genesis runs email replies and community messages
+  through deliberately restricted sessions, because the content is written by
+  someone else and may try to give Genesis instructions. Those restrictions were
+  written as a list of what to block, which means anything nobody thought to add
+  to the list was allowed by default — so the restricted sessions could read the
+  queue of pending messages, and could ask for a disk to be grown or a backup to
+  be taken. Both of those last two still needed explicit approval before anything
+  happened, so nothing could have changed the machine on its own; the problem was
+  that they were reachable at all. The community-message session was missing the
+  restrictions entirely, where the email one had them. Both are now covered, and
+  the rule is checked the other way round: every tool on that server must be
+  explicitly either blocked or justified in writing, so a newly added tool fails
+  the check until someone decides which side of the line it belongs on.
+
+- **The graph projector no longer publishes a snapshot the database was never
+  in, and no longer overwrites a newer one with an older one.** Building a
+  projection reads the links and the visibility metadata separately, and each
+  read was taking its own view of the database — so a change that touched both
+  in one transaction could be half-seen, publishing an edge whose endpoint
+  should have been hidden. Both reads now share one view.
+
+  The claim on the right to publish had a matching gap. A projector takes a
+  lease before it builds, and the lease expires on a timer so a crashed run
+  cannot hold it forever — but nothing checked the lease was still held at the
+  moment of publication. A build slower than its lease could therefore hand the
+  claim to a second run and then overwrite that run's newer result, walking the
+  graph backwards with nothing to notice. Publication now happens only while the
+  lease is still held, and a build that lost it is discarded rather than
+  published: whoever holds the lease has data at least as fresh, so refusing is
+  recoverable where reversing is not.
+
+  Two smaller corrections. A memory whose expiry timestamp is present but empty
+  was hidden by the incumbent path and shown by the new one — the two backends
+  disagreeing about the same row, which is the one thing this work exists to
+  prevent. The same was true of a bare zero. Both are fixed, and the parity is
+  now settled by running the incumbent query itself over the whole range of
+  values that column can hold, rather than against a list of cases someone
+  thought of. And the projection command answers an unreadable or missing
+  database with one line and an exit code, the way it already answered an
+  unreachable engine, instead of a stack trace.
+
+- **Four things that only broke on a genuinely fresh machine are fixed, found by
+  the new fresh-install check on its very first run.** A clean install of Qdrant
+  reported a setup warning anyway and printed "Genesis REQUIRES Qdrant" directly
+  under the line saying it had just installed it. The `genesis` command and the
+  auto-cd on login both assumed the repo lives at one specific path, so on any
+  other clone location the command was installed already broken. One service unit
+  shipped with a placeholder where a directory should be, which systemd rejects.
+  And a server that failed to start printed a warning and carried on as though
+  the install had succeeded. None of these are visible on a machine that already
+  has Genesis running, which is why twelve weeks of installer changes went by
+  without anyone noticing them.
+- **A failed setup now says what went wrong.** The installer tracked warnings as
+  a single yes/no flag set from eight different places, several of which print no
+  warning text at all — so "setup completed with warnings" meant scrolling back
+  through hundreds of lines to guess which one fired. Each warning now records its
+  own reason, and both the summary and the strict-mode failure list them.
+
+- **Qdrant's memory-protection setting is now one the system will actually
+  honour.** The vector store that Genesis depends on declared a protection level
+  no user-level service is permitted to set, so the setting was refused — quietly,
+  with no error anywhere, while every place you could look to check it kept
+  reporting the value it never got. Existing installs are migrated in place, since
+  this particular service has no other path to receive the fix, and it is
+  restarted so the change actually takes effect rather than merely being written
+  down.
+- **The check that watches for this class of problem now looks at every service
+  Genesis installs**, rather than only those whose names begin with "genesis".
+  Two of its own services fell outside that, including the one this change fixes —
+  so the check would have stayed silent about exactly the thing it exists to
+  catch. A test now derives the list from what the repo actually installs, so a
+  newly added service cannot quietly fall outside it again.
+
+- **A test run fronted by a package-manager runner no longer slips past the
+  full-suite guard.** The guard that stops a whole-suite pytest run on a shared
+  box keyed on the command being `pytest` itself, so `uv run pytest tests/`,
+  `uvx pytest tests/`, `poetry run pytest tests/` and their hatch/pdm/xvfb-run
+  equivalents sailed through while the bare form was blocked. The shell parser
+  now sees through these runners to the command they carry — but only through
+  their `run` subcommand, deliberately: treating the whole tool as a
+  pass-through would have made the parser skip past the first word of *every*
+  subcommand, hiding commands that other guards catch today. Any other
+  subcommand still resolves to the tool itself, so `uv pip install pytest` and
+  `poetry add pytest` install the package rather than looking like a run, and a
+  package name handed to a flag (`uv run --with pytest ruff check .`) is read as
+  the dependency it is. Replayed against 37,568 real commands from one install's
+  history: one resolution changed, and it was a `poetry run python` the parser
+  had been reading as `poetry` — the fix behaving, not a casualty.
+- **An unfamiliar option no longer lets a whole-suite run through that guard.**
+  These runners accept options before the command they carry, and some of those
+  options take a value of their own. The parser recognised a list of them, and
+  where an option was missing from that list its value could be mistaken for the
+  command being run — so the guard looked at the wrong word, concluded the run
+  was something else, and allowed it. Keeping such a list complete means tracking
+  another project's options as they change, which is not a thing this parser can
+  promise. It now stops at the first option it does not recognise and reports
+  what it is sure of — that the command is being carried by one of these runners —
+  which is enough for the guard to find the run. Commands that are not test runs
+  are unaffected, and a familiar option still resolves exactly as before.
+
+- **A malformed tool call no longer reports itself as a missing value.** When a long
+  free-text argument is sent with a closing tag that does not match its opening tag,
+  every parameter declared after it is absorbed into that string, and the server then
+  reports those parameters as *missing* — which reads like the caller forgot them, or
+  like a broken tool. One such call was refused six times in a row before the shape was
+  recognised, with the evidence sitting in the error's own echoed input the whole time.
+  The MCP middleware now inspects a missing-argument error, and when a *provided*
+  argument's text contains the markup for a parameter reported *missing*, it replaces
+  the message with both readings — the malformed-call one and the genuinely-absent one
+  — and what to do in each case. It is offered as a possibility rather than a verdict,
+  because prose *about* tool-call syntax looks identical from the arguments alone. This
+  runs on every MCP tool rather than the handful that happen to have that shape, and
+  only ever on a call that is already failing — it never alters arguments and cannot
+  make a well-formed call fail.
+
+- **The rm-guard now reads a multi-line command the way the shell reads it,
+  comments included.** It already joined a line continuation before checking a
+  delete's flags and target, which is what the shell does — but it did so with a
+  pattern that had no notion of a comment, and a comment ends at the newline rather
+  than continuing past it. A trailing comment on a multi-line command could
+  therefore make the guard read the two lines as one, and stop recognising what the
+  second line was. It now tracks quotes and comments while joining, and where a
+  comment begins is checked against the shell itself rather than inferred — both
+  ways round, since a `#` that only looks like a comment start must not stop the
+  join either. Which closing parentheses end a word is part of that question, and
+  the shell's answer is not uniform: a `)` closing a process substitution, an
+  extglob pattern or an array assignment leaves the word open, while one closing a
+  subshell or an arithmetic command ends it, and one form is decided by a shell
+  option rather than by syntax, so the setting this hook actually runs under is
+  what settles it. Each form was checked against the shell rather than reasoned
+  about, because an error in either direction lets a payload through — and the
+  checking is what corrected the first two attempts, both of which had a member
+  wrong. Every parenthesis is now classified from its own opener rather than
+  inheriting from an enclosing one; a single depth count could express neither
+  that nor the case where a comment swallows a bracket.
+
+  Nothing else about the guard changes, and the measurement says so with its
+  denominators. Structurally: a command with no line-joining backslash is
+  returned byte-identical — verified rather than assumed, on all 106,415 distinct
+  commands in this install's history at the time of the run, and independently
+  fuzzed over 198,927 generated strings. Only the 1,838 (1.7%) that do contain one
+  can be affected at all, and across those no verdict moves in either direction.
+  The absolute counts drift as history accumulates; the 1.7% reachable fraction
+  held across runs.
+
+  That last figure is a realism check and not a coverage claim, and the
+  difference matters: the shapes this fix deliberately does change are ones real
+  history happens not to contain, so a corpus finding no movement is the expected
+  result rather than evidence of no effect. What covers those is the enumeration
+  above, each form checked against the shell one at a time.
+
+  Quoting is tracked per nested command, not as one flag for the whole string.
+  A command substitution runs a fresh command with its own quoting, so a quote
+  belonging to that nested command does not close the word around it — and a
+  single quote-state slot read the nested opener as the outer closer, left
+  quote mode early, and then mistook ordinary quoted data for the start of a
+  comment. The join was then skipped where the shell performs one, failing in
+  the same direction as above: the flags split across the newline and the
+  delete stopped being recognised. Both spellings of the construct are handled, along
+  with parameter expansion, where the shell never starts a comment at all.
+  Each was measured against the shell one at a time rather than generalised
+  from the first, and the state each opens is asserted to close again — a
+  context that never resets would disable comment recognition for the rest of
+  the command, which fails in the other direction.
+
+- **Correcting a memory with a short id handle did nothing, silently.**
+  `memory_store` accepts a `supersedes` id, and the proactive recall hook prints
+  memories as short `id:<8-char>` handles -- but only the READ path
+  (`memory_expand`) resolved those handles. On the write path the handle went
+  into an exact-match update, matched nothing, and the "did I find it" answer
+  was thrown away. The call returned an id, so the caller read success, while
+  the stale memory stayed live in recall and the only trace was a `succeeded_by`
+  graph edge pointing from something that was not a memory.
+
+  Measured on one install: three such edges inside one 14-minute window, none
+  ever before, and every one of the three handles named exactly one memory --
+  resolution alone would have prevented all three. Two of them were retried with
+  the full id about ninety seconds later, so the silence also duplicated the
+  correction; the third was simply lost.
+
+  `supersedes` now accepts the same short handles the rest of the system hands
+  out, never guesses an ambiguous one, and refuses a full-length id that names
+  no memory instead of writing a dangling edge and reporting nothing.
+
+  The target is resolved **before the new memory is written**, which is what
+  makes the rejection cheap and total: nothing is stored, nothing is linked, and
+  there is no half-completed operation for the caller to reason about. That
+  ordering also removes a way the old code could corrupt a memory outright --
+  resolving after the write meant a short handle could match the row the call
+  had just created and deprecate the new memory as its own successor.
+
+- Corrected the instruction files where they described the merge gate wrongly. Seven claims ran in the dangerous direction — they made the gate sound looser or narrower than it is — including one that said a pull request with no review at all could merge on CI alone, and one that said editing a hook changed nothing until a sync step ran. CodeRabbit, whose findings can block a merge on their own, was named in none of them.
+
+- Background task failures now reach the reflex nerve. Two independent defects each discarded every one of them without a trace: the event was published one severity level below the threshold the reflex ingestor listens on (and the ego deliberately ignores it as reflex-owned, so it reached nothing), and its payload carried no `error_type`, so an event that did arrive was dropped at the ingestor's admission gate. The emit now clears the severity floor and builds its payload through the shared `failure_details` helper, and an end-to-end test drives the real producer into the real consumer so neither gate can silently reopen.
+
+- **Owner-facing messages no longer skew outreach reply-rate calibration.** Every
+  message Genesis sends to *you* over Telegram or voice (approvals, digests,
+  blockers, alerts, GitHub-activity pings, career nudges, marketing reply-pings,
+  career "bite" alerts) was silently creating reply-received / positive-engagement
+  predictions in the calibration ledger. Those go to you, not to an external
+  recipient, so they can never get a reply — the predictions always resolved as
+  "no reply", quietly dragging Genesis's measured outreach reply rate toward zero.
+  The prediction hook now skips the owner-facing channels (Telegram / voice), so
+  calibration reflects only genuine external outreach. Discriminating on channel
+  (not category) is deliberate: a cold-marketing prospect email carries the same
+  `notification` category as an owner ping but goes to `email` — so it stays
+  correctly calibrated, while the owner ping is skipped. A one-time migration
+  also **voids the historical** owner-facing predictions already in the
+  ledger, so the existing contamination clears at the next grading recompute
+  instead of lingering in the all-time reply-rate cell.
+
+- **Provider-outage notifications remain visible in a crowded observations table and describe only recorded evidence.** The outage clock is now read with a hash-scoped, index-covered query instead of a fetch-100-and-filter pass — on an install with more than 100 unresolved routing observations, the old read silently dropped the target provider row and reported no outage at all. Separately, sparse failure trips remain accumulated until a recovery is recorded, so a low-traffic provider can still reach escalation; messages describe the absence of a recorded recovery rather than claiming continuous call failures.
+
+- **The guardian briefing's observation digest announces truncation.** The
+  dynamic briefing showed the 15 newest unresolved observations with no hint
+  that more existed — on a busy install the oldest (longest-standing)
+  problems silently vanished from the recovery brain's context. A full
+  digest now carries a "showing the 15 newest of N" marker (or an honest
+  "total unavailable" note if the count fails); a short read needs neither.
+
+- **Ambient background workers no longer clutter the session-resume picker.**
+  The shared headless runner (memory arbiter, session-ledger extractor,
+  repo-pulse matcher) spawned its one-turn `claude -p` calls from the server's
+  own working directory, so their transcripts accumulated under the interactive
+  project and surfaced in Claude Code's `--resume` list — previewing as
+  injected hook text, since they contain no human prompt. The runner now uses
+  a fresh working directory per call, outside any repository, removed again
+  afterwards. Nothing can pre-place instructions — or a hook-bearing project
+  config, which would execute — in a directory whose name did not exist a
+  moment ago, which removes the working-directory surface a long-lived shared
+  directory exposed. Directories ABOVE it are a separate matter and are not
+  addressed here: Claude Code reads memory files from a working directory's
+  ancestors as well. This also keeps the resume picker clean, stops the
+  project's session-start hooks from injecting kilobytes of context into
+  calls that cannot use it, and denies the judges every built-in tool
+  outright.
+
+- **The session table now tells the truth about which sessions exist and
+  which are alive.** Interactive terminal sessions had no creation event —
+  a two-hourly poll eventually adopted them, recorded as already finished —
+  so a live session read as completed, a young one didn't exist at all, and
+  a session that died abruptly stayed "active" forever (no code path ever
+  wrote a completion timestamp; the dashboard's failed-in-24h counter also
+  sat at zero because its queries referenced columns that don't exist).
+  Now: a session-start hook registers an honest active row (with the
+  process id) the moment a session begins; adoption records live sessions
+  as live and stamps dead ones with their best-known end time; every
+  status writer stamps the matching timestamp through one disciplined
+  function; each prompt advances the activity clock and un-does a stale
+  "completed" verdict; and the liveness reaper gains real evidence — a
+  fresh heartbeat always proves alive, a provably-dead process id
+  checkpoints the row in ~30 minutes instead of 24 hours (lever:
+  `close_dead` / `dead_process_minutes` in the reaper config). The
+  dashboard stat queries use real columns, counting historical rows via
+  their last activity so no backfill is needed. A fourth, unclosable
+  session-row writer in the budget tracker was removed outright.
+
+- **A slow boot is no longer mistaken for a failed deploy.** The post-update
+  health gate gave the server a fixed three minutes to answer, but a busy
+  machine can take five just to finish starting — and the gate then rolled a
+  perfectly good deploy back to the old code. The gate now watches the server
+  process itself: while it is alive and starting it keeps waiting, and the
+  moment the process dies the wait stops early instead of padding out the
+  clock. The window is fifteen minutes — three times the slowest boot actually
+  seen — and its ceiling is not a chosen number: it is derived from how long
+  the host watchdog has been asked to stand down, because a deploy that waits
+  longer than that leaves the watchdog looking at a machine it has been told
+  to ignore. Raising one now raises the other, and asking for more than the
+  ceiling says so instead of silently truncating. Adjustable via
+  `GENESIS_DEPLOY_HEALTH_WINDOW_SECS`, never less than the old three minutes.
+  The wait is measured on a clock that cannot be stepped, so an NTP correction
+  mid-deploy can no longer cut it short or stretch it, and a moment where the
+  service state cannot be read is treated as "ask again", not as a death. The
+  rollback message now states how long it waited and what state the service
+  was in.
+
+- **Merged entities stay findable, and merge chains stay walkable.** Four
+  rails for the moment entity merges start applying: asking about something by
+  a name that was merged away now finds the surviving entity instead of
+  nothing; lookups follow multi-hop merge chains to the live record instead of
+  stopping one hop in at a tombstone; a person or organization sharing a name with a concept
+  can no longer block the concept lookup and mint an avoidable duplicate; and
+  a merge proposal invalidated by identity drift re-enters the review queue
+  immediately instead of waiting for the weekly sweep to rediscover it.
+  Verdicts also now record which judging policy produced them, and pairs
+  judged "distinct" under the old, stricter policy are re-examined under the
+  current one — previously they were settled forever on rules that no longer
+  apply. The `live` entity-adjudication mode, which merges new pairs with no
+  approval step, is turned off for now: it runs as `propose_only` and the
+  settings lever refuses it until a check at merge time lands (#2742).
+  Approved merges still apply through `entity_adjudication_apply`.
+
+- **A session slot that lost its Claude Code no longer traps you at a bare
+  prompt — the door offers to rebuild it, and asks first.** A slot could exist
+  as a plain shell (its claude exited, or it was created bare), and connecting
+  to it silently attached to that shell instead of launching anything: the
+  connection machinery discards its launch command when the session already
+  exists, so every entry landed at the same dead prompt. On one install that
+  went on for three weeks.
+
+  Connecting to such a slot now says plainly what was found, and — only at a
+  real terminal, only on an explicit yes, with No as the default — ends the
+  bare session so the normal creation path rebuilds it with its full
+  environment. Consent is for the state you were shown, not for the slot: if
+  anything changed while you decided (something started in that pane, another
+  connection got there first, even the whole server restarting underneath),
+  the door stands down and attaches instead. Without a terminal to ask, it
+  only reports, and names the manual route. The slot listing marks such
+  sessions too, pointing at the door that can now actually fix them.
+
+- **A changelog entry removed at a release cut can no longer come back on its own.**
+  `CHANGELOG.md` carried a `merge=union` attribute, which takes lines from both
+  sides of a conflicting hunk and therefore cannot express a removal. Cutting a
+  release moves every unreleased entry under a version heading, so any branch open
+  across a release and merging the base afterwards could have the removed entries
+  silently restored — no conflict, exit 0. Measured on a live branch: 287 removed
+  lines were present again after an ordinary merge, in a branch that used
+  `changelog.d/` fragments and never edited `CHANGELOG.md` deliberately.
+
+  The attribute is replaced by a bare `merge`, which pins git's built-in text
+  merge so that a clone's `merge.default` or a configured merge driver cannot
+  route the file back through union. Such a collision now conflicts visibly and
+  is resolved by taking the base's file and moving the entry into a fragment. A
+  branch cut while union was in force still union-merges once on its first
+  catch-up merge; adding `/CHANGELOG.md merge` to a clone's `.git/info/attributes`
+  closes that for every branch of the clone. The collision the attribute existed
+  to smooth over is addressed structurally by `changelog.d/`, one fragment per
+  change, which has no merge to get wrong.
+
+- The per-prompt memory hook can no longer lose its own output. Claude Code
+  silently files a hook's stdout past a size threshold and shows only a short
+  preview, so an oversized injection costs that prompt its recalled memories,
+  its list of concurrent sessions, and the safety line that tells Claude not to
+  treat another session's text as your input — with no error anywhere. Four
+  parts of the injection had no size limit; the worst was a pasted hash or token
+  in your prompt, which the hook kept whole and then repeated on every later
+  prompt in the session. Each part is now bounded where it is built: over-long
+  pasted tokens are dropped rather than cut (a cut one collides with other ids),
+  the session-trail line drops whole old topics instead of ending mid-topic, a
+  long code signature is shortened while its file path is kept intact, and the
+  concurrent-session list is capped with an explicit "+N more not shown" so a
+  short list is never mistaken for a quiet machine.
+
+- Discord sends and polls now go to the channel you actually asked for. `outreach_send`
+  accepts a sub-channel name (`channel="announcements"`) instead of only
+  `channel="discord"`, which always resolved to one configured default — so an
+  announcement could land in the dev channel and still report success. A channel with no
+  webhook configured is now refused, by both the message and the poll paths, with an
+  error naming the setting to add rather than silently posting somewhere else. The
+  refusal is treated as permanent: it is reported once instead of being retried for
+  hours, and the reason is carried through to the log rather than dropped.
+
+- The one-click fleet door now opens a fresh session picker every time, and a second
+  fleet window no longer takes over the first one. A tmux pane mode belongs to the pane
+  rather than the client, so the picker survived the terminal window closing — the next
+  connect landed back inside the previous chooser, showing another session's preview
+  with keystrokes going to the picker instead of the app. And because every window
+  attached to the same landing session, opening a second one reset the pane under the
+  first, ending whatever was running there. The door is now a script that resets the
+  pane only when nobody is attached, and hands a concurrent window its own short-lived
+  session instead. The numbered slots are untouched either way.
+
+- **The Qdrant client is now pinned to a version the bundled Qdrant server
+  actually supports.** The client dependency carried no version constraint at
+  all, while the installer defaults to installing server 1.14.0 when none is
+  present — so a fresh install pulled whatever client was newest that day and
+  paired it with a server three releases behind. Qdrant's own rule is that the
+  two must share a major version and differ by at most one minor, so every client
+  start logged an incompatibility warning.
+
+  That drift was not only cosmetic. The 1.16 client removed a search method the
+  memory near-duplicate check still called, so on any install that had picked up
+  a 1.16-or-newer client, that check could only fail. It was not reached from
+  anywhere in the running system, which is the sole reason nobody saw it — and
+  also why no test caught it. That call now goes through the same query path the
+  rest of the memory system uses, so it no longer depends on a removed method,
+  and the migration is covered by tests.
+
+  Two limits worth stating plainly. The new tests cover the migration and the
+  filtering around it, not the check as a whole — it looks memories up by a
+  payload key that most stored points do not carry, so it only ever examines a
+  small fraction of the store. That is a longer-standing problem, tracked
+  separately and deliberately not changed here. And the pin is now enforced by a
+  test that re-derives the client/server compatibility window from both files,
+  so the two can no longer drift apart quietly.
+
+  Nothing about your stored memories changes, and the server is untouched. If you
+  had previously installed a newer client by hand, updating will move it back into
+  the supported range.
+
+- **Claude Code sessions are far less likely to silently lose an MCP server that
+  was slow to start.** A session starts eight MCP servers inside about eleven
+  seconds, and
+  Claude Code gives each one 30 seconds to connect. The heaviest Genesis server
+  needs roughly 10 seconds on an idle machine — mostly import time before it runs
+  any of its own code — so on a loaded box it can exceed the limit, and when it
+  does the session simply runs without that server's tools for its entire life.
+  Nothing announces this. On the install this was found on, a session had been
+  running without all 34 memory tools and it was noticed only by reaching for one.
+
+  The limit is now raised to 120 seconds for every install. That is roughly eleven
+  times the typical connect, so a server has to be genuinely stuck rather than
+  merely slow before it is dropped.
+
+  The cost is only paid when something really is broken, but it is slightly wider
+  than just a slower start: Claude Code applies this same limit to other
+  server operations, so a server that wedges mid-session now holds a request for
+  up to two minutes rather than thirty seconds. Against the shortest background
+  task budget that carries servers at all, that is a fifth of the budget in the
+  worst case.
+
+  This covers Genesis's own background sessions too, and that half matters more.
+  A dispatched session runs outside the repository, so it never reads the
+  project's settings and would otherwise have kept the old limit — and it is
+  exactly the case where nobody is present to notice that a session spent an hour
+  working without the memory it thought it had.
+
+  This reduces how often the problem happens; it does not make it visible. Being
+  told when a server fails to connect is tracked separately.
+
+- **Two ways of writing a command that the safety guards could not see.** The
+  guards work out what a command actually runs by looking through the small
+  helper programs people put in front of it — the ones that set an environment
+  variable, apply a timeout, or feed arguments in from a list. To do that the
+  parser has to know which of a helper's own options are followed by a value, so
+  it can step over them and reach the real command. Two entries in that table
+  were wrong in the direction that matters: they claimed an option takes a value
+  when it only takes one optionally, so the parser stepped over the command
+  itself and the guards examined its first argument instead. Both
+  forms run, and both reached a guard that would otherwise have refused them.
+  The two wrong entries are gone, and a test re-derives the table from each tool's
+  own option parser on the machine it runs on — falling back to its documentation
+  where the parser cannot be read — so an entry that stops matching reality fails
+  the build rather than going quiet. Reading the documentation alone was not
+  enough: one helper accepts an option that its own help text never mentions, and
+  a check that trusted the help would have condemned a correct entry and invited
+  a repair that reopened the hole. Replayed against 68,308 real
+  commands from one install's history, 1,744 of which use these helpers: no
+  command's reading changed except the ones this fixes.
+
+- **Every panel on the dashboard gets its header back, and the voice page can
+  scroll.** Panel titles had been rendering as a narrow vertical strip down the
+  left-hand side of their panel, with the title itself floating level with the
+  middle of the body rather than above it, and the panel's content pushed into
+  the remaining space. On a full-height panel that put the title hundreds of
+  pixels below the top of the box it names, often past the bottom of the window
+  — so panels looked untitled, with a wide empty gutter beside them.
+
+  The cause was a layout rule in the inherited base stylesheet, written for a
+  different application's side-by-side panes, landing on a selector this
+  dashboard also uses. The dashboard's own rule for the same selector never said
+  anything about layout, so there was nothing for it to override. Nothing errored
+  and nothing logged; it simply looked wrong, on every tab, for months.
+
+  Looking for other instances of the same leak found a third, and then a fourth.
+  The base stylesheet also pins the page root to a fixed, non-scrolling viewport.
+  Four pages undo that, in four separate places — the voice page did not, so it
+  could not be scrolled at all below the first screenful, and neither did the
+  login page, which is built as a string in Python rather than as a template and
+  had been overlooked twice for that reason. Both neutralisations now live on the
+  stylesheet every page loads, rather than being copied per page, which is what
+  let two pages be forgotten.
+
+  Nothing automatic guards this class yet. A check that reads the stylesheets a
+  page links was built alongside this fix and has been separated onto its own
+  branch: it found the original defect from the text alone, and it was also
+  found fail-open in four consecutive reviews, so it is not something to hold a
+  verified one-declaration fix behind. Worth saying plainly because the absence
+  is the status quo rather than a regression — the three instances above were
+  each found by a person looking at a page.
+
+- **The Zero-Drop tab stops showing a confident count while its own refresh is
+  failing.** The board already refused to print a number when the detector
+  behind it was stale or blind. It did not apply the same rule to itself: once
+  a board had loaded, a refresh that started failing left the body carrying a
+  loud "Refresh is FAILING" banner while the badge above it still showed a
+  figure, for a board that could by then be hours old. The badge now withholds
+  the number and says which fault is responsible.
+
+  The fix runs a little deeper than that panel. Every dashboard panel tracked a
+  single value that meant both "what is my transport doing right now" and "did
+  the last attempt fail", and starting a retry reset it — so any panel asking
+  whether its data was trustworthy got "yes" for the whole duration of each
+  retry. Worse, when a server returns errors for a sustained period the client's
+  backoff grows until it outlives the poll interval, at which point every
+  request is overtaken by the next one before it finishes and the failure is
+  never recorded at all. A panel could then show a confident, hours-old number
+  with no warning of any kind, indefinitely. A failure is now remembered until a
+  request actually succeeds.
+
+  That remembering has one visible side effect beyond the Zero-Drop tab, named
+  here rather than left to be discovered: a panel that has never loaded
+  successfully now shows the previous attempt's error text while it retries,
+  where it used to show nothing. Ten panels can reach that state. It reads as an
+  improvement — a panel that is failing says why — but it is a change, and it
+  arrived as a consequence of the fix rather than as its goal.
+
+  The same correction was needed in a second place: the equivalent function for
+  modal panels cleared the failure too, and was missed the first time. Five
+  modal surfaces render that text.
+
+  It also names every fault that holds at once — "detector blind + refresh
+  failing" — rather than showing only the most severe. The previous wording
+  picked one, so anyone who fixed the fault they were shown would have seen the
+  number return with a second fault still true.
+
+  Separately, when the open-pull-request cache cannot be read at all, that part
+  now says "Unavailable — … (not a zero)" in the same words as every other part
+  of the board. It had been printing the bare reason, which reads like a
+  statement of fact rather than a part that could not be read; the distinction
+  was carried only by the text colour.
+
+- **A red CI `test` job now names its failures somewhere log truncation
+  cannot reach.** The job printed one line per test across ~26,000 tests, and
+  GitHub's log APIs drop the tail of an oversized step log — which is exactly
+  where pytest prints its FAILURES block. Measured on a real red run: the
+  log, the failed-step view, the whole-run log and the raw endpoint all cut
+  at ~44% of the suite, so the run named no failing test through any route,
+  and the junit report that held the names was discarded with the runner.
+  Diagnosis of that failure required compiling the runner's git version from
+  source to reproduce locally — a cost this change exists to make nobody pay
+  twice.
+
+  Three changes, one per layer: pytest drops `-v` for `-rfE` (compact output,
+  with both failures AND errors listed in the terminal summary — an error is
+  a different outcome from a failure, so `-rf` alone would leave every
+  collection-time breakage named nowhere); a failure-only step parses the
+  junit report and writes every failed/errored test id — whole, with the
+  first line of its message — to the job's step summary, which the Actions
+  UI renders outside the log entirely; and the junit report itself is
+  uploaded as a run artifact so the full tracebacks survive the runner. The
+  summary script always exits 0 — the job is already failing, and a narrator
+  that can fail replaces the real failure with its own — with missing and
+  unparseable reports carried as printed notices, including the case where
+  pytest died before writing any report at all.
+
+  The step summary is bounded to GitHub's 1 MiB cap, which is a hard external
+  budget rather than a preference: a summary over it is not rendered, so an
+  unbounded list would print nothing at all and take the artifact pointer
+  with it. The budget is spent on WHOLE rows, the closing pointer is reserved
+  before any row is written, and a shortfall is stated with its denominator —
+  measured at 12,000 failures, the summary lands at 1,048,288 bytes with
+  7,674 rows listed and the remaining 4,326 declared.
+
+- Code-intelligence requests now use a FULL-sync SQLite queue with atomic
+  coalescing, ownership, retry, and terminal-outcome transitions. Existing
+  file markers are atomically claimed during migration so rolling-upgrade
+  writers cannot be unlinked, and lock-contended enqueues use a durable spool
+  instead of disappearing. The runner stops and restores work when its
+  escalation query errors, still defers if its execution lock is unavailable,
+  and only clears last-resort index caches after their rebuild is durably queued.
+
+- **A plan's bookmark keeps its name when the plan has frontmatter.**
+  `plan_bookmark_hook` names a bookmark by the plan document's first markdown
+  heading, and that name is what `/unshelve` searches by keyword. It scanned
+  only the first ten lines of the file, so a plan opening with YAML
+  frontmatter pushed its heading out of range, the title came back empty, and
+  the bookmark became unfindable — silently, since nothing raised and nothing
+  logged. Frontmatter is now skipped before the scan, with the ten-line window
+  kept (a heading far down a plan document is a section, not its title) and a
+  bounded search for the closing fence so a leading `---` thematic break is
+  still read as one.
+
+- Temp protection now starts on a fresh install regardless of where the repo is cloned, and the installer says so when it does not. `genesis-tmp-watchgod.service` was being installed from a stale second copy of the unit that hardcoded `~/genesis`, so on any checkout somewhere else the service was enabled but could never start. `systemctl enable --now` reports success for that failure, so the installer did too; it now checks the service is both enabled and actually running, and warns with the reason when it is not. An existing install already broken this way is healed by the ordinary update path — `bootstrap.sh` rewrites the unit file and reloads systemd, which is enough to bring a restarting unit up — and the installer additionally clears a unit left in a failed state, for the case where the restart loop had given up.
+
+- Short-lived `claude` subcommands no longer take a persistent tmux slot. `claude setup-token`, `claude mcp list`, `claude update` and the like print and exit, so a slot left them occupying session capacity and holding a tmux session open after the command was gone — and the pane's scrollback was captured on exit, which for `setup-token` means a long-lived credential. That capture was already scrubbed and fails closed; this keeps the credential out of the captured region in the first place. Long-running subcommands deliberately keep their slot: `claude agents`, `claude gateway` and `claude ultrareview` are a TUI, a daemon and a minutes-long job, and losing them to a dropped SSH connection is the failure the slot exists to prevent. Bypassed commands run in the repo, matching where a slot would have put them, so `mcp` scope and `project` state still resolve the same way.
+
+- An approval you granted for one step of a background task no longer releases that whole task if the task later blocks. Groundwork ships with it for the blocked-task approvals themselves: releasing a blocked task will consume the approval that released it, so a task that blocks a second time asks again instead of resuming on your earlier answer, and the approval is matched by meaning rather than by text so it can no longer be missed because of how the request happened to be stored. Nothing creates those blocked-task approvals yet — that arrives separately, on top of this.
+
+- Pin GitNexus 1.6.12 from one shared version file so fresh installs and updates cannot downgrade an index into an unreadable storage format. Installers upgrade older versions but refuse to auto-downgrade a newer one; indexing and a fail-closed MCP launcher refuse every unreviewed version. Installers also enforce the package's Node engine range instead of falling back to a floating npm release.
+- Align fresh-install and bootstrap Node checks with the repository's documented Node 22 floor for the pinned Claude Code release.
+- Preserve the machine-local Codebase MCP kill switch across new sessions and bootstrap registration while its OOM fix remains under review.
+- Give GitNexus rebuilds their measured 8 GiB scope instead of the shared 2 GiB cap that killed every full rebuild; Codebase indexing retains its separate 2 GiB limit.
+
+- A `claude` subcommand that skips the session slot now validates the temp directory it resolves, instead of accepting any directory that merely exists — a root-owned leftover from an earlier `sudo` run would previously have been handed to `claude install`/`update` — and says so when no usable one is found rather than failing silently. An explicit `TMPDIR` from the caller is still honoured as-is. The installer also reports temp protection as enabled only when the unit is *durably* enabled, since `systemctl is-enabled` also succeeds for runtime-only enablement that disappears at the next reboot.
+
+- **The deploy guidance no longer prescribes the one mechanism that has killed
+  deploys, and the advisory no longer goes quiet when you use it.** Both the
+  genesis-development skill and the pre-deploy advisory told sessions to run
+  `update.sh` in the background — and the advisory returned early, saying nothing,
+  whenever a command actually did. Deploys started that way have been killed
+  mid-run twice, once leaving the server down through bootstrap. Nothing ever
+  contradicted the advice in practice, because the guard only spoke when the advice
+  was being ignored.
+
+  Both surfaces now prescribe handing the deploy to systemd as a detached unit, and
+  the advisory fires whether the deploy was foregrounded or backgrounded.
+
+  The advice is also narrower than it was, and deliberately so. It covers
+  `update.sh` only. `bootstrap.sh` and `host-setup.sh` both need a channel a
+  detached service does not have — bootstrap calls `sudo` unconditionally, and
+  host-setup is interactive with a recreate prompt whose no-input default stops and
+  renames the existing container. `update.sh` is the only one of the three with no
+  `sudo` calls at all, and the only one actually exercised this way end to end. The
+  advisory no longer mentions the other two rather than offer a recipe that breaks
+  or destroys something.
+
+  One thing measured while fixing it, which our own notes had stated the other way
+  round: backgrounding has no ten-minute ceiling — a 400-second task completed
+  cleanly — so the problem was never a timeout. A background task is bound to the
+  session, which is a different failure and needs a different fix.
+
+  The skill also now describes what a mid-run kill actually does, which depends on
+  the phase: during the pre-update backup no signal handler is installed at all,
+  before the merge an interrupt restarts the services it stopped, and from the merge
+  onward it rolls back. That distinction matters for diagnosis, because "no handler
+  ran" does not tell you which signal arrived.
+
+  Three things a reader can now rely on that were previously wrong or missing.
+  `systemd-run --user --scope` does **not** detach — it isolates the cgroup and
+  keeps the caller's session — and neither does `setsid`, which starts a new session
+  without stopping the caller waiting on it. `--setenv=PATH` is required, because a
+  user unit otherwise runs under a PATH that omits `~/.local/bin` and makes
+  bootstrap take different branches. And "no signal handler ran" does **not** mean a
+  deploy was SIGKILLed: the handlers are installed after the pre-update backup, so a
+  kill during the backup leaves the same evidence either way.
+
+  A stale comment in `update.sh` that described the dashboard's direct update path
+  as un-isolated and a pending bug is corrected too — it isolates today, and the
+  warning now sits on the fallback branch where it still applies.
+
+  The advisory deliberately does not try to work out whether you have already
+  detached; it says so, and over-fires rather than risking silence. Narrowing that
+  is tracked separately.
+
+- The `genesis-merge-gate` self-exclusion now filters the mirror check by name
+  under ANY workflowName: an API-published verdict was observed attached to a
+  check suite owned by a different workflow (GitHub assigns the suite, not the
+  publisher), so the previous empty-workflowName requirement let the mirror
+  double-count as `ci: red` on the local merge path.
+
+- Let capped GitNexus refreshes run on cache-heavy systems by excluding reclaimable file-page cache from memory admission while retaining sibling and cache reserves.
+
+- Closed three suppression holes in the OOM monitor that could silence a genuine container-pressure page: attribution now requires evidence of which cgroup's limit fired (the container root's `memory.events.local` oom counter — the journal names only the victim unit), startup baselining advances the journal cursor so pre-baseline records can never account for a new kill (with a page-and-reanchor fallback when the journal is down at startup), and a reconciliation deficit ensures a unit-failure record that systemd logs LATE retires the kill already paged for instead of covering the next one. Unverifiable trigger evidence now pages instead of suppressing. Also: the CC-sessions dashboard legend matches the 6/8 GB whole-tree thresholds, and the codebase-memory MCP scope is launched with `--collect` so failed scopes can't collide with a reused PID.
+
+- **Updates no longer proceed without a verified SQLite recovery point.** Genesis now quarantines a stably corrupt database, preserves last-known-good backups, aborts updates for database-risk backup failures, and loudly records non-database backup degradation even when an update can safely continue.
+
+- Stop an ambient Git environment from redirecting the review gates' own Git
+  queries: the hook launcher now scrubs Git's repository-location variables for
+  the hook it runs, not only for its own discovery, and the shared review-state
+  and review-scope helpers scrub at every Git call site so a directly-invoked
+  gate is covered too. An exported `GIT_DIR`/`GIT_WORK_TREE` previously made
+  those helpers describe a different repository than the one under review, in
+  every case toward letting a change through.
+- Stop a Git attributes setting from quietly lowering how much review a change
+  needs. A global `core.attributesFile` marking source files binary collapsed
+  the staged diff to nothing countable, and the depth gate then treated a large
+  change as a trivial one; the gates now ask Git to ignore that setting when
+  they measure a diff.
+- Leave your Git configuration alone. Nothing here removes `GIT_CONFIG_GLOBAL`,
+  `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT` or `GIT_CONFIG_PARAMETERS` from the
+  environment, because all four are where Git reads `safe.directory` from — and
+  on a box where the repository is owned by a different user, such as a
+  bind-mounted container or a CI job, removing them made Git refuse and the
+  review gates read that refusal as "nothing to review". The push guard also
+  needs to see the same configuration as the push it is checking.
+
+- Stop shipped scripts from resolving their own directory through `CDPATH`. With `CDPATH` exported, `cd` searches it, so an install, update, or backup step could resolve into a different checkout — and the Bash command guard could locate its guard scripts outside the repository.
+
+- Hooks, session-boundary workers and timer-driven jobs no longer read or write a database that has been quarantined for failing an integrity check. Previously the central connection factories refused, but the script-side hooks connected directly and consulted nothing — the path by which hook writers kept writing to a database already marked corrupt, which is how the corruption kept returning. A syscall-level replay of every automatic entry point now measures zero opens of a quarantined database, with an unfenced control proving each probe can still tell the difference.
+- Closed four read-write openers that could make the problem worse rather than merely observe it: the two MCP health tools, the guardian's deploy-reference read, and the dashboard update route. A read-write open of a quarantined database can write a stale journal back into the main file when it closes, so these were a route by which simply *looking* at system health could corrupt it further.
+- Fixed a post-commit hook regression introduced alongside this work: the audit helper git installs into its hooks directory could not import its new dependency from there, so every bug-fix commit silently skipped recording its audit entry. The dependency is now installed alongside it.
+- Read-only connections, short-lived standalone connections, session peer-awareness reads, and start-of-session procedure loading are all covered for the first time; a read-only handle still holds the database open against an operator trying to replace it.
+- Added structural gates so this cannot quietly regress: the set of connection-opening functions is enumerated automatically and each must perform the check, and a second gate covers the script tree. Adding a new way to open the database fails the build until it is classified. Operator-run command-line tools stay deliberately uncovered — a person is present, and some of them exist to inspect a database precisely because it is suspect.
+- Scope is stated honestly rather than implied: roughly a dozen read-only openers inside the application are still uncovered and are listed in issue #2180. The check removes the class of unattended writer that drove the incident; it is not a guarantee that nothing can touch the file, and recovery still depends on stopping the services that hold it.
+
+- **Secrets-gate and provider-rule hardening.** Provider call patterns now
+  match an explicit port (`api.openai.com:443`) and OpenAI `/v1/embeddings`.
+  `rg x <(curl <endpoint>)` no longer slips the read-only exemption — input
+  process substitution, a bare `&` background operator, and executor flags
+  (`rg --pre`, `--hostname-bin`, `--pager`) all break the search exemption
+  now, and that executor test is SHARED with the `git` branch, which had been
+  returning read-only for any `git log|grep|show|diff|blame` regardless of
+  its flags. Neither half of that flag has a fixed spelling, so the test is a
+  per-subcommand regex rather than a literal table: git accepts any
+  unambiguous prefix (`--op=<cmd>` runs), and `-O` bundles into any short
+  cluster (`-nO<cmd>` runs). The command is tokenized with `shlex` instead of
+  `.split()` because the guard reads it as typed while the shell hands the
+  tool a de-quoted argv — `rg "--pre" <cmd>` slipped every table on the quote
+  alone. `-O` is scoped per subcommand: on `grep` it is that pager flag, on
+  `diff`/`show` it names an ORDER FILE, so matching it everywhere would swap
+  one fail-open for a fail-closed. A quoted bare `secrets.env` that resolves
+  in cwd no longer gates as
+  if it were an operand (`allow_bare` honoured by the stat and inode arms),
+  a quoted mention is not a denial, and a heredoc feeding an interpreter is
+  scanned instead of stripped — `python3 <<EOF … cat secrets.env` can no
+  longer hide a credential read. Globs deeper than two wildcard segments
+  gate instead of walking past the hook budget. `behavioral_linter` and
+  `secrets_env_access_guard` fail CLOSED when a shared sibling module cannot
+  be imported (was exit 1 = non-blocking allow), a failed critical-
+  observation write is logged to stderr instead of swallowed, and the hook
+  write path uses the canonical guarded `connect_sqlite_rw` factory.
+  Wiring `NotebookEdit` read every cell as executable, so a markdown cell
+  that merely documented a provider endpoint was hard-blocked by the same
+  rule that exempts `*.md` for that exact content — a notebook's path ends
+  in `.ipynb`, so the documentation globs could never see the cell. Only an
+  explicitly prose cell type is exempt; an absent or unrecognised one is
+  still read as code. Both guards' docstrings now state the measured scope
+  (3 of 11 access paths, issue #2230) — the correction had landed in one of
+  the two copies, leaving the public guard still telling readers the gap was
+  two known residuals.
+
+- The merge report no longer says `inline-findings: ok` when review findings
+  went unscored. Some findings never count toward the blocking score by design —
+  a review bot the gate does not recognise, a comment below Major, an anchor
+  outside the diff or on a documentation path — and the row said `ok` because the
+  score was zero, which is true and is not what it was read to mean. It now
+  carries how many were not scored, pointing at the detail already printed above
+  it. Where a count cannot be trusted — some reviewer output cannot be parsed
+  into findings, or a review channel under-reported — the number is shown as a
+  floor rather than an exact total, and both causes are named when both apply,
+  because only one of them is recoverable by re-running.
+- A review is no longer silently ignored because the gate does not recognise who
+  wrote it. A second bot, or a human collaborator, could leave a finding on the
+  diff or in a review body and reach nothing the report mentioned, so the row
+  still read `ok`. Those are now counted and named. They are never scored and
+  never block — the gate's job here is to make sure the reviewer is *seen*, and
+  judging what they said is the reader's. Recognising a format is still what
+  earns a weight: an unrecognised comment may carry five findings or none, so
+  wherever one contributes, the reported total is shown as a floor (`3+ items`)
+  rather than an exact count of findings.
+- Nothing about what blocks a merge has changed, and a stranger still cannot
+  make it block: only a recognised reviewer's findings are read for severity.
+
+- Request a 4 GiB Codebase batch scope by default. Probe each tool's scope independently and check the Codebase scope's actual cgroup placement, zero-swap limit, effective page-aligned cap, host memory and shared-ancestor headroom before starting the indexer; defer when the full effective cap cannot be accommodated.
+
+- **A shell invocation the shell never executes is no longer reported as a
+  command, wherever the option sits.** The parser decided "does this run?" from
+  the option bundle carrying `-c` alone, so every option BEFORE it was ignored:
+  `bash -n -c CMD`, `bash -o noexec -c CMD` and an invalid `bash -z -c CMD` all
+  parse and run nothing, yet each produced a nested segment and every guard
+  downstream blocked a command that was never going to execute.
+
+  Measured against the installed bash rather than reasoned about, and the
+  measurement changed the fix. No-exec is not a property of the `-c` bundle —
+  it is ONE left-to-right scan over the whole option list, and the two letters
+  involved do not behave alike. `n` is ordinary shell state: `+n` clears it and
+  the LAST occurrence wins, so `bash -n +n -c CMD` really does execute CMD and
+  a naive "any `-n` means inert" rule would have hidden a live command — a
+  bypass introduced by the fix for a false block. `D` is an invocation action
+  rather than state: either sign selects it and nothing later clears it, which
+  is why `bash -c +D CMD` was still reported. State now carries in both
+  directions across the selector, so `bash -n -c +n CMD` (runs) and
+  `bash -o noexec -c +o noexec CMD` (runs) are distinguished from
+  `bash +n -n -c CMD` (inert). Twenty-one shapes are pinned by a corpus that
+  re-derives every expectation from the real shell on each run, so it cannot
+  quietly stop describing bash the way the option table once did.
+
+- **`sh` now carries the union of both shells' option letters, closing a bypass
+  on hosts where `/bin/sh` is Bash.** The allowlist is selected by the
+  executable's BASENAME, not by the binary the name resolves to. Where `sh` is
+  dash — as on the machine the table was measured on — dash's strict set looked
+  right. Where `sh` is Bash, `sh -ch CMD` runs the command while the strict set
+  rejected the bundle, so the parser returned no script at all and the nested
+  command was invisible to every segment-based guard.
+
+  The two error directions are not symmetric: too strict HIDES a command that
+  really runs, while too permissive costs a false block on an invocation that
+  fails anyway. `sh` therefore takes the union and `dash` keeps the strict set
+  under its own name, where the basename does identify the binary. Recorded
+  because the first attempt at this fix used bash's letters alone and dropped
+  `I` and `V`, which dash accepts — reintroducing the same bypass in the
+  opposite direction, on the very host it was being tested on. The existing
+  dash-bundle tests caught it.
+
+- **A shell-inertness test no longer passes when the shell it probes is
+  missing.** The probe runs the inner interpreter through `bash -c` and asserts
+  its payload did not print. With that interpreter absent, bash reports the
+  failure on stderr and leaves stdout empty, which satisfies the assertion for
+  entirely the wrong reason. The skip is now keyed on the template's own
+  interpreter rather than on one shell by name, so a row added later for another
+  shell cannot reintroduce it.
+
+- The safety guards now see a command run through a launcher such as `eval`, `su -c`, `flock`, `script` or `systemd-run`. Previously the guards resolved only the launcher, so a removal of a protected directory, or a publish behind one of them, ran unchallenged while the same command typed directly was stopped. The guards do not model each launcher's option grammar and do not inspect what it carries — a carried command can be spelled past any inspection — so a launcher is refused outright when the command is one that guard governs. Re-issue the command without the launcher to proceed.
+
+- **`bootstrap.sh` wrote a broken `agent-zero.service`, and nothing noticed.**
+  Unit files are generated from templates containing `__TOKEN__` placeholders,
+  and two scripts generate them: `install.sh` and `bootstrap.sh`. Each kept its
+  own hand-written list of substitutions, and the lists had drifted —
+  `install.sh` learned to substitute `__AZ_ROOT__` and `bootstrap.sh` never did.
+
+  `sed` does not complain about a token it has no instruction for; it copies it
+  through. So `bootstrap.sh` produced a unit reading
+  `WorkingDirectory=__AZ_ROOT__`, which installs and enables reporting success
+  and could only ever fail at start. MEASURED on a live install: that exact line,
+  with a correctly substituted path on the line directly below it.
+
+  Both scripts now substitute the same set, and a test pins them to each other
+  and to the tokens the templates actually use. The test asks "is every token
+  used by a template handled by every generator" rather than looking for tokens
+  known to be bad, so the next template that invents one fails immediately
+  instead of shipping a unit with a literal placeholder in it.
+
+  In practice this was latent for most installs, since `agent-zero.service` is
+  not enabled by default — but the same class had already reached a unit once
+  before, and the generators had no way to catch the third occurrence.
+
+  **Nothing to do on your side.** The next time you run `bootstrap.sh` the unit
+  is rewritten correctly.
+
+- **Uninstall left stale schedule state behind for three timers.** A timer
+  marked `Persistent=true` records when it last ran, in a stamp file that
+  removing the unit does *not* delete. `systemd.timer(5)` says to clear that
+  state *before* uninstalling such a unit, and `uninstall.sh` does — from a list
+  of timer names maintained by hand, which had fallen behind the timers that
+  actually exist.
+
+  `genesis-code-intel.timer` and `genesis-backup.timer` were both missing from
+  it, and from the disable list as well. Removing the unit files by wildcard is
+  not a substitute for either step: it leaves the stamp in place, and it leaves
+  dangling enabled links behind. The practical effect is that reinstalling could
+  inherit a stale "last run" and immediately replay a run it should have
+  skipped.
+
+  All three timers — including the new projection timer — are now disabled and
+  have their state cleared, and a test derives the list of `Persistent=true`
+  timers from the templates themselves and checks each one is covered. The
+  previous test enforced this for a single named timer, so it could not see the
+  next two.
+
+- Corrected the grep.app guidance in the web-tools guide and the researcher agent: it is literal/regex code search, not semantic search, and it is reached through the keyless Grep MCP server rather than by scraping the HTML search page.
+
+- The skills inventory in `AGENTS.md` now gives each skill's real directory, so an external agent client (Codex, Cursor, OpenCode) can open a skill instead of guessing its path from its name. Six skills nest inside a container directory and were unreachable by the obvious guess; twenty-three live under a second root entirely.
+
+- `memory_recall` and `follow_up_create` now reach Claude Code with their full descriptions. Claude Code cuts every MCP tool description at 2,048 characters, and both tools were well over it, so the model had been working from a contract missing its tail — including enum values and required-field rules needed to call them correctly. Both descriptions were cut back to their essentials and now fit under that limit with no setting required. A test now fails any Genesis MCP tool description over the limit.
+
+- **The OpenClaw chat-completions endpoint no longer hangs for five minutes, or
+  answers with a success status it does not mean, when Genesis is shutting
+  down.** If the conversation loop had stopped but was still configured, a
+  request would sit waiting for the full five-minute timeout while occupying
+  one of only three concurrent slots, so a few such requests made the endpoint
+  unresponsive for everyone. If the loop had closed outright, the failure
+  arrived after the response had already begun, so the caller received HTTP 200
+  with a generic "I encountered an error" body and nothing indicating the
+  request had not been served.
+
+  Both states are now refused immediately with 503, and the two possible
+  refusals say which one happened rather than sharing a message.
+
+  Readiness is also re-checked at the moment the request is actually
+  submitted, not only when the response begins. The two are separated by the
+  whole of the request handler, so a shutdown landing in that gap previously
+  produced the same five-minute wait the check was added to prevent. And if
+  the loop stops *after* submission — which no check beforehand can see — the
+  wait now gives up as soon as the loop is gone instead of running to the full
+  timeout, so a shutdown frees the endpoint promptly rather than leaving it
+  occupied by requests that can no longer be served.
+
+- **A message split across several text blocks is no longer truncated to the
+  first one.** Clients that send content as a list of blocks — the usual shape
+  when a message accompanies an image or other attachment — had everything
+  after the first text block silently dropped, so Genesis answered a shortened
+  version of the question with no sign anything was missing. In the common
+  case the discarded part is the instruction that follows the attachment. All
+  text blocks are now used, separated by a blank line.
+
+  Note the voice endpoints still carry their own copies of this parsing and are
+  not covered by this change; see issue #2272.
+
+- **Conversations that arrive through a gateway no longer contribute to the
+  context Genesis carries into every session.** Essential Knowledge includes
+  the topics of recent sessions, and that list is injected into every session
+  Genesis starts — so anything reaching it is read thereafter as Genesis's own
+  background. It previously included sessions from any source, so a topic
+  chosen by a web, WhatsApp, voice or agent caller sat alongside the owner's
+  own work with nothing distinguishing it. Only owner-attended channels now
+  qualify.
+
+  The set of channels that count is taken from the same check the rest of the
+  system uses, rather than listed separately, so the two cannot disagree as
+  channels are added.
+
+  This narrows the surface rather than closing it. Sessions recorded from
+  transcript files carry no channel at all, and are still included — excluding
+  them would empty Essential Knowledge of almost everything, since that is how
+  most sessions are recorded. Closing that properly means recording the channel
+  when the session is first written, which is tracked separately.
+
+- **`agent` is a recognised channel.** It counts as outside content for every
+  trust decision — it is not owner-attended and its provenance is external —
+  so a conversation arriving that way is already handled correctly before any
+  endpoint exists to serve one. It also stops routine refusals on that channel
+  being logged as warnings about an unknown channel.
+
+- The temp watchdog no longer deletes files a program is still writing, and its
+  emergency trigger now measures the real ceiling. Under temp pressure the
+  cleanup removed directories without checking whether anything was using them,
+  so a long download or install could die mid-write on its own missing files;
+  cleanup now leaves a directory alone while a process holds a file open inside
+  it (writers that close each file as they go are not covered — the check sees
+  only descriptors open at sweep time). Separately, on btrfs-backed installs
+  the "disk nearly full" emergency check was reading the shared pool's free
+  space instead of the cc-tmp volume's true 2 GiB cap and so could never fire;
+  it now computes headroom against the configured capacity
+  (`CC_TMP_CAPACITY_MB` in watchgod.conf, default 2048), deliberately without
+  reference to how full the underlying disk is: that disk is shared on every
+  supported setup, so counting it would have let a full system disk trigger the
+  emergency inside an almost-empty temp directory and destroy in-flight work
+  without freeing anything. A genuinely full disk keeps its own separate
+  trigger. Below 150 MB of true
+  headroom every protection is bypassed and everything reclaimable is
+  reclaimed — including files written seconds ago and the active session's own
+  temp tree, with unix sockets the one exception because deleting them frees
+  nothing and breaks cross-session messaging. That exception now actually
+  holds everywhere: the cache cleanup used to delete sockets sitting inside a
+  cache directory moments after the main pass had deliberately kept them.
+  Nothing may stand between Claude Code and its temp space. The emergency is also now evaluated when deciding which cleanup tier
+  to run, not only inside the most aggressive one, so a temp budget configured
+  larger than the volume can no longer keep it out of reach. Two further
+  cleanup defects are fixed alongside: the check that confirms the
+  in-use detection is working was itself misreporting failure on any
+  real-sized scan, and the cleanup silently reclaimed nothing at all whenever
+  no Claude Code session directory was present.
+
+- **A running session can no longer be told its work was interrupted.** The
+  liveness reaper checked "is this session alive?" once at the start of a pass
+  and then worked through rows one at a time — so a session that came back to
+  life partway through that pass could still be checkpointed, and its user got
+  a message saying nothing was running on a request that was in fact still
+  running. The aliveness check now happens again at the moment of the write,
+  inside the same database statement, so there is no window between the two.
+- **A session routed to a non-default model records that model, not "Claude".**
+  Sessions launched against an alternate model were registered under the model
+  Claude Code reports for itself, so the dashboard showed the wrong one and
+  disagreed with the session's own heartbeat record.
+- **The "last 24 hours" session counts really are the last 24 hours.** Two more
+  status queries compared timestamps as text, which let anything sharing the
+  cutoff's calendar date through regardless of its time — measured on a live
+  install, 45 rows counted where 33 belonged, some of them over a day old.
+  The overcount grows through the day and resets at midnight.
+- **One malformed session row no longer silences the whole sweep.** An
+  unexpected error while checking whether a recorded process was still alive
+  could abort an entire reaper pass, leaving every other finished session
+  marked active until the next run.
+
+- The fleet door no longer makes tmux log an error on every connection. It
+  checked whether a session name was free with `has-session`, and on tmux "no
+  such session" is an *error*, recorded in the server's message log. Because
+  the check runs on the success path — the name is always free — one entry
+  accumulated per connection. The door now tests for the session without making
+  tmux raise an error.
+
+  This fragment previously claimed the fix also stopped a yellow bar flashing
+  across the window and dropping you into an unrelated session. It did not, and
+  the mechanism it gave was wrong: a tmux error is not painted on attached
+  clients' status lines from a door invoked as an ssh `RemoteCommand`, where
+  the issuing client has no session and the error goes to its own stderr.
+  MEASURED on tmux 3.4 — three absent probes added three log entries and zero
+  bytes to an attached client's stream, while a `display-message` control on
+  that client did paint. The yellow bar had a different cause and is fixed
+  separately.
+
+- The slot door no longer adds three entries to tmux's server message log on
+  every login. `cc-slot.sh` tested for a session with `tmux has-session`, which
+  answers "absent" by ERRORING, and all three probes asked on paths where
+  absent is the ANSWER rather than a fault: the free-slot search exits by
+  failing, so allocating any slot logged an error, and the two pre-create
+  checks logged one each on every first connection to a slot. Replaced with a
+  silent `_session_exists` helper that answers from tmux's own `-f` filter.
+
+  This also corrects the mechanism stated in the previous fleet-door fix, which
+  claimed a tmux error is "painted on every attached client's status line" and
+  that redirecting stderr therefore did nothing. MEASURED on tmux 3.4 and
+  refuted: with a client attached through a pty, three absent probes added
+  three log entries and zero bytes to that client's stream, while a
+  `display-message` control on the same client did paint. For an ssh
+  RemoteCommand door the issuing client has no session, so the error goes to
+  that client's own stderr, which the redirect did suppress. The yellow bar
+  operators actually saw came from a different mechanism entirely — a terminal
+  reply delivered as keystrokes into `choose-tree` — and is fixed separately.
+
+- `memory_recall(include_deprecated=True)` now returns graph neighbours for the
+  superseded memories it surfaces, instead of returning the memory with an empty
+  `graph_neighbors`. The traversal re-applied the visibility filter the caller
+  had explicitly opted out of, so an audit or history recall could not see how a
+  superseded memory was connected. `memory_expand` gains the same
+  `include_deprecated` parameter, which it previously had no way to express. A
+  superseded neighbour is labelled `"hidden": true` so it cannot be mistaken for
+  a live one. The parameter un-hides superseded memories ONLY — a bitemporally
+  expired memory stays out of the traversal, matching the search beside it, which
+  applies its expiry filter unconditionally. Ordinary recall is unchanged:
+  hiding what recall itself hides remains the default on every backend.
+
+- **MCP servers no longer burn CPU while sitting idle.** Every Genesis MCP server started a background task-queue worker that FastMCP creates by default, backed by an in-process fake Redis whose polling loop woke 100 times a second forever. The queue was always empty — no Genesis tool uses background tasks — so the work was pure waste. Measured on one install: **3.85% of a CPU core per server process**, and with five servers per open Claude Code session that reached **~1.58 cores burned continuously** across 41 processes. Genesis now switches the worker off at startup. Tool behaviour is unchanged; the same 81 tools are served, and the idle cost drops to zero.
+
+- The SSH fleet door no longer drops you into an unrelated session on opening.
+  A terminal that answers a DECRQM mode query replies with bytes like
+  `ESC [ ? 2004 ; 2 $ y`, and tmux's client key parser delivers them as
+  KEYSTROKES — it consumes Device-Attributes replies, which end in `c`, but not
+  these, which end in `y`. The door landed straight in `choose-tree`, where `?`
+  opens the search prompt (the yellow bar) and a bare digit chooses that entry.
+  One stray reply therefore both painted the status line and took the
+  selection, deterministically the same one, and the keypress meant to dismiss
+  the bar confirmed it.
+
+  The landing screen is now a line-based menu with no single-key actions, so
+  stray bytes join a line that fails to parse and the menu redraws. `t` opens
+  the session tree, `r` refreshes, `q` drops to a shell, and `Ctrl-b s` opens
+  the tree from anywhere as before.
+
+  Ruled out by measurement rather than argument: draining the tty before
+  attaching (still stolen), hosting the chooser in a pane (prompt gone, still
+  stolen), any recovery keypress (already switched), and upgrading tmux — 3.7c
+  was built from source and re-probed and is still stolen, and a pane's query
+  never reaches the terminal on 3.4 either, so an upgrade removes no source.
+
+- The fleet door now degrades to a login shell when its picker is missing or
+  not executable, and says why. Previously the pane command failed, which
+  destroyed the window, then the session, then the connection — so a missing
+  file logged the operator out with `[exited]` and no explanation, on every
+  connect.
+
+- The generated `~/.ssh/config` block no longer describes the door as opening
+  `choose-tree`, or `Ctrl-b s` as reopening "the picker". Both were stale, and
+  that text ships to client machines.
+
+- **The test suite no longer fills a RAM-backed temp filesystem.** pytest's own
+  temporary tree is now placed under `~/tmp` (on disk) for every local run, not
+  just runs launched from a session whose `TMPDIR` already pointed at the
+  budget-policed working temp. Runs started from a systemd unit, a detached
+  shell, or any context with `TMPDIR` unset previously fell through to the
+  default `/tmp`, which on a standard install is a small tmpfs — one suite could
+  put hundreds of megabytes into memory and trip the temp watchdog. CI runs and
+  any run passing `--basetemp` are unaffected; set `GENESIS_BIG_TMP` to place the
+  tree somewhere other than `~/tmp`.
+
+- **PR-watch notifications are credited to the code that produces them.** Five
+  files described the `[PRs] …` session nudge as mirroring "the
+  `upstream-pr-steward` campaign's own owner notifications". No such campaign
+  exists. MEASURED: #792 added the `steward` DirectSession profile and referred
+  to an intended "upstream-PR stewardship campaign" in a code comment, but the
+  hyphenated slug appears **0 times** in its diff; #1182 coined that slug and
+  wrote **all five** prose sites in a single commit. So this was not a claim
+  inherited down a chain of commits — one change minted the name and every
+  reference to it at once, and no campaign by that name exists. The rows
+  `pr_watch` reads are written by `recon/account_activity.py` — a poller inside
+  genesis-server whose topics are prefixed `GitHub steward: `, which is what the
+  `%steward%` LIKE actually matches — and by the `github-activity-digest`
+  campaign's digests. Prose only, no behaviour change; the corrected text names
+  both real producers and records that the campaign does not exist, so the
+  attribution is not re-derived from the old wording.
+
+- Declining the Grep code-search server (`GENESIS_GREP_MCP_URL=""`) no longer claims an existing registration is still active when it could not read `~/.claude.json`. It now says the state is unknown and tells you to check with `claude mcp list`, instead of reporting a live entry and offering a removal command for something that may not exist.
+
+- **The contributor-review workflow now posts its review request under a maintainer identity.** The automated reviewer resolves who asked from the comment author and refuses a request authored by `github-actions[bot]`, so every request this workflow posted was rejected in seconds without the diff being read — the request had never once succeeded. The request is now sent by a separate job holding a fine-grained `REVIEW_REQUEST_TOKEN`, stored as a secret of a `review-request` GitHub Environment that only that job names and that admits only the `main` branch — so the job that decides eligibility cannot resolve the token at all, and keeps the default token, which drops to read-only. The environment is referenced with `deployment: false`, so no deployment record appears on contributors' pull requests. Because the two jobs run on separately allocated runners, the posting job re-reads the pull request and its issue and re-applies the same eligibility check immediately before writing, so a pull request closed or returned to draft in between gets no request. An unset secret warns and posts nothing rather than falling back to the identity the reviewer rejects, and an expired one fails the job with the reason instead of throwing. Both `github-script` steps are pinned to a commit SHA rather than a mutable tag. A new test asserts these properties across every job in the file, including that no job checks out head code, runs a shell step, or interpolates an expression into a `github-script` body — the property that separates an outside author from a privileged credential in a `pull_request_target` run.
+- **A contributor PR can no longer be sealed out of its one automatic review by a comment that merely mentions the reviewer — including the reviewer's own.** The one-review-per-issue budget matched `@codex review` anywhere in any comment body. Measured over the 1000 most recent comments on this repository, that matched 374 bodies and 96 of them were the reviewer's own footer, which reads `Comment "@codex review" or ...` and lands on a pull request before any human asks — so the reviewer sealed an issue's only automatic review by introducing itself, with no retry behind it. The match now requires the request to begin or end a line, which drops 136 of those 374 and loses none of the genuine requests (the four human bodies it stops matching all discuss the trigger in backticks rather than asking for a review). A request this workflow posts is recognised by exact equality against the body it writes rather than by a marker substring, so quoting that marker in prose — it appears in the workflow, its test and this changelog — cannot spend the budget either. The posting step re-reads the pull request immediately before writing and declines if a request is already there, using the same predicate rather than a weaker copy: the workflow's concurrency group is keyed on the event name, so a pull-request event and an issue event naming the same PR run in different groups and could both post. That narrows the window rather than closing it — closing it would need a durable claim on the issue, which needs a wider credential than this convenience feature justifies, and the budget stays documented as the courtesy bound it is.
+
+- **The Secrets editor can no longer delete a setting you never typed in.** Opening a configured override and pressing **Save** without editing it used to submit an empty value, and the dashboard read an empty value as *remove this override* — so an untouched field silently deleted the setting. That was unavoidable from the browser, because the empty string meant both "I did not change this" and "clear this" and nothing could tell the two apart. Clearing is now its own **Clear** button beside Save, sending an explicit instruction, and an empty Save is refused with a message pointing at it. The write API states the same thing: a key you omit is left alone, an explicit null clears it (only for settings that have an unset state to fall back to), and an empty value is rejected rather than guessed at. Reload the dashboard after updating — a tab left open with the old page will have its clears refused until you do.
+
+- Conversation cost tracking (Telegram and dashboard chats) stays accurate on Claude Code 2.1.277 and later, including after switching models with `/model`. Those versions report a resumed session's cost as a running total, and Genesis had been adding that total to its record on every turn, so each reply counted the whole conversation again; a three-turn session was recorded at about 2.8x its real cost. Genesis now records only each turn's share. Costs recorded before this fix are not corrected, and a conversation already open when you update counts its earlier turns once more on its next reply.
+
+- **A background session allowed to run the GitHub CLI no longer inherits the operator's credential.** The sealed configuration directory that keeps such a session from reconfiguring the tool into running arbitrary commands copied the credential file into itself, because that is the only place the tool looks for a token. The argument for the copy was that it lands owner-only inside an owner-only directory and so widens nobody's read access, which is true and answered the wrong question: it handed a session whose stated job is reading EXTERNAL pull requests a token carrying whatever scopes the operator's own login carries — on the install where this was measured, including the ability to delete repositories. The copy is gone, the directory is now synthesised from a constant, and the tool cannot authenticate from it; verified by execution against a control that does authenticate. Installs that already ran the old code are healed by a startup reconciliation, and that is a deliberate addition rather than a free consequence: the directory's own stale sweep runs only when a session is dispatched with a restricted shell, and once no profile ships one — which a companion change brings about — nothing would ever run it again, so a previously-copied credential would sit on disk indefinitely. The reconciliation is wired into the unconditional credential self-heal at startup, is idempotent, and deliberately does not CREATE the directory where none exists.
+- **Every credential variable the tool documents is pinned empty, not just the famous one.** Its own environment reference lists four — two for the public host, two for Enterprise — in explicit precedence order, and the tool resolves all of them ahead of the configuration file, so an inherited value would outrank the credential-free directory. Scope, stated precisely because the obvious phrasing overstates it: this covers every session launched through the shared invoker. THREE other paths start a session outside it and are not covered — one passes no environment at all, and two build one by copying the parent's wholesale while carrying a comment saying they mirror the shared builder, which they now do only partially. The count is given because the first draft of this note said "one", described the mechanism of that one, and would therefore have sent anyone grepping for the residual straight past the other two. Out of scope here, tracked as issue #2445. The first version of this change pinned one of the four and was bypassed by the variable documented on the same line: measured, an empty first variable plus a value in the second returns the second. The set is now enumerated from that reference, in one place, with the citation and the version consulted, and the pin is enforced rather than merely set, per variable, and enforced UNCONDITIONALLY. That last word is the correction: an earlier draft put the check inside the per-binary hardening, which the launch path consults only for a session that declared a restricted shell — a shape exactly one shipped profile can produce, which has never been dispatched, and which a companion change removes outright. So the check never ran on any session that has actually run. The pin was set by the builder and never verified, meaning an environment override could have restored a credential on any session. The check is now separate from the binary hardening and runs on every dispatch. Separating them also removed a latent hazard, since the credential entries sat last in the hardening's literal: a name added to the enumeration that collided with one of the hardening's own keys would have silently overwritten it and passed every check, because the verification recomputes the same wrong values. The lesson is narrower than the bug: the same function already enumerated the tool's *program* routes from that same document and said so proudly, and the credential half was then hand-picked from memory.
+- **Two limits stated rather than left to be discovered, because the obvious reading of the change is wrong in both cases.** An empty credential variable does **not** by itself de-authenticate: measured, the tool falls back to the configuration file on disk and authenticates normally, and the variable that actually decides the question is the configuration directory — which is pinned only on the allowlisted path. So a dispatched session permitted a shell without declaring an allowlist still reaches the credential on disk. Pinning that variable more widely was built, reviewed and removed: keying it on session origin reads tight but covers six dispatch profiles and every non-owner-attended conversation channel, and would additionally point a process-global data directory at a read-only tree for all of them; pointing it at the sealed directory is a fail-open on precisely the installs that need it, since a rebuild that fails before its sweep leaves the old copied credential in place.
+- **The sealed directory is no longer addressed by PATH once its identity has been checked, so link and race tricks against it are closed by construction rather than one spelling at a time.** This is a consequence of the reconciliation itself and was found by auditing it rather than by it failing: every filesystem operation the rewrite performs — permission change, directory listing, recursive delete, file write — follows links, and the routine had been reachable only from a dispatch shape that has never occurred on any measured install, so nothing exercised it. Wiring it into startup makes it run on every boot, which is what turned a dormant hazard into a live one. Measured on the pre-fix code: a sealed directory replaced by a link to another directory came back emptied and locked read-only, and an entry inside it replaced by a link to an unrelated file had that file's contents overwritten with the seal's constant. The link case is now refused before anything is modified, with the link's target named in the log so the planted path is recoverable from one line rather than reconstructed; a link found among the entries is removed rather than followed; and the fast path that decides "this directory is already correct" no longer accepts a link as a matching entry, which is what would otherwise have skipped the repair entirely. The same-shape check was added to the dispatch path too, where it refuses the launch rather than silently continuing. A THIRD route was then found by asking what else writes through a caller-influenced path rather than by waiting for another report: the rewrite lock lives in the sealed directory's PARENT and was opened in a mode that both follows a link and empties what it lands on, before any of the checks above run — measured, an unrelated file was emptied to zero bytes while the reconciliation otherwise succeeded and logged nothing. That open now refuses a linked final component outright and no longer empties an existing real lock file, since the lock needs no content. A FOURTH route was a second name for the same file. A hard link is not a symbolic link, so the type checks did not see it, and the entry then satisfied every remaining test — name, permissions, contents — because it IS the same inode. The sweep therefore kept it and wrote through it, and worse, the fast path that decides whether any repair is needed reported the directory CLEAN while a WRITABLE name outside it owned the tool's configuration file. Measured: an alias was written through that outside name and read back from inside the sealed directory, which is the escape the whole mechanism exists to close. A 0500 directory is the only write protection here, and a second link to the inode goes around it invisibly to any content or permission check. The link count is now part of the comparison, in the fast path as well as the rewrite, because the fast path is what decides whether the rewrite runs at all.
+
+  A FIFTH route closed the enumeration for good: a named pipe. It is not a link and not a directory, and the check that decided which entries counted also did not recognise it as a file — so it was dropped from the comparison set entirely, the directory was reported correct, and the tool then read the planted name THROUGH the pipe and adopted the account in it. Under a name the tool actually reads this is worse than a wrong verdict: reading a pipe with no writer blocks indefinitely, so the comparison would have hung the check itself on every dispatch and, because it now runs at startup, every boot.
+
+  So the file-type test is now an ALLOWLIST — an entry must be a regular file, and a pipe, socket, device, directory or link is a non-match by construction. That subsumes the two link checks written earlier, and it is the same correction this change already made to the restricted-shell classification: five spellings were found one at a time, each after the previous fix shipped, which is what a denylist does.
+
+  Two more properties came out of auditing the rewrite rather than from it failing. It now VERIFIES what it produced before reporting success, because it was write-only: an entry planted between the last file being written and the directory being locked ended up inside the finished directory while the function returned it as prepared, and the mismatch was only noticed on the next call — one dispatch after the session that should have been refused had already run. And the recursive removal is bounded: unbounded, a deeply nested planted tree raised an error the documented contract does not cover, escaping into the caller, and left the directory WRITABLE on the way out. The mode is now restored whatever happens, which is the half that matters — wrong contents are self-correcting because the next call rewrites them, whereas a writable directory is the one thing the mechanism cannot tolerate.
+
+  And the type test had to stop being answered from a cached inspection. The first version of it inspected each name once and then read the CONTENTS by name a second time, so the type gate described one file and the bytes came from whatever the name pointed at by then — measured by an adversarial review against a racing writer, one false-clean verdict in roughly half a million trials, where a clean verdict was only reachable by following a link the type gate had already rejected. One hit is one escape, because a clean verdict skips the repair entirely. Every gate is now answered from an open handle to the exact file the bytes come from, with the handle refusing to follow a link and refusing to block on a pipe. That property is pinned by a test that forbids resolving a name twice, rather than by a race, because a race that never reproduces proves nothing: re-running the same probe against the fixed code finds nothing in 600,000 trials, but its control arm shows the competing writer never won the window even once.
+
+  Two further defects came out of auditing that fix. The comparison read an entry of ANY size into memory before rejecting it, which matters because this routine runs at the first step of startup, synchronously, ahead of secrets and database initialisation, and the read happens before the sweep — so it cannot heal its way out: a sparse file of 64 MiB cost a third of a second and about three times its size in resident memory, linearly, and a multi-gigabyte one is free to create. The size is now compared before the contents, which is also strictly more correct, since a differing size IS a differing content. And one judgement about those two checks was wrong in BOTH directions before measurement settled it. First: that the file-TYPE test was a redundant layer, because a pipe reads as empty — true only of an EMPTY pipe, and a pipe can hold data with no writer attached, in which case every other test passes and only the type test refuses it. Then, correcting that: that the type test was therefore the only thing standing — also wrong, because the size check landed in the same round and a pipe reports a size of zero, as do a socket and a directory, so the size check rejects every one of those first. What is true is that the two shadow each other: neither can be shown to matter by removing it alone, so the mutation arms for them are deliberately combined. Both are kept, for reasons now written down rather than assumed — the type test refuses before anything is read and survives any future relaxation of the size check, and it is the read CEILING, not the size check, that bounds the work a planted file can cause.
+
+  22 tests cover the class, 25 counting parametrised arms, each asserting on what the planted entry POINTS AT rather than on the sealed directory, plus controls proving the reconciliation still removes what it exists to remove, that a real lock file survives, and that the depth bound still clears a genuine two-level extension tree. The limit is stated in the code rather than implied: refusing a linked final component does not cover a linked ANCESTOR directory, which is a broader compromise than this routine can bound.
+
+- **A profile-overlay field that advertised allowlisting the interpreter running the server is withdrawn.** It offered locally-defined shell profiles a way to permit exactly that interpreter and run a module through it. That route stopped launching the moment unreviewed binaries began being refused — the interpreter's name is in neither table, so it raises before a session starts — and the refusal is right rather than something to relax: an interpreter runs arbitrary code from its own command line, so no environment setting confines it. What was wrong was leaving a comment instructing the next author to use it. The field and the comment are gone, the test that used it now names a binary that can actually launch, and reviving the route is recorded as needing a real hardening entry with each escape measured, not a field on a context object.
+
+- **A restricted-shell entry is now matched by its canonical name, which closes a quieter hole.** The guard that enforces the restriction compares the first word of the command, so an entry naming the tool by absolute path — or with stray whitespace — was permitted to run while the lookup that applies its hardening missed it entirely: the session launched with the binary allowed and no sealed configuration, against the operator's own writable one, which is precisely the escape the seal exists to close. Both the applying and the verifying site now resolve through one helper that takes the base name, and an entry is then classified into one of three states: hardened, deliberately needing none, or unreviewed and refused. The base name is what closes the measured hole; stripping whitespace closes nothing, because the guard's own first-token split cannot produce a token containing whitespace, and an entry spelled that way permits no command at all. Refusing an unreviewed name is the correction to a skip that was a denylist in allowlist clothing: the version-control binary is the next thing anyone would allow, and it runs programs of its own accord through its configuration exactly as this tool does, so it now refuses until someone writes its hardening. Case is deliberately not folded, because on a case-sensitive filesystem a differently-cased name is a different binary and folding would apply one tool's hardening to another. The third state is not decoration: a first attempt refused every name it did not recognise, and that broke a legitimate entry for a binary which simply has nothing to harden — measured on a real one. The fix was to name those explicitly rather than to go back to skipping silently, so the set of binaries deliberately needing no hardening is now a declared list, and anything outside both lists refuses.
+- **And the second limit is the one worth reading twice: "the tool holds no credential" is not "the session is unauthenticated".** Only the first is this change's claim. Whether the session can reach a credential is decided by its tool scope, not its environment — a profile that permits filesystem reads, skips permission prompts and keeps an outbound notification tool can be instructed by the very content it ingests to read an owner-readable credential file and send it onward. No environment setting touches that. The companion change REMOVES that profile outright rather than narrowing its tools, having measured that a tool-scope fix cannot work while the binary itself is permitted — the tool reads arbitrary files through its own documented flags. A future shell-granting profile faces the same problem; removing a credential from the environment is not a substitute for solving it.
+
+- **The cc-tmp watchdog no longer deletes Claude Code's empty socket
+  directories.** Its sweeps already refused to delete a unix socket, but a
+  socket is a file and that guard could not protect the *directory* holding
+  it — a sockets directory survived only while something inside kept it
+  non-empty, which is protection by accident. Reproduced at both deletion
+  sites: an empty sockets directory and an empty daemon root were removed
+  while a socket-holding sibling survived. Both sites now spare those
+  directories and any directory beneath them, while still reclaiming regular
+  files inside them and still reaping unrelated empty directories.
+  The exclusions are **exact paths**, not name patterns, and both halves of
+  that matter. A `cc-socks*` pattern would make an unbounded subtree immortal
+  (a directory merely *starting* with that name would pin everything under it
+  against the watchdog forever), and `cc-daemon-*` is worse than wide — Claude
+  Code also uses that string as a `mkdtemp` prefix for throwaway directories
+  holding a single log file, so a pattern would empty each one and then spare
+  the husk permanently, turning the empty-directory reaper into an
+  empty-directory leaker. The paths are enumerated rather than computed from a
+  single expression, because the watchdog and a Claude Code session do not
+  share an environment: measured on a live install, the watchdog runs with
+  `XDG_RUNTIME_DIR` set by its service manager while a session under a
+  terminal multiplexer has it unset and falls back to its temp dir, so both
+  locations existed at once and a default-expansion evaluated in the watchdog
+  would have stopped sparing the one inside the budget it sweeps.
+  Severity, stated precisely: Claude Code recreates a missing sockets
+  directory on demand, so this is not a lasting outage. What it costs is a
+  lost race — a sweep landing between the path check and the directory's
+  creation makes that session refuse to bind, and it runs without
+  cross-session messaging for its lifetime rather than retrying.
+  The exclusions are also escaped and normalised before they reach the search
+  tool, which takes a *pattern* rather than a literal path. The temp directory
+  is configurable, so a bracket, star or question mark in it — or a trailing
+  slash — used to leave the exclusion matching nothing at all, deleting the
+  very directory it was written to spare. The same omission was found on the
+  exclusion protecting the active session's own files, and that one needs no
+  configuration change at all to reach: the project directory name comes from
+  the repository path, so a bracket in a repository name was enough to make
+  the emergency sweep delete the running session's working files. Reproduced
+  in every shape against a plain-path control that kept them. Path
+  normalisation now happens where the configured value enters rather than at
+  each place it is compared, because normalising one side of a comparison
+  moves the mismatch instead of closing it.
+
+- **`worktree_lifecycle.py --recover` brings an archived worktree's uncommitted work back when it can, says what it checked, and never deletes a trash entry.**
+  Archiving keeps the worktree's git registration, locked as the history anchor. Recovery now moves the archived tree back under that registration when it still belongs to the archive, so tracked edits, the staged/unstaged split, intent-to-add entries and untracked files come back with it. It does not claim the result is exact: it reports what it checked (this archive holds the lock, HEAD is the recorded commit, the index is present) and exits with status 2, naming the problem, when any check fails, for example a missing index, a branch that moved or was deleted since archiving, or a registration this archive does not hold. A deleted branch is reported with the command that recreates it; recovery no longer changes HEAD itself. A check that cannot be answered stops the recovery with nothing changed.
+  `--recover --dry-run` takes the same checks before anything is placed, so it reports the same problems a real run would.
+  When the registration is gone, recovery recreates the worktree at its recorded ref with its untracked files, as before, and exits 2 if the archive held uncommitted changes it could not restore, or does not record whether it did (archives made before that was recorded); it says which. A worktree's own `.trash_meta.json`, set aside at archive time, gets its name back on both paths, including when it is a directory. Recovery no longer deletes a plain trash directory, and when nothing can be checked out it copies the files into a plain directory and exits 2 instead of moving the only copy.
+  Archiving now records the name it wrote its patch snapshot under, and recovery names exactly that file. For an archive without that record, several candidate files are listed without guessing which is the reaper's, since a worktree's own files can leave the reaper's snapshot anywhere in the naming sequence.
+  Archive metadata is now written atomically, so a failed write (a full disk, for example) leaves the previous copy intact rather than a truncated file recovery cannot read.
+
+- **locate no longer returns duplicate hits from linked worktrees outside .claude/worktrees/.**
+  The repo scope now prunes every linked worktree that git worktree list --porcelain reports.
+
+- **The push and merge guards now account for git's repository-selection
+  options.** Besides the working directory and `git -C`, git can be pointed at a
+  repository with `--git-dir` / `--work-tree` or the `GIT_DIR`, `GIT_WORK_TREE`
+  and `GIT_COMMON_DIR` environment variables. The guards resolved the branch,
+  remote and push configuration from the directory a command ran in, so a
+  command using those options was classified against the wrong checkout. They
+  now treat any of these forms as a working directory they cannot resolve, which
+  every check already handles conservatively: a force push is refused, a publish
+  asks for approval instead of qualifying as a routine re-push, and a merge onto
+  the default branch is refused. The pre-push privacy review now reports that it
+  did not scan such a push, rather than scanning the diff of the directory the
+  command ran in. Pushing or merging from inside the repository (`cd` or
+  `git -C`) behaves exactly as before.
+
+- **The command guards now recognise several shell spellings they previously
+  could not see.** The shared shell parser that every Bash guard uses to work out
+  which command a segment runs now handles a `NAME+=value` or subscripted
+  `name[i]=value` prefix assignment, `env` assignment words that are not plain
+  identifiers (including after `env --`), assignments after the bash `time`
+  keyword, a wrapper's operands after `--` (`timeout -- 5 cmd`), and a command
+  that follows an earlier one inside a subshell. It also no longer treats a word
+  containing `=` as an assignment after wrappers such as `nohup` or `timeout`,
+  which run that word as the program, and follows `sudo`'s own rule: a path
+  containing `=` (`/opt/k=v/tool`, `~/k=v/tool`) is the program it runs.
+  Parentheses inside quotes, comments and `${...}` expansions are no longer
+  counted as subshell boundaries.
+
+- **Inbox capability-build verdicts are no longer silently dropped when the
+  build lane is off.** A `BUILD` recommendation is deliberately skipped by
+  follow-up creation because the build lane owns it — but the lane is
+  optional, and when it is unwired or disabled it ignores the verdict too, so
+  the evaluation reached no consumer at all. With the lane not live, the
+  verdict is now recorded by what it says: `build` becomes a pinned,
+  user-owned follow-up; `needs_discussion` becomes a pinned follow-up labelled
+  as a discussion rather than a build task; a `dont_build` veto is kept as a
+  tabled record and never becomes actionable work. Each carries the verdict's
+  stated reason. As in the lane, a `build` verdict whose build spec is missing
+  or incomplete is recorded as `needs_discussion`, and a BUILD block with no
+  valid verdict creates nothing and logs a warning. Rows are deduplicated per
+  item and verdict: a re-evaluation that merely rephrases the next step adds
+  nothing, while a changed verdict is recorded. With the lane live, nothing
+  changes. If you enable the lane later, an item's still-pending follow-up is
+  closed with a note once the lane takes that item over (when the item is next
+  re-evaluated), because the lane's greenlight card replaces it; and an item
+  the lane already holds gets no follow-up if the lane is later disabled.
+
+- **Inbox items replaced by a newer edit are no longer reported as failed.**
+  When a file changed while its evaluation was parked on an approval, the old
+  row was marked `failed`, so superseded snapshots made up nearly all inbox
+  failures and buried the real ones. Those rows now get a new `superseded`
+  status, keep their reason in `error_message`, and do not consume a retry. A
+  schema migration adds the status and reclassifies existing rows whose reason
+  is a supersession (`superseded by newer modification`, the older
+  `superseded by new inbox scan`, and `content changed`); other invalidation
+  reasons (approval cancelled/expired, source file deleted, content removed
+  before retry) stay `failed`. The user-ego inbox backlog count accounts for
+  the new status, and the inbox overlay gains a superseded tab; each status tab
+  now asks the server for that status instead of filtering the newest 50 rows,
+  which could hide older rows of the chosen status. `scripts/inbox_check.py`
+  now applies pending schema migrations before it runs. Detection behaviour is
+  unchanged: superseded rows were already invisible to the known-file scan
+  and the retry lane.
+
+- Proactive memory recall is faster: the recent-files keyword lane no longer ORs in words that appear in half or more of all memories (which FTS5's ranking ignores anyway but still had to score across the whole store), and the procedure-suggestion cache now refreshes in the background instead of on the request. Every recall now also logs a one-line stage timing, so typical latency is measurable from the server journal.
+
+- **Eval health now reports each model profile separately and separates harness noise from wrong answers.** When a provider was repointed at a new model, `eval_staleness` summed both models' history under one row and labelled it with whichever profile ran last, so its counts described neither. Each `(provider, profile)` now gets its own entry with a `recent` block (last 30 days of that profile's runs) showing the wrong-answer `failure_rate` and the `infra_rate` (rate-limit skips plus provider errors such as timeouts). `unreliable` now fires on the infrastructural share, so a timeout-heavy run is flagged while a reproducible wrong-answer rate is reported as a rate instead. Manual benchmarks (`scheduled: false`) and profiles a provider has moved on from (`superseded: true`) are no longer reported as `stale`, and staleness is measured from the last scheduled run, so a manual run cannot hide a stopped scheduler. `stale_count` and `unreliable_count` now only count profiles that are still scheduled. A failed query (including a missing `eval_results` table beside recorded runs) now reports `status: error` rather than `no_data`, and each scheduled profile carries `days_since_scheduled`, the age its `stale` verdict was taken on. A run whose timestamp cannot be read is counted in `unreadable_runs` and left out of every age, instead of posing as the newest run or being aged as today. The dashboard's eval section shows the profile, the recent failure rate, and the infrastructure rate whenever there were skips or provider errors (including a window where no case could be scored); a stale profile shows its scheduled-run age rather than the age of a later manual run; manual and superseded rows are greyed out; and a failed or empty eval snapshot is shown as such instead of silently disappearing.
+
+- The stranded-work sweep no longer reports every archived worktree as unreadable: it recognises a reaper archive by its lock reason, its tarball in `~/.genesis/worktree-trash` and its missing directory, and keeps holding anything it cannot prove is an archive. The daily disk-hygiene run also releases worktree claims left behind by sessions that have exited (`GENESIS_WORKTREE_STALE_CLAIM_RELEASE=0` disables that). Archived worktrees are still never deleted: `worktree_lifecycle.py --expire-trash` exists but is off by default and is not scheduled, so it deletes nothing unless you pass `--retention-days N` or set `GENESIS_WORKTREE_TRASH_RETENTION_DAYS` yourself.
+
+- **The Guardian now keeps its own snapshots from filling an LVM-thin storage
+  pool, instead of only warning about it.** A thin snapshot costs almost
+  nothing when it is taken, then grows with every block the container
+  rewrites. The daily "healthy" rollback snapshot was replaced create-first,
+  and the replacement can be refused once the pool is past LVM's autoextend
+  threshold. When that happened the old snapshot stayed and kept growing. On
+  one install it grew for a week until the pool hit 100% and the container's
+  filesystem went read-only, while CRITICAL alerts fired every six hours. (An
+  earlier entry said this snapshot is "never more than a day old"; that held
+  only while the replacement succeeded.) Now:
+  - On LVM-thin pools, when the pool refuses the new snapshot on a real
+    measurement, the old one is over a day old, and LVM shows the snapshots
+    hold at least the larger of 1 GiB and 1% of the pool that no live volume
+    maps, the Guardian deletes the old snapshot first, then creates the new
+    one. A pool that is full of live container data keeps its rollback
+    snapshot, since deleting it would free almost nothing. A failed probe never
+    counts as a refusal. On btrfs and dir pools this step does not run; the
+    backstop below protects them. A refused refresh retries within about an hour and sends an
+    alert, throttled rather than hourly; it used to be only a log line.
+  - A backstop runs every tick: when free data space is at or below 3% of the
+    pool, or free metadata space at or below 10%, it deletes one Guardian
+    snapshot (pre-recovery snapshots first, the rollback snapshot last), waits
+    five minutes for a fresh measurement, and alerts on each delete. If no
+    Guardian snapshot is left, it alerts that something else is filling the
+    pool. No new Guardian snapshot is taken while free space is inside that
+    reserve. A rollback snapshot is only ever deleted when a newer one was just
+    created, or when this check's health probe found the container healthy;
+    while it is not, the backstop keeps them and alerts. The daily prune never
+    deletes a rollback snapshot. A delete whose outcome is unknown (the client timed out) stops
+    the pass instead of moving on to another snapshot. If relief cannot measure or identify the pool for an hour, it
+    says so in a daily warning rather than going quiet.
+  - Every Guardian path that deletes or restores a snapshot (relief,
+    rotation, the daily prune, the rollback target) now matches only the exact
+    names the Guardian generates (`guardian-YYYYmmdd-HHMMSS`, optionally
+    `-healthy` or `-pre-recovery`). Previously the prune and rotation matched
+    any name starting with `guardian-`, so a hand-made `guardian-…-healthy`
+    snapshot could be deleted or chosen as the rollback target. Relief never
+    acts on a pool it cannot identify, and nothing here grows the pool.
+  - The pool is identified by what incus declares (`lvm.vg_name`,
+    `lvm.thinpool_name`), not inferred. A backend that cannot be determined,
+    thick LVM, and backends whose pool path is not a mount (zfs, ceph) now read
+    as "not measured" rather than falling back to `df`, which measured the host
+    filesystem instead of the pool. On btrfs and dir pools, free space is what
+    `df` reports as available, so reserved blocks count as used.
+  - Levers: `storage_pool.relief_mode` (`live` / `alert_only` / `off`) and the
+    two reserves in `guardian.yaml`, plus the `GUARDIAN_POOL_RELIEF_DISABLED=1`
+    kill switch, which stops every automatic delete. Recovery runbook:
+    `docs/reference/thin-pool-recovery.md`.
+
+- **`web_search` now runs the backend you ask for, and says exactly why a search
+  failed.** `backend="brave"` used to run the whole SearXNG-then-Brave chain, so
+  it was answered by SearXNG whenever that was up. `backend="brave"` and
+  `backend="searxng"` now run only the named backend. A search where every
+  backend failed used to report `backend_used: "searxng"` and a bare "All search
+  backends unavailable". It now reports `backend_used: null`, and the error
+  names each backend it tried with its reason, e.g.
+  `searxng: ConnectError: …; brave: API_KEY_BRAVE is not set`. That makes an
+  unset Brave key or a missing SearXNG service visible at a glance. Voice web
+  search now uses the standard chain (TinyFish first). It used to ask for
+  `brave`, which in practice meant SearXNG first, and a SearXNG whose upstream
+  engines are rate-limited can answer spoken questions with unrelated pages
+  (a weather question returned a software download page). A failed voice search
+  is now reported as a failure, not as "No results found", and voice search
+  gives up after 20 seconds with a "timed out" error rather than outlasting the
+  30-second voice tool-call limit. TinyFish search snippets now carry the same
+  untrusted-content markers as SearXNG and Brave snippets. A failed explicit search whose credential is missing now says so (for example
+  `API_KEY_TAVILY is not set`); other failures return a short summary, with the detail
+  in the server log.
+
+- **The commit review gate no longer asks for approval on commits in unrelated
+  repositories.** A commit in a scratch repository with no remote (or only a
+  filesystem remote) asked "the open pull request's review history could not be
+  read reliably", and was refused outright in a background session, because the
+  failed pull-request lookup was read as unreadable evidence rather than as
+  "gh has no repository to look in here". The review budget now applies only to
+  an open pull request on the configured public repository. A failed lookup
+  consults no budget when the repository has nothing gh could resolve to GitHub
+  (no remote or branch push target that might be GitHub — a target naming a
+  remote counts by that remote's own URLs, so a clone of a local repository
+  qualifies — and `GH_REPO` and `GIT_DIR` unset) and the command is a single
+  `git commit`, optionally with `-c <key>=<value>` and one
+  `-C <dir>` — the one shape that provably commits in the repository that was
+  checked. A branch whose open pull request lives in a repository with a
+  different name also consults no budget. Nothing changes on the public
+  repository itself: an unreadable lookup there still asks in the foreground and
+  is refused when dispatched. Every other shape keeps that behaviour too,
+  including `cd <dir> && git commit` (use `git -C <dir> commit` in a scratch
+  repository), `--git-dir`, `GIT_DIR`, `pushd`, `env -C`, a wrapper, process
+  substitution, a commit message built with `$(…)`, a remote that might be
+  GitHub, or an
+  undeterminable public repository.
+
+- **The desk endpoint refuses output budgets under 16 tokens.** `/v1/desk/chat/completions` used to accept `max_tokens` as low as 1, and at budgets that small the fast lane's thinking-suppressed model can return nothing, which the endpoint reports as a 502 the client then retries. Such a request now gets a 400 that names the minimum, and no provider call is spent on it.
+
+- **A broken `model_routing.local.yaml` no longer takes every model call site offline.** Most mistakes in that file used to stop the router from starting: a key with nothing under it, a value of the wrong type, or a retry profile name that was misspelled or had no body. Genesis still came up, but no model call site could route, and the only sign was one log line. Invalid YAML was ignored with only a warning. Now, whenever the overlay cannot be used, Genesis logs an error, records a health observation that shows on the dashboard, and routes on the shipped config without the overlay's overrides until you fix it. Every restriction the overlay makes still applies during that fallback, so the fallback never allows a call, provider, attempt or spend that your file ruled out. A provider you disabled or marked not free stays that way. The lower `rpd_limit`, `tpd_limit` and `rpm_limit` apply. `never_pays` holds. `dispatch: api` and `dispatch: cli` keep a `dual` call site on that one executor. Where your file and the shipped config leave a call site no executor in common, it is blocked: it stays listed as API-only with no providers, so it runs nothing and is not treated as a provider outage. A narrowed chain stays narrowed and in your order. The lower retry `max_retries` and `max_total_s` apply, including through a call site moved to a tighter retry profile. A provider whose model, type, endpoint, profile or params you changed is left out, because the shipped values are not the ones you run. Longer retry waits (`base_delay_ms`, `max_delay_ms`, `backoff_multiplier`) and lower `jitter_pct` apply too: the retry deadline (`max_total_s`) is checked before each attempt, so where one is set, slower pacing means fewer attempts. A retry wait that cannot be read means no retries, like an unreadable cap. So does a longer `open_duration_s`. Settings that limit nothing, such as `keep_alive` or a description, are set aside with the rest of the file. If an overlay carries both a provider's old name and its new one, the new one wins, as in the normal load; an old name with no settings under it is ignored, also as in the normal load. If every essential call site is blocked, system degradation stays normal rather than falling back to the older check that counts paid providers, and **Reload routing config** re-reads which essential sites are blocked. A retry backoff too large to compute is capped at `max_delay_ms` instead of failing the call. Old provider names from before a rename are read the same way the normal load reads them. Where the file names a provider, call site or retry profile but the value there cannot be read, Genesis reads it the restrictive way: the provider is disabled, the call site is blocked, and `max_retries` is 0. A retry deadline that cannot be read keeps the shipped one, because a deadline of 0 would stop the call site entirely. If the file cannot be parsed at all, nothing can be read from it, and the fallback runs on the shipped config as it is. A bare `call_sites:` header is handled the same way; it used to remove every call site silently. Some values used to load and then fail on every call: text or NaN where a number belongs, or `"false"` in quotes for `free`, `default_paid` or `never_pays`. These are now rejected at load time and trigger the same fallback. A `null` on `free`, `default_paid`, `never_pays` or `retry_profile` resets that field to its default. `enabled` keeps its existing rules: strings such as `"false"`, and empty values, mean off. The dashboard's **Reload routing config** button, and a call-site save with nothing to change, now refuse a broken overlay and keep the running config, and the routing editor shows the dispatch mode the running router actually uses. Saving a call site from the dashboard checks the exact file it is about to write, and refuses any save the next restart would reject. It also refuses to overwrite an overlay file it cannot read. It can still replace a malformed chain on the call site being saved. Separately, an API-only call site whose providers are all disabled now stays listed as blocked, with a warning. It used to be dropped, and the autonomous dispatcher then treated it as `dual`, which could escalate it to a Claude Code session.
+
+- The `pre-merge-commit` git hook is now installed like `pre-commit` and `pre-push`: by `sync-hooks.sh` (which also runs at session start and version-tracks it) and by the hook loops in `install.sh` and `bootstrap.sh`. Previously nothing installed it. Its older check against merging a PR branch back into local `main` never takes effect on current git (the merge head it reads does not exist yet while the hook runs), and it is left inert on purpose; only its new `live` refusal is active.
+
+- **The push guard now recognises `git push -u origin HEAD` as a push of the current branch, and checks the push config for every spelling it recognises.** It used to recognise only the bare branch name, so `HEAD`, its alias `@`, `refs/heads/<branch>` and `HEAD:refs/heads/<branch>` fell to the generic "approve this push" prompt. For those spellings a re-push of an already-published branch prompted every time, and the checks that report a public branch with no open PR, or a push that follows a `gh pr close` in the same command, never ran. They run now. A first push still asks, and a push naming another branch, a tag, or `main` from a feature branch keeps asking as before. A re-push also keeps asking, whatever the spelling, when the repository's config changes what the push does: a push refspec or `push.default` that sends it to another branch, a push URL (`pushurl`, `pushInsteadOf`) that differs from the fetch URL, a remote with more than one URL, a legacy `.git/remotes` or `.git/branches` file, submodule recursion, `push.followTags`, `push.gpgSign`, a mirror remote, or a configured `receivepack` program. The same applies when the push command supplies its own config (`git -c …`, `--config-env`, a `VAR=value` prefix), carries a git option other than one `-C` before `push`, or shares the command with any step other than `cd`, `git status`, `git rev-parse`, `git add` or `git commit`, or with a redirect, since such a step could change the config before the push runs. Previously the plain `git push origin <branch>` skipped the config check entirely, and the bare `git push` checked only some of these settings. A `--dry-run` given as a push-option value (`git push -o --dry-run …`) no longer counts as a dry run.
+
+- **The safety guards now refuse a command they cannot read line by line.** When a command is split across lines with trailing backslashes and names an operation a guard checks (`git clean`, a git command that discards uncommitted work such as `reset` or `checkout`, a force push, a commit, an `rm`, a worktree removal, or a `pytest` run), the guard refuses it with a message saying to put the command on one line. A continued command cannot be read, so a mention counts even when it is only in text such as a commit message. The pull-request-close, capped-read and tmux advisories give a short note instead of their specific check. The guards also read a checked operation the way the shell assembles it from quotes and backslashes. Continued commands whose text mentions none of these run as before.
+
+- Autonomous code tasks now start their branch from the commit the remote's default branch (`origin/HEAD`) points at, instead of whatever the Genesis checkout has checked out, and the branch no longer tracks the default branch. Their delivery scope check compares against that recorded commit instead of local `main`, which could lag the remote, and their draft PR targets that default branch by name instead of a hardcoded `main`. A repository without a usable `origin/HEAD` (absent, or naming a branch that no longer exists) keeps the previous behaviour.
+
+- **Every malformed registry file is now a `RegistryError`.** PyYAML's built-in
+  constructors raise `ValueError`, `AttributeError` and `KeyError` on some bad
+  input (an impossible date, `!!timestamp nope`, `!!bool abc`), and those
+  escaped the registry's error contract. The loader now converts any failure
+  at its YAML boundary.
+- **The memory-volatility decision is a ranked yes/no.** It now asks whether a
+  memory is likely to stop being true within two months, and consumes
+  `ordering`: its probability ranks memories for re-verification. Measured
+  zero-shot against later evidence, this phrasing separates memories that went
+  stale at AUC 0.66, better than the previous five-way choice (0.62 at best),
+  and unlike a choice it needs no rule for turning an answer into a rank.
+
+- **Guardian: no snapshot delete on a pool that has already recovered.** Pool
+  relief now re-measures the pool immediately before deleting and stops if the
+  shortfall has eased (an autoextend landing, space freed elsewhere). Before,
+  it checked only that it was still the same pool. Delete-first rotation now
+  tries the create once more after its measurements, so if the pressure has
+  cleared it makes an ordinary create-then-delete rotation instead of deleting
+  the rollback snapshot first.
+
+- **The neural monitor maps every call site to a subsystem.**
+  - 26 call sites that rendered only in an "Other" card are now grouped. Some
+    join existing groups (memory, reflection, executor, learning);
+    four new groups take the rest: Dream Cycle, Awareness, Conversation and
+    Evaluation.
+  - Every group stays in one connected block on the grid. The hand-placed
+    map gives each of its groups exactly one cell per site, and the new
+    groups flow into rows below it, each starting on a new row when it would
+    otherwise wrap. Before, a site without a position stacked on the
+    top-left cell.
+  - Five ids that only survive as stale run-history rows are marked removed,
+    so they stop reappearing as live tiles: four with no caller or a newer
+    name, and one job that now runs as a direct session and records no
+    call-site data.
+  - A test now fails CI if any routing call site or live call-site metadata
+    entry is left ungrouped, duplicated, or without a display name, or if a
+    hand-placed group has the wrong number of cells or a split block. Metadata
+    entries that are not call sites of their own (an alias or a work tag) are
+    marked `tile: False` and kept off the grid.
+
+- **`update.sh` no longer deletes the wrong file on exit.** Its exit trap named its
+  temp copy through a path bash evaluates when the trap fires, so an exit from
+  inside a sourced library function (an unbound variable is enough) deleted the
+  library and leaked the copy. And a server started by its `nohup` fallback
+  inherited the "running from the copy" flag, so a dashboard update launched from
+  that server ran in place and its trap deleted `scripts/update.sh` itself. The
+  path is now bound once at startup, and "we are the copy" is proven by the
+  copy's own path.
+- **`update.sh`'s Guardian lease renewer no longer holds the update lock after it
+  exits.** The renewer's `sleep` inherited the lock and outlived the deploy, for up
+  to 15 minutes after a clean exit and about an hour after a kill. It is now
+  started without the lock, and it stops once the deploy that started it is gone —
+  judged by the process's identity (pid and start time), so a killed deploy that
+  lingers as an unreaped zombie, or a new process that reuses its pid, does not
+  keep the Guardian paused. The pause, resume and renewer moved to
+  `scripts/lib/guardian_pause.sh`; the deploy marker and the list of tracked files
+  a deploy may find dirty moved to `scripts/lib/deploy_marker.sh`, shared with
+  `restore.sh`.
+- **A zombie no longer holds the deploy marker.** A deploy that was killed but not
+  yet reaped left `~/.genesis/update_in_progress.pid` naming a zombie, and every
+  liveness check read that as a deploy still running: new deploys refused, and the
+  watchdog kept from restarting a down server. The marker's holder now counts only
+  if it is running and not a zombie, in the deploy scripts and the watchdog's
+  reader alike. The holder check compares no clocks, so a wall-clock step cannot
+  make a live holder read as stale.
+- **`restore.sh` refuses when it cannot write the deploy marker.** The write was
+  unchecked, so an unwritable marker read as held: the restore stopped the server
+  and rebuilt the database without the marker the watchdog defers on, which let
+  the watchdog restart the server mid-rebuild. It now refuses before stopping
+  anything, and says why.
+
+- **Bearer-token checks compare bytes, and bearer tokens must be ASCII.** The MCP HTTP transport's auth guard and the dashboard's internal-API bearer check compared the presented token as text, so a token with non-ASCII characters (or header bytes that are not valid UTF-8) raised inside the comparison and the request failed with a 500. Every bearer check now compares bytes and refuses a wrong token with 401. `GENESIS_MCP_HTTP_TOKEN`, `GENESIS_DESK_TOKEN` and `--auth-token` values containing non-ASCII characters are now treated as unconfigured, with a warning: such a token has more than one byte spelling, which could let two different configured tokens match the same credential. Operator step: if either token contains non-ASCII characters, replace it with an ASCII one (generated tokens are always ASCII).
+
+- **The disk guardian's reclaim paths are safe to enable.** Neither an ORANGE reclaim pass nor the daily groom deletes the code-intel indexes any more (only the guardian's RED last-resort pass does); a completely full filesystem under ~25 MB now reaches RED; a new pressure episode gets its reclaim levers back instead of inheriting the previous episode's cooldown; pages state what reclaim actually did (a start is reported as queued, a failed start or a refused sweep says so, and the cc-tmp sweep counts only units it actually removed) and label the writer list as this user's processes (block-device writes; on a tmpfs page, which those counters cannot see, the page says writers cannot be attributed). No delete crosses a mount: every recursive delete in the guardian's shell scripts (the `~/tmp` prune, the background-sandbox reap, the cc-tmp sweep and the sessions prune) goes through one helper that spares a directory which is, or holds, a mount — read from the mount table, so a bind mount or a same-device volume counts, including names with newlines or control bytes — and every one refuses outright, saying why, when the kernel mount table cannot be read; `disk_reclaim.py` refuses a cache directory that holds a mount, or when the mount table cannot be read. The observe-mode notice now says OOM capture still pages.
+
+- **The safety guards now refuse text the shell builds while it runs.** A command that writes part of its text as an escape inside `$'…'` quoting (a letter, a newline, or a character given by its code) is treated like a command split across lines: when it names an operation a guard checks, the guard refuses it and says to write that text out plainly. The discard guard and the commit gate also refuse a git command whose subcommand is not written out (a variable, a substitution, a brace expansion or an escape stands in its place), as the push guard already did. A tab, a quote, a backslash or a `?` written as an escape counts as built text too, because a shell that reads the text again treats each as syntax; escapes that never mean anything to a shell (a bell, a terminal escape, a form feed) are left alone. Where a tab escape sits in a command that names a checked operation, write a literal tab or `$(printf '\t')` instead. Commands that name no checked operation, and variables in ordinary arguments, work as before.
+
+- **The content-boundary key no longer affects knowledge caching, and is read safely.** The web knowledge processor removes the fetcher's own boundary wrapper (a complete opener and closer with matching ids) before the page text is hashed, so a changed or restored `~/.genesis/boundary_key` no longer makes unchanged pages re-distill; local documents are hashed exactly as they are. The key file is used only if it is a regular file no larger than a key and holding exactly 64 hex characters, read without blocking; anything else falls back to a per-process key with a warning. Web pages already in the knowledge base re-distill once on their next re-ingest, as they would after #2537's wrapper change in any case.
+
+- **`worktree_lifecycle.py --recover` works again.** Two changes that each
+  passed on their own met on `main`: `--recover` gained a `--dry-run` preview,
+  and recovery moved into a locked helper that was never passed the dry-run flag.
+  Every recovery, preview or real, then stopped with `NameError` before
+  touching anything. The flag is now passed through, so an archived worktree can
+  be previewed and restored again.
+
+- **The commit-message hook reads the install's private-identifier fingerprints
+  the way the pre-push review does.** Both read the same fingerprint file, but the
+  hook used `grep -E` and the pre-push review uses Python's `re`, so they disagreed
+  about the same pattern. A pattern using Python-only syntax (`\A`, `\d`, a
+  lookbehind) matched nothing at commit time. A pattern `grep -E` rejected (an
+  unbalanced parenthesis) made the whole file read as "no match", so one bad line
+  turned off every fingerprint, and a file saved with CRLF line endings matched
+  nothing. The hook now reads the file with the pre-push rules, in Python, and in the
+  Genesis venv's interpreter, picked in the pre-push review's order (the main
+  checkout's first, since a pattern can compile in one Python version and not another): each line
+  trimmed, comments and blank lines skipped, and a pattern Python cannot compile
+  matched as literal text, named in a warning by line number. It prints line numbers
+  only, never a pattern (the pattern is the private value) or the file's path (which
+  can name a user or a host). A line that is not UTF-8 is still checked, byte for
+  byte, instead of stopping the whole check. With no usable Python (a broken install,
+  since bootstrap builds the venv before it installs the hooks) the hook says loudly
+  that the message was not checked, and does not block. An `errexit` or `pipefail`
+  inherited through `SHELLOPTS` or `BASH_ENV` no longer turns a clean commit into a
+  failed hook. The pre-push review's reader is hardened the same way: a pattern that
+  breaks the compiler in any way (a huge repeat count, deep nesting) is matched as
+  literal text, and a byte that is not UTF-8 no longer stops its scan, so one bad
+  line cannot turn off every other fingerprint there either.
+
+- The commit gate's review-round lookup now reads a pull request's review evidence in one GitHub GraphQL query instead of five REST calls, cutting its typical time from about 5 seconds to under 2. Commits on busy pull requests now rarely fall back to an approval prompt (or a refusal, in background sessions) because the lookup ran out of time.
+
+- A clean Codex review now satisfies the merge gate's freshness check. Codex posts no review object when it finds nothing, only a comment naming the commit by a short id, so the gate refused to merge until someone waived the check. It now accepts that comment (or Codex's PR-summary "Completed" row) when the short id resolves to exactly one of the pull request's own commits, that commit is the current head, Codex left no review object there, no Codex comment on the pull request carries findings, the comment was not edited by anyone but Codex, and the pull request has never been force-pushed, retargeted or had its branch restored. When it refuses a clean signal, the block message says which one and why.
+
+- **The commit gate's no-pull-request exemption now works under a global git remote setting.** Any `remote.<name>.*` key in the global git config (for example `remote.origin.prune`) makes git list that remote, with no URL, in every repository that has none. The gate read that empty URL as possibly GitHub, so a scratch repository with no remote still asked for approval on every commit. A remote whose listed URL is empty is now skipped, whatever made it empty (a stray key, an empty or whitespace-only `url`, a remote holding only gh's own `gh-resolved` key, or an `insteadOf` rewrite to nothing), since `gh` resolves repositories from the same listing and finds nothing to resolve either. A push-only URL is listed on its own line and still counts.
+
+- **The merge gate now reads CI from the newest run of each workflow.** A PR
+  whose CI failed (for example on a broken base branch) and then passed in a
+  new run on the same head used to stay `ci: red`, because the check rollup
+  keeps every run. For each workflow, the newest run on the head now decides as
+  a whole: a newer passing run clears an older run's failures, and a newer run
+  that failed, was cancelled or is still running decides the result in the same
+  way. Results are never mixed across runs, so two failed runs cannot add up to
+  a pass. A newer run that skips a job also clears that job's failure from an
+  older run. A check whose run cannot be identified is always counted. This does
+  not block re-running a failed job until it passes: GitHub reports only a
+  re-run's latest attempt.
+
+- **`update.sh` refuses a checkout it must not deploy, before it touches anything.**
+  A linked worktree at any path (git decides, not the path name), a bare
+  repository, a detached HEAD, or any branch other than `main` is refused before the
+  lock, the rollback tag and the backup, and the message names the branch it found.
+  An update run on another branch used to merge `main` into that branch and restart
+  services on the result. `GENESIS_ALLOW_NON_DEPLOY_BRANCH=1` admits another named
+  branch deliberately; it never admits a worktree, a detached HEAD, or `live`. The
+  checks now live in `scripts/lib/deploy_checkout.sh`, which
+  `scripts/deploy_code_only.sh` also uses (with no override), so the two deploy
+  paths cannot disagree. `update.sh`'s dirty-tree check is the shared one too: a
+  file renamed into an excused path now counts as a local change, and an unreadable
+  working-tree status refuses instead of passing as clean.
+- **`update.sh` deploys the commit it fetched.** It pins the fetched `main` head and
+  merges that exact commit; a fetch by another session in the same checkout can no
+  longer change what is deployed. A merge that reports success without bringing
+  that commit in, or that landed on a branch other than the one the run started
+  on, fails the update.
+- **`update.sh` never resets a checkout someone else is using.** If another session
+  or editor switches the branch, commits, or edits a tracked file while an update
+  runs, the update refuses before it merges. During the pre-update backup nothing
+  has stopped yet; after the stop, the rollback takes over. That rollback resets
+  only the merge it made itself. A plain branch switch with nothing uncommitted is
+  switched back without force, and the other branch keeps its commits. Any other
+  move is left exactly as it is. Services are reinstalled and restarted only on the
+  pre-update code; otherwise the rollback reports itself incomplete and says what
+  is in the way. The old rollback checked the original branch out and hard-reset
+  it, which could destroy that work, and could restart services on code nobody
+  had validated.
+- **`update.sh` no longer overwrites a local ignored file that the update starts
+  tracking.** Before any service stops, it lists the files the incoming commits
+  add or change and refuses, naming them, if any already exist locally as untracked or
+  ignored files (a local settings or secrets file, for example). Move them aside and
+  re-run. The same check runs again as the last step before the merge, so a file
+  that appears while services are stopped is refused too, before anything merges.
+- **Local edits to `AGENTS.md` and `config/procedure_triggers.yaml` are kept.**
+  `update.sh` used to discard them before every merge, with no copy. It now saves
+  them first, before any service stops, under `~/.genesis/premerge-backups/<run>/`
+  (a patch plus a copy) and prints where. `update.sh`'s own rollback, which resets
+  tracked files, first saves any edit not already backed up, including on a
+  `--post-merge` run. It discards an edit only when the update changes
+  that file or the edit is staged (otherwise git keeps it through the merge), and
+  only once a backup of its current content exists. The daily disk-hygiene run prunes these backups
+  after 45 days.
+
+- **A deploy that left the server down now says so in its "success" record.** Every
+  success entry `update.sh` writes now carries `genesis-server-not-restarted` when the
+  server was not brought back, including the no-change path. On the no-change path, "brought back" now means the health endpoint
+  answers within a bounded wait, not that the unit merely reads as active (a
+  crash-looping server does),
+  and the leftover update-failure marker is cleared only then. With the server down, a
+  no-change run records nothing over a failed, rolled-back or other unresolved update,
+  so the next run still recovers it. The status it reads comes from the install's own
+  database rather than a fixed home path, an unreadable status is treated as a
+  possible failure (recover, and run the full activation) rather than as "nothing
+  happened", and a missing venv now prints a warning that the history entry could not
+  be written, instead of skipping it silently.
+
+- **Re-applying Genesis gstack patches no longer replaces the current `codex`
+  skill with an outdated copy.** Genesis no longer ships a `codex` overlay;
+  `scripts/apply_gstack_patches.sh` now leaves the upstream gstack `codex` skill
+  as-is. An install that customises its `codex` skill maintains that
+  customisation locally. The review-checklist overlay and the safety and
+  description patches are unchanged.
+
+- **The worktree guard refuses a removal whose worktree it cannot read.** Every direct `git worktree remove` is meant to be refused, but the guard only acted when it could read the worktree being removed. It now also refuses when `xargs` or `parallel` runs the removal (or a `git worktree` whose operation is not written out) without naming the worktree, when the command hands the removal to a shell or `source` through stdin, and when a command it cannot tokenize, or a carrier such as `eval`, names the removal with no worktree after it. These refusals name no target, and each gives the remedy for text that is not a command. Measured over one install's recorded commands that mention worktrees (29,556, 2026-09-29): the guard refuses exactly the 178 that the guard on current `main` refuses, none new, and nothing it refuses runs here. Known costs: prose inside a here-document that names the removal under `xargs` is refused, as is a shell fed a here-document whose body only mentions the removal (write such text to a file instead), and `git worktree` under `xargs` with `--help` or a replace-string option.
+
+- **A code-only deploy now refuses a pyproject that moves the package root.** The editable install points at the source directory through a `.pth` that only a reinstall rewrites, and `scripts/deploy_code_only.sh`'s dependency gate never looked at it: a change to `[tool.setuptools.packages.find].where` passed, and the server restarted on the old location. The gate now compares the directory the install's `.pth` names with the one the incoming `pyproject.toml` lays out, and sends a difference to `scripts/update.sh`. It reads the incoming layout from one shape only (the `setuptools.build_meta` backend, and `[tool.setuptools]` holding just `packages.find` with one `where` other than the checkout itself, which is what this repository uses); any other pyproject build configuration is refused as one it cannot check, so such a tree deploys through `update.sh`. A test fails if this repository's own `pyproject.toml` leaves that shape.
+
+- Skill suggestions no longer fire on a single common word. "session" no longer suggests the closing-session skill and "api" no longer suggests an API-gateway skill; a skill is suggested when its full name or one of its declared keywords appears. A slash command's own name is no longer read as the task either. Replayed over 6,803 real prompts, suggestions dropped from 28.5% of prompts to 14.1%.
+
+- The `outreach_queue` MCP tool no longer accepts a `status` argument. It never applied it, so a status-filtered call silently returned unfiltered results. Its description now states that it lists the 20 most recent sent messages and points to `outreach_pending` for queued ones. The `observation_write`/`observation_query`/`observation_resolve` and `procedure_recall` descriptions now state their real contracts: valid priorities, duplicate handling, the 50-row default query limit with no total, and the top-3 cap and usage counting.
+
+- The `live` integration-branch guards close four gaps. The pre-push check for `Deploy-rebuild:` commits now reads commits as stored and treats any line after the subject that starts with the trailer as one, so a trailer key alias (`trailer.<key>.key`), `i18n.logOutputEncoding`, a `git replace` ref, or trailing comment, `Conflicts:` or scissors text can no longer hide one, and a push is refused when the check cannot read its commits. The Claude Code merge guard refuses a merge that follows, in the same command, any git or `gh` command that can change the current branch (everything except reads, `add`, `commit`, `fetch`, `pull` and `merge`), for example `git checkout live && git merge --ff-only feature`, which moved `live` unrefused (the same form reached `main`), and asks for the two to be run separately. The commit guard's repository checks now fit inside its time limit, so a slow `git` makes it refuse instead of being killed and letting the commit through. `~/.genesis/deploy_manifest.json` may now name its repository in a top-level `"repo"` (that checkout's absolute git common dir); the git hooks and both Claude Code guards then apply the `live` protections only in that repository. A manifest without the key behaves as before; one that cannot be read, or whose `"repo"` is not an existing git common dir, keeps the protections on everywhere.
+
+- **A syntax error in `model_routing.local.yaml` now takes routing down until it is fixed.** A file that cannot be read or parsed as YAML holds no restriction the router can read, so loading the shipped config in its place would lift every one of them (disabled providers, `never_pays`, narrowed chains, lower limits). The load is refused instead: a router starting on that file is not created, the ERROR log and a high-priority health observation name the file, and a dashboard reload refuses it and keeps the running config. A router that is already running is unaffected until the next restart. Fix or remove the file before restarting. An overlay that parses but fails validation still falls back to the shipped config with its restrictions applied, as before. Separately, the degradation check now returns to essential-site coverage after a routing reload, even when an earlier reload had no essential call site; previously it stayed on the provider-count check until a restart.
+
+- **`deploy_code_only.sh status --verify` now sees a change to the scripts the server itself uses.** The validation bracket treated only `src/`, `config/` and `pyproject.toml` as what the server depends on, but the server also imports two files under `scripts/` (the code-index marker helper and the worktree-claim lever) and runs four more afresh on each use (the disk-reclaim remediation, the Bash-allowlist guard with its library, and the hook launcher it runs that guard through). A pull that changed only one of them left the token valid. Now it voids the token, and an uncommitted edit to one reads as a runtime edit. Only the two imported files are reported as pending a restart and make `deploy` restart the server; a change to a script run afresh is live at once and asks for no restart. A test checks the lists against the ways the server's code refers to files under `scripts/`.
+
+- **WebSearch override: says why it fell back when another plugin rewrote the
+  result.** The override calls Genesis `web_search` through Claude Code's
+  normal tool pipeline, so another plugin's PostToolUse hook that replaces
+  large MCP results with a summary made most searches fall back to the
+  built-in, logged only as "the reply was not JSON". The log now names the
+  likely cause, and `.claude/docs/web-tools-guide.md` explains how to exempt
+  `web_search` from such a hook (for token-optimizer:
+  `TOKEN_OPTIMIZER_ARCHIVE_EXEMPT_TOOLS`).
+
+- **Retry eligible Claude Code provider overloads (HTTP 529) below the existing approval gate.** Ego cycles, reconcile/realist checks and inbox evaluations retry the same invocation after 30s, 2m and 5m. Known-work overloads (more than one CLI turn) and MCP-backed overloads instead use the replay-unsafe boundary: no stale-resume recovery, full-tools roster failover or durable rate-limit park. The inbox persists a hold that survives scans and retry-cap increases without advancing its completed baseline; a per-item operator command requires explicit replay acknowledgement before release through normal approval/claim handling. Unknown or unusable turn counts remain retryable by accepted policy and can replay work; this is not an exactly-once guarantee. Eligible overload exhaustion does not spend inbox retry budget. Eligible overloads retain capacity-limit handling elsewhere (conversation failover, direct-session parking, Telegram notice and warning-level failure events). Classification retains structured result and stderr evidence even with trailing diagnostics. Detection also stops matching numbers that merely contain `429` or `529`, and treats "temporarily limiting requests (not your usage limit)" as transient rate pressure rather than quota exhaustion. Recovery procedure: `docs/reference/inbox-replay-safety.md`.
+
+- The OpenAI-compatible chat-completions endpoint now returns HTTP 400 when a request does not end in a usable user message (empty, image-only or malformed content, or a trailing non-user entry), instead of falling back to an earlier user message from the history and running that instruction again.
+
+- **Disk reclaim no longer deletes the code-intel indexes on its own.**
+  `scripts/disk_reclaim.py` used to clear the code-intel index databases at
+  95 % disk use whenever a caller did not say otherwise, and the automatic
+  disk-cleanup remediation was one such caller. Deleting them forces a full
+  re-index later, which is heavy. The script now never clears them unless a
+  threshold is passed with `--last-resort-above`, and only the disk guardian's
+  last-resort pass does that. Package and download caches are still cleared
+  as before.
+
+- **Test runs no longer keep every passing test's temporary directory.**
+  The pytest configuration now sets `tmp_path_retention_policy = "failed"`,
+  so a passing test's `tmp_path` is removed when the test finishes and only
+  failing tests keep theirs for debugging. Runs that pass their own
+  `--basetemp` previously kept every directory until removed by hand.
+
+- **Each ego now sees its own history, not the other ego's.** The user ego and
+  the Genesis ego share one cycle history. Two parts of each ego's context
+  were read from that history without telling the egos apart. The "Your
+  Previous Assessment" section came from whichever ego had run most recently,
+  so an ego was often handed the other ego's focus summary as its own. The
+  focus selector's "recent focuses (avoid repetition)" list mixed in the other
+  ego's choices too. Both reads are now scoped to the ego they are for. Cycles
+  recorded before the ego source was tracked are no longer offered to either
+  ego. The dashboard's all-ego views are unchanged.
+
+- **Eval runs keep their lock files in `~/.genesis/locks/`, not `~/tmp`.**
+  The bench, gauntlet and skill-replay runners each refuse to start while
+  another run of the same kind is going. Their lock files lived in `~/tmp`,
+  scratch space that is pruned by age and can fill up, so a lock file pruned
+  between runs could fail to be re-created and stop a run from starting. For
+  one release a run also takes the old `~/tmp` lock, so a runner from before
+  the update and one from after it still cannot run at the same time.
+
+- **Genesis's review and research subagents keep their scratch files out of
+  Claude Code's shared temp.** Each agent definition now tells the agent to
+  create its files in one directory of its own under `~/tmp`, pass that
+  directory explicitly, cap reproductions that create many or large files,
+  and clean up. A subagent writing to the default temp location could fill
+  the space every session shares and break them all.
+
+- **An OOM-kill alert is no longer lost when it cannot be queued.** If the
+  disk guardian could not write the alert (a full disk is the likely cause),
+  the kill was recorded but no page was ever sent. The alert is now kept and
+  retried on every poll until it is queued, and a later kill's alert names
+  both. Separately, the guardian's "can I see other processes?" check no
+  longer counts its own child processes, which matters if it ever runs in a
+  private process namespace.
+
+- **`scripts/update.sh` now chooses its update remote by one fixed rule and pins it.** It used to take the first remote, in name order, whose URL contained the repository name, so a remote added later with the same repository name (a fork fetched for review, for example) could be chosen ahead of `origin`. The shared rule (`genesis.util.update_remote`) uses `origin` when it names the public repository, or when no remote does, and compares repository names whole rather than by substring. It refuses when another remote names the public repository and `origin` does not, because a fork fetched for review carries the same name: an install whose `origin` is a private repository pins its public remote once, with `git config genesis.updateRemote <remote>`, and the refusal says so. `update.sh` pins an `origin` choice in the checkout's own git config on first use, so a remote added afterwards cannot change it, and prints how the remote was chosen. `GENESIS_UPDATE_REMOTE` overrides it for one run. The update-available check uses the same rule, read-only, and reports a refusal as a failed check rather than comparing against `origin`.
+
+- **The worktree reaper no longer archives a worktree with uncommitted changes on the short 7-day clock.** A merge verdict describes commits, never uncommitted edits, and it can pass with nothing merged at all: a branch with no commits of its own has a `main` commit as its tip, and a branch stacked on a squash-merged PR head looks merged too. Any dirty worktree now waits the 14-day unmerged window and is reported as at-risk meanwhile; a clean merged worktree still drains at 7 days. A filename (with `core.quotePath=false`) or a worktree name that is not valid UTF-8 no longer ends the reaper run, and an archive of such a worktree can be recovered.
+
+- **A failed update no longer throws away uncommitted edits made while it ran.** If another session or editor changed tracked files after `update.sh` merged, and a later step failed, the rollback's `git reset --hard` discarded those edits; only `AGENTS.md` and `config/procedure_triggers.yaml` were saved. The rollback now switches the branch back to the pre-update commit with a non-forced `git checkout --no-overwrite-ignore`, which leaves every edit to a file the update did not change in place, keeps staged changes staged, and refuses outright when a file the update changed has local changes or when an untracked or ignored file sits where it would write. It also refuses when the update changed a submodule, whose files git does not check. When it refuses, it reports the update as not rolled back, keeps the migrated database to match the code left in place, and does not restart services.
+
+- **The worktree reaper no longer mistakes a recently changed worktree for an idle one.** Its activity clock missed several kinds of change below its shallow scan: a file or folder deleted or renamed deep in the tree, a path git quotes because it holds unusual bytes, an edit inside a submodule, and a commit, whose status is clean afterwards. It also archived a worktree changed while the scan was running. The clock now reads three signals, one for each kind of change: every directory's mtime (anything created, deleted or renamed, at any depth), the paths git reports as changed (edits), and when HEAD last moved, read from the timestamp inside the newest reflog entry other than the ones a worktree's creation writes, which `git gc` leaves intact. Right before archiving, the reaper re-checks the age and compares the worktree's commit, branch and status with what it read at classification, and holds the worktree if anything changed or cannot be read. A worktree it holds no longer stays listed for archiving on the board until the next run.
+
+- Merge-gate clean Codex signals now bind repo-wide to the verified head, and the history veto covers head force-pushes, head-branch deletion or restoration, and base changes. Base changes stay vetoes because retargeting changes the effective diff without moving the reviewed head; a base force-push no longer voids a signal because the default base forbids it and a forced non-default base must pass through a vetoed base change to merge. Edit-history completeness is required only for Codex Bot comments, and untrusted edits permanently refuse clean signals with the editor named. Freshness reports use the gate's recorded pass reason and say when the head moves afterward.
+
+- Update-history readers (MCP tool, dashboard status, backup tab) now order by true instant via datetime(started_at) and expose per-row deploy facts; a success row carrying genesis-server-not-restarted is surfaced as "server not restarted" instead of a plain live success.
+
+- **Tailscale watchdog state is handled more reliably.** It preserves daemon continuity when identities are incomplete, keeps polling through unreadable systemd reads, counts malformed-only scans as blind, recognizes runtime-enabled timers and masked services, and verifies every watchdog unit before reporting uninstall success.
+
+- **Knowledge ingestion now routes every YouTube video URL to the YouTube processor.** That covers `/live/` and `/embed/` URLs, and watch URLs whose `v=` is not the first query parameter (playlist and share links); all of these used to go to the generic web processor and lose their transcripts. A URL that only contains a YouTube-looking fragment, or a `watch?v=` with no video id, no longer reaches the YouTube processor. The registry now asks the matched processor whether it handles a URL before routing it there.
+
+- **The stranded-branch checks no longer freeze once the repository passes 2000 pull requests.** Zero-drop reads the full PR history to tell merged branches from stranded ones, and `max_prs` (the `gh pr list --limit`) was 2000. A read that fills its limit is treated as truncated, and the branch checks are skipped for that sweep, so once the repository had more PRs than that, every sweep skipped them. `max_prs` is now 100000. gh pages until the PRs run out, so the higher ceiling reads the whole history in the same time; a read that still fills it still freezes rather than guessing.
+
+- **Interactive Claude Code sessions no longer start the Discord MCP server.** `.mcp.json` copied every server from `config/mcp.json.template`, so each interactive session spawned `discord-bot` too, even though only the `community-responder` background profile uses it. The render now leaves out servers that only a dispatch profile uses. The template still lists them, so `community-responder` keeps its Discord tools. This also covers conversation-channel sessions, which run in the checkout and load the same `.mcp.json`; Discord tools are now available only to `community-responder`. (A dispatch on the `full` MCP profile was never affected: it runs outside the repo and never loaded `.mcp.json`. The docs now say so.) `install.sh` now renders `.mcp.json` with the same script `bootstrap.sh` runs. Re-running `install.sh` still leaves an existing `.mcp.json` alone; existing installs pick the change up at their next `bootstrap.sh` (which `update.sh` runs on every applied update; a code-only deploy does not re-render it), and in sessions started after that.
+
+- Routing reloads keep active requests on their original model and isolate replacement-model health. Same-alias model changes preserve daily usage; provider renames preserve incident history; model replacements retain account and operator holds. Captured API-key health preserves essential coverage; proven retirement starts a fresh incident and retires obsolete observations, including delayed writes after alias replacement. Ordinary renames preserve incident ownership and acknowledgments through restart, partial recovery persists provenance, and resilience uses the captured generation. Captured requests retain their RPM policy while sharing pacing history; current health snapshots update cloud resilience in full and readonly runtimes without stale snapshots overwriting live state.
+
+- **Fixed the merge-gate PR-body scanner reading documented examples as real declarations.** `readable_body` now follows CommonMark on the two rules it diverged from: a closing fence must be the same character and at least as long as the opener (a ```` block no longer ends at an inner ``` line), and lines split only on `\n`, `\r\n` and `\r` (a line joined by NEL or a Unicode line/paragraph separator no longer reads as two). The `e2e_declaration` fallback scanner carries the same fix so the two body readers stay in agreement.
+
+- Leave disabled Codebase indexing requests pending without repeatedly claiming them, and support a shared GitNexus Node runtime selection for indexing and MCP readers (`GITNEXUS_NODE_BIN` or `~/.genesis/gitnexus-node`).
+
+- **`ego_decision` and proposal-rejection capture no longer fold a new ruling into
+  an existing decision that only shares its `[type/category]` tag.** Tags match
+  literally, only a repeat of the same ruling reaffirms (whichever path recorded
+  it first, and even when the 500-character cap cut a rejection's provenance
+  note), and `record` returns the other same-tag rulings, most recently affirmed
+  first, as `related` with `related_total`.
+
+- Generated reflection reference datasets now remain unapproved drafts instead of assigning machine grades as human labels. Existing files are preserved, and calibration offers strict reference validation before judge calls. Empty generation can be retried, experiment tools retain their historical reference default, and strict validation rejects duplicate grading questions. Drafts publish atomically so interrupted writes do not block retry with a partial final file.
+
+- NVIDIA health probes now use its models catalog instead of incorrectly reporting
+a missing API key when the probe URL was absent. Catalog observations cannot
+change NVIDIA breakers. Unsupported probe targets retain breaker-based display;
+the health API distinguishes probe support, credential presence and breaker
+authority. Model routing and qualification are unchanged.
+
+- **`worktree_lifecycle.py --recover` restores a worktree's own `.trash_meta.json` in a subdirectory.**
+  When the registration is gone and recovery recreates the worktree, it copies the archive's untracked files back and skips the reaper's own metadata. It skipped every file of that name at any depth, so a worktree's file of the same name in a subdirectory was not restored, and `--dry-run` did not count it. Only the file at the tree's root is the reaper's; the rest are now copied back and counted.
+
+- Global process discovery now records inspection candidates without terminating CLI or browser processes, including when legacy reaper arm flags are present. Explicitly owned jobs keep their existing cancellation behavior.
+
+- **Push-argument parsing now follows Git, in one shared scanner.** The push
+  guard read several push spellings differently from Git: a value after a
+  bundle-ending `-o` (`-uo -f`, `-uo +x`), a `git -c +k=v` global value,
+  `origin -- -f`, a `--repo=fork` that is only an `-o` value, Git's unique
+  long-option abbreviations (`--mirr` is a real `--mirror`), and which
+  destination wins when a push names both `--repo` and a positional repository
+  (Git uses the positional one). A forced push to origin spelled any of these
+  ways now gets the force block instead of an approval prompt.
+
+  Two spellings now get the lighter path, because Git treats them as plain
+  pushes: `git push -- origin HEAD` and abbreviated safe flags such as
+  `--set-up` can ride the re-push path. `git push --force --repo origin backups`
+  now asks instead of blocking, because Git pushes it to `backups`.
+
+- A force push away from origin is now blocked unless the whole command is one
+  plain `git push`, with no prefix, wrapper, git global option, redirect, pipe
+  or other step; its destination is read before the command runs, so those
+  additions can change what the push targets. Non-force pushes carrying any
+  prefix, wrapper or untrusted git global config option are blocked regardless
+  of destination, because supplied config can retarget the push or add a forced
+  refspec such as `remote.<name>.push=+…` or
+  `remote.<name>.pushurl=…` that has no force flag. A force push directly to
+  origin keeps the specific public-repository block.
+
+  The structural force-push rule deliberately means retyping commands such as
+  `git -C <dir> push -f backups`, `git push -f backups 2>&1`,
+  `git push -f backups | cat`, `cd x && git push -f backups` and
+  `timeout … git push -f backups` as a single plain push. For non-force pushes,
+  `git -C <dir>`, `git -P` and `git --no-pager` remain safe; command prefixes
+  and wrappers are blocked even for a disjoint remote.
+
+- **Bootstrap stops when crash recovery cannot be safely completed.**
+  Crash recovery no longer runs `git reset --hard`: it undoes only its own
+  update's merge with a non-forced checkout. If ownership or a safe rollback
+  cannot be established, bootstrap exits 1 and keeps the recovery state file.
+  If a merge is in progress, bootstrap refuses without aborting it — run
+  `git merge --abort` yourself, then rerun bootstrap.
+
+- Review-request compounds now allow only inert neighbors (`cd`, `sleep`, read-only `gh pr view/checks`, and `git status`); other steps are refused. A close predicate may name a pull-request close in the refusal message, but never decides whether the compound is refused.
+
+- **Refuse unsafe staged install-local path changes before an update stops services.**
+  On divergent history, an update now refuses when an excused install-local path
+  has a staged change the pre-merge clear cannot undo, including additions,
+  deletions, intent-to-add entries, gitlinks, and any staged change on the
+  de-tracked transitional paths. Staged edits to `AGENTS.md` and
+  `config/procedure_triggers.yaml`, fast-forward updates, and local-ahead updates
+  remain allowed. The guard runs again immediately before services stop.
+
+- Re-push approval now uses Git's porcelain dry-run ref flag to distinguish first publishes from updates to the current branch. Recorded approvals retain an offline path; remapped refs and unsafe transports continue to require approval.
+
+- **Code-only deploys save install-local edits before resetting ephemeral files.**
+  They store edits under `~/.genesis/premerge-backups`, refresh backups after
+  service stop hooks run, and refuse flagged edits that cannot be safely reset.
+  A failed reset is not reported as completed and still raises the deploy-failure alert.
+
+- **Merges through the GitHub API go through the merge gate.** A pull-request merge sent with `gh api` (REST `pulls/N/merge` or `merge-async`, or a GraphQL merge mutation) is now refused with a pointer to the gated `gh pr merge` command, so every merge-gate check runs. `gh pr merge --help` on its own is no longer refused.
+
+- **Web fetches say when Scrapling is unavailable.** When Scrapling's fetcher cannot be imported (it needs browser-automation packages such as playwright and browserforge), web fetches fall back to plain HTTP without TLS impersonation. That fallback used to be silent; it now logs one warning per process naming the import error.
+
+- **The browser reminders now reach the session.** Genesis's own tools return their result as JSON text, which the reminder hook read as empty, so the reminder after `browser_navigate` never fired. It now fires, on every browser layer, with a pointer to the browser-automation skill's safety gates for payments and credentials; on Camoufox it also points to the stealth-browser skill.
+
+- The browser tools' shared log (`~/tmp/mcp_health.log`) is now rotated by the daily disk-hygiene job once it passes 10 MB, keeping up to two older copies (which the 7-day `~/tmp` cleanup also removes); it previously grew without limit.
+
+- **`browser_sessions` and `browser_clear_domain` cover both browser profiles.** They now read and clear Camoufox's cookies as well as Chromium's, label each result by browser, and use the running browser when one is open. Clearing `x.com` no longer also clears `netflix.com`: domains match whole labels (`x.com` and its subdomains), and a bare public suffix such as `com` is refused. `browser_clear_domain` returns the number of cookies removed instead of yes or no. A profile another session's browser has open is listed from its file and is not cleared; its entry says why.
+
+- **Driving your own Chrome (remote CDP) uses a tab of its own.** Genesis now opens one tab in your Chrome and works there, instead of taking over the first tab you had open. Within a session it reuses that tab (one per Chrome endpoint) when it reconnects, and it never closes it; if it cannot tell whether that tab is still open, the reconnect fails rather than open a second one. A remote session no longer switches on fast "collaborate" timing for the built-in browser that runs afterwards (remote clicks, fills and uploads keep their own fast timing). `browser_snapshot` on a remote tab now clears the "page state changed" advisory, as the advisory says it will.
+
+- **Long form fields no longer time out.** `browser_fill` had a deadline based on the length of the text, which cut off values of a few hundred characters and reset the page. It now times out only if the browser stops responding for 30 seconds in one step.
+
+- **Browser clicks land, or fail saying why.** On the default Camoufox browser, a click on an element below the visible part of the page used to do nothing while reporting success, and a click on an element hidden behind a cookie banner or dialog clicked the banner instead. Clicks now scroll the element into view and aim at a point that is really on the element (a link that wraps over two lines or a rotated element no longer counts as covered by its own container). If something covers the element, the click fails with an error naming the covering element, so it can be dismissed and the click retried, instead of a fallback pressing Enter behind it. (A covered element that is disabled or still moving times out rather than being reported as covered.) A styled checkbox or radio is clicked through its label. A click that may already have been delivered, including one cut off by the tool's timeout, is not followed by a fallback click, and its error says it may have taken effect rather than reporting a plain failure.
+
+- **Each browser closes on its own schedule, and one browser's restart no longer drops another.** After switching from the built-in browser to your own Chrome (remote CDP), the built-in browser used to stay open for as long as you kept using Chrome, because any browser call kept every browser alive. Each browser now closes about an hour after its own last use; a TinyFish cloud session follows the same rule and keeps billing until then. Restarting the built-in browser after its window was closed no longer disconnects your Chrome or ends a TinyFish session, and closing the built-in browser's window now also stops its background driver process. A TinyFish session whose connection dropped is now ended before a new one is created, rather than left billing.
+
+- **The Codex shell guard no longer tells an agent to stop on a denial it can fix itself.** A chained commit, or a heredoc the guard cannot parse, is now denied with "rewrite the command and run it again" instead of "STOP and handoff to the user". Review-budget and approval denials still stop. A deliberate denial also no longer adds a second "review guard unavailable" line, which made every denial read as a broken guard; that line now appears only when the guard script cannot be found.
+
+- **Cancelling a knowledge upload can no longer delete a file outside the upload
+  folder.** The cancel action deleted whatever path the upload's database row
+  held, without checking that it was still inside the upload directory. It now
+  removes only the upload's own file, addressed by name inside the upload's own
+  directory and never through a symlink, and refuses (409) while leaving the
+  file and the row alone if the row points anywhere else. The dashboard's Cancel
+  button now shows that refusal instead of clearing the dialog as if the cancel
+  had worked.
+
+- Strictly proven data-bearing heredocs for `cat`, Git message, and `gh` body receivers no longer expose prose as shell commands; unproven heredocs remain visible to shell and secrets guards.
+
+- The Backup tab's health banner now warns when configured extra backup directories were skipped, archived only in part, or did not reach the off-site copy. Those runs still count as successful. Before, an install without an off-site backend showed nothing, and one with an off-site backend reported the off-site copy as unfinished even though its core snapshot was complete. A gap in the core off-site copy, or a failed schedule check, still takes precedence.
+
+- **The dream cycle now records which memory replaced one it retires.** Both consolidation paths (synthesis and duplicate merging) write the successor to the memory database, not only to the vector index, and rolling a run back clears it again. A synthesis that turns out to be an exact copy of one of its own source memories is now skipped instead of retiring that memory, and an explicit supersede on a dream-retired memory can no longer be silently redirected to the dream's successor. The dream cycle also leaves alone any memory the database already retired, and never retires a memory into one that is itself retired, and rolling a run back no longer undoes an explicit supersede made after the run.
+
+- The merge gate reads CodeRabbit's new bold severity header (`**🟠 Major**`) as well as the old italic one. Since CodeRabbit switched formats on 2026-10-06, its Critical and Major findings had stopped blocking merges, and review-round counting had counted every Trivial comment as a finding.
+
+- Fixed managed Codebase query startup to use the installed venv interpreter,
+verify physical CPU/task ceilings, admit the full query budget against current
+reclaim-aware ancestor usage at startup, and bound readiness around native
+appearance without prematurely consuming its RPC window during preflight.
+
+- Guarded uninstall preserves the original coordination lock namespace while removing other state inside the fixed deletion roots. Unsafe overlapping custom layouts refuse before retirement. Default host cleanup completes its guarded container transaction before removing Guardian artifacts. Backend retirement requires loaded/disabled or exact absence; masked and generated states refuse cleanup. Retention diagnostics account for final root symlinks and retained locks. Existing fallback GitNexus writers, diagnostic symlink loops, both Qdrant binary locations and dangling known unit links are handled explicitly.
+
+- Fixed qualification reference admission and approval to validate the full
+  current policy at each public boundary, and exclude configured bare candidate
+  model IDs and routing aliases from frontier grading.
+
+- Managed Codebase enablement checks typed backend commands and containment before
+  activation and again after explicit native refreshes. Exact current rendered
+  sources and override-free native namespaces govern activation and retirement;
+  unsupported units are preserved for operator intervention. Installation uses
+  the inspected manager directly, and final checks refresh cached native state.
+  Supported retirement remains independent of settings and interpreter existence.
+  Custom installs use their
+  existing `VENV_PATH` selection. Removal validates the full fixed artifact set
+  before unlinking and reports partial removal and reload failures.
+
+- Qualification reference admission now requires declared human or approved frontier
+feedback actors, rejects contradictory human machine identities, and includes
+frontier feedback reviewers in human approval independence. Historical receipts
+without actor metadata remain review obligations; existing corpus approvals are
+not transferred to modified snapshots.
+
+- The disk guardian no longer sends an EMERGENCY "cgroup OOM kill" page when capped work is killed at its own memory cap: jobs started with `python -m genesis.hostmetrics run`, the codebase-memory MCP wrapper and GitNexus index batches (which run in `app-capped.slice`), and opt-in indexing batches in `genesis-workload.slice`. Attribution is now counted from those slices' own cgroup counters, which say both where the killed process lived and whose limit fired, instead of matching journal text, which counted one notice per burst of kills and changes wording across systemd versions. A kill anywhere else, a kill inside those slices that a limit outside them caused, or anything that cannot be measured still pages. Each event in `~/.genesis/logs/oom_events.log` records the count per slice and the units the journal names. `OOM_CONTAINED_UNIT_PREFIXES` is replaced by `OOM_CONTAINED_SLICES`.
+
+- The dashboard's Apply update, Resolve conflicts and Dismiss actions no longer delete or overwrite the in-progress marker of a deploy that started at the same moment, which could let the watchdog restart the server in the middle of that deploy. They now refuse while a deploy, an update or a validation hold is running, and say so.
+
+- When a provider answers 429 with a free-tier daily quota (Google's `QuotaFailure` with a `PerDay` quota id and a `RetryInfo` delay), routing now deselects that provider until the reset time the provider gave, instead of calling the spent quota on every request for the rest of the day. The block is persisted in the daily-budget state file, so it survives a restart; it never trips the circuit breaker. A per-minute 429, or one without a parseable delay, is handled as before.
+
+- **A resumed code task no longer runs against the main checkout when its worktree folder is an orphan.** Resume now checks that git still lists the folder as a live worktree of this repository, under its own name, instead of asking git inside it (which walks up to the main repository and says yes). Worktree checks also ignore `GIT_DIR`-style overrides in the environment (while keeping command-line git config such as `safe.directory`), and the trash refuses to list or restore from a trash folder that is no longer a private directory of yours, or that it cannot read.
+
+- External Codex memory calls no longer process pending Claude session bookmarks; ordinary Genesis clients retain their existing behavior.
+
+- On an install running the `live` integration branch, only regular files may now go under the hook directories (a directory or submodule in place of a hook, or a hook list naming one, is refused like a symbolic link), and dropping a candidate whose git hooks `live` installed is refused while the checkout is off `live`, naming the fix (switch to `live`, then drop), instead of leaving its hooks running.
+
+- The proactive memory hook now stops itself 8.5 seconds after launch when a step stalls (a slow disk, a busy box), keeping what it already printed and saying in one line that recall may be missing, instead of being killed at Claude Code's 10-second limit with its whole output discarded. Its 8-second budget also counts from launch now. A stall inside a disk sync (fsync) can still outlast the limit.
+
+- Fixed the container-swap reconciler clobbering an operator- or Incus-native
+  `limits.memory.swap` byte-ceiling value back to `true` on every tick, which
+  would have flipped swap off continuously once such a value was set.
+
+- Codex budget checks require an absolute `git -C <directory>` for mutating commits and an explicit GitHub PR number/repository or a standalone GitHub PR URL for review requests. Context-dependent targets receive a rewrite instruction before budget lookup.
+
+- On an install running the `live` integration branch, two candidates can no longer combine into a git hook list that names a directory (one lists a name, the other adds a directory there): the rebuild excludes them by name instead of installing nothing for that hook and refusing every later rebuild.
+
+- **Fixed: SQLite temp files from genesis-server, the bridge and the watchdog no longer land on the Claude Code temp volume.** These units keep `TMPDIR` on `~/.genesis/cc-tmp` on purpose, because the Claude Code sessions they launch need it. SQLite inherited it too, so a large sort or index build spilled a 100-200 MB `etilqs_*` file onto that small volume, and the disk guardian paged it as a runaway file. The units now also set `SQLITE_TMPDIR=~/tmp`, which SQLite reads before `TMPDIR`. Only SQLite's spills move; `TMPDIR` is unchanged. A missing or unwritable `~/tmp` falls back to `TMPDIR`, as before the change, and the unit logs a warning saying so instead of refusing to start. Existing installs pick it up when the units are re-rendered (`scripts/update.sh`) and the services restart.
+
+- Fixed the guardian swap reconciler treating `limits.memory.swap: 1` as a
+  one-byte swap ceiling. `1` is an Incus boolean (true), so a live
+  `memory.swap.max` of 0 under it is ordinary swap-off and is now healed
+  instead of reported and left off.
+
+- Memory correction retries now reject unrelated missing or ambiguous successor handles while preserving exact-ID repair after a successor disappears.
+
+- On an install running the `live` integration branch, deploy health no longer reads a candidate's own files as undeployed merges or guardian drift, counts commits behind against origin/main, and raises non-paging findings when `live` cannot be read, when the checkout is off `live` while the deploy manifest lists candidates, when the manifest lists candidates `live` does not hold (or `live` holds ones it no longer lists), or when a candidate brings update.sh-only files. Every manifest and `live` fact comes from one new read-only engine call, `scripts/deploy_candidates list --json`. The Guardian watchdog's host checks (gateway staleness, SSH key hardening, Claude Code auth, linger) now run on any branch instead of only on `main`.
+
+- Memory recall no longer turns a long pasted prompt into a full-text query over every word in it. The expanded query, the file-keyword lane's base and the AND→OR retry now keep at most 32 search tokens, counted over every word including repeats (a snake_case identifier counts once per piece), filled with the most frequent words in the prompt; prompts within that budget are unchanged. Measured on a copy of a 113,000-row memory index over 40 long and 20 short real prompts: the slowest 5% of long-prompt searches fell from 26 s to 0.75 s and the largest temp sort from 155 MiB to 9 MiB; short prompts returned identical results. On long prompts the top results change (median 29% overlap with the unbounded ranking). Query expansion also skips the `session_note` tag, which sits on most memories and widened every expanded query.
+
+- Backup passphrases preserve Unicode whitespace bytes consistently across shell loading, Guardian integrity checks and escrow. Encryption and decryption reject line-feed passphrases before invoking GPG.
+
+- Fixed the daily `git fsck` monitor paging on noise (#2745). Its alert now
+  shows the lines that actually failed instead of thousands of harmless
+  `dangling` objects, and a failure is re-checked two minutes later before it
+  pages. A failure that passes the re-check, or whose re-check reports only
+  objects that turn out to exist (a race with another git writer), is recorded
+  as a `high` observation (morning report, dashboard), not paged. The scan also no longer
+  holds up the awareness tick while it runs.
+
+- **Fixed: an update no longer silently overwrites a systemd unit you edited by hand.** `scripts/update.sh` used to re-render every unit under `~/.config/systemd/user` from its template, discarding any change made in the unit file itself, with nothing in the output saying so. Each rendered unit now ends with a `# genesis-managed` stamp, and an update that finds an edited unit refuses before stopping anything (exit 4), naming the unit and the two fixes: move the change into a drop-in (`<unit>.d/override.conf`, which updates never touch), or run `scripts/update.sh --take-template <unit>` to install the template, with the old file saved under `~/.genesis/deploy-backups/`. The VNC units `scripts/setup-vnc.sh` writes are covered the same way. Timers listed in `~/.genesis/config/disabled_timers` stay off across updates (`systemctl mask` cannot work on these units). Every update now ends with a list of what it changed outside the checkout: units written or kept, timers skipped, Claude Code pin realignments and removed shadow copies. `update.sh --post-merge`, which finishes a merge that already happened, never refuses: it keeps an edited unit and names it. `--take-templates` never replaces a masked unit; only `--take-template <unit>` does.
+
+- Fixed backup-integrity fault injection to cover both GPG decryption option spellings and refreshed the measured atomic-write census after adding authenticated backup publication.
+
+- Refuse first Guardian-enabled loopback activation without a maintained pre-existing pause, including the legacy updater bootstrap and interrupt restart boundaries. Document staging merged updater code through the locked code-only pull before the first full update.
+
+- Requalify ingress rollout controls with qualified and refused pre-stop restart harnesses and the measured atomic-write denominator, without changing the production prerequisite guard.
+
+- The rework merge gate now accepts a `## Rework spec` or `## Rework acknowledgement` heading followed by a qualifier set off by punctuation, such as `## Rework spec (amended, decision-complete)`, and the US spelling "acknowledgment". It accepted only the exact heading, which blocked rebuilds whose spec was posted with a qualifier. A heading continued by a bare word ("Rework acknowledgement needed") still does not count.
+
+- Host uninstall supports an explicit container coordination namespace with `--container-genesis-home`, preserving contention with external-runtime index writers across login initialization.
+
+- Awareness posture now recognizes every Incus false spelling and zero-byte swap ceiling while treating unset values as healthy. Guardian INFO alerts distinguish swap repairs from configured swap-ceiling changes and name `swap_ceiling_pct`.
+
+- Web fetch now reports the client that actually ran, direct-session profile descriptions match their configured permissions, and the architecture index points to tracked decision records.
+
+- Bound SMB client shutdown after the operation timeout.
+- Git repair now reports fsck diagnostics from both streams and ignores reflog-only noise.
+- Managed status seeds systemd's user-session environment; Claude Code 2.1.280 subcommands are classified by lifetime.
+
+- `host-setup.sh` now checks that a proxy device is configured to forward the dashboard address to this container before printing it. When none does, it says what it found, prints the command that fixes it, and offers only routes that reach the container directly, instead of advertising a host URL that does not answer.
+
+- **A hung test no longer holds up every other test run unnoticed.** A run refused by the box-wide test lock (and `scripts/pytest_lock_wait.py`) now names the test the holder is running and for how long, and flags it as LIKELY HUNG after 10 minutes. The per-test timeout drops from 1 hour to 10 minutes, and a run without `pytest-timeout` installed says so at the start instead of at the end.
+
+- **Updates no longer delete the end of your `~/.claude/CLAUDE.md` when a managed block's end marker is missing.** The block writers (network identity, container specs) now leave the file untouched and say which marker is unbalanced and on which line; before, everything from the unmatched begin marker to the end of the file, Personal Notes included, was removed.
+
+- **Updates no longer trust every newly installed skill automatically.** The skill-security allowlist (`~/.genesis/config/skill_scan_trusted.txt`) is seeded the first time bootstrap runs and then left alone; a skill added later stays untrusted, so the scheduled scan reports it, until you review it and add its name to that file. Before, every update re-seeded the list from whatever was installed.
+
+- A morning report, or a queued alert with its own identity, is no longer dropped as a duplicate just because its first 200 characters match an earlier message, and deliveries retried after a send failure are no longer dropped as duplicates of each other. A repeated identical backup failure that had to be queued for retry is still delivered once a day.
+
+- Updates no longer delete MCP servers you added to `.mcp.json`. Bootstrap now replaces only the servers Genesis ships in `config/mcp.json.template`, keeps every other server and setting, saves the previous file under `~/.genesis/deploy-backups/` whenever it changes, and names what it updated, removed or kept. It also stops dropping and re-adding the Serena entry on every run (#2413).
+
+- One malformed file in the alert queue no longer stops queued alerts from being delivered or causes new alerts to be dropped; it is set aside as `.corrupt` with a warning naming the bad field, and deleted once it is more than 14 days old.
+
+- Updates no longer silently overwrite the system config files Genesis installs under `/etc` (the journald size cap, the sshd dead-client setting, the memory and network resilience drop-ins and watchdog units). Each now ends with a `# genesis-managed` line; a file you edited by hand is kept and named in the update summary, and `update.sh --take-template <full path>` installs the Genesis version after backing yours up. Files from earlier installs are marked once, without restarting anything.
+
+- A runaway file that was emptied while still held open, and then filled up again, now pages again (marked "again") instead of staying silent; a writer that closes its file for a moment is still judged against its earlier size.
+
+- Guardian's code-revert recovery now stops when its `git stash` fails or does not finish, and says so, instead of reverting anyway and reporting a misleading revert failure.
+
+- The deploy advisory for `update.sh` now appears only when a command can actually run the script, instead of on every command that mentions it (reading, grepping or editing the file no longer pulls in the full note).
+
+- `SECRETS_PATH` is now honoured by the loaders of `secrets.env` that read a fixed path regardless: the Claude Code hooks (session context, urgent alerts, proactive memory), `gmodel`, the guardian credential bridge, and the reflection and LongMemEval eval harnesses. With `SECRETS_PATH` unset the hooks and `gmodel` read their own checkout's file as before, the bridge reads the checkout's file (unchanged for a checkout at `~/genesis`), and the two eval harnesses try the checkout's own `secrets.env` before the `~/genesis` one. Two readers stay home- or checkout-relative on purpose: the guardian credential-integrity check and the disk-hygiene store knobs.
+
+- Qualification retains empty or whitespace-only processing and cleanup failures by exception type, so restarting cannot silently resume a failed attempt or resend its completion.
+
+- Preserve existing masked Codebase query units during installation and updates, so the remaining unit reload and timer setup can complete.
+
+- Qualification retains failures even when exception formatting raises, and preserves required evidence fields when a credential value matches a field name, allowing verified answers to recover without another completion.
+- Live qualification refuses LiteLLM's optional unredacted payload printer before accessing credentials or sending requests; retained answers still replay offline.
+
+- **The MCP health log can be moved off the shared home directory.** Importing
+  the health MCP's browser module opens `~/tmp/mcp_health.log` and routes every
+  `genesis.*` log line of that process into it, so a test run that merely
+  imported the module wrote into the log the live MCP servers share.
+  `GENESIS_MCP_LOG_DIR` now names that directory (and the Turnstile debug log's);
+  unset keeps `~/tmp`, and a directory that does not exist attaches no log file.
+
+- An update that merged code it never activated, or that stopped on merge conflicts, is no longer forgotten: the record it leaves (`~/.genesis/update_state.json`) used to be deleted by simply opening the dashboard's Updates tab, by starting a new update, or by an early exit of another run, after which `scripts/deploy_code_only.sh` could restart the server onto code bootstrap and migrations never ran on. One rule now decides whether that record still guards anything, and `update.sh`, `deploy_code_only.sh`, the `live` engine, bootstrap's crash recovery and the dashboard all use it. A plain `scripts/update.sh` refuses with exit 5 and names the remedy (finish it with `scripts/update.sh --post-merge`, resolve the conflicts, or Dismiss it on the dashboard's update card); the dashboard's Apply refuses the same way, and the update card offers Dismiss even for a record it cannot read. A leftover that guards nothing (a run that stopped before merging anything) no longer blocks a code-only deploy.
+
+- Managed (prepared-receipt) background sessions handle abnormal endings more precisely. A launch that fails inside process creation (missing or non-executable program, bad working directory) is now an ordinary failure that frees its runner slot, instead of holding the slot until restart as if a child might still run. Confirming that a killed process group is gone is bounded; past the bound the receipt is recorded once as cleanup-unconfirmed, with a log line, and keeps its slot. The slot is held until the receipt's result is persisted, not only until the process exits. A later cancel no longer erases the cleanup-unconfirmed record, and a receipt finished during restart recovery keeps its cost and token totals. These sessions have no caller yet; this prepares them for the peer conversation API.
+
+- Qualification transport now normalizes recovery metadata before redaction/GET,
+  contains diagnostic rendering failures, admits only conservatively supported key
+  and budget headroom, and constructs the HTTP client before durable dispatch.
+  Existing receipt and no-resend semantics remain in place.
+
+- Qualification now retains explicit invalid evidence for excessive or malformed
+  response and billing JSON, redacts unsafe escaped diagnostics, and avoids
+  repeated matching of malformed quoted text. Recovery remains GET-only and
+  never resends a dispatched completion.
+
+- **Refuse unsupported pinned Codebase paths before staging.** Linux repository
+  and cache identities containing a backslash, including symlink targets, now
+  refuse before native configuration can rewrite the path and select another
+  cache. Status retains metadata and independently checks systemd, including
+  when a provider path contains a symlink loop. Literal binary/interpreter paths
+  and structural reads of old settings retain their existing behavior.
+
+- **Managed agent turns can select a configured fallback before starting work.** Tool-disabled readiness checks detect provider quota refusals without replaying a task that already ran. Existing deadlines, cancellation and approvals remain in force. The neural monitor adds **Fallback**, and dashboard indicators distinguish last successful fallback from the models used by concurrent tasks.
+
+- Treat an intentionally disabled peer API as disabled instead of reporting a deployment regression; enabled API readiness checks now include its conversation dependencies.
+
+- Keep deployment status fields aligned with the values used to calculate their verification token when runtime state changes during a status read.
+
+- Retain qualification source bytes outside temporary storage and require verified primary and restored evidence before complete admission. Checkpoint copied evidence when later source reads or validation fail.
+
+- A test that hangs now ends the run after its 600-second per-test limit with a stack dump of every thread, instead of freezing the CI job until the job time limit cancels it.
+
+- The telemetry secret scrubber also redacts HTTP credential headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`) and bearer credentials wherever they appear.
+
+- Refuse unsupported repository and cache identities before managed runtime effects or readiness retries, while preserving diagnostic and retirement reads.
+
+- Gate complete Discord bot replies before chunking or delivery, refusing sensitive content and failed safety checks without echoing values. Send and observe the shared egress gate's cleaned text.
+
+- When bootstrap recovers from an interrupted update, the recovery is now recorded in the update history as `crashed_recovered` (previously the database rejected that status and the record was silently lost), and the dashboard flags it. If the record still cannot be written, bootstrap prints the error instead of hiding it.
+
+- The deep reflection's intelligence digest now counts the knowledge items ingested since the last deep cycle, grouped by pipeline, instead of always reporting that none were ingested; if the count cannot be read, the digest says it is unavailable rather than zero.
+
+- Commands after a here-doc whose body breaks the command parse (an unmatched backtick or an apostrophe in the body) are no longer invisible to the safety guards: the parse reports the command as unreadable, and a guard refuses it when it names the operation that guard checks, with a hint to write the body with an editor tool and run the rest as its own step. The check fails closed: it also reports a here-doc whose end it cannot prove (no terminator line, or one that only ends it inside a substitution), whose delimiter spelling it cannot resolve, or whose unquoted body holds a command substitution or a `${...}` expansion the shell would run, so an occasional here-doc that hides nothing is reported too.
+
+- An install where codebase-memory-mcp is registered but its managed setup was never done now says so: a health alert names what is missing (the settings file or the enabled query unit) with the configure/enable remedy and the opt-out file, and bootstrap, install and update print one matching line instead of an unconditional pointer. Creating the opt-out file silences both.
+
+- Vault audit writes now keep independent transaction ownership through cancellation and rollback. Failed rollback retires the audit connection, preventing later requests from committing abandoned rows; unlock remains fail-closed. Shutdown drops the key first and bounds its audit-owner drain without cancelling cleanup. Already-queued commits cannot be undone, and SQLite worker shutdown has no hard deadline.
+
+- Scoped job cancellation waits for owned descendants after leader exit, keeps the first caller cancellation cooperative, and forces on the second. Watchdog stops retain their separate ten-second force deadline after leader exit. Launch without a reachable systemd user manager is refused.
+
+- Transcript analysis keeps uncertain hook names unknown while retaining scrubbed commands, rejects negative durations and counts, preserves surrounding records after deeply nested malformed JSON, retains scrubbed model-refusal diagnostics, and evaluates chronology against the captured input rather than later appends.
+
+- **Peer conversation admission avoids a circular database wait with result persistence.**
+  Database identity is still checked against the actual private connection before
+  admission, but before acquiring its write lock. Persistence warnings identify
+  exception classes and SQLite error names without logging private error values;
+  regression tests use production database settings and bound their send wait.
+
+- Hook advisories and guard explanations that contain non-ASCII text (em dashes, accented letters, CJK, emoji) are now shortened to the longest part that fits the hook output budget instead of being dropped entirely; a hook whose decision fits the budget with its explanation emptied no longer reports itself as over budget; and hook output containing an unpaired surrogate character is written with that character escaped instead of crashing the hook.
+
+- An update now installs the `test` and `payments` packages (pytest-timeout, hypothesis, the card vault's pyrage and zxcvbn) after the core packages, as a separate step that never fails the update. Before, no install path installed them: local test runs could not import some test files and ran without a per-test timeout, and `genesis vault` refused with "install the payments extra". A code-only deploy now warns, without refusing, when they are missing. The first update after this change installs them; on an install already at the latest commit, run `scripts/update.sh --post-merge`.
+
+- The `youtube-fetch` skill's fallback (yt-dlp) transcript step no longer breaks when the skill is loaded with arguments: its de-duplication kept only the first line, or failed with an awk syntax error.
+
+- **A `live` rebuild refuses to move a checkout someone changed while it was planning.** The rebuild now records where the checkout was (its branch, commit and a clean tracked tree) before it fetches, and checks it again once it holds the checkout lock and just before it writes anything. A commit, branch switch or tracked edit made in that window makes the rebuild refuse with nothing moved, and `update.sh` rolls back as for any other refusal, instead of resetting `live` over the commit or moving the checkout off the other branch. `update.sh` passes the branch and commit it verified (`rebuild --expect-branch --expect-head`). A commit or branch switch that lands in the last moment before the switch is still possible; the rebuild then prints a warning naming it, and it stays in the reflog. A tracked edit made in that same last moment is not warned about. Rebuilding `live` is still disabled on every install until the remaining safeguards land.
+
+- Review requests now refuse a PR URL combined with `--repo`/`-R`, even when both name the same repository, and refuse unsupported explicit hosts before checking review capacity. Use a standalone github.com PR URL or a literal PR number with a repository flag; Codex retains its explicit-host requirement.
+
+- **A rollback on the `live` integration branch no longer reports itself complete when its git hooks or the server did not come back.** `deploy_candidates restore-hooks`, which a `live` rollback runs to put back the old tip's git hooks, now exits 1 when a hook could not be written, the hook list could not be read, `sync-hooks.sh` is missing, fails or times out, or any installed hook still differs from the checkout's copy afterwards (a hand-edited hook included), so the rollback is recorded as incomplete instead of rolled back. When a `live` update is refused for a hand-edited systemd unit (exit 4), the rollback now waits for the restarted server to answer its health endpoint before it records anything: an unhealthy server makes the update history, `last_update_failure.json` and the exit code (1) all say the rollback did not complete. That wait (up to 180 seconds) applies only to that path; rollbacks on `main` are unchanged. A rebuild or drop that cannot sync the hooks after it has moved still only warns.
+
+- **The open review round is found by the head, not by list position.** A PR's
+  rounds are listed in the order of its commit list, which GitHub sorts by date,
+  so after a rebase or cherry-pick a commit can be listed after the head. The
+  budget then read the head's open round as complete, and its findings as owed
+  by nobody. `review_budget`, `review_reflection` and the `--check-pr` rounds row
+  now find the open round as the one whose head is the current head; a budget
+  that says a round is open but carries no single entry for the head owes an
+  unknown amount, never nothing. Every open PR owes the same as before; the
+  `status` output's `round_head` is now empty when no round is open, where it
+  used to name the newest round by list position. The round trend still reads
+  list order and is fixed separately.
+
+- **A peer send that fails with 503 now names the receipt ID it computed.** The route still answers `503 not_ready` when `POST /v1/agent/a2a/message:send` outlives its 15-second bound, or fails after its receipt committed, but the body now carries that receipt ID as a top-level `taskId`. The admission is shielded and keeps running after the timeout, so a client that retried with a new message ID could start the same work twice. The send may still be refused after the 503, so the agent conversations reference now says to poll `GET /tasks/<taskId>` (404 until the admission commits, and for good if it was refused) or retry with the same `messageId`, which returns the original receipt or the refusal and, while the original admission is still in flight, waits on that same work. Other 503 bodies are unchanged.
+
+- **The morning report states current facts instead of stale or mixed ones.** System Health now shows the live PID/task budget of the binding cgroup level (percent, tasks, and which level), read at report time, so an earlier PID alert can be weighed against the current figure; when the reading is not available it says "unavailable" rather than showing an old number. An open PID-budget alert, including one raised before a restart, is resolved automatically once the budget is back below 75%, and a new rise past the alert line alerts again after at most a quarter of the usual hour-long cooldown. Pending deferred work is shown as two figures, the recovery backlog and the scheduled worklist (a deliberate drain, not a backlog), instead of one mixed total, with any stalled worklist items counted directly; every System Health count (queues, surplus queue depth, awareness ticks, Claude Code session counts) that could not be read now says "unavailable" rather than 0 or "None". Genesis's own reflection and self-audit records (gap clustering, wing/memory/procedure audits, self-unblock and prompt reviews, and quarantined reflections) no longer appear in the report's observation sections, where they read as live faults; they are still counted in the "Genesis internal" line, and the dashboard observations panel still shows them. Reflection contradictions stay in the report, because they are written for human judgment.
+
+- The morning-report prompt instructs the model to keep recorded figures and attributed causes separate from current conditions. It preserves supplied measurement times/windows, leaves unknown freshness unknown, and requires current evidence for infrastructure/provider/security alarms while retaining active-goal and outreach blockers. Observation creation-age demotion is unchanged.
+
+- Task-completion rubric 1.1.0 instructs judges to keep missing or contradicted required deliverables below the existing pass threshold, separately from writing quality; qualification requires fresh version-bound references.
+
+- Ordinary Claude streaming now classifies the final effective quota state rather than the presence of a quota event, preserving answers and ordinary empty-output detection for informational events and usable overage.
+
+- Record agent task status transitions and owner-approval changes consistently, and keep task-list pagination stable when an anchor task changes or is deleted.
+
+- Strengthen the queued-index replay test to require complete outcome retirement
+  without repeating the fake provider, and bound its SQLite locker readiness wait.
+
+- Managed Codebase status reports conditional queue initialization-lock prerequisites without opening the queue or rejecting a usable current-schema queue.
+
+
+### Security
+
+- **The guards no longer lose sight of a git command that begins with certain
+  global options.** To work out what a git command does, the guards first walk
+  past any global options in front of the subcommand. An option that takes a
+  separate value has to be stepped over together with that value; an option the
+  walk does not recognise is stepped over alone. Three options that really do
+  take a value were missing from that list, so the value was taken for the
+  subcommand and the real operation behind it was never seen. No unusual
+  quoting was involved — an ordinary, fully written-out command was enough, and
+  both a publish and a worktree removal could pass their guards this way.
+
+  All three are now recognised, in the four places the list is kept. Anyone
+  updating gets the fix by pulling; there is nothing to enable.
+
+  The list is no longer maintained by hand. A new test asks the installed git
+  itself which global options consume a value — sweeping the binary for
+  candidates and probing each — and fails if any of them is one the walk would
+  step over alone. It checks in that direction only, so a list carrying options
+  your git does not have is still fine: git rejects those commands outright.
+  A future git release that adds such an option now turns the build red instead
+  of quietly reopening the gap.
+
+  That test is also what found the third option. An earlier version of this fix
+  covered two and asserted, in a code comment, that the full set could not be
+  determined automatically. That was wrong, and it was the reason the third was
+  missed — the claim is what justified stopping. Deriving the set takes about
+  twenty seconds.
+
+- **An unlisted git global option no longer hides the subcommand from the push
+  guard.** Verb discovery walks a git command's leading options to find the
+  subcommand, and stepped over any option it did not recognise as consuming a
+  value — assuming an unknown option to be harmless. When such an option does
+  consume one, that VALUE lands in the verb slot: the walk reports it as the
+  subcommand, the real operation is never seen, and gates keyed on that
+  subcommand stand down. Three real options behaved exactly this way and were
+  listed one at a time as each was found.
+
+  The failure direction is now inverted, on the signal that means "the verb
+  cannot be trusted". An option in none of the three classification sets marks
+  the verb UNESTABLISHED, which routes to the unresolved-verb blind spot the
+  push guard already refuses. Previously the walk answered confidently and
+  wrongly; it now declines to answer. A future git release adding a
+  value-consuming global becomes a refused command rather than an open door.
+
+  The three sets were MEASURED against the installed binary with an oracle
+  rather than read from help output, which omits several of these options
+  entirely. Of 750 candidates from the binary's own strings table: 8 consume a
+  value, 12 are valueless, 4 run no subcommand, 726 are rejected outright.
+
+  **What did NOT change is the accessor that answers "which word is the verb".**
+  An earlier revision made that return "unknown" too, which is the honest
+  answer and was wrong to ship: 24 call sites across five guards read its
+  existing sentinel as "this segment is not the operation I gate", so widening
+  it widened what each guard ignores. Measured on that revision, a worktree
+  removal behind `--bare` went from refused to allowed, and a `--no-verify`
+  behind any unclassified global became invisible to the commit rule — a
+  fail-open introduced by a change meant to close one. Teaching each guard to
+  consult the blind spot is per-guard work on five enforcement hooks and is
+  tracked separately; this change does not attempt it, and the residual it
+  leaves is exactly what was there before.
+
+  Measured over 50,845 unique real commands (18,936 containing git/gh segments,
+  35,311 segments) by diffing every parser answer a guard can branch on:
+  `git_subcommand`, `gh_pr_subcommand`, `commit_skips_hooks` and the subcommand
+  index are **identical on both trees, 0 flips**. Only the trust signal moves,
+  on 2 commands: an unknown-option probe that git itself rejects, now refused
+  instead of parsed, and `git --help <topic>`, which stops being flagged
+  because a help query runs no subcommand.
+
+- **A deliberate relaxation, and the check that keeps it honest.** A gated verb
+  written after one of the options that run no subcommand — `--exec-path` and
+  its siblings — was refused and is now allowed, because git never
+  reaches the verb. That is a false block removed, but it makes several allow
+  decisions depend on a classification — so both new sets are re-derived from
+  the installed binary on every CI run, and the checks fail if an exempt option
+  ever starts running the subcommand, or a supposedly valueless one turns out
+  to consume a value. A fix for a hand-maintained list that fails open should
+  not introduce a second one.
+
+  The oracle for that derivation must not resolve through the repository.
+  Reading the marker from the probe repo's own config makes the lookup miss for
+  any global that changes repository or config resolution, which scores it as
+  "git rejects this" while its subcommand runs perfectly well — how `--bare`
+  came to be absent from every set while the sweep reported a tidy total. The
+  marker now lives in a file named by absolute path. A completeness check
+  seeded from git's own usage line covers the other direction, since a sweep
+  blind to a class reports the same tidy total either way.
+
+- **Three spellings of the same `gh` option now answer alike.** A glued short
+  value (`-R<value>`) was tested as a whole token, so a repository passed that
+  way was read as an unreadable option NAME and flagged, while the separated
+  and `=`-attached spellings of the identical command were not. Glued values
+  are recognised for the shorts a dispatcher declares — measured per program,
+  because `gh` accepts `-Rowner/repo` and `git` rejects `-C/path` outright.
+
+- A refusal names a remedy that applies. Two causes now reach one predicate,
+  and telling a session to write its subcommand out literally when it already
+  is names a rewrite it cannot perform — on a hard block, the message is the
+  only way out.
+
+- **A hook guard whose own code fails to load now refuses the command instead of
+  disappearing.** Claude Code treats any exit code other than 2 as a non-blocking
+  error, so a guard that raised while it was still importing did not degrade — it
+  vanished, while the session went on believing it was protected. Six guards are
+  covered: protected-path deletion, discard, push/merge, the review gate, the
+  worktree guard and the full-suite guard. Each now falls back to a deliberately
+  crude read of the raw command text and refuses anything that names a gated
+  operation — over-broad by design and loud about it, rather than standing silently
+  aside. A payload that names no command at all is refused on the same reasoning,
+  and no in-band waiver is honoured on that path, because binding a waiver to the
+  command it waives needs the very parser that is missing.
+
+  One guard is deliberately **not** covered: the background-pipe guard, whose only
+  usable signal is the pipe character — present in 70% of ordinary commands, so
+  refusing on it would make a broken install unrepairable rather than safe. What it
+  protects is also the mildest here: a backgrounded pipeline whose output is
+  swallowed, which costs a re-run. Two advisory hooks are unaffected, since an
+  import failure there loses a note and never a refusal.
+
+  Both partial-update orderings fail closed: an older guard calling the newer
+  helper, and a newer guard whose helper is still old — in which case nothing it
+  could import can recover it, so it refuses locally.
+
+  While the hook tree is broken these guards refuse roughly a third of ordinary
+  commands. That is the cost of the state, not of normal operation, and the usual
+  cause is a partially updated install — which the refusal now says.
+
+- The dashboard now withholds your API key values, backup target, backup paths and NAS username from a caller that has not logged in. Setting a dashboard password had always protected them; not setting one now withholds them too. The affected panels show the values again once you set a dashboard password and log in, and nothing else about them changed.
+- On an install with no dashboard password set, the login page now says so instead of appearing to log you in. It previously accepted the form and redirected while creating no session at all, so the protected panels stayed blank with no explanation.
+
+- The dashboard's Files tab now requires you to be logged in, on installs that have a dashboard password set. Previously every file route — list, read, write, rename, delete, download, upload — answered anyone who could reach the dashboard port, even with a password configured. Installs with no dashboard password keep working exactly as before, since there is no credential to check.
+- Separately, and regardless of whether you have a password, the file browser now refuses to serve paths whose names identify them as credentials: names ending in a credential word (`api-token`, `service_creds.env`), key and environment extensions (`.env`, `.pem`, `.key`), and the usual dotfiles (`.netrc`, `.npmrc`). It was willing to hand over the Claude Code OAuth token and Genesis's internal API token, because the old rule matched `credentials.json` by exact name while the real file is `.credentials.json`. This narrows a measured exposure rather than closing the category: a credential named for its service alone, or carrying no recognised word or extension, is still served, and the rule has no bearing on the write routes.
+- The `GENESIS_DASHBOARD_API_AUTH=off` escape hatch reopens the file browser's write, create, rename, delete and upload routes along with the rest of the API's mutations, so a legacy machine caller it was meant to restore keeps working; file reads still require login. The credential-name rule now judges only the path below each allowed root, so an install whose home directory happens to carry such a name is not locked out of the file browser.
+
+- **A background profile that restricts Bash to named binaries now has something enforcing that restriction.** Scoped profiles declare their allowed commands by exporting an allowlist environment variable, and the only code that read it was a global shell hook this repository has never wired into its own settings — so on a fresh clone the restriction was declared and applied by nobody, and such a session ran with unrestricted Bash while every declaration around it said otherwise. Wiring that hook into the repository's settings would not have helped: a dispatched session runs with a working directory outside any git repository, and Claude Code discovers project settings by git-root detection, so repository settings never load there. Enforcement now travels through the settings file the invoker already injects into every dispatched session, which is the one channel that does reach one. The hook returns before reading its input unless an allowlist is actually set, so sessions that declare none are unaffected — measured in both directions on a live install: an allowlisted session refuses a command outside its list and still runs one on it, and a session with no allowlist runs ordinary commands untouched.
+
+  **An allowlist bounds which binary runs, never what that binary can be told to do**, and the one binary a built-in profile allows is one that can be configured to run commands — through an alias, a pager, an editor, a browser, or an extension, each reached with that binary as every token, so the allowlist permits both the command that installs the escape and the command that triggers it. Such a binary now gets per-binary hardening alongside the allowlist, pinning every one of those routes. The set is taken from the tool's own documented environment reference rather than from whatever the last review round happened to find, because routes arriving one review at a time is the signature of a denylist.
+
+  **The route that does not behave like the others is worth stating on its own, because the obvious mitigation misses it entirely.** Extensions are not resolved from the configuration directory — they come from the data directory — so sealing the configuration alone leaves installing an extension and then executing it as arbitrary execution with every token still allowed. This was measured rather than reasoned about, in both directions: an extension placed under the configuration directory was not found, while one under the data directory ran. Pointing the data directory at the same read-only location closes both halves, since the install cannot create the directory it needs and the execution finds nothing. Measured alongside it, so the cure is known not to be worse than the disease: authentication, live API calls and pull-request reads all still work under that pin. One further variable that can name a program was measured INERT and deliberately left alone, with the measurement recorded beside the code so it is not pinned speculatively later.
+
+  The hardening is treated as REQUIRED rather than best-effort, and the check lives where the environment is BUILT and again immediately before the process receives it. That placement is the point, and getting it wrong twice is what taught it: both spawn paths rebuild the environment after any pre-launch verifier runs, and then merge a login fallback on top of THAT, so a check at either earlier point inspects a dictionary that is subsequently added to. The environment that was checked is now the environment that launches. An invocation whose confinement could not be prepared, or whose environment overrides would strip it, is refused rather than launched in a weaker form.
+
+  **What this does NOT give you, stated plainly because a previous version of this note implied otherwise.** A first-token allowlist bounds which BINARY runs. It is not a sandbox. The one binary a built-in profile permits is itself a general-purpose file writer and an authenticated API client, so a scoped session can still write files on the host and reach the network with the operator's credentials — including writes that take effect on a later run. An internal comment elsewhere in the codebase rested a safety argument on that restriction meaning the session "cannot write files"; it did not, and that argument has been removed rather than reworded. Bounding this properly needs a subcommand-level allowlist, which is tracked separately. The honest summary of this change is that a restriction which was previously applied by nobody is now applied — not that the session is confined.
+
+  The chaining denylist gained a bare `&`, which backgrounds the first command and runs the next one and so is not covered by `&&` — that one was a real escape from an allowlisted first token. Parentheses were added alongside it as defence in depth; against real bash they reach nothing the other entries leave open, so they close nothing measurable and do cost an ordinary parenthesis in a filter, a query or a title. Both the enumeration and the cost are recorded beside the code rather than left to be rediscovered.
+
+  Two further supporting changes. The invoker now REFUSES to launch a profile whose allowlist could not be armed rather than launching it unconfined — whether because the settings file could not be written, or because the invocation also asked for a mode that disables hooks entirely. Silently downgrading containment is the failure this whole change exists to remove, so it is not a downgrade worth making quietly at launch either. And the shared hook launcher now runs a shell hook under a shell instead of handing it to the Python interpreter; every hook wired until now was Python, so this path had never been exercised. Routing the new hook through that launcher rather than by absolute path is deliberate — it inherits the launcher's resolution to the main worktree, so the hook cannot drift per branch the way a git-tracked guard otherwise does.
+
+  Separately, the global shell hook no longer treats an unreadable payload as nothing to act on when an allowlist is in force. Reading the command out of that payload needs a JSON tool on PATH, and if it was missing, malformed, or the command was empty, the hook exited cleanly and the restriction dropped in silence — the one failure mode a containment gate must not have. It now refuses instead, and only in that case: a session with no allowlist behaves exactly as before, so a host without that tool is not newly blocked from doing ordinary work.
+
+- The dashboard's Knowledge tab now serves only the knowledge base, not the reference store. Both live in the same table, and the knowledge routes returned every column of every row regardless of which store it belonged to — so reference entries, which carry their stored value in the row body, were reachable through the knowledge browser as well as through the References tab that is built to render them safely. The knowledge routes now refuse that partition on read, search, detail and delete, and the Knowledge tab's counts describe the set it can actually browse. The References tab is unchanged and remains the way to view those entries.
+
+- **A desktop client no longer needs a credential that can do everything.** Until now the desk brain endpoint (`/v1/desk/chat/completions`) authenticated with `GENESIS_MCP_HTTP_TOKEN`, the same token that opens every other `/v1` route: tool execution, memory writes, and the OpenClaw route that starts Claude Code. So any desktop client pointed at Genesis held all of that in its own config file. A new optional `GENESIS_DESK_TOKEN` opens the desk route and nothing else; every other `/v1` route and the MCP transport refuse it. **Nothing breaks on update:** the broad token is still accepted by the desk route, so existing clients keep working. To narrow what a client holds, generate a desk token (`python3 -c "import secrets; print(secrets.token_urlsafe(32))"`), put it in `secrets.env` as `GENESIS_DESK_TOKEN`, restart genesis-server, and give that token to the client instead. **One behaviour change to know about:** a whitespace-only `GENESIS_MCP_HTTP_TOKEN` (for example a quoted `"   "`) now counts as unset everywhere. The dashboard already treated it that way, but the MCP HTTP transport used to accept it as the literal secret; it now refuses to start instead, the same as when the token is empty. Likewise a whitespace-only `--auth-token` argument now falls back to the environment variable, and a token with surrounding whitespace is trimmed before use, so the MCP transport and the dashboard always compare the same value. A client that also calls a `/v1/voice/*` route (such as `tool_call`) still needs the broad token for those calls; voice has no scoped token yet. The boot warning now names only the routes that are actually disabled.
+
+- **The recursive-delete safety guard now judges a wildcard by the folder it
+  sits in.** Deleting `<a>/<b>/<c>/*` removes everything deleting `<a>/<b>/<c>`
+  would, but the depth floor counted the `*` as a fourth path level. So it
+  refused the folder and allowed its entire contents: `~/tmp/*` or `~/tmp/tmp*/`
+  in a scratch area shared by every session, for example. The floor now applies
+  to the literal prefix before the first `*`, `?` or `[`.
+  A wildcard whose literal prefix is at least four levels deep (for example
+  `/home/<user>/tmp/<job>/*`) is unaffected. Patterns that can match `..` and
+  climb upward are refused: a dot-wildcard in the middle of a path (`…/.?/…`),
+  a `..` after any wildcard, and any extglob group (`@(…)`, `!(…)` and the
+  rest), whose extent the guard cannot see. Measured
+  over 1,622 recorded delete commands on one install: 20 (1.23%) are newly
+  refused, all wildcard cleanups directly under a shared scratch folder, and
+  none is newly allowed. Keep per-task scratch in its own subfolder so a
+  wildcard cleanup stays at least four levels deep.
+
+- **Every page `web_fetch` returns is now marked as untrusted content.** Pages fetched through TinyFish, Firecrawl, Crawl4AI or the Ladder backend used to reach the calling session unmarked; only the plain HTTP path wrapped them. All of them now arrive inside the same `<external-content>` boundary, and so does every other string in the result (titles, descriptions, authors, error text a backend echoes back, and any field a backend adds later), URLs and language tags included (only the name of the backend Genesis used stays plain), so sessions reading fetched links, including the inbox evaluator, can tell the page's text from their own instructions. The clean-up that runs before wrapping now also neutralises boundary markers a page nests inside one another, which it previously left partly intact.
+
+- **Observations written by a session over untrusted content are now clearly marked.** When a session reading attacker-authored material (the inbox evaluator, a gateway conversation) writes an observation, its type, source and category are stored with an `untrusted:` prefix, and `critical` priority becomes `high`. Genesis's own pipelines select observations by exact name, so such a row can no longer be mistaken for an escalation, an update notice, an alert or a detected task, and it can no longer page the owner. Nothing is refused: the row is kept under a name that says where it came from, and the owner's world snapshot still shows the inbox evaluator's signals, marked as untrusted content.
+
+- The Genesis API (`/api/genesis/*` and the tool API `/api/t/*`) now answers only callers on loopback or the Tailscale address range by default, whether or not a dashboard password is set; the host supervisor's health, heartbeat and pause-state probes stay reachable from anywhere. **If you open the dashboard over your LAN rather than Tailscale, add your LAN to `GENESIS_DASHBOARD_TRUSTED_NETWORKS`** (comma-separated CIDRs; loopback is always allowed), or set `GENESIS_DASHBOARD_NETWORK_SCOPE=off` to disable the check. See `secrets.env.example`.
+
+- The CI leak scan (detect-secrets, gitleaks, email, binary-artifact and private-pattern checks) now runs on every push to every non-main branch, not only on pull requests, so a branch published without a PR is still checked. The pull-request check and the new branch check run the same script, `scripts/ci/leak_scan.sh`. On a branch push the private-pattern scan and a new gitleaks history scan cover every commit the branch carries that main does not, so a secret added and then removed inside the branch is still caught; the email and binary-artifact checks also read that history, and a merge commit is read as its conflict resolution. Every push gets its own scan run, and scan logs name the file and line of a finding but never the matched text.
+
+- **The VNC fallback no longer starts without a password.** When systemd is unavailable, the browser tools start `x11vnc` themselves; with no `~/.genesis/vnc_passwd` that fallback used to start it with no authentication. It now keeps password authentication like the `genesis-vnc` unit, and when the password file is missing or unusable (not a readable file of at least 8 bytes) it starts nothing and logs that `scripts/setup-vnc.sh` creates one.
+
+- Reject unencrypted or integrity-invalid OpenPGP backups during recovery and transcript evidence reads; failed decryption preserves existing destination files.
+
+- Backup restores and migration rollback reset saved peer authority before database
+installation. Guardian snapshot rollback explicitly warns that approval restores
+saved peer permissions.
+
+- **Genesis now refuses to type, store or send a payment card number through its general tools.** `browser_fill` refuses a card number as the value, and `browser_run_js` refuses a script containing one. `reference_store` and automatic reference capture never save one, and outbound posts (including Discord replies) flag one as critical. Detection needs a known card brand prefix and length plus a valid checksum, so ordinary long numbers, timestamps and UUIDs pass. Card entry is meant for the encrypted card vault tracked in #3172.
+
+- The smb off-site backend now refuses a file or directory name holding a quote, `;`, a backslash or a newline instead of passing it to smbclient; such a file is reported as a failed upload.
+
+- The dashboard's content routes now answer only to requests addressed to this machine: by IP address, `localhost`, the machine's own hostname, or its Tailscale name. If you open the dashboard by another name, add it to `GENESIS_DASHBOARD_ALLOWED_HOSTS` or use the IP address; `GENESIS_DASHBOARD_HOSTNAME_CHECK=off` turns the check off.
+
+- **Browser tools no longer pass a payment card number shown on a page back to the model or into logs.** Every browser tool result and error (page snapshots, `browser_run_js` results, page URLs and titles, exception text, the tool-timeout message) now shows a card number as `[card redacted]`, including one a script returns as a number or as escaped JSON, and one split into digit groups across snapshot lines, list items or object values. `browser_screenshot` refuses, writing no file, when the text a page renders in any frame shows a card number: visible text, form values, placeholders, labels, titles, alt text, options and CSS-generated content. `mcp_health.log` is redacted for every Genesis log line it receives, tracebacks included, and so are the Turnstile debug log, FastMCP's tool-error log and the CAPTCHA Telegram alert's page URL. Detection is the same as the input guards: a known card brand prefix and length plus a valid checksum.
+
+- **Logs redacted for card numbers now also catch a card split across separators.** The card log filter on `mcp_health.log` and the browser tool loggers now redacts a card number whose digit groups are split across lines, separators such as ` / `, or one digit per box, in the message, its arguments and its traceback, and one spelled as `\u` escapes when the whole log message is JSON text. A log record that cannot be turned into text or checked is replaced with a withheld notice instead of being logged as is or raising into the code that logged it, and JSON text nested too deeply to check is withheld rather than raising an error.
+
 
 ### Added
 
