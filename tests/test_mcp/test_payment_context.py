@@ -77,6 +77,15 @@ class El:
         self.on_click = None
         self.owner = None  # the frame the element really lives in (None: the one it was found in)
         self.labels: dict = {}  # a select's option value -> label, where the two differ
+        self.checkbox = False  # an input type=checkbox
+        self.checked = False
+        self.label = ""  # its <label> text
+        self.unchecks = False  # the page clears the tick right after it is set
+        self.on_read = None  # called each time a script reads this element
+        self.untickable = False  # a hidden box Playwright cannot tick
+        self.submits = False  # a submit control (_SUBMITS_JS)
+        self.text = ""  # its visible text (a step's label)
+        self.label_visible = True  # its consent label comes from a visible element
 
 
 class Handle:
@@ -97,6 +106,8 @@ class Handle:
         if js is pc.CARD_FIELD_JS:
             return self.el.tag if arg in self.el.kinds else ""
         if js is pc.PAY_JS:
+            if self.el.on_read is not None:
+                self.el.on_read()
             return dict(self.el.pay)
         if js is pc.EXTRA_FIELD_JS:
             return self.el.extra or self.el.tag
@@ -107,7 +118,30 @@ class Handle:
                 self.el.value,
                 *([self.el.labels[self.el.value]] if self.el.value in self.el.labels else []),
             ]
+        if js is pc._CHECKBOX_JS:
+            return self.el.checkbox
+        if js is pc.CONSENT_JS:
+            return {
+                "box": self.el.checkbox,
+                "checked": self.el.checked,
+                "label": self.el.label,
+                "visible": self.el.label_visible,
+            }
+        if js is pc._SAME_CONTROL_JS:
+            return arg.el is self.el
+        if js is pc._SUBMITS_JS:
+            return self.el.submits
+        if js is pc._RELATED_JS:
+            return arg.el is self.el
+        if js is pc._STEP_LABEL_JS:
+            return self.el.text
         raise AssertionError("unexpected script")
+
+    async def check(self, timeout=None, trial=False):
+        if not self.el.checkbox or self.el.untickable:
+            raise RuntimeError("not tickable")
+        if not trial:
+            self.el.checked = not self.el.unchecks
 
     async def fill(self, value, timeout=None):
         self.el.value = "x" if self.el.mangle else value
@@ -128,6 +162,19 @@ class Handle:
     async def click(self, timeout=None):
         if self.el.on_click is not None:
             self.el.on_click()
+
+
+class BoxArray:
+    """The array handle _BOXES_JS returns: the boxes, compared by element."""
+
+    def __init__(self, frame, boxes):
+        self.frame, self.boxes = frame, boxes
+
+    async def evaluate(self, js):
+        if js != pc._TICKED_JS:
+            raise AssertionError("unexpected script")
+        live = {id(e) for els in self.frame.elements.values() for e in els}
+        return [e.checked if id(e) in live else None for e in self.boxes]
 
 
 class Loc:
@@ -170,6 +217,11 @@ class Frame:
 
     def locator(self, sel):
         return Loc(self, sel)
+
+    async def evaluate_handle(self, js):
+        if js != pc._BOXES_JS:
+            raise AssertionError("unexpected script")
+        return BoxArray(self, [e for els in self.elements.values() for e in els if e.checkbox])
 
     async def frame_element(self):
         frame = self
@@ -400,6 +452,7 @@ class Vault:
         self.requests: list[dict] = []
         self.statuses: list[dict] = [{"ok": True, "state": "granted", "expires_in_s": 120}]
         self.request_reply: dict = {"ok": True, "nonce": "nonce-1"}
+        self.echo_shown = True  # list the optional tap lines, as a current service does
         self.claim_reply: dict | None = None
         self.half_closed: list[str] = []
         self.on_status = None
@@ -437,7 +490,12 @@ class Vault:
             self.request_seen.set()
             if self.hold_request is not None:
                 await self.hold_request.wait()
-            reply = self.request_reply
+            reply = dict(self.request_reply)
+            if self.echo_shown and reply.get("ok") and "shown" not in reply:
+                reply["shown"] = [
+                    k for k, key in (("consent", "consent_labels"), ("steps", "step_labels"))
+                    if req.get(key)
+                ]
         elif op == "release_status":
             if self.on_status is not None:
                 self.on_status()
@@ -2356,3 +2414,452 @@ def test_a_short_value_hop_keeps_the_number_flag_clear():
     assert pc._typing_outcome(flow) == "card_value_in_request"
     g.on_request(_request(f"https://shop.example.com/land?pan={PAN}"))
     assert flow.number_hit is True and pc._typing_outcome(flow) == "card_url_before_pay"
+
+
+# ---------------------------------------------------------------------------
+# A card form behind clicks (steps), framed extra fields, split names, consent
+# ---------------------------------------------------------------------------
+
+
+def behind_steps():
+    """The checkout of ``checkout()``, but the card frame exists only after a
+    click on #open in the payment window (and never on the main page)."""
+    ns = checkout()
+    iframe = ns.ppage.main_frame.elements.pop("iframe#card")
+    del ns.main_page.main_frame.elements["iframe#card"]
+    opener = El(tag="button")
+    clicks: list[str] = []
+
+    def open_form():
+        clicks.append("#open")
+        ns.ppage.main_frame.elements["iframe#card"] = iframe
+
+    opener.on_click = open_form
+    ns.ppage.main_frame.elements["#open"] = [opener]
+    ns.clicks = clicks
+    return ns
+
+
+async def test_steps_bring_up_the_card_form_and_the_flow_pays(vault, logs):
+    ns = behind_steps()
+    out, _ = await _run(ns, steps=["#open"])
+    assert out["code"] == "submitted_unverified"
+    assert ns.clicks == ["#open"]
+    assert ns.els["number"].value == PAN
+    # The main page has no card frame: its chains were skipped, so no card-frame
+    # storage was handed over (only the merchant's).
+    kw = ns.main.new_context_kwargs
+    assert sorted(c["name"] for c in kw["storage_state"]["cookies"]) == ["cart"]
+    _sweep(out, logs)
+
+
+async def test_without_the_steps_a_form_behind_clicks_is_not_found(vault):
+    ns = behind_steps()
+    out, _ = await _run(ns)
+    assert out["code"].startswith("frame_not_found")
+    assert ns.clicks == [] and vault.ops("release_request") == []
+
+
+async def test_a_step_that_matches_nothing_stops_before_the_tap(vault):
+    ns = behind_steps()
+    out, _ = await _run(ns, steps=["#absent"])
+    assert out["code"] == "step_not_found"
+    assert vault.ops("release_request") == [] and ns.pctx.closed
+
+
+async def test_a_step_on_a_checkbox_is_refused_before_the_tap(vault):
+    ns = behind_steps()
+    box = El()
+    box.checkbox = True
+    ns.ppage.main_frame.elements["#agree"] = [box]
+    out, _ = await _run(ns, steps=["#agree", "#open"])
+    assert out["code"] == "step_is_consent"
+    assert not box.checked and ns.clicks == []
+    assert vault.ops("release_request") == []
+
+
+async def test_a_step_whose_click_fails_stops_before_the_tap(vault):
+    ns = behind_steps()
+
+    def boom():
+        raise RuntimeError("detached")
+
+    ns.ppage.main_frame.elements["#open"][0].on_click = boom
+    out, _ = await _run(ns, steps=["#open"])
+    assert out["code"] == "step_failed" and vault.ops("release_request") == []
+
+
+def _billing_in_card_frame(ns):
+    street = El()
+    ns.ppage.main_frame.elements["iframe#card"][0].child.elements["#street"] = [street]
+    return street
+
+
+async def test_an_extra_field_inside_the_card_frame_is_filled_before_the_tap(vault):
+    ns = checkout()
+    street = _billing_in_card_frame(ns)
+    extra = {
+        "email": {"selector": "#email", "value": EMAIL},
+        "address_line1": {"selector": "#street", "frames": ["iframe#card"], "value": "1 Test St"},
+    }
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "submitted_unverified"
+    assert street.value == "1 Test St"
+    assert vault.ops("release_request")[0]["also_filled"] == ["email", "address_line1"]
+
+
+async def test_an_extra_field_in_a_frame_with_no_card_field_is_refused(vault):
+    ns = checkout()
+    other = Frame("https://ads.example.org", {"#x": [El()]})
+    ns.ppage.extra.append(other)
+    ns.ppage.main_frame.elements["iframe#ad"] = [El(tag="iframe", child=other)]
+    extra = {"city": {"selector": "#x", "frames": ["iframe#ad"], "value": "Testville"}}
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "extra_field_origin"
+    assert other.elements["#x"][0].value == "" and vault.ops("release_request") == []
+
+
+def _split_name_form(ns):
+    card = ns.ppage.main_frame.elements["iframe#card"][0].child
+    first, last = El(kinds={"first_name"}), El(kinds={"last_name"})
+    card.elements.update({"#first": [first], "#last": [last]})
+    fields = {k: v for k, v in ns.fields.items() if k != "name"}
+    fields["first_name"] = {"selector": "#first", "frames": ["iframe#card"]}
+    fields["last_name"] = {"selector": "#last", "frames": ["iframe#card"]}
+    return fields, first, last
+
+
+def _claim_with_name(name):
+    card = {
+        "number": PAN,
+        "exp_month": 12,
+        "exp_year": YEAR,
+        "cvc": CVC,
+        "name": name,
+        "label": "Test card",
+        "last4": "4242",
+    }
+    return {"ok": True, "card": card}
+
+
+async def test_first_and_last_name_are_split_from_the_card_name(vault, logs):
+    ns = checkout()
+    fields, first, last = _split_name_form(ns)
+    vault.claim_reply = _claim_with_name(f"{NAME} Q {NAME[::-1]}")
+    out, _ = await _run(ns, fields=fields)
+    assert out["code"] == "submitted_unverified"
+    assert (first.value, last.value) == (f"{NAME} Q", NAME[::-1])
+    origins = vault.ops("release_request")[0]["field_origins"]
+    assert origins["first_name"] == origins["last_name"] == "https://js.cards.example.net"
+    _sweep(out, logs)
+
+
+def test_the_url_guard_arms_the_split_name_parts():
+    _flow, g = _guard(first_name="Alexandra", last_name="Testperson")
+    assert g.carries("https://x.example.com/p?given=Alexandra")
+    assert g.carries("https://x.example.com/p?family=testperson")
+    assert not g.carries("https://x.example.com/p?q=Alex")
+
+
+def test_the_url_guard_arms_the_whole_name_of_a_split_name():
+    # A two-letter surname is too short to arm alone; the whole name is not.
+    _flow, g = _guard(first_name="Alexandra Q", last_name="Li")
+    assert not g.carries("https://x.example.com/p?s=Li")
+    assert g.carries("https://x.example.com/p?holder=Alexandra+Q+Li")
+
+
+def _consent_box(ns, label="I authorize the debit"):
+    box = El()
+    box.checkbox, box.label = True, label
+    ns.ppage.main_frame.elements["iframe#card"][0].child.elements["#agree"] = [box]
+    return box
+
+
+async def test_consent_is_shown_in_the_tap_and_ticked_only_after_it(vault):
+    ns = checkout()
+    box = _consent_box(ns)
+    seen_at_tap: list[bool] = []
+    vault.on_status = lambda: seen_at_tap.append(box.checked)
+    out, _ = await _run(ns, consent=[{"selector": "#agree", "frames": ["iframe#card"]}])
+    assert out["code"] == "submitted_unverified"
+    assert vault.ops("release_request")[0]["consent_labels"] == ["I authorize the debit"]
+    assert seen_at_tap and not any(seen_at_tap)  # never ticked while the tap was pending
+    assert box.checked
+
+
+async def test_no_consent_sends_no_consent_labels(vault):
+    ns = checkout()
+    await _run(ns)
+    assert "consent_labels" not in vault.ops("release_request")[0]
+
+
+async def test_a_consent_target_that_is_not_a_checkbox_is_refused_before_the_tap(vault):
+    ns = checkout()
+    out, _ = await _run(ns, consent=["#email"])
+    assert out["code"] == "consent_not_found" and vault.ops("release_request") == []
+
+
+async def test_a_consent_label_changed_after_the_tap_types_nothing(vault):
+    ns = checkout()
+    box = _consent_box(ns)
+
+    def swap():
+        box.label = "I agree to a recurring charge"
+
+    vault.on_status = swap
+    out, _ = await _run(ns, consent=[{"selector": "#agree", "frames": ["iframe#card"]}])
+    assert out["code"] == "page_changed"
+    assert ns.els["number"].value == "" and not box.checked
+    assert vault.ops("release_claim") == []
+
+
+async def test_a_consent_tick_that_does_not_hold_stops_before_pay(vault):
+    ns = checkout()
+    box = _consent_box(ns)
+    box.unchecks = True
+    clicked: list[bool] = []
+    ns.els["pay"].on_click = lambda: clicked.append(True)
+    out, _ = await _run(ns, consent=[{"selector": "#agree", "frames": ["iframe#card"]}])
+    assert out["code"] == "consent_failed" and clicked == []
+
+
+async def test_a_one_word_card_name_types_no_split_name(vault):
+    ns = checkout()
+    fields, first, last = _split_name_form(ns)
+    vault.claim_reply = _claim_with_name(NAME)
+    out, _ = await _run(ns, fields=fields)
+    assert out["code"] == "card_name_unusable"
+    assert first.value == last.value == ns.els["number"].value == ""
+
+
+async def test_a_consent_untick_after_the_tick_stops_before_pay(vault):
+    # The tick lands and reads back, then a page script clears it on the way to Pay.
+    ns = checkout()
+    box = _consent_box(ns)
+    clicked: list[bool] = []
+    ns.els["pay"].on_click = lambda: clicked.append(True)
+
+    def untick_once_ticked():
+        if box.checked:
+            box.checked = False
+
+    ns.els["pay"].on_read = untick_once_ticked
+    out, _ = await _run(ns, consent=[{"selector": "#agree", "frames": ["iframe#card"]}])
+    assert out["code"] == "consent_failed" and clicked == []
+
+
+async def test_a_service_that_did_not_show_the_consent_line_ticks_nothing(vault):
+    # A vault service that predates the line ignores consent_labels and shows no
+    # "Will tick": the tap did not cover the box, so nothing goes ahead.
+    ns = checkout()
+    box = _consent_box(ns)
+    vault.echo_shown = False
+    out, _ = await _run(ns, consent=[{"selector": "#agree", "frames": ["iframe#card"]}])
+    assert out["code"] == "vault_too_old"
+    assert not box.checked and ns.els["number"].value == ""
+    assert vault.ops("release_claim") == [] and len(vault.ops("release_cancel")) == 1
+
+
+async def test_without_consent_an_older_service_still_pays(vault):
+    ns = checkout()
+    vault.echo_shown = False
+    out, _ = await _run(ns)
+    assert out["code"] == "submitted_unverified"
+
+
+async def test_a_step_that_ticks_a_box_through_its_label_is_refused(vault):
+    # A click on a <label for> ticks its box though the clicked element is no checkbox.
+    ns = checkout()
+    box = _consent_box(ns)
+    label = El(tag="label")
+    label.on_click = lambda: setattr(box, "checked", True)
+    ns.ppage.main_frame.elements["#agree-label"] = [label]
+    out, _ = await _run(ns, steps=["#agree-label"])
+    assert out["code"] == "step_is_consent" and vault.ops("release_request") == []
+
+
+@pytest.mark.parametrize(
+    ("setup", "code"),
+    [
+        (lambda box: setattr(box, "checked", True), "consent_pre_ticked"),
+        (lambda box: setattr(box, "label", "   "), "consent_unlabelled"),
+        (lambda box: setattr(box, "label", "x" * (pc.CONSENT_LABEL_CHARS + 1)),
+         "consent_label_too_long"),
+        (lambda box: setattr(box, "untickable", True), "consent_not_found"),
+    ],
+)
+async def test_a_consent_box_the_tap_cannot_cover_is_refused_before_it(vault, setup, code):
+    ns = checkout()
+    box = _consent_box(ns)
+    setup(box)
+    out, _ = await _run(ns, consent=[{"selector": "#agree", "frames": ["iframe#card"]}])
+    assert out["code"] == code and vault.ops("release_request") == []
+
+
+async def test_the_same_consent_box_twice_is_refused(vault):
+    ns = checkout()
+    _consent_box(ns)
+    spec = {"selector": "#agree", "frames": ["iframe#card"]}
+    out, _ = await _run(ns, consent=[spec, spec])
+    assert out["code"] == "consent_not_found" and vault.ops("release_request") == []
+
+
+async def test_a_consent_label_swapped_on_the_way_to_pay_stops_before_pay(vault):
+    ns = checkout()
+    box = _consent_box(ns)
+    clicked: list[bool] = []
+    ns.els["pay"].on_click = lambda: clicked.append(True)
+
+    def swap_once_ticked():
+        if box.checked:
+            box.label = "I agree to a recurring charge"
+
+    ns.els["pay"].on_read = swap_once_ticked
+    out, _ = await _run(ns, consent=[{"selector": "#agree", "frames": ["iframe#card"]}])
+    assert out["code"] == "consent_failed" and clicked == []
+
+
+async def test_the_tap_lists_what_the_steps_clicked(vault):
+    ns = behind_steps()
+    ns.ppage.main_frame.elements["#open"][0].text = "Add card"
+    out, _ = await _run(ns, steps=["#open"])
+    assert out["code"] == "submitted_unverified"
+    assert vault.ops("release_request")[0]["step_labels"] == ["Add card"]
+
+
+async def test_a_service_that_did_not_show_the_steps_line_fills_nothing(vault):
+    ns = behind_steps()
+    ns.ppage.main_frame.elements["#open"][0].text = "Add card"
+    vault.echo_shown = False
+    out, _ = await _run(ns, steps=["#open"])
+    assert out["code"] == "vault_too_old" and ns.els["number"].value == ""
+
+
+async def test_a_step_on_a_submit_control_or_on_pay_is_refused(vault):
+    ns = behind_steps()
+    ns.ppage.main_frame.elements["#open"][0].submits = True
+    out, _ = await _run(ns, steps=["#open"])
+    assert out["code"] == "step_is_submit" and ns.clicks == []
+    ns = checkout()
+    clicked: list[bool] = []
+    ns.els["pay"].on_click = lambda: clicked.append(True)
+    out, _ = await _run(ns, steps=["#pay"])
+    assert out["code"] == "step_is_submit" and clicked == []
+    assert vault.ops("release_request") == []
+
+
+async def test_a_box_a_page_script_ticks_after_the_steps_is_caught_at_the_tap(vault):
+    # The click itself changes no box; a later script (here: when Pay is read) does.
+    ns = behind_steps()
+    stray = El()
+    stray.checkbox = True
+    ns.ppage.main_frame.elements["#newsletter"] = [stray]
+    ns.els["pay"].on_read = lambda: setattr(stray, "checked", True)
+    out, _ = await _run(ns, steps=["#open"])
+    assert out["code"] == "step_is_consent" and vault.ops("release_request") == []
+
+
+async def test_billing_config_values_are_typed_only_after_the_tap(vault, monkeypatch):
+    ns = checkout()
+    street = _billing_in_card_frame(ns)
+    monkeypatch.setattr(cf, "billing_value", lambda name: "1 Config St")
+    at_tap: list[str] = []
+    vault.on_status = lambda: at_tap.append(street.value)
+    extra = {
+        "email": {"selector": "#email", "value": EMAIL},
+        "address_line1": {"selector": "#street", "frames": ["iframe#card"]},
+    }
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "submitted_unverified"
+    assert at_tap and set(at_tap) == {""}  # not in the page while the tap was pending
+    assert street.value == "1 Config St"
+    assert ns.els["email"].value == EMAIL  # a given value still goes in before the tap
+
+
+async def test_a_consent_box_labelled_only_by_aria_label_is_refused(vault):
+    ns = checkout()
+    box = _consent_box(ns)
+    box.label_visible = False
+    out, _ = await _run(ns, consent=[{"selector": "#agree", "frames": ["iframe#card"]}])
+    assert out["code"] == "consent_unlabelled" and vault.ops("release_request") == []
+
+
+async def test_a_step_that_reveals_an_unticked_box_still_pays(vault):
+    # A new, unticked box (a "save card" option) is a page change, not a tick.
+    ns = behind_steps()
+    opener = ns.ppage.main_frame.elements["#open"][0]
+    shown = El()
+    shown.checkbox = True
+    first = opener.on_click
+
+    def open_and_reveal():
+        first()
+        ns.ppage.main_frame.elements["#save-card"] = [shown]
+
+    opener.on_click = open_and_reveal
+    out, _ = await _run(ns, steps=["#open"])
+    assert out["code"] == "submitted_unverified"
+
+
+async def test_a_step_that_removes_a_box_still_pays(vault):
+    ns = behind_steps()
+    helper = El()
+    helper.checkbox = True
+    ns.ppage.main_frame.elements["#helper"] = [helper]
+    opener = ns.ppage.main_frame.elements["#open"][0]
+    first = opener.on_click
+
+    def open_and_drop():
+        first()
+        del ns.ppage.main_frame.elements["#helper"]
+
+    opener.on_click = open_and_drop
+    out, _ = await _run(ns, steps=["#open"])
+    assert out["code"] == "submitted_unverified"
+
+
+async def test_a_default_ticked_box_without_steps_still_pays(vault):
+    # No steps: nothing of the agent's ticked it, so nothing to refuse.
+    ns = checkout()
+    preset = El()
+    preset.checkbox, preset.checked = True, True
+    ns.ppage.main_frame.elements["#same-as-shipping"] = [preset]
+    out, _ = await _run(ns)
+    assert out["code"] == "submitted_unverified"
+
+
+async def test_a_late_billing_value_that_reprices_stops_before_the_claim(vault, monkeypatch):
+    ns = checkout()
+    street = _billing_in_card_frame(ns)
+    monkeypatch.setattr(cf, "billing_value", lambda name: "1 Config St")
+    original_fill = Handle.fill
+
+    async def fill(self, value, timeout=None):
+        await original_fill(self, value, timeout)
+        if self.el is street:  # the address re-prices the order
+            ns.ppage.main_frame.text = "Order total $24.99"
+
+    monkeypatch.setattr(Handle, "fill", fill)
+    extra = {"address_line1": {"selector": "#street", "frames": ["iframe#card"]}}
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "page_changed"
+    assert vault.ops("release_claim") == [] and ns.els["number"].value == ""
+
+
+async def test_a_late_billing_field_that_is_not_there_stops_before_the_tap(vault, monkeypatch):
+    ns = checkout()
+    monkeypatch.setattr(cf, "billing_value", lambda name: "1 Config St")
+    extra = {"address_line1": {"selector": "#nowhere", "frames": ["iframe#card"]}}
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "extra_field_not_found" and vault.ops("release_request") == []
+
+
+async def test_a_step_inside_the_pay_control_is_refused(vault):
+    # The step's element is not Pay itself but related to it (contained, or containing).
+    ns = checkout()
+    clicked: list[bool] = []
+    ns.els["pay"].on_click = lambda: clicked.append(True)
+    ns.ppage.main_frame.elements["#pay span"] = ns.ppage.main_frame.elements["#pay"]
+    out, _ = await _run(ns, steps=["#pay span"])
+    assert out["code"] == "step_is_submit" and clicked == []
+

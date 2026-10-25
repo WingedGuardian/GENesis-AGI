@@ -396,10 +396,22 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   frame (Stripe's, for one) nothing is observable yet, so use the provider's
   standard ids there. Selectors are plain CSS only (no `>>` chains, no
   `engine=` prefixes such as `internal:` or `text=`, no quoted text, no XPath). Pass selectors, never
-  values: `fields` (number, expiry or exp_month+exp_year, cvc, name,
-  postal_code; `{"selector", "frames"}` for fields inside iframes), `pay`, the
-  total as `amount` exactly as the page shows it, and other checkout fields as
-  `extra_fields` (`{"email": {"selector": "#email", "value": "..."}}`).
+  values: `fields` (number, expiry or exp_month+exp_year, cvc, name or
+  first_name+last_name, postal_code; `{"selector", "frames"}` for fields inside
+  iframes), `pay`, the total as `amount` exactly as the page shows it, and other
+  checkout fields as `extra_fields` (`{"email": {"selector": "#email", "value":
+  "..."}}`; add `"frames"` for a billing field inside the card frame).
+- A card form that appears only after clicks (a cart drawer, "Continue to
+  checkout", "Add card") takes `steps`: the clicks, in order, each a selector or
+  `{"selector", "frames"}`. The payment window replays them after it reopens the
+  checkout's URL, before reading or filling anything. Steps are clicks only,
+  never values and never a checkbox.
+- A required consent checkbox in the card form (a debit authorization) goes in
+  `consent`, never `steps`: the owner's tap shows its label, and the tool ticks
+  it only after the tap.
+- Billing address fields can omit `"value"`: the tool then reads it from
+  `card_fill.billing` in the install's private payments config, so the address
+  stays out of tool arguments.
 - The tool reopens the checkout in a window no other tool reaches, waits for
   the owner's Telegram tap, fills, clicks Pay itself and closes the window.
   You get a fixed `code` and `status` only.

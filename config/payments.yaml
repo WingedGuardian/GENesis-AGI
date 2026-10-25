@@ -13,5 +13,15 @@
 # before the first payment.
 #
 # Override per install in ~/.genesis/config/payments.local.yaml.
+#
+# card_fill.billing (set only in that overlay, never here): the owner's billing
+# details by extra-field name (address_line1, address_line2, city, region,
+# postal_code, country, name, email, phone, company). An extra_fields entry with
+# no "value" takes its value from here, so the address never passes through
+# tool arguments. Example (overlay):
+#   card_fill:
+#     billing:
+#       address_line1: "1 Example St"
+#       city: "Exampleton"
 card_fill:
   enabled: false

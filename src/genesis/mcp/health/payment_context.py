@@ -52,6 +52,10 @@ STEP_S = 15.0  # one Playwright step (a count, a fill, a read-back)
 # fields or Pay after DOMContentLoaded, or a total to render. After the tap an
 # absent element means the page changed, so nothing waits there.
 ATTACH_S = 10.0
+# A step's element: the control a click before it brings up (a cart drawer, a
+# checkout panel, a card form posted into a new frame). MEASURED on one hosted
+# checkout (one probe run): each appeared within 5 s of the click before it.
+STEP_WAIT_S = 20.0
 EXPORT_S = 120.0  # the storage export: one temporary-page visit per origin seen since launch
 GOTO_MS = 30000
 POLL_S = 2.0
@@ -197,6 +201,7 @@ CARD_FIELD_JS = r"""(e, kind) => {
   if (type === 'password' && kind !== 'cvc') return '';  // some checkouts mask the CVC
   const tokens = {number: ['cc-number'], expiry: ['cc-exp'], exp_month: ['cc-exp-month'],
                   exp_year: ['cc-exp-year'], cvc: ['cc-csc'], name: ['cc-name'],
+                  first_name: ['cc-given-name'], last_name: ['cc-family-name'],
                   postal_code: ['postal-code']}[kind];
   if (!tokens) return '';
   const ac = (e.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/);
@@ -257,6 +262,64 @@ _SESSION_JS = (
     " const k = sessionStorage.key(i); o[k] = sessionStorage.getItem(k); } return o; }"
 )
 _SAME_JS = "(a, b) => a === b"
+# Whether clicking ``e`` ticks a box: a checkbox itself, a label whose control is
+# one, or inside a role=checkbox / role=switch element.
+_CHECKBOX_JS = r"""(e) => {
+  const isBox = (n) => !!n && ((n.tagName.toLowerCase() === 'input'
+      && (n.getAttribute('type') || '').toLowerCase() === 'checkbox')
+    || ['checkbox', 'switch'].includes((n.getAttribute('role') || '').toLowerCase()));
+  const lab = e.tagName.toLowerCase() === 'label' ? e : e.closest('label');
+  return isBox(e) || isBox(lab && lab.control) || isBox(e.closest('[role=checkbox],[role=switch]'));
+}"""
+# The most of a consent label the tap shows: a longer one is refused, never cut.
+CONSENT_LABEL_CHARS = 600
+# A consent checkbox: an enabled input type=checkbox, or a <label> whose control
+# is one (a styled box hides its input); whether it is ticked; and its label
+# text from every source a page uses (label elements, aria-labelledby,
+# aria-label), whole, so a label longer than the cap is seen as such.
+CONSENT_JS = r"""(e) => {
+  const c = e.tagName.toLowerCase() === 'label' ? e.control : e;
+  const box = !!c && c.tagName.toLowerCase() === 'input'
+    && (c.getAttribute('type') || '').toLowerCase() === 'checkbox' && !c.matches(':disabled');
+  if (!box) return {box: false, checked: false, label: ''};
+  const text = (n) => (n ? (n.innerText || n.textContent || '') : '');
+  const by = (c.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+    .map((id) => text(document.getElementById(id))).join(' ');
+  const label = [...Array.from(c.labels || []).map(text), by, c.getAttribute('aria-label') || '']
+    .join(' ').replace(/\s+/g, ' ').trim();
+  // A label only aria-label gives is invisible on the page: not one the owner could check.
+  const visible = [...Array.from(c.labels || []).map(text), by].join('').trim() !== '';
+  return {box, checked: !!c.checked, visible, label: label.slice(0, 601)};  // one past the cap
+}"""
+# Two targets that are one checkbox (a label and its control).
+_SAME_CONTROL_JS = (
+    "(a, b) => { const c = (e) => (e.tagName.toLowerCase() === 'label' ? e.control : e);"
+    " return c(a) === c(b); }"
+)
+# A step target that submits: a submit or image input, or a submit button (the
+# default type) inside a form, itself or as the target's nearest button.
+_SUBMITS_JS = r"""(e) => {
+  const t = e.tagName.toLowerCase() === 'label' && e.control ? e.control : e;
+  const b = t.closest('button, input');
+  if (!b) return false;
+  const type = (b.getAttribute('type') || (b.tagName === 'BUTTON' ? 'submit' : 'text')).toLowerCase();
+  if (b.tagName === 'INPUT') return type === 'submit' || type === 'image';
+  return type === 'submit' && !!b.form;
+}"""
+# The Pay control, or inside it, or holding it.
+_RELATED_JS = "(e, p) => e === p || p.contains(e) || e.contains(p)"
+# A document's checkboxes and switches (an array handle: compared by element).
+_BOXES_JS = (
+    "() => Array.from(document.querySelectorAll("
+    "'input[type=checkbox], [role=checkbox], [role=switch]'))"
+)
+# Each one's tick, or null once it left the document.
+_TICKED_JS = (
+    "(a) => a.map((e) => (e.isConnected ? (e.matches('input') ? !!e.checked"
+    " : e.getAttribute('aria-checked') === 'true') : null))"
+)
+# What a step clicks, as the tap lists it.
+_STEP_LABEL_JS = "(e) => (e.innerText || e.value || e.getAttribute('aria-label') || '').slice(0, 200)"
 _TEXT_JS = "() => (document.body ? document.body.innerText : '')"
 
 
@@ -379,7 +442,8 @@ class _UrlGuard:
     - the number: anywhere in a digit run (decoded twice; spaces, plus signs,
       dots, slashes, dashes and underscores ignored);
     - the CVC, the expiry (MMYY and MMYYYY, whatever the format typed), the
-      name and the postal code: a whole parameter key or value, or a whole path
+      name (or its first and last parts) and the postal code: a whole
+      parameter key or value, or a whole path
       segment, EQUAL to the value after ``_norm`` (``_tokens``). Equality, not a
       substring: a 3-digit CVC is a substring of most URLs (measured), but rarely
       a whole parameter. A coincidental equal parameter (``?qty=123`` when the
@@ -435,9 +499,13 @@ class _UrlGuard:
                 if len(d) == 6:
                     d = d[:2] + d[4:]
                 self._whole |= self._digests([d, d[:2] + "20" + d[2:]])
-            elif kind in ("cvc", "name", "postal_code"):
+            elif kind in ("cvc", "name", "first_name", "last_name", "postal_code"):
                 if len(_norm(value)) >= _MIN_VALUE:
                     self._whole |= self._digests([value])
+        if "first_name" in values and "last_name" in values:  # the name typed split, whole
+            whole = f"{values['first_name']} {values['last_name']}"
+            if len(_norm(whole)) >= _MIN_VALUE:
+                self._whole |= self._digests([whole])
         if "exp_month" in values and "exp_year" in values:
             mm, yy = int(values["exp_month"]), int(values["exp_year"]) % 100
             self._pair = (
@@ -869,18 +937,198 @@ def _moved(ppage, top: str, fields: dict[str, _Field], pay: _Field, seen: dict) 
         return True
 
 
-async def _extras(ppage, args: cf.CardArgs, fields: dict[str, _Field], fill: bool) -> None:
-    """Each extra field: exactly one input, textarea or select in the top
-    document, no card field, no two names on one element; filled when ``fill``,
-    and then holding its value (checked again after the tap and before Pay)."""
+async def _boxes(ppage) -> list[tuple]:
+    """Every frame's checkboxes and switches now: ``(array handle, ticks)``. A
+    frame that cannot answer (a new document) is left out."""
+    out = []
+    for frame in list(ppage.frames):
+        with contextlib.suppress(Exception):
+            arr = await _step(frame.evaluate_handle(_BOXES_JS))
+            out.append((arr, await _step(arr.evaluate(_TICKED_JS))))
+    return out
+
+
+async def _newly_ticked(snapshot: list[tuple]) -> bool:
+    """Whether a box unticked in ``snapshot`` and still in its document is ticked
+    now. A box added since, removed, or in a frame that went away counts not."""
+    for arr, before in snapshot:
+        try:
+            now = await _step(arr.evaluate(_TICKED_JS))
+        except Exception:  # noqa: BLE001 - its document is gone
+            continue
+        if (
+            isinstance(before, list)
+            and isinstance(now, list)
+            and any(b is False and n is True for b, n in zip(before, now, strict=False))
+        ):
+            return True
+    return False
+
+
+async def _is_pay(ppage, args: cf.CardArgs, frame, handle) -> bool:
+    """Whether ``handle`` (in ``frame``) is the Pay control, inside it, or holds it
+    (when Pay is already there)."""
+    with contextlib.suppress(Exception):
+        frames, sel = args.pay
+        pay_frame = await _walk(ppage.main_frame, frames)
+        if pay_frame is frame:
+            loc = frame.locator(sel)
+            if await _step(loc.count()) == 1:
+                pay = await _step(loc.element_handle(timeout=5000))
+                return bool(await _step(handle.evaluate(_RELATED_JS, pay)))
+    return False
+
+
+async def _steps(ppage, args: cf.CardArgs) -> tuple[list[str], list]:
+    """Click each step in order, in the payment window, before the form is read
+    and before the tap: no card value exists yet, and a step is a click, never
+    a value. Each waits for its element (``STEP_WAIT_S``), which must be exactly
+    one element of its own frame; a framed step's frame must be on https at a
+    named host. A step never submits (a submit control, or Pay itself) and
+    never ticks a box: a box unticked before a click and ticked after it fails
+    the step, and the snapshots are returned so the tap can check again for a
+    page script that ticks one later. Returns (what each step clicked, the
+    snapshots)."""
+    labels, snapshots = [], []
+    for frames, sel in args.steps:
+        frame = await _walk(ppage.main_frame, frames, wait=True)
+        if frame is None or (frames and not cf.secure_origin(cf.origin_of(frame.url))):
+            raise _Stop("step_not_found")
+        loc = frame.locator(sel)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                loc.first.wait_for(state="attached", timeout=STEP_WAIT_S * 1000),
+                STEP_WAIT_S + 5,
+            )
+        if await _step(loc.count()) != 1:
+            raise _Stop("step_not_found")
+        handle = await _step(loc.element_handle(timeout=5000))
+        try:
+            if not await _owned_by(handle, frame):
+                raise _Stop("step_not_found")
+            # A checkbox is a consent: only `consent` ticks one, after the tap. A
+            # target that ticks a box (itself, its label's control, a role=checkbox
+            # ancestor) is refused up front; the box snapshots around the click
+            # are the backstop (a script that ticks one on click). A box a step
+            # creates already ticked reads as a page default and is not seen.
+            if await _step(handle.evaluate(_CHECKBOX_JS)):
+                raise _Stop("step_is_consent")
+            if await _step(handle.evaluate(_SUBMITS_JS)) or await _is_pay(
+                ppage, args, frame, handle
+            ):
+                raise _Stop("step_is_submit")
+            text = await _step(handle.evaluate(_STEP_LABEL_JS))
+            labels.append(text if isinstance(text, str) else "")
+            snapshot = await _boxes(ppage)
+            snapshots.append(snapshot)
+            try:
+                await _step(handle.click(timeout=CLICK_MS))
+            except Exception as e:  # noqa: BLE001 - never the exception's text
+                logger.warning("payment step click failed (%s)", type(e).__name__)
+                raise _Stop("step_failed") from None
+            if await _newly_ticked(snapshot):
+                raise _Stop("step_is_consent")
+        finally:
+            with contextlib.suppress(Exception):
+                await _step(handle.dispose())
+    return labels, snapshots
+
+
+async def _consents(
+    ppage, args: cf.CardArgs, fields: dict[str, _Field], before_tap: bool = False
+) -> list[tuple]:
+    """Each consent target: exactly one enabled checkbox (or a label of one) of
+    the top document or of a frame that holds a card field, with a label the
+    tap can show whole. ``(handle, label)``, in order. ``before_tap``: the box
+    must be unticked (nothing ticked it but the approved fill) and tickable (a
+    trial tick, which changes nothing)."""
+    out, frames_seen = [], []
+    card_frames = {id(f.frame) for f in fields.values()}
+    for frames, sel in args.consent:
+        frame = await _walk(ppage.main_frame, frames)
+        if frame is None or (frame is not ppage.main_frame and id(frame) not in card_frames):
+            raise _Stop("consent_not_found")
+        loc = frame.locator(sel)
+        if await _step(loc.count()) != 1:
+            raise _Stop("consent_not_found")
+        handle = await _step(loc.element_handle(timeout=5000))
+        if not await _owned_by(handle, frame):
+            raise _Stop("consent_not_found")
+        info = await _step(handle.evaluate(CONSENT_JS))
+        if not isinstance(info, dict) or info.get("box") is not True:
+            raise _Stop("consent_not_found")
+        label = info.get("label")
+        if not isinstance(label, str) or not label.strip() or info.get("visible") is not True:
+            raise _Stop("consent_unlabelled")
+        if len(label) > CONSENT_LABEL_CHARS:
+            raise _Stop("consent_label_too_long")
+        for other_frame, other in zip(frames_seen, (h for h, _lab in out), strict=True):
+            if other_frame is frame and await _step(handle.evaluate(_SAME_CONTROL_JS, other)):
+                raise _Stop("consent_not_found")
+        if before_tap:
+            if info.get("checked") is not False:
+                raise _Stop("consent_pre_ticked")
+            try:
+                await _step(handle.check(trial=True, timeout=CLICK_MS))
+            except Exception as e:  # noqa: BLE001 - never the exception's text
+                logger.warning("payment consent trial tick failed (%s)", type(e).__name__)
+                raise _Stop("consent_not_found") from None
+        out.append((handle, label))
+        frames_seen.append(frame)
+    return out
+
+
+async def _tick(consents: list[tuple], filled: list[str]) -> None:
+    """Tick each consent box (after the tap), then check every one is ticked."""
+    for handle, _label in consents:
+        try:
+            await _step(handle.check(timeout=CLICK_MS))
+        except Exception as e:  # noqa: BLE001 - never the exception's text
+            logger.warning("payment consent tick failed (%s)", type(e).__name__)
+            raise _Stop("consent_failed", filled=filled) from None
+    await _ticked(consents, filled)
+
+
+async def _ticked(consents: list[tuple], filled: list[str]) -> None:
+    """Every consent box is ticked and still has the label the tap showed."""
+    for handle, label in consents:
+        info = await _step(handle.evaluate(CONSENT_JS))
+        if (
+            not isinstance(info, dict)
+            or info.get("checked") is not True
+            or info.get("label") != label
+        ):
+            raise _Stop("consent_failed", filled=filled)
+
+
+async def _extras(
+    ppage,
+    args: cf.CardArgs,
+    fields: dict[str, _Field],
+    fill: bool,
+    names=None,
+    check_values: bool = True,
+) -> None:
+    """Each extra field: exactly one input, textarea or select of its frame (the
+    top document, or a frame that holds a card field, so the tap's Fields line
+    names its origin), no card field, no two names on one element; filled when
+    ``fill``, and then holding its value (checked again after the tap and
+    before Pay)."""
     seen: list = []
-    for sel, value in args.extra.values():
-        loc = ppage.main_frame.locator(sel)
+    card_frames = {id(f.frame) for f in fields.values()}
+    chosen = [(n, v) for n, v in args.extra.items() if names is None or n in names]
+    for _name, ((frames, sel), value) in chosen:
+        frame = await _walk(ppage.main_frame, frames, wait=fill)
+        if frame is None:
+            raise _Stop("extra_field_not_found")
+        if frame is not ppage.main_frame and id(frame) not in card_frames:
+            raise _Stop("extra_field_origin")
+        loc = frame.locator(sel)
         await _attached(loc, fill)
         if await _step(loc.count()) != 1:
             raise _Stop("extra_field_not_found")
         handle = await _step(loc.element_handle(timeout=5000))
-        if not await _owned_by(handle, ppage.main_frame):
+        if not await _owned_by(handle, frame):
             raise _Stop("extra_field_not_found")
         tag = await _step(handle.evaluate(EXTRA_FIELD_JS))
         if tag == "card":
@@ -888,12 +1136,12 @@ async def _extras(ppage, args: cf.CardArgs, fields: dict[str, _Field], fill: boo
         if tag not in ("input", "textarea", "select"):
             raise _Stop("extra_field_not_found")
         for f in fields.values():
-            if f.frame is ppage.main_frame and await _step(handle.evaluate(_SAME_JS, f.handle)):
+            if f.frame is frame and await _step(handle.evaluate(_SAME_JS, f.handle)):
                 raise _Stop("extra_field_is_card_field")
-        for other in seen:
-            if await _step(handle.evaluate(_SAME_JS, other)):
+        for other_frame, other in seen:
+            if other_frame is frame and await _step(handle.evaluate(_SAME_JS, other)):
                 raise _Stop("extra_field_not_found")
-        seen.append(handle)
+        seen.append((frame, handle))
         if fill:
             try:
                 if tag == "select":
@@ -902,7 +1150,9 @@ async def _extras(ppage, args: cf.CardArgs, fields: dict[str, _Field], fill: boo
                     await _step(handle.fill(value, timeout=10000))
             except Exception:  # noqa: BLE001
                 raise _Stop("extra_field_failed") from None
-    for handle, (_sel, value) in zip(seen, args.extra.values(), strict=True):
+    for (_frame, handle), (_name, (_spec, value)) in zip(seen, chosen, strict=True):
+        if not check_values:  # located only (values typed later, after the tap)
+            break
         got = await _step(handle.evaluate(EXTRA_VALUE_JS))
         if not isinstance(got, list) or value.strip().casefold() not in {
             g.strip().casefold() for g in got if isinstance(g, str)
@@ -917,7 +1167,7 @@ async def _title(ppage) -> str:
 
 
 async def _same_page(
-    ppage, args, top, seen, label, title, fields, pay, hooks, clicking=False
+    ppage, args, top, seen, label, title, fields, pay, hooks, clicking=False, extras=None
 ) -> bool:
     """Everything the tap showed still holds: the top and frame origins, the
     page title, Pay (the same label, a button, no GET submit), the mask, the
@@ -934,7 +1184,7 @@ async def _same_page(
     if not await _mask_ok(ppage) or not await _amount_ok(ppage, args.amount):
         return False
     try:
-        await _extras(ppage, args, fields, fill=False)
+        await _extras(ppage, args, fields, fill=False, names=extras)
     except _Stop:
         return False
     return True
@@ -1117,12 +1367,17 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     # may need its own to rebuild the inner one); nothing there is filled or clicked.
     if getattr(main_ctx, "browser", None) is None:  # nothing to open a second context with
         raise _Stop("checkout_load_failed")
+    # With steps the form may exist only after them, in the payment window: a
+    # chain that does not resolve here is then skipped (no storage handed over
+    # for it), and its frame is resolved and checked there after the steps.
     frame_origins = set()
     for kind, (frames, _sel) in [*args.fields.items(), ("pay", args.pay)]:
         if frames:
             chain: list = []
-            frame = await _walk(main_page.main_frame, frames, chain, wait=True)
+            frame = await _walk(main_page.main_frame, frames, chain, wait=not args.steps)
             if frame is None or cf.origin_of(frame.url) is None:
+                if args.steps:
+                    continue
                 raise _Stop(f"frame_not_found:{kind}")
             frame_origins.update(o for fr in chain if (o := cf.origin_of(fr.url)))
     # storage_state reads origins without a live page through a temporary main-context
@@ -1184,11 +1439,30 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     host, top = _top(flow, ppage, site)
     if await hooks.interstitial(ppage):
         raise _Stop("bot_check")
+    step_labels: list[str] = []
+    step_snapshots: list = []
+    if args.steps:
+        step_labels, step_snapshots = await _steps(ppage, args)
+        if not await _mask_ok(ppage):
+            raise _Stop("mask_unverified")
+        host, top = _top(flow, ppage, site)  # a step may move the checkout within its site
+        if await hooks.interstitial(ppage):
+            raise _Stop("bot_check")
 
     fields, pay, label = await _resolve(ppage, args, wait=True)
     origins = {k: f.origin for k, f in fields.items()}
     seen = {**origins, "pay": pay.origin}
-    await _extras(ppage, args, fields, fill=True)  # before the tap: no card value exists yet
+    # No box a step's page script ticked since its click (checked before the extra
+    # fields, so a page reacting to an address is never taken for a step).
+    for snapshot in step_snapshots:
+        if await _newly_ticked(snapshot):
+            raise _Stop("step_is_consent")
+    # Before the tap (no card value exists yet), except values from the billing
+    # config: those go only into a page the owner has approved.
+    early = set(args.extra) - args.late
+    await _extras(ppage, args, fields, fill=True, names=early)
+    if args.late:  # located now, typed only after the tap
+        await _extras(ppage, args, fields, fill=False, names=args.late, check_values=False)
     if not await _mask_ok(ppage):
         raise _Stop("mask_unverified")
     # After the extras (an address can re-price), and the total may render late.
@@ -1204,6 +1478,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     fields, pay, label = await _resolve(ppage, args)
     origins = {k: f.origin for k, f in fields.items()}
     seen = {**origins, "pay": pay.origin}
+    consent_labels = [lab for _h, lab in await _consents(ppage, args, fields, before_tap=True)]
 
     # The tap.
     title = ""
@@ -1220,6 +1495,8 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             origins,
             label,
             list(args.extra),
+            consent_labels or None,
+            step_labels or None,
         )
     )
     try:
@@ -1245,12 +1522,38 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     if not isinstance(reply.get("nonce"), str) or not _NONCE.fullmatch(reply["nonce"]):
         raise _Stop("bad_reply")
     flow.nonce = reply["nonce"]
+    # Everything the tap must show for this payment was shown (an older service
+    # ignores a key it does not know): otherwise the release is cancelled unused.
+    needed = {"consent"} if consent_labels else set()
+    if step_labels:
+        needed.add("steps")
+    shown = reply.get("shown")
+    if needed and (not isinstance(shown, list) or not needed <= set(shown)):
+        raise _Stop("vault_too_old")
     await _await_grant(flow, ppage, hooks, report)
     flow.granted = True
 
     # Granted: the page must still show what the tap was for, fields re-resolved.
     fields, pay, _label = await _resolve(ppage, args)
-    if not await _same_page(ppage, args, top, seen, label, title, fields, pay, hooks):
+    if not await _same_page(
+        ppage, args, top, seen, label, title, fields, pay, hooks, extras=early
+    ):
+        raise _Stop("page_changed")
+    if args.late:  # the billing config's values, now the owner has approved this page
+        try:
+            await _extras(ppage, args, fields, fill=True, names=args.late)
+        except _Stop:
+            raise _Stop("page_changed") from None
+        # Before the claim: an address can re-price or re-render the checkout,
+        # and nothing may be claimed for a page that no longer shows what the tap did.
+        fields, pay, _label = await _resolve(ppage, args)
+        if not await _same_page(ppage, args, top, seen, label, title, fields, pay, hooks):
+            raise _Stop("page_changed")
+    try:
+        consents = await _consents(ppage, args, fields)
+    except _Stop:
+        raise _Stop("page_changed") from None
+    if [lab for _h, lab in consents] != consent_labels:
         raise _Stop("page_changed")
     if why := _gone(flow, ppage, hooks):
         raise _Stop(why)
@@ -1272,6 +1575,11 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         values = cf.values_for(card, list(fields), args.expiry_format)
     finally:
         del card
+    # The vault refuses a card with no usable name for these kinds; an empty part
+    # here (a service that predates that check) is typed nowhere either.
+    if any(not values[k].strip() for k in cf.NAME_KINDS if k in values):
+        values.clear()
+        raise _Stop("card_name_unusable")
     guard.arm(values)  # before anything is typed
 
     # Typing. Nothing is typed into a page that changed after the tap.
@@ -1300,6 +1608,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             if not await _holds(f, kind, values[kind]):
                 raise _Stop("failed_before_pay", field=kind, filled=[*flow.typed, kind])
             flow.typed.append(kind)
+        await _tick(consents, flow.typed)  # the approved consent, ticked only now
 
         # Pay. The one final re-check of the page as tapped, then every card field
         # still holding what was typed (a later field's input, or a script on the
@@ -1316,6 +1625,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
                 f, kind, values[kind]
             ):
                 raise _Stop("failed_before_pay", field=kind, filled=flow.typed)
+        await _ticked(consents, flow.typed)
         # After the last await: nothing below lets a route or page event be handled
         # before the click, so these are final for all the browser has reported.
         if code := _typing_outcome(flow):
