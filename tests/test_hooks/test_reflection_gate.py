@@ -559,7 +559,120 @@ def test_snapshot_exemption_keeps_real_reader_late_debt(repo, quiet, monkeypatch
     assert quiet == []
 
 
+def _late_reflection_problem(repo, monkeypatch, tmp_path, *, owed, names, late_rounds):
+    """Admission at round 2 with ``owed`` owed (c11 a late key whose round
+    contexts, as review_late would place them, are ``late_rounds``) for a
+    round-1-style reflection (Premise: LEAD) naming ``names``."""
+    import time
+
+    import review_late
+
+    head = _head(repo)
+    late = [{"key": "c11", "head": head, "at": datetime.now(UTC)}]
+    monkeypatch.setattr(review_late, "late_findings", lambda *a, **k: late)
+    monkeypatch.setattr(review_late, "fix_time_reader", lambda *a, **k: (lambda h: None))
+    monkeypatch.setattr(review_late, "_ancestry", lambda budget: (set(), lambda sha: ()))
+    monkeypatch.setattr(
+        review_late,
+        "_contexts",
+        lambda *a, **k: [review_late.RoundContext(n, None, ()) for n in late_rounds],
+    )
+    msg = _write_reflection(tmp_path, _reflection(head, keys=tuple(names)))
+    command = f"git commit --allow-empty --cleanup=verbatim -F {msg}"
+    segs, _ = _gate.analyze_checked(command)
+    state = {"owed": list(owed), "late_keys": ["c11"], "cutover": "2026-01-01T00:00:00+00:00"}
+    budget = _budget(count=2, current_head=head)
+    return _gate._reflection_problem(
+        segs, command, str(repo), budget, rr, deadline=time.monotonic() + 30, state=state
+    )
+
+
+@pytest.mark.parametrize("late_round", [0, 1])
+def test_a_late_key_is_admitted_under_its_own_round(repo, monkeypatch, tmp_path, late_round):
+    """Two recorded rounds, only a late key from round 1 (or round 0) owed: a
+    reflection valid for that round is admitted, as review_late would credit it,
+    not refused for lacking round 2's premise checks."""
+    assert _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=["c11"], names=["c11"], late_rounds=[late_round]
+    ) is None
+
+
 @pytest.mark.parametrize(
+    "owed,names,late_rounds,why",
+    [
+        # An open round-2 key is judged at round 2, even with a round-1 late key owed.
+        (["c11", "c12"], ["c12"], [1], "does not pass its grammar"),
+        # A late key on both sides of a merge must pass every candidate round.
+        (["c11"], ["c11"], [1, 2], "does not pass its grammar"),
+        # A late key whose round cannot be placed can never be credited.
+        (["c11"], ["c11"], [], "cannot be placed"),
+        # Naming no owed key credits nothing.
+        (["c11"], ["c99"], [1], "names none of the owed keys"),
+    ],
+)
+def test_admission_follows_what_the_debt_reader_would_credit(
+    repo, monkeypatch, tmp_path, owed, names, late_rounds, why
+):
+    problem = _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=owed, names=names, late_rounds=late_rounds
+    )
+    assert problem is not None and why in problem, problem
+
+
+def test_a_late_round_one_key_is_admitted_through_the_real_reader(repo, monkeypatch, tmp_path):
+    """No stubs: two rounds recorded, round 2 closed, a late finding on round 1
+    owed. The real late reader places it at round 1, so a round-1 reflection is
+    admitted, and the same text judged at round 2 would not be."""
+    import time
+
+    head = _head(repo)
+    base = _git(repo, "rev-parse", "HEAD~1").strip()
+    now = datetime.now(UTC)
+    cutover = (now - timedelta(hours=4)).isoformat()
+
+    def at(hours):
+        return (now - timedelta(hours=hours)).isoformat()
+
+    budget = _budget(
+        pr=3535,
+        repo="WingedGuardian/GENesis-AGI",
+        count=2,
+        current_head=head,
+        round_state="complete",
+        reflection_keys="ok",
+        open_keys=[],
+        body="",
+        rounds=[
+            {"head": base, "opened_at": at(3),
+             "reviews": [{"submitted_at": at(3), "finding_keys": ["c10"]}]},
+            {"head": head, "opened_at": at(2),
+             "reviews": [{"submitted_at": at(2), "finding_keys": ["c12"]}]},
+        ],
+        commits=[{"sha": base, "parents": []}, {"sha": head, "parents": [base]}],
+        findings=[{
+            "head": base,
+            "submitted_at": at(0.5),
+            "late": True,
+            "keys": ["c11"],
+            "round_head": base,
+        }],
+    )
+    state = rr.owed_from_budget(
+        str(repo), budget, budget["repo"], budget["pr"], now=now, cutover=cutover,
+    )
+    assert state["owed"] == ["c11"], state
+    text = _reflection(head, keys=("c11",))
+    assert rr.parse(text, round_number=2).problems  # round 2 would refuse it
+    msg = _write_reflection(tmp_path, text)
+    command = f"git commit --allow-empty --cleanup=verbatim -F {msg}"
+    segs, _ = _gate.analyze_checked(command)
+    assert _gate._reflection_problem(
+        segs, command, str(repo), budget, rr, deadline=time.monotonic() + 30, state=state
+    ) is None
+
+
+@pytest.mark.parametrize(
+
     "outcome",
     [rr.Refused("git unreadable"), RuntimeError("boom"), {"owed": None}],
 )

@@ -1020,8 +1020,41 @@ def _looks_like_reflection(seg, cwd: str | None, rr) -> bool:
     return False
 
 
+def _key_rounds(
+    cwd: str | None, budget: dict, state: dict, keys: set[str], rr, *, deadline: float
+) -> dict[str, list[int | None]]:
+    """Every round the debt reader judges each of ``keys`` under, for the owed
+    keys among them: the PR's current round for an open-round key, and a late
+    key's own round contexts (``review_late._contexts``, ALL of which must pass
+    there). None is a late key with no earlier round, which owes the grammar
+    alone. A late key whose round cannot be placed gets no entry: it can never
+    be credited, so it never admits. The late read runs inside ``deadline``."""
+    owed = set(state.get("owed") or [])
+    late_keys = set(state.get("late_keys") or [])
+    current = int(budget.get("count") or 0)
+    rounds: dict[str, list[int | None]] = {k: [current] for k in (keys & owed) - late_keys}
+    named_late = keys & owed & late_keys
+    if named_late:
+        import review_late  # noqa: PLC0415 — lazy, like review_reflection
+
+        with rr.deadline_scope(deadline):
+            fix_time = review_late.fix_time_reader(cwd or ".", str(budget.get("current_head")))
+            late = review_late.late_findings(budget, state.get("cutover"), fix_time)
+        if late is None:
+            raise rr.Refused("the late findings could not be read")
+        _, ancestors = review_late._ancestry(budget)
+        now = datetime.now(UTC)
+        for item in late:
+            key = item.get("key")
+            if key in named_late:
+                contexts = review_late._contexts(budget, item, now, ancestors)
+                if contexts:
+                    rounds[key] = [context.round_number or None for context in contexts]
+    return rounds
+
+
 def _reflection_problem(
-    segs, command: str, cwd: str | None, budget: dict, rr, *, deadline: float
+    segs, command: str, cwd: str | None, budget: dict, rr, *, deadline: float, state: dict | None = None
 ) -> str | None:
     """Why this commit is NOT a reflection the gate may admit, or None when it is.
 
@@ -1057,13 +1090,39 @@ def _reflection_problem(
         return f"{path} {why}"
     if len(text.encode("utf-8")) > _REFLECTION_FILE_LIMIT:
         return f"{path} is larger than {_REFLECTION_FILE_LIMIT} bytes"
-    parsed = rr.parse(
-        text,
-        round_number=int(budget.get("count") or 0),
-        gate_lane=bool(budget.get("gate_surface")),
-    )
+    gate_lane = bool(budget.get("gate_surface"))
+    parsed = rr.parse(text, gate_lane=gate_lane)  # the grammar alone, and its keys
     if parsed.problems:
         return "the reflection does not pass its grammar: " + "; ".join(parsed.problems[:5])
+    if state is None:  # no owed state (direct callers): the current round, as before
+        rounds = {k: [int(budget.get("count") or 0)] for k in parsed.keys}
+    else:
+        named = set(parsed.keys)
+        owed = set(state.get("owed") or [])
+        if not named & owed:
+            return (
+                "the reflection names none of the owed keys "
+                f"({', '.join(sorted(owed)) or 'none'}), so it would credit nothing"
+            )
+        rounds = _key_rounds(cwd, budget, state, named, rr, deadline=deadline)
+    # Admitted when some named owed key passes under EVERY round the debt
+    # reader judges it under (review_late.covered_late_keys for a late key, the
+    # current round for an open one); which keys it credits is still that
+    # reader's call. A late key whose round cannot be placed admits nothing.
+    problems: list[str] = []
+    for key in sorted(rounds):
+        failed = [
+            problem
+            for round_n in rounds[key]
+            for problem in rr.parse(text, round_number=round_n, gate_lane=gate_lane).problems
+        ]
+        if not failed:
+            break
+        problems = problems or failed
+    else:
+        if not problems:
+            return "the round of the owed keys it names cannot be placed, so it would credit nothing"
+        return "the reflection does not pass its grammar: " + "; ".join(problems[:5])
     if parsed.head != budget.get("current_head"):
         return f"the reflection names head {str(parsed.head)[:12]}, not the PR head {str(budget.get('current_head'))[:12]}"
     return None
@@ -1171,7 +1230,9 @@ def _reflection_rule(
     mode = _reflection_gate_mode()
     if len(commit_segs) == 1 and _looks_like_reflection(commit_segs[0], cwd, rr):
         try:
-            problem = _reflection_problem(segs, command, cwd, budget, rr, deadline=hook_deadline)
+            problem = _reflection_problem(
+                segs, command, cwd, budget, rr, deadline=hook_deadline, state=state
+            )
         except Exception as exc:  # noqa: BLE001 — never admit what was not fully checked
             problem = f"it could not be checked ({type(exc).__name__}); run it again"
         if problem is None:
