@@ -59,7 +59,7 @@ STEP_WAIT_S = 20.0
 EXPORT_S = 120.0  # the storage export: one temporary-page visit per origin seen since launch
 GOTO_MS = 30000
 POLL_S = 2.0
-KEEPALIVE_S = 60.0  # well inside the shortest idle warning measured (25 minutes)
+KEEPALIVE_S = 60.0  # well inside a measured idle logout's warning
 # A total read after the save counts once it reads the same twice this far apart;
 # one equal to the price shown before the save must hold TOTAL_SAME_S (a page
 # reprices on its own schedule, and a stale price must never pass the ceiling).
@@ -1241,9 +1241,9 @@ async def _select(handle, value: str, kind: str = "") -> None:
 
 
 async def _keep_alive(pages) -> None:
-    """A small mouse move in each page: a checkout's own idle tracker (one MEASURED
-    logs out after 25 + 5 idle minutes and empties the cart) sees activity, so
-    the tap wait never outlasts it. No click, no key."""
+    """A small mouse move in each page: a checkout's own idle tracker (a measured
+    idle logout empties the cart) sees activity, so the tap wait never outlasts
+    it. No click, no key."""
     global _alive_tick
     _alive_tick += 1
     shift = 5 * (_alive_tick % 2)  # a move to where the pointer already is fires no event

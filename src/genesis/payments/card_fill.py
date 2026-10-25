@@ -497,7 +497,7 @@ def _price_text(value) -> bool:
 
 
 # A price: digits with optional thousands commas and two decimals ($1,234.56,
-# 285.46, 12). One number only; a text holding two prices is not one total.
+# 123.45, 12). One number only; a text holding two prices is not one total.
 _MONEY = re.compile(r"(?<![\d.,])(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{2}))?(?![\d.,]*\d)")
 # A price's text is short. A longer one is refused, never scanned: _MONEY's
 # lookahead makes a long digit run cost quadratic time.
@@ -540,7 +540,7 @@ _PRICE_TOKEN = re.compile(r"(?:\d[\d,]*(?:\.\d{2})?|-+\.-+)")
 
 
 def label_shape(label) -> str:
-    """A Pay label with its price masked: "Pay $--.--" and "Pay $285.46" match."""
+    """A Pay label with its price masked: "Pay $--.--" and "Pay $123.45" match."""
     return _PRICE_TOKEN.sub("#", _norm(label)) if isinstance(label, str) else ""
 
 

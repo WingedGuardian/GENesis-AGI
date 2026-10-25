@@ -594,12 +594,12 @@ def test_a_ceiling_with_save_is_kept():
 @pytest.mark.parametrize(
     ("text", "value"),
     [
-        ("Pay $285.46", "285.46"),
-        ("$1,285.46", "1285.46"),
+        ("Pay $123.45", "123.45"),
+        ("$1,123.45", "1123.45"),
         ("Total 12", "12.00"),
         ("Pay $--.--", None),
         ("$3.00 and $5.00", None),
-        ("285.4", None),
+        ("123.4", None),
         ("-$25.00", None),  # a negative amount is never a total
         ("$-25.00", None),
         ("$ \u221225.00", None),
@@ -615,8 +615,8 @@ def test_money_reads_one_price(text, value):
 
 
 def test_label_shape_masks_only_the_price():
-    assert cf.label_shape("Pay $--.--") == cf.label_shape("Pay $285.46")
-    assert cf.label_shape("Pay $285.46") != cf.label_shape("Buy now $285.46")
+    assert cf.label_shape("Pay $--.--") == cf.label_shape("Pay $123.45")
+    assert cf.label_shape("Pay $123.45") != cf.label_shape("Buy now $123.45")
 
 
 def test_save_needs_an_amount_the_total_can_be_checked_against():
@@ -639,14 +639,14 @@ def test_a_price_just_under_the_cap_is_still_read():
 
 
 def test_currency_marks():
-    assert cf.currency("Pay $285.46") == {"$"}
-    assert cf.currency("285.46 EUR") == {"EUR"}
-    assert cf.currency("285.46") == frozenset()
+    assert cf.currency("Pay $123.45") == {"$"}
+    assert cf.currency("123.45 EUR") == {"EUR"}
+    assert cf.currency("123.45") == frozenset()
     assert cf.currency(None) == frozenset()
 
 
 def test_label_shape_keeps_the_currency_symbol():
-    assert cf.label_shape("Pay $285.46") != cf.label_shape("Pay \u20ac285.46")
+    assert cf.label_shape("Pay $123.45") != cf.label_shape("Pay \u20ac123.45")
 
 
 def test_save_needs_the_amount_with_its_currency():
