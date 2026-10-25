@@ -1645,3 +1645,19 @@ async def test_no_consent_labels_leave_the_tap_unchanged(ctx):
 @pytest.mark.parametrize("value", ["one", [], ["a", "b", "c"], [3], ["  "], ["x" * 601]])
 async def test_bad_consent_labels_are_refused(ctx, value):
     assert await ctx.request(consent_labels=value) == {"ok": False, "error": "bad consent_labels"}
+
+
+async def test_a_ceiling_and_a_save_button_are_shown_and_echoed(ctx):
+    reply = await ctx.request(amount_max="30.00 USD", save_label="Add Card")
+    assert set(reply["shown"]) == {"amount_max", "save"}
+    fields = ctx.reg.calls[-1][0]
+    assert fields["Amount"].startswith("up to 30.00 USD (subtotal 12.00 USD")
+    assert fields["Save button"] == "Add Card"
+    row = next(e for e in await ctx.events() if e["event"] == "release_requested")
+    assert row["detail"]["field_lengths"]["amount_max"] == len("30.00 USD")
+
+
+@pytest.mark.parametrize("value", ["", 5, "x" * 33])
+async def test_a_bad_ceiling_is_refused(ctx, value):
+    assert await ctx.request(amount_max=value) == {"ok": False, "error": "bad amount_max"}
+

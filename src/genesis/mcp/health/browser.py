@@ -4762,6 +4762,9 @@ async def _impl_browser_fill_card(
     extra_fields: dict | None = None,
     steps: list | None = None,
     consent: list | None = None,
+    save: str | dict | None = None,
+    amount_max: str | None = None,
+    total: str | dict | None = None,
     report=None,
 ) -> dict:
     """Pay with a vault card in an isolated browser context. See browser_fill_card."""
@@ -4771,7 +4774,17 @@ async def _impl_browser_fill_card(
         if card_fill.playwright_debug_on():
             return card_fill.result("playwright_debug_on")
         args = card_fill.validate(
-            card_ref, amount, fields, pay, expiry_format, extra_fields, steps, consent
+            card_ref,
+            amount,
+            fields,
+            pay,
+            expiry_format,
+            extra_fields,
+            steps,
+            consent,
+            save,
+            amount_max,
+            total,
         )
         # Short hold: every browser tool waits on this lock, and the flow waits minutes.
         async with _browser_lock:
@@ -5087,6 +5100,9 @@ async def browser_fill_card(
     extra_fields: dict | None = None,
     steps: list | None = None,
     consent: list | None = None,
+    save: str | dict | None = None,
+    amount_max: str | None = None,
+    total: str | dict | None = None,
     ctx: Context | None = None,
 ) -> dict:
     """Pay with a vault card on the open Camoufox checkout after the owner's
@@ -5112,7 +5128,14 @@ async def browser_fill_card(
     anything is read or filled (a cart, "checkout", "add card"); clicks only,
     never a checkbox. consent: up to 2 checkboxes (a debit authorization in the
     card form), same shape; the tap shows their labels, and they are ticked only
-    after it.
+    after it. save: the control that stores the card (usually in the card
+    frame), clicked before Pay; then the total (the ``total`` element, or Pay's
+    label) is read and Pay is clicked only if amount <= total <= amount_max.
+    amount_max (needs save): the ceiling the tap approves ("up to"); amount
+    stays the subtotal the page shows before the card. With save, pass both as
+    the page writes them, currency symbol included: a total in another currency,
+    or a negative one, is not read. The ceiling checks what the page shows; it
+    is not a limit the merchant enforces.
 
     Returns {code, status, host} (+ filled, field, reason where they apply).
     submitted_unverified: check the order. challenge, card_url_blocked,
@@ -5133,7 +5156,7 @@ async def browser_fill_card(
             )
 
     return await _impl_browser_fill_card(
-        card_ref, amount, fields, pay, expiry_format, extra_fields, steps, consent, report=report
+        card_ref, amount, fields, pay, expiry_format, extra_fields, steps, consent, save, amount_max, total, report=report
     )
 
 

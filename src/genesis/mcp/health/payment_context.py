@@ -59,6 +59,12 @@ STEP_WAIT_S = 20.0
 EXPORT_S = 120.0  # the storage export: one temporary-page visit per origin seen since launch
 GOTO_MS = 30000
 POLL_S = 2.0
+KEEPALIVE_S = 60.0  # well inside the shortest idle warning measured (25 minutes)
+# A total read after the save counts once it reads the same twice this far apart;
+# one equal to the price shown before the save must hold TOTAL_SAME_S (a page
+# reprices on its own schedule, and a stale price must never pass the ceiling).
+TOTAL_STABLE_S = 1.0
+TOTAL_SAME_S = 5.0
 STATUS_FAILS = 5  # consecutive unanswered status polls before giving up
 # The vault refuses a pending release 720 s after its request and a granted
 # one 120 s after the tap; past both (plus slack) nothing can be granted.
@@ -321,6 +327,8 @@ _TICKED_JS = (
 # What a step clicks, as the tap lists it.
 _STEP_LABEL_JS = "(e) => (e.innerText || e.value || e.getAttribute('aria-label') || '').slice(0, 200)"
 _TEXT_JS = "() => (document.body ? document.body.innerText : '')"
+# One character past cf.MONEY_MAX: an over-long text is refused, never cut into a price.
+_INNER_TEXT_JS = "(e) => (e.innerText || e.textContent || '').slice(0, 201)"
 
 
 class PaymentInFlight(Exception):
@@ -355,6 +363,7 @@ class _Flow:
     typing: bool = False
     typed: list[str] = field(default_factory=list)
     paid: bool = False
+    saved: bool = False  # the save control was clicked: the card may be stored on the merchant
     popup: bool = False
     popups: int = 0
     navs: int = 0  # top-document commits, counted from the Pay click
@@ -600,6 +609,7 @@ class _Stop(Exception):
 
 
 _flow: _Flow | None = None
+_alive_tick = 0
 _x_input = 0  # Turnstile X-input phases running in this process
 _prefs_pinned = False
 _tasks: set[asyncio.Task] = set()
@@ -720,6 +730,8 @@ def _ended(flow: _Flow, before_claim: str) -> dict:
     """The result for a flow cut short, by how far it got."""
     if flow.paid:
         return cf.result("outcome_unknown", flow.host)
+    if flow.saved:  # the card went into the checkout's form; Pay was not clicked
+        return cf.result(_typing_outcome(flow) or "saved_stopped", flow.host, filled=flow.typed)
     if flow.typing:
         return cf.result(_typing_outcome(flow) or "failed_before_pay", flow.host, filled=flow.typed)
     return cf.result("claimed_not_filled" if flow.claimed else before_claim, flow.host)
@@ -1228,15 +1240,32 @@ async def _select(handle, value: str, kind: str = "") -> None:
     raise RuntimeError("no matching option")
 
 
-async def _await_grant(flow: _Flow, ppage, hooks: Hooks, report) -> None:
-    """Poll release_status until granted; raises _Stop otherwise."""
+async def _keep_alive(pages) -> None:
+    """A small mouse move in each page: a checkout's own idle tracker (one MEASURED
+    logs out after 25 + 5 idle minutes and empties the cart) sees activity, so
+    the tap wait never outlasts it. No click, no key."""
+    global _alive_tick
+    _alive_tick += 1
+    shift = 5 * (_alive_tick % 2)  # a move to where the pointer already is fires no event
+    for i, page in enumerate(pages):
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(page.mouse.move(40 + i + shift, 40 + i + shift), STEP_S)
+
+
+async def _await_grant(flow: _Flow, ppage, hooks: Hooks, report, main_page=None) -> None:
+    """Poll release_status until granted; raises _Stop otherwise. Every
+    ``KEEPALIVE_S`` the payment page and the main page get a mouse move."""
     loop = asyncio.get_running_loop()
     ceiling = loop.time() + CEILING_S
     backstop, fails = ceiling, 0
+    next_alive = loop.time()
     while True:
         if why := _gone(flow, ppage, hooks):
             raise _Stop(why)
         hooks.touch()
+        if loop.time() >= next_alive:
+            await _keep_alive([ppage, *([main_page] if main_page is not None else [])])
+            next_alive = loop.time() + KEEPALIVE_S
         final = loop.time() >= backstop
         try:
             status = await rc.release_status(flow.nonce)
@@ -1348,6 +1377,155 @@ async def _bank_frame_shown(ppage) -> bool:
         except Exception:  # noqa: BLE001
             return True
     return False
+
+
+async def _resolve_save(ppage, args: cf.CardArgs, fields: dict[str, _Field]):
+    """The save control (``(None, None)`` without one): exactly one button, not a
+    declared GET submit, in the top document or a frame holding a card field
+    (the tap's Fields line names that origin); and its label, for the tap."""
+    if args.save is None:
+        return None, None
+    try:
+        frame, handle, origin = await _resolve_one(ppage, args.save, "pay")
+    except _Stop:
+        raise _Stop("save_not_found") from None
+    card_frames = {id(f.frame) for f in fields.values()}
+    if frame is not ppage.main_frame and id(frame) not in card_frames:
+        raise _Stop("save_not_found")
+    if await _is_pay(ppage, args, frame, handle):  # save is clicked before the tap's bound
+        raise _Stop("save_not_found")
+    info = await _step(handle.evaluate(PAY_JS))
+    if not isinstance(info, dict) or info.get("button") is not True:
+        raise _Stop("save_not_found")
+    if info.get("get") is not False:  # it would put the card in a URL: refused before the tap
+        raise _Stop("pay_get_form")
+    label = info.get("label")
+    return _Field(frame, handle, "save", origin), label if isinstance(label, str) else ""
+
+
+async def _read_total(ppage, args: cf.CardArgs, pay: _Field, card_frames=frozenset()):
+    """The total the checkout shows now: the ``total`` element's text, or the Pay
+    control's label; None while it shows no single price."""
+    try:
+        if args.total is None:
+            info = await _step(pay.handle.evaluate(PAY_JS))
+            text = info.get("label") if isinstance(info, dict) else None
+        else:
+            frames, sel = args.total
+            frame = await _walk(ppage.main_frame, frames)
+            if frame is None or (frame is not ppage.main_frame and id(frame) not in card_frames):
+                return None
+            loc = frame.locator(sel)
+            if await _step(loc.count()) != 1:
+                return None
+            text = await _step(loc.first.evaluate(_INNER_TEXT_JS))
+    except Exception:  # noqa: BLE001 - not shown yet
+        return None
+    if cf.currency(text) != cf.currency(args.amount):  # another currency is not this total
+        return None
+    return cf.money(text)
+
+
+async def _save_stage(flow, ppage, args, save, top, title, label, pay, hooks, fields):
+    """``_save_stage_inner``, with a card value seen in a URL outranking whatever
+    it found (the exposure is never hidden behind a total code)."""
+    code = await _save_stage_inner(flow, ppage, args, save, top, title, label, pay, hooks, fields)
+    if flow.url_blocked or flow.url_leaked:
+        return _typing_outcome(flow)
+    return code
+
+
+async def _save_stage_inner(
+    flow, ppage, args, save, top, title, label, pay, hooks, fields
+) -> str | None:
+    """Click save, wait for the total, check it against the tap, re-check the
+    page. None: Pay may be clicked; else the code to stop with (Pay NOT clicked).
+
+    After save the card frame may be gone, so the re-check covers the top
+    document: its origin and title, no bot check, the mask, the subtotal still
+    shown, Pay a live button with no GET submit whose label differs from the
+    tapped one only in its price, and the top-level extra fields. The network
+    guard stays armed: a card value seen in a URL outranks everything."""
+    marks = (flow.nav_requests, flow.popups)
+    frames_before = {f.url for f in list(ppage.frames)}
+    card_frames = frozenset(id(f.frame) for f in fields.values())
+    shown_before = await _read_total(ppage, args, pay, card_frames)
+    flow.saved = True
+    try:
+        await _step(save.handle.click(timeout=CLICK_MS))
+    except Exception as e:  # noqa: BLE001 - never the exception's text; it may have landed
+        logger.warning("payment save click raised (%s)", type(e).__name__)
+    loop = asyncio.get_running_loop()
+    deadline, total, candidate, since = loop.time() + SETTLE_S, None, None, 0.0
+    while loop.time() < deadline:
+        if flow.url_blocked or flow.url_leaked:
+            return _typing_outcome(flow)
+        if flow.popups != marks[1] or any(
+            _is_challenge(f.url) for f in list(ppage.frames) if f.url not in frames_before
+        ):
+            return "save_challenge"
+        if _gone(flow, ppage, hooks) or flow.nav_requests != marks[0]:
+            return "saved_page_changed"
+        read = await _read_total(ppage, args, pay, card_frames)
+        if read is None or read != candidate:
+            candidate, since = read, loop.time()
+        elif loop.time() - since >= (TOTAL_SAME_S if read == shown_before else TOTAL_STABLE_S):
+            total = read
+            break
+        hooks.touch()
+        await _beat()
+        await asyncio.sleep(TICK_S)
+    if total is None:
+        return "total_not_shown"
+    low = cf.money(args.amount)
+    high = cf.money(args.amount_max) if args.amount_max is not None else low
+    if low is None or high is None:
+        return "total_not_shown"
+    if total > high:
+        return "total_over_ceiling"
+    if total < low:
+        return "total_under_subtotal"
+    if not await _saved_page_ok(ppage, args, top, title, label, pay, hooks, total, card_frames):
+        return "saved_page_changed"
+    if (flow.nav_requests, flow.popups) != marks:  # moved on during the last re-check
+        return "saved_page_changed"
+    if flow.url_blocked or flow.url_leaked:
+        return _typing_outcome(flow)
+    return None
+
+
+async def _saved_page_ok(ppage, args, top, title, label, pay, hooks, total, card_frames) -> bool:
+    """The page after the save still shows what the tap approved, and the total
+    the bound was checked against: Pay's price (when its label has one) and the
+    ``total`` element both read that total now."""
+    try:
+        if cf.origin_of(ppage.url) != top or await _title(ppage) != title:
+            return False
+        if await hooks.interstitial(ppage):
+            return False
+        info = await _step(pay.handle.evaluate(PAY_JS))
+        if not (
+            isinstance(info, dict)
+            and info.get("button") is True
+            and info.get("get") is False
+            and info.get("live") is True
+            and cf.label_shape(info.get("label")) == cf.label_shape(label)
+            and cf.money(info.get("label")) in (None, total)
+        ):
+            return False
+        if args.total is not None and await _read_total(ppage, args, pay, card_frames) != total:
+            return False
+        if not await _mask_ok(ppage) or not await _amount_ok(ppage, args.amount):
+            return False
+        # The card frame may be gone after the save: the top document's extras only.
+        top_only = {n for n, (spec, _v) in args.extra.items() if not spec[0]}
+        await _extras(ppage, args, {}, fill=False, names=top_only)
+    except _Stop:
+        return False
+    except Exception as e:  # noqa: BLE001 - an unanswerable page is a changed one
+        logger.warning("payment re-check after save failed (%s)", type(e).__name__)
+        return False
+    return True
 
 
 async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks, report) -> dict:
@@ -1479,6 +1657,9 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     origins = {k: f.origin for k, f in fields.items()}
     seen = {**origins, "pay": pay.origin}
     consent_labels = [lab for _h, lab in await _consents(ppage, args, fields, before_tap=True)]
+    save, save_label = await _resolve_save(ppage, args, fields)
+    if save is not None:
+        seen["save"] = save.origin
 
     # The tap.
     title = ""
@@ -1497,6 +1678,8 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             list(args.extra),
             consent_labels or None,
             step_labels or None,
+            args.amount_max,
+            save_label,
         )
     )
     try:
@@ -1527,10 +1710,14 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     needed = {"consent"} if consent_labels else set()
     if step_labels:
         needed.add("steps")
+    if args.save is not None:
+        needed.add("save")
+    if args.amount_max is not None:
+        needed.add("amount_max")
     shown = reply.get("shown")
     if needed and (not isinstance(shown, list) or not needed <= set(shown)):
         raise _Stop("vault_too_old")
-    await _await_grant(flow, ppage, hooks, report)
+    await _await_grant(flow, ppage, hooks, report, main_page)
     flow.granted = True
 
     # Granted: the page must still show what the tap was for, fields re-resolved.
@@ -1555,6 +1742,13 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         raise _Stop("page_changed") from None
     if [lab for _h, lab in consents] != consent_labels:
         raise _Stop("page_changed")
+    if args.save is not None:
+        try:
+            save, again = await _resolve_save(ppage, args, fields)
+        except _Stop:
+            raise _Stop("page_changed") from None
+        if again != save_label or save.origin != seen["save"]:
+            raise _Stop("page_changed")
     if why := _gone(flow, ppage, hooks):
         raise _Stop(why)
     flow.claimed = True  # from here the vault may hand the card over: no cancel
@@ -1617,7 +1811,12 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         # that window is an accepted residual (owner ruling 07a1c756), and where
         # a card value can go in a URL is the network guard's job, not the DOM's.
         if not await _same_page(
-            ppage, args, top, seen, label, title, fields, pay, hooks, clicking=True
+            ppage, args, top, seen, label, title, fields, pay, hooks, clicking=save is None
+        ):
+            raise _Stop("failed_before_pay", filled=flow.typed)
+        if save is not None and (
+            cf.origin_of(save.frame.url) != seen["save"]
+            or not _pay_ok(await _step(save.handle.evaluate(PAY_JS)), save_label, True)
         ):
             raise _Stop("failed_before_pay", filled=flow.typed)
         for kind, f in fields.items():
@@ -1636,6 +1835,10 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         raise
     finally:
         values.clear()
+    if save is not None and (
+        code := await _save_stage(flow, ppage, args, save, top, title, label, pay, hooks, fields)
+    ):
+        return cf.result(code, flow.host, filled=flow.typed)
     ppage.on(
         "framenavigated", lambda fr: fr is ppage.main_frame and setattr(flow, "navs", flow.navs + 1)
     )

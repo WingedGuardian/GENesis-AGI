@@ -16,6 +16,7 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit
 
 import yaml
@@ -81,6 +82,13 @@ _NONE = " Nothing was filled."
 _CANCELLED = " The request was cancelled. Nothing was filled."
 _SPENT = " A single-use card is now spent."
 _NO_RETRY = " Outcome unknown: do NOT retry; the owner checks the merchant account or statement."
+# After a save stage: the card went into the checkout's card form, Pay did not.
+_SAVED = (
+    " The card was handed to the checkout's card form (it may now be saved on the merchant "
+    "account) and Pay was NOT clicked. The save control itself may have started a card check "
+    "or a charge: tell the owner to look at the merchant account, and do not repeat the same "
+    "steps blindly (the checkout may now show the saved card)."
+)
 
 TEXTS = {
     "card_fill_disabled": "Card fill is off (config/payments.yaml card_fill.enabled, or "
@@ -89,11 +97,15 @@ TEXTS = {
     "what is typed.",
     "bad_card_ref": "card_ref must be card_ followed by 12 hex characters.",
     "bad_amount": "amount must be the total as the page states it (1-32 printable characters, "
-    "with its digits).",
+    "with its digits); with save, one price with its currency symbol ($19.99).",
     "bad_fields": "fields must map number (required), expiry or exp_month+exp_year, cvc, "
     "name or first_name+last_name, postal_code to a selector or {selector, frames}.",
     "bad_steps": f"steps must be a list of at most {MAX_STEPS} click targets, each a selector "
     "or {selector, frames}.",
+    "bad_amount_max": "amount_max must be a price at or above amount, in the same currency "
+    "(as the page writes prices), and needs save.",
+    "bad_save": "save must be the control that stores the card, or {selector, frames}; total "
+    "needs save.",
     "bad_consent": f"consent must be a list of at most {MAX_CONSENTS} checkboxes, each a "
     "selector or {selector, frames}.",
     "no_billing_value": "An extra field gives no value and card_fill.billing in the payments "
@@ -193,6 +205,16 @@ TEXTS = {
     "vault_too_old": "The vault service did not show everything this payment needs on the "
     "tap (a ceiling, a save button or a consent box); restart genesis-server on current "
     "code." + _NONE,
+    "save_not_found": "The save selector did not match exactly one button in the top "
+    "document or a card field's frame." + _NONE,
+    "total_not_shown": "No total appeared after the card was saved." + _SAVED,
+    "total_over_ceiling": "The total after the card was saved is above amount_max." + _SAVED,
+    "total_under_subtotal": "The total after the card was saved is below the stated amount."
+    + _SAVED,
+    "saved_page_changed": "The checkout changed after the card was saved (origin, title, Pay "
+    "control, mask or a field)." + _SAVED,
+    "save_challenge": "A bank check appeared when the card was saved." + _SAVED,
+    "saved_stopped": "The flow stopped after the card was saved and before Pay." + _SAVED,
     "internal_error": "browser_fill_card failed before Pay; detail withheld.",
 }
 
@@ -219,6 +241,9 @@ class CardArgs:
     # Extra fields whose value comes from the billing config: typed only after
     # the owner's tap, never into a page the owner has not approved.
     late: frozenset[str] = frozenset()
+    save: Spec | None = None  # the control that stores the card, clicked before Pay
+    amount_max: str | None = None  # the ceiling the tap approves ("up to")
+    total: Spec | None = None  # where the total shows after the save (default: Pay's label)
 
     def __repr__(self) -> str:  # never the extra values
         return f"CardArgs({sorted(self.fields)}, extra={list(self.extra)})"
@@ -371,22 +396,38 @@ def _extra_value(v) -> str:
 
 
 def validate(
-    card_ref, amount, fields, pay, expiry_format, extra_fields, steps=None, consent=None
+    card_ref,
+    amount,
+    fields,
+    pay,
+    expiry_format,
+    extra_fields,
+    steps=None,
+    consent=None,
+    save=None,
+    amount_max=None,
+    total=None,
 ) -> CardArgs:
     """The checked arguments, or Refused with the first failing check's code."""
     if not isinstance(card_ref, str) or not CARD_REF.fullmatch(card_ref):
         raise Refused("bad_card_ref")
-    if not (
-        isinstance(amount, str)
-        and 0 < len(amount) <= 32
-        and amount.isprintable()
-        and amount.strip()
-        and any(c.isdigit() for c in amount)  # a price, not generic page text
-        and not holds_long_digit_run(amount)
-    ):
+    if not _price_text(amount):
         raise Refused("bad_amount")
     if expiry_format not in EXPIRY_FORMATS:
         raise Refused("bad_expiry_format")
+    save_spec = None if save is None else _spec(save, "bad_save")
+    total_spec = None if total is None else _spec(total, "bad_save")
+    if total_spec is not None and save_spec is None:
+        raise Refused("bad_save")
+    # The total is checked against it, in its currency: one mark, as the page writes it.
+    if save_spec is not None and (money(amount) is None or len(currency(amount)) != 1):
+        raise Refused("bad_amount")
+    if amount_max is not None:
+        if not (_price_text(amount_max) and save_spec is not None):
+            raise Refused("bad_amount_max")
+        low, high = money(amount), money(amount_max)
+        if low is None or high is None or high < low or currency(amount_max) != currency(amount):
+            raise Refused("bad_amount_max")
     if not isinstance(fields, dict) or not fields or not set(fields) <= set(CARD_KINDS):
         raise Refused("bad_fields")
     has_month, has_year = "exp_month" in fields, "exp_year" in fields
@@ -437,7 +478,70 @@ def validate(
         step_specs,
         consent_specs,
         frozenset(late),
+        save_spec,
+        amount_max,
+        total_spec,
     )
+
+
+def _price_text(value) -> bool:
+    """A price as a page states it: 1-32 printable characters, with its digits."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 32
+        and value.isprintable()
+        and bool(value.strip())
+        and any(c.isdigit() for c in value)  # a price, not generic page text
+        and not holds_long_digit_run(value)
+    )
+
+
+# A price: digits with optional thousands commas and two decimals ($1,234.56,
+# 285.46, 12). One number only; a text holding two prices is not one total.
+_MONEY = re.compile(r"(?<![\d.,])(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{2}))?(?![\d.,]*\d)")
+# A price's text is short. A longer one is refused, never scanned: _MONEY's
+# lookahead makes a long digit run cost quadratic time.
+MONEY_MAX = 200
+_SYMBOLS = "$\u20ac\u00a3\u00a5\u20b9"
+# The currency a price is stated in: a symbol, or a code written beside it.
+_CURRENCY = re.compile(rf"[{_SYMBOLS}]|\b(?:USD|EUR|GBP|JPY|CAD|AUD|CHF|CNY|INR|MXN)\b")
+# A minus before the number, or between its symbol and the number: never a total.
+_NEGATIVE = re.compile(rf"[-\u2212]\s?[{_SYMBOLS}]?\s?\d|[{_SYMBOLS}]\s?[-\u2212]\s?\d")
+
+
+def currency(text) -> frozenset[str]:
+    """The currency marks in a price's text ("$", "EUR"); empty when it has none."""
+    return frozenset(_CURRENCY.findall(_norm(text))) if isinstance(text, str) else frozenset()
+
+
+def money(text) -> Decimal | None:
+    """The one price in ``text`` (units and cents), or None: none, more than one,
+    a negative one, or a text too long to be a price."""
+    if not isinstance(text, str) or len(text) > MONEY_MAX:
+        return None
+    norm = _norm(text)
+    if re.search(r"\d \d", norm):  # digits grouped by spaces ("1 234,56"): not read, refused
+        return None
+    if _NEGATIVE.search(norm):
+        return None
+    found = _MONEY.findall(norm)
+    if len(found) != 1:
+        return None
+    whole, cents = found[0]
+    try:
+        return Decimal(whole.replace(",", "") + "." + (cents or "00"))
+    except InvalidOperation:
+        return None
+
+
+# What a Pay label may change between the tap and the click: its number. The
+# currency symbol stays in the shape, so a label that switches currency differs.
+_PRICE_TOKEN = re.compile(r"(?:\d[\d,]*(?:\.\d{2})?|-+\.-+)")
+
+
+def label_shape(label) -> str:
+    """A Pay label with its price masked: "Pay $--.--" and "Pay $285.46" match."""
+    return _PRICE_TOKEN.sub("#", _norm(label)) if isinstance(label, str) else ""
 
 
 def reply_keys(kinds) -> set[str]:
