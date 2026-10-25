@@ -148,6 +148,7 @@ def test_observe_blocks_browser_interaction():
     assert "mcp__genesis-health__browser_click" in PROFILES["observe"]
     assert "mcp__genesis-health__browser_fill" in PROFILES["observe"]
     assert "mcp__genesis-health__browser_run_js" in PROFILES["observe"]
+    assert "mcp__genesis-health__browser_fill_card" in PROFILES["observe"]
 
 
 def test_observe_blocks_memory_writes():
@@ -229,6 +230,7 @@ def test_research_blocks_browser_interaction():
     assert "mcp__genesis-health__browser_click" in PROFILES["research"]
     assert "mcp__genesis-health__browser_fill" in PROFILES["research"]
     assert "mcp__genesis-health__browser_run_js" in PROFILES["research"]
+    assert "mcp__genesis-health__browser_fill_card" in PROFILES["research"]
 
 
 def test_research_blocks_outreach_send():
@@ -243,6 +245,8 @@ def test_interact_allows_browser_interaction():
     assert "mcp__genesis-health__browser_click" not in PROFILES["interact"]
     assert "mcp__genesis-health__browser_fill" not in PROFILES["interact"]
     assert "mcp__genesis-health__browser_run_js" not in PROFILES["interact"]
+    # Background sessions pay behind the owner's tap (owner ruling).
+    assert "mcp__genesis-health__browser_fill_card" not in PROFILES["interact"]
 
 
 def test_interact_blocks_vector_store_writes():

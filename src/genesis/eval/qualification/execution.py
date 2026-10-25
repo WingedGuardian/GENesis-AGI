@@ -11,7 +11,7 @@ from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from pathlib import Path
 
-from . import pinned
+from . import pinned, sampling
 from .accounting import Journal, _billing, currency, total
 from .evidence import Incomplete, canonical, check_directory, digest, load_json, private_open
 
@@ -92,7 +92,7 @@ def observed_charge(row):
     return (row["spec"]["generation_namespace"], generation), measured
 
 
-def validate(plan, consent, checked):
+def validate(plan, consent, checked, *, cases=None):
     from . import run
 
     keys = {"version", "financial_promise", "stop_semantics", "combined_allowance",
@@ -110,7 +110,6 @@ def validate(plan, consent, checked):
             or set(consent) != {"version", "plan_hash", "scope", "author", "decision_evidence"}
             or type(consent["version"]) is not int or consent["version"] != 1
             or consent["plan_hash"] != digest(plan)
-            or consent["scope"] != f"{2250 * len(aliases)}_requests"
             or consent["author"] != "owner"
             or not isinstance(consent["decision_evidence"], str)
             or not consent["decision_evidence"].strip()):
@@ -132,8 +131,11 @@ def validate(plan, consent, checked):
         if not isinstance(model, dict) or set(model) != {"manifest"}:
             raise Incomplete("operating_model_invalid")
         manifest = deepcopy(model["manifest"])
-        run.validate_campaign(manifest, checked, alias)
-        if (len(manifest["attempts"]) != 2250
+        sampled = sampling.has_sample(manifest)
+        if sampled and aliases != PRO_COMPARISON:
+            raise Incomplete("incumbent_sample_population_invalid")
+        run.validate_campaign(manifest, checked, alias, cases=cases)
+        if ((not sampled and len(manifest["attempts"]) != 2250)
                 or manifest["binding"]["transports"][alias]["credential_fingerprint"] != fingerprint
                 or any(currency(row["max_charge"]) <= 0 for row in manifest["attempts"])):
             raise Incomplete("operating_schedule_invalid")
@@ -142,6 +144,8 @@ def validate(plan, consent, checked):
         manifest["binding"]["operating_plan_hash"] = digest(plan)
         manifest["binding"]["financial_promise"] = PROMISE
         manifests[alias] = manifest
+    if consent["scope"] != f"{sum(len(m['attempts']) for m in manifests.values())}_requests":
+        raise Incomplete("spending_approval_missing_or_changed")
     envelope = total([limit, baseline.copy_negate()])
     if combined <= 0 or total(budgets) > combined or not total(allocations) <= envelope <= combined:
         raise Incomplete("operating_allowance_invalid")
@@ -151,11 +155,11 @@ def validate(plan, consent, checked):
 class Operating:
     """One campaign or pair, with boundary history reads and per-attempt updates."""
 
-    def __init__(self, plan, consent, checked):
+    def __init__(self, plan, consent, checked, *, cases=None):
         from .run import admission_identity
 
         self.inputs, self.plan = (plan, consent), plan.value
-        self.manifests = validate(plan.value, consent.value, checked)
+        self.manifests = validate(plan.value, consent.value, checked, cases=cases)
         self.aliases = tuple(self.manifests)
         self.admission = digest(admission_identity(checked))
         self.journals, self.costs, self.owners = {}, {}, {}
@@ -345,7 +349,7 @@ async def execute(cases, checked, paths, temp_root, *, plan_path, approval_path,
         stack.callback(plan.close)
         consent = Input(approval_path)
         stack.callback(consent.close)
-        operating = Operating(plan, consent, checked)
+        operating = Operating(plan, consent, checked, cases=cases)
         if aliases != operating.aliases:
             raise Incomplete("paired_campaigns_invalid")
         stack.enter_context(comparison_lock(operating.plan["credential_fingerprint"]))
@@ -372,9 +376,17 @@ async def execute(cases, checked, paths, temp_root, *, plan_path, approval_path,
             operating.stop(exc)
             raise
         financial = operating.report()
+        if len(aliases) == 2:
+            from .sampling import comparison
+
+            result = comparison(cases, reports, records,
+                                {a: j.state for a, j in journals.items()}, financial)
+            if operating.stopped:
+                result["status"] = "incomplete"
+                if "comparison_completion" in result:
+                    result["comparison_completion"] = "incomplete"
+            return result
         return {"status": "incomplete" if operating.stopped else
                 run.worst((r["status"] for r in reports.values()), run.OVERALL),
                 "models": reports,
-                **({"paired": run.pair(cases, *(records[a] for a in aliases))}
-                   if len(aliases) == 2 else {}),
                 "financial": financial}

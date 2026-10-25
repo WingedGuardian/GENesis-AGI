@@ -1347,7 +1347,31 @@ Four rules follow, each cheap:
   signal: any reviewer finding that exposes a semantic-modeling gap in a guard
   means STOP and re-architect — never patch the named instance.
 
-  **Decision test (verbatim, apply before shipping any guard):** could a git
+  Git argv is one instance. The wider class is a check that authorizes a future
+  operation by treating a present spelling or snapshot as proof of an unresolved
+  property of that operation or its target. Examples: a filename standing for
+  the file that will actually be opened, a path extension for artifact kind, a
+  flag spelling for whether a command executes, or an unresolved prefix for
+  directory containment. Running before a tool does not by itself make a check
+  open-set: an exact closed protocol can establish a closed structural claim.
+  The failure is using that claim as proof of an operation or effect it does not
+  establish. On #2255's #1826 example, eight of eleven audit findings and all
+  twelve defects across three review rounds had that approximation shape.
+
+  **Decision test (apply before shipping any guard):** a guard may AUTHORIZE
+  (allow or exempt) only on evidence that establishes the property it promises
+  for the action it admits. An inode comparison establishes identity at that
+  lookup; a later pathname open needs an action-bound identity guarantee or an
+  explicitly stated race limitation. A structural parse establishes the syntax
+  it actually parses, not arbitrary command effects. A single chokepoint is
+  useful only when its observed fact governs the admitted action. An exact-form
+  whitelist that fails closed outside its members can establish membership in
+  that closed set; its effect guarantee still needs its own evidence. If the
+  property cannot be resolved before the event, fail closed and say why, abstain
+  and say so, or check it after the event where it IS resolved (snapshot, then
+  compare); never let an approximation allow. A `deny` or `ask` on an imprecise
+  predicate is a separate case ("Two things keep this from reading as licence",
+  below). For git: could a git
   flag you've never heard of change your guard's verdict? If yes, your claim
   is open-set — redesign to closed-set token claims (exact-form whitelists /
   literal token blocks) or to RECOVERABILITY (snapshot-then-allow, where a
