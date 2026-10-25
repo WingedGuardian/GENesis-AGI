@@ -1569,3 +1569,79 @@ def test_retire_released_gives_up_on_a_held_lock(vault, monkeypatch):
     assert [c["status"] for c in vs.list_cards(path) if c["card_ref"] == refs["single"]] == [
         "retired"
     ]
+
+
+async def test_split_name_kinds_are_tapped_and_claimed_as_the_sealed_name(ctx):
+    origins = {
+        "number": "https://js.stripe.com",
+        "first_name": "https://js.stripe.com",
+        "last_name": "https://js.stripe.com",
+    }
+    nonce = await ctx.granted(field_origins=origins)
+    fields = ctx.reg.calls[-1][0]
+    assert "first_name=js.stripe.com" in fields["Fields"]
+    assert "last_name=js.stripe.com" in fields["Fields"]
+    reply = await ctx.claim(nonce)
+    assert reply["ok"] and set(reply["card"]) == {"number", "name", "label", "last4"}
+    assert reply["card"]["name"] == NAME
+
+
+def _add(ctx, *, name, single_use=False):
+    card = vs.parse_card(VISA, f"12/{_exp_year()}", CVC)
+    return vs.add_card(
+        card,
+        label="Name test card",
+        merchant=None if single_use else "example.com",
+        single_use=single_use,
+        name=name,
+        postal_code=POSTAL,
+        path=ctx.svc._vault,
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "kinds"),
+    [("", ("name",)), ("", ("first_name", "last_name")), ("Single", ("first_name", "last_name"))],
+)
+async def test_a_card_with_no_usable_name_is_refused_unspent(ctx, name, kinds):
+    ref = _add(ctx, name=name, single_use=True)
+    origins = {"number": "https://js.stripe.com", **{k: "https://js.stripe.com" for k in kinds}}
+    nonce = await ctx.granted(card_ref=ref, field_origins=origins)
+    reply = await ctx.claim(nonce)
+    assert reply == {"ok": False, "error": "the card has no usable name for the name fields"}
+    # A single-use card stays usable: nothing was retired.
+    assert (
+        next(c for c in vs.list_cards(ctx.svc._vault) if c["card_ref"] == ref)["status"] == "active"
+    )
+
+
+async def test_a_one_word_name_is_fine_for_the_whole_name_kind(ctx):
+    ref = _add(ctx, name="Single")
+    nonce = await ctx.granted(
+        card_ref=ref,
+        field_origins={"number": "https://js.stripe.com", "name": "https://x.example.com"},
+    )
+    assert (await ctx.claim(nonce))["ok"]
+
+
+async def test_consent_labels_are_shown_and_recorded_as_lengths(ctx):
+    label = "I authorize this debit"
+    reply = await ctx.request(consent_labels=[label])
+    assert reply["shown"] == ["consent"]
+    nonce = reply["nonce"]
+    fields = ctx.reg.calls[-1][0]
+    assert fields["Will tick"] == f'"{label}"'
+    row = next(e for e in await ctx.events() if e["event"] == "release_requested")
+    assert row["detail"]["field_lengths"]["consent_labels"] == [len(label)]
+    assert label not in json.dumps(row)
+    assert nonce
+
+
+async def test_no_consent_labels_leave_the_tap_unchanged(ctx):
+    assert (await ctx.request())["shown"] == []
+    assert "Will tick" not in ctx.reg.calls[-1][0]
+
+
+@pytest.mark.parametrize("value", ["one", [], ["a", "b", "c"], [3], ["  "], ["x" * 601]])
+async def test_bad_consent_labels_are_refused(ctx, value):
+    assert await ctx.request(consent_labels=value) == {"ok": False, "error": "bad consent_labels"}
