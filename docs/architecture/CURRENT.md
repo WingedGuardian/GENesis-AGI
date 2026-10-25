@@ -1753,6 +1753,54 @@ the shared banner is not an assertion about all concurrent sessions.
   reclaim); a click that opens a new tab switches the tools to it. `browser_fill` refuses a payment card number
   as the value and `browser_run_js` one in its script (the value check only:
   telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
+  `browser_fill_card` (off unless `config/payments.yaml` `card_fill.enabled`) pays with a
+  vault card in a second, short-lived Camoufox `BrowserContext` that only
+  `mcp/health/payment_context.py` creates or holds (an AST contract test pins it):
+  the merchant's cookies and storage (sessionStorage included) are handed over,
+  it refuses a checkout or card frame not on https at a host the vault's release
+  accepts (a dotted DNS name: no IP, single-label or loopback host), every
+  document is masked transparent from creation and kept so by an observer, top-layer content
+  (modal dialogs, popovers, fullscreen, backdrops, view transitions) and the page background included; a nested frame Camoufox's init script
+  missed (no mask at all) is masked by evaluate and re-checked, while a defeated mask or an unmasked
+  top document fails the check, the owner's tap shows the Pay button label and the
+  extra field names, the tool clicks Pay itself and returns fixed codes only.
+  Card values never leave in a URL: a Pay control whose form DECLARES GET is
+  refused before the tap, and a context-wide network route aborts the first
+  request of any redirect chain whose URL carries a typed card value
+  (`card_url_blocked`, do not retry): the number anywhere in a digit run; the
+  CVC, expiry, name and postal code as a whole parameter or path segment equal
+  to the value (exact equality, so a coincidental `?qty=123` with CVC 123 is
+  blocked too). A script-handled form that is GET only by default is not
+  refused. A redirect hop carrying one cannot be stopped by a
+  route; it is seen and reported (`card_url_leaked`; before Pay,
+  `card_url_before_pay`, or `card_value_in_request` when only a short value
+  matched, which may be a coincidence). WebSocket URLs are not covered. This guards a trusted
+  merchant's flawed form, not a hostile page script: one that reads a field can
+  still send it another way (a request body, an encoding the guard does not undo).
+  Selectors are plain CSS (a `>>` chain, an `engine=` part, quoted text or XPath
+  is refused, mirroring Playwright's own selector parser) and every
+  resolved element must live in the frame whose origin the tap shows
+  (`owner_frame`); a checkout whose host is itself a public suffix is refused;
+  the accessibility tree is off while card fill is on (owner ruling Q14).
+  Top-level navigation requests (sent, committed or not; a fragment or history
+  change sends none) and new windows are counted from the first keystroke: a
+  checkout that moves on while the card is typed ends `moved_while_filling`
+  (do not retry), never "nothing paid", unless a card value also went out in
+  a URL, which ends `card_url_before_pay` (also do not retry). Not seen: a
+  script-only submit (fetch, no navigation) and a navigation inside a child
+  frame (a hosted card frame posting its own form). The network-guard flags are checked
+  again after the last await before the click; a bank frame preloaded hidden
+  and shown after Pay is a `challenge`.
+  Before the tap it waits up to 10 s for a hosted widget's frames, fields, Pay
+  and total to mount (after it, a missing element means the page changed).
+  After the grant, after the claim and before Pay it re-checks the tapped
+  title, origins, Pay control, amount, extra fields and for a bot check, and
+  before Pay reads every card field back; it keeps reporting progress until
+  the end, so a client's idle timeout does not cancel it past the claim.
+  While it runs, the idle reclaim skips Camoufox, Turnstile's X clicks in the
+  same MCP process stand down (other processes on the display: not yet), and after the claim a stale-page restart is refused. Cookies are not
+  handed back to the main context yet, and a 3DS challenge closes the context
+  (`challenge`, outcome unknown).
   Every `_impl_browser_*` result and error passes `@_redacted` (card numbers in
   snapshots, script results, urls, titles and exception text become
   `[card redacted]`; a contract test requires the decorator on each), and the
@@ -3532,8 +3580,11 @@ tool-disabled CC probe without changing its schedule or routing authority.
   message id and text, unedited and accessible, once; anything else, a missing
   bot or audit, or 10 minutes without a tap refuses. Nonces live in memory
   only; no `approval_requests` row is written, and the type is in the gate's
-  approve-all denylist, `refuse_generic` and both dashboard filters. Nothing
-  calls it or decrypts a card yet.
+  approve-all denylist, `refuse_generic` and both dashboard filters.
+  `release.py` serves the release ops (request, status, claim, cancel) to the
+  verified genesis-health peer; `release_client.py` is that peer's side, used
+  by `browser_fill_card`, and `card_fill.py` holds the tool's rules (the
+  switch, launch prefs, argument checks, fixed result texts).
   Backup: `scripts/lib/payment_vault_backup.sh` from
   backup.sh §8 writes the three files as ONE GPG-encrypted tar,
   `creds/payment_vault.tar.gpg`, renamed into place once (cards.db via SQLite
