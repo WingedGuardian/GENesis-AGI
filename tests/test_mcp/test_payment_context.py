@@ -25,6 +25,7 @@ import types
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import quote
 
 import pytest
 
@@ -74,7 +75,6 @@ class El:
         self.value = ""
         self.mangle = False  # the page shows something other than what was typed
         self.on_click = None
-        self.sent = False  # SENT_WITH_PAY_JS's answer: a native submit of Pay's form sends it
         self.owner = None  # the frame the element really lives in (None: the one it was found in)
         self.labels: dict = {}  # a select's option value -> label, where the two differ
 
@@ -102,8 +102,6 @@ class Handle:
             return self.el.extra or self.el.tag
         if js is pc._SAME_JS:
             return arg.el is self.el
-        if js is pc.SENT_WITH_PAY_JS:
-            return self.el.sent
         if js is pc.EXTRA_VALUE_JS:
             return [
                 self.el.value,
@@ -619,10 +617,10 @@ class Route:
         self.done = ("continue",)
 
 
-def _guard(number=PAN):
+def _guard(number=PAN, **values):
     flow = pc._Flow(task=None)
     g = pc._UrlGuard(flow)
-    g.arm(number)
+    g.arm({"number": number, **values})
     return flow, g
 
 
@@ -862,38 +860,12 @@ async def test_a_flag_set_after_the_outcome_settles_still_wins(vault, monkeypatc
     assert out["code"] == "card_url_blocked"
 
 
-@pytest.mark.parametrize(
-    ("sent", "number_top", "code"),
-    [
-        ({"name"}, False, "pay_get_form"),  # the name would go in a URL, the number not
-        ({"cvc"}, False, "submitted_unverified"),  # another document: Pay's form cannot send it
-        ({"name", "number"}, True, "submitted_unverified"),  # the number too: the guard sees it
-        (set(), False, "submitted_unverified"),  # a script-handled form sends none of them
-    ],
-)
-async def test_a_default_get_pay_form_is_refused_only_when_it_would_send_card_fields_alone(
-    vault, sent, number_top, code
-):
+async def test_a_declared_get_form_is_refused_before_the_tap(vault):
     ns = checkout()
-    if number_top:  # the number in Pay's own document
-        ns.ppage.main_frame.elements["#num2"] = ns.ppage.extra[0].elements["#num"]
-        ns.main_page.main_frame.elements["#num2"] = ns.main_page.extra[0].elements["#num"]
-        ns.fields["number"] = "#num2"
-    ns.els["pay"].pay.update(dget=True)
-    for kind in sent:
-        ns.els[kind].sent = True
-    out, _ = await _run(ns)
-    assert out["code"] == code
-    if code == "pay_get_form":
-        assert vault.ops("release_request") == []  # refused before the tap
-
-
-async def test_a_declared_get_ignores_field_membership(vault):
-    ns = checkout()
-    ns.els["pay"].pay.update(get=True, dget=False)
-    ns.els["number"].sent = True
+    ns.els["pay"].pay.update(get=True)
     out, _ = await _run(ns)
     assert out["code"] == "pay_get_form"
+    assert vault.ops("release_request") == []
 
 
 def _main_values(ns):
@@ -972,38 +944,6 @@ async def test_a_click_that_raises_still_counts_as_paid(vault):
     assert out["code"] == "pay_click_unknown"
     assert "do NOT retry" in out["status"] and not out["status"].startswith("Pay was clicked")
     _sweep(out)
-
-
-async def test_the_last_check_before_the_click_is_its_own_guard(vault):
-    # Re-label Pay right AFTER the first Pay read once every field is typed (the
-    # full pre-Pay re-check has just passed): only the final check before the
-    # click can see the change, so Pay must not be clicked. Keyed on the flow's
-    # state, not on a call count, so removing the final check cannot shift it.
-    ns = checkout()
-    clicked: list = []
-    ns.els["pay"].on_click = lambda: clicked.append(1)
-    real = Handle.evaluate
-    done = {"changed": False}
-
-    async def evaluate(self, js, arg=None):
-        out = await real(self, js, arg)
-        flow = pc._flow
-        if (
-            js is pc.PAY_JS
-            and self.el is ns.els["pay"]
-            and flow is not None
-            and len(flow.typed) == len(ns.fields)
-            and not done["changed"]
-        ):
-            done["changed"] = True
-            ns.els["pay"].pay.update(label="Pay $99.99")
-        return out
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(Handle, "evaluate", evaluate)
-        out, _ = await _run(ns)
-    assert done["changed"], "the fixture never reached the pre-Pay re-check"
-    assert out["code"] == "failed_before_pay" and clicked == []
 
 
 async def test_a_cancel_after_the_claim_is_logged_without_values(vault, logs):
@@ -1643,8 +1583,8 @@ async def test_a_card_field_rewritten_by_a_later_fill_stops_before_pay(vault, lo
 
 
 async def test_card_fields_are_read_back_after_the_last_pay_check(vault):
-    """A script that blanks the CVC while the very last Pay check reads the
-    button: the card fields are read back after it, nothing slow in between."""
+    """A script that blanks the CVC while the final pre-Pay check reads the
+    button: the card fields are read back after it."""
     ns = checkout()
     clicked = []
     ns.els["pay"].on_click = lambda: clicked.append(1)
@@ -1659,7 +1599,7 @@ async def test_card_fields_are_read_back_after_the_last_pay_check(vault):
     async def evaluate(self, js, arg=None):
         if js is pc.PAY_JS and typed:
             reads.append(1)
-            if len(reads) == 2:  # the first is _same_page's, the second the last gate's
+            if len(reads) == 1:  # the final _same_page's read
                 ns.els["cvc"].value = ""
         return await real_eval(self, js, arg)
 
@@ -1668,7 +1608,7 @@ async def test_card_fields_are_read_back_after_the_last_pay_check(vault):
         out, _ = await _run(ns)
     finally:
         Handle.fill, Handle.evaluate = real_fill, real_eval
-    assert len(reads) == 2
+    assert len(reads) == 1
     assert out["code"] == "failed_before_pay" and out["field"] == "cvc" and clicked == []
 
 
@@ -2159,24 +2099,7 @@ def test_the_contract_test_catches_a_reach():
     }
 
 
-
 # ── round 7 ─────────────────────────────────────────────────────────────────
-async def test_a_default_get_form_that_stops_sending_the_number_is_refused_at_the_click(vault):
-    # Pre-tap the form sends the number, so a default GET is allowed; an input
-    # handler then unnames the number field. The check repeats before the click.
-    ns = checkout()
-    ns.ppage.main_frame.elements["#num2"] = ns.ppage.extra[0].elements["#num"]
-    ns.main_page.main_frame.elements["#num2"] = ns.main_page.extra[0].elements["#num"]
-    ns.fields["number"] = "#num2"
-    ns.els["pay"].pay.update(dget=True)
-    for kind in ("number", "name"):
-        ns.els[kind].sent = True
-    clicked: list = []
-    ns.els["pay"].on_click = lambda: clicked.append(1)
-    out = await _filling(ns, "number", lambda: setattr(ns.els["number"], "sent", False))
-    assert out["code"] == "failed_before_pay" and clicked == []
-
-
 async def test_a_popup_before_pay_does_not_make_a_clean_pay_a_challenge(vault):
     # A window opened during the claim (before typing) is not something Pay did.
     ns = checkout()
@@ -2204,3 +2127,202 @@ async def test_a_cancel_while_the_release_is_requested_still_cancels_it(vault):
         await task
     assert [r.get("nonce") for r in vault.ops("release_cancel")] == ["nonce-1"]
     assert ns.pctx.closed
+
+
+# ── round 8: the network guard covers every typed value ────────────────────
+YY = f"{YEAR % 100:02d}"
+SHOPX = "https://shop.example.com/charge"
+
+
+def _pct(text: str) -> str:
+    """Every character percent-encoded (what a page or a form may do)."""
+    return "".join(f"%{b:02X}" for b in text.encode())
+
+
+def _wide(digits: str) -> str:
+    """Full-width Unicode digits, percent-encoded as UTF-8."""
+    return quote("".join(chr(0xFF10 + int(d)) for d in digits))
+
+
+def _all_guard():
+    return _guard(cvc=CVC, expiry=f"12/{YY}", name=NAME, postal_code=POSTAL)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"{SHOPX}?cvc={CVC}",  # a query value
+        f"{SHOPX}?a=1&cvc={CVC}&b=2",
+        f"{SHOPX}?ok=1#cvc={CVC}",  # a fragment parameter
+        f"{SHOPX};cvc={CVC}",  # a matrix parameter
+        f"https://shop.example.com/pay/{CVC}/x",  # a whole path segment
+        f"{SHOPX}?cvc={_pct(CVC)}",  # encoded once
+        f"{SHOPX}?cvc={quote(_pct(CVC))}",  # encoded twice
+        f"{SHOPX}?cvc={_wide(CVC)}",  # full-width digits
+        f"{SHOPX}?cvc=" + quote("".join(chr(0x0660 + int(d)) for d in CVC)),  # Arabic-Indic
+        f"{SHOPX}?cvc=+{CVC}+",  # plus signs as spaces around it
+        f"{SHOPX}?q=" + quote(f"cvc={CVC}&a=1", safe=""),  # a query inside a value
+        f"{SHOPX}?r=" + quote(f"/pay/{CVC}", safe=""),  # a path inside a value
+        f"{SHOPX}?{CVC}",  # a bare token
+        f"{SHOPX}?exp=12%2F{YY}",  # the expiry as typed
+        f"{SHOPX}?exp=12/{YY}",
+        f"{SHOPX}?exp=12-{YY}",
+        f"{SHOPX}?exp=12+%2F+{YY}",
+        f"{SHOPX}?exp=12{YEAR}",  # another format than the one typed
+        f"https://shop.example.com/12%2F{YY}/x",
+        f"{SHOPX}?name={NAME.upper()}",  # case-folded
+        f"{SHOPX}?name={NAME[:4]}+{NAME[4:]}",  # a space, as a plus
+        f"{SHOPX}?name={NAME[:4]}%20{NAME[4:]}",
+        f"{SHOPX}?name={quote(_pct(NAME))}",
+        f"{SHOPX}?zip={POSTAL.lower()}",
+        f"{SHOPX}?zip={POSTAL[:3]}-{POSTAL[3:]}",
+    ],
+    ids=lambda _url: "u",  # never a generated value in a test id
+)
+def test_the_url_guard_blocks_every_typed_value_as_a_whole_parameter(url):
+    _flow, g = _all_guard()
+    assert g.carries(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"{SHOPX}?qty={CVC}9",  # the CVC inside a longer value: not equal
+        f"{SHOPX}?qty=9{CVC}",
+        f"{SHOPX}?order={CVC}{CVC}",
+        f"https://shop.example.com/a{CVC}b/x",
+        f"{SHOPX}?t=x{CVC}",
+        f"{SHOPX}?exp=12{YY}9",
+        f"{SHOPX}?n={NAME}x",
+        f"{SHOPX}?n=x{NAME}",
+        f"{SHOPX}?zip={POSTAL}0",
+        f"{SHOPX}?last4=4242&amount=1999",
+        "https://shop.example.com/",
+    ],
+    ids=lambda _url: "u",  # never a generated value in a test id
+)
+def test_the_url_guard_passes_a_value_only_inside_a_longer_one(url):
+    _flow, g = _all_guard()
+    assert g.carries(url) is False
+
+
+def test_a_coincidental_equal_parameter_fails_closed():
+    # The documented edge: equality to a whole parameter is enough, whatever
+    # its name; ?qty=<the CVC> is blocked (a lost request, never a leak).
+    _flow, g = _all_guard()
+    assert g.carries(f"{SHOPX}?qty={CVC}") is True
+
+
+def test_a_separate_month_and_year_are_blocked_only_together():
+    _flow, g = _guard(exp_month="12", exp_year=str(YEAR))
+    assert g.carries(f"{SHOPX}?m=12&y={YEAR}") is True
+    assert g.carries(f"{SHOPX}?m=12&y={YY}") is True  # the year in two digits
+    assert g.carries(f"{SHOPX}?page=12") is False  # a month alone is a common number
+    assert g.carries(f"{SHOPX}?y={YEAR}") is False
+    _flow, g = _guard(exp_month="03", exp_year=YY)
+    assert g.carries(f"{SHOPX}?m=3&y={YEAR}") is True  # the option value without its zero
+
+
+def test_a_value_too_short_to_match_safely_is_not_matched():
+    _flow, g = _guard(name="Q z")  # normalises to two characters
+    assert g.carries(f"{SHOPX}?n=qz") is False
+    assert g.carries(f"{SHOPX}?card={PAN}") is True  # the number is still guarded
+
+
+def test_the_guard_keeps_no_typed_value():
+    _flow, g = _all_guard()
+    held = repr(vars(g))
+    for s in (PAN, CVC, NAME, POSTAL, NAME.casefold(), POSTAL.casefold(), f"12{YY}"):
+        assert s not in held
+
+
+def test_a_url_with_too_many_value_sized_tokens_is_unjudgeable():
+    _flow, g = _all_guard()
+    heavy = SHOPX + "?" + "&".join(f"v={i:03d}" for i in range(100, 1000)) * 5
+    heavy += "&" + "&".join(f"w={i:04d}" for i in range(1000, 5200))
+    with pytest.raises(pc._Unjudgeable):
+        g.carries(heavy)
+
+
+def test_a_redirect_hop_carrying_the_cvc_is_recorded_as_leaked():
+    flow, g = _all_guard()
+    g.on_request(_request(f"https://shop.example.com/land?cvc={CVC}"))
+    assert flow.url_leaked is True
+
+
+async def test_a_get_submit_during_the_click_without_the_number_is_blocked(vault, logs):
+    # Round 7's P1s: a click handler unnames or rewrites the number field, then
+    # the native default-GET submit sends the CVC and expiry alone. No DOM check
+    # can see that; the network guard blocks the request whatever sent it.
+    ns = checkout()
+    hit: list = []
+
+    def pay():
+        r = Route(f"{SHOPX}?cvc={CVC}&exp=12%2F{YY}&name={NAME}")
+        hit.append(r)
+        asyncio.ensure_future(ns.pctx.route_handler(r))
+
+    ns.els["pay"].on_click = pay
+    out, _ = await _run(ns)
+    assert hit[0].done == ("abort", "blockedbyclient")
+    assert out["code"] == "card_url_blocked" and "do NOT retry" in out["status"]
+    _sweep(out, logs)
+
+
+async def test_the_tap_names_the_host_the_extras_moved_the_checkout_to(vault):
+    # Filling an extra field moves the checkout to another host of the same site:
+    # the tap names that host, and the page after the grant is the same page.
+    ns = checkout()
+    real_fill = Handle.fill
+
+    async def fill(self, value, timeout=None):
+        await real_fill(self, value, timeout)
+        if self.el is ns.els["email"]:
+            ns.ppage.same_document("https://pay.example.com/checkout")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Handle, "fill", fill)
+        out, _ = await _run(ns)
+    assert vault.ops("release_request")[0]["host"] == "pay.example.com"
+    assert out["code"] == "submitted_unverified" and out["host"] == "pay.example.com"
+
+
+def test_a_month_option_matched_by_its_label_is_guarded_by_its_value():
+    _flow, g = _guard(exp_month="12", exp_year=str(YEAR))
+    url = f"{SHOPX}?m=mon12&y={YEAR}"
+    assert g.carries(url) is False
+    g.add_option("exp_month", "mon12")
+    assert g.carries(url) is True
+
+
+async def test_a_get_submit_of_a_label_matched_expiry_select_is_blocked(vault, logs):
+    ns = checkout(select_expiry=True)
+    month = ns.els["exp_month"]
+    month.options = ["mon12", *[f"mon{m}" for m in range(1, 12)]]
+    month.labels = {"mon12": "12"}  # only the label says 12: the value is the site's own
+    hit: list = []
+
+    def pay():
+        r = Route(f"{SHOPX}?m=mon12&y={YEAR}")
+        hit.append(r)
+        asyncio.ensure_future(ns.pctx.route_handler(r))
+
+    ns.els["pay"].on_click = pay
+    out, _ = await _run(ns)
+    assert hit[0].done == ("abort", "blockedbyclient")
+    assert out["code"] == "card_url_blocked"
+    _sweep(out, logs)
+
+
+def test_a_name_sent_in_a_legacy_charset_is_blocked():
+    name = NAME[:4] + "é" + NAME[4:]
+    _flow, g = _guard(name=name)
+    latin = "".join(f"%{b:02X}" for b in name.encode("latin-1"))
+    assert g.carries(f"{SHOPX}?name={latin}") is True
+    assert g.carries(f"{SHOPX}?name={quote(name)}") is True
+
+
+def test_a_url_too_long_to_split_on_the_event_loop_is_unjudgeable():
+    _flow, g = _all_guard()
+    with pytest.raises(pc._Unjudgeable):
+        g.carries(SHOPX + "?x=" + "a" * pc._MAX_URL)

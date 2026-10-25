@@ -405,7 +405,7 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   You get a fixed `code` and `status` only.
 - `submitted_unverified`: check the order page or the merchant account.
   `challenge`, `card_url_blocked`, `card_url_leaked`, `pay_click_unknown`, `moved_while_filling`, `card_url_before_pay` or `outcome_unknown`: do NOT retry; tell the owner the outcome is
-  unknown. `card_url_before_pay`: Pay was not clicked, but the card number was
+  unknown. `card_url_before_pay`: Pay was not clicked, but a card value was
   sent or nearly sent in a URL; tell the owner the card may be exposed. Any
   other code before Pay (`failed_before_pay`, `claimed_not_filled`, a
   refusal): Pay was not clicked; a single-use card may be spent, so ask the

@@ -1708,12 +1708,14 @@ the shared banner is not an assertion about all concurrent sessions.
   missed (no mask at all) is masked by evaluate and re-checked, while a defeated mask or an unmasked
   top document fails the check, the owner's tap shows the Pay button label and the
   extra field names, the tool clicks Pay itself and returns fixed codes only.
-  Card values never leave in a URL: a Pay control whose form DECLARES GET, or
-  whose default-GET form would send card fields without the number, is
+  Card values never leave in a URL: a Pay control whose form DECLARES GET is
   refused before the tap, and a context-wide network route aborts the first
-  request of any redirect chain whose URL carries the claimed card number
-  (`card_url_blocked`, do not retry), so a script-handled form that is GET only
-  by default is not refused. A redirect hop carrying it cannot be stopped by a
+  request of any redirect chain whose URL carries a typed card value
+  (`card_url_blocked`, do not retry): the number anywhere in a digit run; the
+  CVC, expiry, name and postal code as a whole parameter or path segment equal
+  to the value (exact equality, so a coincidental `?qty=123` with CVC 123 is
+  blocked too). A script-handled form that is GET only by default is not
+  refused. A redirect hop carrying one cannot be stopped by a
   route; it is seen and reported (`card_url_leaked`; before Pay,
   `card_url_before_pay`). WebSocket URLs are not covered. This guards a trusted
   merchant's flawed form, not a hostile page script: one that reads a field can
@@ -1726,7 +1728,7 @@ the shared banner is not an assertion about all concurrent sessions.
   Top-level navigation requests (sent, committed or not; a fragment or history
   change sends none) and new windows are counted from the first keystroke: a
   checkout that moves on while the card is typed ends `moved_while_filling`
-  (do not retry), never "nothing paid", unless the card number also went out in
+  (do not retry), never "nothing paid", unless a card value also went out in
   a URL, which ends `card_url_before_pay` (also do not retry). Not seen: a
   script-only submit (fetch, no navigation) and a navigation inside a child
   frame (a hosted card frame posting its own form). The network-guard flags are checked

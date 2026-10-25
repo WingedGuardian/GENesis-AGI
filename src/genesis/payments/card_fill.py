@@ -99,8 +99,7 @@ TEXTS = {
     "not_https": "The checkout is not served over https at a named host." + _NONE,
     "pay_not_found": "The pay selector did not match exactly one element.",
     "pay_not_button": "The pay control must be a button or an input type=submit.",
-    "pay_get_form": "Refused: the pay control's form declares GET, or would send card fields "
-    "without the number in a URL.",
+    "pay_get_form": "Refused: the pay control's form declares GET (card fields in a URL).",
     "extra_field_not_found": "An extra field selector did not match one input or select of "
     "its own.",
     "extra_field_is_card_field": "An extra_fields target is a card field.",
@@ -127,7 +126,7 @@ TEXTS = {
     "failed_before_pay": "Filling stopped part-way; Pay was NOT clicked and the payment "
     "window was closed." + _SPENT,
     "card_url_before_pay": "Pay was NOT clicked: while the card was typed, the checkout sent "
-    "or tried to send the card number in a URL (and may have moved on with it). Treat the "
+    "or tried to send a card value in a URL (and may have moved on with it). Treat the "
     "card as exposed and tell the owner." + _NO_RETRY,
     "submitted_unverified": "Pay was clicked and the checkout moved on. Not verified: "
     "check the order page or the merchant account.",
@@ -139,9 +138,9 @@ TEXTS = {
     "opened a window) while the card was typed: it may have submitted the payment itself. "
     "The payment window was closed." + _NO_RETRY,
     "card_url_blocked": "Pay was clicked; the payment window blocked a request that would have "
-    "carried the card number in a URL. Whether the checkout went ahead another way is "
+    "carried a card value in a URL. Whether the checkout went ahead another way is "
     "unknown." + _NO_RETRY,
-    "card_url_leaked": "Pay was clicked; a redirect carried (or may have carried) the card number "
+    "card_url_leaked": "Pay was clicked; a redirect carried (or may have carried) a card value "
     "in a URL, which the payment window could see but not stop." + _NO_RETRY,
     "outcome_unknown": "Pay was clicked, then the payment window, the browser or this call "
     "ended before the checkout settled." + _NO_RETRY,

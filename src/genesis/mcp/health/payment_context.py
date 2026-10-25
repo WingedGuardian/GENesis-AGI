@@ -16,14 +16,14 @@ click Pay, classify what followed, and close the context. Every document of
 the context is masked (fully transparent) from creation, so the display shows
 nothing of the checkout. Every request of the context passes a network guard
 (``_UrlGuard``) that, once the card is claimed, aborts any request whose URL
-carries the card number (the first request of a redirect chain; a redirect
-hop carrying it is seen and reported instead; a WebSocket URL is not covered).
+carries a typed card value (the first request of a redirect chain; a redirect
+hop carrying one is seen and reported instead; a WebSocket URL is not covered).
 
 The agent gets back only a fixed code and text, the merchant host, the kinds
 of fields typed, and a vault reason from its fixed set: never page text, a
 URL path, an exception's text or a value. Card values live in locals of one
 coroutine and are dropped after the fill; the network guard keeps only a random
-key, the number's length and its keyed digest, for the context's life.
+key, the number's length and keyed digests, for the context's life.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ import json
 import logging
 import re
 import secrets
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from urllib.parse import unquote_plus, urlsplit
@@ -181,13 +182,14 @@ _MASK_CHECK_JS = """() => {
 # Whether this document lacks the mask altogether (the init script never ran in
 # it), as opposed to a mask that is present but defeated.
 _MASK_ABSENT_JS = "() => !document.getElementById('__genesis_payment_mask__')"
-# Whether ``e`` is a field of ``kind``: an enabled input or select whose
+# Whether ``e`` is a field of ``kind``: an enabled input or select (``:disabled``,
+# so a disabled ancestor fieldset counts, as Playwright's fill sees it) whose
 # autocomplete names that kind, or a type=tel input (a select for an expiry
 # month or year) whose label, aria-label, placeholder, name or id says so.
 # Returns the tag, or '' when it is not.
 CARD_FIELD_JS = r"""(e, kind) => {
   const tag = e.tagName.toLowerCase();
-  if (!['input', 'select'].includes(tag) || e.disabled || e.readOnly) return '';
+  if (!['input', 'select'].includes(tag) || e.matches(':disabled') || e.readOnly) return '';
   const type = (e.getAttribute('type') || 'text').toLowerCase();
   const bad = ['hidden', 'file', 'checkbox', 'radio', 'submit', 'button', 'image',
                'reset', 'range', 'color'];
@@ -219,7 +221,7 @@ CARD_FIELD_JS = r"""(e, kind) => {
 # only because it has no method attribute is how script-handled checkouts look
 # (the script cancels the submit and pays by its own request), so it is not
 # refused here: the payment context's network guard (_UrlGuard) blocks any
-# request whose URL carries the card number (see its docstring for the limits).
+# request whose URL carries a typed card value (see its docstring for the limits).
 PAY_JS = r"""(e) => {
   const tag = e.tagName.toLowerCase();
   const type = (e.getAttribute('type') || '').toLowerCase();
@@ -231,19 +233,16 @@ PAY_JS = r"""(e) => {
   const formMethod = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'method').get;
   const m = !f ? '' : has(e, 'formmethod') ? e.formMethod
     : has(f, 'method') ? formMethod.call(f) : '';
-  const dget = !!f && !has(e, 'formmethod') && !has(f, 'method');
   const label = tag === 'input' ? (e.value || '') : (e.innerText || e.textContent || '');
-  return {button, get: String(m).toLowerCase() === 'get', dget,
-          live: e.isConnected && !e.disabled, label: label.slice(0, 200)};
+  return {button, get: String(m).toLowerCase() === 'get',
+          live: e.isConnected && !e.matches(':disabled'), label: label.slice(0, 200)};
 }"""
-# Whether field ``e`` would be sent by a native submit of Pay ``p``'s form: in
-# that form, named, enabled. Only asked of a field in Pay's own document.
-SENT_WITH_PAY_JS = "(e, p) => !!e.form && !!p.form && e.form === p.form && !!e.name && !e.disabled"
 # An extra (non-card) field: an input, textarea or select whose autocomplete
 # names no card token. Returns the tag, or ''.
 EXTRA_FIELD_JS = r"""(e) => {
   const tag = e.tagName.toLowerCase();
-  if (!['input', 'textarea', 'select'].includes(tag) || e.disabled || e.readOnly) return '';
+  if (!['input', 'textarea', 'select'].includes(tag) || e.matches(':disabled') || e.readOnly)
+    return '';
   const ac = (e.getAttribute('autocomplete') || '').toLowerCase();
   return /(^|\s)cc-/.test(ac) ? 'card' : tag;
 }"""
@@ -298,8 +297,8 @@ class _Flow:
     navs: int = 0  # top-document commits, counted from the Pay click
     nav_requests: int = 0  # top-document navigation requests, sent or not yet committed
     typing_marks: tuple[int, int] | None = None  # (nav_requests, popups) as typing began
-    url_blocked: bool = False  # the network guard aborted a request carrying the card number
-    url_leaked: bool = False  # a redirect hop carried the card number (a route cannot stop it)
+    url_blocked: bool = False  # the network guard aborted a request carrying a card value
+    url_leaked: bool = False  # a redirect hop carried a card value (a route cannot stop it)
     abort_reason: str | None = None
     tearing_down: bool = False
     stuck: bool = False  # the fallback browser close was not reached
@@ -309,17 +308,57 @@ class _Flow:
     done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
-# What may sit between the card number's digits in a URL and still read as it:
+# What may sit between a value's characters in a URL and still read as it:
 # spaces, plus signs, dots, slashes, dashes and underscores (value_landed in
 # card_fill accepts a slash as card formatting too). ``&`` and ``=`` still end a
 # run, so a match needs the whole number inside one parameter or path segment.
 _URL_SEPARATORS = re.compile(r"[\s.+/_-]+")
-# The guard computes one keyed digest per digit window, on the event loop that
-# also runs the flow: about 6 us each (measured, so 1M digits took 6.4 s). A URL
-# needing more windows than this (about 25 ms of work) is not judged; the route
-# aborts it, unrecorded. No real checkout URL comes near: it takes 4,096 digit
-# windows, a single run over 4,000 digits long for a 16-digit card.
+# Where a URL's parameters and path segments end, for the whole-value match.
+_PARAM_ENDS = re.compile(r"[?&;#]")
+# The guard computes one keyed digest per digit window or candidate token, on the
+# event loop that also runs the flow: about 6 us each (measured, so 1M digits took
+# 6.4 s). A URL needing more than this (about 25 ms of work) is not judged; the
+# route aborts it, unrecorded. No real checkout URL comes near: it takes 4,096
+# digit windows, a single run over 4,000 digits long for a 16-digit card, or
+# 4,096 distinct tokens of a typed value's length.
 _MAX_WINDOWS = 4096
+_MIN_VALUE = 3  # a shorter normalised name or postal code is not matched (noise)
+# A URL longer than this is not judged (aborted, unrecorded): splitting and
+# normalising it runs on the event loop, about 1.3 s per MB (measured).
+_MAX_URL = 65536
+
+
+def _norm(text: str) -> str:
+    """A value as the guard compares it: NFKC, case-folded, any Unicode decimal
+    digit as its ASCII digit, separators removed."""
+    text = unicodedata.normalize("NFKC", text).casefold()
+    if not text.isascii():
+        text = "".join(
+            str(unicodedata.decimal(c)) if not c.isascii() and c.isdecimal() else c for c in text
+        )
+    return _URL_SEPARATORS.sub("", text)
+
+
+def _decoded(text: str) -> str:
+    return unquote_plus(unquote_plus(text))
+
+
+def _tokens(url: str) -> set[str]:
+    """Every whole parameter key, value and path segment of ``url``, normalised:
+    split raw and after each of two decodings, as UTF-8 and as Latin-1 (a form
+    with a legacy charset), so a value encoded inside another becomes its own
+    parameter; each piece decoded twice."""
+    out = set()
+    latin = unquote_plus(url, encoding="latin-1")
+    for text in {url, unquote_plus(url), _decoded(url), latin, unquote_plus(latin, "latin-1")}:
+        for piece in _PARAM_ENDS.split(text):
+            parts = {piece, *piece.split("="), *piece.split("/")}
+            if "=" in piece:
+                value = piece.split("=", 1)[1]
+                parts |= {value, *value.split("/")}
+            out.update(_norm(_decoded(p)) for p in parts)
+    out.discard("")
+    return out
 
 
 class _Unjudgeable(Exception):
@@ -332,21 +371,36 @@ class _UrlGuard:
     Routed on the whole payment context before its first page loads, so the
     first request of every redirect chain, in every frame and popup, passes
     through ``handle``: a native GET form, a page's ``form.submit()``, a link,
-    ``location``, ``fetch``, a beacon. Armed after the claim with the card
-    number; from then on a request whose URL holds that number (decoded twice;
-    spaces, plus signs, dots, slashes, dashes and underscores ignored) is
-    aborted and recorded on the flow (``url_blocked``). A request the guard
-    cannot judge is aborted too, without the record (it does not know the card
-    was in it).
+    ``location``, ``fetch``, a beacon. Armed after the claim with every value
+    the fill types; from then on a request whose URL carries one is aborted and
+    recorded on the flow (``url_blocked``):
+
+    - the number: anywhere in a digit run (decoded twice; spaces, plus signs,
+      dots, slashes, dashes and underscores ignored);
+    - the CVC, the expiry (MMYY and MMYYYY, whatever the format typed), the
+      name and the postal code: a whole parameter key or value, or a whole path
+      segment, EQUAL to the value after ``_norm`` (``_tokens``). Equality, not a
+      substring: a 3-digit CVC is a substring of most URLs (measured), but rarely
+      a whole parameter. A coincidental equal parameter (``?qty=123`` when the
+      CVC is 123) is still blocked: that fails closed, and costs a request;
+    - a separate expiry month and year: only both in one URL (each alone is a
+      common small number).
+
+    A request the guard cannot judge is aborted too, without the record (it does
+    not know the card was in it). This guards a trusted merchant's flawed form:
+    a page script that encodes a value its own way (base64, split, encrypted)
+    is not caught.
 
     What a route cannot stop: a redirect hop (Playwright calls the handler for
     the first URL of a chain only) and a WebSocket URL. A redirect hop that
-    carries the number is still SEEN, by ``on_request``, and recorded as
+    carries a value is still SEEN, by ``on_request``, and recorded as
     ``url_leaked``: it already left, so the flow reports it rather than claiming
     it was blocked. A WebSocket URL is neither stopped nor seen.
 
-    The number itself is not kept: only a random key, its length and its keyed
-    digest, which outlive the fill for the context's life.
+    The values themselves are not kept: only a random key, the number's length
+    and keyed digests, which outlive the fill for the context's life (a
+    low-entropy value such as the CVC is recoverable from them by enumeration,
+    by whatever can read this process's memory while the context lives).
     """
 
     def __init__(self, flow: _Flow) -> None:
@@ -355,32 +409,69 @@ class _UrlGuard:
         self._key = b""
         self._len = 0
         self._tag: bytes | None = None
+        self._whole: set[bytes] = set()  # digests of values matched whole
+        self._pair: tuple[set[bytes], set[bytes]] = (set(), set())  # month forms, year forms
+        self._lens: set[int] = set()  # the normalised lengths of all of them
 
-    def _mac(self, digits: str) -> bytes:
-        return hmac.new(self._key, digits.encode(), "sha256").digest()
+    def _mac(self, text: str) -> bytes:
+        return hmac.new(self._key, text.encode(), "sha256").digest()
 
-    def arm(self, number: str) -> None:
-        digits = re.sub(r"\D", "", number)
+    def _digests(self, forms) -> set[bytes]:
+        normed = {n for n in (_norm(f) for f in forms) if n}
+        self._lens |= {len(n) for n in normed}
+        return {self._mac(n) for n in normed}
+
+    def arm(self, values: dict[str, str]) -> None:
+        """``values``: kind -> the text typed (card_fill.values_for)."""
         self._key = secrets.token_bytes(32)
+        digits = _norm(re.sub(r"\D", "", values["number"]))
         self._len = len(digits)
         self._tag = self._mac(digits)
         del digits
+        for kind, value in values.items():
+            if kind == "expiry":
+                d = re.sub(r"\D", "", _norm(value))  # MMYY or MMYYYY, whatever was typed
+                if len(d) == 6:
+                    d = d[:2] + d[4:]
+                self._whole |= self._digests([d, d[:2] + "20" + d[2:]])
+            elif kind in ("cvc", "name", "postal_code"):
+                if len(_norm(value)) >= _MIN_VALUE:
+                    self._whole |= self._digests([value])
+        if "exp_month" in values and "exp_year" in values:
+            mm, yy = int(values["exp_month"]), int(values["exp_year"]) % 100
+            self._pair = (
+                self._digests([f"{mm:02d}", str(mm)]),
+                self._digests([f"{yy:02d}", f"{2000 + yy}"]),
+            )
+
+    def add_option(self, kind: str, value: str) -> None:
+        """A separate expiry select took an option whose value is not one of the
+        forms armed (matched by its label): that value is what a form sends."""
+        months, years = self._pair
+        if kind in ("exp_month", "exp_year") and months and years:
+            (months if kind == "exp_month" else years).update(self._digests([value]))
 
     def carries(self, url: str) -> bool:
-        """Whether ``url`` holds the armed number. Raises _Unjudgeable when the
+        """Whether ``url`` carries an armed value. Raises _Unjudgeable when the
         check would take more than _MAX_WINDOWS digests."""
-        if self._tag is None or self._len == 0:
+        if self._tag is None:
             return False
-        text = _URL_SEPARATORS.sub("", unquote_plus(unquote_plus(url)))
+        if len(url) > _MAX_URL:
+            raise _Unjudgeable
+        text = _norm(_decoded(url))
         n = self._len
-        runs = re.findall(rf"\d{{{n},}}", text)
-        if sum(len(run) - n + 1 for run in runs) > _MAX_WINDOWS:
+        runs = re.findall(rf"\d{{{n},}}", text) if n else []
+        windows = sum(len(run) - n + 1 for run in runs)
+        cands = [t for t in _tokens(url) if len(t) in self._lens] if self._lens else []
+        if windows + len(cands) > _MAX_WINDOWS:
             raise _Unjudgeable
         for run in runs:
             for i in range(len(run) - n + 1):
                 if hmac.compare_digest(self._mac(run[i : i + n]), self._tag):
                     return True
-        return False
+        macs = {self._mac(t) for t in cands}
+        months, years = self._pair
+        return bool(macs & self._whole) or bool(macs & months and macs & years)
 
     async def handle(self, route) -> None:
         try:
@@ -685,30 +776,10 @@ async def _resolve(page, args: cf.CardArgs, wait=False) -> tuple[dict[str, _Fiel
     info = await _step(handle.evaluate(PAY_JS))
     if not isinstance(info, dict) or info.get("button") is not True:
         raise _Stop("pay_not_button")
-    if info.get("get") is not False:
-        raise _Stop("pay_get_form")
-    if await _dget_unguarded(info, fields, frame, handle):
+    if info.get("get") is not False:  # it would put the card in a URL: refused before the tap
         raise _Stop("pay_get_form")
     label = info.get("label")
     return fields, _Field(frame, handle, "pay", origin), label if isinstance(label, str) else ""
-
-
-async def _dget_unguarded(info, fields: dict, frame, handle) -> bool:
-    """Pay submits its form with GET only by default, and that form would send
-    card fields WITHOUT the number (the number in a provider frame, or unnamed).
-
-    The network guard blocks any URL holding the number, so a default-GET form
-    that sends the number too is safe; card fields sent without it would reach a
-    URL the guard cannot see. Membership is read live: an input handler can
-    rename or unname a field after it was filled, so this runs before the tap
-    and again just before the click."""
-    if not isinstance(info, dict) or info.get("dget") is not True:
-        return False
-    sent = set()
-    for kind, f in fields.items():
-        if f.frame is frame and await _step(f.handle.evaluate(SENT_WITH_PAY_JS, handle)):
-            sent.add(kind)
-    return bool(sent) and "number" not in sent
 
 
 async def _mask_ok(page) -> bool:
@@ -757,6 +828,17 @@ async def _amount_ok(page, amount: str) -> bool:
     ok = cf.amount_on_page(amount, "\n".join(p for p in parts if isinstance(p, str)))
     parts.clear()
     return ok
+
+
+def _top(flow: _Flow, ppage, site: str) -> tuple[str, str]:
+    """The payment page's host and origin, on the checkout's site over https."""
+    host, top = urlsplit(ppage.url).hostname, cf.origin_of(ppage.url)
+    if not host or top is None or registrable_domain(host) != site:
+        raise _Stop("checkout_redirected")
+    if not cf.secure_origin(top):
+        raise _Stop("not_https")
+    flow.host = host
+    return host, top
 
 
 def _gone(flow: _Flow, ppage, hooks: Hooks) -> str | None:
@@ -946,7 +1028,7 @@ async def _outcome(
 ) -> str:
     """What followed the Pay click (``start``: the URL before it; ``before``: the
     frame URLs then; ``popups``: the windows opened before it), from navigation, new frame URLs and a bank frame shown. A
-    request the network guard saw carrying the card number outranks them all: a redirect hop
+    request the network guard saw carrying a card value outranks them all: a redirect hop
     it could only see (leaked) before a request it stopped (blocked)."""
     loop = asyncio.get_running_loop()
     deadline, moved = loop.time() + SETTLE_S, False
@@ -987,7 +1069,7 @@ def _popped(flow: _Flow) -> None:
 
 def _typing_outcome(flow: _Flow) -> str | None:
     """What happened while the card was typed that outranks a plain stop: the
-    card number sent in a URL (the exposure is never hidden behind a move), or
+    card sent in a URL (the exposure is never hidden behind a move), or
     the checkout moving on by itself (a navigation request or a new window)."""
     if flow.url_blocked or flow.url_leaked:
         return "card_url_before_pay"
@@ -1092,12 +1174,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         raise _Stop("checkout_load_failed") from None
     if not await _mask_ok(ppage):
         raise _Stop("checkout_load_failed")
-    host, top = urlsplit(ppage.url).hostname, cf.origin_of(ppage.url)
-    if not host or top is None or registrable_domain(host) != site:
-        raise _Stop("checkout_redirected")
-    if not cf.secure_origin(top):
-        raise _Stop("not_https")
-    flow.host = host
+    host, top = _top(flow, ppage, site)
     if await hooks.interstitial(ppage):
         raise _Stop("bot_check")
 
@@ -1114,7 +1191,9 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             raise _Stop("amount_not_on_page")
         await asyncio.sleep(POLL_S)
     # What the tap shows is read again now: filling the extras can re-render the
-    # checkout (an address re-pricing it), and the owner approves what it shows.
+    # checkout (an address re-pricing it, or moving it to another host of the
+    # site), and the owner approves what it shows.
+    host, top = _top(flow, ppage, site)
     fields, pay, label = await _resolve(ppage, args)
     origins = {k: f.origin for k, f in fields.items()}
     seen = {**origins, "pay": pay.origin}
@@ -1186,7 +1265,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         values = cf.values_for(card, list(fields), args.expiry_format)
     finally:
         del card
-    guard.arm(values["number"])  # before anything is typed
+    guard.arm(values)  # before anything is typed
 
     # Typing. Nothing is typed into a page that changed after the tap.
     if _gone(flow, ppage, hooks) or not await _same_page(
@@ -1206,25 +1285,23 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
                 raise _Stop("failed_before_pay", field=kind, filled=flow.typed)
             if f.tag == "select":
                 await _select(f.handle, values[kind], kind)
+                got = await _step(f.handle.evaluate(EXTRA_VALUE_JS))
+                if isinstance(got, list) and got and isinstance(got[0], str):
+                    guard.add_option(kind, got[0])
             else:
                 await _step(f.handle.fill(values[kind], timeout=10000))
             if not await _holds(f, kind, values[kind]):
                 raise _Stop("failed_before_pay", field=kind, filled=[*flow.typed, kind])
             flow.typed.append(kind)
 
-        # Pay. The page as tapped, then the fastest-changing checks once more, so
-        # nothing slow runs between them and the click: origins, Pay, and every
-        # card field still holding what was typed (a later field's input, or a
-        # script on the way to Pay, can clear or rewrite an earlier one).
+        # Pay. The one final re-check of the page as tapped, then every card field
+        # still holding what was typed (a later field's input, or a script on the
+        # way to Pay, can clear or rewrite an earlier one). The page owns its DOM
+        # between this and the click: a script changing what the tap showed in
+        # that window is an accepted residual (owner ruling 07a1c756), and where
+        # a card value can go in a URL is the network guard's job, not the DOM's.
         if not await _same_page(
             ppage, args, top, seen, label, title, fields, pay, hooks, clicking=True
-        ):
-            raise _Stop("failed_before_pay", filled=flow.typed)
-        info = await _step(pay.handle.evaluate(PAY_JS))
-        if (
-            _moved(ppage, top, fields, pay, seen)
-            or not _pay_ok(info, label, clicking=True)
-            or await _dget_unguarded(info, fields, pay.frame, pay.handle)
         ):
             raise _Stop("failed_before_pay", filled=flow.typed)
         for kind, f in fields.items():

@@ -87,34 +87,23 @@ def test_pay_js(page, html, button, get):
 
 
 @pytest.mark.parametrize(
-    ("html", "dget"),
+    ("html", "live"),
     [
-        ("<form><button id=x>Pay</button></form>", True),
-        ("<form method=post><button id=x>Pay</button></form>", False),
-        ("<form method=get><button id=x>Pay</button></form>", False),  # declared, not default
-        ("<form><button id=x formmethod=post>Pay</button></form>", False),
-        ("<button id=x>Pay</button>", False),  # no form at all
+        ("<form method=post><button id=x>Pay</button></form>", True),
+        ("<form method=post><button id=x disabled>Pay</button></form>", False),
+        ("<form method=post><fieldset disabled><button id=x>Pay</button></fieldset></form>", False),
     ],
 )
-def test_pay_js_reports_a_get_by_default(page, html, dget):
-    assert (_el(page, html, "#x")).evaluate(pc.PAY_JS)["dget"] is dget
+def test_pay_js_sees_a_button_disabled_by_its_fieldset(page, html, live):
+    assert (_el(page, html, "#x")).evaluate(pc.PAY_JS)["live"] is live
 
 
-@pytest.mark.parametrize(
-    ("html", "sent"),
-    [
-        ("<form><input id=f name=cvc><button id=p>Pay</button></form>", True),
-        ("<form><input id=f><button id=p>Pay</button></form>", False),  # unnamed
-        ("<form><input id=f name=cvc disabled><button id=p>Pay</button></form>", False),
-        ("<form><input id=f name=cvc></form><form><button id=p>Pay</button></form>", False),
-        ("<input id=f name=cvc form=g><form id=g><button id=p>Pay</button></form>", True),
-        ("<input id=f name=cvc><button id=p>Pay</button>", False),  # no forms
-    ],
-)
-def test_sent_with_pay_js(page, html, sent):
-    page.set_content(html)
-    f, p = page.query_selector("#f"), page.query_selector("#p")
-    assert f.evaluate(pc.SENT_WITH_PAY_JS, p) is sent
+def test_a_field_in_a_disabled_fieldset_is_no_field(page):
+    html = '<fieldset disabled><input id=x autocomplete="cc-csc"></fieldset>'
+    assert _el(page, html, "#x").evaluate(pc.CARD_FIELD_JS, "cvc") == ""
+    assert _el(page, html, "#x").evaluate(pc.EXTRA_FIELD_JS) == ""
+    html = '<fieldset><input id=x autocomplete="cc-csc"></fieldset>'
+    assert _el(page, html, "#x").evaluate(pc.CARD_FIELD_JS, "cvc") == "input"
 
 
 def test_the_mask_survives_a_page_script_that_removes_it_during_input(page):
