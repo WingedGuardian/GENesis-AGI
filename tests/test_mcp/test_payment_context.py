@@ -2721,15 +2721,15 @@ async def test_a_consent_label_swapped_on_the_way_to_pay_stops_before_pay(vault)
 
 async def test_the_tap_lists_what_the_steps_clicked(vault):
     ns = behind_steps()
-    ns.ppage.main_frame.elements["#open"][0].text = "Add Payment Card"
+    ns.ppage.main_frame.elements["#open"][0].text = "Add card"
     out, _ = await _run(ns, steps=["#open"])
     assert out["code"] == "submitted_unverified"
-    assert vault.ops("release_request")[0]["step_labels"] == ["Add Payment Card"]
+    assert vault.ops("release_request")[0]["step_labels"] == ["Add card"]
 
 
 async def test_a_service_that_did_not_show_the_steps_line_fills_nothing(vault):
     ns = behind_steps()
-    ns.ppage.main_frame.elements["#open"][0].text = "Add Payment Card"
+    ns.ppage.main_frame.elements["#open"][0].text = "Add card"
     vault.echo_shown = False
     out, _ = await _run(ns, steps=["#open"])
     assert out["code"] == "vault_too_old" and ns.els["number"].value == ""
