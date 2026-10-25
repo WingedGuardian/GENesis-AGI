@@ -321,6 +321,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `browser_click` — Click an element on the current page by CSS selector or text.
 - `browser_collaborate` — Toggle collaborative timing mode.
 - `browser_fill` — Fill a form field on the current page.
+- `browser_fill_card` — Pay with a vault card on the Camoufox checkout page now open, after the owner approves this payment with a Telegram tap. Card values never reach you.
 - `browser_navigate` — Navigate to a URL and return an accessibility tree snapshot.
 - `browser_press_key` — Press a keyboard key on the current page.
 - `browser_run_js` — Execute JavaScript in the browser's console on the current page.

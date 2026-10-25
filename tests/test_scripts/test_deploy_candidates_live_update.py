@@ -168,6 +168,13 @@ def _sync_script(w, body: str | None) -> None:
         path.write_text(body)
 
 
+_AS_ROOT = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores the directory's mode bits, so the write cannot be denied",
+)
+
+
+@_AS_ROOT
 def test_restore_hooks_fails_when_a_hook_cannot_be_written(dc, dc_ready, capsys):
     w = dc_ready
     before, tip = _rolled_back(w, dc, capsys)
@@ -338,6 +345,7 @@ def test_a_helper_with_no_source_is_removed(dc, dc_ready, capsys):
     assert not installed.exists(), "an obsolete helper stayed installed"
 
 
+@_AS_ROOT
 def test_a_helper_with_no_source_that_cannot_be_removed_fails(dc, dc_ready, capsys):
     w = dc_ready
     before, head, installed = _helper_source_deleted(w)
@@ -638,14 +646,18 @@ def _rebuild_with_a_candidate(w, dc, capsys, **env: str) -> int:
 def test_the_callers_own_row_is_kept_through_the_rebuild(dc, dc_ready, capsys):
     """A row the shared rule calls harmless is retired before a move, unless it
     is the caller's own: update.sh's restart guard must survive the move it
-    guards."""
+    guards. The engine adds its move record (live_move) to it and changes
+    nothing else (#3492)."""
     w = dc_ready
     state = _own_row(w)
-    before = state.read_bytes()
+    before = json.loads(state.read_text())
     rc = _rebuild_with_a_candidate(w, dc, capsys, DEPLOY_CANDIDATES_OWN_STATE_PID=str(os.getppid()))
     assert rc == 0, capsys.readouterr()
     assert w.live_merges(), "the rebuild did not move"
-    assert state.read_bytes() == before, "the engine retired its caller's restart guard"
+    assert state.exists(), "the engine retired its caller's restart guard"
+    after = json.loads(state.read_text())
+    assert after.pop("live_move") == {"to": w.rev("refs/heads/live"), "phase": "done"}
+    assert after == before, "the engine changed its caller's row beyond its record"
 
 
 def test_the_callers_own_guarding_row_does_not_refuse(dc, dc_ready, capsys):

@@ -1,1 +1,0 @@
-- Refuse first Guardian-enabled loopback activation without a maintained pre-existing pause, including the legacy updater bootstrap and interrupt restart boundaries. Document staging merged updater code through the locked code-only pull before the first full update.

@@ -68,6 +68,10 @@ def main() -> None:
     from genesis.payments import cli as vault_cli
     vault_cli.add_parser(sub)
 
+    # Read-only SQL: genesis db query "<sql>"
+    from genesis.db import query_cli
+    query_cli.add_parser(sub)
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -82,7 +86,7 @@ def main() -> None:
             asyncio.run(_serve(args))
     elif args.command in (
         "contribute", "eval", "restore", "handoffs", "session-address", "vault", "peers",
-        "lessons",
+        "lessons", "db",
     ):
         sys.exit(args.func(args))
     else:

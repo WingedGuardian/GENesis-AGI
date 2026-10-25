@@ -178,6 +178,7 @@ async def user_scheduler_jobs():
     from genesis.db.crud import user_jobs as crud
 
     jobs = await crud.list_jobs(rt.db)
+    scheduler = getattr(rt, "_user_job_scheduler", None)
     return jsonify({
         "jobs": [
             {
@@ -187,6 +188,7 @@ async def user_scheduler_jobs():
                 "cron_expression": j["cron_expression"],
                 "job_type": j.get("job_type", "generic"),
                 "status": j["status"],
+                "registered": scheduler is not None and scheduler.is_registered(j["id"]),
                 "profile": j.get("profile", "observe"),
                 "model": j.get("model", "sonnet"),
                 "last_run_at": j.get("last_run_at"),
@@ -223,7 +225,13 @@ async def user_job_control_endpoint(job_id: str):
             return jsonify({"success": ok, "action": "paused"})
         elif action == "resume":
             ok = await scheduler.resume_job(job_id)
-            return jsonify({"success": ok, "action": "resumed"})
+            result = {
+                "success": ok, "action": "resumed", "job_id": job_id,
+                "registered": scheduler.is_registered(job_id),
+            }
+            if not ok:
+                result["error"] = "Registration failed or job not found. Retry resume with the same job_id."
+            return jsonify(result)
         elif action == "run_now":
             session_id = await scheduler.run_now(job_id)
             return jsonify({"success": session_id is not None, "session_id": session_id})

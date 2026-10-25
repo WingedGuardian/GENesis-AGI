@@ -51,6 +51,8 @@ from __future__ import annotations
 import enum
 import re
 import shlex
+from bisect import bisect_left as _bisect_left
+from bisect import bisect_right as _bisect_right
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -842,9 +844,25 @@ def _excised_text(command: str) -> str:
     return excised[0] if excised is not None else command
 
 
-def parse_segments(command: str) -> list[_ParsedSegment]:
+def parse_segments(
+    command: str,
+    *,
+    _splits: list[int] | None = None,
+    _openers: list[int] | None = None,
+    _starts: list[int] | None = None,
+) -> list[_ParsedSegment]:
     """Split a command line into executed segments, returning per segment BOTH the raw
     text and a redirect-STRIPPED argv source (see ``_ParsedSegment``).
+
+    ``_splits`` and ``_openers`` are internal and never change the result. When a list
+    is passed, ``_splits`` receives the offset of every newline this parse SPLIT on,
+    and ``_openers`` the offset of every ``<<`` (never ``<<<``) this loop reads outside
+    quotes (see :func:`_heredoc_hidden_suffixes`). Deliberately EVERY one: a ``<<`` in
+    a comment, in arithmetic or in a here-doc body is not an opener to bash, but
+    telling those apart means emulating bash, and recording one too many can only add
+    a blind spot. ``_starts``, likewise internal, receives per returned segment the
+    offset in ``command`` where its ``raw`` would begin if it is a plain slice (the
+    caller verifies that; a redirect rewrites ``raw``).
 
     Quote-aware: an operator inside a quoted string does not split. Splits on ``&&``,
     ``||``, ``;``, ``|``, ``&`` and newlines. A ``#`` comment (opened outside quotes)
@@ -871,6 +889,8 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
     test's EXPLOITS).
     """
     pairs: list[tuple[str, str, list[str]]] = []
+    begins: list[int] = []  # where each pair's text began in command
+    begin = 0
     raw_buf: list[str] = []
     argv_buf: list[str] = []
     redirs: list[str] = []
@@ -899,11 +919,15 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
         two = command[i : i + 2]
         if two in ("&&", "||"):
             pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
+            begins.append(begin)
             raw_buf, argv_buf, redirs = [], [], []
             i += 2
+            begin = i
             continue
         op_len = _redirect_operator_len(command, i)
         if op_len is not None:
+            if _openers is not None and op_len == 2 and command[i + 1] == "<":
+                _openers.append(i)
             # Drop a standalone leading fd digit-run from BOTH buffers (the '2' of
             # ` 2>`), but NOT a digit that ends a word (`push2>x` keeps 'push2'). The
             # trailing digits are mirrored in both buffers, so remove the same count.
@@ -946,14 +970,25 @@ def parse_segments(command: str) -> list[_ParsedSegment]:
             i = j
             continue
         if c in (";", "|", "&", "\n"):
+            if c == "\n" and _splits is not None:
+                _splits.append(i)
             pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
+            begins.append(begin)
             raw_buf, argv_buf, redirs = [], [], []
             i += 1
+            begin = i
             continue
         raw_buf.append(c)
         argv_buf.append(c)
         i += 1
     pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
+    begins.append(begin)
+    if _starts is not None:
+        _starts.extend(
+            b + len(r) - len(r.lstrip())
+            for (r, _, _), b in zip(pairs, begins, strict=True)
+            if r.strip()
+        )
     return [
         _ParsedSegment(raw=r.strip(), argv_src=a.strip(), redirects=tuple(d))
         for (r, a, d) in pairs
@@ -1926,17 +1961,493 @@ def has_built_escape(command: str) -> bool:
         return True
 
 
+#: A HERE-DOC BODY THE PARSER READS AS COMMANDS. :func:`parse_segments` has no
+#: here-doc state, so it segments a body like command text. Anything in the body that
+#: leaves the segmenter in an open state carries across the terminator line: an
+#: unmatched backtick or ``$(`` in what reads as a redirect target, or an apostrophe
+#: that opens a quote. The terminator and the commands after it then merge into one
+#: segment, a guard searching the segments for its operation finds none, and the
+#: shell runs it. The root cause is the missing body boundary, not the backtick.
+#:
+#: REPORTED, NOT MODELLED, for the reason :data:`_BLIND_CONTINUATION` is. Modelling
+#: the boundary means the segmentation itself depends on where an opener was
+#: detected, and a mis-detected opener can then HIDE a command that the plain parse
+#: sees. Reporting can only ever add a blind spot. The detector is a check, not a
+#: second parse (:func:`_heredoc_hidden_suffixes`), and it is FAIL-CLOSED BY OWNER
+#: RULING: it does not emulate bash where it cannot prove the answer. Every ``<<``
+#: :func:`parse_segments` reads outside quotes is an opener to it (a comment, an
+#: arithmetic shift or text inside another body included: telling those apart is
+#: emulation, and one opener too many only adds a blind spot). It reports when the
+#: body's start or end is not provable (no terminator line, or a line that starts
+#: with the delimiter and holds a ``)``, which ends the body inside a substitution),
+#: when the delimiter word does not resolve with certainty (:func:`_heredoc_delimiter`),
+#: when bash expands the body (an unquoted delimiter) and it holds a command
+#: substitution or ``${``, and when the terminator's newline is not a point the parse
+#: split on (the body carried the segmenter's state past it). It runs at every depth,
+#: so a here-doc inside ``bash -c`` reaches the top level the way a depth bound does.
+#:
+#: A SUBSTITUTION SCRIPT IS READ IN THE TEXT IT WAS CUT FROM. The extractor ends a
+#: ``$(`` at a ``)`` it cannot tell is body text, and quotes in a body flip the outer
+#: segmenter, so the script the nested parse gets can stop inside a body, before the
+#: terminator and whatever bash runs after it. The check therefore finds bodies in
+#: the outermost text the script is a plain slice of, and a body ending past the cut
+#: is reported. The one exemption, by owner ruling, is the structurally provable
+#: message idiom: the opener first in its substitution after plain words, a quoted
+#: delimiter, its terminator line exactly, then only blanks and the ``)`` closing the
+#: substitution, so nothing else in it can run.
+#:
+#: ``bounds_induced`` is True because the consequence is the one a bound has: the
+#: segments after the terminator are not what the shell runs, so none are returned,
+#: and every consumer's bounds branch already handles that contract.
+#:
+#: ORDERED AFTER :func:`untokenizable`, unlike the other bounds-type causes. The
+#: discard guard deliberately leaves untokenizable commands alone (its measured cost
+#: of refusing them is written beside that branch), and here-doc prose with an
+#: apostrophe is the commonest untokenizable command. Reporting this cause first
+#: would reclassify those commands to bounds-type and reverse that measured decision.
+#: The deliberate residual: an untokenizable command whose body ALSO hides a suffix
+#: keeps the untokenizable cause, and with it that guard's settled behaviour.
+#:
+#: COST, measured over 138,216 recorded unique commands on one install (the 15,488
+#: that contain ``<<``, so every command the check can touch). 101 commands (0.073%)
+#: report this blind spot. 71 are carried-state reports an earlier, emulating version
+#: also made (at the top level an exact bash oracle, which parses the command with the
+#: suffix replaced by a marker and runs nothing, confirms every one of the 77
+#: carried-state fires there); the other 2 it made are the message idiom, where
+#: every statement bash runs is a segment of the parse. 30 are new, none changing
+#: another cause: 17 bodies bash expands that hold a command substitution, 5
+#: unterminated bodies, 4 lines that may end a body inside a substitution, 3 words
+#: that do not resolve or cannot be delimited and 1 opener line whose quote spans
+#: lines. 9 of the 30 (0.007%) mention an operation a guard's bounds branch refuses
+#: on: an upper bound on new refusals, which the fail-closed ruling accepts. An opener
+#: with no newline after its word is no body at all, and bash reads the rest of that
+#: line as the segmenter does, so it is not reported for that alone
+#: (``echo $((1<<2)) x`` once was). No ``git commit`` or ``gh`` message written with the quoted
+#: ``"$(cat <<'EOF'`` idiom is reported. A bash-oracle fuzz of 65,591 generated
+#: commands (36,096 where bash runs the gated command, after a body, inside a
+#: substitution after a body, or expanded inside one), built from quoted ``<<``
+#: decoys, ``#`` that is no comment, ``((`` in bodies and backticks, ``X)`` decoy
+#: lines, unterminated bodies, words closed by an enclosing backtick, delimiter lines
+#: that end a body inside a substitution, bodies the extractor cuts, the message idiom
+#: and every delimiter spelling here, found 2 commands the parse neither shows nor
+#: reports, both from one class this check does not own: an apostrophe in a ``#``
+#: comment, which the segmenter reads as a quote with no here-doc involved at all. The
+#: same fuzz on the version before this reading found 123 in 3,730. The scan is
+#: linear (a sorted index of ``)`` lines with a range-maximum table, built once per
+#: text); at :data:`MAX_COMMAND_CHARS` on adversarial shapes it adds at most 0.11 s to
+#: :func:`analyze_checked`.
+_BLIND_HEREDOC_BODY = BlindSpot(
+    bounds_induced=True,
+    cause="has a here-doc body that changes how the lines after its terminator are read",
+    hint=(
+        "write the body with an editor tool, then run the commands after it as "
+        "their own step"
+    ),
+)
+
+def _heredoc_delimiter(word: str) -> tuple[str, bool] | None:
+    """bash's delimiter for a here-doc ``word``, and whether any part of it is quoted
+    (a quoted delimiter's body is not expanded); None where this is not certain.
+
+    bash applies quote removal to the word and nothing else, per the manual's "Here
+    Documents" (no parameter, command or arithmetic expansion, no globbing, no brace
+    expansion). MEASURED against bash 5.2, which prints the delimiter it chose in
+    ``declare -f``: a backslash outside quotes is removed and keeps the next character
+    (``E\\OF`` is ``EOF``); single quotes keep everything, a backslash included
+    (``'E\\nF'``); inside double quotes a backslash is removed only before ``$``,
+    backtick, ``"`` or ``\\`` (``"E\\OF"`` stays ``E\\OF``); ``$"…"`` reads as
+    ``"…"``; ``$'…'`` is decoded as ANSI-C quoting (``$'E\\x4fF'`` is ``EOF``), so
+    an empty ``$''`` is nothing (``E$''OF`` is ``EOF``).
+
+    FAILS CLOSED, returning None, on what it does not resolve exactly: any other
+    ``$`` (bash keeps it literally, but its body is then expanded), a backtick, a
+    backslash inside ``$'…'`` (the ANSI-C decoder is not repeated here), a newline,
+    and an unterminated quote. The caller reports those.
+    """
+    out: list[str] = []
+    quoted = False
+    i, n = 0, len(word)
+    while i < n:
+        c = word[i]
+        if c in "\n`":
+            return None
+        if c == "\\":
+            if i + 1 >= n or word[i + 1] == "\n":
+                return None
+            out.append(word[i + 1])
+            quoted = True
+            i += 2
+            continue
+        if c == "$":
+            following = word[i + 1 : i + 2]
+            if following == '"':
+                i += 1  # ``$"…"`` reads as ``"…"``
+                continue
+            if following != "'":
+                return None
+            close = word.find("'", i + 2)
+            if close < 0 or "\\" in word[i + 2 : close] or "\n" in word[i + 2 : close]:
+                return None
+            out.append(word[i + 2 : close])
+            quoted = True
+            i = close + 1
+            continue
+        if c == "'":
+            close = word.find("'", i + 1)
+            if close < 0 or "\n" in word[i + 1 : close]:
+                return None
+            out.append(word[i + 1 : close])
+            quoted = True
+            i = close + 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n and word[j] != '"':
+                ch = word[j]
+                if ch in "$`\n":
+                    return None
+                if ch == "\\" and j + 1 < n and word[j + 1] in '$`"\\':
+                    out.append(word[j + 1])
+                    j += 2
+                    continue
+                out.append(ch)
+                j += 1
+            if j >= n:
+                return None
+            quoted = True
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), quoted
+
+
+#: What bash expands in the body of a here-doc whose delimiter is unquoted: a command
+#: substitution (``$(`` or a backtick) runs a command, and ``${`` is reported too by
+#: owner ruling, since its operators nest text bash expands.
+_HEREDOC_EXPANSION = re.compile(r"\$[({]|`")
+
+
+#: After a here-doc's terminator line, nothing but blanks and the ``)`` closing the
+#: substitution that holds it. See the exemption in :func:`_heredoc_hidden_suffixes`.
+_CLOSES_SUBSTITUTION = re.compile(r"[ \t\n]*\)")
+#: What may come before the opener in a substitution for the exemption to apply:
+#: plain words only, so nothing (a subshell, a quote, another substitution) is open
+#: and the ``)`` after the body can only be the one closing the substitution.
+_SIMPLE_WORDS = re.compile(r"[ \t]*(?:[A-Za-z0-9_./=+:@%,-]+[ \t]+)*")
+
+
+class _HeredocLines:
+    """The line index the here-doc check reads a text through, built on first use and
+    then shared: every substitution script cut from one segment is checked against the
+    SAME segment text (its ``origin``), so the index is built once per segment, never
+    once per script."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.built = False
+
+    def build(self) -> _HeredocLines:
+        if self.built:
+            return self
+        text = self.text
+        self.lines = text.split("\n")
+        self.ends: list[int] = []
+        pos = -1
+        for line in self.lines:
+            pos += len(line) + 1
+            self.ends.append(pos)  # the line's newline; len(text) for the last line
+        # Exact lines for ``<<`` and TAB-stripped lines for ``<<-``, separately, so a
+        # lookup is one bisect with nothing filtered after it: a single mixed index
+        # went quadratic on alternating ``<<-`` and TAB lines.
+        self.exact: dict[str, list[int]] = {}
+        self.tabbed: dict[str, list[int]] = {}
+        # Lines holding a ``)``, sorted, so "a line starting with D that holds a ``)``"
+        # is a prefix range found by two bisects (see :meth:`ends_inside_substitution`).
+        paren: list[tuple[str, int]] = []
+        paren_tabbed: list[tuple[str, int]] = []
+        for k, line in enumerate(self.lines):
+            stripped = line.lstrip("\t")
+            self.exact.setdefault(line, []).append(k)
+            self.tabbed.setdefault(stripped, []).append(k)
+            if ")" in line:
+                paren.append((line, k))
+                paren_tabbed.append((stripped, k))
+        paren.sort()
+        paren_tabbed.sort()
+        self.paren = [line for line, _ in paren]
+        self.paren_tabbed = [line for line, _ in paren_tabbed]
+        self.paren_rows = [k for _, k in paren]
+        self.paren_tabbed_rows = [k for _, k in paren_tabbed]
+        self.paren_max: dict[bool, list[list[int]]] = {}
+        self.marks = [m.start() for m in _HEREDOC_EXPANSION.finditer(text)]
+        self.last = len(text.rstrip(" \t\r\n)")) - 1  # the last character that can run
+        self.built = True
+        return self
+
+    def first_after(self, delim: str, tabs: bool, row: int) -> int | None:
+        rows = (self.tabbed if tabs else self.exact).get(delim)
+        if not rows:
+            return None
+        i = _bisect_right(rows, row)
+        return rows[i] if i < len(rows) else None
+
+    def ends_inside_substitution(self, delim: str, tabs: bool, row: int) -> bool:
+        """Whether some line after ``row`` starts with ``delim`` (after TABs for
+        ``<<-``), is not exactly it, and holds a ``)``. MEASURED, bash 5.2: inside
+        ``$(…)`` or ``<(…)`` such a line ends the body (``EOF x)``, ``EOF\\tx)``,
+        ``EOFx)``), and what follows the delimiter on it runs. Not only before the
+        terminator: over-reporting is the safe direction.
+
+        The lines holding a ``)`` are sorted, so those starting with ``delim`` are one
+        range (two bisects), the line equal to it sorts first within it, and the latest
+        row in what is left is a range-maximum lookup."""
+        lines = self.paren_tabbed if tabs else self.paren
+        k = len(delim)
+        first = _bisect_left(lines, delim, key=lambda s: s[:k])
+        end = _bisect_right(lines, delim, key=lambda s: s[:k])
+        start = _bisect_right(lines, delim, first, end)  # past the line equal to it
+        return start < end and self._latest(tabs, start, end) > row
+
+    def _latest(self, tabs: bool, lo: int, hi: int) -> int:
+        """The largest row among sorted ``)`` lines ``lo..hi-1``: a sparse table,
+        built on first use (O(L log L)), then two lookups per query."""
+        table = self.paren_max.get(tabs)
+        if table is None:
+            table = [self.paren_tabbed_rows if tabs else self.paren_rows]
+            width = 1
+            while 2 * width <= len(table[0]):
+                prev = table[-1]
+                table.append([max(prev[i], prev[i + width]) for i in range(len(prev) - width)])
+                width *= 2
+            self.paren_max[tabs] = table
+        level = (hi - lo).bit_length() - 1
+        return max(table[level][lo], table[level][hi - (1 << level)])
+
+
+def _word_left_open(word: str) -> bool:
+    """Whether the word scanner (:func:`_redirect_target_end`) ran to the end of the
+    text INSIDE a quote or a ``$(`` it opened in ``word``: what it swallowed is not one
+    word to bash. Read with the scanner's own rules, so the answer is about the span
+    it actually consumed."""
+    n = len(word)
+    i = 0
+    while i < n:
+        c = word[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c in "'\"":
+            close = i + 1
+            while close < n and word[close] != c:
+                close += 2 if c == '"' and word[close] == "\\" else 1
+            if close >= n:
+                return True
+            i = close + 1
+            continue
+        if word.startswith("$(", i):
+            end = _command_sub_end(word, i, n)
+            if end >= n and not word.endswith(")"):
+                return True
+            i = end
+            continue
+        i += 1
+    return False
+
+
+def _heredoc_hidden_suffixes(
+    text: str,
+    splits: list[int],
+    openers: list[int],
+    origin: tuple[_HeredocLines, int] | None = None,
+    in_substitution: bool = False,
+) -> list[tuple[int, str, int]]:
+    """``(opener, why, at)`` for each here-doc in ``text`` whose body the parse cannot
+    be trusted past. ``splits`` and ``openers`` come from the parse of ``text`` itself
+    (:func:`parse_segments`): every ``<<`` it reads outside quotes, whether or not bash
+    would call it an opener.
+
+    ``origin`` is ``(lines, base)`` when ``text`` is a substitution script cut from a
+    longer text (``lines.text[base:base + len(text)] == text``). Bodies are then found
+    in that ORIGINAL text, because the cut can fall inside a body: the extractor ends a
+    ``$(`` at a ``)`` it cannot tell is body text. A body whose terminator lies past
+    the cut is ``"cut"``: the script the parse read is not what bash runs, unless the
+    exemption below proves nothing else runs.
+
+    FAIL-CLOSED BY OWNER RULING: where the body's end is not provable without
+    emulating bash, report. Each report but ``"cut"`` needs something runnable after
+    the opener's line (anything but blanks and ``)``). ``why`` is one of:
+
+    * ``"start"``: the opener line's first newline is not a split point, so the parse
+      and bash may disagree on where the body begins.
+    * ``"delimiter"``: :func:`_heredoc_delimiter` could not resolve the word, or the
+      word could not be delimited at all (none, one holding a backtick or newline,
+      or none followed by a newline). Then ``at`` is where bash may end the word,
+      and anything runnable after it counts, a lone backtick excepted.
+    * ``"ambiguous"``: a line starts with the delimiter, is not exactly it, and holds
+      a ``)``. bash ends the body there inside a substitution, and proving that
+      context is emulation (:meth:`_HeredocLines.ends_inside_substitution`).
+    * ``"unterminated"``: no later line is the delimiter (leading TABs stripped for
+      ``<<-`` only). The body may end anywhere: at the end of a backtick, say.
+    * ``"expands"``: the delimiter is unquoted, so bash expands the body, and the body
+      holds :data:`_HEREDOC_EXPANSION`.
+    * ``"carried"``: the terminator's newline is not a split point, so the body left
+      the segmenter open across it.
+    * ``"cut"``: the terminator lies past the end of ``text`` (see ``origin``). A
+      terminator followed by anything but the closing ``)`` is reported: bash runs
+      it inside the substitution, and the parse never saw it.
+
+    THE EXEMPTION, by owner ruling, for a substitution body (``in_substitution``)
+    where nothing else can run, whether the extractor cut it short or ran past its
+    end: the opener is the first in ``text`` and only plain words precede it (so no
+    subshell, quote or other substitution is open, and the next ``)`` can only close
+    this substitution), the delimiter is quoted (the body is inert), the terminator
+    line is the delimiter exactly, and after it come only blanks and then a ``)``.
+    That is the ``"$(cat <<'EOF'`` … ``EOF`` newline ``)"`` message idiom. Nothing
+    in ``text`` after it belongs to the substitution, so the check stops there.
+
+    After a ``"cut"`` the rest of ``text`` is that body, so no later opener in it is
+    one. Several openers on one line take their bodies in order, each after the
+    previous one's terminator. After any report but ``"expands"`` and ``"carried"``
+    the rest of that line's bodies are unknown, and the first report covers them.
+
+    MEASURED, the runnable-suffix test matters: the plain "anything after it" test
+    fired on 93 real commands at depth 1 and on none was anything hidden, since a
+    ``"$(cat <<'EOF'`` body with an apostrophe hands the nested parse a script ending
+    ``EOF`` newline ``)``, and a closing paren runs nothing.
+
+    LINEAR, deliberately: the index is built once per text, and each opener costs a
+    constant number of bisects. This runs on a hook path, where a hook killed by its
+    timeout does not refuse.
+    """
+    if not openers:
+        return []
+    n = len(text)
+    holder, base = origin if origin is not None else (_HeredocLines(text), 0)
+    lines = holder.build()
+    whole = lines.text
+    split = set(splits)
+    last = len(text.rstrip(" \t\r\n)")) - 1  # the last character of text that can run
+    # The same, also discounting backticks: after a word cut short at a closing
+    # backtick, a lone backtick runs nothing.
+    last_run = len(text.rstrip(" \t\r\n)`")) - 1
+    found: list[tuple[int, str, int]] = []
+    unknown = len(lines.lines)
+    group_newline = -1  # the newline the current line's bodies follow
+    queued = -1  # the row the next body on that line starts after
+    for opener in openers:
+        j = opener + 2
+        tabs = text[j : j + 1] == "-"
+        if tabs:
+            j += 1
+        while j < n and text[j] in " \t":
+            j += 1
+        end = _redirect_target_end(text, j, n) if j < n and text[j] not in _TARGET_STOP else j
+        # A word the scanner SWALLOWED is never skipped silently. The scanner reads a
+        # backtick as the START of a substitution, so a word that runs into the
+        # backtick CLOSING an enclosing one swallows the rest of the text
+        # (``echo `cat <<EOF`; …``), where bash ends the word at that backtick and
+        # runs what follows. So a backtick or newline inside the word, with anything
+        # runnable after it, is reported, and so is a word that will not resolve
+        # after running to the end of the text (an open quote or substitution).
+        cut = min(
+            (k for k in (text.find("`", j, end), text.find("\n", j, end)) if k >= 0),
+            default=end,
+        )
+        if cut < end:
+            if cut <= last_run:
+                found.append((opener, "delimiter", cut))
+            continue
+        newline = text.find("\n", end)
+        if end == j or newline < 0:
+            # No word (bash refuses the line, or this is an arithmetic shift such as
+            # ``$((1<<(2)))``), or no newline after it: no body follows, and bash
+            # reads the rest of the line as the segmenter does (``echo $((1<<2)) x``).
+            if end == n and _word_left_open(text[j:end]):
+                found.append((opener, "delimiter", j))
+            continue
+        if newline != group_newline:
+            group_newline = newline
+            queued = _bisect_left(lines.ends, base + newline)
+            if newline not in split:
+                if base + newline < lines.last:
+                    found.append((opener, "start", newline))
+                queued = unknown
+        start_row = queued
+        if start_row >= unknown:
+            continue  # an earlier body on this line already made the rest unknown
+        start = lines.ends[start_row]  # in the original text
+        # Something runnable after the body starts. In the ORIGINAL text where the end
+        # of the body is unknown (it may lie past the cut), but in ``text`` alone for
+        # a body with no terminator anywhere: inside a substitution that is a syntax
+        # error to bash (MEASURED), and that is the shape a proven, excised message
+        # body leaves behind, ``$(cat <<'EOF'`` newline ``)``.
+        runnable_after = start < lines.last
+        resolved = _heredoc_delimiter(text[j:end])
+        if resolved is None:
+            if runnable_after:
+                found.append((opener, "delimiter", start - base))
+            queued = unknown
+            continue
+        delim, quoted = resolved
+        if lines.ends_inside_substitution(delim, tabs, start_row):
+            if runnable_after:
+                found.append((opener, "ambiguous", start - base))
+            queued = unknown
+            continue
+        primary = lines.first_after(delim, tabs, start_row)
+        if primary is None:
+            if start - base < last:
+                found.append((opener, "unterminated", start - base))
+            queued = unknown
+            continue
+        terminator = lines.ends[primary]  # in the original text
+        if (
+            in_substitution
+            and quoted
+            # The ONLY opener in this script: a second one on the line would take
+            # its body from the lines after this terminator, so the `)` below is
+            # data to bash and the substitution goes on running.
+            and len(openers) == 1
+            and _SIMPLE_WORDS.fullmatch(text, 0, opener)
+            and _CLOSES_SUBSTITUTION.match(whole, terminator + 1)
+        ):
+            break  # the exemption: nothing else in this substitution runs
+        if terminator - base > n:
+            found.append((opener, "cut", start - base))
+            break  # everything after this opener in text is its body
+        if not quoted:
+            m = _bisect_left(lines.marks, start)
+            if m < len(lines.marks) and lines.marks[m] < terminator:
+                found.append((opener, "expands", start - base))
+        if terminator - base < last and terminator - base not in split:
+            found.append((opener, "carried", terminator - base))
+        queued = primary
+    return found
+
+
+def _heredoc_hides_suffix(command: str) -> bool:
+    """Whether a here-doc body hides a suffix of ``command`` at any depth (the
+    detector behind :data:`_BLIND_HEREDOC_BODY`, without its untokenizable
+    precedence, and False when a size bound fired instead)."""
+    return "<<" in command and _analyze_bounded(command)[1] == "heredoc"
+
+
 def rewrites_before_running(command: str) -> bool:
     """Whether the parse is withheld because the shell REWRITES the text before it
-    runs it (a line continuation, or a built escape), rather than because the
-    command hit a size bound.
+    runs it (a line continuation, or a built escape), or reads it differently from
+    the parse (a here-doc body), rather than because the command hit a size bound.
 
-    Both are bounds-type blind spots, but only a size bound is measured at 0 real
-    commands; these two are ordinary input. A consumer that treats the two kinds
+    All are bounds-type blind spots, but only a size bound is measured at 0 real
+    commands; these are ordinary input. A consumer that treats the two kinds
     differently (a note given per command, not once per session) asks this, so a
     new cause of the same kind is added here once instead of at every caller.
     """
-    return has_continuation(command) or has_built_escape(command)
+    return (
+        has_continuation(command)
+        or has_built_escape(command)
+        or _heredoc_hides_suffix(command)
+    )
 
 def decode_ansi_c(text: str) -> str:
     """``text`` with every ``$'…'`` string replaced by what bash decodes it to.
@@ -2024,13 +2535,15 @@ def unresolved_verb_programs(command: str) -> frozenset[str]:
     advisory targets) meant re-modelling the join, and review found a new defect in
     that modelling each round; those consumers refuse or give a short note instead.
     Reads the command as written and with continuations folded, and returns the
-    union. Bounded exactly like :func:`analyze_checked`: a reading that trips a bound
-    contributes nothing, and the caller's own bounds branch has already refused.
+    union. Bounded exactly like :func:`analyze_checked`: a reading that trips a SIZE
+    bound contributes nothing, and the caller's own bounds branch has already refused.
+    A here-doc reading (``"heredoc"``) is parsed in full, like a continued one, so its
+    segments still contribute: this fact can only add a refusal.
     """
     programs: set[str] = set()
     for text in dict.fromkeys((command, fold_continuations(command))):
         segments, reason = _analyze_bounded(text)
-        if reason:
+        if reason in _SIZE_BOUND_REASONS:
             continue
         programs.update(_basename(s.argv[0]) for s in segments if _dispatcher_verb_unresolved(s))
     return frozenset(programs)
@@ -2085,6 +2598,7 @@ _ALL_BLIND_SPOTS = (
     _BLIND_UNCLASSIFIED_OPTION,
     _BLIND_CONTINUATION,
     _BLIND_BUILT_ESCAPE,
+    _BLIND_HEREDOC_BODY,
 )
 
 
@@ -2173,6 +2687,14 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     The bounds keep precedence because both are bounds-type — the verdict is the same —
     and the bound's remedy is the one that must be acted on first.
 
+    :data:`_BLIND_HEREDOC_BODY` is the one bounds-type cause ordered AFTER
+    :func:`untokenizable`, and BEFORE the unresolved-verb causes. Here the precedence
+    runs the other way on purpose: the discard guard's exemption for untokenizable
+    commands is a measured decision, and here-doc prose with an apostrophe is the
+    commonest untokenizable command, so reporting this cause first would reverse that
+    decision for every such command. The reasoning and the residual it leaves are
+    written beside the blind spot.
+
     WITHHOLDING SEGMENTS ALSO WITHHOLDS THE FACTS ON THEM, which is how an earlier
     revision of this docstring came to claim the placement "never removes" a refusal
     and was wrong. The push guard refused `git $V …` from the unresolved-verb flag on
@@ -2204,6 +2726,8 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
         return [], _BLIND_BUILT_ESCAPE
     if untokenizable(command):
         return segments, _BLIND_UNTOKENIZABLE
+    if reason == "heredoc":
+        return [], _BLIND_HEREDOC_BODY
     hidden = [s for s in segments if _dispatcher_verb_unresolved(s)]
     if hidden:
         # Two causes reach one predicate, and they need DIFFERENT remedies. The
@@ -3473,13 +3997,30 @@ def analyze(command: str) -> list[Segment]:
     return _analyze_bounded(command)[0]
 
 
-def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], str | None]:
+#: The reasons :func:`_analyze_bounded` gives when a SIZE bound cut the parse short.
+#: ``"heredoc"`` is not one: that parse ran in full and reads part of it wrongly.
+_SIZE_BOUND_REASONS = frozenset({"length", "depth"})
+
+
+def _analyze_bounded(
+    command: str,
+    *,
+    _depth: int = 0,
+    _origin: tuple[_HeredocLines, int] | None = None,
+    _in_substitution: bool = False,
+) -> tuple[list[Segment], str | None]:
     """:func:`analyze`, plus which bound (if any) stopped it short of the whole command.
 
-    Returns ``(segments, reason)`` where reason is None, ``"length"`` or ``"depth"``.
-    ``"depth"`` is reported only when there was something left to descend INTO and the
-    bound refused it — reaching the bound with nothing nested below is a complete
-    parse, not a truncated one.
+    Returns ``(segments, reason)`` where reason is None, ``"length"``, ``"depth"`` or
+    ``"heredoc"``. ``"depth"`` is reported only when there was something left to
+    descend INTO and the bound refused it — reaching the bound with nothing nested
+    below is a complete parse, not a truncated one.
+
+    ``"heredoc"`` means the parse is complete but a here-doc body, at this depth or
+    any depth below, carried it across its terminator (see
+    :data:`_BLIND_HEREDOC_BODY`). It propagates up exactly like ``"depth"``, and both
+    size bounds outrank it: a bound is the stronger statement, and its remedy comes
+    first. The segments are returned unchanged, so :func:`analyze` is unaffected.
 
     Both facts come from ONE traversal, on purpose. Answering "did this truncate?"
     with a separate pass means a second model of shell syntax, and any disagreement
@@ -3502,16 +4043,40 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
     # every consumer that must not be blind is already asking for the reason.
     if _depth == 0 and len(command) > MAX_COMMAND_CHARS:
         return [], "length"
+    proven_line = -1  # the end of the line whose here-doc body was proven and excised
     if _depth == 0:
-        command = _excised_text(command)
+        excised = excise_data_heredoc(command)
+        if excised is not None:
+            command = excised[0]
+            proven_line = command.find("\n")
     out: list[Segment] = []
     truncated = False
+    # The newlines this parse split on, from the SAME parse, so the here-doc check
+    # compares bash's body boundary against this parse rather than a second model.
+    splits: list[int] = []
+    openers: list[int] = []
+    starts: list[int] = []
+    parsed = parse_segments(command, _splits=splits, _openers=openers, _starts=starts)
+    # The text the here-doc check reads bodies in: the outermost text this command is
+    # a plain slice of, so a body any extraction cut short is read where it really
+    # ends. Indexed only if some opener needs it.
+    here = _origin if _origin is not None else (_HeredocLines(command), 0)
+    # The excised opener is a proven data here-doc whose body is gone from the text,
+    # so it would read as unterminated. Its line holds no other opener (the excision's
+    # grammar admits none).
+    openers = [o for o in openers if o > proven_line]
+    try:
+        heredoc = bool(
+            _heredoc_hidden_suffixes(command, splits, openers, here, _in_substitution)
+        )
+    except Exception:  # noqa: BLE001 — never raise inside the parse; unread is reported
+        heredoc = True
     # Subshells opened and not yet closed by earlier segments of this command. A
     # `(` opener counts; a `)` closer (bare or glued) at the end of a segment
     # closes. Counted on the segment SOURCE text outside quotes and comments, so a
     # paren inside a quoted argument is never mistaken for a subshell.
     carried_open = 0
-    for seg in parse_segments(command):
+    for seg, start in zip(parsed, starts, strict=True):
         raw = seg.raw
         override = _has_trailing_override(raw)
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
@@ -3530,14 +4095,26 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
                 verb_unresolved=_verb_unresolved(argv),
             )
         )
-        nested = []
+        # (script, origin, is a substitution body): a substitution body keeps where it
+        # was cut from, so the here-doc check reads a body the cut ended early in the
+        # text it came from.
+        nested: list[tuple[str, tuple[_HeredocLines, int] | None, bool]] = []
         if exe in _NESTED:
             script = _nested_script(argv, exe)
             if script:
-                nested.append(script)
+                nested.append((script, None, False))
 
-        nested.extend(_embedded_commands(_argv(seg.argv_src)))
-        nested.extend(_substitutions(raw))
+        nested.extend(
+            (script, None, False) for script in _embedded_commands(_argv(seg.argv_src))
+        )
+        spans = _substitution_spans(raw)
+        if spans:
+            if command.startswith(raw, start):
+                # raw is a plain slice: read its bodies in the outermost text
+                source, offset = here[0], here[1] + start
+            else:
+                source, offset = _HeredocLines(raw), 0  # a redirect rewrote raw
+            nested.extend((raw[a:b], (source, offset + a), True) for a, b in spans)
         if not nested:
             continue
         # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
@@ -3550,9 +4127,12 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
         if _depth >= MAX_SUBSTITUTION_DEPTH:
             truncated = True
             continue
-        for script in nested:
-            inner_segs, inner_reason = _analyze_bounded(script, _depth=_depth + 1)
+        for script, origin, in_substitution in nested:
+            inner_segs, inner_reason = _analyze_bounded(
+                script, _depth=_depth + 1, _origin=origin, _in_substitution=in_substitution
+            )
             truncated = truncated or inner_reason == "depth"
+            heredoc = heredoc or inner_reason == "heredoc"
             for inner in inner_segs:
                 out.append(
                     Segment(
@@ -3565,7 +4145,9 @@ def _analyze_bounded(command: str, *, _depth: int = 0) -> tuple[list[Segment], s
                         verb_unresolved=inner.verb_unresolved,
                     )
                 )
-    return out, ("depth" if truncated else None)
+    if truncated:
+        return out, "depth"
+    return out, ("heredoc" if heredoc else None)
 
 
 def is_pytest_invocation(seg: Segment) -> bool:
@@ -3620,7 +4202,14 @@ def _substitutions(text: str) -> list[str]:
     over-matching on the common forms rather than pretending to cover every shell
     construct.
     """
-    subs: list[str] = []
+    return [text[a:b] for a, b in _substitution_spans(text)]
+
+
+def _substitution_spans(text: str) -> list[tuple[int, int]]:
+    """:func:`_substitutions` as ``(start, end)`` offsets of each body in ``text``, so
+    the here-doc check can read a body the extraction cut against the text it was
+    cut from."""
+    subs: list[tuple[int, int]] = []
     i, n = 0, len(text)
     in_sq = False
     while i < n:
@@ -3636,13 +4225,13 @@ def _substitutions(text: str) -> list[str]:
             continue
         if c == "$" and i + 1 < n and text[i + 1] == "(":
             end = _command_sub_end(text, i, n)  # index past matching ')'
-            subs.append(text[i + 2 : end - 1])  # body between $( and )
+            subs.append((i + 2, end - 1))  # body between $( and )
             i = end
             continue
         if c == "`":
             j = text.find("`", i + 1)
             if j != -1:
-                subs.append(text[i + 1 : j])
+                subs.append((i + 1, j))
                 i = j + 1
                 continue
         i += 1

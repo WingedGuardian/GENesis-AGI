@@ -92,7 +92,12 @@ Prime each reviewer with the RIGHT SHAPE (what a lint scan misses). Paste this i
 
 ## 3. Triage → stage the class-level fix (don't commit yet)
 
-3-bucket disposition: FIX real+material now / evidence-tiered documented-accept / escalate.
+First verify the findings. Re-derive each load-bearing, contradictory or surprising one
+from ground truth (the code, a run, live state), refuting by default. An inconclusive
+refutation never overturns a well-grounded finding, and a refutation needs the same
+evidence as the finding (closing-session, "Review-loop discipline").
+
+Then the 3-bucket disposition: FIX real+material now / evidence-tiered documented-accept / escalate.
 When you fix, fix the mechanism/class — a per-instance patch is what spawns the next review
 round. `git add` the fix, but do NOT commit yet — the commit is the last step, after the marker.
 If the PR's open review round owes a round reflection (`python3 scripts/review_reflection.py status`),

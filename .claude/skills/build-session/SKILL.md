@@ -218,6 +218,22 @@ returned 0 in-server and **three** features shipped green but inert since
 July; the module's docstring claim "same-uid reads succeed" was a shell-tested
 falsehood. The fix routed around the ptrace-gated read entirely.)
 
+**The config twin of that rule: a setting's EFFECT scope and its SOURCE scope are
+different questions, and only the second one is obvious** (from #1605). Ask
+"which sessions or processes does this file actually bind?", never "is this file
+read?". Each process reads config from wherever it happens to sit, so a value
+whose effect is machine-wide but whose source is per-session binds a minority and
+does nothing for the rest, while looking correct everywhere you check. It is not
+"ignored", which is why grepping for the key and finding it loaded proves
+nothing: the file loads, for the sessions that read it. Before shipping any
+config, name the set of processes the value must govern, then the set that will
+actually load the file. If the second is smaller, the config is wrong however
+well it works in your session. This is the Generalizability Gate's deploy-path
+question one level down: how does this reach other SESSIONS? Origin: Claude
+Code's auto-updater suppression and transcript retention were both set in the
+repo's `.claude/settings.json`, which CC merges only for sessions launched at a
+checkout's root (a session started in `src/` keeps the defaults), while the behaviour each controls spans the whole machine.
+
 **And when the work is done, audit the CLAIMS as well as the outcome.**
 Everything above distrusts a VERIFICATION; the companion failure is the
 SENTENCES you wrote about the work — a number in a commit message, a docstring's
@@ -456,6 +472,17 @@ counterexample is whoever is about to rely on the null result, and they will not
 go looking unless you tell them the search is still open. A null passed on bare
 is read as a clearance by everyone downstream, which is how one unproven
 sentence becomes the premise of three later decisions.
+
+**Measure the REMEDY, not only the finding** (#2255). A finding has to be
+demonstrated; a fix is usually asserted, and review, tests and mutation all grade
+the finding rather than the fix. So run the original exploit against the fixed
+code, then run its ADJACENT spellings. A remedy that closes one arm of two
+produces a diff that reads as the fix and changes nothing, which is worse than no
+fix because it retires the finding. Twice in one day a recommended fix was
+measured before shipping: one still gated, because two arms fired independently
+and the finding named one; the other left the in-project spelling of the bypass
+open. If the remedy cannot be measured, say so on the PR and file it rather than
+ship it.
 
 ### Select, don't amputate — truncation is the absence of a decision
 
@@ -723,6 +750,27 @@ these are the GATES that make it enforceable:
   evidence) is a phase that FINISHES before any fix is proposed — never propose
   fixes in the same breath as the symptom. "It's probably X, let me fix that"
   = investigation skipped.
+- **A root cause is VERIFIED TO CERTAINTY, or it is not a root cause** (from
+  #1605). A mechanism you have not tested is a HYPOTHESIS, and stating it in the
+  grammar of a diagnosis is worse than saying nothing: the fix is then designed
+  against fiction and looks correct while the real cause keeps firing. Three
+  rules make it enforceable:
+  1. **Name the artifact that would falsify it, then go get that artifact.** A
+     cause is verified when a specific query, file, timestamp or run comes back
+     the way the cause predicts and could have come back otherwise. "Consistent
+     with" is not verification; a wrong cause is usually consistent too.
+  2. **A subagent's or reviewer's stated mechanism is a LEAD at its stated
+     confidence**, and it does not become fact by being repeated: re-derive it
+     per CLAUDE.md "Verify agent output".
+  3. **Enumerate the population, not a sample, and report the outliers.** N
+     instances explained by a mechanism is a claim about those N. If k of N do
+     not fit, say "k of N unexplained" rather than generalising from the
+     majority; the outlier is where the second bug lives.
+  (Origin, 2026-09-02: an AI-attribution leak into the public repo was relayed as
+  "dispatched sessions don't load project settings", a 70% hypothesis restated as
+  cause. Measured: 10 of 11 leaking commits came from worktrees whose checkout
+  PREDATED the setting, and 1 of 11 stayed unexplained. A fix aimed at the
+  speculated cause would have shipped clean and changed nothing.)
 - **Fix-attempt cap: 3 failed fixes → STOP and question the architecture.**
   The debugging twin of the review round cap, with the same mechanics
   (count attempts visibly; the cap consumes standing approval). Each failed fix
@@ -868,9 +916,19 @@ The bug-first and verify-RED core is in
   rejects a valid mutation and hides a real survivor. Restore from a file copy
   taken beforehand, never `git checkout` — the work is uncommitted — and make
   the restore ATTEMPT unconditional ON THE RUN'S OUTCOME (`trap restore EXIT`, a
-  `finally:`), never the tail of an `&&` chain. Unconditional means it always
-  RUNS, not that it always OVERWRITES: what it writes is still gated on the hash
-  check below. A `trap` that restores blindly is the very thing that destroys a
+  `finally:`), never the tail of an `&&` chain. Unconditional ON THE OUTCOME means
+  it runs whether the run passed or failed. It does not mean it survives every
+  signal. MEASURED 2026-10-22 on bash 5.2 and Python 3.12, with no signal handler
+  installed: a bash `EXIT` trap ran on SIGTERM, SIGINT and SIGHUP; a Python
+  `finally:` ran on SIGINT but NOT on SIGTERM or SIGHUP; neither ran on SIGKILL.
+  A Python harness stopped by SIGTERM (a timeout) or SIGHUP therefore leaves the
+  file mutated unless it installs handlers that turn those signals into an
+  exception (see
+  `.claude/skills/genesis-development/references/high-stakes-verification.md`,
+  "Control the instrument"). Against SIGKILL nothing in-process helps, and the
+  next run's baseline is taken from the mutated file: mutate a disposable copy,
+  or check against a pristine original kept outside the process. Nor does unconditional mean the restore always OVERWRITES: what it writes
+  is still gated on the hash check below. A `trap` that restores blindly is the very thing that destroys a
   concurrent edit. The expected outcome here is a NONZERO exit, and under
   `set -e` a trailing restore is exactly the statement that never runs (the
   `out=$(cmd)` entry in Common Traps is the same mechanism), so the shape that
@@ -1347,7 +1405,31 @@ Four rules follow, each cheap:
   signal: any reviewer finding that exposes a semantic-modeling gap in a guard
   means STOP and re-architect — never patch the named instance.
 
-  **Decision test (verbatim, apply before shipping any guard):** could a git
+  Git argv is one instance. The wider class is a check that authorizes a future
+  operation by treating a present spelling or snapshot as proof of an unresolved
+  property of that operation or its target. Examples: a filename standing for
+  the file that will actually be opened, a path extension for artifact kind, a
+  flag spelling for whether a command executes, or an unresolved prefix for
+  directory containment. Running before a tool does not by itself make a check
+  open-set: an exact closed protocol can establish a closed structural claim.
+  The failure is using that claim as proof of an operation or effect it does not
+  establish. On #2255's #1826 example, eight of eleven audit findings and all
+  twelve defects across three review rounds had that approximation shape.
+
+  **Decision test (apply before shipping any guard):** a guard may AUTHORIZE
+  (allow or exempt) only on evidence that establishes the property it promises
+  for the action it admits. An inode comparison establishes identity at that
+  lookup; a later pathname open needs an action-bound identity guarantee or an
+  explicitly stated race limitation. A structural parse establishes the syntax
+  it actually parses, not arbitrary command effects. A single chokepoint is
+  useful only when its observed fact governs the admitted action. An exact-form
+  whitelist that fails closed outside its members can establish membership in
+  that closed set; its effect guarantee still needs its own evidence. If the
+  property cannot be resolved before the event, fail closed and say why, abstain
+  and say so, or check it after the event where it IS resolved (snapshot, then
+  compare); never let an approximation allow. A `deny` or `ask` on an imprecise
+  predicate is a separate case ("Two things keep this from reading as licence",
+  below). For git: could a git
   flag you've never heard of change your guard's verdict? If yes, your claim
   is open-set — redesign to closed-set token claims (exact-form whitelists /
   literal token blocks) or to RECOVERABILITY (snapshot-then-allow, where a
@@ -1795,7 +1877,7 @@ three protocol steps also apply: `.claude/skills/closing-session/SKILL.md`,
   hand-rolled-parsing hunting, not a lint/secrets scan — and writes the evidence marker. This is
   the review that catches Round-1 bugs before Codex does; `/audit-changes` is only a light
   self-check.
-  A PR whose diff touches the enforcement-hook surface runs the gate-fix lane (wider round 1): `.claude/skills/genesis-development/references/gate-fix-lane.md`.
+  A PR whose diff touches the enforcement-hook surface runs the gate-fix lane: round 1 is DUAL, Codex plus `merge_gate.secondary_reviewer` run together at PR open (Codex-only when none is configured, and the PR says so). Read `.claude/skills/genesis-development/references/gate-fix-lane.md` before opening it.
 
 ### Publishing: the first push opens the PR
 

@@ -1,1 +1,0 @@
-- A runaway file that was emptied while still held open, and then filled up again, now pages again (marked "again") instead of staying silent; a writer that closes its file for a moment is still judged against its earlier size.
