@@ -10,15 +10,24 @@ import pytest
 from tests import _live_fence as fence
 
 
+def _require_installed_systemctl():
+    """The fence stubs a tool only where it is installed, so without systemctl
+    there is no stub to find and a bare call fails as on any such host."""
+    if "systemctl" not in fence._S.stubbed:
+        pytest.skip("systemctl is not installed here, so the fence installs no stub")
+
+
 @pytest.mark.user_manager
 def test_a_user_manager_test_keeps_the_bus_but_systemctl_stays_stubbed():
     for k, v in fence._S.saved_bus.items():
         assert os.environ.get(k) == v, k
+    _require_installed_systemctl()
     found = shutil.which("systemctl")
     assert found is not None and found.startswith(fence._S.base), found
 
 
 def test_systemctl_resolves_to_the_fence_stub():
+    _require_installed_systemctl()
     found = shutil.which("systemctl")
     assert found is not None and found.startswith(fence._S.base), found
 
@@ -49,6 +58,7 @@ def test_a_script_seeding_its_own_bus_default_still_cannot_connect():
 
 
 def test_a_script_calling_systemctl_reaches_the_stub_and_is_answered():
+    _require_installed_systemctl()
     # A harmless probe on purpose: if the fence were missing, this would reach the
     # real user manager, so it must never be a command that changes anything there
     # (an unfenced `stop genesis-server` here once stopped a live server).

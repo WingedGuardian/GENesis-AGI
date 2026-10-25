@@ -2,9 +2,11 @@
 
 Every probe here is harmless even if the fence were absent: the refused call
 is ``sudo -n true``, the answered one ``systemctl --user is-active <a unit
-that does not exist>``, and every deploy script run is a stub under tmp_path. The fence's own tests must never be
-the thing that reaches live state (#2863: a fence's verify-RED once stopped a
-live server).
+that does not exist>``, and every deploy script run is either a stub under
+tmp_path or the checkout's own ``scripts/update.sh``, which refuses itself under
+the fence before it does anything (checked before each run, see
+``_require_self_guarded``). The fence's own tests must never be the thing that
+reaches live state (#2863: a fence's verify-RED once stopped a live server).
 """
 
 from __future__ import annotations
@@ -24,6 +26,21 @@ from tests import _live_fence as fence
 
 PROBE = ["sudo", "-n", "true"]
 READ = ["systemctl", "--user", "is-active", "genesis-fence-probe-nonexistent"]
+UPDATE_SH = Path(__file__).resolve().parent.parent / "scripts" / "update.sh"
+
+
+def _require_self_guarded(script: Path) -> None:
+    """The replay tests run the REAL update.sh, which is safe only because it
+    sources the live-system guard and refuses itself before its first real step
+    (the copy-to-temp block). Check that order before spawning it, so a change
+    that moves or drops the guard fails here instead of running the script."""
+    text = script.read_text(encoding="utf-8")
+    source = text.find("lib/live_system_guard.sh")
+    call = text.find("refuse_if_test_fenced_live")
+    copy = text.find("# ── Copy-to-temp guard")
+    assert 0 <= source < call < copy, (
+        f"{script} must source and call the test fence before its copy-to-temp block"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -343,8 +360,8 @@ def test_replay_direct_branch_is_refused(update_routes, spawned, monkeypatch):
     roots — exit 97, REFUSED logged — which this test consumes. Here the real
     checkout's update.sh stands in for the deployed one: both are listed roots."""
     monkeypatch.setattr(update_routes, "_systemd_run_scope_available", lambda env: False)
-    repo = Path(__file__).resolve().parent.parent
-    monkeypatch.setattr(update_routes, "_UPDATE_SCRIPT", repo / "scripts" / "update.sh")
+    _require_self_guarded(UPDATE_SH)
+    monkeypatch.setattr(update_routes, "_UPDATE_SCRIPT", UPDATE_SH)
     with fence.expect_violation() as v:
         mark = os.path.getsize(fence._S.log)
         update_routes._apply_direct(Path("/nonexistent/pid"))
@@ -357,8 +374,8 @@ def test_replay_direct_probe_is_answered_and_the_fallback_refused(update_routes,
     which steers into the `bash update.sh` fallback. The script then refuses
     itself: a fence that answers a probe must still stop the route it steers
     into."""
-    repo = Path(__file__).resolve().parent.parent
-    monkeypatch.setattr(update_routes, "_UPDATE_SCRIPT", repo / "scripts" / "update.sh")
+    _require_self_guarded(UPDATE_SH)
+    monkeypatch.setattr(update_routes, "_UPDATE_SCRIPT", UPDATE_SH)
     with fence.expect_violation() as v:
         mark = os.path.getsize(fence._S.log)
         update_routes._apply_direct(Path("/nonexistent/pid"))
