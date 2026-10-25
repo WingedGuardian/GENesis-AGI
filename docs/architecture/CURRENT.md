@@ -1654,6 +1654,13 @@ the shared banner is not an assertion about all concurrent sessions.
   locks. This does not activate the service or establish production capacity
   or unattended resource-failure readiness. See
   `docs/reference/codebase-managed.md`.
+  The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
+  artifacts in retained import receipts without replacing business failures;
+  real filesystem/SQLite errors remain visible. Schema 2 upgrades metadata
+  atomically and older writers refuse it. The marker CLI `import-status`
+  observes receipt totals without initialization or migration. This does not
+  implement persistent resource quarantine or the runner's separate list/claim
+  error propagation.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
