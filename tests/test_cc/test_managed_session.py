@@ -655,7 +655,15 @@ async def test_stdin_failure_still_drains_when_both_kill_methods_refuse(
 
 
 @pytest.mark.parametrize("behavior", ["result", "eof", "cancel"])
-@pytest.mark.parametrize("scoped", [False, True], ids=["process-group", "user-scope"])
+@pytest.mark.parametrize(
+    "scoped",
+    [
+        pytest.param(False, id="process-group"),
+        # A real transient user scope: the live fence's systemd-run stub would
+        # answer "unavailable" and skip it, so it opts out (tests/_live_fence.py).
+        pytest.param(True, id="user-scope", marks=pytest.mark.user_manager),
+    ],
+)
 async def test_native_subprocess_lifecycle_and_provenance(
     db, native, tmp_path, monkeypatch, behavior, caplog, scoped
 ):
