@@ -1625,7 +1625,7 @@ async def test_a_one_word_name_is_fine_for_the_whole_name_kind(ctx):
 
 
 async def test_consent_labels_are_shown_and_recorded_as_lengths(ctx):
-    label = "I authorize the merchant to electronically debit my account"
+    label = "I authorize this debit"
     reply = await ctx.request(consent_labels=[label])
     assert reply["shown"] == ["consent"]
     nonce = reply["nonce"]
