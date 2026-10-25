@@ -49,14 +49,42 @@ bootstrap_refuse_if_server_live "$@" || exit 3
 
 # BEGIN crash-recovery
 UPDATE_STATE="$HOME/.genesis/update_state.json"
+# A second argument "guard": the shared guard's message, printed just before,
+# is the remedy (a half-written checkout, which --post-merge refuses), so the
+# generic one is not added to it.
 _crash_recovery_refuse() {
     local _reason="$1" _current_branch _current_head
     _current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
     _current_head="$(git -C "$GENESIS_ROOT" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null || true)"
     echo "  REFUSE: $_reason." >&2
     echo "  Current branch/HEAD: ${_current_branch:-<detached>} @ ${_current_head:-<unreadable>}; rollback tag: ${ROLLBACK_TAG:-<missing>} @ ${rb_commit:-<unresolved>}." >&2
-    echo "  Resolve the checkout, then re-run scripts/bootstrap.sh; or finish forward with scripts/update.sh --post-merge; or remove ~/.genesis/update_state.json once decided." >&2
+    if [ "${2:-}" != guard ]; then
+        echo "  Resolve the checkout, then re-run scripts/bootstrap.sh; or finish forward with scripts/update.sh --post-merge (it refuses a half-written tree; then follow its message); or remove ~/.genesis/update_state.json once decided." >&2
+    fi
     exit 1
+}
+
+# The shared rule's verdict on the state (scripts/lib/update_state_guard.py):
+# sets _guard_rc (10 = nothing to guard) and _guard_msg (its remedy, printed by
+# whoever refuses on it).
+_crash_state_guard() {
+    _guard_rc=0
+    _guard_msg="$(python3 -I -S "$SCRIPT_DIR/lib/update_state_guard.py" "$UPDATE_STATE" "$GENESIS_ROOT" 2>&1)" \
+        || _guard_rc=$?
+}
+
+# Is update.lock held (an update still running: update.sh, or an engine it left
+# orphaned, which keeps update.sh's fd; or a validation hold)? Opened read-only
+# and only when it exists, so bootstrap never creates the lock.
+_update_lock_held() {
+    local _lock="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock" _fd _rc=0
+    [ -e "$_lock" ] || return 1
+    # Returns 2 when the lock cannot be opened: "maybe held", said apart so the
+    # message names the real cause instead of waiting on a holder.
+    exec {_fd}<"$_lock" || return 2
+    flock -n "$_fd" || _rc=$?
+    exec {_fd}<&-
+    [ "$_rc" -ne 0 ]
 }
 
 # Is the state a pending merge conflict (scripts/lib/update_state_guard.py, the rule
@@ -97,6 +125,15 @@ try:
         text_field("deploy_head"),
         "1" if "original_branch" in state else "0",
     ]
+    # The live engine's move record (#3492): its target, or "" with none.
+    move = state.get("live_move")
+    live_to = ""
+    if move is not None:
+        live_to = move.get("to") if isinstance(move, dict) else None
+        if not (isinstance(live_to, str) and len(live_to) in (40, 64)
+                and set(live_to) <= set("0123456789abcdef")):
+            raise ValueError("live_move.to is not a commit id")
+    fields.append(live_to)
     if any(ord(char) < 0x20 for value in fields for char in value):
         raise ValueError("control character in state field")
     print("\x1f".join(fields))
@@ -106,15 +143,39 @@ PY
 )"; then
         _crash_recovery_refuse "update state is unreadable"
     fi
-    IFS=$'\x1f' read -r STATE_PHASE STATE_PID ROLLBACK_TAG ORIGINAL_BRANCH OWN_HEAD DEPLOY_HEAD ORIGINAL_BRANCH_PRESENT \
+    IFS=$'\x1f' read -r STATE_PHASE STATE_PID ROLLBACK_TAG ORIGINAL_BRANCH OWN_HEAD DEPLOY_HEAD ORIGINAL_BRANCH_PRESENT LIVE_TO \
         <<< "$_state_fields"
 
-    # Check if the update process is still alive. Bare `kill -0` ON PURPOSE, unlike
-    # the marker readers (lib/deploy_marker.sh, genesis.env), which also reject a
-    # zombie or reused pid: the "dead" branch below resets the tree, so here a
-    # stale holder must err toward "still running", never toward the reset.
-    if [ "$STATE_PID" -gt 1 ] 2>/dev/null && kill -0 "$STATE_PID" 2>/dev/null; then
-        echo "  Update process (pid $STATE_PID) still running in phase '$STATE_PHASE' — not interfering."
+    # Is an update still running? update.sh holds update.lock for its whole run
+    # (and an engine it ran keeps it through the inherited fd, even after
+    # update.sh dies, #3492), so the lock is the answer, not the recorded pid,
+    # which a zombie or a reused pid makes look alive. Held, it is update.sh's
+    # own step only when the recorded pid is the one running it: update.sh names
+    # its pid in GENESIS_BOOTSTRAP_UPDATE_PID on its bootstrap call, or bootstrap
+    # is its direct child ($PPID is the recorded pid). The second is how the
+    # update.sh before this check calls it (no token), and every install runs
+    # that one once, against this bootstrap, on the update that brings it in. A
+    # dead recorded pid cannot be bootstrap's running parent; a reused one could
+    # only while the lock stays held without update.sh (an orphaned engine), a
+    # window pid_max makes remote. Held
+    # otherwise, bootstrap refuses: a hand-run bootstrap during a live update
+    # (its parent is a shell) now refuses too, the safe direction (a validation
+    # hold, flock -s, reads the same). Free, no update is running and the state
+    # is a dead one's.
+    _lock_rc=0
+    _update_lock_held || _lock_rc=$?
+    # update.sh's own call first: it goes on whether bootstrap can see the lock
+    # as held (0) or cannot open it (2); update.sh holds it either way.
+    if [ "$_lock_rc" -ne 1 ] && [ -n "$STATE_PID" ] \
+        && { [ "${GENESIS_BOOTSTRAP_UPDATE_PID:-}" = "$STATE_PID" ] || [ "$PPID" = "$STATE_PID" ]; }; then
+        echo "  Update process (pid $STATE_PID) is running this bootstrap in phase '$STATE_PHASE' — not interfering."
+    elif [ "$_lock_rc" -eq 2 ]; then
+        echo "  REFUSE: ${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock cannot be opened (check its owner and mode), so whether an update still holds it is unknown: bootstrap does not run." >&2
+        exit 1
+    elif [ "$_lock_rc" -eq 0 ]; then
+        echo "  REFUSE: an update holds update.lock (phase '$STATE_PHASE', recorded pid $STATE_PID) and did not start this bootstrap: it does not run under it." >&2
+        echo "  Re-run scripts/bootstrap.sh once it has finished (nothing holds ${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock); a validation hold (flock -s) reads the same." >&2
+        exit 1
     elif [ "$STATE_PHASE" = "done" ]; then
         echo "  Update completed successfully — cleaning up state file."
         rm -f "$UPDATE_STATE"
@@ -124,7 +185,7 @@ PY
         # --post-merge. It is not a crash, so it is neither recovered nor recorded.
         echo "  An update stopped on merge conflicts (nothing was merged); its state is kept for the resolver."
     else
-        echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID is dead)."
+        echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID; nothing holds update.lock)."
         if [ -z "$ROLLBACK_TAG" ] || ! git -C "$GENESIS_ROOT" check-ref-format "refs/tags/$ROLLBACK_TAG" >/dev/null 2>&1; then
             _crash_recovery_refuse "no valid rollback tag is recorded"
         fi
@@ -166,20 +227,30 @@ PY
         esac
 
         if genesis_checkout_unmoved "$GENESIS_ROOT" "$rb_commit" "$recovery_branch"; then
-            # In the merging phase, a dirty checkout at the tag is what a
-            # fast-forward killed mid-write leaves: HEAD unmoved, files half
-            # new. update.sh treats that state as CRITICAL; installing over it
-            # would run half-written code, so refuse and keep the state file.
-            # The check is genesis_merge_residue (lib/deploy_checkout.sh): every
-            # tracked path (the ephemeral allowlist included: the merge writes
-            # those too), flagged entries, and files the range added. It is
-            # shared with scripts/lib/update_state_guard.py, so the guard's
-            # verdict on this state and this recovery agree.
+            # In the merging phase, a checkout at the tag may still hold part of
+            # what the update wrote: a fast-forward killed mid-write (HEAD
+            # unmoved, files half new), or on `live` a rebuild's switch killed
+            # partway (its move record in the row names the target; only the
+            # two-dot range sees what a switch writes). Installing over it would
+            # run half-written code. The shared guard decides
+            # (scripts/lib/update_state_guard.py: tracked and flagged changes on
+            # the paths the range writes, a tracked change elsewhere guards, and
+            # the files the range adds), so its verdict and this
+            # recovery cannot disagree, and recovery goes on ONLY on its exit
+            # 10. Every other exit refuses with what it said: 4 is a half-written
+            # tree, 0 a state it guards, and 1, 2, 126 or 127 a guard that
+            # crashed or could not run (deploy_code_only.sh's rule).
             if [ "$STATE_PHASE" = "merging" ]; then
-                merge_dirty="$(genesis_merge_residue "$GENESIS_ROOT" "$rb_commit" "$DEPLOY_HEAD")"
-                if [ -n "$merge_dirty" ]; then
-                    printf '%s\n' "$merge_dirty" | sed 's/^/    /'
-                    _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but tracked files changed during the merge (a half-written update or edits by someone else)"
+                _crash_state_guard
+                if [ "$_guard_rc" -ne 10 ]; then
+                    printf '%s\n' "${_guard_msg:-(the guard printed nothing; exit $_guard_rc)}" | sed 's/^/  /'
+                    if [ "$_guard_rc" -eq 4 ]; then
+                        _crash_recovery_refuse "the checkout is at $ROLLBACK_TAG but holds part of an update's checkout" guard
+                    fi
+                    if [ "$_guard_rc" -eq 6 ]; then
+                        _crash_recovery_refuse "the update state cannot be finished forward (see above)" guard
+                    fi
+                    _crash_recovery_refuse "the update state guard did not clear this state (exit $_guard_rc)"
                 fi
             fi
             dirty_paths=""
@@ -202,20 +273,35 @@ PY
                     _crash_recovery_refuse "the update died in phase 'bootstrap', which can change the database schema; the merged code was left in place with the database"
                     ;;
                 *)
-                    _crash_recovery_refuse "the checkout moved while the update was in phase '$STATE_PHASE', before it could have merged"
+                    _crash_recovery_refuse "the checkout is not at the rollback tag of an update that stopped in phase '$STATE_PHASE' (a --post-merge's merged code, or a move by someone else); bootstrap does not tell which"
                     ;;
             esac
+            # On `live` the move was a rebuild, and moving it back also means
+            # putting back the git hooks the rebuild installed, which only
+            # update.sh's own rollback does: bootstrap never rolls live back.
+            # Decided before the own-head check, which on `live` cannot see the
+            # rebuilt tip until update.sh adopts it (the move record names it).
+            # A rollback checkout killed partway back to the tag leaves HEAD at
+            # the tip with tag-side files written: the guard's half-written
+            # verdict, which --post-merge refuses, so its message is the remedy.
+            if [ "$ORIGINAL_BRANCH" = live ]; then
+                _crash_state_guard
+                if [ "$_guard_rc" -eq 4 ] || [ "$_guard_rc" -eq 6 ]; then
+                    # 4 a half-written checkout, 6 one finishing forward would get
+                    # wrong: the guard's message is the remedy either way.
+                    printf '%s\n' "$_guard_msg" | sed 's/^/  /'
+                    _crash_recovery_refuse "the update ran on live and its checkout cannot be finished as it is" guard
+                fi
+                if genesis_checkout_unmoved "$GENESIS_ROOT" "$OWN_HEAD" "$ORIGINAL_BRANCH" \
+                    || { [ -n "$LIVE_TO" ] && genesis_checkout_unmoved "$GENESIS_ROOT" "$LIVE_TO" "$ORIGINAL_BRANCH"; }; then
+                    _crash_recovery_refuse "the update ran on live and the checkout is at its rebuilt tip; finish it with scripts/update.sh --post-merge (bootstrap never rolls live back)"
+                fi
+            fi
             # Only the exact head update.sh recorded as its own merge is undone.
             # It records that head the moment it adopts the merge, so a checkout
             # anywhere else (someone's commit or pull, another branch) is left.
             genesis_checkout_unmoved "$GENESIS_ROOT" "$OWN_HEAD" "$ORIGINAL_BRANCH" \
                 || _crash_recovery_refuse "the checkout is not at the merge this update recorded as its own; refusing to change code it does not own"
-            # On `live` the move was a rebuild, and moving it back also means
-            # putting back the git hooks the rebuild installed, which only
-            # update.sh's own rollback does.
-            if [ "$ORIGINAL_BRANCH" = live ]; then
-                _crash_recovery_refuse "the update ran on live; finish it with scripts/update.sh --post-merge (bootstrap does not roll live back until the live recovery guard lands)"
-            fi
             if ! genesis_rollback_checkout \
                 "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH" "$EPHEMERAL_BACKUP_ROOT" "$rb_commit"; then
                 _crash_recovery_refuse "the non-forced rollback checkout was refused; code was left in place"

@@ -66,7 +66,18 @@ these deliberate constructions stay as residuals:
 - forged ``.pyc`` files, or a ``PYTHONPYCACHEPREFIX`` / ``-X pycache_prefix``;
 - files added beside the script or in site-packages after the start and
   removed before the census reads;
-- the stdlib or site-packages upgraded after the start.
+- the stdlib or site-packages upgraded after the start;
+- a secrets edit landing between the change-time check and the read: at most
+  one census row reads the wrong switch, and the next census sees the new
+  change time, reads unknown, and resets the clock;
+- a venv process in another mount namespace (the test sandbox, MEASURED: 4 of 4
+  such processes) is judged on the host checkout's history, because its paths
+  are not ours to resolve; reading it unknown would reset the clock on every
+  census that lands during a sandboxed test run.
+
+Every fail-closed rule here was measured against the live processes before it
+shipped (owner ruling, 2026-10-20): a dirty row RESETS the 14-day clock, so a
+rule that routine processes trip would make the cutover unreachable.
 
 No reason code carries an environment value or a path from another process.
 """
@@ -95,8 +106,28 @@ PROOF_ENV_KEYS = (
     "GENESIS_REPO_ROOT",
     "GENESIS_DB_PATH",
     "GENESIS_GRAPH_TELEMETRY_DISABLED",
+    "GENESIS_HOME",
 )
 _SWITCH = "GENESIS_GRAPH_TELEMETRY_DISABLED"
+#: PYTHON* variables this module models (each has its own rule above or below).
+_PY_ENV_MODELLED = frozenset(
+    {"PYTHONPATH", "PYTHONHOME", "PYTHONPLATLIBDIR", "PYTHONEXECUTABLE", "PYTHONWARNINGS"}
+)
+#: PYTHON* variables that cannot change which code a script run loads. Any other
+#: PYTHON* variable makes the source unknown: an allowlist, because CPython's
+#: set is small and stable, and a denylist only ever lists the vectors found so far.
+_PY_ENV_INERT = frozenset(
+    {
+        "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE", "PYTHONIOENCODING", "PYTHONUTF8",
+        "PYTHONHASHSEED", "PYTHONFAULTHANDLER", "PYTHONNOUSERSITE", "PYTHONSAFEPATH",
+        "PYTHONTRACEMALLOC", "PYTHONMALLOC", "PYTHONCOERCECLOCALE", "PYTHONASYNCIODEBUG",
+        "PYTHONDEVMODE", "PYTHONSTARTUP",  # PYTHONSTARTUP: interactive sessions only
+    }
+)
+#: Interpreter flags (before the script) that cannot change which code loads.
+_PY_FLAGS_INERT = frozenset(
+    {"-I", "-P", "-u", "-B", "-E", "-s", "-S", "-O", "-OO", "-q", "-b", "-bb", "-R"}
+)
 #: setuptools' ``distutils-precedence.pth``, byte for byte after strip.
 _DISTUTILS_LINE = (
     "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local')"
@@ -168,6 +199,68 @@ def _dotted_warning_category(argv: tuple[str, ...], env: dict[str, str]) -> bool
     return any("." in (f.split(":") + ["", "", ""])[2] for f in filters)
 
 
+def _host_imports() -> frozenset[str]:
+    """Top-level modules THIS process has imported."""
+    return frozenset(n.split(".", 1)[0] for n in list(sys.modules))
+
+
+def options_unmodelled(argv: tuple[str, ...]) -> bool:
+    """Whether the interpreter options before the script include one these rules
+    do not model: anything but the inert flags, ``-X``/``-W`` (separate or
+    attached; ``-W`` is checked for imports on its own) and the ``-m``/``-c``/``-``
+    terminators. ``-mgenesis`` (attached) or ``--check-hash-based-pycs always``
+    would otherwise shift what is read as the script."""
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        token = argv[i]
+        if token in ("-m", "-c", "-"):
+            return False
+        if token in _PY_FLAGS_INERT:
+            i += 1
+        elif token in ("-X", "-W"):
+            i += 2
+        elif token.startswith(("-X", "-W")) and len(token) > 2:
+            i += 1
+        else:
+            return True
+    return False
+
+
+def python_env_unmodelled(env: dict[str, str]) -> bool:
+    """Whether ``env`` sets a PYTHON* variable outside the modelled and inert sets."""
+    return any(
+        k.startswith("PYTHON") and k not in _PY_ENV_MODELLED and k not in _PY_ENV_INERT
+        for k in env
+    )
+
+
+def genesis_home_of(env: dict[str, str], file_vals: dict | None = None) -> Path | None:
+    """The Genesis home that process resolves, as ``genesis.env.genesis_home``
+    does: ``GENESIS_HOME``, else ``<HOME>/.genesis``. A proven secrets file's
+    values are laid over the launch env, because the router reload applies them
+    with ``override=True``. None when it cannot be resolved from here."""
+    merged = {**env, **(file_vals or {})}
+    if merged.get("GENESIS_HOME"):
+        return expand_home(merged["GENESIS_HOME"], merged)
+    home = merged.get("HOME")
+    if home is None:
+        import pwd
+
+        home = pwd.getpwuid(os.getuid()).pw_dir  # what Path.home() falls back to
+    return Path(home) / ".genesis" if os.path.isabs(home) else None
+
+
+def same_home(path: Path | None, host_home: Path) -> bool:
+    """Whether ``path`` is the census host's Genesis home: the same file when
+    both exist, else the same real path (a home not created yet)."""
+    if path is None:
+        return False
+    try:
+        return os.path.samefile(path, host_home)
+    except OSError:
+        return os.path.realpath(path) == os.path.realpath(host_home)
+
+
 def _has_dist_metadata(directory: Path) -> bool:
     """Whether ``directory`` holds package metadata. ``importlib.metadata``
     walks every ``sys.path`` entry, and an entry-point plugin loader (pydantic's,
@@ -200,7 +293,10 @@ def _finder_mapping(site: Path, module: str) -> dict | None:
     return None
 
 
-def _pth_verdict(site: Path, name: str, main_src: str, imports: set[str], added: list[str]) -> bool:
+def _pth_verdict(
+    site: Path, name: str, main_src: str, imports: set[str], added: list[str],
+    runtime: frozenset[str] = frozenset(),
+) -> bool:
     """Whether one ``.pth`` file is a known shape that cannot load other genesis
     code. Adds every module it imports to ``imports`` and every directory it puts
     on ``sys.path`` to ``added``."""
@@ -226,6 +322,12 @@ def _pth_verdict(site: Path, name: str, main_src: str, imports: set[str], added:
                 return False
             target = mapping.get("genesis")
             if target is not None and os.path.realpath(target) != os.path.join(main_src, "genesis"):
+                return False
+            # A finder serving a module the server itself imports (the census
+            # host runs the same code, so its imports are that set) redirects
+            # that dependency. Other keys (an unrelated tool's package) cannot
+            # be reached by the server's code.
+            if any(k != "genesis" and k in runtime for k in mapping):
                 return False
             imports.add(module)
             continue
@@ -296,6 +398,10 @@ def interpreter_source(
         reasons.append("python_executable_set")  # makes a venv python run as its base
     if _dotted_warning_category(proc.argv, proc.env):
         reasons.append("warnings_import")
+    if options_unmodelled(proc.argv):
+        reasons.append("interpreter_options_unmodelled")
+    if python_env_unmodelled(proc.env):
+        reasons.append("python_env_unmodelled")
 
     sites = sorted((venv / "lib").glob("python*/site-packages"))
     imports: set[str] = {"genesis", *_CUSTOMIZE}
@@ -313,7 +419,7 @@ def interpreter_source(
             reasons.append("site_packages_ambiguous")
         added: list[str] = []
         for name in names or []:
-            if not _pth_verdict(site, name, main_src, imports, added):
+            if not _pth_verdict(site, name, main_src, imports, added, _host_imports()):
                 reasons.append(f"unknown_pth:{name}")
         # site imports the customize modules from sys.path AFTER the .pth files
         # extend it, so a directory a .pth adds is searched too (main src included:

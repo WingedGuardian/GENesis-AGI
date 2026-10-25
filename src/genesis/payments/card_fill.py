@@ -52,9 +52,26 @@ CARD_FILL_PREFS = {
     "accessibility.force_disabled": 1,
 }
 
-CARD_KINDS = ("number", "expiry", "exp_month", "exp_year", "cvc", "name", "postal_code")
+CARD_KINDS = (
+    "number",
+    "expiry",
+    "exp_month",
+    "exp_year",
+    "cvc",
+    "name",
+    "first_name",  # the sealed name's words but the last (split_name)
+    "last_name",  # the sealed name's last word
+    "postal_code",
+)
+# The kinds typed from the vault card's one sealed name.
+NAME_KINDS = ("name", "first_name", "last_name")
 EXPIRY_FORMATS = ("MM/YY", "MM / YY", "MM-YY", "MMYY", "MM/YYYY", "MMYYYY")
 MAX_FRAMES = 4
+# Clicks that bring the card form up in the payment window (a cart, a checkout
+# button, an "add card" button): the most a checkout has needed is 3.
+MAX_STEPS = 8
+# Consent checkboxes ticked after the tap (a debit authorization in a card form).
+MAX_CONSENTS = 2
 MAX_SELECTOR = 500
 MAX_EXTRA_VALUE = 256
 # A vault refusal reason is one of release.py's fixed texts (lowercase words,
@@ -74,10 +91,17 @@ TEXTS = {
     "bad_amount": "amount must be the total as the page states it (1-32 printable characters, "
     "with its digits).",
     "bad_fields": "fields must map number (required), expiry or exp_month+exp_year, cvc, "
-    "name, postal_code to a selector or {selector, frames}.",
+    "name or first_name+last_name, postal_code to a selector or {selector, frames}.",
+    "bad_steps": f"steps must be a list of at most {MAX_STEPS} click targets, each a selector "
+    "or {selector, frames}.",
+    "bad_consent": f"consent must be a list of at most {MAX_CONSENTS} checkboxes, each a "
+    "selector or {selector, frames}.",
+    "no_billing_value": "An extra field gives no value and card_fill.billing in the payments "
+    "config has none for it.",
     "bad_pay": "pay must be the Pay control's selector, or {selector, frames}.",
     "bad_extra_fields": "extra_fields must map names from (" + ", ".join(FILL_NAMES) + ") "
-    "to {selector, value}; no long digit run, no name already in fields.",
+    "to {selector, value} or {selector, frames, value}; no long digit run, no name already "
+    "in fields.",
     "bad_expiry_format": "expiry_format must be one of: " + ", ".join(EXPIRY_FORMATS) + ".",
     "no_page": "No page open. Open the checkout with browser_navigate first.",
     "not_camoufox": "Card fill works only on Camoufox: browser_navigate(stealth=True).",
@@ -89,6 +113,23 @@ TEXTS = {
     "payment_in_flight": "A card payment is in progress; wait for it to finish.",
     "turnstile_in_progress": "A Turnstile check is clicking on the display; retry shortly.",
     "frame_not_found": "A frame selector did not match exactly one iframe.",
+    "step_not_found": "A step did not match exactly one element in its frame." + _NONE,
+    "step_failed": "A step's click failed." + _NONE,
+    "step_is_consent": "A step ticked a checkbox (directly, through a label, or by a page "
+    "script): pass it as consent, which is ticked only after the owner's tap." + _NONE,
+    "step_is_submit": "A step targets a submit control or the Pay control: those are clicked "
+    "only after the owner's tap." + _NONE,
+    "consent_not_found": "A consent target is not exactly one checkbox in the top document or "
+    "a card field's frame." + _NONE,
+    "card_name_unusable": "The vault card's name cannot fill the name fields (empty, or one "
+    "word for a first and last name); nothing was typed." + _SPENT,
+    "consent_unlabelled": "A consent checkbox has no label the tap could show." + _NONE,
+    "consent_label_too_long": "A consent checkbox's label is longer than the tap shows whole."
+    + _NONE,
+    "consent_pre_ticked": "A consent checkbox was already ticked before the tap (a default, or "
+    "a step); only the approved fill ticks it." + _NONE,
+    "consent_failed": "A consent checkbox did not take or keep its tick after the card was "
+    "typed; Pay was NOT clicked and the payment window was closed." + _SPENT,
     "checkout_load_failed": "The checkout did not load in the payment window." + _NONE,
     "checkout_redirected": "The checkout redirected to another site." + _NONE,
     "bot_check": "The checkout showed a bot check. Hand the payment to the owner." + _NONE,
@@ -102,6 +143,7 @@ TEXTS = {
     "pay_get_form": "Refused: the pay control's form declares GET (card fields in a URL).",
     "extra_field_not_found": "An extra field selector did not match one input or select of "
     "its own.",
+    "extra_field_origin": "A framed extra field is not in a frame that holds a card field.",
     "extra_field_is_card_field": "An extra_fields target is a card field.",
     "extra_field_failed": "An extra field did not take or keep its value (pass it as the "
     "page formats it)." + _NONE,
@@ -148,6 +190,9 @@ TEXTS = {
     "in a URL, which the payment window could see but not stop." + _NO_RETRY,
     "outcome_unknown": "Pay was clicked, then the payment window, the browser or this call "
     "ended before the checkout settled." + _NO_RETRY,
+    "vault_too_old": "The vault service did not show everything this payment needs on the "
+    "tap (a ceiling, a save button or a consent box); restart genesis-server on current "
+    "code." + _NONE,
     "internal_error": "browser_fill_card failed before Pay; detail withheld.",
 }
 
@@ -168,7 +213,12 @@ class CardArgs:
     fields: dict[str, Spec]  # kind -> spec, in CARD_KINDS order
     pay: Spec
     expiry_format: str
-    extra: dict[str, tuple[str, str]]  # name -> (selector, value), in FILL_NAMES order
+    extra: dict[str, tuple[Spec, str]]  # name -> (spec, value), in FILL_NAMES order
+    steps: tuple[Spec, ...] = ()  # clicks, in order, before the form is read
+    consent: tuple[Spec, ...] = ()  # checkboxes ticked after the tap
+    # Extra fields whose value comes from the billing config: typed only after
+    # the owner's tap, never into a page the owner has not approved.
+    late: frozenset[str] = frozenset()
 
     def __repr__(self) -> str:  # never the extra values
         return f"CardArgs({sorted(self.fields)}, extra={list(self.extra)})"
@@ -185,6 +235,33 @@ def result(code: str, host: str = "", **extra) -> dict:
     if extra.get("filled") is not None:
         out["filled"] = [k for k in extra["filled"] if k in CARD_KINDS]
     return out
+
+
+def _payments_config() -> dict:
+    """``config/payments.yaml`` plus its ``.local.yaml`` overlay; {} when unreadable."""
+    from genesis._config_overlay import merge_local_overlay
+    from genesis.env import repo_root
+
+    path = repo_root() / "config" / "payments.yaml"
+    try:
+        base = yaml.safe_load(path.read_text()) if path.is_file() else {}
+        cfg = merge_local_overlay(base if isinstance(base, dict) else {}, path, strict=True)
+    except Exception as e:
+        logger.warning("payments config unreadable (%s)", type(e).__name__)
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def billing_value(name: str) -> str:
+    """``card_fill.billing.<name>`` (an extra field name) from the payments config's
+    install overlay: the owner's billing details, kept out of tool arguments and
+    public files. Refused when absent."""
+    section = _payments_config().get("card_fill")
+    billing = section.get("billing") if isinstance(section, dict) else None
+    value = billing.get(name) if isinstance(billing, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        raise Refused("no_billing_value")
+    return value
 
 
 def card_fill_enabled() -> bool:
@@ -293,7 +370,9 @@ def _extra_value(v) -> str:
     return v
 
 
-def validate(card_ref, amount, fields, pay, expiry_format, extra_fields) -> CardArgs:
+def validate(
+    card_ref, amount, fields, pay, expiry_format, extra_fields, steps=None, consent=None
+) -> CardArgs:
     """The checked arguments, or Refused with the first failing check's code."""
     if not isinstance(card_ref, str) or not CARD_REF.fullmatch(card_ref):
         raise Refused("bad_card_ref")
@@ -313,22 +392,52 @@ def validate(card_ref, amount, fields, pay, expiry_format, extra_fields) -> Card
     has_month, has_year = "exp_month" in fields, "exp_year" in fields
     if "number" not in fields or has_month != has_year or ("expiry" in fields and has_month):
         raise Refused("bad_fields")
+    if ("first_name" in fields) != ("last_name" in fields):  # half a name types half of it
+        raise Refused("bad_fields")
     specs = {k: _spec(fields[k], "bad_fields") for k in CARD_KINDS if k in fields}
     if pay is None:
         raise Refused("bad_pay")
     pay_spec = _spec(pay, "bad_pay")
+    steps = [] if steps is None else steps
+    if not isinstance(steps, list) or len(steps) > MAX_STEPS:
+        raise Refused("bad_steps")
+    step_specs = tuple(_spec(st, "bad_steps") for st in steps)
+    consent = [] if consent is None else consent
+    if not isinstance(consent, list) or len(consent) > MAX_CONSENTS:
+        raise Refused("bad_consent")
+    consent_specs = tuple(_spec(c, "bad_consent") for c in consent)
     extra_fields = {} if extra_fields is None else extra_fields
     if not isinstance(extra_fields, dict) or not set(extra_fields) <= set(FILL_NAMES):
         raise Refused("bad_extra_fields")
-    extra = {}
+    extra, late = {}, set()
     for name in FILL_NAMES:
         if name not in extra_fields:
             continue
         item = extra_fields[name]
-        if name in specs or not isinstance(item, dict) or set(item) != {"selector", "value"}:
+        if (
+            name in specs
+            or not isinstance(item, dict)
+            or "selector" not in item
+            or set(item) - {"selector", "frames", "value"}
+        ):
             raise Refused("bad_extra_fields")
-        extra[name] = (_selector(item["selector"], "bad_extra_fields"), _extra_value(item["value"]))
-    return CardArgs(card_ref, amount, specs, pay_spec, expiry_format, extra)
+        where = {k: item[k] for k in ("selector", "frames") if k in item}
+        # No value: the owner's billing details in private config, never a public file.
+        value = item["value"] if "value" in item else billing_value(name)
+        if "value" not in item:
+            late.add(name)
+        extra[name] = (_spec(where, "bad_extra_fields"), _extra_value(value))
+    return CardArgs(
+        card_ref,
+        amount,
+        specs,
+        pay_spec,
+        expiry_format,
+        extra,
+        step_specs,
+        consent_specs,
+        frozenset(late),
+    )
 
 
 def reply_keys(kinds) -> set[str]:
@@ -336,8 +445,18 @@ def reply_keys(kinds) -> set[str]:
     back only the tapped fields, ``expiry`` as ``exp_month`` + ``exp_year``)."""
     keys = {"label", "last4"}
     for k in kinds:
-        keys |= {"exp_month", "exp_year"} if k == "expiry" else {k}
+        if k == "expiry":
+            keys |= {"exp_month", "exp_year"}
+        else:
+            keys.add("name" if k in NAME_KINDS else k)
     return keys
+
+
+def split_name(name: str) -> tuple[str, str]:
+    """(first, last): the last word is the last name, the words before it the
+    first name (a middle name or initial stays with the first)."""
+    words = name.split()
+    return " ".join(words[:-1]), (words[-1] if words else "")
 
 
 def values_for(card: dict, kinds, expiry_format: str) -> dict[str, str]:
@@ -352,6 +471,9 @@ def values_for(card: dict, kinds, expiry_format: str) -> dict[str, str]:
                 out[kind] = expiry_format.replace("MM", mm).replace("YYYY", yyyy).replace("YY", yy)
             else:
                 out[kind] = mm if kind == "exp_month" else (yyyy if "YYYY" in expiry_format else yy)
+        elif kind in ("first_name", "last_name"):
+            first, last = split_name(str(card["name"]))
+            out[kind] = first if kind == "first_name" else last
         else:
             out[kind] = str(card[kind])
     return out
