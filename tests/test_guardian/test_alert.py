@@ -137,6 +137,31 @@ class TestTelegramChannel:
         assert re.search(r"&(?!amp;|lt;|gt;|quot;|#x27;)", text) is None  # no split entity
         assert "ESCALATE" in text  # the action survives
 
+    def test_format_is_bounded_in_utf16_units_for_emoji(
+        self,
+        channel: TelegramAlertChannel,
+    ) -> None:
+        """Telegram counts UTF-16 code units, so an emoji outside the Basic
+        Multilingual Plane counts twice: fields full of them must still render
+        under 4,096 units, and a cut never splits one."""
+        import html
+        import re
+
+        rocket = "\U0001f680"
+        alert = Alert(
+            severity=AlertSeverity.EMERGENCY,
+            title=rocket * 1000,
+            body=rocket * 5000,
+            failed_probes=[rocket * 200 for _ in range(100)],
+            likely_cause=rocket * 3000,
+            proposed_action="ESCALATE",
+        )
+        text = channel._format_alert(alert)
+        rendered = html.unescape(re.sub(r"</?b>", "", text))
+        assert len(rendered.encode("utf-16-le")) // 2 <= 4096
+        assert "(cut)" in rendered
+        assert "ESCALATE" in text
+
     @pytest.mark.asyncio
     async def test_send_success(self, channel: TelegramAlertChannel) -> None:
         alert = Alert(severity=AlertSeverity.INFO, title="Test", body="Test body")
