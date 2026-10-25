@@ -805,13 +805,17 @@ def prune(data: Path, *, before: str, projects: Path, lock_path: Path | None = N
             raise ValueError(
                 "store projects root is unbound or unreadable; ingest with explicit adoption first"
             ) from exc
-        if root != str(projects.resolve(strict=True)):
+        # Resolve once, then judge retention only through the canonical root that
+        # matched the binding: a symlinked root or ancestor repointed after this
+        # check must not redirect the containment and existence checks.
+        canonical = projects.resolve(strict=True)
+        if root != str(canonical):
             raise ValueError("projects root differs from the store")
         retired = []
         for key in source_keys(data):
             records = _retained_records(data, key)
             if records and all(
-                _prunable_record(record, projects, cutoff, key) == key
+                _prunable_record(record, canonical, cutoff, key) == key
                 for record in records
             ):
                 retired.append(key)
