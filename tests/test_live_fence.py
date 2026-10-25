@@ -194,9 +194,10 @@ def test_the_fence_arms_the_deploy_scripts_own_guard():
     roots = os.environ["GENESIS_TEST_FENCE_LIVE_ROOTS"].split(":")
     assert repo_root in roots
     if fence._S.real_home:
+        # Listed whether or not they exist yet: a test that creates one
+        # mid-run must not open a gap (CI: a test created ~/.genesis).
         for name in (".genesis", "genesis"):
-            root = os.path.realpath(os.path.join(fence._S.real_home, name))
-            assert (root in roots) == os.path.isdir(root)
+            assert os.path.realpath(os.path.join(fence._S.real_home, name)) in roots
     assert os.environ["GENESIS_TEST_FENCE_LOG"] == fence._S.log
 
 

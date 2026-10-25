@@ -555,6 +555,20 @@ def updates_sandbox(tmp_path, monkeypatch):
     )
 
 
+# ── The deploy engine probe: unanswered for tests that build a health snapshot ──
+@pytest.fixture
+def deploy_engine_unanswered(monkeypatch):
+    """The health snapshot's deploy section runs ``scripts/deploy_candidates list
+    --json`` against this checkout, which reads the install's real deploy manifest
+    and which the live fence refuses. Tests that build a whole snapshot answer it
+    the way an unreachable engine does (``None``: carried as unknown, never 0)."""
+    import importlib
+
+    # The package re-exports a function named deploy_health; patch the module.
+    module = importlib.import_module("genesis.observability.snapshots.deploy_health")
+    monkeypatch.setattr(module, "_observe_engine", lambda *args, **kwargs: None)
+
+
 # ── Graph-traversal telemetry is OFF unless a test opts in ─────────────────
 @pytest.fixture(autouse=True, scope="session")
 def _graph_telemetry_off():

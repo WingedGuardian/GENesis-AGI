@@ -38,7 +38,8 @@ two ways:
    would run is unknowable in-process, and every attempt to predict it leaked
    launch forms. A deploy script run through any shell spelling instead refuses
    ITSELF: the fence exports ``GENESIS_TEST_FENCE_LIVE_ROOTS`` (this checkout's
-   real root, the real home's ``~/.genesis``/``~/genesis`` when they exist, and
+   real root, the real home's ``~/.genesis``/``~/genesis`` whether or not they
+   exist yet, and
    a root named in ``GENESIS_LIVE_FENCE_LIVE_ROOT``) and
    ``GENESIS_TEST_FENCE_LOG`` (this log), and
    ``scripts/lib/live_system_guard.sh``'s ``refuse_if_test_fenced_live`` makes
@@ -367,7 +368,8 @@ def install(config) -> None:
     # The deploy scripts' own guard (scripts/lib/live_system_guard.sh's
     # refuse_if_test_fenced_live) refuses any run whose acting root is a listed
     # root: this checkout's real root, the real home's ~/.genesis and ~/genesis
-    # when they exist, and an install elsewhere named in
+    # (listed even when absent at install, since a test may create one mid-run),
+    # and an install elsewhere named in
     # GENESIS_LIVE_FENCE_LIVE_ROOT. Its REFUSED line lands in this log, so the
     # test that caused it fails at teardown.
     live = {_real(str(Path(__file__).resolve().parent.parent))}
@@ -375,7 +377,6 @@ def install(config) -> None:
         live.update(
             _real(str(root))
             for root in (Path(_S.real_home) / ".genesis", Path(_S.real_home) / "genesis")
-            if root.is_dir()
         )
     if os.environ.get("GENESIS_LIVE_FENCE_LIVE_ROOT"):
         live.add(_real(os.environ["GENESIS_LIVE_FENCE_LIVE_ROOT"]))

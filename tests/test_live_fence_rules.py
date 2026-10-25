@@ -171,12 +171,16 @@ print(json.dumps({'armed': f._S.installed, 'home': f._S.real_home,
     assert result.returncode == 0, result.stderr
     outcome = json.loads(result.stdout)
     repo_root = os.path.realpath(Path(fence.__file__).resolve().parent.parent)
+    roots = [repo_root]
+    if home == "absolute":
+        # The home's live roots are listed even though neither exists here.
+        roots += [os.path.realpath(os.path.join(env["HOME"], n)) for n in (".genesis", "genesis")]
     assert outcome == {
         "armed": True,
         "home": env.get("HOME") if home == "absolute" else None,
         "shim_exists": True,
         "hook_count": 1,
-        "roots": repo_root,
+        "roots": ":".join(sorted(roots)),
         "log": outcome["log"],
     }
     assert outcome["log"].endswith("hits.log")
