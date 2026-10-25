@@ -4172,6 +4172,10 @@ verified: f9a1d4cb 2026-10-18
   structural uncertainty and heredoc completeness independently. Proven inert
   fragments retain narrow relief; complex valid heredoc forms can still be
   refused. See `docs/reference/shell-parse-completeness.md` for the boundary.
+  For hash-free scanner inputs, its unquoted scanner consumes backslash/non-newline
+  pairs as word data. Hash-containing calls retain their earlier scanner behavior
+  to avoid a comment/quote regression; generic #3257/#3264 remain partial/open.
+  Existing continuation, heredoc proof, size bounds and nested refusals remain.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
   existing commit/request budget decisions, denies approval-required or unknown

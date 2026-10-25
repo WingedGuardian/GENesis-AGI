@@ -896,6 +896,8 @@ def parse_segments(
     redirs: list[str] = []
     i, n = 0, len(command)
     quote: str | None = None
+    # Comments are not modeled here; preserve the legacy hash-containing scan.
+    word_escapes = "#" not in command
     while i < n:
         c = command[i]
         if quote:
@@ -909,6 +911,12 @@ def parse_segments(
             if c == quote:
                 quote = None
             i += 1
+            continue
+        if word_escapes and c == "\\" and i + 1 < n and command[i + 1] != "\n":
+            # An escaped quote/operator is word data, not scanner state.
+            raw_buf.extend(command[i : i + 2])
+            argv_buf.extend(command[i : i + 2])
+            i += 2
             continue
         if c in ("'", '"'):
             quote = c
