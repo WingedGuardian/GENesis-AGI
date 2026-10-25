@@ -25,8 +25,8 @@ genesis-health MCP server (``vault_service._handle`` runs that check):
 
 There is one slot for the whole service. A second request while one is
 pending or granted refuses both and tells the owner; while a claim is being
-handed over, only the newcomer is refused. A lock, an idle relock, a stale key
-or a stop refuses the release. The vault owns the deadline: a pending release
+handed over, only the newcomer is refused. A stale key (dropped by the vault
+service) or a stop refuses the release. The vault owns the deadline: a pending release
 expires ``PENDING_BACKSTOP_S`` after its request even if the approval task
 never returns, and every op first settles a release that is due or whose
 requester has exited.
@@ -290,7 +290,7 @@ class ReleaseManager:
             await self._row("release_refused", {**rel.row, "reason": reason}, stopping=stopping)
 
     async def abort(self, reason: str, *, stopping: bool = False) -> None:
-        """Refuse the release in the slot (lock, relock, stop). A decided claim completes.
+        """Refuse the release in the slot (a dropped key, stop). A decided claim completes.
 
         ``stopping`` is the service's stop: the service already refuses late audit
         writes, so the refusal row is written as part of the stop.
@@ -376,7 +376,7 @@ class ReleaseManager:
             if self._approvals is None:
                 raise _Refusal("approval is unavailable")
             if not svc.unlocked:
-                raise _Refusal("the vault is locked")
+                raise _Refusal("the vault key is not loaded (see vault status)")
             card_ref, claim_hash = request.get("card_ref"), request.get("claim_hash")
             if not isinstance(card_ref, str) or not vs.CARD_REF.fullmatch(card_ref):
                 raise _Refusal("bad card_ref")
@@ -431,7 +431,7 @@ class ReleaseManager:
             except ValueError:
                 raise _Refusal("the approval text was refused") from None
             if svc._stopped or epoch != svc._epoch or not svc.unlocked:
-                raise _Refusal("the vault was locked")
+                raise _Refusal("the vault key was dropped")
         except _Refusal as exc:
             return await self._refuse(str(exc), peer)
         nonce = secrets.token_urlsafe(16)
@@ -466,10 +466,10 @@ class ReleaseManager:
             ),
             row=facts,
         )
-        if svc._stopped or epoch != svc._epoch or not svc.unlocked:  # locked during the row
+        if svc._stopped or epoch != svc._epoch or not svc.unlocked:  # dropped during the row
             self._remember(nonce, REFUSED)
-            await self._row("release_refused", {**facts, "reason": "the vault was locked"})
-            return {"ok": False, "error": "the vault was locked"}
+            await self._row("release_refused", {**facts, "reason": "the vault key was dropped"})
+            return {"ok": False, "error": "the vault key was dropped"}
         self._slot = rel
         self._arm(rel)
         audit_detail = {"release": nonce, "card_ref": card_ref, "host": host}
@@ -568,8 +568,8 @@ class ReleaseManager:
         svc = self._svc
         identity, epoch = svc._identity, svc._epoch
         if identity is None:
-            await self._refuse_slot(rel, "the vault is locked")
-            return {"ok": False, "error": "the vault is locked"}
+            await self._refuse_slot(rel, "the vault key is not loaded")
+            return {"ok": False, "error": "the vault key is not loaded"}
         rel.state = CLAIMING
         try:
             return await self._hand_over(rel, identity, epoch, client_gone)

@@ -5,7 +5,9 @@
 # credentials section: backup.sh §8 writes it, restore.sh §8 stages it. The
 # vault is three files, and only all three together, from one moment, are
 # usable:
-#   identity.age   the age secret key, sealed under the vault passphrase
+#   identity.key   the age secret key (0600, no passphrase), or, in a vault
+#                  made before the passphrase was dropped and not yet migrated,
+#                  identity.age: the same key sealed under that passphrase
 #   recipient.txt  its public key (adding a card encrypts to this)
 #   cards.db       SQLite, one row per card, each card's details age-encrypted
 #
@@ -46,7 +48,30 @@
 # them half-done. The archive is built under <temp_root>, outside the backups
 # clone, and moved in by one rename from a name no `*.gpg` reader matches.
 
-PAYMENT_VAULT_FILES=(identity.age recipient.txt cards.db)
+# The key file of the set in <dir>: identity.key when one is there (in any
+# form: a symlink is then refused as the key, never passed over for the
+# sealed copy), else identity.age. A vault holding both (a migration killed
+# part-way) archives the one cards.db's digest records: identity.age while the
+# migration has not moved the digest, identity.key once it has.
+payment_vault_key_file() {
+    local digest="" sum=""
+    if [ -e "$1/identity.key" ] || [ -L "$1/identity.key" ]; then
+        if [ -f "$1/identity.age" ] && [ ! -L "$1/identity.age" ] && [ ! -L "$1/cards.db" ]; then
+            digest="$(sqlite3 -readonly "$1/cards.db" \
+                "SELECT value FROM vault_meta WHERE key = 'identity_sha256'" 2>/dev/null)" || digest=""
+            sum="$(sha256sum < "$1/identity.age" 2>/dev/null)" || sum=""
+            if [ -n "$digest" ] && [ "$digest" = "${sum%% *}" ]; then
+                printf 'identity.age\n'
+                return 0
+            fi
+        fi
+        printf 'identity.key\n'
+    else
+        printf 'identity.age\n'
+    fi
+}
+# The three files of a set whose key file is $1, in the order tar writes them.
+payment_vault_files() { PAYMENT_VAULT_FILES=("$1" recipient.txt cards.db); }
 # The repository's src/, for payment_vault_check's vault_store call.
 _PV_SRC="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../src" 2>/dev/null && pwd)" || _PV_SRC=""
 PAYMENT_VAULT_ARCHIVE=payment_vault.tar.gpg
@@ -59,14 +84,25 @@ PAYMENT_VAULT_SCHEMA_VERSION=1
 PAYMENT_VAULT_COLUMNS="card_ref label brand last4 merchant single_use status created_at retired_at blob"
 
 payment_vault_check() {
-    local dir="$1" f ic uv cols meta digest sum rec why
+    local dir="$1" f ic uv cols meta digest sum rec why key
+    local PAYMENT_VAULT_FILES
+    key="$(payment_vault_key_file "$dir")"
+    payment_vault_files "$key"
     for f in "${PAYMENT_VAULT_FILES[@]}"; do
         if [ -L "$dir/$f" ] || [ ! -f "$dir/$f" ]; then
             printf '%s is missing or not a regular file\n' "$f"
             return 1
         fi
     done
-    if [ "$(head -c 21 "$dir/identity.age" 2>/dev/null)" != "age-encryption.org/v1" ]; then
+    if [ "$key" = identity.key ]; then
+        # One line: "AGE-SECRET-KEY-1" plus 58 uppercase Bech32 characters
+        # (vault_store also verifies its checksum).
+        if [ "$(wc -l < "$dir/identity.key" 2>/dev/null)" != 1 ] || ! head -n 1 "$dir/identity.key" 2>/dev/null \
+            | grep -qE '^AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}$'; then  # pragma: allowlist secret (public BIP-173 alphabet, not a secret)
+            printf 'identity.key is not an age secret key\n'
+            return 1
+        fi
+    elif [ "$(head -c 21 "$dir/identity.age" 2>/dev/null)" != "age-encryption.org/v1" ]; then
         printf 'identity.age is not an age file\n'
         return 1
     fi
@@ -110,9 +146,9 @@ payment_vault_check() {
     fi
     digest="$(sqlite3 -readonly "$dir/cards.db" \
         "SELECT value FROM vault_meta WHERE key = 'identity_sha256'" 2>/dev/null)" || digest=""
-    sum="$(sha256sum < "$dir/identity.age" 2>/dev/null)" || sum=""
+    sum="$(sha256sum < "$dir/$key" 2>/dev/null)" || sum=""
     if [ -z "$digest" ] || [ "$digest" != "${sum%% *}" ]; then
-        printf 'identity.age is not the key this vault was created with\n'
+        printf '%s is not the key this vault was created with\n' "$key"
         return 1
     fi
     rec="$(sqlite3 -readonly "$dir/cards.db" \
@@ -162,7 +198,7 @@ PYVERIFY
 }
 
 backup_payment_vault() (
-    vault="$1" out="$2" tmproot="$3" stage="" fd="" why="" n=""
+    vault="$1" out="$2" tmproot="$3" stage="" fd="" why="" n="" key=""
     archive="$out/$PAYMENT_VAULT_ARCHIVE"
     tmpname="$out/.$PAYMENT_VAULT_ARCHIVE.tmp"
     trap '[ -n "$stage" ] && rm -rf -- "$stage"' EXIT
@@ -193,9 +229,11 @@ backup_payment_vault() (
     declare -F encrypt_file >/dev/null || say failed "encrypt_file is not defined"
     exec {fd}<"$vault" || say failed "the vault directory cannot be opened"
     flock -w 30 "$fd" || say failed "the vault stayed locked for 30s (a vault command running?)"
-    if [ ! -e "$vault/identity.age" ] && [ ! -L "$vault/identity.age" ]; then
+    key="$(payment_vault_key_file "$vault")"
+    payment_vault_files "$key"
+    if [ ! -e "$vault/$key" ] && [ ! -L "$vault/$key" ]; then
         # Never initialised, or an init killed before its key landed (vault_store
-        # treats identity.age as the mark of an initialised vault). Cards without
+        # treats a key file as the mark of an initialised vault). Cards without
         # a key are a loss, not an empty vault (vault_store refuses that state too).
         if [ -e "$vault/cards.db" ] || [ -L "$vault/cards.db" ]; then
             if [ -L "$vault/cards.db" ] || [ ! -f "$vault/cards.db" ]; then
@@ -223,7 +261,7 @@ backup_payment_vault() (
         say failed "cannot create a temp directory"
     }
     mkdir -m 0700 "$stage/set" 2>/dev/null || say failed "cannot create a temp directory"
-    cp -- "$vault/identity.age" "$vault/recipient.txt" "$stage/set/" 2>/dev/null \
+    cp -- "$vault/$key" "$vault/recipient.txt" "$stage/set/" 2>/dev/null \
         || say failed "cannot copy the key files"
     # cd keeps the destination a fixed relative name: .backup takes it quoted,
     # and a path holding a quote would break that.
@@ -248,20 +286,29 @@ backup_payment_vault() (
 )
 
 payment_vault_unpack() {
-    local tarfile="$1" parent="$2" listing types names dest why
+    local tarfile="$1" parent="$2" listing types names dest why key
+    local PAYMENT_VAULT_FILES
     listing="$(tar -tvf "$tarfile" 2>/dev/null)" || {
         printf 'the archive cannot be read\n'
         return 1
     }
     # Exactly three entries, each a regular file, named exactly the three
-    # names (duplicates kept, so a repeated name cannot pass). A link or any
-    # other member type is refused before anything is written.
+    # names of one set (duplicates kept, so a repeated name cannot pass): the
+    # key file identity.key, or identity.age in an archive made before
+    # migration. A link or any other member type is refused before anything
+    # is written.
     types="$(printf '%s\n' "$listing" | cut -c1 | sort | tr -d '\n')"
     names="$(tar -tf "$tarfile" 2>/dev/null | sort | tr '\n' ' ')"
-    if [ "$types" != "---" ] || [ "$names" != "cards.db identity.age recipient.txt " ]; then
+    case "$names" in
+        "cards.db identity.key recipient.txt ") key=identity.key ;;
+        "cards.db identity.age recipient.txt ") key=identity.age ;;
+        *) key="" ;;
+    esac
+    if [ "$types" != "---" ] || [ -z "$key" ]; then
         printf 'the archive does not hold exactly the three vault files\n'
         return 1
     fi
+    payment_vault_files "$key"
     dest="$(umask 077 && mktemp -d -p "$parent" .payment_vault.XXXXXX 2>/dev/null)" || {
         printf 'cannot create a staging directory\n'
         return 1

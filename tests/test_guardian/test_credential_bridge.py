@@ -473,6 +473,23 @@ class TestMirrorCredentialBackup:
         mode = stat.S_IMODE(os.stat(dest / "creds" / "claude.json.gpg").st_mode)
         assert mode == 0o600
 
+    def test_the_card_vault_archives_never_reach_the_host_mirror(self, tmp_path: Path) -> None:
+        # The vault key has no passphrase, and the mirror sits beside the escrowed
+        # backup passphrase: its archives stay in the backup repo only (owner ruling).
+        from genesis.guardian.credential_bridge import mirror_credential_backup
+        clone = self._clone(tmp_path)
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        dest = mirror_credential_backup(shared_dir=shared, backup_dir=clone)
+        stale = dest / "creds" / "payment_vault.tar.gpg"
+        stale.write_bytes(b"ENCRYPTED-an earlier mirror's copy")
+        for name in ("payment_vault.tar.gpg", "payment_vault.last-good.tar.gpg"):
+            (clone / "creds" / name).write_bytes(b"ENCRYPTED-vault")
+        mirror_credential_backup(shared_dir=shared, backup_dir=clone)
+        assert not list(dest.rglob("payment_vault*"))  # never copied, and an old copy pruned
+        assert (dest / "creds" / "claude.json.gpg").exists()  # everything else still is
+        assert "count=3" in (dest / "MIRROR_STAMP").read_text()
+
     def test_skips_unchanged_on_second_run(self, tmp_path: Path) -> None:
         from genesis.guardian.credential_bridge import mirror_credential_backup
         clone = self._clone(tmp_path)
