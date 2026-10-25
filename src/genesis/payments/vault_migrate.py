@@ -131,7 +131,8 @@ def _copy_aside(path: Path, pinned: Path) -> Path:
 def pre_migrate_copies(path: Path | None = None) -> list[Path]:
     """The copies migrate_vault kept beside the vault. After the migration the
     unsealed key opens the cards in them too, so a card retired since stays
-    readable in one until the owner deletes it."""
+    readable in one until backup.sh deletes it (the first backup whose migrated
+    vault reaches the backups remote)."""
     path = path or vault_dir()
     try:
         return sorted(p for p in path.parent.glob(f"{PRE_MIGRATE_PREFIX}*") if p.is_dir())

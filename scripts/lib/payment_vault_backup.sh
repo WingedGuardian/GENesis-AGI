@@ -32,6 +32,9 @@
 #         failed   the vault exists but no fresh archive could be written; the
 #                  earlier archive, if any, is kept, because an older vault
 #                  beats none
+#       With PAYMENT_VAULT_RECORD set to a path, an ok run also writes
+#       "<key file> <recipient>" of the set it archived there (the recipient is
+#       the vault's public key), so the caller can act on exactly that set.
 #       Always exits 0: the caller runs it as `out=$(…)` under `set -e`.
 #       Runs in a subshell, so its EXIT trap never replaces the caller's.
 #
@@ -40,6 +43,18 @@
 #       each a regular file, and unpack them into a NEW directory under
 #       <dest_parent>, checked with payment_vault_check. Prints that directory on
 #       success; prints a reason and returns 1 otherwise (nothing left behind).
+#
+#   payment_vault_drop_copies <vault_dir> <recipient>
+#       Delete the copies `vault migrate` kept beside the vault
+#       (payment_vault.pre-migrate-<UTC stamp>). backup.sh calls it only once the
+#       archive of the migrated vault with that recipient has reached the backups
+#       remote: a copy holds every card the vault had, and the vault's unsealed
+#       key opens them. Only a real directory holding nothing but vault files,
+#       whose recipient.txt is that recipient (migration keeps the key pair), is
+#       deleted; anything else is left. Prints "<deleted> <left>"; always exits 0.
+#
+#   payment_vault_count_copies <vault_dir>
+#       Print how many payment_vault.pre-migrate-* entries sit beside the vault.
 #
 # cards.db is copied with SQLite's online backup (a plain copy can tear on a
 # concurrent `vault add`), from a read-only connection (`-readonly` never
@@ -282,6 +297,10 @@ backup_payment_vault() (
         rm -f -- "$tmpname" 2>/dev/null
         say failed "renaming the archive into place failed"
     }
+    if [ -n "${PAYMENT_VAULT_RECORD:-}" ]; then
+        printf '%s %s\n' "$key" "$(head -n 1 "$stage/set/recipient.txt" 2>/dev/null)" \
+            > "$PAYMENT_VAULT_RECORD" 2>/dev/null || rm -f -- "$PAYMENT_VAULT_RECORD" 2>/dev/null
+    fi
     say ok
 )
 
@@ -326,3 +345,45 @@ payment_vault_unpack() {
     fi
     printf '%s\n' "$dest"
 }
+
+payment_vault_drop_copies() (
+    parent="$(dirname -- "$1")" recipient="${2:-}" removed=0 left=0 d="" f="" plain=""
+    for d in "$parent"/payment_vault.pre-migrate-*; do
+        [ -e "$d" ] || [ -L "$d" ] || continue  # the unmatched pattern: no copy
+        plain=1
+        # The name vault migrate writes, a real directory, and the archived
+        # vault's key pair (a copy of another vault is never this one's to drop).
+        if ! [[ "${d##*/payment_vault.pre-migrate-}" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] \
+            || [ -L "$d" ] || [ ! -d "$d" ] || [ -z "$recipient" ] \
+            || [ -L "$d/recipient.txt" ] || [ ! -f "$d/recipient.txt" ] \
+            || [ "$(head -n 1 "$d/recipient.txt" 2>/dev/null)" != "$recipient" ]; then
+            plain=0
+        else
+            for f in "$d"/* "$d"/.[!.]* "$d"/..?*; do
+                [ -e "$f" ] || [ -L "$f" ] || continue
+                if [ -L "$f" ] || [ ! -f "$f" ]; then plain=0; fi
+                case "${f##*/}" in
+                    identity.age | recipient.txt | cards.db | cards.db-journal | cards.db-wal | cards.db-shm) ;;
+                    *) plain=0 ;;
+                esac
+            done
+        fi
+        if [ "$plain" = 1 ] && rm -f -- "$d"/* "$d"/.[!.]* "$d"/..?* 2>/dev/null \
+            && rmdir -- "$d" 2>/dev/null; then
+            removed=$((removed + 1))
+        else
+            left=$((left + 1))
+        fi
+    done
+    printf '%s %s\n' "$removed" "$left"
+    exit 0
+)
+
+payment_vault_count_copies() (
+    n=0
+    for d in "$(dirname -- "$1")"/payment_vault.pre-migrate-*; do
+        if [ -e "$d" ] || [ -L "$d" ]; then n=$((n + 1)); fi
+    done
+    printf '%s\n' "$n"
+)
+

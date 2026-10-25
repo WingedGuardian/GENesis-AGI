@@ -269,7 +269,8 @@ def _warn_copies() -> None:
     for copy in vm.pre_migrate_copies():
         print(
             f"{copy} (kept by vault migrate) still holds every card it had, and the vault's "
-            "key opens them; delete it once a backup reports payment_vault: ok"
+            "key opens them; a backup that pushes the migrated vault to the backups repo "
+            "deletes it (backup_status.json payment_vault_copies counts any left)"
         )
 
 

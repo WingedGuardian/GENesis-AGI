@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from genesis.payments import vault_migrate as vm
 from genesis.payments import vault_store as vs
 from tests.test_scripts import test_backup_dated_snapshots as dated
 
@@ -1944,3 +1945,168 @@ def test_a_migration_stopped_before_its_row_moved_backs_up_the_sealed_set(_keyed
     names = ("cards.db", "identity.age", "recipient.txt")
     back = _open_archive(out / ARCHIVE, tmp_path, names=names)
     assert (back / "identity.age").read_bytes() == sealed
+
+
+# ── the pre-migrate copies: deleted once the migrated vault is on the remote ──
+
+COPY = "payment_vault.pre-migrate-20261001T000000Z"
+REC = "age1" + "q" * 58  # recipient text; the delete compares it, never parses it
+
+
+def _vault_copy(dest: Path, recipient: str = REC, extra: str | None = None) -> Path:
+    """A directory shaped like the copy `vault migrate` keeps."""
+    dest.mkdir(mode=0o700)
+    for name in ("identity.age", "cards.db", *((extra,) if extra else ())):
+        (dest / name).write_text("x\n")
+    (dest / "recipient.txt").write_text(recipient + "\n")
+    return dest
+
+
+def _drop(vault: Path, recipient: str = REC) -> subprocess.CompletedProcess:
+    script = f'set -euo pipefail; source "{_LIB}"; payment_vault_drop_copies "$1" "$2"'
+    return subprocess.run(
+        ["bash", "-c", script, "lib", str(vault), recipient], capture_output=True, text=True
+    )
+
+
+def test_drop_copies_deletes_only_a_plain_copy_of_this_vault(tmp_path):
+    vault = tmp_path / "payment_vault"
+    vault.mkdir()
+    plain = _vault_copy(tmp_path / COPY)
+    kept = {
+        "extra file": _vault_copy(
+            tmp_path / "payment_vault.pre-migrate-20261002T000000Z", extra="n"
+        ),
+        "another vault": _vault_copy(
+            tmp_path / "payment_vault.pre-migrate-20261003T000000Z", recipient="age1other"
+        ),
+        "hand-made name": _vault_copy(tmp_path / "payment_vault.pre-migrate-handmade"),
+        "other prefix": _vault_copy(tmp_path / "payment_vault.other"),
+    }
+    nested = _vault_copy(tmp_path / "payment_vault.pre-migrate-20261004T000000Z")
+    (nested / "sub").mkdir()
+    target = _vault_copy(tmp_path / "elsewhere")
+    link = tmp_path / "payment_vault.pre-migrate-20261005T000000Z"
+    link.symlink_to(target)
+    linked = _vault_copy(tmp_path / "payment_vault.pre-migrate-20261006T000000Z")
+    outside = tmp_path / "outside.db"
+    outside.write_text("keep\n")
+    (linked / "cards.db").unlink()
+    (linked / "cards.db").symlink_to(outside)
+    proc = _drop(vault)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["1", "6"]  # "other prefix" is not a copy at all
+    assert not plain.exists()
+    for why, d in kept.items():
+        assert len(list(d.iterdir())) in (3, 4), why
+    assert (nested / "sub").is_dir() and (nested / "cards.db").exists()
+    assert link.is_symlink() and len(list(target.iterdir())) == 3
+    assert (linked / "cards.db").is_symlink() and outside.read_text() == "keep\n"
+    assert vault.is_dir()
+
+
+def test_drop_copies_with_no_recipient_deletes_nothing(tmp_path):
+    (tmp_path / "payment_vault").mkdir()
+    copy = _vault_copy(tmp_path / COPY, recipient="")  # empty == empty must not match
+    proc = _drop(tmp_path / "payment_vault", recipient="")
+    assert proc.stdout.split() == ["0", "1"] and copy.is_dir(), proc.stdout + proc.stderr
+
+
+def test_drop_and_count_with_no_copy(tmp_path):
+    (tmp_path / "payment_vault").mkdir()
+    assert _drop(tmp_path / "payment_vault").stdout.split() == ["0", "0"]
+    script = f'source "{_LIB}"; payment_vault_count_copies "$1"'
+    count = subprocess.run(
+        ["bash", "-c", script, "lib", str(tmp_path / "payment_vault")],
+        capture_output=True,
+        text=True,
+    )
+    assert count.stdout.strip() == "0"
+
+
+def _remote_archive(backup_env, tmp_path) -> Path:
+    """The vault archive as the backups REMOTE holds it (a fresh clone)."""
+    url = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=dated._repo(backup_env),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    view = tmp_path / "remote-view"
+    subprocess.run(["git", "clone", "-q", url, str(view)], check=True)
+    return view / "creds" / ARCHIVE
+
+
+def test_a_backup_of_a_migrated_vault_deletes_the_copy_migrate_kept(_legacy, backup_env, tmp_path):
+    gh = backup_env["home"] / ".genesis"
+    vault = _copy_vault(_legacy, gh / "payment_vault")
+    aside = vm.migrate_vault(PASSPHRASE, path=vault)  # the real copy, as migrate makes it
+    assert aside is not None and aside.is_dir()
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = dated._run_local(backup_env, offsite)
+    status = _status(backup_env)
+    assert status["payment_vault"] == "ok" and status["tier1_pushed"] is True, status
+    assert not aside.exists(), proc.stdout[-3000:]
+    assert status["payment_vault_copies"] == 0
+    assert "pre-migrate copies: 1 deleted, 0 left" in proc.stdout
+    # What made the delete safe: the remote holds the MIGRATED vault.
+    (tmp_path / "gnupg").mkdir(mode=0o700, exist_ok=True)
+    back = _open_archive(_remote_archive(backup_env, tmp_path), tmp_path, name="remote")
+    assert (back / "identity.key").read_bytes() == (vault / "identity.key").read_bytes()
+    assert _card_number(back) == VISA
+
+
+def test_a_backup_of_a_sealed_vault_keeps_the_copy(_legacy, backup_env, tmp_path):
+    gh = backup_env["home"] / ".genesis"
+    vault = _copy_vault(_legacy, gh / "payment_vault")
+    copy = _vault_copy(gh / COPY, recipient=(vault / "recipient.txt").read_text().strip())
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = dated._run_local(backup_env, offsite)
+    status = _status(backup_env)
+    assert status["payment_vault"] == "ok", proc.stdout[-3000:]
+    assert copy.is_dir() and status["payment_vault_copies"] == 1
+    assert "pre-migrate copies" not in proc.stdout
+
+
+def test_a_backup_whose_push_fails_keeps_the_copy(_keyed, backup_env, tmp_path):
+    gh = backup_env["home"] / ".genesis"
+    vault = _place_vault(_keyed, gh / "payment_vault")
+    copy = _vault_copy(gh / COPY, recipient=(vault / "recipient.txt").read_text().strip())
+    subprocess.run(
+        ["git", "remote", "set-url", "--push", "origin", str(tmp_path / "no-such-remote.git")],
+        cwd=dated._repo(backup_env),
+        check=True,
+    )
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = dated._run_local(backup_env, offsite)
+    status = _status(backup_env)
+    assert status["payment_vault"] == "ok" and status["tier1_pushed"] is False, (
+        status,
+        proc.stdout[-3000:],
+    )
+    assert copy.is_dir() and status["payment_vault_copies"] == 1
+    assert "pre-migrate copies" not in proc.stdout
+
+
+def test_a_copy_of_another_vault_is_kept_and_counted(_keyed, backup_env, tmp_path):
+    gh = backup_env["home"] / ".genesis"
+    _place_vault(_keyed, gh / "payment_vault")
+    copy = _vault_copy(gh / COPY)  # REC: not this vault's key pair
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = dated._run_local(backup_env, offsite)
+    status = _status(backup_env)
+    assert status["payment_vault"] == "ok" and status["tier1_pushed"] is True, status
+    assert copy.is_dir() and status["payment_vault_copies"] == 1
+    assert "pre-migrate copies: 0 deleted, 1 left" in proc.stdout
+
+
+def test_no_vault_reports_no_copies(backup_env, tmp_path):
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    dated._run_local(backup_env, offsite)
+    assert _status(backup_env)["payment_vault_copies"] == 0
