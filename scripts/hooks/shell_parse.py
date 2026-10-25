@@ -1873,7 +1873,10 @@ _BLIND_BUILT_ESCAPE = BlindSpot(
 
 _BLIND_STRUCTURAL = BlindSpot(
     bounds_induced=True,
-    cause="contains nested syntax this parser cannot tokenize safely",
+    cause=(
+        "contains nested syntax or here-doc text this parser cannot tokenize safely "
+        "(for example an unbalanced quote inside a $(...) on a here-doc line)"
+    ),
     hint=(
         "split the unreadable compound into separate commands, or write prose or "
         "script text to a file instead"
@@ -2020,12 +2023,19 @@ def has_built_escape(command: str) -> bool:
 #: and every consumer's bounds branch already handles that contract.
 #:
 #: ORDERED AFTER :func:`untokenizable`, unlike the other bounds-type causes. The
-#: discard guard deliberately leaves untokenizable commands alone (its measured cost
-#: of refusing them is written beside that branch), and here-doc prose with an
-#: apostrophe is the commonest untokenizable command. Reporting this cause first
-#: would reclassify those commands to bounds-type and reverse that measured decision.
+#: discard guard deliberately leaves ROOT-level untokenizable commands alone (its
+#: measured cost of refusing them is written beside that branch), and here-doc prose
+#: with an apostrophe is the commonest one. Reporting this cause first would
+#: reclassify those commands to bounds-type and reverse that measured decision.
 #: The deliberate residual: an untokenizable command whose body ALSO hides a suffix
 #: keeps the untokenizable cause, and with it that guard's settled behaviour.
+#:
+#: That decision covers the ROOT text only. ``_BLIND_STRUCTURAL`` (nested
+#: extractions that cannot be tokenized) is ordered BEFORE untokenizable, and the
+#: substitution scan reads here-doc body lines as segments, so a ``$(…)`` with an
+#: apostrophe on a body line is reported as structural and refused when the command
+#: also mentions git. That reversal is accepted for that shape and named in
+#: docs/reference/shell-parse-completeness.md.
 #:
 #: COST, measured over 138,216 recorded unique commands on one install (the 15,488
 #: that contain ``<<``, so every command the check can touch). 101 commands (0.073%)
@@ -4165,14 +4175,12 @@ def _analyze_bounded(
                         verb_unresolved=inner_segment.verb_unresolved,
                     )
                 )
+    # No length re-check here: at depth 0 the over-long raw command returned
+    # above, and the decision text (the excised command) is never longer.
     bound_reason = "depth" if truncated else None
-    if _depth == 0 and len(_decision_text) > MAX_COMMAND_CHARS:
-        bound_reason = "length"
     root_untokenizable = _depth == 0 and _raw_untokenizable(_decision_text)
     hidden = [segment for segment in out if _dispatcher_verb_unresolved(segment)]
-    if bound_reason == "length":
-        diagnostic = _BLIND_OVER_LONG
-    elif bound_reason == "depth":
+    if bound_reason == "depth":
         diagnostic = _BLIND_OVER_NESTED
     elif continuation:
         diagnostic = _BLIND_CONTINUATION
