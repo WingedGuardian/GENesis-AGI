@@ -5106,42 +5106,34 @@ async def browser_fill_card(
     ctx: Context | None = None,
 ) -> dict:
     """Pay with a vault card on the open Camoufox checkout after the owner's
-    Telegram tap; fills in a separate blank window and clicks Pay itself. Card
-    values never reach you. Full usage: the browser-automation skill, "Money".
+    Telegram tap; fills in a separate window and clicks Pay itself. Card values
+    never reach you. Usage and limits: the browser-automation skill, "Money".
 
-    card_ref: card_ + 12 hex. amount: the total exactly as the page shows it,
-    digits included. fields: kind -> CSS selector, or {"selector", "frames":
+    card_ref: card_ + 12 hex. amount: the total as the page shows it, digits
+    included; with save, the subtotal before the card, one price with its
+    currency symbol. fields: kind -> CSS selector or {"selector", "frames":
     [iframe selector, ...]}; kinds number (required), expiry or exp_month +
-    exp_year, cvc, name or first_name + last_name (split from the card's
-    name), postal_code. pay: the Pay button, same shape.
-    Selectors are printable plain CSS (no ``>>``, engine= prefix, quoted text
-    or XPath); each element must be in the frame its chain names. Snapshots
-    cannot see inside a cross-origin frame: use the provider's standard ids.
+    exp_year, cvc, name or first_name + last_name, postal_code. pay: the Pay
+    button, same shape. Selectors: printable plain CSS (no ``>>``, engine=
+    prefix, quoted text or XPath), each in the frame its chain names.
     expiry_format: MM/YY, MM / YY, MM-YY, MMYY, MM/YYYY or MMYYYY.
-    extra_fields: name -> {"selector", "value"} or {"selector", "frames",
-    "value"} (email, name, phone, address_line1, address_line2, city, region,
-    postal_code, country, company; the top document, or a frame holding a
-    card field), filled before the tap. With no "value", the value comes from
-    card_fill.billing in the install's payments config.
-    steps: up to 8 clicks, each a selector or {"selector", "frames"}, run in
-    order in the payment window after it opens the checkout's URL and before
-    anything is read or filled (a cart, "checkout", "add card"); clicks only,
-    never a checkbox. consent: up to 2 checkboxes (a debit authorization in the
-    card form), same shape; the tap shows their labels, and they are ticked only
-    after it. save: the control that stores the card (usually in the card
-    frame), clicked before Pay; then the total (the ``total`` element, or Pay's
-    label) is read and Pay is clicked only if amount <= total <= amount_max.
-    amount_max (needs save): the ceiling the tap approves ("up to"); amount
-    stays the subtotal the page shows before the card. With save, pass both as
-    the page writes them, currency symbol included: a total in another currency,
-    or a negative one, is not read. The ceiling checks what the page shows; it
-    is not a limit the merchant enforces.
+    extra_fields: name -> {"selector", "value"} (+ "frames": the top document
+    or a frame holding a card field); names email, name, phone, address_line1,
+    address_line2, city, region, postal_code, country, company. No "value":
+    read from card_fill.billing in the payments config.
+    steps: up to 8 clicks, same shape, before anything is read; no checkbox.
+    consent: up to 2 checkboxes, ticked only after the tap.
+    save: the control that stores the card, clicked before Pay. amount_max
+    (needs save): the ceiling the tap approves, amount's currency; Pay only if
+    amount <= total <= amount_max. total (needs save): the total's element;
+    default Pay's label.
 
     Returns {code, status, host} (+ filled, field, reason where they apply).
     submitted_unverified: check the order. challenge, card_url_blocked,
     card_url_leaked, pay_click_unknown, outcome_unknown, moved_while_filling,
-    card_url_before_pay, card_value_in_request: do NOT retry; tell the owner. Refused while card fill
-    is off or another payment runs.
+    card_url_before_pay, card_value_in_request, and any code after a save: do
+    NOT retry; tell the owner. Refused while card fill is off or another
+    payment runs.
     """
     last_sent, sent = 0.0, 0
 

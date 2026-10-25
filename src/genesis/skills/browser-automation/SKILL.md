@@ -421,7 +421,7 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   ceiling. Otherwise it stops with Pay NOT clicked: the card may now be stored
   on the merchant, so tell the owner rather than repeating the steps. Pass
   `amount` and `amount_max` as the page writes them, currency symbol included
-  ("$19.99"): a total in another currency, or a negative one, is not read. The
+  (a dollar sign before the digits, for a dollar price): a total in another currency, or a negative one, is not read. The
   ceiling checks what the page shows; it is not a limit the merchant enforces.
 - The tool reopens the checkout in a window no other tool reaches, waits for
   the owner's Telegram tap, fills, clicks Pay itself and closes the window.
