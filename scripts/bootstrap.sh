@@ -403,7 +403,12 @@ PY
                 echo "  Recorded the restart the crashed update owes genesis-server."
             else
                 rm -f "$OWED_FILE.tmp" 2>/dev/null || true
-                echo "  WARNING: could not write $OWED_FILE; if genesis-server is still down, the next update.sh may read it as operator-stopped. Start it with: systemctl --user start genesis-server.service" >&2
+                # The state is the only durable evidence left that an update
+                # stopped the server, so it is kept until the record is written.
+                # Re-running this recovery is safe: the checkout is then at the
+                # rollback tag, the history row is keyed to the run, and an
+                # existing failure record is never replaced.
+                _crash_recovery_refuse "could not write $OWED_FILE (the restart the crashed update owes genesis-server); the update state is kept so the next run can record it. Free space on $HOME/.genesis's disk or make it writable"
             fi
         fi
 

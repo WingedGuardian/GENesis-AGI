@@ -633,6 +633,30 @@ if [[ "$POST_MERGE" != "true" ]] && { [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE"
     fi
 fi
 # END prior-state-guard
+# A crashed run's state that the guard let through is about to be overwritten.
+# If it says that run stopped genesis-server, it may be the only evidence left
+# (an updater from before restart-owed, or a bootstrap that could not write the
+# record), so it becomes the restart record first; this run then restores the
+# server and retires the record at its own health check. No record, no overwrite.
+if [[ "$POST_MERGE" != "true" ]] && [ -f "$STATE_FILE" ] && [ ! -e "$SERVER_RESTART_OWED" ] \
+    && python3 -I - "$STATE_FILE" 2>/dev/null <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    state = json.load(f)
+stopped = state.get("services_stopped") if isinstance(state, dict) else None
+ok = state.get("phase") != "done" and isinstance(stopped, list) and "genesis-server" in stopped
+sys.exit(0 if ok else 1)
+PY
+then
+    if ! _owe_server_restart; then
+        echo "REFUSED: an earlier update stopped genesis-server and its state is the only record of it;"
+        echo "         that could not be saved as $SERVER_RESTART_OWED, so the state is kept. Nothing was changed."
+        exit 5
+    fi
+    echo "  An earlier update stopped genesis-server: recorded the restart it owes."
+fi
 
 echo ""
 echo "  Genesis Update"
@@ -1854,10 +1878,12 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     # yet, so aborting here leaves the repo/DB untouched — safe to exit.
     if ! _ensure_server_down; then
         echo "  Aborting update — could not stop genesis-server; refusing to merge over a live process."
-        # A server still running is owed no restart: the record written above
-        # would make a later update start it after a deliberate stop. One that did
-        # go down keeps the record, so the next update restores it.
-        if [ -e "${SERVER_RESTART_OWED:-}" ] \
+        # A server still running is owed no restart by THIS run: the record written
+        # above would make a later update start it after a deliberate stop. One that
+        # did go down keeps the record, so the next update restores it. A record
+        # from before this run is an earlier update's unpaid debt and stays: a
+        # process that merely exists has not passed a health check.
+        if [ "$_owed_before" = 0 ] && [ -e "${SERVER_RESTART_OWED:-}" ] \
             && { systemctl --user is-active --quiet genesis-server.service 2>/dev/null \
                 || pgrep -f "python -m genesis serve" >/dev/null 2>&1; }; then
             rm -f "$SERVER_RESTART_OWED"

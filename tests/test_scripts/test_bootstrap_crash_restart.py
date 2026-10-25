@@ -1017,3 +1017,111 @@ def test_a_rollback_records_the_restart_before_it_stops_the_server(tmp_path):
         r = _sh(tmp_path, home, script)
         assert r.returncode == -9, r.stdout + r.stderr
         assert _owed(home).exists() is owed, were
+
+
+# ── round 7: an error path never drops an earlier update's unpaid debt ───────
+
+
+def test_a_failed_stop_keeps_an_earlier_updates_record(tmp_path):
+    """Codex P2 (4369621212): an earlier crashed update left the record, a
+    watchdog then started a server that never answered health, and this run
+    cannot stop it. A process that merely exists has not paid the debt, so the
+    earlier record stays."""
+    _, _, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    _with_owed(home)
+    proc = _run_update_until_stop(
+        tmp_path,
+        home,
+        active="genesis-server",
+        rollback=rollback,
+        pre="_stop_genesis_server() { :; }\n_ensure_server_down() { return 1; }\n",
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert _owed(home).exists()
+
+
+def test_bootstrap_keeps_the_state_until_it_can_write_the_record(tmp_path):
+    """Codex P2 (4369621214): a pre-marker updater crashed after stopping the
+    server and bootstrap cannot write the record (here a directory squats on its
+    temporary file). The state is the only evidence left, so bootstrap refuses
+    and keeps it; a re-run once the obstacle is gone records the debt."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    _migrated_genesis_root(tmp_path, root)
+    home = tmp_path / "home"
+    blocker = home / ".genesis" / "server_restart_owed.json.tmp"
+    blocker.mkdir(parents=True)
+    state = dict(
+        own_head=deploy,
+        deploy_head=deploy,
+        old_tag="v1.0.0",
+        old_commit=rollback[:7],
+        started_at="2026-10-18T00:00:00+00:00",
+        services_stopped=["genesis-server"],
+    )
+    proc, state_path = _recover(tmp_path, root, **state)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "REFUSE" in proc.stderr and "server_restart_owed.json" in proc.stderr
+    assert state_path.is_file()
+    assert not _owed(home).exists()
+
+    blocker.rmdir()
+    proc = _run_crash_recovery(root, home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not state_path.exists()
+    assert _owed(home).is_file()
+
+
+def _prior_state_conversion(text: str) -> str:
+    start = text.index("# END prior-state-guard\n")
+    return text[start : text.index('\necho ""\necho "  Genesis Update"', start)] + "\n"
+
+
+@pytest.mark.parametrize(
+    ("state", "owed"),
+    [
+        ({"phase": "fetching", "services_stopped": ["genesis-server"]}, True),
+        ({"phase": "fetching", "services_stopped": ["genesis-bridge"]}, False),
+        ({"phase": "fetching"}, False),
+        ({"phase": "done", "services_stopped": ["genesis-server"]}, False),
+    ],
+)
+def test_update_sh_turns_a_crashed_stop_into_the_record_before_overwriting_it(
+    tmp_path, state, owed
+):
+    """The prior-state guard passed a crashed run's state, which this run's own
+    state write would overwrite. When it says that run stopped genesis-server,
+    the record is written first, so the evidence is never consumed unsaved."""
+    text = UPDATE.read_text()
+    home = tmp_path / "home"
+    (home / ".genesis").mkdir(parents=True)
+    (home / ".genesis" / "update_state.json").write_text(json.dumps(state))
+    script = (
+        "set -Eeuo pipefail\n"
+        'STATE_FILE="$HOME/.genesis/update_state.json"\nPOST_MERGE=false\n'
+        + _owed_block(text)
+        + _prior_state_conversion(text)
+        + "echo REACHED\n"
+    )
+    r = _sh(tmp_path, home, script)
+    assert r.returncode == 0 and "REACHED" in r.stdout, r.stdout + r.stderr
+    assert _owed(home).exists() is owed
+
+
+def test_update_sh_refuses_when_a_crashed_stop_cannot_be_recorded(tmp_path):
+    text = UPDATE.read_text()
+    home = tmp_path / "home"
+    (home / ".genesis" / "server_restart_owed.json.tmp").mkdir(parents=True)
+    state_path = home / ".genesis" / "update_state.json"
+    state_path.write_text(json.dumps({"phase": "merging", "services_stopped": ["genesis-server"]}))
+    script = (
+        "set -Eeuo pipefail\n"
+        'STATE_FILE="$HOME/.genesis/update_state.json"\nPOST_MERGE=false\n'
+        + _owed_block(text)
+        + _prior_state_conversion(text)
+        + "echo REACHED\n"
+    )
+    r = _sh(tmp_path, home, script)
+    assert r.returncode == 5 and "REACHED" not in r.stdout, r.stdout + r.stderr
+    assert state_path.is_file() and not _owed(home).exists()
