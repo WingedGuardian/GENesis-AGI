@@ -679,7 +679,7 @@ async def test_the_url_guard_aborts_when_it_cannot_judge(monkeypatch, logs):
     def boom(_url):
         raise ValueError(PAN)
 
-    monkeypatch.setattr(g, "carries", boom)
+    monkeypatch.setattr(g, "_judge", boom)
     r = Route("https://shop.example.com/x")
     await g.handle(r)
     assert r.done == ("abort", "failed")  # fail closed
@@ -2326,3 +2326,33 @@ def test_a_url_too_long_to_split_on_the_event_loop_is_unjudgeable():
     _flow, g = _all_guard()
     with pytest.raises(pc._Unjudgeable):
         g.carries(SHOPX + "?x=" + "a" * pc._MAX_URL)
+
+
+async def test_a_short_value_match_while_typing_says_it_may_be_a_coincidence(vault, logs):
+    # Only the CVC matched (?qty=<CVC> from a page script): Pay is not clicked,
+    # and the result does not claim the card number was exposed.
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    real_fill = Handle.fill
+
+    async def fill(self, value, timeout=None):
+        await real_fill(self, value, timeout)
+        if self.el is ns.els["cvc"]:
+            await ns.pctx.route_handler(Route(f"https://t.example.org/c?qty={CVC}"))
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Handle, "fill", fill)
+        out, _ = await _run(ns)
+    assert out["code"] == "card_value_in_request" and clicked == []
+    assert "coincidence" in out["status"] and "not necessarily exposed" in out["status"]
+    _sweep(out, logs)
+
+
+def test_a_short_value_hop_keeps_the_number_flag_clear():
+    flow, g = _all_guard()
+    g.on_request(_request(f"https://shop.example.com/land?cvc={CVC}"))
+    assert flow.url_leaked is True and flow.number_hit is False
+    assert pc._typing_outcome(flow) == "card_value_in_request"
+    g.on_request(_request(f"https://shop.example.com/land?pan={PAN}"))
+    assert flow.number_hit is True and pc._typing_outcome(flow) == "card_url_before_pay"

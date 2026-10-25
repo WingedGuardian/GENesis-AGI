@@ -5110,7 +5110,7 @@ async def browser_fill_card(
     Returns {code, status, host} (+ filled, field, reason where they apply).
     submitted_unverified: check the order. challenge, card_url_blocked,
     card_url_leaked, pay_click_unknown, outcome_unknown, moved_while_filling,
-    card_url_before_pay: do NOT retry; tell the owner. Refused while card fill
+    card_url_before_pay, card_value_in_request: do NOT retry; tell the owner. Refused while card fill
     is off or another payment runs.
     """
     last_sent, sent = 0.0, 0

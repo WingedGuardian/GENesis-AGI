@@ -1717,7 +1717,8 @@ the shared banner is not an assertion about all concurrent sessions.
   blocked too). A script-handled form that is GET only by default is not
   refused. A redirect hop carrying one cannot be stopped by a
   route; it is seen and reported (`card_url_leaked`; before Pay,
-  `card_url_before_pay`). WebSocket URLs are not covered. This guards a trusted
+  `card_url_before_pay`, or `card_value_in_request` when only a short value
+  matched, which may be a coincidence). WebSocket URLs are not covered. This guards a trusted
   merchant's flawed form, not a hostile page script: one that reads a field can
   still send it another way (a request body, an encoding the guard does not undo).
   Selectors are plain CSS (a `>>` chain, an `engine=` part, quoted text or XPath

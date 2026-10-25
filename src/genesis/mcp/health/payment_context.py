@@ -299,6 +299,7 @@ class _Flow:
     typing_marks: tuple[int, int] | None = None  # (nav_requests, popups) as typing began
     url_blocked: bool = False  # the network guard aborted a request carrying a card value
     url_leaked: bool = False  # a redirect hop carried a card value (a route cannot stop it)
+    number_hit: bool = False  # one of those carried the number (else only a short value)
     abort_reason: str | None = None
     tearing_down: bool = False
     stuck: bool = False  # the fallback browser close was not reached
@@ -454,8 +455,12 @@ class _UrlGuard:
     def carries(self, url: str) -> bool:
         """Whether ``url`` carries an armed value. Raises _Unjudgeable when the
         check would take more than _MAX_WINDOWS digests."""
+        return self._judge(url) is not None
+
+    def _judge(self, url: str) -> str | None:
+        """ "number", "value" (only a short value matched: maybe a coincidence) or None."""
         if self._tag is None:
-            return False
+            return None
         if len(url) > _MAX_URL:
             raise _Unjudgeable
         text = _norm(_decoded(url))
@@ -468,14 +473,14 @@ class _UrlGuard:
         for run in runs:
             for i in range(len(run) - n + 1):
                 if hmac.compare_digest(self._mac(run[i : i + n]), self._tag):
-                    return True
+                    return "number"
         macs = {self._mac(t) for t in cands}
         months, years = self._pair
-        return bool(macs & self._whole) or bool(macs & months and macs & years)
+        return "value" if macs & self._whole or (macs & months and macs & years) else None
 
     async def handle(self, route) -> None:
         try:
-            hit = self.carries(route.request.url)
+            hit = self._judge(route.request.url)
         except Exception as e:  # noqa: BLE001 - never the URL
             logger.warning("payment url guard could not judge a request (%s)", type(e).__name__)
             with contextlib.suppress(Exception):
@@ -483,6 +488,7 @@ class _UrlGuard:
             return
         if hit:
             self._flow.url_blocked = True
+            self._flow.number_hit |= hit == "number"
             with contextlib.suppress(Exception):
                 await route.abort("blockedbyclient")
             return
@@ -505,13 +511,14 @@ class _UrlGuard:
         if getattr(request, "redirected_from", None) is None:
             return
         try:
-            leaked = self.carries(request.url)
+            leaked = self._judge(request.url)
         except Exception as e:  # noqa: BLE001 - never the URL
             # Too heavy to check: counted as a leak, the outcome cannot be vouched for.
             logger.warning("payment url guard could not judge a redirect (%s)", type(e).__name__)
-            leaked = self._tag is not None
+            leaked = "number" if self._tag is not None else None
         if leaked:
             self._flow.url_leaked = True
+            self._flow.number_hit |= leaked == "number"
 
 
 # _outcome's "the checkout did not move on within the bound" (mapped in _run).
@@ -1071,8 +1078,8 @@ def _typing_outcome(flow: _Flow) -> str | None:
     """What happened while the card was typed that outranks a plain stop: the
     card sent in a URL (the exposure is never hidden behind a move), or
     the checkout moving on by itself (a navigation request or a new window)."""
-    if flow.url_blocked or flow.url_leaked:
-        return "card_url_before_pay"
+    if flow.url_blocked or flow.url_leaked:  # a short value alone may be a coincidence
+        return "card_url_before_pay" if flow.number_hit else "card_value_in_request"
     if flow.typing_marks is not None and (flow.nav_requests, flow.popups) != flow.typing_marks:
         return "moved_while_filling"
     return None
@@ -1280,7 +1287,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         flow.typing = True
         for kind, f in fields.items():
             if flow.url_blocked or flow.url_leaked:
-                raise _Stop("card_url_before_pay", filled=flow.typed)
+                raise _Stop(_typing_outcome(flow), filled=flow.typed)
             if cf.origin_of(f.frame.url) != origins[kind] or not await _mask_ok(ppage):
                 raise _Stop("failed_before_pay", field=kind, filled=flow.typed)
             if f.tag == "select":

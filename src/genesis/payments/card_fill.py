@@ -128,6 +128,10 @@ TEXTS = {
     "card_url_before_pay": "Pay was NOT clicked: while the card was typed, the checkout sent "
     "or tried to send a card value in a URL (and may have moved on with it). Treat the "
     "card as exposed and tell the owner." + _NO_RETRY,
+    "card_value_in_request": "Pay was NOT clicked: while the card was typed, a page request "
+    "carried a value equal to a typed CVC, expiry, name or postal code (possibly by "
+    "coincidence) and was stopped. The card number was not seen leaving; the card is not "
+    "necessarily exposed. Tell the owner." + _NO_RETRY,
     "submitted_unverified": "Pay was clicked and the checkout moved on. Not verified: "
     "check the order page or the merchant account.",
     "challenge": "Pay was clicked, then a bank check appeared or the checkout did not move "
