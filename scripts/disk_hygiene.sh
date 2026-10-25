@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # genesis-disk-hygiene — daily disk grooming entrypoint.
 #
-# Run by the genesis-disk-hygiene.timer systemd unit (also runnable by hand).
+# The daily timer starts independent maintenance and worktree-reaper services.
+# With no arguments, runs both in sequence for compatibility with manual use.
 # Best-effort steps — one failing must not skip the others:
 #   1. Reap merged/inactive git worktrees  → scripts/worktree_lifecycle.py
 #      (archives into ~/.genesis/worktree-trash; first releases session-claim
@@ -616,22 +617,17 @@ prune_camoufox_engines_step() {
     )
 }
 
-main() {
-    local disk_reclaim_rc=0
-    if [ -z "$VENV_PY" ]; then
-        echo "disk_hygiene: no python interpreter found" >&2
-        exit 1
-    fi
+hygiene_stage() {
+    local name="$1" started=$SECONDS rc=0
+    shift
+    echo "hygiene stage=$name start=$(date -u +%FT%TZ)"
+    "$@" || rc=$?
+    echo "hygiene stage=$name duration_s=$((SECONDS - started)) status=$rc"
+    return "$rc"
+}
 
-    case "${1:-}" in
-        --pressure) pressure_main "${2:-}"; return 0 ;;
-        "") ;;
-        *) echo "disk_hygiene: unknown argument '$1' (usage: disk_hygiene.sh [--pressure [--last-resort]])" >&2
-           return 2 ;;
-    esac
-
-    echo "=== genesis-disk-hygiene $(date -u +%FT%TZ) ==="
-
+worktrees_main() {
+    local rc=0
     # BEFORE the reaper, deliberately. This is the wall-clock floor for the
     # stranded-work sweep — the detector is normally spawned at session
     # boundaries, so a box that starts no sessions for days would answer "what
@@ -641,23 +637,25 @@ main() {
     # likely to be deleting stale worktrees — and its restore path does not
     # reconstruct uncommitted state. Observing the world after the reaper had
     # cleared it would mean the one daily look never saw what was lost.
-    echo "--- zero-drop stranded-work sweep ---"
-    "$VENV_PY" "$REPO_DIR/scripts/zero_drop_worker.py" --trigger hygiene \
-        || echo "zero_drop_worker exited $?"
+    hygiene_stage zero-drop "$VENV_PY" "$REPO_DIR/scripts/zero_drop_worker.py" --trigger hygiene \
+        || rc=$?
 
     # Stale claims BEFORE the reaper, so a worktree whose claiming session died
     # is judged on its merits tonight rather than pinned for another day. The
     # claim module decides staleness; a lock it did not write is never touched.
-    echo "--- stale worktree-claim release ---"
-    "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" --release-stale-claims \
-        || echo "worktree_lifecycle --release-stale-claims exited $?"
+    hygiene_stage stale-claims "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" --release-stale-claims \
+        || rc=$?
+    hygiene_stage worktree-reaping "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" \
+        || rc=$?
+    return "$rc"
+}
 
-    echo "--- worktree reaping ---"
-    "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" || echo "worktree_lifecycle exited $?"
+maintenance_main() {
+    local disk_reclaim_rc=0
 
     # The deleting steps take the shared reclaim lock. A pressure run holding
     # it is already reclaiming, so after a bounded wait (inside this unit's
-    # 1200s timeout) the daily pass skips them rather than time out and lose
+    # service timeout) the daily pass skips them rather than time out and lose
     # every retention prune below.
     local reclaim_locked=1
     if ! reclaim_lock "${RECLAIM_WAIT_S:-180}"; then
@@ -841,6 +839,31 @@ main() {
 
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"
+}
+
+main() {
+    local mode="${1:-}" reaper_rc=0 maintenance_rc=0
+    if [ -z "$VENV_PY" ]; then
+        echo "disk_hygiene: no python interpreter found" >&2
+        return 1
+    fi
+    case "$mode" in
+        --pressure) pressure_main "${2:-}"; return 0 ;;
+        ""|--maintenance-only|--worktrees-only) ;;
+        *) echo "disk_hygiene: unknown argument '$mode' (usage: disk_hygiene.sh [--maintenance-only|--worktrees-only|--pressure [--last-resort]])" >&2
+           return 2 ;;
+    esac
+    echo "=== genesis-disk-hygiene $(date -u +%FT%TZ) mode=${mode:-all} ==="
+    if [ "$mode" != --maintenance-only ]; then
+        hygiene_stage worktrees worktrees_main || reaper_rc=$?
+    fi
+    if [ "$mode" != --worktrees-only ]; then
+        hygiene_stage maintenance maintenance_main || maintenance_rc=$?
+    fi
+    if [ "$maintenance_rc" -ne 0 ]; then
+        return "$maintenance_rc"
+    fi
+    return "$reaper_rc"
 }
 
 # Run main only when executed directly — lets tests `source` this file to call a
