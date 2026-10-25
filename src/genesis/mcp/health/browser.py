@@ -4760,6 +4760,8 @@ async def _impl_browser_fill_card(
     pay: str | dict | None = None,
     expiry_format: str = "MM/YY",
     extra_fields: dict | None = None,
+    steps: list | None = None,
+    consent: list | None = None,
     report=None,
 ) -> dict:
     """Pay with a vault card in an isolated browser context. See browser_fill_card."""
@@ -4768,7 +4770,9 @@ async def _impl_browser_fill_card(
             return card_fill.result("card_fill_disabled")
         if card_fill.playwright_debug_on():
             return card_fill.result("playwright_debug_on")
-        args = card_fill.validate(card_ref, amount, fields, pay, expiry_format, extra_fields)
+        args = card_fill.validate(
+            card_ref, amount, fields, pay, expiry_format, extra_fields, steps, consent
+        )
         # Short hold: every browser tool waits on this lock, and the flow waits minutes.
         async with _browser_lock:
             page, ctx = _active_page, _stealth_browser
@@ -5081,6 +5085,8 @@ async def browser_fill_card(
     pay: str | dict | None = None,
     expiry_format: str = "MM/YY",
     extra_fields: dict | None = None,
+    steps: list | None = None,
+    consent: list | None = None,
     ctx: Context | None = None,
 ) -> dict:
     """Pay with a vault card on the open Camoufox checkout after the owner's
@@ -5090,14 +5096,23 @@ async def browser_fill_card(
     card_ref: card_ + 12 hex. amount: the total exactly as the page shows it,
     digits included. fields: kind -> CSS selector, or {"selector", "frames":
     [iframe selector, ...]}; kinds number (required), expiry or exp_month +
-    exp_year, cvc, name, postal_code. pay: the Pay button, same shape.
+    exp_year, cvc, name or first_name + last_name (split from the card's
+    name), postal_code. pay: the Pay button, same shape.
     Selectors are printable plain CSS (no ``>>``, engine= prefix, quoted text
     or XPath); each element must be in the frame its chain names. Snapshots
     cannot see inside a cross-origin frame: use the provider's standard ids.
     expiry_format: MM/YY, MM / YY, MM-YY, MMYY, MM/YYYY or MMYYYY.
-    extra_fields: name -> {"selector", "value"} (email, name, phone,
-    address_line1, address_line2, city, region, postal_code, country, company;
-    top document only), filled before the tap.
+    extra_fields: name -> {"selector", "value"} or {"selector", "frames",
+    "value"} (email, name, phone, address_line1, address_line2, city, region,
+    postal_code, country, company; the top document, or a frame holding a
+    card field), filled before the tap. With no "value", the value comes from
+    card_fill.billing in the install's payments config.
+    steps: up to 8 clicks, each a selector or {"selector", "frames"}, run in
+    order in the payment window after it opens the checkout's URL and before
+    anything is read or filled (a cart, "checkout", "add card"); clicks only,
+    never a checkbox. consent: up to 2 checkboxes (a debit authorization in the
+    card form), same shape; the tap shows their labels, and they are ticked only
+    after it.
 
     Returns {code, status, host} (+ filled, field, reason where they apply).
     submitted_unverified: check the order. challenge, card_url_blocked,
@@ -5118,7 +5133,7 @@ async def browser_fill_card(
             )
 
     return await _impl_browser_fill_card(
-        card_ref, amount, fields, pay, expiry_format, extra_fields, report=report
+        card_ref, amount, fields, pay, expiry_format, extra_fields, steps, consent, report=report
     )
 
 

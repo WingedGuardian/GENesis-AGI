@@ -72,7 +72,10 @@ def test_validate_keeps_kinds_and_extras_in_their_fixed_order():
         ({"pay": None}, "bad_pay"),
         ({"pay": {"selector": ""}}, "bad_pay"),
         ({"extra_fields": {"shoe": {"selector": "#s", "value": "x"}}}, "bad_extra_fields"),
-        ({"extra_fields": {"email": {"selector": "#s"}}}, "bad_extra_fields"),
+        (
+            {"extra_fields": {"email": {"selector": "#s"}}},
+            "no_billing_value",
+        ),  # no value and no billing config
         (
             {"extra_fields": {"phone": {"selector": "#s", "value": "+1 555 0100 1234 5678"}}},
             "bad_extra_fields",
@@ -496,3 +499,73 @@ def test_card_fill_prefs_turn_the_accessibility_tree_off():
     # Owner ruling Q14: a same-user AT-SPI client read the typed card number
     # through the accessibility tree; the pref stops Camoufox exposing it.
     assert cf.CARD_FILL_PREFS["accessibility.force_disabled"] == 1
+
+
+def test_steps_and_consent_are_kept_in_order_as_specs():
+    a = _v(
+        steps=["#cart", {"selector": "#add", "frames": ["iframe#p"]}],
+        consent=[{"selector": "#agree", "frames": ["iframe"]}],
+    )
+    assert a.steps == (((), "#cart"), (("iframe#p",), "#add"))
+    assert a.consent == ((("iframe",), "#agree"),)
+    assert _v().steps == () and _v().consent == ()
+
+
+@pytest.mark.parametrize(
+    ("over", "code"),
+    [
+        ({"steps": "#cart"}, "bad_steps"),
+        ({"steps": ["#a"] * (cf.MAX_STEPS + 1)}, "bad_steps"),
+        ({"steps": ["xpath=//button"]}, "bad_steps"),
+        ({"steps": [{"selector": "#a", "value": "x"}]}, "bad_steps"),
+        ({"consent": ["#a", "#b", "#c"]}, "bad_consent"),
+        ({"consent": [{"selector": "#a", "frames": "iframe"}]}, "bad_consent"),
+        ({"fields": {"number": "#n", "first_name": "#f"}}, "bad_fields"),
+        ({"fields": {"number": "#n", "last_name": "#l"}}, "bad_fields"),
+        (
+            {"extra_fields": {"city": {"selector": "#c", "frames": ["x"], "value": "A", "y": 1}}},
+            "bad_extra_fields",
+        ),
+        ({"extra_fields": {"city": {"value": "A"}}}, "bad_extra_fields"),
+    ],
+)
+def test_new_arguments_refuse_with_a_fixed_code(over, code):
+    with pytest.raises(cf.Refused) as e:
+        _v(**over)
+    assert e.value.code == code
+
+
+def test_a_framed_extra_field_keeps_its_frames():
+    a = _v(
+        extra_fields={"city": {"selector": "#c", "frames": ["iframe#card"], "value": "Testville"}}
+    )
+    assert a.extra["city"] == ((("iframe#card",), "#c"), "Testville")
+
+
+def test_split_name_and_the_values_typed_for_the_name_kinds():
+    assert cf.split_name("Ada Q Example") == ("Ada Q", "Example")
+    assert cf.split_name("Single") == ("", "Single")
+    assert cf.split_name("  ") == ("", "")
+    card = {"name": "Ada Q Example"}
+    assert cf.values_for(card, ["first_name", "last_name"], "MM/YY") == {
+        "first_name": "Ada Q",
+        "last_name": "Example",
+    }
+    assert cf.reply_keys(["first_name", "last_name"]) == {"label", "last4", "name"}
+
+
+def test_an_extra_field_without_a_value_takes_it_from_the_billing_overlay(repo):
+    repo.write_text("card_fill:\n  billing:\n    city: Testville\n    region: TS\n")
+    a = _v(extra_fields={"city": {"selector": "#c"}, "region": {"selector": "#r", "value": "XX"}})
+    assert a.extra["city"][1] == "Testville"
+    assert a.extra["region"][1] == "XX"  # a given value wins
+    with pytest.raises(cf.Refused) as e:
+        _v(extra_fields={"postal_code": {"selector": "#p"}})
+    assert e.value.code == "no_billing_value"
+
+
+def test_a_billing_value_still_passes_the_value_checks(repo):
+    repo.write_text(f"card_fill:\n  billing:\n    company: '{PAN}'\n")
+    with pytest.raises(cf.Refused) as e:
+        _v(extra_fields={"company": {"selector": "#c"}})
+    assert e.value.code == "bad_extra_fields"

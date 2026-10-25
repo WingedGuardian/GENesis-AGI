@@ -37,12 +37,20 @@ CENSUS_GAP = timedelta(hours=2, minutes=15)
 #: The census schema whose rows can read clean. An older row lacks the proofs
 #: the current contract requires, so it reads dirty (graph_census.CENSUS_SCHEMA
 #: must equal this; a test pins it).
-CLEAN_CENSUS_SCHEMA = 2
+CLEAN_CENSUS_SCHEMA = 3
 #: Every schema a row may carry and still be READ (a disabled row of any of them
 #: still says disabled). Derived, so a bump can never strand its own rows.
 KNOWN_CENSUS_SCHEMAS = frozenset(range(1, CLEAN_CENSUS_SCHEMA + 1))
 
 _DISABLED = "telemetry disabled in genesis-server"
+#: How a census row's role reads in a verdict message.
+_ROLE_NAMES = {
+    "mcp-memory": "memory server",
+    "ambient": "ambient worker",
+    "server": "server",
+    "bridge": "bridge",
+    "venv-generic": "venv process",
+}
 _CLEAN_OUTCOMES = frozenset({"primary"})
 _NEUTRAL_OUTCOMES = frozenset({"cancelled"})
 
@@ -136,34 +144,51 @@ def census_dirt(m: dict | None) -> str | None:
     if m.get("head_telemetry") is not True:
         return "the checkout's HEAD does not contain the telemetry module"
     if m.get("head_dirty") is not False:
-        return "src/genesis/memory/ is dirty in the checkout"
+        return "the checkout's runtime code (src/ or an entry script) is dirty"
+    if m.get("head_history_telemetry") is not True:
+        return "HEAD held code without telemetry in the last 2h30m (or its history is unreadable)"
     procs = m.get("procs")
     if not isinstance(procs, list):
         return "unreadable census row"
     for p in procs:
         if not isinstance(p, dict):
             return "unreadable census row"
+        role = p.get("role")
+        who = f"{_ROLE_NAMES.get(role, 'process')} pid {p.get('pid')}"
+        if "excluded" in p:
+            # Only replay may be excluded (owner ruling: not live traffic).
+            if role == "replay" and p["excluded"] == "replay_not_live_traffic":
+                continue
+            return "unreadable census row"
+        if p.get("foreign") is True:
+            continue  # a bench process on a scratch DB: its traversals are not ours
+        if role == "venv-generic":
+            # Owner ruling: history and scope only, no source or switch proof.
+            if p.get("telemetry") is not True:
+                why = p.get("unknown") or "started on, or has seen, code without telemetry"
+                return f"{who} may run old code ({why})"
+            continue
         unknown_reasons = p.get("unknown_reasons")
         if not isinstance(unknown_reasons, list) or not all(
             isinstance(r, str) for r in unknown_reasons
         ):
             return "unreadable census row"
-        if p.get("foreign") is True:
-            continue  # a bench server on a scratch DB: its traversals are not ours
+        # A recorded reason names the actual fault; report it before the switch,
+        # which an unprovable process may not even carry.
+        if unknown_reasons:
+            return f"{who}: cannot prove its code ({', '.join(unknown_reasons)})"
         if p.get("telemetry_off") is True:
-            return f"memory server pid {p.get('pid')} has the telemetry kill switch on"
+            return f"{who} has the telemetry kill switch on"
         if p.get("telemetry_off") is not False:
             return (
-                f"memory server pid {p.get('pid')}: kill-switch state unknown (its secrets "
-                "file is missing or changed since it started, or its launch value and "
-                "file disagree)"
+                f"{who}: kill-switch state unknown (its secrets file is missing or "
+                "changed since it started, or its launch value and file disagree)"
             )
-        if unknown_reasons or p.get("source") != "main":
-            why = ", ".join(unknown_reasons) or "no source proof"
-            return f"memory server pid {p.get('pid')}: cannot prove its code ({why})"
+        if p.get("source") != "main":
+            return f"{who}: cannot prove its code (no source proof)"
         if p.get("telemetry") is not True:
             why = p.get("unknown") or "started on, or has seen, code without telemetry"
-            return f"memory server pid {p.get('pid')} may run old code ({why})"
+            return f"{who} may run old code ({why})"
     return None
 
 

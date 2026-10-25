@@ -18,6 +18,8 @@ _spec.loader.exec_module(_rep)
 
 NOW = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
 
+from genesis.memory.graph_cutover import CLEAN_CENSUS_SCHEMA  # noqa: E402
+
 
 def _ts(t: datetime) -> str:
     return t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -34,12 +36,13 @@ def _db(
         " created_at TEXT, prompt_hash TEXT)"
     )
     census = {
-        "v": 2,  # graph_cutover.CLEAN_CENSUS_SCHEMA
+        "v": CLEAN_CENSUS_SCHEMA,
         "procs": [],
         "other_servers": {},
         "unclassified": 0,
         "head_telemetry": True,
         "head_dirty": False,
+        "head_history_telemetry": True,
         "complete": True,
         "reasons": [],
     }

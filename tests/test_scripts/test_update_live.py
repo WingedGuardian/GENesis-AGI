@@ -27,6 +27,12 @@ from tests.test_scripts.test_bootstrap_guards import (
     _recovery_git,
     _recovery_repo,
 )
+from tests.test_scripts.test_update_state_guard import (
+    diverged_live,
+    kill_switch_after,
+    live_row,
+    post_merge_advice,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO / "scripts"
@@ -378,11 +384,16 @@ root = os.environ["STUB_ROOT"]
 
 
 def record(to, phase):
-    # The engine's move record, as deploy_candidates_plan.py writes it.
-    path = os.environ.get("DEPLOY_CANDIDATES_MOVE_RECORD")
-    if path:
-        with open(path, "w") as fh:
-            fh.write(json.dumps({"to": to, "phase": phase}) if phase != "garbage" else "{")
+    # The engine's move record, as deploy_candidates.py writes it: live_move in
+    # the row of the update.sh that named itself (#3492).
+    if not os.environ.get("DEPLOY_CANDIDATES_OWN_STATE_PID"):
+        return
+    path = os.path.join(os.environ["HOME"], ".genesis", "update_state.json")
+    with open(path) as fh:
+        state = json.load(fh)
+    state["live_move"] = {"to": to, "phase": phase} if phase != "garbage" else "{"
+    with open(path, "w") as fh:
+        json.dump(state, fh)
 
 
 def head():
@@ -422,6 +433,13 @@ if sys.argv[1] == "rebuild":
         # killed mid-switch (the record still says "moving"); HEAD stayed.
         open(os.path.join(root, "half-written.py"), "w").write("x = 1\\n")
         record("e" * 40, "moving" if mode == "interrupted" else mode)
+    if mode in ("interrupted-written", "interrupted-clean"):
+        # Killed mid-switch toward a real target (STUB_TARGET adds
+        # half-written.py): the record says "moving", HEAD stayed. "written":
+        # git had written that file; "clean": it had written nothing.
+        if mode == "interrupted-written":
+            open(os.path.join(root, "half-written.py"), "w").write("x = 1\\n")
+        record(os.environ["STUB_TARGET"], "moving")
     if mode == "move-signal":
         os.kill(os.getppid(), signal.SIGTERM)
     sys.exit(0 if mode in ("", "move", "foreign-success", "unrecorded-success",
@@ -436,21 +454,32 @@ sys.exit(0)
 
 @pytest.fixture
 def plain_live(tmp_path: Path):
-    """A checkout on `live` with the rollback tag at HEAD, and a stub engine."""
+    """A checkout on `live` with the rollback tag at HEAD, a stub engine, the
+    shared state guard beside it (as update.sh's scripts/lib holds it), and a
+    commit off HEAD that adds half-written.py (STUB_TARGET: a move's target)."""
     root, home, stub = tmp_path / "root", tmp_path / "home", tmp_path / "stub"
     (home / ".genesis").mkdir(parents=True)
-    stub.mkdir()
+    (stub / "lib").mkdir(parents=True)
     (stub / "deploy_candidates.py").write_text(_STUB_ENGINE)
+    for name in ("update_state_guard.py", "deploy_checkout.sh"):
+        (stub / "lib" / name).write_text((SCRIPTS / "lib" / name).read_text())
     subprocess.run(["git", "init", "-q", "-b", "live", str(root)], check=True, env=_env(home))
     (root / "f.txt").write_text("1\n")
     _git(root, "add", ".")
     _git(root, "commit", "-qm", "base")
+    base = _git(root, "rev-parse", "HEAD")
+    (root / "half-written.py").write_text("x = 1\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "a rebuild's tip")
+    target = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", base)
     _git(root, "tag", TAG)
     env = _env(
         home,
         STUB_LOG=str(tmp_path / "engine.log"),
         STUB_ROOT=str(root),
-        STUB_BASE=_git(root, "rev-parse", "HEAD"),
+        STUB_BASE=base,
+        STUB_TARGET=target,
     )
     return root, home, stub, env, tmp_path / "engine.log"
 
@@ -460,7 +489,14 @@ def _plain_script(root: Path, stub: Path, mu_src: str = "import sys\n", pre: str
 
 
 def _move_record(home: Path) -> Path:
+    """The side file earlier versions recorded the move in: never written now."""
     return home / ".genesis" / "live_move.json"
+
+
+def _row_record(home: Path) -> dict | None:
+    """The engine's record in update.sh's row (#3492), or None."""
+    state = _state(home)
+    return state.get("live_move") if state else None
 
 
 def _engine_calls(log: Path) -> list[str]:
@@ -481,7 +517,8 @@ def test_the_engine_gets_the_update_lock_its_own_state_pid_and_a_free_checkout_l
     state = _state(home)
     assert state["phase"] == "merging" and state["pid"] == int(fields["own"])
     assert state["own_head"] == _git(root, "rev-parse", "HEAD") != state["rollback_tag"]
-    assert not _move_record(home).exists(), "the adopted move's record outlived the adoption"
+    assert not _move_record(home).exists(), "the retired side file was written"
+    assert _row_record(home) is None, "the adopted move's record outlived the adoption"
 
 
 def test_the_engine_is_told_where_update_sh_left_the_checkout(plain_live):
@@ -549,6 +586,10 @@ def test_a_moved_tip_the_record_does_not_name_is_never_adopted(plain_live, mode)
     assert not any(c.startswith("restore-hooks ") for c in _engine_calls(log))
     assert _state(home) is not None, "the restart guard went while moved code stays"
     assert not _move_record(home).exists()
+    if mode != "unrecorded-success":
+        assert _row_record(home) == {"to": "f" * 40, "phase": "done"}, (
+            "the record went with the rollback that kept the state"
+        )
 
 
 @pytest.mark.parametrize("mode", ["", "move-ref", "move-moving"])
@@ -577,6 +618,33 @@ def test_a_partly_written_tree_is_never_restarted(plain_live, mode):
     assert "restart-server" not in _calls(home), "services restarted on a mixed tree"
     assert "ROLLBACK INCOMPLETE" in r.stdout and "mixed working tree" in r.stdout, r.stdout
     assert _state(home) is not None
+    assert _row_record(home) is not None, "the record went with the rollback that kept the state"
+
+
+def test_t4q_a_suspect_rollback_keeps_the_record_and_names_the_paths(plain_live):
+    """T4q: the switch was killed after writing a file its target adds (HEAD
+    unmoved, the record "moving"). The rollback restarts nothing, keeps the
+    state WITH the record (every later reader judges it), and says what the
+    shared guard says: the paths, and that --post-merge refuses this tree."""
+    root, home, stub, env, log = plain_live
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "interrupted-written"})
+    assert r.returncode == 1, _out(r)
+    assert "restart-server" not in _calls(home), "services restarted on a mixed tree"
+    assert _row_record(home) == {"to": env["STUB_TARGET"], "phase": "moving"}
+    kept = r.stdout[r.stdout.index("is kept as the restart guard") :]
+    assert "half-written.py" in kept and "Do NOT run scripts/update.sh --post-merge" in kept, kept
+    assert not post_merge_advice(kept), kept
+
+
+def test_t4r_a_switch_killed_before_it_wrote_anything_restarts_the_old_tip(plain_live):
+    """T4r: the record says "moving" but the two-dot residue toward its target
+    is empty: git wrote nothing, so the old tip is as it was and restarts."""
+    root, home, stub, env, log = plain_live
+    old = _git(root, "rev-parse", "HEAD")
+    r = _bash(_plain_script(root, stub), {**env, "STUB_MODE": "interrupted-clean"})
+    assert r.returncode == 1, _out(r)
+    assert "mixed working tree" not in r.stdout, r.stdout
+    _assert_rolled_back_onto(home, _git(root, "rev-parse", "HEAD"), old)
 
 
 _REFUSE_UNITS = 'import sys\nprint("REFUSED: demo.service (edited by hand)")\nsys.exit(4)\n'
@@ -1437,3 +1505,96 @@ def test_r3b_off_live_the_checkout_gate_still_decides(plain_live):
     r = _gate_run(plain_live, "0", real)
     assert r.returncode == 0, _out(r)
     assert "GATE-PASSED" in r.stdout
+
+
+# ── R1 over a real switch between diverged tips (#3492 T4g) ─────────────────
+
+
+def _adopt_on(d: dict, home: Path, state: dict) -> subprocess.CompletedProcess:
+    """update.sh's _live_adopt_tip (live-helpers, verbatim) on a live row whose
+    engine ran, as its rollback calls it."""
+    (home / ".genesis").mkdir(parents=True, exist_ok=True)
+    (home / ".genesis" / "update_state.json").write_text(json.dumps(state))
+    script = (
+        f'GENESIS_ROOT="{d["root"]}"\nON_LIVE=1\n_LIVE_ENGINE_RAN=1\nORIGINAL_BRANCH=live\n'
+        f'ROLLBACK_TAG=pre\nUPDATE_OWN_HEAD="{d["old"]}"\n_LIVE_TREE_SUSPECT=0\n'
+        'STATE_FILE="$HOME/.genesis/update_state.json"\n'
+        + _block("live-helpers")
+        + '_live_adopt_tip\necho "SUSPECT=$_LIVE_TREE_SUSPECT OWN=$UPDATE_OWN_HEAD"\n'
+    )
+    return _bash(script, _env(home))
+
+
+def test_t4g_r1_marks_a_real_diverged_switch_kill_suspect(tmp_path):
+    """T4g, R1: a real switch from the old live tip to a diverged new one,
+    killed after writing F (the path a dropped candidate had deleted, which only
+    the two-dot range names). The rollback must not restart on that tree."""
+    d = diverged_live(tmp_path / "repo", tag_only=False)
+    kill_switch_after(d["root"], d["new"], "Z")
+    r = _adopt_on(d, tmp_path / "home", live_row(d))
+    assert r.returncode == 0, _out(r)
+    assert "SUSPECT=1" in r.stdout and "    ?? F" in r.stdout, _out(r)
+
+
+def test_t4g_r1_a_switch_that_wrote_nothing_is_not_suspect(tmp_path):
+    """Control: the same record over an untouched tree restarts the old tip."""
+    d = diverged_live(tmp_path / "repo", tag_only=False)
+    r = _adopt_on(d, tmp_path / "home", live_row(d))
+    assert r.returncode == 0, _out(r)
+    assert f"SUSPECT=0 OWN={d['old']}" in r.stdout, _out(r)
+
+
+def test_sf2_r1_a_foreign_edit_does_not_make_an_untouched_tree_suspect(tmp_path):
+    """SF2: the switch began ("moving") and wrote nothing; A, which no switch
+    between the tag and the target writes, carries someone's edit. The tree is
+    not half-written (the code guard still keeps the services down over the
+    foreign edit, as it always has)."""
+    d = diverged_live(tmp_path / "repo", tag_only=False)
+    (d["root"] / "A").write_text("a session's edit\n")
+    r = _adopt_on(d, tmp_path / "home", live_row(d))
+    assert r.returncode == 0, _out(r)
+    assert "SUSPECT=0" in r.stdout, _out(r)
+
+
+def test_sf2_r1_an_edit_on_a_switch_path_is_still_suspect(tmp_path):
+    """Control: O is the tag's and the switch deletes it."""
+    d = diverged_live(tmp_path / "repo")
+    (d["root"] / "O").write_text("half\n")
+    r = _adopt_on(d, tmp_path / "home", live_row(d))
+    assert r.returncode == 0, _out(r)
+    assert "SUSPECT=1" in r.stdout and "M O" in r.stdout, _out(r)
+
+
+def test_review_s2_the_rollback_prints_each_residue_path_as_one_token(tmp_path):
+    """#3532 round-3 review S2: the rollback's own residue printout. A path with
+    a newline is one line, and ESC never reaches the terminal raw."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "live")
+    (root / "a.txt").write_text("a\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "old tip")
+    old = _git(root, "rev-parse", "HEAD")
+    _git(root, "tag", "pre")
+    for name in ("nl\nx", "e\x1bv"):
+        (root / name).write_text("x\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "new tip")
+    new = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", old)
+    for name in ("nl\nx", "e\x1bv"):
+        (root / name).write_text("x\n")
+    state = {
+        "phase": "merging",
+        "rollback_tag": "pre",
+        "original_branch": "live",
+        "own_head": old,
+        "post_merge": False,
+        "live_move": {"to": new, "phase": "moving"},
+    }
+    r = _adopt_on({"root": root, "old": old}, tmp_path / "home", state)
+    assert r.returncode == 0, _out(r)
+    assert "SUSPECT=1" in r.stdout, _out(r)
+    assert "\x1b" not in r.stdout, repr(r.stdout)
+    assert "    ?? $'nl\\nx'" in r.stdout.split("\n"), repr(r.stdout)
+    assert "    ?? $'e\\Ev'" in r.stdout.split("\n"), repr(r.stdout)

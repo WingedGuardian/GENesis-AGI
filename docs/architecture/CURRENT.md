@@ -339,10 +339,26 @@ open (`live_db_moved` otherwise). The threat model is accidental drift (owner
 ruling): deliberately constructed inputs, such as a swapped ancestor directory
 or forged bytecode, are documented residuals in the module docstring. Anything unproven
 lands in `unknown_reasons` or `telemetry_off: null`, and the verdict reads the
-row as not clean, so the clock waits for that server to restart. The cutover
-clock can only start at a census with no server that could be running older
-code; a row of an older schema reads dirty ("predates the current census
-contract"). Pruned with the telemetry rows.
+row as not clean, so the clock waits for that server to restart. Since schema 3
+the census covers the other traversal producers it can see in `/proc`, not
+only memory servers:
+- ambient workers: the same source proof against main's worker script, with the
+  switch and database taken from the launch environment, since the worker loads
+  no secrets file;
+- the census host's own row, proven from where its genesis modules actually
+  loaded;
+- any other python process on main's venv (found by its absolute interpreter
+  path, or by resolving a bare `python` through its own PATH): history and
+  database scope only (owner ruling);
+- replay, listed as excluded because it is not live traffic (owner ruling);
+- another bridge or server beside the host, always dirty.
+
+A census-level `head_history_telemetry` checks every commit HEAD held in the
+last 2h30m, so the CODE HISTORY of a process that lived and died between two
+censuses is still covered; its source and switch are not. Every producer row
+uses the memory servers' database rule above. The cutover clock can only start
+at a census with no producer that could be running older code; a row of an older schema reads dirty
+("predates the current census contract"). Pruned with the telemetry rows.
 **The verdict** is `scripts/graph_cutover_report.py` over the pure
 `memory/graph_cutover.py`: PASS needs 14 days on the clock, at least 100
 falkordb-served traversals and falkordb traffic on at least 10 UTC days in the
@@ -1250,7 +1266,7 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: 50b79ffb 2026-09-01
+verified: a8fa35a358bc 2026-10-23
 ```
 
 - **Surplus generators are deliberately BLIND to `infrastructure_alert`
@@ -1291,7 +1307,12 @@ verified: 50b79ffb 2026-09-01
   distinct labels classified `external_untrusted` (wrapped on recall).
 - **`scheduler/` (top-level package) is the UserJobScheduler** — user-authored
   cron jobs (via MCP) that dispatch background DirectSessions. Distinct from
-  `surplus/scheduler.py`.
+  `surplus/scheduler.py`. Saved `active` is desired intent, while MCP/dashboard
+  `registered` derives current membership in the running scheduler. Failed
+  create registration retains the saved ID; retry `resume` on that ID or the
+  next startup reloads active intent. There is no automatic in-process
+  registration retry loop. Dispatch history `passed` means spawn accepted,
+  not session completion or delivery. See [user-job recovery](../reference/user-jobs.md).
 - `follow_ups/` = accountability ledger + dispatcher (every 5 min) that turns
   follow-ups into surplus tasks; retention sweep on the learning scheduler. The
   `follow_up_create` MCP tool routes USER-OWNED and purely-local operational work
@@ -1638,6 +1659,13 @@ the shared banner is not an assertion about all concurrent sessions.
   locks. This does not activate the service or establish production capacity
   or unattended resource-failure readiness. See
   `docs/reference/codebase-managed.md`.
+  The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
+  artifacts in retained import receipts without replacing business failures;
+  real filesystem/SQLite errors remain visible. Schema 2 upgrades metadata
+  atomically and older writers refuse it. The marker CLI `import-status`
+  observes receipt totals without initialization or migration. This does not
+  implement persistent resource quarantine or the runner's separate list/claim
+  error propagation.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -2916,8 +2944,16 @@ verified: 2f013ed7b 2026-10-23
   extracts physical records, preserves unresolved identity and usage, and
   applies the shared credential scrubber to structured content. Schema5 records
   distinguish executor identity from delegation evidence. This development
-  candidate adds the parser and optional DuckDB/Parquet dependencies; storage,
-  queries, CLI, scheduling and encrypted recovery arrive in dependent changes.
+  candidate adds the parser, durable per-source Parquet records and audited
+  historical readers. Readers capture immutable source selections; historical
+  provenance and unavailable facts remain explicit. Ingestion keeps one captured
+  canonical root, rejects malformed persisted root bindings and isolates source
+  stat failures. Transcript and sidecar-fingerprint reads admit regular descriptors
+  without blocking; fingerprint metadata is limited to 1 MiB. The extractor's
+  independent sidecar reopen remains outside adversarial-concurrency guarantees;
+  parser signatures and historical formats are unchanged. Queries, CLI and scheduling
+  arrive in dependent changes. Additional backup and recovery work is deferred
+  independently of collection and search.
   It does not describe a deployed capability.
   Hook names are limited to literal command targets and option-free supported
   interpreter operands; ambiguous commands report `<unknown>` while preserving
@@ -4082,23 +4118,63 @@ tool-disabled CC probe without changing its schedule or routing authority.
   update that merged code and never activated it, or that stopped on merge
   conflicts, leaves it behind. Whether it still guards is ONE rule,
   `scripts/lib/update_state_guard.py` (stdlib; `safe` / `guards` /
-  `conflict_pending`, plus the remedy text): a "done" state, a plain run's
-  "fetching" at its rollback tag, and a "merging" at the tag with no merge
-  residue and no recorded conflict guard nothing; anything unreadable guards.
-  `deploy_code_only.sh` and the live engine refuse to restart or move the
-  checkout while it guards; a plain `update.sh` exits 5 (before tagging or
-  writing anything), and the dashboard's `/apply` answers 409 on both paths;
-  `--post-merge` is the run that finishes it. Only the run that wrote the file
-  deletes it on its exits (never a `--post-merge`, never a run that had not
-  written yet), a rollback that left merged code keeps it, and bootstrap's
-  crash recovery keeps a pending conflict. The dashboard's progress poll is
-  read-only: it reports the verdict and offers Dismiss, the one retirement by
-  hand. The merge-residue check is shared with bootstrap
-  (`genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`). One exception
+  `conflict_pending` / `mixed_tree` / `holds`, plus the remedy text): a "done"
+  state, a plain run's "fetching" at its rollback tag, and a "merging" at the tag
+  with no merge residue and no recorded conflict guard nothing. A guarding state
+  is one of two kinds (#3532): `guards` (exit 0) is merged code complete on disk
+  that bootstrap has not run on, which `--post-merge` finishes; `holds` (exit 6)
+  is every state where finishing forward is wrong or unknown (the update never
+  changed the checkout, it is not where the update left it, the record cannot be
+  trusted or read, a merge is in progress), whose message names the remedy
+  (usually: save any edit, Dismiss, run the update again). HEAD at the update's
+  own new code (`own_head`) in any phase is checked for a rollback checkout
+  killed partway back to the tag (the two-dot residue back toward the tag),
+  main and `live` alike. Merge residue at the tag is `mixed_tree` (exit 4): a half-written
+  checkout, whose message lists the paths and says to save, restore and
+  Dismiss. Residue counts tracked changes only on the paths the merge
+  (`rollback...deploy_head`) writes; a tracked change elsewhere (an indexer's,
+  another session's) with nothing merged `holds`, not `mixed_tree`. A "merging" row carrying the live engine's move record
+  (`live_move`, #3492) is judged by the TWO-DOT diff a `git switch` writes
+  (the old and new `live` tips diverge, so main's symmetric range would miss
+  what a dropped candidate had deleted), toward the record's target with HEAD
+  at the tag, and back toward the tag with HEAD at the target (a rollback
+  checkout killed partway); only tracked changes on the switch's own paths
+  count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
+  row on `live` whose record update.sh already dropped (it adopted the tip,
+  own_head is that tip) is judged the same way toward own_head, so a rollback
+  killed partway after adoption is caught too. The remedy follows HEAD: at the
+  tag, put the paths back and Dismiss; at the update's new code (main's merge
+  or the rebuilt tip), put them back and finish with `--post-merge`
+  (Dismissing there leaves code bootstrap never ran on). The dashboard's progress poll returns the guard's remedy
+  (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
+  restart or move the checkout while it guards; a plain `update.sh` exits 5
+  (before tagging or writing anything), and the dashboard's `/apply` answers
+  409 on both paths; `--post-merge` finishes only `guards` (a resolved, committed conflict and a
+  merge that landed before update.sh recorded it read so too), and refuses
+  (exit 5, main and `live` alike) a `conflict_pending`, a `mixed_tree`, a
+  `holds`, a state with nothing to finish, or a guard that could not run, with
+  the guard's remedy. Bootstrap's crash recovery and update.sh's kept-state line
+  print that remedy too. Only the run
+  that wrote the file deletes it on its exits (never a `--post-merge`, never a
+  run that had not written yet), a rollback that left merged code keeps it, and
+  bootstrap's crash recovery keeps a pending conflict. Bootstrap's crash
+  recovery judges liveness by update.lock alone, never the recorded pid (a
+  zombie or a reused pid looks alive): held, it goes on only when the state's
+  pid is running it, either named in `GENESIS_BOOTSTRAP_UPDATE_PID` (update.sh
+  passes its own pid) or as bootstrap's direct parent (`$PPID`, how an
+  update.sh from before the token calls it: every install runs that one once,
+  against this bootstrap, on the update that brings it in), and refuses
+  otherwise, a hand-run bootstrap during a live update (its parent is a shell)
+  or an orphaned engine included; free, the update is dead and recovery runs.
+  At the tag in "merging" it goes on only on the guard's exit 10, printing
+  the guard's message otherwise. The dashboard's progress poll is read-only:
+  it reports the verdict and offers Dismiss, the one retirement by hand. The
+  residue check is `genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`
+  (`--two-dot` for a live row). One exception
   in the engine: the "merging" row of the `update.sh` that is running the
   rebuild (its pid named in `DEPLOY_CANDIDATES_OWN_STATE_PID`, equal to the
   engine's parent, update.lock handed over, a plain run) is neither refused nor
-  retired.
+  retired; a run that names a pid whose row is not that run's own refuses.
 - **`update.sh` on `live`** (#2978, #3370): the merge's place, after the stop,
   is taken by the deploy-candidates engine's rebuild (`scripts/deploy_candidates.py
   rebuild`, the `live-engine` block). Everything else is main's path: one DB
@@ -4129,11 +4205,14 @@ tool-disabled CC probe without changing its schedule or routing authority.
   main while `live` already sat at the tip is not seen: git logs nothing
   then). A tracked edit in that last window, before git takes index.lock, is
   not warned about. What the engine did to the checkout is read
-  from its move record (`DEPLOY_CANDIDATES_MOVE_RECORD`, here
-  `~/.genesis/live_move.json`: `{"to", "phase"}` with phase `ref` / `moving` /
-  `partial` / `clean` / `done`, written by `deploy_candidates_plan.py` before and
-  after the move; a record that cannot be written before the move refuses it),
-  never inferred from git: a moved checkout is adopted only when HEAD is on
+  from its move record (`live_move` in update.sh's own "merging" row:
+  `{"to", "phase"}` with phase `ref` / `moving` / `partial` / `clean` / `done`,
+  written by the engine before and after the move, durably (fsynced) before it,
+  and only while the row is still that run's own; a record that cannot be
+  written before the move refuses it; the row outlives the run, so a crash
+  leaves it for every reader; the old `~/.genesis/live_move.json` side file is
+  no longer written or read: no engine ever moved a checkout before it, as
+  readiness refuses every move until PR C2's marker exists), never inferred from git: a moved checkout is adopted only when HEAD is on
   `live` at exactly the commit the record names, then moved back to the
   rollback tag with its git hooks restored (`restore-hooks`), and the services
   restart on the old tip. `restore-hooks` exits 1 when a hook could not be
@@ -4142,10 +4221,13 @@ tool-disabled CC probe without changing its schedule or routing authority.
   installed byte-identical and executable (readiness's own check,
   `hook_install_failures` in `deploy_candidates_gate.py`), a hand-edited hook
   included; the rollback then reports itself incomplete (a rebuild or drop,
-  past its commit point, only warns). A record that cannot be read, or that
-  says the switch began or wrote part of the tree while HEAD is not at its
-  target, means a possibly mixed working tree: nothing is restarted and the
-  rollback reports itself incomplete. Exit 4 after such a rollback needs it to
+  past its commit point, only warns). A record that cannot be read, that says
+  git wrote part of the tree, or that says the switch began while the two-dot
+  residue toward its target is non-empty (HEAD not at the target) means a
+  possibly mixed working tree: nothing is restarted, the rollback reports
+  itself incomplete, the state is kept with its record, and the guard's
+  `mixed_tree` message is printed. A switch that began and wrote nothing
+  restarts the old tip. Exit 4 after such a rollback needs it to
   have completed, hook restore, every service restart and a restarted
   genesis-server answering its health endpoint included; that health wait (up
   to 180 s) runs only on the units-refusal path that can exit 4, inside the
@@ -4167,7 +4249,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: f9a1d4cb 2026-10-18
+verified: 3e27b479 2026-10-23
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4225,6 +4307,15 @@ verified: f9a1d4cb 2026-10-18
   evidence, and returns control to the user without native approval or Genesis
   lifecycle registration. It does not enforce the future reflection gates or
   cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
+  A separate, inactive `scripts/hooks/codex-validator-adapter` translates native
+  validator calls to the existing guards concurrently. It requires an absolute
+  Bash cd/exit opener terminated by a newline, confines patches to validator
+  scratch roots, translates asks
+  to denials and preserves advisories. Six source-bound publishing-allowance
+  tests retain direct evidence only; separate independent-state controls verify
+  the actual ask/refusal and existing push-cache effects. It has no ordinary configuration wiring
+  or role-specific publishing/store policy yet. See
+  `docs/reference/codex-validator-boundary.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,

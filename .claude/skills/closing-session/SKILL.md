@@ -517,6 +517,8 @@ fired at rounds 2 and 3, over findings the gate never counted. The owner's
 words: "You don't block on the things that aren't blocking."
 
 **A PR labelled `gate-surface`, or whose diff touches the enforcement-hook surface, runs the gate-fix lane.** Before writing any fix or requesting any review on it, read `.claude/skills/genesis-development/references/gate-fix-lane.md` (MANDATORY).
+- Round 1 is DUAL: Codex plus the install's secondary reviewer (`merge_gate.secondary_reviewer`), run together at PR open under the lane's standing approval. With no secondary configured it is Codex-only, and the PR says so.
+- After round 1 the diff SHRINKS in scope, never grows: a floor fix may add lines, but new capability is a new PR.
 - Triage before touching code: on this surface the cost is not the edit, it is the PUSH, so a cheap NON-floor finding gets a reply, not a commit.
 - Round 2 is the discovery stop, and the owner decides (step 4): accept and merge with every outstanding finding documented in the PR body, or abandon and re-cut; the always-fix floor is never accepted — a P1, a security defect, anything destructive or fail-open gets FIXED in the terminal push.
 - A NEW P1 on the fix-code at round 2 is an owner decision, not round 3: stop and ask, and with no user to ask, do not merge and do not open round 3.
@@ -556,7 +558,9 @@ each of those is terminal in the same way (this replaced "round 6 and later are
 strongly discouraged", which read round 5 as ordinary; the discouragement was never a
 softer tier, but the mechanism that stops an authorized fifth round coasting into a
 sixth unasked). On the gate-surface lane the same
-ladder is compressed to two rounds, each carrying two ordinary rounds' work.
+ladder is compressed to two discovery rounds plus the marked confirmation
+(`scripts/review_budget.py`, `confirmation_exempt`), each discovery round carrying
+two ordinary rounds' work.
 
 Two caveats a closing session needs, because both are live today. The MECHANISM
 still permits round 5+ under per-request approval — aligning it is tracked work,
@@ -1320,8 +1324,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `scripts/review_budget.py`; the commit gate reads the local streak from one snapshot
   only for the round-2/round-3 interventions. The old lifetime APIs remain
   import-compatible but current gates do not consult them. The
-  `final-round-accept` SIGIL is still parsed and loudly refused, so a stale
-  worktree is still told it is dead.
+  `final-round-accept` SIGIL is still parsed and authorizes nothing. The commit
+  gate and the push guard name it as retired only when they are already asking
+  for approval (`review_enforcement_commit.py` `_allow`; `git_push_guard.py`, the
+  review-request ask); on an action that needs no approval it passes silently.
 
   **THE COUNTER IS CROSS-MODEL ONLY.** The streak exists to catch *cross-model
   non-convergence* — an EXTERNAL reviewer finding NEW defects round after round. It does
@@ -1338,8 +1344,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   is ever `--source external`. The approved methods are **Codex** plus whatever the
   install names as its SECONDARY reviewer — `merge_gate.secondary_reviewer` in local
   `genesis.yaml` — one value, the model or CLI to invoke; **absent means there is no
-  standing secondary**,
-  and round 1 of the gate-fix lane (`.claude/skills/genesis-development/references/gate-fix-lane.md`) runs Codex-only. It is named in config rather
+  standing secondary**, and only then does round 1 of the gate-fix lane
+  (`.claude/skills/genesis-development/references/gate-fix-lane.md`) run Codex-only;
+  with a secondary configured, that round is dual. The secondary is named in config rather
   than here because which model an install can reach is install-local, and a version
   frozen into this file goes stale the day the model does. **OpenRouter is NOT an
   approved method** (a future option, not a current one).
