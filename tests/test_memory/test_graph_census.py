@@ -350,7 +350,7 @@ async def test_record_census_writes_one_row(db, monkeypatch):
 
     await census.record_census(db)
     # The live database is the one THIS process's connection holds open.
-    assert seen == {"live_held_by": os.getpid()}
+    assert seen == {"host_pid": os.getpid(), "include_host": True, "live_held_by": os.getpid()}
 
     cur = await db.execute(
         "SELECT dimension, metrics_json FROM eval_events WHERE event_type = ?",
@@ -631,7 +631,6 @@ def test_the_default_secrets_file_is_main_checkouts(proc_root, repo, tmp_path, m
     assert p2["telemetry_off"] is None
 
 
-
 def test_a_bench_server_holding_the_live_db_open_is_counted(proc_root, repo, tmp_path, main_venv):
     """Its path names a scratch DB, but its open descriptors include the live
     one: that handle is what its long-lived connection uses."""
@@ -670,3 +669,419 @@ def test_the_census_names_the_live_db_its_writer_holds_open(proc_root, repo, tmp
     assert (moved["complete"], "live_db_moved" in moved["reasons"]) == (False, True)
     gone = census.build_census(r, proc_root=proc_root, live_db=live, live_held_by=99999)
     assert "live_db_moved" in gone["reasons"]
+
+
+# ── PR2: every traversal producer, not just memory servers ────────────────
+
+
+def _roles_census(proc_root, repo, tmp_path, procs, *, fds=None, **kw) -> dict:
+    """A census over several fake processes: (pid, argv, env, started).
+    ``fds`` maps a pid to the files it holds open."""
+    import time as _time
+
+    r, _, _ = repo
+    live = tmp_path / "live.db"
+    live.touch()
+    for pid, argv, env, started in procs:
+        _proc(proc_root, pid, argv, started=started or _time.time() + 60, env=env,
+              exe=str(tmp_path / "sys" / "bin" / "python3.12"), fds=(fds or {}).get(pid))
+    return census.build_census(r, proc_root=proc_root, live_db=live, **kw)
+
+
+def _worker_argv(repo, venv_argv, *, tree=None) -> list[str]:
+    r, _, _ = repo
+    script = (tree or r) / "scripts" / "ambient_awareness_worker.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("")
+    return [venv_argv[0], str(script), "--session-id", "s"]
+
+
+def test_an_ambient_worker_on_main_is_proven_from_its_launch_env(
+    proc_root, repo, tmp_path, main_venv
+):
+    """The worker loads no secrets file and builds no router: its launch
+    environment is exactly what it runs with."""
+    m = _roles_census(proc_root, repo, tmp_path, [(90, _worker_argv(repo, main_venv), {}, None)])
+    [p] = m["procs"]
+    assert p["role"] == "ambient"
+    assert (p["source"], p["unknown_reasons"]) == ("main", [])
+    assert p["telemetry_off"] is False
+    assert p["telemetry"] is True
+
+
+def test_an_ambient_worker_with_its_switch_on_says_so(proc_root, repo, tmp_path, main_venv):
+    env = {"GENESIS_GRAPH_TELEMETRY_DISABLED": "1"}
+    m = _roles_census(proc_root, repo, tmp_path, [(91, _worker_argv(repo, main_venv), env, None)])
+    assert m["procs"][0]["telemetry_off"] is True
+
+
+def test_an_ambient_worker_from_another_tree_is_not_main(proc_root, repo, tmp_path, main_venv):
+    argv = _worker_argv(repo, main_venv, tree=tmp_path / "wt")
+    m = _roles_census(proc_root, repo, tmp_path, [(92, argv, {}, None)])
+    assert m["procs"][0]["unknown_reasons"] == ["script_not_main"]
+
+
+def test_a_replay_is_listed_as_excluded_never_as_dirt(proc_root, repo, tmp_path, main_venv):
+    """Owner ruling ba877469: replay re-runs historical turns, not live traffic."""
+    r, _, _ = repo
+    argv = [main_venv[0], str(r / "scripts" / "ambient_replay.py"), "--session-id", "s"]
+    m = _roles_census(proc_root, repo, tmp_path, [(93, argv, {}, None)])
+    [p] = m["procs"]
+    assert (p["role"], p["excluded"]) == ("replay", "replay_not_live_traffic")
+
+
+@pytest.mark.parametrize(
+    "tail", [["-m", "genesis.channels.bridge"], ["-m", "genesis", "serve", "--port", "1"]]
+)
+def test_another_stack_beside_the_census_host_is_dirty(proc_root, repo, tmp_path, main_venv, tail):
+    m = _roles_census(proc_root, repo, tmp_path, [(94, [main_venv[0], *tail], {}, None)])
+    [p] = m["procs"]
+    assert p["role"] in ("bridge", "server")
+    assert p["unknown_reasons"] == ["runs_alongside_host"]
+
+
+def test_the_census_host_itself_is_never_scanned_as_a_peer(proc_root, repo, tmp_path, main_venv):
+    m = _roles_census(
+        proc_root, repo, tmp_path,
+        [(95, [main_venv[0], "-m", "genesis", "serve"], {}, None)], host_pid=95,
+    )
+    assert m["procs"] == []
+
+
+def test_a_generic_venv_process_gets_history_and_scope_only(proc_root, repo, tmp_path, main_venv):
+    """Owner ruling ba877469: history plus scope, no source or switch proof."""
+    r, old, _ = repo
+    old_at = _reflog_times(r)[1][0]
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    m = _roles_census(
+        proc_root, repo, tmp_path,
+        [
+            (96, [main_venv[0], "-m", "pytest"], {}, old_at + 60),  # began on old code
+            (97, [main_venv[0], "-"], {"GENESIS_DB_PATH": str(bench)}, None),  # scratch DB
+        ],
+    )
+    by_pid = {p["pid"]: p for p in m["procs"]}
+    assert by_pid[96]["role"] == "venv-generic"
+    assert by_pid[96]["telemetry"] is False
+    assert "unknown_reasons" not in by_pid[96]
+    assert by_pid[97]["foreign"] is True
+
+
+def test_a_process_on_another_interpreter_is_not_counted(proc_root, repo, tmp_path, main_venv):
+    m = _roles_census(proc_root, repo, tmp_path, [(98, ["/usr/bin/python3", "-m", "pytest"], {}, None)])
+    assert m["procs"] == []
+
+
+def test_head_history_covers_the_last_two_and_a_half_hours(proc_root, repo, tmp_path, main_venv):
+    """A process spawned and gone between two censuses left no row, so the
+    census also checks every commit HEAD held in the window."""
+    r, old, _ = repo
+    m = _roles_census(proc_root, repo, tmp_path, [])
+    assert m["head_history_telemetry"] is True  # the fixture's moves are months old
+    _git(r, "checkout", "-q", old)  # now: HEAD holds code without telemetry
+    _git(r, "checkout", "-q", "main")
+    m = _roles_census(proc_root, repo, tmp_path, [])
+    assert m["head_history_telemetry"] is False
+
+
+def test_the_host_row_is_proven_from_where_its_modules_loaded(tmp_path):
+    from genesis.env import repo_root
+
+    real_src_root = Path(census.__file__).resolve().parents[3]
+    assert census.host_source_reasons(real_src_root) == []
+    assert census.host_source_reasons(tmp_path) == ["host_source_not_main"]
+    assert repo_root()  # resolvable in the test env
+
+
+def test_build_census_appends_the_host_row_when_asked(proc_root, repo, tmp_path, main_venv):
+    import os as _os
+
+    m = _roles_census(proc_root, repo, tmp_path, [], host_pid=_os.getpid(), include_host=True)
+    [host] = m["procs"]
+    assert host["pid"] == _os.getpid()
+    assert host["host"] is True
+    # The fixture repo is not where this test's genesis modules came from.
+    assert host["unknown_reasons"] == ["host_source_not_main"]
+
+
+def test_a_venv_python_started_by_name_is_found_through_its_path(
+    proc_root, repo, tmp_path, main_venv
+):
+    """An activated venv runs `python script.py`: a relative argv0 that exec
+    resolved through the process's own PATH."""
+    venv_bin = str(Path(main_venv[0]).parent)
+    Path(main_venv[0]).resolve().chmod(0o755)  # exec resolves only executables
+    other_bin = tmp_path / "other-venv" / "bin"
+    other_bin.mkdir(parents=True)
+    (other_bin / "python3").write_text("")
+    (other_bin / "python3").chmod(0o755)
+    m = _roles_census(
+        proc_root, repo, tmp_path,
+        [
+            (99, ["python", "job.py"], {"PATH": f"{venv_bin}:/usr/bin"}, None),
+            (100, ["python3", "plugin.py"], {"PATH": f"{other_bin}:/usr/bin"}, None),
+        ],
+    )
+    assert [(p["pid"], p["role"]) for p in m["procs"]] == [(99, "venv-generic")]
+
+
+def test_a_non_python_process_naming_the_worker_is_not_a_producer(
+    proc_root, repo, tmp_path, main_venv
+):
+    r, _, _ = repo
+    worker = str(r / "scripts" / "ambient_awareness_worker.py")
+    m = _roles_census(proc_root, repo, tmp_path, [(101, ["tail", "-f", worker], {}, None)])
+    assert m["procs"] == []
+
+
+def test_an_empty_reflog_window_means_head_held_only_head(repo):
+    """No move since the window start (an empty or expired reflog) is not
+    unknown: HEAD held only HEAD."""
+    from genesis.memory import graph_census as gc
+
+    reader = gc._load_serving_commit()
+    r, old, new = repo
+    assert gc._window_held(reader, "", 0.0, new, 0) == [new]
+    reflog = (r / ".git" / "logs" / "HEAD").read_text()
+    assert gc._window_held(reader, reflog, 9e12, new, 0) == [new]  # window after every move
+    held = gc._window_held(reader, reflog, 0.0, new, 0)  # window before every move
+    assert held[-1] == new and old in held
+
+
+def test_an_unreadable_python_on_another_interpreter_never_makes_it_incomplete(
+    proc_root, repo, tmp_path, main_venv
+):
+    """MEASURED on a live box: another user's service python with an unreadable
+    environ made every census incomplete. Its absolute interpreter is not main's
+    venv, so argv alone settles it."""
+    m = _roles_census(
+        proc_root, repo, tmp_path,
+        [(102, ["/usr/local/other/bin/python", "-m", "service"], {}, None)],
+    )
+    (proc_root / "102" / "environ").chmod(0)
+    try:
+        m = census.build_census(repo[0], proc_root=proc_root, live_db=tmp_path / "live.db")
+    finally:
+        (proc_root / "102" / "environ").chmod(0o644)
+    assert m["complete"] is True
+    assert m["procs"] == []
+
+
+def test_a_generic_process_holding_the_live_db_open_is_counted(
+    proc_root, repo, tmp_path, main_venv
+):
+    """Its env names a scratch DB, but it holds the live one open: that handle
+    is what it uses, so it is never foreign (the same rule as memory servers)."""
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    live = tmp_path / "live.db"
+    live.touch()
+    m = _roles_census(
+        proc_root, repo, tmp_path,
+        [(103, [main_venv[0], "-"], {"GENESIS_DB_PATH": str(bench)}, None)],
+        fds={103: [live]},
+    )
+    [p] = m["procs"]
+    assert p["foreign"] is False
+
+
+def test_an_ambient_worker_holding_the_live_db_open_is_counted(
+    proc_root, repo, tmp_path, main_venv
+):
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    live = tmp_path / "live.db"
+    live.touch()
+    m = _roles_census(
+        proc_root, repo, tmp_path,
+        [(104, _worker_argv(repo, main_venv), {"GENESIS_DB_PATH": str(bench)}, None)],
+        fds={104: [live]},
+    )
+    [p] = m["procs"]
+    assert (p["role"], p["foreign"]) == ("ambient", False)
+
+
+def _reflog_line(old: str, new: str, ts: int) -> str:
+    return f"{old} {new} T <t@example.invalid> {ts} +0000\tcheckout: moving\n"
+
+
+def test_a_reflog_gap_or_a_foreign_end_inside_the_window_is_unknown(repo):
+    """The window is read from the moves themselves, so a move that does not
+    start where the last one ended, a clock step back, or a reflog that does not
+    end at HEAD cannot be trusted to list every commit HEAD held."""
+    from genesis.memory import graph_census as gc
+
+    reader = gc._load_serving_commit()
+    a, b, c, d = ("a" * 40, "b" * 40, "c" * 40, "d" * 40)
+    gap = _reflog_line(a, b, 100) + _reflog_line(c, d, 200)
+    with pytest.raises(reader._Unknown):
+        gc._window_held(reader, gap, 50.0, d, 0)
+    assert gc._window_held(reader, gap, 150.0, d, 0) == [c, d]  # the gap lies before the window
+    with pytest.raises(reader._Unknown):
+        gc._window_held(reader, _reflog_line(a, b, 100), 50.0, c, 0)  # HEAD is not b
+    backwards = _reflog_line(a, b, 200) + _reflog_line(b, c, 100)
+    with pytest.raises(reader._Unknown):
+        gc._window_held(reader, backwards, 150.0, c, 0)
+
+
+def test_an_unreadable_history_window_is_never_clean(proc_root, repo, tmp_path, main_venv):
+    import time as _time
+
+    r, _, new = repo
+    with (r / ".git" / "logs" / "HEAD").open("a") as f:
+        f.write(_reflog_line(new, "f" * 40, int(_time.time())))  # no longer ends at HEAD
+    m = _roles_census(proc_root, repo, tmp_path, [])
+    assert m["head_history_telemetry"] is False
+    assert "history_unreadable" in m["reasons"]
+
+
+def test_an_ambient_worker_from_another_tree_is_never_foreign(
+    proc_root, repo, tmp_path, main_venv
+):
+    """Its database rules model main's worker; with that code unproven, a
+    scratch-DB reading is not evidence enough to skip the row."""
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    argv = _worker_argv(repo, main_venv, tree=tmp_path / "wt")
+    m = _roles_census(proc_root, repo, tmp_path, [(105, argv, {"GENESIS_DB_PATH": str(bench)}, None)])
+    [p] = m["procs"]
+    assert (p["unknown_reasons"], p["foreign"]) == (["script_not_main"], False)
+
+
+def test_another_users_python_is_never_read(proc_root, repo, tmp_path, main_venv, monkeypatch):
+    """A bare `python` names no interpreter until its PATH is read, and another
+    user's environ is not ours to read: it cannot run as this install."""
+    venv_bin = str(Path(main_venv[0]).parent)
+    Path(main_venv[0]).resolve().chmod(0o755)
+    import time as _time
+
+    _proc(proc_root, 106, ["python", "job.py"], started=_time.time() + 60,
+          env={"PATH": f"{venv_bin}:/usr/bin"}, exe=str(tmp_path / "sys" / "bin" / "python3.12"))
+    (tmp_path / "live.db").touch()
+    real = census.os.getuid()
+    monkeypatch.setattr(census.os, "getuid", lambda: real + 1)
+    m = census.build_census(repo[0], proc_root=proc_root, live_db=tmp_path / "live.db")
+    assert m["procs"] == []
+
+
+def test_a_window_reaching_past_reflog_expiry_is_unknown(repo):
+    """Git can expire a detour's two entries together, leaving no gap: a window
+    that starts before the expiry cutoff cannot be proven complete."""
+    from genesis.memory import graph_census as gc
+
+    reader = gc._load_serving_commit()
+    _, _, new = repo
+    assert gc._window_held(reader, "", 100.0, new, 50) == [new]
+    with pytest.raises(reader._Unknown):
+        gc._window_held(reader, "", 100.0, new, 150)
+
+
+def test_a_python_naming_the_worker_as_an_argument_is_not_a_worker(
+    proc_root, repo, tmp_path, main_venv
+):
+    worker = _worker_argv(repo, main_venv)[1]
+    m = _roles_census(proc_root, repo, tmp_path, [(107, [main_venv[0], "-m", "pytest", worker], {}, None)])
+    assert [p["role"] for p in m["procs"]] == ["venv-generic"]
+
+
+def test_a_relative_interpreter_path_is_counted_as_unknown(proc_root, repo, tmp_path, main_venv):
+    """`.venv/bin/python job.py` was resolved against the cwd at exec, which the
+    process may have left: it may be main's venv, so it is counted, unproven."""
+    m = _roles_census(proc_root, repo, tmp_path, [(108, [".venv/bin/python", "job.py"], {}, None)])
+    [p] = m["procs"]
+    assert (p["role"], p["telemetry"], p["unknown"], p["foreign"]) == (
+        "venv-generic", None, "interpreter_unresolved", False,
+    )
+
+
+def test_a_generic_process_in_another_mount_namespace_is_never_foreign(
+    proc_root, repo, tmp_path, main_venv
+):
+    import time as _time
+
+    bench = tmp_path / "bench.db"
+    bench.write_text("")
+    r, _, _ = repo
+    (tmp_path / "live.db").touch()
+    _proc(proc_root, 109, [main_venv[0], "-"], started=_time.time() + 60,
+          env={"GENESIS_DB_PATH": str(bench)}, exe=str(tmp_path / "sys" / "bin" / "python3.12"),
+          ns="mnt:[2]")
+    m = census.build_census(r, proc_root=proc_root, live_db=tmp_path / "live.db")
+    [p] = m["procs"]
+    assert p["foreign"] is False
+
+
+@pytest.mark.parametrize(
+    "rel", ["src/genesis/routing/standalone.py", "scripts/genesis_mcp_server.py"]
+)
+def test_an_edited_loader_outside_the_memory_package_marks_head_dirty(proc_root, repo, rel):
+    """The proofs model the entry scripts and loaders: an uncommitted edit there
+    means a process may run code no commit records."""
+    r, _, _ = repo
+    f = r / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("edited = True\n")
+    assert census.build_census(r, proc_root=proc_root)["head_dirty"] is True
+
+
+def test_a_memory_server_with_another_genesis_home_is_unknown(proc_root, repo, tmp_path, main_venv):
+    """Its graph engine socket and lost-writes file come from ITS home, so its
+    traversals could be served by another engine."""
+    env = {"GENESIS_GRAPH_TELEMETRY_DISABLED": "0", "GENESIS_DB_PATH": str(tmp_path / "live.db"),
+           "GENESIS_HOME": str(tmp_path / "other-home")}
+    p = _census_one(proc_root, repo, tmp_path, main_venv, env)
+    assert "other_genesis_home" in p["unknown_reasons"]
+
+
+def test_a_generic_process_with_another_genesis_home_is_unknown(proc_root, repo, tmp_path, main_venv):
+    m = _roles_census(proc_root, repo, tmp_path,
+                      [(110, [main_venv[0], "-"], {"GENESIS_HOME": str(tmp_path / "other-home")}, None)])
+    [p] = m["procs"]
+    assert (p["telemetry"], p["unknown"]) == (None, "other_genesis_home")
+
+
+def test_a_generic_process_with_an_unmodelled_option_is_unknown(proc_root, repo, tmp_path, main_venv):
+    """An attached module option may be a second server: never history-only."""
+    m = _roles_census(proc_root, repo, tmp_path, [(111, [main_venv[0], '-mgenesis', "serve"], {}, None)])
+    [p] = m["procs"]
+    assert (p["telemetry"], p["unknown"]) == (None, "interpreter_options_unmodelled")
+
+
+def test_a_sandboxed_process_with_its_own_home_does_not_reset_the_clock(
+    proc_root, repo, tmp_path, main_venv
+):
+    """The test sandbox runs in another mount namespace with its own home: the
+    documented residual. Reading it unknown would reset the 14-day clock on
+    every census that lands during a sandboxed test run."""
+    import time as _time
+
+    r, _, _ = repo
+    (tmp_path / "live.db").touch()
+    _proc(proc_root, 112, [main_venv[0], "-m", "pytest"], started=_time.time() + 60,
+          env={"GENESIS_HOME": str(tmp_path / "sandbox-home")},
+          exe=str(tmp_path / "sys" / "bin" / "python3.12"), ns="mnt:[2]")
+    [p] = census.build_census(r, proc_root=proc_root, live_db=tmp_path / "live.db")["procs"]
+    assert p["unknown"] != "other_genesis_home"
+
+
+def test_a_relative_path_entry_before_the_match_is_unresolved(proc_root, repo, tmp_path, main_venv):
+    """`PATH=.venv/bin:/usr/bin python job.py`: exec searched the cwd at exec
+    first, which may have been main's checkout, so the process is counted."""
+    m = _roles_census(
+        proc_root, repo, tmp_path,
+        [(113, ["python", "job.py"], {"PATH": ".venv/bin:/usr/bin"}, None)],
+    )
+    [p] = m["procs"]
+    assert (p["role"], p["unknown"]) == ("venv-generic", "interpreter_unresolved")
+
+
+def test_a_detour_in_the_windows_boundary_second_is_counted(repo):
+    """Reflog times are whole seconds: two moves at second 100 may both be after
+    a window that starts at 100.4."""
+    from genesis.memory import graph_census as gc
+
+    reader = gc._load_serving_commit()
+    a, b = "a" * 40, "b" * 40
+    detour = _reflog_line(a, b, 100) + _reflog_line(b, a, 100)
+    assert b in gc._window_held(reader, detour, 100.4, a, 0)
