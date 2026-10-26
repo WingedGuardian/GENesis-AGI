@@ -14,11 +14,14 @@ Exit codes:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
@@ -843,15 +846,44 @@ def _worktree_root(cwd: str, *, deadline: float | None = None) -> str:
     return os.path.realpath(cwd)
 
 
-def _merge_note(
-    cwd: str | None, *, gate: str = "round", deadline: float | None = None
-) -> str:
-    """A hint appended to a denial when a merge is mid-flight.
+def _integration_in_progress(cwd: str | None, *, deadline: float | None = None) -> bool | None:
+    """Whether a merge, rebase, cherry-pick, revert or squash merge is mid-flight
+    in ``cwd``'s repository, by its sentinel files. None when that cannot be read.
 
-    ``gate`` selects the consequence clause, because the two gates are misled by
-    a merge in DIFFERENT ways and a reader needs the one that applies: the round
-    counter sees another round, the depth gate sees a large authored change.
-    Sharing one wording would describe the wrong problem half the time.
+    The sentinels are unauthenticated files, so a caller may use this only in a
+    direction where forging one hurts the forger: refusing to treat a commit as
+    a reflection, or advisory text. Never to grant an exemption."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=bounded_timeout(deadline, 5),
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        raw = out.stdout.strip()
+        git_dir = Path(raw) if Path(raw).is_absolute() else Path(cwd or ".") / raw
+        return (
+            any(
+                (git_dir / n).exists()
+                for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "SQUASH_MSG")
+            )
+            or (git_dir / "rebase-merge").exists()
+            or (git_dir / "rebase-apply").exists()
+        )
+    except (DeadlineExpired, subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def _merge_note(
+    cwd: str | None, *, gate: str = "depth", deadline: float | None = None
+) -> str:
+    """A hint appended to the depth denial when a merge is mid-flight.
+
+    ``gate`` names the consequence clause. Only the depth gate's remains: the
+    round counter's tiers, which a merge misled differently, are retired.
 
     ADVISORY TEXT ONLY. Deliberately NOT wired into the verdict, the round
     counter, or the depth classification: those sentinels are unauthenticated
@@ -864,31 +896,7 @@ def _merge_note(
     state decide the verdict is not. Adding a second caller does not weaken that:
     this still only ever returns TEXT.
     """
-    try:
-        out = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=bounded_timeout(deadline, 5),
-        )
-        if out.returncode != 0 or not out.stdout.strip():
-            return ""
-        raw = out.stdout.strip()
-        git_dir = Path(raw) if Path(raw).is_absolute() else Path(cwd or ".") / raw
-        merging = (
-            any(
-                (git_dir / n).exists()
-                for n in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "SQUASH_MSG")
-            )
-            or (git_dir / "rebase-merge").exists()
-            or (git_dir / "rebase-apply").exists()
-        )
-    except DeadlineExpired:
-        return ""
-    except (subprocess.SubprocessError, OSError, ValueError):
-        return ""
-    if not merging:
+    if not _integration_in_progress(cwd, deadline=deadline):
         return ""
     if gate == "depth":
         return (
@@ -930,13 +938,420 @@ def _merge_note(
             "whole command still exits 0. Separate commands keep each failure "
             "visible and each sigil bound."
         )
-    return (
-        "\n\nNOTE: a merge/rebase appears to be in progress. The round counter "
-        "keys on the staged diff, so pulling upstream in to resolve a conflict "
-        "reads as another round even though it adds no authored code. If this "
-        "commit IS only that merge, say so in the ack rather than treating it "
-        "as a real round."
+    # The round counter's wording went with the streak tiers it explained.
+    return ""
+
+
+# ── Rule R: a round's reflection comes before its fixes ─────────────────────
+#
+# While a PR's open review round owes a reflection (review_reflection's answer,
+# the same one `review_reflection.py status` prints), a content commit is denied
+# until an empty reflection commit answers the owed keys. It demands work, never
+# permission, so a dispatched session gets the same verdict. Everything it
+# cannot read with certainty ALLOWS with an advisory (owner ruling a34481ca):
+# only a known, owed round blocks.
+
+#: Open PRs that were merge-eligible at go-live owe nothing for rounds opened
+#: before ``review_reflection.REFLECTION_CUTOVER_ISO`` (owner ruling 50cc9dec).
+#: A reviewed snapshot, set once with the cutover; a PR opened later always owes.
+#: MEASURED at the cutover (2026-10-22T04:04Z): `git_push_guard.py --check-pr` on
+#: all 68 open PRs (`gh pr list --limit 500`, a complete read), ignoring only the
+#: scheduled-review row; 1 of 68 passed every other gate.
+REFLECTION_EXEMPT_PRS: frozenset[int] = frozenset({3535})
+REFLECTION_EXEMPT_REPO = "WingedGuardian/GENesis-AGI"
+
+#: Rule R's share of the hook budget: at most this, and never so much that the
+#: rest of the gate is left less than the reserve after it.
+_REFLECTION_SLICE = 1.0
+_REFLECTION_RESERVE = 1.5
+_REFLECTION_FILE_LIMIT = 64 * 1024
+
+#: Advisories for the agent, delivered with the allow (stderr is discarded on an
+#: exit-0 hook) or with the ask.
+_ADVISORIES: list[str] = []
+
+
+def _reflection_message_file(seg) -> str | None:
+    """The ``-F`` file of a commit shaped exactly like a reflection, or None.
+
+    An ALLOWLIST: ``--allow-empty``, one ``-F``/``--file`` and nothing but
+    ``-q``/``--quiet``/``--cleanup=verbatim``. Any other option (``-m``, ``-a``,
+    ``--amend``, ``--fixup``, ``-c``/``-C``, a pathspec) could carry content or a
+    message the file does not hold."""
+    argv = seg.argv
+    try:
+        i = argv.index("commit") + 1
+    except ValueError:
+        return None
+    path: str | None = None
+    empty = False
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--allow-empty":
+            empty = True
+        elif tok in ("-q", "--quiet", "--cleanup=verbatim"):
+            pass
+        elif tok == "--cleanup" and i + 1 < len(argv) and argv[i + 1] == "verbatim":
+            i += 1
+        elif tok in ("-F", "--file") and i + 1 < len(argv) and path is None:
+            path = argv[i + 1]
+            i += 1
+        elif tok.startswith("--file=") and path is None:
+            path = tok.split("=", 1)[1]
+        elif tok.startswith("-F") and len(tok) > 2 and path is None:
+            path = tok[2:]
+        else:
+            return None
+        i += 1
+    return path if empty and path and path != "-" else None
+
+
+def _looks_like_reflection(seg, cwd: str | None, rr) -> bool:
+    """A commit that was MEANT as a reflection: ``--allow-empty``, or a message
+    file whose first line starts the reflection header. Used only to word a
+    refusal, never to admit anything. The file is read by ``rr._read_evidence``
+    (non-blocking open, regular files only), so a FIFO named as the message
+    cannot hang the hook into its timeout, which would let the commit through."""
+    if "--allow-empty" in seg.argv:
+        return True
+    for i, tok in enumerate(seg.argv):
+        path = seg.argv[i + 1] if tok in ("-F", "--file") and i + 1 < len(seg.argv) else None
+        if path:
+            text, _, _ = rr._read_evidence(path, cwd or ".")
+            if text is not None and text.startswith("Round-reflection:"):
+                return True
+    return False
+
+
+def _key_rounds(
+    cwd: str | None, budget: dict, state: dict, keys: set[str], rr, *, deadline: float
+) -> dict[str, list[int | None]]:
+    """Every round the debt reader judges each of ``keys`` under, for the owed
+    keys among them: the PR's current round for an open-round key, and a late
+    key's own round contexts (``review_late._contexts``, ALL of which must pass
+    there). None is a late key with no earlier round, which owes the grammar
+    alone. A late key whose round cannot be placed gets no entry: it can never
+    be credited, so it never admits. The late read runs inside ``deadline``."""
+    owed = set(state.get("owed") or [])
+    late_keys = set(state.get("late_keys") or [])
+    current = int(budget.get("count") or 0)
+    rounds: dict[str, list[int | None]] = {k: [current] for k in (keys & owed) - late_keys}
+    named_late = keys & owed & late_keys
+    if named_late:
+        import review_late  # noqa: PLC0415 — lazy, like review_reflection
+
+        with rr.deadline_scope(deadline):
+            fix_time = review_late.fix_time_reader(cwd or ".", str(budget.get("current_head")))
+            late = review_late.late_findings(budget, state.get("cutover"), fix_time)
+        if late is None:
+            raise rr.Refused("the late findings could not be read")
+        _, ancestors = review_late._ancestry(budget)
+        now = datetime.now(UTC)
+        for item in late:
+            key = item.get("key")
+            if key in named_late:
+                contexts = review_late._contexts(budget, item, now, ancestors)
+                if contexts:
+                    rounds[key] = [context.round_number or None for context in contexts]
+    return rounds
+
+
+def _reflection_problem(
+    segs, command: str, cwd: str | None, budget: dict, rr, *, deadline: float, state: dict | None = None
+) -> str | None:
+    """Why this commit is NOT a reflection the gate may admit, or None when it is.
+
+    Admitted only when it is one plain ``git commit`` (``_exemption_shape_ok``)
+    in the reflection shape, nothing is staged, no merge/rebase/cherry-pick/
+    revert is in progress, and the message file is a regular UTF-8 file whose
+    text passes the reflection grammar for this round and names the current
+    head. Whether it credits anything is judged later, by the same reader that
+    owes the keys; an empty commit adds no content either way."""
+    if not _exemption_shape_ok(segs, command):
+        return (
+            "run the reflection commit as one plain `git commit` (or `git -C <dir> commit`) "
+            "command, nothing chained and no env prefix"
+        )
+    path = _reflection_message_file(segs[0])
+    if path is None:
+        return (
+            "the reflection form is exactly "
+            "`git commit --allow-empty --cleanup=verbatim -F <file>` (no -m, -a, "
+            "--amend or pathspec)"
+        )
+    staged = _staged_files(cwd, deadline=deadline)
+    if staged is None:
+        return "the staged set could not be read"
+    if staged:
+        return f"files are staged ({len(staged)}): unstage them; a reflection carries no content"
+    if _integration_in_progress(cwd, deadline=deadline) is not False:
+        return "a merge, rebase, cherry-pick or revert is in progress (or unreadable): finish or abort it first"
+    # Non-blocking open, type from the opened descriptor: a path swapped for a
+    # FIFO between any check and the read is refused, never waited on.
+    text, _, why = rr._read_evidence(path, cwd or ".")
+    if text is None:
+        return f"{path} {why}"
+    if len(text.encode("utf-8")) > _REFLECTION_FILE_LIMIT:
+        return f"{path} is larger than {_REFLECTION_FILE_LIMIT} bytes"
+    gate_lane = bool(budget.get("gate_surface"))
+    parsed = rr.parse(text, gate_lane=gate_lane)  # the grammar alone, and its keys
+    if parsed.problems:
+        return "the reflection does not pass its grammar: " + "; ".join(parsed.problems[:5])
+    if state is None:  # no owed state (direct callers): the current round, as before
+        rounds = {k: [int(budget.get("count") or 0)] for k in parsed.keys}
+    else:
+        named = set(parsed.keys)
+        owed = set(state.get("owed") or [])
+        if not named & owed:
+            return (
+                "the reflection names none of the owed keys "
+                f"({', '.join(sorted(owed)) or 'none'}), so it would credit nothing"
+            )
+        rounds = _key_rounds(cwd, budget, state, named, rr, deadline=deadline)
+    # Admitted when some named owed key passes under EVERY round the debt
+    # reader judges it under (review_late.covered_late_keys for a late key, the
+    # current round for an open one); which keys it credits is still that
+    # reader's call. A late key whose round cannot be placed admits nothing.
+    problems: list[str] = []
+    for key in sorted(rounds):
+        failed = [
+            problem
+            for round_n in rounds[key]
+            for problem in rr.parse(text, round_number=round_n, gate_lane=gate_lane).problems
+        ]
+        if not failed:
+            break
+        problems = problems or failed
+    else:
+        if not problems:
+            return "the round of the owed keys it names cannot be placed, so it would credit nothing"
+        return "the reflection does not pass its grammar: " + "; ".join(problems[:5])
+    if parsed.head != budget.get("current_head"):
+        return f"the reflection names head {str(parsed.head)[:12]}, not the PR head {str(budget.get('current_head'))[:12]}"
+    return None
+
+
+def _owed_message(state: dict, budget: dict, rr) -> str:
+    """The deny for a content commit while a reflection is owed."""
+    round_n = int(budget.get("count") or 0)
+    gate_lane = bool(budget.get("gate_surface"))
+    audit, premise = rr.obligations(round_n, gate_lane)
+    owed = ", ".join(state.get("owed") or [])
+    lines = [
+        f"BLOCKED: review round {round_n} of PR #{budget.get('pr')} owes a round "
+        f"reflection before any further commit. Owed: {owed}.",
+    ]
+    if not state.get("settled") and state.get("settle_until"):
+        lines.append(
+            f"Findings may still arrive until {str(state['settle_until'])[:16]} UTC. A "
+            "reflection made now credits the keys it names; findings that land after it "
+            "owe another."
+        )
+    needs = []
+    if audit:
+        needs.append("an Audit-evidence: line citing a fresh-context class audit of this round")
+    if premise:
+        needs.append("a Premise-evidence: line citing an independent premise check")
+    lines += [
+        f"This round ({'gate' if gate_lane else 'ordinary'} lane) needs "
+        + ("; ".join(needs) if needs else "the reflection alone")
+        + ".",
+        "1. `python3 scripts/review_reflection.py status` shows what is owed.",
+        f"2. Write the reflection and check it: `python3 scripts/review_reflection.py "
+        f"validate --round {round_n}{' --gate' if gate_lane else ''} <file>`.",
+        "3. Commit it alone: `git commit --allow-empty --cleanup=verbatim -F <file>`.",
+        "Then commit the fix. Reflect first, fix second: the reflection reads the round "
+        "as a class before any instance is patched.",
+        "If a committed reflection still leaves a key owed, `status` and `validate` say "
+        "why. Usually the reflection failed its full check (`Escalate: yes`, an evidence "
+        "file written before this round started, an acceptance point with no `Scope: "
+        "covered:` line): correct it and commit a second reflection. Only when a fix of "
+        "that key already sits between the round head and every reflection can none at "
+        "this head clear it; then push what is committed, and the next review opens a "
+        "new round. If this verdict looks wrong, stop and ask the owner; do not work "
+        "around it.",
+    ]
+    return "\n".join(lines)
+
+
+def _reflection_rule(
+    segs, commit_segs, command: str, cwd: str | None, budget: dict | None, *, hook_deadline
+) -> tuple[str, str | None]:
+    """Rule R's verdict: ``("continue", None)``, ``("reflection", None)`` for an
+    admitted reflection commit, or ``("deny", message)``. Every unknown is
+    ``continue`` with an advisory queued in :data:`_ADVISORIES`."""
+    if budget is None or budget.get("status") != "ok":
+        return "continue", None
+    pr, repo = budget.get("pr"), budget.get("repo")
+    if not isinstance(pr, int) or not isinstance(repo, str):
+        _ADVISORIES.append("reflection gate: the PR identity is unknown, so nothing was checked.")
+        return "continue", None
+    try:
+        import review_reflection as rr  # noqa: PLC0415 — lazy: only a PR with a budget pays
+
+        remaining = (hook_deadline or 0.0) - time.monotonic()
+        slice_s = min(_REFLECTION_SLICE, remaining - _REFLECTION_RESERVE)
+        if hook_deadline is None or slice_s <= 0:
+            raise TimeoutError("no time left in the hook budget")
+        state = rr.owed_from_budget(
+            cwd or ".",
+            budget,
+            repo,
+            pr,
+            now=datetime.now(UTC),
+            cutover=rr.REFLECTION_CUTOVER_ISO,
+            deadline=time.monotonic() + slice_s,
+        )
+    except Exception as exc:  # noqa: BLE001 — unknown is not owed (owner ruling a34481ca)
+        _ADVISORIES.append(
+            f"reflection gate: what this round owes could not be read ({type(exc).__name__}: "
+            f"{str(exc)[:160]}), so the commit is allowed. Run "
+            "`python3 scripts/review_reflection.py status` to see it."
+        )
+        return "continue", None
+    owed = state.get("owed")
+    if owed is None:
+        _ADVISORIES.append(
+            "reflection gate: this round's owed keys are unknown, so the commit is allowed. "
+            "`python3 scripts/review_reflection.py status` names the cause."
+        )
+        return "continue", None
+    if not owed:
+        return "continue", None
+    if (
+        repo.casefold() == REFLECTION_EXEMPT_REPO.casefold()
+        and pr in REFLECTION_EXEMPT_PRS
+        and _opened_before_cutover(state, rr.REFLECTION_CUTOVER_ISO)
+    ):
+        # The snapshot exempts the old open contribution, never new late debt.
+        # Intersect with remaining debt so credited late keys stay credited.
+        late_keys = set(state.get("late_keys") or [])
+        owed = [key for key in owed if key in late_keys]
+        if not owed:
+            return "continue", None
+        state = {**state, "owed": owed}
+    mode = _reflection_gate_mode()
+    if len(commit_segs) == 1 and _looks_like_reflection(commit_segs[0], cwd, rr):
+        try:
+            problem = _reflection_problem(
+                segs, command, cwd, budget, rr, deadline=hook_deadline, state=state
+            )
+        except Exception as exc:  # noqa: BLE001 — never admit what was not fully checked
+            problem = f"it could not be checked ({type(exc).__name__}); run it again"
+        if problem is None:
+            return "reflection", None
+        message = f"BLOCKED: this looks like a round reflection, but: {problem}."
+    else:
+        message = _owed_message(state, budget, rr)
+    if mode == "advisory":
+        _ADVISORIES.append("reflection gate (advisory mode, NOT enforced): " + message)
+        return "continue", None
+    return "deny", message
+
+
+def _opened_before_cutover(state: dict, cutover: str | None) -> bool:
+    """Whether the open round began before the go-live cutover, so a PR in the
+    exempt snapshot owes nothing for it. Only an OPEN round with a readable start
+    qualifies: late keys are owed only from the cutover on, so a PR owing late
+    keys alone owes debt that arose after the snapshot, and an unreadable start
+    proves nothing about when the round began."""
+    if cutover is None:
+        return True
+    started = state.get("round_started")
+    if state.get("round_state") != "open" or not isinstance(started, str):
+        return False
+    try:
+        return datetime.fromisoformat(started) < datetime.fromisoformat(cutover)
+    except ValueError:
+        return False  # unparseable proves nothing, as an absent start does
+
+
+#: Rule R's kill switch: ``hooks.reflection_gate: enforce | advisory`` in the
+#: install's config. A switch on a BLOCK, so it is read here and not by
+#: ``hook_ask_policy``, whose contract is that it can only ever turn off an ask.
+_REFLECTION_CONFIG = "~/.genesis/config/genesis.yaml"
+_REFLECTION_SEAM = "_TEST_REFLECTION_GATE"
+
+
+def _reflection_path_problem(yaml, text: str) -> str | None:
+    """Why ``hooks.reflection_gate`` cannot be read with certainty, or None.
+
+    A node-graph walk, as ``hook_ask_policy`` does for its own path: a repeated
+    key or a YAML merge key anywhere along it means safe_load's last-wins answer
+    may not be the one the operator reads in the file."""
+    node = yaml.compose(text, Loader=yaml.SafeLoader)
+    for label in ("hooks", "reflection_gate"):
+        if not isinstance(node, yaml.MappingNode):
+            return None
+        keys = [k for k, _ in node.value if isinstance(k, yaml.ScalarNode)]
+        if any(k.tag == "tag:yaml.org,2002:merge" for k in keys):
+            return "uses a YAML merge key (<<)"
+        values = [v for k, v in node.value if isinstance(k, yaml.ScalarNode) and k.value == label]
+        if len(values) > 1:
+            return f"declares {label} more than once"
+        if not values:
+            return None
+        node = values[0]
+    return None
+
+
+def _reflection_gate_mode() -> str:
+    """``"advisory"`` only when the install declares exactly that; else ``"enforce"``.
+
+    Advisory prints what the gate would deny and allows. Every failure — no
+    file, no pyyaml, a parse error, a duplicate or merge key on the path, any
+    other value — enforces, with an advisory where the operator wrote something
+    this reader refused: a kill switch that fails toward "off" is a bypass."""
+    raw = os.environ.get(_REFLECTION_SEAM)
+    if raw is not None and os.environ.get("PYTEST_CURRENT_TEST"):
+        return "advisory" if raw == "advisory" else "enforce"
+    try:
+        with open(os.path.expanduser(_REFLECTION_CONFIG)) as fh:
+            text = fh.read()
+        import yaml  # noqa: PLC0415 — lazy: the genesis venv has pyyaml
+
+        problem = _reflection_path_problem(yaml, text)
+        if problem:
+            _ADVISORIES.append(
+                f"hooks.reflection_gate in {_REFLECTION_CONFIG} {problem}: refused, so the "
+                "reflection gate ENFORCES."
+            )
+            return "enforce"
+        cfg = yaml.safe_load(text)
+        hooks = cfg.get("hooks") if isinstance(cfg, dict) else None
+        value = hooks.get("reflection_gate") if isinstance(hooks, dict) else None
+    except FileNotFoundError:
+        return "enforce"
+    except Exception:  # noqa: BLE001 — an unreadable switch is no switch: enforce
+        _ADVISORIES.append(
+            f"hooks.reflection_gate in {_REFLECTION_CONFIG} could not be read: the "
+            "reflection gate ENFORCES."
+        )
+        return "enforce"
+    if value is None or value == "enforce":
+        return "enforce"
+    if value == "advisory":
+        return "advisory"
+    _ADVISORIES.append(
+        f"hooks.reflection_gate in {_REFLECTION_CONFIG} is {str(value)[:40]!r}, not "
+        "enforce or advisory: the reflection gate ENFORCES."
     )
+    return "enforce"
+
+
+def _emit_advisories() -> None:
+    """Deliver queued advisories as context on an allow. Never raises."""
+    if not _ADVISORIES:
+        return
+    text = "\n".join(_ADVISORIES)
+    payload = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}
+    try:
+        from hook_output import print_json_bounded  # noqa: PLC0415
+
+        print_json_bounded(payload, text_keys=("hookSpecificOutput.additionalContext",))
+    except Exception:  # noqa: BLE001 — an advisory must never change the verdict
+        with contextlib.suppress(Exception):
+            print(json.dumps(payload))
 
 
 def _is_dispatched() -> bool:
@@ -1524,14 +1939,11 @@ def main() -> None:
 
     try:
         from review_state import (
-            ESCALATION_ROUND_CAP,
             get_current_branch,
-            get_review_counters,
             has_code_changes,
             has_valid_review_marker,
             is_review_current,
             marker_content_current,
-            reset_review_round,
         )
     except Exception:  # noqa: BLE001 — ANY load failure, not just absence.
         # If review_state cannot be loaded, fail open — don't block.
@@ -1719,30 +2131,12 @@ def main() -> None:
             )
             return
 
-    # Rule 3: review escalation cap. After ESCALATION_ROUND_CAP CONSECUTIVE
-    # defect-bearing review→fix→re-review rounds on this change, block the commit
-    # until an explicit '# escalation-ack' trailing comment — a machine-enforced
-    # STOP. The streak is CROSS-MODEL ONLY: only an EXTERNAL, non-Anthropic reviewer
-    # (Codex/Kimi/…) marked `--source external` advances or resets it (see
-    # review_state.bump_review_round). Internal same-model self/subagent reviews
-    # (genesis-architect/genesis-security/any spawned agent) NEVER count — they are
-    # free and share the author's blind spots, so penalizing them just punishes
-    # self-review. This is why the mode-switch audit below (an internal subagent) does
-    # NOT trip the cap: only a repeat EXTERNAL non-convergence does. The machine-
-    # enforced STOP keeps a genuine cross-model review→fix loop from silently running
-    # long on a standing "proceed" (see closing-session SKILL.md), while
-    # honestly-clean multi-commit development never trips. Checked BEFORE
-    # both the docs/config skip AND Rule 2 ON PURPOSE: the hard stop must not be
-    # bypassable by file extension (a reviewed prompt/skill/docs-only commit at the
-    # cap would otherwise sneak past via the docs skip), nor by '# review-override'
-    # (which exits Rule 2 early) — the two acknowledgments are independent. Like
-    # review-override, the ack does NOT bypass Rule 0 (--no-verify) or Rule 1
-    # (main-branch), checked above. Recognition mirrors _commit_override: a clean
-    # trailing comment on EVERY commit segment (all(), so one ack can't license a
-    # chained sibling commit). NOTE: on a nested `bash -c 'git commit …'` the ack
-    # must sit on the INNER command (the sigil isn't propagated to wrappers); the
-    # documented `git commit … # escalation-ack` form is a plain segment.
-    round_n, _local_lifetime = get_review_counters(cwd=cwd, deadline=hook_deadline)
+    # Rule R: a round's reflection comes before its fixes (see _reflection_rule).
+    # It reads the same budget as the round-approval ask below, and sits where the
+    # retired streak tiers sat ON PURPOSE: before the docs/config skip, so a
+    # prose-only fix cannot slip past an owed reflection, and before Rule 2, so
+    # '# review-override' does not waive it. Rules 0 and 1 (above) still apply to
+    # a reflection commit.
     commit_segs = [s for s in segs if git_subcommand(s.argv) == "commit"]
 
     branch = get_current_branch(cwd=cwd, deadline=hook_deadline)
@@ -1797,128 +2191,23 @@ def main() -> None:
             if _is_dispatched():
                 _deny("BLOCKED: " + reason)
                 return
+            if _ADVISORIES:
+                reason += "\n\n" + "\n".join(_ADVISORIES)
             _native_ask(reason)
+        _emit_advisories()
         sys.exit(0)
 
-    if round_n >= ESCALATION_ROUND_CAP:
-        acked = bool(commit_segs) and all(
-            has_trailing_override(s.raw, sigil="escalation-ack") for s in commit_segs
-        )
-        if not acked:
-            _deny(
-                f"BLOCKED: review escalation cap reached — {round_n} consecutive "
-                f"EXTERNAL cross-model review rounds each surfaced NEW defects (cap "
-                f"{ESCALATION_ROUND_CAP}; internal same-model self/subagent audits are "
-                "not counted). The cross-model review→fix loop has run long — the "
-                "round-2 mode-switch audit did NOT converge, which means the DESIGN or "
-                "the problem statement is likely wrong, not just this fix. STOP and get "
-                "a FRESH user decision. The options, the one this gate could not "
-                "previously name first:\n"
-                "  (a) HAND IT BACK through the ESTABLISHED disposition — a foreground "
-                "architecture conversation with the user, or the "
-                "`needs-architecture-session` label plus a `ready` follow-up naming the "
-                "PR and the decision it awaits when nobody is present — and stop "
-                "reviewing. Not a new path around that one. Three "
-                "rounds that each found something NEW after a class-level audit is the "
-                "strongest evidence available that the premise — not the code — is what "
-                "is wrong, and no further round can fix that. The work so far bought "
-                "the understanding of why this shape does not hold; it is the input to "
-                "the next attempt, not waste.\n"
-                "  (b) REDESIGN robust-by-construction — make the defect class "
-                "unconstructible rather than tested-for.\n"
-                "  (c) NARROW the scope to the part that is converging.\n"
-                "  (d) SHELVE it.\n"
-                "Bring evidence to the choice rather than a feeling: the premise check "
-                "(`.claude/docs/premise-check.md`) verdicts each claim the change rests "
-                "on, independently, with a falsifier.\n\n"
-                "THE EXIT DEPENDS ON WHICH OPTION THE USER CHOSE, and (a) has none.\n"
-                "  Chose (b), (c) or (d) — acknowledge the decision with a trailing "
-                "shell comment (outside any quotes):\n"
-                '        git commit -m "your message"  # escalation-ack\n'
-                "  Chose (a) HAND IT BACK — do NOT run that command. The index still "
-                "holds the design just judged premise-broken and its review marker is "
-                "current, so the sigil would permit exactly that commit AND reset the "
-                "streak — landing the work and erasing the evidence that stopped it. "
-                "Hand the branch off with the premise-check writeup instead. The streak "
-                "is per-branch, so whoever picks up the SAME branch inherits it: say so "
-                "in the handoff." + _merge_note(cwd, deadline=hook_deadline)
-            )
-            return
-        # Acked = a fresh decision to continue → reset the round budget so the next
-        # stop is a fresh cap away, not per-commit friction for the branch's whole
-        # life. Reset stands even if a later rule blocks THIS commit: the
-        # acknowledgment was made, and erring toward less friction only happens
-        # AFTER a conscious ack.
-        reset_review_round(cwd=cwd, deadline=hook_deadline)
-    elif round_n == ESCALATION_ROUND_CAP - 1:
-        # Tier 1 — MODE-SWITCH, one round BEFORE the hard stop. Two consecutive
-        # defect-bearing rounds is the signature of fixing the INSTANCE a reviewer
-        # named instead of the CLASS: round N's narrow patch leaves sibling
-        # edge/boundary/sentinel cases that round N+1 then surfaces. Stopping here
-        # only "fails louder"; the fix is to force a DIFFERENT approach so the loop
-        # CONVERGES in one more round instead of grinding to the round-3 stop. Block
-        # until a '# audit-ack' — NOT a hard stop (the session can proceed once it
-        # has done the audit), and deliberately one round earlier than the cap so
-        # the intervention lands while the loop is still short. Does NOT reset the
-        # counter: a still-narrow fix must still reach the round-3 stop, and a
-        # clean review afterwards resets the streak via bump_review_round(clean).
-        # Independent of '# review-override' (Rule 2) and '# escalation-ack' (above).
-        acked = bool(commit_segs) and all(
-            has_trailing_override(s.raw, sigil="audit-ack") for s in commit_segs
-        )
-        if not acked:
-            _deny(
-                f"BLOCKED (mode-switch): {round_n} consecutive EXTERNAL cross-model "
-                f"review rounds each surfaced NEW defects (cap {ESCALATION_ROUND_CAP}; "
-                "internal self/subagent audits are not counted). Two rounds of NEW "
-                "defects means one of two things, and they have OPPOSITE remedies. "
-                "Decide WHICH before writing another line of fix-code:\n\n"
-                "  (A) The PREMISE is wrong — the change cannot do what it claims, or "
-                "rests on something untrue. More rounds cannot help: every fix creates "
-                "the surface for the next finding, which is why the loop reads like bad "
-                "luck. Hand it back to a BUILDER session with the evidence and stop "
-                "here. The code written so far is what bought the understanding of why "
-                "this shape does not work — that is what it was for, and sunk cost is "
-                "not a reason to keep patching.\n"
-                "  (B) The premise holds and you are fixing the INSTANCE the reviewer "
-                "named, not the CLASS. A third external round is how THAT loop runs "
-                "away, and the remedy is one class-level commit:\n"
-                "      1. Dispatch a FRESH-CONTEXT adversarial reviewer (a subagent with "
-                "clean context) over the ENTIRE diff — tell it to exhaustively "
-                "enumerate every edge/boundary/sentinel/hierarchy/error case, "
-                "independent of what the bot flagged. (This audit is INTERNAL — mark it "
-                "`--source internal` or plainly; it does NOT advance the cap, so it can "
-                "never be the round that blocks you — that was the bug this fixes.)\n"
-                "      2. For any domain semantics in play (cgroup, systemd, SQLite, "
-                "async, timezones, …), READ the authoritative docs/source — do not "
-                "reason from assumption; assumption is what produced the serial "
-                "defects.\n"
-                "      3. Fix the WHOLE enumerated class in ONE commit — not just the "
-                "named case.\n\n"
-                "(A) NEEDS TWO OR MORE of these signals, which is the bar the review "
-                "mandate already sets and this message must not undercut: findings "
-                "CONCENTRATING in one file/function; a finding landing on a line THIS "
-                "change added in an earlier round; the diff GROWING across rounds "
-                "instead of shrinking. ONE alone is an ordinary local defect wearing "
-                "the shape of an architectural one — findings concentrate in any large "
-                "parser, and that on its own says nothing. Short of two it is (B) — the "
-                "ordinary case is a sound design "
-                "carrying defects, and handing back a change that only needed polish "
-                "costs more than the extra round. Handing one back WRONGLY costs more "
-                "than either. The premise check (`.claude/docs/premise-check.md`, "
-                "genesis-architect Step 0.6) is how to decide with evidence rather than "
-                "by feel.\n"
-                "If you chose (B), acknowledge you did the audit (not another blind "
-                "patch) with a trailing shell comment (outside any quotes):\n"
-                '  git commit -m "your message"  # audit-ack\n'
-                "If you chose (A), do NOT commit past this block. `# audit-ack` "
-                "ATTESTS that the class-level audit happened — appending it because "
-                "you want to land something is falsifying it. Hand the branch off "
-                "with the evidence instead. (The streak is per-branch, so a builder "
-                "picking up the SAME branch inherits it: say so in the handoff.)"
-                + _merge_note(cwd, deadline=hook_deadline)
-            )
-            return
+    verdict, rule_r_message = _reflection_rule(
+        segs, commit_segs, command, cwd, cloud_budget, hook_deadline=hook_deadline
+    )
+    if verdict == "deny":
+        _deny(rule_r_message or "BLOCKED: a round reflection is owed.")
+        return
+    if verdict == "reflection":
+        # An admitted reflection is empty and is the step a round past its
+        # budget should take, so it skips the round-approval ask (plan N7).
+        _emit_advisories()
+        sys.exit(0)
 
     # Docs/config-only skip: a commit whose ENTIRE staged set is documentation
     # or config carries no code to review (adaptive-review "review level: None"),
@@ -1929,8 +2218,8 @@ def main() -> None:
     # the docs/config allowlist. An impure commit, an empty staged set, a diff we
     # cannot read, or an ambiguous cwd (already blocked by Rule 1) falls through
     # to normal enforcement — never skipped. Placed AFTER Rule 0 (--no-verify),
-    # Rule 1 (main-branch), and Rule 3 (escalation cap) so it can never weaken
-    # those hard blocks.
+    # Rule 1 (main-branch), and Rule R (the round reflection) so it can never
+    # weaken those hard blocks.
     # Whether the commit may stage content BEYOND the current index — a pathspec, -a/-i/-o/-p,
     # or a git add/rm/mv/reset in the chain (P1-D). When true the hook-time index does NOT
     # reflect what will be committed, so we can neither classify the staged diff nor bind the
@@ -2018,8 +2307,8 @@ def main() -> None:
                 "to the per-worktree path from `python3 scripts/review_state.py evidence-path` "
                 "(concurrent sessions don't clobber it), then re-mark:\n"
                 "  python3 scripts/review_state.py mark   # a genesis-architect audit is "
-                "INTERNAL — it satisfies this depth gate and never counts toward the "
-                "escalation cap; no outcome flag needed\n"
+                "INTERNAL — it satisfies this depth gate and never moves the cross-model "
+                "streak; no outcome flag needed\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
                 + _merge_note(cwd, gate="depth", deadline=hook_deadline)
@@ -2039,8 +2328,8 @@ def main() -> None:
     if rule2_blocks:
         # A trailing '# review-override' comment (outside quotes) acknowledges
         # accepted findings and bypasses ONLY this review gate — never Rule 0
-        # (--no-verify), Rule 1 (main-branch), or Rule 3 (escalation cap), all
-        # checked above.
+        # (--no-verify), Rule 1 (main-branch), or Rule R (the round reflection),
+        # all checked above.
         override = _commit_override(command, segs)
         if override == "valid":
             print(
@@ -2066,7 +2355,7 @@ def main() -> None:
             "agent — save it to `python3 scripts/review_state.py evidence-path`, then "
             "re-mark: `python3 scripts/review_state.py mark --agent-output <that file>` "
             "(a genesis-architect audit is INTERNAL and satisfies this gate; it never "
-            "counts toward the escalation cap — no outcome flag needed). Only a "
+            "moves the cross-model streak — no outcome flag needed). Only a "
             "non-Anthropic cross-model review (Codex/Kimi) is marked `--source external "
             "--defects|--clean`.\n"
             "If findings are intentionally accepted, append a trailing shell "
@@ -2088,6 +2377,10 @@ def _deny(message: str) -> None:
     in prose — the load-bearing claim is "sole chokepoint", and that is checked:
     this file has exactly one ``sys.exit(2)``, the one below.)
     """
+    # Advisories queued before the deny (e.g. why the reflection kill switch was
+    # refused) belong with it: a deny is the one exit whose stderr is delivered.
+    if _ADVISORIES:
+        message = message + "\n\n" + "\n".join(_ADVISORIES)
     print(message, file=sys.stderr)
     if discarded_write is not None:
         discarded_write.warn()

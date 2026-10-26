@@ -1122,14 +1122,12 @@ def _strip_trailing_comment(seg: str) -> str:
 
 
 # The recognized ack/override sigils. A trailing comment may carry several of these
-# together (`# audit-ack depth-ack`), so the leading run of the comment is allowed to
+# together (`# depth-ack review-override`), so the leading run of the comment is allowed to
 # contain any of them; the FIRST prose token ends the run. Kept in sync with the
 # sigils actually passed to has_trailing_override across the guard hooks.
 _KNOWN_SIGILS = (
     "review-override",
     "depth-ack",
-    "audit-ack",
-    "escalation-ack",
     "ci-override",
     "stale-review-override",
     "scheduled-review-override",
@@ -1179,7 +1177,7 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
 
     The sigil must appear in the LEADING contiguous run of recognized ack/override
     tokens: `# review-override: accepted P2s` (sigil first, prose follows) and
-    `# audit-ack depth-ack` (a run of two sigils — each satisfies its own check)
+    `# depth-ack review-override` (a run of two sigils — each satisfies its own check)
     both count, but `# not a review-override` / `# see review-override docs` do NOT
     — a prose token ahead of the sigil ends the run. This keeps independent acks
     able to coexist without letting an incidental or negated prose mention waive
