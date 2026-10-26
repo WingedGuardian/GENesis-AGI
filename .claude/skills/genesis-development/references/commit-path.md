@@ -123,11 +123,17 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
 ### Sigils, chained commits and worktree removal
 
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
-  `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
+  `git commit ... | tail  # depth-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending
   one — do not generalise from one guard's behaviour.
 - **Sigils must lead the trailing comment.** The override is read from the
-  leading run of recognised tokens, so `# see audit-ack notes` overrides nothing.
+  leading run of recognised tokens, so `# see depth-ack notes` overrides nothing.
+  The retired `# audit-ack` and `# escalation-ack` are no longer recognised, so
+  writing one FIRST ends the run: `# audit-ack depth-ack` waives nothing. Drop them.
+  Put several sigils in ONE comment: `# stale-review-override scheduled-review-override`.
+  In `# stale-review-override # scheduled-review-override` the second `#` is a
+  token the parser does not recognise, so it ends the run and only the first
+  sigil applies (`scripts/hooks/shell_parse.py` `_has_trailing_override`).
 - **`--no-verify` is blocked before any override is even considered.** There is
   no way to skip the native hooks; fix the cause.
 - **Chained commits are heavily restricted** — across worktrees, blocked

@@ -208,6 +208,34 @@ from deploy_candidates_core import (  # noqa: E402
     out,
 )
 
+#: update.sh names its own pid here when it runs the rebuild after its stop: its
+#: "merging" row is then its restart guard, and where the move is recorded.
+OWN_STATE_PID = "DEPLOY_CANDIDATES_OWN_STATE_PID"
+
+
+def _replace_json(path: Path, data: dict, durable: bool) -> None:
+    """Replace ``path`` with ``data`` atomically (same-directory temp file and
+    os.replace). ``durable``: the temp file is fsynced before the rename and the
+    directory after it, so the new content survives a crash or power loss."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=4)
+            if durable:
+                fh.flush()
+                os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    if durable:
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
 
 def _err(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -216,8 +244,16 @@ def _err(msg: str) -> None:
 def _restart_advice(moved: plan.Move) -> None:
     """The next step after a move. When HEAD left `live` in the last instant
     (Move.head_left), a restart would load that branch's tree, so the advice is
-    to switch back first."""
+    to switch back first. When where HEAD is could not be read (Move.head_unknown),
+    a restart would load a checkout nobody verified, so no restart is advised."""
     out("  The server was not restarted: it runs what it loaded until it does. Next step, when no")
+    if moved.head_unknown:
+        out(
+            "  validation holds the lock: the checkout could not be read after the move, so it is "
+            f"not known to be on `live` at {moved.at[:12]}. Check where HEAD is (git symbolic-ref "
+            "HEAD) and switch it back to `live` if it is elsewhere; no restart is advised until then."
+        )
+        return
     if moved.head_left:
         out(
             f"  validation holds the lock: switch the checkout back to `live` (it is on "
@@ -264,6 +300,15 @@ class Engine(Repo):
         was judged safe is exactly what every later re-check compares to, and
         the checkout must still match it here. It is never read again."""
         self.require_main_checkout()
+        if self.env.get(OWN_STATE_PID) and not self._own_update_state():
+            # A caller that names itself is update.sh, whose "merging" row the
+            # move records into (live_move). If the row is not that run's own,
+            # the shared rule could call it harmless and retire it, and the
+            # record would land in another update's state (#3492).
+            raise Refusal(
+                f"{self.update_state} is not the calling update's own row (phase "
+                '"merging", its pid, a plain run, update.lock handed over); nothing changed.'
+            )
         data = self.store.load()
         if need_manifest and data is None:
             raise Refusal(
@@ -320,7 +365,8 @@ class Engine(Repo):
         except Exception as exc:  # noqa: BLE001 - any failure to decide refuses
             return (
                 f"{path} could not be checked ({exc}); it is kept. Finish that update with "
-                "scripts/update.sh --post-merge, or Dismiss it on the dashboard's update card."
+                "scripts/update.sh --post-merge (it refuses a half-written tree), or Dismiss it "
+                "on the dashboard's update card."
             )
 
     def _own_update_state(self) -> bool:
@@ -334,7 +380,7 @@ class Engine(Repo):
         handed-over fd, the named pid is this process's parent, and the file records
         that pid, phase "merging", from a plain run. Anything else is judged by the
         shared rule."""
-        named = self.env.get("DEPLOY_CANDIDATES_OWN_STATE_PID", "")
+        named = self.env.get(OWN_STATE_PID, "")
         if not (self._update_lock_held and named.isdigit() and int(named) == os.getppid()):
             return False
         try:
@@ -349,6 +395,33 @@ class Engine(Repo):
             and type(state.get("pid")) is int
             and state["pid"] == int(named)
         )
+
+    def record_move(self, to: str, phase: str, *, before: bool) -> None:
+        """Record how far the move got as ``live_move`` in the calling update.sh's
+        own row (#3492), every other key kept, so its rollback and every
+        crash-recovery reader (update_state_guard.py) see it for as long as the
+        row lives. Written only while the row is still that run's own, checked
+        at each write. Before the move the write is durable (temp file fsynced,
+        renamed, directory fsynced) and a failure refuses: nothing has moved.
+        After it, a plain replace whose failure only warns. No named caller (a
+        hand run): no row to record in, so nothing is written."""
+        if not self.env.get(OWN_STATE_PID):
+            return
+        path = self.update_state
+        try:
+            if not self._own_update_state():
+                raise OSError("it is no longer the calling update's own row")
+            with open(path, encoding="utf-8") as fh:
+                state = json.load(fh)
+            state["live_move"] = {"to": to, "phase": phase}
+            _replace_json(path, state, durable=before)
+        except (OSError, ValueError, RecursionError) as exc:
+            if before:
+                raise Refusal(f"cannot record the move in {path} ({exc}); nothing moved") from exc
+            out(
+                f"  WARNING: the move's record ({phase}, toward {to[:12]}) could not be "
+                f"written to {path}: {exc}"
+            )
 
     def _retire_harmless_update_state(self) -> None:
         """Remove an update_state.json that guards nothing, before a move.

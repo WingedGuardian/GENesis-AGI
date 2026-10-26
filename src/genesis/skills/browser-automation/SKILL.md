@@ -387,7 +387,54 @@ error, followed by a checklist. Read the underlying error to find the cause.
 **Money.** Before any purchase or payment: summarise what is bought, show the
 total, get explicit approval for this transaction (approval never carries over),
 and never click "Place order", "Pay now" or similar without it. Never type a
-card number. The user types it on the VNC display or in their own Chrome.
+card number with the general tools. The user types it on the VNC display or in
+their own Chrome, or, when card fill is on, use `browser_fill_card`:
+
+- Open the checkout with `browser_navigate` (Camoufox) and read the card
+  fields, the Pay button and the total off a snapshot. A snapshot and
+  `browser_run_js` see only the top document: inside a cross-origin checkout
+  frame (Stripe's, for one) nothing is observable yet, so use the provider's
+  standard ids there. Selectors are plain CSS only (no `>>` chains, no
+  `engine=` prefixes such as `internal:` or `text=`, no quoted text, no XPath). Pass selectors, never
+  values: `fields` (number, expiry or exp_month+exp_year, cvc, name or
+  first_name+last_name, postal_code; `{"selector", "frames"}` for fields inside
+  iframes), `pay`, the total as `amount` exactly as the page shows it, and other
+  checkout fields as `extra_fields` (`{"email": {"selector": "#email", "value":
+  "..."}}`; add `"frames"` for a billing field inside the card frame).
+- A card form that appears only after clicks (a cart drawer, "Continue to
+  checkout", "Add card") takes `steps`: the clicks, in order, each a selector or
+  `{"selector", "frames"}`. The payment window replays them after it reopens the
+  checkout's URL, before reading or filling anything. Steps are clicks only,
+  never values and never a checkbox.
+- A required consent checkbox in the card form (a debit authorization) goes in
+  `consent`, never `steps`: the owner's tap shows its label, and the tool ticks
+  it only after the tap.
+- Billing address fields can omit `"value"`: the tool then reads it from
+  `card_fill.billing` in the install's private payments config, so the address
+  stays out of tool arguments.
+- A checkout that stores the card first and shows its fee only then ("Add
+  Card", then "Pay $X") takes `save` (the store control, usually in the card
+  frame) and `amount_max`, the ceiling you approved with the owner. `amount`
+  stays the subtotal the page shows before the card. The tap reads "up to
+  <amount_max>". After the save the tool reads the total (from `total` if
+  given, else Pay's label) and clicks Pay only if the subtotal <= total <=
+  ceiling. Otherwise it stops with Pay NOT clicked: the card may now be stored
+  on the merchant, so tell the owner rather than repeating the steps. Pass
+  `amount` and `amount_max` as the page writes them, currency symbol included
+  (a dollar sign before the digits, for a dollar price): a total in another currency, or a negative one, is not read. The
+  ceiling checks what the page shows; it is not a limit the merchant enforces.
+- The tool reopens the checkout in a window no other tool reaches, waits for
+  the owner's Telegram tap, fills, clicks Pay itself and closes the window.
+  You get a fixed `code` and `status` only.
+- `submitted_unverified`: check the order page or the merchant account.
+  `challenge`, `card_url_blocked`, `card_url_leaked`, `pay_click_unknown`, `moved_while_filling`, `card_url_before_pay`, `card_value_in_request` or `outcome_unknown`: do NOT retry; tell the owner the outcome is
+  unknown. `card_url_before_pay`: Pay was not clicked, but a card value was
+  sent or nearly sent in a URL; tell the owner the card may be exposed.
+  `card_value_in_request`: Pay was not clicked; a request matched a short card
+  value (maybe by coincidence); the number was not seen leaving. Any
+  other code before Pay (`failed_before_pay`, `claimed_not_filled`, a
+  refusal): Pay was not clicked; a single-use card may be spent, so ask the
+  owner before trying again.
 
 **Credentials.**
 - Do not type a password, code or card number the user pasted into chat. Ask

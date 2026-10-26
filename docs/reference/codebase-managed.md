@@ -347,6 +347,19 @@ populate `settings_error` without suppressing metadata or the systemd check.
 Structural settings reads remain available for retained-state diagnosis; no
 incompatible cache is repaired or deleted automatically.
 
+The separate `queue_initialization` object observes
+`$GENESIS_HOME/index-requests/.queue-db-init.lock` (defaulting to
+`$HOME/.genesis`). Its `required_when` is `queue initialization or schema upgrade`:
+a current-schema queue can remain usable when this append-only lock is not
+writable. `state` reports `absent`, `observed_writable`, or `unavailable`, with
+the selected `path`, observed lexical `exists`, and any `error`. Unknown
+existence is `null` when lookup fails. An absent lock also checks its first
+existing parent's write/search prerequisites without creating anything. This
+advisory neither inspects the database schema nor acquires a lock, and does not
+change availability or readiness. Observed writability does not guarantee a
+future open or an uncontended lock. Settings and manager diagnostics remain
+independent of this observation.
+
 Existing settings and state are never refreshed in place. Schema 1 and other
 builds remain diagnosable, but are not valid schema-2 execution configurations.
 Before reconfiguration, stop any existing managed native processes, preserve
@@ -475,7 +488,50 @@ clear the sentinel, release the freeze or retry unattended after resource failur
 Follow the supervised production acceptance and resource gates in
 `../architecture/codebase-managed-runtime.md`.
 
+### Legacy queue import evidence
+
+The queue upgrades its import metadata atomically to schema 2. Each legacy
+artifact is isolated by a savepoint: malformed content produces a retained
+receipt containing its exact raw bytes and a reason, while unrelated valid
+requests continue. These diagnostics do not replace a repository's genuine
+failed request or conflicting-outcome state. Stale, unowned outcome artifacts
+also appear in import receipts; owned conflicting outcomes retain their existing
+business handling. Filesystem and SQLite failures remain errors, with claimed
+files retained until the import transaction commits. A failure after commit is
+recoverable from the receipt even if a later directory sync fails after unlink.
+
+Inspect receipts without importing work or initializing the queue:
+
+```bash
+python3 scripts/lib/index_marker.py import-status --limit 20
+```
+
+The JSON reports actual totals, imported/quarantined counts, the display limit
+and truncation. Source names use lossless hexadecimal filesystem bytes; raw
+rejected payloads remain in the private queue database and are not printed.
+An absent queue is explicit; schema 1 reports that receipt diagnostics are
+unavailable. Unsupported schema/journal mode, read and lock failures exit 2.
+The reader uses read-only/query-only SQLite against the supported rollback
+journal format; it never ignores recovery journals with `immutable=1`.
+Converted schema-1 metadata is labeled `legacy-metadata-only`: it proves prior
+processing, not historical content validity. No rejected payload is invented.
+
+Receipt identity includes source bytes, raw digest and exact decimal mtime.
+Prior identities remain retained so a commit-before-unlink replay cannot import
+work twice. Do not clear this history to retry a request. Older queue binaries
+refuse schema 2; rolling back code must not restore an old queue snapshot over
+new writes. This migration does not enable indexing, add resource quarantine,
+or fix the runner's separate list/claim error handling tracked in #2043.
+
 ## Verification
+
+The runner's SQLite contention fixture verifies actual outcome replay: after
+the fixture locker releases the ordinary runner lock, a real recovery tick
+must retire pending, inflight and failure records and the outcome spool while
+calling the fake provider only once. An empty pending list or a successful
+lock-busy no-op does not prove completion. The fixture also bounds its locker
+readiness wait. These tests use an isolated home and fake provider; they do not
+qualify production indexing or explain a separate first-tick timeout.
 
 The configuration test suite uses synthetic paths and fixtures. Native staging
 acceptance explicitly opts in to the independently pinned release binary:

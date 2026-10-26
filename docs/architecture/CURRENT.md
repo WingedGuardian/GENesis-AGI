@@ -339,10 +339,26 @@ open (`live_db_moved` otherwise). The threat model is accidental drift (owner
 ruling): deliberately constructed inputs, such as a swapped ancestor directory
 or forged bytecode, are documented residuals in the module docstring. Anything unproven
 lands in `unknown_reasons` or `telemetry_off: null`, and the verdict reads the
-row as not clean, so the clock waits for that server to restart. The cutover
-clock can only start at a census with no server that could be running older
-code; a row of an older schema reads dirty ("predates the current census
-contract"). Pruned with the telemetry rows.
+row as not clean, so the clock waits for that server to restart. Since schema 3
+the census covers the other traversal producers it can see in `/proc`, not
+only memory servers:
+- ambient workers: the same source proof against main's worker script, with the
+  switch and database taken from the launch environment, since the worker loads
+  no secrets file;
+- the census host's own row, proven from where its genesis modules actually
+  loaded;
+- any other python process on main's venv (found by its absolute interpreter
+  path, or by resolving a bare `python` through its own PATH): history and
+  database scope only (owner ruling);
+- replay, listed as excluded because it is not live traffic (owner ruling);
+- another bridge or server beside the host, always dirty.
+
+A census-level `head_history_telemetry` checks every commit HEAD held in the
+last 2h30m, so the CODE HISTORY of a process that lived and died between two
+censuses is still covered; its source and switch are not. Every producer row
+uses the memory servers' database rule above. The cutover clock can only start
+at a census with no producer that could be running older code; a row of an older schema reads dirty
+("predates the current census contract"). Pruned with the telemetry rows.
 **The verdict** is `scripts/graph_cutover_report.py` over the pure
 `memory/graph_cutover.py`: PASS needs 14 days on the clock, at least 100
 falkordb-served traversals and falkordb traffic on at least 10 UTC days in the
@@ -1250,7 +1266,7 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: 50b79ffb 2026-09-01
+verified: a8fa35a358bc 2026-10-23
 ```
 
 - **Surplus generators are deliberately BLIND to `infrastructure_alert`
@@ -1291,7 +1307,12 @@ verified: 50b79ffb 2026-09-01
   distinct labels classified `external_untrusted` (wrapped on recall).
 - **`scheduler/` (top-level package) is the UserJobScheduler** — user-authored
   cron jobs (via MCP) that dispatch background DirectSessions. Distinct from
-  `surplus/scheduler.py`.
+  `surplus/scheduler.py`. Saved `active` is desired intent, while MCP/dashboard
+  `registered` derives current membership in the running scheduler. Failed
+  create registration retains the saved ID; retry `resume` on that ID or the
+  next startup reloads active intent. There is no automatic in-process
+  registration retry loop. Dispatch history `passed` means spawn accepted,
+  not session completion or delivery. See [user-job recovery](../reference/user-jobs.md).
 - `follow_ups/` = accountability ledger + dispatcher (every 5 min) that turns
   follow-ups into surplus tasks; retention sweep on the learning scheduler. The
   `follow_up_create` MCP tool routes USER-OWNED and purely-local operational work
@@ -1495,7 +1516,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: a8fa35a358bc 2026-10-23
+verified: 74c474c0f 2026-10-24
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1627,15 +1648,24 @@ the shared banner is not an assertion about all concurrent sessions.
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
   live runtime (stale-but-functional).
   External Codebase has pinned configuration staging/diagnostics and bounded
-  native query unit entry points in `scripts/codebase_managed.py`. Install and
-  bootstrap render disabled query/client-slice templates without auto-upgrading
-  a PATH provider. Staging does not activate it; MCP registration always uses
+  native query unit entry points in `scripts/codebase_managed.py`.
+  Status separately observes conditional queue initialization-lock prerequisites
+  without opening the queue or changing current-schema availability.
+  Install and bootstrap render disabled query/client-slice templates without
+  auto-upgrading a PATH provider. Staging does not activate it; MCP registration always uses
   the managed launcher, including absent PATH binaries. Queued indexing uses the
   existing durable queue and an exact-build native worker in a separate
   8 GiB, zero-swap scope, with final managed admission and canonical repository
   locks. This does not activate the service or establish production capacity
   or unattended resource-failure readiness. See
   `docs/reference/codebase-managed.md`.
+  The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
+  artifacts in retained import receipts without replacing business failures;
+  real filesystem/SQLite errors remain visible. Schema 2 upgrades metadata
+  atomically and older writers refuse it. The marker CLI `import-status`
+  observes receipt totals without initialization or migration. This does not
+  implement persistent resource quarantine or the runner's separate list/claim
+  error propagation.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -1751,6 +1781,54 @@ the shared banner is not an assertion about all concurrent sessions.
   reclaim); a click that opens a new tab switches the tools to it. `browser_fill` refuses a payment card number
   as the value and `browser_run_js` one in its script (the value check only:
   telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
+  `browser_fill_card` (off unless `config/payments.yaml` `card_fill.enabled`) pays with a
+  vault card in a second, short-lived Camoufox `BrowserContext` that only
+  `mcp/health/payment_context.py` creates or holds (an AST contract test pins it):
+  the merchant's cookies and storage (sessionStorage included) are handed over,
+  it refuses a checkout or card frame not on https at a host the vault's release
+  accepts (a dotted DNS name: no IP, single-label or loopback host), every
+  document is masked transparent from creation and kept so by an observer, top-layer content
+  (modal dialogs, popovers, fullscreen, backdrops, view transitions) and the page background included; a nested frame Camoufox's init script
+  missed (no mask at all) is masked by evaluate and re-checked, while a defeated mask or an unmasked
+  top document fails the check, the owner's tap shows the Pay button label and the
+  extra field names, the tool clicks Pay itself and returns fixed codes only.
+  Card values never leave in a URL: a Pay control whose form DECLARES GET is
+  refused before the tap, and a context-wide network route aborts the first
+  request of any redirect chain whose URL carries a typed card value
+  (`card_url_blocked`, do not retry): the number anywhere in a digit run; the
+  CVC, expiry, name and postal code as a whole parameter or path segment equal
+  to the value (exact equality, so a coincidental `?qty=123` with CVC 123 is
+  blocked too). A script-handled form that is GET only by default is not
+  refused. A redirect hop carrying one cannot be stopped by a
+  route; it is seen and reported (`card_url_leaked`; before Pay,
+  `card_url_before_pay`, or `card_value_in_request` when only a short value
+  matched, which may be a coincidence). WebSocket URLs are not covered. This guards a trusted
+  merchant's flawed form, not a hostile page script: one that reads a field can
+  still send it another way (a request body, an encoding the guard does not undo).
+  Selectors are plain CSS (a `>>` chain, an `engine=` part, quoted text or XPath
+  is refused, mirroring Playwright's own selector parser) and every
+  resolved element must live in the frame whose origin the tap shows
+  (`owner_frame`); a checkout whose host is itself a public suffix is refused;
+  the accessibility tree is off while card fill is on (owner ruling Q14).
+  Top-level navigation requests (sent, committed or not; a fragment or history
+  change sends none) and new windows are counted from the first keystroke: a
+  checkout that moves on while the card is typed ends `moved_while_filling`
+  (do not retry), never "nothing paid", unless a card value also went out in
+  a URL, which ends `card_url_before_pay` (also do not retry). Not seen: a
+  script-only submit (fetch, no navigation) and a navigation inside a child
+  frame (a hosted card frame posting its own form). The network-guard flags are checked
+  again after the last await before the click; a bank frame preloaded hidden
+  and shown after Pay is a `challenge`.
+  Before the tap it waits up to 10 s for a hosted widget's frames, fields, Pay
+  and total to mount (after it, a missing element means the page changed).
+  After the grant, after the claim and before Pay it re-checks the tapped
+  title, origins, Pay control, amount, extra fields and for a bot check, and
+  before Pay reads every card field back; it keeps reporting progress until
+  the end, so a client's idle timeout does not cancel it past the claim.
+  While it runs, the idle reclaim skips Camoufox, Turnstile's X clicks in the
+  same MCP process stand down (other processes on the display: not yet), and after the claim a stale-page restart is refused. Cookies are not
+  handed back to the main context yet, and a 3DS challenge closes the context
+  (`challenge`, outcome unknown).
   Every `_impl_browser_*` result and error passes `@_redacted` (card numbers in
   snapshots, script results, urls, titles and exception text become
   `[card redacted]`; a contract test requires the decorator on each), and the
@@ -1911,7 +1989,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 85652265c 2026-10-09
+verified: fbb0b6f19 2026-10-21
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -1975,6 +2053,23 @@ verified: 85652265c 2026-10-09
   can see (the host, a process owned by another user, or I/O byte counters
   miss, such as fsync storms and swap). Unreadable processes are counted, and
   command lines are never logged.
+- **Recovery on a `live` checkout** (#3492 D3): `REVERT_CODE` (stash, then
+  revert HEAD) never runs where the container checkout is on `live`, judged by
+  git's own HEAD (`refs/heads/live` bans, whatever the manifest says) and then
+  `scripts/lib/live_checkout.py`, both over `incus exec`; a failed git, or
+  anything but a clean `other`, counts as live. `check.py` turns that proposal into
+  `RESTART_CONTAINER` before Gate 2 (after F.1's git-health redirect), and
+  `recovery.py` refuses it as a backstop. A restart ends lock holders and lets
+  a boot repair run where one is installed; a bad candidate is removed by
+  `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
+  `live-move repair:` journal lines and a summary of the newest
+  `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
+  nor superseded (6 h window on its own `ts`), JSON-quoted, capped at 2,000
+  characters and fenced as untrusted; empty, and the prompt unchanged, when
+  there are none. The container reads are bounded where they are produced
+  (regular non-symlink reports, 4 MiB each; journal lines cut to 400), and
+  Telegram alert fields are cut before escaping. Residual: a container that
+  fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
@@ -2843,6 +2938,8 @@ modules: [learning, eval, experimentation, feedback, calibration, ledger, transc
 verified: 2f013ed7b 2026-10-24
 ```
 
+- Verification refresh is limited to the sampled qualification-runner behavior
+  below; other learning and evaluation evidence retains its dated basis.
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
   glue over Claude Code transcripts and `cc_sessions.skill_tags`. Per skill:
   tool loads, slash loads, SKILL.md reads (not counted in a session that edits
@@ -2860,12 +2957,30 @@ verified: 2f013ed7b 2026-10-24
   `Skill` tool_use records, so once that library's storage ships this report
   should become a query over it rather than a second parser.
 
-- **transcript_analytics/**: optional local transcript parser library. It
+- **transcript_analytics/**: optional local transcript analytics library. It
   extracts physical records, preserves unresolved identity and usage, and
   applies the shared credential scrubber to structured content. Schema5 records
   distinguish executor identity from delegation evidence. This development
-  candidate adds the parser and optional DuckDB/Parquet dependencies; storage,
-  queries, CLI, scheduling and encrypted recovery arrive in dependent changes.
+  candidate adds the parser, durable per-source records, audited historical
+  readers and live query views. Readers capture immutable source selections;
+  tool blocks remain distinct, and uncertain result or delegation matches stay
+  unresolved. CLI and scheduling arrive in dependent changes. Additional backup
+  and recovery integration is deferred independently of collection and search.
+  Unknown historical content is excluded from content metrics. Views version 24
+  preserves missing call/result hashes as unknown and admits ownership from the
+  same evidence used by supported status and delegation; absent envelopes remain
+  distinct. Duplicate orphan results retain scrub-failure evidence. Query manifests
+  identify the views version. Historical actors without identities cannot form
+  lineage nodes. Paired-result IDs remain searchable raw evidence but do not
+  prove or contradict lineage: their independent result context was not retained.
+  Independent companion evidence and scoped unpaired results remain eligible;
+  paired-only associations stay unresolved and excluded from confirmed coverage.
+  Ingestion keeps one captured
+  canonical root, rejects malformed persisted root bindings and isolates source
+  stat failures. Transcript and sidecar-fingerprint reads admit regular descriptors
+  without blocking; fingerprint metadata is limited to 1 MiB. The extractor's
+  independent sidecar reopen remains outside adversarial-concurrency guarantees;
+  parser signatures and historical formats are unchanged.
   It does not describe a deployed capability.
   Hook names are limited to literal command targets and option-free supported
   interpreter operands; ambiguous commands report `<unknown>` while preserving
@@ -3085,6 +3200,11 @@ verified: 2f013ed7b 2026-10-24
   independent-backup claim. Missing retained evidence refuses before rendering.
   The isolated serial CLI supports Flash-only, explicit Pro–Flash or historical MiMo–Flash execution
   under an exact frozen operating plan and a separate local spending assertion.
+  An explicit manifest-bound Pro incumbent sample retains complete reference
+  admission and full Flash gates. Sampled Pro reports completion separately
+  from qualification; execution and detached reporting use the same declared
+  paired population and status rules. Exploratory case and reference-class comparisons do
+  not treat repeated responses as independent cases or authorize promotion.
   A credential-scoped lock precedes journal writers and credential reads. The
   actual pre-dispatch key snapshot must fund the whole selected pending
   population, including effective/member headroom; uncertain evidence stops
@@ -3094,6 +3214,8 @@ verified: 2f013ed7b 2026-10-24
   invalidate scoring on detected drift, without a per-request source-integrity
   guarantee. Detached reports score retained snapshots under current admission,
   read no credentials and do not authenticate current external spending consent.
+  Unmarked legacy histories retain detailed incomplete reports; malformed sample
+  markers are refused during validation.
   No paid quality, promotion or live activation follows from synthetic wiring.
   After source review, the integrated runner passed 1,777 affected tests and a
   complete synthetic 750-case/2,250-request actual-CLI run plus credential-free
@@ -3549,30 +3671,33 @@ inferred current provider outage. The readiness worker uses the shared
 tool-disabled CC probe without changing its schedule or routing authority.
 
 - **payments/**: the encrypted card vault, virtual cards only.
-  `python -m genesis vault init|add|list|retire|status` (`payments/cli.py`);
+  `python -m genesis vault init|add|list|retire|migrate|status` (`payments/cli.py`);
   `vault_store.py` keeps `~/.genesis/payment_vault/` (0700, files 0600): an age
-  X25519 identity sealed under the owner's passphrase (zxcvbn score 4), its
-  public key, and `cards.db`, whose card details exist only as age blobs
-  encrypted to that key, each carrying its own `card_ref` and merchant scope;
-  cards.db also records the sealed key's sha256 and public key, checked (with no
-  passphrase) before any add, so a damaged or swapped key is refused; the public
+  X25519 identity in `identity.key` with no passphrase (owner ruling a4a95392:
+  the per-payment Telegram tap is the gate, the cards are merchant-locked
+  virtual cards), its public key, and `cards.db`, whose card details exist only
+  as age blobs encrypted to that key, each carrying its own `card_ref` and
+  merchant scope; cards.db also records the key file's sha256 and public key,
+  checked before any add, so a damaged or swapped key is refused; the public
   key is checked again on the connection that writes the card, so a swapped
-  database takes nothing. `add` needs no passphrase and requires a merchant
-  scope or `--single-use`; init/add/retire need a TTY that can hide input (every
-  answer is hidden) and refuse inside a coding agent's session, Claude Code or
-  Codex (accident guard). Needs the `payments` extra, which bootstrap and
+  database takes nothing. A vault made before the ruling holds the key sealed
+  as `identity.age` and is refused until `vault migrate` unseals it once (the
+  passphrase asked one last time; the vault is copied aside first; a migration
+  killed part-way resumes with no passphrase). `add` requires a merchant scope
+  or `--single-use`; init/add/retire/migrate need a TTY that can hide input
+  and refuse inside a coding agent's session, Claude Code or Codex (accident
+  guard). Needs the `payments` extra, which bootstrap and
   install.sh install on every install as a non-fatal step after the core
   (`venv_setup.sh` `install_runtime_extras`, with the `test` extra).
   `vault_service.py` runs inside genesis-server (started from
-  `StandaloneAdapter.serve()`, never the bridge or terminal): after
-  `vault unlock` it holds the X25519 identity in memory and relocks on
-  `vault lock`, after 30 minutes idle, on a key/recipient mismatch, and on
-  restart. It serves unlock/lock/status on `~/.genesis/run/payment_vault.sock`
-  (0700 dir, peer uid checked with SO_PEERCRED); the scrypt unwrap runs in a
-  short-lived subprocess so the event loop never waits on it (a thread stalled
-  the loop for the whole decrypt here). Every unlock, lock,
-  refusal and relock lands in `payment_vault_events` with the requesting pid
-  and process names; unlock fails closed without that audit row.
+  `StandaloneAdapter.serve()`, never the bridge or terminal): it loads the
+  X25519 identity from `identity.key` at start, and again on `status` or a
+  release request while none is held (so a migrate or init under a running
+  server takes effect), and drops it on a key/recipient mismatch and at stop.
+  It serves status and the release ops on `~/.genesis/run/payment_vault.sock`
+  (0700 dir, peer uid checked with SO_PEERCRED); `vault unlock` and `vault
+  lock` are retired and answer why. Every load, refused load and drop lands in
+  `payment_vault_events`; a load fails closed without its audit row.
   `approval.py` `PaymentApprovalRegistry` (created in `serve()`, audited
   through the vault service's own connection, bot attached after Telegram
   starts) asks the owner to approve a card release: a code-built,
@@ -3581,8 +3706,11 @@ tool-disabled CC probe without changing its schedule or routing authority.
   message id and text, unedited and accessible, once; anything else, a missing
   bot or audit, or 10 minutes without a tap refuses. Nonces live in memory
   only; no `approval_requests` row is written, and the type is in the gate's
-  approve-all denylist, `refuse_generic` and both dashboard filters. Nothing
-  calls it or decrypts a card yet.
+  approve-all denylist, `refuse_generic` and both dashboard filters.
+  `release.py` serves the release ops (request, status, claim, cancel) to the
+  verified genesis-health peer; `release_client.py` is that peer's side, used
+  by `browser_fill_card`, and `card_fill.py` holds the tool's rules (the
+  switch, launch prefs, argument checks, fixed result texts).
   Backup: `scripts/lib/payment_vault_backup.sh` from
   backup.sh §8 writes the three files as ONE GPG-encrypted tar,
   `creds/payment_vault.tar.gpg`, renamed into place once (cards.db via SQLite
@@ -4080,23 +4208,63 @@ tool-disabled CC probe without changing its schedule or routing authority.
   update that merged code and never activated it, or that stopped on merge
   conflicts, leaves it behind. Whether it still guards is ONE rule,
   `scripts/lib/update_state_guard.py` (stdlib; `safe` / `guards` /
-  `conflict_pending`, plus the remedy text): a "done" state, a plain run's
-  "fetching" at its rollback tag, and a "merging" at the tag with no merge
-  residue and no recorded conflict guard nothing; anything unreadable guards.
-  `deploy_code_only.sh` and the live engine refuse to restart or move the
-  checkout while it guards; a plain `update.sh` exits 5 (before tagging or
-  writing anything), and the dashboard's `/apply` answers 409 on both paths;
-  `--post-merge` is the run that finishes it. Only the run that wrote the file
-  deletes it on its exits (never a `--post-merge`, never a run that had not
-  written yet), a rollback that left merged code keeps it, and bootstrap's
-  crash recovery keeps a pending conflict. The dashboard's progress poll is
-  read-only: it reports the verdict and offers Dismiss, the one retirement by
-  hand. The merge-residue check is shared with bootstrap
-  (`genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`). One exception
+  `conflict_pending` / `mixed_tree` / `holds`, plus the remedy text): a "done"
+  state, a plain run's "fetching" at its rollback tag, and a "merging" at the tag
+  with no merge residue and no recorded conflict guard nothing. A guarding state
+  is one of two kinds (#3532): `guards` (exit 0) is merged code complete on disk
+  that bootstrap has not run on, which `--post-merge` finishes; `holds` (exit 6)
+  is every state where finishing forward is wrong or unknown (the update never
+  changed the checkout, it is not where the update left it, the record cannot be
+  trusted or read, a merge is in progress), whose message names the remedy
+  (usually: save any edit, Dismiss, run the update again). HEAD at the update's
+  own new code (`own_head`) in any phase is checked for a rollback checkout
+  killed partway back to the tag (the two-dot residue back toward the tag),
+  main and `live` alike. Merge residue at the tag is `mixed_tree` (exit 4): a half-written
+  checkout, whose message lists the paths and says to save, restore and
+  Dismiss. Residue counts tracked changes only on the paths the merge
+  (`rollback...deploy_head`) writes; a tracked change elsewhere (an indexer's,
+  another session's) with nothing merged `holds`, not `mixed_tree`. A "merging" row carrying the live engine's move record
+  (`live_move`, #3492) is judged by the TWO-DOT diff a `git switch` writes
+  (the old and new `live` tips diverge, so main's symmetric range would miss
+  what a dropped candidate had deleted), toward the record's target with HEAD
+  at the tag, and back toward the tag with HEAD at the target (a rollback
+  checkout killed partway); only tracked changes on the switch's own paths
+  count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
+  row on `live` whose record update.sh already dropped (it adopted the tip,
+  own_head is that tip) is judged the same way toward own_head, so a rollback
+  killed partway after adoption is caught too. The remedy follows HEAD: at the
+  tag, put the paths back and Dismiss; at the update's new code (main's merge
+  or the rebuilt tip), put them back and finish with `--post-merge`
+  (Dismissing there leaves code bootstrap never ran on). The dashboard's progress poll returns the guard's remedy
+  (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
+  restart or move the checkout while it guards; a plain `update.sh` exits 5
+  (before tagging or writing anything), and the dashboard's `/apply` answers
+  409 on both paths; `--post-merge` finishes only `guards` (a resolved, committed conflict and a
+  merge that landed before update.sh recorded it read so too), and refuses
+  (exit 5, main and `live` alike) a `conflict_pending`, a `mixed_tree`, a
+  `holds`, a state with nothing to finish, or a guard that could not run, with
+  the guard's remedy. Bootstrap's crash recovery and update.sh's kept-state line
+  print that remedy too. Only the run
+  that wrote the file deletes it on its exits (never a `--post-merge`, never a
+  run that had not written yet), a rollback that left merged code keeps it, and
+  bootstrap's crash recovery keeps a pending conflict. Bootstrap's crash
+  recovery judges liveness by update.lock alone, never the recorded pid (a
+  zombie or a reused pid looks alive): held, it goes on only when the state's
+  pid is running it, either named in `GENESIS_BOOTSTRAP_UPDATE_PID` (update.sh
+  passes its own pid) or as bootstrap's direct parent (`$PPID`, how an
+  update.sh from before the token calls it: every install runs that one once,
+  against this bootstrap, on the update that brings it in), and refuses
+  otherwise, a hand-run bootstrap during a live update (its parent is a shell)
+  or an orphaned engine included; free, the update is dead and recovery runs.
+  At the tag in "merging" it goes on only on the guard's exit 10, printing
+  the guard's message otherwise. The dashboard's progress poll is read-only:
+  it reports the verdict and offers Dismiss, the one retirement by hand. The
+  residue check is `genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`
+  (`--two-dot` for a live row). One exception
   in the engine: the "merging" row of the `update.sh` that is running the
   rebuild (its pid named in `DEPLOY_CANDIDATES_OWN_STATE_PID`, equal to the
   engine's parent, update.lock handed over, a plain run) is neither refused nor
-  retired.
+  retired; a run that names a pid whose row is not that run's own refuses.
 - **`update.sh` on `live`** (#2978, #3370): the merge's place, after the stop,
   is taken by the deploy-candidates engine's rebuild (`scripts/deploy_candidates.py
   rebuild`, the `live-engine` block). Everything else is main's path: one DB
@@ -4127,11 +4295,14 @@ tool-disabled CC probe without changing its schedule or routing authority.
   main while `live` already sat at the tip is not seen: git logs nothing
   then). A tracked edit in that last window, before git takes index.lock, is
   not warned about. What the engine did to the checkout is read
-  from its move record (`DEPLOY_CANDIDATES_MOVE_RECORD`, here
-  `~/.genesis/live_move.json`: `{"to", "phase"}` with phase `ref` / `moving` /
-  `partial` / `clean` / `done`, written by `deploy_candidates_plan.py` before and
-  after the move; a record that cannot be written before the move refuses it),
-  never inferred from git: a moved checkout is adopted only when HEAD is on
+  from its move record (`live_move` in update.sh's own "merging" row:
+  `{"to", "phase"}` with phase `ref` / `moving` / `partial` / `clean` / `done`,
+  written by the engine before and after the move, durably (fsynced) before it,
+  and only while the row is still that run's own; a record that cannot be
+  written before the move refuses it; the row outlives the run, so a crash
+  leaves it for every reader; the old `~/.genesis/live_move.json` side file is
+  no longer written or read: no engine ever moved a checkout before it, as
+  readiness refuses every move until PR C2's marker exists), never inferred from git: a moved checkout is adopted only when HEAD is on
   `live` at exactly the commit the record names, then moved back to the
   rollback tag with its git hooks restored (`restore-hooks`), and the services
   restart on the old tip. `restore-hooks` exits 1 when a hook could not be
@@ -4140,10 +4311,13 @@ tool-disabled CC probe without changing its schedule or routing authority.
   installed byte-identical and executable (readiness's own check,
   `hook_install_failures` in `deploy_candidates_gate.py`), a hand-edited hook
   included; the rollback then reports itself incomplete (a rebuild or drop,
-  past its commit point, only warns). A record that cannot be read, or that
-  says the switch began or wrote part of the tree while HEAD is not at its
-  target, means a possibly mixed working tree: nothing is restarted and the
-  rollback reports itself incomplete. Exit 4 after such a rollback needs it to
+  past its commit point, only warns). A record that cannot be read, that says
+  git wrote part of the tree, or that says the switch began while the two-dot
+  residue toward its target is non-empty (HEAD not at the target) means a
+  possibly mixed working tree: nothing is restarted, the rollback reports
+  itself incomplete, the state is kept with its record, and the guard's
+  `mixed_tree` message is printed. A switch that began and wrote nothing
+  restarts the old tip. Exit 4 after such a rollback needs it to
   have completed, hook restore, every service restart and a restarted
   genesis-server answering its health endpoint included; that health wait (up
   to 180 s) runs only on the units-refusal path that can exit 4, inside the
@@ -4165,7 +4339,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: f9a1d4cb 2026-10-18
+verified: 3e27b479 2026-10-23
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4217,12 +4391,25 @@ verified: f9a1d4cb 2026-10-18
   too; `--settings` does not carry this key (#3543). Re-measure
   with `claude -p --model <m> --debug-file <f>` when the catalog or installed
   plugins grow, or for a model with a smaller window.
+  The shared guard parser (`scripts/hooks/shell_parse.py`) carries nested
+  structural uncertainty and heredoc completeness independently. Proven inert
+  fragments retain narrow relief; complex valid heredoc forms can still be
+  refused. See `docs/reference/shell-parse-completeness.md` for the boundary.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
   existing commit/request budget decisions, denies approval-required or unknown
   evidence, and returns control to the user without native approval or Genesis
   lifecycle registration. It does not enforce the future reflection gates or
   cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
+  A separate, inactive `scripts/hooks/codex-validator-adapter` translates native
+  validator calls to the existing guards concurrently. It requires an absolute
+  Bash cd/exit opener terminated by a newline, confines patches to validator
+  scratch roots, translates asks
+  to denials and preserves advisories. Six source-bound publishing-allowance
+  tests retain direct evidence only; separate independent-state controls verify
+  the actual ask/refusal and existing push-cache effects. It has no ordinary configuration wiring
+  or role-specific publishing/store policy yet. See
+  `docs/reference/codex-validator-boundary.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,

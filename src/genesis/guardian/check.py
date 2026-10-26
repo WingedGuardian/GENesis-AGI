@@ -1740,12 +1740,19 @@ async def _execute_recovery_with_approval(
     # post-approval action (that would break gate-everything and hand the user a more
     # destructive recovery than they authorized). Rollback restores a healthy .git AND
     # repairs a read-only rootfs in one move.
+    # #3492 D3: on `live` a revert never runs (recovery.py says why). The proposal
+    # becomes the ladder's next rung, RESTART_CONTAINER: it ends any process still
+    # holding the update or checkout lock, and the server's systemd start runs the
+    # boot repair where one is installed (#3492 D2). A restart does not fix a bad
+    # candidate's code: that is the drop step, which #3492 C2 has the guardian run.
+    # Checked after F.1, whose rollback also repairs the git a restart cannot.
     if diagnosis.recommended_action == RecoveryAction.REVERT_CODE:
+        from dataclasses import replace
+
         from genesis.guardian.git_watch import container_git_supports_revert
+        from genesis.guardian.recovery import container_on_live
 
         if not await container_git_supports_revert(config):
-            from dataclasses import replace
-
             logger.warning(
                 "REVERT_CODE proposed but container git is unhealthy/read-only — "
                 "redirecting the proposal to SNAPSHOT_ROLLBACK before approval"
@@ -1757,6 +1764,19 @@ async def _execute_recovery_with_approval(
                     diagnosis.likely_cause
                     + " — container git is unhealthy, so a code revert is unavailable; "
                     "proposing snapshot rollback instead"
+                ),
+            )
+        elif await container_on_live(config.container_name):
+            logger.warning("REVERT_CODE proposed on `live` — proposing RESTART_CONTAINER")
+            diagnosis = replace(
+                diagnosis,
+                recommended_action=RecoveryAction.RESTART_CONTAINER,
+                likely_cause=(
+                    diagnosis.likely_cause
+                    + " — the checkout is on `live` (or could not be shown not to be), where "
+                    "a code revert never runs. Proposing a container restart: it ends lock "
+                    "holders and lets a boot repair run where one is installed. A bad "
+                    "candidate is removed with `scripts/deploy_candidates drop <branch>`"
                 ),
             )
 
