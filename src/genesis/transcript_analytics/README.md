@@ -68,5 +68,43 @@ for ingestion, even when its transcript fingerprint happens to match: if the
 transcript exists it can be re-extracted; if permanently gone its audited
 historical observations remain usable.
 
-The independent storage tests require no query/reconciliation modules. Query and
-snapshot functionality follow in the dependent A2 and B parts of #3425.
+## Live queries
+
+`query.connect(data)` binds all raw tables to one captured source selection.
+DuckDB's later lazy reads and query evidence use those same immutable paths and
+metadata. Live and deduplicated views retain the existing reconciliation rules;
+hooks/events aggregate scrub failures over every copy. Recomputed tool latency
+and fallback latency are nonnegative or unknown.
+
+Tool observations are identified by their enclosing event and tool-use ID, so
+multiple tool blocks on one JSON record remain separate. Cross-file results
+require a matching call observation or a shared known context; ambiguous results
+remain orphaned. Delegation evidence is scoped to its context and requires one
+distinct spawning observation before confirming a parent. Scrub failures are
+retained when any call copy or linked result reports one.
+Paired results retain raw child IDs for search, but cannot prove or contradict
+lineage because extraction did not retain their independent result context.
+Without independent companion evidence their spawn association stays unresolved
+and excluded from confirmed coverage. Unpaired results retain their own context
+and remain eligible for the existing producer checks.
+Unknown historical actors keep distinct structured source-local identities and
+do not create lineage nodes. Missing content hashes remain unknown and count as
+excluded content; observed conflicting hashes remain conflicts, including mixed
+known/missing copies. Ownership and supported attribution use the same complete
+evidence envelope, including every call copy used by delegation. Missing call or
+result envelopes are distinct from present envelopes whose hashes are unknown;
+validity remains false in both cases. Hook/event ownership also requires every
+observed actor. Conflicting tool observations retain stable display values without
+resolving ownership, and duplicate orphan results preserve any scrub-failure flag.
+Views version 24 invalidates caches containing the previous derived semantics;
+stored source schemas, extraction stamps and original provenance are unchanged.
+
+`source_coverage` exposes original per-source provenance and unavailable
+historical facts. `run_query(..., manifest_path=...)` records the same captured
+coverage alongside result denominators, the query views version and scrubbed query labels. Missing
+historical identity is unresolved, not attributed to a current executor.
+
+Each connection uses its own 0700 spill directory under `TA_DUCKDB_TMP` or
+`~/tmp/transcript-analytics/duckdb`; an unowned or symlinked root is rejected.
+The independent storage tests require no query/reconciliation modules.
+Disposable snapshots follow in the dependent B part of #3425.
