@@ -349,6 +349,10 @@ def test_version_reports_gateway_sha(stub_bin, tmp_path):
     deployed_path = home / ".local" / "bin" / "guardian-gateway.sh"
     content = "#!/usr/bin/env bash\n# DEPLOYED GATEWAY CONTENT\n"
     deployed_path.write_text(content)
+    # `version` also asks `claude auth status`; answer as a box without claude.
+    fake_claude = stub_bin / "claude"
+    fake_claude.write_text("#!/bin/sh\nexit 127\n")
+    fake_claude.chmod(0o755)
 
     proc = _run_verb(home, stub_bin, "version")
 

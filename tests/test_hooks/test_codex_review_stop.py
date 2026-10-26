@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -41,6 +42,23 @@ def test_unrelated_commands_do_not_lookup_budget(adapter, monkeypatch, command):
     monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: ("allow", ""))
     monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup"))
     assert adapter.decide(payload(command)) is None
+
+
+@pytest.mark.parametrize(
+    ("command", "blocked"),
+    [
+        ("bash -c " + shlex.quote("echo ok # don't\ngit $ACTION status"), True),
+        ("bash -c " + shlex.quote("echo ok # don't\ngh pr $ACTION 1"), True),
+        ("bash -c " + shlex.quote("echo ok # don't\nprintf hello"), False),
+    ],
+)
+def test_nested_blind_git_gh_errors_but_unrelated_text_is_allowed(
+    adapter, monkeypatch, command, blocked
+):
+    monkeypatch.setattr(
+        adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup")
+    )
+    assert bool(adapter.decide(payload(command))) is blocked
 
 
 @pytest.mark.parametrize("result", [None, {"status": "ok", "commit_approval_required": False}])

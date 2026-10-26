@@ -66,8 +66,8 @@ call, and running out is a refusal, never "nothing owed".
 Late findings (reviews that opened no round, and round-opening reviews that
 arrived after a fix to their head) are owed from ``REFLECTION_CUTOVER_ISO`` on,
 each credited only under its own round's context; ``review_late`` holds that
-reader and is imported only when a cutover is set. The cutover is None until the
-commit gate enforces reflections, so until then nothing more is owed.
+reader and is imported only when a cutover is set. The cutover was set when the
+commit gate started enforcing reflections, so no late debt predates that gate.
 
 CLI: ``status`` (what the open round owes, whether it has settled; ``--cutover``
 reports what late findings from that time on would owe, enforcing nothing) and
@@ -99,11 +99,12 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 SETTLE = timedelta(minutes=30)
-#: When late findings start being owed (``review_late``). None until the commit
-#: gate enforces reflections, which sets it at its own merge, so no debt appears
-#: before anything enforces it (owner ruling 50cc9dec). With None, what is owed
-#: is exactly the open round's, and ``review_late`` is never imported.
-REFLECTION_CUTOVER_ISO: str | None = None
+#: When late findings start being owed (``review_late``): the moment the commit
+#: gate started enforcing reflections, set once by that change and taken with its
+#: exempt snapshot (``review_enforcement_commit.REFLECTION_EXEMPT_PRS``), so no
+#: debt predates the gate (owner ruling 50cc9dec). None would owe exactly the
+#: open round's keys and never import ``review_late``.
+REFLECTION_CUTOVER_ISO: str | None = "2026-10-22T04:04:01+00:00"
 MIN_BLOCK_CHARS = 300
 LOG_DEPTH = 1000
 #: A template placeholder; it can never match a field, so it is refused anyway,

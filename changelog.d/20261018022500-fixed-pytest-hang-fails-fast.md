@@ -1,1 +1,0 @@
-- A test that hangs now ends the run after its 600-second per-test limit with a stack dump of every thread, instead of freezing the CI job until the job time limit cancels it.

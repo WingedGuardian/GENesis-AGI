@@ -49,6 +49,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     native_env,
     native_install,
     parent_identity,
+    queue_initialization_advisory,
     sentinel_armed,
     systemctl_env,
     units_dir,
@@ -672,7 +673,8 @@ def configure(args: argparse.Namespace, path: Path) -> None:
 
 def status(path: Path | None, path_error: str | None = None) -> dict:
     """Diagnose broken/old configuration without running its binary or requiring it."""
-    result = dict(settings=None, settings_error=path_error, service=None, manager_error=None)
+    result = dict(settings=None, settings_error=path_error, service=None, manager_error=None,
+                  queue_initialization=queue_initialization_advisory())
     try:
         if path is not None:
             value = read_document(path)
