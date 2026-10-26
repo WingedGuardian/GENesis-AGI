@@ -41,6 +41,93 @@ def _queue_payload(**overrides) -> dict:
     }
 
 
+def _import_receipts():
+    db = sqlite3.connect(im.database_path().as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("PRAGMA query_only=ON")
+        return [dict(row) for row in db.execute("SELECT * FROM legacy_imports")]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("poison_hash", ["0" * 16, "f" * 16], ids=["poison-first", "poison-last"])
+def test_poison_enqueue_import_retains_evidence_and_valid_sibling(
+    tmp_path, monkeypatch, poison_hash
+):
+    _home(tmp_path, monkeypatch)
+    good_repo = "/tmp/legacy-valid"
+    good_hash = im.marker_hash(good_repo)
+    assert "0" * 16 < good_hash < "f" * 16
+    poison = im.marker_dir() / f".spool-{poison_hash}-{'a' * 32}.spool"
+    valid = im.marker_dir() / f".spool-{good_hash}-{'b' * 32}.spool"
+    raw = json.dumps(_queue_payload(repo_path="\ud800")).encode()
+    poison.parent.mkdir(parents=True)
+    poison.write_bytes(raw)
+    _legacy(valid, _queue_payload(repo_path=good_repo, tools="gitnexus"))
+
+    rows = im.list_markers()
+
+    assert [(row["hash"], row["tools"]) for row in rows] == [(good_hash, "gitnexus")]
+    receipts = _import_receipts()
+    bad = [r for r in receipts if r["content_sha256"] == hashlib.sha256(raw).hexdigest()]
+    assert len(bad) == 1 and bad[0]["disposition"] == "quarantined"
+    assert bytes(bad[0]["raw_payload"]) == raw
+    assert im.get_failed(poison_hash) is None
+    assert not poison.exists() and not valid.exists()
+
+
+def test_valid_legacy_import_preserves_oversized_metadata_identity(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    _home(tmp_path, monkeypatch)
+    h = im.marker_hash("/tmp/legacy-metadata")
+    path = im.marker_dir() / f"{h}.json"
+    _legacy(path, _queue_payload(repo_path="/tmp/legacy-metadata"))
+    original_stat = Path.stat
+    oversized = 2**70
+
+    def large_metadata(candidate, *args, **kwargs):
+        value = original_stat(candidate, *args, **kwargs)
+        if candidate.parent == im.marker_dir() and candidate.name.startswith(
+            path.name + ".migrating-"
+        ):
+            return SimpleNamespace(st_mode=value.st_mode, st_mtime_ns=oversized)
+        return value
+
+    monkeypatch.setattr(Path, "stat", large_metadata)
+
+    assert im.list_markers()[0]["hash"] == h
+    receipts = _import_receipts()
+    assert len(receipts) == 1 and receipts[0]["source_mtime_ns"] == str(oversized)
+    assert receipts[0]["disposition"] == "imported"
+
+
+def test_legacy_read_io_failure_stays_visible_and_recoverable(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    h = im.marker_hash("/tmp/legacy-io")
+    path = im.marker_dir() / f"{h}.json"
+    _legacy(path, _queue_payload(repo_path="/tmp/legacy-io", attempts=2))
+    original_read = Path.read_bytes
+
+    def unreadable(candidate):
+        if candidate.parent == im.marker_dir() and candidate.name.startswith(
+            path.name + ".migrating-"
+        ):
+            raise PermissionError("injected owned legacy read failure")
+        return original_read(candidate)
+
+    monkeypatch.setattr(Path, "read_bytes", unreadable)
+    with pytest.raises(PermissionError, match="injected owned legacy read failure"):
+        im.list_markers()
+    assert len(list(im.marker_dir().glob(path.name + ".migrating-*"))) == 1
+    assert _import_receipts() == []
+    monkeypatch.setattr(Path, "read_bytes", original_read)
+    rows = im.list_markers()
+    assert len(rows) == 1 and rows[0]["attempts"] == 2
+    assert im.get_failed(h) is None
+
+
 @pytest.mark.parametrize("path", ["/tmp/example-repo", "/tmp", str(_ROOT)])
 def test_hash_matches_entrypoint_algorithm(path):
     canonical = os.path.realpath(path)
@@ -302,8 +389,9 @@ def test_stale_outcome_spool_cannot_apply_to_a_newer_claim(tmp_path, monkeypatch
 
     assert im.repend_stale_inflight() == [h]
     assert im.list_markers()[0]["attempts"] == 1
-    with sqlite3.connect(im.database_path()) as db:
-        assert db.execute("SELECT reason FROM failed_outcomes WHERE hash=?", (h,)).fetchone()
+    receipt = _import_receipts()[0]
+    assert receipt["disposition"] == "quarantined" and receipt["reason"] == "unowned-outcome"
+    assert bytes(receipt["raw_payload"])
     assert not spool.exists()
 
 
@@ -318,9 +406,7 @@ def test_conflicting_outcome_spools_fail_closed_to_one_retry(tmp_path, monkeypat
     assert im.repend_stale_inflight() == [h]
     assert im.list_markers()[0]["attempts"] == 1
     with sqlite3.connect(im.database_path()) as db:
-        reason = db.execute(
-            "SELECT reason FROM failed_outcomes WHERE hash=?", (h,)
-        ).fetchone()[0]
+        reason = db.execute("SELECT reason FROM failed_outcomes WHERE hash=?", (h,)).fetchone()[0]
     assert reason == f"conflicting durable outcomes for claim {claim_id}"
     assert not first.exists() and not second.exists()
 
@@ -464,7 +550,7 @@ def test_crash_left_migration_claim_is_recovered(tmp_path, monkeypatch):
     assert not claim.exists()
 
 
-def test_unreadable_legacy_claim_is_quarantined_without_wedging_queue(tmp_path, monkeypatch):
+def test_unreadable_legacy_claim_remains_visible_until_access_is_repaired(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     h = im.marker_hash("/tmp")
     path = im.marker_dir() / f"{h}.json"
@@ -472,16 +558,17 @@ def test_unreadable_legacy_claim_is_quarantined_without_wedging_queue(tmp_path, 
     path.chmod(0)
 
     try:
-        assert im.list_markers() == []
-        failed = im.get_failed(h)
-        assert failed["reason"] == "unreadable legacy marker (PermissionError)"
-        assert not path.exists()
-        assert list(im.marker_dir().glob(f"{h}.json.migrating-*")) == []
-        im.write_marker("/tmp", "gitnexus", "fast")
-        assert im.list_markers()[0]["tools"] == "gitnexus"
+        with pytest.raises(PermissionError):
+            im.list_markers()
+        claims = list(im.marker_dir().glob(f"{h}.json.migrating-*"))
+        assert len(claims) == 1 and _import_receipts() == []
+        claims[0].chmod(0o600)
+        assert im.list_markers()[0]["tools"] == "cbm"
+        assert im.get_failed(h) is None
     finally:
-        if path.exists():
-            path.chmod(0o600)
+        for candidate in [path, *im.marker_dir().glob(f"{h}.json.migrating-*")]:
+            if candidate.exists():
+                candidate.chmod(0o600)
 
 
 def test_temporary_spool_files_are_never_discovered_as_legacy_state(tmp_path, monkeypatch):
@@ -504,9 +591,10 @@ def test_malformed_enqueue_spool_is_quarantined(tmp_path, monkeypatch):
     _legacy(spool, "{truncated")
 
     assert im.list_markers() == []
-    failed = im.get_failed(h)
-    assert failed["reason"] == "malformed enqueue spool"
-    assert bytes(failed["raw_payload"]) == b"{truncated"
+    receipt = _import_receipts()[0]
+    assert receipt["reason"] == "invalid-json" and receipt["disposition"] == "quarantined"
+    assert bytes(receipt["raw_payload"]) == b"{truncated"
+    assert im.get_failed(h) is None
     assert not spool.exists()
 
 
@@ -570,9 +658,10 @@ def test_malformed_legacy_inflight_is_quarantined(tmp_path, monkeypatch, payload
     path = im.marker_dir() / f"{h}.inflight.json"
     _legacy(path, payload)
     assert im.repend_stale_inflight() == []
-    failed = im.get_failed(h)
-    assert failed["reason"] == "malformed legacy inflight marker"
-    assert bytes(failed["raw_payload"]).decode() == payload
+    receipt = _import_receipts()[0]
+    assert receipt["disposition"] == "quarantined"
+    assert bytes(receipt["raw_payload"]).decode() == payload
+    assert im.get_failed(h) is None
     assert not path.exists()
 
 
@@ -591,7 +680,8 @@ def test_legacy_numbers_outside_sqlite_range_are_quarantined(tmp_path, monkeypat
     _legacy(path, payload)
 
     assert im.list_markers() == []
-    assert im.get_failed(h)["reason"] == "malformed legacy pending marker"
+    assert _import_receipts()[0]["reason"] == "invalid-queue-fields"
+    assert im.get_failed(h) is None
     assert not path.exists()
 
 
@@ -709,8 +799,10 @@ def test_cli_terminal_outcome_spools_across_process_boundary_when_database_is_bu
             "--claim-id",
             claim_id,
         )
-        spool = Path(result.stdout.strip()) if result.stdout.strip() else next(
-            queue_dir.glob(f".outcome-spool-{h}-{claim_id}-*.spool")
+        spool = (
+            Path(result.stdout.strip())
+            if result.stdout.strip()
+            else next(queue_dir.glob(f".outcome-spool-{h}-{claim_id}-*.spool"))
         )
         assert spool.exists()
     finally:

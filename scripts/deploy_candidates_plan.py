@@ -13,10 +13,8 @@ Flat sibling of deploy_candidates.py (see that file for the commands).
 
 from __future__ import annotations
 
-import contextlib
 import fcntl
 import hashlib
-import json
 import os
 import subprocess
 import time
@@ -261,6 +259,7 @@ class Move(NamedTuple):
     at: str
     before: str | None
     head_left: str | None = None  # where HEAD went if it left `live` in the last instant
+    head_unknown: bool = False  # where HEAD is could not be read after the move
 
 
 class Source(NamedTuple):
@@ -375,35 +374,22 @@ def _acquire_checkout_lock(repo: Repo) -> int:
         raise
 
 
-#: Where a caller (update.sh on `live`) asks for the move record: a JSON file
-#: {"to": <tip>, "phase": <phase>} saying how far the move got, so the caller
-#: never infers from git afterwards what the move did. Phases: "ref" (the ref is
-#: about to move, the tree is unchanged), "moving" (the switch is about to run),
+#: The move record: {"to": <tip>, "phase": <phase>}, saying how far the move
+#: got, so its caller and every crash-recovery reader (update_state_guard.py)
+#: never infer from git what the move did. Phases: "ref" (the ref is about to
+#: move, the tree is unchanged), "moving" (the switch is about to run),
 #: "partial" (git wrote part of the tree and failed), "clean" (git refused and
-#: wrote nothing), "done" (the checkout is at "to"). No variable, no record.
-MOVE_RECORD_ENV = "DEPLOY_CANDIDATES_MOVE_RECORD"
+#: wrote nothing), "done" (the checkout is at "to"). Where it goes is the
+#: repo's (Repo.record_move): the engine writes it into the calling update.sh's
+#: own update_state.json row as "live_move" (#3492); with no caller, nowhere.
+MOVE_PHASES = ("ref", "moving", "partial", "clean", "done")
 
 
 def _write_move_record(repo: Repo, to: str, phase: str, *, before: bool) -> None:
-    """Write the move record atomically (same-directory temp + os.replace).
-    Before the move a failure refuses (nothing has moved: a missing record must
-    keep meaning "the engine never moved"); after it, a failure only warns."""
-    path = repo.env.get(MOVE_RECORD_ENV)
-    if not path:
-        return
-    tmp = f"{path}.{os.getpid()}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"to": to, "phase": phase}, fh)
-        os.replace(tmp, path)
-    except OSError as exc:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        if before:
-            raise Refusal(f"cannot write the move record {path} ({exc}); nothing moved") from exc
-        out(
-            f"  WARNING: the checkout is at {to[:12]}, but the move record {path} could not be written: {exc}"
-        )
+    """Record the move's phase. Before the move a failure refuses (nothing has
+    moved: a missing record must keep meaning "the engine never moved"); after
+    it, a failure only warns (repo.record_move decides both)."""
+    repo.record_move(to, phase, before=before)
 
 
 def move_checkout(
@@ -541,6 +527,8 @@ def _move_checkout_locked(
     # Past the commit point: the checkout has moved (or was already right), so
     # nothing below may raise a refusal that would claim nothing changed.
     state = f"`live` is at {at[:12]}"
+    # None: the read failed (after_move warned). That is not "on `live`": the
+    # restart advice must not load a checkout nobody could read (#3516).
     head_left = after_move(state, "reading where HEAD is", lambda: _head_left_live(repo))
     after_move(state, "keeping the reflog of `live` (git config)", lambda: ensure_reflog_kept(repo))
     up = after_move(
@@ -554,7 +542,7 @@ def _move_checkout_locked(
         out(
             f"  WARNING: could not set `live` to track {BASE_REMOTE}/{BASE_BRANCH}: {up.stderr.strip()}"
         )
-    return Move(files_moved, at, source.head, head_left or None)
+    return Move(files_moved, at, source.head, head_left or None, head_left is None)
 
 
 def _head_left_live(repo: Repo) -> str:
@@ -563,9 +551,13 @@ def _head_left_live(repo: Repo) -> str:
     switched branch after the last re-check moves nothing back (git's
     update-ref guards only `live` itself, not symbolic HEAD), so it is named,
     and the caller replaces its restart advice. Returns where HEAD went, or ""
-    when it is on `live`. Never refuses."""
+    when it is on `live`. Never refuses; a git that cannot say (symbolic-ref
+    exits other than 0 or 1, the detached answer) raises, so after_move warns
+    and the caller reports where HEAD is as unknown, never as detached."""
     p = repo.git("symbolic-ref", "-q", "HEAD", check=False)
-    ref = p.stdout.strip()
+    if p.returncode not in (0, 1):
+        raise repo._unknown("which branch is checked out", p)
+    ref = p.stdout.strip() if p.returncode == 0 else ""
     if ref == LIVE_REF:
         return ""
     where = (

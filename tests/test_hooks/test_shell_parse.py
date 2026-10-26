@@ -310,15 +310,15 @@ class TestOverride:
 
     def test_independent_sigils_coexist(self):
         # Codex P2: two INDEPENDENT acks must be able to share one trailing comment —
-        # at escalation round 2 a genuine-but-unrecognized audit needs BOTH audit-ack
-        # (Rule 3) and depth-ack (Rule 2.5). Every whitespace token is scanned, so order
-        # is irrelevant and each sigil matches its own token.
+        # a merge commit can need BOTH depth-ack (Rule 2.5) and review-override
+        # (Rule 2). Every whitespace token is scanned, so order is irrelevant and
+        # each sigil matches its own token.
         for cmd in (
-            "git commit -m x # audit-ack depth-ack",
-            "git commit -m x # depth-ack audit-ack",
+            "git commit -m x # review-override depth-ack",
+            "git commit -m x # depth-ack review-override",
         ):
             seg = sp.analyze(cmd)[0].raw
-            assert sp.has_trailing_override(seg, sigil="audit-ack"), cmd
+            assert sp.has_trailing_override(seg, sigil="review-override"), cmd
             assert sp.has_trailing_override(seg, sigil="depth-ack"), cmd
         # Every merge-gate sigil must be in _KNOWN_SIGILS or it ENDS the leading run and
         # silently breaks combined waivers. scheduled-review-override (newest) combined
@@ -350,8 +350,8 @@ class TestOverride:
         seg = sp.analyze("git commit -m x # TODO consider depth-ack later")[0].raw
         assert not sp.has_trailing_override(seg, sigil="depth-ack")
         # a non-sigil token AHEAD of a real sigil ends the run (the sigil is unreachable)
-        seg2 = sp.analyze("git commit -m x # depth-ack-nope audit-ack")[0].raw
-        assert not sp.has_trailing_override(seg2, sigil="audit-ack")
+        seg2 = sp.analyze("git commit -m x # depth-ack-nope review-override")[0].raw
+        assert not sp.has_trailing_override(seg2, sigil="review-override")
 
 
 # ── commit hook-skip flag detection ─────────────────────────────────────
@@ -991,8 +991,8 @@ class TestSigilRunRegression:
     def test_an_unlisted_leading_sigil_no_longer_ends_the_run(self):
         h = sp.has_trailing_override
 
-        assert h("git merge f  # merge-to-main-override audit-ack", "audit-ack")
-        assert h("git merge f  # audit-ack merge-to-main-override", "audit-ack")
+        assert h("git merge f  # merge-to-main-override depth-ack", "depth-ack")
+        assert h("git merge f  # depth-ack merge-to-main-override", "depth-ack")
         assert h("git merge f  # merge-to-main-override", "merge-to-main-override")
 
     def test_prose_still_ends_the_run(self):
@@ -1012,7 +1012,7 @@ class TestSigilRunRegression:
 
         The population is ``scripts/**.py``, NOT ``scripts/hooks/*.py``: a
         hooks-only glob misses ``review_enforcement_commit.py``, where
-        ``audit-ack`` and ``depth-ack`` are queried — 2 of the declared sigils,
+        ``review-override`` and ``depth-ack`` are queried — 2 of the declared sigils,
         invisible to a scan that claimed to cover "every hook".
         """
         _DEFAULT_SIGIL = inspect.signature(sp._has_trailing_override).parameters["sigil"].default

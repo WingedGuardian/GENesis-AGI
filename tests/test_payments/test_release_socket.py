@@ -23,8 +23,6 @@ from pathlib import Path
 
 import aiosqlite
 import pytest
-from pyrage import passphrase as age_passphrase
-from pyrage import x25519
 
 from genesis.db.crud import payment_vault_events as audit
 from genesis.payments import approval as ap
@@ -32,7 +30,6 @@ from genesis.payments import vault_store as vs
 from genesis.payments.peer_check import LAUNCHED, PeerPolicy, check_release_peer
 from genesis.payments.vault_service import VaultService
 
-PASSPHRASE = "quartz lantern ember noodle 41"
 MIG = importlib.import_module("genesis.db.migrations.20261011060631_payment_vault_events")
 VISA = "4242" * 4  # Stripe's public test Visa
 SECRET = "socket-claim-secret"
@@ -93,17 +90,16 @@ class FakeRegistry:
 
 
 @pytest.fixture(scope="module")
-def _sealed(tmp_path_factory):
-    path = tmp_path_factory.mktemp("sealed") / "payment_vault"
-    vs.init_vault(PASSPHRASE, path)
-    key = age_passphrase.decrypt((path / vs.IDENTITY).read_bytes(), PASSPHRASE).decode()
-    return path, key
+def _keyed(tmp_path_factory):
+    path = tmp_path_factory.mktemp("keyed") / "payment_vault"
+    vs.init_vault(path)
+    return path
 
 
 @pytest.fixture
-async def rig(_sealed, tmp_path):
+async def rig(_keyed, tmp_path):
     vault = tmp_path / "payment_vault"
-    shutil.copytree(_sealed[0], vault)
+    shutil.copytree(_keyed, vault)
     exp = f"12/{datetime.now(UTC).year + 3}"
     ref = vs.add_card(
         vs.parse_card(VISA, exp, "987"),
@@ -133,8 +129,8 @@ async def rig(_sealed, tmp_path):
                 check_release_peer, policy=policy, server_pid=os.getppid()
             ),
         )
-        svc._identity = x25519.Identity.from_str(_sealed[1])
-        await svc.start()
+        await svc.start()  # loads identity.key
+        assert svc.unlocked
         request = {
             "op": "release_request",
             "card_ref": ref,

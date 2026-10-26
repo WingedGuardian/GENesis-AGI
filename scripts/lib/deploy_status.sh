@@ -25,6 +25,7 @@
 _RUNTIME_RELOAD_SCRIPTS=(
     scripts/hooks/secret_scrub.py    # retained by transcript_analytics.scrub
     scripts/lib/index_marker.py      # imported by surplus/jobs/gitnexus.py (and disk_reclaim.py)
+    scripts/lib/index_marker_legacy.py # retained by index_marker's registered sibling loader
     scripts/hooks/worktree_claim.py  # loaded at import by observability/worktree_ownership_config.py
 )
 # Read or run afresh on every use, so a new copy is live at once, no restart:
@@ -35,7 +36,7 @@ _RUNTIME_FRESH_SCRIPTS=(
     scripts/lib/update_state_guard.py     # loaded by dashboard/routes/updates.py for /apply and the progress poll
     scripts/hooks/bash_allowlist_guard.sh # run through .claude/hooks/genesis-hook by cc/invoker.py
     scripts/hooks/bash_allowlist_lib.sh   # sourced by bash_allowlist_guard.sh on every run
-    scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot
+    scripts/lib/deploy_marker.sh          # sourced by observability/snapshots/deploy_health.py's main-checkout probe on every snapshot, and by update_state_guard.py
     scripts/lib/deploy_checkout.sh        # sourced by the same probe (its dirty-tree predicate), and by update_state_guard.py
     scripts/hooks/main_checkout_guard.py  # registered by cc/invoker.py for dispatched sessions
     scripts/hooks/hook_input.py           # imported by main_checkout_guard.py on every run
