@@ -21,6 +21,8 @@ def _reset_runtime():
 def _all_init_patches():
     """Context managers that patch all bootstrap init steps."""
     return [
+        # Reads, and can restore, the real home's credential files.
+        patch("genesis.runtime.GenesisRuntime._selfheal_credentials_startup"),
         patch("genesis.runtime.GenesisRuntime._load_secrets"),
         patch("genesis.runtime.GenesisRuntime._init_db", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_tool_registry", new_callable=AsyncMock),
