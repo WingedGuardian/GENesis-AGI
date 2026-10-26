@@ -20,13 +20,16 @@ genesis-health MCP server (``vault_service._handle`` runs that check):
   pid and start time), and only when ``sha256(claim)`` is the request's
   ``claim_hash``. Only the fields ``field_origins`` named (and the tap's
   "Fields" line showed) are returned, ``expiry`` as ``exp_month`` and
-  ``exp_year``, plus the label and last four.
+  ``exp_year``, ``first_name`` and ``last_name`` as the one sealed ``name``
+  (the fill splits it), plus the label and last four. A tapped name kind needs
+  a sealed name (two words for the split ones), refused before anything is
+  spent.
 - ``release_cancel {nonce}``, from the requesting process.
 
 There is one slot for the whole service. A second request while one is
 pending or granted refuses both and tells the owner; while a claim is being
-handed over, only the newcomer is refused. A lock, an idle relock, a stale key
-or a stop refuses the release. The vault owns the deadline: a pending release
+handed over, only the newcomer is refused. A stale key (dropped by the vault
+service) or a stop refuses the release. The vault owns the deadline: a pending release
 expires ``PENDING_BACKSTOP_S`` after its request even if the approval task
 never returns, and every op first settles a release that is due or whose
 requester has exited.
@@ -99,6 +102,11 @@ _RECENT = 16
 _TITLE_CHARS = 80
 _AMOUNT_CHARS = 32
 _BUTTON_CHARS = 40  # a Pay control's label is short: the title's rule, at half its cap
+# A consent checkbox's label (a debit authorization), as the tap shows it: whole,
+# or refused (payment_context.CONSENT_LABEL_CHARS is the fill's own cap).
+_CONSENT_CHARS = 600
+_MAX_CONSENTS = 2
+_MAX_STEPS = 8  # card_fill.MAX_STEPS
 _NO_BUTTON = "(not given)"  # what the tap shows when a request carries no label
 # The non-card fields a fill may also fill, in the order the tap lists them.
 # Names only: a request never carries their values.
@@ -115,9 +123,21 @@ FILL_NAMES = (
     "company",
 )
 _ORIGIN_KEYS = frozenset(
-    {"number", "expiry", "exp_month", "exp_year", "cvc", "name", "postal_code"}
+    {
+        "number",
+        "expiry",
+        "exp_month",
+        "exp_year",
+        "cvc",
+        "name",
+        "first_name",
+        "last_name",
+        "postal_code",
+    }
 )
 _EXPIRY_KEYS = ("exp_month", "exp_year")  # one "expiry" field is both
+# Typed from the card's one sealed name: the fill splits it (last word = last name).
+_SPLIT_NAME_KEYS = ("first_name", "last_name")
 #: Unicode Default_Ignorable_Code_Point (DerivedCoreProperties.txt), the ranges
 #: that render as nothing. Most are category Cf/Cn and dropped anyway; this
 #: catches the rest (Mn variation selectors, U+034F, Hangul fillers, U+115F/60).
@@ -150,6 +170,7 @@ class _Release:
     deadline: float  # on the service clock
     card_shown: tuple[str, str]  # (label, last4) as the tap showed them
     fields: frozenset[str]  # the card fields the tap named: the claim returns only these
+    split_name: bool = False  # first_name/last_name named: the sealed name needs two words
     state: str = PENDING
     decided: bool = False  # a claim past its epoch check completes
     task: asyncio.Task | None = None
@@ -172,6 +193,46 @@ def _sanitise_shown(raw: str, *, empty: str, cap: int) -> str:
         if ch.isspace() or not unicodedata.category(ch).startswith("C")
     )
     return (" ".join(text.split()) or empty)[:cap].rstrip()  # a cut can end on a space
+
+
+def _amount_text(value) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= _AMOUNT_CHARS
+        and value.isprintable()
+        and bool(value.strip())
+    )
+
+
+def _consents(value) -> tuple[str, ...]:
+    """The labels of the checkboxes the fill will tick after the tap, as shown."""
+    if value is None:
+        return ()
+    if (
+        not isinstance(value, list)
+        or not 0 < len(value) <= _MAX_CONSENTS
+        or not all(isinstance(v, str) for v in value)
+    ):
+        raise _Refusal("bad consent_labels")
+    shown = tuple(_sanitise_shown(v, empty="", cap=_CONSENT_CHARS + 1) for v in value)
+    if any(not s or len(s) > _CONSENT_CHARS for s in shown):  # never cut, never blank
+        raise _Refusal("bad consent_labels")
+    return shown
+
+
+def _step_labels(value) -> tuple[str, ...]:
+    """What the fill's steps clicked before the tap (a cart, a checkout button), as shown."""
+    if value is None:
+        return ()
+    if (
+        not isinstance(value, list)
+        or not 0 < len(value) <= _MAX_STEPS
+        or not all(isinstance(v, str) for v in value)
+    ):
+        raise _Refusal("bad step_labels")
+    shown = (_sanitise_shown(v, empty="(no label)", cap=4 * _BUTTON_CHARS) for v in value)
+    # Cut loudly: a long button text keeps its start and says it was cut.
+    return tuple(s if len(s) <= _BUTTON_CHARS else s[: _BUTTON_CHARS - 1] + "…" for s in shown)
 
 
 def _also_filled(value) -> tuple[str, ...]:
@@ -214,6 +275,23 @@ def _origins(value) -> dict[str, str]:
         text = host if scheme == "https" else f"{scheme}://{host}"
         shown[key] = text + (f":{int(port)}" if port else "")
     return shown
+
+
+def _claim_keys(origins) -> set[str]:
+    """The sealed fields a claim returns for the tapped kinds."""
+    keys = set()
+    for key in origins:
+        if key == "expiry":
+            keys.update(_EXPIRY_KEYS)
+        else:
+            keys.add("name" if key in _SPLIT_NAME_KEYS else key)
+    return keys
+
+
+def _name_usable(name, split: bool) -> bool:
+    """A name kind was tapped: the sealed name is there (two words or more to split)."""
+    words = name.split() if isinstance(name, str) else []
+    return len(words) >= (2 if split else 1)
 
 
 def _now() -> datetime:
@@ -290,7 +368,7 @@ class ReleaseManager:
             await self._row("release_refused", {**rel.row, "reason": reason}, stopping=stopping)
 
     async def abort(self, reason: str, *, stopping: bool = False) -> None:
-        """Refuse the release in the slot (lock, relock, stop). A decided claim completes.
+        """Refuse the release in the slot (a dropped key, stop). A decided claim completes.
 
         ``stopping`` is the service's stop: the service already refuses late audit
         writes, so the refusal row is written as part of the stop.
@@ -376,7 +454,7 @@ class ReleaseManager:
             if self._approvals is None:
                 raise _Refusal("approval is unavailable")
             if not svc.unlocked:
-                raise _Refusal("the vault is locked")
+                raise _Refusal("the vault key is not loaded (see vault status)")
             card_ref, claim_hash = request.get("card_ref"), request.get("claim_hash")
             if not isinstance(card_ref, str) or not vs.CARD_REF.fullmatch(card_ref):
                 raise _Refusal("bad card_ref")
@@ -384,13 +462,18 @@ class ReleaseManager:
                 raise _Refusal("bad claim_hash")
             host = _host(request.get("host"))
             amount, title = request.get("amount"), request.get("page_title")
-            if not (
-                isinstance(amount, str)
-                and 0 < len(amount) <= _AMOUNT_CHARS
-                and amount.isprintable()
-                and amount.strip()
-            ):
+            if not _amount_text(amount):
                 raise _Refusal("bad amount")
+            # A ceiling: the fill reads the real total after the card is saved and
+            # pays only at or under it (and at or above ``amount``, the subtotal).
+            ceiling = request.get("amount_max")
+            if ceiling is not None and not _amount_text(ceiling):
+                raise _Refusal("bad amount_max")
+            save = request.get("save_label")  # optional; the control clicked before Pay
+            if save is not None:
+                if not isinstance(save, str):
+                    raise _Refusal("bad save_label")
+                save = _sanitise_shown(save, empty="(no label)", cap=_BUTTON_CHARS)
             if not isinstance(title, str):
                 raise _Refusal("bad page_title")
             title = _sanitise_shown(title, empty="(no title)", cap=_TITLE_CHARS)
@@ -403,6 +486,8 @@ class ReleaseManager:
                     raise _Refusal("bad button_label")
             origins = _origins(request.get("field_origins"))
             also = _also_filled(request.get("also_filled"))
+            consents = _consents(request.get("consent_labels"))
+            steps = _step_labels(request.get("step_labels"))
             try:
                 cards = await asyncio.to_thread(vs.list_cards, svc._vault)
             except (vs.VaultError, OSError):
@@ -417,7 +502,12 @@ class ReleaseManager:
             session = "Genesis-launched session" if peer.kind == LAUNCHED else "foreground session"
             fields = {
                 "Site": host,
-                "Amount": f"{amount} (as stated by Genesis)",
+                "Amount": (
+                    f"{amount} (as stated by Genesis)"
+                    if ceiling is None
+                    else f"up to {ceiling} (subtotal {amount}, as stated by Genesis; the total "
+                    "is read after the card is saved, and Pay is clicked only within it)"
+                ),
                 "Card": f"{row['label']} ending {row['last4']}",
                 "Requester": f"{peer.comm} pid {peer.pid}, {session} (claude pid {peer.claude_pid})",
                 "Page title": title,
@@ -425,13 +515,25 @@ class ReleaseManager:
                 "Fields": ", ".join(f"{k}={v}" for k, v in origins.items()),
                 "Also filled": ", ".join(also) or "none",
             }
+            shown = set()
+            if save is not None:  # saved first, then Pay: older taps unchanged
+                fields["Save button"] = save
+                shown.add("save")
+            if ceiling is not None:
+                shown.add("amount_max")
+            if steps:  # the clicks that brought the card form up, before this tap
+                fields["Clicked first"] = "; ".join(f'"{x}"' for x in steps)
+                shown.add("steps")
+            if consents:  # the line only when there is a box to tick: older taps unchanged
+                fields["Will tick"] = "; ".join(f'"{c}"' for c in consents)
+                shown.add("consent")
             # What the registry would refuse is refused here, before any row.
             try:
                 approval.build_text(fields)
             except ValueError:
                 raise _Refusal("the approval text was refused") from None
             if svc._stopped or epoch != svc._epoch or not svc.unlocked:
-                raise _Refusal("the vault was locked")
+                raise _Refusal("the vault key was dropped")
         except _Refusal as exc:
             return await self._refuse(str(exc), peer)
         nonce = secrets.token_urlsafe(16)
@@ -446,6 +548,10 @@ class ReleaseManager:
                     "amount": len(amount),
                     "page_title": len(title),
                     "button_label": None if button is None else len(button),
+                    **({"consent_labels": [len(c) for c in consents]} if consents else {}),
+                    **({"step_labels": [len(x) for x in steps]} if steps else {}),
+                    **({"amount_max": len(ceiling)} if ceiling is not None else {}),
+                    **({"save_label": len(save)} if save is not None else {}),
                 },
                 "field_origins": origins,
                 "also_filled": list(also),  # names from FILL_NAMES, never values
@@ -461,20 +567,21 @@ class ReleaseManager:
             epoch=epoch,
             deadline=svc._clock() + PENDING_BACKSTOP_S,
             card_shown=(row["label"], row["last4"]),
-            fields=frozenset(
-                k for key in origins for k in (_EXPIRY_KEYS if key == "expiry" else (key,))
-            ),
+            fields=frozenset(_claim_keys(origins)),
+            split_name=any(k in origins for k in _SPLIT_NAME_KEYS),
             row=facts,
         )
-        if svc._stopped or epoch != svc._epoch or not svc.unlocked:  # locked during the row
+        if svc._stopped or epoch != svc._epoch or not svc.unlocked:  # dropped during the row
             self._remember(nonce, REFUSED)
-            await self._row("release_refused", {**facts, "reason": "the vault was locked"})
-            return {"ok": False, "error": "the vault was locked"}
+            await self._row("release_refused", {**facts, "reason": "the vault key was dropped"})
+            return {"ok": False, "error": "the vault key was dropped"}
         self._slot = rel
         self._arm(rel)
         audit_detail = {"release": nonce, "card_ref": card_ref, "host": host}
         rel.task = self._spawn(self._await_approval(rel, fields, audit_detail), "payment-release")
-        return {"ok": True, "nonce": nonce}
+        # The optional tap lines this request showed: a requester that needs one
+        # checks it is listed, since a service that predates a line ignores its key.
+        return {"ok": True, "nonce": nonce, "shown": sorted(shown)}
 
     async def _await_approval(self, rel: _Release, fields: dict, audit_detail: dict) -> None:
         outcome, why = REFUSED, "the approval failed"
@@ -568,8 +675,8 @@ class ReleaseManager:
         svc = self._svc
         identity, epoch = svc._identity, svc._epoch
         if identity is None:
-            await self._refuse_slot(rel, "the vault is locked")
-            return {"ok": False, "error": "the vault is locked"}
+            await self._refuse_slot(rel, "the vault key is not loaded")
+            return {"ok": False, "error": "the vault key is not loaded"}
         rel.state = CLAIMING
         try:
             return await self._hand_over(rel, identity, epoch, client_gone)
@@ -619,6 +726,9 @@ class ReleaseManager:
             refusal = "the card has expired"  # valid through its expiry month, as add_card has it
         elif (card["label"], card["last4"]) != rel.card_shown:
             refusal = "the card is not the one shown in the approval"
+        elif "name" in rel.fields and not _name_usable(card.get("name"), rel.split_name):
+            # Before the row and any retire: a single-use card stays unspent.
+            refusal = "the card has no usable name for the name fields"
         if refusal is not None:
             del card
             await self._refuse_slot(rel, refusal)

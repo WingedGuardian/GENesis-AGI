@@ -133,11 +133,12 @@
                         Dismiss</button>
                     </div>
                   </div>
-                  <div style="font-size:0.8rem; color:var(--color-text-secondary);"
+                  <div style="font-size:0.8rem; color:var(--color-text-secondary); white-space:pre-wrap;"
                        x-text="$store.genesisDashboard.updateProgress?.conflicts
                          ? 'The update has merge conflicts that could not be resolved automatically. Opus can analyze both sides and find the best resolution.'
                          : $store.genesisDashboard.updateProgress?.guards
-                           ? 'An earlier update merged code it has not activated, or its record cannot be read. Finish it with scripts/update.sh --post-merge, or Dismiss its record (code-only deploys will then restart onto the checkout as it stands).'
+                           ? ($store.genesisDashboard.updateProgress?.guard_remedy
+                             || 'An earlier update merged code it has not activated, or its record cannot be read. Finish it with scripts/update.sh --post-merge, or Dismiss its record (code-only deploys will then restart onto the checkout as it stands).')
                            : 'The last update attempt did not complete successfully. You can retry or dismiss this notice.'"></div>
                   <template x-if="$store.genesisDashboard.updateProgress?.summary">
                     <div style="margin-top:0.5rem; padding:0.5rem; border-radius:4px; background:rgba(255,152,0,0.05); font-size:0.8rem; font-family:monospace; color:var(--color-text-secondary);"

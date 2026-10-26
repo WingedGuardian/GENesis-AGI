@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Put the escalation cap's own menu in front of the user, not the session's retelling.
 
+DORMANT: the escalation cap this serves is retired (the commit gate now requires a
+round reflection instead), so the menu never appears. Kept until the follow-on
+cleanup deletes it; the text below describes the retired design.
+
 THE PROBLEM. On 2026-08-31 the escalation cap printed THREE remedies -- it prints four
 today, lettered (a)-(d), a change that landed 2026-09-13 in #1971, so do not "correct"
 the count below against the current gate -- and the relay to the user dropped the first,
@@ -175,35 +179,15 @@ def _payload_cwd(payload: dict) -> str | None:
 
 
 def _cap_is_live(cwd: str | None) -> bool:
-    """True when the escalation CAP tier is what the next commit would actually hit.
+    """Always False: the escalation CAP tier this menu answered is retired.
 
-    Mirrors the commit gate's local streak rule. The cloud-backed per-action approval
-    has its own native dialog and does not use this AskUserQuestion substitution.
-
-    `get_review_counters` is branch-scoped by construction -- it reads (0, 0) when the
-    stored state belongs to a different branch -- so a menu never follows you onto
-    unrelated work.
-
-    Every failure path returns False (no menu). Fail-open in the sense that matters --
-    a miss costs a menu, never a gate.
+    The commit gate no longer stops on the local three-consecutive-defect streak:
+    a round's reflection (``review_reflection``, enforced by the commit gate)
+    took its place, and its deny names its own remedies. The menu stays dormant
+    until the follow-on cleanup deletes it, so a stale counter can never bring
+    back a menu for a stop that no longer exists.
     """
-    try:
-        from review_state import (
-            ESCALATION_ROUND_CAP,
-            get_review_counters,
-        )
-    except Exception:  # noqa: BLE001 -- no counters, no menu. Never a refusal.
-        # Deliberately NO fallback to the two-call pair on ImportError. `genesis-hook`
-        # resolves scripts from the MAIN worktree while GENESIS_HOOK_DEV_LOCAL=1 splits
-        # the trees, so version skew is a real configuration here -- and against a tree
-        # too old to have the snapshot accessor, the fallback's only effect would be to
-        # reinstate the race this import exists to close. No menu is the better miss.
-        return False
-    try:
-        round_n, _lifetime_n = get_review_counters(cwd=cwd)
-        return int(round_n) >= ESCALATION_ROUND_CAP
-    except Exception:  # noqa: BLE001
-        return False
+    return False
 
 
 def _canonical_question() -> dict | None:

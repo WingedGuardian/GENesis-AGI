@@ -244,9 +244,10 @@ _MARKER_DIR = Path.home() / ".genesis" / "review_markers"
 # commit, but the round count must SURVIVE commits — a review→fix→re-review loop
 # commits between rounds, and the whole point is to notice when that loop runs long.
 _ROUND_DIR = Path.home() / ".genesis" / "review_rounds"
-# After this many CONSECUTIVE review rounds on one change, the commit gate blocks
-# pending an explicit '# escalation-ack'. Mirrors the closing-session SKILL.md
-# prose cap.
+# The streak's old hard-stop threshold. No gate reads it any more: the commit
+# gate's streak tiers (and '# escalation-ack') are retired, replaced by the round
+# reflection the gate now enforces. The statusline still shows the streak against
+# it until the follow-on cleanup deletes the counter.
 ESCALATION_ROUND_CAP = 3
 # Standing authorization is measured from GitHub-backed review rounds, not
 # from the local streak/lifetime store below.  Keep these constants here as the
@@ -731,7 +732,8 @@ def mark_reviewed(
             "(create_all_tables + the numbered migration); both ends of a marker/parser "
             "spec; every commit-A-then-B writer; every status in a state machine. "
             "Instance-patching the one flagged line is the #1 cause of review-loop churn. "
-            "(See CC memory review_loop_termination.)",
+            "That classification belongs in the round reflection, which the commit gate "
+            "requires before the fix (`python3 scripts/review_reflection.py status`).",
             file=sys.stderr,
         )
     return True

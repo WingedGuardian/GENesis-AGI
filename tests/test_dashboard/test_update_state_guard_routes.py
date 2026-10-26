@@ -270,3 +270,57 @@ def test_tier_1_sends_a_retry_that_exits_5_to_the_refusal_step():
 def test_the_orchestrator_log_is_true_for_both_refusals():
     assert "refused over hand-edited units" not in updates._ORCHESTRATOR_TEMPLATE
     assert "an earlier update unfinished" in updates._ORCHESTRATOR_TEMPLATE
+
+
+# ── the guard's own remedy on the card (#3492 PR C, SF3) ────────────────────
+
+
+def _half_written(w) -> None:
+    """A main merge killed after writing only the file it adds: HEAD at the
+    tag, b.txt untracked. The guard calls that a half-written tree."""
+    root = w["root"]
+    (root / "b.txt").write_text("b\n")
+    _git(root, "add", "b.txt")
+    _git(root, "commit", "-qm", "incoming")
+    incoming = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", "pre")
+    (root / "b.txt").write_text("b\n")
+    _write(w, {"phase": "merging", "rollback_tag": "pre", "deploy_head": incoming, "pid": 1})
+
+
+def test_the_poll_carries_the_guards_own_remedy(client, w, monkeypatch):
+    """The card names the remedy the guard gives, which for a half-written tree
+    is not --post-merge (it refuses one); the guard is asked once per poll."""
+    _half_written(w)
+    calls = []
+    real = updates._state_guard_verdict
+
+    def counted():
+        calls.append(1)
+        return real()
+
+    monkeypatch.setattr(updates, "_state_guard_verdict", counted)
+    body = client.get("/api/genesis/updates/progress").get_json()
+    assert body["guard"] == "mixed_tree" and body["guards"] is True, body
+    assert "b.txt" in body["guard_remedy"], body
+    assert "Do NOT run scripts/update.sh --post-merge" in body["guard_remedy"], body
+    assert len(calls) == 1, "the poll asked the guard more than once"
+
+
+def test_the_poll_has_no_remedy_when_nothing_is_guarded(client, w):
+    _write(
+        w, {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": False}
+    )
+    body = client.get("/api/genesis/updates/progress").get_json()
+    assert body["guard"] == "safe" and body["guard_remedy"] is None, body
+
+
+def test_the_card_shows_the_guards_remedy_and_a_true_dismiss_warning():
+    html = (
+        Path(updates.__file__).parent.parent / "templates" / "partials" / "tabs" / "backup.html"
+    ).read_text()
+    assert "updateProgress?.guard_remedy" in html, "the card ignores the guard's remedy"
+    js = (Path(updates.__file__).parent.parent / "webui" / "js" / "dashboard.js").read_text()
+    dismiss = js[js.index("async dismissUpdate()") :][:900]
+    assert "merged code it has not activated (or its record cannot be read)" not in dismiss
+    assert "half-written" in dismiss, dismiss

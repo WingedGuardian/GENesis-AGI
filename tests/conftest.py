@@ -391,7 +391,19 @@ def _is_introspection_only(config) -> bool:
     )
 
 
+pytest_plugins = ["tests._live_fence"]
+
+
 def pytest_configure(config):
+    _configure_lock_and_basetemp(config)
+    # Armed AFTER the lock (a run refused by it exits above) and after basetemp is
+    # placed (the fence allows fakes under it). See tests/_live_fence.py.
+    from tests import _live_fence
+
+    _live_fence.install(config)
+
+
+def _configure_lock_and_basetemp(config):
     # ── Box-wide serialization ─────────────────────────────────────────────
     # Acquire BEFORE anything else, and before the basetemp early-return
     # below, so every exit path from this function is already governed.
@@ -493,6 +505,9 @@ def pytest_unconfigure(config):
     produces."""
     target = getattr(config, "_genesis_basetemp_cleanup", None)
     try:
+        from tests import _live_fence
+
+        _live_fence.uninstall_files(config)
         if target:
             # BROAD for the same reason as pytest_configure's fallback: a hook that
             # raises turns a passing suite into exit 1, and cleanup is best-effort.
@@ -538,6 +553,20 @@ def updates_sandbox(tmp_path, monkeypatch):
     return isolate_update_routes(
         monkeypatch, tmp_path / "sandbox-home", scratch_repo(tmp_path / "sandbox-repo")
     )
+
+
+# ── The deploy engine probe: unanswered for tests that build a health snapshot ──
+@pytest.fixture
+def deploy_engine_unanswered(monkeypatch):
+    """The health snapshot's deploy section runs ``scripts/deploy_candidates list
+    --json`` against this checkout, which reads the install's real deploy manifest
+    and which the live fence refuses. Tests that build a whole snapshot answer it
+    the way an unreachable engine does (``None``: carried as unknown, never 0)."""
+    import importlib
+
+    # The package re-exports a function named deploy_health; patch the module.
+    module = importlib.import_module("genesis.observability.snapshots.deploy_health")
+    monkeypatch.setattr(module, "_observe_engine", lambda *args, **kwargs: None)
 
 
 # ── Graph-traversal telemetry is OFF unless a test opts in ─────────────────

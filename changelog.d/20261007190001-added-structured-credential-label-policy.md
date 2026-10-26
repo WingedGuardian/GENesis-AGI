@@ -1,1 +1,0 @@
-- Shared credential-label recognition for structured consumers, using the same token, password and environment-label vocabulary as the plain-text scrubber. Existing plain-text redaction behavior is unchanged.
