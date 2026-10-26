@@ -87,6 +87,47 @@ async def test_missing_answers_are_unscored_without_dispatch(data):
     assert not data.gateway.requests
 
 
+@pytest.mark.parametrize("manifest", [None, {"version": 1}, {"version": 1, "binding": None},
+                                     {"version": 1, "binding": []},
+                                     {"version": 1, "binding": "baseline_sample"},
+                                     {"version": 1, "binding": {}}])
+@pytest.mark.parametrize("paired", [False, True])
+async def test_legacy_reports_keep_incomplete_details_without_acquisition(
+    data, monkeypatch, capsys, manifest, paired,
+):
+    from genesis.eval.qualification.evidence import Campaign
+
+    with Campaign(data.path) as campaign:
+        if manifest is None:
+            campaign.append("dispatch", alias="historical")
+        else:
+            campaign.append("manifest", manifest=manifest)
+    paths = [data.path]
+    extra = []
+    if paired:
+        other = data.temp / "other-legacy"
+        with Campaign(other):
+            pass
+        paths.append(other)
+        extra = ["--against", "openrouter-deepseek-flash", "--against-campaign", str(other)]
+    before = {str(p): (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_mode)
+              for directory in paths for p in directory.iterdir()}
+    monkeypatch.delenv(pinned.KEY_ENV)
+    await finish_acquisition_logging()
+    capsys.readouterr()
+    assert await asyncio.to_thread(report_cli, data, monkeypatch, *extra) == 2
+    report = json.loads(capsys.readouterr().out)
+    reports = report["models"].values() if paired else [report]
+    assert report["status"] == "incomplete"
+    for value in reports:
+        assert value["status"] == "incomplete"
+        assert all(rep["unscored"] == 2 and rep["unscored_reasons"] == ["campaign_incompatible"]
+                   for contract in value["contracts"].values() for rep in contract["repetitions"])
+    assert not data.gateway.requests and not data.gateway.key_reads and not data.gateway.receipt_reads
+    assert before == {str(p): (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_mode)
+                      for directory in paths for p in directory.iterdir()}
+
+
 @pytest.mark.parametrize("content", ['broken', '{"score":true}', '{"score":"1"}', '{"score":null}',
                                      '{"score":' + '1' + '0' * 400 + '}'])
 async def test_only_verified_malformed_answers_count_as_model_errors(data, content):
@@ -127,7 +168,7 @@ async def test_report_ephemeral_failure_changes_no_history(data):
     assert before == {p.name: p.read_bytes() for p in data.path.iterdir()}
 
 
-@pytest.mark.parametrize("module", ["run.py", "__main__.py", "execution.py", "accounting.py", "evidence.py"])
+@pytest.mark.parametrize("module", ["run.py", "__main__.py", "execution.py", "accounting.py", "evidence.py", "sampling.py", "../stats.py"])
 @pytest.mark.parametrize("when", ["before", "after"])
 async def test_report_binds_every_direct_runner_source(data, monkeypatch, capsys, module, when):
     # Actual identity and report boundaries; subset admission is explicit here.
@@ -140,7 +181,7 @@ async def test_report_binds_every_direct_runner_source(data, monkeypatch, capsys
     changed = when == "before"
 
     def file_hash(path):
-        if changed and path == run.Path(run.__file__).with_name(module):
+        if changed and path == run.Path(run.__file__).parent / module:
             return "0" * 64
         return original_hash(path)
 

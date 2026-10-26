@@ -1,1 +1,0 @@
-- genesis-development skill: rising review findings now prompt a provenance check; split correct separable additions or revert incorrect ones before adding more changes.

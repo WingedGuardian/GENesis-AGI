@@ -1,1 +1,0 @@
-- Refuse unsupported repository and cache identities before managed runtime effects or readiness retries, while preserving diagnostic and retirement reads.

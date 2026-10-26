@@ -346,7 +346,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-22: 82 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-22: 84 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -709,7 +709,11 @@ jobs:
         # cases skipped unless GENESIS_CODEX_NATIVE_TESTS=1, ceiling 198 -> 216.
         # Native validator-patch checks (test_codex_validator_patch.py): 128 opt-in
         # cases skipped unless GENESIS_CODEX_NATIVE_TESTS=1, ceiling 216 -> 344.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 344
+        # Interactive adapter (#3577): runner job 120459349900 records 70
+        # "opt-in native qualification" skips. Two added reason-delivery cases
+        # share that module flag. Four legacy-anchor refusal/no-op controls
+        # bring the module to 76 new opt-ins, ceiling 344 -> 420.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 420
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job
