@@ -128,6 +128,10 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   one — do not generalise from one guard's behaviour.
 - **Sigils must lead the trailing comment.** The override is read from the
   leading run of recognised tokens, so `# see audit-ack notes` overrides nothing.
+  Put several sigils in ONE comment: `# stale-review-override scheduled-review-override`.
+  In `# stale-review-override # scheduled-review-override` the second `#` is a
+  token the parser does not recognise, so it ends the run and only the first
+  sigil applies (`scripts/hooks/shell_parse.py` `_has_trailing_override`).
 - **`--no-verify` is blocked before any override is even considered.** There is
   no way to skip the native hooks; fix the cause.
 - **Chained commits are heavily restricted** — across worktrees, blocked

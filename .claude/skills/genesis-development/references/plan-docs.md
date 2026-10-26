@@ -13,9 +13,10 @@ property, marked as such.
    plan directory — `memory/open_loops._plan_lines()` (which renders the
    SessionStart in-flight block, by filename and mtime), `mcp/memory/locate.py`'s
    `plans` scope (which will content-search a plan when given `contains`), and
-   `scripts/plan_bookmark_hook.py` (which takes an explicit path from hook
-   input, falling back to mtime, and opens the file for its title and a task
-   count). So "a plan doc is read by nobody" is false — an earlier draft said
+   `scripts/plan_bookmark_hook.py` (which takes the payload's `planFilePath`
+   through the shared reader `scripts/hooks/plan_doc.py`, falling back to this
+   session's plan by filename or the only plan on the box, and opens the file
+   for its title and a task count). So "a plan doc is read by nobody" is false — an earlier draft said
    that — and so is "they all key on filename and mtime", which is what the
    first correction replaced it with. Both were too broad.
 
@@ -94,6 +95,12 @@ exactly the failure CLAUDE.md's evidence principle names.
 
 Everything above that divider is live plan content. Everything below is
 archaeology, kept for provenance. A plan with no divider is entirely live.
+
+Hooks find the divider through one reader, `scripts/hooks/plan_doc.py`
+(`live_section`): the first `#` heading whose text begins with
+`SUPERSEDED BELOW` (after an optional `═` rule), outside fenced code. So a heading with a single `#`, or with text after the rule, still
+divides, and a divider shown inside a ``` example does not. Write the canonical
+spelling above anyway; the grep below matches only that.
 
 This is the one rule about body LAYOUT. What the live body must STATE (the
 verified/NOT-verified split, alternatives, red-team, test plan, "Changed in this
