@@ -169,6 +169,45 @@ def _provider_config_reader(rel, node, chain) -> bool:
     )
 
 
+def _queue_import_reader(rel, node, chain) -> bool:
+    """Only the independent queue's exact read-only diagnostic connection."""
+    expected = ast.parse(
+        'sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0.5)', mode="eval"
+    ).body
+    return (
+        rel == "lib/index_marker_legacy.py"
+        and bool(chain)
+        and chain[0].name == "import_status"
+        and ast.dump(node) == ast.dump(expected)
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        'sqlite3.connect("genesis.db")',
+        "sqlite3.connect(database.as_uri(), uri=True, timeout=0.5)",
+        'sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=5)',
+    ],
+)
+def test_queue_reader_exception_cannot_exempt_another_opener(tmp_path, monkeypatch, extra):
+    tree = ast.parse((_SCRIPTS / "lib/index_marker_legacy.py").read_text())
+    status = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "import_status"
+    )
+    calls = list(_connect_calls(tree))
+    assert len(calls) == 1 and _queue_import_reader("lib/index_marker_legacy.py", *calls[0])
+    status.body.append(ast.parse(extra).body[0])
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib/index_marker_legacy.py").write_text(ast.unparse(tree))
+    monkeypatch.setitem(globals(), "_SCRIPTS", tmp_path)
+    monkeypatch.setitem(globals(), "_ALLOWLIST", {})
+    with pytest.raises(AssertionError, match="raw sqlite3.connect without"):
+        test_every_scripts_opener_consults_the_admission_fence()
+
+
 @pytest.mark.parametrize(
     "extra",
     [
@@ -230,7 +269,7 @@ def test_every_scripts_opener_consults_the_admission_fence():
                             "use the unaliased module name"
                         )
         for node, chain in _connect_calls(tree):
-            if _provider_config_reader(rel, node, chain):
+            if _provider_config_reader(rel, node, chain) or _queue_import_reader(rel, node, chain):
                 continue
             if rel in _ALLOWLIST:
                 seen_allowlisted.add(rel)
