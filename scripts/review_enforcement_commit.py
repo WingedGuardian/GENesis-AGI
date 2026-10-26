@@ -144,12 +144,15 @@ _GIT_WORD = re.compile(r"\bgit\b")
 #: so, which is why the early exit below cannot be what lets it through. The
 #: push guard refuses the same shape for the same reason.
 _HIDDEN_GIT_VERB_MSG = (
-    "BLOCKED: this command runs git with a subcommand review enforcement cannot "
-    "read (a variable, a substitution or an escape stands where it goes, or an "
-    "option before it that the parser cannot classify), so it cannot tell "
-    "whether it commits.\n"
-    "To proceed: write the git subcommand out literally, and pass any option "
-    "the parser does not recognise after it or not at all."
+    "BLOCKED: this command may run a git operation whose subcommand review "
+    "enforcement cannot read or reliably establish (a variable, a substitution, "
+    "an escape, unreadable nested syntax, or an unclassified Git global option "
+    "obscures it), so it cannot tell whether a commit would run.\n"
+    "To proceed: for an unclassified Git global option, omit it or configure it "
+    "another way; split unreadable compounds into separate "
+    "commands, write the git subcommand out literally, or write prose or "
+    "script text to a file. For prose that merely mentions a commit, use the "
+    "Write tool instead of a here-doc."
 )
 
 
@@ -1882,13 +1885,15 @@ def main() -> None:
         # approval. Keep main's bounds refusal and its cause-specific remedy.
         if blind is not None:
             _deny(
-                f"BLOCKED: this command {blind.cause} and mentions a commit, so "
-                "review enforcement cannot verify what it would actually run.\n"
+                f"BLOCKED: this command {blind.cause} and mentions a commit; a "
+                "Git operation may run, but review enforcement cannot establish "
+                "whether it is a commit.\n"
                 f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
                 "message, a plan, review notes) whose content merely mentions "
                 "a commit, use the Write tool instead of a here-doc. If you are "
-                "RUNNING a git command, rewrite it in a directly-parseable "
-                "form (plain quotes, or `git commit -F <file>`)."
+                "RUNNING a git command, split unreadable compounds or rewrite "
+                "it in a directly-parseable form (plain quotes, or `git commit "
+                "-F <file>`)."
             )
         sys.exit(0)
 
