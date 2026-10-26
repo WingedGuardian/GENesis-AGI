@@ -53,6 +53,18 @@ async def test_record_and_list_newest_first(db):
     assert len(await audit.list_recent(db, 1)) == 1
 
 
+async def test_the_key_file_events_are_recorded_and_the_old_ones_still_are(db):
+    """key_loaded / key_load_refused / key_dropped (vault_service.ensure_key) are
+    key events; the passphrase-era names stay valid so earlier rows still read."""
+    new = ("key_loaded", "key_load_refused", "key_dropped")
+    old = ("unlock", "unlock_refused", "lock", "idle_relock", "stale_identity_relock")
+    for event in (*old, *new):
+        await audit.record_event(db, event, {"reason": "r"})
+    rows = await audit.list_recent(db, events=audit.KEY_EVENTS)
+    assert [r["event"] for r in rows] == list(reversed((*old, *new)))
+    assert set(new) <= audit.KEY_EVENTS
+
+
 async def test_unknown_event_is_refused(db):
     with pytest.raises(ValueError, match="unknown payment vault event"):
         await audit.record_event(db, "card_released")
