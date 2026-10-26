@@ -1989,7 +1989,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 85652265c 2026-10-09
+verified: fbb0b6f19 2026-10-21
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2053,6 +2053,23 @@ verified: 85652265c 2026-10-09
   can see (the host, a process owned by another user, or I/O byte counters
   miss, such as fsync storms and swap). Unreadable processes are counted, and
   command lines are never logged.
+- **Recovery on a `live` checkout** (#3492 D3): `REVERT_CODE` (stash, then
+  revert HEAD) never runs where the container checkout is on `live`, judged by
+  git's own HEAD (`refs/heads/live` bans, whatever the manifest says) and then
+  `scripts/lib/live_checkout.py`, both over `incus exec`; a failed git, or
+  anything but a clean `other`, counts as live. `check.py` turns that proposal into
+  `RESTART_CONTAINER` before Gate 2 (after F.1's git-health redirect), and
+  `recovery.py` refuses it as a backstop. A restart ends lock holders and lets
+  a boot repair run where one is installed; a bad candidate is removed by
+  `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
+  `live-move repair:` journal lines and a summary of the newest
+  `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
+  nor superseded (6 h window on its own `ts`), JSON-quoted, capped at 2,000
+  characters and fenced as untrusted; empty, and the prompt unchanged, when
+  there are none. The container reads are bounded where they are produced
+  (regular non-symlink reports, 4 MiB each; journal lines cut to 400), and
+  Telegram alert fields are cut before escaping. Residual: a container that
+  fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
@@ -3594,30 +3611,33 @@ inferred current provider outage. The readiness worker uses the shared
 tool-disabled CC probe without changing its schedule or routing authority.
 
 - **payments/**: the encrypted card vault, virtual cards only.
-  `python -m genesis vault init|add|list|retire|status` (`payments/cli.py`);
+  `python -m genesis vault init|add|list|retire|migrate|status` (`payments/cli.py`);
   `vault_store.py` keeps `~/.genesis/payment_vault/` (0700, files 0600): an age
-  X25519 identity sealed under the owner's passphrase (zxcvbn score 4), its
-  public key, and `cards.db`, whose card details exist only as age blobs
-  encrypted to that key, each carrying its own `card_ref` and merchant scope;
-  cards.db also records the sealed key's sha256 and public key, checked (with no
-  passphrase) before any add, so a damaged or swapped key is refused; the public
+  X25519 identity in `identity.key` with no passphrase (owner ruling a4a95392:
+  the per-payment Telegram tap is the gate, the cards are merchant-locked
+  virtual cards), its public key, and `cards.db`, whose card details exist only
+  as age blobs encrypted to that key, each carrying its own `card_ref` and
+  merchant scope; cards.db also records the key file's sha256 and public key,
+  checked before any add, so a damaged or swapped key is refused; the public
   key is checked again on the connection that writes the card, so a swapped
-  database takes nothing. `add` needs no passphrase and requires a merchant
-  scope or `--single-use`; init/add/retire need a TTY that can hide input (every
-  answer is hidden) and refuse inside a coding agent's session, Claude Code or
-  Codex (accident guard). Needs the `payments` extra, which bootstrap and
+  database takes nothing. A vault made before the ruling holds the key sealed
+  as `identity.age` and is refused until `vault migrate` unseals it once (the
+  passphrase asked one last time; the vault is copied aside first; a migration
+  killed part-way resumes with no passphrase). `add` requires a merchant scope
+  or `--single-use`; init/add/retire/migrate need a TTY that can hide input
+  and refuse inside a coding agent's session, Claude Code or Codex (accident
+  guard). Needs the `payments` extra, which bootstrap and
   install.sh install on every install as a non-fatal step after the core
   (`venv_setup.sh` `install_runtime_extras`, with the `test` extra).
   `vault_service.py` runs inside genesis-server (started from
-  `StandaloneAdapter.serve()`, never the bridge or terminal): after
-  `vault unlock` it holds the X25519 identity in memory and relocks on
-  `vault lock`, after 30 minutes idle, on a key/recipient mismatch, and on
-  restart. It serves unlock/lock/status on `~/.genesis/run/payment_vault.sock`
-  (0700 dir, peer uid checked with SO_PEERCRED); the scrypt unwrap runs in a
-  short-lived subprocess so the event loop never waits on it (a thread stalled
-  the loop for the whole decrypt here). Every unlock, lock,
-  refusal and relock lands in `payment_vault_events` with the requesting pid
-  and process names; unlock fails closed without that audit row.
+  `StandaloneAdapter.serve()`, never the bridge or terminal): it loads the
+  X25519 identity from `identity.key` at start, and again on `status` or a
+  release request while none is held (so a migrate or init under a running
+  server takes effect), and drops it on a key/recipient mismatch and at stop.
+  It serves status and the release ops on `~/.genesis/run/payment_vault.sock`
+  (0700 dir, peer uid checked with SO_PEERCRED); `vault unlock` and `vault
+  lock` are retired and answer why. Every load, refused load and drop lands in
+  `payment_vault_events`; a load fails closed without its audit row.
   `approval.py` `PaymentApprovalRegistry` (created in `serve()`, audited
   through the vault service's own connection, bot attached after Telegram
   starts) asks the owner to approve a card release: a code-built,

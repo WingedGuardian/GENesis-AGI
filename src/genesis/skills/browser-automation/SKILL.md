@@ -412,6 +412,17 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
 - Billing address fields can omit `"value"`: the tool then reads it from
   `card_fill.billing` in the install's private payments config, so the address
   stays out of tool arguments.
+- A checkout that stores the card first and shows its fee only then ("Add
+  Card", then "Pay $X") takes `save` (the store control, usually in the card
+  frame) and `amount_max`, the ceiling you approved with the owner. `amount`
+  stays the subtotal the page shows before the card. The tap reads "up to
+  <amount_max>". After the save the tool reads the total (from `total` if
+  given, else Pay's label) and clicks Pay only if the subtotal <= total <=
+  ceiling. Otherwise it stops with Pay NOT clicked: the card may now be stored
+  on the merchant, so tell the owner rather than repeating the steps. Pass
+  `amount` and `amount_max` as the page writes them, currency symbol included
+  (a dollar sign before the digits, for a dollar price): a total in another currency, or a negative one, is not read. The
+  ceiling checks what the page shows; it is not a limit the merchant enforces.
 - The tool reopens the checkout in a window no other tool reaches, waits for
   the owner's Telegram tap, fills, clicks Pay itself and closes the window.
   You get a fixed `code` and `status` only.

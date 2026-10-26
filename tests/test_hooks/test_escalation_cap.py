@@ -1,5 +1,8 @@
-"""Tests for the review escalation cap — the machine-enforced round counter +
-commit-gate block (scripts/review_state.py + scripts/review_enforcement_commit.py).
+"""Tests for the review round counter (scripts/review_state.py).
+
+The commit-gate block it once fed (the escalation cap's streak tiers) is retired;
+the round reflection replaced it (tests/test_hooks/test_reflection_gate.py). The
+counter, its helpers and the shared harness below stay until the follow-on cleanup.
 
 Hermetic: throwaway git repo under ``tmp_path`` with ``HOME`` pointed at another
 temp dir, so the real per-worktree markers/round counters under ``~/.genesis/``
@@ -378,156 +381,12 @@ def _reach_rounds(repo: Path, home: Path, n: int) -> None:
         assert m.returncode == 0, m.stderr
 
 
-def test_commit_blocked_at_round_cap(repo, home):
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)  # 3 rounds
-    # Review IS current for the latest staged diff (just marked), so Rule 2 passes —
-    # the escalation cap (Rule 3) is what must now block.
-    res = _run_hook('git commit -m "wip"', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "escalation cap" in res.stderr
-
-
-def test_escalation_ack_allows_past_cap(repo, home):
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert res.returncode == 0, res.stderr
-
-
-def test_ack_inside_message_does_not_bypass(repo, home):
-    # The token buried in the -m string (not a clean trailing comment) must NOT ack.
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    res = _run_hook('git commit -m "escalation-ack please"', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "escalation cap" in res.stderr
-
-
-def test_first_defect_round_not_blocked(repo, home):
-    # One defect-bearing round (below the mode-switch tier) → allowed with no ack.
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 2)  # 1 round
-    res = _run_hook('git commit -m "wip"', repo, home)
-    assert res.returncode == 0, res.stderr
-
-
-# ── Tier 1: round CAP-1 mode-switch (audit-ack) ───────────────────────────
-
-
-def test_mode_switch_blocks_at_second_defect_round(repo, home):
-    # Two consecutive defect-bearing rounds → the mode-switch tier blocks (one round
-    # BEFORE the hard cap), demanding a fresh-eyes audit rather than another patch.
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)  # 2 rounds
-    res = _run_hook('git commit -m "wip"', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "mode-switch" in res.stderr
-    assert "audit-ack" in res.stderr
-
-
-def test_audit_ack_allows_past_mode_switch(repo, home):
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
-    res = _run_hook('git commit -m "wip"  # audit-ack', repo, home)
-    assert res.returncode == 0, res.stderr
-
-
-def test_audit_ack_inside_message_does_not_bypass(repo, home):
-    # The token buried in -m (not a clean trailing comment) must NOT ack.
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
-    res = _run_hook('git commit -m "did the audit-ack thing"', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "mode-switch" in res.stderr
-
-
-def test_escalation_ack_does_not_satisfy_mode_switch(repo, home):
-    # The two acks are distinct: at the round-2 mode-switch the gate wants the
-    # AUDIT ack, not the round-3 user-decision ack. A wrong sigil stays blocked.
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
-    res = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "mode-switch" in res.stderr
-
-
-def test_audit_ack_does_not_reset_counter_so_round3_still_hard_stops(repo, home):
-    # The mode-switch ack lets THIS commit through but must NOT reset the streak:
-    # if the "audit" didn't actually converge and a third defect round follows,
-    # the hard cap must still fire. (Only a CLEAN review resets the streak.)
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)  # round 2
-    r_mode = _run_hook('git commit -m "audited"  # audit-ack', repo, home)
-    assert r_mode.returncode == 0, r_mode.stderr
-    _git(repo, "commit", "-qm", "audited")  # land it
-    _stage(repo, "third = 1\n")  # a THIRD distinct defect round
-    assert _mark(repo, home).returncode == 0
-    # Assert via the gate (subprocess under the test HOME) — an in-process
-    # get_review_round() would read the REAL ~/.genesis, not the test home. The
-    # hard stop firing proves the counter reached the cap (audit-ack did NOT reset).
-    r_hard = _run_hook('git commit -m "wip3"', repo, home)
-    assert r_hard.returncode == 2, r_hard.stdout + r_hard.stderr
-    assert "escalation cap" in r_hard.stderr
-
-
-def test_audit_ack_then_clean_review_resets(repo, home):
-    # The intended happy path: mode-switch → do the audit → a CLEAN review resets
-    # the streak, so the branch is back to zero friction (no round-3 stop).
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)  # round 2
-    r_mode = _run_hook('git commit -m "audited"  # audit-ack', repo, home)
-    assert r_mode.returncode == 0, r_mode.stderr
-    _git(repo, "commit", "-qm", "audited")
-    _stage(repo, "post_audit = 1\n")
-    m = _mark(repo, home, clean=True)  # audit converged → clean review resets streak
-    assert m.returncode == 0 and "streak reset" in m.stdout
-    res = _run_hook('git commit -m "wip"', repo, home)
-    assert res.returncode == 0, res.stdout + res.stderr
-
-
-def test_review_override_does_not_bypass_cap(repo, home):
-    # The cap is checked BEFORE Rule 2, so a '# review-override' (which would exit
-    # the review rule early) can NOT sneak a past-cap commit through.
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    _stage(repo, "unreviewed = 1\n")  # make review stale so override would apply
-    res = _run_hook('git commit -m "wip"  # review-override', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "escalation cap" in res.stderr
-
-
-def test_ack_resets_budget_no_permanent_friction(repo, home):
-    # Acking is a fresh decision → resets the round budget, so subsequent commits
-    # (back under the cap) don't each need a fresh ack.
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    r1 = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert r1.returncode == 0, r1.stderr  # ack allows + resets the counter
-    _git(repo, "commit", "-qm", "wip")  # actually land it
-    _stage(repo, "more = 1\n")
-    assert _mark(repo, home).returncode == 0  # one fresh review → round 1
-    r2 = _run_hook('git commit -m "wip2"', repo, home)
-    assert r2.returncode == 0, r2.stderr  # under cap again, no ack needed
-
-
-def test_codex_scenario_independent_clean_reviews_never_block(repo, home):
-    # Codex round-4 finding, verbatim: "When a branch contains three independently
-    # reviewed commits, or simply three clean reviews of distinct staged diffs,
-    # [the old counter] increments every time ... The commit gate then hard-blocks
-    # routine multi-commit development at round 3 even though no escalating
-    # review→fix loop occurred." With reset-on-clean the streak stays 0 throughout,
-    # so four clean-reviewed commits all pass the gate.
-    for i in range(1, 5):
-        _stage(repo, f"clean_{i} = {i}\n")
-        m = _mark(repo, home, clean=True)
-        assert m.returncode == 0, m.stderr
-        res = _run_hook(f'git commit -m "commit {i}"', repo, home)
-        assert res.returncode == 0, res.stdout + res.stderr
-        _git(repo, "commit", "-qm", f"commit {i}")  # actually land it
-
-
-def test_clean_mark_via_cli_prevents_block_after_defect_rounds(repo, home):
-    # Full CLI plumbing: two defect-bearing rounds, then a clean review via the
-    # `--clean` flag resets the streak, so the next commit is not blocked.
-    _reach_rounds(repo, home, 2)  # 2 defect-bearing rounds
-    _stage(repo, "clean_pass = 1\n")
-    m = _mark(repo, home, clean=True)
-    assert m.returncode == 0, m.stderr
-    assert "streak reset" in m.stdout
-    key = review_state._worktree_key(cwd=str(repo))
-    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
-    assert json.loads(rf.read_text())["round"] == 0
-    res = _run_hook('git commit -m "wip"', repo, home)
-    assert res.returncode == 0, res.stdout + res.stderr
+# ── The counter itself ─────────────────────────────────────────────────────
+#
+# The commit gate's streak tiers (the round-2 mode-switch and the round-3 hard
+# stop) are retired: a round reflection, enforced by the commit gate, replaced
+# them (tests/test_hooks/test_reflection_gate.py). The counter stays until the
+# follow-on cleanup, because the statusline still reads it; these tests pin it.
 
 
 def test_clean_staged_mark_does_not_inflate(repo, _isolate_rounds):
@@ -536,21 +395,6 @@ def test_clean_staged_mark_does_not_inflate(repo, _isolate_rounds):
     assert review_state.bump_review_round(cwd=str(repo), source="external") == 1
     _git(repo, "commit", "-qm", "wip")  # staged area now clean
     assert review_state.bump_review_round(cwd=str(repo), source="external") == 1  # no inflation
-
-
-def test_docs_only_commit_still_blocked_at_cap(repo, home):
-    # The hard stop must NOT be bypassable by file extension: a docs/skill-only
-    # commit at the cap (which would otherwise hit the docs-skip) is still blocked.
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    _git(repo, "commit", "-qm", "land code")  # clear staging (direct git, no gate)
-    (repo / "README.md").write_text("# docs change\n")
-    _git(repo, "add", "-A")  # staged set is now docs-only
-    res = _run_hook('git commit -m "docs"', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "escalation cap" in res.stderr
-    # ...and an ack lets the docs commit through.
-    res2 = _run_hook('git commit -m "docs"  # escalation-ack', repo, home)
-    assert res2.returncode == 0, res2.stderr
 
 
 def test_corrupt_round_counter_does_not_crash(repo, _isolate_rounds):
@@ -599,18 +443,6 @@ def test_bump_no_crash_on_truthy_non_dict(repo, _isolate_rounds):
     )  # treats as fresh, no crash
 
 
-def test_gate_fails_open_on_non_dict_counter(repo, home):
-    # End-to-end: a truthy non-dict counter file must NOT crash the commit gate.
-    _stage(repo, "a = 2\n")
-    assert _mark(repo, home).returncode == 0
-    key = review_state._worktree_key(cwd=str(repo))
-    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
-    rf.parent.mkdir(parents=True, exist_ok=True)
-    rf.write_text("[1, 2, 3]")  # non-dict → gate must fail open, not crash
-    res = _run_hook('git commit -m "wip"', repo, home)
-    assert res.returncode == 0, res.stdout + res.stderr
-
-
 # ── Malformed counter-file VALUE (round-5 class fix: 1e999 → inf → OverflowError) ──
 
 
@@ -653,20 +485,6 @@ def test_bump_no_crash_on_infinity_round(repo, _isolate_rounds):
     )
     _stage(repo, "a = 2\n")
     assert review_state.bump_review_round(cwd=str(repo), source="external") == 1
-
-
-def test_gate_fails_open_on_infinity_round(repo, home):
-    # End-to-end: the gate calls get_review_round() unguarded; an infinity 'round'
-    # in the counter file must fail open (round→0 < cap → allowed), not crash.
-    _stage(repo, "a = 2\n")
-    assert _mark(repo, home).returncode == 0
-    branch = review_state.get_current_branch(cwd=str(repo))
-    key = review_state._worktree_key(cwd=str(repo))
-    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
-    rf.parent.mkdir(parents=True, exist_ok=True)
-    rf.write_text('{"branch": "' + branch + '", "round": 1e999, "last_hash": "x"}')
-    res = _run_hook('git commit -m "wip"', repo, home)
-    assert res.returncode == 0, res.stdout + res.stderr
 
 
 # ── Source axis: the streak is CROSS-MODEL only (--source external) ───────────
@@ -804,42 +622,6 @@ def test_internal_clean_does_not_reset_external_streak(repo, home):
     key = review_state._worktree_key(cwd=str(repo))
     rf = home / ".genesis" / "review_rounds" / f"{key}.json"
     assert json.loads(rf.read_text())["round"] == 2
-
-
-def test_external_defect_loop_still_reaches_cap(repo, home):
-    # LOCKING: the source axis must NOT weaken the cap — three EXTERNAL defect rounds
-    # still hard-block the commit at the escalation cap.
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)  # 3 external rounds
-    res = _run_hook('git commit -m "wip"', repo, home)
-    assert res.returncode == 2, res.stdout + res.stderr
-    assert "escalation cap" in res.stderr
-
-
-def test_acceptance_bar_incident_replay(repo, home):
-    # THE ACCEPTANCE BAR — replays the 2026-09-01 false-block. The real sequence was:
-    # external Codex wave-1 (defects), external Codex wave-2 (defects → mode-switch
-    # fired CORRECTLY, forcing the audit that found F1/F2), then the MANDATED internal
-    # fresh-context audit — which under the old model counted as round 3 and tripped
-    # the HARD cap, penalizing the very remedy the gate demanded. New semantics: the
-    # two external rounds reach 2 (mode-switch), the internal audit does NOT advance,
-    # so the commit proceeds behind `# audit-ack` and the hard cap NEVER fires.
-    _stage(repo, "codex_w1 = 1\n")
-    _mark(repo, home)  # external round 1 (Codex wave-1)
-    _stage(repo, "codex_w2 = 1\n")
-    _mark(repo, home)  # external round 2 (Codex wave-2) → mode-switch territory
-    _stage(repo, "audit_fix = 1\n")
-    _mark(repo, home, source="internal")  # the mandated fresh-context audit — internal
-    key = review_state._worktree_key(cwd=str(repo))
-    rf = home / ".genesis" / "review_rounds" / f"{key}.json"
-    assert json.loads(rf.read_text())["round"] == 2, "internal audit must not advance the streak"
-    # Hard cap must NOT fire; the mode-switch audit-ack lets the commit proceed.
-    res_blocked = _run_hook('git commit -m "wip"', repo, home)
-    assert res_blocked.returncode == 2, res_blocked.stdout + res_blocked.stderr
-    assert (
-        "mode-switch" in res_blocked.stderr and "escalation cap reached" not in res_blocked.stderr
-    )
-    res_ok = _run_hook('git commit -m "wip"  # audit-ack', repo, home)
-    assert res_ok.returncode == 0, res_ok.stdout + res_ok.stderr
 
 
 def test_marker_and_round_json_carry_source(repo, home):

@@ -28,8 +28,8 @@ genesis-health MCP server (``vault_service._handle`` runs that check):
 
 There is one slot for the whole service. A second request while one is
 pending or granted refuses both and tells the owner; while a claim is being
-handed over, only the newcomer is refused. A lock, an idle relock, a stale key
-or a stop refuses the release. The vault owns the deadline: a pending release
+handed over, only the newcomer is refused. A stale key (dropped by the vault
+service) or a stop refuses the release. The vault owns the deadline: a pending release
 expires ``PENDING_BACKSTOP_S`` after its request even if the approval task
 never returns, and every op first settles a release that is due or whose
 requester has exited.
@@ -193,6 +193,15 @@ def _sanitise_shown(raw: str, *, empty: str, cap: int) -> str:
         if ch.isspace() or not unicodedata.category(ch).startswith("C")
     )
     return (" ".join(text.split()) or empty)[:cap].rstrip()  # a cut can end on a space
+
+
+def _amount_text(value) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= _AMOUNT_CHARS
+        and value.isprintable()
+        and bool(value.strip())
+    )
 
 
 def _consents(value) -> tuple[str, ...]:
@@ -359,7 +368,7 @@ class ReleaseManager:
             await self._row("release_refused", {**rel.row, "reason": reason}, stopping=stopping)
 
     async def abort(self, reason: str, *, stopping: bool = False) -> None:
-        """Refuse the release in the slot (lock, relock, stop). A decided claim completes.
+        """Refuse the release in the slot (a dropped key, stop). A decided claim completes.
 
         ``stopping`` is the service's stop: the service already refuses late audit
         writes, so the refusal row is written as part of the stop.
@@ -445,7 +454,7 @@ class ReleaseManager:
             if self._approvals is None:
                 raise _Refusal("approval is unavailable")
             if not svc.unlocked:
-                raise _Refusal("the vault is locked")
+                raise _Refusal("the vault key is not loaded (see vault status)")
             card_ref, claim_hash = request.get("card_ref"), request.get("claim_hash")
             if not isinstance(card_ref, str) or not vs.CARD_REF.fullmatch(card_ref):
                 raise _Refusal("bad card_ref")
@@ -453,13 +462,18 @@ class ReleaseManager:
                 raise _Refusal("bad claim_hash")
             host = _host(request.get("host"))
             amount, title = request.get("amount"), request.get("page_title")
-            if not (
-                isinstance(amount, str)
-                and 0 < len(amount) <= _AMOUNT_CHARS
-                and amount.isprintable()
-                and amount.strip()
-            ):
+            if not _amount_text(amount):
                 raise _Refusal("bad amount")
+            # A ceiling: the fill reads the real total after the card is saved and
+            # pays only at or under it (and at or above ``amount``, the subtotal).
+            ceiling = request.get("amount_max")
+            if ceiling is not None and not _amount_text(ceiling):
+                raise _Refusal("bad amount_max")
+            save = request.get("save_label")  # optional; the control clicked before Pay
+            if save is not None:
+                if not isinstance(save, str):
+                    raise _Refusal("bad save_label")
+                save = _sanitise_shown(save, empty="(no label)", cap=_BUTTON_CHARS)
             if not isinstance(title, str):
                 raise _Refusal("bad page_title")
             title = _sanitise_shown(title, empty="(no title)", cap=_TITLE_CHARS)
@@ -488,7 +502,12 @@ class ReleaseManager:
             session = "Genesis-launched session" if peer.kind == LAUNCHED else "foreground session"
             fields = {
                 "Site": host,
-                "Amount": f"{amount} (as stated by Genesis)",
+                "Amount": (
+                    f"{amount} (as stated by Genesis)"
+                    if ceiling is None
+                    else f"up to {ceiling} (subtotal {amount}, as stated by Genesis; the total "
+                    "is read after the card is saved, and Pay is clicked only within it)"
+                ),
                 "Card": f"{row['label']} ending {row['last4']}",
                 "Requester": f"{peer.comm} pid {peer.pid}, {session} (claude pid {peer.claude_pid})",
                 "Page title": title,
@@ -497,6 +516,11 @@ class ReleaseManager:
                 "Also filled": ", ".join(also) or "none",
             }
             shown = set()
+            if save is not None:  # saved first, then Pay: older taps unchanged
+                fields["Save button"] = save
+                shown.add("save")
+            if ceiling is not None:
+                shown.add("amount_max")
             if steps:  # the clicks that brought the card form up, before this tap
                 fields["Clicked first"] = "; ".join(f'"{x}"' for x in steps)
                 shown.add("steps")
@@ -509,7 +533,7 @@ class ReleaseManager:
             except ValueError:
                 raise _Refusal("the approval text was refused") from None
             if svc._stopped or epoch != svc._epoch or not svc.unlocked:
-                raise _Refusal("the vault was locked")
+                raise _Refusal("the vault key was dropped")
         except _Refusal as exc:
             return await self._refuse(str(exc), peer)
         nonce = secrets.token_urlsafe(16)
@@ -526,6 +550,8 @@ class ReleaseManager:
                     "button_label": None if button is None else len(button),
                     **({"consent_labels": [len(c) for c in consents]} if consents else {}),
                     **({"step_labels": [len(x) for x in steps]} if steps else {}),
+                    **({"amount_max": len(ceiling)} if ceiling is not None else {}),
+                    **({"save_label": len(save)} if save is not None else {}),
                 },
                 "field_origins": origins,
                 "also_filled": list(also),  # names from FILL_NAMES, never values
@@ -545,10 +571,10 @@ class ReleaseManager:
             split_name=any(k in origins for k in _SPLIT_NAME_KEYS),
             row=facts,
         )
-        if svc._stopped or epoch != svc._epoch or not svc.unlocked:  # locked during the row
+        if svc._stopped or epoch != svc._epoch or not svc.unlocked:  # dropped during the row
             self._remember(nonce, REFUSED)
-            await self._row("release_refused", {**facts, "reason": "the vault was locked"})
-            return {"ok": False, "error": "the vault was locked"}
+            await self._row("release_refused", {**facts, "reason": "the vault key was dropped"})
+            return {"ok": False, "error": "the vault key was dropped"}
         self._slot = rel
         self._arm(rel)
         audit_detail = {"release": nonce, "card_ref": card_ref, "host": host}
@@ -649,8 +675,8 @@ class ReleaseManager:
         svc = self._svc
         identity, epoch = svc._identity, svc._epoch
         if identity is None:
-            await self._refuse_slot(rel, "the vault is locked")
-            return {"ok": False, "error": "the vault is locked"}
+            await self._refuse_slot(rel, "the vault key is not loaded")
+            return {"ok": False, "error": "the vault key is not loaded"}
         rel.state = CLAIMING
         try:
             return await self._hand_over(rel, identity, epoch, client_gone)

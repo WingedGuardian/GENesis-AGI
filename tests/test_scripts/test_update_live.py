@@ -206,6 +206,8 @@ def _engine_script(root: Path, script_dir: Path, base: str, mu: str, pre: str = 
             ).group(0)
             for name in ("_mu_record_refusal", "_mu_remedy")
         )
+        # The restart record (#3451) the stop and _do_rollback write.
+        + _block("restart-owed")
         + _function("_write_state")
         + _function("_clear_deploy_marker")
         + _block("live-helpers")

@@ -21,10 +21,9 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
   `_is_dispatched()` check after `_check_codex_round_escalation`), and the commit
   gate for a fix commit once a third round is recorded, or at two rounds once
   the confirmation is spent (`commit_approval_required`;
-  `review_enforcement_commit.py` `_allow`). Once the local streak holds three
-  consecutive defect-bearing external rounds, the escalation cap refuses that
-  commit before `_allow` can ask (the local-streak table in closing-session, "Escalation cap"; `# escalation-ack`
-  records a fresh decision). Unreadable round evidence takes the
+  `review_enforcement_commit.py` `_allow`). Rule R runs first: while the round owes
+  its reflection, the fix commit is denied before `_allow` can ask, and the
+  reflection commit itself skips the ask. Unreadable round evidence takes the
   same ask/deny path at any count, with one install-local exception: with
   `hooks.asks.review_request: off`, a transient read failure on a lone review
   request becomes a note instead of an ask (a dispatched session is still
@@ -72,15 +71,13 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
      local mark ONCE with combined evidence. That single mark is `--defects` if EITHER
      reviewer raised a new BLOCKER/SHOULD-FIX/P1/P2 — a clean secondary does not launder
      a defect-bearing Codex round.
-     **Two separate marks do NOT halve the budget; they can DISARM it, which is worse.**
-     An earlier draft said "halves", and the code says otherwise: `bump_review_round`
-     increments only on a DISTINCT staged hash, so a second defect mark on the same diff
-     is idempotent and costs nothing (`review_state.py:850-865`). But `--clean` resets
-     the streak to 0 **regardless of whether the staged diff changed** (`:780-784`), and
-     an idempotent same-hash `--defects` cannot restore the round it just erased. So on
-     one staged diff, in EITHER order, a mixed clean/defect pair records as CLEAN — the
-     defect-bearing round vanishes and the cap it was arming goes back to zero. That is
-     the failure the one-mark rule prevents (Codex P2, #1903).
+     **Two separate marks falsify the record.** `bump_review_round` increments only on
+     a DISTINCT staged hash, so a second defect mark on the same diff is idempotent. But
+     `--clean` resets the streak to 0 whether or not the staged diff changed, and an
+     idempotent same-hash `--defects` cannot restore the round it just erased. So on
+     one staged diff, in EITHER order, a mixed clean/defect pair records as CLEAN (Codex
+     P2, #1903). No gate acts on the streak now, but the one-mark rule keeps the record
+     honest.
   2. **Triage before touching code — and here it OUTRANKS the cheap-fix habit.**
      That rule (closing-session, "'Not blocking' describes the GATE, not the finding", and right for ordinary PRs) weighs what a fix costs before the owner
      decides. On this surface the cost is not the edit, it is the PUSH: it
@@ -165,9 +162,9 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
   shared `review_budget` path predicate, including rename sources and destinations.
   The second-round fix is permitted, and the exact-head marked confirmation is the one
   exempt request. If that confirmation finds another defect and a further fix is needed,
-  the commit requires fresh native approval. The independent local streak may still
-  demand its round-2 class audit or round-3 stop; those are process interventions rather
-  than substitutes for the per-action user decision.
+  the commit requires fresh native approval. Rule R's round reflection still comes
+  before that fix; it is a process step, not a substitute for the per-action user
+  decision.
 
   **Queue priority:** gate PRs get reviewed and driven before ordinary ones — read this
   as a THIRD standing justification alongside the two in closing-session, "When to DRIVE a Merge",
@@ -179,5 +176,5 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
   a dual round does not spend two rounds.
 
   **A note for anyone reading only CLAUDE.md:** the shared evaluator now gates a third
-  discovery request mechanically. The local round-2 MODE-SWITCH still acts on commits
-  and remains a separate class-audit intervention.
+  discovery request mechanically, and the commit gate's Rule R requires each round's
+  reflection, with its class audit or premise check, before that round's fixes.

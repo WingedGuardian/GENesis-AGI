@@ -77,6 +77,8 @@ async def request_release(
     also_filled: list[str],
     consent_labels: list[str] | None = None,
     step_labels: list[str] | None = None,
+    amount_max: str | None = None,
+    save_label: str | None = None,
 ) -> dict:
     """``{ok, nonce, shown}`` or ``{ok: False, error}`` (the service's fixed reason).
     ``button_label`` is the Pay control's visible text, ``also_filled`` the
@@ -99,6 +101,10 @@ async def request_release(
         request["consent_labels"] = consent_labels
     if step_labels:
         request["step_labels"] = step_labels
+    if amount_max is not None:
+        request["amount_max"] = amount_max
+    if save_label is not None:
+        request["save_label"] = save_label
     return await _ask(request)
 
 

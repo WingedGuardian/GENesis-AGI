@@ -23,18 +23,17 @@ from unittest.mock import AsyncMock, MagicMock
 import aiosqlite
 import pytest
 from pyrage import encrypt, x25519
-from pyrage import passphrase as age_passphrase
 
 from genesis.db.crud import payment_vault_events as audit
 from genesis.payments import approval as ap
 from genesis.payments import release as rl
+from genesis.payments import vault_migrate as vm
 from genesis.payments import vault_release_store as vrs
 from genesis.payments import vault_store as vs
 from genesis.payments.peer_check import FOREGROUND, LAUNCHED, Peer, PeerRefused, start_of
 from genesis.payments.vault_service import VaultService
 from genesis.security.card_shapes import contains_card_number
 
-PASSPHRASE = "quartz lantern ember noodle 41"
 MIG = importlib.import_module("genesis.db.migrations.20261011060631_payment_vault_events")
 VISA = "4242" * 4  # Stripe's public test Visa
 THREEDS = "4000" + "0025" + "0000" + "3155"  # Stripe's public 3-D Secure test card
@@ -70,17 +69,17 @@ def _me(**over) -> Peer:
 
 
 @pytest.fixture(scope="module")
-def _sealed(tmp_path_factory):
-    path = tmp_path_factory.mktemp("sealed") / "payment_vault"
-    vs.init_vault(PASSPHRASE, path)
-    key = age_passphrase.decrypt((path / vs.IDENTITY).read_bytes(), PASSPHRASE).decode()
-    return path, key
+def _keyed(tmp_path_factory):
+    """A key-file vault (identity.key) and its key text."""
+    path = tmp_path_factory.mktemp("keyed") / "payment_vault"
+    vs.init_vault(path)
+    return path, (path / vs.IDENTITY).read_text().strip()
 
 
 @pytest.fixture
-def vault(_sealed, tmp_path):
+def vault(_keyed, tmp_path):
     path = tmp_path / "payment_vault"
-    shutil.copytree(_sealed[0], path)
+    shutil.copytree(_keyed[0], path)
     card = vs.parse_card(VISA, f"12/{_exp_year()}", CVC)
     refs = {
         "scoped": vs.add_card(
@@ -220,8 +219,16 @@ async def _until(pred, timeout: float = 3.0) -> None:
             await asyncio.sleep(0.005)
 
 
+STALE = "the held key no longer matches recipient.txt"
+
+
+def _replace_recipient(path) -> None:
+    """recipient.txt now names another key: the held one is stale."""
+    (path / vs.RECIPIENT).write_text(f"{x25519.Identity.generate().to_public()}\n")
+
+
 @pytest.fixture
-async def ctx(db, vault, tmp_path, _sealed, caplog):
+async def ctx(db, vault, tmp_path, caplog):
     caplog.set_level(logging.DEBUG)
     path, refs = vault
     reg = FakeRegistry()
@@ -235,8 +242,8 @@ async def ctx(db, vault, tmp_path, _sealed, caplog):
         approvals=reg,
         release_peer=lambda pid, **_k: holder["ctx"].peer,
     )
-    svc._identity = x25519.Identity.from_str(_sealed[1])  # unlocked (scrypt once per module)
-    await svc.start()
+    await svc.start()  # loads identity.key
+    assert svc.unlocked
     c = Ctx(svc, reg, refs, clock, db)
     holder["ctx"] = c
     yield c
@@ -418,18 +425,23 @@ async def test_a_requester_that_exited_frees_the_slot(ctx, op):
         assert (await ctx.claim(nonce))["error"] == "no such release"
     assert ctx.svc._release._recent[nonce] == rl.REFUSED
     await _until(lambda: ctx.reg.futures[0].cancelled())
-    reasons = [e["detail"].get("reason") for e in await ctx.events()]
+    reasons = [(e["detail"] or {}).get("reason") for e in await ctx.events()]
     assert "requester gone" in reasons
 
 
 @pytest.mark.parametrize("granted", [False, True])
-async def test_a_lock_refuses_the_release(ctx, granted):
+async def test_a_dropped_key_refuses_the_release(ctx, granted):
     nonce = await ctx.granted() if granted else (await ctx.request())["nonce"]
-    await ctx.ask({"op": "lock"})
+    _replace_recipient(ctx.svc._vault)
+    await ctx.ask({"op": "status"})  # finds the held key stale and drops it
+    assert not ctx.svc.unlocked
     assert (await ctx.status(nonce))["state"] == "refused"
     assert (await ctx.claim(nonce))["error"] == "no such release"
-    reasons = [e["detail"].get("reason") for e in await ctx.events() if e["detail"]]
-    assert "the vault was locked" in reasons
+    events = await ctx.events()
+    reasons = [e["detail"].get("reason") for e in events if e["event"] == "release_refused"]
+    assert STALE in reasons
+    dropped = [(e["detail"] or {}).get("reason") for e in events if e["event"] == "key_dropped"]
+    assert dropped == [STALE]
 
 
 async def test_a_grant_after_an_abort_is_refused(ctx):
@@ -444,10 +456,10 @@ async def test_a_grant_after_an_abort_is_refused(ctx):
     assert (await ctx.status(nonce))["state"] == "refused"
 
 
-async def test_a_grant_landing_after_a_lock_is_refused(ctx, monkeypatch):
+async def test_a_grant_landing_after_a_key_drop_is_refused(ctx, monkeypatch):
     nonce = (await ctx.request())["nonce"]
     await _until(lambda: ctx.reg.futures)
-    ctx.svc._epoch += 1  # a lock whose abort has not yet run
+    ctx.svc._epoch += 1  # a key drop whose abort has not yet run
     ctx.reg.futures[0].set_result(ap.GRANTED)
     await _until(lambda: ctx.slot() is None)
     assert "release_granted" not in await ctx.names()
@@ -468,7 +480,7 @@ async def test_a_lost_grant_row_refuses(ctx, monkeypatch):
     assert (await ctx.status(nonce))["state"] == "refused"
 
 
-async def test_stop_refuses_a_pending_release(db, vault, tmp_path, _sealed):
+async def test_stop_refuses_a_pending_release(db, vault, tmp_path):
     reg = FakeRegistry()
     svc = VaultService(
         db,
@@ -477,7 +489,6 @@ async def test_stop_refuses_a_pending_release(db, vault, tmp_path, _sealed):
         approvals=reg,
         release_peer=lambda pid, **_k: _me(),
     )
-    svc._identity = x25519.Identity.from_str(_sealed[1])
     await svc.start()
     c = Ctx(svc, reg, vault[1], [0.0], db)
     nonce = (await c.request())["nonce"]
@@ -489,7 +500,7 @@ async def test_stop_refuses_a_pending_release(db, vault, tmp_path, _sealed):
     assert names[-2:] == ["release_refused", "service_stop"]
 
 
-async def test_only_the_stop_abort_row_passes_the_stopped_guard(db, vault, tmp_path, _sealed):
+async def test_only_the_stop_abort_row_passes_the_stopped_guard(db, vault, tmp_path):
     """A release write racing stop()'s abort row is still refused once stopped."""
     reg = FakeRegistry()
     svc = VaultService(
@@ -499,7 +510,6 @@ async def test_only_the_stop_abort_row_passes_the_stopped_guard(db, vault, tmp_p
         approvals=reg,
         release_peer=lambda pid, **_k: _me(),
     )
-    svc._identity = x25519.Identity.from_str(_sealed[1])
     await svc.start()
     c = Ctx(svc, reg, vault[1], [0.0], db)
     await c.request()
@@ -640,7 +650,7 @@ async def test_a_lost_claimed_row_returns_nothing(ctx, monkeypatch):
 
 async def test_a_card_retired_by_the_cli_meanwhile_is_not_released(ctx):
     nonce = await ctx.granted()
-    vs.retire_card(ctx.refs["scoped"], PASSPHRASE, ctx.svc._vault)
+    vs.retire_card(ctx.refs["scoped"], ctx.svc._vault)
     assert await ctx.claim(nonce) == {"ok": False, "error": "the card could not be opened"}
     assert (await ctx.status(nonce))["state"] == "refused"
 
@@ -739,18 +749,23 @@ async def test_a_second_request_while_claiming_refuses_only_the_newcomer(ctx, ga
     assert "the first goes ahead" in ctx.reg.notices[0]
 
 
-async def test_a_lock_before_the_decision_point_aborts_the_claim(ctx, gate):
+async def test_a_key_drop_before_the_decision_point_aborts_the_claim(ctx, gate):
     entered, release = gate
     nonce = await ctx.granted()
     claim = asyncio.create_task(ctx.claim(nonce))
     await _until(entered.is_set)
-    await ctx.ask({"op": "lock"})
+    recipient = (ctx.svc._vault / vs.RECIPIENT).read_bytes()
+    _replace_recipient(ctx.svc._vault)
+    await ctx.ask({"op": "status"})  # drops the stale key
+    assert not ctx.svc.unlocked
+    # Put it back, so the card opens and the refusal is the drop's alone.
+    (ctx.svc._vault / vs.RECIPIENT).write_bytes(recipient)
     release.set()
     assert (await claim) == {"ok": False, "error": "the release was refused"}
     assert "release_claimed" not in await ctx.names()
 
 
-async def test_a_lock_after_the_decision_point_does_not_take_values_back(ctx, monkeypatch):
+async def test_a_key_drop_after_the_decision_point_does_not_take_values_back(ctx, monkeypatch):
     nonce = await ctx.granted()
     real = ctx.svc._audit
     entered, release = asyncio.Event(), asyncio.Event()
@@ -764,13 +779,18 @@ async def test_a_lock_after_the_decision_point_does_not_take_values_back(ctx, mo
     monkeypatch.setattr(ctx.svc, "_audit", held)
     claim = asyncio.create_task(ctx.claim(nonce))
     await asyncio.wait_for(entered.wait(), 3)
-    lock = asyncio.create_task(ctx.svc.lock(None))
+    _replace_recipient(ctx.svc._vault)
+    drop = asyncio.create_task(ctx.svc.ensure_key())
     await asyncio.sleep(0.02)
     release.set()
-    await lock
+    await drop
+    assert not ctx.svc.unlocked
     assert (await claim)["ok"]
-    assert "the vault was locked" not in [
-        (e["detail"] or {}).get("reason") for e in await ctx.events()
+    assert "release_claimed" in await ctx.names()
+    assert STALE not in [
+        (e["detail"] or {}).get("reason")
+        for e in await ctx.events()
+        if e["event"] == "release_refused"
     ]
 
 
@@ -1246,19 +1266,35 @@ async def test_the_also_filled_line_names_the_extra_fields(ctx, names, shown):
 @pytest.mark.parametrize(
     ("state", "reason"),
     [
-        ("locked", "the vault is locked"),
+        ("not_loaded", "the vault key is not loaded (see vault status)"),
         ("no_approvals", "approval is unavailable"),
         ("stopped", "the vault service is stopping"),
     ],
 )
-async def test_a_request_needs_an_unlocked_running_service_with_approvals(ctx, state, reason):
-    if state == "locked":
+async def test_a_request_needs_a_loaded_key_a_running_service_and_approvals(
+    ctx, monkeypatch, state, reason
+):
+    if state == "not_loaded":
         ctx.svc._identity = None
+
+        def refused(_path=None):
+            raise vs.VaultError("the key cannot be loaded (test)")
+
+        monkeypatch.setattr(vrs, "load_identity", refused)
     elif state == "no_approvals":
         ctx.svc._release._approvals = None
     else:
         ctx.svc._stopped = True
     assert (await ctx.request())["error"] == reason
+
+
+async def test_a_request_loads_a_key_not_held(ctx):
+    """A key loaded since start (a vault migrated under a running server) is picked up."""
+    ctx.svc._identity = None
+    reply = await ctx.request()
+    assert reply["ok"] and ctx.svc.unlocked, reply
+    names = await ctx.names()
+    assert names.count("key_loaded") == 2, names  # start, then the request
 
 
 async def test_a_lost_requested_row_means_no_request(ctx, monkeypatch):
@@ -1272,7 +1308,7 @@ async def test_a_lost_requested_row_means_no_request(ctx, monkeypatch):
     assert ctx.slot() is None and ctx.reg.calls == []
 
 
-async def test_a_lock_during_the_requested_row_refuses(ctx, monkeypatch):
+async def test_a_key_drop_during_the_requested_row_refuses(ctx, monkeypatch):
     real = ctx.svc._audit
 
     async def locking(event, detail=None, **kw):
@@ -1283,7 +1319,7 @@ async def test_a_lock_during_the_requested_row_refuses(ctx, monkeypatch):
 
     monkeypatch.setattr(ctx.svc, "_audit", locking)
     reply = await ctx.request()
-    assert reply == {"ok": False, "error": "the vault was locked"}
+    assert reply == {"ok": False, "error": "the vault key was dropped"}
     assert ctx.slot() is None and ctx.reg.calls == []
 
 
@@ -1320,7 +1356,8 @@ async def test_a_refused_peer_gets_a_fixed_error_and_a_row(ctx, monkeypatch):
     assert row["detail"]["peer"]["pid"] == os.getpid()
     # The owner's CLI ops keep the uid-only check.
     assert (await ctx.ask({"op": "status"}))["ok"]
-    assert (await ctx.ask({"op": "lock"}))["ok"]
+    # The retired lock op is answered as retired, not as a refused peer.
+    assert await ctx.ask({"op": "lock"}) == {"ok": False, "error": vm.RETIRED}
 
 
 def _long_digits() -> str:
@@ -1425,17 +1462,18 @@ def test_release_events_are_known_and_not_key_events():
     }
     assert names <= audit.EVENTS
     assert not names & audit.KEY_EVENTS
-    assert {"unlock", "lock", "idle_relock"} <= audit.KEY_EVENTS
+    assert {"key_loaded", "key_load_refused", "key_dropped"} <= audit.KEY_EVENTS
+    assert {"unlock", "lock", "idle_relock"} <= audit.KEY_EVENTS  # earlier rows stay valid
 
 
-async def test_release_rows_do_not_hide_an_unlock_left_open(db, tmp_path):
-    await audit.record_event(db, "unlock")
+async def test_release_rows_do_not_hide_the_last_key_event(db, tmp_path, monkeypatch):
+    await audit.record_event(db, "key_loaded")
     for event in ("release_requested", "release_granted", "release_refused"):
         await audit.record_event(db, event, {"nonce": "n"})
     svc = VaultService(db, vault_path=tmp_path / "v", socket_path=tmp_path / "s")
-    await svc._correct_trail()
-    assert (await audit.list_recent(db, 1))[0]["event"] == "lock"
-    assert (await svc.status())["last_event"]["event"] == "lock"
+    monkeypatch.setattr(svc, "ensure_key", AsyncMock())  # no row of its own
+    assert (await audit.list_recent(db, 1))[0]["event"] == "release_refused"
+    assert (await svc.status())["last_event"]["event"] == "key_loaded"
 
 
 async def test_start_vault_service_hands_the_registry_to_the_release(db, monkeypatch):
@@ -1475,9 +1513,9 @@ def _blob(ref, **over) -> dict:
     return {k: v for k, v in secret.items() if v is not _DROP}
 
 
-def test_open_card_returns_the_fields_and_the_row_names(vault, _sealed):
+def test_open_card_returns_the_fields_and_the_row_names(vault, _keyed):
     path, refs = vault
-    card = vrs.open_card(refs["scoped"], x25519.Identity.from_str(_sealed[1]), path)
+    card = vrs.open_card(refs["scoped"], x25519.Identity.from_str(_keyed[1]), path)
     assert (card["number"], card["label"], card["last4"]) == (VISA, "Test card", "4242")
 
 
@@ -1498,16 +1536,16 @@ def test_open_card_returns_the_fields_and_the_row_names(vault, _sealed):
         {"card_ref": "card_000000000000"},
     ],
 )
-def test_open_card_refuses_a_damaged_or_foreign_blob(vault, _sealed, over):
+def test_open_card_refuses_a_damaged_or_foreign_blob(vault, _keyed, over):
     path, refs = vault
     _reseal(path, refs["scoped"], _blob(refs["scoped"], **over))
     with pytest.raises(vs.VaultError) as info:
-        vrs.open_card(refs["scoped"], x25519.Identity.from_str(_sealed[1]), path)
+        vrs.open_card(refs["scoped"], x25519.Identity.from_str(_keyed[1]), path)
     assert VISA not in str(info.value) and CVC not in str(info.value)
     assert info.value.__cause__ is None and info.value.__context__ is None
 
 
-def test_open_card_refuses_a_blob_copied_from_another_row(vault, _sealed):
+def test_open_card_refuses_a_blob_copied_from_another_row(vault, _keyed):
     path, refs = vault
     with sqlite3.connect(path / vs.CARDS) as conn:
         conn.execute(
@@ -1516,15 +1554,15 @@ def test_open_card_refuses_a_blob_copied_from_another_row(vault, _sealed):
             (refs["single"], refs["scoped"]),
         )
     with pytest.raises(vs.VaultError, match="damaged or not this row"):
-        vrs.open_card(refs["scoped"], x25519.Identity.from_str(_sealed[1]), path)
+        vrs.open_card(refs["scoped"], x25519.Identity.from_str(_keyed[1]), path)
 
 
-def test_open_card_refuses_a_last4_that_is_not_the_sealed_number(vault, _sealed):
+def test_open_card_refuses_a_last4_that_is_not_the_sealed_number(vault, _keyed):
     path, refs = vault
     with sqlite3.connect(path / vs.CARDS) as conn:
         conn.execute("UPDATE cards SET last4 = '0000' WHERE card_ref = ?", (refs["scoped"],))
     with pytest.raises(vs.VaultError, match="damaged or not this row") as info:
-        vrs.open_card(refs["scoped"], x25519.Identity.from_str(_sealed[1]), path)
+        vrs.open_card(refs["scoped"], x25519.Identity.from_str(_keyed[1]), path)
     assert info.value.__cause__ is None and info.value.__context__ is None
 
 
@@ -1536,9 +1574,9 @@ def test_open_card_with_the_wrong_key_says_nothing_of_the_card(vault):
     assert info.value.__context__ is None
 
 
-def test_open_card_refuses_bad_refs_and_retired_cards(vault, _sealed):
+def test_open_card_refuses_bad_refs_and_retired_cards(vault, _keyed):
     path, refs = vault
-    key = x25519.Identity.from_str(_sealed[1])
+    key = x25519.Identity.from_str(_keyed[1])
     with pytest.raises(vs.VaultError, match="not a card ref"):
         vrs.open_card("card_zz", key, path)
     vrs.retire_released(refs["single"], path)
@@ -1645,3 +1683,19 @@ async def test_no_consent_labels_leave_the_tap_unchanged(ctx):
 @pytest.mark.parametrize("value", ["one", [], ["a", "b", "c"], [3], ["  "], ["x" * 601]])
 async def test_bad_consent_labels_are_refused(ctx, value):
     assert await ctx.request(consent_labels=value) == {"ok": False, "error": "bad consent_labels"}
+
+
+async def test_a_ceiling_and_a_save_button_are_shown_and_echoed(ctx):
+    reply = await ctx.request(amount_max="30.00 USD", save_label="Add Card")
+    assert set(reply["shown"]) == {"amount_max", "save"}
+    fields = ctx.reg.calls[-1][0]
+    assert fields["Amount"].startswith("up to 30.00 USD (subtotal 12.00 USD")
+    assert fields["Save button"] == "Add Card"
+    row = next(e for e in await ctx.events() if e["event"] == "release_requested")
+    assert row["detail"]["field_lengths"]["amount_max"] == len("30.00 USD")
+
+
+@pytest.mark.parametrize("value", ["", 5, "x" * 33])
+async def test_a_bad_ceiling_is_refused(ctx, value):
+    assert await ctx.request(amount_max=value) == {"ok": False, "error": "bad amount_max"}
+

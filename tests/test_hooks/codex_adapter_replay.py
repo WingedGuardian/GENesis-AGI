@@ -70,14 +70,14 @@ PUBLISHING_TEST_SHA256 = (
     "0afa9ef6"
 )
 PUBLISHING_GUARD_SHA256 = (
-    "7e83b3e8"
-    "3880a648"
-    "208d5d06"
-    "9921cafd"
-    "a156d95c"
-    "6e47d554"
-    "12462caf"
-    "1491d051"
+    "64977394"
+    "746ce8eb"
+    "7c0998a9"
+    "5fa323f7"
+    "38fe1583"
+    "11d46d02"
+    "6f7eec69"
+    "cb72f6f1"
 )
 
 

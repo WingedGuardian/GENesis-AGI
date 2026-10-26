@@ -569,3 +569,99 @@ def test_a_billing_value_still_passes_the_value_checks(repo):
     with pytest.raises(cf.Refused) as e:
         _v(extra_fields={"company": {"selector": "#c"}})
     assert e.value.code == "bad_extra_fields"
+
+
+@pytest.mark.parametrize(
+    ("over", "code"),
+    [
+        ({"amount_max": "$25.00"}, "bad_amount_max"),  # needs save
+        ({"amount_max": "$10.00", "save": "#s"}, "bad_amount_max"),  # below the subtotal
+        ({"amount_max": "lots", "save": "#s"}, "bad_amount_max"),
+        ({"total": "#t"}, "bad_save"),  # needs save
+    ],
+)
+def test_the_ceiling_arguments_refuse_with_a_fixed_code(over, code):
+    with pytest.raises(cf.Refused) as e:
+        _v(**over)
+    assert e.value.code == code
+
+
+def test_a_ceiling_with_save_is_kept():
+    a = _v(save={"selector": "#s", "frames": ["iframe"]}, amount_max="$25.00", total="#t")
+    assert a.save == (("iframe",), "#s") and a.amount_max == "$25.00" and a.total == ((), "#t")
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("Pay $123.45", "123.45"),
+        ("$1,123.45", "1123.45"),
+        ("Total 12", "12.00"),
+        ("Pay $--.--", None),
+        ("$3.00 and $5.00", None),
+        ("123.4", None),
+        ("-$25.00", None),  # a negative amount is never a total
+        ("$-25.00", None),
+        ("$ \u221225.00", None),
+        ("1" * 300 + ".11", None),  # too long to be a price
+        ("1 234,56 \u20ac", None),  # space-grouped digits are refused, never misread
+        ("1\u00a0234,56 \u20ac", None),
+        (None, None),
+    ],
+)
+def test_money_reads_one_price(text, value):
+    got = cf.money(text)
+    assert (str(got) if got is not None else None) == value
+
+
+def test_label_shape_masks_only_the_price():
+    assert cf.label_shape("Pay $--.--") == cf.label_shape("Pay $123.45")
+    assert cf.label_shape("Pay $123.45") != cf.label_shape("Buy now $123.45")
+
+
+def test_save_needs_an_amount_the_total_can_be_checked_against():
+    with pytest.raises(cf.Refused) as e:
+        _v(amount="19,99 EUR", save="#s")
+    assert e.value.code == "bad_amount"
+
+
+def test_a_long_digit_run_is_refused_without_scanning_it():
+    import time
+
+    start = time.monotonic()
+    assert cf.money("1" * 200_000 + ".1") is None
+    assert time.monotonic() - start < 0.5
+
+
+def test_a_price_just_under_the_cap_is_still_read():
+    text = " " * (cf.MONEY_MAX - 6) + "$19.99"
+    assert len(text) == cf.MONEY_MAX and str(cf.money(text)) == "19.99"
+
+
+def test_currency_marks():
+    assert cf.currency("Pay $123.45") == {"$"}
+    assert cf.currency("123.45 EUR") == {"EUR"}
+    assert cf.currency("123.45") == frozenset()
+    assert cf.currency(None) == frozenset()
+
+
+def test_label_shape_keeps_the_currency_symbol():
+    assert cf.label_shape("Pay $123.45") != cf.label_shape("Pay \u20ac123.45")
+
+
+def test_save_needs_the_amount_with_its_currency():
+    with pytest.raises(cf.Refused) as e:
+        _v(amount="19.99", save="#s")
+    assert e.value.code == "bad_amount"
+
+
+def test_a_ceiling_in_another_currency_is_refused():
+    with pytest.raises(cf.Refused) as e:
+        _v(save="#s", amount_max="\u20ac25.00")
+    assert e.value.code == "bad_amount_max"
+
+
+
+@pytest.mark.parametrize("text", ["R$ 21.50", "CA$21.50", "HK$21.50", "US$21.50"])
+def test_a_letter_prefixed_dollar_is_its_own_currency(text):
+    assert cf.currency(text) != cf.currency("$21.50")
