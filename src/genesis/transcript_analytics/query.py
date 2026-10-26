@@ -75,7 +75,10 @@ def _snapshot(data, selection):
     directory = selector.resolve(strict=True)
     if directory.parent != root or not directory.is_dir():
         raise ValueError("invalid snapshot selector")
-    manifest = json.loads((directory / "MANIFEST.json").read_text())
+    # A FIFO or device in the cache must not block the reader (or a rebuild
+    # holding the writer lock); only a regular file is read.
+    with store._open_regular(directory / "MANIFEST.json") as handle:
+        manifest = json.loads(handle.read())
     if (
         not isinstance(manifest, dict)
         or manifest.get("views_version") != VIEWS_VERSION
@@ -94,7 +97,11 @@ def _load_snapshot(con, data, selection):
         con.execute("BEGIN")
         started = True
         for view in _DERIVED:
-            path = str(directory / f"{view}.parquet").replace("'", "''")
+            table_file = directory / f"{view}.parquet"
+            # As for the manifest: a special file would block the full read.
+            if not stat.S_ISREG(os.lstat(table_file).st_mode):
+                raise ValueError("snapshot table is not a regular file")
+            path = str(table_file).replace("'", "''")
             # CTAS reads every page now; returned connections never lazily
             # depend on a disposable snapshot that another build can remove.
             con.execute(
@@ -113,19 +120,13 @@ def _load_snapshot(con, data, selection):
         return None
 
 
-def snapshot_manifest(data):
-    try:
-        value = json.loads((data / "derived/current/MANIFEST.json").read_text())
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError, RuntimeError):
-        return {}
-
-
 def derived_current(data, *, selection=None):
     selection = store.select_sources(data) if selection is None else selection
     try:
         _snapshot(data, selection)
-        with contextlib.closing(connect(data, selection=selection)) as con:
+        # snapshot_only: answering "is the cache current?" must not pay for the
+        # full live computation a missing snapshot otherwise triggers.
+        with contextlib.closing(connect(data, selection=selection, snapshot_only=True)) as con:
             return _READS[con].get("snapshot") is not None
     except Exception:
         return False
@@ -149,17 +150,8 @@ def _spill_directory():
     return temporary
 
 
-def connect(data: Path, *, memory_limit=None, threads=None, selection=None, live=False):
-    """Use a fully read current cache, or live views over one source selection."""
-    import pyarrow as pa
-
-    from genesis.transcript_analytics.schema import SCHEMAS
-
-    # CLI has verified this scope against kernel limits before importing us.
-    budget = os.environ.get("GENESIS_TRANSCRIPT_RESOURCE_CHILD")
-    ram, cpu = (float(v) for v in budget.split(",")) if budget else (3_000_000_000, 200)
-    memory_limit = memory_limit or f"{max(1, int(ram * 0.5))}B"
-    threads = threads or max(1, int(cpu / 100))
+def _configured(memory_limit, threads):
+    """A DuckDB connection with the resource settings and its own private spill."""
     temporary = _spill_directory()
     con = duckdb.connect()
     weakref.finalize(con, temporary.cleanup)
@@ -170,6 +162,112 @@ def connect(data: Path, *, memory_limit=None, threads=None, selection=None, live
         con.execute("SET preserve_insertion_order=false")
         con.execute("SET autoinstall_known_extensions=false")
         con.execute("SET autoload_known_extensions=false")
+    except BaseException:
+        con.close()
+        raise
+    return con
+
+
+def _install_live(con, records):
+    """The raw_* views over ``records``, then reconciliation and the derived views."""
+    import pyarrow as pa
+
+    from genesis.transcript_analytics.schema import SCHEMAS
+
+    for table in TABLES:
+        groups = {}
+        for record in records:
+            groups.setdefault(record.adapter, []).append(str(record.path(table)))
+        parts = []
+        for adapter, files in groups.items():
+            relation = con.from_parquet(files, union_by_name=False)
+            present = history.schema_for(table, adapter).names
+            types = {"string": "VARCHAR", "int64": "BIGINT", "bool": "BOOLEAN"}
+            columns = [
+                f'"{f.name}"' if f.name in present else
+                f'NULL::{types.get(str(f.type), "VARCHAR[]")} AS "{f.name}"'
+                for f in SCHEMAS[table]
+            ]
+            parts.append(relation.project(",".join(columns)))
+        if parts:
+            relation = parts[0]
+            for part in parts[1:]:
+                relation = relation.union(part)
+            relation.create_view(f"raw_{table}")
+        else:
+            con.register(f"_empty_{table}", pa.Table.from_pylist([], schema=SCHEMAS[table]))
+            con.execute(f"CREATE VIEW raw_{table} AS SELECT * FROM _empty_{table}")  # noqa: S608 — fixed table names
+    from .reconcile import install
+
+    install(con)
+    con.execute(_VIEWS)
+
+
+_UNITS = {
+    "": 1, "B": 1, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12,
+    "KIB": 2**10, "MIB": 2**20, "GIB": 2**30, "TIB": 2**40,
+}
+
+
+def _half(limit):
+    """Half a DuckDB memory limit string (``1500000000B``, ``16MB``, ``2GiB``), in bytes."""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?I?B)?\s*", str(limit), re.IGNORECASE)
+    if not match:
+        raise ValueError(f"unreadable memory limit {limit!r}")
+    unit = _UNITS[(match.group(2) or "").upper()]
+    return f"{max(1, int(float(match.group(1)) * unit / 2))}B"
+
+
+def _load_live_derived(con, records, memory_limit, threads):
+    """Without a current snapshot, live=False still exposes only the derived views.
+
+    The live graph is built on a private connection and each derived view is read
+    completely into this connection, as the snapshot loader does. Its raw_* views
+    and reconciliation intermediates never reach the caller, so live=False offers
+    the same relations whether or not the snapshot loaded, and no SQL text check is
+    needed to keep raw data behind ``live=True``.
+
+    Both DuckDB instances are alive during the copy, so each gets half the
+    caller's memory limit until it ends. Lossless Arrow conversion keeps JSON,
+    HUGEINT and UUID columns their own types instead of VARCHAR or DECIMAL.
+    """
+    half = _half(memory_limit)
+    con.execute("SET memory_limit = ?", [half])
+    try:
+        with contextlib.closing(_configured(half, threads)) as private:
+            private.execute("SET arrow_lossless_conversion = true")
+            _install_live(private, records)
+            for view in _DERIVED:
+                rows = private.sql(f"SELECT * FROM {view}").arrow()  # noqa: S608 — fixed view names
+                con.register("_derived_source", rows)
+                try:
+                    con.execute(f"CREATE TEMP TABLE _derived_{view} AS SELECT * FROM _derived_source")  # noqa: S608 — fixed view names
+                finally:
+                    con.unregister("_derived_source")
+                con.execute(f"CREATE VIEW {view} AS SELECT * FROM _derived_{view}")  # noqa: S608 — fixed view names
+    finally:
+        con.execute("SET memory_limit = ?", [memory_limit])
+
+
+def connect(
+    data: Path, *, memory_limit=None, threads=None, selection=None, live=False, snapshot_only=False
+):
+    """Use a fully read current cache, or live views over one source selection.
+
+    ``live=False`` exposes the derived views only: from the snapshot when it is
+    current, otherwise computed live and read in full. ``live=True`` adds the
+    raw_* views and reconciliation intermediates. ``snapshot_only`` raises instead
+    of computing the derived views live when no current snapshot loads.
+    """
+    import pyarrow as pa
+
+    # CLI has verified this scope against kernel limits before importing us.
+    budget = os.environ.get("GENESIS_TRANSCRIPT_RESOURCE_CHILD")
+    ram, cpu = (float(v) for v in budget.split(",")) if budget else (3_000_000_000, 200)
+    memory_limit = memory_limit or f"{max(1, int(ram * 0.5))}B"
+    threads = threads or max(1, int(cpu / 100))
+    con = _configured(memory_limit, threads)
+    try:
         selection = store.select_sources(data) if selection is None else selection
         records, excluded = selection
         _READS[con] = {
@@ -211,35 +309,12 @@ def connect(data: Path, *, memory_limit=None, threads=None, selection=None, live
             snapshot = _load_snapshot(con, data, selection)
             if snapshot is not None:
                 _READS[con]["snapshot"] = snapshot
-                con.execute("SET lock_configuration=true")
-                return con
-        for table in TABLES:
-            groups = {}
-            for record in records:
-                groups.setdefault(record.adapter, []).append(str(record.path(table)))
-            parts = []
-            for adapter, files in groups.items():
-                relation = con.from_parquet(files, union_by_name=False)
-                present = history.schema_for(table, adapter).names
-                types = {"string": "VARCHAR", "int64": "BIGINT", "bool": "BOOLEAN"}
-                columns = [
-                    f'"{f.name}"' if f.name in present else
-                    f'NULL::{types.get(str(f.type), "VARCHAR[]")} AS "{f.name}"'
-                    for f in SCHEMAS[table]
-                ]
-                parts.append(relation.project(",".join(columns)))
-            if parts:
-                relation = parts[0]
-                for part in parts[1:]:
-                    relation = relation.union(part)
-                relation.create_view(f"raw_{table}")
+            elif snapshot_only:
+                raise ValueError("no current snapshot")
             else:
-                con.register(f"_empty_{table}", pa.Table.from_pylist([], schema=SCHEMAS[table]))
-                con.execute(f"CREATE VIEW raw_{table} AS SELECT * FROM _empty_{table}")  # noqa: S608 — fixed table names
-        from .reconcile import install
-
-        install(con)
-        con.execute(_VIEWS)
+                _load_live_derived(con, records, memory_limit, threads)
+        else:
+            _install_live(con, records)
         con.execute("SET lock_configuration=true")
         return con
     except BaseException:
@@ -333,16 +408,18 @@ def run_query(
             ),
             file=sys.stderr,
         )
-        # live=False forbids raw access even when a failed snapshot load
-        # fell back to the live graph and raw_* views therefore exist.
-        if not live and re.search(r"\braw_[A-Za-z0-9_]*", sql):
-            raise ValueError("raw_* views require --live")
+        # With live=False the connection holds only the derived views (connect),
+        # so a raw_* reference fails as an unknown table in either mode. The hint
+        # is added without reading the SQL text.
         try:
             rel = con.sql(sql, params=params)
         except duckdb.CatalogException as exc:
-            if "raw_" in str(exc):
-                raise ValueError("raw_* views require --live") from exc
-            raise
+            if live:
+                raise
+            raise duckdb.CatalogException(
+                f"{exc}\nlive=False reads derived views only; raw_* views and"
+                " reconciliation intermediates need live=True"
+            ) from exc
         result = (rel.columns, rel.fetchall()) if rel is not None else ([], [])
         if manifest_path:
             identity_coverage = turn_identity_coverage(con)
