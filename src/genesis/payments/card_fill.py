@@ -215,6 +215,8 @@ TEXTS = {
     "control, mask or a field)." + _SAVED,
     "save_challenge": "A bank check appeared when the card was saved." + _SAVED,
     "saved_stopped": "The flow stopped after the card was saved and before Pay." + _SAVED,
+    "save_unconfirmed": "The total after the save is the one shown before it, so nothing "
+    "showed the card was saved (the checkout may hold another card)." + _SAVED,
     "internal_error": "browser_fill_card failed before Pay; detail withheld.",
 }
 
@@ -504,7 +506,9 @@ _MONEY = re.compile(r"(?<![\d.,])(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{2}))?(?![\d.,]
 MONEY_MAX = 200
 _SYMBOLS = "$\u20ac\u00a3\u00a5\u20b9"
 # The currency a price is stated in: a symbol, or a code written beside it.
-_CURRENCY = re.compile(rf"[{_SYMBOLS}]|\b(?:USD|EUR|GBP|JPY|CAD|AUD|CHF|CNY|INR|MXN)\b")
+_CURRENCY = re.compile(
+    rf"\b[A-Za-z]{{1,3}}\$|[{_SYMBOLS}]|\b(?:USD|EUR|GBP|JPY|CAD|AUD|CHF|CNY|INR|MXN)\b"
+)
 # A minus before the number, or between its symbol and the number: never a total.
 _NEGATIVE = re.compile(rf"[-\u2212]\s?[{_SYMBOLS}]?\s?\d|[{_SYMBOLS}]\s?[-\u2212]\s?\d")
 

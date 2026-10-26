@@ -86,6 +86,9 @@ class El:
         self.submits = False  # a submit control (_SUBMITS_JS)
         self.text = ""  # its visible text (a step's label)
         self.label_visible = True  # its consent label comes from a visible element
+        self.connected = True  # still in its document
+        self.gone = False  # its document was replaced: every script on it raises
+        self.form = None  # its form, for _SAME_FORM_JS
 
 
 class Handle:
@@ -103,6 +106,8 @@ class Handle:
         pass
 
     async def evaluate(self, js, arg=None):
+        if self.el.gone:
+            raise RuntimeError("Execution context was destroyed")
         if js is pc.CARD_FIELD_JS:
             return self.el.tag if arg in self.el.kinds else ""
         if js is pc.PAY_JS:
@@ -126,6 +131,7 @@ class Handle:
                 "checked": self.el.checked,
                 "label": self.el.label,
                 "visible": self.el.label_visible,
+                "connected": self.el.connected,
             }
         if js is pc._SAME_CONTROL_JS:
             return arg.el is self.el
@@ -135,6 +141,10 @@ class Handle:
             return arg.el is self.el
         if js is pc._STEP_LABEL_JS:
             return self.el.text
+        if js is pc._INNER_TEXT_JS:
+            return self.el.text
+        if js is pc._SAME_FORM_JS:
+            return self.el.form is not None and self.el.form == arg.el.form
         raise AssertionError("unexpected script")
 
     async def check(self, timeout=None, trial=False):
@@ -197,6 +207,9 @@ class Loc:
     async def count(self):
         return len(self.frame.elements.get(self.sel, []))
 
+    async def evaluate(self, js):
+        return await Handle(self.frame.elements[self.sel][0], self.frame).evaluate(js)
+
     async def element_handle(self, timeout=None):
         return Handle(self.frame.elements[self.sel][0], self.frame)
 
@@ -214,6 +227,11 @@ class Frame:
         self.mask_raises = 0  # the next N mask checks raise (a frame still navigating)
         self.session: dict = {}
         self.visible = False  # its iframe element is shown (a revealed bank frame)
+        self.detached = False  # removed from the page
+        self.dead = False  # does not answer scripts at all
+
+    def is_detached(self):
+        return self.detached
 
     def locator(self, sel):
         return Loc(self, sel)
@@ -233,6 +251,10 @@ class Frame:
         return FrameEl()
 
     async def evaluate(self, js):
+        if js == pc._FRAME_ALIVE_JS:
+            if self.dead:
+                raise RuntimeError("Target closed")
+            return 1
         if js == pc._MASK_CHECK_JS:
             if self.mask_raises:
                 self.mask_raises -= 1
@@ -551,7 +573,6 @@ def _clean(monkeypatch):
         ("TICK_S", 0.01),
         ("ATTACH_S", 0.05),
         ("TOTAL_STABLE_S", 0.02),
-        ("TOTAL_SAME_S", 0.08),
     ):
         monkeypatch.setattr(pc, name, value)
     # The flow reads Camoufox's media defaults for the payment context. CI's test
@@ -3062,3 +3083,211 @@ async def test_a_popup_during_the_last_recheck_stops_before_pay(vault, monkeypat
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
     assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
 
+
+# ── Codex rounds 1-2 on the save stage ─────────────────────────────────────
+
+CONSENT = [{"selector": "#agree", "frames": ["iframe#card"]}]
+
+
+def _save(ns):
+    return ns.ppage.main_frame.elements["iframe#card"][0].child.elements["#save"][0]
+
+
+def _after_save(ns, fn):
+    save = _save(ns)
+    first = save.on_click
+
+    def both():
+        first()
+        fn()
+
+    save.on_click = both
+
+
+async def test_a_save_click_that_raises_stops_before_pay(vault):
+    ns = save_checkout()
+    ns.els["pay"].pay["label"] = "Pay $21.50"  # an in-range total already shown
+
+    def boom():
+        raise TimeoutError("click timed out")
+
+    _save(ns).on_click = boom
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_stopped" and ns.pay_clicks == []
+
+
+async def test_a_pay_label_with_a_second_number_is_refused(vault):
+    ns = save_checkout("Pay $99.00 (12 months)")
+    ns.els["pay"].pay["label"] = "Pay $--.-- (12 months)"
+    total = El()  # no price until the save
+    ns.ppage.main_frame.elements["#total"] = [total]
+    _after_save(ns, lambda: setattr(total, "text", "$19.99"))
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00", total="#total")
+    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+
+
+async def test_a_pay_label_without_digits_still_passes_with_a_total_element(vault):
+    ns = save_checkout("Pay now")
+    ns.els["pay"].pay["label"] = "Pay now"
+    total = El()  # no price until the save
+    ns.ppage.main_frame.elements["#total"] = [total]
+    _after_save(ns, lambda: setattr(total, "text", "$21.50"))
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00", total="#total")
+    assert out["code"] == "submitted_unverified" and ns.pay_clicks == [True]
+
+
+async def test_a_preloaded_bank_frame_the_save_reveals_is_a_challenge(vault):
+    ns = save_checkout()
+    bank = Frame("https://hooks.stripe.com/3d_secure_2/x")
+    bank.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(bank)
+    _after_save(ns, lambda: setattr(bank, "visible", True))
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "save_challenge" and ns.pay_clicks == []
+
+
+async def test_a_consent_label_changed_before_its_tick_is_never_ticked(vault, monkeypatch):
+    ns = checkout()
+    box = _consent_box(ns)
+    real = pc._tick
+
+    async def relabel_then_tick(consents, filled):
+        box.label = "I authorize recurring debits"
+        await real(consents, filled)
+
+    monkeypatch.setattr(pc, "_tick", relabel_then_tick)
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_failed"
+    assert box.checked is False  # never ticked: its handlers never ran
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda box: setattr(box, "checked", False),
+        lambda box: setattr(box, "label", "I authorize recurring debits"),
+    ],
+    ids=["unticked", "relabelled"],
+)
+async def test_a_consent_changed_by_the_save_stops_before_pay(vault, change):
+    ns = save_checkout()
+    box = _consent_box(ns)
+    _after_save(ns, lambda: change(box))
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00", consent=CONSENT)
+    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+
+
+def _card_frame(ns):
+    return ns.ppage.main_frame.elements["iframe#card"][0].child
+
+
+@pytest.mark.parametrize(
+    "gone",
+    [
+        lambda ns, box: setattr(_card_frame(ns), "detached", True),
+        lambda ns, box: setattr(box, "connected", False),
+        lambda ns, box: setattr(box, "gone", True),  # a new document; the frame answers
+    ],
+    ids=["frame_detached", "element_removed", "frame_reloaded"],
+)
+async def test_a_consent_the_save_removed_is_not_checked(vault, gone):
+    ns = save_checkout()
+    box = _consent_box(ns)
+
+    def remove():
+        box.checked = False  # whatever the removed box would say, it is not read
+        gone(ns, box)
+
+    _after_save(ns, remove)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00", consent=CONSENT)
+    assert out["code"] == "submitted_unverified" and ns.pay_clicks == [True]
+
+
+async def test_a_consent_that_cannot_be_read_is_a_refusal(vault):
+    ns = save_checkout()
+    box = _consent_box(ns)
+
+    def unreadable():
+        box.gone = True
+        _card_frame(ns).dead = True  # not detached, and not answering either
+
+    _after_save(ns, unreadable)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00", consent=CONSENT)
+    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+
+
+
+async def test_a_bank_frame_shown_only_while_the_total_settles_is_a_challenge(vault):
+    # It shows during the wait for the total and hides before the final check:
+    # only the check inside the wait sees it.
+    ns = save_checkout()
+    bank = Frame("https://hooks.stripe.com/3d_secure_2/x")
+    bank.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(bank)
+    def flash():
+        bank.visible = True
+        # Hidden again at the first read of the total, which comes after the
+        # in-wait check and long before the final one.
+        ns.els["pay"].on_read = lambda: setattr(bank, "visible", False)
+
+    _after_save(ns, flash)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "save_challenge" and ns.pay_clicks == []
+
+
+# ── the save-stage audit ─────────────────────────────────────────────────
+
+
+async def test_a_save_that_changes_nothing_never_pays(vault):
+    # The checkout already shows an in-range price (a card it holds); the save
+    # does nothing. That price staying put shows no save, so Pay is not clicked.
+    ns = save_checkout(None)
+    ns.els["pay"].pay["label"] = "Pay $19.99"
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "save_unconfirmed" and ns.pay_clicks == []
+    assert out["status"] == cf.TEXTS["save_unconfirmed"]
+
+
+async def test_a_pay_label_that_is_the_price_source_must_still_read_the_total(
+    vault, monkeypatch
+):
+    # No total element: Pay's label is where the total was read, so a label
+    # gone back to a placeholder at the final check is refused.
+    ns = save_checkout()
+    real = pc._saved_page_ok
+
+    async def placeholder_then_check(*a, **k):
+        ns.els["pay"].pay["label"] = "Pay $--.--"
+        return await real(*a, **k)
+
+    monkeypatch.setattr(pc, "_saved_page_ok", placeholder_then_check)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+
+
+async def test_a_save_control_in_the_pay_form_is_refused(vault):
+    ns = save_checkout()
+    save = El(tag="button", pay={"button": True, "get": False, "live": True, "label": "Add"})
+    save.form = ns.els["pay"].form = "checkout-form"
+    ns.ppage.main_frame.elements["#add"] = [save]
+    out, _ = await _run(ns, save="#add", amount_max="$25.00")
+    assert out["code"] == "save_not_found" and ns.pay_clicks == []
+    assert vault.ops("release_request") == []
+
+
+async def test_a_box_the_save_ticks_stops_before_pay(vault):
+    ns = save_checkout()
+    extra = El()
+    extra.checkbox, extra.label = True, "Enroll in autopay"
+    ns.ppage.main_frame.elements["#autopay"] = [extra]
+    _after_save(ns, lambda: setattr(extra, "checked", True))
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+
+
+async def test_a_card_frame_that_changes_origin_after_the_save_stops_before_pay(vault):
+    ns = save_checkout()
+    card = ns.ppage.main_frame.elements["iframe#card"][0].child
+    _after_save(ns, lambda: setattr(card, "url", "https://other-origin.example/form"))
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []

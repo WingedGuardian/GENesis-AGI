@@ -60,11 +60,10 @@ EXPORT_S = 120.0  # the storage export: one temporary-page visit per origin seen
 GOTO_MS = 30000
 POLL_S = 2.0
 KEEPALIVE_S = 60.0  # well inside a measured idle logout's warning
-# A total read after the save counts once it reads the same twice this far apart;
-# one equal to the price shown before the save must hold TOTAL_SAME_S (a page
-# reprices on its own schedule, and a stale price must never pass the ceiling).
+# A total read after the save counts once it reads the same twice this far apart.
+# One equal to the price shown before the save never counts: it is a stale price,
+# or the save did nothing (the checkout may charge a card it already holds).
 TOTAL_STABLE_S = 1.0
-TOTAL_SAME_S = 5.0
 STATUS_FAILS = 5  # consecutive unanswered status polls before giving up
 # The vault refuses a pending release 720 s after its request and a granted
 # one 120 s after the tap; past both (plus slack) nothing can be granted.
@@ -295,8 +294,14 @@ CONSENT_JS = r"""(e) => {
     .join(' ').replace(/\s+/g, ' ').trim();
   // A label only aria-label gives is invisible on the page: not one the owner could check.
   const visible = [...Array.from(c.labels || []).map(text), by].join('').trim() !== '';
-  return {box, checked: !!c.checked, visible, label: label.slice(0, 601)};  // one past the cap
+  return {box, checked: !!c.checked, visible, connected: e.isConnected,
+          label: label.slice(0, 601)};  // one past the cap
 }"""
+# Two controls of one form (a save that would submit Pay's form).
+_SAME_FORM_JS = (
+    "(a, b) => { const f = (e) => (e.closest('button, input') || e).form || null;"
+    " const x = f(a); return !!x && x === f(b); }"
+)
 # Two targets that are one checkbox (a label and its control).
 _SAME_CONTROL_JS = (
     "(a, b) => { const c = (e) => (e.tagName.toLowerCase() === 'label' ? e.control : e);"
@@ -991,6 +996,23 @@ async def _is_pay(ppage, args: cf.CardArgs, frame, handle) -> bool:
     return False
 
 
+async def _submits_pay_form(ppage, args: cf.CardArgs, frame, handle) -> bool:
+    """Whether ``handle`` (in ``frame``) belongs to the Pay control's form. One that
+    cannot be answered is treated as yes."""
+    try:
+        frames, sel = args.pay
+        pay_frame = await _walk(ppage.main_frame, frames)
+        if pay_frame is not frame:
+            return False  # a form never spans frames
+        loc = frame.locator(sel)
+        if await _step(loc.count()) != 1:
+            return True
+        pay = await _step(loc.element_handle(timeout=5000))
+        return bool(await _step(handle.evaluate(_SAME_FORM_JS, pay)))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 async def _steps(ppage, args: cf.CardArgs) -> tuple[list[str], list]:
     """Click each step in order, in the payment window, before the form is read
     and before the tap: no card value exists yet, and a step is a click, never
@@ -1091,8 +1113,13 @@ async def _consents(
 
 
 async def _tick(consents: list[tuple], filled: list[str]) -> None:
-    """Tick each consent box (after the tap), then check every one is ticked."""
-    for handle, _label in consents:
+    """Tick each consent box (after the tap), then check every one is ticked.
+    Each box is checked against the tap's label just before its own tick: a
+    tick fires the page's handlers, which a later refusal cannot take back."""
+    for handle, label in consents:
+        info = await _step(handle.evaluate(CONSENT_JS))
+        if not isinstance(info, dict) or info.get("box") is not True or info.get("label") != label:
+            raise _Stop("consent_failed", filled=filled)
         try:
             await _step(handle.check(timeout=CLICK_MS))
         except Exception as e:  # noqa: BLE001 - never the exception's text
@@ -1111,6 +1138,36 @@ async def _ticked(consents: list[tuple], filled: list[str]) -> None:
             or info.get("label") != label
         ):
             raise _Stop("consent_failed", filled=filled)
+
+
+# Answers in any live document: a frame that runs it is alive.
+_FRAME_ALIVE_JS = "() => 1"
+
+
+async def _consents_kept(consents: list[tuple], frames: list) -> bool:
+    """After the save: every consent box still on the page is ticked and has the
+    tap's label. A box the save removed is not checked, and "removed" is only
+    what can be shown (measured in Camoufox): its frame detached, its element
+    disconnected, or its handle dead while its frame still answers (the frame
+    loaded a new document). Anything else unanswered is a refusal."""
+    for (handle, label), frame in zip(consents, frames, strict=True):
+        if frame.is_detached():
+            continue
+        try:
+            info = await _step(handle.evaluate(CONSENT_JS))
+        except Exception:  # noqa: BLE001 - the box's document may be gone
+            try:
+                await _step(frame.evaluate(_FRAME_ALIVE_JS))
+            except Exception:  # noqa: BLE001 - nothing shows the box is gone
+                return False
+            continue
+        if not isinstance(info, dict):
+            return False
+        if info.get("connected") is False:
+            continue
+        if info.get("checked") is not True or info.get("label") != label:
+            return False
+    return True
 
 
 async def _extras(
@@ -1394,6 +1451,8 @@ async def _resolve_save(ppage, args: cf.CardArgs, fields: dict[str, _Field]):
         raise _Stop("save_not_found")
     if await _is_pay(ppage, args, frame, handle):  # save is clicked before the tap's bound
         raise _Stop("save_not_found")
+    if await _submits_pay_form(ppage, args, frame, handle):  # it would submit the payment
+        raise _Stop("save_not_found")
     info = await _step(handle.evaluate(PAY_JS))
     if not isinstance(info, dict) or info.get("button") is not True:
         raise _Stop("save_not_found")
@@ -1426,17 +1485,19 @@ async def _read_total(ppage, args: cf.CardArgs, pay: _Field, card_frames=frozens
     return cf.money(text)
 
 
-async def _save_stage(flow, ppage, args, save, top, title, label, pay, hooks, fields):
+async def _save_stage(flow, ppage, args, save, top, title, label, pay, hooks, fields, consents):
     """``_save_stage_inner``, with a card value seen in a URL outranking whatever
     it found (the exposure is never hidden behind a total code)."""
-    code = await _save_stage_inner(flow, ppage, args, save, top, title, label, pay, hooks, fields)
+    code = await _save_stage_inner(
+        flow, ppage, args, save, top, title, label, pay, hooks, fields, consents
+    )
     if flow.url_blocked or flow.url_leaked:
         return _typing_outcome(flow)
     return code
 
 
 async def _save_stage_inner(
-    flow, ppage, args, save, top, title, label, pay, hooks, fields
+    flow, ppage, args, save, top, title, label, pay, hooks, fields, consents
 ) -> str | None:
     """Click save, wait for the total, check it against the tap, re-check the
     page. None: Pay may be clicked; else the code to stop with (Pay NOT clicked).
@@ -1450,18 +1511,28 @@ async def _save_stage_inner(
     frames_before = {f.url for f in list(ppage.frames)}
     card_frames = frozenset(id(f.frame) for f in fields.values())
     shown_before = await _read_total(ppage, args, pay, card_frames)
+    try:  # each consent's frame, while its handle can still name it
+        consent_frames = [await _step(h.owner_frame()) for h, _lab in consents]
+    except Exception:  # noqa: BLE001 - nothing clicked yet
+        return "failed_before_pay"
+    boxes = await _boxes(ppage)  # a box the save ticks was never approved
     flow.saved = True
     try:
         await _step(save.handle.click(timeout=CLICK_MS))
     except Exception as e:  # noqa: BLE001 - never the exception's text; it may have landed
+        # Whether the card was saved is unknown, and an unchanged in-range total
+        # does not establish it (it can be a default method the merchant holds).
         logger.warning("payment save click raised (%s)", type(e).__name__)
+        return "saved_stopped"
     loop = asyncio.get_running_loop()
     deadline, total, candidate, since = loop.time() + SETTLE_S, None, None, 0.0
     while loop.time() < deadline:
         if flow.url_blocked or flow.url_leaked:
             return _typing_outcome(flow)
-        if flow.popups != marks[1] or any(
-            _is_challenge(f.url) for f in list(ppage.frames) if f.url not in frames_before
+        if (
+            flow.popups != marks[1]
+            or any(_is_challenge(f.url) for f in list(ppage.frames) if f.url not in frames_before)
+            or await _bank_frame_shown(ppage)
         ):
             return "save_challenge"
         if _gone(flow, ppage, hooks) or flow.nav_requests != marks[0]:
@@ -1469,13 +1540,15 @@ async def _save_stage_inner(
         read = await _read_total(ppage, args, pay, card_frames)
         if read is None or read != candidate:
             candidate, since = read, loop.time()
-        elif loop.time() - since >= (TOTAL_SAME_S if read == shown_before else TOTAL_STABLE_S):
+        elif read != shown_before and loop.time() - since >= TOTAL_STABLE_S:
             total = read
             break
         hooks.touch()
         await _beat()
         await asyncio.sleep(TICK_S)
     if total is None:
+        if candidate is not None and candidate == shown_before:
+            return "save_unconfirmed"
         return "total_not_shown"
     low = cf.money(args.amount)
     high = cf.money(args.amount_max) if args.amount_max is not None else low
@@ -1485,7 +1558,13 @@ async def _save_stage_inner(
         return "total_over_ceiling"
     if total < low:
         return "total_under_subtotal"
-    if not await _saved_page_ok(ppage, args, top, title, label, pay, hooks, total, card_frames):
+    if not await _saved_page_ok(
+        ppage, args, top, title, label, pay, hooks, total, card_frames, fields
+    ):
+        return "saved_page_changed"
+    if await _bank_frame_shown(ppage):
+        return "save_challenge"
+    if not await _consents_kept(consents, consent_frames) or await _newly_ticked(boxes):
         return "saved_page_changed"
     if (flow.nav_requests, flow.popups) != marks:  # moved on during the last re-check
         return "saved_page_changed"
@@ -1494,12 +1573,32 @@ async def _save_stage_inner(
     return None
 
 
-async def _saved_page_ok(ppage, args, top, title, label, pay, hooks, total, card_frames) -> bool:
+def _label_price_ok(label, total, price_source: bool) -> bool:
+    """Pay's label after the save. When it is where the total was read
+    (``price_source``) it must read exactly that total. Otherwise one with no
+    digits (a price placeholder) says nothing about it, and one with digits must
+    read exactly it (a second number, as in "(12 months)", makes it unreadable)."""
+    if not isinstance(label, str):
+        return False
+    if not price_source and not any(c.isdigit() for c in label):
+        return True
+    return cf.money(label) == total
+
+
+async def _saved_page_ok(
+    ppage, args, top, title, label, pay, hooks, total, card_frames, fields
+) -> bool:
     """The page after the save still shows what the tap approved, and the total
     the bound was checked against: Pay's price (when its label has one) and the
     ``total`` element both read that total now."""
     try:
         if cf.origin_of(ppage.url) != top or await _title(ppage) != title:
+            return False
+        # A card frame the save kept is still on the origin the tap showed.
+        if any(
+            not f.frame.is_detached() and cf.origin_of(f.frame.url) != f.origin
+            for f in fields.values()
+        ):
             return False
         if await hooks.interstitial(ppage):
             return False
@@ -1510,7 +1609,7 @@ async def _saved_page_ok(ppage, args, top, title, label, pay, hooks, total, card
             and info.get("get") is False
             and info.get("live") is True
             and cf.label_shape(info.get("label")) == cf.label_shape(label)
-            and cf.money(info.get("label")) in (None, total)
+            and _label_price_ok(info.get("label"), total, args.total is None)
         ):
             return False
         if args.total is not None and await _read_total(ppage, args, pay, card_frames) != total:
@@ -1836,7 +1935,9 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     finally:
         values.clear()
     if save is not None and (
-        code := await _save_stage(flow, ppage, args, save, top, title, label, pay, hooks, fields)
+        code := await _save_stage(
+            flow, ppage, args, save, top, title, label, pay, hooks, fields, consents
+        )
     ):
         return cf.result(code, flow.host, filled=flow.typed)
     ppage.on(

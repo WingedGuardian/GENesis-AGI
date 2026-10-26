@@ -660,3 +660,8 @@ def test_a_ceiling_in_another_currency_is_refused():
         _v(save="#s", amount_max="\u20ac25.00")
     assert e.value.code == "bad_amount_max"
 
+
+
+@pytest.mark.parametrize("text", ["R$ 21.50", "CA$21.50", "HK$21.50", "US$21.50"])
+def test_a_letter_prefixed_dollar_is_its_own_currency(text):
+    assert cf.currency(text) != cf.currency("$21.50")
