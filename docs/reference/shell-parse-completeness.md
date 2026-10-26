@@ -10,10 +10,20 @@ Backslash-newline retains the existing continuation handling. No input rewriting
 new tokenizer, larger limit or generic tokenization exemption is added.
 
 This is a partial repair: #3257 and #3264 remain open for their broader
-hash/escape and substitution classes. Validators separately refuse commands
-containing both literal `#` and backslash before parsing, including harmless
-quoted examples. Ordinary clients do not acquire that refusal. Use body files
-for data; neither layer claims complete Bash grammar or process isolation.
+hash/escape and substitution classes. A separate, later validator change is
+planned to refuse commands containing both literal `#` and backslash before
+parsing; nothing in this tree does so yet, and ordinary clients would not acquire
+that refusal. Use body files for data; the parser does not claim complete Bash
+grammar or process isolation.
+
+One new refusal follows from the repair, in the fail-closed direction. The
+substitution scanner (`_substitution_spans`) has no unquoted-backslash rule, so
+a segment the scanner now keeps whole, such as `echo \`id\``, yields a
+backtick body ending in a backslash that cannot be tokenized, and the call is
+reported blind. Hash-free commands that pair an escaped quote with escaped
+backticks, for example `echo It\'s; echo \`git push\``, parsed before and are
+now refused; `echo \`id\`; curl x` alone was already refused. #3635 tracks
+giving the substitution scanner the same backslash rule.
 
 `analyze_checked` withholds segments when a length/depth bound, continuation,
 built escape, unreadable nested syntax or hidden heredoc suffix makes them
