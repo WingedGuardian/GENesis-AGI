@@ -108,6 +108,24 @@ async def call(s, name="task_context", arguments=None):
     )
 
 
+@pytest.mark.parametrize("unsafe", [False, True])
+async def test_common_return_boundary_scans_original_outcome(setup, monkeypatch, unsafe):
+    s = setup
+    text = 'token: "' + secrets.token_hex(16) + '"' if unsafe else "Public fixture"
+
+    async def outcome(row, decisions, arguments):
+        return {"task_id": row["id"], "context": text}
+
+    schema, _, capability = s.broker._operations["task_context"]
+    monkeypatch.setitem(s.broker._operations, "task_context", (schema, outcome, capability))
+    response = await call(s)
+    assert response.status_code == (400 if unsafe else 200)
+    if unsafe:
+        assert response.json() == {"code": "operation_refused"}
+    else:
+        assert response.json()["context"] == text
+
+
 async def test_real_stdio_and_uds_context_resource_pipeline(setup):
     s = setup
     assert s.lease_path.stat().st_mode & 0o777 == 0o600

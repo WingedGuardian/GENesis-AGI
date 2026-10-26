@@ -942,6 +942,20 @@ verified: e4df379de612 2026-10-09
   Passwordless dashboard admission alone cannot resolve peer approvals.
   Notification failure stays visible; an already committed manager delivery
   receipt repairs missing association bookkeeping without another send.
+  Private `peers/lifecycle_state.py` now consumes named, timely consent atomically
+  with continuation queueing and preserves it for the unchanged request across
+  attempts. `peers/operation_state.py` separates operation outcomes from consent;
+  receipt and broker context scans inspect original JSON keys/values and their
+  associations, including whole JSON encoded within strings with duplicate members
+  preserved. Compound JSON-valued mapping keys refuse disclosure; ordinary scalar
+  keys and JSON-valued strings remain supported. Disclosure work and traversal depth are bounded; pathological inputs
+  can refuse below the existing operation result size cap.
+  Only exact immutable reads can retry unknown effects after confirmed drain.
+  Claiming retires invalid, drained pending work transactionally while preserving
+  durable holds and unresolved consequential effects. Attempted-task retirement
+  requires the observed generation or a drained persisted cancellation.
+  These are dark state primitives: runtime installation and complete integration
+  testing remain later lifecycle slices. See [lifecycle state](../reference/peer-lifecycle.md).
   Continuation consumption and runtime activation require the coordinator slice.
   See [peer approvals](../reference/peer-approvals.md).
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
