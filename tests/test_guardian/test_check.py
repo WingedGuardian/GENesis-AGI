@@ -26,6 +26,15 @@ from genesis.guardian.pool import StoragePoolStatus
 from genesis.guardian.state_machine import ConfirmationStateMachine, GuardianState
 
 
+@pytest.fixture(autouse=True)
+def _no_container_cgroup_access(monkeypatch):
+    """``run_check`` runs the container-swap reconciler, which reads (and can
+    write) the container's ``memory.swap.max`` through ``sudo``. That acts on
+    the machine the test runs on, so it is a no-op here; the reconciler has its
+    own tests (``tests/test_guardian/test_swap_watch.py``)."""
+    monkeypatch.setattr("genesis.guardian.check._check_container_swap_and_alert", AsyncMock())
+
+
 @pytest.fixture
 def config(tmp_path: Path) -> GuardianConfig:
     cfg = GuardianConfig()

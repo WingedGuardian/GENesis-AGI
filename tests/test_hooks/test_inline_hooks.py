@@ -182,6 +182,14 @@ class TestBashHookRmRf:
     deep to be allowed. Special targets (., .., /) are always blocked.
     """
 
+    @pytest.fixture(autouse=True)
+    def _a_real_home(self, monkeypatch):
+        """``~`` cases assume an ordinary (two-level) home; the live closure's
+        session HOME is deep. The guard only judges the text it is given."""
+        from tests import _live_closure
+
+        monkeypatch.setenv("HOME", _live_closure.REAL_HOME)
+
     def test_rm_rf_root_blocked(self, rm_rf_hook_command: str) -> None:
         """rm -rf / -> BLOCKED (always-block target)."""
         result = run_hook(rm_rf_hook_command, {"command": "rm -rf /"})

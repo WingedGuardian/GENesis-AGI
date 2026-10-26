@@ -301,7 +301,7 @@ def test_the_step_prunes_the_cache_secrets_env_names(tmp_path):
         f'XDG_CACHE_HOME="{cache}"\nCAMOUFOX_EXECUTABLE_PATH=/opt/cf/camoufox-bin\nAPI_KEY=nope\n'
     )
     script = (
-        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nunset XDG_CACHE_HOME CAMOUFOX_EXECUTABLE_PATH\n"
+        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nunset XDG_CACHE_HOME CAMOUFOX_EXECUTABLE_PATH SECRETS_PATH\n"
         'prune_browser_engines() { echo "root=$1 xdg=$XDG_CACHE_HOME ov=${CAMOUFOX_EXECUTABLE_PATH-} key=${API_KEY-}"; }\n'
         "prune_camoufox_engines_step\n"
         'echo "after=${XDG_CACHE_HOME-unset}"'
@@ -316,7 +316,7 @@ def test_the_step_defaults_to_the_home_cache(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     script = (
-        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nHOME='{tmp_path}'\nunset XDG_CACHE_HOME\n"
+        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nHOME='{tmp_path}'\nunset XDG_CACHE_HOME SECRETS_PATH\n"
         'prune_browser_engines() { echo "root=$1"; }\n'
         "prune_camoufox_engines_step"
     )

@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from tests import _live_closure
 from tests.conftest import require_access_denied
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
@@ -341,7 +342,12 @@ def test_charter_part_overhead_fits_the_budget():
     header = _ctx.emit_cost(
         _ctx._recovery_header(
             "charter",
-            Path.home() / ".genesis" / "sessions" / str(uuid.uuid4()) / "context-charter.md",
+            # The real home, not the live closure's deep per-session test HOME.
+            Path(_live_closure.REAL_HOME)
+            / ".genesis"
+            / "sessions"
+            / str(uuid.uuid4())
+            / "context-charter.md",
         )
     )
     # The mis-wire alert fires ON this part, so the worst case includes it —
