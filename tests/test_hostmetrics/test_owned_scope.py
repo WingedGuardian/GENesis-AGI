@@ -11,6 +11,11 @@ import pytest
 
 from genesis.hostmetrics import jobs, run
 
+# Every test here drives a real transient scope through the user manager, so it
+# opts out of the live fence's systemd stubs (tests/_live_fence.py) and skips
+# where no user manager is reachable. Each scope is named for this test run.
+pytestmark = [pytest.mark.user_manager, pytest.mark.real_tool("systemctl")]
+
 
 def _require_user_manager():
     if not all(shutil.which(tool) for tool in ('systemd-run', 'systemctl')):

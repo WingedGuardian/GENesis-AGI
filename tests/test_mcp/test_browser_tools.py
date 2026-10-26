@@ -6005,6 +6005,8 @@ _PAGE_ACTION_EXEMPT = {
     "_impl_browser_snapshot": "read-only: sends no input, so it cannot open a tab",
     "_impl_browser_sessions": "reads the profile's cookie database; touches no page",
     "_impl_browser_clear_domain": "edits the profile's cookie database; touches no page",
+    "_impl_browser_fill_card": "acts only in its own payment context; reads the active "
+    "page's URL and storage, sends it no input",
 }
 
 
@@ -7230,7 +7232,7 @@ def test_every_impl_browser_function_is_redacted():
         if not any(isinstance(d, ast.Name) and d.id == "_redacted" for d in n.decorator_list)
     ]
     assert unwrapped == []
-    assert len(impls) == 11
+    assert len(impls) == 12
     for n in impls:
         assert hasattr(getattr(browser, n.name), "__wrapped__"), n.name
 

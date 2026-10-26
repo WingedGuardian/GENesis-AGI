@@ -440,10 +440,9 @@ def test_literal_argv_controls(oracle: _BashOracle, command: str, expected: list
     [
         ("gh3257", r"ls 'a'\''b'; curl x"),
         ("gh3264", r'cat "$(rm "q\"r")" && curl x'),
-        ("gh3271", r'''bash -c "cat \"\$(rm 'q\"r')\" && curl x"'''),
         ("gh3272", r'''rm "$(pytest 'q"r')" ; curl x ; ls "$(cat 'q"r')"'''),
     ],
-    ids=("gh3257", "gh3264", "gh3271", "gh3272"),
+    ids=("gh3257", "gh3264", "gh3272"),
 )
 def test_known_gap_still_reproduces(oracle: _BashOracle, gap_id: str, command: str) -> None:
     observed = oracle.run(command)
@@ -452,3 +451,12 @@ def test_known_gap_still_reproduces(oracle: _BashOracle, gap_id: str, command: s
     assert any(invocation[0] == "curl" for invocation in observed), message
     assert blind is None, message
     assert not any(segment.exe == "curl" for segment in segments), message
+
+
+def test_gh3271_nested_execution_is_reported_as_structurally_blind(oracle: _BashOracle):
+    command = r'''bash -c "cat \"\$(rm 'q\"r')\" && curl x"'''
+    observed = oracle.run(command)
+    segments, blind = sp.analyze_checked(command)
+    assert any(invocation[0] == "curl" for invocation in observed)
+    assert not any(segment.exe == "curl" for segment in segments)
+    assert blind is sp._BLIND_STRUCTURAL
