@@ -96,14 +96,13 @@ two mechanical facts follow:
   `fatal: '<branch>' is already used by worktree at '<path>'`). `--force` gets
   past it and gives you two trees on one branch, which is how a commit lands on
   top of another session's uncommitted work.
-- The review marker and the escalation-round counter are keyed by the
+- The review marker is keyed by the
   **worktree path** (`sha256(realpath(toplevel))[:12]`, `review_state.py:65-79`).
-  A detached-HEAD replacement tree is therefore a *different key*: the escalation
-  counter reads 0 on a branch that has already spent three rounds, and the cap
-  silently stops protecting exactly the PR that most needs it.
+  A detached-HEAD replacement tree is therefore a *different key*: it starts with
+  none of the review evidence the build session recorded.
 
 So the protocol is **reuse the build session's worktree in place** — it is the
-only tree that inherits the counters — after establishing it is not live:
+only tree that inherits the review marker — after establishing it is not live:
 
 ```bash
 git -C <worktree> status --short          # uncommitted work = another session's
@@ -565,28 +564,23 @@ two ordinary rounds' work.
 Two caveats a closing session needs, because both are live today. The MECHANISM
 still permits round 5+ under per-request approval — aligning it is tracked work,
 so until then this paragraph and the approval prompts are what carry the rule.
-And a SECOND, local non-convergence streak (cap 3) exists alongside the
-round budget. They are independent gates: the streak's cap-3 hard
-stop blocks commits whatever the round count, and the round
-budget gates review requests and fix commits whatever the streak. Neither
-overrides the other; only the budget's rounds are numbered as rounds.
+And each budget round owes a ROUND REFLECTION before its fixes: while one is
+owed, the commit gate denies content commits (Rule R, below). The old local
+cross-model streak and its two stops are retired; the counter is still recorded
+and displayed, but no gate acts on it. Only the budget's rounds are numbered as
+rounds.
 
 **Bring a premise check to every escalation.** Before putting any of these to
 the owner, run the premise check (a fresh-context agent following
 `.claude/docs/premise-check.md`) and present its verdict with the question:
 
 - a terminal or past-terminal decision: budget round 4 on the ordinary lane, or
-  round 2 on the gate-surface lane;
-- the streak's cap-3 stop.
+  round 2 on the gate-surface lane.
 
-An option list on its own gives the owner nothing to decide with. And record
-every defect-bearing external round with
-`python3 scripts/review_state.py mark --source external --defects`, run from the
-PR's worktree when its fix is staged. The streak's stops fire only on rounds that
-were recorded, and a past round cannot be recorded later.
+An option list on its own gives the owner nothing to decide with.
 
 Full mechanics — findings as claims to verify and as a sample of a class, the
-two-tier machine gate, what counts as a round — are in "Review-loop discipline"
+round reflection gate, what counts as a round — are in "Review-loop discipline"
 below. Do not re-derive them.
 
 ### 4. The merge gate
@@ -629,9 +623,9 @@ it** (owner ruling, 2026-10-19):
   `# stale-review-override`, `# scheduled-review-override`,
   `# substitute-review`, `# rework-override`);
 - merge-and-accept at a terminal round, or any round past it;
-- a PR that has hit a round cap or stop (the terminal round of its lane, or
-  the cap-3 streak stop): the cap voids standing approval, closing requests
-  included, so it needs a fresh decision even when its gates are now clean;
+- a PR that has hit a round cap (the terminal round of its lane): the cap
+  voids standing approval, closing requests included, so it needs a fresh
+  decision even when its gates are now clean;
 - a PR over 1,000 counted lines (the owner's yes to the shape as well as the
   merge);
 - a design, premise or user-impact question the review raised.
@@ -767,7 +761,7 @@ diff, not just the section.
   work, and still gets fixed now.
 - **It does not weaken a gate to get past it.** A gate that keeps blocking is
   evidence about the change, not an obstacle to route around. Approval gates and
-  escalation caps are never downgrade candidates.
+  round caps are never downgrade candidates.
 
 ## Devin-built PRs: premise audit before spending review rounds (standing owner rule, 2026-10-04)
 
@@ -950,8 +944,8 @@ neither blocks opening).
 
 - **Two reviewers pushing OPPOSITE values for the same constant, one review
   pass apart, is a signal about the DEPENDENCY, not about the value.** (Review
-  passes here, not the cross-model *rounds* the escalation cap counts — see
-  that section for the reserved sense.) The instinct is to adjudicate: measure
+  passes here, not the review *rounds* `review_budget.py` counts — see
+  "A round is what the budget counts" for the reserved sense.) The instinct is to adjudicate: measure
   the box, pick the winner, move on. That answers the pass and leaves the
   mechanism, because both reviewers are usually right about the environment
   each has in mind — which means the code depends on something that is not
@@ -1058,11 +1052,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   finally closed it took one AST script and would have worked in round one.
 - **Fixing the named instance is how a loop runs away.** If two consecutive
   rounds each surface NEW defects, stop patching: that is the signature of
-  instance-fixing, and the commit gate hard-blocks TWICE: first at the SECOND
-  round (`review_enforcement_commit.py` mode-switch, cleared by `# audit-ack`),
-  then at the third (escalation cap, `# escalation-ack`). Both call `_deny`, so
-  the first stop arrives one round earlier than "the cap" suggests — see the
-  two-tier table below. Switch to enumeration BEFORE the gate has to say so.
+  instance-fixing. The commit gate puts that stop in every round: while a round
+  owes its ROUND REFLECTION, `review_enforcement_commit.py` denies content
+  commits (Rule R, below), and the reflection is where the round's findings are
+  read as a class before any instance is patched. Do the enumeration there.
 - **Rising findings are a prompt to check PROVENANCE, not a verdict by count.**
   When round N+1 returns more findings than round N, stop patching long enough to
   determine whether the new findings land on additions made to address round N.
@@ -1164,12 +1157,11 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   it must name a state, say which side gives way, because an absolute with an
   unstated remedy is discharged in whatever direction the reader already leans.
 
-- **Escalation cap — a HARD BLOCK at 3 CROSS-MODEL rounds that each find NEW defects.**
-  A *round* = one EXTERNAL cross-model review→fix→re-review iteration. INTERNAL
-  same-model reviews (genesis-architect / genesis-security / any subagent) are NOT
-  rounds — they never move the machine counter (see "THE COUNTER IS CROSS-MODEL ONLY"
-  below) and must not be counted in the visible tally either, or a session re-creates the
-  very false-stop this is meant to remove.
+- **A round is what the budget counts — never your own tally.**
+  A *round* is a distinct head that drew findings from a GitHub App reviewer, as
+  `scripts/review_budget.py` counts it (definition below). INTERNAL same-model
+  reviews (genesis-architect / genesis-security / any subagent) are NOT rounds and
+  must not be counted in any visible tally.
 
   ⚠ **CALL AN INTERNAL AUDIT A "PASS", NEVER A ROUND — including in your own
   evidence file and your own prose.** The word is reserved for the counted thing,
@@ -1181,39 +1173,25 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   definition excludes — and built a process question on the wrong number. **Never
   state a round number you have not just read out of `review_budget.py`**; your own
   tally is not a source, and `review_state.py mark` prints "internal review —
-  cross-model streak unchanged" precisely so you cannot mistake one for the other. A cloud-bot (Codex) re-review round counts; a
-  locally-run non-Anthropic reviewer (the install's configured secondary) counts. The
-  cap is enforced by three
-  mechanics, not by vibes:
-  1. **Visible streak counter.** From the first EXTERNAL round, the plan file (or task
-     list) carries `Cross-model streak: N (cap 3)`, updated every external cycle. It
-     counts consecutive defect-bearing external rounds for this cap — a STREAK
-     POSITION, never a round NUMBER. Round numbers come only from
-     `review_budget.py`'s round count, and the two differ (a locally run
-     secondary advances the streak without adding a reviewed head). The streak is a tracked artifact — "it's the same class, it doesn't really count" is exactly
-     the rationalization the counter exists to kill (for a repeat EXTERNAL round).
-  2. **The block point is BEFORE dispatching the next review.** The check is
-     "am I about to trigger a 4th consecutive defect-bearing external round
-     (streak at the cap)?" — evaluated at the mechanical moment
-     (the `@codex review` comment, the reviewer dispatch — NOT the push itself,
-     which triggers nothing TODAY — an owner-tunable
-     setting, so verify at the PR rather than trusting this clause), never after
-     reading the next batch of findings.
-  3. **The cap CONSUMES standing approval.** A prior "proceed", "merge when
-     clean", or "keep going until Codex is green" is VOID once the cap fires.
-     Continuing a round-4+ loop on an earlier instruction is a violation, not
-     obedience — STOP, post the round ledger (round → what it found → what it
-     cost), name the cap explicitly ("we've hit the 3-round escalation cap"),
-     and get a FRESH decision: HAND IT BACK through the established disposition
-     — architecture conversation, or `needs-architecture-session` + draft + a `ready` row
-     (three rounds
-     each finding something new, after a class-level audit, is the strongest
-     evidence available that the PREMISE and not the code is what is wrong —
-     and no further round can fix that), switch to a robust-by-construction
-     redesign, narrow scope, or shelve. The hand-back option is first because
-     it is the one nothing used to name, not because it is the likeliest —
-     decide it on evidence via `.claude/docs/premise-check.md`, and see the
-     two-path doctrine below.
+  cross-model streak unchanged" precisely so you cannot mistake one for the other.
+  A locally run reviewer adds no reviewed head, so it opens no budget round.
+
+  **The terminal round CONSUMES standing approval.** A prior "proceed", "merge when
+  clean", or "keep going until Codex is green" is VOID once the lane's terminal
+  round is reached (round 4 ordinary, round 2 gate lane; see below).
+  Continuing past it on an earlier instruction is a violation, not
+  obedience — STOP, post the round ledger (round → what it found → what it
+  cost), name the terminal round explicitly,
+  and get a FRESH decision: HAND IT BACK through the established disposition
+  — architecture conversation, or `needs-architecture-session` + draft + a `ready` row
+  (rounds
+  each finding something new, after a class-level audit, is the strongest
+  evidence available that the PREMISE and not the code is what is wrong —
+  and no further round can fix that), switch to a robust-by-construction
+  redesign, narrow scope, or shelve. The hand-back option is first because
+  it is the one nothing used to name, not because it is the likeliest —
+  decide it on evidence via `.claude/docs/premise-check.md`, and see the
+  two-path doctrine below.
   **Tabulate findings by CLASS before fixing — but never let that change what
   COUNTS.**
   Tabulate the findings with a CLASS column before fixing ANY round's findings,
@@ -1228,17 +1206,13 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   five at once. If one class has ≥2 entries, look for the shared GENERATOR and fix
   that; two findings can land in one superficial class without sharing a cause, so
   the count is the prompt to look, not the verdict.
-  **Class grouping decides HOW you fix — never whether an external round counts.**
-  The counter is deliberately class-blind: `bump_review_round` increments on a
-  distinct staged diff and records no CLASS identity (it records only `source`, to
-  gate internal-vs-external), and the marking rule below is finding-based — ANY new
-  BLOCKER/SHOULD-FIX/P1/P2 from an EXTERNAL reviewer makes the round defect-bearing,
-  including the second instance of a class you have already named. On an external
-  round, passing `--clean` to keep a repeat-class round off the counter is a
-  falsification, and worse than miscounting: an external `--clean` RESETS the streak
-  to zero, so it disarms the cap outright rather than merely under-counting it.
-  (Internal reviews never count either way, so there is nothing to falsify there —
-  the temptation and the rule both live only on external marks.)
+  **Class grouping decides HOW you fix — never whether a round counts.**
+  The budget is class-blind: a head that drew findings is a round, including the
+  second instance of a class you have already named. The local `review_state.py
+  mark` counter is class-blind too (`bump_review_round` records only `source`), and
+  its marking rule below is finding-based. No gate acts on that counter any more,
+  but on an external round, passing `--clean` to keep a repeat-class round off it is
+  still a falsified record.
 
   A corollary that costs a round if missed: when you delete a duplicated layer,
   verify the class is closed by enumerating the registry for the BEHAVIOUR, not
@@ -1250,12 +1224,31 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
 
   These disciplines are backstopped by two complementary machine layers.
 
-  The LOCAL defect-bearing streak keeps its established interventions:
+  **Rule R, the round reflection, in the commit gate.** While a PR's open review
+  round owes a ROUND REFLECTION, `review_enforcement_commit.py` denies a content
+  commit, foreground and dispatched alike. `python3 scripts/review_reflection.py
+  status` prints what is owed. Write the reflection, check it with
+  `python3 scripts/review_reflection.py validate --round N [--gate] <file>`, and
+  commit it ALONE as an empty commit:
+  `git commit --allow-empty --cleanup=verbatim -F <file>`. A valid reflection commit
+  is admitted without the round-approval ask. Then commit the fix. Rule R runs before
+  the docs/config skip and before Rule 2, so a docs-only fix or `# review-override`
+  does not dodge it. What the reflection must cite comes from
+  `review_reflection.obligations()`:
 
-  | Local streak | Gate | Required action |
-  |---|---|---|
-  | 2 | **MODE-SWITCH block** | Decide premise-vs-polish, run the fresh-context class audit, then use `# audit-ack` only if that audit happened. |
-  | 3 | **HARD STOP** | Hand back, redesign, narrow, or shelve. `# escalation-ack` records a fresh decision and resets only this local streak. |
+  | Lane | Class audit (`Audit-evidence:`) | Premise check (`Premise-evidence:`) | Terminal |
+  |---|---|---|---|
+  | gate | round 1 | round 2 and later | round 2 |
+  | ordinary | round 3 (the class sweep) | round 2 and later | round 4 |
+
+  An unreadable review budget keeps the gate's existing path (the round-approval
+  ask in the foreground, a deny when dispatched). Anything else Rule R cannot read
+  (owed keys unknown, git unreadable, hook out of time) ALLOWS the commit with an
+  advisory. The owner can set
+  `hooks.reflection_gate: advisory` in the install's `~/.genesis/config/genesis.yaml`,
+  which prints what would be denied and allows; the default is `enforce`. The local
+  streak's two tiers are retired: the round-2 mode-switch and the round-3 hard stop
+  no longer exist, and `# audit-ack` and `# escalation-ack` authorize nothing.
 
   Standing authorization is a separate GitHub-backed budget. It counts ROUNDS, not
   local marks: a round is a distinct head that drew FINDINGS from any GitHub App
@@ -1270,7 +1263,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   every review MARKS the head it reviewed, clean ones too, and a finding review that
   lands on a head after one of that head's descendants was marked is a LATE review. It
   opens no round; `review_budget`'s `findings` list keeps it with the round it belongs
-  to, for the round reflection to owe: `scripts/review_late.py` owes it from `REFLECTION_CUTOVER_ISO` (`scripts/review_reflection.py`) on, and credits it only by a reflection judged under its own round. The cutover stays None (nothing more owed) until the commit gate enforces reflections; `review_reflection.py status --cutover <iso>` reports what it would owe. A reflection credits a finding only when no fix of it sits between the round head and the reflection: a commit made before that finding's review (by the later of its author and committer times, so amending or rebasing it afterwards makes it a fix) is no fix of it, and neither is a merge of the default branch that holds only git's own merge result and the resolution of its conflicted files. So a commit made while a head's reviews are still landing does not strand the answers to the reviews that came after it.
+  to, for the round reflection to owe: `scripts/review_late.py` owes it from `REFLECTION_CUTOVER_ISO` (`scripts/review_reflection.py`) on, and credits it only by a reflection judged under its own round. The cutover is the moment the commit gate started enforcing reflections, so late findings from then on are owed and none from before; `review_reflection.py status --cutover <iso>` reports what another cutover would owe. A reflection credits a finding only when no fix of it sits between the round head and the reflection: a commit made before that finding's review (by the later of its author and committer times, so amending or rebasing it afterwards makes it a fix) is no fix of it, and neither is a merge of the default branch that holds only git's own merge result and the resolution of its conflicted files. So a commit made while a head's reviews are still landing does not strand the answers to the reviews that came after it.
   Each entry says whether it was late (`late`) and each round when it opened
   (`opened_at`, None when unknown); read those, never membership in `rounds[].reviews`, which also lists
   late reviews of a head that already is a round. Evidence from before `ROUND_RULE_CUTOVER_ISO` (`scripts/review_budget.py`)
@@ -1281,9 +1274,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   fifth review request or the fix commit after four rounds, every action needs its
   own native user approval. Round 4 is terminal (step 3).
 
-  This approval is never a shell sigil and is never persisted. `# escalation-ack` still
-  serves the local round-3 intervention; `# final-round-accept` is legacy syntax and
-  authorizes no current gate. An earlier "okay" cannot authorize a later request or
+  This approval is never a shell sigil and is never persisted. `# escalation-ack` and
+  `# final-round-accept` are retired syntax and authorize no current gate. An earlier "okay" cannot authorize a later request or
   commit. Foreground sessions receive the native approval dialog at the action;
   autonomous/dispatched sessions are denied because nobody is present to answer it.
   Unreadable or ambiguous GitHub evidence takes the same ask/deny direction and never
@@ -1299,18 +1291,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   requests is rejected before any request is sent. Inline comment bodies containing
   shell expansion are opaque at the hook boundary and therefore take the ask/deny path.
 
-  The round-2 block is not the round-3 cap arriving early — it is a different
-  instruction. It says the *approach* is wrong (you are fixing instances, not the
-  class), where the cap says *stop and re-decide*. Acking round 2 without actually
-  doing the fresh-context audit is how a session arrives at round 3 having learned
-  nothing. `# audit-ack` attests that the audit HAPPENED; it is not a "continue"
-  button. Note the fresh-context subagent this tier mandates is INTERNAL — mark it
-  plainly (`--source internal`, the default); it satisfies the depth gate and does
-  NOT advance the counter, so it can never be the round that hard-blocks you. Only a
-  repeat EXTERNAL (Codex, the configured secondary, …) non-convergence moves the streak
-  toward the cap.
-  (Origin, 2026-09-01: under the old model the audit this very tier demanded counted
-  as round 3 and tripped the HARD cap — the gate penalized the remedy it mandated.)
+  The fresh-context class audit or premise check a reflection cites is INTERNAL:
+  mark it plainly (`--source internal`, the default). It satisfies the depth gate and
+  opens no round.
 
   There is a separate depth tier that can fire at ANY round: a **substantial**
   change (≥50 reviewable lines OR >1 code file OR auth/api/migrations OR any
@@ -1320,16 +1303,17 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   anchors rather than acking past it.
 
   `review_state.py` still keeps the local `round` streak and legacy lifetime
-  fields for stale-worktree compatibility. Current authorization uses
-  `scripts/review_budget.py`; the commit gate reads the local streak from one snapshot
-  only for the round-2/round-3 interventions. The old lifetime APIs remain
+  fields for stale-worktree compatibility, and the statusline still shows the
+  streak. No gate reads it any more; a follow-on cleanup deletes it. Current
+  authorization uses `scripts/review_budget.py`. The old lifetime APIs remain
   import-compatible but current gates do not consult them. The
   `final-round-accept` SIGIL is still parsed and authorizes nothing. The commit
   gate and the push guard name it as retired only when they are already asking
   for approval (`review_enforcement_commit.py` `_allow`; `git_push_guard.py`, the
   review-request ask); on an action that needs no approval it passes silently.
 
-  **THE COUNTER IS CROSS-MODEL ONLY.** The streak exists to catch *cross-model
+  **THE COUNTER IS CROSS-MODEL ONLY.** These are the semantics `mark` still records;
+  the counter no longer gates anything. The streak was built to catch *cross-model
   non-convergence* — an EXTERNAL reviewer finding NEW defects round after round. It does
   NOT exist to penalize the free, encouraged act of reviewing your own work. So `mark`
   takes a `--source {internal,external}` (default `internal`) that records WHO PRODUCED THE
@@ -1375,8 +1359,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
     blind spots (rubber-stamp risk), so it **NEVER moves the streak** — not an
     increment, not a reset — whatever it found. No outcome flag is needed (a bare
     `python3 scripts/review_state.py mark --agent-output <path>` is a valid internal
-    review). This is the fix for the weeks of false blocks: your own audits, including
-    the one the round-2 mode-switch gate itself *mandates*, can never trip the cap.
+    review). Your own audits, including the ones a round reflection cites, never move
+    the counter.
   - **`--source external`** — a non-Anthropic cross-model reviewer drove this round.
     This is the ONLY kind that counts, so it REQUIRES exactly one outcome flag:
     - a NEW **BLOCKER / SHOULD-FIX / P1 / P2** → `--defects`
@@ -1392,17 +1376,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `external`; a mark of your own architect/security audit is `internal`. A round is
   CLEAN iff the external review found no BLOCKER/SHOULD-FIX/P1/P2 (and no security
   CRITICAL/WARNING). NOTEs, nitpicks, and dispositioned optional-hardening do NOT make
-  a round defect-bearing. The ack (`# audit-ack` / `# escalation-ack`) is a conscious,
-  logged act (like `# review-override`); adding it — or falsely passing an external
-  `--clean` — WITHOUT the honest review result is the same violation as ignoring the
-  prose above. (Supersedes feea3f71/#1446: its unconditional required-outcome only
+  a round defect-bearing. Falsely passing an external `--clean` WITHOUT the honest
+  review result is the same violation as ignoring the prose above. (Supersedes feea3f71/#1446: its unconditional required-outcome only
   ever bit internal re-audits, which now can't inflate the streak at all; the outcome
   requirement is kept where it is still load-bearing — on external marks.)
   Caveats: **multiple findings in a single pass = one round** (not an
   escalation); the same defect reappearing (an incomplete prior fix) is a
   fix-it-properly issue, not an escalation trigger. This complements the
-  enumerate-class-then-lock convergence discipline — the cap is the escalation
-  trigger when the class won't lock within ≤3 rounds. (Origin: PR #1281 ran ~7
+  enumerate-class-then-lock convergence discipline — the lane's terminal round is
+  the escalation point when the class won't lock. (Origin: PR #1281 ran ~7
   reviewer rounds because a standing "proceed once clean" silently carried
   through rounds 4–6.)
 
@@ -1589,7 +1571,7 @@ MEASURED across the 65 open `fix`/`feat` PRs on this repo, 2026-09-10:
 Chained to the round data: **86% of PRs over 1,000 lines reach 3+ Codex rounds,
 against 6% under 200.** So the likely mechanism is `feat` → bigger → more rounds
 → more of the maintainer's conscious decisions consumed, because past the
-escalation cap every additional round costs a fresh human sign-off; that chain is
+round budget every additional round costs a fresh human sign-off; that chain is
 an association, and causation is not established (#1925).
 
 **The honest limit, which changes how to apply this.** The findings-score gap is
