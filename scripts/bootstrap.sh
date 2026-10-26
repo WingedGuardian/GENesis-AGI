@@ -1425,6 +1425,11 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         timer_name=$(basename "$template" .template)
         case "$timer_name" in
             genesis-backup.timer) continue ;;  # deliberate setup step — see note below
+            genesis-transcript-analytics.timer)
+                if ! transcript_analytics_ready "$GENESIS_ROOT/.venv"; then
+                    systemctl --user disable --now "$timer_name" 2>/dev/null || true
+                    continue
+                fi ;;
         esac
         if [ -f "$SYSTEMD_USER_DIR/$timer_name" ]; then
             systemctl --user enable --now "$timer_name" 2>/dev/null && \

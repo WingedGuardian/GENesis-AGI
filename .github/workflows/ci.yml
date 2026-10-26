@@ -1158,4 +1158,5 @@ jobs:
         # 60->82, net22. Floor26138+22=26160; no added skip allowance.
         # Four-class correction at59b96ce: integration43->71, CLI23->34,
         # derive16->22; native82->127 net45. Floor26160+45=26205.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 26205
+        # Installer17 versus main5: net+12; actual execution parent26205+12=26217.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 102 --min-collected 26217

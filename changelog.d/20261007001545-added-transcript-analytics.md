@@ -1,0 +1,1 @@
+- Install the opt-in transcript analytics extra, hourly supervised collection timer and opportunity-scan skill; unavailable optional dependencies keep the timer disabled without failing core installation.

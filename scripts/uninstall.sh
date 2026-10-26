@@ -56,7 +56,7 @@ CONTAINER_NAME="genesis"
 GENESIS_PERSISTENT_TIMERS="genesis-cc-settings-align.timer genesis-cc-align.timer \
 genesis-disk-hygiene.timer genesis-watchdog.timer genesis-graph-project.timer \
 genesis-code-intel.timer genesis-backup.timer genesis-cc-tmp-align.timer \
-genesis-star-milestone.timer"
+genesis-star-milestone.timer genesis-transcript-analytics.timer"
 # The ROOT timers scripts/lib/network_resilience.sh installs under
 # /etc/systemd/system, with their scripts and /run files. Both removal paths
 # (direct and via incus) run this one command, so they cannot drift apart. The
@@ -536,6 +536,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \
                     genesis-graph-project.timer genesis-graph-project.service \
+                    genesis-transcript-analytics.timer genesis-transcript-analytics.service \
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-star-milestone.timer genesis-star-milestone.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
@@ -642,6 +643,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                 systemctl --user stop genesis-cc-tmp-align.timer genesis-cc-tmp-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-cc-settings-align.timer genesis-cc-settings-align.service 2>/dev/null || true;
                 systemctl --user stop genesis-graph-project.timer genesis-graph-project.service 2>/dev/null || true;
+                systemctl --user stop genesis-transcript-analytics.timer genesis-transcript-analytics.service 2>/dev/null || true;
                 systemctl --user stop genesis-code-intel.timer genesis-code-intel.service 2>/dev/null || true;
                 systemctl --user stop genesis-star-milestone.timer genesis-star-milestone.service 2>/dev/null || true;
                 systemctl --user stop genesis-serena-claude-code.service genesis-serena-codex.service 2>/dev/null || true;
@@ -654,6 +656,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-graph-project.timer genesis-graph-project.service \
+                    genesis-transcript-analytics.timer genesis-transcript-analytics.service \
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-star-milestone.timer genesis-star-milestone.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
