@@ -40,6 +40,10 @@ class UserJobScheduler:
     def is_running(self) -> bool:
         return self._scheduler is not None and self._scheduler.running
 
+    def is_registered(self, job_id: str) -> bool:
+        """Report current runtime membership, separately from saved active intent."""
+        return self.is_running and self._scheduler.get_job(f"user_job:{job_id}") is not None
+
     async def start(self) -> None:
         """Load active jobs from DB and start the APScheduler."""
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -53,7 +57,11 @@ class UserJobScheduler:
             self._register_job(job)
 
         self._scheduler.start()
-        logger.info("User job scheduler started with %d active job(s)", len(jobs))
+        registered = sum(self.is_registered(job["id"]) for job in jobs)
+        logger.info(
+            "User job scheduler started with %d registered, %d pending job(s)",
+            registered, len(jobs) - registered,
+        )
 
     async def stop(self) -> None:
         """Shut down the APScheduler."""
@@ -109,7 +117,7 @@ class UserJobScheduler:
         from genesis.db.crud import user_jobs as crud
 
         job = await crud.get_job(self._db, job_id)
-        if not job:
+        if not job or job["status"] != "active" or not self.is_running:
             return False
         return self._register_job(job)
 
@@ -128,15 +136,11 @@ class UserJobScheduler:
         return await crud.update_job(self._db, job_id, status="paused")
 
     async def resume_job(self, job_id: str) -> bool:
-        """Resume a paused job."""
+        """Save active intent and report whether registration succeeded."""
         from genesis.db.crud import user_jobs as crud
 
         updated = await crud.update_job(self._db, job_id, status="active")
-        if updated:
-            job = await crud.get_job(self._db, job_id)
-            if job:
-                self._register_job(job)
-        return updated
+        return await self.add_job(job_id) if updated else False
 
     async def run_now(self, job_id: str) -> str | None:
         """Immediately dispatch a job, bypassing the cron schedule.

@@ -1,1 +1,0 @@
-- The deploy advisory for `update.sh` now appears only when a command can actually run the script, instead of on every command that mentions it (reading, grepping or editing the file no longer pulls in the full note).

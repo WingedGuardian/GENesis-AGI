@@ -10,6 +10,7 @@ unpack side are driven directly. Sandboxed like test_backup_dated_snapshots
 """
 
 import getpass
+import hashlib
 import io
 import json
 import os
@@ -27,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from genesis.payments import vault_migrate as vm
 from genesis.payments import vault_store as vs
 from tests.test_scripts import test_backup_dated_snapshots as dated
 
@@ -36,7 +38,7 @@ backup_env = dated.backup_env  # the shared sandbox fixture
 
 _LIB = dated._BACKUP.parent / "lib" / "payment_vault_backup.sh"
 _GATE = dated._BACKUP.parent / "lib" / "backup_status_gate.py"
-PASSPHRASE = "quartz lantern ember noodle 41"
+PASSPHRASE = "quartz lantern ember noodle 41"  # seals a LEGACY vault's identity.age
 VISA = "4242" * 4  # Stripe's public test Visa
 
 
@@ -45,7 +47,8 @@ def _future() -> str:
     return f"12/{(datetime.now(UTC).year + 2) % 100:02d}"
 
 
-NAMES = ("identity.age", "recipient.txt", "cards.db")
+NAMES = ("identity.key", "recipient.txt", "cards.db")
+LEGACY_NAMES = ("identity.age", "recipient.txt", "cards.db")  # made before migration
 ARCHIVE = "payment_vault.tar.gpg"
 TMPNAME = f".{ARCHIVE}.tmp"
 LAST_GOOD = "payment_vault.last-good.tar.gpg"
@@ -53,11 +56,56 @@ _ASIDE_RE = re.compile(r"payment_vault\.pre-restore-\d{8}T\d{6}Z\.\d+")
 
 
 @pytest.fixture(scope="module")
-def _sealed(tmp_path_factory):
-    """One real init (scrypt costs seconds), copied fresh into each test."""
-    path = tmp_path_factory.mktemp("sealed") / "payment_vault"
-    vs.init_vault(PASSPHRASE, path)
+def _keyed(tmp_path_factory):
+    """One real init (a key-file vault), copied fresh into each test."""
+    path = tmp_path_factory.mktemp("keyed") / "payment_vault"
+    vs.init_vault(path)
     return path
+
+
+def _seal_key(key_text: str) -> bytes:
+    from pyrage import passphrase as age_passphrase
+
+    return age_passphrase.encrypt(key_text.strip().encode(), PASSPHRASE)
+
+
+def _make_legacy(path: Path) -> None:
+    """Turn a key-file vault into one made before the passphrase was dropped:
+    identity.age (the key sealed under PASSPHRASE) and its digest recorded."""
+    sealed = _seal_key((path / vs.IDENTITY).read_text())
+    fd = os.open(path / vs.SEALED_IDENTITY, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(sealed)
+    (path / vs.IDENTITY).unlink()
+    with sqlite3.connect(path / vs.CARDS) as conn:
+        conn.execute(
+            "UPDATE vault_meta SET value = ? WHERE key = ?",
+            (hashlib.sha256(sealed).hexdigest(), vs._IDENTITY_DIGEST),
+        )
+
+
+@pytest.fixture(scope="module")
+def _legacy(tmp_path_factory):
+    """A vault still holding identity.age, with its one card added before it was
+    sealed (vault_store refuses to add to a vault still to migrate). scrypt once
+    per module; copy it with _copy_vault."""
+    path = _place_vault(
+        _init_at(tmp_path_factory, "legacy"), tmp_path_factory.mktemp("legacy-card") / "v"
+    )
+    _make_legacy(path)
+    return path
+
+
+def _init_at(factory, name: str) -> Path:
+    path = factory.mktemp(name) / "payment_vault"
+    vs.init_vault(path)
+    return path
+
+
+def _copy_vault(src: Path, dest: Path) -> Path:
+    shutil.copytree(src, dest)
+    os.chmod(dest, 0o700)
+    return dest
 
 
 def _place_vault(sealed: Path, dest: Path) -> Path:
@@ -117,12 +165,15 @@ def _gpg_encrypt(src: Path, dst: Path, home: Path) -> None:
 
 
 def _card_number(vault: Path) -> str:
-    """Unseal the identity with the vault passphrase and decrypt the one card."""
+    """Read the identity (unsealing a legacy identity.age) and decrypt the one card."""
     from pyrage import decrypt, x25519
     from pyrage import passphrase as age_passphrase
 
-    sealed = (vault / "identity.age").read_bytes()
-    ident = x25519.Identity.from_str(age_passphrase.decrypt(sealed, PASSPHRASE).decode())
+    if (vault / "identity.key").exists():
+        text = (vault / "identity.key").read_text().strip()
+    else:
+        text = age_passphrase.decrypt((vault / "identity.age").read_bytes(), PASSPHRASE).decode()
+    ident = x25519.Identity.from_str(text)
     with sqlite3.connect(f"file:{vault / 'cards.db'}?mode=ro", uri=True) as conn:
         (blob,) = conn.execute("SELECT blob FROM cards").fetchone()
     return json.loads(decrypt(blob, [ident]))["number"]
@@ -202,7 +253,7 @@ def _archive(out: Path) -> bytes | None:
     return p.read_bytes() if p.is_file() else None
 
 
-def _open_archive(src: Path, tmp_path: Path, name: str = "back") -> Path:
+def _open_archive(src: Path, tmp_path: Path, name: str = "back", names=NAMES) -> Path:
     """Decrypt a payment_vault.tar.gpg and unpack it with Python (independently of
     the lib's unpack); the member list must be exactly the three regular files."""
     tarf = tmp_path / f"{name}.tar"
@@ -211,45 +262,78 @@ def _open_archive(src: Path, tmp_path: Path, name: str = "back") -> Path:
     back.mkdir()
     with tarfile.open(tarf) as tf:
         members = tf.getmembers()
-        assert sorted(m.name for m in members) == sorted(NAMES)
+        assert sorted(m.name for m in members) == sorted(names)
         assert all(m.isreg() for m in members)
         tf.extractall(back, filter="data")
     return back
 
 
 def test_names_match_the_vault_store():
+    """Each set's file list (identity.key, or the legacy identity.age) is vault_store's."""
     proc = subprocess.run(
         [
             "bash",
             "-c",
-            f'source "{_LIB}"; printf "%s\\n" "${{PAYMENT_VAULT_FILES[@]}}"; '
+            f'source "{_LIB}"; printf "unset=%s\\n" "${{PAYMENT_VAULT_FILES[*]-}}"; '
+            'for k in "$1" "$2"; do payment_vault_files "$k"; '
+            'printf "%s\\n" "${PAYMENT_VAULT_FILES[*]}"; done; '
             'printf "%s\\n" "$PAYMENT_VAULT_ARCHIVE"',
+            "x",
+            vs.IDENTITY,
+            vs.SEALED_IDENTITY,
         ],
         capture_output=True,
         text=True,
         check=True,
     )
-    *files, archive = proc.stdout.split()
-    assert tuple(files) == (vs.IDENTITY, vs.RECIPIENT, vs.CARDS) == NAMES
+    unset, keyed, legacy, archive = proc.stdout.splitlines()
+    assert unset == "unset="  # no global default: every caller picks its set
+    assert tuple(keyed.split()) == (vs.IDENTITY, vs.RECIPIENT, vs.CARDS) == NAMES
+    assert tuple(legacy.split()) == (vs.SEALED_IDENTITY, vs.RECIPIENT, vs.CARDS) == LEGACY_NAMES
     assert archive == ARCHIVE
 
 
-def test_ok_writes_one_archive_that_unpacks_to_a_working_vault(_sealed, tmp_path):
-    vault = _place_vault(_sealed, tmp_path / "vault")
+def test_ok_writes_one_archive_that_unpacks_to_a_working_vault(_keyed, tmp_path):
+    vault = _place_vault(_keyed, tmp_path / "vault")
     out = tmp_path / "creds"
     proc = _lib(tmp_path, vault, out)
     assert proc.stdout.strip() == "ok", proc.stdout + proc.stderr
     # Exactly one file: no per-file layout, no staging name left behind.
     assert sorted(p.name for p in out.iterdir()) == [ARCHIVE]
     assert not (out / "payment_vault").exists()
-    back = _open_archive(out / ARCHIVE, tmp_path)
-    assert (back / "identity.age").read_bytes() == (vault / "identity.age").read_bytes()
+    back = _open_archive(out / ARCHIVE, tmp_path)  # exactly cards.db, identity.key, recipient.txt
+    assert (back / "identity.key").read_bytes() == (vault / "identity.key").read_bytes()
     assert (back / "recipient.txt").read_bytes() == (vault / "recipient.txt").read_bytes()
     assert vs.list_cards(back) == vs.list_cards(vault)
     assert _card_number(back) == VISA
     # Neither the archive nor its plaintext tar holds the number (the blob is age-encrypted).
     assert _no_card_number_under(out, back, tmp_path / "back.tar") == []
     assert list((tmp_path / "bigtmp").iterdir()) == []  # the staging dir is removed
+
+
+def test_a_legacy_vault_still_backs_up_with_identity_age(_legacy, tmp_path):
+    vault = _copy_vault(_legacy, tmp_path / "vault")
+    out = tmp_path / "creds"
+    proc = _lib(tmp_path, vault, out)
+    assert proc.stdout.strip() == "ok", proc.stdout + proc.stderr
+    back = _open_archive(out / ARCHIVE, tmp_path, names=LEGACY_NAMES)
+    assert (back / "identity.age").read_bytes() == (vault / "identity.age").read_bytes()
+    assert _card_number(back) == VISA
+
+
+def test_a_vault_holding_both_key_files_backs_up_identity_key_alone(_keyed, tmp_path):
+    """A migration killed after its last step left identity.age beside the recorded
+    identity.key: the set is judged, and shipped, by identity.key."""
+    vault = _place_vault(_keyed, tmp_path / "vault")
+    stray = _seal_key((vault / "identity.key").read_text())
+    (vault / "identity.age").write_bytes(stray)
+    (vault / "identity.age").chmod(0o600)
+    out = tmp_path / "creds"
+    proc = _lib(tmp_path, vault, out)
+    assert proc.stdout.strip() == "ok", proc.stdout + proc.stderr
+    back = _open_archive(out / ARCHIVE, tmp_path)  # NAMES: no identity.age member
+    assert (back / "identity.key").read_bytes() == (vault / "identity.key").read_bytes()
+    assert _card_number(back) == VISA
 
 
 def test_absent_and_missing(tmp_path):
@@ -265,7 +349,7 @@ def test_absent_and_missing(tmp_path):
 @pytest.mark.parametrize("cards", ["empty file", "empty table"])
 @pytest.mark.parametrize("with_recipient", [False, True])
 def test_a_directory_with_no_key_and_no_cards_is_no_vault(tmp_path, with_recipient, cards):
-    """An init killed before identity.age landed (vault_store places recipient.txt
+    """An init killed before identity.key landed (vault_store places recipient.txt
     first) is not initialised: there is no key to keep, and init can rerun."""
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -293,14 +377,14 @@ def test_a_directory_with_no_key_and_no_cards_is_no_vault(tmp_path, with_recipie
         ("link", "cards.db is not a regular file in a vault with no key"),
     ],
 )
-def test_cards_without_a_key_fail_never_absent(_sealed, tmp_path, damage, reason):
-    """A vault whose identity.age is gone but whose cards.db holds cards is a loss
+def test_cards_without_a_key_fail_never_absent(_keyed, tmp_path, damage, reason):
+    """A vault whose identity.key is gone but whose cards.db holds cards is a loss
     to report, not an empty vault (vault_store refuses to re-init it too)."""
-    vault = _place_vault(_sealed, tmp_path / "vault")
+    vault = _place_vault(_keyed, tmp_path / "vault")
     out = tmp_path / "creds"
     assert _lib(tmp_path, vault, out).stdout.strip() == "ok"
     earlier = _archive(out)
-    (vault / "identity.age").unlink()
+    (vault / "identity.key").unlink()
     if damage == "unreadable":
         (vault / "cards.db").write_bytes(b"not sqlite" * 100)
     elif damage == "link":
@@ -326,15 +410,15 @@ def test_cards_without_a_key_fail_never_absent(_sealed, tmp_path, damage, reason
         ("rm cards.db", "the vault is incomplete (cards.db"),
         ("link cards.db", "the vault is incomplete (cards.db is missing or not a regular file)"),
         ("corrupt cards.db", "integrity check"),
-        ("garble identity.age", "identity.age is not an age file"),
+        ("garble identity.key", "identity.key is not an age secret key"),
         ("garble recipient.txt", "recipient.txt does not hold an age public key"),
         ("version0 cards.db", "not a vault database of format version 1"),
         ("version2 cards.db", "not a vault database of format version 1"),
         ("encrypt fails", "encrypting the vault failed"),
     ],
 )
-def test_failed_keeps_the_earlier_archive_byte_identical(_sealed, tmp_path, damage, reason):
-    vault = _place_vault(_sealed, tmp_path / "vault")
+def test_failed_keeps_the_earlier_archive_byte_identical(_keyed, tmp_path, damage, reason):
+    vault = _place_vault(_keyed, tmp_path / "vault")
     out = tmp_path / "creds"
     assert _lib(tmp_path, vault, out).stdout.strip() == "ok"
     earlier = _archive(out)
@@ -368,8 +452,8 @@ def test_failed_keeps_the_earlier_archive_byte_identical(_sealed, tmp_path, dama
     assert list((tmp_path / "bigtmp").iterdir()) == []
 
 
-def test_a_symlinked_vault_directory_is_refused(_sealed, tmp_path):
-    real = _place_vault(_sealed, tmp_path / "real")
+def test_a_symlinked_vault_directory_is_refused(_keyed, tmp_path):
+    real = _place_vault(_keyed, tmp_path / "real")
     (tmp_path / "vault").symlink_to(real)
     proc = _lib(tmp_path, tmp_path / "vault", tmp_path / "creds")
     assert proc.stdout.startswith("failed the vault path is not a directory"), proc.stdout
@@ -377,10 +461,10 @@ def test_a_symlinked_vault_directory_is_refused(_sealed, tmp_path):
 
 
 @pytest.mark.parametrize("where", ["creds", "its parent"])
-def test_a_symlinked_creds_directory_is_refused(_sealed, tmp_path, where):
+def test_a_symlinked_creds_directory_is_refused(_keyed, tmp_path, where):
     """A symlink at creds (or the clone above it) would send the archive outside the
     backups repo while the run reported ok."""
-    vault = _place_vault(_sealed, tmp_path / "vault")
+    vault = _place_vault(_keyed, tmp_path / "vault")
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     if where == "creds":
@@ -396,7 +480,7 @@ def test_a_symlinked_creds_directory_is_refused(_sealed, tmp_path, where):
     assert _tree(elsewhere) == before
 
 
-def test_a_staging_leftover_of_a_killed_run_is_removed(_sealed, tmp_path):
+def test_a_staging_leftover_of_a_killed_run_is_removed(_keyed, tmp_path):
     out = tmp_path / "creds"
     out.mkdir()
     (out / TMPNAME).write_bytes(b"half")
@@ -404,14 +488,14 @@ def test_a_staging_leftover_of_a_killed_run_is_removed(_sealed, tmp_path):
     assert not (out / TMPNAME).exists()
     # And on a successful run, the leftover never survives next to the new archive.
     (out / TMPNAME).write_bytes(b"half")
-    vault = _place_vault(_sealed, tmp_path / "vault")
+    vault = _place_vault(_keyed, tmp_path / "vault")
     assert _lib(tmp_path, vault, out).stdout.strip() == "ok"
     assert sorted(p.name for p in out.iterdir()) == [ARCHIVE]
 
 
-def test_a_directory_at_the_archive_path_is_a_failure_not_ok(_sealed, tmp_path):
+def test_a_directory_at_the_archive_path_is_a_failure_not_ok(_keyed, tmp_path):
     """mv would move the archive INTO a directory there and report ok."""
-    vault = _place_vault(_sealed, tmp_path / "v" / "payment_vault")
+    vault = _place_vault(_keyed, tmp_path / "v" / "payment_vault")
     out = tmp_path / "creds"
     (out / ARCHIVE).mkdir(parents=True)
     r = _lib(tmp_path, vault, out)
@@ -419,9 +503,9 @@ def test_a_directory_at_the_archive_path_is_a_failure_not_ok(_sealed, tmp_path):
     assert list((out / ARCHIVE).iterdir()) == []
 
 
-def test_a_directory_at_the_temp_name_is_a_failure_not_ok(_sealed, tmp_path):
+def test_a_directory_at_the_temp_name_is_a_failure_not_ok(_keyed, tmp_path):
     """cp would copy INTO a directory there, and mv would publish the directory."""
-    vault = _place_vault(_sealed, tmp_path / "v" / "payment_vault")
+    vault = _place_vault(_keyed, tmp_path / "v" / "payment_vault")
     out = tmp_path / "creds"
     (out / TMPNAME).mkdir(parents=True)
     r = _lib(tmp_path, vault, out)
@@ -461,10 +545,10 @@ def test_the_staging_name_is_gitignored_and_the_archive_is_not(tmp_path):
     assert not ignored(f"creds/{ARCHIVE}")
 
 
-def test_waits_for_a_held_vault_lock(_sealed, tmp_path):
+def test_waits_for_a_held_vault_lock(_keyed, tmp_path):
     """The backup takes the directory lock `vault init`, `add` and `retire` hold,
     so it never reads a half-made vault."""
-    vault = _place_vault(_sealed, tmp_path / "vault")
+    vault = _place_vault(_keyed, tmp_path / "vault")
     flag = tmp_path / "locked"
     holder = subprocess.Popen(
         [
@@ -536,8 +620,8 @@ def _store_columns() -> str:
         return " ".join(r[1] for r in conn.execute("PRAGMA table_info(cards)"))
 
 
-def test_the_shell_check_accepts_a_real_vault_and_matches_its_schema(_sealed, tmp_path):
-    vault = _place_vault(_sealed, tmp_path / "vault")
+def test_the_shell_check_accepts_a_real_vault_and_matches_its_schema(_keyed, tmp_path):
+    vault = _place_vault(_keyed, tmp_path / "vault")
     proc = _check(vault)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     consts = subprocess.run(
@@ -572,7 +656,9 @@ def _rebuild_cards(db: Path, schema: str) -> None:
         ("recipient long", "recipient.txt does not hold an age public key"),
         ("recipient bad charset", "recipient.txt does not hold an age public key"),
         ("no vault_meta", "does not record the vault keys"),
-        ("identity flipped", "identity.age is not the key this vault was created with"),
+        ("identity replaced", "identity.key is not the key this vault was created with"),
+        ("identity bad shape", "identity.key is not an age secret key"),
+        ("identity two lines", "identity.key is not an age secret key"),
         ("recipient swapped", "recipient.txt is not the public key this vault was created with"),
         # Codex round 2 on #3211: what only the vault's own acceptance catches.
         ("recipient extra line", "recipient.txt does not hold a valid age public key"),
@@ -581,8 +667,8 @@ def _rebuild_cards(db: Path, schema: str) -> None:
         ("extra index", "cards.db is not a vault card database"),
     ],
 )
-def test_the_shell_check_refuses_what_vault_store_would(_sealed, tmp_path, damage, reason):
-    vault = _place_vault(_sealed, tmp_path / "vault")
+def test_the_shell_check_refuses_what_vault_store_would(_keyed, tmp_path, damage, reason):
+    vault = _place_vault(_keyed, tmp_path / "vault")
     db = vault / "cards.db"
     key = (vault / "recipient.txt").read_text().strip()
     if damage == "user_version 2":
@@ -602,10 +688,17 @@ def test_the_shell_check_refuses_what_vault_store_would(_sealed, tmp_path, damag
     elif damage == "no vault_meta":
         with sqlite3.connect(db) as conn:
             conn.execute("DROP TABLE vault_meta")
-    elif damage == "identity flipped":
-        data = bytearray((vault / "identity.age").read_bytes())
-        data[-5] ^= 0x01  # same length, same shape
-        (vault / "identity.age").write_bytes(bytes(data))
+    elif damage == "identity replaced":
+        from pyrage import x25519
+
+        # A whole, valid key of the right shape: only the recorded digest tells.
+        (vault / "identity.key").write_text(f"{x25519.Identity.generate()}\n")
+    elif damage == "identity bad shape":
+        text = (vault / "identity.key").read_text()
+        (vault / "identity.key").write_text(text[:20] + "b" + text[21:])  # 'b': not Bech32
+    elif damage == "identity two lines":
+        text = (vault / "identity.key").read_text()
+        (vault / "identity.key").write_text(text + text)  # the first line is still a key
     elif damage == "recipient swapped":
         from pyrage import x25519
 
@@ -631,14 +724,42 @@ def test_the_shell_check_refuses_what_vault_store_would(_sealed, tmp_path, damag
         (vault / "recipient.txt").write_text(key[:-1] + "b\n")  # 'b' is not Bech32
     proc = _check(vault)
     assert proc.returncode == 1 and reason in proc.stdout, proc.stdout + proc.stderr
+    if damage.startswith("identity"):  # the shell's own check, not vault_store's later one
+        assert proc.stdout == reason + "\n", proc.stdout
+
+
+def test_the_shell_check_accepts_a_legacy_set(_legacy, tmp_path):
+    vault = _copy_vault(_legacy, tmp_path / "vault")
+    proc = _check(vault)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize(
+    "damage, reason",
+    [
+        ("garble", "identity.age is not an age file"),
+        ("flipped", "identity.age is not the key this vault was created with"),
+    ],
+)
+def test_the_shell_check_refuses_a_damaged_legacy_key(_legacy, tmp_path, damage, reason):
+    vault = _copy_vault(_legacy, tmp_path / "vault")
+    if damage == "garble":
+        (vault / "identity.age").write_text("not a key\n")
+    else:
+        data = bytearray((vault / "identity.age").read_bytes())
+        data[-5] ^= 0x01  # same length, same shape
+        (vault / "identity.age").write_bytes(bytes(data))
+    proc = _check(vault)
+    assert proc.returncode == 1 and proc.stdout == reason + "\n", proc.stdout + proc.stderr
 
 
 # ── payment_vault_unpack: restore's side of the archive ────────────────
 
 
-#: Two real vaults, one per mark, made once per module by _real_sets (scrypt
-#: costs seconds). A stand-in set would not pass payment_vault_check, which runs
-#: the vault's own acceptance (vault_store.verify_set).
+#: Two real vaults, one per mark, made once per module by _real_sets, and a
+#: legacy one (identity.age; scrypt costs a second). A stand-in set would
+#: not pass payment_vault_check, which runs the vault's own acceptance
+#: (vault_store.verify_set).
 _REAL_SETS: dict[str, Path] = {}
 
 
@@ -646,8 +767,12 @@ _REAL_SETS: dict[str, Path] = {}
 def _real_sets(tmp_path_factory):
     for mark in ("p", "q"):
         path = tmp_path_factory.mktemp(f"real-{mark}") / "payment_vault"
-        vs.init_vault(PASSPHRASE, path)
+        vs.init_vault(path)
         _REAL_SETS[mark] = path
+    legacy = tmp_path_factory.mktemp("real-legacy") / "payment_vault"
+    vs.init_vault(legacy)
+    _make_legacy(legacy)
+    _REAL_SETS["legacy"] = legacy
     yield
     _REAL_SETS.clear()
 
@@ -683,8 +808,8 @@ def _write_tar(path: Path, members: list[tuple[str, str, object]]) -> None:
                 tf.addfile(ti)
 
 
-def _set_members(plain: Path) -> list[tuple[str, str, object]]:
-    return [(n, "file", (plain / n).read_bytes()) for n in NAMES]
+def _set_members(plain: Path, names=NAMES) -> list[tuple[str, str, object]]:
+    return [(n, "file", (plain / n).read_bytes()) for n in names]
 
 
 def _unpack(tarf: Path, parent: Path) -> subprocess.CompletedProcess:
@@ -702,11 +827,14 @@ def _unpack(tarf: Path, parent: Path) -> subprocess.CompletedProcess:
     )
 
 
-def test_unpack_makes_a_private_new_directory(tmp_path):
+@pytest.mark.parametrize("kind", ["keyfile", "legacy"])
+def test_unpack_makes_a_private_new_directory(tmp_path, kind):
+    """Either set unpacks: identity.key, or identity.age from before migration."""
+    names = NAMES if kind == "keyfile" else LEGACY_NAMES
     plain = tmp_path / "plain"
-    _synthetic_set(plain)
+    _synthetic_set(plain, mark="q" if kind == "keyfile" else "legacy")
     tarf = tmp_path / "v.tar"
-    _write_tar(tarf, _set_members(plain))
+    _write_tar(tarf, _set_members(plain, names))
     parent = tmp_path / "parent"
     parent.mkdir()
     proc = _unpack(tarf, parent)
@@ -714,15 +842,25 @@ def test_unpack_makes_a_private_new_directory(tmp_path):
     dest = Path(proc.stdout.strip())
     assert dest.parent == parent and dest.name.startswith(".payment_vault.")
     assert stat.S_IMODE(dest.stat().st_mode) == 0o700
-    assert sorted(p.name for p in dest.iterdir()) == sorted(NAMES)
-    for n in NAMES:
+    assert sorted(p.name for p in dest.iterdir()) == sorted(names)
+    for n in names:
         assert stat.S_IMODE((dest / n).stat().st_mode) == 0o600, n
         assert (dest / n).read_bytes() == (plain / n).read_bytes()
 
 
 @pytest.mark.parametrize(
     "case",
-    ["symlink cards.db", "hardlink cards.db", "duplicate", "extra", "dotdot", "missing", "dir"],
+    [
+        "symlink cards.db",
+        "hardlink cards.db",
+        "duplicate",
+        "extra",
+        "dotdot",
+        "missing",
+        "dir",
+        "both keys",
+        "mixed",
+    ],
 )
 def test_unpack_refuses_anything_but_the_three_files(tmp_path, case):
     plain = tmp_path / "plain"
@@ -732,14 +870,17 @@ def test_unpack_refuses_anything_but_the_three_files(tmp_path, case):
     outside.chmod(0o644)
     good = _set_members(plain)
     ident, recip, cards = good
+    sealed = ("identity.age", "file", _seal_key((plain / "identity.key").read_text()))
     members = {
         "symlink cards.db": [ident, recip, ("cards.db", "symlink", str(outside))],
-        "hardlink cards.db": [ident, recip, ("cards.db", "hardlink", "identity.age")],
+        "hardlink cards.db": [ident, recip, ("cards.db", "hardlink", "identity.key")],
         "duplicate": [ident, recip, cards, cards],
         "extra": [*good, ("notes.txt", "file", b"x")],
         "dotdot": [ident, recip, ("../cards.db", "file", cards[2])],
         "missing": [ident, recip],
         "dir": [ident, recip, ("cards.db", "dir", None)],
+        "both keys": [*good, sealed],  # four files: a set holds one key file
+        "mixed": [ident, sealed, recip],  # three names, but of no one set
     }[case]
     tarf = tmp_path / "v.tar"
     _write_tar(tarf, members)
@@ -1284,7 +1425,7 @@ def test_a_symlinked_creds_checkout_is_left_alone_and_the_snapshot_vault_staged(
 def _staged_matches(vault: Path, fresh: Path, proc) -> None:
     staged = _staged(fresh)
     assert sorted(p.name for p in staged.iterdir()) == sorted(NAMES), proc.stdout[-3000:]
-    for n in ("identity.age", "recipient.txt"):
+    for n in ("identity.key", "recipient.txt"):
         assert (staged / n).read_bytes() == (vault / n).read_bytes()
     assert vs.list_cards(staged) == vs.list_cards(vault)
     assert _card_number(staged) == VISA
@@ -1304,9 +1445,9 @@ def _tracked(repo: Path, path: str = "creds") -> list[str]:
 
 
 def test_round_trip_through_the_clone_and_through_the_offsite_snapshot(
-    _sealed, backup_env, tmp_path
+    _keyed, backup_env, tmp_path
 ):
-    vault = _place_vault(_sealed, backup_env["home"] / ".genesis" / "payment_vault")
+    vault = _place_vault(_keyed, backup_env["home"] / ".genesis" / "payment_vault")
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     proc = dated._run_local(backup_env, offsite)
@@ -1351,9 +1492,9 @@ def test_no_vault_is_absent_and_changes_nothing(backup_env, tmp_path):
     assert not (creds / ARCHIVE).exists() and not (creds / "payment_vault").exists()
 
 
-def test_a_relative_genesis_home_still_finds_the_vault(_sealed, backup_env, tmp_path):
+def test_a_relative_genesis_home_still_finds_the_vault(_keyed, backup_env, tmp_path):
     """§8 runs inside the backups clone, so GENESIS_HOME is made absolute first."""
-    _place_vault(_sealed, backup_env["home"] / ".genesis" / "payment_vault")
+    _place_vault(_keyed, backup_env["home"] / ".genesis" / "payment_vault")
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     env = dict(os.environ)
@@ -1388,11 +1529,11 @@ def test_a_relative_genesis_home_still_finds_the_vault(_sealed, backup_env, tmp_
     assert (dated._repo(backup_env) / "creds" / ARCHIVE).is_file()
 
 
-def test_a_tilde_genesis_home_finds_the_vault(_sealed, backup_env, tmp_path, monkeypatch):
+def test_a_tilde_genesis_home_finds_the_vault(_keyed, backup_env, tmp_path, monkeypatch):
     """GENESIS_HOME=~/x names $HOME/x for the runtime (Path.expanduser); so here."""
     # dr_lock.sh still reads GENESIS_HOME literally (#3438): keep its "~" dir out of the repo.
     monkeypatch.chdir(tmp_path)
-    _place_vault(_sealed, backup_env["home"] / "custom" / "payment_vault")
+    _place_vault(_keyed, backup_env["home"] / "custom" / "payment_vault")
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     proc = dated._run_local(backup_env, offsite, extra_env={"GENESIS_HOME": "~/custom"})
@@ -1495,9 +1636,9 @@ def test_a_stage_on_a_tilde_genesis_home_is_refused(tmp_path, monkeypatch):
 
 
 def test_a_vault_backup_failure_fails_the_run_and_update_continues_degraded(
-    _sealed, backup_env, tmp_path
+    _keyed, backup_env, tmp_path
 ):
-    vault = _place_vault(_sealed, backup_env["home"] / ".genesis" / "payment_vault")
+    vault = _place_vault(_keyed, backup_env["home"] / ".genesis" / "payment_vault")
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     assert dated._run_local(backup_env, offsite).returncode == 0
@@ -1530,9 +1671,9 @@ def test_a_vault_backup_failure_fails_the_run_and_update_continues_degraded(
 
 
 def test_a_vault_that_vanished_fails_the_run_and_keeps_the_last_archive(
-    _sealed, backup_env, tmp_path
+    _keyed, backup_env, tmp_path
 ):
-    vault = _place_vault(_sealed, backup_env["home"] / ".genesis" / "payment_vault")
+    vault = _place_vault(_keyed, backup_env["home"] / ".genesis" / "payment_vault")
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     assert dated._run_local(backup_env, offsite).returncode == 0
@@ -1567,8 +1708,8 @@ def test_a_vault_that_vanished_fails_the_run_and_keeps_the_last_archive(
     _assert_no_plaintext_tar(fresh)
 
 
-def test_no_passphrase_is_skipped_not_a_vault_failure(_sealed, backup_env, tmp_path):
-    _place_vault(_sealed, backup_env["home"] / ".genesis" / "payment_vault")
+def test_no_passphrase_is_skipped_not_a_vault_failure(_keyed, backup_env, tmp_path):
+    _place_vault(_keyed, backup_env["home"] / ".genesis" / "payment_vault")
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     dated._run_local(backup_env, offsite, {"GENESIS_BACKUP_PASSPHRASE": ""})
@@ -1740,8 +1881,8 @@ def _smb_filesystem_stub(bind: Path, root: Path, log: Path) -> None:
     )
 
 
-def test_smb_offsite_puts_the_one_archive_flat_in_creds(_sealed, backup_env, tmp_path):
-    _place_vault(_sealed, backup_env["home"] / ".genesis" / "payment_vault")
+def test_smb_offsite_puts_the_one_archive_flat_in_creds(_keyed, backup_env, tmp_path):
+    _place_vault(_keyed, backup_env["home"] / ".genesis" / "payment_vault")
     nas = tmp_path / "nas"
     nas.mkdir()
     log = tmp_path / "smb.log"
@@ -1763,10 +1904,10 @@ def test_smb_offsite_puts_the_one_archive_flat_in_creds(_sealed, backup_env, tmp
     assert not [c for c in cmds if "mkdir" in c and "creds/payment_vault" in c], cmds
 
 
-def test_an_unresolved_src_path_refuses_instead_of_importing_from_cwd(_sealed, tmp_path):
+def test_an_unresolved_src_path_refuses_instead_of_importing_from_cwd(_keyed, tmp_path):
     """An empty sys.path entry is the current directory: with src/ unresolved, a
     stray genesis/ there must not stand in for vault_store."""
-    vault = _place_vault(_sealed, tmp_path / "vault")
+    vault = _place_vault(_keyed, tmp_path / "vault")
     with sqlite3.connect(vault / "cards.db") as conn:
         conn.execute("CREATE INDEX i ON cards (label)")  # vault_store refuses this set
     stub = tmp_path / "cwd" / "genesis" / "payments"
@@ -1784,3 +1925,188 @@ def test_an_unresolved_src_path_refuses_instead_of_importing_from_cwd(_sealed, t
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "cannot find vault_store" in proc.stdout
+
+
+def test_a_migration_stopped_before_its_row_moved_backs_up_the_sealed_set(_keyed, tmp_path):
+    """identity.key placed, cards.db still recording identity.age: the archive is the
+    set cards.db records (identity.age), never a key file the digest does not name."""
+    vault = _place_vault(_keyed, tmp_path / "vault")
+    sealed = _seal_key((vault / "identity.key").read_text())
+    (vault / "identity.age").write_bytes(sealed)
+    (vault / "identity.age").chmod(0o600)
+    with sqlite3.connect(vault / "cards.db") as conn:
+        conn.execute(
+            "UPDATE vault_meta SET value = ? WHERE key = 'identity_sha256'",
+            (hashlib.sha256(sealed).hexdigest(),),
+        )
+    out = tmp_path / "creds"
+    proc = _lib(tmp_path, vault, out)
+    assert proc.stdout.strip() == "ok", proc.stdout + proc.stderr
+    names = ("cards.db", "identity.age", "recipient.txt")
+    back = _open_archive(out / ARCHIVE, tmp_path, names=names)
+    assert (back / "identity.age").read_bytes() == sealed
+
+
+# ── the pre-migrate copies: deleted once the migrated vault is on the remote ──
+
+COPY = "payment_vault.pre-migrate-20261001T000000Z"
+REC = "age1" + "q" * 58  # recipient text; the delete compares it, never parses it
+
+
+def _vault_copy(dest: Path, recipient: str = REC, extra: str | None = None) -> Path:
+    """A directory shaped like the copy `vault migrate` keeps."""
+    dest.mkdir(mode=0o700)
+    for name in ("identity.age", "cards.db", *((extra,) if extra else ())):
+        (dest / name).write_text("x\n")
+    (dest / "recipient.txt").write_text(recipient + "\n")
+    return dest
+
+
+def _drop(vault: Path, recipient: str = REC) -> subprocess.CompletedProcess:
+    script = f'set -euo pipefail; source "{_LIB}"; payment_vault_drop_copies "$1" "$2"'
+    return subprocess.run(
+        ["bash", "-c", script, "lib", str(vault), recipient], capture_output=True, text=True
+    )
+
+
+def test_drop_copies_deletes_only_a_plain_copy_of_this_vault(tmp_path):
+    vault = tmp_path / "payment_vault"
+    vault.mkdir()
+    plain = _vault_copy(tmp_path / COPY)
+    kept = {
+        "extra file": _vault_copy(
+            tmp_path / "payment_vault.pre-migrate-20261002T000000Z", extra="n"
+        ),
+        "another vault": _vault_copy(
+            tmp_path / "payment_vault.pre-migrate-20261003T000000Z", recipient="age1other"
+        ),
+        "hand-made name": _vault_copy(tmp_path / "payment_vault.pre-migrate-handmade"),
+        "other prefix": _vault_copy(tmp_path / "payment_vault.other"),
+    }
+    nested = _vault_copy(tmp_path / "payment_vault.pre-migrate-20261004T000000Z")
+    (nested / "sub").mkdir()
+    target = _vault_copy(tmp_path / "elsewhere")
+    link = tmp_path / "payment_vault.pre-migrate-20261005T000000Z"
+    link.symlink_to(target)
+    linked = _vault_copy(tmp_path / "payment_vault.pre-migrate-20261006T000000Z")
+    outside = tmp_path / "outside.db"
+    outside.write_text("keep\n")
+    (linked / "cards.db").unlink()
+    (linked / "cards.db").symlink_to(outside)
+    proc = _drop(vault)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["1", "6"]  # "other prefix" is not a copy at all
+    assert not plain.exists()
+    for why, d in kept.items():
+        assert len(list(d.iterdir())) in (3, 4), why
+    assert (nested / "sub").is_dir() and (nested / "cards.db").exists()
+    assert link.is_symlink() and len(list(target.iterdir())) == 3
+    assert (linked / "cards.db").is_symlink() and outside.read_text() == "keep\n"
+    assert vault.is_dir()
+
+
+def test_drop_copies_with_no_recipient_deletes_nothing(tmp_path):
+    (tmp_path / "payment_vault").mkdir()
+    copy = _vault_copy(tmp_path / COPY, recipient="")  # empty == empty must not match
+    proc = _drop(tmp_path / "payment_vault", recipient="")
+    assert proc.stdout.split() == ["0", "1"] and copy.is_dir(), proc.stdout + proc.stderr
+
+
+def test_drop_and_count_with_no_copy(tmp_path):
+    (tmp_path / "payment_vault").mkdir()
+    assert _drop(tmp_path / "payment_vault").stdout.split() == ["0", "0"]
+    script = f'source "{_LIB}"; payment_vault_count_copies "$1"'
+    count = subprocess.run(
+        ["bash", "-c", script, "lib", str(tmp_path / "payment_vault")],
+        capture_output=True,
+        text=True,
+    )
+    assert count.stdout.strip() == "0"
+
+
+def _remote_archive(backup_env, tmp_path) -> Path:
+    """The vault archive as the backups REMOTE holds it (a fresh clone)."""
+    url = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=dated._repo(backup_env),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    view = tmp_path / "remote-view"
+    subprocess.run(["git", "clone", "-q", url, str(view)], check=True)
+    return view / "creds" / ARCHIVE
+
+
+def test_a_backup_of_a_migrated_vault_deletes_the_copy_migrate_kept(_legacy, backup_env, tmp_path):
+    gh = backup_env["home"] / ".genesis"
+    vault = _copy_vault(_legacy, gh / "payment_vault")
+    aside = vm.migrate_vault(PASSPHRASE, path=vault)  # the real copy, as migrate makes it
+    assert aside is not None and aside.is_dir()
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = dated._run_local(backup_env, offsite)
+    status = _status(backup_env)
+    assert status["payment_vault"] == "ok" and status["tier1_pushed"] is True, status
+    assert not aside.exists(), proc.stdout[-3000:]
+    assert status["payment_vault_copies"] == 0
+    assert "pre-migrate copies: 1 deleted, 0 left" in proc.stdout
+    # What made the delete safe: the remote holds the MIGRATED vault.
+    (tmp_path / "gnupg").mkdir(mode=0o700, exist_ok=True)
+    back = _open_archive(_remote_archive(backup_env, tmp_path), tmp_path, name="remote")
+    assert (back / "identity.key").read_bytes() == (vault / "identity.key").read_bytes()
+    assert _card_number(back) == VISA
+
+
+def test_a_backup_of_a_sealed_vault_keeps_the_copy(_legacy, backup_env, tmp_path):
+    gh = backup_env["home"] / ".genesis"
+    vault = _copy_vault(_legacy, gh / "payment_vault")
+    copy = _vault_copy(gh / COPY, recipient=(vault / "recipient.txt").read_text().strip())
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = dated._run_local(backup_env, offsite)
+    status = _status(backup_env)
+    assert status["payment_vault"] == "ok", proc.stdout[-3000:]
+    assert copy.is_dir() and status["payment_vault_copies"] == 1
+    assert "pre-migrate copies" not in proc.stdout
+
+
+def test_a_backup_whose_push_fails_keeps_the_copy(_keyed, backup_env, tmp_path):
+    gh = backup_env["home"] / ".genesis"
+    vault = _place_vault(_keyed, gh / "payment_vault")
+    copy = _vault_copy(gh / COPY, recipient=(vault / "recipient.txt").read_text().strip())
+    subprocess.run(
+        ["git", "remote", "set-url", "--push", "origin", str(tmp_path / "no-such-remote.git")],
+        cwd=dated._repo(backup_env),
+        check=True,
+    )
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = dated._run_local(backup_env, offsite)
+    status = _status(backup_env)
+    assert status["payment_vault"] == "ok" and status["tier1_pushed"] is False, (
+        status,
+        proc.stdout[-3000:],
+    )
+    assert copy.is_dir() and status["payment_vault_copies"] == 1
+    assert "pre-migrate copies" not in proc.stdout
+
+
+def test_a_copy_of_another_vault_is_kept_and_counted(_keyed, backup_env, tmp_path):
+    gh = backup_env["home"] / ".genesis"
+    _place_vault(_keyed, gh / "payment_vault")
+    copy = _vault_copy(gh / COPY)  # REC: not this vault's key pair
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = dated._run_local(backup_env, offsite)
+    status = _status(backup_env)
+    assert status["payment_vault"] == "ok" and status["tier1_pushed"] is True, status
+    assert copy.is_dir() and status["payment_vault_copies"] == 1
+    assert "pre-migrate copies: 0 deleted, 1 left" in proc.stdout
+
+
+def test_no_vault_reports_no_copies(backup_env, tmp_path):
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    dated._run_local(backup_env, offsite)
+    assert _status(backup_env)["payment_vault_copies"] == 0

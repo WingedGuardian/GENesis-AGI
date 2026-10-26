@@ -1008,31 +1008,104 @@ def test_the_dirty_list_matches_the_deploy_scripts_pipeline(dc, dc_ready):
     assert got == want and "a.txt" in got
 
 
-# ── the move record update.sh reads (#3370) ─────────────────────────────────
+# ── the move record update.sh reads: its own row's live_move (#3370, #3492) ──
 
 
-def _record(w) -> Path:
-    return w.home / "live_move.json"
+OWN_PID = "DEPLOY_CANDIDATES_OWN_STATE_PID"
+
+
+def _own_row(w, **over) -> Path:
+    """update.sh's own "merging" row, as it stands when it runs the rebuild:
+    a plain run, its own pid (this process's parent here, as update.sh is the
+    engine's parent there)."""
+    row = {
+        "phase": "merging",
+        "rollback_tag": "pre",
+        "original_branch": "live",
+        "own_head": w.rev("HEAD"),
+        "deploy_head": w.rev("refs/remotes/origin/main"),
+        "post_merge": False,
+        "pid": os.getppid(),
+        "started_at": "now",
+        "services_stopped": ["genesis-server"],
+        **over,
+    }
+    state = w.home / ".genesis" / "update_state.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps(row, indent=4))
+    return state
+
+
+class _MoveRecord:
+    """The ``live_move`` field of update.sh's row (where the engine records how
+    far its move got): exists() when the field is there, read_text() its JSON."""
+
+    def __init__(self, state: Path):
+        self.state = state
+
+    def _row(self) -> dict:
+        return json.loads(self.state.read_text()) if self.state.exists() else {}
+
+    def exists(self) -> bool:
+        return "live_move" in self._row()
+
+    def read_text(self) -> str:
+        return json.dumps(self._row()["live_move"])
+
+
+def _own_env() -> dict[str, str]:
+    return {OWN_PID: str(os.getppid())}
 
 
 def test_a_rebuild_that_moves_records_done_at_its_tip(dc, dc_ready, capsys):
+    """T4m: the record goes into the caller's own row, every other key kept."""
     w = dc_ready
     w.candidate("feat/a", {"x.txt": "x\n"})
     w.write_manifest([w.entry("feat/a")])
-    rec = _record(w)
-    assert w.run(dc, "rebuild", extra_env={"DEPLOY_CANDIDATES_MOVE_RECORD": str(rec)}) == 0, (
-        capsys.readouterr()
-    )
-    assert json.loads(rec.read_text()) == {"to": w.rev("refs/heads/live"), "phase": "done"}
-    assert not list(rec.parent.glob("live_move.json.*.tmp")), "the temp file was left behind"
+    state = _own_row(w)
+    before = json.loads(state.read_text())
+    assert w.run(dc, "rebuild", extra_env=_own_env()) == 0, capsys.readouterr()
+    after = json.loads(state.read_text())
+    assert after.pop("live_move") == {"to": w.rev("refs/heads/live"), "phase": "done"}
+    assert after == before, "the engine changed another key of its caller's row"
+    assert not list(state.parent.glob("update_state.json.*")), "the temp file was left behind"
+    assert not list(w.home.rglob("live_move.json*")), "the retired side file was written"
 
 
-def test_without_the_variable_no_record_is_written(dc, dc_ready, capsys):
+def test_the_record_before_the_switch_is_made_durable(dc, dc_ready, capsys, monkeypatch):
+    """T4m: "moving" is on disk (file and directory fsynced) before git writes."""
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    state = _own_row(w)
+    synced: list[int] = []
+    at_switch: list[tuple[int, dict]] = []
+    real_fsync, real_git = os.fsync, dc.Engine.git
+
+    def fsync(fd):
+        synced.append(fd)
+        return real_fsync(fd)
+
+    def git(self, *args, **kw):
+        if args and args[0] == "switch":
+            at_switch.append((len(synced), json.loads(state.read_text()).get("live_move")))
+        return real_git(self, *args, **kw)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(dc.Engine, "git", git)
+    assert w.run(dc, "rebuild", extra_env=_own_env()) == 0, capsys.readouterr()
+    assert at_switch, "the move never switched"
+    count, record = at_switch[0]
+    assert record and record["phase"] == "moving" and count >= 2, at_switch
+
+
+def test_without_its_own_row_no_record_is_written(dc, dc_ready, capsys):
+    """A hand rebuild (no caller named) has no row to record in (residual R-3)."""
     w = dc_ready
     w.candidate("feat/a", {"x.txt": "x\n"})
     w.write_manifest([w.entry("feat/a")])
     assert w.run(dc, "rebuild") == 0, capsys.readouterr()
-    assert not _record(w).exists()
+    assert not (w.home / ".genesis" / "update_state.json").exists()
     assert not list(w.home.rglob("live_move.json*"))
 
 
@@ -1046,27 +1119,79 @@ def test_a_switch_that_fails_partway_records_partial(dc, dc_ready, capsys):
     (w.root / ".git" / "info" / "attributes").write_text("*.bin filter=bad\n")
     w.git(w.root, "config", "filter.bad.smudge", "false")
     w.git(w.root, "config", "filter.bad.required", "true")
-    rec = _record(w)
-    assert w.run(dc, "rebuild", extra_env={"DEPLOY_CANDIDATES_MOVE_RECORD": str(rec)}) == 1
+    rec = _MoveRecord(_own_row(w))
+    assert w.run(dc, "rebuild", extra_env=_own_env()) == 1
     assert "failed partway" in capsys.readouterr().err
     got = json.loads(rec.read_text())
     assert got["phase"] == "partial" and got["to"] != w.rev("HEAD")
 
 
-def test_an_unwritable_record_refuses_before_anything_moves(dc, dc_ready, capsys):
-    """A missing record must keep meaning "never moved": a record that cannot be
-    written before the move refuses the move."""
+def _unwritable_state(monkeypatch) -> None:
+    """update_state.json cannot be replaced (a full or read-only disk)."""
+    real = os.replace
+
+    def replace(src, dst, *a, **kw):
+        if str(dst).endswith("update_state.json"):
+            raise OSError(28, "No space left on device")
+        return real(src, dst, *a, **kw)
+
+    monkeypatch.setattr(os, "replace", replace)
+
+
+def test_an_unwritable_record_refuses_before_anything_moves(dc, dc_ready, capsys, monkeypatch):
+    """T4p: a missing record must keep meaning "never moved", so a record that
+    cannot be written before the move refuses the move."""
     w = dc_ready
     w.candidate("feat/a", {"x.txt": "x\n"})
     w.write_manifest([w.entry("feat/a")])
     head = w.rev("HEAD")
-    rec = w.home / "no-such-dir" / "live_move.json"
-    assert w.run(dc, "rebuild", extra_env={"DEPLOY_CANDIDATES_MOVE_RECORD": str(rec)}) == 1
-    assert "move record" in capsys.readouterr().err
+    state = _own_row(w)
+    before = state.read_bytes()
+    _unwritable_state(monkeypatch)
+    assert w.run(dc, "rebuild", extra_env=_own_env()) == 1
+    err = capsys.readouterr().err
+    assert "cannot record the move" in err and "nothing moved" in err, err
     assert w.rev("HEAD") == head and not w.live_merges()
+    assert state.read_bytes() == before
+    assert not list(state.parent.glob("update_state.json.*")), "the temp file was left behind"
 
 
-# ── the source the move was planned from (#3492) ────────────────────────────
+def test_a_named_caller_whose_row_is_not_its_own_refuses(dc, dc_ready, capsys):
+    """T4n: the caller names itself, but the row is another run's (here a
+    harmless one the shared rule calls safe, at its tag): writing the record
+    there, or retiring it, would act on another update's state."""
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    w.git(w.root, "tag", "-f", "pre")
+    state = _own_row(w, pid=os.getppid() + 1)
+    before = state.read_bytes()
+    assert w.run(dc, "rebuild", extra_env=_own_env()) == 1
+    err = capsys.readouterr().err
+    assert "not the calling update's own row" in err, err
+    assert state.read_bytes() == before and not w.live_merges()
+
+
+def test_an_orphaned_engine_never_writes_its_callers_row(dc, dc_ready, capsys, monkeypatch):
+    """S13': update.sh was SIGKILLed, so the engine's parent is no longer the
+    pid it was named: the row is not its caller's any more. A record before the
+    move refuses (nothing moved); one after it only warns. The row is untouched
+    either way."""
+    w = dc_ready
+    state = _own_row(w)
+    before = state.read_bytes()
+    engine = dc.Engine(w.root, {**w.env, **_own_env()})
+    engine._update_lock_held = True
+    assert engine._own_update_state(), "control: the row is the caller's while it lives"
+    # Reparented: any pid but the named one (a sandbox may already run pytest
+    # as pid 1's child, so 1 is not "different" there).
+    named = os.getppid()
+    monkeypatch.setattr(os, "getppid", lambda: named + 1)
+    with pytest.raises(dc.Refusal, match="nothing moved"):
+        engine.record_move("e" * 40, "moving", before=True)
+    engine.record_move("e" * 40, "done", before=False)
+    assert "WARNING" in capsys.readouterr().out
+    assert state.read_bytes() == before
 
 
 def _second_rebuild_world(dc, w, capsys) -> str:
@@ -1093,9 +1218,9 @@ def _before_the_lock(dc, monkeypatch, act) -> None:
     monkeypatch.setattr(dc.plan, "_acquire_checkout_lock", acting)
 
 
-def _rebuild_with_record(dc, w) -> tuple[int, Path]:
-    rec = _record(w)
-    return w.run(dc, "rebuild", extra_env={"DEPLOY_CANDIDATES_MOVE_RECORD": str(rec)}), rec
+def _rebuild_with_record(dc, w) -> tuple[int, _MoveRecord]:
+    rec = _MoveRecord(_own_row(w))
+    return w.run(dc, "rebuild", extra_env=_own_env()), rec
 
 
 def test_a_session_commit_on_live_before_the_lock_refuses_and_keeps_it(
@@ -1398,9 +1523,9 @@ def test_a_drop_whose_move_finds_a_moved_source_names_the_rebuild_not_a_retry(
     w = dc_ready
     _second_rebuild_world(dc, w, capsys)
     assert w.run(dc, "rebuild") == 0, capsys.readouterr()
-    rec = w.home / "no-such-dir" / "live_move.json"
-    env = {"DEPLOY_CANDIDATES_MOVE_RECORD": str(rec)}
-    assert w.run(dc, "drop", "feat/b", extra_env=env) == 1
+    _own_row(w)
+    _unwritable_state(monkeypatch)
+    assert w.run(dc, "drop", "feat/b", extra_env=_own_env()) == 1
     err = capsys.readouterr().err
     assert "WAS saved" in err and "deploy_candidates rebuild" in err, err
     assert "run this again" not in err, err
@@ -1793,3 +1918,33 @@ def test_a_branch_switch_after_the_unchanged_check_is_warned(dc, dc_ready, capsy
     out = capsys.readouterr().out
     assert "checkout: unchanged" in out, out
     assert "WARNING: HEAD is now on feat-s" in out and "switch the checkout back" in out, out
+
+
+@pytest.mark.parametrize("how", ["git-fails", "git-raises"])
+def test_an_unreadable_head_after_the_move_is_unknown_not_on_live(
+    dc, dc_ready, capsys, monkeypatch, how
+):
+    """#3516 round 4: when where HEAD is cannot be read after the move, the run
+    does not know the checkout is on `live`. The restart advice says so and
+    never recommends the plain restart (which would load whatever HEAD is on)."""
+    w = dc_ready
+    _second_rebuild_world(dc, w, capsys)
+    real_git = dc.Engine.git
+    switched: list[bool] = []
+
+    def git(self, *args, **kw):
+        if args and args[0] == "switch":
+            switched.append(True)
+        elif switched and args[:1] == ("symbolic-ref",):
+            if how == "git-raises":
+                raise OSError("git could not be run")
+            return subprocess.CompletedProcess(["git", *args], 128, "", "fatal: broken")
+        return real_git(self, *args, **kw)
+
+    monkeypatch.setattr(dc.Engine, "git", git)
+    assert w.run(dc, "rebuild") == 0
+    out = capsys.readouterr().out
+    assert switched, "the move never switched: the fixture did not reach the hazard"
+    assert "could not be read" in out, out
+    assert "validation holds the lock: scripts/deploy_code_only.sh restart" not in out, out
+    assert "on a detached" not in out, "an unreadable HEAD was reported as detached"
