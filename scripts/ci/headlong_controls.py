@@ -16,7 +16,7 @@ from tempfile import TemporaryDirectory
 
 import headlong_fixture as fixture
 
-PIN = "eab04ad4097fb2030f27bee6026e24f57289f12d"
+PIN = "eab04ad4097fb2030f27bee6026e24f57289f12d"  # pragma: allowlist secret (public upstream commit pin)
 ROUTES = ("fixed", "http", "cli")
 KINDS = ("effect", "noop", "failure")
 UPSTREAM = [(name, "", 1) for name in (
