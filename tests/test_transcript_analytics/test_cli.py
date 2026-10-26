@@ -8,6 +8,27 @@ import pytest
 from genesis.transcript_analytics import cli, config
 
 
+@pytest.mark.parametrize('option', ['--max-rows', '--cell-width'])
+@pytest.mark.parametrize('value', ['-1', '-100', '1.5', 'nan'])
+def test_sql_display_limits_reject_invalid_input_before_admission(monkeypatch, option, value):
+    def unexpected_config(*args, **kwargs):
+        pytest.fail('invalid display input reached configuration/admission')
+    monkeypatch.setattr(config, 'load', unexpected_config)
+    with pytest.raises(SystemExit) as error:
+        cli.main(['sql', 'SELECT 1', option, value])
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize('value', [0, 1, 120])
+def test_sql_zero_and_positive_display_limits_remain_supported(value):
+    import argparse
+    parser = argparse.ArgumentParser()
+    cli._configure(parser)
+    args = parser.parse_args(['sql', 'SELECT 1', '--max-rows', str(value), '--cell-width', str(value)])
+    assert args.max_rows == args.cell_width == value
+    assert cli._cell('abcd', 0) == '…(+4 chars)'
+
+
 def test_disabled_and_help_never_import_analytics_dependencies(tmp_path):
     # Import blocker is stronger than having optional libraries installed locally.
     source = str(Path(__file__).resolve().parents[2] / "src")
@@ -41,6 +62,32 @@ def test_invalid_config_does_not_collect(monkeypatch):
 
     monkeypatch.setattr(config, "load", bad)
     assert cli.main(["ingest"]) == 2
+
+
+@pytest.mark.parametrize("missing", [("duckdb",), ("pyarrow",), ("duckdb", "pyarrow"), ()])
+def test_dependency_guidance_matches_actual_extra_installation(monkeypatch, capsys, tmp_path, missing):
+    import importlib.util
+    from unittest.mock import Mock
+
+    from genesis.transcript_analytics import resources
+
+    monkeypatch.setattr(config, "load", lambda: config.Config(enabled=True, data_dir=tmp_path))
+    real_find = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name in missing else real_find(name))
+    admission = Mock(return_value=75)
+    monkeypatch.setattr(resources, "ensure_capped", admission)
+    result = cli.main(["ingest"])
+    if missing:
+        assert result == 2
+        admission.assert_not_called()
+        report = json.loads(capsys.readouterr().out)
+        assert report["unavailable"] == list(missing)
+        assert "transcript-analytics" in report["action"]
+        assert "docs/reference/transcript-analytics.md" in report["action"]
+        assert "bootstrap" not in report["action"]
+    else:
+        assert result == 75
+        admission.assert_called_once()
 
 
 def test_ingest_returns_deferred_when_snapshot_lock_busy(tmp_path, monkeypatch, capsys):

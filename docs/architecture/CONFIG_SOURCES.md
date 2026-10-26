@@ -194,7 +194,8 @@ names, so an overlay of a read-only file is editable (#2446).
 - **Process env only** (no file layer): paths — `GENESIS_REPO_ROOT`, `SECRETS_PATH`,
   `GENESIS_DB_PATH`, `GENESIS_HOME`, `VENV_PATH`, `CLAUDE_HOME`, `GENESIS_PLANS_DIR`,
   `GENESIS_OUTPUT_DIR`, `GENESIS_CC_PROJECT_ID`; tuning — `GENESIS_DB_BUSY_TIMEOUT_MS`
-  (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`.
+  (MCP children default it to 15000), read-pool sizes, `GENESIS_RECALL_RERANK_RPM`,
+  `GENESIS_SQLITE_SLOW_MS` (slow-statement log threshold, default 1000, `0` = off).
   All in `src/genesis/env.py`. They reach a process via the unit, `secrets.env`, or the parent.
 - **`~/.genesis/resource-budget.env`** — optional `KEY=VALUE` file for the resource-budget
   levers (`GENESIS_RB_*`), read by `genesis.hostmetrics`; the process environment wins over

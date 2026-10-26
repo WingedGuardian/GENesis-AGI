@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from genesis.env import genesis_home
+from genesis.hostmetrics.run import MIN_RAM
 
 
 @dataclass(frozen=True)
@@ -56,16 +57,19 @@ def persistent_values(base_path: Path | None = None) -> dict:
 
 def load(base_path: Path | None = None, *, ignore_kill: bool = False) -> Config:
     """Read base and strict private overlay; malformed settings never opt in."""
-    if not ignore_kill and os.environ.get("GENESIS_TRANSCRIPT_ANALYTICS_DISABLED") == "1":
-        return Config()
     values = persistent_values(base_path)
-    return from_values(values)
+    cfg = from_values(values)
+    if not ignore_kill and os.environ.get("GENESIS_TRANSCRIPT_ANALYTICS_DISABLED") == "1":
+        return replace(cfg, enabled=False)
+    return cfg
 
 
 def from_values(values: dict) -> Config:
     """Validate a persistent mapping through the same runtime configuration policy."""
     if not isinstance(values, dict):
         raise ValueError("transcript analytics config must be a mapping")
+    if values.keys() - (Config.__dataclass_fields__.keys() | {"scope"}):
+        raise ValueError("transcript analytics config contains unsupported keys")
     if type(values.get("enabled", False)) is not bool:
         raise ValueError("enabled must be a boolean")
     if values.get("scope", "all") != "all":
@@ -86,7 +90,7 @@ def from_values(values: dict) -> Config:
         if key not in kwargs or (key == "ram_bytes" and kwargs[key] is None):
             continue
         value = kwargs[key]
-        minimum = {"evidence_records": 0, "evidence_bytes": 1024, "ram_bytes": 1}[key]
+        minimum = {"evidence_records": 0, "evidence_bytes": 1024, "ram_bytes": MIN_RAM}[key]
         if type(value) is not int or value < minimum:
             raise ValueError(f"{key} must be an integer >= {minimum}")
     return Config(**kwargs)

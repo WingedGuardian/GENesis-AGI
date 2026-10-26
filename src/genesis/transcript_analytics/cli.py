@@ -38,6 +38,16 @@ def _disabled(args) -> bool:
     )
 
 
+def _nonnegative_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("display limit must be a nonnegative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("display limit must be a nonnegative integer")
+    return parsed
+
+
 def _positive_window(value):
     if value is None:
         return None
@@ -336,10 +346,10 @@ def _configure(ap):
     p.add_argument(
         "--live", action="store_true", help="query the per-source files, not the snapshot (slow)"
     )
-    p.add_argument("--max-rows", type=int, default=100)
+    p.add_argument("--max-rows", type=_nonnegative_int, default=100)
     p.add_argument(
         "--cell-width",
-        type=int,
+        type=_nonnegative_int,
         default=120,
         help="display preview width; --csv prints whole values",
     )
@@ -395,7 +405,10 @@ def run(args, argv=None):
                 {
                     "enabled": True,
                     "unavailable": missing,
-                    "action": "run the normal update/bootstrap to install the transcript-analytics extra",
+                    "action": (
+                        "install the transcript-analytics package extra in your development "
+                        "environment; see docs/reference/transcript-analytics.md"
+                    ),
                 }
             )
         )

@@ -3470,9 +3470,12 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
   a context note naming the setting. That note is what proves a silenced
   access; with no note, assume the access went past the guard unseen. It
   approves nothing; other hooks and Claude Code's own permissions still decide
-  the command, and a dispatched session is still denied. The only other key is
-  `push_publish` (owner ruling 2026-10-01), same no-decision-plus-note shape.
-  It silences only the first push of the CURRENT branch, and only when the
+  the command, and a dispatched session is still denied. The other keys are
+  `push_routine` (routine push prompts, 2026-10-06), `review_request` (a Codex
+  review request whose review history could not be read; the round-cap prompt
+  still asks, 2026-10-07) and `push_publish` (owner ruling 2026-10-01), all the
+  same no-decision-plus-note shape; `hook_ask_policy.py` holds the exact scope
+  of each. `push_publish` silences only the first push of the CURRENT branch, and only when the
   whole command is exactly one plain `git push` (e.g. `git push -u origin
   HEAD`) — a chained command still asks, so run the first push as its own
   command. The remote git really pushes to must resolve (rewrites applied) to
