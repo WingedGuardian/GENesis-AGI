@@ -928,14 +928,20 @@ are the other timing/volume controls on that path.
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: 85652265ca1a 2026-10-09
+verified: e4df379de612 2026-10-09
 ```
 
 - **Individual peer consent foundation**: `peers/approvals.py` persists exact
   task/generation/capability/digest creation intents before ApprovalManager rows
   and retries the normal approval notification helper. Only named individual
   dashboard or authorized Telegram buttons resolve peer operations; batch and
-  generic resolver origins refuse them. Notification failure stays visible.
+  generic resolver origins refuse them. Generic consent banners exclude peer
+  operations while the dedicated peer/task/digest card remains available.
+  Dashboard peer resolution requires internal owner bearer proof or a verified
+  password-backed session with same-origin intent, even with general API auth off.
+  Passwordless dashboard admission alone cannot resolve peer approvals.
+  Notification failure stays visible; an already committed manager delivery
+  receipt repairs missing association bookkeeping without another send.
   Private `peers/lifecycle_state.py` now consumes named, timely consent atomically
   with continuation queueing and preserves it for the unchanged request across
   attempts. `peers/operation_state.py` separates operation outcomes from consent;
@@ -950,6 +956,7 @@ verified: 85652265ca1a 2026-10-09
   requires the observed generation or a drained persisted cancellation.
   These are dark state primitives: runtime installation and complete integration
   testing remain later lifecycle slices. See [lifecycle state](../reference/peer-lifecycle.md).
+  Continuation consumption and runtime activation require the coordinator slice.
   See [peer approvals](../reference/peer-approvals.md).
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
   converge there. `EmailAutonomyGate` (`autonomy/email_gate.py`, WS-8

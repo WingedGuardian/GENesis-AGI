@@ -852,3 +852,36 @@ def test_the_secrets_editor_sends_null_to_clear_and_never_an_empty_value():
     assert r.stdout.strip().endswith("OK"), (
         "the secrets editor's PUT payload shape is wrong:\n" + r.stdout
     )
+
+
+
+def test_outreach_modal_excludes_peer_consent_from_actual_fetch_body():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+    js = DASHBOARD_JS.read_text()
+    signature = "async fetchOutreachMessages() {"
+    start = js.index(signature) + len(signature)
+    body = js[start:js.index("\n        },", start)]
+    script = """
+const assert = require('node:assert/strict');
+let approvalResponse = [{id:'ordinary', action_type:'ordinary'},
+                        {id:'peer', action_type:'peer_operation'}];
+const fetchApi = async (path) => ({ok:true,
+  json:async () => path.includes('/approvals') ? approvalResponse : []});
+const ctx = {outreachModal:{}, approvals:[{id:'dedicated-peer'}],
+  startModalFetch(){}, finishModalFetch(){},
+  failModalFetch(){throw new Error('modal fetch failed');},
+  async fetchOutreachMessages(){BODY}
+};
+(async () => {
+  await ctx.fetchOutreachMessages();
+  assert.deepEqual(ctx.outreachModal.pendingApprovals.map(row => row.id), ['ordinary']);
+  assert.deepEqual(ctx.approvals, [{id:'dedicated-peer'}]);
+  approvalResponse=[];
+  await ctx.fetchOutreachMessages();
+  assert.deepEqual(ctx.outreachModal.pendingApprovals, []);
+})().catch(() => {process.exitCode=1;});
+""".replace("BODY", body)
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, "Actual outreach modal fetch body failed its feed contract"

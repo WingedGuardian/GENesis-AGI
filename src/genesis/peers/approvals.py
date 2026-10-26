@@ -12,6 +12,7 @@ import re
 from contextlib import suppress
 from datetime import UTC, datetime
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from genesis.autonomy.peer_approval import PEER_OPERATION_ACTION_TYPE
 from genesis.peers.registry import capability as validate_capability
@@ -23,7 +24,7 @@ from genesis.security.output_scanner import scan_outbound
 class PeerApprovals:
     def __init__(self, registry, manager, gate):
         self.registry, self.manager, self.gate = registry, manager, gate
-        self._notification_locks = {}
+        self._notification_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
     async def _current(self, db, intent):
         row = await (
@@ -134,7 +135,10 @@ class PeerApprovals:
 
     async def deliver(self, approval_id):
         """Retry only notification/creation; never execute or resolve an operation."""
-        async with self._notification_locks.setdefault(approval_id, asyncio.Lock()):
+        # Every holder and waiter keeps its selected lock alive through release.
+        # Do not evict manually: another waiter may still own the same lock.
+        lock = self._notification_locks.setdefault(approval_id, asyncio.Lock())
+        async with lock:
             return await self._deliver(approval_id)
 
     async def _deliver(self, approval_id):
@@ -165,27 +169,32 @@ class PeerApprovals:
                 timeout_seconds=remaining,
             )
             request = await self.manager.get_by_id(approval_id)
+        persisted_context = json.loads(request["context"])
         if (
             request["action_type"] != PEER_OPERATION_ACTION_TYPE
             or request["description"] != intent["description"]
-            or json.loads(request["context"])["extra"] != context["extra"]
+            or persisted_context["extra"] != context["extra"]
         ):
             raise TaskRefusal("state_conflict", 409)
         if request["status"] != "pending" or intent["notified_at"] is not None:
             return False
-        delivered = False
-        # Notification failure remains visible and retryable, never consent.
-        with suppress(Exception):
-            delivered = (
-                await self.gate._send_request(
-                    request_id=approval_id,
-                    context=context,
-                    action_label=intent["description"],
-                    invocation=None,
-                    api_error=None,
+        # The manager receipt commits before association bookkeeping. Recover
+        # that success without sending again; receipt metadata is never consent.
+        receipt = persisted_context.get("delivery_id")
+        delivered = isinstance(receipt, str) and bool(receipt)
+        if not delivered:
+            # Notification failure remains visible and retryable, never consent.
+            with suppress(Exception):
+                delivered = (
+                    await self.gate._send_request(
+                        request_id=approval_id,
+                        context=context,
+                        action_label=intent["description"],
+                        invocation=None,
+                        api_error=None,
+                    )
+                    is True
                 )
-                is True
-            )
         async with self.registry.transaction() as db:
             await db.execute(
                 "UPDATE peer_operation_approvals SET notification_attempts=notification_attempts+1,"
