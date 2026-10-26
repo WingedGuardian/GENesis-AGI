@@ -274,9 +274,7 @@ exception: a Devin-built PR is audited before further rounds are spent, and a
 SOUND-BUT-INFERIOR verdict with a better shape that changes the mechanism or the
 files touched IS kicked back to Devin. See the closing-session skill, "Devin-built PRs".)
 
-**The evidence bar is TWO OR MORE independent signals**, the same bar the
-round-2 gate message states, because a doc that set a lower one would be the
-easier surface to read and would quietly undercut it. The signals: findings
+**The evidence bar is TWO OR MORE independent signals.** The signals: findings
 CONCENTRATING in one file or function; a finding landing on a line THIS change
 added in an earlier round; the diff GROWING across rounds instead of shrinking.
 One alone is an ordinary local defect wearing an architectural shape — findings

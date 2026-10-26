@@ -655,7 +655,15 @@ async def test_stdin_failure_still_drains_when_both_kill_methods_refuse(
 
 
 @pytest.mark.parametrize("behavior", ["result", "eof", "cancel"])
-@pytest.mark.parametrize("scoped", [False, True], ids=["process-group", "user-scope"])
+@pytest.mark.parametrize(
+    "scoped",
+    [
+        pytest.param(False, id="process-group"),
+        # A real transient user scope: the live fence's systemd-run stub would
+        # answer "unavailable" and skip it, so it opts out (tests/_live_fence.py).
+        pytest.param(True, id="user-scope", marks=pytest.mark.user_manager),
+    ],
+)
 async def test_native_subprocess_lifecycle_and_provenance(
     db, native, tmp_path, monkeypatch, behavior, caplog, scoped
 ):
@@ -694,6 +702,13 @@ async def test_native_subprocess_lifecycle_and_provenance(
         "_build_args",
         lambda *args, **kwargs: [str(script), "-p", "--output-format", "json"],
     )
+    if scoped:
+        # Probe afresh: an earlier test's probe under the live fence's systemd-run
+        # stub fails and starts the module's retry cooldown, which would answer []
+        # here without probing at all.
+        monkeypatch.setattr("genesis.cc.invoker._SCOPE_ARGS", None)
+        monkeypatch.setattr("genesis.cc.invoker._SCOPE_PROBE_FAILED_AT", None)
+        monkeypatch.setattr("genesis.cc.invoker._SCOPE_PROBE_FAILURES", 0)
     prefix = await _get_scope_args() if scoped else []
     if scoped and not prefix:
         pytest.skip("Native user scope is unavailable on this test host")

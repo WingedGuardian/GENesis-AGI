@@ -89,20 +89,32 @@ async def user_job_create(
             effort=effort,
         )
 
-        # Register with APScheduler
-        await _scheduler.add_job(job_id)
-
-        return {
-            "success": True,
-            "job_id": job_id,
-            "title": title,
-            "cron_expression": cron_expression,
-            "profile": profile,
-            "model": model,
-        }
     except Exception as exc:
         logger.error("Failed to create user job: %s", exc, exc_info=True)
         return {"error": f"Failed to create job: {exc}"}
+
+    # A failed registration must not lose the already-saved definition's ID.
+    try:
+        ok = await _scheduler.add_job(job_id)
+    except Exception as exc:
+        logger.error("User job registration failed (%s)", type(exc).__name__)
+        ok = False
+    result = {
+        "success": ok,
+        "saved": True,
+        "registered": _scheduler.is_registered(job_id),
+        "job_id": job_id,
+        "title": title,
+        "cron_expression": cron_expression,
+        "profile": profile,
+        "model": model,
+    }
+    if not ok:
+        result["error"] = (
+            f"Job {job_id} was saved, but registration failed. "
+            "Retry user_job_control with this job_id and action='resume'; do not recreate it."
+        )
+    return result
 
 
 @mcp.tool()
@@ -126,6 +138,7 @@ async def user_job_list() -> dict:
                     "cron_expression": j["cron_expression"],
                     "job_type": j.get("job_type", "generic"),
                     "status": j["status"],
+                    "registered": _scheduler is not None and _scheduler.is_registered(j["id"]),
                     "profile": j.get("profile", "observe"),
                     "model": j.get("model", "sonnet"),
                     "last_run_at": j.get("last_run_at"),
@@ -165,7 +178,13 @@ async def user_job_control(
             return {"success": ok, "action": "paused", "job_id": job_id}
         elif action == "resume":
             ok = await _scheduler.resume_job(job_id)
-            return {"success": ok, "action": "resumed", "job_id": job_id}
+            result = {
+                "success": ok, "action": "resumed", "job_id": job_id,
+                "registered": _scheduler.is_registered(job_id),
+            }
+            if not ok:
+                result["error"] = "Registration failed or job not found. Retry resume with the same job_id."
+            return result
         elif action == "run_now":
             session_id = await _scheduler.run_now(job_id)
             return {

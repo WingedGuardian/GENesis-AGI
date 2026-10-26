@@ -364,6 +364,28 @@ def _writable_path(path: Path, *, directory: bool, readable: bool = False) -> No
         )
 
 
+def queue_initialization_advisory() -> dict:
+    """Conditional append-lock prerequisites; no schema or contention probe."""
+    result = {
+        "path": None, "exists": None, "state": "unavailable", "error": None,
+        "required_when": "queue initialization or schema upgrade",
+    }
+    try:
+        state = absolute(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
+        lock = state / "index-requests/.queue-db-init.lock"
+        result["path"] = str(lock)
+        try:
+            lock.lstat()
+            result["exists"] = True
+        except FileNotFoundError:
+            result["exists"] = False
+        _writable_path(lock, directory=False)
+        result["state"] = "observed_writable" if result["exists"] else "absent"
+    except (OSError, ValueError, RuntimeError) as error:
+        result["error"] = str(error)
+    return result
+
+
 def verify_worker_writes(config: dict, persistence: bool) -> None:
     """Advisory write prerequisites; real IO failures retain their classification."""
     state = absolute(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
