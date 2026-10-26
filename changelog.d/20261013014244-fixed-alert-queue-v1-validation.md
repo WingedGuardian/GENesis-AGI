@@ -1,1 +1,0 @@
-- One malformed file in the alert queue no longer stops queued alerts from being delivered or causes new alerts to be dropped; it is set aside as `.corrupt` with a warning naming the bad field, and deleted once it is more than 14 days old.

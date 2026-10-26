@@ -39,7 +39,9 @@ _SECTION = re.compile(r"^\s{0,3}[A-Z][A-Z ]*$")
 
 def _measured_flags(group: str, sub: str) -> tuple[frozenset[str], frozenset[str]]:
     """Re-derive (value_flags, bool_flags) for one table row from live help."""
-    cmd = [GH, "help", group] + ([sub] if sub else [])
+    # Resolved per call: the live fence's real_tool marker takes its stub off
+    # PATH for this test, after module import has already run.
+    cmd = [shutil.which("gh") or GH, "help", group] + ([sub] if sub else [])
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     assert out.returncode == 0, f"`{' '.join(cmd)}` exited {out.returncode}: {out.stderr}"
     value: set[str] = set()
@@ -59,6 +61,7 @@ def _measured_flags(group: str, sub: str) -> tuple[frozenset[str], frozenset[str
     return frozenset(value), frozenset(boolean)
 
 
+@pytest.mark.real_tool("gh")  # reads the installed gh's own help text
 def test_flag_table_matches_gh_help():
     """Every modeled row agrees with what the installed gh's own help declares.
 
