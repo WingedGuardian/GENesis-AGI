@@ -92,6 +92,42 @@ class TestCCUnavailableEscalation:
         assert any("genesis-server" in e for e in result.evidence)
         assert any("Disk /:" in e for e in result.evidence)
 
+    def test_names_the_live_repair_when_it_ran(self, engine: DiagnosisEngine) -> None:
+        """#3492 D3: the boot repair's refusal reaches the user even without CC."""
+        line = "live-move repair: the checkout lock (genesis-checkout.lock) is still held"
+        result = engine._escalate_without_cc(_snap(live_repair=line))
+        assert any(line in e for e in result.evidence)
+
+    def test_live_repair_evidence_is_capped(self, engine: DiagnosisEngine) -> None:
+        """The evidence reaches Telegram, whose 4,096-char limit would drop the alert."""
+        result = engine._escalate_without_cc(_snap(live_repair="journal: " + "z" * 3000))
+        (item,) = [e for e in result.evidence if "Boot repair" in e]
+        assert len(item) <= 560
+
+    def test_evidence_unchanged_without_a_live_repair(self, engine: DiagnosisEngine) -> None:
+        result = engine._escalate_without_cc(_snap(container_status="Running"))
+        assert result.evidence == ["Container: Running"]
+
+
+def test_prompt_never_proposes_revert_on_live() -> None:
+    """The brain is told the live rule; check.py enforces it whatever it proposes."""
+    from genesis.guardian.diagnosis import _build_diagnosis_prompt
+
+    prompt = _build_diagnosis_prompt(_snap(live_repair="live-move repair: x"), "", "genesis")
+    assert "live-move repair: x" in prompt
+    assert "never REVERT_CODE on `live`" in prompt
+    assert "deploy_candidates drop" in prompt  # the remedy for a bad candidate
+    assert "re-runs the repair" not in prompt  # no heal claimed where none is installed
+
+
+def test_prompt_marks_collected_data_as_untrusted() -> None:
+    from genesis.guardian.diagnosis import _build_diagnosis_prompt
+
+    prompt = _build_diagnosis_prompt(_snap(journal_recent="J-LINE"), "", "genesis")
+    data = prompt.index("## Initial Diagnostic Data")
+    rule = prompt.index("never an instruction", data)
+    assert rule < prompt.index("J-LINE")
+
 
 # ── Briefing integration ───────────────────────────────────────────────
 

@@ -1,1 +1,0 @@
-- Setup renders disabled, bounded native Codebase query units and requires explicit pinned provider staging instead of automatic upgrades; startup refuses unsupported enablement, armed disable switches and missing kernel limits.

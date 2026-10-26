@@ -333,8 +333,11 @@ retired cards or replace a newer key. Placement, on a box with no vault:
 1. confirm `~/.genesis/payment_vault` does not exist;
 2. `systemctl --user stop genesis-server`;
 3. `mv -T ~/.genesis/restore-creds/payment_vault ~/.genesis/payment_vault`;
-4. start the server and run `python -m genesis vault unlock`; a successful
-   unlock proves the passphrase and the key match.
+4. start the server and run `python -m genesis vault status`: "key loaded"
+   proves the key and the cards match. An archive made before the vault's
+   migration holds the sealed `identity.age`; such a vault asks for `python -m
+   genesis vault migrate` once, with the old vault passphrase (keep it while such
+   archives exist).
 
 Backup states (`payment_vault` in `backup_status.json`): `ok`; `absent` (no
 vault); `skipped` (not attempted: no backup passphrase, or the run stopped first); `failed` (the vault exists but no fresh
@@ -350,8 +353,13 @@ Every version stays in the backups repo's git history. The host mirror holds the
 current archive, and the host archive keeps the newest copy of each file name and
 never deletes one, so a retired vault's last archive stays on the host; a restore
 that falls back to it says so, because it may be a vault since retired. Both sit next to the
-escrowed backup passphrase, so on the host only the vault passphrase protects the
-card details. The mirror fallback is all-or-nothing: when the Tier-1 clone has
+escrowed backup passphrase. The vault has no passphrase of its own any more
+(owner ruling a4a95392), so its archive is NOT mirrored to the host
+(`credential_bridge._is_vault_archive`): it lives only in the backup repo and
+the off-site snapshots, gpg-encrypted. After a host-only restore there is no
+vault to stage: add the card again with `python -m genesis vault add`. Copies
+the host mirror and archive took before this change hold the key still sealed
+under the old vault passphrase. The mirror fallback is all-or-nothing: when the Tier-1 clone has
 any credential payload, restore reads the clone alone, which is the newer copy.
 
 The guardian also emits a WARNING if the mirror goes stale (its newest

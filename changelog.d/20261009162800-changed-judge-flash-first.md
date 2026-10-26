@@ -1,1 +1,0 @@
-- General rubric judging now tries DeepSeek V4.1 Flash directly and through OpenRouter before the V4 Pro fallback. This interim operator preference does not qualify Flash for procedure suppression.
