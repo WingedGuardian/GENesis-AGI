@@ -31,7 +31,7 @@ def corpus():
     pem = begin + "\nU1lOVEhFVElD\n" + end
     values = ["", "hello\nRouting signals:\nChoose ONE", '{ "content": "hello", "n": 42 }', "λ🙂" * 100000,
               "4111 1111 1111 1111", "4111111111111111", "VISA is 4111 1111 1111 1111",
-              "https://user:pass@example.test", '{"auth":"U1lOVEhFVElDOk5PVF9BX1NFQ1JFVA=="}',
+              "https://user:pass@example.test", '{"auth":"U1lOVEhFVElDOk5PVF9BX1NFQ1JFVA=="}',  # pragma: allowlist secret (synthetic redaction fixture)
               "before " + pem + " after", begin + "\nU1lOVEhFVElD\n\nRouting signals", pem + pem]
     values += [prefix + suffix for prefix, suffix in (
         ("ghp_", "abcdefghijklmnopqrstuvwxyz"), ("github_pat_", "abcdefghijklmnopqrstuv"),
@@ -40,7 +40,7 @@ def corpus():
         ("AKIA", "ABCDEFGHIJKLMNOP"), ("eyJ", "abcdefghijkl.abcdefghijkl.abcdefghijkl"),
         ("sk_live_", "abcdefghijklmnop"), ("whsec_", "abcdefghijkl"), ("npm_", "abcdefghijklmnopqrstuvwxyz"),
         ("glpat-", "abcdefghijkl"), ("dckr_pat-", "abcdefghijkl"), ("SG.", "abcdefghijkl.abcdefghijkl"),
-        ("SK", "abcdef0123456789abcdef0123456789"), ("key-", "abcdefghijklmnopqrstuvwxyz"),
+        ("SK", "abcdef0123456789abcdef0123456789"), ("key-", "abcdefghijklmnopqrstuvwxyz"),  # pragma: allowlist secret (synthetic redaction fixture)
         ("aws_secret_access_key=", "synthetic-value"))]
     return values + [json.dumps({"nested": [{"content": value}]}) for value in values]
 
